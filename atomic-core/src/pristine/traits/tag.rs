@@ -219,6 +219,80 @@ pub trait GitShaIndexMutTxnT: GitShaIndexTxnT {
     fn del_git_sha(&mut self, sha: &str) -> Result<bool, PristineError>;
 }
 
+/// Read persistent Git commit interpretation closures (CB-9B review R1).
+pub trait GitCommitClosureTxnT {
+    /// The complete interpreted closure recorded for `sha`, or `None` when
+    /// the commit has no persisted closure (pre-closure import).
+    fn get_git_commit_closure(&self, sha: &str) -> Result<Option<Vec<Hash>>, PristineError>;
+
+    /// Whether any closure row exists for `sha`.
+    fn has_git_commit_closure(&self, sha: &str) -> Result<bool, PristineError>;
+}
+
+/// Write persistent Git commit interpretation closures (CB-9B review R1).
+pub trait GitCommitClosureMutTxnT: GitCommitClosureTxnT {
+    /// Persist the complete interpreted closure for `sha`. Idempotent:
+    /// rewriting an identical closure is a no-op; a different closure for an
+    /// existing SHA is refused (Git ancestry is immutable, so disagreement is
+    /// corruption or a conflicting reimport).
+    fn put_git_commit_closure(&mut self, sha: &str, closure: &[Hash]) -> Result<(), PristineError>;
+}
+
+/// Read captured bridge hook events (CB-9B review R4).
+pub trait BridgeEventCaptureTxnT {
+    /// The exact captured bytes for `digest`, or `None` when no capture
+    /// exists. Presence of a capture is what makes a journal line
+    /// operation-linkage evidence.
+    fn get_bridge_event_capture(&self, hash: &[u8; 32]) -> Result<Option<Vec<u8>>, PristineError>;
+
+    /// The operation id `digest`'s capture is anchored to, or `None` when the
+    /// capture is unanchored (review C2): only an anchored capture was
+    /// created during an active captured operation and can authenticate as
+    /// operation linkage (RFC §5.4).
+    fn get_bridge_event_capture_anchor(
+        &self,
+        hash: &[u8; 32],
+    ) -> Result<Option<[u8; 32]>, PristineError>;
+
+    /// The capture token minted for `operation` at preparation time (review
+    /// E2), or `None` when the operation carries no capture context.
+    fn get_bridge_ref_capture_token(
+        &self,
+        operation: &[u8; 32],
+    ) -> Result<Option<[u8; 32]>, PristineError>;
+}
+
+/// Write captured bridge hook events (CB-9B review R4).
+pub trait BridgeEventCaptureMutTxnT: BridgeEventCaptureTxnT {
+    /// Capture event bytes immutably. An identical re-capture is a no-op;
+    /// different bytes for an existing hash are refused.
+    fn put_bridge_event_capture(&mut self, bytes: &[u8]) -> Result<[u8; 32], PristineError>;
+
+    /// Capture event bytes immutably AND anchor them to `operation` (review
+    /// C2): the anchor is accepted only while `operation` exists in the
+    /// journal and currently holds the active head of its scope — the
+    /// RFC §5.4 "during an active captured operation" precondition. A
+    /// capture for an unknown or non-active operation is refused, so an
+    /// anchor row is proof the capture was written while that operation was
+    /// the live head.
+    fn put_anchored_bridge_event_capture(
+        &mut self,
+        bytes: &[u8],
+        operation: &crate::types::OperationId,
+    ) -> Result<[u8; 32], PristineError>;
+
+    /// Mint the capture context for `operation` (review E2): stores the
+    /// 32-byte token the operation's capture must carry. Insert-only: the
+    /// same token is idempotent; a different token for an existing operation
+    /// is corruption and refused, so a prepared capture context can never be
+    /// silently replaced.
+    fn put_bridge_ref_capture_token(
+        &mut self,
+        operation: &[u8; 32],
+        token: &[u8; 32],
+    ) -> Result<(), PristineError>;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

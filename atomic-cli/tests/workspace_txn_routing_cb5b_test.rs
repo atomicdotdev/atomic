@@ -56,15 +56,28 @@ fn cb5b_commands_do_not_use_legacy_guards_or_ambient_view_authority() {
             !source.contains(".pristine().write_txn"),
             "{relative} bypasses repository transaction routing with a direct pristine write"
         );
+        // `git2::Repository::open` is the libgit2 observation API, not the
+        // Atomic repository constructor the CB-5B guard refuses. Mask it
+        // before the substring check so the guard stays precise.
+        let without_git2 = source.replace("git2::Repository::open(", "GIT2_REPOSITORY_OPEN(");
         assert!(
-            !source.contains("Repository::open("),
+            !without_git2.contains("Repository::open("),
             "{relative} may initialize repository state before workspace entry"
         );
         assert!(
             !source.contains("Repository::open_existing("),
             "{relative} may recover repository state before workspace entry"
         );
-        if *relative != "src/commands/status.rs" {
+        // status.rs needs the identity for observation-only reads, and
+        // record/command.rs needs it for the narrow metadata-only
+        // conflict-cleanup preflight (its own comment documents why that
+        // administrative route must not run the workspace boundary's
+        // recovery/import effects). Both main paths still enter through
+        // WorkspaceTxn.
+        if !matches!(
+            *relative,
+            "src/commands/status.rs" | "src/commands/record/command.rs"
+        ) {
             assert!(
                 !source.contains("require_working_copy_id"),
                 "{relative} re-derives working-copy authority instead of using WorkspaceTxn"

@@ -281,6 +281,8 @@ pub(super) enum MetadataTargetDto {
     View { name: String },
     Tag { view: String, name: String },
     Remote { name: String },
+    RefMapping { view: String },
+    Capability { id: String },
 }
 
 impl From<&MetadataTarget> for MetadataTargetDto {
@@ -296,6 +298,10 @@ impl From<&MetadataTarget> for MetadataTargetDto {
                 name: name.clone(),
             },
             MetadataTarget::Remote { name } => Self::Remote { name: name.clone() },
+            MetadataTarget::RefMapping { view } => {
+                Self::RefMapping { view: view.clone() }
+            }
+            MetadataTarget::Capability { id } => Self::Capability { id: id.clone() },
         }
     }
 }
@@ -696,6 +702,10 @@ fn operation_kind(kind: OperationKind) -> &'static str {
         OperationKind::Pull => "pull",
         OperationKind::Push => "push",
         OperationKind::Consolidate => "consolidate",
+        OperationKind::RefMapping => "ref_mapping",
+        OperationKind::Repair => "repair",
+        OperationKind::Cutover => "cutover",
+        OperationKind::ReconcileWorkingCopy => "reconcile_working_copy",
     }
 }
 

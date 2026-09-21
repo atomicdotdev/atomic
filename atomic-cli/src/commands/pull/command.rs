@@ -40,9 +40,7 @@ use atomic_remote::{ChangelistEntry, HttpRemote, HttpRemoteConfig, StateResponse
 use atomic_repository::history::HistoryOptions;
 use atomic_repository::{InsertOptions, Repository, ViewManifest};
 
-use crate::commands::git::guard::{
-    guard_working_copy, GuardError, GuardOperation, GuardOutcome, GuardRequest,
-};
+use crate::commands::workspace_txn::{boundary_mode, enter_workspace};
 use crate::commands::{find_repository_root, format_hash, Command};
 use crate::error::{CliError, CliResult};
 use crate::output::{
@@ -487,14 +485,21 @@ impl Pull {
     /// This is the main entry point for the pull operation. It coordinates
     /// all the steps required to download and apply remote changes.
     async fn run_async(&self, repo_root: PathBuf) -> CliResult<()> {
-        // Open repository after the synchronous command boundary has guarded it.
-        let mut repo = Repository::open(&repo_root).map_err(CliError::Repository)?;
-        let working_copy = repo
-            .require_working_copy_id()
-            .map_err(CliError::Repository)?;
-        let desired_view = repo
-            .desired_view_name(working_copy)
-            .map_err(CliError::Repository)?;
+        // Open the repository and enter the shared workspace transaction for the
+        // whole boundary. Dry runs observe without mutation — the boundary opens
+        // read-only so Observe is mutation-free by construction; ordinary pulls
+        // reconcile safe drift and refuse unsafe baselines before any network
+        // or graph work. WorkspaceTxn authority (working copy + view) is
+        // retained for the entire command body.
+        let mut repo = if self.dry_run {
+            Repository::open_readonly(&repo_root)
+        } else {
+            Repository::open_for_workspace_transaction(&repo_root)
+        }
+        .map_err(CliError::Repository)?;
+        let workspace = enter_workspace(&mut repo, boundary_mode(self.dry_run))?;
+        let working_copy = workspace.working_copy();
+        let desired_view = workspace.view().name.clone();
 
         // Resolve remote name, URL, and identity hint
         let (remote_name, remote_url, identity_hint) = self.resolve_remote_url(&repo)?;
@@ -1022,32 +1027,15 @@ impl Command for Pull {
     fn run(&self) -> CliResult<()> {
         let repo_root = find_repository_root()?;
 
-        if self.may_materialize_working_copy() {
-            match guard_working_copy(GuardRequest::new(&repo_root, GuardOperation::Materialize))
-                .map_err(|error| match error {
-                    GuardError::Checkpoint(error) => CliError::InvalidRepository {
-                        reason: error.to_string(),
-                    },
-                    GuardError::Observation(error) => CliError::GitError {
-                        message: error.to_string(),
-                    },
-                    GuardError::Wip(error) => CliError::GitError {
-                        message: error.to_string(),
-                    },
-                })? {
-                GuardOutcome::Pass(_) => {}
-                GuardOutcome::Refuse(refusal) => {
-                    return Err(CliError::StaleBaseline {
-                        report: refusal.to_string(),
-                    });
-                }
-            }
-        }
-
-        // Create a runtime for async operations
-        let rt = tokio::runtime::Runtime::new().map_err(|e| {
-            CliError::Internal(anyhow::anyhow!("Failed to create async runtime: {}", e))
-        })?;
+        // A current-thread runtime keeps the workspace transaction's ordered
+        // operation locks bound to one thread for the whole async body; nested
+        // repository operations re-enter them instead of contending.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| {
+                CliError::Internal(anyhow::anyhow!("Failed to create async runtime: {}", e))
+            })?;
 
         rt.block_on(self.run_async(repo_root))
     }

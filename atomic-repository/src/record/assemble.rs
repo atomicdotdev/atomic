@@ -160,6 +160,22 @@ impl fmt::Display for RecordStats {
 
 // RESULT
 
+/// Summary of a scoped stale-conflict cleanup performed by the record path.
+///
+/// Present when `record` cleared persisted conflict rows that no longer
+/// describe a real graph conflict, without recording any content change.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConflictCleanupSummary {
+    /// View whose conflict table was reconciled.
+    pub view: String,
+    /// Explicitly named paths whose rows were cleared, sorted.
+    pub paths: Vec<String>,
+    /// Number of persisted conflict rows deleted.
+    pub rows_cleared: usize,
+    /// Immutable journaled operation identity.
+    pub operation: Option<atomic_core::OperationId>,
+}
+
 /// Result of recording changes.
 #[derive(Debug)]
 pub struct RecordOutcome {
@@ -196,6 +212,9 @@ pub struct RecordOutcome {
     /// Vault paths that were deflated (synced from disk to redb).
     vault_paths: Vec<String>,
 
+    /// Scoped stale-conflict cleanup performed by the record call, if any.
+    conflict_cleanup: Option<ConflictCleanupSummary>,
+
     /// The original serialized V3 bytes from the first serialize() call.
     ///
     /// Stored so that `save_change` can write the exact bytes to disk
@@ -222,6 +241,7 @@ impl RecordOutcome {
             skipped_files: Vec::new(),
             errors: Vec::new(),
             vault_paths: Vec::new(),
+            conflict_cleanup: None,
             v3_bytes: None,
         }
     }
@@ -379,6 +399,17 @@ impl RecordOutcome {
     /// Get the vault paths that were deflated.
     pub fn vault_paths(&self) -> &[String] {
         &self.vault_paths
+    }
+
+    /// Attach the scoped stale-conflict cleanup performed by this record call.
+    pub fn set_conflict_cleanup(&mut self, cleanup: ConflictCleanupSummary) {
+        self.conflict_cleanup = Some(cleanup);
+    }
+
+    /// The scoped stale-conflict cleanup performed by this record call, if any.
+    #[must_use]
+    pub fn conflict_cleanup(&self) -> Option<&ConflictCleanupSummary> {
+        self.conflict_cleanup.as_ref()
     }
 }
 

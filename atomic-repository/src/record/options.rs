@@ -111,6 +111,15 @@ pub struct RecordOptions {
     /// Defaults to `true`. Internal callers that already know every path they
     /// intend to record may disable this to avoid an unrelated untracked scan.
     detect_raw_renames: bool,
+
+    /// Explicit name-conflict resolution targets (::15 blocker support, the
+    /// user's "Preserve current files" decision): these paths are resolved
+    /// as name conflicts even when the working bytes match MULTIPLE alive
+    /// claimants — the surviving claimant is the canonical TREE-bound
+    /// incarnation among the byte-equal sides, so the resolution preserves
+    /// the current working content and retains every competing recorded
+    /// incarnation (the supersede is append-only metadata).
+    resolve_name_conflicts: Vec<String>,
 }
 
 impl RecordOptions {
@@ -282,6 +291,22 @@ impl RecordOptions {
     pub fn allow_conflict_markers(mut self, allow: bool) -> Self {
         self.allow_conflict_markers = allow;
         self
+    }
+
+    /// Explicit name-conflict resolution targets: the named paths are
+    /// resolved as name conflicts (append-only supersede of the losing
+    /// claims) with the canonical TREE-bound claimant among the working-
+    /// byte-equal sides surviving. See the field docs.
+    #[must_use]
+    pub fn resolve_name_conflicts(mut self, paths: Vec<String>) -> Self {
+        self.resolve_name_conflicts = paths;
+        self
+    }
+
+    /// The explicit name-conflict resolution targets.
+    #[must_use]
+    pub fn get_resolve_name_conflicts(&self) -> &[String] {
+        &self.resolve_name_conflicts
     }
 
     /// Get whether recording marker-laden files is allowed.
@@ -457,7 +482,18 @@ impl RecordOptions {
     /// Convert to assembly options.
     #[must_use]
     pub fn to_assembly_options(&self) -> AssemblyOptions {
-        AssemblyOptions::new()
+        // CB-9C: the assembled change must carry the full tracked content —
+        // the 500 MB opaque-binary corpus exceeds the default 100 MB
+        // assembly content cap, and an import refusal for a tracked blob is
+        // exactly the silent-loss class the corpus forbids. The record-side
+        // file-size policy still governs ordinary local records; assembly
+        // follows this option's file-size budget when it is set, otherwise
+        // the default applies.
+        let assembly = {
+            let bytes_budget = self.max_file_size.saturating_mul(4).max(1024 * 1024);
+            AssemblyOptions::new().max_content_size(bytes_budget as usize)
+        };
+        assembly
             .include_empty_files(self.record_empty_files)
             .globalize_options(
                 GlobalizeOptions::new()
@@ -492,6 +528,7 @@ impl Default for RecordOptions {
             provenance: Vec::new(),
             allow_conflict_markers: false,
             detect_raw_renames: true,
+            resolve_name_conflicts: Vec::new(),
         }
     }
 }

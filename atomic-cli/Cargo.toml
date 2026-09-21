@@ -2,6 +2,10 @@
 default = ["teams"]
 remote = []
 teams = ["atomic-teams"]
+# Forwards the atomic-repository opt-in test instrumentation (R8): the CLI
+# test suite builds the binary with the deterministic adoption seams. The
+# default/shipping configuration compiles no injection code at all.
+adoption-test-injection = ["atomic-repository/adoption-test-injection"]
 
 [package]
 name = "atomic-cli"
@@ -83,6 +87,10 @@ rayon = { workspace = true }
 
 # Git interop
 git2 = { workspace = true }
+
+# Unix signal disposition (SIGPIPE) for pipeline-safe CLI output.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 tempfile = { workspace = true }

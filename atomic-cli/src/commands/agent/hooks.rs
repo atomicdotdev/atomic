@@ -60,7 +60,9 @@ use atomic_agent::hooks::AgentRegistry;
 use atomic_core::change::session::{IncompleteSession, SessionIncompleteOrigin};
 use atomic_core::types::Base32;
 
-use crate::commands::git::guard::{guard_working_copy, GuardOperation, GuardOutcome, GuardRequest};
+use crate::commands::git::guard::GuardOperation;
+use crate::commands::git::wip::{capture_or_reuse_tracked_wip, WipCaptureRequest};
+use atomic_repository::{Repository, WorkspaceTxnMode, WorkspaceTxnStart};
 
 use crate::commands::{find_repository_root, Command};
 use crate::error::{CliError, CliResult};
@@ -349,7 +351,7 @@ impl Command for Hooks {
     }
 }
 
-fn guard_agent_boundary(
+pub(crate) fn guard_agent_boundary(
     repository_root: &std::path::Path,
     managed: &mut Option<super::lifecycle::ManagedLifecycle>,
     session_id: &str,
@@ -371,51 +373,148 @@ fn guard_agent_boundary(
         return Ok(Some(existing.outcome.clone()));
     }
 
-    // One stable WIP identity covers turn-end/session-end retries for this
-    // session. If the process crashes after capture but before lifecycle/session
-    // persistence, CB-0C validates and reuses the immutable ref on retry.
-    let outcome = guard_working_copy(
-        GuardRequest::new(repository_root, operation)
-            .with_wip(session_id, "agent-lifecycle-boundary"),
-    )
-    .map_err(|error| CliError::StaleBaseline {
-        report: format!(
-            "Unsafe operation: {operation}\nGuard failed before agent boundary: {error}"
-        ),
-    })?;
-
-    let GuardOutcome::Refuse(refusal) = outcome else {
-        return Ok(None);
-    };
-    let report = refusal.to_string();
-    let recovery = refusal
-        .recovery
-        .clone()
-        .ok_or_else(|| CliError::StaleBaseline {
+    let mut repository =
+        Repository::open(repository_root).map_err(|error| CliError::StaleBaseline {
             report: format!(
-                "{report}\nAgent refusal did not produce the required WIP recovery capture"
+                "Unsafe operation: {operation}\nGuard failed before agent boundary: {error}"
             ),
         })?;
-    let incomplete = IncompleteSession::new(
-        report,
-        recovery
-            .paths
-            .iter()
-            .map(|path| String::from_utf8_lossy(path).into_owned()),
-        recovery.ref_name,
-        SessionIncompleteOrigin::UnknownPostCheckout,
-    );
+    let boundary_start = repository
+        .begin_workspace_txn(WorkspaceTxnMode::Reconcile)
+        .map_err(|error| CliError::StaleBaseline {
+            report: format!(
+                "Unsafe operation: {operation}\nGuard failed before agent boundary: {error}"
+            ),
+        })?;
 
-    if let Some(lifecycle) = managed.as_mut() {
-        *lifecycle =
-            super::lifecycle::persist_refusal(repository_root, lifecycle, session_id, incomplete)?;
-        return Ok(lifecycle
-            .refusal
-            .as_ref()
-            .map(|refusal| refusal.outcome.clone()));
+    match boundary_start {
+        WorkspaceTxnStart::Ready(_workspace) => {
+            // Safe baseline: the turn proceeds to the orchestrator.
+            //
+            // A session ending for a session Atomic never saw is the last
+            // chance to preserve pending tracked work: no session-start ever
+            // ran, so no pre-session capture exists and the ending must not
+            // quietly discard unattributed bytes. Preservation failure is
+            // never an empty successful turn — it persists a durable
+            // incomplete reason and ends non-zero. Successful preservation of
+            // pending work is evidence-only: nothing was imported, projected,
+            // or recorded, so the ending reports incomplete rather than
+            // claiming success.
+            if hook_type == HookType::SessionEnd
+                && !agent_session_exists(repository_root, session_id)?
+            {
+                let capture = capture_or_reuse_tracked_wip(WipCaptureRequest::new(
+                    repository_root,
+                    session_id,
+                    "agent-lifecycle-boundary",
+                ));
+                match capture {
+                    Ok(evidence) if evidence.paths.is_empty() => {
+                        // Nothing pending — a quiet ending claims nothing.
+                        return Ok(None);
+                    }
+                    Ok(evidence) => {
+                        return Ok(Some(IncompleteSession::new(
+                            format!(
+                                "Unsafe operation: agent session-end\n\
+                                 Ending session with pending tracked work preserved as \
+                                 evidence only (recovery ref {}); nothing was recorded, \
+                                 imported, or claimed",
+                                evidence.ref_name
+                            ),
+                            evidence
+                                .paths
+                                .iter()
+                                .map(|path| String::from_utf8_lossy(path).into_owned()),
+                            evidence.ref_name,
+                            SessionIncompleteOrigin::UnknownPostCheckout,
+                        )));
+                    }
+                    Err(wip_error) => {
+                        return Ok(Some(IncompleteSession::new(
+                            format!(
+                                "Unsafe operation: agent session-end\n\
+                                 WIP preservation failed before the session ended: {wip_error}\n\
+                                 No import, projection, or recording may be claimed"
+                            ),
+                            Vec::<String>::new(),
+                            "",
+                            SessionIncompleteOrigin::UnknownPostCheckout,
+                        )));
+                    }
+                }
+            }
+            Ok(None)
+        }
+        WorkspaceTxnStart::Remediation(remediation) => {
+            // Refused: classify with the typed remediation and preserve
+            // pending work as capture-or-reuse WIP evidence. Never import,
+            // project, or claim a successful recording during a Git-owned
+            // partial operation.
+            let report = format!(
+                "Unsafe operation: {operation}\nRefusal: {}",
+                remediation.describe()
+            );
+            let incomplete = match capture_or_reuse_tracked_wip(WipCaptureRequest::new(
+                repository_root,
+                session_id,
+                "agent-lifecycle-boundary",
+            )) {
+                Ok(recovery) => IncompleteSession::new(
+                    report,
+                    recovery
+                        .paths
+                        .iter()
+                        .map(|path| String::from_utf8_lossy(path).into_owned()),
+                    recovery.ref_name,
+                    SessionIncompleteOrigin::UnknownPostCheckout,
+                ),
+                Err(wip_error) => {
+                    // Preservation itself failed: persist the durable
+                    // incomplete reason (no WIP ref exists) and end the turn
+                    // non-zero. No import, projection, or recording may be
+                    // claimed.
+                    IncompleteSession::new(
+                        format!(
+                            "{report}\nWIP preservation failed before the turn ended: {wip_error}"
+                        ),
+                        Vec::<String>::new(),
+                        "",
+                        SessionIncompleteOrigin::UnknownPostCheckout,
+                    )
+                }
+            };
+
+            if let Some(lifecycle) = managed.as_mut() {
+                *lifecycle = super::lifecycle::persist_refusal(
+                    repository_root,
+                    lifecycle,
+                    session_id,
+                    incomplete.clone(),
+                )?;
+                return Ok(lifecycle
+                    .refusal
+                    .as_ref()
+                    .map(|refusal| refusal.outcome.clone()));
+            }
+            Ok(Some(incomplete))
+        }
     }
+}
 
-    Ok(Some(incomplete))
+/// Whether a durable session record exists for `session_id` in the canonical
+/// session store. Loading never creates state.
+fn agent_session_exists(repository_root: &std::path::Path, session_id: &str) -> CliResult<bool> {
+    let store = match atomic_repository::Repository::canonical_dot_dir(repository_root) {
+        Ok(dot_dir) => atomic_agent::turn::session::SessionStore::new(dot_dir.join("sessions"))
+            .map_err(|e| CliError::Internal(anyhow!("session store unavailable: {}", e)))?,
+        Err(_) => atomic_agent::turn::session::SessionStore::for_repo(repository_root)
+            .map_err(|e| CliError::Internal(anyhow!("session store unavailable: {}", e)))?,
+    };
+    store
+        .load(session_id)
+        .map(|loaded| loaded.is_some())
+        .map_err(|e| CliError::Internal(anyhow!("cannot load session {}: {}", session_id, e)))
 }
 
 impl Hooks {
@@ -817,7 +916,7 @@ mod tests {
         assert_eq!(refusal.origin, SessionIncompleteOrigin::UnknownPostCheckout);
         assert!(refusal.recovery_ref.starts_with("refs/atomic/wip/"));
         assert!(refusal.reason.contains("Unsafe operation: agent turn-end"));
-        assert!(refusal.reason.contains("Git HEAD"));
+        assert!(refusal.reason.contains("HeadChanged"));
         let persisted = managed
             .as_ref()
             .and_then(|lifecycle| lifecycle.refusal.as_ref())
@@ -889,8 +988,9 @@ mod tests {
     fn inherited_agent_view_name_mismatch_passes_shared_guard() {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path();
-        let (git, _) = initialized_colocated_repository(root);
-        drop(git);
+        let (git_repo, head) = initialized_colocated_repository(root);
+        let head_tree = git_repo.find_commit(head).unwrap().tree_id().to_string();
+        drop(git_repo);
 
         let mut repository = atomic_repository::Repository::open_existing(root).unwrap();
         let parent = repository.current_view().to_string();
@@ -900,6 +1000,22 @@ mod tests {
             .set_current_view(working_copy, "agent-view")
             .unwrap();
         drop(repository);
+
+        // The routed view switch keeps the bridge checkpoint aligned with the
+        // working-copy record; refresh it exactly as the routed path would.
+        let atomic = atomic_repository::Repository::open_readonly(root).unwrap();
+        let view_info = atomic.get_view_info("agent-view").unwrap();
+        drop(atomic);
+        checkpoint::write_verified_checkpoint(
+            root,
+            VerifiedCheckpointInput {
+                view: "agent-view",
+                atomic_state: &view_info.state.to_string(),
+                git_head: &head.to_string(),
+                git_tree: &head_tree,
+            },
+        )
+        .unwrap();
 
         let mut managed = Some(managed_lifecycle(root));
         assert!(guard_agent_boundary(

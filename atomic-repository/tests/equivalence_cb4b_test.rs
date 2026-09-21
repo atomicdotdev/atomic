@@ -289,6 +289,7 @@ fn adversarial_reports_are_structured_deterministic_and_joint() {
         version: GIT_INDEX_STATE_VERSION + 1,
         index_version: 4,
         object_format: GitHashAlgorithm::Sha1,
+        sparse_index: false,
         entries: vec![
             GitIndexEntry {
                 path: RepoPath::from_bytes(b"file").unwrap(),

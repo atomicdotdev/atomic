@@ -507,7 +507,20 @@ where
     // Fast path: machine-generated files (lockfiles, bundled output) skip
     // both the expensive diff computation AND CRDT tokenization.  We treat
     // them as a whole-file replace — one vertex in, one vertex out.
-    if super::globalize::should_use_opaque_generated_vertices(&detected.path) {
+    //
+    // Review ::26 R1 follow-up (2026-09-16): this fast path is ONLY safe
+    // when the file has NO existing per-line semantic state. On a MODIFY of
+    // recorded content the emitted hunk (`deleted_lines` empty,
+    // `inserted_lines` 1) made the assembly materialize ONLY the first
+    // line of the new content (a lockfile-only modification rendered 12 of
+    // 67 bytes — a real data-loss defect) and dropped the semantic ops
+    // entirely. With existing branches bound, fall through to the normal
+    // per-line record: the diff produces Modify ops bound to the existing
+    // branches (the proven shape every plain-file modify uses), and the
+    // final content fidelity is identical.
+    if super::globalize::should_use_opaque_generated_vertices(&detected.path)
+        && existing_branches.map_or(true, |branches| branches.is_empty())
+    {
         let mut replace_hunk = BuiltHunk::new_replace_with_lines(
             Local::new(&detected.path, 1),
             Some(encoding),
@@ -550,6 +563,24 @@ where
         replace_hunk.content_start = Some(0);
         replace_hunk.content_end = Some(new_content.len() as u64);
         recorded.add_hunk(replace_hunk);
+
+        // CB-9B (review blocker 3 / F4): a forced whole-file replace must still
+        // regenerate semantic FileOps, and the CRDT side must mirror the
+        // graph's shape — the graph deletes every alive vertex and inserts
+        // the full content fresh, so the semantic layer tombstones every
+        // bound branch and inserts every line fresh. A positional diff here
+        // kept unchanged lines bound to graph-deleted vertices, leaving the
+        // CRDT layer unable to reconstruct the file.
+        let (crdt_ops, crdt_stats) = crdt::build_crdt_ops_for_whole_file_replace(
+            &detected.path,
+            &new_content,
+            encoding,
+            existing_trunk_id,
+            existing_branches,
+        );
+        recorded.set_crdt_ops(crdt_ops);
+        recorded.set_crdt_stats(crdt_stats);
+
         recorded.set_content(new_content);
 
         return Ok(recorded);
@@ -588,6 +619,23 @@ where
         replace_hunk.content_start = Some(0);
         replace_hunk.content_end = Some(new_content.len() as u64);
         recorded.add_hunk(replace_hunk);
+
+        // CB-9B (review blocker 3): binary replaces keep the same semantic
+        // contract as forced replaces — regenerate FileOps from the byte
+        // diff instead of returning without a semantic layer.
+        let recipe_ctx = RecipeContext {
+            path: &detected.path,
+            old_content: crdt_old_content.unwrap_or(old_content),
+            new_content: &new_content,
+            existing_branches,
+            existing_trunk_id,
+            encoding,
+            algorithm: options.get_algorithm(),
+        };
+        let (crdt_ops, crdt_stats) = Recipe::detect(&recipe_ctx).build_ops(&recipe_ctx);
+        recorded.set_crdt_ops(crdt_ops);
+        recorded.set_crdt_stats(crdt_stats);
+
         recorded.set_content(new_content);
 
         return Ok(recorded);

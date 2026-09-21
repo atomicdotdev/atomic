@@ -69,7 +69,9 @@ mod assemble;
 pub mod move_evidence;
 mod options;
 
-pub use assemble::{build_header, filter_files, RecordOutcome, RecordStats};
+pub use assemble::{
+    build_header, filter_files, ConflictCleanupSummary, RecordOutcome, RecordStats,
+};
 pub use move_evidence::{
     extract_move_evidence, merge_move_evidence, AuthoritativeMove, LossNote, MoveAuthority,
     MoveBasis, MoveEvidence, MoveEvidenceError, ProbableMove, RenameCandidate,

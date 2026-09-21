@@ -209,6 +209,18 @@ pub trait MutTxnT:
     /// Remove a file from the tree (removes path↔inode mappings).
     fn del_tree(&mut self, path: &str) -> Result<Option<Inode>, PristineError>;
 
+    /// Rebuild REV_TREE as the exact inverse of TREE.
+    ///
+    /// History (0.17.x tree writes) could re-bind a path to a new inode
+    /// without cleaning the previous inode's REV_TREE row, leaving stale
+    /// reverse rows that fail the TREE/REV_TREE bijection validation every
+    /// later tree write runs. This repair removes every reverse row whose
+    /// path is not TREE-bound back to the same inode and inserts the missing
+    /// inverse for every forward row. TREE is authoritative for the binding;
+    /// the repair never touches forward rows. Returns
+    /// `(removed_stale, inserted_missing)`.
+    fn repair_rev_tree_bijection(&mut self) -> Result<(usize, usize), PristineError>;
+
     /// Store file index entry (mtime + size + content hash) for fast status detection.
     ///
     /// Called after a file is recorded or applied. Subsequent `status()` calls

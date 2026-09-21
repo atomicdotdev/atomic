@@ -260,6 +260,25 @@ impl Pristine {
             // Git SHA index (git commit SHA → entity_id)
             write_txn.open_table(GIT_SHA_INDEX)?;
 
+            // Persistent Git commit interpretation closures (CB-9B review R1)
+            write_txn.open_table(GIT_COMMIT_CLOSURES)?;
+
+            // Immutable captured bridge hook events (CB-9B review R4)
+            write_txn.open_table(BRIDGE_EVENT_CAPTURES)?;
+
+            // Immutable operation anchors for captured bridge hook events
+            // (CB-9B review C2)
+            write_txn.open_table(BRIDGE_EVENT_CAPTURE_ANCHORS)?;
+
+            // Immutable capture-token bindings for prepared bridge Git-ref
+            // operations (CB-9B review E2)
+            write_txn.open_table(BRIDGE_REF_CAPTURE_TOKENS)?;
+
+            // Immutable Git state bindings (RFC-ATOMIC-GIT-CAUSAL-BRIDGE §5.1)
+            write_txn.open_table(BINDINGS)?;
+
+            // Mutable view ↔ Git ref mappings (RFC §8.1, CB-10A)
+            write_txn.open_table(REF_MAPPINGS)?;
             // Session tables (provenance-derived session data, any agent)
             write_txn.open_table(SESSION_EVENTS)?;
             write_txn.open_table(SESSION_TODOS)?;

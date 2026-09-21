@@ -129,11 +129,14 @@ pub trait InodeAttrTxnT: GraphTxnT {
         name: InodeAttrName,
         visible_changes: &HashSet<NodeId>,
     ) -> PristineResult<InodeAttrState> {
-        reduce_events(
-            self,
-            self.get_inode_attr_events(position, name)?,
-            visible_changes,
-        )
+        let candidates: Vec<InodeAttrEvent> = self
+            .get_inode_attr_events(position, name)?
+            .into_iter()
+            .filter(|event| visible_changes.contains(&event.introduced_by))
+            .collect();
+        let mut maxima = attr_event_dependency_frontier(self, candidates)?;
+        maxima.dedup_by_key(|event| event.value);
+        Ok(InodeAttrState { events: maxima })
     }
 }
 
@@ -224,25 +227,33 @@ impl InodeAttrMutTxnT for WriteTxn<'_> {
     }
 }
 
-fn reduce_events<T: GraphTxnT + ?Sized>(
+/// The causally maximal writers among already-selected register events.
+///
+/// An event is dominated when another selected event's introducing change has
+/// this event's introducing change in its dependency closure; dominated
+/// writers are already transitive dependencies of their dominator, so only
+/// the frontier needs to become a direct dependency of a new write. Unlike
+/// [`InodeAttrState`] (whose register projection deduplicates equal values),
+/// the dependency frontier keeps every maximal writer: two concurrent writers
+/// of the same value are both causality a new write must dominate.
+///
+/// Visibility filtering is the caller's or the view-scoped transaction's
+/// responsibility — this helper only reduces ancestry among the events it is
+/// given (review CB-9C R1).
+pub fn attr_event_dependency_frontier<T: GraphTxnT + ?Sized>(
     txn: &T,
     events: Vec<InodeAttrEvent>,
-    visible_changes: &HashSet<NodeId>,
-) -> PristineResult<InodeAttrState> {
-    let candidates: Vec<_> = events
-        .into_iter()
-        .filter(|event| visible_changes.contains(&event.introduced_by))
-        .collect();
+) -> PristineResult<Vec<InodeAttrEvent>> {
     let mut ancestry = HashMap::<NodeId, BTreeSet<NodeId>>::new();
-    for event in &candidates {
+    for event in &events {
         ancestry.insert(
             event.introduced_by,
             causal_ancestors(txn, event.introduced_by)?,
         );
     }
     let mut maxima = Vec::new();
-    'candidate: for candidate in &candidates {
-        for other in &candidates {
+    'candidate: for candidate in &events {
+        for other in &events {
             if other.introduced_by != candidate.introduced_by
                 && ancestry[&other.introduced_by].contains(&candidate.introduced_by)
             {
@@ -252,8 +263,7 @@ fn reduce_events<T: GraphTxnT + ?Sized>(
         maxima.push(*candidate);
     }
     maxima.sort_unstable();
-    maxima.dedup_by_key(|event| event.value);
-    Ok(InodeAttrState { events: maxima })
+    Ok(maxima)
 }
 
 fn causal_ancestors<T: GraphTxnT + ?Sized>(
@@ -356,5 +366,64 @@ mod tests {
         .unwrap();
         bytes[10] = 1;
         assert!(decode_inode_attr_event(&bytes).is_err());
+    }
+
+    /// Review CB-9C R1: the dependency frontier keeps only causally maximal
+    /// writers. A dominated writer is already a transitive dependency of its
+    /// dominator; concurrent writers (even of the same value) all remain.
+    #[test]
+    fn dependency_frontier_keeps_maximal_writers_only() {
+        let temp = tempfile::tempdir().unwrap();
+        let pristine = Pristine::open(temp.path().join("frontier.redb")).unwrap();
+        let h1 = Hash::of(b"frontier base");
+        let h2 = Hash::of(b"frontier concurrent");
+        let h3 = Hash::of(b"frontier later dependent");
+
+        let (id1, id2, id3) = {
+            let mut txn = pristine.write_txn().unwrap();
+            let id1 = txn.register_change(&h1).unwrap();
+            let id2 = txn.register_change(&h2).unwrap();
+            let id3 = txn.register_change(&h3).unwrap();
+            txn.put_change_deps(id1, &[]).unwrap();
+            txn.put_change_deps(id2, &[]).unwrap();
+            txn.put_change_deps(id3, &[h1]).unwrap();
+            txn.commit().unwrap();
+            (id1, id2, id3)
+        };
+
+        let txn = pristine.read_txn().unwrap();
+        let event = |id, mode| InodeAttrEvent {
+            introduced_by: id,
+            value: InodeAttr::Mode(mode),
+        };
+
+        // id1 is an ancestor of id3: id3 dominates it.
+        let frontier = attr_event_dependency_frontier(
+            &txn,
+            vec![
+                event(id1, 0o644),
+                event(id2, 0o755),
+                event(id3, 0o700),
+            ],
+        )
+        .unwrap();
+        let writers: std::collections::HashSet<NodeId> =
+            frontier.iter().map(|event| event.introduced_by).collect();
+        assert_eq!(writers, HashSet::from([id2, id3]));
+
+        // Concurrent writers both stay, even when their values match: a new
+        // write must dominate both writers.
+        let frontier = attr_event_dependency_frontier(
+            &txn,
+            vec![event(id1, 0o644), event(id2, 0o644)],
+        )
+        .unwrap();
+        assert_eq!(frontier.len(), 2);
+
+        // A single writer is its own frontier.
+        let frontier =
+            attr_event_dependency_frontier(&txn, vec![event(id3, 0o700)]).unwrap();
+        assert_eq!(frontier.len(), 1);
+        assert_eq!(frontier[0].introduced_by, id3);
     }
 }

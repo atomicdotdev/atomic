@@ -632,6 +632,62 @@ impl PreparedTreeProjection {
 }
 
 impl Repository {
+    /// The explicit EmptyDirectory loss facts for a view's Atomic→Git
+    /// projection (review CB-9C R7): every explicitly tracked directory whose
+    /// projection contains no alive file beneath it. Git trees cannot hold an
+    /// empty directory, so the projection omits it — the loss note is the
+    /// reviewed fact that it was omitted deliberately, not silently. Git
+    /// import must never fabricate directory-only inodes to avoid this loss.
+    ///
+    /// # Errors
+    ///
+    /// Returns `RepositoryError` when the projection or visibility closure
+    /// fails.
+    pub fn empty_directory_loss_notes(
+        &self,
+        view_name: &str,
+    ) -> Result<Vec<crate::record::LossNote>, RepositoryError> {
+        use atomic_core::pristine::{GraphTxnT, TreeTxnT, ViewTxnT};
+        let txn = self
+            .pristine
+            .read_txn()
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        let view = txn
+            .get_view(view_name)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?
+            .ok_or_else(|| RepositoryError::ViewNotFound {
+                name: view_name.to_string(),
+            })?;
+        let visibility = super::filter::graph_visibility_closure(&txn, &view)?;
+        let projection = self.project_tree_for_visibility(&txn, &visibility)?;
+        // A tracked directory is empty exactly when no present FILE path
+        // carries it as a prefix (the projection itself only materializes
+        // structural directories from file paths).
+        let mut notes = Vec::new();
+        let mut directories: Vec<&str> = projection
+            .present
+            .iter()
+            .filter(|(path, item)| {
+                item.is_directory
+                    && !crate::repository::project_tree::atomic_private_path(path.as_bytes())
+            })
+            .map(|(path, _)| path.as_str())
+            .collect();
+        directories.sort_unstable();
+        for directory in directories {
+            let prefix = format!("{directory}/");
+            let holds_files = projection.present.iter().any(|(path, item)| {
+                !item.is_directory
+                    && !crate::repository::project_tree::atomic_private_path(path.as_bytes())
+                    && path.as_str().starts_with(&prefix)
+            });
+            if !holds_files {
+                notes.push(crate::record::LossNote::empty_directory(directory.to_string()));
+            }
+        }
+        Ok(notes)
+    }
+
     pub(super) fn plan_tree_projection(
         &self,
         txn: &mut atomic_core::pristine::WriteTxn<'_>,
@@ -850,9 +906,49 @@ impl Repository {
         visibility: &GraphVisibilityClosure,
     ) -> Result<TreeProjection, RepositoryError>
     where
-        T: GraphTxnT + TreeTxnT + PathClaimTxnT,
+        T: GraphTxnT
+            + TreeTxnT
+            + PathClaimTxnT
+            + atomic_core::pristine::InodeGraphOps<
+                InodeError = atomic_core::pristine::PristineError,
+            >,
+    {
+        self.project_tree_for_visibility_scoped(txn, visibility, None)
+    }
+
+    /// Path-scoped variant of [`Self::project_tree_for_visibility`].
+    ///
+    /// Resolving presence for a SINGLE path must not pay the absent-liveness
+    /// cost of every other absent claim in the view. On a large repository the
+    /// exhaustive absent check runs `retrieve_graph` per absent entry and is a
+    /// measured per-entry bottleneck (14–62 s each, 659 entries per
+    /// projection), even when the requested path is already present. With
+    /// `wanted = Some(path)` the expensive liveness check runs only for that
+    /// path; other absent claims are recorded absent without the check, which
+    /// is exact for the requested path and irrelevant to the caller. Consumers
+    /// that need the complete projection pass `None` and keep the full check.
+    pub(super) fn project_tree_for_visibility_scoped<T>(
+        &self,
+        txn: &T,
+        visibility: &GraphVisibilityClosure,
+        wanted: Option<&str>,
+    ) -> Result<TreeProjection, RepositoryError>
+    where
+        T: GraphTxnT
+            + TreeTxnT
+            + PathClaimTxnT
+            + atomic_core::pristine::InodeGraphOps<
+                InodeError = atomic_core::pristine::PristineError,
+            >,
     {
         let reduced = super::name_resolution::reduce_path_claims(txn, visibility)?;
+        if std::env::var("ATOMIC_DEBUG_PROJECTION").is_ok() {
+            eprintln!(
+                "PTV reduced present={} absent={}",
+                reduced.present.len(),
+                reduced.absent.len()
+            );
+        }
         let name_conflicts = reduced.conflicts;
         let alive_inodes: HashSet<Inode> = reduced
             .present
@@ -887,22 +983,41 @@ impl Repository {
             }
             projection.present_metadata.insert(side.path.clone(), side);
         }
+        let debug_projection = std::env::var("ATOMIC_DEBUG_PROJECTION").is_ok();
+        let mut absent_checks = 0u64;
+        let mut absent_check_ms = 0u128;
         for absent in reduced.absent {
-            if !absent.directory
+            let wanted_here = wanted.is_none_or(|path| path == absent.path.as_str());
+            if wanted_here
+                && !absent.directory
                 && !alive_inodes.contains(&absent.inode)
                 && !alive_paths.contains(&absent.path)
-                && crate::repository::status::is_file_alive_via_retrieval(
+            {
+                let check_start = std::time::Instant::now();
+                let alive = self.inode_renders_alive_content(
                     txn,
                     absent.inode,
                     absent.position,
                     visibility,
-                )?
-            {
-                projection.present.insert(
-                    absent.path.clone(),
-                    OutputItem::file(absent.path, absent.inode, absent.position),
-                );
-                continue;
+                )?;
+                absent_checks += 1;
+                absent_check_ms += check_start.elapsed().as_millis();
+                if debug_projection {
+                    eprintln!(
+                        "PTV absent#{} path={} inode={} ms={}",
+                        absent_checks,
+                        absent.path,
+                        absent.inode.get(),
+                        check_start.elapsed().as_millis()
+                    );
+                }
+                if alive {
+                    projection.present.insert(
+                        absent.path.clone(),
+                        OutputItem::file(absent.path, absent.inode, absent.position),
+                    );
+                    continue;
+                }
             }
             if projection.present.contains_key(&absent.path)
                 || name_conflicts.contains_key(&absent.path)
@@ -922,6 +1037,11 @@ impl Repository {
             .absent
             .sort_by(|left, right| left.path().cmp(right.path()));
         projection.name_conflicts = name_conflicts;
+        if debug_projection {
+            eprintln!(
+                "PTV done absent_checks={absent_checks} absent_check_ms={absent_check_ms}"
+            );
+        }
         Ok(projection)
     }
 
@@ -1350,6 +1470,15 @@ impl Repository {
                 .map_err(|error| RepositoryError::Database(error.to_string()))?
                 .is_none()
             {
+                // A TREE row whose inode has no graph position is stale
+                // (retired or orphaned). The realign owns TREE, so retire the
+                // row instead of leaving an owner the projection cannot match;
+                // otherwise the desired rebind below conflicts with a ghost.
+                affected.insert(path);
+                operations.push(TreeProjectionOperation::Delete {
+                    inode,
+                    retire: false,
+                });
                 continue;
             }
             if desired

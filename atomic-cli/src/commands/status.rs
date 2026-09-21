@@ -1,10 +1,3 @@
-//! The `status` command for showing the working copy state.
-//!
-//! This module implements the `atomic status` command, which displays
-//! information about modified, added, deleted, and untracked files in
-//! the working copy relative to the repository's recorded state.
-//!
-//! # Usage
 //!
 //! ```text
 //! atomic status [OPTIONS] [PATH]
@@ -106,7 +99,9 @@ use clap::Parser;
 
 use atomic_core::types::Base32;
 use atomic_repository::status::{FileStatus, RepositoryStatus, StatusOptions};
-use atomic_repository::{Repository, SnapshotStatus, WorkspaceRemediation, WorkspaceTxnMode};
+use atomic_repository::{
+    Repository, SnapshotStatus, WorkspaceRemediation, WorkspaceTxnMode, WorkspaceTxnStart,
+};
 
 use crate::commands::git::bridge::read_checkpoint_observation;
 use crate::commands::git::observation::{
@@ -211,6 +206,21 @@ pub struct Status {
     /// materialization, or any bridge reconciliation path.
     #[arg(long = "no-reconcile", conflicts_with = "reindex")]
     pub no_reconcile: bool,
+
+    /// Show the Git-inspired, versioned staging subset (RFC §9.2).
+    ///
+    /// Two-column codes distinguish the staged layer (Git baseline → index)
+    /// from the unstaged layer (index → worktree). This is a bounded,
+    /// versioned subset: it does not claim full Git porcelain compatibility.
+    /// Output is observation-only: it never journals reconciliation,
+    /// materializes, or mutates durable tracking.
+    #[arg(long = "git", conflicts_with = "reindex")]
+    pub git: bool,
+
+    /// Machine-readable JSON for `--git`: format version, bridge state,
+    /// origin, staged/unstaged layers, notices, and ignore policy.
+    #[arg(long = "json", requires = "git")]
+    pub json: bool,
 }
 
 impl Status {
@@ -223,6 +233,8 @@ impl Status {
             debug_ignore: false,
             reindex: false,
             no_reconcile: false,
+            git: false,
+            json: false,
         }
     }
 
@@ -307,13 +319,22 @@ impl Status {
         let has_changes = status.modified_count() > 0
             || status.deleted_count() > 0
             || status.added_count() > 0
-            || status.conflicted_count() > 0;
+            || status.conflicted_count() > 0
+            || status.type_changed_count() > 0
+            || status.permissions_changed_count() > 0;
 
         let has_untracked = status.untracked_count() > 0;
 
         if !has_changes && !has_untracked {
             println!("{}", info("nothing to record, working tree clean"));
             return Ok(());
+        }
+
+        // Advisory notices (e.g. the RFC §8.3 conflict-snapshot caveat) are
+        // surfaced before the file listing so the distinction between a
+        // committed conflict snapshot and Git unmerged stages is explicit.
+        for notice in status.notices() {
+            print_warning(notice);
         }
 
         // Print changes section
@@ -351,6 +372,18 @@ impl Status {
                 } else {
                     println!("\t{}   {}", deleted("deleted:"), style_path(&path_str));
                 }
+            }
+
+            // Print type-changed files (regular ↔ symlink ↔ directory)
+            for entry in status.type_changed() {
+                let path_str = entry.path().display().to_string();
+                println!("\t{}     {}", warning("type:"), style_path(&path_str));
+            }
+
+            // Print permission-changed files
+            for entry in status.permissions_changed() {
+                let path_str = entry.path().display().to_string();
+                println!("\t{}      {}", warning("mode:"), style_path(&path_str));
             }
 
             // Print conflicted files
@@ -439,6 +472,18 @@ impl Status {
             } else {
                 println!("D  {}", path_str);
             }
+        }
+
+        // Print type-changed files
+        for entry in status.type_changed() {
+            let path_str = entry.path().display().to_string();
+            println!("T  {}", path_str);
+        }
+
+        // Print permission-changed files
+        for entry in status.permissions_changed() {
+            let path_str = entry.path().display().to_string();
+            println!("P  {}", path_str);
         }
 
         // Print conflicted files
@@ -540,14 +585,23 @@ impl Command for Status {
         // Find the repository root
         let repo_root = find_repository_root()?;
 
+        // Git-inspired, versioned staging subset (observation-only).
+        if self.git {
+            return crate::commands::status_git::run_git_status(&repo_root, self.json);
+        }
+
         if self.no_reconcile {
             let mut repo =
                 Repository::open_readonly(&repo_root).map_err(|e| CliError::InvalidRepository {
                     reason: e.to_string(),
                 })?;
-            return match observe_workspace(&mut repo)? {
+            match observe_workspace(&mut repo)? {
                 Ok(workspace) => {
-                    print_forensic_status(&repo_root, &repo, &workspace.view().name, None)
+                    let view = workspace.view().name.clone();
+                    let result = print_forensic_status(&repo_root, &repo, &view, None);
+                    // CB-10A: surface ref-mapping divergence (read-only).
+                    let _ = crate::commands::git::ref_mapping::print_divergence_notices(&repo);
+                    return result;
                 }
                 Err(remediation) => {
                     let working_copy = repo.require_working_copy_id().map_err(|e| {
@@ -558,9 +612,12 @@ impl Command for Status {
                     let view = repo
                         .desired_view_name(working_copy)
                         .map_err(CliError::from)?;
-                    print_forensic_status(&repo_root, &repo, &view, Some(&remediation))
+                    let result =
+                        print_forensic_status(&repo_root, &repo, &view, Some(&remediation));
+                    let _ = crate::commands::git::ref_mapping::print_divergence_notices(&repo);
+                    return result;
                 }
-            };
+            }
         }
 
         let mut repo = Repository::open_for_workspace_transaction(&repo_root).map_err(|e| {
@@ -568,8 +625,42 @@ impl Command for Status {
                 reason: e.to_string(),
             }
         })?;
-        let workspace = enter_workspace(&mut repo, self.workspace_mode())?;
-        let working_copy = workspace.working_copy();
+        let working_copy =
+            repo.require_working_copy_id()
+                .map_err(|e| CliError::InvalidRepository {
+                    reason: e.to_string(),
+                })?;
+        // Enter the workspace boundary. A Git-owned operation in progress is
+        // reported as a Git-informed notice instead of a hard failure so the
+        // native status stays readable (RFC §9.2 "Git merge in progress");
+        // every other remediation still fails closed.
+        let mut git_merge_notice: Option<String> = None;
+        let workspace = match repo.begin_workspace_txn(self.workspace_mode()) {
+            Ok(WorkspaceTxnStart::Ready(workspace)) => Some(workspace),
+            Ok(WorkspaceTxnStart::Remediation(WorkspaceRemediation::GitOperationInProgress {
+                repository_state,
+                conflict_stages,
+                ..
+            })) => {
+                let mut notice = format!("Git operation in progress ({repository_state})");
+                if !conflict_stages.is_empty() {
+                    notice.push_str(&format!(
+                        "; index holds {} conflicted stage entries",
+                        conflict_stages.len()
+                    ));
+                }
+                git_merge_notice = Some(notice);
+                None
+            }
+            Ok(WorkspaceTxnStart::Remediation(other)) => {
+                return Err(crate::commands::workspace_txn::remediation_error(other))
+            }
+            Err(e) => return Err(CliError::Repository(e)),
+        };
+        let working_copy = workspace
+            .as_ref()
+            .map(|workspace| workspace.working_copy())
+            .unwrap_or(working_copy);
 
         // Reindex first if requested (needs read-write access)
         if self.reindex {
@@ -597,9 +688,22 @@ impl Command for Status {
         let options = self.get_status_options();
 
         // Compute status
-        let status = repo
+        let mut status = repo
             .status(working_copy, options)
             .map_err(|e| CliError::Internal(e.into()))?;
+
+        // Git-informed overlays (colocated only): index-new paths displayed
+        // as pending additions, unmerged entries as Git merge conflicts.
+        // Display only — durable tracking is never mutated here.
+        crate::commands::status_git::apply_git_informed_overlays(&repo, &repo_root, &mut status)?;
+
+        if let Some(notice) = &git_merge_notice {
+            print_warning(notice);
+        }
+
+        // CB-10A: surface ref-mapping divergence with actionable remediation
+        // (read-only; never materializes).
+        crate::commands::git::ref_mapping::print_divergence_notices(&repo)?;
 
         // Print in appropriate format
         if self.short {
@@ -638,15 +742,88 @@ fn print_forensic_status(
         checkpoint.as_ref(),
         &ManifestEquivalence::NotComputed,
     );
+    let manifest_root = forensic_manifest_root(repo_root, repo, view);
 
     print!(
         "{}",
-        build_forensic_report(repo_root, &atomic, checkpoint.as_ref(), &git, &eligibility)
+        build_forensic_report(
+            repo_root,
+            &atomic,
+            checkpoint.as_ref(),
+            &git,
+            &eligibility,
+            manifest_root.as_deref(),
+        )
     );
     if let Some(remediation) = remediation {
         println!("Workspace remediation required: {remediation:#?}");
     }
     Ok(())
+}
+
+fn forensic_manifest_root(repo_root: &Path, repo: &Repository, view: &str) -> Option<String> {
+    if !repo_root.join(".git").exists() {
+        return None;
+    }
+    let git_repo = git2::Repository::open(repo_root).ok()?;
+    let policy = crate::commands::git::parallel::conversion_policy(&git_repo).ok()?;
+    let project = repo.project_tree(view, &policy).ok()?;
+    let root = project.manifest.root();
+    Some(format!("v{} {}", root.version, root.content_key))
+}
+
+/// Report observed drift between the checkpoint and current state as plain
+/// observations. No stale-baseline classification is made: index movement is
+/// legitimate Git work between boundaries (CB-11A).
+fn forensic_drift(
+    checkpoint: Option<&crate::commands::git::observation::BridgeCheckpointObservation>,
+    atomic: &AtomicAnchorObservation,
+    git: &GitObservation,
+) -> Vec<String> {
+    let Some(checkpoint) = checkpoint else {
+        return vec!["checkpoint absent (nothing to compare)".to_string()];
+    };
+    let GitObservation::Repository(repository) = git else {
+        return vec!["git repository absent".to_string()];
+    };
+    let mut drift = Vec::new();
+    if checkpoint.view != atomic.view {
+        drift.push(format!(
+            "view: checkpoint {} vs current {}",
+            checkpoint.view, atomic.view
+        ));
+    }
+    if checkpoint.atomic_state != atomic.state {
+        drift.push(format!(
+            "atomic state: checkpoint {} vs current {}",
+            checkpoint.atomic_state, atomic.state
+        ));
+    }
+    let observed_head = repository
+        .head
+        .oid()
+        .map(|oid| oid.to_string())
+        .unwrap_or_else(|| "none".to_string());
+    if checkpoint.git_head != observed_head {
+        drift.push(format!(
+            "Git HEAD: checkpoint {} vs current {observed_head}",
+            checkpoint.git_head
+        ));
+    }
+    let observed_tree = repository
+        .head_tree_oid
+        .map(|oid| oid.to_string())
+        .unwrap_or_else(|| "none".to_string());
+    if checkpoint.git_tree != observed_tree {
+        drift.push(format!(
+            "Git tree: checkpoint {} vs current {observed_tree}",
+            checkpoint.git_tree
+        ));
+    }
+    if drift.is_empty() {
+        drift.push("none (checkpoint matches current state)".to_string());
+    }
+    drift
 }
 
 fn build_forensic_report(
@@ -655,6 +832,7 @@ fn build_forensic_report(
     checkpoint: Option<&crate::commands::git::observation::BridgeCheckpointObservation>,
     git: &GitObservation,
     eligibility: &ProvisionalCheckpointEligibility,
+    manifest_root: Option<&str>,
 ) -> String {
     let mut report = String::new();
     let _ = writeln!(
@@ -664,6 +842,21 @@ fn build_forensic_report(
     let _ = writeln!(report, "Atomic root: {}", repo_root.display());
     let _ = writeln!(report, "Atomic view: {}", atomic.view);
     let _ = writeln!(report, "Atomic state: {}", atomic.state);
+    match manifest_root {
+        Some(root) => {
+            let _ = writeln!(report, "Durable manifest root: {root}");
+        }
+        None => {
+            let _ = writeln!(
+                report,
+                "Durable manifest root: unavailable (non-colocated or projection refused)"
+            );
+        }
+    }
+    let _ = writeln!(report, "Drift (observed, not classified):");
+    for line in forensic_drift(checkpoint, atomic, git) {
+        let _ = writeln!(report, "  {line}");
+    }
 
     match checkpoint {
         Some(checkpoint) => {

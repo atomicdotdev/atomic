@@ -17,16 +17,17 @@ Atomic view into a git commit via `atomic git push --no-push`. When a
 view's working copy contains **unresolved conflict markers** (produced by
 cross-view materialization of conflicting changes), the shadow push commits
 those markers verbatim into git. The result is git branches whose source files
-contain lines like:
+contain lines like (marker lines backslash-escaped so this example doesn't
+itself read as an unresolved conflict to Atomic's own marker scanner):
 
 ```
->>>>>>> 1
+\>>>>>>> 1
   onOpenRemoteUpdate: () => void;
-======= 1 [C2YTBAHQ]
+\======= 1 [C2YTBAHQ]
   remoteUpdateError: string | null;
-======= 1 [UDILON2P]
+\======= 1 [UDILON2P]
 };
-<<<<<<< 1
+\<<<<<<< 1
 ```
 
 These branches do not compile, are indistinguishable from real work in git
@@ -112,9 +113,9 @@ Atomic's conflict markers are numbered and change-hash-tagged (not classic git
 3-way markers):
 
 ```
->>>>>>> <N>
-=======  <N> [<CHANGE_HASH_BASE32>]
-<<<<<<< <N>
+\>>>>>>> <N>
+\=======  <N> [<CHANGE_HASH_BASE32>]
+\<<<<<<< <N>
 ```
 
 Detection must match `>>>>>>>`, `<<<<<<<`, and `======= N [hash]` at

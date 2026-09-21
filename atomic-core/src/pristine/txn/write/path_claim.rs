@@ -59,6 +59,12 @@ impl PathClaimTxnT for WriteTxn<'_> {
 }
 
 impl PathClaimMutTxnT for WriteTxn<'_> {
+    fn del_path_claim(&mut self, path: &str, event: &PathClaimEvent) -> PristineResult<bool> {
+        let encoded = encode_path_claim_event(event);
+        let mut table = self.txn.open_multimap_table(PATH_CLAIMS)?;
+        Ok(table.remove(path, &encoded)?)
+    }
+
     fn put_path_claim(&mut self, path: &str, event: &PathClaimEvent) -> PristineResult<bool> {
         let encoded = encode_path_claim_event(event);
         let mut table = self.txn.open_multimap_table(PATH_CLAIMS)?;

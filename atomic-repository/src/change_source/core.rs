@@ -53,6 +53,33 @@ pub enum ChangeSourceFallbackReason {
     SourceError(String),
 }
 
+impl ChangeSourceFallbackReason {
+    /// Stable observability code for this degradation reason (RFC §13
+    /// Phase 13 task 5). Codes are fixed snake_case strings; details live
+    /// in logs, never in structured telemetry.
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::MissingIndex => "missing_index",
+            Self::MalformedIndex(_) => "malformed_index",
+            Self::ConversionPolicyChanged => "conversion_policy_changed",
+            Self::CanonicalAttributesChanged => "canonical_attributes_changed",
+            Self::SparsePolicyChanged => "sparse_policy_changed",
+            Self::ConfigurationChanged => "configuration_changed",
+            Self::FilterChanged => "filter_changed",
+            Self::ConfiguredOff => "configured_off",
+            Self::DisabledInCi => "disabled_in_ci",
+            Self::DisabledInContainer => "disabled_in_container",
+            Self::Unavailable(_) => "unavailable",
+            Self::UnsupportedVersion { .. } => "unsupported_version",
+            Self::UnknownToken => "unknown_token",
+            Self::Overflow => "overflow",
+            Self::MalformedResponse(_) => "malformed_response",
+            Self::Timeout { .. } => "timeout",
+            Self::SourceError(_) => "source_error",
+        }
+    }
+}
+
 /// Why a path was selected for canonical re-verification.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ChangeCandidateReason {

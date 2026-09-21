@@ -34,7 +34,584 @@ struct PreparedNameResolution {
     conflict_inodes: Vec<Inode>,
 }
 
+/// Build the record outcome that reports a scoped stale-conflict cleanup which
+/// cleared rows without recording any content change.
+fn conflict_cleanup_outcome(
+    header: ChangeHeader,
+    cleanup: ConflictReconcileOutcome,
+) -> RecordOutcome {
+    let change = Change::empty(header);
+    let mut outcome = RecordOutcome::new(change, Hash::ZERO, RecordStats::new());
+    outcome.set_conflict_cleanup(crate::record::ConflictCleanupSummary {
+        view: cleanup.view,
+        paths: cleanup.cleared_paths,
+        rows_cleared: cleanup.cleared_rows,
+        operation: cleanup.operation,
+    });
+    outcome
+}
+
 impl Repository {
+    /// CB-9B: record one merge-resolution or rewritten-history modification
+    /// as a graph-safe replace with regenerated semantic FileOps and stable
+    /// CRDT identities (review blocker 3).
+    ///
+    /// The baseline is the bytes the view's graph renders for `path` — never
+    /// a Git worktree read. When the baseline required fork/cyclic conflict
+    /// resolution (a merge union with both spans alive) or
+    /// `conflict_baseline` is set, the whole-file-replace safety path is
+    /// forced: "what's alive gets deleted, this is inserted fresh", which is
+    /// exactly a merge resolution. Delete/Modify CRDT ops bind to the real
+    /// existing alive branches, so the semantic layer stays coherent after
+    /// the resolution. Errors fail closed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error message when the path has no inode binding, content
+    /// retrieval fails, or the recorded result is empty.
+    pub fn record_resolution_modified_file(
+        &self,
+        path: &str,
+        new_content: &[u8],
+        view_name: &str,
+        conflict_baseline: bool,
+    ) -> Result<atomic_core::record::workflow::RecordedFile, String> {
+        use atomic_core::output::alive::RetrieveOptions;
+
+        let txn = self
+            .pristine
+            .read_txn()
+            .map_err(|e| format!("cannot open pristine: {e}"))?;
+        let view = txn
+            .get_view(view_name)
+            .map_err(|e| format!("cannot read view: {e}"))?
+            .ok_or_else(|| format!("view '{view_name}' does not exist"))?;
+        let visibility = super::filter::graph_visibility_closure(&txn, &view)
+            .map_err(|e| format!("cannot build view visibility: {e}"))?;
+
+        let inode = txn
+            .get_inode(path)
+            .map_err(|e| format!("cannot read inode for '{path}': {e}"))?
+            .ok_or_else(|| format!("path '{path}' has no inode binding"))?;
+        let position = txn
+            .inode_position(inode)
+            .map_err(|e| format!("cannot read position for '{path}': {e}"))?
+            .ok_or_else(|| format!("inode {inode:?} has no graph position"))?;
+
+        let (old_content, had_fork_structure) =
+            super::content::retrieve_content_with_filter_fast_with_fork_info(
+                &txn,
+                &self.change_store,
+                inode,
+                position,
+                RetrieveOptions::new().with_graph_visibility(visibility.clone()),
+            )
+            .map_err(|e| format!("cannot retrieve baseline for '{path}': {e}"))?;
+
+        self.record_foreign_modified_file(path, &old_content, new_content, conflict_baseline || had_fork_structure)
+    }
+
+    /// Record a modified file against an explicit baseline while binding the
+    /// edit to the file's existing CRDT trunk and alive branches (CB-9B
+    /// review F4).
+    ///
+    /// The bridge importer drives this for foreign deltas: the baseline is
+    /// the commit's own context (Git parent-tree bytes in leg mode), never
+    /// silently re-read from the view. The semantic state resolution is the
+    /// same as [`Self::record_resolution_modified_file`]: the file's current
+    /// CRDT trunk is resolved by path (falling back to the inode index) and
+    /// its alive branches are bound so delete/modify ops tombstone the real
+    /// lines with stable identities. Errors fail closed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error message when the path has no inode binding, content
+    /// retrieval fails, or the recorded result is empty.
+    pub fn record_foreign_modified_file(
+        &self,
+        path: &str,
+        old_content: &[u8],
+        new_content: &[u8],
+        force_whole_file_replace: bool,
+    ) -> Result<atomic_core::record::workflow::RecordedFile, String> {
+        let txn = self
+            .pristine
+            .read_txn()
+            .map_err(|e| format!("cannot open pristine: {e}"))?;
+        let inode = txn
+            .get_inode(path)
+            .map_err(|e| format!("cannot read inode for '{path}': {e}"))?
+            .ok_or_else(|| format!("path '{path}' has no inode binding"))?;
+        let position = txn
+            .inode_position(inode)
+            .map_err(|e| format!("cannot read position for '{path}': {e}"))?
+            .ok_or_else(|| format!("inode {inode:?} has no graph position"))?;
+        drop(txn);
+        let (existing_trunk_id, existing_branches) =
+            self.resolve_existing_semantic_state(path, inode)?;
+        use atomic_core::record::workflow::{record_modified_file, DetectedFile};
+        let memory_wc = atomic_core::output::memory::Memory::new();
+        memory_wc.add_file(path, new_content);
+        let mut detected = DetectedFile::modified(path);
+        detected.inode = Some(inode);
+        detected.position = Some(position);
+        let options = if force_whole_file_replace {
+            atomic_core::record::workflow::RecordingOptions::new()
+                .force_whole_file_replace(true)
+        } else {
+            atomic_core::record::workflow::RecordingOptions::new()
+        };
+        record_modified_file(
+            &memory_wc,
+            &detected,
+            old_content,
+            None,
+            &options,
+            existing_trunk_id,
+            if existing_branches.is_empty() {
+                None
+            } else {
+                Some(existing_branches.as_slice())
+            },
+        )
+    }
+
+    /// Record a foreign modification for a path that a Git-detected rename
+    /// just moved: the new path has no inode binding in the graph yet (the
+    /// move and the edit land in the same synthesized change), so the
+    /// identity is anchored to the OLD path's stable inode and its CRDT
+    /// trunk, while the record's path — and therefore the semantic FileOps —
+    /// name the new path (CB-9C).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error message when the old path has no inode binding or
+    /// the recorded result is empty.
+    pub fn record_foreign_renamed_file(
+        &self,
+        new_path: &str,
+        old_path: &str,
+        old_content: &[u8],
+        new_content: &[u8],
+        force_whole_file_replace: bool,
+    ) -> Result<atomic_core::record::workflow::RecordedFile, String> {
+        let txn = self
+            .pristine
+            .read_txn()
+            .map_err(|e| format!("cannot open pristine: {e}"))?;
+        let inode = txn
+            .get_inode(old_path)
+            .map_err(|e| format!("cannot read inode for '{old_path}': {e}"))?
+            .ok_or_else(|| format!("path '{old_path}' has no inode binding"))?;
+        let position = txn
+            .inode_position(inode)
+            .map_err(|e| format!("cannot read position for '{old_path}': {e}"))?
+            .ok_or_else(|| format!("inode {inode:?} has no graph position"))?;
+        drop(txn);
+        // The trunk follows the inode through the move: resolve by inode,
+        // never by the new path (which cannot have a trunk yet).
+        let (existing_trunk_id, existing_branches) = {
+            use atomic_core::crdt::queries::iter_trunk_branches_in_file_order;
+            use atomic_core::crdt::tables::{decode_trunk_id, encode_branch_id};
+            use atomic_core::pristine::CrdtTxnT;
+            let txn = self
+                .pristine
+                .read_txn()
+                .map_err(|e| format!("cannot open pristine: {e}"))?;
+            let existing_trunk_id = txn
+                .get_crdt_inode_trunk(inode.get())
+                .map_err(|e| format!("cannot read CRDT trunk for inode: {e}"))?
+                .map(|key| decode_trunk_id(&key));
+            let existing_branches: Vec<atomic_core::crdt::BranchId> =
+                match existing_trunk_id.as_ref() {
+                    Some(trunk_id) => match iter_trunk_branches_in_file_order(&txn, *trunk_id) {
+                        Ok(all) => {
+                            let mut alive = Vec::with_capacity(all.len());
+                            for b in all {
+                                let bk = encode_branch_id(&b);
+                                if let Ok(Some(_bd)) = txn.get_crdt_branch(&bk) {
+                                    alive.push(b);
+                                }
+                            }
+                            alive
+                        }
+                        Err(_) => Vec::new(),
+                    },
+                    None => Vec::new(),
+                };
+            (existing_trunk_id, existing_branches)
+        };
+        use atomic_core::record::workflow::{record_modified_file, DetectedFile};
+        let memory_wc = atomic_core::output::memory::Memory::new();
+        memory_wc.add_file(new_path, new_content);
+        let mut detected = DetectedFile::modified(new_path);
+        detected.inode = Some(inode);
+        detected.position = Some(position);
+        let options = if force_whole_file_replace {
+            atomic_core::record::workflow::RecordingOptions::new()
+                .force_whole_file_replace(true)
+        } else {
+            atomic_core::record::workflow::RecordingOptions::new()
+        };
+        record_modified_file(
+            &memory_wc,
+            &detected,
+            old_content,
+            None,
+            &options,
+            existing_trunk_id,
+            if existing_branches.is_empty() {
+                None
+            } else {
+                Some(existing_branches.as_slice())
+            },
+        )
+    }
+
+    /// The exact alive structural path claim for `path` on `view_name`, or
+    /// `None` when the projection does not bind it. Refuses contested state:
+    /// a path with zero causally maximal alive claims is unbound, and a path
+    /// with several is ambiguous — a structural move must never route through
+    /// an unproven source claim (the same authority rule the native
+    /// `plan_file_moves` enforces via `source.claims.len() != 1`). The
+    /// projected inode and position are returned alongside so callers can
+    /// prove the claim binds the exact stable identity they resolved.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error message when projection or claim reduction fails.
+    pub fn resolve_single_path_claim(
+        &self,
+        view_name: &str,
+        path: &str,
+    ) -> Result<
+        Option<(
+            atomic_core::pristine::PathClaimId,
+            Inode,
+            Position<NodeId>,
+        )>,
+        String,
+    > {
+        use atomic_core::pristine::ViewTxnT;
+        let txn = self
+            .pristine
+            .read_txn()
+            .map_err(|e| format!("cannot open pristine: {e}"))?;
+        let view = txn
+            .get_view(view_name)
+            .map_err(|e| format!("cannot read view: {e}"))?
+            .ok_or_else(|| format!("view '{view_name}' does not exist"))?;
+        let graph_visibility = super::filter::graph_visibility_closure(&txn, &view)
+            .map_err(|e| format!("cannot build view visibility: {e}"))?;
+        let claim_visibility = super::name_resolution::path_claim_visibility_for_view(
+            &txn,
+            &self.change_store,
+            &view,
+            &graph_visibility,
+        )
+        .map_err(|e| format!("cannot build claim visibility: {e}"))?;
+        let projection = self
+            .project_tree_for_visibility(&txn, &claim_visibility)
+            .map_err(|e| format!("cannot project path claims: {e}"))?;
+        let Some(claim) = projection.present_metadata.get(path) else {
+            return Ok(None);
+        };
+        let mut claims = claim.claims.clone();
+        if claims.len() != 1 {
+            return Err(format!(
+                "path '{path}' has {} causally maximal structural claims; refusing to \
+                 route a structural move through a contested source claim",
+                claims.len()
+            ));
+        }
+        Ok(claims.pop().map(|single| (single, claim.inode, claim.position)))
+    }
+
+    /// Record a foreign Git-detected rename through the native identity-
+    /// preserving move pipeline (review CB-9C R2): the OLD path's stable
+    /// inode, position, CRDT trunk and alive branches are resolved first and
+    /// the exact source claim is validated, so the synthesized change carries
+    /// a real semantic `TrunkOp::Move` (plus any destination line/token
+    /// edits beneath it) — not merely a structural graph rename.
+    ///
+    /// The semantic trunk follows the inode through the move: it is resolved
+    /// by the OLD path's inode, never by the new path (which cannot have a
+    /// trunk yet). Destination bytes ride the same
+    /// `record_moved_file` → `record_modified_file` pipeline an ordinary edit
+    /// uses, so a pure move emits the semantic move alone and a move+edit
+    /// emits the move plus the regenerated line ops.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error message when the old path has no inode binding, no
+    /// CRDT trunk, no uncontested source claim, or the recorded result is
+    /// empty.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_foreign_moved_file(
+        &self,
+        view_name: &str,
+        new_path: &str,
+        old_path: &str,
+        old_content: &[u8],
+        new_content: &[u8],
+        force_whole_file_replace: bool,
+    ) -> Result<atomic_core::record::workflow::RecordedFile, String> {
+        use atomic_core::record::workflow::{
+            record_moved_file, DetectedFile, RecordingOptions,
+        };
+        let txn = self
+            .pristine
+            .read_txn()
+            .map_err(|e| format!("cannot open pristine: {e}"))?;
+        let inode = txn
+            .get_inode(old_path)
+            .map_err(|e| format!("cannot read inode for '{old_path}': {e}"))?
+            .ok_or_else(|| format!("path '{old_path}' has no inode binding"))?;
+        let position = txn
+            .inode_position(inode)
+            .map_err(|e| format!("cannot read position for '{old_path}': {e}"))?
+            .ok_or_else(|| format!("inode {inode:?} has no graph position"))?;
+        drop(txn);
+
+        // The trunk follows the inode through the move: resolve by inode,
+        // never by the new path (which cannot have a trunk yet). A moved
+        // record without a semantic trunk is exactly the defect the review
+        // pinned (graph-present bytes with no path→trunk mapping after
+        // reopen), so a missing trunk refuses instead of degrading to a
+        // structural-only move.
+        let (existing_trunk_id, existing_branches) = {
+            use atomic_core::crdt::queries::iter_trunk_branches_in_file_order;
+            use atomic_core::crdt::tables::{decode_trunk_id, encode_branch_id};
+            use atomic_core::pristine::CrdtTxnT;
+            let txn = self
+                .pristine
+                .read_txn()
+                .map_err(|e| format!("cannot open pristine: {e}"))?;
+            let existing_trunk_id = txn
+                .get_crdt_inode_trunk(inode.get())
+                .map_err(|e| format!("cannot read CRDT trunk for inode: {e}"))?
+                .map(|key| decode_trunk_id(&key))
+                .ok_or_else(|| {
+                    format!(
+                        "path '{old_path}' has no CRDT trunk; refusing a semantic move \
+                         without an existing semantic identity"
+                    )
+                })?;
+            let existing_branches: Vec<atomic_core::crdt::BranchId> =
+                match iter_trunk_branches_in_file_order(&txn, existing_trunk_id) {
+                    Ok(all) => {
+                        let mut alive = Vec::with_capacity(all.len());
+                        for b in all {
+                            let bk = encode_branch_id(&b);
+                            if let Ok(Some(_bd)) = txn.get_crdt_branch(&bk) {
+                                alive.push(b);
+                            }
+                        }
+                        alive
+                    }
+                    Err(_) => Vec::new(),
+                };
+            (existing_trunk_id, existing_branches)
+        };
+
+        let (source, claim_inode, claim_position) = self
+            .resolve_single_path_claim(view_name, old_path)?
+            .ok_or_else(|| {
+                format!(
+                    "move source '{old_path}' holds no alive structural path claim on \
+                     view '{view_name}'; refusing to fabricate a move authority"
+                )
+            })?;
+        if claim_inode != inode || claim_position != position {
+            return Err(format!(
+                "move source '{old_path}' claims stable inode {} but the inode binding \
+                 resolves {}; the structural move authority must match the stable identity",
+                claim_inode.get(),
+                inode.get()
+            ));
+        }
+
+        let memory_wc = atomic_core::output::memory::Memory::new();
+        memory_wc.add_file(new_path, new_content);
+        let detected = DetectedFile::moved(old_path, new_path)
+            .with_inode(inode)
+            .with_position(position);
+        let options = if force_whole_file_replace {
+            RecordingOptions::new().force_whole_file_replace(true)
+        } else {
+            RecordingOptions::new()
+        };
+        let recorded = record_moved_file(
+            &memory_wc,
+            &detected,
+            old_content,
+            None,
+            &options,
+            inode,
+            position,
+            source,
+            existing_trunk_id,
+            if existing_branches.is_empty() {
+                None
+            } else {
+                Some(existing_branches.as_slice())
+            },
+        )
+        .map_err(|message| format!("cannot record moved path '{new_path}': {message}"))?;
+        if recorded.crdt_ops().is_none() {
+            return Err(format!(
+                "cannot record moved path '{new_path}': the native move pipeline produced \
+                 no semantic FileOps"
+            ));
+        }
+        Ok(recorded)
+    }
+
+    /// Record a foreign Git deletion bound to the ACTUAL deleted trunk
+    /// (review CB-9C R2, re-review EYL): the canonical delete record's
+    /// semantic ops use a placeholder trunk that resolves to the deleting
+    /// change, so `update_trunk_state` tombstoned nobody and the moved-to or
+    /// previously-created trunk row stayed Alive after the graph deletion.
+    /// This method resolves the OLD path's real CRDT trunk and alive branches
+    /// first, then emits `TrunkOp::Delete` on that trunk with line deletes
+    /// bound to the real branches — the semantic lifecycle matches the graph
+    /// deletion on the trunk that actually exists.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error message when the path has no inode binding, no CRDT
+    /// trunk, or the canonical FileDel record is empty.
+    pub fn record_foreign_deleted_file(
+        &self,
+        path: &str,
+    ) -> Result<atomic_core::record::workflow::RecordedFile, String> {
+        use atomic_core::change::FileOps;
+        use atomic_core::pristine::{GraphTxnT, TreeTxnT};
+        let txn = self
+            .pristine
+            .read_txn()
+            .map_err(|e| format!("cannot open pristine: {e}"))?;
+        let inode = txn
+            .get_inode(path)
+            .map_err(|e| format!("cannot read inode for '{path}': {e}"))?
+            .ok_or_else(|| format!("path '{path}' has no inode binding"))?;
+        let position = txn
+            .inode_position(inode)
+            .map_err(|e| format!("cannot read position for '{path}': {e}"))?
+            .ok_or_else(|| format!("inode {inode:?} has no graph position"))?;
+        drop(txn);
+        let (existing_trunk_id, existing_branches) =
+            self.resolve_existing_semantic_state(path, inode)?;
+        let existing_trunk_id = existing_trunk_id.ok_or_else(|| {
+            format!("path '{path}' has no CRDT trunk; refusing a semantic deletion without \
+                     an existing semantic identity")
+        })?;
+
+        let mut detected = atomic_core::record::workflow::DetectedFile::deleted(path);
+        detected.inode = Some(inode);
+        detected.position = Some(position);
+        let core_options = atomic_core::record::workflow::RecordingOptions::new();
+        let mut recorded =
+            atomic_core::record::workflow::record_deleted_file(&detected, &core_options)
+                .map_err(|message| message)?;
+        if recorded.is_empty() {
+            return Err(format!(
+                "cannot import deletion '{path}': canonical FileDel is empty"
+            ));
+        }
+        // Bind the semantic deletion to the real trunk and alive branches.
+        let mut ops = FileOps::delete(existing_trunk_id, path.to_string());
+        for branch in existing_branches {
+            ops.add_line_op(atomic_core::change::LineOps::delete_empty(branch));
+        }
+        recorded.set_crdt_ops(ops);
+        Ok(recorded)
+    }
+
+    /// Whether `path` carries persisted conflict state on `view_name` (review
+/// CB-11A). A conflicted path's rendered bytes are a conflict projection
+/// (marker lines with side provenance interleaved), not a plain file
+/// rendering: a positional diff against it cannot be mapped onto the
+/// graph's per-line vertices, so foreign deltas for such paths must be
+/// recorded as whole-file replacements instead.
+pub fn path_has_persisted_conflict(
+    &self,
+    path: &str,
+    view_name: &str,
+) -> Result<bool, RepositoryError> {
+    use atomic_core::pristine::{TreeTxnT, ViewTxnT};
+    let txn = self
+        .pristine
+        .read_txn()
+        .map_err(|e| RepositoryError::Database(e.to_string()))?;
+    let view = txn
+        .get_view(view_name)
+        .map_err(|e| RepositoryError::Database(e.to_string()))?
+        .ok_or_else(|| RepositoryError::ViewNotFound {
+            name: view_name.to_string(),
+        })?;
+    let Some(inode) = txn
+        .get_inode(path)
+        .map_err(|e| RepositoryError::Database(e.to_string()))?
+    else {
+        return Ok(false);
+    };
+    let conflicts = txn
+        .get_conflicts(view.id, inode.get())
+        .map_err(|e| RepositoryError::Database(e.to_string()))?;
+    Ok(!conflicts.is_empty())
+}
+
+/// Resolve the existing CRDT semantic state of a tracked path: the
+    /// current trunk (path index first — the authoritative "trunk of this
+    /// path" mapping; the inode index can lag when the CRDT layer allocated
+    /// a parallel inode for synthesized flows) and its alive branches in
+    /// file order. Errors fail closed.
+    fn resolve_existing_semantic_state(
+        &self,
+        path: &str,
+        inode: atomic_core::types::Inode,
+    ) -> Result<(Option<atomic_core::crdt::TrunkId>, Vec<atomic_core::crdt::BranchId>), String>
+    {
+        use atomic_core::crdt::queries::iter_trunk_branches_in_file_order;
+        use atomic_core::crdt::tables::{decode_trunk_id, encode_branch_id};
+        use atomic_core::pristine::CrdtTxnT;
+
+        let txn = self
+            .pristine
+            .read_txn()
+            .map_err(|e| format!("cannot open pristine: {e}"))?;
+        let inode_u64 = inode.get();
+        let existing_trunk_id = match txn.get_trunk_by_path(path) {
+            Ok(Some(trunk_key)) => Some(trunk_key),
+            _ => match txn.get_crdt_inode_trunk(inode_u64) {
+                Ok(Some(trunk_key)) => Some(decode_trunk_id(&trunk_key)),
+                _ => None,
+            },
+        };
+        let existing_branches: Vec<atomic_core::crdt::BranchId> = match existing_trunk_id
+            .as_ref()
+        {
+            Some(trunk_id) => match iter_trunk_branches_in_file_order(&txn, *trunk_id) {
+                Ok(all) => {
+                    let mut alive = Vec::with_capacity(all.len());
+                    for b in all {
+                        let bk = encode_branch_id(&b);
+                        if let Ok(Some(bd)) = txn.get_crdt_branch(&bk) {
+                            if bd.state.is_alive() {
+                                alive.push(b);
+                            }
+                        }
+                    }
+                    alive
+                }
+                Err(_) => Vec::new(),
+            },
+            None => Vec::new(),
+        };
+        Ok((existing_trunk_id, existing_branches))
+    }
+
     /// This is the main entry point for creating a change from working copy
     /// modifications. It detects changes, creates hunks, globalizes positions,
     /// and assembles a complete change.
@@ -112,6 +689,24 @@ impl Repository {
         }
 
         let target_view = lifecycle.target_view(&desired_view).to_string();
+
+        // Scoped stale-conflict cleanup: when the caller explicitly names paths
+        // and opts into conflict-marker content, reconcile persisted conflict
+        // rows that no longer describe a real graph conflict. This runs before
+        // any long-lived read transaction is opened so the journaled mutation
+        // can take its own write boundary, and it only touches the named paths.
+        let mut conflict_cleanup: Option<ConflictReconcileOutcome> = None;
+        if options.get_allow_conflict_markers()
+            && !options.all()
+            && !options.get_paths().is_empty()
+        {
+            if let Some(outcome) = self
+                .reconcile_explicit_conflicts(working_copy, options.get_paths())
+                .map_err(RecordError::Repository)?
+            {
+                conflict_cleanup = Some(outcome);
+            }
+        }
 
         let trace_record = std::env::var_os("ATOMIC_TRACE_RECORD").is_some();
         use atomic_core::output::Memory;
@@ -329,6 +924,78 @@ impl Repository {
             })
             .collect();
         remapped_entries.sort_by(|left, right| left.path().cmp(right.path()));
+
+        // A projected name conflict (two or more live claimants) is surfaced by
+        // `status` as `Conflicted`, and the ordinary recordable filter then
+        // excludes it — including when the working tree already holds exactly
+        // one incarnation's bytes and no conflict row was ever persisted. That
+        // silently preserves the ambiguity forever. For an explicit ask
+        // (`--all`, or a named path) classify every resolvable *file* name
+        // conflict as a Modified candidate so the normal
+        // `prepare_name_resolution` path can supersede the losing claims inside
+        // a recorded change.
+        //
+        // The resolution itself accepts only a side whose rendered bytes equal
+        // the working tree byte-for-byte; a third value or an ambiguous match
+        // is reported, never chosen. Read-only and observation-only turns never
+        // reach the record body, and renaming/directory conflicts are left to
+        // their own flows.
+        // Review ::15 blocker support (user decision "Preserve current
+        // files"): paths in `resolve_name_conflicts` are EXPLICIT resolution
+        // targets — they qualify without --all and may carry MULTIPLE
+        // byte-equal claimants (the preserve-mode canonical selection in
+        // `prepare_name_resolution` handles that case; a zero-match path is
+        // still refused — unrecorded working content is never silently
+        // chosen).
+        let explicit_resolution_targets: std::collections::HashSet<String> = options
+            .get_resolve_name_conflicts()
+            .iter()
+            .map(|path| path.replace('\\', "/"))
+            .collect();
+        let name_resolvable: std::collections::HashSet<String> = projected_name_conflicts
+            .iter()
+            .filter(|(path, conflict)| {
+                if conflict.is_rename_conflict() {
+                    return false;
+                }
+                let explicit = explicit_resolution_targets.contains(path.as_str());
+                if !explicit && !(options.all() || !options.get_paths().is_empty()) {
+                    return false;
+                }
+                if !explicit && !options.should_include(path) {
+                    return false;
+                }
+                let sides = conflict.sides_at_path(path);
+                sides.len() >= 2 && sides.iter().all(|side| !side.is_directory())
+            })
+            .map(|(path, _)| path.clone())
+            .collect();
+        if !name_resolvable.is_empty() {
+            remapped_entries.retain(|entry| {
+                !(entry.status() == FileStatus::Conflicted
+                    && name_resolvable.contains(entry.path().to_string_lossy().as_ref()))
+            });
+            let present: std::collections::HashSet<String> = remapped_entries
+                .iter()
+                .map(|entry| entry.path().to_string_lossy().into_owned())
+                .collect();
+            for path in &name_resolvable {
+                if present.contains(path) {
+                    continue;
+                }
+                let mut entry =
+                    FileStatusEntry::new(std::path::PathBuf::from(path), FileStatus::Modified);
+                if let Some(side) = projected_name_conflicts
+                    .get(path)
+                    .and_then(|conflict| conflict.sides_at_path(path).first().copied())
+                {
+                    entry.set_inode(side.inode);
+                }
+                remapped_entries.push(entry);
+            }
+            remapped_entries.sort_by(|left, right| left.path().cmp(right.path()));
+        }
+
         let files_to_record = filter_files(&remapped_entries, &options);
 
         log::debug!(
@@ -341,6 +1008,9 @@ impl Repository {
         }
 
         if files_to_record.is_empty() && planned_moves.is_empty() {
+            if let Some(cleanup) = conflict_cleanup.take() {
+                return Ok(conflict_cleanup_outcome(final_header.clone(), cleanup));
+            }
             return Err(RecordError::NothingToRecord);
         }
 
@@ -975,6 +1645,7 @@ impl Repository {
                 let opaque = content_filter.is_git_tracked(std::path::Path::new(path))
                     && (repository_bytes.len() as u64 > options.max_file_size()
                         || crate::content_filter::looks_binary(&repository_bytes));
+                let preserve_mode = explicit_resolution_targets.contains(path);
                 let resolution = match projected_name_conflicts.get(path) {
                     Some(conflict) => {
                         match prepare_name_resolution(
@@ -985,6 +1656,7 @@ impl Repository {
                             path,
                             conflict,
                             &repository_bytes,
+                            preserve_mode,
                         ) {
                             Ok(resolution) => Some(resolution),
                             Err(error) => {
@@ -1217,6 +1889,29 @@ impl Repository {
             && name_resolution_ops.is_empty()
             && pending_attributes.is_empty()
         {
+            // Fail closed with the REAL cause: per-file errors (e.g. a
+            // refused name-conflict resolution) must not be swallowed into
+            // a misleading "working copy is clean" — the caller could
+            // believe nothing was pending when a resolution actually
+            // refused. (Review ::15 resolution support, 2026-09-16.)
+            if let Some((path, message)) = errors.first() {
+                return Err(RecordError::Database(format!(
+                    "record failed for {} path(s); first error at '{path}': {message}",
+                    errors.len()
+                )));
+            }
+            // A recordable path that produced NO outcome and NO error means
+            // the file loop silently dropped it — fail closed with the
+            // recorded-path diagnostics instead of a misleading clean-copy.
+            if !recorded_paths.is_empty() || !skipped_paths.is_empty() {
+                return Err(RecordError::Database(format!(
+                    "record produced no change but tracked paths remain: \
+                     recorded={recorded_paths:?} skipped={skipped_paths:?}"
+                )));
+            }
+            if let Some(cleanup) = conflict_cleanup.take() {
+                return Ok(conflict_cleanup_outcome(final_header.clone(), cleanup));
+            }
             return Err(RecordError::NothingToRecord);
         }
 
@@ -1343,6 +2038,14 @@ impl Repository {
         if !move_evidence.is_empty() {
             crate::record::merge_move_evidence(&mut change, &move_evidence)
                 .map_err(|error| RecordError::ChangeStore(error.to_string()))?;
+        }
+        // Application metadata (e.g. the CB-7B adoption attribution marker)
+        // is part of the hashed change content: it is set before
+        // serialization so the marker is content-addressed with the change
+        // and can never be edited after the fact.
+        let application_metadata = options.get_metadata_bytes();
+        if !application_metadata.is_empty() {
+            change.hashed.metadata = application_metadata.to_vec();
         }
         lifecycle.verify_promotion_content(&change, self)?;
         change = lifecycle.classify(change)?;
@@ -1565,6 +2268,32 @@ impl Repository {
                     super::operation::current_operation_timestamp_ms(),
                 )
                 .map_err(RecordError::Repository)?;
+            // R3 (CB-7B): refuse a dependency-invalid snapshot BEFORE it is
+            // published (RFC §12.3). The prepared membership operation is
+            // aborted so the journal shows an immutable refusal, not an
+            // applied-then-compensated publication: no snapshot change that
+            // depends on a snapshot-kind change is ever saved or applied.
+            if lifecycle.is_snapshot_publication()
+                && outcome
+                    .change()
+                    .dependencies()
+                    .iter()
+                    .any(|dependency| {
+                        self.load_change(dependency)
+                            .map(|change| change.kind().is_snapshot())
+                            .unwrap_or(false)
+                    })
+            {
+                self.abort_prepared_metadata_operation(&operation_lock, &operation)
+                    .map_err(RecordError::Repository)?;
+                return Err(RecordError::Repository(RepositoryError::InvalidOperation {
+                    message: format!(
+                        "snapshot change {} depends on a snapshot change; refusing to \
+                         publish a dependency-invalid snapshot",
+                        computed_hash.to_base32()
+                    ),
+                }));
+            }
             Some((operation_lock, operation))
         } else {
             None
@@ -2260,6 +2989,7 @@ fn prepare_name_resolution(
     path: &str,
     conflict: &super::name_resolution::ProjectedNameConflict,
     working: &[u8],
+    preserve_mode: bool,
 ) -> Result<PreparedNameResolution, RecordError> {
     use atomic_core::record::workflow::globalize::{
         globalize_solve_name_conflict, GlobalizeContext, NameConflictClaim,
@@ -2317,11 +3047,76 @@ fn prepare_name_resolution(
         }
     }
     if matching.len() != 1 {
-        return Err(RecordError::Database(format!(
-            "resolved name conflict at '{}' matches {} claimants; leave exactly one side byte-for-byte before recording",
-            path,
-            matching.len()
-        )));
+        // Review ::15 blocker support (user decision "Preserve current
+        // files"): with MULTIPLE byte-equal claimants the working content is
+        // ambiguous by bytes alone, so the EXPLICIT preserve-mode resolves
+        // the identity through the RAW canonical TREE binding for the path
+        // (the global path→inode row — distinct from the filtered conflict
+        // projection). The binding must EXIST and correspond to one of the
+        // byte-equal sides; otherwise the survivor's identity is unresolved
+        // and the resolution FAILS CLOSED — a lowest-inode or any other
+        // arbitrary fallback was never authorized (review ::26 N1 probe:
+        // first=Inode(2) second=Inode(3) TREE=None, the old fallback picked
+        // Inode(2)). A ZERO-match path is still refused: unrecorded working
+        // content is never silently chosen.
+        let canonical_selected = if preserve_mode {
+            let tree_inode = txn
+                .get_inode(path)
+                .map_err(|e| RecordError::Database(e.to_string()))?;
+            match tree_inode {
+                Some(canonical_inode) => {
+                    let canonical = matching
+                        .iter()
+                        .find(|side| side.inode == canonical_inode)
+                        .cloned();
+                    match canonical {
+                        Some(side) => {
+                            log::info!(
+                                "record: preserve-content resolution at '{path}' selects the \
+                                 canonical TREE-bound claimant (inode {}) among {} byte-equal sides",
+                                side.inode.get(),
+                                matching.len()
+                            );
+                            Some(side)
+                        }
+                        None => {
+                            return Err(RecordError::Database(format!(
+                                "preserve-content resolution refused at '{path}': the canonical \
+                                 TREE binding (inode {}) is stale or unrelated — it does not match \
+                                 any of the {} working-byte-equal claimants; re-bind the intended \
+                                 incarnation (e.g. a normal record on its view) and retry",
+                                canonical_inode.get(),
+                                matching.len()
+                            )));
+                        }
+                    }
+                }
+                None => {
+                    return Err(RecordError::Database(format!(
+                        "preserve-content resolution refused at '{path}': no canonical TREE \
+                         binding exists for the path, so the survivor's identity is unresolved \
+                         among {} working-byte-equal claimants; establish the binding (e.g. a \
+                         normal record that binds the intended incarnation) and retry",
+                        matching.len()
+                    )));
+                }
+            }
+        } else {
+            None
+        };
+        match canonical_selected {
+            Some(side) => {
+                matching.clear();
+                matching.push(side);
+            }
+            None => {
+                return Err(RecordError::Database(format!(
+                    "resolved name conflict at '{}' matches {} claimants; leave exactly one side byte-for-byte before recording",
+                    path,
+                    matching.len()
+                )));
+            }
+        }
     }
     let winner = matching.remove(0);
     let losing_claims: Vec<_> = sides

@@ -451,6 +451,117 @@ fn recovery_between_chained_effects_reverses_only_the_reached_stage() {
     );
 }
 
+/// CB-13C observability: an executed recovery is recorded in the bridge
+/// event journal with the original/recovery operation IDs and whether a
+/// new `Recover` operation was created. The automatic sink is
+/// consent-gated (review R1/R4), so the fixture opts in first.
+#[test]
+fn executed_recovery_is_recorded_in_the_event_journal() {
+    let (temp, mut repo) = create_temp_repo();
+    opt_in_bridge_telemetry(temp.path());
+    let (_prepared, initial, intermediate, _) = prepare_working_copy_chain(&repo);
+    let lock = repo.try_lock_operation(repo.working_copy()).unwrap();
+    repo.apply_working_copy_state_locked(&lock, &intermediate)
+        .unwrap();
+    drop(lock);
+    drop(repo);
+
+    // Reopening performs the idempotent recovery before accepting new work.
+    let reopened = Repository::open(temp.path()).unwrap();
+    let record = reopened
+        .working_copy_record(reopened.require_working_copy_id().unwrap())
+        .unwrap();
+    assert_eq!(
+        record.materialized_state, initial.materialized_state,
+        "the interrupted stage was reversed"
+    );
+
+    let journal = temp
+        .path()
+        .join(super::super::DOT_DIR)
+        .join("bridge/events.jsonl");
+    let text = std::fs::read_to_string(&journal).unwrap();
+    let line = text
+        .lines()
+        .find(|line| line.contains("\"recovery\""))
+        .expect("the recovery outcome is recorded");
+    let event: serde_json::Value = serde_json::from_str(line).unwrap();
+    assert_eq!(event["event"], "recovery");
+    assert_eq!(event["created"], true, "a new Recover operation was appended");
+    assert!(
+        event["original"].as_str().is_some_and(|id| !id.is_empty()),
+        "the original operation id is recorded"
+    );
+    assert!(
+        event["recovery"].as_str().is_some_and(|id| !id.is_empty()),
+        "the recovery operation id is recorded"
+    );
+}
+
+/// Append the explicit bridge opt-in to the repository config: the
+/// automatic recovery journal sink is consent-gated (review R1/R4).
+fn opt_in_bridge_telemetry(root: &std::path::Path) {
+    use std::io::Write as _;
+    let config = root.join(super::super::DOT_DIR).join("config.toml");
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&config)
+        .unwrap();
+    writeln!(file, "\n[git.bridge]\nenabled = true\n").unwrap();
+}
+
+/// Review R5: a recovery that fails closed — here a replay lease
+/// rejection because the observed file content matches neither the old
+/// nor the new value — records a `recovery_failure` event with the
+/// original operation and a stable reason, and the writable open fails
+/// closed.
+#[test]
+fn failed_recovery_records_a_failure_event() {
+    let (temp, mut repo) = create_temp_repo();
+    opt_in_bridge_telemetry(temp.path());
+    let path = "tracked.txt";
+    let old_bytes = b"old contents\n";
+    let target_bytes = b"target contents\n";
+    std::fs::write(temp.path().join(path), old_bytes).unwrap();
+    let (prepared, _) = prepare_file_switch(&repo, path, target_bytes);
+    // Execute the operation's file effect (receipt Applied, operation not
+    // yet finalized), then corrupt the file to a third lease value: the
+    // recovery inverse must fail closed on reopen.
+    {
+        let lock = repo.try_lock_operation(repo.working_copy()).unwrap();
+        repo.execute_filesystem_effect(
+            &lock,
+            prepared.operation().id(),
+            0,
+            Some(target_bytes.as_slice()),
+        )
+        .unwrap();
+    }
+    std::fs::write(temp.path().join(path), b"newer external contents\n").unwrap();
+    drop(repo);
+
+    // Reopening performs the idempotent recovery before accepting new
+    // work; the diverged lease fails closed.
+    Repository::open(temp.path()).unwrap_err();
+
+    let journal = temp
+        .path()
+        .join(super::super::DOT_DIR)
+        .join("bridge/events.jsonl");
+    let text = std::fs::read_to_string(&journal).unwrap();
+    let line = text
+        .lines()
+        .find(|line| line.contains("recovery_failure"))
+        .expect("the recovery failure is recorded");
+    let event: serde_json::Value = serde_json::from_str(line).unwrap();
+    assert_eq!(event["event"], "recovery_failure");
+    assert_eq!(event["reason"], "inverse_construction");
+    assert!(
+        event["original"].as_str().is_some_and(|id| !id.is_empty()),
+        "the original operation id is recorded"
+    );
+}
+
 #[test]
 fn recovery_handles_current_new_without_original_receipt() {
     let (temp, mut repo) = create_temp_repo();
@@ -841,4 +952,55 @@ fn recovery_rejects_third_value_without_mutating_it() {
         txn.get_effect_receipts(head).unwrap().len()
     };
     assert_eq!(first_receipt_count, second_receipt_count);
+}
+
+/// CB-13D review R1: the metadata-only budget fences writable-open
+/// recovery — an open under `MetadataOnly` refuses pending recovery work
+/// with a typed deferral *before* any effect-bearing plan replays, while
+/// the ordinary command open still recovers.
+#[test]
+fn metadata_only_open_refuses_pending_recovery_instead_of_replaying() {
+    let (temp, repo) = create_temp_repo();
+    let path = "tracked.txt";
+    let old_bytes = b"old contents\n";
+    let new_bytes = b"new contents\n";
+    std::fs::write(temp.path().join(path), old_bytes).unwrap();
+    let (prepared, _) = prepare_file_switch(&repo, path, new_bytes);
+    std::fs::write(temp.path().join(path), new_bytes).unwrap();
+    let original = prepared.operation().id();
+    drop(prepared);
+    drop(repo);
+
+    // The metadata-only open refuses: no recovery ran, so the user's bytes
+    // are exactly what the interrupted operation left on disk.
+    let error = Repository::open_with_budget(temp.path(), ReconcileEffectBudget::MetadataOnly)
+        .unwrap_err();
+    assert!(
+        matches!(&error, RepositoryError::ReactiveDeferred { .. }),
+        "the metadata-only open must defer pending recovery, got {error:?}"
+    );
+    assert!(
+        error.to_string().contains("explicit command boundary"),
+        "the deferral must name the command-boundary remediation: {error}"
+    );
+    assert_eq!(
+        std::fs::read(temp.path().join(path)).unwrap(),
+        new_bytes,
+        "the metadata-only open must not replay the interrupted effect"
+    );
+
+    // The command budget open recovers exactly as before.
+    let reopened = Repository::open(temp.path()).unwrap();
+    assert_eq!(std::fs::read(temp.path().join(path)).unwrap(), old_bytes);
+    let txn = reopened.pristine().read_txn().unwrap();
+    let heads = txn
+        .get_operation_heads(atomic_core::operation::OperationScope::WorkingCopy(
+            reopened.require_working_copy_id().unwrap(),
+        ))
+        .unwrap();
+    let recovery = txn.get_operation(heads.as_slice()[0]).unwrap().unwrap();
+    assert_eq!(recovery.payload().parents, vec![original]);
+    assert!(has_operation_verified_receipt(
+        &txn.get_effect_receipts(recovery.id()).unwrap()
+    ));
 }

@@ -710,6 +710,33 @@ impl Repository {
         Ok(persisted)
     }
 
+    /// Attach durable turn boundaries and the semantic outcome to an already
+    /// indexed turn row (CB-12A, RFC §10.1/§10.2).
+    ///
+    /// Returns `Ok(None)` when no turn row carries this provenance hash (the
+    /// turn recorded no provenance — git-only or observation-only outcomes
+    /// have no ledger row by design).
+    #[allow(clippy::too_many_arguments)]
+    pub fn attach_turn_boundary(
+        &self,
+        session_id: &str,
+        provenance_hash: &Hash,
+        boundary_start: &atomic_core::change::session::TurnBoundary,
+        boundary_end: &atomic_core::change::session::TurnBoundary,
+        outcome: &atomic_core::change::session::ManagedTurnOutcome,
+    ) -> Result<Option<bool>, RepositoryError> {
+        let mut txn = self
+            .pristine
+            .write_txn()
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        let attached = txn
+            .attach_turn_boundary(session_id, provenance_hash, boundary_start, boundary_end, outcome)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        txn.commit()
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        Ok(Some(attached))
+    }
+
     /// Create a forked session from a parent at a turn boundary.
     ///
     /// The child inherits the parent's turn records through `fork_turn` as an

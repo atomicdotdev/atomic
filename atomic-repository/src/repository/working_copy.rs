@@ -45,6 +45,29 @@ enum IdentityFile {
     Malformed(String),
 }
 
+/// CB-13D ::24 R1/R5: the public root detection for LINKED worktrees —
+/// a tree whose `.git` pointer resolves to a common repository with a
+/// `.atomic/` is a valid repository root even though it has no local
+/// `.atomic/`. Returns the working root the CLI should treat as the
+/// repository root, or `None` when `start` is not inside a repository.
+/// CB-13D ::24 R5: the canonical common `.atomic` directory for `start`,
+/// when `start` resolves inside a repository layout (linked worktrees
+/// resolve to the common store; a plain repository to its own `.atomic`).
+pub fn canonical_dot_dir_for(start: &Path) -> Option<PathBuf> {
+    match discover_layout(start) {
+        Ok(layout) => Some(layout.common_dot_dir),
+        Err(_) => None,
+    }
+}
+
+pub fn detect_repository_root(start: &Path) -> Result<Option<PathBuf>, RepositoryError> {
+    match discover_layout(start) {
+        Ok(layout) => Ok(Some(layout.working_root)),
+        Err(RepositoryError::NotInRepository) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
 pub(super) fn discover_layout(start: &Path) -> Result<RepositoryLayout, RepositoryError> {
     let start = search_start(start)?;
     let home_dir = dirs::home_dir().and_then(|path| std::fs::canonicalize(path).ok());
@@ -79,7 +102,12 @@ pub(super) fn discover_layout(start: &Path) -> Result<RepositoryLayout, Reposito
                     ),
                 })?;
         let common_dot_dir = common_parent.join(DOT_DIR);
-        if common_dot_dir.join("pristine.redb").is_file() {
+        // CB-13D ::24 R1: linked-layout detection keys on the resolved Git
+        // common directory's .atomic presence, not on `pristine.redb` file
+        // existence — a linked worktree whose common store has not yet
+        // created the database file (or is mid-migration) must still
+        // resolve to its common layout instead of being misdetected.
+        if common_dot_dir.is_dir() {
             let working_copy_dot_dir = git.worktree_root.join(DOT_DIR);
             return Ok(RepositoryLayout {
                 working_root: git.worktree_root.clone(),
@@ -367,7 +395,13 @@ fn resolve_git_admin(root: &Path) -> Result<Option<GitAdminPaths>, RepositoryErr
 }
 
 fn run_git_optional(root: &Path, args: &[&str]) -> Result<Option<Vec<u8>>, RepositoryError> {
-    let output = match Command::new("git").arg("-C").arg(root).args(args).output() {
+    let output = match Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(args)
+        .env_remove("GIT_INDEX_FILE")
+        .output()
+    {
         Ok(output) => output,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(RepositoryError::Io(error)),
@@ -384,6 +418,11 @@ fn run_git_required(root: &Path, args: &[&str]) -> Result<Vec<u8>, RepositoryErr
         .arg("-C")
         .arg(root)
         .args(args)
+        // CB-11A: the repository location fingerprint must not depend on an
+        // alternate index selection. `git rev-parse --git-path index` honors
+        // GIT_INDEX_FILE, so strip it here: the canonical primary index path
+        // is an identity input, the selected index is only evidence.
+        .env_remove("GIT_INDEX_FILE")
         .output()?;
     if !output.status.success() {
         return Err(RepositoryError::InvalidRepository {

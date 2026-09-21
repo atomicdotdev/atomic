@@ -12,7 +12,7 @@ begin_section "Prerequisites"
 require_git
 
 atomic_current_view() {
-    atomic view list 2>/dev/null | awk '/^\*/ { print $2; exit }'
+    atomic view list 2>/dev/null | awk '/^\*/ { print $2 }'
 }
 
 wait_for_receipt() {

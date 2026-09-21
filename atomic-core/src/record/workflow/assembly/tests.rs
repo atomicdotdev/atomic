@@ -308,3 +308,172 @@ fn test_assembly_result_into_change() {
     let taken = result.into_change();
     assert_eq!(taken.message(), "Take me");
 }
+
+// ========================================================================
+// Placeholder Namespace Tests (CB-9B review B1)
+// ========================================================================
+
+use crate::crdt::{BranchId as CrdtBranchId, LeafId, TrunkId as CrdtTrunkId};
+use crate::diff::TokenKind;
+use crate::types::NodeId;
+
+/// One one-line file-create entry with a single leaf: the smallest possible
+/// placeholder namespace span (branch span 1, leaf span 1).
+fn one_line_entry(path: &str) -> FileOps {
+    let mut ops = FileOps::create(CrdtTrunkId::ROOT, path.to_string(), None);
+    ops.add_line_op(crate::change::LineOps::new(
+        CrdtBranchId::ROOT,
+        BranchOp::Insert {
+            after: None,
+            content: vec![LeafOp::Insert {
+                after: None,
+                kind: TokenKind::Word,
+                content: b"line".to_vec(),
+            }],
+        },
+    ));
+    ops
+}
+
+/// A multi-line entry: `lines` chained inserts plus `tokens` leaves per line,
+/// with `after` references that must shift with the branch base.
+fn multi_line_entry(path: &str, lines: usize, tokens: usize) -> FileOps {
+    let mut ops = FileOps::create(CrdtTrunkId::ROOT, path.to_string(), None);
+    for line in 0..lines {
+        let after = if line == 0 {
+            None
+        } else {
+            Some(CrdtBranchId::new(NodeId::ROOT, (line - 1) as u32))
+        };
+        let mut content = Vec::with_capacity(tokens);
+        for token in 0..tokens {
+            content.push(LeafOp::Insert {
+                after: if token == 0 {
+                    None
+                } else {
+                    Some(LeafId::new(NodeId::ROOT, (token - 1) as u32))
+                },
+                kind: if token % 2 == 0 {
+                    TokenKind::Word
+                } else {
+                    TokenKind::Whitespace
+                },
+                content: format!("t{token}").into_bytes(),
+            });
+        }
+        ops.add_line_op(crate::change::LineOps::new(
+            CrdtBranchId::new(NodeId::ROOT, line as u32),
+            BranchOp::Insert { after, content },
+        ));
+    }
+    ops
+}
+
+#[test]
+fn add_file_ops_placeholder_namespace_advances_linearly_for_one_line_files() {
+    let header = ChangeHeader::builder().message("many files").build();
+    let mut ctx = AssemblyContext::new(header);
+    // 300 one-line entries: the pre-fix implementation doubled the running
+    // base per entry (2·b + span), overflowing u32 around the 33rd entry.
+    for i in 0..300 {
+        ctx.add_file_ops(one_line_entry(&format!("f{i}.txt")))
+            .expect("one-line entry must always fit");
+    }
+    // Each entry's local span is exactly 1 branch slot and 1 leaf slot, so
+    // both bases advance linearly (review B1: base grows by the span, not
+    // geometrically).
+    assert_eq!(ctx.placeholder_branch_base, 300);
+    assert_eq!(ctx.placeholder_leaf_base, 300);
+    // Every entry occupies its own namespace slot: entry i's placeholder
+    // branch index and trunk file index are exactly i (referential
+    // integrity under the apply-time substitution).
+    for (i, ops) in ctx.file_ops.iter().enumerate() {
+        let i = i as u32;
+        assert_eq!(ops.trunk_id().file_idx(), i, "trunk file idx of entry {i}");
+        assert!(ops.trunk_id().change_id().is_root());
+        for line_op in ops.line_ops() {
+            let branch = line_op.branch_id();
+            assert!(branch.change_id().is_root());
+            assert_eq!(
+                branch.branch_idx(),
+                i,
+                "branch placeholder of entry {i} must be shifted into its own slot"
+            );
+        }
+    }
+}
+
+#[test]
+fn add_file_ops_placeholder_namespace_advances_by_exact_span_for_mixed_entries() {
+    let header = ChangeHeader::builder().message("mixed").build();
+    let mut ctx = AssemblyContext::new(header);
+    // Mixed line/token counts: each entry advances the branch base by its
+    // own local branch span (one slot per line) and the leaf base by its
+    // own local leaf-after span (the highest placeholder leaf index + 1).
+    let shapes = [(1usize, 1usize), (3, 2), (5, 4), (2, 7), (1, 1)];
+    let mut branch = 0u32;
+    let mut leaf = 0u32;
+    for (idx, (lines, tokens)) in shapes.iter().enumerate() {
+        let entry = multi_line_entry(&format!("m{idx}.txt"), *lines, *tokens);
+        ctx.add_file_ops(entry).expect("mixed entry fits");
+        branch += *lines as u32;
+        // The leaf placeholder namespace only needs one slot beyond the
+        // highest `after` index: a t-token line chains after-refs 0..t-2,
+        // and a single-token line (no after ref) still occupies slot 0.
+        leaf += (tokens.saturating_sub(1)).max(1) as u32;
+        assert_eq!(ctx.placeholder_branch_base, branch, "branch base after entry {idx}");
+        assert_eq!(ctx.placeholder_leaf_base, leaf, "leaf base after entry {idx}");
+        // The entry just added was renumbered into [base - span, base):
+        // every branch placeholder in it must land inside its own span.
+        let ops = ctx.file_ops.last().expect("entry recorded");
+        let span = *lines as u32;
+        for line_op in ops.line_ops() {
+            let b = line_op.branch_id().branch_idx();
+            assert!(
+                b >= branch - span && b < branch,
+                "branch idx {b} outside this entry's namespace [{},{})",
+                branch - span,
+                branch
+            );
+        }
+    }
+    // Cross-entry uniqueness: no branch placeholder appears in two entries.
+    let mut seen = std::collections::HashSet::new();
+    for ops in &ctx.file_ops {
+        for line_op in ops.line_ops() {
+            assert!(
+                seen.insert(line_op.branch_id().branch_idx()),
+                "duplicate placeholder branch index across entries"
+            );
+        }
+    }
+}
+
+#[test]
+fn add_file_ops_placeholder_namespace_exhaustion_is_typed_not_a_panic() {
+    let header = ChangeHeader::builder().message("exhausted").build();
+    let mut ctx = AssemblyContext::new(header);
+    // Test-only seed: push the running base to the namespace limit, then
+    // verify the next entry is refused with the typed error in BOTH debug
+    // (overflow panics) and release (wraps) modes instead.
+    ctx.force_placeholder_bases(u32::MAX, 0);
+    let error = ctx
+        .add_file_ops(one_line_entry("overflow.txt"))
+        .expect_err("exhausted namespace must fail closed");
+    assert!(matches!(
+        error,
+        crate::record::workflow::assembly::AssemblyError::PlaceholderNamespaceExhausted { .. }
+    ));
+    let message = error.to_string();
+    assert!(message.contains("namespace exhausted"), "{message}");
+}
+
+impl AssemblyContext {
+    /// Test-only seed for the exhaustion path (CB-9B review B1): force the
+    /// running placeholder bases so the next entry cannot fit.
+    #[cfg(test)]
+    fn force_placeholder_bases(&mut self, branch: u32, leaf: u32) {
+        self.placeholder_branch_base = branch;
+        self.placeholder_leaf_base = leaf;
+    }
+}

@@ -68,6 +68,71 @@ pub fn graph_visibility_closure<T: ViewTxnT>(
     super::effective_projection_closure(txn, view)
 }
 
+/// CB-9B assembly visibility: `view`'s validated closure with `excluded`
+/// changes (and everything only reachable through them) held invisible.
+///
+/// Merge legs use this to assemble each leg against its own Git parent's
+/// interpreted closure: a sibling leg's changes are excluded, so the leg
+/// anchors only to vertices its own lineage introduced and never inherits
+/// false sibling causality. The full ancestor chain's membership (not just
+/// the leaf view's own log) minus `excluded` is rebuilt into a validated
+/// closure, so ancestor views' changes stay visible (review R1) and
+/// dependency metadata stays fail-closed (a missing root or incomplete index
+/// is an error, not a silent widening).
+pub(crate) fn assembly_visibility_excluding<T: ViewTxnT>(
+    txn: &T,
+    view: &ViewState,
+    excluded: &[atomic_core::types::Hash],
+) -> Result<GraphVisibilityClosure, RepositoryError> {
+    if excluded.is_empty() {
+        return super::effective_projection_closure(txn, view);
+    }
+    let mut excluded_ids = std::collections::HashSet::new();
+    for hash in excluded {
+        match txn
+            .get_internal(hash)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?
+        {
+            Some(id) => {
+                excluded_ids.insert(id);
+            }
+            None => {
+                return Err(RepositoryError::InvalidOperation {
+                    message: format!(
+                        "assembly exclusion names change {} which is not registered locally",
+                        hash.to_base32()
+                    ),
+                });
+            }
+        }
+    }
+    let mut kept = Vec::new();
+    // Walk the complete view chain (leaf + every ancestor): a merge leg's
+    // parent closure may live in an ancestor view, and dropping it would
+    // silently strip the parent's own knowledge out of the assembly (R1).
+    for member_view in txn
+        .resolve_full_view_chain(view)
+        .map_err(|e| RepositoryError::Database(e.to_string()))?
+    {
+        for entry in txn
+            .iter_changes(&member_view, 0)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?
+        {
+            let (_, change_id, _) =
+                entry.map_err(|e| RepositoryError::Database(e.to_string()))?;
+            if !excluded_ids.contains(&change_id) {
+                kept.push(change_id);
+            }
+        }
+    }
+    if kept.is_empty() {
+        return Err(RepositoryError::InvalidOperation {
+            message: "assembly exclusion removed every view member".to_string(),
+        });
+    }
+    graph_visibility_from_membership(txn, &ViewMembershipSet::from_ordered(kept))
+}
+
 /// Typed compatibility alias for callers that still use the former helper name.
 pub fn collect_view_change_ids<T: ViewTxnT>(
     txn: &T,

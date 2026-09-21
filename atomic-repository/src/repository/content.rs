@@ -70,6 +70,71 @@ impl Repository {
         self.get_file_content(path)
     }
 
+    /// Get file content through the view-aware semantic consumer for a
+    /// SPECIFIC view (the requested-closure form of
+    /// [`Self::get_file_content_via_crdt`]).
+    ///
+    /// The CRDT branch/leaf tables are ambient — shared across views and
+    /// updated by every applied change — so a direct
+    /// `output_file_via_crdt` read of a concurrently edited path renders a
+    /// sibling view's bytes rather than the requested closure's. This entry
+    /// point resolves the requested view's effective closure and returns
+    /// exactly that closure's bytes (the canonical closure-filtered
+    /// projection), so a sibling lineage can never leak into the requested
+    /// view's semantic view. It is the view-parameterized companion to the
+    /// compatibility entry point above and preserves the same no-leak
+    /// contract.
+    pub fn get_file_content_via_crdt_on_view<P: AsRef<Path>>(
+        &self,
+        path: P,
+        view_name: &str,
+    ) -> Result<Option<Vec<u8>>, RepositoryError> {
+        self.get_file_content_on_view(path, view_name)
+    }
+
+    /// Whether an inode renders any alive content for the requested visibility,
+    /// using the inode-scoped `INODE_GRAPH` fast path before the exhaustive
+    /// global retrieval.
+    ///
+    /// `is_file_alive_via_retrieval` runs `retrieve_graph` (global `GRAPH`
+    /// traversal) for EVERY absent path-claim entry on every projection; on a
+    /// large repository that is a per-entry bottleneck (measured 14–62 s per
+    /// entry on the workspace graph, 659 entries per projection). The
+    /// inode-linear walk reads the file's own `INODE_GRAPH` rows, so a path
+    /// that simply has no alive content resolves without touching the global
+    /// graph. A non-linear (fork/delete-through) structure still falls back to
+    /// the exhaustive retrieval, so the verdict stays exact.
+    pub(crate) fn inode_renders_alive_content<T>(
+        &self,
+        txn: &T,
+        inode: Inode,
+        position: atomic_core::types::Position<NodeId>,
+        visibility: &GraphVisibilityClosure,
+    ) -> Result<bool, RepositoryError>
+    where
+        T: atomic_core::pristine::GraphTxnT
+            + atomic_core::pristine::InodeGraphOps<
+                InodeError = atomic_core::pristine::PristineError,
+            >
+            + atomic_core::pristine::TreeTxnT,
+    {
+        let options =
+            atomic_core::output::alive::RetrieveOptions::new()
+                .with_graph_visibility(visibility.clone());
+        match try_retrieve_linear_content_with_filter(
+            txn,
+            &self.change_store,
+            inode,
+            position,
+            &options,
+        ) {
+            Ok(Some(content)) => return Ok(!content.is_empty()),
+            Ok(None) => {}
+            Err(_) => {}
+        }
+        super::status::is_file_alive_via_retrieval(txn, inode, position, visibility)
+    }
+
     /// Get file content, excluding a specific change.
     ///
     /// This is identical to [`Self::get_file_content`] but removes
@@ -268,7 +333,11 @@ impl Repository {
             &view,
             &visibility,
         )?;
-        let projection = self.project_tree_for_visibility(&txn, &claim_visibility)?;
+        let projection = self.project_tree_for_visibility_scoped(
+            &txn,
+            &claim_visibility,
+            Some(normalized.as_str()),
+        )?;
         if let Some(conflict) = projection.name_conflicts.get(&normalized) {
             return Err(RepositoryError::InvalidOperation {
                 message: format!(
@@ -299,6 +368,110 @@ impl Repository {
         )
         .map_err(|error| RepositoryError::Database(error.to_string()))?;
         Ok(MaterializedEntry::present(normalized, item.inode, bytes))
+    }
+
+    /// Read a path through an exact assembly visibility: `view`'s validated
+    /// closure minus `excluded` changes (CB-9B review R2).
+    ///
+    /// Merge baselines must consult the same exact visibility that recording
+    /// and staged verification use — the full-view render would mix sibling
+    /// lineages (or their conflicts) into the baseline and fabricate false
+    /// causality. Storage errors propagate; only genuine absence is `None`.
+    pub fn get_file_content_on_view_excluding<P: AsRef<Path>>(
+        &self,
+        path: P,
+        view_name: &str,
+        excluded: &[Hash],
+    ) -> Result<Option<Vec<u8>>, RepositoryError> {
+        let normalized = normalize_path(path.as_ref());
+        let txn = self
+            .pristine
+            .read_txn()
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        let view = txn
+            .get_view(view_name)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?
+            .ok_or_else(|| RepositoryError::ViewNotFound {
+                name: view_name.to_string(),
+            })?;
+        let visibility =
+            super::filter::assembly_visibility_excluding(&txn, &view, excluded)?;
+        let projection = self.project_tree_for_visibility(&txn, &visibility)?;
+        if projection.name_conflicts.contains_key(&normalized) {
+            return Err(RepositoryError::InvalidOperation {
+                message: format!(
+                    "path '{}' has an unresolved name conflict inside the exact assembly closure; refusing to choose content",
+                    normalized
+                ),
+            });
+        }
+        let Some(item) = projection.present.get(&normalized) else {
+            return Ok(None);
+        };
+        if item.is_directory {
+            return Ok(None);
+        }
+        let bytes = retrieve_content_with_filter_fast(
+            &txn,
+            &self.change_store,
+            item.inode,
+            item.position,
+            atomic_core::output::alive::RetrieveOptions::new()
+                .with_graph_visibility(visibility),
+        )
+        .map_err(|error| RepositoryError::Database(error.to_string()))?;
+        Ok(Some(bytes))
+    }
+
+    /// Project the graph-backed inode attributes (mode/kind) for one path
+    /// through an exact assembly visibility (CB-9C).
+    ///
+    /// Import paths consult the same visibility that staged verification
+    /// uses, so a delta's expected Git mode/kind is compared against exactly
+    /// the state the importing change will build on. Returns `None` when the
+    /// path is absent from the projection (untracked/new); conflicted
+    /// registers are returned as-is so callers can fail closed.
+    pub fn projected_attributes_on_view_excluding(
+        &self,
+        path: &str,
+        view_name: &str,
+        excluded: &[Hash],
+    ) -> Result<Option<atomic_core::output::InodeAttributeProjection>, RepositoryError> {
+        let normalized = normalize_path(Path::new(path));
+        let txn = self
+            .pristine
+            .read_txn()
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        let view = txn
+            .get_view(view_name)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?
+            .ok_or_else(|| RepositoryError::ViewNotFound {
+                name: view_name.to_string(),
+            })?;
+        let visibility =
+            super::filter::assembly_visibility_excluding(&txn, &view, excluded)?;
+        let projection = self.project_tree_for_visibility(&txn, &visibility)?;
+        if projection.name_conflicts.contains_key(&normalized) {
+            return Err(RepositoryError::InvalidOperation {
+                message: format!(
+                    "path '{}' has an unresolved name conflict inside the exact assembly closure; refusing to project attributes",
+                    normalized
+                ),
+            });
+        }
+        let Some(item) = projection.present.get(&normalized) else {
+            return Ok(None);
+        };
+        if item.is_directory {
+            return Ok(None);
+        }
+        let projected = atomic_core::output::project_inode_attributes(
+            &txn,
+            item.position,
+            &visibility.iter_dependency_first().copied().collect(),
+        )
+        .map_err(|error| RepositoryError::Database(error.to_string()))?;
+        Ok(Some(projected))
     }
 
     /// Get the recorded content for a tracked file with options.
@@ -744,8 +917,7 @@ impl Repository {
     }
 }
 
-pub(crate) fn retrieve_content_with_filter_fast<T, C>(
-    txn: &T,
+pub(crate) fn retrieve_content_with_filter_fast<T, C>(    txn: &T,
     changes: &C,
     inode: Inode,
     position: Position<NodeId>,
@@ -753,7 +925,8 @@ pub(crate) fn retrieve_content_with_filter_fast<T, C>(
 ) -> atomic_core::record::RecordResult<Vec<u8>>
 where
     T: atomic_core::pristine::GraphTxnT
-        + atomic_core::pristine::InodeGraphOps<InodeError = atomic_core::pristine::PristineError>,
+        + atomic_core::pristine::InodeGraphOps<InodeError = atomic_core::pristine::PristineError>
+        + atomic_core::pristine::TreeTxnT,
     C: atomic_core::change::ChangeStore,
 {
     retrieve_content_with_filter_fast_with_fork_info(txn, changes, inode, position, options)
@@ -780,15 +953,25 @@ pub(crate) fn retrieve_content_with_filter_fast_with_fork_info<T, C>(
 ) -> atomic_core::record::RecordResult<(Vec<u8>, bool)>
 where
     T: atomic_core::pristine::GraphTxnT
-        + atomic_core::pristine::InodeGraphOps<InodeError = atomic_core::pristine::PristineError>,
+        + atomic_core::pristine::InodeGraphOps<InodeError = atomic_core::pristine::PristineError>
+        + atomic_core::pristine::TreeTxnT,
     C: atomic_core::change::ChangeStore,
 {
     let trace_retrieve = std::env::var_os("ATOMIC_TRACE_RETRIEVE").is_some();
+    let debug_retrieve = std::env::var("ATOMIC_DEBUG_RETRIEVE").is_ok();
+    let retrieve_start = std::time::Instant::now();
 
     // Try the inode-linear fast path first (works with or without filter).
     if let Some(content) =
         try_retrieve_linear_content_with_filter(txn, changes, inode, position, &options)?
     {
+        if debug_retrieve && retrieve_start.elapsed().as_millis() > 100 {
+            eprintln!(
+                "RETRIEVE fast path ms={} bytes={}",
+                retrieve_start.elapsed().as_millis(),
+                content.len()
+            );
+        }
         if trace_retrieve {
             eprintln!(
                 "[retrieve_content_with_filter_fast] inode fast path hit bytes={}",
@@ -802,9 +985,26 @@ where
         eprintln!("[retrieve_content_with_filter_fast] falling back to retrieve_graph");
     }
 
-    atomic_core::record::workflow::retrieve::retrieve_content_with_filter_and_fork_info(
-        txn, changes, position, options,
-    )
+    let result = match atomic_core::pristine::InodeScopedGraph::new(txn, inode) {
+        // The byte-graph walk must resolve edge destinations through the
+        // file-local INODE_GRAPH index; on a multi-GB global GRAPH the
+        // unscoped walk is orders of magnitude slower. `InodeScopedGraph`
+        // falls back to the global lookup per call when the inode index is
+        // not populated, so the result is unchanged.
+        Ok(scoped) => atomic_core::record::workflow::retrieve::
+            retrieve_content_with_filter_and_fork_info(&scoped, changes, position, options),
+        Err(_) => atomic_core::record::workflow::retrieve::
+            retrieve_content_with_filter_and_fork_info(txn, changes, position, options),
+    };
+    if debug_retrieve && retrieve_start.elapsed().as_millis() > 200 {
+        eprintln!(
+            "RETRIEVE fallback ms={} bytes={:?} inode={}",
+            retrieve_start.elapsed().as_millis(),
+            result.as_ref().ok().map(|(b, _)| b.len()),
+            inode.get()
+        );
+    }
+    result
 }
 
 /// Outcome of choosing the next vertex in a linear (single-path) content walk.
@@ -902,7 +1102,8 @@ fn try_retrieve_linear_content_with_filter<T, C>(
 ) -> atomic_core::record::RecordResult<Option<Vec<u8>>>
 where
     T: atomic_core::pristine::GraphTxnT
-        + atomic_core::pristine::InodeGraphOps<InodeError = atomic_core::pristine::PristineError>,
+        + atomic_core::pristine::InodeGraphOps<InodeError = atomic_core::pristine::PristineError>
+        + atomic_core::pristine::TreeTxnT,
     C: atomic_core::change::ChangeStore,
 {
     #[allow(unused_imports)]
@@ -948,7 +1149,6 @@ where
     }
 
     let mut content = Vec::new();
-    let mut change_contents = std::collections::HashMap::<Hash, Vec<u8>>::new();
     for node in vertices {
         let hash = txn.get_external(node.change)?.ok_or_else(|| {
             atomic_core::pristine::PristineError::ChangeNotFound {
@@ -956,33 +1156,59 @@ where
             }
         })?;
 
-        if let std::collections::hash_map::Entry::Vacant(entry) = change_contents.entry(hash) {
-            let change = changes.get_change(&hash).map_err(|error| {
-                atomic_core::record::RecordError::Io(std::io::Error::other(format!(
-                    "failed to load change {} for {}: {}",
-                    hash, node, error
-                )))
-            })?;
-            entry.insert(change.contents);
-        }
-
+        // Performance (RFC §21 measured budgets, CB-13C AC-3): copy ONLY
+        // this vertex's span instead of loading the whole change. The
+        // former per-vertex `get_change` cache hit CLONES the entire change
+        // (hunks, FileOps, provenance, contents) for every vertex — for a
+        // 5000-file imported change that is a ~130KB clone per retrieval
+        // call, ~18s across a status pass. `get_contents` peeks the cache
+        // (no clone) and copies the requested byte range.
         let start = node.start.get() as usize;
         let end = node.end.get() as usize;
-        let bytes = change_contents.get(&hash).expect("change contents cached");
-        if start > end || end > bytes.len() {
+        if start > end {
             return Err(atomic_core::pristine::PristineError::InvalidVertex {
                 message: format!(
-                    "content span {}..{} for {} exceeds change {} content length {}",
+                    "content span {}..{} for {} is inverted in change {}",
                     start,
                     end,
                     node,
-                    hash,
-                    bytes.len()
+                    hash
                 ),
             }
             .into());
         }
-        content.extend_from_slice(&bytes[start..end]);
+        let mut span = vec![0u8; end - start];
+        let copied = changes
+            .get_contents(
+                |id| txn.get_external(id).ok().flatten(),
+                node,
+                &mut span,
+            )
+            .map_err(|error| {
+                atomic_core::record::RecordError::Io(std::io::Error::other(format!(
+                    "content span {}..{} for {} exceeds change {} content length: {}",
+                    start,
+                    end,
+                    node,
+                    hash,
+                    error
+                )))
+            })?;
+        if copied != end - start {
+            return Err(atomic_core::pristine::PristineError::InvalidVertex {
+                message: format!(
+                    "content span {}..{} for {} in change {} copied {} bytes (expected {})",
+                    start,
+                    end,
+                    node,
+                    hash,
+                    copied,
+                    end - start
+                ),
+            }
+            .into());
+        }
+        content.extend_from_slice(&span);
     }
 
     Ok(Some(content))

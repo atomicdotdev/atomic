@@ -5,6 +5,17 @@ impl Record {
     pub(super) fn format_outcome(&self, view_name: &str, outcome: &RecordOutcome) -> String {
         let mut output = String::new();
 
+        // A scoped stale-conflict cleanup records no content change; report it
+        // as such instead of a zero-file change summary.
+        if let Some(cleanup) = outcome.conflict_cleanup() {
+            return format_conflict_cleanup(
+                &cleanup.view,
+                &cleanup.paths,
+                cleanup.rows_cleared,
+                cleanup.operation,
+            );
+        }
+
         // Get hash (shortened)
         let hash_short = &outcome.hash().to_base32()[..DEFAULT_HASH_LENGTH.min(8)];
 
@@ -177,6 +188,26 @@ impl Record {
             println!("  (no changes to record)");
         }
 
+        // Scoped stale-conflict cleanup is a metadata mutation that records no
+        // content change; surface exactly what an apply would clear.
+        if self.allow_conflict_markers && !self.all && !self.files.is_empty() {
+            if let Ok(report) = repo.inspect_stale_conflicts(working_copy, &self.files) {
+                let stale = report.stale_paths();
+                if !stale.is_empty() {
+                    println!();
+                    println!("Would clear stale conflict metadata (no content change):");
+                    for path in &stale {
+                        println!("  stale conflict:  {}", path);
+                    }
+                    println!(
+                        "  {} row(s) across {} path(s)",
+                        report.stale_row_count(),
+                        stale.len()
+                    );
+                }
+            }
+        }
+
         Ok(())
     }
 }
@@ -185,4 +216,30 @@ impl Default for Record {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Render the scoped stale-conflict cleanup result.
+///
+/// Shared by the ordinary record outcome path and the metadata-only narrow
+/// route so both report the same actual operation identity and cleared scope.
+pub(super) fn format_conflict_cleanup(
+    view: &str,
+    paths: &[String],
+    rows_cleared: usize,
+    operation: Option<atomic_core::OperationId>,
+) -> String {
+    let operation = operation
+        .map(|id| id.to_string())
+        .unwrap_or_else(|| "none".to_string());
+    let mut output = format!(
+        "Cleared stale conflict metadata on view '{}': {} row(s) across {} path(s)\n",
+        view,
+        rows_cleared,
+        paths.len()
+    );
+    for path in paths {
+        output.push_str(&format!("  cleared: {}\n", path));
+    }
+    output.push_str(&format!("  operation: {}\n", operation));
+    output
 }

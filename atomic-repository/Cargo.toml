@@ -8,7 +8,16 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
+[features]
+# Opt-in test-only instrumentation (R8): compiles the deterministic CB-7B
+# adoption seams (`ATOMIC_FAIL_ADOPTION_*` failpoints, the enumerated
+# `ATOMIC_INJECT_ADOPTION_AFTER_PROOF` proof-to-plan action, and the
+# `ATOMIC_INJECT_WALK_READ_DIR_ERROR` walk-error injection). Shipping builds
+# never compile these seams: no environment value can alter adoption.
+adoption-test-injection = []
+
 [dependencies]
+unicode-normalization = "0.1"
 atomic-core = { workspace = true }
 atomic-canonical = { workspace = true }
 atomic-config = { workspace = true }
@@ -28,6 +37,7 @@ zstd = { workspace = true }
 dirs = "5.0"
 ulid = { workspace = true }
 walkdir = { workspace = true }
+uuid = { version = "1.0", features = ["v4"] }
 reflink-copy = "0.1"
 ignore = { workspace = true }
 git2 = { workspace = true }
@@ -43,6 +53,7 @@ flate2 = "1.0"
 sha1 = "0.10"
 sha2 = "0.10"
 fs2 = "0.4"
+blake3 = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

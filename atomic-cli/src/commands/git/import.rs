@@ -36,15 +36,20 @@ use clap::Parser;
 use git2::{Repository as GitRepository, Sort};
 
 use atomic_core::types::WorkingCopyId;
+use atomic_repository::repository::ReconcileEffectBudget;
 use atomic_repository::Repository;
 
 use super::parallel::{
     forecast_commit_kind, incremental_import_skips, trace_git_import, ForecastKind,
-    ParallelImportOptions, ParallelImporter, ProspectiveImportPlan,
+    ImportStats, ParallelImportOptions, ParallelImporter, ProspectiveImportPlan,
+};
+use crate::commands::workspace_txn::{
+    enter_remediation_workspace, enter_remediation_workspace_budgeted, observe_workspace,
+    remediation_error,
 };
 use crate::commands::{find_repository_root, Command};
 use crate::error::{CliError, CliResult};
-use crate::output::{print_hint, print_info, print_success, print_warning};
+use crate::output::{emphasis, print_hint, print_info, print_success, print_warning};
 
 /// Import a Git repository into Atomic.
 ///
@@ -116,46 +121,21 @@ pub struct Import {
     /// Internal bridge imports align and checkpoint in their outer operation.
     #[arg(skip)]
     pub(crate) skip_checkpoint_refresh: bool,
-}
 
-fn import_ignore_patterns(workdir: &Path, kind: Option<&str>) -> Vec<String> {
-    const COMMON_IMPORT_IGNORES: &[&str] = &[
-        "node_modules/",
-        "bower_components/",
-        ".yarn/cache/",
-        ".pnpm-store/",
-    ];
+    /// Internal §7.5 detached-HEAD import tip: the commits behind this commit
+    /// import into `branch`'s view even though no local branch carries it.
+    /// Never set from the command line; only the bridge reconcile path uses it
+    /// after resolving the §7.5 view mapping, and it never invents Git refs.
+    #[arg(skip)]
+    pub(crate) detached_tip: Option<String>,
 
-    let template = if let Some(kind) = kind {
-        super::super::init::get_ignore_template(kind)
-    } else if workdir.join("Cargo.toml").exists() {
-        super::super::init::get_ignore_template("rust")
-    } else if workdir.join("package.json").exists() {
-        super::super::init::get_ignore_template("node")
-    } else if workdir.join("go.mod").exists() {
-        super::super::init::get_ignore_template("go")
-    } else if workdir.join("setup.py").exists() || workdir.join("pyproject.toml").exists() {
-        super::super::init::get_ignore_template("python")
-    } else {
-        None
-    };
-
-    let mut patterns: Vec<String> = COMMON_IMPORT_IGNORES
-        .iter()
-        .map(|pattern| (*pattern).to_string())
-        .collect();
-
-    patterns.extend(
-        template
-            .unwrap_or(".atomic\n.git\n")
-            .lines()
-            .map(str::trim)
-            .filter(|line| !line.is_empty() && !line.starts_with('#'))
-            .map(ToOwned::to_owned),
-    );
-    patterns.sort();
-    patterns.dedup();
-    patterns
+    /// Internal effect budget (CB-13D review R1): set only by the
+    /// metadata-only bridge watch reconcile path. Under
+    /// [`ReconcileEffectBudget::MetadataOnly`] the import refuses every
+    /// command-boundary effect — repository bootstrap, Git exclude writes,
+    /// and working-copy materialization — and runs metadata-only work only.
+    #[arg(skip)]
+    pub(crate) reactive_budget: Option<atomic_repository::repository::ReconcileEffectBudget>,
 }
 
 fn current_git_branch(git_repo: &GitRepository) -> Option<String> {
@@ -211,6 +191,33 @@ pub(crate) fn ensure_git_shadow_excludes(git_dir: &Path) -> CliResult<bool> {
     Ok(true)
 }
 
+/// Read-only variant of [`ensure_git_shadow_excludes`]: reports whether the
+/// Git exclude file is missing any shadow-exclude pattern, without writing
+/// anything (CB-13D review R1: the metadata-only watch path must never edit
+/// Git administrative files; it defers instead).
+fn ensure_git_shadow_excludes_needed(git_dir: &Path) -> CliResult<bool> {
+    let exclude_path = git_dir.join("info").join("exclude");
+    let content = match std::fs::read_to_string(&exclude_path) {
+        Ok(content) => content,
+        Err(e) if e.kind() == ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e.into()),
+    };
+    Ok(GIT_SHADOW_EXCLUDE_PATTERNS
+        .iter()
+        .any(|pattern| !content.lines().any(|line| line.trim() == *pattern)))
+}
+
+/// Record one import run's synthesis aggregation (review R5): the real
+/// per-branch import statistics, one bounded structured event, emitted
+/// only for repositories that opted in (consent-gated, lossy). The loss
+/// observable remains the per-fetch `binding_fetch` loss flag: an import
+/// never fetches bindings, so there is no per-import loss counter.
+fn emit_import_synthesis(repo: &Repository, stats: &ImportStats) {
+    // CB-13C F4: the shared emitter (partial failures pass
+    // `failed_after_landed` at their own site inside the writer).
+    super::parallel::emit_import_synthesis(repo, stats, None);
+}
+
 impl Import {
     /// Import a single branch into an Atomic view using parallel processing.
     fn import_branch(
@@ -222,7 +229,7 @@ impl Import {
         known_states: &HashSet<atomic_core::types::Merkle>,
         mode: BranchImportMode,
         plan: ProspectiveImportPlan,
-    ) -> CliResult<usize> {
+    ) -> CliResult<ImportStats> {
         // Get repository name from remote URL or working directory
         let repo_name = self.get_repo_name(git_repo);
 
@@ -231,10 +238,6 @@ impl Import {
             incremental: self.incremental,
             imported_shas: imported_shas.clone(),
             repo_name,
-            ignored_path_patterns: import_ignore_patterns(
-                git_repo.workdir().unwrap_or_else(|| repo.root()),
-                self.kind.as_deref(),
-            ),
             mainline_only: mode.mainline_only,
             graph_only: !self.with_crdt,
             preserve_working_copy: mode.preserve_working_copy,
@@ -247,8 +250,9 @@ impl Import {
 
         // Run the three-phase parallel import
         let stats = importer.import_prevalidated(branch_name, repo, plan)?;
-        // Return total changes created (written + empty + merge)
-        Ok(stats.changes_written + stats.empty_commits + stats.merge_commits)
+        // Full per-import synthesis counters (review R5: the per-import
+        // aggregation wires the real import statistics, not inferred ones).
+        Ok(stats)
     }
 
     /// Get repository name from remote URL or working directory.
@@ -294,11 +298,22 @@ impl Import {
         repair_index: bool,
     ) -> CliResult<(HashSet<String>, HashSet<atomic_core::types::Merkle>)> {
         let started = std::time::Instant::now();
-        let mut shas: HashSet<String> = repo
-            .indexed_git_shas()
-            .map_err(|error| CliError::Internal(error.into()))?
-            .into_iter()
-            .collect();
+        // CB-6C: the GIT_SHA_INDEX is a checked cache, never authority. Every
+        // row is validated against hash-authoritative change bytes before it
+        // may act as an import marker; stale rows are repaired and invalid
+        // rows are dropped, so a corrupt cache produces exactly the same
+        // skip decisions as a cold cache (the legacy backfill below).
+        let (indexed, dropped) = repo
+            .checked_git_sha_markers()
+            .map_err(|error| CliError::Internal(error.into()))?;
+        for sha in dropped.iter().take(3) {
+            log::warn!(
+                "Dropped unverifiable GIT_SHA_INDEX row for {} (same treatment as a cold cache)",
+                &sha[..8.min(sha.len())]
+            );
+        }
+        let mut shas: HashSet<String> = indexed.into_iter().collect();
+        let _ = dropped;
         let mut states = HashSet::new();
         let mut index_repairs = Vec::new();
 
@@ -601,12 +616,21 @@ impl Command for Import {
             // read-only so we can subtract what each branch's view already
             // contains. A fresh (not-yet-initialized) repo has nothing
             // imported, so the forecast is the full history — which is correct.
-            let repo = if self.incremental && workdir.join(".atomic").join("pristine.redb").exists()
-            {
-                Repository::open_readonly(workdir).ok()
-            } else {
-                None
-            };
+            // The dry run selects the explicit Observe mode: it never mutates.
+            let mut repo =
+                if self.incremental && workdir.join(".atomic").join("pristine.redb").exists() {
+                    Repository::open_readonly(workdir).ok()
+                } else {
+                    None
+                };
+            if let Some(repository) = repo.as_mut() {
+                if let Err(remediation) = observe_workspace(repository)? {
+                    print_warning(&format!(
+                        "Forensic Git import forecast observed an unsafe workspace baseline: {}",
+                        remediation.describe()
+                    ));
+                }
+            }
 
             for branch_name in &branches {
                 if let Ok(reference) = git_repo.find_branch(branch_name, git2::BranchType::Local) {
@@ -660,13 +684,56 @@ impl Command for Import {
         // writes, or materialization. Existing repositories are opened read-only
         // solely to seed the isolated prospective projection.
         let default_branch = self.get_default_branch(&git_repo)?;
+        // §7.5: a detached tip imports behind an explicit commit instead of a
+        // branch reference; the view name is resolved by the caller.
+        let detached_tip = match self.detached_tip.as_deref() {
+            None => None,
+            Some(hex) => Some(
+                git2::Oid::from_str(hex).map_err(|error| CliError::GitError {
+                    message: format!(
+                        "detached import tip '{hex}' is not a valid object ID: {error}"
+                    ),
+                })?,
+            ),
+        };
+        if detached_tip.is_some() && self.branch.is_none() {
+            return Err(CliError::GitError {
+                message: "a detached import tip requires an explicit target view name".to_string(),
+            });
+        }
         let repo_exists = workdir.join(".atomic").join("pristine.redb").exists();
+        // CB-13D review R1: the metadata-only watch path never bootstraps a
+        // repository — init, ignore templates, and vault setup are
+        // command-boundary effects.
+        let metadata_only = self
+            .reactive_budget
+            .is_some_and(|budget| budget.is_metadata_only());
+        if metadata_only && !repo_exists {
+            return Err(CliError::GitError {
+                message: "the bridge watch daemon imports metadata only and never bootstraps \
+                          an Atomic repository; run 'atomic git import' explicitly"
+                    .to_string(),
+            });
+        }
         let mut preopened_repo = if repo_exists {
-            Some(Repository::open(workdir).map_err(CliError::from)?)
+            let open_result = if metadata_only {
+                Repository::open_with_budget(
+                    workdir,
+                    self.reactive_budget.expect("metadata_only implies a budget"),
+                )
+            } else {
+                Repository::open(workdir)
+            };
+            Some(open_result.map_err(CliError::from)?)
         } else {
             None
         };
         let prospective_branches = if self.all_branches {
+            if detached_tip.is_some() {
+                return Err(CliError::GitError {
+                    message: "a detached import tip cannot be combined with --all".to_string(),
+                });
+            }
             self.get_all_branches(&git_repo)?
         } else {
             vec![self
@@ -677,11 +744,14 @@ impl Command for Import {
         let mut prospective_plans = HashMap::new();
         let preflight_start = std::time::Instant::now();
         for branch_name in &prospective_branches {
+            // CB-9A: the already-imported marker set is loaded for every real
+            // import, not only incremental ones. The deepening guard and the
+            // deterministic sequencing need the indexed closure even in full
+            // import mode: legacy bytes stay authoritative, and history that
+            // deepens below an indexed commit is refused instead of silently
+            // re-derived. (Dry-run forecasts keep their own semantics.)
             let (imported_shas, known_states) = match preopened_repo.as_ref() {
-                Some(repo)
-                    if self.incremental
-                        && repo.view_exists(branch_name).map_err(CliError::from)? =>
-                {
+                Some(repo) if repo.view_exists(branch_name).map_err(CliError::from)? => {
                     self.get_incremental_markers(repo, branch_name, false)?
                 }
                 _ => (HashSet::new(), HashSet::new()),
@@ -690,7 +760,6 @@ impl Command for Import {
                 incremental: self.incremental,
                 imported_shas: imported_shas.clone(),
                 repo_name: self.get_repo_name(&git_repo),
-                ignored_path_patterns: import_ignore_patterns(workdir, self.kind.as_deref()),
                 mainline_only: !self.all_branches,
                 graph_only: !self.with_crdt,
                 preserve_working_copy: true,
@@ -699,11 +768,27 @@ impl Command for Import {
                 validate_equivalence: false,
             };
             let plan = ParallelImporter::new(&git_repo, options)
-                .validate_branch_prospectively(branch_name, preopened_repo.as_ref())?;
+                .validate_branch_prospectively_for_tip(
+                    branch_name,
+                    preopened_repo.as_ref(),
+                    detached_tip,
+                )?;
             prospective_plans.insert(branch_name.clone(), (plan, imported_shas, known_states));
         }
         trace_git_import(format!("import preflight: {:?}", preflight_start.elapsed()));
-        if ensure_git_shadow_excludes(git_repo.path())? {
+        // CB-13D review R1: the metadata-only watch path never edits Git
+        // administrative files. If the shadow-exclude line is missing, defer
+        // to the explicit command instead of writing it.
+        if metadata_only {
+            if ensure_git_shadow_excludes_needed(git_repo.path())? {
+                return Err(CliError::GitError {
+                    message: "the bridge watch daemon never edits Git administrative files; \
+                              the Git shadow exclude line is missing — run 'atomic git import' \
+                              or 'atomic git bridge reconcile' explicitly once"
+                    .to_string(),
+                });
+            }
+        } else if ensure_git_shadow_excludes(git_repo.path())? {
             print_info("Configured Git to ignore Atomic local state.");
         }
 
@@ -725,12 +810,26 @@ impl Command for Import {
                 .map_err(|e| CliError::Internal(e.into()))?
         };
 
-        let working_copy = repo
-            .require_working_copy_id()
-            .map_err(|e| CliError::Internal(e.into()))?;
-        let original_view = repo
-            .desired_view_name(working_copy)
-            .map_err(|e| CliError::Internal(e.into()))?;
+        // Enter the shared workspace boundary. Import is also the bootstrap
+        // remediation path for a Git checkout that has no bridge checkpoint
+        // yet, so it uses the explicit repair entry: it still refuses Git-owned
+        // operations, index locks, and diverged operation heads, but tolerates
+        // the unanchored baseline it exists to establish. The metadata-only
+        // watch budget refuses effect-bearing adoption and recovery before
+        // any of it runs (CB-13D review R1).
+        let workspace = match if metadata_only {
+            enter_remediation_workspace_budgeted(
+                &mut repo,
+                self.reactive_budget.expect("metadata_only implies a budget"),
+            )?
+        } else {
+            enter_remediation_workspace(&mut repo)?
+        } {
+            Ok(workspace) => workspace,
+            Err(remediation) => return Err(remediation_error(remediation)),
+        };
+        let working_copy = workspace.working_copy();
+        let original_view = workspace.view().name.clone();
         let preserve_current_view = repo_exists && self.incremental;
 
         if self.with_crdt {
@@ -799,8 +898,10 @@ impl Command for Import {
                 if preserve_branch_working_copy {
                     repo.set_current_view_in_memory(&original_view);
                 }
-                let count = import_result?;
-                total_imported += count;
+                let stats = import_result?;
+                total_imported += stats.changes_written + stats.empty_commits + stats.merge_commits;
+                emit_import_synthesis(&repo, &stats);
+                import_git_tags_into_view(&mut repo, &git_repo, &branch_name);
             }
 
             if preserve_current_view {
@@ -812,6 +913,17 @@ impl Command for Import {
                     "Preserved current Atomic view '{}'.",
                     original_view
                 ));
+            } else if matches!(self.reactive_budget, Some(budget) if !budget.allows_materialization())
+            {
+                // CB-13D ::24 R1: the metadata-only budget adopts
+                // bookkeeping only — working-copy materialization is a
+                // command-boundary filesystem effect and is deferred with
+                // an explicit notice instead of executing (the latent
+                // internal hole: the all-branches materialization branch
+                // had no budget guard).
+                print_info(
+                    "Working copy materialization deferred to the explicit command boundary (metadata-only reactive budget).",
+                );
             } else {
                 // Materialize the working copy from the graph
                 print_info("Materializing working copy...");
@@ -854,12 +966,15 @@ impl Command for Import {
             // Import single branch
             let branch_name = self.branch.clone().unwrap_or(default_branch);
 
-            // Validate branch exists
-            git_repo
-                .find_branch(&branch_name, git2::BranchType::Local)
-                .map_err(|_| CliError::GitError {
-                    message: format!("Branch '{}' not found", branch_name),
-                })?;
+            // Validate branch exists. A detached tip (§7.5) imports behind an
+            // explicit commit and skips the branch reference check.
+            if detached_tip.is_none() {
+                git_repo
+                    .find_branch(&branch_name, git2::BranchType::Local)
+                    .map_err(|_| CliError::GitError {
+                        message: format!("Branch '{}' not found", branch_name),
+                    })?;
+            }
 
             let (plan, imported_shas, known_states) =
                 prospective_plans.remove(&branch_name).ok_or_else(|| {
@@ -869,12 +984,23 @@ impl Command for Import {
                 })?;
             let changed_paths = plan.changed_paths();
             let expected_git_tree = plan.expected_git_tree();
+            let raw_git_tree = plan.raw_git_tree();
 
-            // Ensure the view exists with the branch name
+            // Ensure the view exists with the branch name. A detached tip
+            // (§7.5) targets an ephemeral Draft view the caller must have
+            // created with the right scope and parent; import never invents
+            // one as Shared behind the caller's back.
             if !repo
                 .view_exists(&branch_name)
                 .map_err(|e| CliError::Internal(e.into()))?
             {
+                if detached_tip.is_some() {
+                    return Err(CliError::GitError {
+                        message: format!(
+                            "detached import refused: target view '{branch_name}' does not exist; resolve the §7.5 mapping first"
+                        ),
+                    });
+                }
                 repo.create_shared_view(&branch_name)
                     .map_err(|e| CliError::Internal(e.into()))?;
             }
@@ -892,7 +1018,7 @@ impl Command for Import {
 
             // Import
             let write_start = std::time::Instant::now();
-            let count = self.import_branch(
+            let stats = self.import_branch(
                 &git_repo,
                 &branch_name,
                 &mut repo,
@@ -904,6 +1030,8 @@ impl Command for Import {
                 },
                 plan,
             )?;
+            let count = stats.changes_written + stats.empty_commits + stats.merge_commits;
+            emit_import_synthesis(&repo, &stats);
             trace_git_import(format!(
                 "import write/finalize: {:?}",
                 write_start.elapsed()
@@ -923,6 +1051,17 @@ impl Command for Import {
                 }
             } else {
                 // Importing a non-checked-out branch must update disk from Atomic.
+                // CB-13D review R1: the metadata-only watch path never
+                // materializes — materializing a non-checked-out target is a
+                // command-boundary filesystem effect.
+                if metadata_only {
+                    return Err(CliError::GitError {
+                        message: "the bridge watch daemon reconciles metadata only and never \
+                                  materializes a non-checked-out target; run 'atomic git import' \
+                                  explicitly to materialize"
+                            .to_string(),
+                    });
+                }
                 print_info("Materializing working copy...");
                 match repo.materialize(working_copy) {
                     Ok(result) => {
@@ -965,7 +1104,14 @@ impl Command for Import {
                 );
             } else {
                 print_info("Building content search index...");
-                match atomic_repository::build_content_index(workdir) {
+                // RFC §21 measured budgets (CB-13C AC-3): refresh, not
+                // unconditional full rebuild. The full walk-and-rebuild was
+                // re-run on every non-incremental import — the measured
+                // warm 100k-file import spent 45s+ of CPU in it. The
+                // refresh is HEAD-based: it is a no-op when the index is
+                // already current and a full rebuild only when the index is
+                // missing or the Git HEAD moved.
+                match atomic_repository::refresh_content_index(workdir) {
                     Ok(()) => print_info("Content index built."),
                     Err(e) => log::warn!("Content index build failed: {}", e),
                 }
@@ -975,18 +1121,23 @@ impl Command for Import {
                 "Imported {} changes from branch '{}'",
                 count, branch_name
             ));
+            // CB-8A (RFC §8.4): restore Git tags as bound Atomic state tags.
+            import_git_tags_into_view(&mut repo, &git_repo, &branch_name);
             trace_git_import(format!(
                 "import command before checkpoint: {:?}",
                 run_start.elapsed()
             ));
             if !self.skip_checkpoint_refresh {
-                if let Some(expected_tree) = expected_git_tree.as_ref() {
+                if let (Some(expected_tree), Some(git_tree)) =
+                    (expected_git_tree.as_ref(), raw_git_tree.as_ref())
+                {
                     super::bridge::refresh_checkpoint_after_verified_import(
                         &repo,
                         working_copy,
                         &git_repo,
                         &branch_name,
                         expected_tree,
+                        git_tree,
                     )?;
                     checkpoint_refreshed = true;
                 }
@@ -1001,12 +1152,61 @@ impl Command for Import {
         // checkpoints afterward.
         if !self.skip_checkpoint_refresh && !checkpoint_refreshed {
             let checkpoint_root = workdir.to_path_buf();
+            // Drop the repository and the workspace transaction first: the
+            // workspace's ordered lock guard holds the pristine open, and the
+            // checkpoint publication re-opens the repository in this process.
+            drop(workspace);
             drop(repo);
             drop(git_repo);
             let _ = super::bridge::refresh_checkpoint_if_aligned(&checkpoint_root)?;
         }
 
         Ok(())
+    }
+}
+
+/// Import Git tags from the imported repository into an Atomic view.
+///
+/// CB-8A (RFC §8.4): a Git tag whose peeled commit carries a verified Git
+/// state binding restores the exact bound Merkle state as an Atomic tag.
+/// Tags on unbound commits — or annotated tags claiming a wrong binding —
+/// are refused with a warning, never approximated, and never abort the
+/// surrounding import.
+fn import_git_tags_into_view(repo: &mut Repository, git_repo: &GitRepository, view: &str) {
+    let Ok(tag_refs) = git_repo.references_glob("refs/tags/*") else {
+        return;
+    };
+    let mut imported = 0usize;
+    let mut refused = 0usize;
+    for reference in tag_refs.flatten() {
+        let Some(name) = reference.shorthand().map(str::to_string) else {
+            continue;
+        };
+        match repo.import_git_tag_from_git(view, git_repo, &name) {
+            Ok(tag) => {
+                imported += 1;
+                print_info(&format!(
+                    "Imported Git tag '{}' as an Atomic state tag on view '{}'.",
+                    emphasis(&name),
+                    emphasis(view)
+                ));
+                if let Some(message) = tag.message.as_deref() {
+                    trace_git_import(format!("tag '{name}' annotation: {message}"));
+                }
+            }
+            Err(error) => {
+                refused += 1;
+                print_warning(&format!(
+                    "Git tag '{}' not imported: {error}",
+                    emphasis(&name)
+                ));
+            }
+        }
+    }
+    if imported > 0 || refused > 0 {
+        trace_git_import(format!(
+            "git tag import into '{view}': {imported} imported, {refused} refused"
+        ));
     }
 }
 
@@ -1263,6 +1463,13 @@ mod tests {
     fn stale_mode_link_and_empty_projection_is_rejected_without_atomic_mutation() {
         use std::os::unix::fs::{symlink, PermissionsExt};
 
+        // CB-9C: the supported corpus now covers executables, symlinks, and
+        // empty tracked files — the old CB-9A capability fence that refused
+        // them was superseded by graph-backed mode/kind registers. The same
+        // fixture now imports, and the fence still refuses genuinely
+        // unsupported tree modes (a set-id bit cannot appear in a normal Git
+        // tree, so it is simulated by the delta-level mode validator through
+        // the rejected case below).
         let root = tempfile::tempdir().unwrap();
         init_git(root.path());
         fs::write(root.path().join("executable"), b"#!/bin/sh\n").unwrap();
@@ -1275,12 +1482,15 @@ mod tests {
         symlink("empty", root.path().join("link")).unwrap();
         git_ok(root.path(), &["add", "executable", "empty", "link"]);
         git_ok(root.path(), &["commit", "-q", "-m", "modes links empties"]);
-        assert_rejected_before_atomic_init(
-            root.path(),
-            Import {
-                no_vault: true,
-                ..Import::default()
-            },
+        let _dir_guard = DirGuard::new();
+        std::env::set_current_dir(root.path()).unwrap();
+        let import = Import {
+            no_vault: true,
+            ..Import::default()
+        };
+        assert!(
+            import.run().is_ok(),
+            "the CB-9C supported corpus imports executables, symlinks, and empty files"
         );
     }
 
@@ -1359,12 +1569,74 @@ mod tests {
     }
 
     #[test]
-    fn test_import_ignore_patterns_always_exclude_dependency_dirs() {
-        let patterns = import_ignore_patterns(Path::new("."), Some("go"));
+    #[serial]
+    fn import_records_a_per_import_synthesis_aggregation() {
+        // Review R5: the per-import synthesis aggregation is wired from
+        // the real import statistics and is consent-gated. Failing before
+        // the fix: no aggregation event existed at all.
+        let _dir_guard = DirGuard::new();
+        let root = tempfile::tempdir().unwrap();
+        init_git(root.path());
+        fs::write(root.path().join("tracked.txt"), b"first\n").unwrap();
+        git_ok(root.path(), &["add", "tracked.txt"]);
+        git_ok(root.path(), &["commit", "-q", "-m", "first"]);
+        std::env::set_current_dir(root.path()).unwrap();
 
-        assert!(patterns.iter().any(|p| p == "node_modules/"));
-        assert!(patterns.iter().any(|p| p == ".yarn/cache/"));
-        assert!(patterns.iter().any(|p| p == "vendor/"));
+        Import {
+            no_vault: true,
+            ..Import::default()
+        }
+        .run()
+        .unwrap();
+
+        // Un-consented: the automatic sink writes nothing (review R1/R4).
+        let journal = root.path().join(".atomic/bridge/events.jsonl");
+        assert!(
+            !journal.exists(),
+            "an un-opted repository must not record import synthesis"
+        );
+
+        // Opt in exactly as `atomic git bridge enable` records the consent,
+        // then import a second commit.
+        let config = root.path().join(".atomic/config.toml");
+        {
+            use std::io::Write as _;
+            let mut file = std::fs::OpenOptions::new().append(true).open(&config).unwrap();
+            writeln!(file, "\n[git.bridge]\nenabled = true\n").unwrap();
+        }
+        fs::write(root.path().join("tracked.txt"), b"second\n").unwrap();
+        git_ok(root.path(), &["add", "tracked.txt"]);
+        git_ok(root.path(), &["commit", "-q", "-m", "second"]);
+        Import {
+            no_vault: true,
+            ..Import::default()
+        }
+        .run()
+        .unwrap();
+
+        let text = fs::read_to_string(&journal).unwrap();
+        let line = text
+            .lines()
+            .find(|line| line.contains("import_synthesis"))
+            .expect("the per-import synthesis aggregation is recorded");
+        let event: serde_json::Value = serde_json::from_str(line).unwrap();
+        assert_eq!(event["event"], "import_synthesis");
+        // Real counters from the import run, not constructed booleans: the
+        // run imported the second commit (one parsed commit, one written
+        // change).
+        assert_eq!(event["written"], 1);
+        assert_eq!(event["empty"], 0);
+        assert_eq!(event["merges"], 0);
+        assert_eq!(
+            event["commits_found"].as_u64().unwrap()
+                - event["self_push_skipped"].as_u64().unwrap()
+                - event["squash_inserted"].as_u64().unwrap()
+                - event["written"].as_u64().unwrap()
+                - event["empty"].as_u64().unwrap()
+                - event["merges"].as_u64().unwrap(),
+            0,
+            "every found commit is accounted for by the aggregation"
+        );
     }
 
     #[test]

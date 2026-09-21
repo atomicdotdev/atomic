@@ -1,3 +1,22 @@
+//! Snapshot split: reassemble a snapshot into an exact index-selected
+//! durable change plus a new-durable→worktree remainder (RFC §10.3.2).
+//!
+//! # RFC §19 Q2 — inseparable-operation commit policy: APPROVED allow-as-incomplete (owner, 2026-09-14)
+//!
+//! The owner deferred this decision on 2026-09-13 ("lets flag this to come
+//! back to. i dont know how to handle it currently"). Until it is resolved:
+//!
+//! - The typed refusals below (`SplitSnapshotError::Refused`) are **split
+//!   refusals, not a commit policy**. They are not, and must not be read as,
+//!   the answer to RFC §19 Q2 ("reject the commit" vs. "allow it only as
+//!   synthesized/incomplete for review").
+//! - No managed capture of an inseparable operation is implemented, and no
+//!   reject/allow default is installed anywhere in the capture path.
+//! - Neither outcome may approximate a path-level split or claim exact
+//!   coverage; a verified commit-time capture (`atomic_agent::turn::capture`)
+//!   is evidence only and never classifies a turn as
+//!   `ManagedGitCommitCaptured`.
+
 use std::collections::HashSet;
 use std::ffi::OsString;
 use std::path::{Component, Path, PathBuf};
@@ -315,6 +334,16 @@ impl Repository {
         })();
         let _ = std::fs::remove_dir_all(root);
         result
+    }
+
+    /// Whether the working copy's active snapshot already covers the current
+    /// worktree content (CB-7B evidence freshness check).
+    pub(super) fn snapshot_covers_worktree(
+        &self,
+        working_copy: WorkingCopyId,
+        snapshot: Hash,
+    ) -> bool {
+        self.verify_snapshot_matches_worktree(working_copy, snapshot).is_ok()
     }
 
     fn prepare_split_scratch(

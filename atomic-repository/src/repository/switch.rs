@@ -27,7 +27,7 @@ pub(super) fn ensure_workspace_dir(dot_dir: &Path, view_name: &str) -> Result<()
     Ok(())
 }
 
-fn working_copy_workspace_path(
+pub(super) fn working_copy_workspace_path(
     dot_dir: &Path,
     working_copy: WorkingCopyId,
     view_name: &str,
@@ -685,51 +685,7 @@ impl Repository {
             });
         }
 
-        for path in &ignored_paths {
-            let source = EffectTarget::WorkspacePath {
-                working_copy,
-                path: path.clone(),
-            };
-            let source_old = self.observe_filesystem_effect(working_copy, &source)?;
-            if source_old == EffectValue::Absent {
-                continue;
-            }
-            let shelf = EffectTarget::ShelfPath {
-                working_copy,
-                view: old_view_name.clone(),
-                path: path.clone(),
-            };
-            let shelf_old = self.observe_filesystem_effect(working_copy, &shelf)?;
-            if shelf_old == source_old {
-                effects.push(EffectPlan {
-                    ordinal: effects.len() as u32,
-                    target: source,
-                    expected_old: source_old,
-                    expected_new: EffectValue::Absent,
-                });
-                continue;
-            }
-            if shelf_old != EffectValue::Absent {
-                effects.push(EffectPlan {
-                    ordinal: effects.len() as u32,
-                    target: shelf.clone(),
-                    expected_old: shelf_old,
-                    expected_new: EffectValue::Absent,
-                });
-            }
-            effects.push(EffectPlan {
-                ordinal: effects.len() as u32,
-                target: source,
-                expected_old: source_old.clone(),
-                expected_new: EffectValue::Absent,
-            });
-            effects.push(EffectPlan {
-                ordinal: effects.len() as u32,
-                target: shelf,
-                expected_old: EffectValue::Absent,
-                expected_new: source_old,
-            });
-        }
+        self.plan_shelve_ignored_paths(working_copy, &old_view_name, &ignored_paths, &mut effects)?;
 
         let mut removal_paths: HashSet<String> = old_files
             .difference(&new_files)
@@ -833,7 +789,15 @@ impl Repository {
                 atomic_core::change::InodeKind::Symlink => FileKind::Symlink,
                 atomic_core::change::InodeKind::Gitlink => FileKind::Gitlink,
             };
-            let mode = u32::from(materialization.mode);
+            // A symlink's physical permission bits are the platform's
+            // creation mode (Linux yields 0o777 and cannot be changed), not
+            // the inode's stored mode; the lease must predict the write that
+            // actually happens.
+            let mode = if kind == FileKind::Symlink {
+                u32::from(atomic_core::output::platform_symlink_mode())
+            } else {
+                u32::from(materialization.mode)
+            };
             let expected_new = EffectValue::File(FileState {
                 kind,
                 mode,
@@ -850,49 +814,7 @@ impl Repository {
         }
 
         for path in &restore_paths {
-            let shelf = EffectTarget::ShelfPath {
-                working_copy,
-                view: view.to_string(),
-                path: path.clone(),
-            };
-            let shelf_old = effects
-                .iter()
-                .rev()
-                .find(|effect| effect.target == shelf)
-                .map(|effect| effect.expected_new.clone())
-                .unwrap_or(self.observe_filesystem_effect(working_copy, &shelf)?);
-            if shelf_old == EffectValue::Absent {
-                continue;
-            }
-            let destination = EffectTarget::WorkspacePath {
-                working_copy,
-                path: path.clone(),
-            };
-            let destination_old = effects
-                .iter()
-                .rev()
-                .find(|effect| effect.target == destination)
-                .map(|effect| effect.expected_new.clone())
-                .unwrap_or(self.observe_filesystem_effect(working_copy, &destination)?);
-            if destination_old != EffectValue::Absent {
-                return Err(RepositoryError::InvalidOperation {
-                    message: format!(
-                        "cannot restore shelf path '{path}': working-copy destination has unexplained content"
-                    ),
-                });
-            }
-            effects.push(EffectPlan {
-                ordinal: effects.len() as u32,
-                target: shelf,
-                expected_old: shelf_old.clone(),
-                expected_new: EffectValue::Absent,
-            });
-            effects.push(EffectPlan {
-                ordinal: effects.len() as u32,
-                target: destination,
-                expected_old: EffectValue::Absent,
-                expected_new: shelf_old,
-            });
+            self.plan_restore_ignored_paths(working_copy, view, path, &mut effects)?;
         }
 
         effects.push(EffectPlan {
@@ -909,6 +831,7 @@ impl Repository {
             before_state,
             after_state,
             effects,
+            Vec::new(),
             actor,
             operation_timestamp_ms(),
         )?;
@@ -1068,7 +991,7 @@ impl Repository {
         Ok(result)
     }
 
-    fn execute_shelve_path(
+    pub(super) fn execute_shelve_path(
         &self,
         operation_lock: &super::locks::WorkingCopyOperationLockGuard,
         prepared: &super::operation::PreparedSwitchOperation,
@@ -1291,7 +1214,7 @@ impl Repository {
         txn.commit()
     }
 
-    fn execute_restore_path(
+    pub(super) fn execute_restore_path(
         &self,
         operation_lock: &super::locks::WorkingCopyOperationLockGuard,
         prepared: &super::operation::PreparedSwitchOperation,
@@ -1417,7 +1340,128 @@ impl Repository {
         txn.commit()
     }
 
-    fn collect_switch_ignored_paths(&self, tracked_paths: &HashSet<String>) -> Vec<String> {
+    /// `old_view`'s workspace shelf (RFC §7.2: old shelf / current disk /
+    /// target shelf, never overwriting unexplained disk content).
+    ///
+    /// Shared by view switch and bound-HEAD adoption so both transitions use
+    /// the identical lease plan and executor.
+    pub(super) fn plan_shelve_ignored_paths(
+        &self,
+        working_copy: WorkingCopyId,
+        old_view: &str,
+        ignored_paths: &[String],
+        effects: &mut Vec<EffectPlan>,
+    ) -> Result<(), RepositoryError> {
+        for path in ignored_paths {
+            let source = EffectTarget::WorkspacePath {
+                working_copy,
+                path: path.clone(),
+            };
+            let source_old = self.observe_filesystem_effect(working_copy, &source)?;
+            if source_old == EffectValue::Absent {
+                continue;
+            }
+            let shelf = EffectTarget::ShelfPath {
+                working_copy,
+                view: old_view.to_string(),
+                path: path.clone(),
+            };
+            let shelf_old = self.observe_filesystem_effect(working_copy, &shelf)?;
+            if shelf_old == source_old {
+                effects.push(EffectPlan {
+                    ordinal: effects.len() as u32,
+                    target: source,
+                    expected_old: source_old,
+                    expected_new: EffectValue::Absent,
+                });
+                continue;
+            }
+            if shelf_old != EffectValue::Absent {
+                effects.push(EffectPlan {
+                    ordinal: effects.len() as u32,
+                    target: shelf.clone(),
+                    expected_old: shelf_old,
+                    expected_new: EffectValue::Absent,
+                });
+            }
+            effects.push(EffectPlan {
+                ordinal: effects.len() as u32,
+                target: source,
+                expected_old: source_old.clone(),
+                expected_new: EffectValue::Absent,
+            });
+            effects.push(EffectPlan {
+                ordinal: effects.len() as u32,
+                target: shelf,
+                expected_old: EffectValue::Absent,
+                expected_new: source_old,
+            });
+        }
+        Ok(())
+    }
+
+    /// Plan the collision-safe restore of `new_view`'s shelved artifacts into
+    /// the working copy. A destination occupied by unexplained content is a
+    /// typed refusal, never an overwrite.
+    pub(super) fn plan_restore_ignored_paths(
+        &self,
+        working_copy: WorkingCopyId,
+        new_view: &str,
+        path: &str,
+        effects: &mut Vec<EffectPlan>,
+    ) -> Result<(), RepositoryError> {
+        let shelf = EffectTarget::ShelfPath {
+            working_copy,
+            view: new_view.to_string(),
+            path: path.to_string(),
+        };
+        let shelf_old = effects
+            .iter()
+            .rev()
+            .find(|effect| effect.target == shelf)
+            .map(|effect| effect.expected_new.clone())
+            .unwrap_or(self.observe_filesystem_effect(working_copy, &shelf)?);
+        if shelf_old == EffectValue::Absent {
+            return Ok(());
+        }
+        let destination = EffectTarget::WorkspacePath {
+            working_copy,
+            path: path.to_string(),
+        };
+        let destination_old = effects
+            .iter()
+            .rev()
+            .find(|effect| effect.target == destination)
+            .map(|effect| effect.expected_new.clone())
+            .unwrap_or(self.observe_filesystem_effect(working_copy, &destination)?);
+        if destination_old != EffectValue::Absent {
+            return Err(RepositoryError::InvalidOperation {
+                message: format!(
+                    "cannot restore shelf path '{path}': working-copy destination has unexplained content"
+                ),
+            });
+        }
+        effects.push(EffectPlan {
+            ordinal: effects.len() as u32,
+            target: shelf,
+            expected_old: shelf_old.clone(),
+            expected_new: EffectValue::Absent,
+        });
+        effects.push(EffectPlan {
+            ordinal: effects.len() as u32,
+            target: destination,
+            expected_old: EffectValue::Absent,
+            expected_new: shelf_old,
+        });
+        Ok(())
+    }
+
+    /// Ignored-path candidates for the shelf planner, excluding graph-tracked
+    /// paths and `[workspace] expose` policy paths.
+    pub(super) fn collect_switch_ignored_paths(
+        &self,
+        tracked_paths: &HashSet<String>,
+    ) -> Vec<String> {
         let repo_expose = atomic_config::RepoConfig::load(&self.config_path())
             .unwrap_or_default()
             .workspace
@@ -1444,13 +1488,21 @@ impl Repository {
             .collect()
     }
 
-    fn collect_ignored_paths_in_workspace(&self, root: &Path) -> Vec<String> {
-        let rules = self.load_ignore_rules();
+        pub(super) fn collect_ignored_paths_in_workspace(&self, root: &Path) -> Vec<String> {
+        // R4/CB-7B: the worktree's own ignore rules — but when the rules
+        // file itself was shelved into a view workspace (it is an ignored
+        // path like any other), the shelved artifacts must stay discoverable
+        // for restoration. Union the worktree rules with the workspace's own
+        // shelved rules so a path ignored by either source is collected; a
+        // candidate without shelf content is skipped by the planner anyway.
+        let worktree_rules = self.load_ignore_rules();
+        let workspace_rules = IgnoreRules::load(root);
         let mut result = Vec::new();
         fn walk(
             root: &Path,
             dir: &Path,
-            rules: &crate::ignore::IgnoreRules,
+            worktree_rules: &crate::ignore::IgnoreRules,
+            workspace_rules: &crate::ignore::IgnoreRules,
             out: &mut Vec<String>,
         ) {
             let Ok(entries) = std::fs::read_dir(dir) else {
@@ -1462,16 +1514,18 @@ impl Repository {
                     continue;
                 };
                 let is_directory = path.is_dir();
-                if rules.is_ignored(relative, is_directory) {
+                let ignored = worktree_rules.is_ignored(relative, is_directory)
+                    || workspace_rules.is_ignored(relative, is_directory);
+                if ignored {
                     if let Some(relative) = relative.to_str() {
                         out.push(relative.to_string());
                     }
                 } else if is_directory {
-                    walk(root, &path, rules, out);
+                    walk(root, &path, worktree_rules, workspace_rules, out);
                 }
             }
         }
-        walk(root, root, &rules, &mut result);
+        walk(root, root, &worktree_rules, &workspace_rules, &mut result);
         result.sort();
         result
     }

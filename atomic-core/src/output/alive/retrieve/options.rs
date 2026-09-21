@@ -90,6 +90,17 @@ pub struct RetrieveOptions {
     /// remains next to the deletion marker, so it is retrieved as a
     /// zombie and occupies a position in the output order.
     pub deletions_final: bool,
+
+    /// Stop the traversal as soon as the graph holds at least one alive
+    /// non-empty content vertex.
+    ///
+    /// This is an optional liveness fast path (review E4): a caller that only
+    /// needs "does this position render any alive bytes?" (for example the
+    /// path-projection's absent-entry resurrection check) can request the
+    /// early exit instead of walking every vertex of a long-history file. The
+    /// returned graph is PARTIAL and must not be used as content — only its
+    /// `total_bytes() > 0` verdict is meaningful.
+    pub stop_at_first_content: bool,
 }
 
 impl RetrieveOptions {
@@ -113,6 +124,13 @@ impl RetrieveOptions {
     /// this size, retrieval will stop and the result will be truncated.
     pub fn max_vertices(mut self, max: usize) -> Self {
         self.max_vertices = Some(max);
+        self
+    }
+
+    /// Request the liveness fast path: stop as soon as the traversal has
+    /// recorded one alive non-empty content vertex (review E4).
+    pub fn stop_at_first_content(mut self, stop: bool) -> Self {
+        self.stop_at_first_content = stop;
         self
     }
 
@@ -237,6 +255,21 @@ impl RetrieveOptions {
         txn: &T,
         vertex: GraphNode<NodeId>,
     ) -> Result<bool, PristineError> {
+        let mut memo = HashMap::new();
+        self.is_vertex_alive_with_memo(txn, vertex, &mut memo)
+    }
+
+    /// Vertex aliveness with a caller-owned dependency memo.
+    ///
+    /// `change_depends_on` is a pure function of the change pair; sharing the
+    /// memo across a whole retrieval avoids re-resolving the same causal
+    /// dominance questions for every vertex of a heavily edited file.
+    pub fn is_vertex_alive_with_memo<T: GraphTxnT>(
+        &self,
+        txn: &T,
+        vertex: GraphNode<NodeId>,
+        memo: &mut HashMap<(NodeId, NodeId), bool>,
+    ) -> Result<bool, PristineError> {
         // Without a filter (and without deletions_final), delegate to the
         // unfiltered classifier. With deletions_final set, the logic below
         // applies with every visible change "in the filter" — passes_filter
@@ -258,7 +291,6 @@ impl RetrieveOptions {
             .into_iter()
             .filter(|parent| self.passes_filter(parent.introduced_by))
             .collect();
-        let mut memo = HashMap::new();
         let mut visiting = Vec::new();
         let mut maximal = Vec::new();
         for (index, candidate) in parents.iter().enumerate() {
@@ -271,7 +303,7 @@ impl RetrieveOptions {
                     txn,
                     other.introduced_by,
                     candidate.introduced_by,
-                    &mut memo,
+                    memo,
                     &mut visiting,
                 )? {
                     superseded = true;

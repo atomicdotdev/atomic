@@ -12,18 +12,22 @@ use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 
 use atomic_core::operation::{
-    ActorRef, EffectPlan, EffectReceipt, EffectReceiptKind, EffectReceiptPayload, EffectTarget,
-    EffectValue, FileKind, FileState, MetadataTarget, MetadataTransition, MetadataValue, Operation,
-    OperationKind, OperationPayload, OperationRelation, OperationScope, RepoStateDelta,
+    ActorRef, CheckpointKind, DigestKind, EffectPlan, EffectReceipt, EffectReceiptKind,
+    EffectReceiptPayload, EffectTarget, EffectValue, FileKind, FileState, GitHashAlgorithm,
+    GitHeadState, GitObjectId, GitRefTarget, MetadataTarget, MetadataTransition, MetadataValue,
+    Operation, OperationKind, OperationPayload, OperationRelation, OperationScope, RepoStateDelta,
     RepoStateRef, WorkingCopyStateRef,
 };
 use atomic_core::pristine::{
-    GraphTxnT, MutTxnT, OperationMutTxnT, OperationTxnT, TagMutTxnT, TagTxnT, ViewTxnT,
-    WorkingCopyMutTxnT, WorkingCopyRecord, WorkingCopyTxnT,
+    CapabilityMutTxnT, CapabilityTxnT, GraphTxnT, MutTxnT, OperationMutTxnT, OperationTxnT,
+    RefMappingMutTxnT, RefMappingTxnT, SUPPORTED_REPOSITORY_CAPABILITIES, TagMutTxnT, TagTxnT,
+    ViewTxnT, WorkingCopyMutTxnT, WorkingCopyRecord, WorkingCopyTxnT,
 };
+use atomic_core::types::Base32;
 use atomic_core::{Hash, OperationId, WorkingCopyId};
 
 use super::locks::WorkingCopyOperationLockGuard;
+use super::workspace_txn::{read_workspace_checkpoint, write_workspace_checkpoint, WorkspaceCheckpoint};
 use super::Repository;
 use crate::RepositoryError;
 
@@ -32,6 +36,9 @@ const BACKUP_ENTRIES_DIR: &str = "entries";
 const BACKUP_VALUE: &str = "value";
 const BACKUP_ABSENT: &str = "absent";
 const BACKUP_COMPLETE: &str = "complete";
+/// CB-8B: marks a retained Git-index backup whose expected-old was an absent
+/// index file (the rollback re-removes the index instead of restoring bytes).
+const RECOVERY_ABSENT_MARKER: &str = "absent";
 const BACKUP_VERSION: &[u8] = b"atomic-operation-recovery-v1\n";
 const RECEIPT_ATTEMPT: u32 = 0;
 const ANCHOR_ACTOR: &str = "cb-1b-anchor";
@@ -101,6 +108,30 @@ impl PreparedRemoteOperation {
     }
 }
 
+/// A journaled bridge-owned Git ref write awaiting its leased effect receipt.
+///
+/// The operation (and therefore its operation ID and intended effect) is
+/// durable before the caller performs the Git mutation; retaining this value
+/// keeps the ordered operation locks held until the receipt is recorded.
+pub struct PreparedBridgeGitWrite {
+    /// Immutable operation identity journaled before the Git write.
+    pub operation_id: OperationId,
+    /// Git ref the mutation targets (for example `refs/heads/main`).
+    pub ref_name: String,
+    /// Ref target observed before the write, when the ref existed.
+    pub(super) observed_old: Option<GitRefTarget>,
+    /// Intended post-write target of the ref.
+    pub intended_new: GitRefTarget,
+    /// The capture token minted for this write's capture context (review
+    /// E2), or `None` for an ordinary ref movement that is not a rewrite
+    /// execution (CB-9B F2). An executor driving Git hooks inside this
+    /// write's capture context exports it as `ATOMIC_BRIDGE_CAPTURE_TOKEN`;
+    /// only captured events carrying this exact token can later anchor to
+    /// the operation.
+    pub capture_token: Option<[u8; 32]>,
+    pub(super) _operation_lock: WorkingCopyOperationLockGuard,
+}
+
 /// Pure classification of an observed value against one expected-old/new lease.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum LeaseClassification {
@@ -115,7 +146,7 @@ pub(super) enum LeaseClassification {
 /// Result of preparing a switch operation and its recovery substrate.
 #[derive(Debug, Clone)]
 pub(super) struct PreparedSwitchOperation {
-    operation: Operation,
+    pub(super) operation: Operation,
     backup_root: PathBuf,
 }
 
@@ -166,6 +197,22 @@ enum ResolvedRecoveryTarget {
         recursive_directory: bool,
     },
     WorkingCopy(WorkingCopyId),
+    /// A Git reference observed/rolled back through the lease-safe bridge
+    /// reader (R3: the adoption completion's WIP-ref drop; CB-8B: projection
+    /// refs and shared branches).
+    GitRef(String),
+    /// The working copy's Git HEAD, observed/rolled back through the
+    /// lease-safe bridge reader (CB-8B projection publication).
+    GitHead(WorkingCopyId),
+    /// The derived bridge checkpoint file, addressed by content digest
+    /// (R3: the adoption completion's verified checkpoint publish).
+    Checkpoint { working_copy: WorkingCopyId },
+    /// One content-addressed Git object creation (CB-8B: journaled projection
+    /// objects). Presence is idempotent; the object is never deleted.
+    GitObject(atomic_core::operation::GitObjectId),
+    /// The working copy's replaced Git index (CB-8B: journaled projection
+    /// index replacement).
+    GitIndex(WorkingCopyId),
 }
 
 /// Classify one observation without performing I/O or consulting receipts.
@@ -416,6 +463,317 @@ impl Repository {
         Ok(operation_id)
     }
 
+    /// Journal one bridge-owned Git ref mutation before it becomes visible.
+    ///
+    /// The returned value carries the immutable operation ID and the exact
+    /// intended effect. Journal failure returns an error and the caller must
+    /// not perform the Git write. The lease observes `observed_old` as
+    /// provided by the caller (the bridge owns Git observation through its
+    /// own handle); a later receipt classifies the outcome against the lease.
+    ///
+    /// This is an ORDINARY ref movement, not a rewrite execution: it does NOT
+    /// mint a capture token, so a post-rewrite hook event can never anchor to
+    /// it (CB-9B F2). A caller that is actually executing a Git rewrite must
+    /// use [`Self::prepare_bridge_git_rewrite`].
+    pub fn prepare_bridge_git_ref_write(
+        &self,
+        working_copy: WorkingCopyId,
+        ref_name: &str,
+        observed_old: Option<GitRefTarget>,
+        intended_new: GitRefTarget,
+        evidence: Hash,
+    ) -> Result<PreparedBridgeGitWrite, RepositoryError> {
+        self.prepare_bridge_git_write_impl(
+            false,
+            working_copy,
+            ref_name,
+            observed_old,
+            intended_new,
+            evidence,
+            Vec::new(),
+        )
+    }
+
+    /// [`Self::prepare_bridge_git_ref_write`] with a companion durable
+    /// metadata intent (CB-10A review R3): the SAME journaled operation
+    /// carries the ref effect lease AND the metadata transitions, so a ref
+    /// movement is never visible without its recoverable mapping intent —
+    /// the mapping intent is durable before the ref write and is applied
+    /// only after the ref effect's receipt (see
+    /// [`Self::complete_bridge_git_write_with_metadata`]). The metadata
+    /// leases are validated at prepare time: a mapping that moved between
+    /// the caller's observation and this preparation refuses closed.
+    pub fn prepare_bridge_git_ref_write_with_metadata(
+        &self,
+        working_copy: WorkingCopyId,
+        ref_name: &str,
+        observed_old: Option<GitRefTarget>,
+        intended_new: GitRefTarget,
+        evidence: Hash,
+        metadata: Vec<atomic_core::operation::MetadataTransition>,
+    ) -> Result<PreparedBridgeGitWrite, RepositoryError> {
+        self.prepare_bridge_git_write_impl(
+            false,
+            working_copy,
+            ref_name,
+            observed_old,
+            intended_new,
+            evidence,
+            metadata,
+        )
+    }
+
+    /// [`Self::finalize_bridge_git_write`] for a write prepared with
+    /// companion metadata (CB-10A review R3): the metadata transitions are
+    /// applied under the held operation lock BEFORE the operation-level
+    /// Verified receipt, so the mapping intent lands exactly once — after
+    /// the ref effect it accompanies.
+    pub fn complete_bridge_git_write_with_metadata(
+        &self,
+        prepared: PreparedBridgeGitWrite,
+        observed_ref: Option<GitRefTarget>,
+    ) -> Result<OperationId, RepositoryError> {
+        self.apply_operation_metadata_locked(&prepared._operation_lock, prepared.operation_id)?;
+        self.finalize_bridge_git_write(prepared, observed_ref)
+    }
+
+    /// Journal a bridge-owned Git REWRITE execution before it becomes
+    /// visible, minting the operation's immutable capture context.
+    ///
+    /// Only a genuine rewrite executor (one that actually ran the Git rewrite
+    /// and will move the ref to the rewritten target) calls this. The minted
+    /// token is the unforgeable binding between a hook capture produced during
+    /// this operation's execution and the operation itself (CB-9B F2): an
+    /// ordinary ref movement prepared through
+    /// [`Self::prepare_bridge_git_ref_write`] carries no capture context and
+    /// can never be promoted into rewrite authority.
+    pub fn prepare_bridge_git_rewrite(
+        &self,
+        working_copy: WorkingCopyId,
+        ref_name: &str,
+        observed_old: Option<GitRefTarget>,
+        intended_new: GitRefTarget,
+        evidence: Hash,
+    ) -> Result<PreparedBridgeGitWrite, RepositoryError> {
+        self.prepare_bridge_git_write_impl(
+            true,
+            working_copy,
+            ref_name,
+            observed_old,
+            intended_new,
+            evidence,
+            Vec::new(),
+        )
+    }
+
+    fn prepare_bridge_git_write_impl(
+        &self,
+        mint_capture: bool,
+        working_copy: WorkingCopyId,
+        ref_name: &str,
+        observed_old: Option<GitRefTarget>,
+        intended_new: GitRefTarget,
+        evidence: Hash,
+        metadata: Vec<atomic_core::operation::MetadataTransition>,
+    ) -> Result<PreparedBridgeGitWrite, RepositoryError> {
+        let operation_lock = self.try_lock_operation(working_copy)?;
+        if let OperationHeadState::Diverged(heads) =
+            self.consolidate_operation_heads_locked(&operation_lock)?
+        {
+            return Err(RepositoryError::OperationHeadsDiverged {
+                scope: OperationScope::WorkingCopy(working_copy).to_string(),
+                heads: heads.iter().map(ToString::to_string).collect(),
+            });
+        }
+        let state = self.current_working_copy_state(working_copy)?;
+        let effects = vec![EffectPlan {
+            ordinal: 0,
+            target: EffectTarget::GitRef {
+                name: ref_name.to_string(),
+            },
+            expected_old: observed_old
+                .clone()
+                .map(EffectValue::GitRef)
+                .unwrap_or(EffectValue::Absent),
+            expected_new: EffectValue::GitRef(intended_new.clone()),
+        }];
+        let operation = self.prepare_working_copy_transition_with_metadata(
+            &operation_lock,
+            OperationKind::ExportGitRefs,
+            None,
+            state.clone(),
+            state,
+            effects,
+            metadata,
+            vec![evidence],
+            ActorRef::System {
+                name: "repository-bridge-git".to_string(),
+            },
+            current_operation_timestamp_ms(),
+        )?;
+        // Review E2: mint this write's capture context NOW, at preparation
+        // time, but ONLY for a rewrite execution (CB-9B F2). An ordinary ref
+        // movement is not a rewrite and carries no capture context, so a
+        // post-rewrite hook event can never anchor to it: the captured event
+        // must carry this exact token, and a capture created before the
+        // operation existed (the advisory hook path) can never be
+        // retroactively promoted onto it. The token row is written while the
+        // operation lock is still held; a crash before it lands leaves an
+        // operation with no capture context, which fails closed (captures can
+        // never anchor to it).
+        let capture_token = if mint_capture {
+            let mut token = [0u8; 32];
+            token[..16].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
+            token[16..].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
+            {
+                let mut txn = self
+                    .pristine
+                    .write_txn()
+                    .map_err(pristine_error)?;
+                use atomic_core::pristine::BridgeEventCaptureMutTxnT;
+                txn.put_bridge_ref_capture_token(operation.operation.id().as_bytes(), &token)
+                    .map_err(pristine_error)?;
+                txn.commit()
+                    .map_err(|e| RepositoryError::Database(e.to_string()))?;
+            }
+            Some(token)
+        } else {
+            None
+        };
+        Ok(PreparedBridgeGitWrite {
+            operation_id: operation.operation.id(),
+            _operation_lock: operation_lock,
+            ref_name: ref_name.to_string(),
+            observed_old,
+            intended_new,
+            capture_token,
+        })
+    }
+
+    /// Append the leased effect receipt after a journaled bridge Git write.
+    ///
+    /// `observed_after` is what Git now shows for the ref. Values matching the
+    /// intended target append an Applied (or idempotent Recovered) receipt;
+    /// any third value appends a durable rejection receipt and fails closed.
+    pub fn record_bridge_git_ref_receipt(
+        &self,
+        prepared: &PreparedBridgeGitWrite,
+        observed_after: Option<GitRefTarget>,
+    ) -> Result<EffectReceipt, RepositoryError> {
+        let observed_after = observed_after
+            .map(EffectValue::GitRef)
+            .unwrap_or(EffectValue::Absent);
+        let observed_before = prepared
+            .observed_old
+            .clone()
+            .map(EffectValue::GitRef)
+            .unwrap_or(EffectValue::Absent);
+        self.record_effect_outcome(
+            &prepared._operation_lock,
+            prepared.operation_id,
+            0,
+            observed_before,
+            observed_after,
+        )
+    }
+
+    /// Append the operation-level Verified receipt for a completed bridge write.
+    ///
+    /// The GitRef effect lease is verified against `observed_ref`, which the
+    /// bridge reads back from Git after the mutation (the lease-safe executor
+    /// the recovery layer requires). Any third value fails closed without a
+    /// Verified receipt.
+    pub fn finalize_bridge_git_write(
+        &self,
+        prepared: PreparedBridgeGitWrite,
+        observed_ref: Option<GitRefTarget>,
+    ) -> Result<OperationId, RepositoryError> {
+        let operation_id = prepared.operation_id;
+        let operation = self.load_operation(operation_id)?;
+        self.validate_operation_lock(&prepared._operation_lock, &operation)?;
+        let receipts = {
+            let txn = self.pristine.read_txn().map_err(pristine_error)?;
+            txn.get_effect_receipts(operation_id)
+                .map_err(pristine_error)?
+        };
+        let completed: BTreeSet<u32> = receipts
+            .iter()
+            .filter_map(|receipt| match receipt.payload().kind {
+                EffectReceiptKind::Applied
+                | EffectReceiptKind::Recovered
+                | EffectReceiptKind::RolledBack => receipt.payload().effect_ordinal,
+                EffectReceiptKind::Verified | EffectReceiptKind::LeaseRejected => None,
+            })
+            .collect();
+        for effect in &operation.payload().delta.effects {
+            if !completed.contains(&effect.ordinal) {
+                return Err(RepositoryError::InvalidOperation {
+                    message: format!(
+                        "operation {} cannot be verified before effect {} has a successful receipt",
+                        operation.id(),
+                        effect.ordinal
+                    ),
+                });
+            }
+        }
+        let observed = observed_ref
+            .map(EffectValue::GitRef)
+            .unwrap_or(EffectValue::Absent);
+        for effect in &operation.payload().delta.effects {
+            if observed != effect.expected_new {
+                return Err(lease_divergence_error(
+                    effect,
+                    &EffectValue::Absent,
+                    Some(&observed),
+                ));
+            }
+        }
+        let receipt = deterministic_effect_receipt(
+            &operation,
+            None,
+            EffectReceiptKind::Verified,
+            None,
+            None,
+        )?;
+        self.append_receipt_immediate(&prepared._operation_lock, &operation, &receipt)?;
+        Ok(operation_id)
+    }
+
+    pub(super) fn current_working_copy_state(
+        &self,
+        working_copy: WorkingCopyId,
+    ) -> Result<RepoStateRef, RepositoryError> {
+        self.current_working_copy_state_for_projection(working_copy)
+    }
+
+    pub(super) fn current_working_copy_state_for_projection(
+        &self,
+        working_copy: WorkingCopyId,
+    ) -> Result<RepoStateRef, RepositoryError> {
+        let txn = self.pristine.read_txn().map_err(pristine_error)?;
+        let record = txn
+            .get_working_copy(working_copy)
+            .map_err(pristine_error)?
+            .ok_or(RepositoryError::WorkingCopyRecordNotFound { id: working_copy })?;
+        let view = ViewTxnT::get_view_by_id(&txn, record.desired_view)
+            .map_err(pristine_error)?
+            .ok_or_else(|| RepositoryError::InvalidRepository {
+                reason: format!(
+                    "working copy {working_copy} references missing view {}",
+                    record.desired_view
+                ),
+            })?;
+        Ok(RepoStateRef {
+            view: Some(atomic_core::operation::ViewStateRef {
+                name: view.name,
+                state: view.state,
+                set_id: None,
+            }),
+            working_copy: Some(working_copy_state_ref(record)),
+            git: None,
+        })
+    }
+
     /// Append an inverse operation for the current verified working-copy head.
     ///
     /// The optional target must be the sole current head. This first implementation
@@ -627,7 +985,7 @@ impl Repository {
     }
 
     fn append_related_metadata_operation(
-        &self,
+        &mut self,
         working_copy: WorkingCopyId,
         target: &Operation,
         kind: OperationKind,
@@ -671,6 +1029,57 @@ impl Repository {
         } else {
             target.payload().delta.after.clone()
         };
+        // CB-13B R2: the undo of an effect-bearing operation carries the
+        // swapped effect plans and replays them from the original's
+        // retained backups, so a cutover's hook/config decommission
+        // restores under its exact leases. Restore stays metadata-only:
+        // replaying an arbitrary historical operation's effects forward
+        // is not supported by this build.
+        let inverse_effects = if inverse {
+            if target.payload().delta.effects.is_empty() {
+                Vec::new()
+            } else {
+                let selected = self.selected_inverse_ordinals(working_copy, target)?;
+                if selected.is_empty() {
+                    Vec::new()
+                } else {
+                    target
+                        .payload()
+                        .delta
+                        .effects
+                        .iter()
+                        .rev()
+                        .filter(|effect| selected.contains(&effect.ordinal))
+                        .enumerate()
+                        .map(|(ordinal, effect)| {
+                            Ok(EffectPlan {
+                                ordinal: u32::try_from(ordinal).map_err(|_| {
+                                    RepositoryError::InvalidOperation {
+                                        message:
+                                            "too many effects to construct the undo operation"
+                                                .to_string(),
+                                    }
+                                })?,
+                                target: effect.target.clone(),
+                                expected_old: effect.expected_new.clone(),
+                                expected_new: effect.expected_old.clone(),
+                            })
+                        })
+                        .collect::<Result<Vec<_>, RepositoryError>>()?
+                }
+            }
+        } else {
+            if !target.payload().delta.effects.is_empty() {
+                return Err(RepositoryError::InvalidOperation {
+                    message: format!(
+                        "operation {} carries external effects; restore supports \
+                         metadata-only operations",
+                        target.id()
+                    ),
+                });
+            }
+            Vec::new()
+        };
         if !inverse && metadata.is_empty() {
             if let Some(expected_view) = &after.view {
                 let txn = self.pristine.read_txn().map_err(pristine_error)?;
@@ -688,24 +1097,49 @@ impl Repository {
                 }
             }
         }
-        let operation = self.prepare_metadata_operation(
-            &operation_lock,
-            kind,
-            Some(relation),
-            current.payload().delta.after.clone(),
-            after,
-            metadata,
-            target.payload().evidence.clone(),
-            ActorRef::System {
-                name: if inverse {
-                    "operation-undo".to_string()
-                } else {
-                    "operation-restore".to_string()
+        let operation = if inverse_effects.is_empty() {
+            self.prepare_metadata_operation(
+                &operation_lock,
+                kind,
+                Some(relation),
+                current.payload().delta.after.clone(),
+                after,
+                metadata,
+                target.payload().evidence.clone(),
+                ActorRef::System {
+                    name: if inverse {
+                        "operation-undo".to_string()
+                    } else {
+                        "operation-restore".to_string()
+                    },
                 },
-            },
-            current_operation_timestamp_ms(),
-        )?;
+                current_operation_timestamp_ms(),
+            )?
+        } else {
+            self.prepare_working_copy_transition_with_metadata(
+                &operation_lock,
+                kind,
+                Some(relation),
+                current.payload().delta.after.clone(),
+                after,
+                inverse_effects.clone(),
+                metadata,
+                target.payload().evidence.clone(),
+                ActorRef::System {
+                    name: "operation-undo".to_string(),
+                },
+                current_operation_timestamp_ms(),
+            )?
+            .operation
+        };
         self.apply_operation_metadata_locked(&operation_lock, operation.id())?;
+        if !inverse_effects.is_empty() {
+            // Replay the undo's effects from the original operation's
+            // retained backups: every restoration is leased, and a
+            // divergent value fails closed instead of overwriting newer
+            // external work.
+            self.replay_filesystem_recovery(&operation_lock, target, &operation)?;
+        }
         self.finalize_operation_verified(&operation_lock, operation.id())?;
         let operation_id = operation.id();
         drop(operation_lock);
@@ -1064,13 +1498,31 @@ impl Repository {
         state: &RepoStateRef,
     ) -> Result<OperationId, RepositoryError> {
         let scope = OperationScope::Repository;
+        let mut txn = operation_lock.begin_write_immediate()?;
+        let head = self.ensure_repository_anchor_in_txn(&mut txn, state)?;
+        txn.commit()?;
+        Ok(head)
+    }
+
+    /// Resolve the sole current repository-scope head inside a caller-owned
+    /// transaction, consolidating verified commuting heads and creating the
+    /// verified anchor when the scope is empty.
+    ///
+    /// The caller owns the transaction lifecycle: nothing here commits, so a
+    /// remediation journal can chain from the returned head in the same
+    /// durable transaction as its own mutation.
+    pub(super) fn ensure_repository_anchor_in_txn(
+        &self,
+        txn: &mut atomic_core::pristine::WriteTxn<'_>,
+        state: &RepoStateRef,
+    ) -> Result<OperationId, RepositoryError> {
+        let scope = OperationScope::Repository;
         let repository_state = RepoStateRef {
             view: state.view.clone(),
             working_copy: None,
             git: state.git.clone(),
         };
-        let mut txn = operation_lock.begin_write_immediate()?;
-        let head_state = self.consolidate_operation_heads_in_txn(&mut txn, scope)?;
+        let head_state = self.consolidate_operation_heads_in_txn(txn, scope)?;
         match head_state {
             OperationHeadState::Single(head) => {
                 let receipts = txn.get_effect_receipts(head).map_err(pristine_error)?;
@@ -1079,7 +1531,6 @@ impl Repository {
                         operation: head.to_string(),
                     });
                 }
-                txn.commit()?;
                 Ok(head)
             }
             OperationHeadState::Empty => {
@@ -1115,7 +1566,6 @@ impl Repository {
                 )?;
                 txn.append_effect_receipt(&verified)
                     .map_err(pristine_error)?;
-                txn.commit()?;
                 Ok(anchor.id())
             }
             OperationHeadState::Diverged(heads) => Err(RepositoryError::OperationHeadsDiverged {
@@ -1147,11 +1597,13 @@ impl Repository {
             before,
             after,
             effects,
+            Vec::new(),
             actor,
             timestamp_ms,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     #[allow(clippy::too_many_arguments)]
     pub(super) fn prepare_working_copy_transition(
         &self,
@@ -1161,6 +1613,7 @@ impl Repository {
         before: RepoStateRef,
         after: RepoStateRef,
         effects: Vec<EffectPlan>,
+        evidence: Vec<Hash>,
         actor: ActorRef,
         timestamp_ms: i64,
     ) -> Result<PreparedSwitchOperation, RepositoryError> {
@@ -1182,7 +1635,7 @@ impl Repository {
                 effects,
             },
             git_observed: Vec::new(),
-            evidence: Vec::new(),
+            evidence,
             actor,
             timestamp_ms,
             lossy: Vec::new(),
@@ -1196,6 +1649,74 @@ impl Repository {
         txn.put_operation(&operation).map_err(pristine_error)?;
         txn.compare_and_set_operation_heads(scope, &[parent], &[operation.id()])
             .map_err(pristine_error)?;
+        txn.commit()?;
+
+        let backup_root = self.snapshot_operation_filesystem(operation_lock, &operation)?;
+        Ok(PreparedSwitchOperation {
+            operation,
+            backup_root,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn prepare_working_copy_transition_with_metadata(
+        &self,
+        operation_lock: &WorkingCopyOperationLockGuard,
+        kind: OperationKind,
+        relation: Option<OperationRelation>,
+        before: RepoStateRef,
+        after: RepoStateRef,
+        effects: Vec<EffectPlan>,
+        metadata: Vec<MetadataTransition>,
+        evidence: Vec<Hash>,
+        actor: ActorRef,
+        timestamp_ms: i64,
+    ) -> Result<PreparedSwitchOperation, RepositoryError> {
+        let working_copy = operation_lock.working_copy();
+        validate_state_working_copy(&before, working_copy)?;
+        validate_state_working_copy(&after, working_copy)?;
+        for transition in &metadata {
+            validate_capability_lease(&transition.target, &transition.expected_new)?;
+            let observed = self.observe_metadata_value(&transition.target)?;
+            if observed != transition.expected_old {
+                return Err(metadata_divergence_error(transition, &observed));
+            }
+        }
+        let parent = self.ensure_working_copy_anchor(operation_lock, before.clone())?;
+        self.require_complete_single_head(working_copy, parent)?;
+        let repository_parent = self.ensure_repository_anchor(operation_lock, &before)?;
+        let operation = Operation::new(OperationPayload {
+            parents: vec![parent, repository_parent],
+            kind,
+            relation,
+            working_copy: Some(working_copy),
+            before,
+            delta: RepoStateDelta {
+                after,
+                metadata,
+                effects,
+            },
+            git_observed: Vec::new(),
+            evidence,
+            actor,
+            timestamp_ms,
+            lossy: Vec::new(),
+        })
+        .map_err(codec_error)?;
+        validate_effect_target_chains(&operation)?;
+
+        self.preflight_filesystem_leases(working_copy, &operation)?;
+        let scope = OperationScope::WorkingCopy(working_copy);
+        let mut txn = operation_lock.begin_write_immediate()?;
+        txn.put_operation(&operation).map_err(pristine_error)?;
+        txn.compare_and_set_operation_heads(scope, &[parent], &[operation.id()])
+            .map_err(pristine_error)?;
+        txn.compare_and_set_operation_heads(
+            OperationScope::Repository,
+            &[repository_parent],
+            &[operation.id()],
+        )
+        .map_err(pristine_error)?;
         txn.commit()?;
 
         let backup_root = self.snapshot_operation_filesystem(operation_lock, &operation)?;
@@ -1222,6 +1743,7 @@ impl Repository {
         validate_state_working_copy(&before, working_copy)?;
         validate_state_working_copy(&after, working_copy)?;
         for transition in &metadata {
+            validate_capability_lease(&transition.target, &transition.expected_new)?;
             let observed = self.observe_metadata_value(&transition.target)?;
             if observed != transition.expected_old {
                 return Err(metadata_divergence_error(transition, &observed));
@@ -1271,9 +1793,9 @@ impl Repository {
     ) -> Result<(), RepositoryError> {
         let operation = self.load_operation(operation_id)?;
         self.validate_operation_lock(operation_lock, &operation)?;
-        if operation.payload().delta.metadata.is_empty() {
-            return Ok(());
-        }
+        // An operation with no metadata transitions still publishes its
+        // working-copy record transition (delta.after), so the record write
+        // below is not gated on metadata being non-empty.
         let mut txn = operation_lock.begin_write_immediate()?;
         let mut pending = Vec::new();
         for transition in &operation.payload().delta.metadata {
@@ -1841,7 +2363,13 @@ impl Repository {
             many => return Err(multiple_heads_error(scope, many)),
         };
         let head_operation = self.load_operation(head)?;
-        self.validate_operation_lock(operation_lock, &head_operation)?;
+        // CB-13C observability (review R5): terminal recovery failures are
+        // recorded, not only successful recoveries. The journal is the
+        // consent-gated automatic sink (`for_repository`).
+        if let Err(error) = self.validate_operation_lock(operation_lock, &head_operation) {
+            self.emit_recovery_failure(&head_operation, super::observability::RecoveryFailureCode::LockValidation);
+            return Err(error);
+        }
         if self.operation_is_verified(head)? {
             return Ok(RecoveryOutcome::AlreadyComplete { operation: head });
         }
@@ -1851,7 +2379,20 @@ impl Repository {
                 let original_id = sole_recovery_parent(&head_operation)?;
                 (self.load_operation(original_id)?, head_operation, false)
             } else {
-                let recovery = self.inverse_recovery_operation(&head_operation, working_copy)?;
+                let recovery =
+                    match self.inverse_recovery_operation(&head_operation, working_copy) {
+                        Ok(recovery) => recovery,
+                        Err(error) => {
+                            // Review R5: the pre-recovery lease divergence
+                            // ("diverged before recovery") previously had
+                            // no terminal event.
+                            self.emit_recovery_failure(
+                                &head_operation,
+                                super::observability::RecoveryFailureCode::InverseConstruction,
+                            );
+                            return Err(error);
+                        }
+                    };
                 let mut txn = operation_lock.begin_write_immediate()?;
                 txn.put_operation(&recovery).map_err(pristine_error)?;
                 txn.compare_and_set_operation_heads(scope, &[head], &[recovery.id()])
@@ -1871,14 +2412,98 @@ impl Repository {
                 (head_operation, recovery, true)
             };
 
-        self.apply_operation_metadata_locked(operation_lock, recovery.id())?;
-        self.replay_filesystem_recovery(operation_lock, &original, &recovery)?;
-        self.finalize_operation_verified(operation_lock, recovery.id())?;
+        if let Err(error) = self.apply_operation_metadata_locked(operation_lock, recovery.id()) {
+            self.emit_recovery_failure(&original, super::observability::RecoveryFailureCode::RecoveryApply);
+            return Err(error);
+        }
+        if let Err(error) = self.replay_filesystem_recovery(operation_lock, &original, &recovery) {
+            self.emit_recovery_failure(&original, super::observability::RecoveryFailureCode::FilesystemReplay);
+            return Err(error);
+        }
+        if let Err(error) = self.finalize_operation_verified(operation_lock, recovery.id()) {
+            self.emit_recovery_failure(&original, super::observability::RecoveryFailureCode::Finalize);
+            return Err(error);
+        }
+        // CB-13C observability: recovery outcomes are recorded with their
+        // operation IDs (validated fixed-format base32) — lossy, advisory
+        // only, consent-gated.
+        self.emit_recovery_outcome(&original, &recovery, created);
         Ok(RecoveryOutcome::Recovered {
             original: original.id(),
             recovery: recovery.id(),
             created,
         })
+    }
+
+    /// Record one executed recovery (consent-gated, lossy, advisory only).
+    /// Skips silently when an operation ID somehow fails fixed-format
+    /// validation: no free-form value can bypass the typed event surface.
+    fn emit_recovery_outcome(
+        &self,
+        original: &Operation,
+        recovery: &Operation,
+        created: bool,
+    ) {
+        if let (Some(original), Some(recovery)) = (
+            super::observability::OpIdRef::new(&original.id().to_string()),
+            super::observability::OpIdRef::new(&recovery.id().to_string()),
+        ) {
+            super::observability::BridgeEventJournal::for_repository(self).emit_lossy(
+                super::observability::BridgeEventKind::Recovery {
+                    original,
+                    recovery,
+                    created,
+                },
+            );
+        }
+    }
+
+    /// Record one terminal recovery failure (review R5: lease rejections
+    /// and replay/finalize failures previously had no event). Consent-gated
+    /// and lossy.
+    fn emit_recovery_failure(
+        &self,
+        original: &Operation,
+        reason: super::observability::RecoveryFailureCode,
+    ) {
+        if let Some(original) = super::observability::OpIdRef::new(&original.id().to_string()) {
+            super::observability::BridgeEventJournal::for_repository(self).emit_lossy(
+                super::observability::BridgeEventKind::RecoveryFailure {
+                    original,
+                    reason,
+                },
+            );
+        }
+    }
+
+    /// Raw bytes of the derived bridge checkpoint file, empty when absent
+    /// (R3: the Checkpoint lease observes the file's content digest).
+    /// Facts digest of the derived bridge checkpoint (R3): the parsed
+    /// checkpoint's canonical serialization, so the lease is format-agnostic
+    /// (the CLI's richer v2 writer and the simple writer carry the same
+    /// facts) and a fact-preserving rewrite is idempotent.
+    pub fn read_projection_checkpoint_facts_digest(&self) -> Result<Hash, RepositoryError> {
+        self.read_workspace_checkpoint_facts_digest()
+    }
+
+    pub(super) fn read_workspace_checkpoint_facts_digest(
+        &self,
+    ) -> Result<atomic_core::Hash, RepositoryError> {
+        let bytes = std::fs::read(self.dot_dir.join("bridge/workspace.json")).map_err(|error| {
+            RepositoryError::InvalidRepository {
+                reason: format!(
+                    "cannot read the bridge checkpoint for a lease: {error}"
+                ),
+            }
+        })?;
+        let checkpoint = read_workspace_checkpoint(&self.root)?
+            .ok_or_else(|| RepositoryError::InvalidRepository {
+                reason: "the bridge checkpoint disappeared during adoption completion".to_string(),
+            })?;
+        let _ = bytes;
+        Ok(atomic_core::Hash::of(
+            super::adoption::checkpoint_facts_bytes(&checkpoint)?.as_slice(),
+        ))
     }
 
     fn observe_metadata_value(
@@ -1901,6 +2526,13 @@ impl Repository {
                     .map(MetadataValue::Sequence)
                     .unwrap_or(MetadataValue::Absent))
             }
+            MetadataTarget::View { name } => {
+                let view = txn
+                    .get_view(name)
+                    .map_err(pristine_error)?
+                    .ok_or_else(|| RepositoryError::ViewNotFound { name: name.clone() })?;
+                encode_view_lease(&view)
+            }
             MetadataTarget::Tag { view, name } => txn
                 .get_tag(view, name)
                 .map_err(pristine_error)?
@@ -1911,8 +2543,153 @@ impl Repository {
                 })
                 .transpose()
                 .map(|value| value.unwrap_or(MetadataValue::Absent)),
+            MetadataTarget::RefMapping { view } => {
+                observe_ref_mapping_value(&txn, view)
+            }
+            MetadataTarget::Capability { id } => observe_capability_value(&txn, id),
             target => Err(unsupported_metadata_error(target)),
         }
+    }
+
+    /// Re-derive the pre-completion bridge checkpoint from the original
+    /// completion operation's recorded before-state (R3): the view name and
+    /// state come from `before.view`, and the Git facts (symref, HEAD OID,
+    /// index digest/tree) come from `before.git`, so the rollback is exact
+    /// without retaining checkpoint file bytes anywhere.
+    fn restore_checkpoint_from_state(
+        &self,
+        repo: &git2::Repository,
+        original: &Operation,
+    ) -> Result<WorkspaceCheckpoint, RepositoryError> {
+        let before = &original.payload().before;
+        let Some(view) = &before.view else {
+            return Err(RepositoryError::InvalidOperation {
+                message: format!(
+                    "operation {} has no before-view to restore the checkpoint from",
+                    original.id()
+                ),
+            });
+        };
+        let Some(git) = &before.git else {
+            return Err(RepositoryError::InvalidOperation {
+                message: format!(
+                    "operation {} has no before-Git state to restore the checkpoint from",
+                    original.id()
+                ),
+            });
+        };
+        let (symref, head_hex) = match &git.head {
+            GitHeadState::Attached { symref, oid } => {
+                (Some(symref.clone()), git_object_hex(oid)?)
+            }
+            GitHeadState::Detached { oid } => (None, git_object_hex(oid)?),
+            other => {
+                return Err(RepositoryError::InvalidOperation {
+                    message: format!(
+                        "operation {} before-Git head {other:?} cannot restore a checkpoint",
+                        original.id()
+                    ),
+                })
+            }
+        };
+        let oid = git2::Oid::from_str(&head_hex).map_err(|error| {
+            RepositoryError::InvalidRepository {
+                reason: format!("cannot parse restored HEAD '{head_hex}': {error}"),
+            }
+        })?;
+        let commit = repo.find_commit(oid).map_err(|error| {
+            RepositoryError::InvalidRepository {
+                reason: format!(
+                    "cannot re-read the pre-completion commit {head_hex} for the checkpoint: {error}"
+                ),
+            }
+        })?;
+        Ok(WorkspaceCheckpoint {
+            version: 2,
+            view: view.name.clone(),
+            atomic_state: view.state.to_base32(),
+            git_head_symref: symref,
+            git_head: head_hex,
+            git_tree: commit.tree_id().to_string(),
+            git_index_tree: git
+                .index
+                .as_ref()
+                .and_then(|index| index.tree.as_ref())
+                .map(|tree| git_object_hex(tree))
+                .transpose()?,
+            git_index_digest: git
+                .index
+                .as_ref()
+                .map(|index| index.digest.to_base32()),
+        })
+    }
+
+    /// Restore one journaled projection index effect's expected-old index
+    /// content (CB-8B ac-3): the exact bytes retained before the swap, or the
+    /// index-file removal for an effect whose expected-old was an absent
+    /// index. The caller re-observes and rejects any third value.
+    fn restore_retained_index(
+        &self,
+        original: &Operation,
+        backup_root: &Path,
+        git_dir: &Path,
+    ) -> Result<(), RepositoryError> {
+        // Identify the original effect that inverted into this recovery
+        // target: the sole GitIndex effect of the original operation.
+        let original_effect = original
+            .payload()
+            .delta
+            .effects
+            .iter()
+            .find(|effect| matches!(effect.target, EffectTarget::GitIndex { .. }))
+            .ok_or_else(|| RepositoryError::InvalidOperation {
+                message: format!(
+                    "operation {} has no Git index effect to restore",
+                    original.id()
+                ),
+            })?;
+        let entry = backup_entry_path(backup_root, original_effect.ordinal);
+        let index_path = git_dir.join("index");
+        if entry.join(RECOVERY_ABSENT_MARKER).is_file() {
+            return match std::fs::remove_file(&index_path) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(RepositoryError::InvalidRepository {
+                    reason: format!(
+                        "cannot re-remove the Git index '{}': {error}",
+                        index_path.display()
+                    ),
+                }),
+            };
+        }
+        let bytes = std::fs::read(entry.join(BACKUP_VALUE)).map_err(|error| {
+            RepositoryError::InvalidOperation {
+                message: format!(
+                    "the retained index bytes for operation {} effect {} are missing: {error}",
+                    original.id(),
+                    original_effect.ordinal
+                ),
+            }
+        })?;
+        let staging = git_dir.join(format!(
+            "atomic-index-restore.{}.tmp",
+            std::process::id()
+        ));
+        let result = (|| -> Result<(), RepositoryError> {
+            write_new_synced(&staging, &bytes)?;
+            std::fs::rename(&staging, &index_path).map_err(|error| {
+                RepositoryError::InvalidRepository {
+                    reason: format!(
+                        "cannot restore the Git index '{}': {error}",
+                        index_path.display()
+                    ),
+                }
+            })
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_file(&staging);
+        }
+        result
     }
 
     /// Observe the exact typed value of an effect supported by this repository engine.
@@ -1969,7 +2746,7 @@ impl Repository {
         }
     }
 
-    fn load_operation(&self, operation_id: OperationId) -> Result<Operation, RepositoryError> {
+    pub(super) fn load_operation(&self, operation_id: OperationId) -> Result<Operation, RepositoryError> {
         let txn = self.pristine.read_txn().map_err(pristine_error)?;
         txn.get_operation(operation_id)
             .map_err(pristine_error)?
@@ -1979,6 +2756,15 @@ impl Repository {
     }
 
     fn validate_operation_lock(
+        &self,
+        operation_lock: &WorkingCopyOperationLockGuard,
+        operation: &Operation,
+    ) -> Result<(), RepositoryError> {
+        self.validate_projection_lock(operation_lock, operation)
+    }
+
+    /// Lock validation exposed to the projection executor (CB-8B).
+    pub(super) fn validate_projection_lock(
         &self,
         operation_lock: &WorkingCopyOperationLockGuard,
         operation: &Operation,
@@ -2001,7 +2787,7 @@ impl Repository {
         }
     }
 
-    fn append_receipt_immediate(
+    pub(super) fn append_receipt_immediate(
         &self,
         operation_lock: &WorkingCopyOperationLockGuard,
         operation: &Operation,
@@ -2222,12 +3008,12 @@ impl Repository {
             txn.get_effect_receipts(recovery.id())
                 .map_err(pristine_error)?
         };
-        let completed: BTreeSet<u32> = receipts
+let completed: BTreeSet<u32> = receipts
             .iter()
             .filter_map(|receipt| match receipt.payload().kind {
                 EffectReceiptKind::Applied
-                | EffectReceiptKind::RolledBack
-                | EffectReceiptKind::Recovered => receipt.payload().effect_ordinal,
+                | EffectReceiptKind::Recovered
+                | EffectReceiptKind::RolledBack => receipt.payload().effect_ordinal,
                 EffectReceiptKind::Verified | EffectReceiptKind::LeaseRejected => None,
             })
             .collect();
@@ -2272,6 +3058,37 @@ impl Repository {
             let observed = self.observe_recovery_target(&target)?;
             let classification =
                 classify_effect_lease(&observed, &effect.expected_old, &effect.expected_new);
+            // CB-8B: a PROJECTION PUBLICATION's checkpoint effect is
+            // derived evidence, never an authority. Its recovery is a
+            // no-op — the checkpoint only publishes through a lease that
+            // classifies against the live facts, and the retry's own
+            // publication re-derives and writes it. Fabricating the
+            // post-publication checkpoint here (when the operation's Git
+            // effects never landed) would publish state the journal never
+            // reached. Other checkpoint effects keep the adopted
+            // rollback-to-before contract (CB-7B's adoption completion).
+            if classification == LeaseClassification::Apply
+                && matches!(
+                    effect.target,
+                    EffectTarget::Checkpoint {
+                        kind: CheckpointKind::Bridge,
+                        ..
+                    }
+                )
+                && original.payload().kind == OperationKind::ExportGitRefs
+            {
+                if !completed.contains(&effect.ordinal) {
+                    let receipt = deterministic_effect_receipt(
+                        recovery,
+                        Some(effect.ordinal),
+                        EffectReceiptKind::Recovered,
+                        Some(observed.clone()),
+                        Some(observed),
+                    )?;
+                    self.append_receipt_immediate(operation_lock, recovery, &receipt)?;
+                }
+                continue;
+            }
             match classification {
                 LeaseClassification::Apply => {
                     let mut shelf_txn = if matches!(
@@ -2430,6 +3247,117 @@ impl Repository {
             {
                 self.apply_working_copy_state_locked(operation_lock, state)
             }
+            // R3: the adoption completion's WIP-ref lease rolls back by
+            // recreating the exact Git object identity the operation observed
+            // before the drop (the commit object is content-addressed, so the
+            // recreate is exact).
+            (EffectValue::GitRef(target), ResolvedRecoveryTarget::GitRef(name)) => {
+                let repo = git2::Repository::open(&self.root).map_err(|error| {
+                    RepositoryError::InvalidRepository {
+                        reason: format!("cannot open the Git repository to restore a ref: {error}"),
+                    }
+                })?;
+                let GitRefTarget::Direct(object) = target else {
+                    return Err(RepositoryError::InvalidOperation {
+                        message: format!(
+                            "recovery of Git ref '{name}' only supports direct object leases"
+                        ),
+                    });
+                };
+                let oid = git_oid_from_object(&repo, object)?;
+                repo.reference(
+                    name,
+                    oid,
+                    true,
+                    "atomic: restore rolled-back completion ref",
+                )
+                .map(|_| ())
+                .map_err(|error| {
+                    RepositoryError::InvalidRepository {
+                        reason: format!("cannot restore Git ref '{name}': {error}"),
+                    }
+                })
+            }
+            (EffectValue::Absent, ResolvedRecoveryTarget::GitRef(name)) => {
+                let repo = git2::Repository::open(&self.root).map_err(|error| {
+                    RepositoryError::InvalidRepository {
+                        reason: format!("cannot open the Git repository to restore a ref: {error}"),
+                    }
+                })?;
+                let found = repo.find_reference(name);
+                match found {
+                    Ok(mut reference) => reference
+                        .delete()
+                        .map_err(|error| RepositoryError::InvalidRepository {
+                            reason: format!("cannot re-delete Git ref '{name}': {error}"),
+                        }),
+                    Err(error) if error.code() == git2::ErrorCode::NotFound => Ok(()),
+                    Err(error) => Err(RepositoryError::InvalidRepository {
+                        reason: format!("cannot read Git ref '{name}' during recovery: {error}"),
+                    }),
+                }
+            }
+            // CB-8B: the projection publish's HEAD lease rolls back by
+            // re-pointing HEAD at the exact state the operation observed
+            // before the move: attached (symbolic) or detached (direct). The
+            // pre-classification guard (the caller) ensures an external
+            // writer's newer HEAD is never overwritten.
+            (EffectValue::GitRef(target), ResolvedRecoveryTarget::GitHead(_)) => {
+                let repo = git2::Repository::open(&self.root).map_err(|error| {
+                    RepositoryError::InvalidRepository {
+                        reason: format!("cannot open the Git repository to restore HEAD: {error}"),
+                    }
+                })?;
+                match target {
+                    GitRefTarget::Direct(object) => {
+                        let oid = git_oid_from_object(&repo, object)?;
+                        repo.set_head_detached(oid)
+                            .map_err(|error| RepositoryError::InvalidRepository {
+                                reason: format!("cannot restore Git HEAD: {error}"),
+                            })
+                    }
+                    GitRefTarget::Symbolic(symref) => repo
+                        .set_head(symref)
+                        .map_err(|error| RepositoryError::InvalidRepository {
+                            reason: format!("cannot restore attached Git HEAD: {error}"),
+                        }),
+                }
+            }
+            // R3: the derived bridge checkpoint is restored to its
+            // pre-completion content, re-derived from the original
+            // operation's recorded before-state (view + Git facts). The
+            // caller re-observes the digest and rejects any third value.
+            (
+                EffectValue::Digest {
+                    kind: DigestKind::Checkpoint,
+                    ..
+                },
+                ResolvedRecoveryTarget::Checkpoint { .. },
+            ) => {
+                let repo = git2::Repository::open(&self.root).map_err(|error| {
+                    RepositoryError::InvalidRepository {
+                        reason: format!(
+                            "cannot open the Git repository to restore the checkpoint: {error}"
+                        ),
+                    }
+                })?;
+                let restored = self.restore_checkpoint_from_state(&repo, original)?;
+                write_workspace_checkpoint(self.root(), &restored)
+            }
+            // CB-8B: a journaled projection index replacement rolls back by
+            // restoring the exact index bytes retained before the swap (or
+            // re-removing an index that did not exist). The caller
+            // re-observes the lease and rejects any third value.
+            (EffectValue::GitIndex(_), ResolvedRecoveryTarget::GitIndex(_)) => {
+                let repo = git2::Repository::open(&self.root).map_err(|error| {
+                    RepositoryError::InvalidRepository {
+                        reason: format!(
+                            "cannot open the Git repository to restore the index: {error}"
+                        ),
+                    }
+                })?;
+                self.restore_retained_index(original, backup_root, repo.path())
+            }
             (value, target) => Err(RepositoryError::InvalidOperation {
                 message: format!(
                     "recovery cannot restore value {value:?} through resolved target {target:?}"
@@ -2438,11 +3366,17 @@ impl Repository {
         }
     }
 
-    fn inverse_recovery_operation(
+    /// The effect ordinals of `original` whose inverse must replay during
+    /// a recovery or an undo (CB-8B lease-chain semantics, shared by both
+    /// paths): per target, every attempt up to the furthest state the
+    /// receipts prove was reached. A target whose every attempt ended in
+    /// a durable LeaseRejected receipt never mutated and contributes
+    /// nothing.
+    fn selected_inverse_ordinals(
         &self,
-        original: &Operation,
         working_copy: WorkingCopyId,
-    ) -> Result<Operation, RepositoryError> {
+        original: &Operation,
+    ) -> Result<BTreeSet<u32>, RepositoryError> {
         let receipts = {
             let txn = self.pristine.read_txn().map_err(pristine_error)?;
             txn.get_effect_receipts(original.id())
@@ -2457,6 +3391,13 @@ impl Repository {
                 EffectReceiptKind::Verified | EffectReceiptKind::LeaseRejected => None,
             })
             .collect();
+        let rejected: BTreeSet<u32> = receipts
+            .iter()
+            .filter_map(|receipt| match receipt.payload().kind {
+                EffectReceiptKind::LeaseRejected => receipt.payload().effect_ordinal,
+                _ => None,
+            })
+            .collect();
 
         let original_effects = &original.payload().delta.effects;
         let mut selected = BTreeSet::new();
@@ -2466,10 +3407,35 @@ impl Repository {
                 continue;
             }
             visited_targets.push(first.target.clone());
+            // CB-8B: a PROJECTION PUBLICATION's object creations are
+            // content-addressed and immutable. Their presence is idempotent,
+            // they are never deleted, and unreachable objects are reclaimed
+            // by CB-13A's GC — so no inverse recovery effect exists for them.
+            if matches!(first.target, EffectTarget::GitObject { .. })
+                && original.payload().kind == OperationKind::ExportGitRefs
+            {
+                continue;
+            }
             let chain: Vec<&EffectPlan> = original_effects
                 .iter()
                 .filter(|effect| effect.target == first.target)
                 .collect();
+            // CB-8B: a target whose every attempt ended in a durable
+            // LeaseRejected receipt never mutated (the executor records the
+            // rejection only when the observed value is a third value and
+            // writes nothing), and later effects on that target never ran.
+            // There is nothing to roll back; the observed third value — the
+            // newer external work — must simply be preserved, so the target
+            // contributes no inverse effect.
+            let chain_completed = chain
+                .iter()
+                .any(|effect| completed.contains(&effect.ordinal));
+            let chain_rejected = chain
+                .iter()
+                .all(|effect| rejected.contains(&effect.ordinal));
+            if !chain_completed && chain_rejected {
+                continue;
+            }
             let target = self.resolve_recovery_target(working_copy, &first.target)?;
             let observed = self.observe_recovery_target(&target)?;
             let mut states = Vec::with_capacity(chain.len() + 1);
@@ -2507,8 +3473,8 @@ impl Repository {
                 _ => {
                     return Err(RepositoryError::InvalidOperation {
                         message: format!(
-                            "operation {} target {:?} has an ambiguous cyclic lease chain at observed value {:?}",
-                            original.id(), first.target, observed
+                            "operation {} target {:?} has an ambiguous cyclic lease chain at observed value {:?} (expected one of {:?})",
+                            original.id(), first.target, observed, states
                         ),
                     })
                 }
@@ -2517,6 +3483,16 @@ impl Repository {
                 selected.insert(effect.ordinal);
             }
         }
+        Ok(selected)
+    }
+
+    fn inverse_recovery_operation(
+        &self,
+        original: &Operation,
+        working_copy: WorkingCopyId,
+    ) -> Result<Operation, RepositoryError> {
+        let selected = self.selected_inverse_ordinals(working_copy, original)?;
+        let original_effects = &original.payload().delta.effects;
 
         let mut metadata = Vec::new();
         for transition in &original.payload().delta.metadata {
@@ -2603,6 +3579,65 @@ impl Repository {
                     "working-copy effect belongs to {target_working_copy}, operation lock is for {working_copy}"
                 ),
             }),
+            EffectTarget::GitRef { name } => {
+                // R3 + CB-8B: Atomic-owned Git refs are recoverable by this
+                // engine — the WIP recovery refs (CB-1B), the Draft view
+                // reachability refs `refs/atomic/views/<name>`, and the
+                // shared projection branches `refs/heads/<name>` written by
+                // the journaled projection publisher. Every inverse effect
+                // classifies its lease before touching the ref, so an
+                // external writer's newer value is never overwritten. Other
+                // namespaces stay gated (the repository never invents an
+                // after-state for a foreign interrupted write).
+                let owned = name.starts_with("refs/atomic/wip/")
+                    || name.starts_with("refs/atomic/views/")
+                    || (name.starts_with("refs/heads/") && name.len() > "refs/heads/".len());
+                if !owned {
+                    return Err(unsupported_effect_error(target));
+                }
+                Ok(ResolvedRecoveryTarget::GitRef(name.clone()))
+            }
+            EffectTarget::GitHead { working_copy: target_working_copy } => {
+                if *target_working_copy != working_copy {
+                    return Err(RepositoryError::InvalidOperation {
+                        message: format!(
+                            "Git HEAD effect belongs to {target_working_copy}, operation lock is for {working_copy}"
+                        ),
+                    });
+                }
+                Ok(ResolvedRecoveryTarget::GitHead(working_copy))
+            }
+            EffectTarget::Checkpoint {
+                working_copy: target_working_copy,
+                kind,
+            } => {
+                if *kind != CheckpointKind::Bridge {
+                    return Err(unsupported_effect_error(target));
+                }
+                if *target_working_copy != working_copy {
+                    return Err(RepositoryError::InvalidOperation {
+                        message: format!(
+                            "checkpoint effect belongs to {target_working_copy}, operation lock is for {working_copy}"
+                        ),
+                    });
+                }
+                Ok(ResolvedRecoveryTarget::Checkpoint { working_copy })
+            }
+            EffectTarget::GitObject { object } => {
+                Ok(ResolvedRecoveryTarget::GitObject(object.clone()))
+            }
+            EffectTarget::GitIndex {
+                working_copy: target_working_copy,
+            } => {
+                if *target_working_copy != working_copy {
+                    return Err(RepositoryError::InvalidOperation {
+                        message: format!(
+                            "Git index effect belongs to {target_working_copy}, operation lock is for {working_copy}"
+                        ),
+                    });
+                }
+                Ok(ResolvedRecoveryTarget::GitIndex(working_copy))
+            }
             _ => Err(unsupported_effect_error(target)),
         }
     }
@@ -2624,6 +3659,86 @@ impl Repository {
                     .ok_or(RepositoryError::WorkingCopyRecordNotFound { id: *id })?;
                 Ok(EffectValue::WorkingCopy(working_copy_state_ref(record)))
             }
+            ResolvedRecoveryTarget::GitRef(name) => {
+                let repo = git2::Repository::open(&self.root).map_err(|error| {
+                    RepositoryError::InvalidRepository {
+                        reason: format!("cannot open the Git repository for a ref lease: {error}"),
+                    }
+                })?;
+                let found = repo.find_reference(name);
+                match found {
+                    Ok(reference) => {
+                        let oid =
+                            reference
+                                .target()
+                                .ok_or_else(|| RepositoryError::InvalidOperation {
+                                    message: format!("Git ref '{name}' has no direct target"),
+                                })?;
+                        let algorithm = match oid.as_bytes().len() {
+                            20 => GitHashAlgorithm::Sha1,
+                            32 => GitHashAlgorithm::Sha256,
+                            other => {
+                                return Err(RepositoryError::InvalidRepository {
+                                    reason: format!("unexpected Git OID width {other}"),
+                                })
+                            }
+                        };
+                        let object = GitObjectId::new(algorithm, oid.as_bytes().to_vec())
+                            .map_err(codec_error)?;
+                        Ok(EffectValue::GitRef(GitRefTarget::Direct(object)))
+                    }
+                    Err(error) if error.code() == git2::ErrorCode::NotFound => {
+                        Ok(EffectValue::Absent)
+                    }
+                    Err(error) => Err(RepositoryError::InvalidRepository {
+                        reason: format!("cannot read Git ref '{name}' for a lease: {error}"),
+                    }),
+                }
+            }
+            ResolvedRecoveryTarget::Checkpoint { .. } => Ok(EffectValue::Digest {
+                kind: DigestKind::Checkpoint,
+                hash: self.read_workspace_checkpoint_facts_digest()?,
+            }),
+            ResolvedRecoveryTarget::GitObject(object) => {
+                let repo = git2::Repository::open(&self.root).map_err(|error| {
+                    RepositoryError::InvalidRepository {
+                        reason: format!(
+                            "cannot open the Git repository for an object lease: {error}"
+                        ),
+                    }
+                })?;
+                super::projection_effects::observe_git_object_lease(&repo, object)
+            }
+            ResolvedRecoveryTarget::GitIndex(_) => {
+                let repo = git2::Repository::open(&self.root).map_err(|error| {
+                    RepositoryError::InvalidRepository {
+                        reason: format!(
+                            "cannot open the Git repository for an index lease: {error}"
+                        ),
+                    }
+                })?;
+                Ok(EffectValue::GitIndex(
+                    super::projection_effects::observe_git_index_lease(&repo)?,
+                ))
+            }
+            ResolvedRecoveryTarget::GitHead(_) => {
+                let repo = git2::Repository::open(&self.root).map_err(|error| {
+                    RepositoryError::InvalidRepository {
+                        reason: format!(
+                            "cannot open the Git repository for a HEAD lease: {error}"
+                        ),
+                    }
+                })?;
+                // The same lease protocol the projection executor records
+                // (CB-8B ac-3): symbolic when attached, direct when detached,
+                // absent when HEAD is missing or unborn. The resolved-commit
+                // reading would misclassify an attached HEAD against a
+                // symbolic expected-old lease.
+                let observed = super::projection_effects::read_head_target(&repo)?;
+                Ok(observed
+                    .map(EffectValue::GitRef)
+                    .unwrap_or(EffectValue::Absent))
+            }
         }
     }
 
@@ -2636,7 +3751,16 @@ impl Repository {
             EffectTarget::FilesystemPath { path } => {
                 let content_store_effect =
                     Path::new(path).starts_with(Path::new(".atomic/changes"));
-                let relative = validate_relative_path(path, content_store_effect)?;
+                // CB-13B R2: `.git/hooks/<name>` is the one `.git`-rooted
+                // surface a journaled effect may target — the hook
+                // decommission migration lease. Exactly one hook-file
+                // component; the effect machinery's symlink-parent checks
+                // and per-ordinal backups apply unchanged.
+                let git_hook_effect = is_git_hooks_effect_path(path);
+                let relative = validate_relative_path(
+                    path,
+                    content_store_effect || git_hook_effect,
+                )?;
                 if relative.starts_with(Path::new(".atomic"))
                     && !relative.starts_with(Path::new(".atomic/changes"))
                 {
@@ -2696,7 +3820,7 @@ impl Repository {
             .join(operation.to_string())
     }
 
-    fn operation_recovery_root(
+    pub(super) fn operation_recovery_root(
         &self,
         working_copy: WorkingCopyId,
         original: OperationId,
@@ -2723,6 +3847,70 @@ fn classify_metadata_lease(
     }
 }
 
+/// The view field a `MetadataTarget::View` lease moves: the parent pointer.
+/// View state and change count belong to the `ViewChange` leases of the same
+/// operation; within the journal's serialization the parent is the only
+/// field a metadata transition may move directly.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ViewLeaseValue {
+    pub parent: Option<u64>,
+}
+
+fn encode_view_lease(view: &atomic_core::pristine::ViewState) -> Result<MetadataValue, RepositoryError> {
+    let lease = ViewLeaseValue {
+        parent: view.parent,
+    };
+    postcard::to_allocvec(&lease)
+        .map(MetadataValue::Bytes)
+        .map_err(|error| RepositoryError::Serialization(error.to_string()))
+}
+
+fn decode_view_lease(value: &MetadataValue, name: &str) -> Result<ViewLeaseValue, RepositoryError> {
+    let MetadataValue::Bytes(bytes) = value else {
+        return Err(RepositoryError::InvalidOperation {
+            message: format!("view lease for '{name}' requires canonical bytes"),
+        });
+    };
+    postcard::from_bytes(bytes)
+        .map_err(|error| RepositoryError::Serialization(error.to_string()))
+}
+
+
+fn decode_ref_mapping_value(
+    value: &MetadataValue,
+    view: &str,
+) -> Result<atomic_core::pristine::RefMapping, RepositoryError> {
+    let MetadataValue::Bytes(bytes) = value else {
+        return Err(RepositoryError::InvalidOperation {
+            message: format!("ref-mapping lease for '{view}' requires canonical bytes"),
+        });
+    };
+    atomic_core::pristine::RefMapping::decode(bytes)
+        .map_err(|error| RepositoryError::Serialization(error.to_string()))
+}
+
+/// The complete effective change-filter of `view` as hashes (CB-10A closure
+/// containment input). Dependency-first closure with external hashes; changes
+/// without a registered external hash are skipped by construction because
+/// they cannot be compared against Git closure evidence.
+pub(super) fn visible_change_hashes(
+    txn: &atomic_core::pristine::ReadTxn,
+    view: &atomic_core::pristine::ViewState,
+) -> Result<BTreeSet<Hash>, RepositoryError> {
+    let visibility = super::filter::graph_visibility_closure(txn, view)
+        .map_err(|error| RepositoryError::Database(error.to_string()))?;
+    let mut hashes = BTreeSet::new();
+    for change_id in visibility.iter_dependency_first().copied() {
+        if let Some(hash) = txn
+            .get_external(change_id)
+            .map_err(pristine_error)?
+        {
+            hashes.insert(hash);
+        }
+    }
+    Ok(hashes)
+}
+
 fn observe_metadata_value_in_write(
     txn: &atomic_core::pristine::WriteTxn<'_>,
     target: &MetadataTarget,
@@ -2742,6 +3930,13 @@ fn observe_metadata_value_in_write(
                 .map(MetadataValue::Sequence)
                 .unwrap_or(MetadataValue::Absent))
         }
+        MetadataTarget::View { name } => {
+            let view = txn
+                .get_view(name)
+                .map_err(pristine_error)?
+                .ok_or_else(|| RepositoryError::ViewNotFound { name: name.clone() })?;
+            encode_view_lease(&view)
+        }
         MetadataTarget::Tag { view, name } => txn
             .get_tag(view, name)
             .map_err(pristine_error)?
@@ -2752,7 +3947,121 @@ fn observe_metadata_value_in_write(
             })
             .transpose()
             .map(|value| value.unwrap_or(MetadataValue::Absent)),
+        MetadataTarget::RefMapping { view } => {
+            observe_ref_mapping_value(txn, view)
+        }
+        MetadataTarget::Capability { id } => observe_capability_value(txn, id),
         target => Err(unsupported_metadata_error(target)),
+    }
+}
+
+/// Observe the durable required version of one capability (CB-13B).
+///
+/// `Sequence(version)` when the requirement row exists, `Absent` otherwise.
+/// The lease classification compares this against the transition's
+/// expected-old so an interrupted cutover is `AlreadyApplied` on resume and
+/// any external requirement change is `Diverged`.
+fn observe_capability_value<T: atomic_core::pristine::CapabilityTxnT>(
+    txn: &T,
+    id: &str,
+) -> Result<MetadataValue, RepositoryError> {
+    Ok(txn
+        .required_capability_version(id)
+        .map_err(pristine_error)?
+        .map(|version| MetadataValue::Sequence(u64::from(version)))
+        .unwrap_or(MetadataValue::Absent))
+}
+
+/// Observe the current ref-mapping bytes for `view` (CB-10A).
+///
+/// The mapping is keyed by the durable view id; when the view row is gone
+/// (deleted Shared view), the lease falls back to a view-name scan so the
+/// stale mapping stays observable and can be marked `Unrepresentable` or
+/// removed instead of failing the whole operation.
+pub(super) fn observe_ref_mapping_value<T>(
+    txn: &T,
+    view: &str,
+) -> Result<MetadataValue, RepositoryError>
+where
+    T: atomic_core::pristine::RefMappingTxnT + atomic_core::pristine::ViewTxnT,
+{
+    if let Some(view_state) = txn.get_view(view).map_err(pristine_error)? {
+        return Ok(txn
+            .get_ref_mapping_bytes(view_state.id)
+            .map_err(pristine_error)?
+            .map(MetadataValue::Bytes)
+            .unwrap_or(MetadataValue::Absent));
+    }
+    for (_, bytes) in txn.iter_ref_mapping_bytes().map_err(pristine_error)? {
+        if let Ok(mapping) = atomic_core::pristine::RefMapping::decode(&bytes) {
+            if mapping.view_name == view {
+                return Ok(MetadataValue::Bytes(bytes));
+            }
+        }
+    }
+    Ok(MetadataValue::Absent)
+}
+
+/// Validate a capability lease's value shape and version support (CB-13B R3).
+///
+/// Called both at prepare time — so an unsatisfiable capability lease never
+/// enters the operation journal — and again in the apply path as defense in
+/// depth. A lease is valid when the capability is known to this build and the
+/// leased `Sequence` version fits the representable range and does not exceed
+/// what this build supports; deletion leases (`Absent`) are only valid for
+/// capabilities this build knows, so an unknown requirement row written by a
+/// newer build can never be deleted into a bypass here.
+fn validate_capability_lease(
+    target: &MetadataTarget,
+    expected_new: &MetadataValue,
+) -> Result<(), RepositoryError> {
+    let MetadataTarget::Capability { id } = target else {
+        return Ok(());
+    };
+    match expected_new {
+        MetadataValue::Sequence(version) => {
+            let supported = SUPPORTED_REPOSITORY_CAPABILITIES
+                .iter()
+                .find(|capability| capability.id() == id.as_str())
+                .ok_or_else(|| RepositoryError::InvalidOperation {
+                    message: format!(
+                        "capability lease requires '{id}', which this build does not support"
+                    ),
+                })?;
+            let requested = u32::try_from(*version).map_err(|_| {
+                RepositoryError::InvalidOperation {
+                    message: format!(
+                        "capability lease requires '{id}' version {version}, which exceeds the \
+                         representable capability version range"
+                    ),
+                }
+            })?;
+            if requested > supported.minimum_version() {
+                return Err(RepositoryError::InvalidOperation {
+                    message: format!(
+                        "capability lease requires '{id}' version {requested}, but this build \
+                         supports only through version {}",
+                        supported.minimum_version()
+                    ),
+                });
+            }
+            Ok(())
+        }
+        MetadataValue::Absent => {
+            if !SUPPORTED_REPOSITORY_CAPABILITIES
+                .iter()
+                .any(|capability| capability.id() == id.as_str())
+            {
+                return Err(RepositoryError::InvalidOperation {
+                    message: format!(
+                        "capability lease deletes '{id}', which this build does not support; \
+                         refusing before mutation preserves the requirement row"
+                    ),
+                });
+            }
+            Ok(())
+        }
+        _ => Err(unsupported_metadata_error(target)),
     }
 }
 
@@ -2762,6 +4071,19 @@ fn apply_metadata_value_in_write(
     value: &MetadataValue,
 ) -> Result<(), RepositoryError> {
     match (target, value) {
+        (MetadataTarget::View { name }, MetadataValue::Bytes(_)) => {
+            let lease = decode_view_lease(value, name)?;
+            let mut view = txn
+                .get_view(name)
+                .map_err(pristine_error)?
+                .ok_or_else(|| RepositoryError::ViewNotFound { name: name.clone() })?;
+            // The parent was already lease-verified at prepare time; sibling
+            // transitions in the same operation may legitimately have moved
+            // state and count since. The transition itself only moves the
+            // parent pointer.
+            view.parent = lease.parent;
+            txn.update_view(&view).map_err(pristine_error)
+        }
         (MetadataTarget::ViewChange { view, change }, MetadataValue::Absent) => {
             let mut view_state = txn
                 .get_view(view)
@@ -2819,6 +4141,86 @@ fn apply_metadata_value_in_write(
             txn.put_tag(&tag).map_err(pristine_error)?;
             Ok(())
         }
+        (MetadataTarget::RefMapping { view }, MetadataValue::Bytes(bytes)) => {
+            let mapping = decode_ref_mapping_value(
+                &MetadataValue::Bytes(bytes.clone()),
+                view,
+            )?;
+            if mapping.view_name != *view {
+                return Err(RepositoryError::InvalidOperation {
+                    message: format!(
+                        "ref-mapping lease names view '{}' but targets '{view}'",
+                        mapping.view_name
+                    ),
+                });
+            }
+            let view_state = txn
+                .get_view(view)
+                .map_err(pristine_error)?
+                .ok_or_else(|| RepositoryError::ViewNotFound { name: view.clone() })?;
+            if mapping.view_id != view_state.id {
+                return Err(RepositoryError::InvalidOperation {
+                    message: format!(
+                        "ref-mapping lease for '{view}' carries view id {}, but the durable view id is {}",
+                        mapping.view_id, view_state.id
+                    ),
+                });
+            }
+            txn.put_ref_mapping_bytes(mapping.view_id, bytes)
+                .map_err(pristine_error)
+        }
+        (MetadataTarget::RefMapping { view }, MetadataValue::Absent) => {
+            if let Some(view_state) = txn.get_view(view).map_err(pristine_error)? {
+                txn.del_ref_mapping(view_state.id).map_err(pristine_error)?;
+                return Ok(());
+            }
+            // The view is gone: remove any stale rows still naming it.
+            let mut stale_ids = Vec::new();
+            for (id, bytes) in txn.iter_ref_mapping_bytes().map_err(pristine_error)? {
+                if let Ok(mapping) = atomic_core::pristine::RefMapping::decode(&bytes) {
+                    if mapping.view_name == *view {
+                        stale_ids.push(id);
+                    }
+                }
+            }
+            for id in stale_ids {
+                txn.del_ref_mapping(id).map_err(pristine_error)?;
+            }
+            Ok(())
+        }
+        (MetadataTarget::Capability { id }, MetadataValue::Sequence(version)) => {
+            // Unknown capabilities are errors, never silently stored fields
+            // (CB-13B constraint), and a requirement above what this build
+            // supports cannot be satisfied by this build's apply path.
+            validate_capability_lease(
+                &MetadataTarget::Capability { id: id.clone() },
+                &MetadataValue::Sequence(*version),
+            )?;
+            // Write exactly the leased version: substituting this build's
+            // supported version here wrote a different value than the lease,
+            // so replay observed a third value and diverged, and older valid
+            // leases were silently raised to the build maximum (CB-13B R3).
+            let requested = u32::try_from(*version).map_err(|_| RepositoryError::InvalidOperation {
+                message: format!(
+                    "capability lease requires '{id}' version {version}, which exceeds the \
+                     representable capability version range"
+                ),
+            })?;
+            txn.put_required_capability_exact(id, requested)
+                .map_err(pristine_error)?;
+            Ok(())
+        }
+        (MetadataTarget::Capability { id }, MetadataValue::Absent) => {
+            // Fail closed: an unknown requirement row was written by a newer
+            // build, and deleting it here would bypass that fence instead of
+            // reporting the unsupported rollback (CB-13B constraint).
+            validate_capability_lease(
+                &MetadataTarget::Capability { id: id.clone() },
+                &MetadataValue::Absent,
+            )?;
+            txn.del_required_capability(id).map_err(pristine_error)?;
+            Ok(())
+        }
         (target, _) => Err(unsupported_metadata_error(target)),
     }
 }
@@ -2838,6 +4240,13 @@ fn metadata_target_view(target: &MetadataTarget) -> Option<&str> {
     match target {
         MetadataTarget::ViewChange { view, .. } => Some(view),
         MetadataTarget::View { name } => Some(name),
+        // A ref-mapping row is pure bookkeeping: it never moves view
+        // membership, so the tree projection does not need realignment (and
+        // the view row may legitimately be gone — deleted view lifecycle).
+        MetadataTarget::RefMapping { .. } => None,
+        // A capability requirement is repository-scoped; no view tree
+        // projection follows it (CB-13B).
+        MetadataTarget::Capability { .. } => None,
         MetadataTarget::Tag { .. } => None,
         MetadataTarget::Remote { .. } => None,
     }
@@ -3289,6 +4698,39 @@ fn lease_divergence_error(
     }
 }
 
+pub(super) fn git_object_hex(object: &GitObjectId) -> Result<String, RepositoryError> {
+    let hex: String = object
+        .as_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    Ok(hex)
+}
+
+pub(super) fn git_oid_from_object(
+    repo: &git2::Repository,
+    object: &GitObjectId,
+) -> Result<git2::Oid, RepositoryError> {
+    let hex = git_object_hex(object)?;
+    let oid = git2::Oid::from_str(&hex).map_err(|error| RepositoryError::InvalidRepository {
+        reason: format!("cannot parse Git object id '{hex}': {error}"),
+    })?;
+    let expected_width = match object.algorithm() {
+        GitHashAlgorithm::Sha1 => 20,
+        GitHashAlgorithm::Sha256 => 32,
+    };
+    if oid.as_bytes().len() != expected_width {
+        return Err(RepositoryError::InvalidRepository {
+            reason: format!(
+                "Git object id '{hex}' width {} disagrees with the repository format",
+                oid.as_bytes().len()
+            ),
+        });
+    }
+    let _ = repo;
+    Ok(oid)
+}
+
 fn unsupported_effect_error(target: &EffectTarget) -> RepositoryError {
     RepositoryError::InvalidOperation {
         message: format!(
@@ -3297,13 +4739,13 @@ fn unsupported_effect_error(target: &EffectTarget) -> RepositoryError {
     }
 }
 
-fn codec_error(error: impl std::fmt::Display) -> RepositoryError {
+pub(super) fn codec_error(error: impl std::fmt::Display) -> RepositoryError {
     RepositoryError::InvalidOperation {
         message: format!("invalid operation journal object: {error}"),
     }
 }
 
-fn pristine_error(error: impl std::fmt::Display) -> RepositoryError {
+pub(super) fn pristine_error(error: impl std::fmt::Display) -> RepositoryError {
     RepositoryError::Database(error.to_string())
 }
 
@@ -3323,12 +4765,35 @@ fn is_recursive_filesystem_target(target: &EffectTarget) -> bool {
     )
 }
 
-fn backup_entry_path(root: &Path, ordinal: u32) -> PathBuf {
+pub(super) fn backup_entry_path(root: &Path, ordinal: u32) -> PathBuf {
     root.join(BACKUP_ENTRIES_DIR).join(format!("{ordinal:010}"))
 }
 
-fn validate_relative_path(path: &str, allow_vcs_names: bool) -> Result<PathBuf, RepositoryError> {
-    if path.is_empty() {
+/// Whether `path` is exactly `.git/hooks/<name>` — the single `.git`-rooted
+/// surface a journaled filesystem effect may target (CB-13B R2 hook
+/// decommission lease). One normal hook-file component; no dotfiles, no
+/// nesting, no repeats.
+fn is_git_hooks_effect_path(path: &str) -> bool {
+    let mut components = Path::new(path).components();
+    let git = matches!(
+        components.next(),
+        Some(Component::Normal(value)) if value == OsStr::new(".git")
+    );
+    let hooks = matches!(
+        components.next(),
+        Some(Component::Normal(value)) if value == OsStr::new("hooks")
+    );
+    let hook_file = matches!(
+        components.next(),
+        Some(Component::Normal(value))
+            if !value.to_string_lossy().starts_with('.')
+                && value != OsStr::new("hooks")
+                && value != OsStr::new(".git")
+    );
+    git && hooks && hook_file && components.next().is_none()
+}
+
+fn validate_relative_path(path: &str, allow_vcs_names: bool) -> Result<PathBuf, RepositoryError> {    if path.is_empty() {
         return Err(RepositoryError::InvalidOperation {
             message: "operation effect path cannot be empty".to_string(),
         });
@@ -3523,7 +4988,7 @@ fn copy_entry(source: &Path, destination: &Path) -> Result<(), RepositoryError> 
     Ok(())
 }
 
-fn write_new_synced(path: &Path, bytes: &[u8]) -> Result<(), RepositoryError> {
+pub(super) fn write_new_synced(path: &Path, bytes: &[u8]) -> Result<(), RepositoryError> {
     let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
     file.write_all(bytes)?;
     file.sync_all()?;

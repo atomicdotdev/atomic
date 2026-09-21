@@ -105,6 +105,7 @@ use std::collections::HashMap;
 /// let result = retrieve_graph(&txn, file_pos, RetrieveOptions::default())?;
 /// println!("Retrieved {} vertices", result.graph.len_vertices());
 /// ```
+
 pub fn retrieve_graph<T: GraphTxnT>(
     txn: &T,
     start_pos: Position<NodeId>,
@@ -117,6 +118,17 @@ pub fn retrieve_graph<T: GraphTxnT>(
     // different vertices: an empty inode span V[9:9] or a content span V[9:23].
     // Using the resolved span as the key ensures we visit each unique span once.
     let mut cache: HashMap<GraphNode<NodeId>, VertexId> = HashMap::new();
+    // Per-retrieval aliveness memo. `is_vertex_alive` iterates the vertex's
+    // parent edges and resolves causal dominance between them; on a heavily
+    // edited file the same vertices are re-checked across the main traversal
+    // and every `walk_through_dead` walk, which is the dominant repeated work.
+    // Aliveness is a pure function of (txn, options, vertex), so one memo per
+    // retrieval removes the repetition without changing any verdict.
+    let mut alive_memo: HashMap<GraphNode<NodeId>, bool> = HashMap::new();
+    // Per-retrieval reachability memo for the dead-walk's chain comparisons.
+    let mut chain_memo: HashMap<(GraphNode<NodeId>, GraphNode<NodeId>), bool> = HashMap::new();
+    // Shared causal-dominance memo across every aliveness check in this walk.
+    let mut dep_memo: HashMap<(NodeId, NodeId), bool> = HashMap::new();
 
     // Add dummy span at index 0
     result.graph.push_vertex(AliveVertex::DUMMY);
@@ -158,6 +170,13 @@ pub fn retrieve_graph<T: GraphTxnT>(
     let mut pending_bypass: HashMap<VertexId, Vec<VertexId>> = HashMap::new();
 
     while let Some(vid) = stack.pop() {
+        // Liveness fast path (review E4): the moment the traversal holds
+        // one alive non-empty vertex, the caller's "any alive bytes?"
+        // question is answered; walking the rest of a long-history file is
+        // wasted work. The option is opt-in and the graph is partial.
+        if options.stop_at_first_content && result.graph.total_bytes() > 0 {
+            break;
+        }
         // Check span limit
         if let Some(max) = options.max_vertices {
             if result.graph.len_vertices() >= max {
@@ -234,7 +253,7 @@ pub fn retrieve_graph<T: GraphTxnT>(
                 // additive model).  If the destination vertex is alive
                 // through some OTHER edge, the normal traversal will
                 // pick it up via that path.
-                let dest_alive = options.is_vertex_alive(txn, resolved_vertex)?;
+                let dest_alive = memo_vertex_alive(&options, txn, resolved_vertex, &mut alive_memo, &mut dep_memo)?;
 
                 if !dest_alive {
                     let successors = walk_through_dead(
@@ -244,6 +263,9 @@ pub fn retrieve_graph<T: GraphTxnT>(
                         resolved_vertex,
                         &mut stack,
                         &mut cache,
+                        &mut alive_memo,
+                        &mut chain_memo,
+                        &mut dep_memo,
                         &mut result,
                     )?;
                     // Collect bypass children; placement decided after
@@ -270,7 +292,7 @@ pub fn retrieve_graph<T: GraphTxnT>(
                 // Otherwise, use the normal create_alive_vertex check.
                 let alive_vertex = if options.deletion_aware() {
                     // Full vertex aliveness check using typed parent iteration
-                    if !options.is_vertex_alive(txn, resolved_vertex)? {
+                    if !memo_vertex_alive(&options, txn, resolved_vertex, &mut alive_memo, &mut dep_memo)? {
                         // Vertex was deleted at the target state.  Skip
                         // emitting it, but walk THROUGH it to find live
                         // successors so we don't lose unrelated downstream
@@ -282,6 +304,9 @@ pub fn retrieve_graph<T: GraphTxnT>(
                             resolved_vertex,
                             &mut stack,
                             &mut cache,
+                            &mut alive_memo,
+                            &mut chain_memo,
+                            &mut dep_memo,
                             &mut result,
                         )?;
                         for succ_vid in successors {
@@ -304,6 +329,9 @@ pub fn retrieve_graph<T: GraphTxnT>(
                         resolved_vertex,
                         &mut stack,
                         &mut cache,
+                        &mut alive_memo,
+                        &mut chain_memo,
+                        &mut dep_memo,
                         &mut result,
                     )?;
                     for succ_vid in successors {
@@ -418,6 +446,22 @@ pub fn retrieve_graph<T: GraphTxnT>(
 /// responsible for adding those successors to its `children_to_add`
 /// list so they appear as proper graph children of the upstream alive
 /// parent.
+/// Memoized vertex-aliveness lookup for one `retrieve_graph` call.
+fn memo_vertex_alive<T: GraphTxnT>(
+    options: &RetrieveOptions,
+    txn: &T,
+    vertex: GraphNode<NodeId>,
+    memo: &mut std::collections::HashMap<GraphNode<NodeId>, bool>,
+    dep_memo: &mut std::collections::HashMap<(NodeId, NodeId), bool>,
+) -> Result<bool, PristineError> {
+    if let Some(&alive) = memo.get(&vertex) {
+        return Ok(alive);
+    }
+    let alive = options.is_vertex_alive_with_memo(txn, vertex, dep_memo)?;
+    memo.insert(vertex, alive);
+    Ok(alive)
+}
+
 fn walk_through_dead<T: GraphTxnT>(
     txn: &T,
     options: &RetrieveOptions,
@@ -425,11 +469,14 @@ fn walk_through_dead<T: GraphTxnT>(
     dead_vertex: GraphNode<NodeId>,
     stack: &mut Vec<VertexId>,
     cache: &mut std::collections::HashMap<GraphNode<NodeId>, VertexId>,
+    alive_memo: &mut std::collections::HashMap<GraphNode<NodeId>, bool>,
+    chain_memo: &mut std::collections::HashMap<(GraphNode<NodeId>, GraphNode<NodeId>), bool>,
+    dep_memo: &mut std::collections::HashMap<(NodeId, NodeId), bool>,
     result: &mut RetrieveResult,
 ) -> Result<Vec<VertexId>, PristineError> {
     use std::collections::HashSet;
     let mut live_successors: Vec<VertexId> = Vec::new();
-
+    
     // BFS through dead vertices, recording live ones we encounter.
     //
     // We track three sets separately:
@@ -468,7 +515,7 @@ fn walk_through_dead<T: GraphTxnT>(
             }
 
             // Is this vertex alive in our view?
-            let alive = options.is_vertex_alive(txn, next_vertex)?;
+            let alive = memo_vertex_alive(options, txn, next_vertex, alive_memo, dep_memo)?;
 
             if alive {
                 // Live successor. Only surface it as a bypass child when
@@ -486,7 +533,7 @@ fn walk_through_dead<T: GraphTxnT>(
                         crate::types::ParentEdgeKind::Block
                         | crate::types::ParentEdgeKind::Folder => {
                             let source_vertex = txn.find_block_end(parent.dest)?;
-                            if !options.is_vertex_alive(txn, source_vertex)? {
+                            if !memo_vertex_alive(options, txn, source_vertex, alive_memo, dep_memo)? {
                                 continue;
                             }
                             if source_vertex == owner_parent {
@@ -525,7 +572,7 @@ fn walk_through_dead<T: GraphTxnT>(
                     let mut shadowed_by_existing = false;
                     for existing_vid in live_successors.iter().copied() {
                         let existing_node = result.graph.get_vertex(existing_vid).node;
-                        if visible_chain_reaches(txn, options, existing_node, next_vertex)? {
+                        if memo_visible_chain_reaches(txn, options, existing_node, next_vertex, chain_memo)? {
                             shadowed_by_existing = true;
                             break;
                         }
@@ -535,7 +582,7 @@ fn walk_through_dead<T: GraphTxnT>(
                         let mut retained = Vec::with_capacity(live_successors.len());
                         for existing_vid in live_successors.drain(..) {
                             let existing_node = result.graph.get_vertex(existing_vid).node;
-                            if !visible_chain_reaches(txn, options, next_vertex, existing_node)? {
+                            if !memo_visible_chain_reaches(txn, options, next_vertex, existing_node, chain_memo)? {
                                 retained.push(existing_vid);
                             }
                         }
@@ -560,6 +607,26 @@ fn walk_through_dead<T: GraphTxnT>(
     }
 
     Ok(live_successors)
+}
+
+/// Memoized `visible_chain_reaches` for one `retrieve_graph` call. The
+/// reachability question is a pure function of (txn, options, start, target),
+/// and the dead-walk asks the same pairs repeatedly; without the memo each
+/// answer re-runs a full forward DFS.
+fn memo_visible_chain_reaches<T: GraphTxnT>(
+    txn: &T,
+    options: &RetrieveOptions,
+    start: GraphNode<NodeId>,
+    target: GraphNode<NodeId>,
+    memo: &mut std::collections::HashMap<(GraphNode<NodeId>, GraphNode<NodeId>), bool>,
+) -> Result<bool, PristineError> {
+    let key = (start, target);
+    if let Some(&reaches) = memo.get(&key) {
+        return Ok(reaches);
+    }
+    let reaches = visible_chain_reaches(txn, options, start, target)?;
+    memo.insert(key, reaches);
+    Ok(reaches)
 }
 
 fn visible_chain_reaches<T: GraphTxnT>(

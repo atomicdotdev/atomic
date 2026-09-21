@@ -132,6 +132,86 @@ fn rebase_marker_is_detected_even_when_libgit_reports_clean() {
     assert!(markers.contains(&GitOperationMarker::RebaseMerge));
 }
 
+/// A standalone `AUTO_MERGE` root ref (merge-ort's derived tree reference)
+/// with a `Clean` libgit2 state and no other marker must not fence a matching
+/// anchored workspace.
+#[test]
+fn standalone_auto_merge_ref_permits_ready_entry() {
+    let (directory, mut repo, head, tree) = initialized_colocated_repository();
+    write_checkpoint(directory.path(), &repo, &head, &tree);
+    fs::write(directory.path().join(".git/AUTO_MERGE"), format!("{tree}\n")).unwrap();
+    let checkpoint_path = directory.path().join(".atomic/bridge/workspace.json");
+    let checkpoint_before = fs::read(&checkpoint_path).unwrap();
+    let tracked_before = fs::read(directory.path().join("tracked.txt")).unwrap();
+
+    let WorkspaceTxnStart::Ready(txn) =
+        repo.begin_workspace_txn(WorkspaceTxnMode::Observe).unwrap()
+    else {
+        panic!("a standalone AUTO_MERGE must not fence a clean anchored workspace");
+    };
+    drop(txn);
+
+    // The advisory ref is left byte-identical and nothing was materialized.
+    assert_eq!(
+        fs::read(directory.path().join(".git/AUTO_MERGE")).unwrap(),
+        format!("{tree}\n").into_bytes()
+    );
+    assert_eq!(fs::read(&checkpoint_path).unwrap(), checkpoint_before);
+    assert_eq!(
+        fs::read(directory.path().join("tracked.txt")).unwrap(),
+        tracked_before
+    );
+}
+
+/// A genuine stopped merge writes `MERGE_HEAD`; with `AUTO_MERGE` also present
+/// it must still refuse.
+#[test]
+fn merge_head_with_auto_merge_ref_still_refuses() {
+    let (directory, mut repo, head, tree) = initialized_colocated_repository();
+    write_checkpoint(directory.path(), &repo, &head, &tree);
+    fs::write(
+        directory.path().join(".git/MERGE_HEAD"),
+        format!("{head}\n"),
+    )
+    .unwrap();
+    fs::write(directory.path().join(".git/AUTO_MERGE"), format!("{tree}\n")).unwrap();
+
+    let WorkspaceTxnStart::Remediation(WorkspaceRemediation::GitOperationInProgress {
+        markers,
+        ..
+    }) = repo.begin_workspace_txn(WorkspaceTxnMode::Observe).unwrap()
+    else {
+        panic!("an active merge must return typed remediation");
+    };
+    assert!(markers.contains(&GitOperationMarker::MergeHead));
+    assert!(markers.contains(&GitOperationMarker::AutoMerge));
+}
+
+/// An unmerged index refuses even when `AUTO_MERGE` is the only marker.
+/// (The synthetic classification test in `workspace_txn.rs` covers the exact
+/// `index_stages = [1,2,3]` lease; the real-repository conflict case is
+/// covered by the CLI observation suite.)
+#[test]
+fn unmerged_index_with_standalone_auto_merge_ref_still_refuses() {
+    let (directory, mut repo, head, tree) = initialized_colocated_repository();
+    write_checkpoint(directory.path(), &repo, &head, &tree);
+    fs::write(directory.path().join(".git/AUTO_MERGE"), format!("{tree}\n")).unwrap();
+    // Mirror the observer's unmerged-stage evidence without corrupting the
+    // on-disk index: the boundary is driven purely by the observed stages.
+    let mut stages = observe_git_metadata(directory.path()).unwrap();
+    let WorkspaceGitObservation::Repository(git) = &mut stages else {
+        panic!("expected a Git repository");
+    };
+    git.index_stages = vec![0, 1, 2, 3];
+    let start = repo
+        .begin_workspace_txn_with(WorkspaceTxnMode::Observe, |_| Ok(stages.clone()))
+        .unwrap();
+    assert!(matches!(
+        start,
+        WorkspaceTxnStart::Remediation(WorkspaceRemediation::GitOperationInProgress { .. })
+    ));
+}
+
 #[test]
 fn changed_head_blocks_filesystem_phase_before_reconciliation() {
     let (directory, mut repo, _head, tree) = initialized_colocated_repository();
@@ -162,6 +242,65 @@ fn changed_head_blocks_filesystem_phase_before_reconciliation() {
         WorkspaceFilesystemPlan::BlockedUntilHeadAligned
     );
     assert_eq!(plan.refs(), WorkspaceRefPlan::Deferred);
+}
+
+#[test]
+fn head_mutation_between_observations_retries_at_most_three_times_and_never_mutates() {
+    let (directory, mut repo, head, tree) = initialized_colocated_repository();
+    write_checkpoint(directory.path(), &repo, &head, &tree);
+    let working_copy = repo.require_working_copy_id().unwrap();
+    let state_before = repo.working_copy_record(working_copy).unwrap().desired_state;
+    let checkpoint_bytes =
+        fs::read(directory.path().join(".atomic/bridge/workspace.json")).unwrap();
+
+    // Injected TOCTOU: every observation reports a different index digest
+    // while the classified facts (HEAD, index tree) stay checkpoint-stable,
+    // so the boundary can never observe the same token twice. HEAD/index are
+    // observed before the filesystem phase on every attempt, and after
+    // MAX_WORKSPACE_TXN_ATTEMPTS (3) unstable observations the boundary
+    // returns the typed ConcurrentGitMutation remediation.
+    let mut flips = 0usize;
+    let unstable = |root: &Path| -> Result<WorkspaceGitObservation, super::ObservationError> {
+        let mut observation = observe_git_metadata(root)?;
+        if let WorkspaceGitObservation::Repository(git) = &mut observation {
+            flips += 1;
+            let mut digest = [0u8; 32];
+            digest[0] = flips as u8;
+            git.index_digest = atomic_core::Hash::from_bytes(digest);
+        }
+        Ok(observation)
+    };
+    let start = repo.begin_workspace_txn_with(WorkspaceTxnMode::Reconcile, unstable).unwrap();
+    let WorkspaceTxnStart::Remediation(WorkspaceRemediation::ConcurrentGitMutation {
+        attempts,
+        ..
+    }) = start
+    else {
+        panic!("an unstable baseline must end in the typed TOCTOU remediation");
+    };
+    assert_eq!(
+        attempts, MAX_WORKSPACE_TXN_ATTEMPTS,
+        "the boundary retries at most three times"
+    );
+
+    // Nothing was mutated by the refused boundary.
+    assert_eq!(
+        repo.working_copy_record(working_copy).unwrap().desired_state,
+        state_before
+    );
+    assert_eq!(
+        fs::read(directory.path().join(".atomic/bridge/workspace.json")).unwrap(),
+        checkpoint_bytes
+    );
+    let log = repo
+        .operation_log(OperationScope::WorkingCopy(working_copy), None, false)
+        .unwrap();
+    assert!(
+        !log.entries
+            .iter()
+            .any(|entry| entry.operation.payload().kind != atomic_core::operation::OperationKind::Anchor),
+        "an unstable boundary journals nothing beyond the anchor"
+    );
 }
 
 #[test]

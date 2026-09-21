@@ -101,6 +101,7 @@
 //! - **16.4** — `FileSubscription` for background real-time events (optional)
 //! - **16.5** — `FallbackWatcher` for environments without Watchman
 
+pub mod bridge;
 pub mod fallback;
 
 use std::future::Future;
@@ -271,6 +272,104 @@ pub trait FileWatcher: Send + Sync {
 
 // Factory Function
 
+/// The watcher tier a factory call selected (review R4: explicit, not
+/// inferred from a fallback-only bracket).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WatcherTier {
+    /// The real Watchman turn watcher. **Unshipped** in this release
+    /// (Phase 16.2–16.3): a detected Watchman daemon is reported and the
+    /// snapshot fallback is used, so no code path can claim Watchman
+    /// semantics it does not implement.
+    Watchman,
+    /// The always-available snapshot-based watcher.
+    Fallback,
+}
+
+/// Probe whether a Watchman daemon is reachable (`watchman get-sockname`).
+///
+/// CB-13D ::24 R4: the probe is BOUNDED — a stuck (never-exiting) daemon
+/// is killed after the timeout and reports unavailable, so no
+/// `create_watcher` caller (ordinary reconcile/switch or managed-agent
+/// setup) can hang behind an optional daemon that never answers. A
+/// missing binary or a failing socket query simply reports unavailable.
+/// Never used as state authority — availability only selects which honest
+/// diagnostic the factory emits.
+fn watchman_available() -> bool {
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+    const PROBE_TIMEOUT: Duration = Duration::from_millis(500);
+    let Ok(mut child) = std::process::Command::new("watchman")
+        .arg("get-sockname")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    else {
+        return false;
+    };
+    let deadline = Instant::now() + PROBE_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.success(),
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+        }
+    }
+}
+
+/// Create a [`FileWatcher`] using the best available backend.
+///
+/// The factory reports the selected tier explicitly (review R4): a
+/// detected Watchman daemon is named, and the fact that the Watchman
+/// turn-watcher adapter is **unshipped** (Phase 16.2–16.3 in
+/// ATOMIC-AGENT-TASKS.md) is stated as the reason the snapshot fallback
+/// runs — it is never silently attributed to missing test infrastructure.
+///
+/// # Arguments
+///
+/// * `config` — Watcher configuration (repo root, ignore patterns)
+///
+/// # Returns
+///
+/// A boxed `FileWatcher` implementation together with the tier that was
+/// selected, so callers can log/observe the honest tier.
+pub async fn create_watcher_with_tier(
+    config: WatcherConfig,
+) -> AgentResult<(Box<dyn FileWatcher>, WatcherTier)> {
+    if watchman_available() {
+        // The Watchman adapter is unshipped in this release. The fallback
+        // is a deliberate, explicitly-reported substitute — not an
+        // implementation hidden behind a missing daemon.
+        log::warn!(
+            "watcher tier: watchman daemon detected, but the Watchman turn-watcher adapter \
+             is unshipped (Phase 16.2-16.3); using the snapshot fallback watcher — \
+             state enter/leave and since-queries are NOT implemented"
+        );
+        return Ok((
+            Box::new(fallback::FallbackWatcher::new(config)),
+            // CB-13D ::24 R4 tier truth: the constructed adapter IS the
+            // snapshot fallback — reporting `Watchman` here made consumers
+            // believe state-enter/leave bracketing existed when it does
+            // not. The detection fact stays in the diagnostic above; the
+            // tier reports what actually runs.
+            WatcherTier::Fallback,
+        ));
+    }
+    log::info!(
+        "watcher tier: snapshot fallback (Watchman not reachable; \
+         install/enable Watchman when the adapter ships)"
+    );
+    Ok((
+        Box::new(fallback::FallbackWatcher::new(config)),
+        WatcherTier::Fallback,
+    ))
+}
+
 /// Create a [`FileWatcher`] using the best available backend.
 ///
 /// Attempts to connect to Watchman first. If Watchman is not running or
@@ -287,25 +386,12 @@ pub trait FileWatcher: Send + Sync {
 ///
 /// # Implementation Status
 ///
-/// Currently returns a `FallbackWatcher` unconditionally. The Watchman
-/// backend will be implemented in Phase 16.2–16.3.
+/// The snapshot fallback ships. The Watchman backend is unshipped
+/// (Phase 16.2–16.3): availability is probed and reported, but the returned
+/// watcher is always the snapshot fallback — see
+/// [`create_watcher_with_tier`] for the explicit tier selection.
 pub async fn create_watcher(config: WatcherConfig) -> AgentResult<Box<dyn FileWatcher>> {
-    // Watchman backend (Phase 16.2-16.3 in ATOMIC-AGENT-TASKS.md):
-    //
-    // When implemented, this function will attempt to connect to the Watchman
-    // daemon first. If successful, it returns a WatchmanTurnWatcher that uses
-    // clock + since queries for O(changed-files) detection. If Watchman is not
-    // running, it falls through to the snapshot-based fallback below.
-    //
-    // The Watchman backend will use:
-    //   - watchman_client::Connector::new().connect() for connection
-    //   - client.clock() + client.query(since: ...) for turn boundary diffing
-    //   - client.state_enter/state_leave("atomic-turn") for subscriber coordination
-    //   - Expr::Not(DirName(".atomic")) to exclude the repo metadata directory
-
-    // Fall back to snapshot-based watcher (always available, O(all files) per boundary)
-    log::info!("Using fallback file watcher (install Watchman for faster change detection)");
-    Ok(Box::new(fallback::FallbackWatcher::new(config)))
+    Ok(create_watcher_with_tier(config).await?.0)
 }
 
 // Tests
@@ -315,6 +401,50 @@ mod tests {
     use super::*;
 
     // WatcherConfig tests
+
+
+    /// CB-13D ::24 R4: a STUCK Watchman daemon (never answers, never
+    /// exits) must not hang `create_watcher` — the bounded probe kills it
+    /// after the timeout and the factory proceeds to the fallback with the
+    /// honest tier. Failing before (the probe blocked forever on
+    /// `Command::output`), passing after.
+    #[test]
+    fn stuck_watchman_daemon_cannot_hang_the_factory() {
+        let shim_dir = tempfile::tempdir().unwrap();
+        let shim = shim_dir.path().join("watchman");
+        std::fs::write(
+            &shim,
+            "#!/bin/sh\nsleep 300\n",
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let path_env = format!(
+            "{}:{}",
+            shim_dir.path().display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+
+        let config = WatcherConfig::new("/repo");
+        let started = std::time::Instant::now();
+        let watcher_and_tier = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async { create_watcher_with_tier(config).await })
+            .expect("the factory must survive a stuck daemon");
+        let (watcher, tier) = watcher_and_tier;
+        let elapsed = started.elapsed();
+        drop(watcher);
+        assert!(
+            elapsed < std::time::Duration::from_secs(30),
+            "the factory must not hang behind a stuck daemon: {elapsed:?}"
+        );
+        // Tier truth: the constructed adapter IS the snapshot fallback.
+        assert_eq!(tier, WatcherTier::Fallback, "tier truth");
+    }
 
     #[test]
     fn test_config_new() {

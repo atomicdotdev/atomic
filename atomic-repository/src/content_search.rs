@@ -46,6 +46,24 @@ pub fn build_content_index(repo_root: &Path) -> Result<(), ContentSearchError> {
     Ok(())
 }
 
+/// Refresh the content index for an import, skipping the full rebuild when
+/// the existing index is already current (RFC §21 measured budgets, CB-13C
+/// AC-3).
+///
+/// `rebuild_if_stale` is HEAD-based: a full rebuild stamps the current Git
+/// HEAD as the index's `base_commit`, so an import that does not move Git
+/// leaves the index current and the next import's refresh is a no-op. Only
+/// a missing or unusable index falls back to the full walk-and-rebuild —
+/// which is the cold-import behavior this preserves.
+pub fn refresh_content_index(repo_root: &Path) -> Result<(), ContentSearchError> {
+    match update_content_index(repo_root) {
+        Ok(()) => Ok(()),
+        // Missing or unusable index: fall back to the full walk-and-rebuild
+        // (the cold-import behavior this preserves).
+        Err(_) => build_content_index(repo_root),
+    }
+}
+
 /// Incrementally update the content index after file changes.
 ///
 /// If the repository HEAD has moved since the last full build, this performs

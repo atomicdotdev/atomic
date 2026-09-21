@@ -70,9 +70,20 @@ pub struct Diff {
     #[arg(long)]
     pub untracked: bool,
 
-    /// Show staged changes (reserved for future use).
-    #[arg(long, hide = true)]
+    /// Show staged changes (baseline → index) in `--git` mode.
+    ///
+    /// Without `--git` this flag is reserved and has no effect.
+    #[arg(long)]
     pub cached: bool,
+
+    /// Git-inspired, versioned staging diff (RFC §9.1/§9.2).
+    ///
+    /// Compares two distinct layers: with `--cached`, the Git baseline
+    /// (HEAD tree) against the index (staged); by default, the index against
+    /// the worktree (unstaged). This is a bounded subset; the native
+    /// baseline→worktree diff remains the default behavior without `--git`.
+    #[arg(long)]
+    pub git: bool,
 
     /// View to compare against.
     #[arg(long, add = ArgValueCompleter::new(complete_view_names))]
@@ -105,6 +116,7 @@ impl Diff {
             short: false,
             untracked: false,
             cached: false,
+            git: false,
             view: None,
             snapshot: false,
             word_diff: false,
@@ -220,12 +232,275 @@ impl Diff {
     }
 
     fn workspace_mode(&self) -> WorkspaceTxnMode {
-        if self.change.is_some() || self.snapshot {
+        if self.change.is_some() || self.snapshot || self.git {
             WorkspaceTxnMode::Observe
         } else {
             WorkspaceTxnMode::Reconcile
         }
     }
+
+    /// Versioned Git-inspired staging diff (CB-11A).
+    ///
+    /// Read-only comparison of two adjacent layers:
+    /// - `--cached`: Git baseline (HEAD tree) → index (staged),
+    /// - default: index → worktree (unstaged).
+    fn run_git_diff(&self, repo_root: &std::path::Path) -> CliResult<()> {
+        use std::collections::BTreeMap;
+
+        // The --git staging diff is a versioned, bounded subset (RFC §9.1):
+        // the version marker makes the contract inspectable in every output
+        // format and asserts this is not full Git porcelain compatibility.
+        println!("# atomic-diff-git v1 (bounded subset; layers: --cached baseline→index, default index→worktree)");
+
+        let mut repo =
+            Repository::open_readonly(repo_root).map_err(|e| CliError::InvalidRepository {
+                reason: e.to_string(),
+            })?;
+        let workspace = match observe_workspace(&mut repo)? {
+            Ok(workspace) => workspace,
+            Err(remediation) => return Err(remediation_error(remediation)),
+        };
+        let _ = workspace;
+
+        let git_repo = git2::Repository::open(repo_root).map_err(|error| CliError::GitError {
+            message: format!("cannot open Git repository: {error}"),
+        })?;
+        let policy = crate::commands::git::parallel::conversion_policy(&git_repo)?;
+        let filter = atomic_repository::GitAttributesFilter::for_repository(repo_root);
+
+        // Baseline: HEAD tree blobs (read-only).
+        let mut baseline: BTreeMap<String, (Vec<u8>, u32)> = BTreeMap::new();
+        if let Ok(head) = git_repo.head() {
+            if let Ok(commit) = head.peel_to_commit() {
+                if let Ok(tree) = commit.tree() {
+                    collect_baseline_blobs(&git_repo, &tree, &mut Vec::new(), &mut baseline)?;
+                }
+            }
+        }
+
+        // Index: stage-0 entries with blob content (read-only ODB access).
+        let index_state =
+            atomic_repository::observe_git_index(repo_root, &policy).map_err(|error| {
+                CliError::GitError {
+                    message: error.to_string(),
+                }
+            })?;
+        let mut index: BTreeMap<String, (Vec<u8>, u32)> = BTreeMap::new();
+        for entry in &index_state.entries {
+            if entry.stage != 0 || entry.sparse_directory {
+                continue;
+            }
+            let path = String::from_utf8_lossy(entry.path.as_bytes()).into_owned();
+            let Some(oid) = &entry.oid else { continue };
+            let gid =
+                git2::Oid::from_bytes(oid.as_bytes()).map_err(|error| CliError::GitError {
+                    message: format!("cannot parse index object id: {error}"),
+                })?;
+            let content = git_repo
+                .find_blob(gid)
+                .map(|blob| blob.content().to_vec())
+                .unwrap_or_default();
+            index.insert(path, (content, entry.mode));
+        }
+
+        // Worktree: cleaned repository bytes for paths of interest.
+        let mut worktree_content: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+        let mut read_worktree = |path: &str, worktree: &mut BTreeMap<String, Vec<u8>>| {
+            if worktree.contains_key(path) {
+                return;
+            }
+            let native = repo_root.join(path);
+            let Ok(metadata) = std::fs::symlink_metadata(&native) else {
+                return;
+            };
+            let bytes = if metadata.file_type().is_symlink() {
+                std::fs::read_link(&native)
+                    .map(|target| target.to_string_lossy().into_owned().into_bytes())
+                    .unwrap_or_default()
+            } else if metadata.is_file() {
+                match std::fs::read(&native) {
+                    Ok(bytes) => bytes,
+                    Err(_) => return,
+                }
+            } else {
+                return;
+            };
+            let cleaned = atomic_repository::ContentFilter::clean(
+                &filter,
+                std::path::Path::new(path),
+                &bytes,
+            )
+            .map(|filtered| filtered.bytes)
+            .unwrap_or(bytes);
+            worktree.insert(path.to_string(), cleaned);
+        };
+
+        let algorithm = self.parse_algorithm()?;
+        let mut file_diffs: Vec<FileDiff> = Vec::new();
+        let mut stats = DiffStats::new();
+
+        if self.cached {
+            // Staged layer: baseline → index.
+            let paths: BTreeMap<String, ()> = baseline
+                .keys()
+                .chain(index.keys())
+                .map(|path| (path.clone(), ()))
+                .collect();
+            for path in paths.keys() {
+                if !self.files.is_empty() && !self.files.iter().any(|file| file == path) {
+                    continue;
+                }
+                let old = baseline.get(path).map(|(bytes, _)| bytes.clone());
+                let new = index.get(path).map(|(bytes, _)| bytes.clone());
+                if old == new {
+                    continue;
+                }
+                let diff = build_layer_file_diff(
+                    path,
+                    old,
+                    new,
+                    index.contains_key(path),
+                    baseline.contains_key(path),
+                    algorithm,
+                    self.context,
+                )?;
+                stats.add_file(diff.stats.clone());
+                file_diffs.push(diff);
+            }
+        } else {
+            // Unstaged layer: index → worktree. skip-worktree and
+            // assume-unchanged entries are exempt from worktree comparison.
+            let flagged: std::collections::BTreeSet<String> = index_state
+                .entries
+                .iter()
+                .filter(|entry| entry.stage == 0 && (entry.skip_worktree || entry.assume_unchanged))
+                .map(|entry| String::from_utf8_lossy(entry.path.as_bytes()).into_owned())
+                .collect();
+            let paths: BTreeMap<String, ()> = index
+                .keys()
+                .filter(|path| !flagged.contains(*path))
+                .map(|path| (path.clone(), ()))
+                .collect();
+            for path in paths.keys() {
+                if !self.files.is_empty() && !self.files.iter().any(|file| file == path) {
+                    continue;
+                }
+                read_worktree(path, &mut worktree_content);
+                let old = index.get(path).map(|(bytes, _)| bytes.clone());
+                let new = worktree_content.get(path).cloned();
+                if old == new {
+                    continue;
+                }
+                let diff = build_layer_file_diff(
+                    path,
+                    old,
+                    new,
+                    worktree_content.contains_key(path),
+                    index.contains_key(path),
+                    algorithm,
+                    self.context,
+                )?;
+                stats.add_file(diff.stats.clone());
+                file_diffs.push(diff);
+            }
+        }
+
+        if file_diffs.is_empty() {
+            self.print_no_changes();
+            return Ok(());
+        }
+
+        let config = self.get_output_config();
+        match config.format {
+            DiffFormat::Unified => self.print_unified(&file_diffs, &config),
+            DiffFormat::Stat => self.print_stat(&stats, &config),
+            DiffFormat::NameOnly => self.print_name_only(&file_diffs),
+            DiffFormat::NameStatus => self.print_name_status(&file_diffs, &config),
+        }
+    }
+}
+
+/// Collect HEAD tree blob entries recursively into `path -> (bytes, mode)`.
+fn collect_baseline_blobs(
+    repository: &git2::Repository,
+    tree: &git2::Tree<'_>,
+    prefix: &mut Vec<u8>,
+    output: &mut std::collections::BTreeMap<String, (Vec<u8>, u32)>,
+) -> CliResult<()> {
+    for entry in tree.iter() {
+        let mut path = prefix.clone();
+        if !path.is_empty() {
+            path.push(b'/');
+        }
+        path.extend_from_slice(entry.name_bytes());
+        if entry.kind() == Some(git2::ObjectType::Tree) {
+            let child = repository
+                .find_tree(entry.id())
+                .map_err(|error| CliError::GitError {
+                    message: format!("cannot read subtree {}: {error}", entry.id()),
+                })?;
+            collect_baseline_blobs(repository, &child, &mut path, output)?;
+        } else {
+            let content = if entry.kind() == Some(git2::ObjectType::Blob) {
+                repository
+                    .find_blob(entry.id())
+                    .map(|blob| blob.content().to_vec())
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            output.insert(
+                String::from_utf8_lossy(&path).into_owned(),
+                (content, entry.filemode() as u32),
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Build one file diff between two layer byte-sets.
+fn build_layer_file_diff(
+    path: &str,
+    old: Option<Vec<u8>>,
+    new: Option<Vec<u8>>,
+    new_present: bool,
+    old_present: bool,
+    algorithm: Algorithm,
+    context: usize,
+) -> CliResult<FileDiff> {
+    let (diff, old_bytes, new_bytes) = match (old_present.then_some(()), new_present.then_some(()))
+    {
+        (Some(()), Some(())) => {
+            let diff = FileDiff::modified(path);
+            (diff, old.unwrap_or_default(), new.unwrap_or_default())
+        }
+        (None, Some(())) => {
+            let diff = FileDiff::added(path);
+            (diff, Vec::new(), new.unwrap_or_default())
+        }
+        (Some(()), None) => {
+            let diff = FileDiff::deleted(path);
+            (diff, old.unwrap_or_default(), Vec::new())
+        }
+        (None, None) => {
+            return Err(CliError::InvalidArgument {
+                message: format!("diff for '{path}' has no content on either side"),
+            })
+        }
+    };
+
+    let diff_result = diff_text(&old_bytes, &new_bytes, algorithm);
+    let mut diff = diff;
+    if !diff_result.is_unchanged() {
+        let old_lines: Vec<_> = old_bytes.split(|&b| b == b'\n').collect();
+        let new_lines: Vec<_> = new_bytes.split(|&b| b == b'\n').collect();
+        let hunks = build_hunks_from_diff(&diff_result, &old_lines, &new_lines, context);
+        for hunk in hunks {
+            diff.add_hunk(hunk);
+        }
+    }
+    diff.compute_stats();
+    Ok(diff)
 }
 
 impl Default for Diff {
@@ -245,6 +520,11 @@ impl Command for Diff {
     fn run(&self) -> CliResult<()> {
         // Find the repository root
         let repo_root = find_repository_root()?;
+
+        // Git-inspired, versioned staging diff (observation-only).
+        if self.git {
+            return self.run_git_diff(&repo_root);
+        }
 
         // Open the repository and retain its stable workspace boundary for all diff work.
         let mode = self.workspace_mode();

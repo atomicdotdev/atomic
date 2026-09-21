@@ -335,6 +335,44 @@ mod tests {
     }
 
     #[test]
+    fn repair_rev_tree_bijection_removes_stale_and_backfills_missing() {
+        let dir = tempdir().unwrap();
+        let pristine = Pristine::open(dir.path().join("pristine")).unwrap();
+        let mut txn = pristine.write_txn().unwrap();
+        let live = Inode::new(7);
+        let stale = Inode::new(3);
+
+        txn.put_tree("kept.txt", live).unwrap();
+        // Simulate the 0.17.x re-bind residue: a reverse row for a dead inode
+        // that no forward row maps, plus a forward row whose inverse is
+        // missing. Both fail the bijection validation a later tree write
+        // performs.
+        {
+            let mut table = txn
+                .open_table_for_test(crate::pristine::tables::REV_TREE)
+                .unwrap();
+            table.insert(stale.get(), "kept.txt").unwrap();
+        }
+        txn.put_tree("gap.txt", Inode::new(9)).unwrap();
+        // Reverse row for inode 9 exists (put_tree writes both sides); drop
+        // it to model a missing inverse instead.
+        {
+            let mut table = txn
+                .open_table_for_test(crate::pristine::tables::REV_TREE)
+                .unwrap();
+            table.remove(Inode::new(9).get()).unwrap();
+        }
+        assert!(txn.validate_tree_bijection().is_err());
+
+        let (removed, inserted) = txn.repair_rev_tree_bijection().unwrap();
+        assert_eq!(removed, 1, "the stale dead-inode row is removed");
+        assert_eq!(inserted, 1, "the missing inverse is backfilled");
+        assert_eq!(txn.get_inode("kept.txt").unwrap(), Some(live));
+        assert_eq!(txn.get_path(live).unwrap().as_deref(), Some("kept.txt"));
+        txn.validate_tree_bijection().unwrap();
+    }
+
+    #[test]
     fn file_index_v2_reopens_and_coexists_with_unchanged_legacy_rows() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("pristine");
@@ -457,10 +495,28 @@ mod tests {
             reverse.insert(reverse_only.get(), "same.txt").unwrap();
         }
 
+        // Full-bijection consistency is enforced by `validate_tree_bijection`
+        // (and by `TreeProjectionPlan::plan`/`apply` in atomic-repository,
+        // the production removal path — see its batched-projection test).
         let error = txn.validate_tree_bijection().unwrap_err();
         assert!(error.to_string().contains("invariant violation"));
-        assert!(txn.del_tree("same.txt").is_err());
-        assert_eq!(txn.get_inode("same.txt").unwrap(), Some(primary));
+
+        // `del_tree` verifies its own point-invariant pair: TREE maps the
+        // path to the inode AND REV_TREE maps that inode back to the path.
+        // A point-level mismatch is refused without a full-table scan
+        // (RFC §21 measured budgets, CB-13C AC-3 — the former per-delete
+        // full REV_TREE scan was O(n) per delete, O(n²) per batch).
+        txn.put_tree("other.txt", Inode::new(3)).unwrap();
+        {
+            let mut reverse = txn.txn.open_table(REV_TREE).unwrap();
+            reverse.insert(3u64, "not-other.txt").unwrap();
+        }
+        let mismatch = txn.del_tree("other.txt").unwrap_err();
+        assert!(
+            mismatch.to_string().contains("REV_TREE maps that inode"),
+            "the point-level reverse mismatch must be refused, got: {mismatch}"
+        );
+        assert_eq!(txn.get_inode("other.txt").unwrap(), Some(Inode::new(3)));
         txn.abort().unwrap();
     }
 }

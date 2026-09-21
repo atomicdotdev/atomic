@@ -9,9 +9,18 @@ pub const REQUIRED_CAPABILITY_PREFIX: &str = "required-capability/";
 pub const CHANGE_FORMAT_VNEXT_CAPABILITY: RepositoryCapability =
     RepositoryCapability::new("change-format-vnext", 1);
 
+/// CB-13B: capability a repository requires once the transactional shadow
+/// migration has cut over to the colocated bridge.
+///
+/// The requirement lives in `PRISTINE_META` under `required-capability/`,
+/// so builds that predate this capability fail closed on open instead of
+/// writing through a legacy shadow pipeline the repository no longer owns.
+pub const BRIDGE_CUTOVER_CAPABILITY: RepositoryCapability =
+    RepositoryCapability::new("git-bridge-cutover", 1);
+
 /// Capabilities supported by this Atomic build.
 pub const SUPPORTED_REPOSITORY_CAPABILITIES: &[RepositoryCapability] =
-    &[CHANGE_FORMAT_VNEXT_CAPABILITY];
+    &[CHANGE_FORMAT_VNEXT_CAPABILITY, BRIDGE_CUTOVER_CAPABILITY];
 
 /// A repository capability and the minimum version required to use it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

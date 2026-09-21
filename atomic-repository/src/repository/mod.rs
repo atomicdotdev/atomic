@@ -78,18 +78,30 @@ use crate::RepositoryError;
 
 // ── Sub-modules (new) ───────────────────────────────────────────────────
 
+mod anchor;
+mod adoption;
+mod conflict_object;
+mod conflict_reconcile;
+mod cutover;
 mod deferred_tree;
 mod equivalence;
 mod file_index_v2;
 mod filter;
+mod ignore_mirror;
 mod git_observation;
+mod binding_fetch;
+mod binding_store;
 mod locks;
 mod materialize;
 mod migration;
 mod name_resolution;
+pub mod observability;
 mod operation;
 mod project_tree;
 mod projection;
+mod projection_commit;
+mod projection_effects;
+pub mod ref_mapping;
 mod repair;
 mod sandbox;
 mod semantic_materialize;
@@ -97,13 +109,27 @@ mod set_id;
 mod snapshot;
 mod snapshot_split;
 mod split;
+mod staging;
+mod synthesis;
+mod resurrection;
 mod switch;
+mod tag_projection;
 mod views;
 mod working_copy;
+mod working_copy_reconcile;
 mod workspace_txn;
 
 // Re-export public items so external callers and sibling sub-modules that
 // use `use super::*;` continue to resolve them at `crate::repository::…`.
+pub use workspace_txn::{
+    git_state_quiescent, git_locks_present, GitQuiescence, ReconcileEffectBudget,
+    MIN_REACTIVE_QUIESCENCE_MS,
+};
+pub use cutover::{
+    BridgeCutoverAudit, BridgeCutoverOutcome, BridgeCutoverPlan, CutoverAuditDisposition,
+    CutoverSchemaAudit,
+};
+pub use anchor::{AdoptBoundHead, DetachedImportTarget};
 pub use equivalence::{
     compare_project_state, compare_project_to_index, compare_project_to_worktree,
     verify_prospective_equivalence, EquivalenceClaims, EquivalenceLayer, EquivalenceMismatch,
@@ -115,26 +141,43 @@ pub use filter::{
     graph_visibility_closure, graph_visibility_from_membership, view_membership,
     view_membership_at_sequence,
 };
+pub use ignore_mirror::{
+    check_ignore_policy, mirror_ignores, IgnoreMirrorError, IgnorePolicyReport,
+    MANAGED_BLOCK_BEGIN, MANAGED_BLOCK_END,
+};
 pub use git_observation::{
-    observe_git_index, observe_git_metadata, observe_worktree, GitAdminEntryKind,
-    GitAdminPathObservation, GitHeadObservation, GitObservationToken, GitOperationMarker,
-    GitOperationMarkerObservation, GitOperationObservation, ObservationError,
-    WorkspaceGitObservation, WorkspaceGitRepositoryObservation,
+    observe_colocated_git_readiness, observe_git_index, observe_git_metadata, observe_worktree,
+    ATOMIC_DISPATCHER_MARKER, ATOMIC_LEGACY_MARKER_BEGIN, ColocatedGitForm,
+    ColocatedGitReadiness, GitAdminEntryKind, GitAdminPathObservation, GitHeadObservation,
+    GitObservationToken, GitOperationMarker, GitOperationMarkerObservation, GitOperationObservation,
+    ObservationError, OwnedHookDispatcher, WorkspaceGitObservation,
+    WorkspaceGitRepositoryObservation,
 };
 pub use locks::RepositoryCommonLockGuard;
+pub use working_copy::detect_repository_root;
+pub use working_copy::canonical_dot_dir_for;
 pub use operation::{
     OperationDetails, OperationHeadState, OperationLog, OperationLogEntry,
-    OperationVerificationState, PreparedRemoteOperation,
+    OperationVerificationState, PreparedBridgeGitWrite, PreparedRemoteOperation,
 };
 pub use project_tree::{
-    ConversionPolicy, ExclusionPolicy, ExclusionReason, GitIndexEntry, GitIndexState, GitObject,
-    GitObjectDatabase, GitObjectKind, GitTree, GitTreeEntry, LossPolicy, ManifestDisposition,
-    ManifestRoot, PhysicalKind, PlatformCapabilities, ProjectTree, ProjectTreeError, RepoPath,
-    RepositoryEntry, RepositoryManifest, WorktreeEntry, WorktreeObservation,
-    CONVERSION_POLICY_VERSION, GIT_INDEX_STATE_VERSION, REPOSITORY_MANIFEST_VERSION,
-    REPO_PATH_VERSION, WORKTREE_OBSERVATION_VERSION,
+    escape_repo_path, unescape_repo_path, ConversionPolicy, ExclusionPolicy, ExclusionReason,
+    GitIndexEntry, GitIndexState, GitObject, GitObjectDatabase, GitObjectKind, GitTree,
+    GitTreeEntry, LossPolicy, ManifestDisposition, ManifestRoot, PhysicalKind,
+    PlatformCapabilities, ProjectTree, ProjectTreeError, RepoPath, RepositoryEntry,
+    RepositoryManifest, WorktreeEntry, WorktreeObservation, CONVERSION_POLICY_VERSION,
+    GIT_INDEX_STATE_VERSION, REPOSITORY_MANIFEST_VERSION, REPO_PATH_VERSION,
+    WORKTREE_OBSERVATION_VERSION,
 };
 pub use projection::effective_projection_closure;
+pub use projection_commit::{
+    armor_commit_signature, build_projected_commit, foreign_git_did, projection_commit_message,
+    signature_header_value, strip_signature_header, unarmor_commit_signature,
+    verify_commit_signature, write_projected_commit, write_raw_git_object, ProjectionAuthor,
+    ProjectionCommitError, ProjectionCommitInput, ProjectionIdentityMap, ProjectionParents,
+    ProjectionSigning, WholeViewMergeProof, ATOMIC_SIGNATURE_BEGIN, ATOMIC_SIGNATURE_END,
+    COMMIT_SIGNATURE_DOMAIN,
+};
 pub use sandbox::{SealOptions, SealResult, StageOptions, StageResult, SANDBOX_POINTER};
 pub use set_id::{effective_projection_identity, view_set_id, ViewIdentity};
 pub use snapshot::{
@@ -144,15 +187,27 @@ pub use snapshot_split::{
     IndexEntryState, IndexManifest, IndexManifestEntry, SnapshotSplitRefusal, SplitSnapshotError,
     SplitSnapshotOutcome, INDEX_MANIFEST_VERSION,
 };
+pub use staging::{
+    format_two_column, git_object_id_hex, observe_git_staging_state, observe_staging_state,
+    quote_path, BaselineEntry, StageCode, StagingEntry, StagingError, StagingNotice, StagingState,
+    ASSUME_VALID_FLAG, INTENT_TO_ADD_FLAG, SKIP_WORKTREE_FLAG, STAGING_STATE_VERSION,
+};
 pub use split::{SplitChange, SplitOptions, SplitOutcome};
+pub use projection_effects::{PreparedProjectionPublish, ProjectionCheckpointPlan};
+pub use tag_projection::TagProjectionOutcome;
+pub use conflict_reconcile::{
+    ConflictReconcileOutcome, StaleConflictDisposition, StaleConflictPath, StaleConflictReport,
+};
 pub use views::{ManifestApplyOutcome, ViewInfo};
+pub use working_copy_reconcile::{
+    WorkingCopyReconcileOutcome, WorkingCopyRegistrationDiagnosis,
+};
 pub use workspace_txn::{
     GitOperationDisposition, UnanchoredWorkspace, WorkspaceCheckpoint, WorkspaceEntryPlan,
     WorkspaceFilesystemPlan, WorkspaceHeadPlan, WorkspaceRefPlan, WorkspaceRemediation,
     WorkspaceTxn, WorkspaceTxnMode, WorkspaceTxnStart, MAX_WORKSPACE_ENTRY_PLAN_ITEMS,
     MAX_WORKSPACE_TXN_ATTEMPTS,
 };
-
 // Re-import workspace helpers from `switch` so they are available to
 // `mod.rs` (used in `init`) and to sibling sub-modules via `use super::*;`.
 use switch::{ensure_workspace_dir, workspace_path};
@@ -165,6 +220,7 @@ mod changes;
 mod content;
 mod history;
 mod insert;
+pub mod provenance_gate;
 mod provenance_summary;
 mod record;
 mod remotes;
@@ -185,7 +241,22 @@ mod verify;
 pub use insert::{
     ImportLineIndexSeed, ImportLineIndexSeedLine, ImportWriteOutcome, ImportWriteTimings,
 };
+pub use synthesis::{
+    git_resolution_metadata, git_synthesis_metadata, GitResolutionOrigin, GitSynthesisOrigin,
+    ResurrectionOutcome, StagedExpectation, StagedPathExpectation, StagedTreeExpectation,
+    SynthesisOutcome,
+};
+pub use resurrection::{
+    ExactResurrection, GitShaResolution, ProjectionProof,
+};
+pub use anchor::{
+    conversion_policy_for_git, format_equivalence_report, read_head_map,
+    BridgeAnchorError, BridgeAnchorOutcome, BridgeAnchorRefusal, HeadMapEntry,
+};
 pub use provenance_summary::ProvenanceSummary;
+pub use provenance_gate::{
+    GateBlocker, GateVerdict, MacKeyProvider, PublicationGateConfig,
+};
 pub use repair::{
     NativeIndex, NativeIndexProblem, NativeIndexProblemKind, NativeIndexRepairOutcome,
     NativeIndexReport,
@@ -203,10 +274,21 @@ pub use vault_intent::{
 };
 pub use vault_kg_enrich::KgEnrichStats;
 pub use vault_names::{derive_intent_prefix, generate_goal_name};
+pub use binding_fetch::{
+    BindingChangeSource, ClosureAcquisition, ClosureReadiness, IncompletenessReason,
+};
+pub use binding_store::{BindingPublication, VerifiedPublishedBinding, BINDING_REF_PREFIX};
+pub use conflict_object::{
+    ConflictClaimantObject, ConflictEntryKind, ConflictEntryObject, ConflictFileObject,
+    ConflictObjectError, ConflictRepresentability, ConflictSetObject, ConflictSideObject,
+    CONFLICT_SET_MAGIC, CONFLICT_SET_VERSION,
+};
 pub use verify::{VerifyProblem, VerifyReport};
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+pub(crate) use tests::{create_temp_repo, create_test_change};
 
 // ── Constants ───────────────────────────────────────────────────────────
 
@@ -407,8 +489,32 @@ default = "{}"
     ///
     /// Returns an error if no repository is found.
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, RepositoryError> {
+        Self::open_with_budget(path, ReconcileEffectBudget::Command)
+    }
+
+    /// Open an existing repository under an explicit effect budget (CB-13D).
+    ///
+    /// Under [`ReconcileEffectBudget::MetadataOnly`] the writable open
+    /// refuses *before* any recovery runs when the repository holds pending
+    /// work whose recovery would execute effect-bearing plans (deferred
+    /// tree alignment, incomplete working-copy or repository operation
+    /// heads): the returned error is
+    /// [`RepositoryError::ReactiveDeferred`] and nothing was mutated. A
+    /// [`ReconcileEffectBudget::Command`] open behaves exactly like
+    /// [`open`](Self::open).
+    pub fn open_with_budget<P: AsRef<Path>>(
+        path: P,
+        budget: ReconcileEffectBudget,
+    ) -> Result<Self, RepositoryError> {
         if let Some((working_root, canonical, view)) = sandbox::detect_sandbox(path.as_ref()) {
-            return Self::open_sandbox(working_root, canonical, &view);
+            // CB-13D ::24 R1: the sandbox open passes the SAME budget gate
+            // as the ordinary open — it must not return before the
+            // recovery fence (a metadata-only sandbox open refuses unsafe
+            // pending recovery instead of replaying it).
+            let mut sandbox = Self::open_sandbox(working_root, canonical, &view)?;
+            let working_copy = sandbox.require_working_copy_id()?;
+            sandbox.fence_recovery_for_budget(working_copy, budget)?;
+            return Ok(sandbox);
         }
 
         let mut layout = working_copy::discover_layout(path.as_ref())?;
@@ -451,20 +557,7 @@ default = "{}"
             change_store,
             is_sandbox: false,
         };
-        let operation_lock = repository.try_lock_operation(working_copy_id)?;
-        repository.recover_pending_deferred_tree_alignment_locked(&operation_lock)?;
-        repository.ensure_repository_operation_safe_for(&operation_lock)?;
-        if let OperationHeadState::Diverged(heads) =
-            repository.consolidate_operation_heads_locked(&operation_lock)?
-        {
-            return Err(RepositoryError::OperationHeadsDiverged {
-                scope: atomic_core::operation::OperationScope::WorkingCopy(working_copy_id)
-                    .to_string(),
-                heads: heads.iter().map(ToString::to_string).collect(),
-            });
-        }
-        repository.recover_incomplete_operation(&operation_lock)?;
-        drop(operation_lock);
+        repository.fence_recovery_for_budget(working_copy_id, budget)?;
 
         // Deferred TREE or operation recovery may rewrite the compatibility
         // pointer. Reassert the persistent record as the sole authority.
@@ -487,9 +580,51 @@ default = "{}"
     ///
     /// Use this for short-lived processes (agent hooks, background jobs)
     /// where blocking on the init write lock would hang the process.
+    /// The shared open-time recovery fence (CB-13D ::24 R1): a
+    /// metadata-only budget refuses unsafe pending recovery instead of
+    /// replaying it inside the open; a command budget runs the recovery
+    /// steps. The ordinary open and the sandbox open pass this gate.
+    pub(crate) fn fence_recovery_for_budget(
+        &mut self,
+        working_copy: WorkingCopyId,
+        budget: ReconcileEffectBudget,
+    ) -> Result<(), RepositoryError> {
+        let operation_lock = self.try_lock_operation(working_copy)?;
+        // CB-13D review R1: a metadata-only open fences recovery — refuse
+        // before any effect-bearing recovery step instead of replaying it
+        // inside the open.
+        if budget.is_metadata_only() {
+            if let Some(detail) = self.pending_unsafe_recovery_work(working_copy)? {
+                drop(operation_lock);
+                return Err(RepositoryError::ReactiveDeferred { detail });
+            }
+        }
+        self.recover_pending_deferred_tree_alignment_locked(&operation_lock)?;
+        self.ensure_repository_operation_safe_for(&operation_lock)?;
+        if let OperationHeadState::Diverged(heads) =
+            self.consolidate_operation_heads_locked(&operation_lock)?
+        {
+            return Err(RepositoryError::OperationHeadsDiverged {
+                scope: atomic_core::operation::OperationScope::WorkingCopy(working_copy)
+                    .to_string(),
+                heads: heads.iter().map(ToString::to_string).collect(),
+            });
+        }
+        self.recover_incomplete_operation(&operation_lock)?;
+        drop(operation_lock);
+        Ok(())
+    }
+
     pub fn open_existing<P: AsRef<Path>>(path: P) -> Result<Self, RepositoryError> {
         if let Some((working_root, canonical, view)) = sandbox::detect_sandbox(path.as_ref()) {
-            return Self::open_sandbox(working_root, canonical, &view);
+            // CB-13D ::24 R1: the sandbox open runs the SAME recovery
+            // steps as the ordinary open_existing (which recovers
+            // unconditionally) — the sandbox path must not return before
+            // that gate.
+            let mut sandbox = Self::open_sandbox(working_root, canonical, &view)?;
+            let working_copy = sandbox.require_working_copy_id()?;
+            sandbox.fence_recovery_for_budget(working_copy, ReconcileEffectBudget::Command)?;
+            return Ok(sandbox);
         }
         let layout = working_copy::discover_layout(path.as_ref())?;
         let root = layout.working_root.clone();
@@ -543,6 +678,10 @@ default = "{}"
         path: P,
     ) -> Result<Self, RepositoryError> {
         if let Some((working_root, canonical, view)) = sandbox::detect_sandbox(path.as_ref()) {
+            // CB-13D ::24 R1: this constructor performs NO recovery on
+            // either path (the ordinary path defers everything to
+            // begin_workspace_txn), so the sandbox path matches it and
+            // returns without a recovery gate by design.
             return Self::open_sandbox(working_root, canonical, &view);
         }
         let layout = working_copy::discover_layout(path.as_ref())?;
@@ -985,6 +1124,40 @@ default = "{}"
 
     /// Get a reference to the pristine database.
     #[inline]
+    /// Whether `oid` is reachable from `expected_tip` in the colocated Git
+    /// repository at `root` (CB-12B follow-up AC-4 exact-OID binding: pushed
+    /// foreign history legitimately proposes ancestors of the verified
+    /// projection; nothing outside that ancestry is bound by the gate).
+    /// Read-only; the root must be a Git repository. `false` on any
+    /// lookup failure — the caller refuses unbound OIDs.
+    pub fn git_oid_is_ancestor(root: &std::path::Path, oid: &str, expected_tip: &str) -> bool {
+        let Ok(git) = git2::Repository::open(root) else {
+            return false;
+        };
+        let Ok(oid) = git2::Oid::from_str(oid) else {
+            return false;
+        };
+        let Ok(tip) = git2::Oid::from_str(expected_tip) else {
+            return false;
+        };
+        if oid == tip {
+            return true;
+        }
+        // Walk ancestry from the tip: any reachable commit with the exact
+        // OID proves the binding. Depth-bounded by the full walk (read-only).
+        let Ok(commit) = git.find_commit(tip) else {
+            return false;
+        };
+        let mut revwalk = match git.revwalk() {
+            Ok(revwalk) => revwalk,
+            Err(_) => return false,
+        };
+        if revwalk.push(commit.id()).is_err() {
+            return false;
+        }
+        revwalk.any(|step| step.map(|step_oid| step_oid == oid).unwrap_or(false))
+    }
+
     pub fn pristine(&self) -> &Pristine {
         &self.pristine
     }

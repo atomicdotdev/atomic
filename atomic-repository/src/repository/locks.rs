@@ -77,6 +77,34 @@ struct AdvisoryFileLock {
     path: PathBuf,
 }
 
+impl AdvisoryFileLock {
+    /// A same-thread alias of this held lock (CB-8B): the alias shares the
+    /// underlying OS lock and increments the nesting count, so a nested
+    /// executor can hold its own guard under the caller's boundary without
+    /// a second flock. Dropping the alias only decrements the count.
+    fn alias(&self) -> Self {
+        HELD_LOCKS.with(|held| {
+            let mut held = held.borrow_mut();
+            match held.get_mut(&self.path) {
+                Some((count, _, _)) => *count += 1,
+                None => {
+                    // The outer guard always has a HELD_LOCKS entry; a
+                    // missing entry means the alias is outliving its
+                    // boundary, which the caller must never do.
+                    let entry = held
+                        .entry(self.path.clone())
+                        .or_insert((0usize, Weak::new(), false));
+                    entry.0 += 1;
+                }
+            }
+        });
+        Self {
+            file: Arc::clone(&self.file),
+            path: self.path.clone(),
+        }
+    }
+}
+
 impl Drop for AdvisoryFileLock {
     fn drop(&mut self) {
         let release = HELD_LOCKS.with(|held| {
@@ -136,7 +164,7 @@ impl Repository {
         self.try_lock_common_operation_with_reentrancy(false)
     }
 
-    fn try_lock_common_operation_with_reentrancy(
+    pub(super) fn try_lock_common_operation_with_reentrancy(
         &self,
         reentrant: bool,
     ) -> Result<RepositoryCommonLockGuard, RepositoryError> {
@@ -206,11 +234,31 @@ impl RepositoryCommonLockGuard {
             working_copy,
         })
     }
+
+    /// A same-thread alias of this held common lock (CB-8B): the nested
+    /// projection executor builds its own working-copy guard under the
+    /// caller's shadow-commit boundary without a second flock on the common
+    /// file. Dropping the alias only decrements the nesting count.
+    pub(super) fn alias(&self) -> Self {
+        Self {
+            _common_lock: self._common_lock.alias(),
+            dot_dir: self.dot_dir.clone(),
+            pristine: Arc::clone(&self.pristine),
+            reentrant: self.reentrant,
+        }
+    }
 }
 
 impl WorkingCopyOperationLockGuard {
     pub(super) fn working_copy(&self) -> WorkingCopyId {
         self.working_copy
+    }
+
+    /// A same-thread alias of the embedded common guard (CB-10A review R6):
+    /// callers nested in a workspace transaction build their own mapping
+    /// operations under the held boundary without a second flock.
+    pub(super) fn common_alias(&self) -> RepositoryCommonLockGuard {
+        self.common.alias()
     }
 
     /// Begin a pristine write only after both nonblocking file locks are held.
@@ -254,6 +302,14 @@ impl CommonPristineWriteTxn<'_> {
     pub(super) fn commit(self) -> Result<(), RepositoryError> {
         self.txn
             .commit()
+            .map_err(|error| RepositoryError::Database(error.to_string()))
+    }
+
+    /// Discard the transaction: no journal entry and no table mutation.
+    pub(super) fn abort(self) -> Result<(), RepositoryError> {
+        use atomic_core::pristine::MutTxnT;
+        self.txn
+            .abort()
             .map_err(|error| RepositoryError::Database(error.to_string()))
     }
 }

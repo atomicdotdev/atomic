@@ -952,6 +952,11 @@ where
     // Output the graph content (with semantic merge resolution)
     output_graph_content_resolved(changes, hash_fn, &graph, &order, &mut writer, &resolved)?;
 
+    // Whether the renderer itself emitted conflict markers. Source content
+    // that merely contains marker-shaped bytes (documentation examples, test
+    // fixtures) is written through `output_line` and never sets this.
+    let rendered_conflict = writer.has_conflict_markers();
+
     // Extract buffer
     let content = writer.into_inner();
 
@@ -965,6 +970,15 @@ where
                 FileConflict::new(String::new(), FileConflictType::Cyclic).with_id(conflict_id),
             );
         }
+    }
+    // An unresolved fork that is not a cyclic SCC still emits markers through
+    // the renderer; record it so callers see `conflicts` as "markers were
+    // rendered", never as "source content happens to look like markers".
+    if rendered_conflict && conflicts.is_empty() {
+        conflict_id += 1;
+        conflicts.push(
+            FileConflict::new(String::new(), FileConflictType::Order).with_id(conflict_id),
+        );
     }
 
     Ok((content, conflicts, had_fork_structure))

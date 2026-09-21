@@ -9,11 +9,17 @@ use std::path::Path;
 use tempfile::TempDir;
 
 mod attribute_tests;
+mod binding_fetch_tests;
+mod binding_store_tests;
+mod binding_verify_tests;
+mod bridge_git_journal_tests;
 mod capability_tests;
 mod change_tests;
+mod conflict_restore_tests;
 mod conflict_surface_tests;
 mod content_filter_tests;
 mod cross_view_merge_tests;
+mod cutover_tests;
 mod delete_propagation_tests;
 mod directory_lifecycle_tests;
 mod edit_tests;
@@ -31,18 +37,25 @@ mod operation_recovery_tests;
 mod operation_routing_tests;
 mod operation_undo_tests;
 mod path_claim_migration_tests;
+mod projection_effects_tests;
+mod ref_mapping_tests;
 mod record_duplication_tests;
 mod record_tests;
 mod rename_tests;
+mod resurrection_tests;
 mod shadow_lock_tests;
 mod snapshot_tests;
+mod stale_conflict_reconcile_tests;
 mod status_tests;
+mod synthesis_tests;
+mod tag_projection_tests;
 
 mod tracking_tests;
 mod tree_projection_tests;
 mod verify_tests;
 mod view_tests;
 mod working_copy_identity_tests;
+mod working_copy_reconcile_tests;
 mod workspace_txn_tests;
 
 // ── Shared Helpers ──────────────────────────────────────────────────────
@@ -294,14 +307,14 @@ impl DerefMut for TestRepository {
     }
 }
 
-pub(super) fn create_temp_repo() -> (TempDir, TestRepository) {
+pub(crate) fn create_temp_repo() -> (TempDir, TestRepository) {
     let temp_dir = TempDir::new().unwrap();
     let repo = Repository::init(temp_dir.path()).unwrap();
     (temp_dir, TestRepository::new(repo))
 }
 
 /// Create a simple test change with the given message.
-pub(super) fn create_test_change(message: &str) -> Change {
+pub(crate) fn create_test_change(message: &str) -> Change {
     let header = ChangeHeader::builder()
         .message(message)
         .author(Author::new("Test Author", Some("test@example.com")))

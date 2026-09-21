@@ -143,7 +143,9 @@ pub use command::Clone;
 pub use types::{CloneOutcome, ClonePhase, CloneProgress, CloneStats};
 
 // Helper functions that might be useful externally
-pub use helpers::{format_count as helpers_format_count, infer_repo_name, CleanupGuard};
+pub use helpers::{
+    format_count as helpers_format_count, infer_repo_name, CleanupGuard, CloneBootstrapBoundary,
+};
 
 // Constants
 pub use command::{DEFAULT_TIMEOUT_SECS, DEFAULT_VIEW};

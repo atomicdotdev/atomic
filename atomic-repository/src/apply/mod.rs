@@ -239,8 +239,6 @@ pub fn write_change_to_graph(
     let mut workspace = Workspace::new();
     let mut conflict_tracker = ConflictTracker::new();
     let mut stats = InsertStats::new();
-    let trace_record = std::env::var_os("ATOMIC_TRACE_RECORD").is_some()
-        || std::env::var_os("ATOMIC_TRACE_INSERT").is_some();
 
     // Get the current view
     let mut view = txn
@@ -270,97 +268,20 @@ pub fn write_change_to_graph(
     );
 
     if should_apply_hunks {
-        let hunks = change.hunks();
-        let total_hunks = hunks.len();
-        let hunk_phase_start = std::time::Instant::now();
-        // Open GRAPH + INODE_GRAPH once for the whole hunk pass. All graph
-        // reads and writes flow through this cached handle, so the tables are
-        // opened twice per change instead of ~6 times per hunk. The scope ends
-        // before the FileOps/view-update phase, which needs `&mut txn` again.
-        {
-            let mut cached = CachedWriteGraphTxn::new(&*txn)
-                .map_err(|e| InsertError::Database(e.to_string()))?;
-            for (hunk_idx, graph_op) in hunks.iter().enumerate() {
-                if trace_record && (hunk_idx == 0 || (hunk_idx + 1) % 1_000 == 0) {
-                    eprintln!(
-                        "[write_change_to_graph] applying hunk {}/{} elapsed={:?}",
-                        hunk_idx + 1,
-                        total_hunks,
-                        hunk_phase_start.elapsed()
-                    );
-                }
-                write_hunk(
-                    &mut cached,
-                    &mut workspace,
-                    &mut conflict_tracker,
-                    change_id,
-                    graph_op,
-                    change,
-                    &verified_frontier,
-                    options,
-                    &mut stats,
-                )?;
-            }
-        }
-        // Attribute events depend on structural FileAdd atoms having installed
-        // the position→inode mapping, so apply them after the cached graph pass.
-        for graph_op in hunks {
-            if matches!(graph_op, GraphOp::SetAttr { .. }) {
-                apply_set_attr(txn, change_id, graph_op)
-                    .map_err(|error| InsertError::Database(error.to_string()))?;
-            }
-        }
-        if trace_record {
-            eprintln!(
-                "[write_change_to_graph] hunks complete count={} elapsed={:?}",
-                total_hunks,
-                hunk_phase_start.elapsed()
-            );
-        }
-
-        // Apply FileOps to CRDT tables (semantic layer)
-        // This enables human-readable diffs and token-level blame
-        if change.has_file_ops() {
-            let file_ops = change.file_ops();
-            let file_ops_count = file_ops.len();
-            log::debug!(
-                "write_change_to_graph: applying {} FileOps to CRDT tables",
-                file_ops_count
-            );
-            let crdt_start = std::time::Instant::now();
-            if trace_record {
-                eprintln!(
-                    "[write_change_to_graph] apply_file_ops start count={}",
-                    file_ops_count
-                );
-            }
-            let _crdt_stats = apply_file_ops_batched(txn, change_id, file_ops).map_err(
-                |e: atomic_core::pristine::PristineError| InsertError::Database(e.to_string()),
-            )?;
-            let crdt_ms = crdt_start.elapsed().as_millis();
-            if trace_record {
-                eprintln!(
-                    "[write_change_to_graph] apply_file_ops complete elapsed={:?}",
-                    crdt_start.elapsed()
-                );
-            }
-            if crdt_ms > 50 {
-                log::warn!(
-                    "write_change_to_graph: SLOW apply_file_ops took {}ms ({} FileOps)",
-                    crdt_ms,
-                    file_ops_count
-                );
-            } else {
-                log::debug!("write_change_to_graph: apply_file_ops took {}ms", crdt_ms);
-            }
-        } else {
-            log::debug!("write_change_to_graph: no FileOps to apply");
-        }
+        apply_change_hunks_locked(
+            txn,
+            &mut workspace,
+            &mut conflict_tracker,
+            &mut stats,
+            change_id,
+            change,
+            &verified_frontier,
+            options,
+        )?;
     }
 
     // Compute new state
     log::debug!("write_change_to_graph: computing new state + updating view");
-    let step_start = std::time::Instant::now();
     let new_state = compute_new_state(&view.state, change_hash);
 
     // Update the view
@@ -373,10 +294,7 @@ pub fn write_change_to_graph(
     view.change_count = sequence;
     txn.update_view(&view)
         .map_err(|e| InsertError::Database(e.to_string()))?;
-    log::debug!(
-        "write_change_to_graph: view update took {}ms",
-        step_start.elapsed().as_millis()
-    );
+    log::debug!("write_change_to_graph: view update complete");
 
     // Build conflict summary
     let has_conflicts = conflict_tracker.has_conflicts();
@@ -396,6 +314,147 @@ pub fn write_change_to_graph(
         has_conflicts,
         stats,
     ))
+}
+
+/// Apply one change's hunks, attribute events, and FileOps to the global
+/// graph **without advancing any view membership** (CB-6C isolated
+/// resurrection builder).
+///
+/// The caller must have validated dependencies/causal frontier (graph-level
+/// `verify_dependencies` + `verify_causal_frontier`; view-level
+/// already-applied checks do not apply because membership is published
+/// separately). The hunk pass, `SetAttr` events, and FileOps are identical to
+/// [`write_change_to_graph`]; only the view-log update is absent, so a
+/// rejected projection proof can abort the whole transaction without any
+/// membership/checkpoint effect ever existing.
+pub fn apply_change_hunks_without_membership(
+    txn: &mut WriteTxn<'_>,
+    change_id: NodeId,
+    change: &Change,
+    verified_frontier: &atomic_core::change::VerifiedCausalFrontier,
+    options: &InsertOptions,
+) -> InsertResult<InsertStats> {
+    let mut workspace = Workspace::new();
+    let mut conflict_tracker = ConflictTracker::new();
+    let mut stats = InsertStats::new();
+    apply_change_hunks_locked(
+        txn,
+        &mut workspace,
+        &mut conflict_tracker,
+        &mut stats,
+        change_id,
+        change,
+        verified_frontier,
+        options,
+    )?;
+    stats.changes_applied = 1;
+    Ok(stats)
+}
+
+/// The shared hunk/FileOps mutation stage of [`write_change_to_graph`] and
+/// [`apply_change_hunks_without_membership`].
+#[allow(clippy::too_many_arguments)]
+fn apply_change_hunks_locked(
+    txn: &mut WriteTxn<'_>,
+    workspace: &mut Workspace,
+    conflict_tracker: &mut ConflictTracker,
+    stats: &mut InsertStats,
+    change_id: NodeId,
+    change: &Change,
+    verified_frontier: &atomic_core::change::VerifiedCausalFrontier,
+    options: &InsertOptions,
+) -> InsertResult<()> {
+    let trace_record = std::env::var_os("ATOMIC_TRACE_RECORD").is_some()
+        || std::env::var_os("ATOMIC_TRACE_INSERT").is_some();
+
+    let hunks = change.hunks();
+    let total_hunks = hunks.len();
+    let hunk_phase_start = std::time::Instant::now();
+    // Open GRAPH + INODE_GRAPH once for the whole hunk pass. All graph
+    // reads and writes flow through this cached handle, so the tables are
+    // opened twice per change instead of ~6 times per hunk. The scope ends
+    // before the FileOps/view-update phase, which needs `&mut txn` again.
+    {
+        let mut cached = CachedWriteGraphTxn::new(&*txn)
+            .map_err(|e| InsertError::Database(e.to_string()))?;
+        for (hunk_idx, graph_op) in hunks.iter().enumerate() {
+            if trace_record && (hunk_idx == 0 || (hunk_idx + 1) % 1_000 == 0) {
+                eprintln!(
+                    "[write_change_to_graph] applying hunk {}/{} elapsed={:?}",
+                    hunk_idx + 1,
+                    total_hunks,
+                    hunk_phase_start.elapsed()
+                );
+            }
+            write_hunk(
+                &mut cached,
+                workspace,
+                conflict_tracker,
+                change_id,
+                graph_op,
+                change,
+                verified_frontier,
+                options,
+                stats,
+            )?;
+        }
+    }
+    // Attribute events depend on structural FileAdd atoms having installed
+    // the position→inode mapping, so apply them after the cached graph pass.
+    for graph_op in hunks {
+        if matches!(graph_op, GraphOp::SetAttr { .. }) {
+            apply_set_attr(txn, change_id, graph_op)
+                .map_err(|error| InsertError::Database(error.to_string()))?;
+        }
+    }
+    if trace_record {
+        eprintln!(
+            "[write_change_to_graph] hunks complete count={} elapsed={:?}",
+            total_hunks,
+            hunk_phase_start.elapsed()
+        );
+    }
+
+    // Apply FileOps to CRDT tables (semantic layer)
+    // This enables human-readable diffs and token-level blame
+    if change.has_file_ops() {
+        let file_ops = change.file_ops();
+        let file_ops_count = file_ops.len();
+        log::debug!(
+            "write_change_to_graph: applying {} FileOps to CRDT tables",
+            file_ops_count
+        );
+        let crdt_start = std::time::Instant::now();
+        if trace_record {
+            eprintln!(
+                "[write_change_to_graph] apply_file_ops start count={}",
+                file_ops_count
+            );
+        }
+        let _crdt_stats = apply_file_ops_batched(txn, change_id, file_ops).map_err(
+            |e: atomic_core::pristine::PristineError| InsertError::Database(e.to_string()),
+        )?;
+        let crdt_ms = crdt_start.elapsed().as_millis();
+        if trace_record {
+            eprintln!(
+                "[write_change_to_graph] apply_file_ops complete elapsed={:?}",
+                crdt_start.elapsed()
+            );
+        }
+        if crdt_ms > 50 {
+            log::warn!(
+                "write_change_to_graph: SLOW apply_file_ops took {}ms ({} FileOps)",
+                crdt_ms,
+                file_ops_count
+            );
+        } else {
+            log::debug!("write_change_to_graph: apply_file_ops took {}ms", crdt_ms);
+        }
+    } else {
+        log::debug!("write_change_to_graph: no FileOps to apply");
+    }
+
+    Ok(())
 }
 
 /// Apply a single hunk's atoms through the cached graph writer.

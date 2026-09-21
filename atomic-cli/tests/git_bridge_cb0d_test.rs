@@ -244,6 +244,15 @@ fn bridge_enable_records_checkout_and_direct_observation_does_not_need_the_hook(
     );
 
     fs::remove_file(&hook).expect("disable dispatcher");
+    // CB-9B also installs an advisory reference-transaction dispatcher; a
+    // hook-less observation must remove both (a live ref-transaction
+    // dispatcher journals the switches' ref movement by design).
+    fs::remove_file(
+        repository
+            .path()
+            .join(".git/hooks/reference-transaction"),
+    )
+    .expect("disable reference-transaction dispatcher");
     fs::remove_file(journal_path(repository.path())).expect("remove advisory evidence");
     let deferred_dir = repository
         .path()

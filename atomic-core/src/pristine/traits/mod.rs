@@ -23,6 +23,7 @@
 //! ```
 
 mod crdt_read;
+pub(crate) mod capability_txn;
 mod embeddings;
 mod file_index_v2;
 mod graph;
@@ -41,6 +42,7 @@ mod working_copy;
 #[cfg(test)]
 mod tests;
 
+pub use capability_txn::{CapabilityMutTxnT, CapabilityTxnT};
 pub use crdt_read::CrdtTxnT;
 pub use embeddings::{EmbeddingsMutTxnT, EmbeddingsTxnT};
 pub use file_index_v2::{FileIndexV2MutTxnT, FileIndexV2TxnT};
@@ -49,7 +51,11 @@ pub use mutate::MutTxnT;
 pub use native_derived::{NativeDerivedIndexes, NativeDerivedIndexesMutTxnT};
 pub use operation::{OperationMutTxnT, OperationTxnT};
 pub use path_claim::{PathClaimMutTxnT, PathClaimTxnT};
-pub use tag::{GitShaIndexMutTxnT, GitShaIndexTxnT, TagKind, TagMutTxnT, TagRecord, TagTxnT};
+pub use tag::{
+    BridgeEventCaptureMutTxnT, BridgeEventCaptureTxnT, GitCommitClosureMutTxnT,
+    GitCommitClosureTxnT, GitShaIndexMutTxnT, GitShaIndexTxnT, TagKind, TagMutTxnT, TagRecord,
+    TagTxnT,
+};
 pub use tree::{FileIndexEntry, FileIndexMetadata, TreeTxnT};
 pub use triples::{KgMutTxnT, KgTxnT};
 pub use vault::{VaultEntryMeta, VaultMutTxnT, VaultTxnT};

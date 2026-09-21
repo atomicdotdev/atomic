@@ -4,7 +4,7 @@ use atomic_core::operation::{
     RepoStateRef, ViewStateRef,
 };
 
-fn validate_import_deleted_paths(
+pub(super) fn validate_import_deleted_paths(
     change: &Change,
     deleted_paths: &[String],
 ) -> Result<(), RepositoryError> {
@@ -1768,6 +1768,29 @@ impl Repository {
             .as_deref()
             .unwrap_or(&self.current_view)
             .to_string();
+
+        // CB-12B: trusted provenance publication gate. Before any metadata
+        // operation or mutation on a Shared target, the complete reachable
+        // closure of this change must carry trusted managed-session evidence.
+        // Draft targets are unaffected (work stays local until promotion).
+        if !options.skip_publication_gate {
+            let shared_target = {
+                let txn = self
+                    .pristine
+                    .read_txn()
+                    .map_err(|e| RepositoryError::Database(e.to_string()))?;
+                txn.get_view(&view_name)
+                    .map_err(|e| RepositoryError::Database(e.to_string()))?
+                    .map(|view| view.kind == atomic_core::pristine::ViewScope::Shared)
+                    .unwrap_or(false)
+            };
+            if shared_target {
+                let closure = super::provenance_gate::reachable_closure(self, std::slice::from_ref(hash))?;
+                let provider = super::provenance_gate::local_session_mac_key_provider(self);
+                self.enforce_publication_gate("shared-view insertion", &closure, Some(&provider))?;
+            }
+        }
+
         let operation_context = if let Some(working_copy) = self.working_copy_id() {
             let operation_lock = self.try_lock_operation(working_copy)?;
             if let OperationHeadState::Diverged(heads) =
@@ -2049,7 +2072,7 @@ impl Repository {
     pub fn insert_change_rec(
         &self,
         hash: &Hash,
-        options: InsertOptions,
+        mut options: InsertOptions,
     ) -> Result<InsertOutcome, RepositoryError> {
         let trace_insert = std::env::var_os("ATOMIC_TRACE_INSERT").is_some();
         let t0 = std::time::Instant::now();
@@ -2115,6 +2138,21 @@ impl Repository {
 
         // Reverse to get topological order (dependencies first)
         to_insert.reverse();
+
+        // CB-12B: gate the complete reachable closure ONCE before any
+        // mutation when the target is Shared. The per-change gate inside
+        // `insert_change` is then skipped for this loop via the internal
+        // flag — the closure above is a superset of every per-change
+        // closure, so coverage is complete and diagnostics are exact.
+        if !to_insert.is_empty() {
+            let shared_target = view.kind == atomic_core::pristine::ViewScope::Shared;
+            if shared_target {
+                let closure = super::provenance_gate::reachable_closure(self, &to_insert)?;
+                let provider = super::provenance_gate::local_session_mac_key_provider(self);
+                self.enforce_publication_gate("shared-view insertion", &closure, Some(&provider))?;
+                options.skip_publication_gate = true;
+            }
+        }
 
         if trace_insert {
             eprintln!(
@@ -2599,6 +2637,7 @@ impl Repository {
             .ok_or_else(|| RepositoryError::ViewNotFound {
                 name: options.to_view.clone(),
             })?;
+        let target_is_shared = to_view.kind == atomic_core::pristine::ViewScope::Shared;
 
         let missing = filter_missing_in_view(&txn, &to_view, &source_changes)
             .map_err(|e| RepositoryError::Apply(e.to_string()))?;
@@ -2644,6 +2683,17 @@ impl Repository {
             return Ok(outcome);
         }
 
+        // CB-12B: trusted provenance publication gate before cross-view
+        // promotion into a Shared target. The gate covers the complete
+        // reachable closure of the source delta (transitive dependencies,
+        // not just the selected changes) and fails closed before any
+        // VIEW_CHANGES metadata movement.
+        if target_is_shared {
+            let closure = super::provenance_gate::reachable_closure(self, &source_changes)?;
+            let provider = super::provenance_gate::local_session_mac_key_provider(self);
+            self.enforce_publication_gate("triage promotion", &closure, Some(&provider))?;
+        }
+
         // When the source view is Draft, its changes were recorded against
         // the view filter (GRAPH).  Inserting those changes
         // into a different view verifies edge context against a different
@@ -2661,9 +2711,12 @@ impl Repository {
                 .unwrap_or(false)
         };
 
-        let apply_opts = InsertOptions::default()
+        let mut apply_opts = InsertOptions::default()
             .view(&options.to_view)
             .allow_conflict(options.allow_conflicts || source_is_draft);
+        // The closure-level gate above already covered every change this
+        // loop is about to insert; skip the redundant per-change gate.
+        apply_opts.skip_publication_gate = target_is_shared;
 
         let total_missing = missing.len();
         for (i, hash) in missing.iter().enumerate() {

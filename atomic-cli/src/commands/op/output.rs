@@ -182,6 +182,14 @@ fn write_metadata_target(output: &mut String, indent: usize, target: &MetadataTa
             write_key_value(output, indent, "kind", "remote");
             write_key_value(output, indent, "name", name);
         }
+        MetadataTargetDto::RefMapping { view } => {
+            write_key_value(output, indent, "kind", "ref_mapping");
+            write_key_value(output, indent, "view", view);
+        }
+        MetadataTargetDto::Capability { id } => {
+            write_key_value(output, indent, "kind", "capability");
+            write_key_value(output, indent, "id", id);
+        }
     }
 }
 

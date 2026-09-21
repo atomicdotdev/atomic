@@ -334,17 +334,32 @@ fn observe_atomic_on_handle(
         .collect();
     paths.sort();
 
+    // RFC §8.3 (CB-8B): a conflicted view's materialized state IS the
+    // marker projection. The checkpoint's atomic-visible manifest must
+    // describe exactly the bytes on disk and in the conflict snapshot's Git
+    // tree, so the workspace classifies as aligned instead of inventing
+    // "pending edits" for the lossy marker representation.
+    let conflict_markers = repo
+        .capture_view_conflict_set_with_markers(view)
+        .map_err(|error| CheckpointError::Atomic(error.to_string()))?
+        .map(|(object, markers)| (object.hash().ok(), markers));
+
     let mut hasher = blake3::Hasher::new();
     hasher.update(ATOMIC_MANIFEST_DOMAIN);
     for path in paths {
-        let content = repo
-            .get_file_content_on_view(&path, view)
-            .map_err(|error| CheckpointError::Atomic(error.to_string()))?
-            .ok_or_else(|| {
-                CheckpointError::Atomic(format!(
-                    "visible path '{path}' has no graph-derived content on view '{view}'"
-                ))
-            })?;
+        let content = match &conflict_markers {
+            Some((_, markers)) if markers.contains_key(&path) => {
+                markers.get(&path).cloned().expect("marker bytes")
+            }
+            _ => repo
+                .get_file_content_on_view(&path, view)
+                .map_err(|error| CheckpointError::Atomic(error.to_string()))?
+                .ok_or_else(|| {
+                    CheckpointError::Atomic(format!(
+                        "visible path '{path}' has no graph-derived content on view '{view}'"
+                    ))
+                })?,
+        };
         hasher.update(&(path.len() as u64).to_le_bytes());
         hasher.update(path.as_bytes());
         hasher.update(&(content.len() as u64).to_le_bytes());
@@ -378,8 +393,14 @@ pub(crate) fn write_verified_checkpoint(
     let GitObservation::Repository(repository) = observation else {
         return Err(CheckpointError::NoGit);
     };
-    let HeadObservation::Attached { symref, oid } = &repository.head else {
-        return Err(CheckpointError::UnsupportedHead);
+    // CB-8A: Draft views stay detached at their projection commit (RFC
+    // §8.1); the checkpoint records a `None` symref for detached states so
+    // the workspace entry protocol keeps them aligned, exactly like the
+    // CB-7A anchor does for adopted ephemeral views.
+    let (symref, oid) = match &repository.head {
+        HeadObservation::Attached { symref, oid } => (Some(symref.clone()), *oid),
+        HeadObservation::Detached { oid } => (None, *oid),
+        _ => return Err(CheckpointError::UnsupportedHead),
     };
     let head_tree = repository
         .head_tree_oid
@@ -405,7 +426,7 @@ pub(crate) fn write_verified_checkpoint(
         view: atomic.view,
         atomic_state: input.atomic_state.to_string(),
         atomic_manifest_root: atomic.manifest_root,
-        git_head_symref: Some(symref.clone()),
+        git_head_symref: symref,
         git_head: input.git_head.to_string(),
         git_tree: input.git_tree.to_string(),
         git_manifest_root: Some(ManifestRootEvidence::git_tree(input.git_tree)),

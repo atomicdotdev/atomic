@@ -484,6 +484,13 @@ fn stale_git_branch_and_head_refuse_every_guarded_process_before_output_or_mutat
     fixture.atomic_ok(&["git", "bridge", "enable"]);
     let hook_path = fixture.git_text(&["rev-parse", "--git-path", "hooks/post-checkout"]);
     fs::remove_file(fixture.root().join(hook_path)).expect("remove advisory post-checkout hook");
+    // CB-9B also installs the advisory reference-transaction dispatcher; a
+    // hook-less observation removes both (a live dispatcher journals the
+    // checkout's ref movement by design).
+    let ref_hook_path =
+        fixture.git_text(&["rev-parse", "--git-path", "hooks/reference-transaction"]);
+    fs::remove_file(fixture.root().join(ref_hook_path))
+        .expect("remove advisory reference-transaction hook");
 
     fixture.raw_git_drift("raw-drift");
     assert!(
@@ -564,7 +571,16 @@ fn ordinary_edits_and_atomic_only_advancement_pass_the_shared_guard() {
         .find_map(|line| line.strip_prefix("Atomic state: "))
         .expect("current Atomic state");
     assert_ne!(current_state, checkpoint_state);
-    assert_eq!(fixture.git_text(&["rev-parse", "HEAD"]), git_head);
+    // CB-8A: an Atomic-origin record is a bridge transition — the recorded
+    // state projects immediately, so Git HEAD advances via the operation-
+    // specific projection commit and both statuses stay clean (RFC §8.2,
+    // Phase 8 acceptance). The checkpoint tracks the projected HEAD.
+    let projected_head = fixture.git_text(&["rev-parse", "HEAD"]);
+    assert_ne!(projected_head, git_head);
+    assert!(
+        fixture.git_text(&["status", "--porcelain"]).is_empty(),
+        "git status clean after the record projection"
+    );
 
     fixture.atomic_ok(&["status", "--short"]);
     fixture.atomic_ok(&["diff", "--name-only", "--no-color"]);

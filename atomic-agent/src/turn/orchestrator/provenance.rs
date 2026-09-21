@@ -637,6 +637,7 @@ impl TurnOrchestrator {
         session: &AgentSession,
         outcome: &TurnRecordOutcome,
         event: &TurnEvent,
+        boundary_end: Option<atomic_core::change::session::TurnBoundary>,
     ) {
         use atomic_core::types::Base32;
 
@@ -768,6 +769,35 @@ impl TurnOrchestrator {
                             session_id,
                             e,
                         );
+                    }
+
+                    // CB-12A: attach the durable boundary pair and the
+                    // ContentChanges outcome onto the just-indexed turn row.
+                    // Best-effort like Phase 2; the session JSON carries the
+                    // same evidence as the crash-safe fallback.
+                    if let Some(boundary_end) = boundary_end {
+                        if let Some(boundary_start) = session.boundary_start.clone() {
+                            let outcome = atomic_core::change::session::ManagedTurnOutcome::
+                                ContentChanges {
+                                    durable: vec![outcome.hash],
+                                    snapshot: None,
+                                };
+                            if let Err(e) = repo.attach_turn_boundary(
+                                session_id,
+                                &hash,
+                                &boundary_start,
+                                &boundary_end,
+                                &outcome,
+                            ) {
+                                log::warn!(
+                                    "Turn-boundary attach for session {} turn graph {} \
+                                     failed (session JSON carries the evidence): {}",
+                                    session_id,
+                                    hash.to_base32(),
+                                    e,
+                                );
+                            }
+                        }
                     }
                 }
                 Err(e) => {

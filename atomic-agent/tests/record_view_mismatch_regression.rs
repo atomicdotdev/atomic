@@ -5,7 +5,7 @@
 //! direct callers that skip session-start exercise the mismatch.
 
 use atomic_agent::event::{HookType, TurnEvent};
-use atomic_agent::record::{record_turn, TurnRecordOptions};
+use atomic_agent::record::{record_turn, TurnRecordOptions, TurnRecordResult};
 use atomic_agent::turn::AgentSession;
 
 use atomic_core::types::Base32;
@@ -50,8 +50,17 @@ fn two_turns_with_default_random_view_both_record() {
     let event1 = TurnEvent::new("regress-sess", HookType::TurnEnd);
     let first = record_turn(root, &options(&session, &event1, 1, "create login.rs"))
         .expect("turn 1 (new file) should record");
+    // TurnRecordResult is Classified-or-Recorded; a create turn with new
+    // content must be Recorded with a change hash.
+    let first_hash = match &first {
+        TurnRecordResult::Recorded(outcome) => outcome.hash,
+        TurnRecordResult::Classified(classified) => panic!(
+            "a create turn must record content, not classify: {:?}",
+            classified.outcome
+        ),
+    };
     assert!(
-        !first.hash.to_base32().is_empty(),
+        !first_hash.to_base32().is_empty(),
         "turn 1 must yield a hash"
     );
 
@@ -68,13 +77,20 @@ fn two_turns_with_default_random_view_both_record() {
     let second = record_turn(root, &options(&session, &event2, 2, "fix pdf upload"))
         .expect("turn 2 (modified tracked file) should record — regression: was EmptyTurn");
 
+    let second_hash = match &second {
+        TurnRecordResult::Recorded(outcome) => outcome.hash,
+        TurnRecordResult::Classified(classified) => panic!(
+            "a modify turn must record content, not classify: {:?}",
+            classified.outcome
+        ),
+    };
     assert!(
-        !second.hash.to_base32().is_empty(),
+        !second_hash.to_base32().is_empty(),
         "turn 2 must yield a hash"
     );
     assert_ne!(
-        first.hash.to_base32(),
-        second.hash.to_base32(),
+        first_hash.to_base32(),
+        second_hash.to_base32(),
         "the modification must produce a change distinct from the creation"
     );
 }
@@ -102,13 +118,27 @@ fn delete_last_session_file_records_instead_of_emptyturn() {
     let second = record_turn(root, &options(&session, &event2, 2, "delete only.rs"))
         .expect("turn 2 (delete last session file) should record — regression: was EmptyTurn");
 
+    let first_hash = match &first {
+        TurnRecordResult::Recorded(outcome) => outcome.hash,
+        TurnRecordResult::Classified(classified) => panic!(
+            "a create turn must record content, not classify: {:?}",
+            classified.outcome
+        ),
+    };
+    let second_hash = match &second {
+        TurnRecordResult::Recorded(outcome) => outcome.hash,
+        TurnRecordResult::Classified(classified) => panic!(
+            "a deletion turn must record content, not classify: {:?}",
+            classified.outcome
+        ),
+    };
     assert!(
-        !second.hash.to_base32().is_empty(),
+        !second_hash.to_base32().is_empty(),
         "the deletion must produce a change hash"
     );
     assert_ne!(
-        first.hash.to_base32(),
-        second.hash.to_base32(),
+        first_hash.to_base32(),
+        second_hash.to_base32(),
         "the deletion must be a change distinct from the creation"
     );
 }

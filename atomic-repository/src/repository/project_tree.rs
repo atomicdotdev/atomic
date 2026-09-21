@@ -95,17 +95,84 @@ impl RepoPath {
     }
 
     pub fn escaped(&self) -> String {
-        let mut output = String::new();
-        for byte in &self.0 {
-            if byte.is_ascii_graphic() && *byte != b'%' {
-                output.push(char::from(*byte));
-            } else {
-                use std::fmt::Write;
-                let _ = write!(output, "%{byte:02X}");
-            }
-        }
-        output
+        escape_repo_path(&self.0)
     }
+
+    /// Whether this path's canonical String identity needs escaping: any
+    /// non-ASCII-graphic byte, or a literal `%` (which would make the escape
+    /// scheme ambiguous). A plain printable-UTF-8 path without `%` passes
+    /// through unchanged; everything else carries the injective `%XX`
+    /// reversible form.
+    pub fn needs_escaping(&self) -> bool {
+        self.0
+            .iter()
+            .any(|byte| !byte.is_ascii_graphic() || *byte == b'%')
+    }
+}
+
+/// The canonical reversible escape for repository path bytes (review CB-9C
+/// R7): every byte that is not ASCII graphic — and every literal `%` — is
+/// encoded as `%XX`. The mapping is injective over all byte strings and its
+/// inverse is [`unescape_repo_path`], so raw non-UTF-8 path bytes survive
+/// reversible display escaping; normalization never becomes identity.
+pub fn escape_repo_path(bytes: &[u8]) -> String {
+    let mut output = String::new();
+    for byte in bytes {
+        if byte.is_ascii_graphic() && *byte != b'%' {
+            output.push(char::from(*byte));
+        } else {
+            use std::fmt::Write;
+            let _ = write!(output, "%{byte:02X}");
+        }
+    }
+    output
+}
+
+/// The exact inverse of [`escape_repo_path`]: decode every `%XX` escape back
+/// to its byte. Errors on a malformed escape (`%` not followed by two hex
+/// digits), never silently rewriting identity.
+pub fn unescape_repo_path(escaped: &str) -> Result<Vec<u8>, ProjectTreeError> {
+    let bytes = escaped.as_bytes();
+    let mut output = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] != b'%' {
+            output.push(bytes[index]);
+            index += 1;
+            continue;
+        }
+        let Some(first) = bytes.get(index + 1).copied() else {
+            return Err(ProjectTreeError::InvalidPath(format!(
+                "truncated escape in path display {escaped:?}"
+            )));
+        };
+        let Some(second) = bytes.get(index + 2).copied() else {
+            return Err(ProjectTreeError::InvalidPath(format!(
+                "truncated escape in path display {escaped:?}"
+            )));
+        };
+        let hex = |byte: u8| -> Option<u8> {
+            match byte {
+                b'0'..=b'9' => Some(byte - b'0'),
+                b'a'..=b'f' => Some(byte - b'a' + 10),
+                b'A'..=b'F' => Some(byte - b'A' + 10),
+                _ => None,
+            }
+        };
+        let Some(high) = hex(first) else {
+            return Err(ProjectTreeError::InvalidPath(format!(
+                "invalid escape in path display {escaped:?}"
+            )));
+        };
+        let Some(low) = hex(second) else {
+            return Err(ProjectTreeError::InvalidPath(format!(
+                "invalid escape in path display {escaped:?}"
+            )));
+        };
+        output.push((high << 4) | low);
+        index += 3;
+    }
+    Ok(output)
 }
 
 impl fmt::Debug for RepoPath {
@@ -156,15 +223,46 @@ pub enum ExclusionPolicy {
 
 impl ExclusionPolicy {
     pub fn exclusion(self, path: &RepoPath) -> Option<ExclusionReason> {
-        let first = path.components().next().unwrap_or_default();
-        if first == b".atomic" || path.as_bytes() == b".atomicignore" {
+        if atomic_private_path(path.as_bytes()) {
             Some(ExclusionReason::AtomicPrivate)
-        } else if first == b".vault" && self == Self::BridgePrivate {
+        } else if path.components().next().unwrap_or_default() == b".vault"
+            && self == Self::BridgePrivate
+        {
             Some(ExclusionReason::VaultPrivate)
         } else {
             None
         }
     }
+}
+
+/// Whether `path` is Atomic-private bridge state (`.atomic*`): tracked alive
+/// in the worktree's Atomic view but deliberately absent from project
+/// manifests and from Git. Staged whole-tree verification (review R3) exempts
+/// these paths from the extra-path refusal exactly as the conversion policy
+/// does.
+pub fn atomic_private_path(path_bytes: &[u8]) -> bool {
+    let first = path_bytes
+        .split(|byte| *byte == b'/')
+        .next()
+        .unwrap_or_default();
+    first == b".atomic" || path_bytes == b".atomicignore"
+}
+
+/// Whether `path` is bridge-private state under
+/// [`ExclusionPolicy::BridgePrivate`] — deliberately absent from project
+/// manifests while tracked alive in the Atomic view. This is exactly the
+/// path set [`ExclusionPolicy::BridgePrivate::exclusion`] rejects: Atomic
+/// private state (`.atomic*`) plus the vault (`.vault/`), whose files a
+/// colocated repository legitimately tracks in both Git and the graph.
+/// Staged verification must exempt the whole set, not only the `.atomic*`
+/// half, or importing a repository that tracks `.vault/` files refuses with
+/// "staged path ... is present but the commit tree does not hold it".
+pub fn bridge_private_path(path_bytes: &[u8]) -> bool {
+    let first = path_bytes
+        .split(|byte| *byte == b'/')
+        .next()
+        .unwrap_or_default();
+    first == b".atomic" || path_bytes == b".atomicignore" || first == b".vault"
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -416,6 +514,10 @@ pub struct GitIndexState {
     pub entries: Vec<GitIndexEntry>,
     /// Exact tree represented by ordinary stage-0 entries, when one exists.
     pub tree: Option<GitObjectId>,
+    /// The on-disk index uses sparse-directory (`sdir`) entries and was
+    /// observed through read-only in-memory expansion. Sparse absence is
+    /// never a deletion.
+    pub sparse_index: bool,
 }
 
 impl GitIndexState {
@@ -426,6 +528,7 @@ impl GitIndexState {
             object_format,
             entries,
             tree: None,
+            sparse_index: false,
         }
     }
 
@@ -614,7 +717,7 @@ impl GitObjectDatabase {
         Ok(())
     }
 
-    fn insert(
+    pub fn insert(
         &mut self,
         algorithm: GitHashAlgorithm,
         kind: GitObjectKind,
@@ -821,7 +924,10 @@ fn write_directory(
         let oid = write_directory(child, algorithm, objects)?;
         entries.push(GitTreeEntry {
             mode: 0o040000,
-            name: name.clone(),
+            // CB-9C path fidelity (review R7): manifest paths carry the
+            // reversible escaped identity; Git tree objects hold the exact
+            // raw bytes, so the escaped form decodes before writing.
+            name: unescape_repo_path(&String::from_utf8_lossy(name))?,
             oid,
         });
     }
@@ -842,7 +948,7 @@ fn write_directory(
         }
         entries.push(GitTreeEntry {
             mode: entry.git_mode(),
-            name: name.clone(),
+            name: unescape_repo_path(&String::from_utf8_lossy(name))?,
             oid,
         });
     }
@@ -966,13 +1072,21 @@ impl Repository {
             return Err(ProjectTreeError::UnsupportedPlatformPath);
         }
         let txn = self.pristine.read_txn().map_err(repo_error)?;
+        let debug_tree = std::env::var("ATOMIC_DEBUG_PROJECTION").is_ok();
+        let tree_start = std::time::Instant::now();
         let view = txn
             .get_view(view_name)
             .map_err(repo_error)?
             .ok_or_else(|| ProjectTreeError::Repository(format!("view '{view_name}' not found")))?;
         let closure = effective_projection_closure(&txn, &view).map_err(ProjectTreeError::from)?;
+        if debug_tree {
+            eprintln!("PTREE closure ms={}", tree_start.elapsed().as_millis());
+        }
         let identity =
             effective_projection_identity(&txn, &view).map_err(ProjectTreeError::from)?;
+        if debug_tree {
+            eprintln!("PTREE identity ms={}", tree_start.elapsed().as_millis());
+        }
         let claim_visibility = super::name_resolution::path_claim_visibility_for_view(
             &txn,
             &self.change_store,
@@ -980,9 +1094,19 @@ impl Repository {
             closure.graph_visibility(),
         )
         .map_err(ProjectTreeError::from)?;
+        if debug_tree {
+            eprintln!("PTREE claim_visibility ms={}", tree_start.elapsed().as_millis());
+        }
         let projection = self
             .project_tree_for_visibility(&txn, &claim_visibility)
             .map_err(ProjectTreeError::from)?;
+        if debug_tree {
+            eprintln!(
+                "PTREE projection ms={} present={}",
+                tree_start.elapsed().as_millis(),
+                projection.present.len()
+            );
+        }
         if !projection.name_conflicts.is_empty() {
             let mut paths: Vec<_> = projection.name_conflicts.keys().cloned().collect();
             paths.sort();
@@ -1003,9 +1127,17 @@ impl Repository {
                 .exclusion(&path)
                 .map(ManifestDisposition::Excluded)
                 .unwrap_or(ManifestDisposition::Included);
+            let attrs_start = std::time::Instant::now();
             let attrs =
                 project_inode_attributes(&txn, item.position, closure.attribute_visibility())
                     .map_err(repo_error)?;
+            if debug_tree && attrs_start.elapsed().as_millis() > 100 {
+                eprintln!(
+                    "PTREE attrs slow path={} ms={}",
+                    path.escaped(),
+                    attrs_start.elapsed().as_millis()
+                );
+            }
             if attrs.is_conflicted() {
                 return Err(ProjectTreeError::Repository(format!(
                     "inode attributes conflict at '{}'",
@@ -1093,8 +1225,6 @@ impl Repository {
         roots: &[Hash],
         policy: &ConversionPolicy,
     ) -> Result<ProjectTree, ProjectTreeError> {
-        use atomic_core::pristine::{EffectiveProjectionClosure, ViewMembershipSet};
-
         if !policy.platform.lossless_unix_paths {
             return Err(ProjectTreeError::UnsupportedPlatformPath);
         }
@@ -1103,6 +1233,60 @@ impl Repository {
             .get_view(view_name)
             .map_err(repo_error)?
             .ok_or_else(|| ProjectTreeError::Repository(format!("view '{view_name}' not found")))?;
+        self.project_change_closure_with_txn(&txn, &view, roots, policy)
+    }
+
+    /// The closure projection computed over an explicit transaction.
+    ///
+    /// Identical to [`Self::project_tree_for_change_closure`], but usable
+    /// with a write transaction so the CB-6C resurrection builder can prove
+    /// the projected tree against a binding inside the same isolated write
+    /// transaction that applied the closure — before any membership is
+    /// published. The manifest carries the recomputed order-invariant SetId
+    /// of the closure.
+    pub(super) fn project_change_closure_with_txn<T>(
+        &self,
+        txn: &T,
+        view: &atomic_core::pristine::ViewState,
+        roots: &[Hash],
+        policy: &ConversionPolicy,
+    ) -> Result<ProjectTree, ProjectTreeError>
+    where
+        T: atomic_core::pristine::ViewTxnT
+            + atomic_core::pristine::GraphTxnT
+            + atomic_core::pristine::TreeTxnT
+            + atomic_core::pristine::PathClaimTxnT
+            + atomic_core::pristine::InodeGraphOps<InodeError = atomic_core::pristine::PristineError>
+            + atomic_core::pristine::InodeAttrTxnT,
+    {
+        self.project_change_closure_with_conflict_markers(txn, view, roots, policy, &Default::default())
+    }
+
+    /// Project a change closure, substituting conflict-marker bytes for the
+    /// named paths (RFC §8.3 conflict snapshot commits, CB-8B).
+    ///
+    /// Name-conflict paths are carried with their rendered marker bytes and
+    /// injected even though path-claim resolution hides their sides; every
+    /// other path behaves exactly like [`Self::project_change_closure_with_txn`].
+    /// Attribute conflicts still refuse: markers cannot carry two modes.
+    pub(super) fn project_change_closure_with_conflict_markers<T>(
+        &self,
+        txn: &T,
+        view: &atomic_core::pristine::ViewState,
+        roots: &[Hash],
+        policy: &ConversionPolicy,
+        marker_bytes: &std::collections::BTreeMap<String, Vec<u8>>,
+    ) -> Result<ProjectTree, ProjectTreeError>
+    where
+        T: atomic_core::pristine::ViewTxnT
+            + atomic_core::pristine::GraphTxnT
+            + atomic_core::pristine::TreeTxnT
+            + atomic_core::pristine::PathClaimTxnT
+            + atomic_core::pristine::InodeGraphOps<InodeError = atomic_core::pristine::PristineError>
+            + atomic_core::pristine::InodeAttrTxnT,
+    {
+        use atomic_core::pristine::{EffectiveProjectionClosure, ViewMembershipSet};
+
         let mut root_ids = Vec::with_capacity(roots.len());
         for hash in roots {
             root_ids.push(txn.get_internal(hash).map_err(repo_error)?.ok_or_else(|| {
@@ -1110,27 +1294,40 @@ impl Repository {
             })?);
         }
         let membership = ViewMembershipSet::from_ordered(root_ids);
-        let closure = EffectiveProjectionClosure::try_from_membership(&txn, &membership)
+        let closure = EffectiveProjectionClosure::try_from_membership(txn, &membership)
             .map_err(repo_error)?;
         let claim_visibility = super::name_resolution::path_claim_visibility_for_view(
-            &txn,
+            txn,
             &self.change_store,
-            &view,
+            view,
             closure.graph_visibility(),
         )
         .map_err(ProjectTreeError::from)?;
         let projection = self
-            .project_tree_for_visibility(&txn, &claim_visibility)
+            .project_tree_for_visibility(txn, &claim_visibility)
             .map_err(ProjectTreeError::from)?;
-        if !projection.name_conflicts.is_empty() {
-            let mut paths: Vec<_> = projection.name_conflicts.keys().cloned().collect();
-            paths.sort();
+        // Unprojected name claims refuse exactly like the clean path: a path
+        // claimed by several inodes is carried only when its complete marker
+        // bytes were captured (RFC §8.3); silently choosing a side is never
+        // allowed.
+        let mut unresolved_claims: Vec<&String> = projection
+            .name_conflicts
+            .keys()
+            .filter(|path| !marker_bytes.contains_key(*path))
+            .collect();
+        unresolved_claims.sort();
+        if !unresolved_claims.is_empty() {
+            let paths: Vec<String> = unresolved_claims
+                .into_iter()
+                .map(|path| path.clone())
+                .collect();
             return Err(ProjectTreeError::Repository(format!(
                 "unresolved path claims: {}",
                 paths.join(", ")
             )));
         }
         let mut entries = Vec::new();
+        let mut projected_paths = std::collections::BTreeSet::new();
         for item in projection
             .present
             .values()
@@ -1143,7 +1340,7 @@ impl Repository {
                 .map(ManifestDisposition::Excluded)
                 .unwrap_or(ManifestDisposition::Included);
             let attrs =
-                project_inode_attributes(&txn, item.position, closure.attribute_visibility())
+                project_inode_attributes(txn, item.position, closure.attribute_visibility())
                     .map_err(repo_error)?;
             if attrs.is_conflicted() {
                 return Err(ProjectTreeError::Repository(format!(
@@ -1152,19 +1349,23 @@ impl Repository {
                 )));
             }
             let materialization = attrs.materialization;
-            let bytes = super::content::retrieve_content_with_filter_fast(
-                &txn,
-                &self.change_store,
-                item.inode,
-                item.position,
-                RetrieveOptions::new().with_graph_visibility(closure.clone()),
-            )
-            .map_err(|error| ProjectTreeError::Repository(error.to_string()))?;
-            let gitlink = if materialization.kind == InodeKind::Gitlink {
+            let bytes = match marker_bytes.get(item.path.as_str()) {
+                Some(override_bytes) => override_bytes.clone(),
+                None => super::content::retrieve_content_with_filter_fast(
+                    txn,
+                    &self.change_store,
+                    item.inode,
+                    item.position,
+                    RetrieveOptions::new().with_graph_visibility(closure.clone()),
+                )
+                .map_err(|error| ProjectTreeError::Repository(error.to_string()))?,
+            };
+            let gitlink = if materialization.kind == InodeKind::Gitlink && marker_bytes.is_empty() {
                 Some(parse_gitlink_bytes(policy.object_format, &bytes)?)
             } else {
                 None
             };
+            projected_paths.insert(item.path.clone());
             entries.push(RepositoryEntry::new(
                 path,
                 bytes,
@@ -1174,7 +1375,44 @@ impl Repository {
                 disposition,
             )?);
         }
-        let manifest = RepositoryManifest::new(SetId::ZERO, policy.root().content_key, entries)?;
+        // Name-conflict paths are resolved away by path-claim visibility, so
+        // they may be absent from `present`; their marker bytes are injected
+        // as regular-file entries so the snapshot commit carries every side.
+        for (path, bytes) in marker_bytes {
+            if projected_paths.contains(path.as_str()) {
+                continue;
+            }
+            let repo_path = RepoPath::from_bytes(path.as_bytes())?;
+            let disposition = policy
+                .exclusions
+                .exclusion(&repo_path)
+                .map(ManifestDisposition::Excluded)
+                .unwrap_or(ManifestDisposition::Included);
+            entries.push(RepositoryEntry::new(
+                repo_path,
+                bytes.clone(),
+                atomic_core::output::DEFAULT_REGULAR_MODE,
+                InodeKind::Regular,
+                None,
+                disposition,
+            )?);
+        }
+        // The order-invariant identity of this exact closure: additive SetId
+        // over every closure member in dependency-first order.
+        let mut set_id = SetId::ZERO;
+        for change_id in closure.iter_dependency_first().copied() {
+            let hash = txn
+                .get_external(change_id)
+                .map_err(repo_error)?
+                .ok_or_else(|| {
+                    ProjectTreeError::Repository(format!(
+                        "closure change {} has no external hash",
+                        change_id.get()
+                    ))
+                })?;
+            set_id = set_id.add(&hash);
+        }
+        let manifest = RepositoryManifest::new(set_id, policy.root().content_key, entries)?;
         ProjectTree::from_manifest(manifest, policy)
     }
 }

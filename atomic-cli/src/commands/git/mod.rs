@@ -54,15 +54,23 @@
 //! $ atomic git import --incremental
 //! ```
 
+pub mod anchor;
+pub mod binding;
+pub(crate) mod bootstrap;
 pub mod bridge;
+pub mod census;
 pub(crate) mod checkpoint;
 pub(crate) mod guard;
 pub mod hooks;
 pub mod import;
 pub(crate) mod observation;
 pub mod parallel;
-pub mod push;
+pub(crate) mod push;
+pub(crate) mod ref_mapping;
 pub(crate) mod shadow;
+pub(crate) mod transport;
+pub(crate) mod verify_receive;
+pub(crate) mod watch;
 pub(crate) mod wip;
 
 use clap::Subcommand;

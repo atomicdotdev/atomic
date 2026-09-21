@@ -64,6 +64,10 @@ mod tests;
 
 use std::path::Path;
 
+use atomic_core::change::session::{
+    GitBoundaryCheckpoint, IncompleteSession, ManagedTurnOutcome, SessionIncompleteOrigin,
+    TurnBoundary,
+};
 use atomic_core::change::ChangeHeader;
 use atomic_core::types::Base32;
 
@@ -74,17 +78,673 @@ use crate::identity::build_agent_author;
 use crate::transcript;
 
 // Re-export primary types
-pub use options::{TurnRecordOptions, TurnRecordOutcome};
+pub use options::{RecordedGitTransition, TurnRecordOptions, TurnRecordOutcome};
 
 use message::build_turn_message;
 use provenance::{
     build_turn_envelope, build_turn_provenance, build_unhashed_turn_data, should_ignore_untracked,
 };
 
-// Change Header Construction
+// Turn boundary capture and Git-only classification (CB-12A, RFC §10.1/§10.2)
 
-/// Build a `ChangeHeader` for an agent turn.
+/// The result of trying to record one turn.
 ///
+/// `EmptyTurn` is removed (RFC §10.2): a clean worktree is *classified* as
+/// `ObservationOnly` or `RepositoryOperations`, never treated as "nothing
+/// happened" and never surfaced as an error.
+#[derive(Debug)]
+pub enum TurnRecordResult {
+    /// Durable content changes were recorded as Atomic changes.
+    Recorded(TurnRecordOutcome),
+    /// No working-copy content change; the turn is classified instead.
+    Classified(ClassifiedTurn),
+}
+
+/// One git-only or observation-only turn classification.
+#[derive(Debug)]
+pub struct ClassifiedTurn {
+    /// Semantic outcome (never `ContentChanges` in this variant).
+    pub outcome: ManagedTurnOutcome,
+    /// Turn-start baseline, when one was captured.
+    pub boundary_start: Option<TurnBoundary>,
+    /// Turn-end boundary captured during classification.
+    pub boundary_end: Option<TurnBoundary>,
+    /// Durable incomplete refusal for unexplained Git transitions.
+    pub incomplete: Option<IncompleteSession>,
+}
+
+impl ClassifiedTurn {
+    /// The turn this classification belongs to.
+    pub fn turn(&self) -> u32 {
+        self.boundary_end.as_ref().map(|b| b.turn).unwrap_or(0)
+    }
+}
+
+/// Capture one durable turn boundary from a live repository handle.
+///
+/// Observation only: nothing is interpreted, reconciled or materialized
+/// (RFC §12.1/§12.2 — reconciliation happens in repository command
+/// boundaries; the agent boundary observes). Fields the repository cannot
+/// compute yet stay `None` and are documented on `TurnBoundary`.
+pub fn capture_turn_boundary(
+    repo: &atomic_repository::Repository,
+    repo_root: &Path,
+    session_id: &str,
+    turn: u32,
+) -> Option<TurnBoundary> {
+    let working_copy = match repo.require_working_copy_id() {
+        Ok(working_copy) => working_copy.to_string(),
+        Err(error) => {
+            log::warn!("Boundary capture: cannot resolve working-copy identity: {}", error);
+            return None;
+        }
+    };
+
+    let view = repo.current_view().to_string();
+    let (view_state, set_id) = match repo.view_identity(&view) {
+        Ok(identity) => (Some(identity.merkle), Some(identity.set_id)),
+        Err(error) => {
+            // The view does not exist yet (e.g. a session view forked at
+            // first record) — record the boundary with unknown identity.
+            log::debug!(
+                "Boundary capture: view '{}' identity unavailable: {}",
+                view,
+                error
+            );
+            (None, None)
+        }
+    };
+
+    let git = match atomic_repository::observe_git_metadata(repo_root) {
+        Ok(observation) => Some(git_checkpoint(&observation.token())),
+        Err(error) => {
+            log::warn!("Boundary capture: git observation failed: {}", error);
+            None
+        }
+    };
+
+    Some(TurnBoundary {
+        working_copy,
+        operation: None,
+        view,
+        view_state,
+        set_id,
+        snapshot: None,
+        git,
+        // Phase 4 manifest engine pending — recorded as None, never faked.
+        manifest: None,
+        conversion_policy: None,
+        session_id: session_id.to_string(),
+        turn,
+        at: chrono::Utc::now().timestamp(),
+    })
+}
+
+/// Map an observation token onto the durable checkpoint type.
+pub fn git_checkpoint(token: &atomic_repository::GitObservationToken) -> GitBoundaryCheckpoint {
+    let (head_oid, head_symref) = match &token.head {
+        atomic_repository::GitHeadObservation::Attached { symref, oid } => {
+            (Some(oid.clone()), Some(symref.clone()))
+        }
+        atomic_repository::GitHeadObservation::Detached { oid } => (Some(oid.clone()), None),
+        atomic_repository::GitHeadObservation::Unborn { symref }
+        | atomic_repository::GitHeadObservation::MissingTarget { symref } => {
+            (None, Some(symref.clone()))
+        }
+    };
+    GitBoundaryCheckpoint {
+        head_oid,
+        head_symref,
+        head_tree: token.head_tree.clone(),
+        index_digest: Some(token.index_digest),
+        index_tree: token.index_tree.clone(),
+        index_locked: token.index_locked,
+        repository_state: token.repository_state.clone(),
+        markers: token
+            .markers
+            .iter()
+            .map(|marker| format!("{marker:?}"))
+            .collect(),
+    }
+}
+
+/// Describe what moved between two Git checkpoints (observed-operation-only).
+fn describe_git_transition(
+    start: &GitBoundaryCheckpoint,
+    end: &GitBoundaryCheckpoint,
+) -> Vec<String> {
+    let mut operations = Vec::new();
+    if start.head_oid != end.head_oid {
+        operations.push(format!(
+            "HEAD {} -> {}",
+            start.head_oid.as_deref().unwrap_or("<unborn>"),
+            end.head_oid.as_deref().unwrap_or("<unborn>")
+        ));
+    }
+    if start.index_digest != end.index_digest {
+        operations.push(format!(
+            "primary index {} -> {}",
+            start
+                .index_digest
+                .as_ref()
+                .map(|digest| digest.to_base32())
+                .unwrap_or_else(|| "<unreadable>".to_string()),
+            end.index_digest
+                .as_ref()
+                .map(|digest| digest.to_base32())
+                .unwrap_or_else(|| "<unreadable>".to_string())
+        ));
+    }
+    if start.repository_state != end.repository_state || start.markers != end.markers {
+        operations.push("git operation state changed".to_string());
+    }
+    if operations.is_empty() {
+        operations.push("non-checkpoint git state changed".to_string());
+    }
+    operations
+}
+
+/// Resolve the sessions directory the same way the pre-commit producer and
+/// the orchestrator do: the canonical common `.atomic` (review R9). Reading
+/// the worktree-local `.atomic/sessions` instead would strand the producer's
+/// captures away from linked-worktree consumers.
+fn sessions_dir_for(repo_root: &Path) -> std::path::PathBuf {
+    atomic_repository::Repository::canonical_dot_dir(repo_root)
+        .map(|dot| dot.join("sessions"))
+        .unwrap_or_else(|_| repo_root.join(".atomic").join("sessions"))
+}
+
+/// Semantic checkpoint equality (review R5).
+///
+/// The raw index digest is evidence, not semantics: a stat-only index refresh
+/// changes the file bytes (and its digest) without changing the represented
+/// tree. When both sides observed an index tree, tree equality proves the
+/// index semantically unchanged even if the digest drifted. A digest drift
+/// without a readable tree stays INEQUALITY (uncertainty is never equality).
+fn checkpoints_semantically_equal(
+    start: &GitBoundaryCheckpoint,
+    end: &GitBoundaryCheckpoint,
+) -> bool {
+    let index_equal = match (&start.index_digest, &end.index_digest) {
+        (Some(a), Some(b)) if a == b => true,
+        (Some(_), Some(_)) => start.index_tree.is_some() && end.index_tree.is_some(),
+        _ => start.index_digest == end.index_digest,
+    };
+    start.head_oid == end.head_oid
+        && start.head_symref == end.head_symref
+        && start.head_tree == end.head_tree
+        && start.index_tree == end.index_tree
+        && index_equal
+        && start.repository_state == end.repository_state
+        && start.markers == end.markers
+}
+
+/// Whether the observed HEAD move is explained by an anchored journal record.
+///
+/// Review R4: the advisory journal is untrusted input. A record explains a
+/// transition only when it was written for THIS worktree (the real journal
+/// writes the canonical worktree root) and inside the turn window (a stale
+/// or future-dated row is replay evidence, not an explanation). Anything else
+/// is ignored and the transition stays unexplained.
+fn checkout_journaled(
+    repo_root: &Path,
+    start_oid: Option<&str>,
+    end_oid: Option<&str>,
+    not_before_unix: i64,
+) -> bool {
+    let (Some(start_oid), Some(end_oid)) = (start_oid, end_oid) else {
+        return false;
+    };
+    let journal = repo_root.join(".atomic").join("bridge").join("git-events.jsonl");
+    let Ok(bytes) = std::fs::read(&journal) else {
+        return false;
+    };
+    // Bound the scan: the journal is append-only; a recent tail is enough.
+    let tail_start = bytes.len().saturating_sub(256 * 1024);
+    let tail = &bytes[tail_start..];
+    let worktree_root = std::fs::canonicalize(repo_root).unwrap_or_else(|_| repo_root.to_path_buf());
+    let now_unix = chrono::Utc::now().timestamp();
+    let mut records = 0usize;
+    for line in tail.split(|byte| *byte == b'\n') {
+        if records >= 512 {
+            break;
+        }
+        let Ok(record) = serde_json::from_slice::<serde_json::Value>(line) else {
+            continue;
+        };
+        if record.get("record_type").and_then(|value| value.as_str()) != Some("post-checkout") {
+            continue;
+        }
+        records += 1;
+        let old_head = record.get("old_head").and_then(|value| value.as_str());
+        let new_head = record.get("new_head").and_then(|value| value.as_str());
+        if old_head != Some(start_oid) || new_head != Some(end_oid) {
+            continue;
+        }
+        // Worktree binding: the row must name this worktree (review R4:
+        // "worktree /" in the executed probe is a fabricated row).
+        let recorded_root = record
+            .get("worktree_root")
+            .and_then(|value| value.as_str())
+            .map(std::path::PathBuf::from)
+            .map(|path| std::fs::canonicalize(&path).unwrap_or(path));
+        if recorded_root.as_deref() != Some(worktree_root.as_path()) {
+            continue;
+        }
+        // Turn-window anchoring: the row must have been written inside the
+        // window, with a generous same-machine clock skew on both sides.
+        let recorded_at = record
+            .get("recorded_at")
+            .and_then(|value| value.as_str())
+            .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+            .map(|time| time.timestamp());
+        let Some(recorded_unix) = recorded_at else {
+            continue;
+        };
+        if recorded_unix < not_before_unix.saturating_sub(60)
+            || recorded_unix > now_unix.saturating_add(300)
+        {
+            continue;
+        }
+        return true;
+    }
+    false
+}
+
+/// The classification of one Git transition between turn boundaries.
+struct GitTransitionClassification {
+    operations: Vec<String>,
+    capture: Option<atomic_core::types::Hash>,
+    incomplete: Option<IncompleteSession>,
+    /// The exact commit OID when the recorded delta covers it exactly
+    /// (CB-12A follow-up AC-8: verified capture + no worktree remainder).
+    exact_commit_oid: Option<String>,
+}
+
+/// Classify a Git transition (review R2/R4): verified commit-time capture
+/// binding, journaled-checkout explanation, or durable refusal. Used by both
+/// the clean-turn path and the mixed content+transition path, with identical
+/// authority.
+#[allow(clippy::too_many_arguments)]
+fn classify_git_transition(
+    repo_root: &Path,
+    options: &TurnRecordOptions<'_>,
+    start_git: &GitBoundaryCheckpoint,
+    end_git: &GitBoundaryCheckpoint,
+    operations: Vec<String>,
+    expected_working_copy: &str,
+    content_recorded: bool,
+) -> GitTransitionClassification {
+    let sessions_dir = sessions_dir_for(repo_root);
+    let capture = match crate::turn::capture::verify_capture(
+        &sessions_dir,
+        options.session,
+        options.turn_number,
+        expected_working_copy,
+        start_git.head_oid.as_deref(),
+        end_git.head_tree.as_deref(),
+        boundary_start_at(options),
+    ) {
+        Ok(Some(capture)) => {
+            let bytes = capture.to_json().unwrap_or_default();
+            Some(atomic_core::types::Hash::of(&bytes))
+        }
+        Ok(None) => None,
+        Err(error) => {
+            log::warn!(
+                "Commit-time capture failed authentication for session {} turn {}: {}",
+                options.session.session_id,
+                options.turn_number,
+                error
+            );
+            None
+        }
+    };
+    let capture_failed_authentication = capture.is_none()
+        && crate::turn::capture::has_capture(
+            &sessions_dir,
+            &options.session.session_id,
+            options.turn_number,
+        );
+
+    // A verified capture binds the move, but this is NOT the
+    // ManagedGitCommitCaptured classification: the exact baseline→index /
+    // index→worktree reassembly (RFC §10.3.2) is not implemented. Per the
+    // owner-APPROVED RFC §19 Q2 policy (2026-09-14, allow-as-incomplete):
+    // the commit is carried as synthesis with observed-operation-only
+    // attribution and a DURABLE incomplete status requiring review — never
+    // exact attribution, never an approximate path-level split. The capture
+    // hash is retained as recovery evidence.
+    if let Some(capture_hash) = capture.clone() {
+        log::info!(
+            "Verified commit-time capture binds the Git transition for session {} turn {}; \
+             durable incomplete until the exact reassembly (RFC §10.3.2) attributes it \
+             (RFC §19 Q2 approved allow-as-incomplete, 2026-09-14)",
+            options.session.session_id,
+            options.turn_number
+        );
+        let incomplete = IncompleteSession::new(
+            "Managed commit captured and authenticated, but the exact baseline→index / \
+             index→worktree reassembly (RFC §10.3.2) has not attributed it; carried as \
+             synthesis with observed-operation-only attribution per the owner-approved \
+             RFC §19 Q2 policy (allow-as-incomplete, 2026-09-14)",
+            Vec::<String>::new(),
+            String::new(),
+            SessionIncompleteOrigin::ManagedCaptureAwaitingReassembly,
+        )
+        .with_unbound_commits(vec![end_git.head_oid.clone().unwrap_or_default()]);
+        let _ = capture_hash;
+        // CB-12A follow-up AC-8 (exact separable case): when the turn-end
+        // worktree carries NO remainder beyond the commit (worktree ==
+        // commit tree), the recorded content delta IS the capture's
+        // HEAD→index delta and the change is classified
+        // ManagedGitCommitCaptured (exact) — no durable incomplete.
+        let remainder = worktree_has_remainder(repo_root);
+        if !remainder && content_recorded {
+            return GitTransitionClassification {
+                operations,
+                capture,
+                incomplete: None,
+                exact_commit_oid: end_git.head_oid.clone(),
+            };
+        }
+        return GitTransitionClassification {
+            operations,
+            capture,
+            incomplete: Some(incomplete),
+            exact_commit_oid: None,
+        };
+    }
+
+    let unbound_commit = end_git.head_oid.clone().unwrap_or_default();
+
+    // A capture file exists but failed authentication: never explained away,
+    // even by journaled checkout evidence — a capture can only exist if a
+    // commit attempt ran the pre-commit hook.
+    if capture_failed_authentication {
+        log::warn!(
+            "Commit-time capture failed authentication for session {} turn {}; marking \
+             session incomplete with observed-operation-only attribution",
+            options.session.session_id,
+            options.turn_number
+        );
+        let incomplete = IncompleteSession::new(
+            "Git transition between turn boundaries failed commit-time capture \
+             authentication; observed-operation-only attribution (RFC §10.3.2)",
+            Vec::<String>::new(),
+            String::new(),
+            SessionIncompleteOrigin::UnattributedGitOperation,
+        )
+        .with_unbound_commits(vec![unbound_commit]);
+        return GitTransitionClassification {
+            operations,
+            capture: None,
+            incomplete: Some(incomplete),
+            exact_commit_oid: None,
+        };
+    }
+
+    // No capture. An anchored journaled checkout explains the move without
+    // implying any commit authorship (review R4: worktree- and window-bound).
+    let not_before = boundary_start_at(options);
+    if checkout_journaled(
+        repo_root,
+        start_git.head_oid.as_deref(),
+        end_git.head_oid.as_deref(),
+        not_before,
+    ) {
+        log::info!(
+            "HEAD move for session {} turn {} is explained by an anchored journaled \
+             checkout (advisory evidence, RFC §11)",
+            options.session.session_id,
+            options.turn_number
+        );
+        return GitTransitionClassification {
+            operations,
+            capture: None,
+            incomplete: None,
+            exact_commit_oid: None,
+        };
+    }
+
+    // Unexplained transition without authenticated commit-time capture:
+    // observed-operation-only attribution plus durable incomplete status
+    // until reviewed (RFC §10.3.2). Synthesis of the commit itself is NOT
+    // implemented and is never faked here.
+    log::warn!(
+        "Unexplained Git transition for session {} turn {} ({:?}); marking session \
+         incomplete with observed-operation-only attribution",
+        options.session.session_id,
+        options.turn_number,
+        operations
+    );
+    let incomplete = IncompleteSession::new(
+        "Git transition between turn boundaries without authenticated commit-time capture \
+         (hook bypassed, removed, or --no-verify); observed-operation-only attribution \
+         (RFC §10.3.2)",
+        Vec::<String>::new(),
+        String::new(),
+        SessionIncompleteOrigin::UnattributedGitOperation,
+    )
+    .with_unbound_commits(vec![unbound_commit]);
+    GitTransitionClassification {
+        operations,
+        capture: None,
+        incomplete: Some(incomplete),
+        exact_commit_oid: None,
+    }
+}
+
+fn boundary_start_at(options: &TurnRecordOptions<'_>) -> i64 {
+    options
+        .session
+        .boundary_start
+        .as_ref()
+        .map(|boundary| boundary.at)
+        .unwrap_or(0)
+}
+
+/// Classify a turn whose working copy is clean (no durable content change).
+#[allow(clippy::too_many_arguments)]
+fn classify_clean_turn(
+    _repo: &atomic_repository::Repository,
+    repo_root: &Path,
+    options: &TurnRecordOptions<'_>,
+    boundary_start: Option<TurnBoundary>,
+    boundary_end: TurnBoundary,
+) -> ClassifiedTurn {
+    let start_git = boundary_start.as_ref().and_then(|boundary| boundary.git.clone());
+    let end_git = boundary_end.git.clone();
+
+    // No baseline: refuse to claim ObservationOnly, record the observation
+    // gap explicitly, and durably refuse attribution (review R3: the missing
+    // observation is itself evidence, never a silent success).
+    let Some(start_git) = start_git else {
+        log::warn!(
+            "Turn-end classification for session {} has no turn-start baseline; \
+             HEAD/index transition is unverifiable and no attribution is claimed",
+            options.session.session_id
+        );
+        let unbound = boundary_end
+            .git
+            .as_ref()
+            .and_then(|git| git.head_oid.clone())
+            .unwrap_or_default();
+        let incomplete = IncompleteSession::new(
+            "turn-start boundary unavailable; HEAD/index transition unverifiable and \
+             no attribution is claimed (RFC §10.2)",
+            Vec::<String>::new(),
+            String::new(),
+            SessionIncompleteOrigin::ObservationUnavailable,
+        )
+        .with_unbound_commits(vec![unbound]);
+        return ClassifiedTurn {
+            outcome: ManagedTurnOutcome::RepositoryOperations {
+                operations: vec![
+                    "turn-start boundary unavailable; HEAD/index transition unverifiable"
+                        .to_string(),
+                ],
+                capture: None,
+            },
+            boundary_start,
+            boundary_end: Some(boundary_end),
+            incomplete: Some(incomplete),
+        };
+    };
+
+    let Some(end_git) = end_git else {
+        // Baseline existed but the end observation failed — the same
+        // conservative treatment as a missing baseline: durable refusal
+        // (review R3).
+        log::warn!(
+            "Turn-end git observation failed for session {}; \
+             no attribution is claimed",
+            options.session.session_id
+        );
+        let incomplete = IncompleteSession::new(
+            "turn-end git observation failed; transition unverifiable and no \
+             attribution is claimed (RFC §10.2)",
+            Vec::<String>::new(),
+            String::new(),
+            SessionIncompleteOrigin::ObservationUnavailable,
+        );
+        return ClassifiedTurn {
+            outcome: ManagedTurnOutcome::RepositoryOperations {
+                operations: vec![
+                    "turn-end git observation failed; transition unverifiable".to_string(),
+                ],
+                capture: None,
+            },
+            boundary_start,
+            boundary_end: Some(boundary_end),
+            incomplete: Some(incomplete),
+        };
+    };
+
+    // Semantic equality over the checkpoint (review R5): timestamps excluded,
+    // raw index digest treated as evidence rather than semantics, and the
+    // view identity must not have moved either — a view-only move is a real
+    // operation, never ObservationOnly.
+    let view_identity_equal = match (&boundary_start, &boundary_end) {
+        (Some(start), end) => match (&start.view_state, &end.view_state) {
+            (Some(a), Some(b)) => a == b,
+            (None, None) => true,
+            // Unknown on either side: the checkpoint equality below still
+            // decides; view identity is not contradicted by an unobserved
+            // identity on both ends of an observation gap.
+            _ => true,
+        },
+        (None, _) => true,
+    };
+    if checkpoints_semantically_equal(&start_git, &end_git) && view_identity_equal {
+        return ClassifiedTurn {
+            outcome: ManagedTurnOutcome::ObservationOnly,
+            boundary_start,
+            boundary_end: Some(boundary_end),
+            incomplete: None,
+        };
+    }
+
+    // Git (or the view identity) moved. Classify the transition with full
+    // capture/journal/refusal authority (review R2/R4).
+    let mut operations = describe_git_transition(&start_git, &end_git);
+    if !view_identity_equal {
+        operations.push("Atomic view identity moved between turn boundaries".to_string());
+    }
+    // The CLEAN path records no content: the commit's content never landed
+    // in Atomic, so the exact ManagedGitCommitCaptured classification is
+    // unavailable (synthesis/import remains).
+    let classification = classify_git_transition(
+        repo_root,
+        options,
+        &start_git,
+        &end_git,
+        operations,
+        &boundary_end.working_copy,
+        false,
+    );
+    ClassifiedTurn {
+        outcome: ManagedTurnOutcome::RepositoryOperations {
+            operations: classification.operations,
+            capture: classification.capture,
+        },
+        boundary_start,
+        boundary_end: Some(boundary_end),
+        incomplete: classification.incomplete,
+    }
+}
+
+/// Classify the Git transition of a turn whose working copy was NOT clean
+/// (review R2): the content work is attributed normally, but the transition
+/// is classified with the same authority as a git-only turn. Returns `None`
+/// when there is no observed transition to classify (missing baseline, failed
+/// end observation, or semantic checkpoint equality).
+fn classify_dirty_turn_git_transition(
+    repo_root: &Path,
+    options: &TurnRecordOptions<'_>,
+    boundary_end: Option<&TurnBoundary>,
+) -> Option<RecordedGitTransition> {
+    let start_git = options
+        .session
+        .boundary_start
+        .as_ref()
+        .and_then(|boundary| boundary.git.clone())?;
+    let end_boundary = boundary_end?;
+    let end_git = end_boundary.git.clone()?;
+    if checkpoints_semantically_equal(&start_git, &end_git) {
+        return None;
+    }
+    let operations = describe_git_transition(&start_git, &end_git);
+    // The DIRTY path records the worktree content: when the worktree has
+    // no remainder beyond the commit, the recorded delta IS the commit
+    // delta (exact — ManagedGitCommitCaptured).
+    let classification = classify_git_transition(
+        repo_root,
+        options,
+        &start_git,
+        &end_git,
+        operations,
+        &end_boundary.working_copy,
+        true,
+    );
+    Some(RecordedGitTransition {
+        operations: classification.operations,
+        capture: classification.capture,
+        incomplete: classification.incomplete,
+        exact_commit_oid: classification.exact_commit_oid,
+    })
+}
+
+/// Whether the working tree carries changes beyond the Git HEAD (unstaged
+/// or untracked content) — the CB-12A follow-up exact-separability oracle.
+/// A clean worktree at the boundary means the turn's recorded content
+/// equals the commit tree exactly (no remainder), so the verified capture's
+/// HEAD→index delta IS the recorded delta. Read-only; any git failure is
+/// conservatively a remainder (never claims exactness).
+fn worktree_has_remainder(repo_root: &Path) -> bool {
+    let Ok(output) = std::process::Command::new("git")
+        .args(["status", "--porcelain"])
+        .current_dir(repo_root)
+        .output()
+    else {
+        return true;
+    };
+    if !output.status.success() {
+        return true;
+    }
+    // Atomic-owned state (.atomic/, .vault/) is never content remainder.
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let remainder_lines: Vec<&str> = stdout
+        .lines()
+        .filter(|line| {
+            let path = line.get(3..).unwrap_or(line);
+            !(path.starts_with(".atomic/") || path.starts_with(".vault/"))
+        })
+        .collect();
+    !remainder_lines.is_empty()
+}
+
+/// Build a `ChangeHeader` for an agent turn.///
 /// The message is built from the file changes and prompt context:
 /// - Good prompt: `"Fix the authentication bug in login.rs"`
 /// - Slash command or no prompt: `"Add src/main.rs, Cargo.toml"`
@@ -178,12 +838,18 @@ fn align_or_repair_session_view(
     }
 }
 
-/// Record an agent turn as an Atomic change.
+/// Record an agent turn as an Atomic change, or classify a clean turn.
 ///
 /// This is the function that bridges the agent world into the VCS world.
 /// It builds a `ChangeHeader`, `Provenance`, and `SessionEnvelope`, then
 /// calls the repository's `record()` method to create a proper content-addressed,
 /// hashable, pushable Atomic change.
+///
+/// When the working copy is clean, `EmptyTurn` is NOT returned (RFC §10.2
+/// removed it): the turn is classified as `ObservationOnly` (semantic
+/// checkpoint equality) or `RepositoryOperations` (Git state moved between
+/// boundaries) and returned as `TurnRecordResult::Classified` with durable
+/// boundary evidence.
 ///
 /// # Arguments
 ///
@@ -193,18 +859,16 @@ fn align_or_repair_session_view(
 ///
 /// # Returns
 ///
-/// A `TurnRecordOutcome` with the change hash, turn number, file count,
-/// and message. The change has already been applied to the agent's view.
+/// A `TurnRecordResult`: `Recorded` with the change outcome, or `Classified`
+/// with the semantic turn outcome and durable boundaries.
 ///
 /// # Errors
 ///
-/// Returns `AgentError::EmptyTurn` if the repository has nothing to record
-/// (no files changed since the last recorded state).
 /// Returns `AgentError::RecordFailed` if the repository record operation fails.
 pub fn record_turn(
     repo_root: &Path,
     options: &TurnRecordOptions<'_>,
-) -> AgentResult<TurnRecordOutcome> {
+) -> AgentResult<TurnRecordResult> {
     // Step 1: Open the repository read-only for the initial status check.
     // This avoids blocking on the redb write lock — we only need read access
     // to decide whether there's work to do and which files are untracked.
@@ -277,13 +941,43 @@ pub fn record_turn(
             reason: format!("Failed to get repository status: {}", e),
         })?;
 
-    // Check if there's anything to record at all
-    if status.is_clean() && status.untracked_count() == 0 {
-        return Err(AgentError::EmptyTurn {
-            session_id: options.session.session_id.clone(),
-            turn_number: options.turn_number,
-        });
+    // Check if there's anything to record at all. A clean turn is classified
+    // (RFC §10.2), never reported as empty.
+    // A projected name conflict is surfaced as `Conflicted`, which
+    // `FileStatus::is_dirty` deliberately does not count as a content change.
+    // A turn whose only issue is such a conflict is therefore NOT clean: the
+    // recorded change is what supersedes the losing claims (or refuses a third
+    // value), so it must reach the record body instead of classifying as
+    // observation-only. Otherwise a content-clean name conflict would be
+    // silently ignored forever.
+    if status.is_clean() && status.conflicted_count() == 0 && status.untracked_count() == 0 {
+        return Ok(TurnRecordResult::Classified(classify_clean_turn(
+            &repo,
+            repo_root,
+            options,
+            options.session.boundary_start.clone(),
+            capture_turn_boundary(&repo, repo_root, &options.session.session_id, options.turn_number)
+                .ok_or_else(|| AgentError::RecordFailed {
+                    session_id: options.session.session_id.clone(),
+                    turn_number: options.turn_number,
+                    reason: "Failed to capture turn-end boundary on a clean turn".to_string(),
+                })?,
+        )));
     }
+
+    // Review R2 (ATOM::aaron::8): a mixed turn — working-copy content AND a
+    // Git-side transition — is transition-classified BEFORE ordinary content
+    // attribution. Dirty content alone never bypasses capture classification:
+    // an unexplained commit inside the turn window carries its durable
+    // refusal on the recorded outcome, whatever content is recorded.
+    let dirty_boundary_end = capture_turn_boundary(
+        &repo,
+        repo_root,
+        &options.session.session_id,
+        options.turn_number,
+    );
+    let git_transition =
+        classify_dirty_turn_git_transition(repo_root, options, dirty_boundary_end.as_ref());
 
     // Step 3: Add — track any new files the agent created
     // Agents create new files all the time (new modules, tests, configs).
@@ -373,11 +1067,19 @@ pub fn record_turn(
             reason: format!("Failed to refresh repository status after add: {}", e),
         })?;
 
-    if status.is_clean() {
-        return Err(AgentError::EmptyTurn {
-            session_id: options.session.session_id.clone(),
-            turn_number: options.turn_number,
-        });
+    if status.is_clean() && status.conflicted_count() == 0 {
+        return Ok(TurnRecordResult::Classified(classify_clean_turn(
+            &repo,
+            repo_root,
+            options,
+            options.session.boundary_start.clone(),
+            capture_turn_boundary(&repo, repo_root, &options.session.session_id, options.turn_number)
+                .ok_or_else(|| AgentError::RecordFailed {
+                    session_id: options.session.session_id.clone(),
+                    turn_number: options.turn_number,
+                    reason: "Failed to capture turn-end boundary on a clean turn".to_string(),
+                })?,
+        )));
     }
 
     // Step 4: Build SessionEnvelope + Record the Atomic change
@@ -426,10 +1128,20 @@ pub fn record_turn(
     let mut outcome = match repo.record(working_copy, header, record_options) {
         Ok(outcome) => outcome,
         Err(atomic_repository::record::RecordError::NothingToRecord) => {
-            return Err(AgentError::EmptyTurn {
-                session_id: options.session.session_id.clone(),
-                turn_number: options.turn_number,
-            });
+            // Nothing recorded even though status looked dirty — classify
+            // instead of reporting an empty turn (RFC §10.2).
+            return Ok(TurnRecordResult::Classified(classify_clean_turn(
+                &repo,
+                repo_root,
+                options,
+                options.session.boundary_start.clone(),
+                capture_turn_boundary(&repo, repo_root, &options.session.session_id, options.turn_number)
+                    .ok_or_else(|| AgentError::RecordFailed {
+                        session_id: options.session.session_id.clone(),
+                        turn_number: options.turn_number,
+                        reason: "Failed to capture turn-end boundary on a clean turn".to_string(),
+                    })?,
+            )));
         }
         Err(e) => {
             return Err(AgentError::RecordFailed {
@@ -525,12 +1237,13 @@ pub fn record_turn(
 
     let hash = *outcome.hash();
 
-    Ok(TurnRecordOutcome {
+    Ok(TurnRecordResult::Recorded(TurnRecordOutcome {
         hash,
         turn_number: options.turn_number,
         file_count,
         message,
         recorded_files,
         unhashed_data,
-    })
+        git_transition,
+    }))
 }

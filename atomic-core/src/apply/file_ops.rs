@@ -168,10 +168,39 @@ pub fn apply_file_ops<T: MutTxnT>(
     change_id: NodeId,
     file_ops: &[FileOps],
 ) -> PristineResult<ApplyFileOpsStats> {
+    let trace_crdt = std::env::var_os("ATOMIC_TRACE_APPLY_CRDT").is_some();
+    let crdt_start = std::time::Instant::now();
     let mut stats = ApplyFileOpsStats::new();
     let mut next_leaf_idx = 0u32;
-    for ops in file_ops {
+    for (ops_index, ops) in file_ops.iter().enumerate() {
+        if trace_crdt {
+            eprintln!(
+                "[apply-crdt] ops {ops_index}/{} path={:?} line_ops={} encoding_of_trunk={:?} elapsed_before={:?}",
+                file_ops.len(),
+                ops.path(),
+                ops.line_ops().len(),
+                ops.trunk_op().map(|op| match op {
+                    crate::crdt::TrunkOp::Create { encoding, .. } => {
+                        encoding.as_ref().map(ToString::to_string)
+                    }
+                    _ => None,
+                }),
+                crdt_start.elapsed()
+            );
+        }
         apply_single_file_ops(txn, change_id, ops, &mut stats, &mut next_leaf_idx)?;
+        if trace_crdt {
+            eprintln!(
+                "[apply-crdt] ops {ops_index} complete elapsed={:?}",
+                crdt_start.elapsed()
+            );
+        }
+    }
+    if trace_crdt {
+        eprintln!(
+            "[apply-crdt] all ops complete total={:?}",
+            crdt_start.elapsed()
+        );
     }
     Ok(stats)
 }
@@ -289,7 +318,12 @@ pub fn apply_file_ops_batched(
                     unreachable!("batched apply only runs for insert-only leaf ops");
                 };
 
-                let leaf_id = LeafId::new(branch_id.change_id(), next_leaf_idx);
+                // Leaf rows are keyed by the APPLYING change (review C1): the
+                // applier's NodeId plus the per-apply counter is globally
+                // unique, so a later apply can never re-key another branch's
+                // rows. Insert-created branches are applier-owned, so this
+                // matches the historical keying exactly on this path.
+                let leaf_id = LeafId::new(change_id, next_leaf_idx);
                 next_leaf_idx += 1;
                 let leaf_key = encode_leaf_id(&leaf_id);
                 let leaf_value = encode_leaf_value(&SerializedLeaf {
@@ -442,7 +476,9 @@ pub fn apply_file_ops_batched_groups(
                         unreachable!("batched apply only runs for insert-only leaf ops");
                     };
 
-                    let leaf_id = LeafId::new(branch_id.change_id(), next_leaf_idx);
+                    // Leaf rows are keyed by the APPLYING change (review C1):
+                    // same contract as `apply_file_ops_batched`.
+                    let leaf_id = LeafId::new(*change_id, next_leaf_idx);
                     next_leaf_idx += 1;
                     let leaf_key = encode_leaf_id(&leaf_id);
                     let leaf_value = encode_leaf_value(&SerializedLeaf {
@@ -464,8 +500,19 @@ pub fn apply_file_ops_batched_groups(
 }
 
 fn can_batch_apply_file_ops(file_ops: &[FileOps]) -> bool {
-    file_ops.iter().all(|ops| {
-        matches!(ops.trunk_op(), None | Some(TrunkOp::Create { .. }))
+    let trace_crdt = std::env::var_os("ATOMIC_TRACE_APPLY_CRDT").is_some();
+    let outcome = file_ops.iter().all(|ops| {
+        // Attribute trunk ops (SetMode/SetKind) carry semantic facts only —
+        // GraphOp::SetAttr owns their persistence — so they batch like a
+        // no-op instead of forcing the whole file through the generic
+        // per-op table-reopening path (the 1 MB binary add took 36s there).
+        matches!(
+            ops.trunk_op(),
+            None
+                | Some(TrunkOp::Create { .. })
+                | Some(TrunkOp::SetMode { .. })
+                | Some(TrunkOp::SetKind { .. })
+        )
             && ops.line_ops().iter().all(|line_ops| {
                 matches!(
                     line_ops.operation(),
@@ -475,7 +522,52 @@ fn can_batch_apply_file_ops(file_ops: &[FileOps]) -> bool {
                             .all(|leaf_op| matches!(leaf_op, LeafOp::Insert { .. }))
                 )
             })
-    })
+    });
+    if trace_crdt && !outcome {
+        for (ops_index, ops) in file_ops.iter().enumerate() {
+            let trunk_ok = matches!(
+                ops.trunk_op(),
+                None
+                    | Some(TrunkOp::Create { .. })
+                    | Some(TrunkOp::SetMode { .. })
+                    | Some(TrunkOp::SetKind { .. })
+            );
+            if !trunk_ok {
+                eprintln!(
+                    "[apply-crdt] batch refused: ops {ops_index} trunk_op is not Create/None"
+                );
+            }
+            for (line_index, line_ops) in ops.line_ops().iter().enumerate() {
+                let is_insert = matches!(line_ops.operation(), BranchOp::Insert { .. });
+                if !is_insert {
+                    eprintln!(
+                        "[apply-crdt] batch refused: ops {ops_index} line {line_index} is not Insert"
+                    );
+                }
+                if let BranchOp::Insert { content, .. } = line_ops.operation() {
+                    for (leaf_index, leaf_op) in content.iter().enumerate() {
+                        if !matches!(leaf_op, LeafOp::Insert { .. }) {
+                            eprintln!(
+                                "[apply-crdt] batch refused: ops {ops_index} line {line_index} leaf {leaf_index} is {:?}",
+                                leaf_op_discriminant(leaf_op)
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+    outcome
+}
+
+/// Debug label for a leaf op's variant (batch-refusal tracing).
+fn leaf_op_discriminant(leaf_op: &LeafOp) -> &'static str {
+    match leaf_op {
+        LeafOp::Insert { .. } => "Insert",
+        LeafOp::Delete { .. } => "Delete",
+        LeafOp::Replace { .. } => "Replace",
+        LeafOp::Restore { .. } => "Restore",
+    }
 }
 
 /// Apply FileOps for a single file.
@@ -671,7 +763,13 @@ fn apply_line_ops_with_position<T: MutTxnT>(
 
             // Apply leaf operations for this line's tokens
             for leaf_op in content {
-                let leaf_id = LeafId::new(branch_id.change_id(), *next_leaf_idx);
+                // Leaf rows are keyed by the APPLYING change (review C1): the
+                // applier's NodeId plus the per-apply counter is globally
+                // unique, so no later apply can re-key this branch's rows or
+                // collide with a sibling branch's rows of a shared owner.
+                // For Insert-created branches the applier IS the branch's
+                // creator, so existing keying is preserved exactly here.
+                let leaf_id = LeafId::new(change_id, *next_leaf_idx);
                 *next_leaf_idx += 1;
                 apply_leaf_op(txn, branch_id, leaf_id, leaf_op, stats)?;
             }
@@ -748,9 +846,35 @@ fn apply_line_ops_with_position<T: MutTxnT>(
                 }
             }
 
+            // Tombstone the branch's previous alive tokens before inserting
+            // the replacement tokens (review C1): a Modify is semantically a
+            // delete-then-insert of the line's content, so the old tokens
+            // must not stay alive-linked to the reused branch id — otherwise
+            // the branch renders both the stale and the replacement tokens.
+            // With applier-keyed leaf ids the stale rows belong to the
+            // earlier applier's namespace and can be tombstoned without
+            // touching any other branch's rows.
+            {
+                let branch_key = encode_branch_id(&branch_id);
+                let stale: Vec<[u8; 12]> = txn
+                    .iter_branch_leaves(&branch_key)?
+                    .collect::<PristineResult<Vec<_>>>()?;
+                for leaf_key in stale {
+                    if let Some(mut row) = txn.get_crdt_leaf(&leaf_key)? {
+                        if row.state == LeafState::Alive {
+                            row.state = LeafState::Deleted;
+                            txn.put_crdt_leaf(&leaf_key, &encode_leaf_value(&row))?;
+                            stats.leaves_deleted += 1;
+                        }
+                    }
+                }
+            }
+
             // Apply leaf operations for the new content
             for leaf_op in new_content {
-                let leaf_id = LeafId::new(branch_id.change_id(), *next_leaf_idx);
+                // Applier-keyed leaf id (review C1): the modifying change owns
+                // the replacement tokens it records.
+                let leaf_id = LeafId::new(change_id, *next_leaf_idx);
                 *next_leaf_idx += 1;
                 apply_leaf_op(txn, branch_id, leaf_id, leaf_op, stats)?;
             }

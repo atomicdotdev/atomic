@@ -369,14 +369,29 @@ where
     let mut alive = Vec::new();
     let mut absent = Vec::new();
     let mut ambiguous = HashSet::<(String, Inode)>::new();
+    let debug_reduce = std::env::var("ATOMIC_DEBUG_REDUCE").is_ok();
+    let reduce_start = std::time::Instant::now();
+    let mut dep_calls = 0u64;
+    let mut max_events = 0u64;
 
     for ((path, position), events) in by_logical_claim {
+        if debug_reduce && events.len() as u64 > max_events {
+            max_events = events.len() as u64;
+            eprintln!(
+                "REDUCE group path={path:?} events={} ms={}",
+                events.len(),
+                reduce_start.elapsed().as_millis()
+            );
+        }
         let mut maximal = Vec::new();
         for candidate in &events {
             let mut superseded = false;
             for other in &events {
                 if candidate == other {
                     continue;
+                }
+                if candidate.event_change != other.event_change {
+                    dep_calls += 1;
                 }
                 if (candidate.event_change == other.event_change
                     && candidate.operation_index < other.operation_index)
@@ -432,6 +447,15 @@ where
             .any(|event| event.state == PathClaimState::Dead);
         if has_alive && has_dead {
             ambiguous.insert((path.clone(), inode));
+            if debug_reduce {
+                let alive_count = maximal.iter().filter(|e| e.state == PathClaimState::Alive).count();
+                eprintln!(
+                    "REDUCE ambiguous path={path:?} inode={} alive_events={} dead_events={}",
+                    inode.get(),
+                    alive_count,
+                    maximal.len() - alive_count
+                );
+            }
         }
 
         let alive_events: Vec<_> = maximal
@@ -547,7 +571,16 @@ where
         }
     }
 
-    let present = alive
+    if debug_reduce {
+        eprintln!(
+            "REDUCE alive_len={} ambiguous_len={} dep_calls={} ms={}",
+            alive.len(),
+            ambiguous.len(),
+            dep_calls,
+            reduce_start.elapsed().as_millis()
+        );
+    }
+    let present: Vec<ProjectedPathClaim> = alive
         .into_iter()
         .filter(|side| !conflicted.contains(&(side.path.clone(), side.inode)))
         .collect();
@@ -568,6 +601,15 @@ where
     }
     unambiguous_absent.sort_by(|left, right| left.path.cmp(&right.path));
 
+    if debug_reduce {
+        eprintln!(
+            "REDUCE present_len={} absent_len={} conflicts_len={} ms={}",
+            present.len(),
+            unambiguous_absent.len(),
+            conflicts.len(),
+            reduce_start.elapsed().as_millis()
+        );
+    }
     Ok(ReducedPathClaims {
         present,
         absent: unambiguous_absent,

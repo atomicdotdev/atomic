@@ -439,6 +439,10 @@ impl Encoder {
             OperationKind::Pull => 19,
             OperationKind::Push => 20,
             OperationKind::Consolidate => 21,
+            OperationKind::RefMapping => 22,
+            OperationKind::Repair => 23,
+            OperationKind::Cutover => 24,
+            OperationKind::ReconcileWorkingCopy => 25,
         })
     }
 
@@ -522,6 +526,14 @@ impl Encoder {
             MetadataTarget::Remote { name } => {
                 self.put_u8(3)?;
                 self.put_string(name, "metadata remote name")
+            }
+            MetadataTarget::RefMapping { view } => {
+                self.put_u8(4)?;
+                self.put_string(view, "metadata ref-mapping view")
+            }
+            MetadataTarget::Capability { id } => {
+                self.put_u8(5)?;
+                self.put_string(id, "metadata capability id")
             }
         }
     }
@@ -1041,6 +1053,12 @@ impl<'a> Decoder<'a> {
             19 if encoding_version == OPERATION_VERSION_V2 => Ok(OperationKind::Pull),
             20 if encoding_version == OPERATION_VERSION_V2 => Ok(OperationKind::Push),
             21 if encoding_version == OPERATION_VERSION_V2 => Ok(OperationKind::Consolidate),
+            22 if encoding_version == OPERATION_VERSION_V2 => Ok(OperationKind::RefMapping),
+            23 if encoding_version == OPERATION_VERSION_V2 => Ok(OperationKind::Repair),
+            24 if encoding_version == OPERATION_VERSION_V2 => Ok(OperationKind::Cutover),
+            25 if encoding_version == OPERATION_VERSION_V2 => {
+                Ok(OperationKind::ReconcileWorkingCopy)
+            }
             tag => Err(OperationCodecError::new(format!(
                 "unsupported operation kind tag {tag} for operation version {encoding_version}"
             ))),
@@ -1136,6 +1154,12 @@ impl<'a> Decoder<'a> {
             }),
             3 => Ok(MetadataTarget::Remote {
                 name: self.read_string("metadata remote name")?,
+            }),
+            4 => Ok(MetadataTarget::RefMapping {
+                view: self.read_string("metadata ref-mapping view")?,
+            }),
+            5 => Ok(MetadataTarget::Capability {
+                id: self.read_string("metadata capability id")?,
             }),
             tag => Err(OperationCodecError::new(format!(
                 "unsupported metadata target tag {tag}"

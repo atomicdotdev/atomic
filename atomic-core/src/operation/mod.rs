@@ -77,13 +77,41 @@ pub enum OperationKind {
     Pull,
     Push,
     Consolidate,
+    /// CB-10A: journaled view ↔ Git ref mapping bookkeeping (no Git effects).
+    RefMapping,
+    /// CB-13A: an explicit, immutable native derived-index remediation. The
+    /// mutation itself is redb-internal (no external effect), journaled with
+    /// before/after evidence digests and a same-transaction verified receipt.
+    Repair,
+    /// CB-13B: the transactional shadow → bridge cutover. Repository-scoped:
+    /// fences legacy shadow writers by requiring the `git-bridge-cutover`
+    /// repository capability, journaled with a same-transaction verified
+    /// receipt. Follow-up filesystem effects (legacy hook removal) are
+    /// leased separately and resumable; rollback is an `Undo`-related child.
+    Cutover,
+    /// Explicit, metadata-only reconciliation of one physical working copy's
+    /// persistent registration with an existing view. It rebinds
+    /// `desired_view`/`desired_state` to the view's *current* state and clears
+    /// any stale `materialized_state`/`materialized_manifest` claim, so a
+    /// working copy that drifted behind its view (for example after a
+    /// registration was written while the view advanced) can be trusted again
+    /// without re-materializing. It carries no filesystem, shelf, Git, or
+    /// view-membership effect and never deletes working-tree bytes.
+    ReconcileWorkingCopy,
 }
 
 impl OperationKind {
     fn requires_v2(self) -> bool {
         matches!(
             self,
-            Self::Restore | Self::Pull | Self::Push | Self::Consolidate
+            Self::Restore
+                | Self::Pull
+                | Self::Push
+                | Self::Consolidate
+                | Self::RefMapping
+                | Self::Repair
+                | Self::Cutover
+                | Self::ReconcileWorkingCopy
         )
     }
 }
@@ -427,6 +455,15 @@ pub enum MetadataTarget {
     View { name: String },
     Tag { view: String, name: String },
     Remote { name: String },
+    /// CB-10A: the mutable ref mapping for `view`, keyed by durable view id.
+    /// The value carries the complete versioned [`crate::pristine::RefMapping`]
+    /// encoding (`Bytes`) or `Absent` when the mapping row is removed.
+    RefMapping { view: String },
+    /// CB-13B: the `required-capability/<id>` row in `PRISTINE_META` whose
+    /// value is the required minimum version (`Sequence`) or `Absent` when
+    /// the requirement is rolled back. The capability fence makes clients
+    /// without the capability fail closed on open.
+    Capability { id: String },
 }
 
 /// Typed expected value for a repository metadata transition.
@@ -546,6 +583,132 @@ pub struct GitIndexState {
 pub enum GitRefTarget {
     Direct(GitObjectId),
     Symbolic(String),
+}
+
+/// Decode one full-length hex Git object id (40-char SHA-1 or 64-char
+/// SHA-256) into its tagged object id (review D3). The hex decoding is
+/// strict: the token must be entirely hex digits of exactly one supported
+/// length.
+pub fn parse_git_oid_hex(token: &str) -> Option<GitObjectId> {
+    let (algorithm, width) = match token.len() {
+        40 => (GitHashAlgorithm::Sha1, 20usize),
+        64 => (GitHashAlgorithm::Sha256, 32usize),
+        _ => return None,
+    };
+    if !token.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(width);
+    for index in 0..width {
+        let byte = u8::from_str_radix(&token[index * 2..index * 2 + 2], 16).ok()?;
+        bytes.push(byte);
+    }
+    GitObjectId::new(algorithm, bytes).ok()
+}
+
+/// Parse a post-rewrite event's `<old> <new>` full-OID pair (review D3).
+///
+/// The RFC §5.4 operation-linkage tier binds a captured post-rewrite event
+/// to the operation that performed the rewrite, so the event bytes must
+/// name exactly two full-length OIDs separated by whitespace — the Git
+/// post-rewrite wire format. `None` means the bytes cannot describe a
+/// rewrite pair at all.
+pub fn parse_post_rewrite_pair(
+    bytes: &[u8],
+) -> Option<(GitObjectId, GitObjectId)> {
+    let text = std::str::from_utf8(bytes).ok()?;
+    let mut tokens = text.split_whitespace();
+    let old = tokens.next()?;
+    let new = tokens.next()?;
+    if tokens.next().is_some() {
+        return None;
+    }
+    Some((parse_git_oid_hex(old)?, parse_git_oid_hex(new)?))
+}
+
+/// Parse a post-rewrite event's rewrite pairs (review D3).
+///
+/// The RFC §5.4 operation-linkage tier binds a captured post-rewrite event
+/// to the operation that performed the rewrite. Two byte shapes carry the
+/// pairs: the Git post-rewrite wire format (`<old> <new>` lines of
+/// full-length OIDs) and the durable JSON evidence record the hook journals
+/// (`record_type: "post-rewrite"` with a `rewritten` pair array). Returns
+/// the named pairs, or `None` when the bytes cannot describe a rewrite
+/// event at all.
+pub fn post_rewrite_event_pairs(
+    bytes: &[u8],
+) -> Option<Vec<(GitObjectId, GitObjectId)>> {
+    if let Ok(text) = std::str::from_utf8(bytes) {
+        if !text.trim_start().starts_with('{') {
+            let mut pairs = Vec::new();
+            for line in text.lines() {
+                let line = line.trim();
+                if line.is_empty() {
+                    continue;
+                }
+                let mut tokens = line.split_whitespace();
+                let old = tokens.next()?;
+                let new = tokens.next()?;
+                if tokens.next().is_some() {
+                    return None;
+                }
+                pairs.push((parse_git_oid_hex(old)?, parse_git_oid_hex(new)?));
+            }
+            if pairs.is_empty() {
+                return None;
+            }
+            return Some(pairs);
+        }
+    }
+    let record: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+    if record.get("record_type").and_then(|v| v.as_str()) != Some("post-rewrite") {
+        return None;
+    }
+    let mut pairs = Vec::new();
+    for pair in record.get("rewritten").and_then(|value| value.as_array())? {
+        let old = pair.get("old_oid").and_then(|value| value.as_str())?;
+        let new = pair.get("new_oid").and_then(|value| value.as_str())?;
+        pairs.push((parse_git_oid_hex(old)?, parse_git_oid_hex(new)?));
+    }
+    if pairs.is_empty() {
+        None
+    } else {
+        Some(pairs)
+    }
+}
+
+/// The operation capture token carried by post-rewrite event bytes (review
+/// E2), or `None` when the bytes carry no capture token.
+///
+/// Bare Git `<old> <new>` wire pairs never carry a token. The durable JSON
+/// evidence record the hook journals during a prepared operation's capture
+/// context carries the minted token in its `capture_token` field. Anchoring
+/// compares this token against the operation's minted context, so only a
+/// capture produced within the prepared operation can bind to it.
+pub fn post_rewrite_event_capture_token(bytes: &[u8]) -> Option<String> {
+    let record: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+    if record.get("record_type").and_then(|v| v.as_str()) != Some("post-rewrite") {
+        return None;
+    }
+    let token = record.get("capture_token")?.as_str()?;
+    if token.is_empty() {
+        None
+    } else {
+        Some(token.to_string())
+    }
+}
+
+/// Whether a Git-ref effect lease value equals the parsed OID (an all-zero
+/// OID matches the absent lease, matching Git's zero-OID ref conventions).
+pub fn effect_lease_matches_oid(
+    value: &EffectValue,
+    oid: &GitObjectId,
+) -> bool {
+    match value {
+        EffectValue::GitRef(GitRefTarget::Direct(target)) => target == oid,
+        EffectValue::Absent => oid.as_bytes().iter().all(|byte| *byte == 0),
+        _ => false,
+    }
 }
 
 /// One immutable Git-reference observation, sorted by ref name in an operation.

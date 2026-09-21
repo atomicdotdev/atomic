@@ -148,6 +148,33 @@ pub enum RepositoryError {
     #[error("Invalid operation: {message}")]
     InvalidOperation { message: String },
 
+    /// The legacy Git shadow pipeline refused to write (CB-13B).
+    ///
+    /// The repository durably requires the `git-bridge-cutover` capability,
+    /// so the colocated bridge owns writes. Nothing was written: the legacy
+    /// writer refuses before taking its lock or mutating any state.
+    #[error(
+        "repository has cut over to the colocated Git bridge: legacy shadow writes are \
+         fenced by required capability '{capability}'"
+    )]
+    LegacyShadowWriterFenced { capability: String },
+
+    /// The trusted provenance publication gate refused (CB-12B, RFC §10.4).
+    ///
+    /// No metadata, ref, or pack was moved: the refusal happens before any
+    /// mutation or publication. Content correctness is NOT implied to be
+    /// wrong — the report names the exact evidence blockers and limitations.
+    #[error(
+        "publication refused at {boundary}: trusted provenance gate found {managed_changes} \
+         managed-session change(s) with incomplete evidence (of {checked} checked):\n{report}"
+    )]
+    PublicationGateRefused {
+        boundary: String,
+        report: String,
+        managed_changes: usize,
+        checked: usize,
+    },
+
     /// Change not found
     #[error("Change not found: {hash}")]
     ChangeNotFound { hash: String },
@@ -171,9 +198,25 @@ pub enum RepositoryError {
     #[error("Operation scope '{scope}' is Diverged: {}", heads.join(", "))]
     OperationHeadsDiverged { scope: String, heads: Vec<String> },
 
+    /// A leased Git effect observed a third value: newer external work owns
+    /// the resource and was preserved; the effect mutated nothing (RFC §12.6).
+    #[error("SyncConflict: leased effect on {target} diverged — expected {expected}, observed {observed}")]
+    LeaseDiverged {
+        target: String,
+        expected: String,
+        observed: String,
+    },
+
     /// The selected operation has not completed verification.
     #[error("Operation {operation} is not verified")]
     OperationNotVerified { operation: String },
+
+    /// A metadata-only (reactive watch) boundary deferred instead of acting:
+    /// the repository/entry holds unsafe recovery or Git-owned work that only
+    /// an explicit command boundary may execute. Nothing was mutated (CB-13D,
+    /// RFC §11.2 rule 4).
+    #[error("reactive metadata-only boundary deferred: {detail}; the pending work requires an explicit command boundary")]
+    ReactiveDeferred { detail: String },
 
     /// The selected operation is outside the current scope's reachable history.
     #[error("Operation {operation} is not reachable from scope '{scope}'")]
@@ -246,6 +289,17 @@ pub enum RepositoryError {
     LockContended {
         lock: RepositoryLockKind,
         path: PathBuf,
+    },
+
+    /// A mapping replacement was built from an observation that is no longer
+    /// the stored row (CB-10A review R6): the caller must re-observe and
+    /// rebuild instead of clobbering a newer row under an invented lease.
+    #[error(
+        "ref mapping for view '{view}' moved since the caller observed it; \
+         re-observe and rebuild the replacement (nothing was written)"
+    )]
+    RefMappingObservationMoved {
+        view: String,
     },
 
     /// Legacy unscoped lock error.
@@ -331,6 +385,59 @@ pub enum RepositoryError {
         declared: String,
         actual: String,
     },
+
+    /// A stored Git-state binding names this commit but failed verification.
+    /// Resurrection refuses closed instead of re-synthesizing over a known
+    /// binding claim (RFC §12.4); the rejection is recoverable by retry.
+    #[error(
+        "binding {id} for commit {commit} failed verification and cannot be resurrected: {reason}"
+    )]
+    BindingRejected {
+        id: String,
+        commit: String,
+        reason: String,
+    },
+
+    /// The binding's change closure could not be completed from any source.
+    #[error(
+        "binding {id} closure is incomplete ({count} missing); refusing resurrection: {reasons}"
+    )]
+    BindingClosureIncomplete {
+        id: String,
+        count: usize,
+        reasons: String,
+    },
+
+    /// The isolated projection recomputed from the restored closure does not
+    /// match the binding's bound Git tree or SetId (RFC §5.2 projection
+    /// compare). Nothing was published; the rejection is recoverable.
+    #[error("resurrection of binding {id} rejected: {reason}")]
+    ResurrectionRejected { id: String, reason: String },
+
+    /// The observed Git lease changed during resurrection (TOCTOU guard);
+    /// the attempt was aborted and the retry budget exhausted.
+    #[error(
+        "resurrection of binding {id} contended with concurrent Git mutation for {attempts} attempts; refusing"
+    )]
+    ResurrectionContended { id: String, attempts: u8 },
+
+    /// Internal marker: the Git lease observed before the projection proof
+    /// changed before publication. Never surfaced directly; the guard loop
+    /// converts it into a fresh attempt or a [`RepositoryError::ResurrectionContended`].
+    #[error("Git lease changed during resurrection; retrying")]
+    ResurrectionLeaseChanged,
+
+    /// CB-7A: no verified binding covers the observed Git HEAD, so the bound
+    /// HEAD adoption refuses. Unbound Git adoption ships with Phase 9 foreign
+    /// synthesis (RFC §7.3, §12.4); the prototype importer is never invoked.
+    #[error("cannot adopt unbound Git HEAD {head}: {reason}")]
+    HeadAdoptionUnbound { head: String, reason: String },
+
+    /// CB-7A: the bound HEAD adoption refused for a typed reason — unexplained
+    /// post-checkout differences, unborn/missing HEAD, verification failure,
+    /// or contention. Nothing was adopted and no tracked file was rewritten.
+    #[error("cannot adopt Git HEAD {head}: {reason}")]
+    HeadAdoptionRefused { head: String, reason: String },
 }
 
 impl RepositoryError {

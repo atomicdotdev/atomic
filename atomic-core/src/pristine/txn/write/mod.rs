@@ -660,6 +660,9 @@ impl<'a> WriteTxn<'a> {
             timestamp: graph.timestamp,
             plan_id: graph.plan_id.clone(),
             todos: graph.todos.clone(),
+            boundary_start: None,
+            boundary_end: None,
+            outcome: None,
         };
 
         self.index_session_turn_candidate(record, turns, candidate)
@@ -875,6 +878,64 @@ impl<'a> WriteTxn<'a> {
         Ok(persisted)
     }
 
+    /// Attach durable turn boundaries and the semantic outcome to an already
+    /// indexed turn row (CB-12A, RFC §10.1/§10.2).
+    ///
+    /// The row is located by its immutable provenance hash; nothing is
+    /// created. Turns without recorded provenance (git-only or
+    /// observation-only outcomes) have no ledger row by design — their
+    /// boundaries/outcomes live in the session record and attestation instead.
+    /// Attaching is idempotent: re-attaching the same evidence is a no-op.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attach_turn_boundary(
+        &mut self,
+        session_id: &str,
+        provenance_hash: &crate::types::Hash,
+        boundary_start: &crate::change::session::TurnBoundary,
+        boundary_end: &crate::change::session::TurnBoundary,
+        outcome: &crate::change::session::ManagedTurnOutcome,
+    ) -> PristineResult<bool> {
+        use crate::change::session::{
+            encode_session_turn_key, session_turn_namespace, SessionTurn,
+        };
+
+        let mut turns = self.txn.open_table(SESSION_TURNS)?;
+        let namespace = session_turn_namespace(session_id);
+        let scan_start = encode_session_turn_key(namespace, 0);
+        let scan_end = encode_session_turn_key(namespace, u32::MAX);
+
+        let mut matches: Vec<([u8; 40], SessionTurn)> = Vec::new();
+        for row in turns.range::<&[u8; 40]>(&scan_start..=&scan_end)? {
+            let (key, value) = row?;
+            let turn = SessionTurn::from_bytes(value.value()).map_err(|e| {
+                PristineError::Serialization {
+                    message: format!("session turn decode: {}", e),
+                }
+            })?;
+            if turn.session_id == session_id && turn.provenance_hash == *provenance_hash {
+                matches.push((*key.value(), turn));
+            }
+        }
+
+        let Some((key, mut turn)) = matches.into_iter().next() else {
+            return Ok(false);
+        };
+
+        let unchanged = turn.boundary_start.as_ref() == Some(boundary_start)
+            && turn.boundary_end.as_ref() == Some(boundary_end)
+            && turn.outcome.as_ref() == Some(outcome);
+        if unchanged {
+            return Ok(true);
+        }
+
+        turn.boundary_start = Some(boundary_start.clone());
+        turn.boundary_end = Some(boundary_end.clone());
+        turn.outcome = Some(outcome.clone());
+        turns.insert(&key, turn.to_bytes().as_slice())?;
+        drop(turns);
+        Ok(true)
+    }
+
     /// Store an immutable session manifest and advance its convenience head.
     pub fn save_session_manifest(
         &mut self,
@@ -897,11 +958,14 @@ fn format_timestamp_ms(epoch_ms: i64) -> String {
         .unwrap_or_else(|| format!("{}", epoch_ms))
 }
 
+mod bindings;
+mod capability;
 mod embeddings;
 mod graph;
 mod native_derived;
 mod operation;
 mod path_claim;
+mod ref_mapping;
 mod session_kg;
 mod set_id_index;
 mod tag;
@@ -913,6 +977,17 @@ mod working_copy;
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+impl<'a> WriteTxn<'a> {
+    /// Test-only raw table access (corruption seeding for repair tests).
+    pub(crate) fn open_table_for_test<'t, K: redb::Key + 'static, V: redb::Value + 'static>(
+        &'t mut self,
+        definition: redb::TableDefinition<'static, K, V>,
+    ) -> Result<redb::Table<'t, K, V>, redb::TableError> {
+        self.txn.open_table(definition)
+    }
+}
 
 // Entity registration helper
 
@@ -1649,28 +1724,21 @@ impl<'a> MutTxnT for WriteTxn<'a> {
             return Ok(None);
         };
 
-        let (reverse, competing_reverse) = {
+        // Performance (RFC §21 measured budgets, CB-13C AC-3): the former
+        // competing-reverse check scanned the ENTIRE REV_TREE table per
+        // delete — O(n) per call, O(n²) per batch (measured: 4000 deletes
+        // spent 19.5s here). Two other inode→path rows mapping to the same
+        // path is a bijection violation that `validate_tree_bijection`
+        // catches in full (and which `TreeProjectionPlan::apply` runs after
+        // every projection), so the point checks below suffice on the hot
+        // path.
+        let reverse = {
             let table = self.txn.open_table(REV_TREE)?;
-            let reverse = table
+            let result = table
                 .get(inode.get())?
                 .map(|value| value.value().to_string());
-            let mut competing = None;
-            for row in table.iter()? {
-                let (candidate, reverse_path) = row?;
-                if candidate.value() != inode.get() && reverse_path.value() == path {
-                    competing = Some(Inode::new(candidate.value()));
-                    break;
-                }
-            }
-            (reverse, competing)
+            result
         };
-        if let Some(competing) = competing_reverse {
-            return Err(tree_bijection_error(format!(
-                "cannot delete '{}': REV_TREE also maps inode {} to that path",
-                path,
-                competing.get()
-            )));
-        }
         if reverse.as_deref() != Some(path) {
             return Err(tree_bijection_error(format!(
                 "cannot delete '{}': TREE maps it to inode {}, but REV_TREE maps that inode to {:?}",
@@ -1704,6 +1772,50 @@ impl<'a> MutTxnT for WriteTxn<'a> {
         }
 
         Ok(Some(inode))
+    }
+
+    fn repair_rev_tree_bijection(&mut self) -> PristineResult<(usize, usize)> {
+        let forward: std::collections::BTreeMap<String, u64> = {
+            let table = self.txn.open_table(TREE)?;
+            let mut forward = std::collections::BTreeMap::new();
+            for row in table.iter()? {
+                let (key, value) = row?;
+                forward.insert(key.value().to_string(), value.value());
+            }
+            forward
+        };
+        let reverse: Vec<(u64, String)> = {
+            let table = self.txn.open_table(REV_TREE)?;
+            let mut reverse = Vec::new();
+            for row in table.iter()? {
+                let (key, value) = row?;
+                reverse.push((key.value(), value.value().to_string()));
+            }
+            reverse
+        };
+        let mut removed_stale = 0usize;
+        {
+            let mut table = self.txn.open_table(REV_TREE)?;
+            for (inode, reverse_path) in &reverse {
+                if forward.get(reverse_path).copied() == Some(*inode) {
+                    continue;
+                }
+                table.remove(inode)?;
+                removed_stale += 1;
+            }
+        }
+        let mut inserted_missing = 0usize;
+        {
+            let mut table = self.txn.open_table(REV_TREE)?;
+            for (path, inode) in &forward {
+                if table.get(inode)?.is_some() {
+                    continue;
+                }
+                table.insert(inode, path.as_str())?;
+                inserted_missing += 1;
+            }
+        }
+        Ok((removed_stale, inserted_missing))
     }
 
     fn put_file_index(

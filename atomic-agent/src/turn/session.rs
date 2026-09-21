@@ -54,11 +54,15 @@
 
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-pub use atomic_core::change::session::{IncompleteSession, SessionIncompleteOrigin, SessionStatus};
+pub use atomic_core::change::session::{
+    GitBoundaryCheckpoint, IncompleteSession, ManagedTurnOutcome, SessionIncompleteOrigin,
+    SessionStatus, TurnBoundary,
+};
 
 use crate::error::{AgentError, AgentResult};
 use crate::turn::phase::Phase;
@@ -85,6 +89,47 @@ pub struct ManagedRunStamp {
     pub work_item_id: Option<String>,
 }
 
+/// One classified turn outcome persisted in the session ledger (CB-12A).
+///
+/// Bounded: the session keeps at most
+/// [`MAX_SESSION_TURN_OUTCOMES`] entries that carry no unattested evidence
+/// so long-running sessions cannot grow the JSON file without limit — while
+/// unattested evidence stays append-only (see
+/// [`AgentSession::record_turn_outcome`]).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TurnOutcomeEntry {
+    /// The turn this classification belongs to (1-indexed).
+    pub turn: u32,
+    /// Semantic classification (RFC §10.2; `EmptyTurn` is removed).
+    pub outcome: ManagedTurnOutcome,
+    /// Turn-start boundary, when one was captured.
+    pub boundary_start: Option<TurnBoundary>,
+    /// Turn-end boundary, when one was captured.
+    pub boundary_end: Option<TurnBoundary>,
+}
+
+impl TurnOutcomeEntry {
+    /// Whether dropping this entry destroys no unattested evidence (review
+    /// R7). ContentChanges evidence is the durable change itself (tracked in
+    /// `recorded_change_hashes` and the change store); ObservationOnly claims
+    /// nothing; RepositoryOperations entries are evictable only once every
+    /// observed operation is covered by an attestation.
+    fn evictable(&self, attested_operations: &[String]) -> bool {
+        match &self.outcome {
+            ManagedTurnOutcome::ContentChanges { .. } | ManagedTurnOutcome::ObservationOnly => true,
+            ManagedTurnOutcome::RepositoryOperations { operations, .. } => {
+                operations.iter().all(|operation| {
+                    let decorated = format!("turn {} {}", self.turn, operation);
+                    attested_operations.contains(&decorated)
+                })
+            }
+        }
+    }
+}
+
+/// Maximum number of classified outcomes retained per session JSON.
+pub const MAX_SESSION_TURN_OUTCOMES: usize = 64;
+
 // AgentSession
 
 /// State of an agent session.
@@ -104,6 +149,27 @@ pub struct ManagedRunStamp {
 /// `AgentSession` is not thread-safe. The orchestrator holds exclusive access
 /// during hook processing. Concurrent sessions in different processes use
 /// separate session IDs and separate files.
+/// One operator repair action on a session (CB-12A AC3).
+///
+/// Append-only: every repair records the prior status and RETAINS the
+/// incomplete evidence verbatim. A repair may resume work but can never
+/// erase or manufacture missing attribution.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RepairNote {
+    /// When the repair ran (RFC 3339).
+    pub at_rfc3339: String,
+    /// What the repair did ("resume", "verify", "retain").
+    pub action: String,
+    /// The status label before the action.
+    pub prior_status: String,
+    /// The incomplete evidence as it stood before the action, verbatim.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retained_incomplete: Option<IncompleteSession>,
+    /// Human-readable detail (attestation/capture verification outcomes).
+    #[serde(default)]
+    pub detail: String,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AgentSession {
     /// Unique session identifier (assigned by the agent).
@@ -224,6 +290,52 @@ pub struct AgentSession {
     /// direct sessions. `lifecycle end --json` harvests runs from this.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub managed_run: Option<ManagedRunStamp>,
+
+    /// Turn-start boundary captured by the orchestrator (CB-12A, RFC §10.1).
+    ///
+    /// Set on every `TurnStart` whose repository observation succeeds and
+    /// consumed by the turn-end classification. `None` means the baseline
+    /// could not be observed; classification then refuses to claim
+    /// `ObservationOnly` and records the observation gap explicitly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub boundary_start: Option<TurnBoundary>,
+
+    /// Most recent classified turn outcomes (bounded to
+    /// [`MAX_SESSION_TURN_OUTCOMES`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub turn_outcomes: Vec<TurnOutcomeEntry>,
+
+    /// Per-session MAC key (64 hex chars) for commit-time capture evidence.
+    ///
+    /// This is evidence quality only (constraint 1): the key lives beside the
+    /// evidence, so the MAC detects tampering and cross-session forgery, not
+    /// a determined local attacker with write access.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mac_key: Option<String>,
+
+    /// Observed Git operations already covered by an attestation, so session
+    /// attestation stays incremental across resumes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attested_operations: Vec<String>,
+
+    /// The most recent attestation saved for this session (review R7).
+    ///
+    /// Git-only sessions have no content changes, so the change-based
+    /// attestation lookup cannot discover their prior chain; this durable
+    /// session-scoped link keeps their attestations chained across resumes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_attestation: Option<atomic_core::types::Hash>,
+
+    /// Append-only operator repair history (CB-12A AC3). Repairs resume
+    /// work and retain every incomplete-evidence snapshot verbatim.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub repair_history: Vec<RepairNote>,
+
+    /// Retention lease: this session's WIP/snapshot/capture evidence is
+    /// protected irrespective of age — cleanup paths must never discard the
+    /// only unbound copy (CB-12A AC3). Set by repair; never cleared.
+    #[serde(default)]
+    pub evidence_retained: bool,
 }
 
 impl AgentSession {
@@ -267,6 +379,13 @@ impl AgentSession {
             current_turn_started_at: None,
             recorded_change_hashes: Vec::new(),
             managed_run: None,
+            boundary_start: None,
+            turn_outcomes: Vec::new(),
+            mac_key: None,
+            attested_operations: Vec::new(),
+            last_attestation: None,
+            repair_history: Vec::new(),
+            evidence_retained: false,
         }
     }
 
@@ -351,6 +470,117 @@ impl AgentSession {
     /// Returns the number of unique files touched across the session.
     pub fn files_touched_count(&self) -> u32 {
         self.files_touched.len() as u32
+    }
+
+    /// Record the boundary captured at this turn's start (CB-12A).
+    pub fn set_boundary_start(&mut self, boundary: TurnBoundary) {
+        self.boundary_start = Some(boundary);
+    }
+
+    /// Clear the turn-start baseline when a new turn begins without one.
+    pub fn clear_boundary_start(&mut self) {
+        self.boundary_start = None;
+    }
+
+    /// Persist one classified turn outcome.
+    ///
+    /// Review R7 (executed probe): the bounded history is a display cache,
+    /// and bounding it must never evict the only unattested evidence. Only a
+    /// leading run of entries whose evidence is fully attested (or that
+    /// carries nothing unattestable) is drained; unattested git-only outcomes
+    /// are append-only until a session attestation covers them. Sessions that
+    /// never attest therefore grow this ledger instead of silently dropping
+    /// their evidence — the honest failure mode.
+    pub fn record_turn_outcome(&mut self, entry: TurnOutcomeEntry) {
+        self.turn_outcomes.push(entry);
+        let excess = self
+            .turn_outcomes
+            .len()
+            .saturating_sub(MAX_SESSION_TURN_OUTCOMES);
+        if excess > 0 {
+            let evictable = self
+                .turn_outcomes
+                .iter()
+                .take(excess)
+                .take_while(|entry| entry.evictable(&self.attested_operations))
+                .count();
+            if evictable > 0 {
+                self.turn_outcomes.drain(0..evictable);
+            }
+        }
+    }
+
+    /// The recorded classification for one turn, when still retained.
+    pub fn outcome_for_turn(&self, turn: u32) -> Option<&TurnOutcomeEntry> {
+        self.turn_outcomes.iter().find(|entry| entry.turn == turn)
+    }
+
+    /// Git-only observed operations not yet covered by any attestation.
+    ///
+    /// Only `RepositoryOperations` outcomes carry attributable observations;
+    /// `ContentChanges` are covered through their change hashes and
+    /// `ObservationOnly` turns claim nothing to attest. Outcomes whose
+    /// classification could not observe both boundaries (missing turn-start
+    /// baseline or failed end observation) stay in the session ledger but are
+    /// never attested: an attestation binds verified observations, not
+    /// observation gaps.
+    pub fn unattested_git_operations(&self) -> Vec<String> {
+        self.turn_outcomes
+            .iter()
+            .filter_map(|entry| match &entry.outcome {
+                ManagedTurnOutcome::RepositoryOperations { operations, .. } => {
+                    Some((entry.turn, operations))
+                }
+                _ => None,
+            })
+            .filter(|(_, operations)| !operations.is_empty())
+            .filter(|(turn, _)| {
+                self.outcome_for_turn(*turn)
+                    .map(|entry| {
+                        entry
+                            .boundary_start
+                            .as_ref()
+                            .and_then(|b| b.git.as_ref())
+                            .is_some()
+                            && entry
+                                .boundary_end
+                                .as_ref()
+                                .and_then(|b| b.git.as_ref())
+                                .is_some()
+                    })
+                    .unwrap_or(false)
+            })
+            .flat_map(|(turn, operations)| {
+                operations
+                    .iter()
+                    .map(move |operation| format!("turn {} {}", turn, operation))
+            })
+            .filter(|operation| !self.attested_operations.contains(operation))
+            .collect()
+    }
+
+    /// Mark observed Git operations as attested (idempotent).
+    pub fn mark_operations_attested(&mut self, operations: &[String]) {
+        for operation in operations {
+            if !self.attested_operations.contains(operation) {
+                self.attested_operations.push(operation.clone());
+            }
+        }
+    }
+
+    /// The per-session MAC key, creating it on first use.
+    ///
+    /// Evidence-quality key (constraint 1): 32 bytes of OS randomness with a
+    /// deterministic fallback when `/dev/urandom` is unavailable. Stored
+    /// beside the evidence, so it detects tampering and cross-session
+    /// forgery rather than resisting a determined local writer.
+    pub fn ensure_mac_key(&mut self) -> String {
+        if let Some(key) = &self.mac_key {
+            return key.clone();
+        }
+        let key = random_mac_key();
+        self.mac_key = Some(key.clone());
+        key
     }
 
     /// Persist the first incomplete outcome observed for this session.
@@ -471,6 +701,45 @@ impl super::phase::SessionState for AgentSession {
 
 // SessionStore
 
+/// 32 bytes of evidence-quality randomness for the session MAC key.
+///
+/// Prefers OS randomness; falls back to a process/time mix so evidence
+/// capture still works in sandboxes without `/dev/urandom`. This is not a
+/// secret: the key is stored beside the evidence it protects.
+fn random_mac_key() -> String {
+    let mut bytes = [0u8; 32];
+    #[cfg(unix)]
+    {
+        use std::io::Read;
+        if let Ok(mut file) = std::fs::File::open("/dev/urandom") {
+            if file.read_exact(&mut bytes).is_ok() {
+                return hex_encode(&bytes);
+            }
+        }
+    }
+    // Deterministic fallback: unique per session/process/creation instant.
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let mix = format!(
+        "{}:{}:{}",
+        nanos,
+        std::process::id(),
+        "atomic-agent-mac-key"
+    );
+    bytes.copy_from_slice(&blake3::derive_key(
+        "atomic-agent session mac key",
+        mix.as_bytes(),
+    ));
+    hex_encode(&bytes)
+}
+
+/// Lowercase hex encoding for MAC keys.
+fn hex_encode(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
 /// Persistent storage for agent session state files.
 ///
 /// Sessions are stored as `{session_id}.json` files in the sessions directory
@@ -504,6 +773,49 @@ impl SessionStore {
     /// The sessions directory is `{repo_root}/.atomic/sessions/`.
     pub fn for_repo(repo_root: &Path) -> AgentResult<Self> {
         Self::new(repo_root.join(".atomic").join("sessions"))
+    }
+
+    /// Load every parseable session in the store (CB-12A: used by the
+    /// pre-commit capture hook to find active managed sessions).
+    ///
+    /// Unparseable files are skipped: the capture hook is advisory evidence
+    /// and must never fail a commit because one session file is corrupt.
+    pub fn list_sessions(&self) -> AgentResult<Vec<AgentSession>> {
+        let mut sessions = Vec::new();
+        let entries = match std::fs::read_dir(&self.sessions_dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(sessions);
+            }
+            Err(error) => {
+                return Err(AgentError::SessionLoadFailed {
+                    session_id: "*".to_string(),
+                    reason: format!("cannot read sessions dir: {}", error),
+                });
+            }
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
+                continue;
+            }
+            let Ok(data) = std::fs::read(&path) else {
+                continue;
+            };
+            if let Ok(session) = serde_json::from_slice::<AgentSession>(&data) {
+                sessions.push(session);
+            }
+        }
+        Ok(sessions)
+    }
+
+    /// Every session currently in an active phase (CB-12A capture targets).
+    pub fn active_sessions(&self) -> AgentResult<Vec<AgentSession>> {
+        Ok(self
+            .list_sessions()?
+            .into_iter()
+            .filter(|session| session.is_turn_active())
+            .collect())
     }
 
     /// Load a session by ID.
@@ -659,6 +971,230 @@ impl SessionStore {
     pub fn sessions_dir(&self) -> &Path {
         &self.sessions_dir
     }
+
+    /// Write one pending bridge-watch notice for a session (CB-13D).
+    ///
+    /// The optional metadata-only bridge watch daemon (RFC §11.2 rule 6)
+    /// calls this when it detects an external Git transition or an unsafe
+    /// state while a managed session is active. The notice is a separate
+    /// pending file — it never mutates the session state file the
+    /// orchestrator owns, so the daemon cannot clobber orchestrator state.
+    /// The orchestrator drains the file at the session's next turn start or
+    /// tool call; until then the notice is purely additive evidence.
+    pub fn write_watch_notice(
+        &self,
+        session_id: &str,
+        kind: &str,
+        detail: &str,
+        remediation: &str,
+    ) -> AgentResult<()> {
+        validate_session_id(session_id)?;
+        let notices = self.sessions_dir.join(WATCH_NOTICES_DIRECTORY);
+        std::fs::create_dir_all(&notices)?;
+        let notice = WatchNotice {
+            version: WATCH_NOTICE_VERSION,
+            record_type: WATCH_NOTICE_RECORD_TYPE.to_string(),
+            session_id: session_id.to_string(),
+            kind: kind.to_string(),
+            detail: detail.to_string(),
+            remediation: remediation.to_string(),
+            recorded_at: Utc::now().to_rfc3339(),
+        };
+        let path = self.watch_notice_path(session_id);
+        // A per-writer unique temporary name (review R6): two concurrent
+        // daemon instances (or a daemon and a command) must never share the
+        // same `.tmp` name — a shared name lets one writer's rename publish
+        // another writer's partially-written bytes.
+        let tmp = path.with_extension(format!(
+            "json.{}.{}.tmp",
+            std::process::id(),
+            WATCH_NOTICE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let bytes = serde_json::to_vec(&notice)?;
+        std::fs::write(&tmp, bytes)?;
+        // rename(2) publishes the complete notice atomically; a newer
+        // notice replaces an older pending one without any reader seeing a
+        // partial file.
+        std::fs::rename(&tmp, &path)?;
+        Ok(())
+    }
+
+    /// Take the pending bridge-watch notice for a session, if any (CB-13D).
+    ///
+    /// Consuming claims the notice atomically first (review R6): the pending
+    /// file is renamed to a per-consumer claim name before it is read, so a
+    /// producer that publishes a *newer* notice after the claim still finds
+    /// its file at the pending path and is delivered on the next take — the
+    /// old read-then-unlink order destroyed exactly that newer notice. A
+    /// crash between claim and parse leaves the claim file behind (reported
+    /// once) and never re-delivers a consumed notice. A notice written for a
+    /// different session (or of an unknown version) is refused rather than
+    /// delivered.
+    pub fn take_watch_notice(&self, session_id: &str) -> AgentResult<Option<WatchNotice>> {
+        validate_session_id(session_id)?;
+        // CB-13D ::24 R6 exactly-once replay: a claim file left behind by a
+        // CRASHED consumer (its writer pid no longer exists) is replayed
+        // before claiming new work — the claimed notice was consumed from
+        // the pending slot but never delivered. A claim whose writer is
+        // still alive belongs to a live consumer mid-delivery and is never
+        // stolen (a live consumer holds it between the claim rename and
+        // the consume remove).
+        if let Some(notice) = self.replay_crashed_claim(session_id)? {
+            return Ok(Some(notice));
+        }
+        let path = self.watch_notice_path(session_id);
+        let claim = path.with_extension(format!(
+            "json.claim.{}.{}",
+            std::process::id(),
+            WATCH_NOTICE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        // Atomically claim whatever is pending right now. `NotFound` means
+        // no notice is pending; any claim error after this point leaves the
+        // pending file alone (the notice is not consumed).
+        if let Err(error) = std::fs::rename(&path, &claim) {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                return Ok(None);
+            }
+            return Err(AgentError::SessionLoadFailed {
+                session_id: session_id.to_string(),
+                reason: format!("cannot claim watch notice: {}", error),
+            });
+        }
+        let bytes = match std::fs::read(&claim) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                let _ = std::fs::remove_file(&claim);
+                return Err(AgentError::SessionLoadFailed {
+                    session_id: session_id.to_string(),
+                    reason: format!("cannot read watch notice: {}", error),
+                });
+            }
+        };
+        if let Err(error) = std::fs::remove_file(&claim) {
+            return Err(AgentError::SessionLoadFailed {
+                session_id: session_id.to_string(),
+                reason: format!("cannot consume watch notice: {}", error),
+            });
+        }
+        let notice: WatchNotice = serde_json::from_slice(&bytes)?;
+        if notice.record_type != WATCH_NOTICE_RECORD_TYPE
+            || notice.version != WATCH_NOTICE_VERSION
+            || notice.session_id != session_id
+        {
+            return Err(AgentError::SessionLoadFailed {
+                session_id: session_id.to_string(),
+                reason: "watch notice does not match its session identity".to_string(),
+            });
+        }
+        Ok(Some(notice))
+    }
+
+    /// Replay notices a crashed consumer claimed but never delivered
+    /// (CB-13D ::24 R6): scan the notices directory for claim files whose
+    /// writer pid is gone, deliver the oldest one, and remove it.
+    fn replay_crashed_claim(&self, session_id: &str) -> AgentResult<Option<WatchNotice>> {
+        let notices = self.sessions_dir.join(WATCH_NOTICES_DIRECTORY);
+        let entries = match std::fs::read_dir(&notices) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(AgentError::SessionLoadFailed {
+                    session_id: session_id.to_string(),
+                    reason: format!("cannot scan watch notice claims: {}", error),
+                })
+            }
+        };
+        let prefix = format!("{session_id}.json.claim.");
+        let mut candidates: Vec<(u64, std::path::PathBuf)> = Vec::new();
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                // CB-13D ::24 R2: an unreadable entry fails the scan
+                // fail-closed instead of silently narrowing the namespace.
+                Err(error) => {
+                    return Err(AgentError::SessionLoadFailed {
+                        session_id: session_id.to_string(),
+                        reason: format!("cannot read watch notice claim entry: {}", error),
+                    })
+                }
+            };
+            let name = entry.file_name().to_string_lossy().to_string();
+            let Some(rest) = name.strip_prefix(&prefix) else {
+                continue;
+            };
+            let Some(pid_text) = rest.split('.').next() else {
+                continue;
+            };
+            let Ok(pid) = pid_text.parse::<u64>() else {
+                continue;
+            };
+            if pid == std::process::id() as u64 || pid_alive(pid) {
+                continue;
+            }
+            candidates.push((pid, entry.path()));
+        }
+        candidates.sort();
+        let Some((_, claim)) = candidates.first() else {
+            return Ok(None);
+        };
+        let bytes = std::fs::read(claim).map_err(|error| AgentError::SessionLoadFailed {
+            session_id: session_id.to_string(),
+            reason: format!("cannot read a crashed consumer's watch notice claim: {}", error),
+        })?;
+        let notice: WatchNotice = serde_json::from_slice(&bytes)?;
+        if notice.record_type != WATCH_NOTICE_RECORD_TYPE
+            || notice.version != WATCH_NOTICE_VERSION
+            || notice.session_id != session_id
+        {
+            return Err(AgentError::SessionLoadFailed {
+                session_id: session_id.to_string(),
+                reason: "watch notice claim does not match its session identity".to_string(),
+            });
+        }
+        std::fs::remove_file(claim).map_err(|error| AgentError::SessionLoadFailed {
+            session_id: session_id.to_string(),
+            reason: format!("cannot consume the replayed watch notice: {}", error),
+        })?;
+        Ok(Some(notice))
+    }
+
+    fn watch_notice_path(&self, session_id: &str) -> PathBuf {
+        self.sessions_dir
+            .join(WATCH_NOTICES_DIRECTORY)
+            .join(format!("{}.json", session_id))
+    }
+}
+
+/// Pending-notice subdirectory under the sessions directory.
+const WATCH_NOTICES_DIRECTORY: &str = "notices";
+/// Process-local sequence for unique notice temp/claim file names.
+static WATCH_NOTICE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+/// Current bridge-watch notice payload version.
+pub const WATCH_NOTICE_VERSION: u32 = 1;
+/// Expected `record_type` of a bridge-watch notice payload.
+pub const WATCH_NOTICE_RECORD_TYPE: &str = "bridge-watch-notice";
+
+/// One pending external-transition or unsafe-state notice written by the
+/// optional bridge watch daemon (RFC §11.2 rule 6) for an active managed
+/// session. Purely advisory: without the daemon the next agent boundary
+/// still fully reconciles, and the notice never changes command outcomes.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct WatchNotice {
+    /// Payload schema version.
+    pub version: u32,
+    /// Fixed record type; consumed notices of any other type are refused.
+    pub record_type: String,
+    /// The session the notice was written for; consumed notices for a
+    /// different session are refused.
+    pub session_id: String,
+    /// Stable kind: `external-head-change` or `unsafe-state`.
+    pub kind: String,
+    /// Human-readable detail of what was observed.
+    pub detail: String,
+    /// The typed remediation the user or agent should run.
+    pub remediation: String,
+    /// RFC 3339 timestamp of the observation.
+    pub recorded_at: String,
 }
 
 impl fmt::Debug for SessionStore {
@@ -674,7 +1210,7 @@ impl fmt::Debug for SessionStore {
 /// Validate a session ID to prevent path traversal.
 ///
 /// Rejects IDs containing `..`, `/`, `\`, or null bytes.
-fn validate_session_id(session_id: &str) -> AgentResult<()> {
+pub(crate) fn validate_session_id(session_id: &str) -> AgentResult<()> {
     if session_id.is_empty() {
         return Err(AgentError::SessionIdInvalid {
             session_id: "(empty)".to_string(),
@@ -710,6 +1246,8 @@ fn validate_session_id(session_id: &str) -> AgentResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
     use crate::turn::phase::SessionState;
     use tempfile::TempDir;
 
@@ -1083,6 +1621,55 @@ mod tests {
         assert!(loaded.recorded_change_hashes.is_empty());
     }
 
+    /// Review ATOM::aaron::8 R7 (executed probe): bounding the outcome cache
+    /// must never evict the only unattested evidence. 65 distinct unattested
+    /// git-only outcomes all survive; the oldest is not silently dropped.
+    #[test]
+    fn unattested_outcomes_are_never_evicted() {
+        let mut session = make_session();
+        let boundary = TurnBoundary {
+            working_copy: "01ABCDEF26CHARSULID0000000".into(),
+            operation: None,
+            view: "main".into(),
+            view_state: None,
+            set_id: None,
+            snapshot: None,
+            git: Some(GitBoundaryCheckpoint {
+                head_oid: Some("0123456789abcdef0123456789abcdef01234567".into()),
+                head_symref: None,
+                head_tree: Some("tree".into()),
+                index_digest: Some(atomic_core::types::Hash::of(b"index")),
+                index_tree: Some("tree".into()),
+                index_locked: false,
+                repository_state: String::new(),
+                markers: Vec::new(),
+            }),
+            manifest: None,
+            conversion_policy: None,
+            session_id: session.session_id.clone(),
+            turn: 1,
+            at: 1,
+        };
+        for turn in 1..=65u32 {
+            session.record_turn_outcome(TurnOutcomeEntry {
+                turn,
+                outcome: ManagedTurnOutcome::RepositoryOperations {
+                    operations: vec![format!("operation-{turn}")],
+                    capture: None,
+                },
+                boundary_start: Some(boundary.clone()),
+                boundary_end: Some(boundary.clone()),
+            });
+        }
+        assert_eq!(
+            session.turn_outcomes.len(),
+            65,
+            "unattested evidence is append-only: the bounded cache may not drop it"
+        );
+        assert!(session.outcome_for_turn(1).is_some());
+        assert_eq!(session.unattested_git_operations().len(), 65);
+    }
+
     #[test]
     fn test_serde_roundtrip_with_managed_run_stamp() {
         let mut s = make_session();
@@ -1440,4 +2027,118 @@ mod tests {
         assert_eq!(ended.len(), 1);
         assert_eq!(ended[0].session_id, "lifecycle-test");
     }
+
+    /// CB-13D review R6: a producer publishing a newer notice while a
+    /// consumer claims an older one must never destroy the newer notice.
+    /// The consumer claims by rename, so the producer's publish lands on
+    /// the pending path and is delivered on the next take; the notices
+    /// directory must be left without temp/claim leftovers.
+    #[test]
+    fn watch_notice_claim_never_loses_a_concurrent_newer_notice() {
+        use std::thread::sleep;
+        use std::time::Duration;
+
+        let dir = TempDir::new().unwrap();
+        let notices_dir = dir.path().join("sessions").join("notices");
+        let session_id = "sess-overlap";
+        const TOTAL: usize = 120;
+
+        let producer = {
+            let store = SessionStore::new(dir.path().join("sessions")).unwrap();
+            std::thread::spawn(move || {
+                for index in 0..TOTAL {
+                    store
+                        .write_watch_notice(
+                            session_id,
+                            "unsafe-state",
+                            &format!("notice-{index}"),
+                            "wait for git",
+                        )
+                        .unwrap();
+                    sleep(Duration::from_millis(2));
+                }
+            })
+        };
+
+        // The consumer drains continuously while the producer runs; every
+        // delivered detail is collected under a shared mutex.
+        let delivered: Arc<std::sync::Mutex<Vec<String>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let consumer_handle = {
+            let store = SessionStore::new(dir.path().join("sessions")).unwrap();
+            let delivered = Arc::clone(&delivered);
+            let stop = Arc::new(AtomicBool::new(false));
+            let stop_handle = Arc::clone(&stop);
+            let handle = std::thread::spawn(move || {
+                while !stop_handle.load(Ordering::SeqCst) {
+                    match store.take_watch_notice(session_id).unwrap() {
+                        Some(notice) => delivered.lock().unwrap().push(notice.detail),
+                        None => sleep(Duration::from_millis(2)),
+                    }
+                }
+            });
+            (handle, stop)
+        };
+
+        producer.join().unwrap();
+        sleep(Duration::from_millis(40));
+        let (consumer_handle, stop) = consumer_handle;
+        stop.store(true, Ordering::SeqCst);
+        consumer_handle.join().unwrap();
+
+        // No-loss invariant: after the producer stopped, nothing overwrites
+        // the final notice, so it must be EITHER already delivered by the
+        // overlapping consumer OR still pending for the final drain — never
+        // silently destroyed.
+        let store = SessionStore::new(dir.path().join("sessions")).unwrap();
+        let delivered_list = delivered.lock().unwrap().clone();
+        let final_notice = store.take_watch_notice(session_id).unwrap();
+        match final_notice {
+            Some(notice) => assert_eq!(
+                notice.detail,
+                format!("notice-{}", TOTAL - 1),
+                "a still-pending final notice must be the last one written"
+            ),
+            None => assert!(
+                delivered_list
+                    .iter()
+                    .any(|detail| *detail == format!("notice-{}", TOTAL - 1)),
+                "the last written notice must never be destroyed by a concurrent consume; \
+                 delivered: {:?}",
+                delivered_list
+            ),
+        }
+        assert!(
+            !delivered_list.is_empty(),
+            "the overlapping consumer must have delivered notices while producing"
+        );
+        // No temp or claim files leak behind the consumed notices.
+        let leftovers: Vec<String> = std::fs::read_dir(&notices_dir)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().to_string())
+            .filter(|name| name.ends_with(".tmp") || name.contains(".claim."))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "temp/claim files must never leak: {leftovers:?}"
+        );
+        // The pending path is empty after the final drain.
+        assert!(!store.watch_notice_path(session_id).exists());
+    }
+}
+
+/// Whether a writer pid is still alive (CB-13D ::24 R6): a claim file
+/// whose writer is gone belongs to a crashed consumer and is replayed.
+#[cfg(unix)]
+fn pid_alive(pid: u64) -> bool {
+    std::path::Path::new("/proc").join(pid.to_string()).exists()
+}
+
+#[cfg(not(unix))]
+fn pid_alive(_pid: u64) -> bool {
+    // Without a liveness probe the replay scanner cannot distinguish a
+    // crashed consumer from a live one; claims are never stolen (the
+    // notice stays pending for an operator, never double-delivered).
+    true
 }

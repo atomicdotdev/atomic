@@ -441,7 +441,7 @@ mod tests {
         let mut switch_feature = Switch::with_name("feature");
         switch_feature.force = true;
         switch_feature.run().unwrap();
-        let stale_feature_tip = git_ok(root, &["rev-parse", "refs/heads/feature"]);
+        let stale_feature_tip = git_ok(root, &["rev-parse", "HEAD"]);
 
         let mut switch_main = Switch::with_name("main");
         switch_main.force = true;
@@ -460,12 +460,21 @@ mod tests {
 
         // The draft's own state did not advance, but its live parent filter did.
         // Switching it must project the inherited bytes instead of restoring the
-        // stale feature branch/index from before the parent change.
+        // stale detached tip from before the parent change (RFC §8.1: the Draft
+        // switch leaves HEAD detached at the projection commit).
         switch_feature.run().unwrap();
         let projected_feature_tip = git_ok(root, &["rev-parse", "HEAD"]);
         assert_ne!(projected_feature_tip, stale_feature_tip);
         assert_eq!(git_ok(root, &["rev-parse", "HEAD^"]), stale_feature_tip);
-        assert_eq!(git_ok(root, &["branch", "--show-current"]), "feature");
+        assert_eq!(
+            git_ok(root, &["branch", "--show-current"]),
+            "",
+            "a Draft switch must leave HEAD detached"
+        );
+        assert_eq!(
+            git_ok(root, &["rev-parse", "refs/atomic/views/feature"]),
+            projected_feature_tip
+        );
         assert_eq!(
             std::fs::read_to_string(root.join("tracked.txt")).unwrap(),
             "tracked\nparent advance\n"
@@ -567,17 +576,20 @@ mod tests {
         switch_main.force = true;
         switch_main.run().unwrap();
         let original_head = git_ok(root, &["rev-parse", "HEAD"]);
-        let original_feature = git_ok(root, &["rev-parse", "refs/heads/feature"]);
+        let original_feature = git_ok(root, &["rev-parse", "refs/atomic/views/feature"]);
         let original_index = git_ok(root, &["write-tree"]);
 
         let error = switch_feature
             .run()
             .expect_err("conflicted materialization must not become Git evidence");
-        assert!(error.to_string().contains("conflict marker"));
+        assert!(
+            error.to_string().contains("conflict marker"),
+            "the refusal must name the conflict markers: {error}"
+        );
         assert_eq!(git_ok(root, &["branch", "--show-current"]), "main");
         assert_eq!(git_ok(root, &["rev-parse", "HEAD"]), original_head);
         assert_eq!(
-            git_ok(root, &["rev-parse", "refs/heads/feature"]),
+            git_ok(root, &["rev-parse", "refs/atomic/views/feature"]),
             original_feature
         );
         assert_eq!(git_ok(root, &["write-tree"]), original_index);
@@ -602,7 +614,11 @@ mod tests {
             .unwrap();
         }
         switch_feature.run().unwrap();
-        assert_eq!(git_ok(root, &["branch", "--show-current"]), "feature");
+        assert_eq!(
+            git_ok(root, &["branch", "--show-current"]),
+            "",
+            "a resolved Draft switch stays detached at its projection commit"
+        );
         assert_eq!(git_ok(root, &["show", "HEAD:tracked.txt"]), "resolved");
         assert!(git_ok(root, &["status", "--porcelain=v1"]).is_empty());
         assert_eq!(

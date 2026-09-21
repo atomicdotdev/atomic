@@ -204,6 +204,15 @@ pub enum OperationMarkerKind {
 }
 
 impl OperationMarkerKind {
+    /// Whether a present marker is authoritative evidence of an active Git
+    /// operation. Mirrors the repository observer: `AUTO_MERGE` is a derived
+    /// tree ref written by merge-ort for any worktree-updating merge and is
+    /// removed on completion, so a standalone AUTO_MERGE is advisory only; a
+    /// stopped merge also carries `MERGE_HEAD`.
+    pub fn is_active_operation_evidence(self) -> bool {
+        !matches!(self, Self::AutoMerge)
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Sequencer => "sequencer",
@@ -260,14 +269,30 @@ pub struct OperationObservation {
 }
 
 impl OperationObservation {
+    /// Whether Git owns an in-progress operation. True when libgit2 reports a
+    /// non-`Clean` state or an authoritative marker is present; a standalone
+    /// `AUTO_MERGE` is advisory and does not, by itself, count.
     pub fn is_in_progress(&self) -> bool {
-        self.repository_state != "Clean" || self.markers.iter().any(|marker| marker.is_present())
+        self.repository_state != "Clean"
+            || self.markers.iter().any(|marker| {
+                marker.is_present() && marker.marker.is_active_operation_evidence()
+            })
     }
 
+    /// Every present marker, including advisory ones, for reporting.
     pub fn present_markers(&self) -> Vec<OperationMarkerKind> {
         self.markers
             .iter()
             .filter(|marker| marker.is_present())
+            .map(|marker| marker.marker)
+            .collect()
+    }
+
+    /// Present markers that are authoritative evidence of an active operation.
+    pub fn active_markers(&self) -> Vec<OperationMarkerKind> {
+        self.markers
+            .iter()
+            .filter(|marker| marker.is_present() && marker.marker.is_active_operation_evidence())
             .map(|marker| marker.marker)
             .collect()
     }
@@ -1940,6 +1965,73 @@ mod tests {
         assert!(present.contains(&OperationMarkerKind::RevertHead));
         assert!(present.contains(&OperationMarkerKind::BisectLog));
         assert_eq!(before, snapshot_tree(directory.path()));
+    }
+
+    /// A standalone `AUTO_MERGE` is advisory merge-ort output, not proof of an
+    /// active operation; it is reported but never fences on its own. A
+    /// `MERGE_HEAD` (with or without AUTO_MERGE) is authoritative.
+    #[test]
+    fn standalone_auto_merge_marker_is_advisory_not_in_progress() {
+        let marker = |marker, kind| OperationMarkerObservation {
+            marker,
+            path: PathBuf::from(format!(".git/{}", marker.relative_path())),
+            kind,
+        };
+
+        let advisory = OperationObservation {
+            repository_state: "Clean".to_string(),
+            markers: vec![marker(OperationMarkerKind::AutoMerge, AdminEntryKind::File)],
+        };
+        assert!(!advisory.is_in_progress());
+        assert!(advisory.active_markers().is_empty());
+        assert_eq!(
+            advisory.present_markers(),
+            vec![OperationMarkerKind::AutoMerge]
+        );
+
+        let active = OperationObservation {
+            repository_state: "Clean".to_string(),
+            markers: vec![
+                marker(OperationMarkerKind::MergeHead, AdminEntryKind::File),
+                marker(OperationMarkerKind::AutoMerge, AdminEntryKind::File),
+            ],
+        };
+        assert!(active.is_in_progress());
+        assert_eq!(
+            active.active_markers(),
+            vec![OperationMarkerKind::MergeHead]
+        );
+        assert_eq!(active.present_markers().len(), 2);
+
+        let non_clean = OperationObservation {
+            repository_state: "Merge".to_string(),
+            markers: Vec::new(),
+        };
+        assert!(non_clean.is_in_progress());
+    }
+
+    /// A real repository with only a standalone `AUTO_MERGE` ref is observed as
+    /// not-in-progress, still reports the marker, and is left unchanged.
+    #[test]
+    fn standalone_auto_merge_ref_in_real_repository_is_advisory() {
+        let (directory, repository) = initialized_repository();
+        let _oid = commit_file(&repository, "file.txt", b"one\n", "initial");
+        let git_dir = repository.path().to_path_buf();
+        drop(repository);
+        fs::write(git_dir.join("AUTO_MERGE"), b"one-tree-oid\n").expect("auto merge ref");
+        let before = snapshot_tree(directory.path());
+
+        let observation = repository_observation(directory.path());
+        assert!(
+            !observation.operation.is_in_progress(),
+            "a standalone AUTO_MERGE must not read as an active operation"
+        );
+        assert!(observation
+            .operation
+            .present_markers()
+            .contains(&OperationMarkerKind::AutoMerge));
+        assert!(observation.operation.active_markers().is_empty());
+        assert_eq!(before, snapshot_tree(directory.path()), "observation is read-only");
     }
 
     #[test]

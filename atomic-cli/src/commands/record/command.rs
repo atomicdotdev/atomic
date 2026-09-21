@@ -32,6 +32,37 @@ impl Command for Record {
             Repository::open_for_workspace_transaction(&repo_root)
         }
         .map_err(CliError::Repository)?;
+
+        // Narrow metadata-only route: an explicit, scoped
+        // `record --allow-conflict-markers <paths>` whose preflight proves every
+        // named path is already recorded (working bytes equal the canonical
+        // render, no graph conflict) and only stale CONFLICTS metadata needs to
+        // change. That administrative cleanup needs no anchored Git baseline and
+        // must not execute the workspace boundary's recovery/import effects, so
+        // it runs through the leased reconcile API directly. Anything not proven
+        // metadata-only falls through to the ordinary boundary and record path,
+        // which clears nothing when it refuses.
+        if !self.dry_run && self.allow_conflict_markers && !self.all && !self.files.is_empty() {
+            let working_copy = repo
+                .require_working_copy_id()
+                .map_err(CliError::Repository)?;
+            if let Some(cleanup) = repo
+                .record_metadata_only_conflict_cleanup(working_copy, &self.files)
+                .map_err(CliError::Repository)?
+            {
+                print!(
+                    "{}",
+                    super::format::format_conflict_cleanup(
+                        &cleanup.view,
+                        &cleanup.cleared_paths,
+                        cleanup.cleared_rows,
+                        cleanup.operation,
+                    )
+                );
+                return Ok(());
+            }
+        }
+
         let workspace = enter_workspace(&mut repo, mode)?;
         let working_copy = workspace.working_copy();
         let view_name = workspace.view().name.clone();
@@ -132,6 +163,25 @@ impl Command for Record {
                 "{} skipped (unchanged, empty, binary, or too large)",
                 format_count(outcome.skipped_files().len(), "file")
             ));
+        }
+
+        // CB-8A (RFC §7.6, §8.1): an Atomic-origin record is a bridge
+        // transition. In an active Git shadow the recorded durable state is
+        // projected immediately — an operation-specific commit on the view's
+        // mapped ref with the scope-correct HEAD placement and the index
+        // aligned to the projected tree — so `git status` and `atomic
+        // status` are both clean afterwards. Partial user staging is
+        // intentionally preserved (never staged over) and skips only the
+        // projection, never the record itself.
+        let recorded_something =
+            !outcome.recorded_files().is_empty() || !outcome.deleted_files().is_empty();
+        let recorded_hash = recorded_something.then(|| *outcome.hash());
+        drop(workspace);
+        drop(repo);
+        if let Some(hash) = recorded_hash {
+            crate::commands::git::shadow::sync_git_projection_after_record(
+                &repo_root, &view_name, &hash,
+            )?;
         }
 
         Ok(())

@@ -1,5 +1,14 @@
 # Git Shadow — POC Task List
 
+> **Status (CB-13C, 2026-09-14):** this document is the historical Shadow
+> POC design record. The colocated bridge is the forward path; see the
+> [bridge operating guide](bridge-operating-guide.md) for supported
+> workflows. The Shadow→bridge **cutover is unsupported**: the transactional
+> cutover has no CLI caller and open review findings (fence-before-lock race
+> in the legacy writer's fence check, `.git`-existence-only readiness
+> acceptance, and already-fenced no-op proof). Do not attempt CLI migration;
+> keep backups.
+
 > **Goal:** Run Atomic alongside Git so that every commit, rebase, squash, and
 > force-push is captured as immutable Atomic provenance. When Git rewrites
 > history, the true record survives in Atomic's content-addressed change store.

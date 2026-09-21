@@ -201,6 +201,15 @@ pub struct RecordedFile {
     /// original inode and reverses only graph edges introduced by these
     /// visible deletion changes.
     undelete_changes: Vec<Hash>,
+
+    /// Graph-backed inode attribute writes (mode/kind) this record makes.
+    ///
+    /// Emitted by assembly as `GraphOp::SetAttr` hunks plus semantic
+    /// `SetMode`/`SetKind` FileOps. Import paths use this to carry Git
+    /// executable bits, symlink kinds, and gitlink kinds; the native
+    /// working-copy record path computes attributes itself and does not
+    /// populate this field.
+    attrs: Vec<crate::change::InodeAttr>,
 }
 
 impl RecordedFile {
@@ -236,7 +245,23 @@ impl RecordedFile {
             opaque_generated: false,
             pre_globalized: None,
             undelete_changes: Vec::new(),
+            attrs: Vec::new(),
         }
+    }
+
+    /// Register an inode attribute write for this file.
+    ///
+    /// The same attribute name may appear at most once per record; a second
+    /// value under one name would make the change self-conflicting.
+    pub fn set_attr(&mut self, value: crate::change::InodeAttr) {
+        if !self.attrs.iter().any(|existing| existing.name() == value.name()) {
+            self.attrs.push(value);
+        }
+    }
+
+    /// The inode attribute writes this record carries.
+    pub fn attrs(&self) -> &[crate::change::InodeAttr] {
+        &self.attrs
     }
 
     /// Set the old (pristine) line count.
@@ -531,7 +556,10 @@ impl RecordedFile {
     /// because the move itself is a meaningful operation that must be recorded.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        if matches!(self.kind, Some(DetectionKind::Moved)) || self.is_undelete() {
+        if matches!(self.kind, Some(DetectionKind::Moved))
+            || self.is_undelete()
+            || !self.attrs.is_empty()
+        {
             return false;
         }
         self.hunks.is_empty()

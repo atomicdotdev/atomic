@@ -106,3 +106,61 @@ fn test_is_internal_path() {
     assert!(repo.is_internal_path(repo.changes_dir()));
     assert!(!repo.is_internal_path(repo.root().join("src")));
 }
+
+/// Dropping a repository that performed a record must release the redb lock
+/// so the bridge checkpoint verifier can reopen (CB-8A record projection).
+#[test]
+fn test_drop_after_record_releases_the_database_lock() {
+    let (temp_dir, repo) = create_temp_repo();
+    let root = repo.root().to_path_buf();
+    std::fs::write(root.join("file.txt"), b"content\n").unwrap();
+    repo.add(&root.join("file.txt"), Default::default()).unwrap();
+    let outcome = repo
+        .record_with_message("record then reopen", Default::default())
+        .unwrap();
+    assert!(outcome.was_applied());
+    drop(repo);
+    assert!(
+        Repository::open(&root).is_ok(),
+        "sequential reopen after record must succeed"
+    );
+}
+
+/// The CB-8A record projection sequence: workspace transaction + record +
+/// drop, then a fresh writable open (the checkpoint verifier's) must succeed.
+#[test]
+fn test_workspace_record_then_reopen_releases_the_database_lock() {
+    let (temp_dir, repo) = create_temp_repo();
+    let root = repo.root().to_path_buf();
+    std::fs::write(root.join("file.txt"), b"content\n").unwrap();
+    repo.add(&root.join("file.txt"), Default::default()).unwrap();
+
+    // Mirror the record command: open_for_workspace_transaction, enter the
+    // workspace, record, then drop everything.
+    drop(repo);
+    let mut repo = Repository::open_for_workspace_transaction(&root).unwrap();
+    let start = repo.begin_workspace_txn(WorkspaceTxnMode::Reconcile).unwrap();
+    let workspace = match start {
+        crate::WorkspaceTxnStart::Ready(workspace) => workspace,
+        crate::WorkspaceTxnStart::Remediation(_) => panic!("expected ready workspace"),
+    };
+    let working_copy = workspace.working_copy();
+    let outcome = repo
+        .record_with_lifecycle(
+            working_copy,
+            atomic_core::change::ChangeHeader::builder()
+                .message("workspace record")
+                .author(atomic_core::change::Author::new("T", Some("t@t")))
+                .build(),
+            Default::default(),
+            crate::repository::snapshot::RecordLifecycle::Durable,
+        )
+        .unwrap();
+    assert!(outcome.was_applied());
+    drop(workspace);
+    drop(repo);
+    assert!(
+        Repository::open(&root).is_ok(),
+        "reopen after workspace record must succeed"
+    );
+}

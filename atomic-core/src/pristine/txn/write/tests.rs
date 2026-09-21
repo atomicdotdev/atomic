@@ -1148,4 +1148,85 @@ mod tests {
         assert_eq!(record.turn_count, 0);
         assert!(txn.get_session_turns("sess-incomplete").unwrap().is_empty());
     }
+
+    #[test]
+    fn test_attach_turn_boundary_updates_only_existing_rows() {
+        use crate::change::session::{
+            GitBoundaryCheckpoint, ManagedTurnOutcome, TurnBoundary,
+        };
+
+        let dir = tempdir().unwrap();
+        let pristine = Pristine::open(dir.path().join("pristine")).unwrap();
+        let provenance = crate::types::Hash::of(b"provenance");
+
+        let boundary = |session: &str, turn: u32| TurnBoundary {
+            working_copy: "01ABCDEF26CHARSULID0000000".into(),
+            operation: None,
+            view: "main".into(),
+            view_state: None,
+            set_id: None,
+            snapshot: None,
+            git: Some(GitBoundaryCheckpoint {
+                head_oid: Some("a".repeat(40)),
+                head_symref: None,
+                head_tree: None,
+                index_digest: None,
+                index_tree: None,
+                index_locked: false,
+                repository_state: String::new(),
+                markers: vec![],
+            }),
+            manifest: None,
+            conversion_policy: None,
+            session_id: session.into(),
+            turn,
+            at: 7,
+        };
+        let outcome = || ManagedTurnOutcome::ContentChanges {
+            durable: vec![crate::types::Hash::of(b"change")],
+            snapshot: None,
+        };
+
+        let mut txn = pristine.write_txn().unwrap();
+        txn.index_session_turn(
+            "sess-b",
+            ".atomic/sessions/sess-b.json",
+            &provenance,
+            &crate::change::provenance_graph::ProvenanceGraph::builder("sess-b", "claude-code").build(),
+        )
+        .unwrap();
+
+        // The row exists: the boundary pair and outcome attach.
+        let attached = txn
+            .attach_turn_boundary("sess-b", &provenance, &boundary("sess-b", 1), &boundary("sess-b", 1), &outcome())
+            .unwrap();
+        assert!(attached);
+
+        // Re-attaching identical evidence is an idempotent no-op.
+        let attached = txn
+            .attach_turn_boundary("sess-b", &provenance, &boundary("sess-b", 1), &boundary("sess-b", 1), &outcome())
+            .unwrap();
+        assert!(attached);
+
+        // Unknown provenance / session: nothing is created.
+        let missing = txn
+            .attach_turn_boundary(
+                "sess-other",
+                &provenance,
+                &boundary("sess-other", 1),
+                &boundary("sess-other", 1),
+                &outcome(),
+            )
+            .unwrap();
+        assert!(!missing);
+        txn.commit().unwrap();
+
+        let txn = pristine.read_txn().unwrap();
+        let turns = txn.get_session_turns("sess-b").unwrap();
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].boundary_start.as_ref().unwrap().turn, 1);
+        assert_eq!(turns[0].boundary_end.as_ref().unwrap().turn, 1);
+        assert!(matches!(turns[0].outcome, Some(ManagedTurnOutcome::ContentChanges { .. })));
+        assert!(txn.get_session_turns("sess-other").unwrap().is_empty());
+    }
 }

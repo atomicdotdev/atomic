@@ -491,6 +491,13 @@ pub fn conversion_policy_fingerprint(
                 bytes.extend_from_slice(&content);
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => bytes.push(0),
+            // Linked Git worktrees keep `.git` as a gitfile, so reserved paths
+            // like `.git/config` are not readable through the worktree root
+            // (their truth lives in the common directory). Treat that shape
+            // like an absent input instead of failing status; the fingerprint
+            // stays deterministic for a given worktree shape (CB-7A linked
+            // worktrees).
+            Err(error) if error.raw_os_error() == Some(20) => bytes.push(0),
             Err(error) => {
                 return Err(ChangeSourceError::Io {
                     path: path.escaped(),

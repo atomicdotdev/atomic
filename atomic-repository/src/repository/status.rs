@@ -254,6 +254,8 @@ impl Repository {
 
         let index_start = std::time::Instant::now();
         let mut canonical_tracked = Vec::new();
+        let mut gitlink_paths: std::collections::HashSet<PathBuf> =
+            std::collections::HashSet::new();
         for path in &tracked_paths {
             if inode_map
                 .get(path)
@@ -280,6 +282,15 @@ impl Repository {
             )
             .map_err(|error| RepositoryError::Database(error.to_string()))?;
             if projected.is_conflicted() {
+                continue;
+            }
+            // CB-9C: gitlink paths have no materialized bytes to verify —
+            // their content identity is the Git index's object ID, not the
+            // submodule directory's disk state — so they are excluded from
+            // the canonical content-verification set and recorded for the
+            // tracked-file classification loop instead.
+            if projected.materialization.kind == atomic_core::change::InodeKind::Gitlink {
+                gitlink_paths.insert(path.clone());
                 continue;
             }
             let repo_path = crate::repository::RepoPath::from_native(path)
@@ -390,6 +401,12 @@ impl Repository {
         )
         .map_err(map_change_source_error)?;
         status.set_change_source_verification(verified_scan.root, verified_scan.metrics.clone());
+        // CB-13C observability (review R1): status is an observational
+        // boundary and never writes telemetry — including from read-only
+        // opens, non-Git repositories or un-opted configurations. The
+        // degradation metrics are returned to the caller here (see
+        // `change_source_metrics`); only explicit bridge command boundaries
+        // decide whether an authorized journal records them.
         let verified_by_path: HashMap<PathBuf, _> = verified_scan
             .candidates
             .iter()
@@ -431,6 +448,24 @@ impl Repository {
             let abs_path = self.root.join(path);
             let inode = inode_map.get(path).copied();
             let has_graph = has_graph_content_cache.get(path).copied().unwrap_or(false);
+
+            // CB-9C: a tracked gitlink materializes as a submodule
+            // directory. Its content identity lives in the Git index, its
+            // disk permissions are foreign state, and its submodule
+            // contents are not Atomic untracked content — so the gitlink
+            // path itself is present and clean unless the projected state
+            // says otherwise.
+            if gitlink_paths.contains(path) {
+                found_on_disk.insert(path.clone());
+                if !abs_path.is_dir() {
+                    let mut entry = FileStatusEntry::new(path.clone(), FileStatus::TypeChanged);
+                    if let Some(inode) = inode {
+                        entry.set_inode(inode);
+                    }
+                    status.add_entry(entry);
+                }
+                continue;
+            }
 
             let is_dir = inode
                 .map(|i| directory_inodes.contains(&i))
@@ -526,13 +561,22 @@ impl Repository {
                         actual.mode,
                         actual.kind,
                     );
+                    // CB-9C: a gitlink's registered mode is not a
+                    // materialized fact — the submodule directory's own
+                    // permission bits are foreign state, so a mode
+                    // difference on a Gitlink kind is never a reportable
+                    // permission change. The materialized directory mode is
+                    // whatever the filesystem created.
+                    let permissions_changed = facts.permissions_changed
+                        && projected.materialization.kind
+                            != atomic_core::change::InodeKind::Gitlink;
                     if facts.type_changed {
                         let mut entry = FileStatusEntry::new(path.clone(), FileStatus::TypeChanged);
                         entry.set_inode(inode);
                         status.add_entry(entry);
                         continue;
                     }
-                    if facts.permissions_changed {
+                    if permissions_changed {
                         let mut entry =
                             FileStatusEntry::new(path.clone(), FileStatus::PermissionsChanged);
                         entry.set_inode(inode);
@@ -658,8 +702,16 @@ impl Repository {
                 None
             };
 
+            // Review CB-9C R5: prune only authoritative nested-repository
+            // boundaries. Tracked visible gitlink paths are passed
+            // explicitly; every other directory is pruned only when its
+            // `.git` marker is an actual repository, so incidental `.git`
+            // markers never hide ordinary parent content.
+            let walker_options = options.clone().with_nested_repo_boundaries(
+                gitlink_paths.iter().cloned(),
+            );
             let working_files =
-                collect_working_copy_files_with_rules(&self.root, &options, rules.as_ref())
+                collect_working_copy_files_with_rules(&self.root, &walker_options, rules.as_ref())
                     .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
             for path in working_files {
@@ -757,6 +809,38 @@ impl Repository {
             // Conflicted supersedes any prior (e.g. Modified) entry so the
             // file is reported exactly once.
             status.add_or_replace_entry(entry);
+        }
+
+        // RFC §8.3 (CB-8B) — the essential conflict caveat: when this view's
+        // conflict state has been projected as an ordinary Git conflict
+        // snapshot commit (clean Git index, committed markers), the notice
+        // must make the distinction explicit. Committed markers are a lossy
+        // Git representation, NOT Git unmerged stages 1-3: Git status is
+        // clean for them and merge tools do not apply, while the Atomic
+        // conflict remains unresolved until it is resolved in Atomic.
+        if status.entries().iter().any(|entry| entry.status() == FileStatus::Conflicted) {
+            let git_snapshot = git2::Repository::open(&self.root)
+                .ok()
+                .and_then(|git| {
+                    let head = git.head().ok()?.target()?;
+                    let commit = git.find_commit(head).ok()?;
+                    let message = commit.message().unwrap_or("");
+                    Some(
+                        message
+                            .lines()
+                            .any(|line| line.trim().starts_with("atomic-conflict ")),
+                    )
+                })
+                .unwrap_or(false);
+            if git_snapshot {
+                status.add_notice(
+                    "Git HEAD is an Atomic conflict snapshot commit: marker files are \
+                     committed on a CLEAN Git index (not Git unmerged stages 1-3). The \
+                     Atomic conflict remains unresolved; resolve it in Atomic and record \
+                     before treating the state as clean."
+                        .to_string(),
+                );
+            }
         }
 
         let untracked_ms = untracked_start.elapsed().as_millis();
@@ -997,7 +1081,15 @@ pub(crate) fn is_file_alive_via_retrieval<T: GraphTxnT>(
 ) -> Result<bool, RepositoryError> {
     use atomic_core::output::alive::{retrieve_graph, RetrieveOptions};
 
-    let options = RetrieveOptions::new().with_graph_visibility(visibility.clone());
+    // Liveness fast path (review E4): this check runs for EVERY absent
+    // path-claim entry on every projection, and a full alive-graph walk per
+    // entry is quadratic on long-history repositories (a single file with a
+    // deep history took minutes). The question is exactly "does this position
+    // render any alive bytes?", so the traversal can stop at the first alive
+    // content vertex; the partial graph's byte total is the whole verdict.
+    let options = RetrieveOptions::new()
+        .with_graph_visibility(visibility.clone())
+        .stop_at_first_content(true);
     let retrieved = retrieve_graph(txn, position, options)
         .map_err(|e| RepositoryError::Database(e.to_string()))?;
     Ok(retrieved.graph.total_bytes() > 0)
@@ -1228,5 +1320,54 @@ mod change_source_convergence_tests {
             );
             assert!(metrics.fallback_reason.is_some());
         }
+    }
+
+    /// Review R1: status is observational and must not write bridge
+    /// telemetry — not from a read-only open, a non-Git repository, or a
+    /// configuration with the bridge un-opted. A degrading change source
+    /// still surfaces its metrics to the caller, but no event file may be
+    /// created (this failed before: the fallback emitted into
+    /// `.atomic/bridge/events.jsonl` unconditionally).
+    #[test]
+    fn status_fallback_writes_no_event_journal() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        let working_copy = repo.require_working_copy_id().unwrap();
+        std::fs::write(dir.path().join("a.txt"), b"one").unwrap();
+        repo.add(working_copy, "a.txt", TrackingOptions::default())
+            .unwrap();
+        repo.record(
+            working_copy,
+            ChangeHeader::new("seed"),
+            RecordOptions::new()
+                .with_all(true)
+                .save_to_store(true)
+                .apply_after_record(true),
+        )
+        .unwrap();
+
+        let source = selected(
+            GitWatch::Fsmonitor,
+            Arc::new(FailingSource(ChangeSourceError::Unavailable("missing".into()))),
+            Arc::new(CandidateSource(CandidateMutation::Exact)),
+        );
+        let status = repo
+            .status_with_change_source(working_copy, StatusOptions::tracked_only(), &source)
+            .unwrap();
+
+        // The degradation metrics are returned to the caller (the
+        // explicitly authorized sink boundary decides what to record).
+        let metrics = status.change_source_metrics().unwrap();
+        assert_eq!(metrics.fallback_count, 1);
+        assert!(status.change_source_fallback().is_some());
+
+        let journal_path = dir
+            .path()
+            .join(crate::repository::DOT_DIR)
+            .join("bridge/events.jsonl");
+        assert!(
+            !journal_path.exists(),
+            "observational status must never write bridge telemetry"
+        );
     }
 }

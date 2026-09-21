@@ -118,9 +118,54 @@ impl GitAttributesFilter {
     /// Load filter bounds and driver definitions from `.atomic/config.toml`.
     pub fn for_repository(root: impl Into<PathBuf>) -> Self {
         let root = root.into();
-        let config = atomic_config::RepoConfig::load(&root.join(".atomic/config.toml"))
+        let mut config = atomic_config::RepoConfig::load(&root.join(".atomic/config.toml"))
             .map(|config| config.filters)
             .unwrap_or_default();
+        // Git-defined filter drivers are authoritative for a colocated
+        // working copy (CB-3C filter policy): `filter.<name>.clean`,
+        // `filter.<name>.smudge`, and `filter.<name>.required` from the
+        // repository's Git config seed the driver map for every
+        // .gitattributes filter name the Git-side operations must honor.
+        // Atomic-declared drivers win on name collision, because they can
+        // only narrow an already-Git-honored contract deliberately.
+        if let Ok(output) = Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args(["config", "--get-regexp", r"^filter\."])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .output()
+        {
+            if output.status.success() {
+                let mut drivers: std::collections::BTreeMap<String, ExternalFilterConfig> =
+                    std::collections::BTreeMap::new();
+                for line in String::from_utf8_lossy(&output.stdout).lines() {
+                    let Some((key, value)) = line.split_once(' ') else {
+                        continue;
+                    };
+                    // key: "filter.<name>.<clean|smudge|required>"
+                    let Some(rest) = key.strip_prefix("filter.") else {
+                        continue;
+                    };
+                    let Some((name, property)) = rest.rsplit_once('.') else {
+                        continue;
+                    };
+                    if !matches!(property, "clean" | "smudge" | "required") {
+                        continue;
+                    }
+                    let driver = drivers.entry(name.to_string()).or_default();
+                    match property {
+                        "clean" => driver.clean = Some(value.to_string()),
+                        "smudge" => driver.smudge = Some(value.to_string()),
+                        "required" => driver.required = value == "true",
+                        _ => {}
+                    }
+                }
+                for (name, driver) in drivers {
+                    config.drivers.entry(name).or_insert(driver);
+                }
+            }
+        }
         Self::new(root, config)
     }
 

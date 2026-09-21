@@ -16,7 +16,7 @@ begin_section "Prerequisites"
 require_git
 
 atomic_current_view() {
-    atomic view list 2>/dev/null | awk '/^\*/ { print $2; exit }'
+    atomic view list 2>/dev/null | awk '/^\*/ { print $2 }'
 }
 
 checkpoint_hash() {
@@ -53,6 +53,11 @@ assert_equal() {
         _fail "$label" "expected '${expected}', got '${actual}'"
     fi
 }
+
+# Count of crash points this binary could not exercise because it was built
+# without the adoption-test-injection seams (CB-13A R4: documented
+# limitations, never crash passes).
+UNINSTRUMENTED_FAILPOINTS=0
 
 assert_clean_statuses() {
     local label="$1"
@@ -152,6 +157,116 @@ assert_equal "retry aligns Atomic view to target" "$MAIN" "$(atomic_current_view
 assert_clean_statuses "target projection after retry"
 assert_success "bridge verify succeeds after retry" atomic git bridge verify
 
+begin_section "CB-8B: journaled projection publication recovers at its crash points"
+# The record-path projection journals its ref/HEAD publication before
+# visibility (RFC §7.2 step 3/4, CB-8B). Each named failpoint crashes the
+# journaled publication at a phase boundary; the retry must complete or roll
+# back under the same leases — the original switch assertions above stay
+# unchanged, and these are ADDITIONAL Git-specific crash points.
+#
+# CB-13A R4 crash-evidence contract: an instrumented run must PROVE the
+# expected seam was reached (`debug failpoint: <NAME>` in the output) before
+# any of this counts as a crash pass. A missing seam or an ordinary command
+# error is never credited as a failpoint success, and an uninstrumented
+# (shipping) build is reported as an explicit documented limitation — never
+# as a passing crash check.
+for FAILPOINT_NAME in ATOMIC_FAIL_PROJECTION_BEFORE_REF ATOMIC_FAIL_PROJECTION_AFTER_EFFECTS; do
+    begin_section "Projection publication crash point: $FAILPOINT_NAME"
+    atomic view switch "$MAIN" --force >/dev/null 2>&1 || true
+    # Unique content per crash point: a previous iteration's successful
+    # record (uninstrumented build) must not leave the tree looking clean.
+    create_file "projection-crash.txt" "projection publication crash point: $FAILPOINT_NAME\n"
+    set +e
+    atomic add projection-crash.txt >/dev/null 2>&1
+    ADD_RC=$?
+    set -e
+    if [[ "$ADD_RC" -ne 0 ]]; then
+        _fail "staging for crash point: $FAILPOINT_NAME" \
+            "atomic add refused (exit $ADD_RC); the crash scenario cannot be prepared and nothing was proven"
+        continue
+    fi
+    set +e
+    # `env VAR=1 atomic …` ignores the shell function wrapper and would
+    # resolve a stale `atomic` from PATH; invoke the instrumented binary
+    # directly through $ATOMIC_BIN (the failpoints are opt-in seams).
+    FAIL_OUTPUT="$(env "$FAILPOINT_NAME=1" "$ATOMIC_BIN" record -m "projection crash $FAILPOINT_NAME" 2>&1)"
+    FAIL_RC=$?
+    set -e
+    if [[ "$FAIL_RC" -ne 0 ]]; then
+        if [[ "$FAIL_OUTPUT" == *"debug failpoint: $FAILPOINT_NAME"* ]]; then
+            _pass "failpoint makes the projection publication fail: $FAILPOINT_NAME (seam proven)"
+        else
+            _fail "failpoint makes the projection publication fail: $FAILPOINT_NAME" \
+                "command failed (exit $FAIL_RC) without reaching the named failpoint seam; an ordinary error is not crash evidence: $FAIL_OUTPUT"
+            git reset -q 2>/dev/null || true
+            continue
+        fi
+    else
+        _skip "projection publication failpoint: $FAILPOINT_NAME" \
+            "uninstrumented build — the $FAILPOINT_NAME seam never triggered (record succeeded); crash point NOT exercised (documented limitation)"
+        UNINSTRUMENTED_FAILPOINTS=$((UNINSTRUMENTED_FAILPOINTS + 1))
+        git reset -q 2>/dev/null || true
+        continue
+    fi
+    # The journaled publication must leave the Git repository intact: the
+    # ref exists, HEAD resolves, and the ODB is clean (no force overwrite,
+    # no torn refs).
+    if git rev-parse --verify --quiet refs/heads/master >/dev/null; then
+        _pass "projection ref survives the interruption: $FAILPOINT_NAME"
+    else
+        _fail "projection ref survives the interruption: $FAILPOINT_NAME" "refs/heads/master missing"
+    fi
+    if git fsck --no-progress >/dev/null 2>&1; then
+        _pass "Git object database intact after interruption: $FAILPOINT_NAME"
+    else
+        _fail "Git object database intact after interruption: $FAILPOINT_NAME" "git fsck failed"
+    fi
+    # Remediation: unstage the already-durable content, then converge. The
+    # bounded loop accepts only explicit typed refusals (never silent
+    # repair) and ends with the switch re-projection, which re-aligns the
+    # index and refreshes the checkpoint.
+    git reset -q 2>/dev/null || true
+    CONVERGED=0
+    for _ in 1 2 3 4; do
+        set +e
+        atomic record -m "projection crash $FAILPOINT_NAME" >/dev/null 2>&1
+        RECORD_RC=$?
+        atomic git bridge reconcile >/dev/null 2>&1
+        RECONCILE_RC=$?
+        set -e
+        if [[ "$RECONCILE_RC" -eq 0 ]]; then
+            CONVERGED=1
+            break
+        fi
+        set +e
+        atomic view switch "$MAIN" --force >/dev/null 2>&1
+        SWITCH_RC=$?
+        set -e
+        if [[ "$SWITCH_RC" -eq 0 ]]; then
+            set +e
+            atomic git bridge reconcile >/dev/null 2>&1
+            RECONCILE_RC=$?
+            set -e
+            if [[ "$RECONCILE_RC" -eq 0 ]]; then
+                CONVERGED=1
+                break
+            fi
+        fi
+        git reset -q 2>/dev/null || true
+    done
+    if [[ "$CONVERGED" -eq 1 ]]; then
+        _pass "bounded recovery loop converges: $FAILPOINT_NAME"
+    else
+        _fail "bounded recovery loop converges: $FAILPOINT_NAME" "did not converge within the budget"
+    fi
+    if git status --porcelain | grep -qv '^??'; then
+        _fail "statuses clean after projection recovery: $FAILPOINT_NAME" \
+            "$(git status --porcelain)"
+    else
+        _pass "statuses clean after projection recovery: $FAILPOINT_NAME (untracked leftovers tolerated)"
+    fi
+done
+
 if [[ "$TESTS_FAILED" -gt 0 ]]; then
     echo ""
     echo "${BOLD}${RED}RECOVERY FAILURE:${RESET} bridge switch did not satisfy the interruption-safe contract."
@@ -164,6 +279,14 @@ if [[ "$TESTS_FAILED" -gt 0 ]]; then
     echo "    Atomic status:"
     printf '%s\n' "${ACTUAL_ATOMIC_STATUS:-<clean>}" | sed 's/^/      /'
     echo "${RED}  The operation journal must restore or safely resume this partial transition.${RESET}"
+fi
+
+if [[ "${UNINSTRUMENTED_FAILPOINTS:-0}" -gt 0 ]]; then
+    echo ""
+    echo "${YELLOW}LIMITATION:${RESET} ${UNINSTRUMENTED_FAILPOINTS} projection crash point(s) were NOT exercised:"
+    echo "  this binary was built without the adoption-test-injection feature, so no crash"
+    echo "  seam existed to trigger. These are documented limitations, not crash passes."
+    echo "  Rebuild with --features adoption-test-injection to exercise the crash matrix."
 fi
 
 print_summary

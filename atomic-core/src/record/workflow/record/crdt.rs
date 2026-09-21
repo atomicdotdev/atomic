@@ -68,7 +68,10 @@ pub(super) fn build_crdt_ops_for_deleted_file(path: &str) -> (FileOps, CrdtBuild
     // Create a trunk ID for the deletion
     // Note: In a full implementation, we'd look up the existing trunk ID
     let trunk_id = TrunkId::new(placeholder_change_id, 0);
-    builder.delete_file(trunk_id);
+    // The FileOps path must name the deleted file: downstream semantic
+    // coverage checks match FileOps by path, and an anonymous delete op
+    // cannot be attributed to the recorded delta (CB-9B review F3).
+    builder.delete_file(trunk_id, path);
 
     let result = builder.finish();
     let stats = result.stats().clone();
@@ -632,11 +635,93 @@ pub(crate) fn build_crdt_ops_for_modified_file(
         collected_line_ops = consolidated;
     }
 
-    // Add final line_ops to file_ops.
     for line_op in collected_line_ops {
         file_ops.add_line_op(line_op);
     }
 
     // Convert to the canonical change::FileOps type
+    (file_ops.into_change_ops(), stats)
+}
+
+/// Build CRDT operations for a forced whole-file replace (CB-9B review F4).
+///
+/// The graph side of a forced replace rewrites the whole file: every alive
+/// vertex is deleted and the full new content is inserted as fresh vertices.
+/// The semantic layer must mirror that shape — tombstone every existing
+/// alive branch (bound to the real branches, so their identities stay
+/// coherent) and insert every new line as a fresh branch chained from the
+/// start of the file. A positional diff here would keep unchanged lines
+/// bound to the graph-deleted vertices, leaving the CRDT layer pointing at
+/// dead content and unable to reconstruct the file.
+///
+/// `existing_branches` is the file-ordered list of alive `BranchId`s to
+/// tombstone; `None` or an empty slice leaves no deletes (the file had no
+/// bound branches). Every insert carries its new line number so globalization
+/// enriches each with the whole-file replace hunk's content range.
+pub(crate) fn build_crdt_ops_for_whole_file_replace(
+    path: &str,
+    new_content: &[u8],
+    _encoding: Encoding,
+    existing_trunk_id: Option<TrunkId>,
+    existing_branches: Option<&[BranchId]>,
+) -> (FileOps, CrdtBuildStats) {
+    let placeholder_change_id = NodeId::new(0);
+    let trunk_id = existing_trunk_id.unwrap_or_else(|| TrunkId::new(placeholder_change_id, 0));
+    let mut file_ops = BuilderFileOps::new(trunk_id, path.to_string(), None);
+
+    let mut stats = CrdtBuildStats::new();
+    let mut next_branch_idx: u32 = 0;
+    let mut next_leaf_idx: u32 = 0;
+    let mut alloc_branch = || {
+        let id = BranchId::new(placeholder_change_id, next_branch_idx);
+        next_branch_idx += 1;
+        id
+    };
+    let mut alloc_leaf = || {
+        let id = LeafId::new(placeholder_change_id, next_leaf_idx);
+        next_leaf_idx += 1;
+        id
+    };
+
+    let new_tokenizer = ContentTokenizer::new(new_content);
+    let new_lines: Vec<_> = new_tokenizer.lines().collect();
+
+    // 1. Tombstone every existing alive branch. The graph's whole-file
+    //    replace deletes the old content vertices, so the semantic layer
+    //    must mark the bound branches deleted too (state coherence with
+    //    the graph; the branch → vertex mappings stay for blame history).
+    if let Some(existing) = existing_branches {
+        for (old_line_idx, branch_id) in existing.iter().enumerate() {
+            let line_op = BuilderLineOps::delete(*branch_id, Vec::new())
+                .with_old_line_num(old_line_idx + 1);
+            file_ops.add_line_op(line_op);
+            stats.lines_deleted += 1;
+        }
+    }
+
+    // 2. Insert every new line fresh, chained from the start of the file,
+    //    with token-level LeafOps.
+    let mut prev_branch: Option<BranchId> = None;
+    for (new_line_idx, line) in new_lines.iter().enumerate() {
+        let branch_id = alloc_branch();
+        let mut prev_leaf: Option<LeafId> = None;
+        let mut leaf_ops = Vec::new();
+        for token in line.tokens() {
+            let leaf_id = alloc_leaf();
+            leaf_ops.push(LeafOp::Insert {
+                after: prev_leaf,
+                kind: token.kind(),
+                content: token.content().to_vec(),
+            });
+            stats.tokens_added += 1;
+            prev_leaf = Some(leaf_id);
+        }
+        let line_op = BuilderLineOps::insert(branch_id, prev_branch, leaf_ops)
+            .with_new_line_num(new_line_idx + 1);
+        file_ops.add_line_op(line_op);
+        stats.lines_added += 1;
+        prev_branch = Some(branch_id);
+    }
+
     (file_ops.into_change_ops(), stats)
 }

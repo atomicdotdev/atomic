@@ -138,6 +138,7 @@ impl Repository {
         working_copy: WorkingCopyId,
         paths: &[&str],
     ) -> Result<usize, RepositoryError> {
+        use crate::tracking::{TreeProjectionKind, TreeProjectionOperation, TreeProjectionPlan};
         self.validate_working_copy(working_copy)?;
         if paths.is_empty() {
             return Ok(0);
@@ -148,18 +149,42 @@ impl Repository {
             .write_txn()
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
+        // Performance (RFC §21 measured budgets, CB-13C AC-3): plan the
+        // whole batch as ONE tree projection. `TreeProjectionPlan::plan`
+        // derives directory occupancy from a FULL `iter_tree` scan, so
+        // planning per path rescans the entire TREE table once per file —
+        // O(n²) across a batch (measured: a 10k-file import spent minutes
+        // here). Planning once keeps the scan linear in the final tree.
+        let mut operations: Vec<TreeProjectionOperation> = Vec::with_capacity(paths.len());
+        let mut planned: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut count = 0usize;
         for path in paths {
             let normalized = normalize_path(Path::new(path));
+            if planned.contains(&normalized) {
+                continue;
+            }
             if is_tracked(&txn, &normalized)
                 .map_err(|e| RepositoryError::Database(e.to_string()))?
             {
                 continue;
             }
-            add_to_tree(&mut txn, &normalized, false)
+            let inode = txn
+                .alloc_inode()
                 .map_err(|e| RepositoryError::Database(e.to_string()))?;
+            operations.push(TreeProjectionOperation::Add {
+                inode,
+                path: Some(normalized.clone()),
+                position: None,
+                kind: TreeProjectionKind::File,
+            });
+            planned.insert(normalized);
             count += 1;
         }
+
+        TreeProjectionPlan::plan(&txn, operations)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?
+            .apply(&mut txn)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
         txn.commit()
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
@@ -185,6 +210,7 @@ impl Repository {
         working_copy: WorkingCopyId,
         paths: &[&str],
     ) -> Result<usize, RepositoryError> {
+        use crate::tracking::{TreeProjectionOperation, TreeProjectionPlan};
         self.validate_working_copy(working_copy)?;
         if paths.is_empty() {
             return Ok(0);
@@ -195,16 +221,32 @@ impl Repository {
             .write_txn()
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
+        // Performance: one tree projection for the whole batch (see
+        // add_batch — per-path planning rescans the full TREE table).
+        let mut operations: Vec<TreeProjectionOperation> = Vec::with_capacity(paths.len());
+        let mut planned: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut count = 0usize;
         for path in paths {
             let normalized = normalize_path(Path::new(path));
-            if remove_from_tree(&mut txn, &normalized)
+            if planned.contains(&normalized) {
+                continue;
+            }
+            planned.insert(normalized.clone());
+            if let Some(inode) = crate::tracking::get_inode(&txn, &normalized)
                 .map_err(|e| RepositoryError::Database(e.to_string()))?
-                .is_some()
             {
+                operations.push(TreeProjectionOperation::Delete {
+                    inode,
+                    retire: true,
+                });
                 count += 1;
             }
         }
+
+        TreeProjectionPlan::plan(&txn, operations)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?
+            .apply(&mut txn)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
         txn.commit()
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
@@ -735,5 +777,61 @@ impl Repository {
 
         tracked_under_prefix(&txn, &normalized)
             .map_err(|e| RepositoryError::Database(e.to_string()))
+    }
+}
+
+#[cfg(test)]
+mod batch_scaling_tests {
+    use super::*;
+    use crate::repository::Repository;
+    use tempfile::TempDir;
+
+    /// RFC §21 measured-budget regression (CB-13C AC-3): `add_batch` plans
+    /// the whole batch as ONE tree projection. Planning per path re-derives
+    /// directory occupancy from a full `iter_tree` scan per file, which is
+    /// O(n²) across a batch — the measured 10k-file import spent minutes
+    /// here and a 100k-file corpus would take hours. The batched plan keeps
+    /// the scan linear; 4000 paths land well under the bound while the
+    /// per-path shape overruns it by an order of magnitude in debug.
+    #[test]
+    fn add_batch_plans_one_tree_projection_not_one_per_path() {
+        let dir = TempDir::new().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        let working_copy = repo.require_working_copy_id().unwrap();
+
+        let paths: Vec<String> = (0..4000)
+            .map(|i| format!("dir-{:03}/file-{:05}.txt", i / 500, i))
+            .collect();
+        let refs: Vec<&str> = paths.iter().map(|p| p.as_str()).collect();
+
+        let started = std::time::Instant::now();
+        let added = repo.add_batch(working_copy, &refs).unwrap();
+        let elapsed = started.elapsed();
+
+        assert_eq!(added, 4000);
+        // Every path must actually be tracked (the batched plan applied all
+        // of the adds).
+        let txn = repo.pristine().read_txn().unwrap();
+        for path in &paths {
+            assert!(
+                crate::tracking::is_tracked(&txn, path).unwrap(),
+                "'{path}' must be tracked after add_batch"
+            );
+        }
+        assert!(
+            elapsed.as_secs() < 10,
+            "add_batch of 4000 paths took {elapsed:?}; the one-projection batch \
+             must stay linear (a per-path plan scan overruns this bound)"
+        );
+
+        // remove_batch shares the shape: one projection for the whole batch.
+        let started = std::time::Instant::now();
+        let removed = repo.remove_batch(working_copy, &refs).unwrap();
+        let elapsed = started.elapsed();
+        assert_eq!(removed, 4000);
+        assert!(
+            elapsed.as_secs() < 10,
+            "remove_batch of 4000 paths took {elapsed:?}; must stay linear"
+        );
     }
 }

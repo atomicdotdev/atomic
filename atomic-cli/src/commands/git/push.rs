@@ -13,9 +13,11 @@ use atomic_core::pristine::ViewScope;
 use atomic_core::types::{Base32, Merkle};
 use atomic_repository::{HistoryEntry, HistoryOptions, Repository};
 
+use crate::commands::workspace_txn::{enter_workspace, remediation_error};
 use crate::commands::{find_repository_root, Command};
 use crate::error::{CliError, CliResult};
 use crate::output::{print_info, print_success, print_warning};
+use atomic_repository::WorkspaceTxnMode;
 
 /// Push Atomic changes to Git.
 ///
@@ -67,6 +69,15 @@ pub struct Push {
     /// turn-end hook must never pass this.
     #[arg(long = "allow-conflict-markers")]
     pub allow_conflict_markers: bool,
+
+    /// Explicitly allow exporting a view with unresolved Atomic conflicts to
+    /// a remote (RFC §8.3, CB-8B). This is refused by default for every
+    /// remote export. The flag does NOT bypass any other gate: the complete
+    /// conflict-object pack must already be published and verify against the
+    /// current conflict set, and signing, trust, lease, and publication
+    /// policy all still apply. Never passed by automation.
+    #[arg(long = "allow-conflicts")]
+    pub allow_conflicts: bool,
 }
 
 impl Default for Push {
@@ -77,6 +88,7 @@ impl Default for Push {
             remote: "origin".to_string(),
             branch: None,
             allow_conflict_markers: false,
+            allow_conflicts: false,
         }
     }
 }
@@ -96,9 +108,110 @@ impl Command for Push {
             .map_err(CliError::Repository)?;
         let mut publication =
             super::shadow::verify_git_publication(&readonly_repo, &repo_root, &current_view)?;
+        // CB-12B: trusted provenance publication gate for Git ref export
+        // (RFC §10.4). Before any commit/ref/ODB mutation, the complete
+        // reachable closure of the exported view must carry trusted
+        // managed-session evidence. This is fail-closed with exact
+        // diagnostics; content correctness is verified independently by the
+        // publication check above.
+        {
+            let view_changes: Vec<atomic_core::types::Hash> = readonly_repo
+                .get_view_changes(Some(&current_view))
+                .map_err(CliError::Repository)?
+                .into_iter()
+                .map(|(_, hash)| hash)
+                .collect();
+            let closure = atomic_repository::repository::provenance_gate::reachable_closure(
+                &readonly_repo,
+                &view_changes,
+            )
+            .map_err(CliError::Repository)?;
+            let provider = atomic_repository::repository::provenance_gate::
+                local_session_mac_key_provider(&readonly_repo);
+            readonly_repo
+                .enforce_publication_gate("Git ref export", &closure, Some(&provider))
+                .map_err(CliError::Repository)?;
+        }
+        // RFC §8.3 (CB-8B): remote export of a view with unresolved Atomic
+        // conflicts is refused by default. Even with --allow-conflicts the
+        // complete conflict-object pack must already be published and verify
+        // against the CURRENT conflict set — markers plus a hash are
+        // insufficient, and the flag cannot bless a missing or stale pack.
+        {
+            let conflicted = readonly_repo
+                .capture_view_conflict_set(&current_view)
+                .map_err(CliError::Repository)?
+                .is_some();
+            if conflicted {
+                if !self.allow_conflicts {
+                    return Err(CliError::Repository(
+                        atomic_repository::RepositoryError::InvalidOperation {
+                            message: format!(
+                                "view '{current_view}' has unresolved Atomic conflicts; remote \
+                                 export is refused. Project the conflict snapshot on a Draft ref \
+                                 and publish its binding with --with-conflicts-pack first, or pass \
+                                 --allow-conflicts explicitly (which still requires a complete, \
+                                 current conflict pack and never bypasses trust/signing/lease gates)"
+                            ),
+                        },
+                    ));
+                }
+                let git_for_conflicts =
+                    GitRepository::discover(&repo_root).map_err(|error| CliError::GitError {
+                        message: format!("cannot discover Git repository: {error}"),
+                    })?;
+                let object = readonly_repo
+                    .capture_view_conflict_set(&current_view)
+                    .map_err(CliError::Repository)?
+                    .expect("conflict presence checked above");
+                let set_hash = object.hash().map_err(|error| {
+                    CliError::Repository(
+                        atomic_repository::RepositoryError::InvalidOperation {
+                            message: format!("cannot hash the conflict set: {error}"),
+                        },
+                    )
+                })?;
+                let mut pack_current = false;
+                for id in readonly_repo.binding_ids().map_err(CliError::Repository)? {
+                    if let Some(pack) = readonly_repo
+                        .load_binding_conflicts_pack(&git_for_conflicts, &id)
+                        .map_err(CliError::Repository)?
+                    {
+                        if atomic_repository::git_binding::validate_conflicts_pack(
+                            &pack,
+                            &set_hash,
+                        )
+                        .is_ok()
+                        {
+                            pack_current = true;
+                            break;
+                        }
+                    }
+                }
+                if !pack_current {
+                    return Err(CliError::Repository(
+                        atomic_repository::RepositoryError::InvalidOperation {
+                            message: format!(
+                                "--allow-conflicts requires a published binding whose \
+                                 conflicts.pack verifies against the CURRENT conflict set \
+                                 ({}); no such pack exists, so the export stays refused",
+                                atomic_core::types::Base32::to_base32(&set_hash)
+                            ),
+                        },
+                    ));
+                }
+            }
+        }
         drop(readonly_repo);
 
-        let repo = Repository::open(&repo_root).map_err(CliError::Repository)?;
+        let mut repo = Repository::open(&repo_root).map_err(CliError::Repository)?;
+        // Enter the shared workspace transaction and retain its authority for
+        // the whole export; the working copy and view come from the
+        // working-copy record, never current_view.
+        let workspace = enter_workspace(&mut repo, WorkspaceTxnMode::Reconcile)?;
+        let working_copy = workspace.working_copy();
+        let current_view = workspace.view().name.clone();
+        drop(workspace);
         let git_repo = GitRepository::discover(&repo_root).map_err(|_| CliError::GitError {
             message: "Not a git repository (or any parent up to mount point)".to_string(),
         })?;
@@ -267,7 +380,7 @@ impl Command for Push {
                         self.remote, target
                     ));
                 }
-                self.push_to_remote(&repo, &repo_root, &git_repo, target_override, &publication)?;
+                self.push_to_remote(&repo, &repo_root, &git_repo, target_override, &publication, &_shadow_lock)?;
                 print_success(&format!("Pushed to {}/{}", self.remote, target));
                 return Ok(());
             }
@@ -278,13 +391,15 @@ impl Command for Push {
         // and the Atomic-Changes trailer. The Atomic-State trailer always
         // reflects the latest view state so the next push can find this point.
         let latest_state = history.last().map(|e| e.state).unwrap_or_default();
-        let commit_message =
-            self.build_commit_message(new_history, &latest_state, &current_view, &publication)?;
-
-        // Get git signature
-        let sig = git_repo.signature().map_err(|e| CliError::GitError {
-            message: format!("Failed to get git signature: {}", e),
-        })?;
+        let (commit_message, sig) = self.build_commit_message(
+            &repo,
+            &repo_root,
+            new_history,
+            &latest_state,
+            &current_view,
+            &publication,
+            &git_repo,
+        )?;
 
         // Get parent commit (HEAD), if any
         let parent = git_repo.head().ok().and_then(|h| h.peel_to_commit().ok());
@@ -321,7 +436,7 @@ impl Command for Push {
 
         // Push to remote unless --no-push
         if !self.no_push {
-            match self.push_to_remote(&repo, &repo_root, &git_repo, target_override, &publication) {
+            match self.push_to_remote(&repo, &repo_root, &git_repo, target_override, &publication, &_shadow_lock) {
                 Ok(()) => {
                     let target = self.target_branch(&git_repo, target_override);
                     print_success(&format!("Pushed to {}/{}", self.remote, target));
@@ -344,14 +459,19 @@ impl Push {
     /// Only the changes in `new_history` (those new since the last push) are
     /// referenced in the body and the `Atomic-Changes` trailer. The
     /// `Atomic-State` trailer always carries the latest view state so the
-    /// next push can find this commit as its starting point.
+    /// next push can find this commit as its starting point. The RFC §8.2
+    /// headers (`atomic-set`, `atomic-state`, `atomic-author`) are emitted
+    /// alongside them, with identity resolved through the §5.5 map.
     fn build_commit_message(
         &self,
+        repo: &Repository,
+        repo_root: &std::path::Path,
         new_history: &[HistoryEntry],
         latest_state: &Merkle,
         view: &str,
         publication: &super::shadow::VerifiedPublication,
-    ) -> CliResult<String> {
+        git_repo: &GitRepository,
+    ) -> CliResult<(String, git2::Signature<'static>)> {
         let latest_state = latest_state.to_base32();
         if publication.view() != view || publication.atomic_state() != latest_state {
             return Err(CliError::GitError {
@@ -390,13 +510,38 @@ impl Push {
         ));
         msg.push_str(&format!("Atomic-Tree: {}\n", publication.git_tree_oid()?));
 
+        // RFC §8.2 operation-identity headers. The projection SetId comes
+        // from the canonical effective closure; the author DID from the
+        // §5.5 email mapping.
+        let set_id = repo.view_set_id(view).map_err(CliError::Repository)?;
+        let state =
+            Merkle::from_base32(latest_state.as_bytes()).ok_or_else(|| CliError::GitError {
+                message: "verified view state is not a valid Merkle value".to_string(),
+            })?;
+        msg.push_str(&format!("atomic-set {}\n", set_id.to_base32()));
+        msg.push_str(&format!("atomic-state {latest_state}\n"));
+        let git_sig = git_repo.signature().map_err(|e| CliError::GitError {
+            message: format!("Failed to get git signature: {}", e),
+        })?;
+        let author =
+            super::shadow::projection_author(repo, repo_root, git_sig.name(), git_sig.email());
+        msg.push_str(&format!("atomic-author {}\n", author.did));
+        if let Some(agent) = &author.agent_did {
+            msg.push_str(&format!("atomic-agent {agent}\n"));
+            msg.push_str(&format!("Co-authored-by: {} <{}>\n", author.name, agent));
+        }
+
         let change_hashes: Vec<String> = new_history.iter().map(|e| e.hash.to_base32()).collect();
 
         if !change_hashes.is_empty() {
             msg.push_str(&format!("Atomic-Changes: {}\n", change_hashes.join(", ")));
         }
 
-        Ok(msg)
+        let owned_sig =
+            git2::Signature::now(&author.name, &author.email).map_err(|e| CliError::GitError {
+                message: format!("Failed to build projected commit signature: {}", e),
+            })?;
+        Ok((msg, owned_sig))
     }
 
     /// Synthesize a commit message from the new Atomic change messages.
@@ -554,6 +699,15 @@ impl Push {
     /// callback can only consult the ssh-agent, which fails for anyone
     /// whose keys live in `~/.ssh/config` (a common setup, e.g.
     /// `IdentityFile ~/.ssh_keys/github` with an empty agent).
+    ///
+    /// CB-10B (RFC §8.5): a mapped remote update is leased against the
+    /// mapping's `last_observed_remote` with
+    /// `--force-with-lease=<ref>:<expected>` — a stale push refuses and
+    /// newer external remote work is never overwritten. A view without a
+    /// persisted mapping gets its baseline mapping created here, and an
+    /// unobserved remote is observed explicitly first (`git ls-remote`);
+    /// the new remote tip is verified after the push and recorded back into
+    /// the mapping, so the next push is leased against it.
     fn push_to_remote(
         &self,
         repo: &Repository,
@@ -561,6 +715,7 @@ impl Push {
         git_repo: &GitRepository,
         override_branch: Option<&str>,
         publication: &super::shadow::VerifiedPublication,
+        common: &atomic_repository::RepositoryCommonLockGuard,
     ) -> CliResult<()> {
         let head = git_repo.head().map_err(|e| CliError::GitError {
             message: format!("Failed to get HEAD: {}", e),
@@ -573,7 +728,16 @@ impl Push {
                 message: format!("refusing to publish local recovery ref '{destination}'"),
             });
         }
-        let refspec = format!("HEAD:{destination}");
+        // CB-10B review R3: push the PINNED verified commit, never the
+        // mutable HEAD — the refspec names the exact commit the publication
+        // snapshot verified, so a branch that moves after verification
+        // cannot change what is pushed.
+        let verified_head = publication.git_head.ok_or_else(|| {
+            CliError::GitError {
+                message: "the verified publication carries no Git commit to push".to_string(),
+            }
+        })?;
+        let refspec = format!("{}:{destination}", verified_head);
 
         let workdir = git_repo.workdir().ok_or_else(|| CliError::GitError {
             message: "Git repository has no working directory (bare repository?)".to_string(),
@@ -582,10 +746,126 @@ impl Push {
         // Re-observe immediately before handing the ref effect to `git push`.
         publication.reobserve_for_git_push(repo, repo_root, git_repo)?;
 
+        // CB-10B remote lease (RFC §8.5). Every mapped view push runs under
+        // an expected-old lease: the mapping's last_observed_remote pins the
+        // expected remote tip, an unobserved remote is observed explicitly
+        // first, and the verified new tip is recorded back for the next
+        // push. The working copy comes from the publication boundary.
+        let current_view = publication.view().to_string();
+        let working_copy = repo.require_working_copy_id().map_err(CliError::Repository)?;
+        let mapping = match repo.get_ref_mapping(&current_view).map_err(CliError::Repository)? {
+            Some(mapping) => Some(mapping),
+            None => {
+                // First push for this view: create the baseline mapping so
+                // the remote observation below has a durable row to advance.
+                super::ref_mapping::ensure_baseline_mapping(repo, working_copy, git_repo, &current_view)?.0;
+                repo.get_ref_mapping(&current_view).map_err(CliError::Repository)?
+            }
+        };
+        // The tracked remote pair: the mapping's pair when it matches this
+        // remote; otherwise the pushed destination becomes the pair (first
+        // push or re-target).
+        let tracked = mapping
+            .as_ref()
+            .and_then(|mapping| mapping.remote.as_ref())
+            .filter(|(name, _)| name == &self.remote)
+            .map(|(_, reference)| reference.clone())
+            .unwrap_or_else(|| destination.clone());
+        let lease = match mapping
+            .as_ref()
+            .and_then(|mapping| mapping.last_observed_remote.as_deref())
+            .filter(|_| tracked == destination)
+        {
+            Some(expected) => super::transport::remote_lease_refspec(Some(expected), &destination),
+            None if tracked == destination => {
+                // No prior remote observation: observe explicitly. An ABSENT
+                // remote ref is leased as expected-absence (create-only). An
+                // OBSERVED remote ref carries someone's work — possibly
+                // AHEAD of us — and is never leased: leasing the observed
+                // tip would grant force authority to overwrite exactly that
+                // unrequested work (CB-10B review R2). The push runs
+                // without a lease, so Git's own fast-forward check refuses
+                // a non-descendant update.
+                let tip = super::transport::observe_remote_ref(&workdir, &self.remote, &destination)?;
+                match tip {
+                    None => Some(format!("--force-with-lease={destination}:")),
+                    Some(_) => None,
+                }
+            }
+            None => None,
+        };
+
+        // CB-10B review R3 race fixture: a concurrent writer moves the local
+        // branch AFTER the publication snapshot (a ref move only — the
+        // worktree stays clean). With the pinned-OID refspec the push still
+        // publishes the exact verified commit; the mutable-HEAD refspec
+        // would have published the moved branch instead.
+        #[cfg(feature = "adoption-test-injection")]
+        if std::env::var_os("ATOMIC_FAIL_PUSH_MOVE_BRANCH_AFTER_VERIFY").is_some() {
+            // The race moves the LOCAL branch HEAD names (the override
+            // target is the REMOTE destination only).
+            let branch_ref = format!(
+                "refs/heads/{}",
+                git_repo
+                    .head()
+                    .ok()
+                    .and_then(|head| head.shorthand().map(str::to_string))
+                    .unwrap_or_else(|| "master".to_string())
+            );
+            let verified = publication.git_head.ok_or_else(|| CliError::GitError {
+                message: "race fixture: no verified commit".to_string(),
+            })?;
+            let signature = git2::Signature::now("Racer", "racer@example.com")
+                .map_err(|error| CliError::GitError { message: error.to_string() })?;
+            let tree_id = {
+                let mut builder = git_repo
+                    .treebuilder(None)
+                    .map_err(|error| CliError::GitError { message: error.to_string() })?;
+                builder
+                    .write()
+                    .map_err(|error| CliError::GitError { message: error.to_string() })?
+            };
+            let tree = git_repo
+                .find_tree(tree_id)
+                .map_err(|error| CliError::GitError { message: error.to_string() })?;
+            let parent = git_repo
+                .find_commit(verified)
+                .map_err(|error| CliError::GitError { message: error.to_string() })?;
+            let moved = git_repo
+                .commit(None, &signature, &signature, "raced branch move", &tree, &[&parent])
+                .map_err(|error| CliError::GitError { message: error.to_string() })?;
+            let mut reference = git_repo
+                .find_reference(&branch_ref)
+                .map_err(|error| CliError::GitError { message: error.to_string() })?;
+            reference
+                .set_target(moved, "raced branch move after the publication snapshot")
+                .map_err(|error| CliError::GitError { message: error.to_string() })?;
+        }
+
+        let mut args: Vec<String> = vec!["push".to_string(), self.remote.clone()];
+        if let Some(lease) = &lease {
+            args.push(lease.clone());
+        }
+        args.push(refspec.clone());
+
+        // CB-12B (RFC §10.4/§11.1): local gates and hooks are advisory to
+        // the Git-publication guarantee. State plainly — before the push —
+        // that this push is NOT blocked by Atomic unless the receiving
+        // remote itself enforces provenance. Never claim protection that
+        // the boundary does not provide.
+        print_warning(&format!(
+            "Local provenance verification is advisory: this push is only protected if '{}' \
+             enforces managed provenance server-side (Atomic-controlled remote, a \
+             pre-receive/update hook running 'atomic git bridge verify-receive', or a required \
+             CI status check). Pushing to a remote without such enforcement is NOT blocked by \
+             Atomic; the push will proceed regardless of what this client verified.",
+            self.remote
+        ));
+
         // Inherit stdio so the user sees git's native output and any
         // interactive auth prompts (ssh passphrase, askpass) work.
         let status = std::process::Command::new("git")
-            .args(["push", &self.remote, &refspec])
+            .args(&args)
             .current_dir(workdir)
             .status()
             .map_err(|e| CliError::GitError {
@@ -593,9 +873,46 @@ impl Push {
             })?;
 
         if !status.success() {
+            let stale = if lease.is_some() {
+                " (the remote ref moved since it was last observed; the lease refused \
+                 to overwrite newer external work — fetch/reconcile and retry)"
+            } else {
+                ""
+            };
             return Err(CliError::GitError {
-                message: format!("git push exited with {}", status),
+                message: format!("git push exited with {}{stale}", status),
             });
+        }
+
+        // Verify the remote tip equals the pushed commit before recording
+        // the observation (RFC §8.5 lease semantics, CB-10B AC-1). The
+        // expected value is the PINNED verified commit — the same OID the
+        // refspec carried — never a mutable HEAD reread (CB-10B review R3:
+        // a concurrent branch move between the push and this observation
+        // must not corrupt the verification).
+        let pushed_oid = verified_head.to_string();
+        let remote_tip = super::transport::observe_remote_ref(&workdir, &self.remote, &destination)?;
+        match remote_tip {
+            Some(tip) if tip == pushed_oid => {
+                super::ref_mapping::record_remote_push_observation(
+                    repo,
+                    working_copy,
+                    &current_view,
+                    &self.remote,
+                    &destination,
+                    &tip,
+                    Some(common),
+                )?;
+            }
+            other => {
+                return Err(CliError::GitError {
+                    message: format!(
+                        "remote '{}/{}' holds {:?} but the pushed commit is {pushed_oid}; \
+                         the remote update is NOT recorded as observed",
+                        self.remote, destination, other
+                    ),
+                });
+            }
         }
 
         Ok(())
@@ -638,6 +955,7 @@ mod tests {
             remote: "upstream".to_string(),
             branch: Some("pr-branch".to_string()),
             allow_conflict_markers: false,
+            allow_conflicts: false,
         };
         assert_eq!(push.message.as_deref(), Some("custom message"));
         assert!(push.no_push);

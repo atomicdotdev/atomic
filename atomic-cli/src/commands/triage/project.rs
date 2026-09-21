@@ -712,6 +712,64 @@ pub fn build_report(
         change_reports[i].blast_radius = callers.into_iter().collect();
     }
 
+    // 9. PUBLICATION_GATE (block, shared targets only): managed-session
+    //    changes in the candidate closure whose evidence fails the trusted
+    //    provenance publication gate (CB-12B, RFC §10.4). The verdict is
+    //    provenance-only: content correctness is verified independently and
+    //    is NOT implied wrong by these findings.
+    if target_is_shared {
+        let mut candidate_hashes: Vec<Hash> = set
+            .only_in_feature
+            .iter()
+            .chain(set.closure_additions.iter())
+            .filter_map(|b32| Hash::from_base32(b32.as_bytes()))
+            .collect();
+        candidate_hashes.sort();
+        candidate_hashes.dedup();
+        if !candidate_hashes.is_empty() {
+            let provider = atomic_repository::repository::provenance_gate::
+                local_session_mac_key_provider(repo);
+            match repo.evaluate_publication_gate(
+                &candidate_hashes,
+                &atomic_repository::repository::provenance_gate::PublicationGateConfig::from_repo(
+                    repo,
+                )
+                .unwrap_or(atomic_repository::repository::provenance_gate::PublicationGateConfig {
+                    trust: Default::default(),
+                    repository_identity: None,
+                }),
+                Some(&provider),
+            ) {
+                Ok(verdict) => {
+                    for blocker in &verdict.blocks {
+                        findings.push(
+                            Finding::new(
+                                F_PUBLICATION_GATE,
+                                SEV_BLOCK,
+                                blocker.change().to_string(),
+                                format!("publication gate refused: {blocker}"),
+                            )
+                            .with_remedy(
+                                "repair or review the named managed session; do not erase \
+                                 incomplete markers or downgrade trust to pass",
+                            ),
+                        );
+                    }
+                }
+                Err(error) => {
+                    findings.push(
+                        Finding::new(
+                            F_PUBLICATION_GATE,
+                            SEV_WARN,
+                            "publication-gate".to_string(),
+                            format!("gate evaluation failed (surface this to review): {error}"),
+                        ),
+                    );
+                }
+            }
+        }
+    }
+
     // Stable, severity-sorted findings (block → warn → info).
     findings.sort_by(|a, b| {
         a.severity_rank()

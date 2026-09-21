@@ -896,6 +896,7 @@ fn test_outcome_display() {
         message: "Turn 3: Fix the bug".to_string(),
         recorded_files: vec!["a.rs".to_string(), "b.rs".to_string()],
         unhashed_data: None,
+        git_transition: None,
     };
 
     let display = outcome.to_string();
@@ -912,6 +913,7 @@ fn test_outcome_display_singular() {
         message: "Turn 1: Init".to_string(),
         recorded_files: vec!["a.rs".to_string()],
         unhashed_data: None,
+        git_transition: None,
     };
 
     let display = outcome.to_string();
@@ -928,6 +930,7 @@ fn test_outcome_recorded_file_list() {
         message: "Turn 1".to_string(),
         recorded_files: vec!["src/main.rs".to_string(), "src/lib.rs".to_string()],
         unhashed_data: None,
+        git_transition: None,
     };
 
     assert_eq!(outcome.recorded_file_list(), &["src/main.rs", "src/lib.rs"]);
@@ -1017,6 +1020,7 @@ fn test_outcome_recorded_file_list_empty() {
         message: "Turn 1".to_string(),
         recorded_files: vec![],
         unhashed_data: None,
+        git_transition: None,
     };
 
     assert!(outcome.recorded_file_list().is_empty());
@@ -1140,12 +1144,19 @@ fn test_orphaned_session_view_duplicates_content_on_merge() {
     record_turn(repo_root, &options_b)
         .expect("record_turn should self-heal an orphaned session view rather than fail");
 
-    // Merge both session views into dev.
+    // Merge both session views into a merge target.
+    //
+    // CB-12B: insertion into a Shared view is a gated publication boundary
+    // now, so this merge-semantics regression exercises a Draft fork of dev
+    // instead — identical graph semantics (same parent chain, same change
+    // closure), no publication policy in play. The no-duplicate assertion
+    // below is unchanged.
     {
-        let repo = Repository::open_existing(repo_root).unwrap();
-        repo.insert_from_view(CrossViewInsertOptions::new("session-a", "dev"))
+        let mut repo = Repository::open_existing(repo_root).unwrap();
+        repo.create_view_from("dev-merge", "dev").unwrap();
+        repo.insert_from_view(CrossViewInsertOptions::new("session-a", "dev-merge"))
             .unwrap();
-        repo.insert_from_view(CrossViewInsertOptions::new("session-b", "dev"))
+        repo.insert_from_view(CrossViewInsertOptions::new("session-b", "dev-merge"))
             .unwrap();
         let working_copy = repo.require_working_copy_id().unwrap();
         repo.materialize(working_copy).unwrap();
@@ -1153,9 +1164,9 @@ fn test_orphaned_session_view_duplicates_content_on_merge() {
 
     let repo = Repository::open_existing(repo_root).unwrap();
     let content = repo
-        .get_file_content_on_view("main.go", "dev")
+        .get_file_content_on_view("main.go", "dev-merge")
         .unwrap()
-        .expect("file should exist on dev");
+        .expect("file should exist on the merge target");
     let content = String::from_utf8(content).unwrap();
 
     for i in 0..80 {
@@ -1176,5 +1187,742 @@ fn test_orphaned_session_view_duplicates_content_on_merge() {
     assert!(
         content.contains("return 7000"),
         "session B's edit should survive the merge"
+    );
+}
+
+// CB-12A: git-only turn classification (RFC §10.2). A clean worktree is
+// classified — never reported as an empty turn.
+mod cb12a_classification {
+    use super::*;
+    use crate::turn::capture;
+    use crate::turn::session::SessionStore;
+    use atomic_core::change::session::{ManagedTurnOutcome, SessionIncompleteOrigin};
+    use atomic_repository::tracking::TrackingOptions;
+    use atomic_repository::Repository;
+    use std::path::Path;
+    use tempfile::TempDir;
+
+    fn staged_git_token(root: &Path) -> atomic_repository::GitObservationToken {
+        atomic_repository::observe_git_metadata(root)
+            .unwrap()
+            .token()
+    }
+
+    fn commit_file(git: &git2::Repository, root: &Path, name: &str, content: &str) -> String {
+        std::fs::write(root.join(name), content).unwrap();
+        let mut index = git.index().unwrap();
+        index.add_path(Path::new(name)).unwrap();
+        index.write().unwrap();
+        let tree_id = index.write_tree().unwrap();
+        let tree = git.find_tree(tree_id).unwrap();
+        let signature = git2::Signature::now("Turn Test", "turn@test.invalid").unwrap();
+        let parent = git.head().ok().and_then(|head| head.peel_to_commit().ok());
+        let parents: Vec<&git2::Commit> = parent.iter().collect();
+        git.commit(Some("HEAD"), &signature, &signature, "test commit", &tree, &parents)
+            .unwrap()
+            .to_string()
+    }
+
+    fn make_options<'a>(
+        session: &'a AgentSession,
+        event: &'a TurnEvent,
+        turn: u32,
+    ) -> TurnRecordOptions<'a> {
+        TurnRecordOptions {
+            session,
+            event,
+            turn_number: turn,
+            turn_duration_ms: 1,
+            prompt: Some("git-only turn".to_string()),
+        }
+    }
+
+    /// Colocated atomic+git repo with `file` tracked in Atomic (baseline) and
+    /// a turn-start boundary captured. The session is saved to disk like the
+    /// orchestrator does at turn start.
+    fn setup(
+        dir: &TempDir,
+        session_id: &str,
+        file: &str,
+        content: &str,
+    ) -> (git2::Repository, AgentSession) {
+        let git = git2::Repository::init(dir.path()).unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        let mut session = AgentSession::new(session_id, "claude-code", "Claude Code");
+        session.view_name = repo.current_view().to_string();
+
+        // Baseline: Atomic tracks the same content Git will commit, so the
+        // worktree stays clean across the git-only turn.
+        std::fs::write(dir.path().join(file), content).unwrap();
+        let working_copy = repo.require_working_copy_id().unwrap();
+        repo.add(working_copy, file, TrackingOptions::default()).unwrap();
+        repo.record(
+            working_copy,
+            atomic_core::change::ChangeHeader::new("baseline"),
+            atomic_repository::record::RecordOptions::new(),
+        )
+        .unwrap();
+
+        let baseline =
+            crate::record::capture_turn_boundary(&repo, dir.path(), session_id, 1)
+                .expect("turn-start boundary captures on a real repository");
+        session.set_boundary_start(baseline.clone());
+        drop(repo);
+
+        // The orchestrator persisted the session (with its boundary) at turn
+        // start; the pre-commit hook loads it from disk.
+        let store = SessionStore::new(dir.path().join(".atomic").join("sessions")).unwrap();
+        store.save(&session).unwrap();
+        (git, session)
+    }
+
+    #[test]
+    fn clean_turn_without_git_move_is_observation_only() {
+        let dir = TempDir::new().unwrap();
+        let (_git, mut session) = setup(&dir, "sess-obs-only", "tracked.txt", "same\n");
+        let event = TurnEvent::new("sess-obs-only", HookType::TurnEnd);
+        let options = make_options(&session, &event, 1);
+
+        match record_turn(dir.path(), &options).unwrap() {
+            TurnRecordResult::Classified(classified) => {
+                assert_eq!(classified.outcome, ManagedTurnOutcome::ObservationOnly);
+                assert!(classified.incomplete.is_none());
+                assert!(classified.boundary_end.is_some());
+            }
+            TurnRecordResult::Recorded(_) => {
+                panic!("a clean turn with no git move must classify, not record")
+            }
+        }
+        let _ = &mut session;
+    }
+
+    #[test]
+    fn clean_turn_with_unexplained_commit_is_incomplete() {
+        let dir = TempDir::new().unwrap();
+        let (git, mut session) = setup(&dir, "sess-unexplained", "tracked.txt", "same\n");
+
+        // A commit happens inside the turn window without any pre-commit
+        // capture (hook bypassed / --no-verify).
+        let new_head = commit_file(&git, dir.path(), "tracked.txt", "same\n");
+
+        let event = TurnEvent::new("sess-unexplained", HookType::TurnEnd);
+        let options = make_options(&session, &event, 1);
+
+        match record_turn(dir.path(), &options).unwrap() {
+            TurnRecordResult::Classified(classified) => {
+                match &classified.outcome {
+                    ManagedTurnOutcome::RepositoryOperations { operations, capture } => {
+                        assert!(capture.is_none());
+                        assert!(
+                            operations.iter().any(|operation| operation.contains("HEAD")),
+                            "the observed HEAD transition must be described: {operations:?}"
+                        );
+                    }
+                    other => panic!("expected RepositoryOperations, got {other:?}"),
+                }
+                let incomplete =
+                    classified.incomplete.expect("unexplained commit refuses attribution");
+                assert_eq!(
+                    incomplete.origin,
+                    SessionIncompleteOrigin::UnattributedGitOperation
+                );
+                assert_eq!(
+                    incomplete.unbound_commits,
+                    vec![new_head],
+                    "the observed commit is durably unbound evidence"
+                );
+            }
+            TurnRecordResult::Recorded(_) => panic!("a git-only turn must classify, not record"),
+        }
+    }
+
+    #[test]
+    fn clean_turn_with_verified_capture_binds_but_never_claims_managed_capture() {
+        let dir = TempDir::new().unwrap();
+        let (git, mut session) = setup(&dir, "sess-captured", "tracked.txt", "same\n");
+        let sessions_dir = dir.path().join(".atomic").join("sessions");
+
+        // The pre-commit hook path: stage the exact tree, capture (HEAD =
+        // parent, index tree = the tree about to be committed), sign,
+        // persist, then the commit lands.
+        let mut index = git.index().unwrap();
+        index.add_path(Path::new("tracked.txt")).unwrap();
+        index.write().unwrap();
+        drop(index);
+        let commit_time_token = staged_git_token(dir.path());
+        {
+            let store = SessionStore::new(&sessions_dir).unwrap();
+            let mut stored = store.load("sess-captured").unwrap().unwrap();
+            let working_copy = stored.boundary_start.clone().unwrap().working_copy;
+            capture::write_capture(&sessions_dir, &mut stored, 1, working_copy, &commit_time_token)
+                .unwrap();
+            store.save(&stored).unwrap();
+        }
+        {
+            let mut index = git.index().unwrap();
+            let tree_id = index.write_tree().unwrap();
+            let tree = git.find_tree(tree_id).unwrap();
+            let signature = git2::Signature::now("Turn Test", "turn@test.invalid").unwrap();
+            let parent = git.head().ok().and_then(|head| head.peel_to_commit().ok());
+            let parents: Vec<&git2::Commit> = parent.iter().collect();
+            git.commit(Some("HEAD"), &signature, &signature, "captured commit", &tree, &parents)
+                .unwrap();
+        }
+
+        let event = TurnEvent::new("sess-captured", HookType::TurnEnd);
+        let options = make_options(&session, &event, 1);
+
+        match record_turn(dir.path(), &options).unwrap() {
+            TurnRecordResult::Classified(classified) => {
+                // RFC §19 Q2 APPROVED (allow-as-incomplete, 2026-09-14): a
+                // verified capture binds the transition but, without the
+                // exact §10.3.2 reassembly, the session stays DURABLY
+                // INCOMPLETE with observed-operation-only attribution.
+                let incomplete = classified.incomplete.as_ref().expect(
+                    "a verified capture without the exact reassembly must mark the session durably incomplete",
+                );
+                assert_eq!(
+                    incomplete.origin,
+                    SessionIncompleteOrigin::ManagedCaptureAwaitingReassembly,
+                    "the durable origin names the awaiting-reassembly policy: {incomplete:?}"
+                );
+                assert!(
+                    !incomplete.unbound_commits.is_empty(),
+                    "the observed commit is retained as an unbound commit: {incomplete:?}"
+                );
+                match &classified.outcome {
+                    ManagedTurnOutcome::RepositoryOperations { capture, .. } => {
+                        assert!(
+                            capture.is_some(),
+                            "the verified capture hash must bind the transition"
+                        );
+                    }
+                    other => panic!("expected RepositoryOperations, got {other:?}"),
+                }
+            }
+            TurnRecordResult::Recorded(_) => panic!("a git-only turn must classify, not record"),
+        }
+    }
+
+    #[test]
+    fn clean_turn_with_tampered_capture_is_incomplete() {
+        let dir = TempDir::new().unwrap();
+        let (git, mut session) = setup(&dir, "sess-tampered", "tracked.txt", "same\n");
+        let sessions_dir = dir.path().join(".atomic").join("sessions");
+
+        // Capture, then tamper with a covered field before the commit lands.
+        let mut index = git.index().unwrap();
+        index.add_path(Path::new("tracked.txt")).unwrap();
+        index.write().unwrap();
+        drop(index);
+        let token = staged_git_token(dir.path());
+        {
+            let store = SessionStore::new(&sessions_dir).unwrap();
+            let mut stored = store.load("sess-tampered").unwrap().unwrap();
+            let working_copy = stored.boundary_start.clone().unwrap().working_copy;
+            capture::write_capture(&sessions_dir, &mut stored, 1, working_copy, &token).unwrap();
+            store.save(&stored).unwrap();
+
+            let path = {
+                let files = std::fs::read_dir(capture::capture_dir(&sessions_dir, "sess-tampered").unwrap())
+                    .unwrap()
+                    .flatten()
+                    .map(|entry| entry.path())
+                    .collect::<Vec<_>>();
+                assert_eq!(files.len(), 1, "exactly one capture attempt exists");
+                files.into_iter().next().unwrap()
+            };
+            let mut written =
+                capture::ManagedCommitCapture::from_json(&std::fs::read(&path).unwrap()).unwrap();
+            written.index_tree = Some("forged-tree".to_string());
+            std::fs::write(&path, written.to_json().unwrap()).unwrap();
+        }
+        {
+            let mut index = git.index().unwrap();
+            let tree_id = index.write_tree().unwrap();
+            let tree = git.find_tree(tree_id).unwrap();
+            let signature = git2::Signature::now("Turn Test", "turn@test.invalid").unwrap();
+            let parent = git.head().ok().and_then(|head| head.peel_to_commit().ok());
+            let parents: Vec<&git2::Commit> = parent.iter().collect();
+            git.commit(Some("HEAD"), &signature, &signature, "tampered capture", &tree, &parents)
+                .unwrap();
+        }
+
+        let event = TurnEvent::new("sess-tampered", HookType::TurnEnd);
+        let options = make_options(&session, &event, 1);
+
+        match record_turn(dir.path(), &options).unwrap() {
+            TurnRecordResult::Classified(classified) => {
+                let incomplete = classified
+                    .incomplete
+                    .expect("a tampered capture must refuse attribution");
+                assert_eq!(
+                    incomplete.origin,
+                    SessionIncompleteOrigin::UnattributedGitOperation
+                );
+                match &classified.outcome {
+                    ManagedTurnOutcome::RepositoryOperations { capture, .. } => {
+                        assert!(capture.is_none());
+                    }
+                    other => panic!("expected RepositoryOperations, got {other:?}"),
+                }
+            }
+            TurnRecordResult::Recorded(_) => panic!("a git-only turn must classify, not record"),
+        }
+    }
+
+    #[test]
+    fn clean_turn_with_journaled_checkout_is_explained() {
+        let dir = TempDir::new().unwrap();
+        let git = git2::Repository::init(dir.path()).unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        let mut session = AgentSession::new("sess-checkout", "claude-code", "Claude Code");
+        session.view_name = repo.current_view().to_string();
+
+        // Baseline + first commit so HEAD is real.
+        std::fs::write(dir.path().join("tracked.txt"), "same\n").unwrap();
+        let working_copy = repo.require_working_copy_id().unwrap();
+        repo.add(working_copy, "tracked.txt", TrackingOptions::default()).unwrap();
+        repo.record(
+            working_copy,
+            atomic_core::change::ChangeHeader::new("baseline"),
+            atomic_repository::record::RecordOptions::new(),
+        )
+        .unwrap();
+        commit_file(&git, dir.path(), "tracked.txt", "same\n");
+
+        // Boundary AFTER the first commit: the turn window starts at C1.
+        let baseline = crate::record::capture_turn_boundary(&repo, dir.path(), "sess-checkout", 1)
+            .unwrap();
+        let start_oid = baseline.git.as_ref().unwrap().head_oid.clone().unwrap();
+        session.set_boundary_start(baseline);
+        drop(repo);
+        SessionStore::new(dir.path().join(".atomic").join("sessions"))
+            .unwrap()
+            .save(&session)
+            .unwrap();
+
+        // A second commit with identical content moves HEAD (C1 -> C2) with
+        // no worktree change; the journal explains it as a checkout.
+        let end_oid = commit_file(&git, dir.path(), "tracked.txt", "same\n");
+        assert_ne!(start_oid, end_oid);
+
+        // A genuine-shape journal row: real worktree root, in-window time.
+        let journal = dir.path().join(".atomic").join("bridge");
+        std::fs::create_dir_all(&journal).unwrap();
+        let recorded_at = chrono::Utc::now().to_rfc3339();
+        let record = format!(
+            "{{\"version\":1,\"record_type\":\"post-checkout\",\"event_id\":\"e1\",\
+             \"recorded_at\":\"{recorded_at}\",\"advisory\":true,\
+             \"old_head\":\"{start_oid}\",\"new_head\":\"{end_oid}\",\
+             \"checkout_kind\":\"branch\",\"worktree_root\":\"{}\"}}\n",
+            dir.path().display()
+        );
+        std::fs::write(journal.join("git-events.jsonl"), record).unwrap();
+
+        let event = TurnEvent::new("sess-checkout", HookType::TurnEnd);
+        let options = make_options(&session, &event, 1);
+
+        match record_turn(dir.path(), &options).unwrap() {
+            TurnRecordResult::Classified(classified) => {
+                assert!(
+                    classified.incomplete.is_none(),
+                    "a genuine in-window checkout row explains the move: {:?}",
+                    classified.incomplete
+                );
+                match &classified.outcome {
+                    ManagedTurnOutcome::RepositoryOperations { capture, .. } => {
+                        assert!(capture.is_none());
+                    }
+                    other => panic!("expected RepositoryOperations, got {other:?}"),
+                }
+            }
+            TurnRecordResult::Recorded(_) => panic!("a git-only turn must classify, not record"),
+        }
+    }
+
+    /// Review ATOM::aaron::8 R4 (executed probe): a hand-written stale
+    /// advisory row with a wrong worktree root must NOT clear incompleteness.
+    /// Advisory journal evidence is anchored to the worktree and the turn
+    /// window before it can explain a transition.
+    #[test]
+    fn forged_stale_checkout_row_does_not_clear_incomplete() {
+        let dir = TempDir::new().unwrap();
+        let git = git2::Repository::init(dir.path()).unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        let mut session = AgentSession::new("sess-forged", "claude-code", "Claude Code");
+        session.view_name = repo.current_view().to_string();
+
+        std::fs::write(dir.path().join("tracked.txt"), "same\n").unwrap();
+        let working_copy = repo.require_working_copy_id().unwrap();
+        repo.add(working_copy, "tracked.txt", TrackingOptions::default()).unwrap();
+        repo.record(
+            working_copy,
+            atomic_core::change::ChangeHeader::new("baseline"),
+            atomic_repository::record::RecordOptions::new(),
+        )
+        .unwrap();
+        commit_file(&git, dir.path(), "tracked.txt", "same\n");
+
+        let baseline = crate::record::capture_turn_boundary(&repo, dir.path(), "sess-forged", 1)
+            .unwrap();
+        let start_oid = baseline.git.as_ref().unwrap().head_oid.clone().unwrap();
+        session.set_boundary_start(baseline);
+        drop(repo);
+        SessionStore::new(dir.path().join(".atomic").join("sessions"))
+            .unwrap()
+            .save(&session)
+            .unwrap();
+
+        let end_oid = commit_file(&git, dir.path(), "tracked.txt", "same\n");
+        assert_ne!(start_oid, end_oid);
+
+        // The exact forged row from the review's probe: stale timestamp and
+        // a worktree root of "/" that cannot be this worktree.
+        let journal = dir.path().join(".atomic").join("bridge");
+        std::fs::create_dir_all(&journal).unwrap();
+        let record = format!(
+            "{{\"version\":1,\"record_type\":\"post-checkout\",\"event_id\":\"e1\",\
+             \"recorded_at\":\"2026-09-13T00:00:00+00:00\",\"advisory\":true,\
+             \"old_head\":\"{start_oid}\",\"new_head\":\"{end_oid}\",\
+             \"checkout_kind\":\"branch\",\"worktree_root\":\"/\"}}\n"
+        );
+        std::fs::write(journal.join("git-events.jsonl"), record).unwrap();
+
+        let event = TurnEvent::new("sess-forged", HookType::TurnEnd);
+        let options = make_options(&session, &event, 1);
+
+        match record_turn(dir.path(), &options).unwrap() {
+            TurnRecordResult::Classified(classified) => {
+                let incomplete = classified
+                    .incomplete
+                    .expect("a stale, wrong-worktree advisory row must not clear incompleteness");
+                assert_eq!(
+                    incomplete.origin,
+                    SessionIncompleteOrigin::UnattributedGitOperation
+                );
+                assert_eq!(incomplete.unbound_commits, vec![end_oid]);
+            }
+            TurnRecordResult::Recorded(_) => panic!("a git-only turn must classify, not record"),
+        }
+    }
+
+    /// Review ATOM::aaron::8 R2 (executed probe): a mixed turn — working-copy
+    /// edit AND a Git commit with no capture — records its content AND
+    /// carries a durable refusal for the unexplained transition. Dirty
+    /// content alone never bypasses capture classification.
+    #[test]
+    fn dirty_turn_with_unexplained_commit_marks_incomplete() {
+        let dir = TempDir::new().unwrap();
+        let (git, mut session) = setup(&dir, "sess-dirty-bypass", "tracked.txt", "baseline\n");
+
+        // Mixed turn: uncovered edit + Git commit inside the same window.
+        std::fs::write(dir.path().join("tracked.txt"), "uncovered edit\n").unwrap();
+        let new_head = commit_file(&git, dir.path(), "tracked.txt", "uncovered edit\n");
+
+        let event = TurnEvent::new("sess-dirty-bypass", HookType::TurnEnd);
+        let options = make_options(&session, &event, 1);
+
+        match record_turn(dir.path(), &options).unwrap() {
+            TurnRecordResult::Recorded(outcome) => {
+                let transition = outcome
+                    .git_transition
+                    .expect("the mixed turn must classify its Git transition");
+                let incomplete = transition
+                    .incomplete
+                    .expect("an unexplained commit inside a dirty turn refuses attribution");
+                assert_eq!(
+                    incomplete.origin,
+                    SessionIncompleteOrigin::UnattributedGitOperation
+                );
+                assert_eq!(incomplete.unbound_commits, vec![new_head]);
+                assert!(
+                    transition.operations.iter().any(|op| op.contains("HEAD")),
+                    "the observed HEAD transition must be described: {:?}",
+                    transition.operations
+                );
+            }
+            TurnRecordResult::Classified(_) => {
+                panic!("dirty content must record, with its transition classified alongside")
+            }
+        }
+    }
+
+    /// Review R2: a mixed turn whose commit carries a verified capture binds
+    /// the transition WITHOUT a refusal, while the content records normally.
+    #[test]
+    fn dirty_turn_with_verified_capture_binds_transition() {
+        let dir = TempDir::new().unwrap();
+        let (git, mut session) = setup(&dir, "sess-dirty-captured", "tracked.txt", "same\n");
+        let sessions_dir = dir.path().join(".atomic").join("sessions");
+
+        // Capture at commit time (parent HEAD, index tree), then commit, then
+        // leave additional dirty content for the recorded turn.
+        let mut index = git.index().unwrap();
+        index.add_path(Path::new("tracked.txt")).unwrap();
+        index.write().unwrap();
+        drop(index);
+        let token = staged_git_token(dir.path());
+        {
+            let store = SessionStore::new(&sessions_dir).unwrap();
+            let mut stored = store.load("sess-dirty-captured").unwrap().unwrap();
+            let working_copy = stored.boundary_start.clone().unwrap().working_copy;
+            capture::write_capture(&sessions_dir, &mut stored, 1, working_copy, &token).unwrap();
+            store.save(&stored).unwrap();
+        }
+        {
+            let mut index = git.index().unwrap();
+            let tree_id = index.write_tree().unwrap();
+            let tree = git.find_tree(tree_id).unwrap();
+            let signature = git2::Signature::now("Turn Test", "turn@test.invalid").unwrap();
+            let parent = git.head().ok().and_then(|head| head.peel_to_commit().ok());
+            let parents: Vec<&git2::Commit> = parent.iter().collect();
+            git.commit(Some("HEAD"), &signature, &signature, "captured", &tree, &parents)
+                .unwrap();
+        }
+        // Additional content work after the commit, inside the same turn.
+        std::fs::write(dir.path().join("extra.txt"), "later work\n").unwrap();
+
+        let event = TurnEvent::new("sess-dirty-captured", HookType::TurnEnd);
+        let options = make_options(&session, &event, 1);
+
+        match record_turn(dir.path(), &options).unwrap() {
+            TurnRecordResult::Recorded(outcome) => {
+                let transition = outcome
+                    .git_transition
+                    .expect("the mixed turn must classify its Git transition");
+                // RFC §19 Q2 APPROVED (allow-as-incomplete): the capture
+                // binds the transition while the session stays durably
+                // incomplete until the exact §10.3.2 reassembly attributes
+                // the commit.
+                let incomplete = transition.incomplete.as_ref().expect(
+                    "a verified capture without the exact reassembly must mark the turn durably incomplete",
+                );
+                assert_eq!(
+                    incomplete.origin,
+                    SessionIncompleteOrigin::ManagedCaptureAwaitingReassembly
+                );
+                assert!(transition.capture.is_some());
+            }
+            TurnRecordResult::Classified(_) => {
+                panic!("dirty content must record, with its transition classified alongside")
+            }
+        }
+    }
+
+    /// CB-12A follow-up AC-8 (exact separable case): a dirty turn whose
+    /// worktree carries NO remainder beyond the verified commit (everything
+    /// staged and committed, nothing untracked) records the commit delta
+    /// EXACTLY — ManagedGitCommitCaptured: incomplete is None and the
+    /// exact_commit_oid names the commit. The Atomic change and the Git
+    /// commit carry the same content.
+    #[test]
+    fn dirty_turn_with_verified_capture_and_no_remainder_is_exact() {
+        let dir = TempDir::new().unwrap();
+        let (git, mut session) = setup(&dir, "sess-exact", "tracked.txt", "same\n");
+        let sessions_dir = dir.path().join(".atomic").join("sessions");
+
+        // Change the tracked content, stage it, capture at commit time,
+        // then commit — with NO content left behind (the worktree equals
+        // the commit tree, and the commit content differs from the view
+        // baseline so the turn records the delta).
+        std::fs::write(dir.path().join("tracked.txt"), "exact delta\n").unwrap();
+        let mut index = git.index().unwrap();
+        index.add_path(Path::new("tracked.txt")).unwrap();
+        index.write().unwrap();
+        drop(index);
+        let token = staged_git_token(dir.path());
+        {
+            let store = SessionStore::new(&sessions_dir).unwrap();
+            let mut stored = store.load("sess-exact").unwrap().unwrap();
+            let working_copy = stored.boundary_start.clone().unwrap().working_copy;
+            capture::write_capture(&sessions_dir, &mut stored, 1, working_copy, &token).unwrap();
+            store.save(&stored).unwrap();
+        }
+        let commit_oid = {
+            let mut index = git.index().unwrap();
+            let tree_id = index.write_tree().unwrap();
+            let tree = git.find_tree(tree_id).unwrap();
+            let signature = git2::Signature::now("Turn Test", "turn@test.invalid").unwrap();
+            let parent = git.head().ok().and_then(|head| head.peel_to_commit().ok());
+            let parents: Vec<&git2::Commit> = parent.iter().collect();
+            let oid = git
+                .commit(Some("HEAD"), &signature, &signature, "captured exact", &tree, &parents)
+                .unwrap();
+            oid.to_string()
+        };
+
+        let event = TurnEvent::new("sess-exact", HookType::TurnEnd);
+        let options = make_options(&session, &event, 1);
+
+        match record_turn(dir.path(), &options).unwrap() {
+            TurnRecordResult::Recorded(outcome) => {
+                let transition = outcome
+                    .git_transition
+                    .expect("the mixed turn must classify its Git transition");
+                assert!(
+                    transition.incomplete.is_none(),
+                    "the exact case reports complete coverage for the commit: {:?}",
+                    transition.incomplete
+                );
+                assert_eq!(
+                    transition.exact_commit_oid.as_deref(),
+                    Some(commit_oid.as_str()),
+                    "the exact binding names the commit"
+                );
+                assert!(transition.capture.is_some());
+            }
+            TurnRecordResult::Classified(_) => {
+                panic!("the exact turn records content with its transition classified alongside")
+            }
+        }
+    }
+
+    /// Review ATOM::aaron::8 R3 (executed probe): a missing turn-start
+    /// baseline is a durable refusal, not a silently successful
+    /// RepositoryOperations classification.
+    #[test]
+    fn missing_turn_start_baseline_is_durable_incomplete() {
+        let dir = TempDir::new().unwrap();
+        let (_git, mut session) = setup(&dir, "sess-no-baseline", "tracked.txt", "same\n");
+        session.clear_boundary_start();
+        SessionStore::new(dir.path().join(".atomic").join("sessions"))
+            .unwrap()
+            .save(&session)
+            .unwrap();
+
+        let event = TurnEvent::new("sess-no-baseline", HookType::TurnEnd);
+        let options = make_options(&session, &event, 1);
+
+        match record_turn(dir.path(), &options).unwrap() {
+            TurnRecordResult::Classified(classified) => {
+                let incomplete = classified
+                    .incomplete
+                    .expect("a missing baseline must refuse attribution durably");
+                assert_eq!(
+                    incomplete.origin,
+                    SessionIncompleteOrigin::ObservationUnavailable
+                );
+                match &classified.outcome {
+                    ManagedTurnOutcome::RepositoryOperations { .. } => {}
+                    other => panic!("expected RepositoryOperations, got {other:?}"),
+                }
+            }
+            TurnRecordResult::Recorded(_) => panic!("a git-only turn must classify, not record"),
+        }
+    }
+}
+
+/// Native agent recording (`record_turn` — the same entry the Stop hook uses)
+/// must invoke the name-conflict resolver for a *content-clean* conflict where
+/// the working tree already holds exactly one incarnation's bytes, and it must
+/// keep the session envelope. Disposable colocated, unanchored repo: no Atomic
+/// Git checkpoint exists, mirroring the live Stop-hook conditions.
+#[test]
+fn record_turn_resolves_content_clean_name_conflict_with_provenance() {
+    use tempfile::TempDir;
+
+    let dir = TempDir::new().unwrap();
+    let repo_root = dir.path();
+    let _git = git2::Repository::init(repo_root).unwrap();
+
+    fn record_all(repo: &atomic_repository::Repository, wc: atomic_core::WorkingCopyId, message: &str) {
+        let header = atomic_core::change::ChangeHeader::new(message);
+        repo.record(
+            wc,
+            header,
+            atomic_repository::record::RecordOptions::new()
+                .with_all(true)
+                .save_to_store(true)
+                .apply_after_record(true),
+        )
+        .unwrap();
+    }
+    fn add(repo: &atomic_repository::Repository, wc: atomic_core::WorkingCopyId, path: &str) {
+        repo.add(
+            wc,
+            path,
+            atomic_repository::tracking::TrackingOptions::default(),
+        )
+        .unwrap();
+    }
+
+    {
+        let mut repo = atomic_repository::Repository::init(repo_root).unwrap();
+        let wc = repo.require_working_copy_id().unwrap();
+
+        std::fs::write(repo_root.join("seed.txt"), b"seed\n").unwrap();
+        add(&repo, wc, "seed.txt");
+        record_all(&repo, wc, "base");
+
+        repo.create_view_from("feature", "dev").unwrap();
+
+        repo.switch_view(wc, "feature").unwrap();
+        std::fs::write(repo_root.join("new.txt"), b"from-feature\n").unwrap();
+        add(&repo, wc, "new.txt");
+        record_all(&repo, wc, "feature creates new.txt");
+
+        repo.switch_view(wc, "dev").unwrap();
+        std::fs::write(repo_root.join("new.txt"), b"from-base\n").unwrap();
+        add(&repo, wc, "new.txt");
+        record_all(&repo, wc, "dev creates new.txt");
+
+        repo.insert_from_view(atomic_repository::CrossViewInsertOptions::new(
+            "feature", "dev",
+        ))
+        .unwrap();
+
+        // The user resolves the ambiguity on disk to exactly one side's bytes,
+        // with no persisted conflict row and no markers.
+        std::fs::write(repo_root.join("new.txt"), b"from-base\n").unwrap();
+    }
+
+    // A real turn-start boundary (the user-prompt hook captures this).
+    let baseline = {
+        let repo = atomic_repository::Repository::open_readonly(repo_root).unwrap();
+        crate::record::capture_turn_boundary(&repo, repo_root, "sess-conflict", 1).unwrap()
+    };
+
+    let mut session = AgentSession::new("sess-conflict", "claude-code", "Claude Code");
+    session.view_name = "dev".to_string();
+    session.set_model_info("anthropic", "claude-sonnet-4-20250514");
+    session.set_boundary_start(baseline);
+    let event = TurnEvent::new("sess-conflict", HookType::TurnEnd);
+    let options = TurnRecordOptions {
+        session: &session,
+        event: &event,
+        turn_number: 1,
+        turn_duration_ms: 1000,
+        prompt: Some("resolve the name conflict".to_string()),
+    };
+
+    let outcome = match record_turn(repo_root, &options).expect("native record_turn must run") {
+        TurnRecordResult::Recorded(outcome) => outcome,
+        other => panic!("expected Recorded, got {other:?}"),
+    };
+    assert!(
+        outcome
+            .recorded_file_list()
+            .iter()
+            .any(|path| path == "new.txt"),
+        "the resolver must record the name-conflicted path: {:?}",
+        outcome.recorded_file_list()
+    );
+
+    // The conflict resolves to the side whose bytes the working tree held.
+    let repo = atomic_repository::Repository::open_readonly(repo_root).unwrap();
+    assert_eq!(
+        repo.get_file_content_on_view("new.txt", "dev")
+            .unwrap()
+            .as_deref(),
+        Some(b"from-base\n".as_slice()),
+        "the winner is chosen by byte equality, not by timestamp"
+    );
+
+    // Session provenance survives in the recorded change's hashed metadata.
+    let change = repo.load_change(&outcome.hash).unwrap();
+    assert!(
+        SessionEnvelope::is_session_envelope(&change.hashed.metadata),
+        "the recorded change must carry the session envelope"
     );
 }

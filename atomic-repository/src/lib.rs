@@ -92,12 +92,14 @@ pub mod change_source;
 pub mod changestore;
 pub mod content_filter;
 pub mod error;
+pub mod git_binding;
 pub mod ignore;
 pub mod manifest;
 pub mod record;
 pub mod repository;
 pub mod status;
 pub mod tracking;
+pub mod wip;
 
 // Phase 7 additions
 pub mod archive;
@@ -130,9 +132,9 @@ pub mod query_plan;
 
 // Content search re-exports
 pub use content_search::{
-    build_content_index, content_index_stats, has_content_index, search_content,
-    update_content_index, update_content_index_paths, ContentIndexStats, ContentMatch,
-    ContentSearchError, ContentSearchOptions, ContentSearchResult,
+    build_content_index, content_index_stats, has_content_index, refresh_content_index,
+    search_content, update_content_index, update_content_index_paths, ContentIndexStats,
+    ContentMatch, ContentSearchError, ContentSearchOptions, ContentSearchResult,
 };
 
 // Re-export main types at crate root for convenience

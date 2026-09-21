@@ -258,7 +258,7 @@ impl New {
         repo: &mut Repository,
         working_copy: atomic_core::WorkingCopyId,
         workspace_view: &str,
-    ) -> CliResult<()> {
+    ) -> CliResult<bool> {
         let kind = if self.draft {
             ViewScope::Draft
         } else {
@@ -278,15 +278,41 @@ impl New {
             style_view(parent_name),
         ));
 
-        self.maybe_switch(name, repo, working_copy)
+        if self.switch {
+            let result = repo
+                .switch_view(working_copy, name)
+                .map_err(CliError::Repository)?;
+            print_success(&format!(
+                "Switched to view: {} ({} files updated)",
+                style_view(name),
+                result.files_written,
+            ));
+            let repo_root = find_repository_root()?;
+            if crate::commands::git::shadow::bridge_publication_required(&repo_root) {
+                let shadow_sync =
+                    crate::commands::git::shadow::sync_git_head_to_view(repo, &repo_root, name)?;
+                drop(shadow_sync);
+                // The projected switch moved Git HEAD; the checkpoint
+                // verifier takes its own redb lock, so the caller refreshes
+                // it after releasing this repository handle.
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// Optionally switch to the new view and print hint.
+    ///
+    /// The switch coordinates the Git shadow exactly like `atomic view
+    /// switch` does (CB-8A): the materialized view projects onto its mapped
+    /// ref with the scope-correct HEAD policy and a verified checkpoint, so
+    /// the next workspace entry stays anchored.
     fn maybe_switch(
         &self,
         name: &str,
         repo: &mut Repository,
         working_copy: atomic_core::WorkingCopyId,
+        repo_root: &std::path::Path,
     ) -> CliResult<()> {
         if self.switch {
             let result = repo
@@ -345,7 +371,14 @@ impl Command for New {
 
         // If --draft or --parent is specified, use the two-tier create path
         if self.draft || self.parent.is_some() {
-            return self.run_two_tier(name, &mut repo, working_copy, &workspace_view);
+            let refresh_needed =
+                self.run_two_tier(name, &mut repo, working_copy, &workspace_view)?;
+            drop(workspace);
+            drop(repo);
+            if refresh_needed {
+                crate::commands::git::bridge::refresh_checkpoint_if_aligned(&repo_root)?;
+            }
+            return Ok(());
         }
 
         // Determine how to create the new view:
@@ -416,7 +449,7 @@ impl Command for New {
             ));
         }
 
-        self.maybe_switch(name, &mut repo, working_copy)
+        self.maybe_switch(name, &mut repo, working_copy, &repo_root)
     }
 }
 

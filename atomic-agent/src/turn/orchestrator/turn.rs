@@ -5,10 +5,13 @@
 use std::fs::File;
 use std::path::Path;
 
-use crate::error::{AgentError, AgentResult};
+use atomic_core::change::session::{ManagedTurnOutcome, SessionIncompleteOrigin};
+
+use crate::error::AgentResult;
 use crate::event::{HookType, TurnEvent};
 use crate::record::{record_turn, TurnRecordOptions};
 use crate::turn::phase::{self, Action, Event, TransitionContext};
+use crate::turn::session::{IncompleteSession, TurnOutcomeEntry};
 
 use super::{DispatchResult, TurnOrchestrator};
 
@@ -28,6 +31,34 @@ enum TurnEndLock {
     Acquired(TurnEndLockGuard),
     Busy,
     Unavailable,
+}
+
+/// Drain a pending bridge-watch notice (CB-13D, RFC §11.2 rule 6) for a
+/// managed session, if one is pending.
+///
+/// The optional metadata-only watch daemon writes a pending notice when it
+/// sees an external Git transition or an unsafe state while the session is
+/// active. Draining happens at turn start and at every tool-call boundary
+/// so the notice reaches the agent *before* its next tool call. Both sides
+/// are advisory: a failed drain is logged and never blocks the turn, and
+/// without the daemon the next agent boundary still fully reconciles at
+/// the command boundary.
+fn drain_watch_notice(orchestrator: &TurnOrchestrator, session_id: &str) -> Option<String> {
+    match orchestrator.session_store.take_watch_notice(session_id) {
+        Ok(Some(notice)) => Some(format!(
+            "bridge watch ({}): {}; remediation: {}",
+            notice.kind, notice.detail, notice.remediation
+        )),
+        Ok(None) => None,
+        Err(error) => {
+            log::warn!(
+                "Failed to drain bridge-watch notice for session {}: {}",
+                session_id,
+                error
+            );
+            None
+        }
+    }
 }
 
 impl TurnOrchestrator {
@@ -79,6 +110,41 @@ impl TurnOrchestrator {
             // Continue anyway — we'll just miss file changes
         }
 
+        // CB-12A: capture the durable turn-start boundary (RFC §10.1).
+        //
+        // Pure observation — never reconciles, interprets or materializes
+        // (RFC §12.1/§12.2; reconciliation stays in repository command
+        // boundaries). A failed capture leaves the baseline absent, and the
+        // turn-end classification then refuses to claim ObservationOnly.
+        match atomic_repository::Repository::open_readonly(&self.repo_root) {
+            Ok(repo) => {
+                let turn_number = session.turn_count + 1;
+                match crate::record::capture_turn_boundary(
+                    &repo,
+                    &self.repo_root,
+                    session_id,
+                    turn_number,
+                ) {
+                    Some(boundary) => session.set_boundary_start(boundary),
+                    None => {
+                        log::warn!(
+                            "Turn-start boundary capture failed for session {} turn {}",
+                            session_id,
+                            turn_number
+                        );
+                    }
+                }
+            }
+            Err(error) => {
+                log::debug!(
+                    "Turn-start boundary capture skipped for session {}: repository \
+                     unavailable: {}",
+                    session_id,
+                    error
+                );
+            }
+        }
+
         // Mark the turn as started in the session
         session.begin_turn();
 
@@ -99,6 +165,13 @@ impl TurnOrchestrator {
                     session_id
                 ));
             }
+        }
+
+        // CB-13D: surface a pending bridge-watch notice (external Git
+        // transition or unsafe state observed by the optional daemon)
+        // before the turn proceeds.
+        if let Some(warning) = drain_watch_notice(self, session_id) {
+            dispatch = dispatch.with_warning(warning);
         }
 
         // Provenance: append a goal node from the user's prompt.
@@ -167,11 +240,56 @@ impl TurnOrchestrator {
         // have been edited. We check the working copy for recent mtimes
         // by scanning only the repo root (not recursively) and common
         // source directories.
-        if !self.has_working_copy_changes() {
-            log::info!(
-                "Turn end for session {} — no changes detected, skipping record",
-                session_id
-            );
+        //
+        // CB-12A: the gate is NOT "clean worktree = empty turn". A clean
+        // worktree whose Git checkpoint moved is a git-only turn that must
+        // reach record_turn() for RFC §10.2 classification.
+        //
+        // Review R5 (executed probe): a turn the gate classifies as
+        // observation-only is still a TURN — its classification, turn count
+        // and phase transition are persisted here instead of returning a
+        // fresh Idle while the session stayed Active with zero outcomes.
+        if !self.has_working_copy_or_git_changes(session_id) {
+            if let Some(mut session) = self.session_store.load(session_id)? {
+                let turn_number = session.end_turn();
+                let boundary_end = atomic_repository::Repository::open_readonly(&self.repo_root)
+                    .ok()
+                    .and_then(|repo| {
+                        crate::record::capture_turn_boundary(
+                            &repo,
+                            &self.repo_root,
+                            session_id,
+                            turn_number,
+                        )
+                    });
+                let entry = TurnOutcomeEntry {
+                    turn: turn_number,
+                    outcome: ManagedTurnOutcome::ObservationOnly,
+                    boundary_start: session.boundary_start.clone(),
+                    boundary_end,
+                };
+                session.record_turn_outcome(entry);
+                session.clear_boundary_start();
+                session.clear_current_prompt();
+
+                let result = phase::transition(
+                    session.phase,
+                    Event::TurnEnd,
+                    TransitionContext {
+                        has_files_changed: true, // observation-only; nothing to record
+                    },
+                );
+                phase::apply_common_actions(&mut session, &result);
+                self.session_store.save(&session)?;
+                log::info!(
+                    "Turn end for session {} — observation-only turn {} persisted",
+                    session_id,
+                    turn_number
+                );
+                return Ok(
+                    DispatchResult::new(session_id, session.phase).with_view(&session.view_name)
+                );
+            }
             return Ok(DispatchResult::new(session_id, phase::Phase::Idle));
         }
 
@@ -227,6 +345,18 @@ impl TurnOrchestrator {
             plugin_duration_ms.unwrap_or_else(|| session.current_turn_duration_ms().unwrap_or(0));
         let turn_number = session.end_turn(); // increments turn_count, returns new count
 
+        // CB-12A: capture the durable turn-end boundary (observation only).
+        let boundary_end = atomic_repository::Repository::open_readonly(&self.repo_root)
+            .ok()
+            .and_then(|repo| {
+                crate::record::capture_turn_boundary(
+                    &repo,
+                    &self.repo_root,
+                    session_id,
+                    turn_number,
+                )
+            });
+
         // State machine transition — always say files MAY have changed.
         // The actual check happens inside record_turn() which returns
         // EmptyTurn if nothing changed.
@@ -267,7 +397,7 @@ impl TurnOrchestrator {
                     };
 
                     match record_turn(&self.repo_root, &record_options) {
-                        Ok(outcome) => {
+                        Ok(crate::record::TurnRecordResult::Recorded(outcome)) => {
                             // Track the recorded files in the session
                             let recorded_files: Vec<String> = outcome.recorded_file_list().to_vec();
                             session.add_files_touched(&recorded_files);
@@ -276,6 +406,60 @@ impl TurnOrchestrator {
                             // covers only what the agent actually recorded — not
                             // inherited baseline changes from the parent view.
                             session.recorded_change_hashes.push(outcome.hash);
+
+                            // CB-12A: attach the boundary pair onto the ledger
+                            // turn row and persist the ContentChanges
+                            // classification in the session ledger. Provenance
+                            // first: it needs `session.boundary_start` still
+                            // set; persistence clears it afterwards.
+                            self.save_turn_provenance(
+                                session_id,
+                                &session,
+                                &outcome,
+                                &event,
+                                boundary_end.clone(),
+                            );
+                            self.persist_content_turn_outcome(
+                                &mut session,
+                                &outcome,
+                                boundary_end.clone(),
+                            );
+
+                            // Review R2 (ATOM::aaron::8): a mixed turn's Git
+                            // transition carries its own authority. An
+                            // unexplained transition durably refuses
+                            // attribution even though the content recorded.
+                            if let Some(ref transition) = outcome.git_transition {
+                                if let Some(ref incomplete) = transition.incomplete {
+                                    let persisted =
+                                        self.persist_incomplete_refusal(&mut session, incomplete);
+                                    dispatch = dispatch.with_incomplete(persisted);
+                                    dispatch = dispatch.with_warning(format!(
+                                        "Git transition between turn boundaries is not attributed: {incomplete}"
+                                    ));
+                                } else if let Some(ref commit_oid) = transition.exact_commit_oid {
+                                    // CB-12A follow-up AC-8: the recorded
+                                    // change covers the commit exactly —
+                                    // ManagedGitCommitCaptured, complete
+                                    // coverage for the commit, no incomplete.
+                                    log::info!(
+                                        "Recorded turn {} for session {} is the EXACT managed \
+                                         commit {} (ManagedGitCommitCaptured): the verified \
+                                         capture + clean remainder prove the recorded delta \
+                                         equals the commit delta",
+                                        turn_number,
+                                        session_id,
+                                        commit_oid
+                                    );
+                                } else if transition.capture.is_some() {
+                                    log::info!(
+                                        "Recorded turn {} for session {} carries a verified \
+                                         commit-time capture binding its Git transition",
+                                        turn_number,
+                                        session_id
+                                    );
+                                }
+                            }
 
                             // Clear current_prompt so the next turn doesn't
                             // reuse this turn's prompt as the change message.
@@ -298,7 +482,6 @@ impl TurnOrchestrator {
                             // then append a patch proposal node and save the graph.
                             self.inject_reasoning_nodes(session_id, &event);
                             self.inject_response_node(session_id, &session, &event);
-                            self.save_turn_provenance(session_id, &session, &outcome, &event);
 
                             log::info!(
                                 "Recorded turn {} for session {}: {}",
@@ -308,14 +491,26 @@ impl TurnOrchestrator {
                             );
                             dispatch = dispatch.with_change(outcome);
                         }
-                        Err(AgentError::EmptyTurn { .. }) => {
-                            // No files changed — this is normal (e.g., agent
-                            // only read files, didn't modify anything)
+                        Ok(crate::record::TurnRecordResult::Classified(classified)) => {
+                            // RFC §10.2: a clean turn is classified, never empty.
+                            // Persist the boundaries/outcome durably; surface
+                            // durable incomplete refusals for unexplained Git
+                            // transitions.
+                            self.persist_classified_turn(&mut session, &classified);
+                            if let Some(ref incomplete) = classified.incomplete {
+                                dispatch = dispatch.with_incomplete(incomplete.clone());
+                                dispatch = dispatch.with_warning(format!(
+                                    "Git transition between turn boundaries is not attributed: {}",
+                                    incomplete
+                                ));
+                            }
                             log::info!(
-                                "Turn {} for session {} had no changes — skipping record",
+                                "Turn {} for session {} classified as {:?}",
                                 turn_number,
-                                session_id
+                                session_id,
+                                classified.outcome
                             );
+                            session.clear_current_prompt();
                         }
                         Err(e) => {
                             log::error!(
@@ -324,6 +519,20 @@ impl TurnOrchestrator {
                                 session_id,
                                 e
                             );
+                            // Review R3: a record failure is durable
+                            // evidence of unrecorded work, never a warning
+                            // beside a successful turn. The refusal survives
+                            // on the session and the CLI surfaces it as
+                            // nonzero.
+                            let incomplete = IncompleteSession::new(
+                                format!("turn {turn_number} record failed: {e}"),
+                                Vec::<String>::new(),
+                                String::new(),
+                                SessionIncompleteOrigin::UnrecordedWork,
+                            );
+                            let persisted =
+                                self.persist_incomplete_refusal(&mut session, &incomplete);
+                            dispatch = dispatch.with_incomplete(persisted);
                             dispatch = dispatch.with_warning(format!(
                                 "Failed to record turn {}: {}",
                                 turn_number, e
@@ -364,7 +573,18 @@ impl TurnOrchestrator {
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
         if fully_idle {
-            self.create_session_attestation(&session);
+            if let Err(error) = self.create_session_attestation(&mut session) {
+                // Review R3/R6: an attestation failure is durable refusal
+                // evidence, never a silent success beside unattested work.
+                let incomplete = IncompleteSession::new(
+                    format!("session attestation failed: {error}"),
+                    Vec::<String>::new(),
+                    String::new(),
+                    SessionIncompleteOrigin::UnfinalizedAttestation,
+                );
+                let persisted = self.persist_incomplete_refusal(&mut session, &incomplete);
+                dispatch = dispatch.with_incomplete(persisted);
+            }
         }
 
         self.session_store.save(&session)?;
@@ -456,7 +676,14 @@ impl TurnOrchestrator {
             }
         }
 
-        Ok(DispatchResult::new(session_id, session.phase))
+        // CB-13D: surface a pending bridge-watch notice before the agent's
+        // next tool call executes (RFC §11.2 rule 6).
+        let mut dispatch = DispatchResult::new(session_id, session.phase);
+        if let Some(warning) = drain_watch_notice(self, session_id) {
+            dispatch = dispatch.with_warning(warning);
+        }
+
+        Ok(dispatch)
     }
 
     fn try_turn_end_lock(&self, session_id: &str) -> TurnEndLock {

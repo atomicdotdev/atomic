@@ -22,8 +22,10 @@
 //! - Cross-file queries remain possible via the primary index
 
 mod impls;
+mod scoped;
 mod types;
 
+pub use scoped::InodeScopedGraph;
 pub use types::{
     InodeAdjState, InodeEdgeIter, InodeGraphOps, InodeGraphStats, InodeVertex, IntoInodeVertex,
 };

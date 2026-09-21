@@ -96,6 +96,7 @@ mod change;
 mod classification;
 mod credit;
 mod encoding;
+pub mod envelope;
 pub mod format_v3;
 mod graph_op;
 mod header;

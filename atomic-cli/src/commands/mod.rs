@@ -89,8 +89,10 @@ pub mod revise;
 pub mod sandbox;
 pub mod session;
 pub mod split;
+pub mod stage;
 pub mod stash;
 pub mod status;
+pub mod status_git;
 pub mod tag;
 pub mod triage;
 pub mod unrecord;
@@ -103,6 +105,7 @@ pub mod agent;
 
 // Phase 3: Remote Commands
 pub mod auth;
+pub mod blame;
 pub mod clone;
 pub mod pull;
 pub mod push;
@@ -138,6 +141,7 @@ pub use agent::Agent;
 pub use change::ChangeCmd;
 pub use clone::Clone;
 pub use completions::Completions;
+pub use blame::Blame;
 pub use conflicts::Conflicts;
 pub use diff::Diff;
 pub use doctor::Doctor;
@@ -164,6 +168,7 @@ pub use sandbox::Sandbox;
 pub use server::ServerCmd;
 pub use session::Session;
 pub use split::Split;
+pub use stage::{Stage, Unstage};
 pub use stash::Stash;
 pub use status::Status;
 pub use tag::Tag;
@@ -304,6 +309,18 @@ pub fn find_repository_root_from(start_path: &Path) -> CliResult<PathBuf> {
         // repository root; `Repository::open*` resolves the pointer.
         if current.join(SANDBOX_POINTER).is_file() {
             return Ok(current);
+        }
+
+        // CB-13D ::24 R1/R5: a LINKED worktree also has no local `.atomic/`
+        // — its `.git` pointer resolves to the common repository's `.atomic`.
+        // The repository layer's layout detection is authoritative here; a
+        // plain `git worktree` used to fall through to "not a repository".
+        if current.join(".git").is_file() {
+            if let Ok(Some(root)) =
+                atomic_repository::detect_repository_root(&current)
+            {
+                return Ok(root);
+            }
         }
 
         // Move to parent directory

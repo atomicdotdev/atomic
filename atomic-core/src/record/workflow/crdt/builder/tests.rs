@@ -362,8 +362,10 @@ mod tests {
         let change_id = NodeId::new(1);
         let mut builder = CrdtChangeBuilder::new(change_id);
 
+        // Text content tokenizes into lines and tokens.
         let content = b"line one\nline two\n";
-        let _trunk_id = builder.add_file_with_content("test.txt", content, None);
+        let _trunk_id =
+            builder.add_file_with_content("test.txt", content, Some(Encoding::Utf8));
 
         let result = builder.finish();
 
@@ -373,12 +375,38 @@ mod tests {
     }
 
     #[test]
+    fn test_builder_add_binary_file_is_opaque() {
+        // CB-9C: binary/unknown-encoding content is an opaque trunk — the
+        // semantic layer records the trunk Create with NO line or token
+        // ops (tokenizing random binary emitted ~1 branch per ~256 bytes
+        // and one leaf per token, making a 1 MB binary add take 36s to
+        // apply).
+        let change_id = NodeId::new(1);
+        let mut builder = CrdtChangeBuilder::new(change_id);
+
+        let content = b"\x00\xff\x01binary\xfe\n\x80";
+        let _trunk_id = builder.add_file_with_content("blob.bin", content, None);
+
+        let result = builder.finish();
+
+        assert_eq!(result.file_count(), 1);
+        assert_eq!(result.stats().lines_added, 0, "no line ops for an opaque trunk");
+        assert_eq!(result.stats().tokens_added, 0, "no token ops for an opaque trunk");
+        match result.file_ops()[0].trunk_op().unwrap() {
+            TrunkOp::Create { encoding, .. } => {
+                assert_eq!(*encoding, None, "the trunk records the opaque encoding");
+            }
+            _ => panic!("Expected TrunkOp::Create"),
+        }
+    }
+
+    #[test]
     fn test_builder_delete_file() {
         let change_id = NodeId::new(1);
         let mut builder = CrdtChangeBuilder::new(change_id);
 
         let trunk_id = TrunkId::new(NodeId::new(0), 0); // Existing file
-        builder.delete_file(trunk_id);
+        builder.delete_file(trunk_id, "deleted.txt");
 
         let result = builder.finish();
         assert_eq!(result.stats().files_deleted, 1);
@@ -593,7 +621,7 @@ mod tests {
 
         // Delete a file
         let existing_trunk = TrunkId::new(NodeId::new(0), 0);
-        builder.delete_file(existing_trunk);
+        builder.delete_file(existing_trunk, "old.rs");
 
         // Move a file
         let another_trunk = TrunkId::new(NodeId::new(0), 1);

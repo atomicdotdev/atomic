@@ -89,6 +89,10 @@ fn materialize_inode_path(
 /// This is the authoritative signal for "this materialized file is
 /// conflicted": it reflects exactly what was written to disk, so persisted
 /// conflict state stays in lock-step with the bytes the user sees.
+/// Whether `content` carries a Git-style conflict marker line (CB-9B): a
+/// conflict-rendered baseline is not file content, and no foreign import
+/// may record a content delta against it. `pub(crate)` so the importer can
+/// consult it through a repository helper.
 pub(crate) fn first_conflict_marker_line(content: &[u8]) -> Option<u32> {
     let text = match std::str::from_utf8(content) {
         Ok(t) => t,
@@ -103,6 +107,20 @@ pub(crate) fn first_conflict_marker_line(content: &[u8]) -> Option<u32> {
 }
 
 impl Repository {
+    /// Whether the view's rendered bytes for `path` carry a conflict marker
+    /// (CB-9B): a conflict-rendered baseline is not file content, and a
+    /// foreign import must not record a content delta against it.
+    pub fn baseline_has_conflict_marker(
+        &self,
+        path: &str,
+        view_name: &str,
+    ) -> Result<bool, RepositoryError> {
+        match self.get_file_content_on_view(path, view_name)? {
+            Some(bytes) => Ok(first_conflict_marker_line(&bytes).is_some()),
+            None => Ok(false),
+        }
+    }
+
     /// Return the first working-copy file that still contains an unresolved
     /// conflict marker, as `(path, 1-based line)`, or `None` if the working
     /// copy is clean.
@@ -123,8 +141,23 @@ impl Repository {
     pub fn try_lock_shadow_commit(
         &self,
     ) -> Result<Option<RepositoryCommonLockGuard>, RepositoryError> {
+        // CB-13B: once the `git-bridge-cutover` requirement is durable, the
+        // colocated bridge owns writes. The legacy shadow writer refuses
+        // before taking its lock or touching any state (fast path).
+        self.require_legacy_shadow_write_allowed()?;
+        #[cfg(test)]
+        shadow_fence_interleave_window();
         match self.try_lock_common_operation() {
-            Ok(guard) => Ok(Some(guard)),
+            Ok(guard) => {
+                // CB-13B R5: re-observe the fence under the held common
+                // lock. A cutover that fenced between the fast-path
+                // observation and this acquisition must fail closed, and
+                // because a cutover itself must take this same lock to
+                // fence, no fence can land after this observation while
+                // the writer path keeps the guard.
+                self.require_legacy_shadow_write_allowed_under_lock(&guard)?;
+                Ok(Some(guard))
+            }
             Err(error) if error.is_lock_contended() => Ok(None),
             Err(error) => Err(error),
         }
@@ -157,6 +190,84 @@ impl Repository {
         }
         Ok(None)
     }
+
+    /// Scan the materialized view content for unresolved conflict markers,
+    /// covering files the status filter above cannot see: a file recorded
+    /// with `--allow-conflict-markers` has marker bytes as its RECORDED
+    /// state, so its status is clean while its worktree and view content
+    /// still carry the markers (review ::26 R5 — the shadow V1 guard's
+    /// status-filtered scan let a marker-recorded state become Git
+    /// evidence when the worktree matched the recording).
+    ///
+    /// This is the switch/shadow-side boundary scan: the materialized
+    /// worktree IS the view's canonical content at switch time, so reading
+    /// the tracked files' worktree bytes covers the recorded state without
+    /// a second graph render pass. O(tracked files) reads — the same order
+    /// as the materialization this guards.
+    pub fn first_view_conflict_marker(
+        &self,
+        working_copy: WorkingCopyId,
+    ) -> Result<Option<(String, u32)>, RepositoryError> {
+        self.validate_working_copy(working_copy)?;
+        for tracked in self.list_tracked_files()? {
+            if tracked.is_directory {
+                continue;
+            }
+            let path = tracked.path.to_string_lossy().to_string();
+            let full_path = self.root.join(&tracked.path);
+            if let Ok(content) = std::fs::read(&full_path) {
+                if let Some(line) = first_conflict_marker_line(&content) {
+                    return Ok(Some((path, line)));
+                }
+            }
+        }
+        Ok(None)
+    }
+}
+
+/// CB-13B R5 test seam: pause inside the read-to-lock window of
+/// [`Repository::try_lock_shadow_commit`] — after the pre-lock fence
+/// observation and before the common-lock acquisition — so the
+/// interleaving regression can fence the repository exactly there. The
+/// installing thread signals `at_window` and blocks until `resume` (or a
+/// 30s deadline, so a broken test fails instead of hanging). The seam does
+/// not exist in shipping builds.
+#[cfg(test)]
+fn shadow_fence_interleave_window() {
+    use std::time::{Duration, Instant};
+    let signal = SHADOW_FENCE_WINDOW.with(|slot| slot.borrow_mut().take());
+    let Some((at_window, resume)) = signal else {
+        return;
+    };
+    let _ = at_window.send(());
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while resume.recv_timeout(Duration::from_millis(50)).is_err() {
+        assert!(Instant::now() < deadline, "interleave window resume timed out");
+    }
+    // Restore so further acquisitions on this thread pause again.
+    SHADOW_FENCE_WINDOW.with(|slot| *slot.borrow_mut() = Some((at_window, resume)));
+}
+
+/// Install the CB-13B R5 interleave seam for the calling thread: the next
+/// [`Repository::try_lock_shadow_commit`] on this thread pauses in the
+/// read-to-lock window and signals `at_window` exactly there, resuming
+/// only when a value arrives on `resume`. Test-only.
+#[cfg(test)]
+pub(crate) fn install_shadow_fence_interleave_window(
+    at_window: std::sync::mpsc::Sender<()>,
+    resume: std::sync::mpsc::Receiver<()>,
+) {
+    SHADOW_FENCE_WINDOW.with(|slot| {
+        *slot.borrow_mut() = Some((at_window, resume));
+    });
+}
+
+/// Per-thread signal pair for [`shadow_fence_interleave_window`]. Test-only.
+#[cfg(test)]
+thread_local! {
+    static SHADOW_FENCE_WINDOW: std::cell::RefCell<
+        Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>,
+    > = const { std::cell::RefCell::new(None) };
 }
 
 /// Render a name conflict: two or more inodes are alive at the same path on
@@ -170,7 +281,7 @@ impl Repository {
 /// matching Atomic's inverted marker convention. `sides` must already be in a
 /// deterministic order so the rendering is stable across runs.
 #[allow(clippy::too_many_arguments)]
-fn render_name_conflict<C: atomic_core::change::ChangeStore>(
+pub(super) fn render_name_conflict<C: atomic_core::change::ChangeStore>(
     txn: &atomic_core::pristine::ReadTxn,
     store: &C,
     inode_graph_table: &redb::ReadOnlyMultimapTable<&'static [u8; 32], &'static [u8; 24]>,
@@ -247,6 +358,59 @@ pub(super) fn render_name_conflict_side<C: atomic_core::change::ChangeStore>(
     output_graph_content_resolved(store, hash_fn, &graph, &order, &mut writer, &resolved)
         .map_err(|e| format!("{}: name-conflict content: {:?}", path, e))?;
     Ok(writer.into_inner())
+}
+
+/// Render a file's alive graph into bytes and simultaneously capture the
+/// conflict-region structure (kinds, lines, side vertices, side content
+/// hashes) used by complete conflict objects (CB-8B).
+///
+/// The rendered bytes are byte-identical to materialization output because
+/// the capture writer replicates the output layer's marker encoding.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn capture_file_conflict_bytes<C: atomic_core::change::ChangeStore>(
+    txn: &atomic_core::pristine::ReadTxn,
+    store: &C,
+    inode_graph_table: &redb::ReadOnlyMultimapTable<&'static [u8; 32], &'static [u8; 24]>,
+    visibility: &GraphVisibilityClosure,
+    external_hashes: &std::collections::HashMap<NodeId, Hash>,
+    path: &str,
+    inode: Inode,
+    position: Position<NodeId>,
+) -> Result<
+    (
+        Vec<u8>,
+        Vec<super::conflict_object::CapturedRegion>,
+    ),
+    String,
+> {
+    use atomic_core::output::repo::{output_graph_content_resolved, resolve_conflicts_semantically};
+    use atomic_core::output::{compute_order, retrieve_graph, RetrieveOptions};
+    use atomic_core::pristine::InodePreloadTxn;
+    use super::conflict_object::ConflictCaptureWriter;
+
+    let preloaded = InodePreloadTxn::from_table(txn, inode, inode_graph_table)
+        .map_err(|e| format!("{}: conflict capture preload: {:?}", path, e))?;
+    let retrieve_opts = RetrieveOptions::default().with_graph_visibility(visibility.clone());
+    let retrieve_result = retrieve_graph(&preloaded, position, retrieve_opts)
+        .map_err(|e| format!("{}: conflict capture retrieve: {:?}", path, e))?;
+    let mut graph = retrieve_result.graph;
+    let order = compute_order(&mut graph);
+    let resolved = resolve_conflicts_semantically(&preloaded, store, &graph, &order)
+        .map_err(|error| format!("{}: conflict capture semantic resolution: {}", path, error))?;
+    let mut capture = ConflictCaptureWriter::new();
+    let hash_fn = |node_id: NodeId| -> Result<Option<Hash>, atomic_core::pristine::PristineError> {
+        if node_id.is_root() {
+            return Ok(None);
+        }
+        external_hashes
+            .get(&node_id)
+            .copied()
+            .map(Some)
+            .ok_or(atomic_core::pristine::PristineError::ChangeNotFound { id: node_id.get() })
+    };
+    output_graph_content_resolved(store, hash_fn, &graph, &order, &mut capture, &resolved)
+        .map_err(|e| format!("{}: conflict capture content: {:?}", path, e))?;
+    Ok(capture.into_parts())
 }
 
 struct PreparedNameConflictOutput {
@@ -864,6 +1028,14 @@ impl Repository {
             let observed = self.observe_filesystem_effect(working_copy, &target)?;
             let mut expected_new = entry.expected_new;
             match (&observed, &mut expected_new) {
+                (EffectValue::Absent, EffectValue::File(new))
+                    if new.kind == FileKind::Symlink =>
+                {
+                    // Linux `symlink(2)` ignores umask and yields the
+                    // platform's full-permission creation mode; probing a
+                    // directory's umask mask would mispredict the lease.
+                    new.mode = u32::from(atomic_core::output::platform_symlink_mode());
+                }
                 (EffectValue::Absent, EffectValue::File(new)) => {
                     new.mode = self.materialized_creation_mode(new.mode)?;
                 }
@@ -949,6 +1121,7 @@ impl Repository {
             before_state,
             after_state,
             effects,
+            Vec::new(),
             ActorRef::System {
                 name: "repository-materialize".to_string(),
             },
@@ -1312,13 +1485,15 @@ impl Repository {
                 let retrieve_ms = t_retrieve.elapsed();
                 let mut graph = retrieve_result.graph;
 
-                let (repository_content, order_ms, content_ms) = if graph.is_empty() {
-                    (
-                        Vec::new(),
-                        std::time::Duration::ZERO,
-                        std::time::Duration::ZERO,
-                    )
-                } else {
+                let (repository_content, order_ms, content_ms, rendered_conflicts) =
+                    if graph.is_empty() {
+                        (
+                            Vec::new(),
+                            std::time::Duration::ZERO,
+                            std::time::Duration::ZERO,
+                            false,
+                        )
+                    } else {
                     let t_order = std::time::Instant::now();
                     let order = compute_order(&mut graph);
                     let order_ms = t_order.elapsed();
@@ -1352,7 +1527,12 @@ impl Repository {
                         &resolved,
                     )
                     .map_err(|e| format!("{}: content: {:?}", item.path, e))?;
-                    (writer.into_inner(), order_ms, t_content.elapsed())
+                    // Whether the renderer itself emitted a conflict region.
+                    // A file whose *source* merely contains marker-shaped
+                    // lines (documentation examples, test fixtures) writes
+                    // them through `output_line` and stays marker-free here.
+                    let rendered_conflicts = writer.has_conflict_markers();
+                    (writer.into_inner(), order_ms, t_content.elapsed(), rendered_conflicts)
                 };
 
                 let materialization = inode_materialization
@@ -1379,9 +1559,17 @@ impl Repository {
                     .bytes()
                     .expect("parallel renderer always produces a present entry");
 
-                // Detect conflict markers in the materialized bytes. This is
-                // the source of truth for persisted conflict state.
-                let marker_line = first_conflict_marker_line(content);
+                // Persist a conflict only when the renderer actually emitted
+                // a conflict region for this file. Source content that merely
+                // contains marker-shaped lines (documentation examples, test
+                // fixtures) is written through `output_line`, never the
+                // conflict-marker path, so it must not be persisted as an
+                // order conflict.
+                let marker_line = if rendered_conflicts {
+                    first_conflict_marker_line(content)
+                } else {
+                    None
+                };
 
                 // Compute content hash from the in-memory buffer.
                 let content_hash = Hash::of(content);
@@ -1530,26 +1718,29 @@ impl Repository {
             }
             for rendered in rendered_files.iter().flatten() {
                 if rendered.2 {
+                    let materialization = inode_materialization
+                        .get(rendered.0.path())
+                        .copied()
+                        .unwrap_or_default();
+                    let kind = match materialization.kind {
+                        atomic_core::change::InodeKind::Regular => FileKind::Regular,
+                        atomic_core::change::InodeKind::Symlink => FileKind::Symlink,
+                        atomic_core::change::InodeKind::Gitlink => FileKind::Gitlink,
+                    };
                     desired.insert(
                         rendered.0.path().to_string(),
                         EffectValue::File(FileState {
-                            kind: match inode_materialization
-                                .get(rendered.0.path())
-                                .copied()
-                                .unwrap_or_default()
-                                .kind
-                            {
-                                atomic_core::change::InodeKind::Regular => FileKind::Regular,
-                                atomic_core::change::InodeKind::Symlink => FileKind::Symlink,
-                                atomic_core::change::InodeKind::Gitlink => FileKind::Gitlink,
+                            kind,
+                            // A symlink's physical permission bits are the
+                            // platform's creation mode (Linux yields 0o777
+                            // and cannot be changed), never the inode's
+                            // stored mode; the lease must predict the write
+                            // it actually performs.
+                            mode: if kind == FileKind::Symlink {
+                                u32::from(atomic_core::output::platform_symlink_mode())
+                            } else {
+                                u32::from(materialization.mode)
                             },
-                            mode: u32::from(
-                                inode_materialization
-                                    .get(rendered.0.path())
-                                    .copied()
-                                    .unwrap_or_default()
-                                    .mode,
-                            ),
                             content: rendered.1,
                         }),
                     );

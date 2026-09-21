@@ -241,3 +241,171 @@ fn regular_to_dangling_symlink_records_type_and_materializes_target() {
     assert!(std::fs::symlink_metadata(&path).unwrap().is_file());
     assert_eq!(std::fs::read(&path).unwrap(), b"regular again");
 }
+
+/// Register the invisible sibling writers the review R1 probe plants: two
+/// independent changes writing one value each to the same register, visible
+/// from no view in this fixture. Returns their NodeIds.
+fn seed_invisible_siblings(
+    repo: &TestRepository,
+    inode: atomic_core::types::Inode,
+    position: atomic_core::types::Position<atomic_core::types::NodeId>,
+    values: [InodeAttr; 2],
+) -> Vec<atomic_core::types::NodeId> {
+    use atomic_core::pristine::{InodeAttrEvent, InodeAttrMutTxnT, MutTxnT};
+    let mut txn = repo.pristine.write_txn().unwrap();
+    let mut ids = Vec::new();
+    for (index, value) in values.into_iter().enumerate() {
+        let hash = atomic_core::Hash::of(format!("sibling {value:?} {index}").as_bytes());
+        let id = txn.register_change(&hash).unwrap();
+        txn.put_change_deps(id, &[]).unwrap();
+        txn.put_inode_attr_event(inode, position, InodeAttrEvent::new(id, value).unwrap())
+            .unwrap();
+        ids.push(id);
+    }
+    txn.commit().unwrap();
+    ids
+}
+
+/// Assemble one attribute-only change on the base-only `dev` view through
+/// the production entry the import path uses.
+fn assemble_attribute_write(
+    repo: &TestRepository,
+    path: &str,
+    value: InodeAttr,
+) -> atomic_core::change::Change {
+    use atomic_core::record::workflow::{DetectionKind, RecordedFile};
+    let (inode, position) = {
+        use atomic_core::pristine::TreeTxnT;
+        let txn = repo.pristine.read_txn().unwrap();
+        let inode = txn.get_inode(path).unwrap().unwrap();
+        let position = txn.inode_position(inode).unwrap().unwrap();
+        (inode, position)
+    };
+    let mut recorded = RecordedFile::new(path);
+    recorded.set_kind(DetectionKind::Modified);
+    recorded.set_inode(inode);
+    recorded.set_position(position);
+    recorded.set_attr(value);
+    let (change, _) = repo
+        .assemble_and_hash(
+            "dev",
+            ChangeHeader::new("assembled attribute write on base-only view"),
+            &[recorded],
+        )
+        .unwrap();
+    change
+}
+
+/// Review CB-9C R1 (mode register): a chmod-only change assembled against a
+/// base-only view depends on that view's visible register writer only. Two
+/// invisible sibling chmod writers — registered in either order — never
+/// become causal dependencies, and the dependency set is exactly the
+/// observed visible frontier.
+#[cfg(unix)]
+#[test]
+fn sibling_mode_writers_never_become_foreign_assembly_dependencies() {
+    use std::os::unix::fs::PermissionsExt;
+
+    for sibling_values in [
+        [InodeAttr::Mode(0o700), InodeAttr::Mode(0o711)],
+        [InodeAttr::Mode(0o711), InodeAttr::Mode(0o700)],
+    ] {
+        let (temp, repo) = create_temp_repo();
+        let path = temp.path().join("register.txt");
+        std::fs::write(&path, b"content\n").unwrap();
+        repo.add("register.txt", TrackingOptions::default()).unwrap();
+        let base = record_all(&repo, "add register file")
+            .change()
+            .hash()
+            .unwrap();
+
+        // The visible writer: a real chmod recorded on the base-only view.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let visible_writer = record_all(&repo, "visible chmod").change().hash().unwrap();
+
+        let siblings = {
+            let txn = repo.pristine.read_txn().unwrap();
+            let inode = txn.get_inode("register.txt").unwrap().unwrap();
+            let position = txn.inode_position(inode).unwrap().unwrap();
+            seed_invisible_siblings(&repo, inode, position, sibling_values)
+        };
+
+        let change = assemble_attribute_write(&repo, "register.txt", InodeAttr::Mode(0o755));
+        let deps = change.dependencies();
+        let expected: std::collections::HashSet<atomic_core::Hash> =
+            [base, visible_writer].into_iter().collect();
+        let actual: std::collections::HashSet<atomic_core::Hash> = deps.iter().copied().collect();
+        assert_eq!(
+            actual, expected,
+            "exact assembly visibility: the attribute write depends on the target \
+             position's base change and the register's visible frontier writer — \
+             never an invisible sibling (deps: {:?})",
+            deps.iter().map(|h| h.to_base32()).collect::<Vec<_>>()
+        );
+    }
+}
+
+/// Review CB-9C R1 (kind register): the kind-register analogue — the visible
+/// file→symlink conversion is the only dependency; invisible sibling kind
+/// writers in either registration order never leak into the assembly.
+#[cfg(unix)]
+#[test]
+fn sibling_kind_writers_never_become_foreign_assembly_dependencies() {
+    for sibling_values in [
+        [InodeAttr::Kind(InodeKind::Symlink), InodeAttr::Kind(InodeKind::Gitlink)],
+        [InodeAttr::Kind(InodeKind::Gitlink), InodeAttr::Kind(InodeKind::Symlink)],
+    ] {
+        let (temp, repo) = create_temp_repo();
+        let path = temp.path().join("register.txt");
+        std::fs::write(&path, b"content\n").unwrap();
+        repo.add("register.txt", TrackingOptions::default()).unwrap();
+        let base = record_all(&repo, "add register file")
+            .change()
+            .hash()
+            .unwrap();
+
+        // The visible writer: a real file→symlink conversion recorded on
+        // the base-only view.
+        std::fs::remove_file(&path).unwrap();
+        std::os::unix::fs::symlink("target", &path).unwrap();
+        let visible_writer = record_all(&repo, "visible conversion").change().hash().unwrap();
+
+        let siblings = {
+            let inode = inode_of(&repo, "register.txt");
+            let position = position_of(&repo, "register.txt");
+            seed_invisible_siblings(&repo, inode, position, sibling_values)
+        };
+
+        let change = assemble_attribute_write(
+            &repo,
+            "register.txt",
+            InodeAttr::Kind(InodeKind::Gitlink),
+        );
+        let deps = change.dependencies();
+        let expected: std::collections::HashSet<atomic_core::Hash> =
+            [base, visible_writer].into_iter().collect();
+        let actual: std::collections::HashSet<atomic_core::Hash> = deps.iter().copied().collect();
+        assert_eq!(
+            actual, expected,
+            "exact assembly visibility for the kind register: the base change and \
+             the visible kind writer only — never an invisible sibling (deps: {:?})",
+            deps.iter().map(|h| h.to_base32()).collect::<Vec<_>>()
+        );
+    }
+}
+
+fn inode_of(repo: &TestRepository, path: &str) -> atomic_core::types::Inode {
+    use atomic_core::pristine::TreeTxnT;
+    let txn = repo.pristine.read_txn().unwrap();
+    txn.get_inode(path).unwrap().unwrap()
+}
+
+fn position_of(
+    repo: &TestRepository,
+    path: &str,
+) -> atomic_core::types::Position<atomic_core::types::NodeId> {
+    use atomic_core::pristine::TreeTxnT;
+    let txn = repo.pristine.read_txn().unwrap();
+    let inode = txn.get_inode(path).unwrap().unwrap();
+    txn.inode_position(inode).unwrap().unwrap()
+}

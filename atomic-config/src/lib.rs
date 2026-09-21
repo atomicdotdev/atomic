@@ -352,6 +352,106 @@ pub enum ColorChoice {
     Never,
 }
 
+/// Execution environment of the current process, classified from the
+/// standard CI/container markers (`CI`, `container`,
+/// `KUBERNETES_SERVICE_HOST`, `/.dockerenv`).
+///
+/// RFC §11.2 rule 7: watchers and reactive daemons default off in CI and
+/// containers because those environments have no persistent session to
+/// watch and every command boundary already reconciles.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Environment {
+    /// A developer workstation or other persistent session.
+    #[default]
+    Desktop,
+    /// A CI run (`CI` is set).
+    Ci,
+    /// A container or orchestrator run.
+    Container,
+}
+
+impl Environment {
+    /// Classify the current process environment from the standard markers.
+    pub fn detect() -> Self {
+        if std::env::var_os("CI").is_some() {
+            return Self::Ci;
+        }
+        if std::env::var_os("container").is_some()
+            || std::env::var_os("KUBERNETES_SERVICE_HOST").is_some()
+            || std::path::Path::new("/.dockerenv").exists()
+        {
+            return Self::Container;
+        }
+        Self::Desktop
+    }
+}
+
+/// Legacy-compatible `remotes` deserialization.
+///
+/// Accepts the current `[[remotes]]` sequence and the legacy
+/// `[remotes.<name>]` map (0.17.x shape) interchangeably; the legacy map's
+/// `default` flag is structural to 0.17.x and carries no meaning in the
+/// current schema, so it is ignored here.
+fn deserialize_remotes_compat<'de, D>(deserializer: D) -> Result<Vec<RemoteConfig>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    match value {
+        serde_json::Value::Array(entries) => entries
+            .into_iter()
+            .map(|entry| serde_json::from_value::<RemoteConfig>(entry).map_err(serde::de::Error::custom))
+            .collect(),
+        serde_json::Value::Object(map) => {
+            let mut remotes = Vec::new();
+            for (name, entry) in map {
+                let url = entry
+                    .get("url")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| {
+                        serde::de::Error::custom(format!("legacy remote '{name}' has no url"))
+                    })?;
+                remotes.push(RemoteConfig {
+                    name,
+                    url: url.to_string(),
+                    default_channel: entry
+                        .get("default_channel")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string),
+                });
+            }
+            remotes.sort_by(|left, right| left.name.cmp(&right.name));
+            Ok(remotes)
+        }
+        other => Err(serde::de::Error::custom(format!(
+            "remotes must be a sequence or a legacy name-keyed map, got {other:?}"
+        ))),
+    }
+}
+
+/// Serialize `remotes` in the legacy `[remotes.<name>]` map shape so 0.17.x
+/// binaries keep parsing the file.
+fn serialize_remotes_compat<S>(remotes: &[RemoteConfig], serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    use serde::ser::SerializeMap as _;
+    let mut map = serializer.serialize_map(Some(remotes.len()))?;
+    for remote in remotes {
+        let mut entry = serde_json::Map::new();
+        entry.insert("url".into(), serde_json::Value::String(remote.url.clone()));
+        entry.insert("default".into(), serde_json::Value::Bool(false));
+        if let Some(channel) = &remote.default_channel {
+            entry.insert(
+                "default_channel".into(),
+                serde_json::Value::String(channel.clone()),
+            );
+        }
+        map.serialize_entry(&remote.name, &serde_json::Value::Object(entry))?;
+    }
+    map.end()
+}
+
 /// Repository-specific configuration
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct RepoConfig {
@@ -360,7 +460,17 @@ pub struct RepoConfig {
     pub author: Option<Author>,
 
     /// Remote repositories
-    #[serde(default)]
+    ///
+    /// Deserialized compatibly: both the current `[[remotes]]` sequence and
+    /// the legacy `[remotes.<name>]` map written by 0.17.x are accepted.
+    /// Serialized back in the legacy map shape so 0.17.x binaries keep
+    /// reading the file (`default` is emitted as `false`, matching the
+    /// shape 0.17.x itself writes).
+    #[serde(
+        default,
+        deserialize_with = "deserialize_remotes_compat",
+        serialize_with = "serialize_remotes_compat"
+    )]
     pub remotes: Vec<RemoteConfig>,
 
     /// Workspace configuration for view switching behavior.
@@ -382,6 +492,371 @@ pub struct GitConfig {
     /// Candidate-path source used for Git-backed working copies.
     #[serde(default)]
     pub watch: GitWatch,
+
+    /// Binding signer trust policy (RFC-ATOMIC-GIT-CAUSAL-BRIDGE §5.6).
+    #[serde(default)]
+    pub trust: GitTrustConfig,
+
+    /// Export identity mapping (RFC-ATOMIC-GIT-CAUSAL-BRIDGE §5.5).
+    #[serde(default)]
+    pub identity: GitIdentityConfig,
+
+    /// Bridge rollout gate (RFC-ATOMIC-GIT-CAUSAL-BRIDGE §13 Phase 13
+    /// task 4, CB-13C). Default-off: the bridge is never enabled by
+    /// configuration alone.
+    #[serde(default)]
+    pub bridge: GitBridgeConfig,
+}
+
+/// Bridge rollout gate (RFC §13 Phase 13 task 4, CB-13C).
+///
+/// # Decision recorded for CB-13C
+///
+/// The colocated bridge stays **opt-in only**. `enabled` defaults to
+/// `false`, and no code path flips it: default enablement additionally
+/// requires every named rollout gate (recovery, parity, security,
+/// migration, performance) to be independently `Passed`, which per the
+/// RFC §21 evidence matrix in the tracker they are not (several are
+/// `Unknown`, and none carries owner approval). Until the owner approves
+/// measured thresholds, [`GitBridgeConfig::default_enablement`] refuses.
+///
+/// ```toml
+/// [git.bridge]
+/// enabled = true   # explicit per-repository opt-in; default false
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GitBridgeConfig {
+    /// Explicit opt-in for bridge workflows on this repository. Defaults
+    /// to `false`; the bridge is never enabled by configuration alone.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// The optional metadata-only bridge watch daemon (RFC §11.2, CB-13D).
+    /// Defaults to disabled; an absent `[git.bridge.watch]` section reads
+    /// as fully disabled.
+    #[serde(default)]
+    pub watch: BridgeWatchConfig,
+}
+
+impl Default for GitBridgeConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            watch: BridgeWatchConfig::default(),
+        }
+    }
+}
+
+/// Configuration for the optional metadata-only bridge watch daemon
+/// (RFC §11.2 rules 3–7).
+///
+/// The daemon is a latency accelerator only: correctness always comes from
+/// command-boundary reconciliation, and a stopped or killed daemon must
+/// never change the next command's outcome. It is therefore disabled unless
+/// explicitly opted in per repository, over and above the bridge opt-in.
+///
+/// ```toml
+/// [git.bridge.watch]
+/// enabled = true  # explicit per-repository opt-in; default false
+/// quiet_ms = 250  # minimum silence before a reactive reconcile (>= 250)
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BridgeWatchConfig {
+    /// Explicit opt-in for the watch daemon on this repository. Defaults to
+    /// `false`; the daemon is never started by configuration alone — not
+    /// even in CI or containers, which simply receive the same disabled
+    /// default everywhere else does.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Minimum silence window, in milliseconds, before a reactive
+    /// reconcile may run (RFC §11.2 rule 3: at least 250 ms). Values below
+    /// the floor are clamped up to [`BridgeWatchConfig::MIN_QUIET_MS`] by
+    /// [`BridgeWatchConfig::effective_quiet_ms`]; the raw field is
+    /// preserved for round-tripping.
+    #[serde(default = "BridgeWatchConfig::default_quiet_ms")]
+    pub quiet_ms: u64,
+}
+
+impl BridgeWatchConfig {
+    /// The enforced lower bound for the reactive silence window
+    /// (RFC §11.2 rule 3: at least 250 ms).
+    pub const MIN_QUIET_MS: u64 = 250;
+
+    const fn default_quiet_ms() -> u64 {
+        Self::MIN_QUIET_MS
+    }
+
+    /// The silence window the daemon actually waits for: the configured
+    /// value clamped up to the RFC floor. Never lower than 250 ms.
+    pub fn effective_quiet_ms(&self) -> u64 {
+        self.quiet_ms.max(Self::MIN_QUIET_MS)
+    }
+
+    /// Why the daemon must not start under the current configuration, if it
+    /// must not. The daemon is opt-in only (RFC §11.2 rule 7): it is off
+    /// unless `[git.bridge.watch] enabled = true` is explicitly recorded,
+    /// which is also how CI and containers stay off — they get the same
+    /// disabled default as everywhere else, and only an explicit
+    /// per-repository opt-in starts the daemon there.
+    pub fn startup_refusal(&self) -> Option<&'static str> {
+        if self.enabled {
+            return None;
+        }
+        Some(
+            "the bridge watch daemon is disabled (set [git.bridge.watch] enabled = true to opt in; \
+             command boundaries fully reconcile without it)",
+        )
+    }
+}
+
+impl Default for BridgeWatchConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            quiet_ms: Self::default_quiet_ms(),
+        }
+    }
+}
+
+/// Measured rollout gates that must each be `Passed` before any default
+/// enablement (RFC §21 evidence matrix; tracker "RFC §21 evidence matrix").
+///
+/// The states here are the recorded CB-13C decision surface: a gate is
+/// flipped only when the tracker matrix cites measured evidence for it and
+/// the owner approves the threshold.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RolloutGateState {
+    pub passed: bool,
+    pub measured: bool,
+}
+
+/// The named rollout gates and their current recorded states.
+pub const ROLLOUT_GATES: &[(&str, RolloutGateState)] = &[
+    (
+        "recovery",
+        RolloutGateState {
+            passed: false,
+            measured: false,
+        },
+    ),
+    (
+        "parity",
+        RolloutGateState {
+            passed: false,
+            measured: false,
+        },
+    ),
+    (
+        "security",
+        RolloutGateState {
+            passed: false,
+            measured: false,
+        },
+    ),
+    (
+        "migration",
+        RolloutGateState {
+            passed: false,
+            measured: false,
+        },
+    ),
+    (
+        "performance",
+        RolloutGateState {
+            passed: false,
+            measured: false,
+        },
+    ),
+];
+
+/// Why default enablement is refused.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum DefaultEnablementRefusal {
+    #[error("the bridge is opt-in only: set [git.bridge] enabled = true to opt in")]
+    NotOptedIn,
+    #[error("rollout gate '{gate}' is unmeasured; default enablement is blocked until the RFC §21 matrix records measured evidence and owner approval")]
+    UnmeasuredGate { gate: &'static str },
+    #[error("rollout gate '{gate}' has not passed its measured threshold; default enablement is blocked")]
+    FailedGate { gate: &'static str },
+}
+
+impl GitBridgeConfig {
+    /// Whether the bridge may be enabled *by default* (without an explicit
+    /// user action naming this repository). Refuses while the repository has
+    /// not opted in, or while any rollout gate is unmeasured or unpassed.
+    pub fn default_enablement(&self) -> Result<(), DefaultEnablementRefusal> {
+        if !self.enabled {
+            return Err(DefaultEnablementRefusal::NotOptedIn);
+        }
+        for (gate, state) in ROLLOUT_GATES {
+            if !state.measured {
+                return Err(DefaultEnablementRefusal::UnmeasuredGate { gate });
+            }
+            if !state.passed {
+                return Err(DefaultEnablementRefusal::FailedGate { gate });
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Export identity mapping (RFC §5.5).
+///
+/// Maps Git emails to Atomic DIDs for exported commits. Mapped emails use
+/// their configured DID; unmapped emails receive a deterministic
+/// `did:atomic:git:<email-hash>` foreign identity flagged in provenance.
+///
+/// ```toml
+/// [git.identity]
+/// "lee@atomic.dev" = "did:atomic:U4NN…"
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct GitIdentityConfig {
+    /// Email → DID mappings used when projecting commits to Git.
+    #[serde(flatten)]
+    pub mappings: std::collections::BTreeMap<String, String>,
+}
+
+impl GitIdentityConfig {
+    /// Look up the DID for one email: configured mapping, else
+    /// `None` (the caller synthesizes the deterministic foreign identity).
+    pub fn did_for_email(&self, email: &str) -> Option<&str> {
+        self.mappings.get(email).map(String::as_str)
+    }
+}
+
+/// Binding signer trust policy.
+///
+/// # Decision for RFC 19 question 4 (CB-6A)
+///
+/// The default trust model is a **per-repository explicit allowlist**
+/// (deny-by-default). The repository's own identity is trusted, plus every
+/// DID listed under `[git.trust] signers` (configured collaborators).
+/// Everything else is `Unknown` and yields explicitly **untrusted**
+/// provenance/attestation claims — content correctness is still recomputed
+/// independently of the signer (RFC §5.2), so an unknown signer can supply
+/// correct content but can never satisfy a publication gate.
+///
+/// Web-of-trust via delegation certificates was considered and **deferred**:
+/// it broadens who can satisfy gates without a repository-local decision, and
+/// enabling it later requires an explicit policy decision (delegation
+/// certificates and transitive trust evaluation), not a silent default. Until
+/// such a decision lands, `revoked` signers stay revoked even when also
+/// listed in `signers`, and revocation always wins.
+///
+/// ```toml
+/// [git.trust]
+/// signers = ["did:atomic:U4NN…"]   # configured collaborators
+/// revoked = ["did:atomic:AAAA…"]   # explicit revocation; overrides signers
+/// ```
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitTrustConfig {
+    /// Explicitly trusted signer DIDs (configured collaborators).
+    #[serde(default)]
+    pub signers: Vec<String>,
+
+    /// Explicitly revoked signer DIDs. Takes precedence over `signers` and
+    /// over the repository identity.
+    #[serde(default)]
+    pub revoked: Vec<String>,
+}
+
+/// Trust evaluation outcome for one binding signer.
+///
+/// Trust is independent of content validity: a signature proves who signed,
+/// never that the content is correct (RFC §5.2/§12.8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignerTrust {
+    /// The signer is the repository identity or a configured collaborator.
+    Trusted,
+    /// The signer was explicitly revoked; overrides any other rule.
+    Revoked,
+    /// The signer is cryptographically valid but not configured; its
+    /// provenance/attestation claims stay untrusted.
+    Unknown,
+}
+
+impl GitTrustConfig {
+    /// Evaluate one signer against this policy.
+    ///
+    /// `repository_identity` is the repository's own signer DID (the stated
+    /// default trust root) when one is configured. `revoked` always wins:
+    /// revocation is explicit and cannot be re-trusted by listing.
+    pub fn evaluate(&self, signer: &str, repository_identity: Option<&str>) -> SignerTrust {
+        if self.revoked.iter().any(|did| did == signer) {
+            return SignerTrust::Revoked;
+        }
+        if repository_identity.is_some_and(|identity| identity == signer)
+            || self.signers.iter().any(|did| did == signer)
+        {
+            return SignerTrust::Trusted;
+        }
+        SignerTrust::Unknown
+    }
+}
+
+#[cfg(test)]
+mod trust_evaluation_tests {
+    use super::*;
+
+    /// CB-12B follow-up AC-6 (RFC §19 Q4): trust evaluation is
+    /// configured-policy-ONLY — unknown signers are untrusted, revocation
+    /// wins over any allowlisting, the repository identity is trusted, and
+    /// NO default (per-repo allowlist inference, web of trust, or
+    /// content-acceptance inference) is granted. This test pins the exact
+    /// semantics so no future change silently invents a Q4 default.
+    #[test]
+    fn git_trust_evaluation_is_configured_policy_only() {
+        let repo_did = "did:atomic:REPO";
+        let signer = GitTrustConfig {
+            signers: vec!["did:atomic:COLLAB".to_string()],
+            revoked: vec!["did:atomic:EVIL".to_string()],
+        };
+
+        // Unknown → untrusted: never inferred from anything else.
+        assert_eq!(
+            signer.evaluate("did:atomic:STRANGER", Some(repo_did)),
+            SignerTrust::Unknown
+        );
+        assert_eq!(signer.evaluate("did:atomic:STRANGER", None), SignerTrust::Unknown);
+
+        // Configured collaborator → trusted.
+        assert_eq!(
+            signer.evaluate("did:atomic:COLLAB", None),
+            SignerTrust::Trusted
+        );
+
+        // The repository's own identity → trusted.
+        assert_eq!(
+            signer.evaluate(repo_did, Some(repo_did)),
+            SignerTrust::Trusted
+        );
+
+        // Revocation WINS over allowlisting and over the repository identity.
+        assert_eq!(
+            signer.evaluate("did:atomic:EVIL", None),
+            SignerTrust::Revoked
+        );
+        let revoked_repo = GitTrustConfig {
+            signers: Vec::new(),
+            revoked: vec![repo_did.to_string()],
+        };
+        assert_eq!(
+            revoked_repo.evaluate(repo_did, Some(repo_did)),
+            SignerTrust::Revoked
+        );
+
+        // The empty `[git.trust]` section has no allowlist — but the
+        // repository's own identity remains its stated default trust root
+        // (explicitly passed as repository_identity, a self-root, not a Q4
+        // web-of-trust default). Strangers are still Unknown.
+        let empty = GitTrustConfig::default();
+        assert_eq!(
+            empty.evaluate(repo_did, Some(repo_did)),
+            SignerTrust::Trusted
+        );
+        assert_eq!(empty.evaluate("did:atomic:STRANGER", Some(repo_did)), SignerTrust::Unknown);
+    }
 }
 
 /// Candidate-path source preference for Git-backed working copies.
@@ -563,14 +1038,43 @@ impl RepoConfig {
         Ok(toml::from_str(&content)?)
     }
 
-    /// Save repository configuration to a specific path
+    /// Save repository configuration to a specific path.
+    ///
+    /// Atomic replacement (write a same-directory temporary, fsync, rename
+    /// over the target) — CB-13C F2: consent must never be persisted by a
+    /// truncating in-place rewrite, so an interrupted save can never leave
+    /// a half-written consent state behind.
     pub fn save(&self, path: &std::path::Path) -> Result<(), ConfigError> {
         let content = toml::to_string_pretty(self)?;
-        std::fs::write(path, content).map_err(|e| ConfigError::WriteError {
+        let temporary = path.with_extension(format!(
+            "toml.tmp.{}",
+            std::process::id()
+        ));
+        {
+            use std::io::Write;
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temporary)
+                .map_err(|e| ConfigError::WriteError {
+                    path: temporary.clone(),
+                    source: e,
+                })?;
+            file.write_all(content.as_bytes())
+                .and_then(|()| file.sync_all())
+                .map_err(|e| ConfigError::WriteError {
+                    path: temporary.clone(),
+                    source: e,
+                })?;
+        }
+        let renamed = std::fs::rename(&temporary, path);
+        if renamed.is_err() {
+            let _ = std::fs::remove_file(&temporary);
+        }
+        renamed.map_err(|e| ConfigError::WriteError {
             path: path.to_path_buf(),
             source: e,
         })?;
-
         Ok(())
     }
 
@@ -591,6 +1095,73 @@ mod tests {
         assert_eq!(parsed.git.watch, GitWatch::Auto);
     }
 
+    /// CB-13D (RFC §11.2): the watch daemon is opt-in only and its silence
+    /// window is floored at 250 ms; an absent section reads as fully
+    /// disabled and round-trips losslessly.
+    #[test]
+    fn bridge_watch_defaults_to_disabled_with_rfc_floor() {
+        let parsed: RepoConfig = toml::from_str("").unwrap();
+        assert!(!parsed.git.bridge.watch.enabled);
+        assert_eq!(parsed.git.bridge.watch.quiet_ms, 250);
+        assert_eq!(parsed.git.bridge.watch.effective_quiet_ms(), 250);
+        assert!(parsed.git.bridge.watch.startup_refusal().is_some());
+
+        let parsed: RepoConfig =
+            toml::from_str("[git.bridge.watch]\nenabled = true\nquiet_ms = 40\n").unwrap();
+        assert!(parsed.git.bridge.watch.enabled);
+        assert_eq!(
+            parsed.git.bridge.watch.effective_quiet_ms(),
+            250,
+            "the daemon never waits less than the RFC 250 ms silence floor"
+        );
+        assert!(parsed.git.bridge.watch.startup_refusal().is_none());
+
+        let parsed: RepoConfig =
+            toml::from_str("[git.bridge.watch]\nenabled = true\nquiet_ms = 900\n").unwrap();
+        assert_eq!(parsed.git.bridge.watch.effective_quiet_ms(), 900);
+
+        // Round-trip: a saved opt-in keeps its exact values.
+        let config = RepoConfig {
+            git: GitConfig {
+                bridge: GitBridgeConfig {
+                    enabled: true,
+                    watch: BridgeWatchConfig {
+                        enabled: true,
+                        quiet_ms: 500,
+                    },
+                },
+                ..GitConfig::default()
+            },
+            ..RepoConfig::default()
+        };
+        let encoded = toml::to_string_pretty(&config).unwrap();
+        let decoded: RepoConfig = toml::from_str(&encoded).unwrap();
+        assert_eq!(decoded.git.bridge.watch, config.git.bridge.watch);
+    }
+
+    #[test]
+    fn git_identity_defaults_to_no_mappings() {
+        let config: RepoConfig = toml::from_str("").unwrap();
+        assert!(config.git.identity.mappings.is_empty());
+        assert!(config
+            .git
+            .identity
+            .did_for_email("lee@atomic.dev")
+            .is_none());
+    }
+
+    /// RFC §5.5: `[git.identity]` maps Git emails to Atomic DIDs.
+    #[test]
+    fn git_identity_parses_email_to_did_mappings() {
+        let config: RepoConfig =
+            toml::from_str("[git.identity]\n\"lee@atomic.dev\" = \"did:atomic:U4NN\"\n").unwrap();
+        assert_eq!(
+            config.git.identity.did_for_email("lee@atomic.dev"),
+            Some("did:atomic:U4NN")
+        );
+        assert!(config.git.identity.did_for_email("other@x.dev").is_none());
+    }
+
     #[test]
     fn repo_git_watch_parses_all_modes() {
         for (value, expected) in [
@@ -603,6 +1174,168 @@ mod tests {
                 toml::from_str(&format!("[git]\nwatch = \"{value}\"\n")).unwrap();
             assert_eq!(config.git.watch, expected);
         }
+    }
+
+    /// CB-13C rollout gate: the bridge is opt-in only and default-off.
+    #[test]
+    fn git_bridge_defaults_to_disabled() {
+        let config: RepoConfig = toml::from_str("").unwrap();
+        assert!(!config.git.bridge.enabled);
+        assert_eq!(
+            config.git.bridge.default_enablement(),
+            Err(DefaultEnablementRefusal::NotOptedIn)
+        );
+    }
+
+    /// Explicit opt-in parses, and default enablement is still refused
+    /// while any rollout gate is unmeasured (RFC §21 matrix).
+    #[test]
+    fn git_bridge_opt_in_parses_but_default_enablement_stays_blocked_by_unmeasured_gates() {
+        let config: RepoConfig = toml::from_str("[git.bridge]\nenabled = true\n").unwrap();
+        assert!(config.git.bridge.enabled);
+        match config.git.bridge.default_enablement() {
+            Err(DefaultEnablementRefusal::UnmeasuredGate { gate }) => {
+                assert_eq!(gate, "recovery", "the first unmeasured gate is named")
+            }
+            other => panic!("expected an unmeasured-gate refusal, got {other:?}"),
+        }
+    }
+
+    /// Review R4: the recorded gate surface is exercised for what it
+    /// actually is — every named gate is unmeasured, so default enablement
+    /// refuses with the FIRST gate and can never report `FailedGate` while
+    /// the constants are fixed. The helper is consumed by the CLI enable
+    /// command and the consent-gated telemetry sink (`for_repository`);
+    /// the live opt-in/rollback transition is covered by the CLI bridge
+    /// test `enable_records_opt_in_and_disable_rolls_back`, which drives
+    /// the real config file. This test asserts the real recorded states,
+    /// not constructed booleans.
+    #[test]
+    fn default_enablement_refuses_with_the_real_unmeasured_gate_surface() {
+        let config: RepoConfig = toml::from_str("[git.bridge]\nenabled = true\n").unwrap();
+        assert!(config.git.bridge.enabled);
+
+        // The recorded surface itself: every gate unmeasured and unpassed.
+        for (gate, state) in ROLLOUT_GATES {
+            assert!(!state.measured, "gate '{gate}' must stay unmeasured until the RFC §21 matrix records measured evidence and owner approval");
+            assert!(
+                !state.passed,
+                "gate '{gate}' must stay unpassed without owner approval"
+            );
+        }
+        // Opting in does not approve default rollout: the first gate is
+        // named as unmeasured.
+        match config.git.bridge.default_enablement() {
+            Err(DefaultEnablementRefusal::UnmeasuredGate { gate }) => {
+                assert_eq!(gate, "recovery")
+            }
+            other => panic!("expected an unmeasured-gate refusal, got {other:?}"),
+        }
+
+        // Rollback semantics on the type: opting back out refuses with
+        // NotOptedIn regardless of any gate state.
+        let rolled_back: RepoConfig = toml::from_str("").unwrap();
+        assert_eq!(
+            rolled_back.git.bridge.default_enablement(),
+            Err(DefaultEnablementRefusal::NotOptedIn)
+        );
+        // The FailedGate branch is unreachable while every gate is
+        // unmeasured — that is the recorded decision surface, and this
+        // test pins it instead of simulating approval.
+    }
+
+    #[test]
+    fn git_trust_defaults_to_empty_deny_by_default_policy() {
+        let config: RepoConfig = toml::from_str("").unwrap();
+        assert!(config.git.trust.signers.is_empty());
+        assert!(config.git.trust.revoked.is_empty());
+        // Deny-by-default: with no configuration at all, only the repository
+        // identity is trusted.
+        assert_eq!(
+            config
+                .git
+                .trust
+                .evaluate("did:atomic:AA", Some("did:atomic:AA")),
+            SignerTrust::Trusted
+        );
+        assert_eq!(
+            config
+                .git
+                .trust
+                .evaluate("did:atomic:BB", Some("did:atomic:AA")),
+            SignerTrust::Unknown
+        );
+        assert_eq!(
+            config.git.trust.evaluate("did:atomic:BB", None),
+            SignerTrust::Unknown
+        );
+    }
+
+    #[test]
+    fn git_trust_parses_signers_and_revoked() {
+        let config: RepoConfig = toml::from_str(
+            "[git.trust]\nsigners = [\"did:atomic:COLLAB\"]\nrevoked = [\"did:atomic:BANNED\"]\n",
+        )
+        .unwrap();
+        assert_eq!(
+            config.git.trust.evaluate("did:atomic:COLLAB", None),
+            SignerTrust::Trusted
+        );
+        assert_eq!(
+            config.git.trust.evaluate("did:atomic:BANNED", None),
+            SignerTrust::Revoked
+        );
+        assert_eq!(
+            config.git.trust.evaluate("did:atomic:OTHER", None),
+            SignerTrust::Unknown
+        );
+    }
+
+    #[test]
+    fn git_trust_revocation_overrides_signers_and_repository_identity() {
+        let config = GitTrustConfig {
+            signers: vec!["did:atomic:BOTH".to_string()],
+            revoked: vec!["did:atomic:BOTH".to_string()],
+        };
+        assert_eq!(
+            config.evaluate("did:atomic:BOTH", None),
+            SignerTrust::Revoked,
+            "revoked must win over the signers allowlist"
+        );
+        let revoked_identity = GitTrustConfig {
+            signers: Vec::new(),
+            revoked: vec!["did:atomic:REPO".to_string()],
+        };
+        assert_eq!(
+            revoked_identity.evaluate("did:atomic:REPO", Some("did:atomic:REPO")),
+            SignerTrust::Revoked,
+            "an explicitly revoked repository identity stays revoked"
+        );
+    }
+
+    #[test]
+    fn git_trust_reloads_from_repository_config_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        std::fs::write(&path, "").unwrap();
+        let before = RepoConfig::load(&path).unwrap();
+        assert_eq!(
+            before.git.trust.evaluate("did:atomic:X", None),
+            SignerTrust::Unknown
+        );
+
+        std::fs::write(&path, "[git.trust]\nsigners = [\"did:atomic:X\"]\n").unwrap();
+        let after = RepoConfig::load(&path).unwrap();
+        assert_eq!(
+            before.git.trust.evaluate("did:atomic:X", None),
+            SignerTrust::Unknown,
+            "the previously loaded policy snapshot is unchanged"
+        );
+        assert_eq!(
+            after.git.trust.evaluate("did:atomic:X", None),
+            SignerTrust::Trusted,
+            "a configuration reload picks up newly trusted signers"
+        );
     }
 
     #[test]

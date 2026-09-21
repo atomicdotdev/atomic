@@ -9,10 +9,12 @@ use crate::operation::{
     decode_effect_receipt, decode_operation, decode_operation_heads, decode_operation_scope,
     EffectReceipt, Operation, OperationHeads, OperationScope,
 };
-use crate::pristine::tables::{VAULT_ENTRIES, VAULT_MANIFEST};
-use crate::pristine::traits::tag::GitShaIndexTxnT;
+use crate::pristine::tables::{BRIDGE_EVENT_CAPTURES, BRIDGE_EVENT_CAPTURE_ANCHORS, BRIDGE_REF_CAPTURE_TOKENS, REF_MAPPINGS, VAULT_ENTRIES, VAULT_MANIFEST};
+use crate::pristine::traits::tag::{BridgeEventCaptureTxnT, GitCommitClosureTxnT, GitShaIndexTxnT};
 use crate::pristine::traits::tag::TagRecord;
+use crate::pristine::traits::capability_txn::{capability_metadata_key, CapabilityTxnT};
 use crate::pristine::traits::{EmbeddingsTxnT, KgTxnT, TagTxnT, VaultEntryMeta, VaultTxnT};
+use crate::pristine::ref_mapping::RefMappingTxnT;
 use crate::pristine::vault::{EmbeddingRecord, KgEdge, KgNode, SearchResult};
 use crate::pristine::{
     decode_file_index_v2, decode_set_id_index_entry, FileIndexV2Entry, FileIndexV2Key,
@@ -151,6 +153,16 @@ impl SetIdIndexTxnT for ReadTxn {
     }
 }
 
+impl CapabilityTxnT for ReadTxn {
+    fn required_capability_version(&self, id: &str) -> PristineResult<Option<u32>> {
+        let table = self.txn.open_table(PRISTINE_META)?;
+        let version = table
+            .get(capability_metadata_key(id).as_str())?
+            .map(|version| version.value());
+        Ok(version)
+    }
+}
+
 impl PathClaimTxnT for ReadTxn {
     fn path_claim_schema_version(&self) -> PristineResult<Option<u32>> {
         let table = self.txn.open_table(PRISTINE_META)?;
@@ -271,46 +283,43 @@ impl GraphTxnT for ReadTxn {
         let change_id = pos.change.get();
         let target_pos = pos.pos.get();
 
-        let start_key = encode_vertex(change_id, 0, 0);
-        let end_key = encode_vertex(change_id, u64::MAX, u64::MAX);
-
-        // Track empty span match as fallback
-        let mut empty_vertex_match: Option<GraphNode<NodeId>> = None;
-
-        for result in table.range::<&[u8; 24]>(&start_key..=&end_key)? {
-            let (key, _values) = result?;
-            let (v_change, v_start, v_end) = decode_vertex(key.value());
-
-            if v_change != change_id {
-                continue;
-            }
-
-            // Check for non-empty span containing this position.
-            // For edges pointing to content, we want to find the content span
-            // even if there's an empty inode span at the same start position.
-            // This is critical for graph traversal: an edge to position 9 should
-            // find content span V[9:23], not inode span V[9:9].
-            if v_start != v_end && v_start <= target_pos && target_pos < v_end {
+        // Binary-search candidates instead of scanning every vertex of the
+        // change (the historical full-range scan made each call
+        // O(change vertices); within one change the non-empty hunks are
+        // DISJOINT ranges of that change's contents buffer, so the containing
+        // vertex is the LAST vertex key ≤ (pos, u64::MAX) and the
+        // empty-vertex fallback is an exact-key lookup — review ::15,
+        // 2026-09-16). Semantics identical to the scan, including the
+        // inode/content start ambiguity (AGENTS.md "Position Ambiguity").
+        let upper = encode_vertex(change_id, target_pos, u64::MAX);
+        if let Some((v_change, v_start, v_end)) = table
+            .range::<&[u8; 24]>(&encode_vertex(change_id, 0, 0)..=&upper)?
+            .rev()
+            .next()
+            .transpose()?
+            .map(|(key, _values)| decode_vertex(key.value()))
+        {
+            if v_change == change_id
+                && v_start != v_end
+                && v_start <= target_pos
+                && target_pos < v_end
+            {
                 return Ok(GraphNode {
-                    change: NodeId::new(v_change),
-                    start: ChangePosition::new(v_start),
-                    end: ChangePosition::new(v_end),
-                });
-            }
-
-            // Track empty span at exact position as fallback
-            if v_start == v_end && v_start == target_pos && empty_vertex_match.is_none() {
-                empty_vertex_match = Some(GraphNode {
-                    change: NodeId::new(v_change),
+                    change: NodeId::new(change_id),
                     start: ChangePosition::new(v_start),
                     end: ChangePosition::new(v_end),
                 });
             }
         }
 
-        // Return empty span if no non-empty span matched
-        if let Some(found) = empty_vertex_match {
-            return Ok(found);
+        // Empty-vertex fallback: the exact key (change, pos, pos).
+        let empty_key = encode_vertex(change_id, target_pos, target_pos);
+        if try_is_present(table.get(&empty_key)?)? {
+            return Ok(GraphNode {
+                change: NodeId::new(change_id),
+                start: ChangePosition::new(target_pos),
+                end: ChangePosition::new(target_pos),
+            });
         }
 
         Err(PristineError::BlockNotFound {
@@ -345,32 +354,44 @@ impl GraphTxnT for ReadTxn {
             });
         }
 
-        // SECOND: Fall back to iteration to find vertices that end at this position
-        let start_key = encode_vertex(change_id, 0, 0);
-        let end_key = encode_vertex(change_id, u64::MAX, u64::MAX);
-
-        // Look for a span that ends at this position or contains it
-        for result in table.range::<&[u8; 24]>(&start_key..=&end_key)? {
-            let (key, _values) = result?;
-            let (v_change, v_start, v_end) = decode_vertex(key.value());
-
-            if v_change != change_id {
-                continue;
+        // SECOND: binary-search the vertices that end at or contain this
+        // position (the historical full-range scan made each call
+        // O(change vertices) — review ::15, 2026-09-16). Under within-change
+        // hunk disjointness: an ends-at-pos span (unique when it exists) is
+        // the last vertex key ≤ (pos-1, MAX); a contains-pos span (unique
+        // when it exists) is the last vertex key ≤ (pos, MAX); an
+        // ends-at-pos span starts strictly before any contains-pos span, so
+        // this order preserves the historical first-match semantics.
+        if target_pos > 0 {
+            let before_upper = encode_vertex(change_id, target_pos - 1, u64::MAX);
+            if let Some((v_change, v_start, v_end)) = table
+                .range::<&[u8; 24]>(&encode_vertex(change_id, 0, 0)..=&before_upper)?
+                .rev()
+                .next()
+                .transpose()?
+                .map(|(key, _values)| decode_vertex(key.value()))
+            {
+                if v_change == change_id && v_end == target_pos && v_start < v_end {
+                    return Ok(GraphNode {
+                        change: NodeId::new(change_id),
+                        start: ChangePosition::new(v_start),
+                        end: ChangePosition::new(v_end),
+                    });
+                }
             }
+        }
 
-            // Check for span that ends at this position
-            if v_end == target_pos && v_start < v_end {
+        let contains_upper = encode_vertex(change_id, target_pos, u64::MAX);
+        if let Some((v_change, v_start, v_end)) = table
+            .range::<&[u8; 24]>(&encode_vertex(change_id, 0, 0)..=&contains_upper)?
+            .rev()
+            .next()
+            .transpose()?
+            .map(|(key, _values)| decode_vertex(key.value()))
+        {
+            if v_change == change_id && v_start <= target_pos && target_pos < v_end {
                 return Ok(GraphNode {
-                    change: NodeId::new(v_change),
-                    start: ChangePosition::new(v_start),
-                    end: ChangePosition::new(v_end),
-                });
-            }
-
-            // Also check if position falls within [start, end)
-            if v_start <= target_pos && target_pos < v_end {
-                return Ok(GraphNode {
-                    change: NodeId::new(v_change),
+                    change: NodeId::new(change_id),
                     start: ChangePosition::new(v_start),
                     end: ChangePosition::new(v_end),
                 });
@@ -986,6 +1007,23 @@ impl FileIndexV2TxnT for ReadTxn {
 // Session data queries
 
 impl ReadTxn {
+    /// Sequence number recorded for a view's Merkle state, if that state is
+    /// present (CB-12B receiving-side verification uses this to locate the
+    /// ingested boundary between an old and a new view state).
+    pub fn get_state_seq(
+        &self,
+        view_id: u64,
+        merkle: &crate::types::Merkle,
+    ) -> PristineResult<Option<u64>> {
+        use crate::pristine::tables::{encode_view_merkle, STATES};
+
+        let table = self.txn.open_table(STATES)?;
+        match table.get(&encode_view_merkle(view_id, merkle.as_bytes()))? {
+            Some(value) => Ok(Some(value.value())),
+            None => Ok(None),
+        }
+    }
+
     /// Read the indexed metadata for an external session ID.
     pub fn get_session_record(
         &self,
@@ -2061,6 +2099,7 @@ impl<'txn> TreeTxnT for CachedGraphTxn<'txn> {
         self.txn.get_directory_flags(inode)
     }
 
+
     fn get_path(&self, inode: Inode) -> PristineResult<Option<String>> {
         self.txn.get_path(inode)
     }
@@ -2113,6 +2152,95 @@ impl<'txn> TreeTxnT for CachedGraphTxn<'txn> {
 
     fn iter_file_index(&self) -> PristineResult<Vec<FileIndexEntry>> {
         self.txn.iter_file_index()
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// CrdtTxnT — delegate to the inner ReadTxn (CRDT tables are global)
+// ─────────────────────────────────────────────────────────────────────────
+
+impl<'txn> crate::pristine::CrdtTxnT for CachedGraphTxn<'txn> {
+    fn get_crdt_trunk(
+        &self,
+        key: &[u8; 12],
+    ) -> PristineResult<Option<crate::crdt::tables::SerializedTrunk>> {
+        self.txn.get_crdt_trunk(key)
+    }
+
+    fn get_crdt_inode_trunk(&self, inode: u64) -> PristineResult<Option<[u8; 12]>> {
+        self.txn.get_crdt_inode_trunk(inode)
+    }
+
+    fn get_crdt_branch(
+        &self,
+        key: &[u8; 12],
+    ) -> PristineResult<Option<crate::crdt::tables::SerializedBranch>> {
+        self.txn.get_crdt_branch(key)
+    }
+
+    fn get_crdt_branch_after(&self, branch_key: &[u8; 12]) -> PristineResult<Option<[u8; 12]>> {
+        self.txn.get_crdt_branch_after(branch_key)
+    }
+
+    fn get_crdt_leaf(
+        &self,
+        key: &[u8; 12],
+    ) -> PristineResult<Option<crate::crdt::tables::SerializedLeaf>> {
+        self.txn.get_crdt_leaf(key)
+    }
+
+    fn get_trunk_by_path(&self, path: &str) -> PristineResult<Option<crate::crdt::TrunkId>> {
+        self.txn.get_trunk_by_path(path)
+    }
+
+    fn iter_trunk_branches(
+        &self,
+        trunk_key: &[u8; 12],
+    ) -> PristineResult<Box<dyn Iterator<Item = PristineResult<[u8; 12]>> + '_>> {
+        self.txn.iter_trunk_branches(trunk_key)
+    }
+
+    fn iter_branch_leaves(
+        &self,
+        branch_key: &[u8; 12],
+    ) -> PristineResult<Box<dyn Iterator<Item = PristineResult<[u8; 12]>> + '_>> {
+        self.txn.iter_branch_leaves(branch_key)
+    }
+
+    fn get_crdt_branch_vertex(
+        &self,
+        branch_key: &[u8; 12],
+    ) -> PristineResult<Option<crate::types::GraphNode<crate::types::NodeId>>> {
+        self.txn.get_crdt_branch_vertex(branch_key)
+    }
+
+    fn get_crdt_vertex_branch(
+        &self,
+        vertex_key: &[u8; 24],
+    ) -> PristineResult<Option<crate::crdt::BranchId>> {
+        self.txn.get_crdt_vertex_branch(vertex_key)
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// InodeAttrTxnT — delegate to the inner ReadTxn (attribute registers are global)
+// ─────────────────────────────────────────────────────────────────────────
+
+impl<'txn> crate::pristine::InodeAttrTxnT for CachedGraphTxn<'txn> {
+    fn get_inode_attr_events(
+        &self,
+        position: Position<NodeId>,
+        name: crate::change::InodeAttrName,
+    ) -> PristineResult<Vec<crate::pristine::InodeAttrEvent>> {
+        self.txn.get_inode_attr_events(position, name)
+    }
+
+    fn get_inode_attr_events_by_inode(
+        &self,
+        inode: Inode,
+        name: crate::change::InodeAttrName,
+    ) -> PristineResult<Vec<crate::pristine::InodeAttrEvent>> {
+        self.txn.get_inode_attr_events_by_inode(inode, name)
     }
 }
 
@@ -2846,8 +2974,144 @@ impl TagTxnT for ReadTxn {
 }
 
 // ============================================================================
+// IMMUTABLE GIT STATE BINDINGS
+// ============================================================================
+
+impl crate::pristine::BindingTxnT for ReadTxn {
+    fn get_binding_bytes(&self, id: &[u8; 32]) -> PristineResult<Option<Vec<u8>>> {
+        let table = match self.txn.open_table(BINDINGS) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+            Err(error) => return Err(PristineError::from(error)),
+        };
+        Ok(table.get(id)?.map(|value| value.value().to_vec()))
+    }
+
+    fn iter_binding_ids(&self) -> PristineResult<Vec<[u8; 32]>> {
+        let table = match self.txn.open_table(BINDINGS) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+            Err(error) => return Err(PristineError::from(error)),
+        };
+        let mut ids = Vec::new();
+        for row in table.iter()? {
+            let (key, _) = row?;
+            ids.push(*key.value());
+        }
+        Ok(ids)
+    }
+}
+
+// ============================================================================
 // GIT SHA INDEX
 // ============================================================================
+
+impl GitCommitClosureTxnT for ReadTxn {
+    fn get_git_commit_closure(&self, sha: &str) -> PristineResult<Option<Vec<Hash>>> {
+        let table = match self.txn.open_table(GIT_COMMIT_CLOSURES) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+            Err(error) => return Err(PristineError::from(error)),
+        };
+        match table.get(sha)? {
+            Some(bytes) => {
+                let value = bytes.value();
+                if value.len() < 4 {
+                    return Err(PristineError::Serialization {
+                        message: format!(
+                            "git commit closure for {sha} is truncated: {} byte(s)",
+                            value.len()
+                        ),
+                    });
+                }
+                let count = u32::from_le_bytes([value[0], value[1], value[2], value[3]]) as usize;
+                if value.len() != 4 + count * 32 {
+                    return Err(PristineError::Serialization {
+                        message: format!(
+                            "git commit closure for {sha} claims {count} hashes but holds {} bytes",
+                            value.len()
+                        ),
+                    });
+                }
+                let mut closure = Vec::with_capacity(count);
+                for index in 0..count {
+                    let start = 4 + index * 32;
+                    let mut hash = [0u8; 32];
+                    hash.copy_from_slice(&value[start..start + 32]);
+                    closure.push(Hash::from_bytes(hash));
+                }
+                Ok(Some(closure))
+            }
+            None => Ok(None),
+        }
+    }
+
+    fn has_git_commit_closure(&self, sha: &str) -> PristineResult<bool> {
+        let table = match self.txn.open_table(GIT_COMMIT_CLOSURES) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(false),
+            Err(error) => return Err(PristineError::from(error)),
+        };
+        Ok(table.get(sha)?.is_some())
+    }
+}
+
+impl BridgeEventCaptureTxnT for ReadTxn {
+    fn get_bridge_event_capture(&self, hash: &[u8; 32]) -> PristineResult<Option<Vec<u8>>> {
+        let table = match self.txn.open_table(BRIDGE_EVENT_CAPTURES) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+            Err(error) => return Err(PristineError::from(error)),
+        };
+        Ok(table.get(hash)?.map(|v| v.value().to_vec()))
+    }
+
+    fn get_bridge_event_capture_anchor(&self, hash: &[u8; 32]) -> PristineResult<Option<[u8; 32]>> {
+        let table = match self.txn.open_table(BRIDGE_EVENT_CAPTURE_ANCHORS) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+            Err(error) => return Err(PristineError::from(error)),
+        };
+        Ok(table.get(hash)?.map(|v| *v.value()))
+    }
+
+    fn get_bridge_ref_capture_token(
+        &self,
+        operation: &[u8; 32],
+    ) -> PristineResult<Option<[u8; 32]>> {
+        let table = match self.txn.open_table(BRIDGE_REF_CAPTURE_TOKENS) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+            Err(error) => return Err(PristineError::from(error)),
+        };
+        Ok(table.get(operation)?.map(|v| *v.value()))
+    }
+}
+
+impl RefMappingTxnT for ReadTxn {
+    fn get_ref_mapping_bytes(&self, view_id: u64) -> PristineResult<Option<Vec<u8>>> {
+        let table = match self.txn.open_table(REF_MAPPINGS) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+            Err(error) => return Err(PristineError::from(error)),
+        };
+        Ok(table.get(view_id)?.map(|guard| guard.value().to_vec()))
+    }
+
+    fn iter_ref_mapping_bytes(&self) -> PristineResult<Vec<(u64, Vec<u8>)>> {
+        let table = match self.txn.open_table(REF_MAPPINGS) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+            Err(error) => return Err(PristineError::from(error)),
+        };
+        let mut rows = Vec::new();
+        for row in table.iter()? {
+            let (key, value) = row?;
+            rows.push((key.value(), value.value().to_vec()));
+        }
+        Ok(rows)
+    }
+}
 
 impl GitShaIndexTxnT for ReadTxn {
     fn get_by_git_sha(&self, sha: &str) -> PristineResult<Option<NodeId>> {

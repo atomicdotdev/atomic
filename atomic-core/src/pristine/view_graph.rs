@@ -406,6 +406,118 @@ impl<'a, T: TreeTxnT> TreeTxnT for ViewGraph<'a, T> {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+// CrdtTxnT — delegate to inner txn (CRDT tables are global, not filtered)
+// ─────────────────────────────────────────────────────────────────────────
+
+impl<'a, T: crate::pristine::CrdtTxnT> crate::pristine::CrdtTxnT for ViewGraph<'a, T> {
+    fn get_crdt_trunk(
+        &self,
+        key: &[u8; 12],
+    ) -> Result<Option<crate::crdt::tables::SerializedTrunk>, PristineError> {
+        self.inner.get_crdt_trunk(key)
+    }
+
+    fn get_crdt_inode_trunk(&self, inode: u64) -> Result<Option<[u8; 12]>, PristineError> {
+        self.inner.get_crdt_inode_trunk(inode)
+    }
+
+    fn get_crdt_branch(
+        &self,
+        key: &[u8; 12],
+    ) -> Result<Option<crate::crdt::tables::SerializedBranch>, PristineError> {
+        self.inner.get_crdt_branch(key)
+    }
+
+    fn get_crdt_branch_after(
+        &self,
+        branch_key: &[u8; 12],
+    ) -> Result<Option<[u8; 12]>, PristineError> {
+        self.inner.get_crdt_branch_after(branch_key)
+    }
+
+    fn get_crdt_leaf(
+        &self,
+        key: &[u8; 12],
+    ) -> Result<Option<crate::crdt::tables::SerializedLeaf>, PristineError> {
+        self.inner.get_crdt_leaf(key)
+    }
+
+    fn get_trunk_by_path(&self, path: &str) -> Result<Option<crate::crdt::TrunkId>, PristineError> {
+        self.inner.get_trunk_by_path(path)
+    }
+
+    fn iter_trunk_branches(
+        &self,
+        trunk_key: &[u8; 12],
+    ) -> Result<Box<dyn Iterator<Item = Result<[u8; 12], PristineError>> + '_>, PristineError> {
+        self.inner.iter_trunk_branches(trunk_key)
+    }
+
+    fn iter_branch_leaves(
+        &self,
+        branch_key: &[u8; 12],
+    ) -> Result<Box<dyn Iterator<Item = Result<[u8; 12], PristineError>> + '_>, PristineError> {
+        self.inner.iter_branch_leaves(branch_key)
+    }
+
+    fn get_crdt_branch_vertex(
+        &self,
+        branch_key: &[u8; 12],
+    ) -> Result<Option<crate::types::GraphNode<crate::types::NodeId>>, PristineError> {
+        self.inner.get_crdt_branch_vertex(branch_key)
+    }
+
+    fn get_crdt_vertex_branch(
+        &self,
+        vertex_key: &[u8; 24],
+    ) -> Result<Option<crate::crdt::BranchId>, PristineError> {
+        self.inner.get_crdt_vertex_branch(vertex_key)
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// InodeAttrTxnT — register events are view-scoped (review CB-9C R1)
+// ─────────────────────────────────────────────────────────────────────────
+
+impl<'a, T: crate::pristine::InodeAttrTxnT> crate::pristine::InodeAttrTxnT for ViewGraph<'a, T> {
+    /// Only register events introduced by changes visible in THIS view.
+    ///
+    /// The POSITION_ATTRS/INODE_ATTRS tables are global, so the raw read
+    /// returns every sibling's writers. A change assembled on this view must
+    /// not import invisible sibling causality: an event written by a change
+    /// outside the view's closure is not an ancestor of the new change, and
+    /// wiring it as a dependency leaks foreign causality into the assembly
+    /// (review CB-9C R1). Event writers can never be ROOT
+    /// ([`InodeAttrEvent::new`] rejects it), so the closure check alone is
+    /// exact.
+    fn get_inode_attr_events(
+        &self,
+        position: Position<NodeId>,
+        name: crate::change::InodeAttrName,
+    ) -> Result<Vec<crate::pristine::InodeAttrEvent>, PristineError> {
+        Ok(self
+            .inner
+            .get_inode_attr_events(position, name)?
+            .into_iter()
+            .filter(|event| self.visibility.contains(event.introduced_by))
+            .collect())
+    }
+
+    fn get_inode_attr_events_by_inode(
+        &self,
+        inode: Inode,
+        name: crate::change::InodeAttrName,
+    ) -> Result<Vec<crate::pristine::InodeAttrEvent>, PristineError> {
+        Ok(self
+            .inner
+            .get_inode_attr_events_by_inode(inode, name)?
+            .into_iter()
+            .filter(|event| self.visibility.contains(event.introduced_by))
+            .collect())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -554,5 +666,101 @@ mod tests {
         };
 
         assert_eq!(vg.inner().0, 123);
+    }
+
+    /// Review CB-9C R1: register events read through a view-scoped graph are
+    /// exactly the events introduced by the view's visible changes. An
+    /// invisible sibling chmod must never appear — otherwise a change
+    /// assembled on this view would import foreign sibling causality as a
+    /// dependency.
+    #[test]
+    fn register_events_are_visible_only_inside_the_view_closure() {
+        use crate::change::InodeAttr;
+        use crate::pristine::{
+            InodeAttrEvent, InodeAttrMutTxnT, InodeAttrTxnT, MutTxnT, Pristine,
+        };
+
+        let temp = tempfile::tempdir().unwrap();
+        let pristine = Pristine::open(temp.path().join("vg-attrs.redb")).unwrap();
+        let h1 = Hash::of(b"vg base change");
+        let h2 = Hash::of(b"vg left sibling chmod");
+        let h3 = Hash::of(b"vg right sibling chmod");
+        let inode = Inode::new(11);
+        let position = Position::new(NodeId::new(5), ChangePosition::new(3));
+        let (id1, id2, id3) = {
+            let mut txn = pristine.write_txn().unwrap();
+            let id1 = txn.register_change(&h1).unwrap();
+            let id2 = txn.register_change(&h2).unwrap();
+            let id3 = txn.register_change(&h3).unwrap();
+            txn.put_change_deps(id1, &[]).unwrap();
+            txn.put_change_deps(id2, &[h1]).unwrap();
+            txn.put_change_deps(id3, &[]).unwrap();
+            txn.put_inode_attr_event(
+                inode,
+                position,
+                InodeAttrEvent::new(id1, InodeAttr::Mode(0o644)).unwrap(),
+            )
+            .unwrap();
+            txn.put_inode_attr_event(
+                inode,
+                position,
+                InodeAttrEvent::new(id2, InodeAttr::Mode(0o755)).unwrap(),
+            )
+            .unwrap();
+            txn.put_inode_attr_event(
+                inode,
+                position,
+                InodeAttrEvent::new(id3, InodeAttr::Mode(0o700)).unwrap(),
+            )
+            .unwrap();
+            txn.commit().unwrap();
+            (id1, id2, id3)
+        };
+
+        let txn = pristine.read_txn().unwrap();
+
+        // Base-only view: the register's visible state is the base writer
+        // alone, even though the global table also holds both siblings.
+        let base_only = GraphVisibilityClosure::from_ordered_unchecked([id1]);
+        let view = ViewGraph::new(&txn, base_only);
+        let events = view
+            .get_inode_attr_events(position, crate::change::InodeAttrName::Mode)
+            .unwrap();
+        assert_eq!(
+            events,
+            vec![InodeAttrEvent {
+                introduced_by: id1,
+                value: InodeAttr::Mode(0o644)
+            }],
+            "an invisible sibling chmod must not surface in the view's register"
+        );
+        assert!(view
+            .get_inode_attr_events_by_inode(inode, crate::change::InodeAttrName::Mode)
+            .unwrap()
+            .iter()
+            .all(|event| event.introduced_by == id1));
+
+        // A view that saw the left sibling sees base + left writers, never
+        // the independent right sibling.
+        let with_left = GraphVisibilityClosure::from_ordered_unchecked([id1, id2]);
+        let view = ViewGraph::new(&txn, with_left);
+        let writers: std::collections::HashSet<NodeId> = view
+            .get_inode_attr_events(position, crate::change::InodeAttrName::Mode)
+            .unwrap()
+            .into_iter()
+            .map(|event| event.introduced_by)
+            .collect();
+        assert_eq!(
+            writers,
+            std::iter::once(id1).chain(std::iter::once(id2)).collect(),
+            "the view sees its own closure's writers only"
+        );
+        // Contrast: the unscoped transaction still holds all three global
+        // rows — the fence is at the view boundary, not in the table.
+        let all = txn
+            .get_inode_attr_events(position, crate::change::InodeAttrName::Mode)
+            .unwrap();
+        assert_eq!(all.len(), 3);
+        assert!(all.iter().any(|event| event.introduced_by == id3));
     }
 }

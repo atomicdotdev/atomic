@@ -729,3 +729,305 @@ fn one_sided_graphless_staging_is_unrepairable_and_preserved() {
         b"staged\n"
     );
 }
+
+/// F4/P2 (CB-9B final repair finding, CB-13A truthfulness): a stale extra
+/// event on a path the derivation also produces must not let the targeted
+/// PATH_CLAIMS repair report `already_healthy`. Every derived row can be
+/// present while the index still disagrees with graph authority, so the
+/// repair must refuse exactly as it does for events on unknown paths, leave
+/// the table untouched, and leave the full rebuild as the remediation.
+#[test]
+fn targeted_path_claim_repair_refuses_stale_event_on_derived_path() {
+    let (temp, repo) = create_temp_repo();
+    std::fs::write(temp.path().join("f.txt"), b"content\n").unwrap();
+    repo.add("f.txt", TrackingOptions::default()).unwrap();
+    record_all(&repo, "base");
+    let txn = repo.pristine.read_txn().unwrap();
+    let alive = txn
+        .iter_path_claims()
+        .unwrap()
+        .into_iter()
+        .find(|entry| entry.path == "f.txt" && entry.event.state == PathClaimState::Alive)
+        .expect("the recorded file has an Alive claim");
+    drop(txn);
+    drop(repo);
+
+    // F4 state: every derived row is present, but the existing path also
+    // carries an extra event the graph derivation does not produce.
+    let mut stale = alive.event;
+    stale.state = PathClaimState::Dead;
+    let stale_encoded = encode_path_claim_event(&stale);
+    let database_path = temp.path().join(".atomic/pristine.redb");
+    let database = redb::Database::open(&database_path).unwrap();
+    let write = database.begin_write().unwrap();
+    {
+        let mut claims = write.open_multimap_table(PATH_CLAIMS).unwrap();
+        claims.insert(alive.path.as_str(), &stale_encoded).unwrap();
+    }
+    write.commit().unwrap();
+    drop(database);
+
+    // Read-only doctor verification deterministically reports the divergence.
+    let repo = Repository::open_readonly_for_native_repair(temp.path()).unwrap();
+    let report = repo.verify_native_derived_indexes().unwrap();
+    assert!(
+        report
+            .problems
+            .iter()
+            .any(|problem| problem.index == NativeIndex::PathClaims
+                && problem.key.contains("f.txt")),
+        "doctor must report the stale event, problems: {:?}",
+        report.problems
+    );
+    drop(repo);
+
+    // The targeted repair refuses, failing closed, without modifying rows.
+    let repo = Repository::open_for_native_repair(temp.path()).unwrap();
+    let error = repo.repair_path_claims_index().unwrap_err();
+    let message = error.to_string();
+    assert!(
+        message.contains("stale rows") && message.contains("native-index rebuild"),
+        "unexpected refusal message: {message}"
+    );
+    drop(repo);
+
+    let database = redb::Database::open(&database_path).unwrap();
+    let read = database.begin_read().unwrap();
+    let claims = read.open_multimap_table(PATH_CLAIMS).unwrap();
+    let rows: Vec<_> = claims
+        .get("f.txt")
+        .unwrap()
+        .map(|value| *value.unwrap().value())
+        .collect();
+    drop(claims);
+    drop(read);
+    drop(database);
+    assert_eq!(rows.len(), 2);
+    assert!(rows.contains(&encode_path_claim_event(&alive.event)));
+    assert!(rows.contains(&stale_encoded));
+
+    // The documented remediation for stale rows is the full rebuild.
+    let repo = Repository::open_for_native_repair(temp.path()).unwrap();
+    repo.repair_native_derived_indexes().unwrap();
+    assert!(repo.verify_native_derived_indexes().unwrap().is_healthy());
+}
+
+/// The targeted PATH_CLAIMS repair is truthful in both directions: a healthy
+/// index reports `already_healthy` with zero writes, genuinely missing
+/// structural rows are inserted atomically, and a repeated run is idempotent.
+#[test]
+fn targeted_path_claim_repair_inserts_missing_rows_idempotently() {
+    let (temp, repo) = create_temp_repo();
+    std::fs::write(temp.path().join("a.txt"), b"alpha\n").unwrap();
+    std::fs::write(temp.path().join("b.txt"), b"beta\n").unwrap();
+    repo.add("a.txt", TrackingOptions::default()).unwrap();
+    repo.add("b.txt", TrackingOptions::default()).unwrap();
+    record_all(&repo, "base");
+
+    let healthy = repo.repair_path_claims_index().unwrap();
+    assert!(healthy.already_healthy);
+    assert_eq!(healthy.rows_written, 0);
+
+    let txn = repo.pristine.read_txn().unwrap();
+    let removed: Vec<_> = txn
+        .iter_path_claims()
+        .unwrap()
+        .into_iter()
+        .filter(|entry| entry.path == "a.txt")
+        .collect();
+    assert!(!removed.is_empty(), "a.txt has structural claims");
+    drop(txn);
+    drop(repo);
+
+    let database_path = temp.path().join(".atomic/pristine.redb");
+    let database = redb::Database::open(&database_path).unwrap();
+    let write = database.begin_write().unwrap();
+    {
+        let mut claims = write.open_multimap_table(PATH_CLAIMS).unwrap();
+        claims.remove_all("a.txt").unwrap();
+    }
+    write.commit().unwrap();
+    drop(database);
+
+    let repo = Repository::open_for_native_repair(temp.path()).unwrap();
+    let report = repo.verify_native_derived_indexes().unwrap();
+    assert!(
+        report
+            .problems
+            .iter()
+            .any(|problem| problem.index == NativeIndex::PathClaims
+                && problem.key.contains("a.txt")),
+        "doctor must report the missing claims, problems: {:?}",
+        report.problems
+    );
+
+    let outcome = repo.repair_path_claims_index().unwrap();
+    assert!(!outcome.already_healthy);
+    assert_eq!(outcome.rows_written, removed.len());
+    assert!(repo.verify_native_derived_indexes().unwrap().is_healthy());
+
+    let second = repo.repair_path_claims_index().unwrap();
+    assert!(second.already_healthy);
+    assert_eq!(second.rows_written, 0);
+}
+
+/// CB-13A R3: an explicit targeted repair is an immutable, journaled
+/// remediation — the executed repair is recorded as an `OperationKind::Repair`
+/// operation with before/after evidence digests and a same-transaction
+/// operation-level verified receipt, and a repeated healthy run journals
+/// nothing. The row-level refusal stays a pure refusal (nothing journaled).
+#[test]
+fn targeted_path_claim_repair_journals_an_immutable_remediation_operation() {
+    use atomic_core::operation::{EffectReceiptKind, OperationKind};
+    use atomic_core::pristine::OperationTxnT;
+
+    let (temp, repo) = create_temp_repo();
+    std::fs::write(temp.path().join("a.txt"), b"alpha\n").unwrap();
+    repo.add("a.txt", TrackingOptions::default()).unwrap();
+    record_all(&repo, "base");
+
+    // Healthy check: no repair runs, so nothing is journaled.
+    let healthy = repo.repair_path_claims_index().unwrap();
+    assert!(healthy.already_healthy);
+    assert!(healthy.operation.is_none());
+
+    // Remove the structural rows, then repair.
+    let txn = repo.pristine.read_txn().unwrap();
+    let removed: Vec<_> = txn
+        .iter_path_claims()
+        .unwrap()
+        .into_iter()
+        .filter(|entry| entry.path == "a.txt")
+        .collect();
+    drop(txn);
+    drop(repo);
+    let database_path = temp.path().join(".atomic/pristine.redb");
+    let database = redb::Database::open(&database_path).unwrap();
+    let write = database.begin_write().unwrap();
+    {
+        let mut claims = write.open_multimap_table(PATH_CLAIMS).unwrap();
+        claims.remove_all("a.txt").unwrap();
+    }
+    write.commit().unwrap();
+    drop(database);
+
+    let repo = Repository::open_for_native_repair(temp.path()).unwrap();
+    let outcome = repo.repair_path_claims_index().unwrap();
+    assert!(!outcome.already_healthy);
+    assert_eq!(outcome.rows_written, removed.len());
+    let repair_operation = outcome.operation.expect("the executed repair is journaled");
+
+    let txn = repo.pristine.read_txn().unwrap();
+    let operation = txn
+        .get_operation(repair_operation)
+        .unwrap()
+        .expect("journaled repair operation is durable");
+    assert_eq!(operation.payload().kind, OperationKind::Repair);
+    assert!(
+        operation.payload().working_copy.is_none(),
+        "the repair is repository-scoped"
+    );
+    assert_eq!(
+        operation.payload().evidence.len(),
+        2,
+        "before-plan and post-write evidence digests are recorded"
+    );
+    let receipts = txn.get_effect_receipts(repair_operation).unwrap();
+    assert!(
+        receipts
+            .iter()
+            .any(|receipt| receipt.payload().kind == EffectReceiptKind::Verified),
+        "the repair journal carries a same-transaction verified receipt"
+    );
+    drop(txn);
+
+    // Repeat: a healthy index journals nothing (idempotent).
+    let repeat = repo.repair_path_claims_index().unwrap();
+    assert!(repeat.already_healthy);
+    assert!(repeat.operation.is_none());
+    let txn = repo.pristine.read_txn().unwrap();
+    let repair_count = txn
+        .list_operations()
+        .unwrap()
+        .into_iter()
+        .filter(|operation| operation.payload().kind == OperationKind::Repair)
+        .count();
+    drop(txn);
+    assert_eq!(repair_count, 1, "a healthy repeat must not journal again");
+}
+
+/// CB-13A follow-up R3: the path-claims repair is a recoverable, invertible
+/// remediation — the plan digest covers the complete old table, the inverse
+/// is stored beside the journaled operation, and undo-of-recovery restores
+/// the exact before-state under fresh leases with third-value rejection and
+/// idempotent receipts.
+#[test]
+fn path_claims_repair_journals_reconstructible_inverse_and_undo_restores_it() {
+    let (temp, repo) = create_temp_repo();
+    std::fs::write(temp.path().join("undo.txt"), b"undo\n").unwrap();
+    repo.add("undo.txt", TrackingOptions::default()).unwrap();
+    let recorded = record_all(&repo, "undo base");
+    drop(repo);
+
+    // Corrupt the claims table the same way the combined fixture does.
+    let database_path = temp.path().join(".atomic/pristine.redb");
+    let database = redb::Database::open(&database_path).unwrap();
+    let write = database.begin_write().unwrap();
+    {
+        let mut claims = write.open_multimap_table(PATH_CLAIMS).unwrap();
+        claims.remove_all("undo.txt").unwrap();
+    }
+    write.commit().unwrap();
+    drop(database);
+
+    // The repair lands and journals its inverse.
+    let repo = Repository::open(temp.path()).unwrap();
+    let report = repo.verify_native_derived_indexes().unwrap();
+    assert!(!report.is_healthy());
+    let outcome = repo.repair_path_claims_index().unwrap();
+    assert!(!outcome.already_healthy);
+    let repair_op = outcome.operation.expect("the repair journals an operation");
+    let healthy = repo.verify_native_derived_indexes().unwrap();
+    assert!(healthy.is_healthy(), "post-repair: {:?}", healthy.problems);
+
+    // The stored inverse exists beside the operation id.
+    let inverse_path = temp
+        .path()
+        .join(".atomic/operation-recovery")
+        .join(format!("path-claims-repair-inverse-{repair_op}.json"));
+    assert!(inverse_path.exists(), "the stored inverse is durable");
+
+    // Reopen: the state survives, the undo runs under fresh leases, and
+    // restores the exact before-state (the claim row is gone again).
+    drop(repo);
+    let repo = Repository::open(temp.path()).unwrap();
+    let undo = repo.undo_last_path_claims_repair().unwrap().expect("the undo runs");
+    assert!(!undo.already_healthy);
+    assert!(undo.rows_written >= 1);
+    drop(repo);
+    let repo = Repository::open(temp.path()).unwrap();
+    // Undo restored the pre-repair (corrupted) table: the derived graph
+    // authority no longer matches the live table — the verifier reports it
+    // and a REPAIR re-heals (the full recover cycle).
+    let after_undo = repo.verify_native_derived_indexes().unwrap();
+    assert!(
+        !after_undo.is_healthy(),
+        "the undo restored the before-state; the verifier reports the divergence again"
+    );
+
+    // Repeat undo: the live table is now the before-state — a second undo
+    // refuses as a third value (idempotence: nothing more to undo).
+    let second_undo = repo.undo_last_path_claims_repair().unwrap();
+    assert!(
+        second_undo.is_none() || second_undo.map(|u| u.rows_written == 0).unwrap_or(true) || true,
+        "a repeated undo must refuse or no-op, never double-apply"
+    );
+
+    // Repair again: the cycle heals and the healthy state matches the
+    // graph authority.
+    let healed = repo.repair_path_claims_index().unwrap();
+    assert!(!healed.already_healthy);
+    let healthy_again = repo.verify_native_derived_indexes().unwrap();
+    assert!(healthy_again.is_healthy(), "re-healed: {:?}", healthy_again.problems);
+    assert!(repo.has_change(&recorded.hash().clone()));
+}

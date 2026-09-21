@@ -9,6 +9,25 @@ use crate::types::{NodeId, Position};
 /// Defaults used when a legacy inode has no graph-backed attribute events.
 pub const DEFAULT_REGULAR_MODE: u16 = 0o644;
 
+/// The POSIX mode a freshly created symlink carries on this platform.
+///
+/// Linux `symlink(2)` ignores umask and always yields full permissions
+/// (`0o777`); macOS applies umask and typically yields `0o755`. Symlink
+/// permission bits are not settable through `std` on Linux (there is no
+/// `lchmod`), so leased effect plans must expect the platform's creation
+/// mode for `FileKind::Symlink` — never the inode's stored mode, which
+/// records Git's kind (120000) semantics rather than physical bits.
+pub fn platform_symlink_mode() -> u16 {
+    #[cfg(target_os = "linux")]
+    {
+        0o777
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        0o755
+    }
+}
+
 /// An unambiguous inode materialization plan.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct InodeMaterialization {

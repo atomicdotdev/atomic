@@ -7,6 +7,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use atomic_core::operation::{GitHashAlgorithm, GitObjectId};
 use atomic_core::Hash;
@@ -65,17 +66,197 @@ pub fn observe_git_index(
             expected: policy.object_format,
         });
     }
-    let index = repository
-        .index()
-        .map_err(|error| ObservationError::GitIndex(error.to_string()))?;
-    observe_open_git_index(&repository, &index)
+    match repository.index() {
+        Ok(index) => observe_open_git_index(observed_algorithm, &index),
+        // libgit2 cannot parse indexes carrying mandatory extensions it does
+        // not implement (e.g. `sdir` sparse-directory entries in sparse
+        // indexes). Fall back to read-only plumbing so observation keeps
+        // working instead of failing status in sparse-checkout repositories.
+        Err(_) => observe_git_index_via_plumbing(root, None, observed_algorithm),
+    }
 }
 
-fn observe_open_git_index(
-    repository: &git2::Repository,
+/// Observe an explicitly selected index file (e.g. an alternate
+/// `GIT_INDEX_FILE`) without refreshing, locking, or writing it.
+pub fn observe_git_index_path(
+    root: &Path,
+    index_path: &Path,
+    policy: &ConversionPolicy,
+) -> Result<GitIndexState, ObservationError> {
+    let repository =
+        git2::Repository::discover(root).map_err(|error| ObservationError::GitOpen {
+            path: root.display().to_string(),
+            message: error.to_string(),
+        })?;
+    let observed_algorithm = repository_object_algorithm(&repository)?;
+    if observed_algorithm != policy.object_format {
+        return Err(ObservationError::ObjectFormat {
+            observed: format!("{observed_algorithm:?}"),
+            expected: policy.object_format,
+        });
+    }
+    match git2::Index::open(index_path) {
+        Ok(index) => observe_open_git_index(observed_algorithm, &index),
+        Err(_) => observe_git_index_via_plumbing(root, Some(index_path), observed_algorithm),
+    }
+}
+
+/// Read-only index observation through `git ls-files` plumbing, for index
+/// formats libgit2 cannot parse. Nothing is written: `--no-optional-locks`
+/// prevents refresh-time index writes, and `ls-files`/`status` only read.
+fn observe_git_index_via_plumbing(
+    root: &Path,
+    index_path: Option<&Path>,
+    algorithm: GitHashAlgorithm,
+) -> Result<GitIndexState, ObservationError> {
+    let mut command = Command::new("git");
+    command
+        .arg("--no-optional-locks")
+        .arg("-C")
+        .arg(root)
+        .args(["ls-files", "--stage", "-t", "-z"]);
+    match index_path {
+        Some(path) => {
+            command.env("GIT_INDEX_FILE", path);
+        }
+        None => {
+            command.env_remove("GIT_INDEX_FILE");
+        }
+    }
+    let output = command.output().map_err(|error| ObservationError::GitIndex(
+        format!("cannot run git ls-files: {error}"),
+    ))?;
+    if !output.status.success() {
+        return Err(ObservationError::GitIndex(format!(
+            "git ls-files failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )));
+    }
+
+    let mut entries = Vec::new();
+    for record in output.stdout.split(|byte| *byte == 0) {
+        if record.is_empty() {
+            continue;
+        }
+        let line = String::from_utf8_lossy(record);
+        // `<tag> <mode> <oid> <stage>\t<path>`
+        let Some((meta, path)) = line.split_once('\t') else {
+            return Err(ObservationError::GitIndex(format!(
+                "cannot parse ls-files record: {line:?}"
+            )));
+        };
+        let mut parts = meta.splitn(4, ' ');
+        let tag = parts.next().unwrap_or("H");
+        let Some(mode) = parts.next().and_then(|mode| u32::from_str_radix(mode, 8).ok()) else {
+            return Err(ObservationError::GitIndex(format!(
+                "cannot parse ls-files mode: {line:?}"
+            )));
+        };
+        let oid_hex = parts.next().unwrap_or_default();
+        let stage = parts
+            .next()
+            .and_then(|stage| stage.parse::<u8>().ok())
+            .unwrap_or(0);
+        let oid = parse_git_oid_hex(algorithm, oid_hex)?;
+        let path = RepoPath::from_bytes(path.as_bytes())
+            .map_err(|error| ObservationError::InvalidPath(error.to_string()))?;
+        entries.push(GitIndexEntry {
+            path,
+            stage,
+            mode: canonical_index_mode(mode),
+            oid: Some(oid),
+            intent_to_add: false,
+            skip_worktree: tag == "S",
+            // git ls-files -t reports assume-unchanged entries in lowercase.
+            assume_unchanged: tag.chars().next().is_some_and(|tag| tag.is_ascii_lowercase()),
+            sparse_directory: mode & 0o170000 == 0o040000,
+        });
+    }
+
+    // Intent-to-add records intent only; porcelain surfaces it as an
+    // unstaged add (`XY` = ` A`). Read-only via --no-optional-locks.
+    let mut status_command = Command::new("git");
+    status_command.arg("--no-optional-locks").arg("-C").arg(root);
+    match index_path {
+        Some(path) => {
+            status_command.env("GIT_INDEX_FILE", path);
+        }
+        None => {
+            status_command.env_remove("GIT_INDEX_FILE");
+        }
+    }
+    status_command.args(["status", "--porcelain=v1", "-z", "--untracked-files=no"]);
+    if let Ok(status_output) = status_command.output() {
+        if status_output.status.success() {
+            for record in status_output.stdout.split(|byte| *byte == 0) {
+                if record.len() < 3 {
+                    continue;
+                }
+                let (columns, path) = record.split_at(2);
+                if columns == b" A" {
+                    for entry in &mut entries {
+                        if entry.path.as_bytes() == path {
+                            entry.intent_to_add = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    entries.sort_by(|left, right| {
+        (&left.path, left.stage, &left.oid).cmp(&(&right.path, right.stage, &right.oid))
+    });
+    let tree = compute_index_tree(algorithm, &entries)?;
+    // Detect the sparse-directory extension in the observed index file.
+    let index_file = index_path.map_or_else(
+        || repository_path_index(root),
+        Path::to_path_buf,
+    );
+    let sparse_index = fs::read(&index_file)
+        .map(|bytes| bytes.windows(4).any(|window| window == b"sdir"))
+        .unwrap_or(false);
+    Ok(GitIndexState {
+        version: GIT_INDEX_STATE_VERSION,
+        index_version: 0,
+        object_format: algorithm,
+        entries,
+        tree,
+        sparse_index,
+    })
+}
+
+fn repository_path_index(root: &Path) -> PathBuf {
+    git2::Repository::discover(root)
+        .map(|repository| repository.path().join("index"))
+        .unwrap_or_else(|_| root.join(".git").join("index"))
+}
+
+/// Parse a lowercase hex Git object ID into an algorithm-tagged identity.
+fn parse_git_oid_hex(algorithm: GitHashAlgorithm, hex: &str) -> Result<GitObjectId, ObservationError> {
+    if hex.len() % 2 != 0 {
+        return Err(ObservationError::GitIndex(format!(
+            "odd-length object id: {hex}"
+        )));
+    }
+    let mut bytes = Vec::with_capacity(hex.len() / 2);
+    let byte_pairs = hex.as_bytes();
+    for pair in byte_pairs.chunks(2) {
+        let high = (pair[0] as char)
+            .to_digit(16)
+            .ok_or_else(|| ObservationError::GitIndex(format!("invalid hex digit in {hex}")))?;
+        let low = (pair[1] as char)
+            .to_digit(16)
+            .ok_or_else(|| ObservationError::GitIndex(format!("invalid hex digit in {hex}")))?;
+        bytes.push(((high << 4) | low) as u8);
+    }
+    GitObjectId::new(algorithm, bytes).map_err(|error| ObservationError::GitIndex(error.to_string()))
+}
+
+pub(super) fn observe_open_git_index(
+    observed_algorithm: GitHashAlgorithm,
     index: &git2::Index,
 ) -> Result<GitIndexState, ObservationError> {
-    let observed_algorithm = repository_object_algorithm(repository)?;
     let mut entries = Vec::with_capacity(index.len());
     for entry in index.iter() {
         let path = RepoPath::from_bytes(&entry.path)
@@ -103,6 +284,7 @@ fn observe_open_git_index(
         object_format: observed_algorithm,
         entries,
         tree,
+        sparse_index: false,
     })
 }
 
@@ -581,7 +763,7 @@ pub enum GitOperationMarker {
 }
 
 impl GitOperationMarker {
-    const ALL: [Self; 12] = [
+    pub(crate) const ALL: [Self; 12] = [
         Self::Sequencer,
         Self::MergeHead,
         Self::RebaseHead,
@@ -596,7 +778,25 @@ impl GitOperationMarker {
         Self::BisectExpectedRev,
     ];
 
-    fn relative_path(self) -> &'static str {
+    /// Whether a present marker is *authoritative* evidence that Git owns an
+    /// in-progress operation.
+    ///
+    /// `AUTO_MERGE` is the one advisory marker: merge-ort writes it as a root
+    /// ref (`refs_update_ref(..., "AUTO_MERGE", ...)`) for **any**
+    /// worktree-updating merge — clean or conflicted — and `git merge` removes
+    /// it with the rest of the merge state on completion or abort. It is a
+    /// derived tree reference used to reconstruct the auto-merged result, not
+    /// proof that a merge is still running. A merge that actually stopped
+    /// before committing also has `MERGE_HEAD` (written by `write_merge_state`),
+    /// so an AUTO_MERGE left alone is a stale diagnostic of a completed or
+    /// interrupted cleanup. Every other marker names a live operation and stays
+    /// authoritative; a non-`Clean` libgit2 repository state still refuses
+    /// independently, as does any unmerged index stage.
+    pub(crate) fn is_active_operation_evidence(self) -> bool {
+        !matches!(self, Self::AutoMerge)
+    }
+
+    pub(crate) fn relative_path(self) -> &'static str {
         match self {
             Self::Sequencer => "sequencer",
             Self::MergeHead => "MERGE_HEAD",
@@ -614,6 +814,12 @@ impl GitOperationMarker {
     }
 }
 
+impl std::fmt::Display for GitOperationMarker {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.relative_path())
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GitOperationMarkerObservation {
     pub marker: GitOperationMarker,
@@ -628,14 +834,22 @@ pub struct GitOperationObservation {
 }
 
 impl GitOperationObservation {
+    /// Whether Git owns an in-progress operation that must fence a workspace
+    /// mutation.
+    ///
+    /// True when libgit2 reports a non-`Clean` repository state, or when any
+    /// present marker is authoritative evidence of an active operation
+    /// ([`GitOperationMarker::is_active_operation_evidence`]). A standalone
+    /// `AUTO_MERGE` does not, by itself, count: it is advisory.
     pub fn is_in_progress(&self) -> bool {
         self.repository_state != "Clean"
-            || self
-                .markers
-                .iter()
-                .any(|marker| marker.kind != GitAdminEntryKind::Missing)
+            || self.markers.iter().any(|marker| {
+                marker.kind != GitAdminEntryKind::Missing
+                    && marker.marker.is_active_operation_evidence()
+            })
     }
 
+    /// Every present marker, including advisory ones, for reporting.
     pub fn present_markers(&self) -> Vec<GitOperationMarker> {
         self.markers
             .iter()
@@ -643,11 +857,65 @@ impl GitOperationObservation {
             .map(|marker| marker.marker)
             .collect()
     }
+
+    /// Present markers that are authoritative evidence of an active operation.
+    pub fn active_markers(&self) -> Vec<GitOperationMarker> {
+        self.markers
+            .iter()
+            .filter(|marker| {
+                marker.kind != GitAdminEntryKind::Missing
+                    && marker.marker.is_active_operation_evidence()
+            })
+            .map(|marker| marker.marker)
+            .collect()
+    }
+}
+
+/// Canonical, stat-independent lease digest over one observed index state
+/// (CB-8B ac-3).
+///
+/// The Git-index effect lease authenticates the index's semantic content —
+/// sorted `(path, stage, mode, oid)` entries with their intent/skip/assume
+/// flags — never the on-disk bytes, so a stat-cache refresh by an external
+/// `git status` does not masquerade as a third lease value.
+pub(super) fn index_lease_digest(entries: &[GitIndexEntry]) -> Hash {
+    let mut hasher = blake3::Hasher::new();
+    hasher_update_tag(&mut hasher, b"atomic:git-index-lease:v1\0");
+    for entry in entries {
+        hasher_update_tag(&mut hasher, entry.path.as_bytes());
+        hasher_update_tag(&mut hasher, &entry.stage.to_be_bytes());
+        hasher_update_tag(&mut hasher, &entry.mode.to_be_bytes());
+        match &entry.oid {
+            Some(oid) => hasher_update_tag(&mut hasher, oid.as_bytes()),
+            None => hasher_update_tag(&mut hasher, b"\0absent"),
+        }
+        hasher_update_tag(&mut hasher, &[u8::from(entry.intent_to_add)]);
+        hasher_update_tag(&mut hasher, &[u8::from(entry.skip_worktree)]);
+        hasher_update_tag(&mut hasher, &[u8::from(entry.assume_unchanged)]);
+        hasher_update_tag(&mut hasher, &[u8::from(entry.sparse_directory)]);
+    }
+    Hash::of(&hasher.finalize().as_bytes()[..])
+}
+
+fn hasher_update_tag(hasher: &mut blake3::Hasher, bytes: &[u8]) {
+    hasher.update(&(bytes.len() as u64).to_le_bytes());
+    hasher.update(bytes);
+}
+
+/// Observe one open index as a core `GitIndexState` lease value (CB-8B ac-3).
+pub(super) fn observe_index_lease(
+    algorithm: GitHashAlgorithm,
+    index: &git2::Index,
+) -> Result<atomic_core::operation::GitIndexState, ObservationError> {
+    let state = observe_open_git_index(algorithm, index)?;
+    Ok(atomic_core::operation::GitIndexState {
+        digest: index_lease_digest(&state.entries),
+        tree: state.tree,
+    })
 }
 
 /// Observe HEAD, index identity, locks, and Git-owned sequence state without mutation.
-pub fn observe_git_metadata(root: &Path) -> Result<WorkspaceGitObservation, ObservationError> {
-    let git_marker_exists = fs::symlink_metadata(root.join(".git")).is_ok();
+pub fn observe_git_metadata(root: &Path) -> Result<WorkspaceGitObservation, ObservationError> {    let git_marker_exists = fs::symlink_metadata(root.join(".git")).is_ok();
     let repository = match git2::Repository::open(root) {
         Ok(repository) => repository,
         Err(error) if error.code() == git2::ErrorCode::NotFound && !git_marker_exists => {
@@ -682,7 +950,7 @@ pub fn observe_git_metadata(root: &Path) -> Result<WorkspaceGitObservation, Obse
             )));
         }
     };
-    let index_state = observe_open_git_index(&repository, &index)?;
+    let index_state = observe_open_git_index(repository_object_algorithm(&repository)?, &index)?;
     let mut index_stages: Vec<u8> = index_state
         .entries
         .iter()
@@ -794,7 +1062,7 @@ fn observe_metadata_head(
     }
 }
 
-fn git_object_id_hex(oid: &GitObjectId) -> String {
+pub(super) fn git_object_id_hex(oid: &GitObjectId) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut output = String::with_capacity(oid.as_bytes().len() * 2);
     for byte in oid.as_bytes() {
@@ -866,6 +1134,199 @@ fn append_metadata_suffix(path: &Path, suffix: &str) -> PathBuf {
     let mut value = path.as_os_str().to_os_string();
     value.push(suffix);
     PathBuf::from(value)
+}
+
+/// The physical form of the colocated `.git` path, observed fresh at
+/// cutover time (CB-13B R6). Mere existence is never readiness: only
+/// [`ColocatedGitForm::Repository`] proves an openable Git repository.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ColocatedGitForm {
+    /// No `.git` path at all.
+    Absent,
+    /// An openable Git repository (a `.git` directory or a worktree
+    /// gitdir pointer file).
+    Repository,
+    /// A directory that is not a valid Git repository (e.g. empty).
+    InvalidDirectory,
+    /// A regular file that is not a valid Git gitdir pointer.
+    InvalidFile,
+    /// A symlink that does not resolve to a valid Git repository.
+    InvalidSymlink,
+}
+
+/// The marker prefix identifying an Atomic-owned advisory dispatcher,
+/// shared with the CLI hook installer (CB-13B R2): the cutover
+/// decommissions these through journaled migration-effect leases while
+/// foreign hooks refuse.
+pub const ATOMIC_DISPATCHER_MARKER: &str = "# atomic:git-bridge-dispatcher:v1";
+/// Legacy Atomic import-hook block marker (also Atomic-owned).
+pub const ATOMIC_LEGACY_MARKER_BEGIN: &str = "# atomic:git:begin";
+
+fn owned_dispatcher_content(bytes: &[u8]) -> bool {
+    bytes.starts_with(format!("#!/bin/sh\n{ATOMIC_DISPATCHER_MARKER}\n").as_bytes())
+        || bytes.starts_with(ATOMIC_LEGACY_MARKER_BEGIN.as_bytes())
+}
+
+/// An Atomic-owned advisory dispatcher observed in the colocated hooks
+/// directory (CB-13B R2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnedHookDispatcher {
+    /// Hook file name (e.g. `post-checkout`).
+    pub name: String,
+    /// Path relative to the repository root, when the hooks directory
+    /// lives under it (a linked worktree's common gitdir does not).
+    pub path: Option<String>,
+    /// Content hash of the dispatcher bytes (the effect lease value).
+    pub content: Hash,
+    /// Executable file mode.
+    pub mode: u32,
+}
+
+/// Colocated Git readiness observed for the CB-13B cutover: the physical
+/// form plus the hook and remote surfaces the audit labels `Refused`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ColocatedGitReadiness {
+    pub form: ColocatedGitForm,
+    /// Active FOREIGN hook surfaces: a configured `core.hooksPath` and
+    /// non-sample executable files that Atomic does not own.
+    pub active_hooks: Vec<String>,
+    /// Atomic-owned advisory dispatchers: the cutover decommissions
+    /// these through journaled migration-effect leases.
+    pub owned_dispatchers: Vec<OwnedHookDispatcher>,
+    /// Configured remote names.
+    pub remotes: Vec<String>,
+    /// The repository's resolved HEAD (hex oid), when openable.
+    pub head: Option<String>,
+}
+
+impl ColocatedGitReadiness {
+    /// An absent observation (no colocated Git at all).
+    fn absent() -> Self {
+        Self {
+            form: ColocatedGitForm::Absent,
+            active_hooks: Vec::new(),
+            owned_dispatchers: Vec::new(),
+            remotes: Vec::new(),
+            head: None,
+        }
+    }
+
+    fn invalid(form: ColocatedGitForm) -> Self {
+        Self {
+            form,
+            active_hooks: Vec::new(),
+            owned_dispatchers: Vec::new(),
+            remotes: Vec::new(),
+            head: None,
+        }
+    }
+}
+
+/// Observe the colocated Git repository's physical form, hooks and
+/// remotes without mutation (CB-13B R6). The observation never refuses by
+/// itself: classification only; policy lives with the cutover gates.
+pub fn observe_colocated_git_readiness(root: &Path) -> ColocatedGitReadiness {
+    let metadata = match fs::symlink_metadata(root.join(".git")) {
+        Ok(metadata) => metadata,
+        Err(_) => return ColocatedGitReadiness::absent(),
+    };
+    let invalid_form = if metadata.file_type().is_symlink() {
+        ColocatedGitForm::InvalidSymlink
+    } else if metadata.is_dir() {
+        ColocatedGitForm::InvalidDirectory
+    } else {
+        ColocatedGitForm::InvalidFile
+    };
+    let Ok(repository) = git2::Repository::open(root) else {
+        return ColocatedGitReadiness::invalid(invalid_form);
+    };
+
+    let mut active_hooks = Vec::new();
+    let mut owned_dispatchers = Vec::new();
+    if let Ok(config) = repository.config() {
+        if let Ok(hooks_path) = config.get_string("core.hooksPath") {
+            active_hooks.push(format!("core.hooksPath={hooks_path}"));
+        }
+    }
+    let hooks_dir = repository.path().join("hooks");
+    if let Ok(entries) = fs::read_dir(&hooks_dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.ends_with(".sample") || name.starts_with('.') {
+                continue;
+            }
+            // Follow symlinks: a hook manager that symlinks a dispatcher
+            // into hooks/ is an active hook surface, not an inert entry.
+            let metadata = match fs::metadata(entry.path()) {
+                Ok(metadata) => metadata,
+                Err(_) => {
+                    // A dangling symlink in hooks/ is still an active
+                    // surface: it names a hook the manager intends to run.
+                    active_hooks.push(format!("hooks/{name} (broken symlink)"));
+                    continue;
+                }
+            };
+            let is_file = metadata.is_file();
+            if !is_file {
+                continue;
+            }
+            #[cfg(unix)]
+            let (executable, mode) = {
+                use std::os::unix::fs::PermissionsExt;
+                // The effect lease compares against the observation's
+                // permission-bit mode (no file-type bits).
+                let mode = metadata.permissions().mode() & 0o777;
+                (mode != 0, mode)
+            };
+            #[cfg(not(unix))]
+            let (executable, mode) = (true, 0o755u32);
+            if !executable {
+                continue;
+            }
+            let bytes = fs::read(entry.path()).unwrap_or_default();
+            if owned_dispatcher_content(&bytes) {
+                // The decommission effect must address the file relative
+                // to the worktree root; a linked worktree's common gitdir
+                // is outside it and stays an explicit refusal.
+                let path = entry
+                    .path()
+                    .strip_prefix(root)
+                    .ok()
+                    .map(|relative| relative.to_string_lossy().to_string());
+                owned_dispatchers.push(OwnedHookDispatcher {
+                    name,
+                    path,
+                    content: Hash::of(&bytes),
+                    mode,
+                });
+            } else {
+                active_hooks.push(format!("hooks/{name}"));
+            }
+        }
+    }
+    active_hooks.sort();
+    owned_dispatchers.sort_by(|left, right| left.name.cmp(&right.name));
+    let remotes = repository
+        .remotes()
+        .map(|names| {
+            names
+                .iter()
+                .flatten()
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let head = repository.head().ok().and_then(|head| {
+        head.target()
+            .map(|oid| oid.to_string())
+    });
+    ColocatedGitReadiness {
+        form: ColocatedGitForm::Repository,
+        active_hooks,
+        owned_dispatchers,
+        remotes,
+        head,
+    }
 }
 
 #[cfg(test)]

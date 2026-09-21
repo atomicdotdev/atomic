@@ -86,6 +86,12 @@ pub trait PathClaimMutTxnT: PathClaimTxnT {
     fn put_path_claim(&mut self, path: &str, event: &PathClaimEvent)
         -> Result<bool, PristineError>;
 
+    /// Remove one event (CB-13A follow-up R3: the stored repair inverse's
+    /// undo removes exactly the rows a repair added). Returns whether the
+    /// event was present. Identical `(path, event)` pairs are idempotent.
+    fn del_path_claim(&mut self, path: &str, event: &PathClaimEvent)
+        -> Result<bool, PristineError>;
+
     /// Clear all events and the completion marker before an atomic rebuild.
     fn reset_path_claim_migration(&mut self) -> Result<(), PristineError>;
 

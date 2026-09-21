@@ -382,12 +382,16 @@ impl TreeProjectionPlan {
                     )));
                 }
                 if occupant != *inode {
+                    // The occupant vacates the path when the same plan moves
+                    // it elsewhere or retires its path (`Some(None)`); both
+                    // free the path for the new binding in this projection.
                     let occupant_moves_away = moving_inodes.contains(&occupant)
                         && self
                             .entries
                             .get(&occupant)
                             .and_then(|entry| entry.path.as_ref())
-                            .is_some_and(|desired| desired.as_deref() != Some(path.as_str()));
+                            .map(|desired| desired.as_deref() != Some(path.as_str()))
+                            .unwrap_or(false);
                     let already_claims_path = current_path.as_deref() == Some(path.as_str());
                     let planned_primary = desired_claims
                         .get(path)

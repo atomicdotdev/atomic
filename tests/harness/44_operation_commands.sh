@@ -13,7 +13,7 @@ operation_head() {
 begin_section "Operation log and show expose canonical journal data"
 make_temp_repo "operation-commands"
 init_repo
-BASE_VIEW="$(atomic view list 2>/dev/null | awk '/^\*/ { print $2; exit }')"
+BASE_VIEW="$(atomic view list 2>/dev/null | awk '/^\*/ { print $2 }')"
 
 create_file "state.txt" "base content"
 assert_success "track operation fixture" atomic add state.txt

@@ -55,7 +55,7 @@ use atomic_repository::Repository;
 
 use crate::commands::Command;
 use crate::error::{CliError, CliResult};
-use crate::output::{print_hint, print_next_steps, print_success};
+use crate::output::{print_hint, print_next_steps, print_success, print_warning};
 
 // Constants
 
@@ -326,6 +326,20 @@ pub struct Init {
     /// Useful for minimal repos that don't need goals, intents, or memory.
     #[arg(long, default_value_t = false)]
     pub no_vault: bool,
+
+    /// CB-10B: adopt an existing Git checkout through the shared
+    /// binding-first anchoring (RFC §7.3, §8.6) — the `git clone` +
+    /// `atomic init --adopt-git` bootstrap path. A verified binding for
+    /// HEAD restores the exact bound state; an unbound history is an
+    /// explicit typed refusal naming the supported foreign-synthesis path
+    /// (`atomic git import`), never a silent merge or a false exact label.
+    #[arg(long, requires = "binding_key_file")]
+    pub adopt_git: bool,
+
+    /// Explicit Ed25519 key file signing the bootstrap's Anchor binding
+    /// (required with --adopt-git; managed signing is CB-12B).
+    #[arg(long)]
+    pub binding_key_file: Option<PathBuf>,
 }
 
 impl Init {
@@ -346,6 +360,8 @@ impl Init {
             kind: None,
             vault: true,
             no_vault: false,
+            adopt_git: false,
+            binding_key_file: None,
         }
     }
 
@@ -357,6 +373,8 @@ impl Init {
             kind: None,
             vault: true,
             no_vault: false,
+            adopt_git: false,
+            binding_key_file: None,
         }
     }
 
@@ -585,54 +603,103 @@ impl Command for Init {
                 }
             }
 
-            // Add and record .atomicignore
-            let _ = repo.add(
-                working_copy,
-                ".atomicignore",
-                atomic_repository::TrackingOptions::default(),
-            );
-            let header = atomic_core::change::ChangeHeader::new("Initialize repository");
-            let options = atomic_repository::RecordOptions::new()
-                .add_path(".atomicignore")
-                .detect_raw_renames(false);
-            match repo.record(working_copy, header, options) {
-                Ok(_) => {}
-                Err(atomic_repository::RecordError::NothingToRecord) => {}
-                Err(e) => log::warn!("Failed to record .atomicignore: {}", e),
+            // Add and record .atomicignore. CB-10B: with --adopt-git the
+            // exact resurrection owns the view content, so the scaffold view
+            // stays empty — the file is still created (policy-excluded from
+            // the Git projection) but never recorded here, or the restored
+            // closure would collide with a scaffold-bound inode.
+            if !self.adopt_git {
+                let _ = repo.add(
+                    working_copy,
+                    ".atomicignore",
+                    atomic_repository::TrackingOptions::default(),
+                );
+                let header = atomic_core::change::ChangeHeader::new("Initialize repository");
+                let options = atomic_repository::RecordOptions::new()
+                    .add_path(".atomicignore")
+                    .detect_raw_renames(false);
+                match repo.record(working_copy, header, options) {
+                    Ok(_) => {}
+                    Err(atomic_repository::RecordError::NothingToRecord) => {}
+                    Err(e) => log::warn!("Failed to record .atomicignore: {}", e),
+                }
             }
         }
 
         // ── Step 3: Create .vault/ → install defaults → add → record ─
-        if self.vault && !self.no_vault {
-            // Create vault tables + directory structure + default files
-            repo.init_vault().map_err(CliError::Repository)?;
-
-            println!("Initialized vault at {}", repo.vault_dir().display());
-
-            // Add all vault files to tracking
-            let vault_dir = repo.vault_dir();
-            if vault_dir.exists() {
-                add_vault_files_recursive(&repo, &vault_dir)?;
-            }
-
-            // Record vault files as their own change
-            let header = atomic_core::change::ChangeHeader::new("Initialize vault");
-            let options = atomic_repository::RecordOptions::new()
-                .add_path(".vault")
-                .detect_raw_renames(false);
-            match repo.record(working_copy, header, options) {
-                Ok(outcome) => {
-                    println!(
-                        "Recorded vault defaults ({} files)",
-                        outcome.stats().files_recorded
-                    );
-                }
-                Err(atomic_repository::RecordError::NothingToRecord) => {}
-                Err(e) => log::warn!("Failed to record vault files: {}", e),
-            }
+        //
+        // CB-10B review R5: with --adopt-git the vault recording is DEFERRED
+        // until after the exact resurrection — the scaffold view must not
+        // carry recorded vault state before the verified binding is
+        // resurrected into it.
+        let defer_vault = self.adopt_git && self.vault && !self.no_vault;
+        if self.vault && !self.no_vault && !defer_vault {
+            record_vault_state(&repo, working_copy)?;
         }
 
+
         // ── Status should be clean at this point ─────────────────────
+
+        // ── CB-10B: --adopt-git shared bootstrap (RFC §7.3/§8.6) ─────
+        //
+        // The scaffold view was created above; the binding-first bootstrap
+        // installs the fetched bindings (fail-closed), resurrects a verified
+        // binding for HEAD exactly into the scaffold view, and — with the
+        // explicit key — anchors the bridge. An unbound history is a typed
+        // refusal naming the explicit import path; init itself stays
+        // successful (the repository exists), the adoption does not run.
+        if self.adopt_git {
+            // redb admits one writable open per process: the scaffold handle
+            // must be released before the bootstrap opens the repository.
+            drop(repo);
+            let key_file = self.binding_key_file.as_deref().expect("required by clap");
+            let outcome = crate::commands::git::bootstrap::adopt_git_checkout(
+                &target_path,
+                Some(key_file),
+                "origin",
+                // CB-10B review R9: the degraded namespace is a clone-time
+                // reader opt-in; default init keeps the primary namespace.
+                false,
+            )?;
+            match outcome {
+                crate::commands::git::bootstrap::BootstrapOutcome::Bound {
+                    binding_id,
+                    view,
+                    provenance_trusted,
+                    anchored,
+                } => {
+                    print_success(&format!(
+                        "Adopted Git checkout: exact bound restoration of binding {binding_id} into view '{view}'{}",
+                        anchored
+                            .map(|anchor| format!(" (anchored with binding {id})", id = anchor))
+                            .unwrap_or_default(),
+                    ));
+                    if !provenance_trusted {
+                        print_warning(
+                            "Binding provenance is UNTRUSTED (content was independently verified).",
+                        );
+                    }
+                    // CB-10B review R5: the deferred vault state is recorded
+                    // only AFTER the exact resurrection/adoption succeeded.
+                    if defer_vault {
+                        let repo = Repository::open(&target_path).map_err(CliError::Repository)?;
+                        let working_copy =
+                            repo.require_working_copy_id().map_err(CliError::Repository)?;
+                        record_vault_state(&repo, working_copy)?;
+                    }
+                }
+                crate::commands::git::bootstrap::BootstrapOutcome::Unbound { head, reason } => {
+                    return Err(CliError::GitError {
+                        message: format!(
+                            "adoption of Git HEAD {head} is unbound: {reason}\
+                             \nHint: 'atomic git import --incremental' performs the explicit \
+                             supported foreign synthesis; the checkout is never labeled exact \
+                             without a verified binding."
+                        ),
+                    });
+                }
+            }
+        }
 
         // Print next steps
         print_next_steps(&[
@@ -643,6 +710,40 @@ impl Command for Init {
 
         Ok(())
     }
+}
+
+
+/// Create the vault, install defaults, track and record them as their own
+/// change (CB-10B review R5: the deferred default-init vault recording runs
+/// only after an --adopt-git exact resurrection when one applies).
+fn record_vault_state(repo: &Repository, working_copy: atomic_core::WorkingCopyId) -> CliResult<()> {
+    // Create vault tables + directory structure + default files
+    repo.init_vault().map_err(CliError::Repository)?;
+
+    println!("Initialized vault at {}", repo.vault_dir().display());
+
+    // Add all vault files to tracking
+    let vault_dir = repo.vault_dir();
+    if vault_dir.exists() {
+        add_vault_files_recursive(repo, &vault_dir)?;
+    }
+
+    // Record vault files as their own change
+    let header = atomic_core::change::ChangeHeader::new("Initialize vault");
+    let options = atomic_repository::RecordOptions::new()
+        .add_path(".vault")
+        .detect_raw_renames(false);
+    match repo.record(working_copy, header, options) {
+        Ok(outcome) => {
+            println!(
+                "Recorded vault defaults ({} files)",
+                outcome.stats().files_recorded
+            );
+        }
+        Err(atomic_repository::RecordError::NothingToRecord) => {}
+        Err(e) => log::warn!("Failed to record vault files: {}", e),
+    }
+    Ok(())
 }
 
 /// Recursively add all files under a directory to Atomic tracking.
