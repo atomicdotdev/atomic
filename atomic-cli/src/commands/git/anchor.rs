@@ -102,7 +102,7 @@ fn enable_anchor_inner(
     };
     let signer = load_signing_key(key_file)?;
 
-    let mut repo = Repository::open(root.to_path_buf()).map_err(CliError::from)?;
+    let mut repo = Repository::open(root).map_err(CliError::from)?;
     let git = super::bridge::open_git(root)?;
 
     if options.adopt_atomic {

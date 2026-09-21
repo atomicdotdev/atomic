@@ -84,9 +84,7 @@ pub fn fingerprint(root: &Path, path: &str) -> Result<Option<String>, String> {
 pub fn snapshot(root: &Path, extra: &[String]) -> Result<serde_json::Value, String> {
     let repo = Repository::open_readonly_wait(root, std::time::Duration::from_secs(10))
         .map_err(|e| e.to_string())?;
-    let working_copy = repo
-        .require_working_copy_id()
-        .map_err(|e| e.to_string())?;
+    let working_copy = repo.require_working_copy_id().map_err(|e| e.to_string())?;
     let status = repo
         .status(working_copy, StatusOptions::default().with_untracked(true))
         .map_err(|e| e.to_string())?;

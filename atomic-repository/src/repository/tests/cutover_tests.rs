@@ -1,5 +1,6 @@
 use super::*;
 
+use atomic_core::operation::EffectReceiptKind;
 use atomic_core::operation::{
     ActorRef, MetadataTarget, MetadataTransition, MetadataValue, OperationKind, OperationScope,
     RepoStateRef,
@@ -9,7 +10,6 @@ use atomic_core::pristine::{
     BRIDGE_CUTOVER_CAPABILITY, CHANGE_FORMAT_VNEXT_CAPABILITY, REF_MAPPING_VERSION,
     SUPPORTED_REPOSITORY_CAPABILITIES,
 };
-use atomic_core::operation::EffectReceiptKind;
 use atomic_core::OperationId;
 
 use crate::RepositoryError;
@@ -288,7 +288,7 @@ fn cutover_rollback_restores_the_exact_prior_state_through_the_journal() {
     // The cutover operation is journaled and verified, then rolled back
     // through the typed inverse: the requirement row returns to Absent.
     let (temp, mut repo) = create_temp_repo();
-    let head = init_real_git_repo(temp.path(), &repo.current_view().to_string());
+    let head = init_real_git_repo(temp.path(), repo.current_view());
     install_bridge_evidence(&repo, temp.path(), &head);
     let working_copy = repo.require_working_copy_id().unwrap();
 
@@ -310,15 +310,13 @@ fn cutover_rollback_restores_the_exact_prior_state_through_the_journal() {
     }));
     assert!(log.entries.iter().any(|entry| {
         entry.operation.payload().kind == OperationKind::Undo
-            && entry
-                .operation
-                .payload()
-                .relation
-                .is_some_and(|relation| matches!(
+            && entry.operation.payload().relation.is_some_and(|relation| {
+                matches!(
                     relation,
                     atomic_core::operation::OperationRelation::Undo { target }
                         if target == cutover_operation
-                ))
+                )
+            })
     }));
 
     // The rollback's own undo child is not the cutover: a second rollback
@@ -425,7 +423,7 @@ fn bridge_cutover_is_journaled_verified_and_fences_legacy_writers() {
     assert!(error.contains("colocated Git repository"), "{error}");
     assert_eq!(capability_row(&repo, CUTOVER_ID), None);
 
-    let head = init_real_git_repo(temp.path(), &repo.current_view().to_string());
+    let head = init_real_git_repo(temp.path(), repo.current_view());
     install_bridge_evidence(&repo, temp.path(), &head);
     let working_copy = repo.require_working_copy_id().unwrap();
 
@@ -473,7 +471,7 @@ fn bridge_cutover_is_journaled_verified_and_fences_legacy_writers() {
 #[test]
 fn bridge_cutover_rollback_lifts_the_fence_and_allows_legacy_writers() {
     let (temp, mut repo) = create_temp_repo();
-    let head = init_real_git_repo(temp.path(), &repo.current_view().to_string());
+    let head = init_real_git_repo(temp.path(), repo.current_view());
     install_bridge_evidence(&repo, temp.path(), &head);
 
     repo.execute_bridge_cutover().unwrap();
@@ -492,7 +490,7 @@ fn bridge_cutover_rollback_lifts_the_fence_and_allows_legacy_writers() {
 #[test]
 fn bridge_cutover_rollback_refuses_a_foreign_head() {
     let (temp, mut repo) = create_temp_repo();
-    let head = init_real_git_repo(temp.path(), &repo.current_view().to_string());
+    let head = init_real_git_repo(temp.path(), repo.current_view());
     install_bridge_evidence(&repo, temp.path(), &head);
     let working_copy = repo.require_working_copy_id().unwrap();
     repo.execute_bridge_cutover().unwrap();
@@ -526,7 +524,7 @@ fn cutover_rollback_keeps_newer_required_format_fences() {
     // format fence (change-format-vnext) recorded before the cutover
     // survives the rollback: newer objects keep their format requirement.
     let (temp, mut repo) = create_temp_repo();
-    let head = init_real_git_repo(temp.path(), &repo.current_view().to_string());
+    let head = init_real_git_repo(temp.path(), repo.current_view());
     install_bridge_evidence(&repo, temp.path(), &head);
     let working_copy = repo.require_working_copy_id().unwrap();
 
@@ -553,10 +551,7 @@ fn cutover_rollback_keeps_newer_required_format_fences() {
 
 // ── CB-13B R4: final-schema census, goldens and compatibility matrix ────
 
-fn surface<'a>(
-    final_schema: &'a [CutoverSchemaAudit],
-    item: &str,
-) -> &'a CutoverSchemaAudit {
+fn surface<'a>(final_schema: &'a [CutoverSchemaAudit], item: &str) -> &'a CutoverSchemaAudit {
     final_schema
         .iter()
         .find(|surface| surface.item == item)
@@ -570,25 +565,43 @@ fn final_schema_census_names_every_contract_surface() {
     // identity, operation versions, attributes and remote capabilities —
     // each observed live and classified.
     let (temp, repo) = create_temp_repo();
-    let head = init_real_git_repo(temp.path(), &repo.current_view().to_string());
+    let head = init_real_git_repo(temp.path(), repo.current_view());
     install_bridge_evidence(&repo, temp.path(), &head);
     let audit = repo.audit_bridge_cutover().unwrap();
 
     let expected: &[(&str, CutoverAuditDisposition)] = &[
         ("extra_known", CutoverAuditDisposition::PreservedImmutable),
-        ("view-state-set-id", CutoverAuditDisposition::PreservedImmutable),
-        ("unrecord-suffixes", CutoverAuditDisposition::PreservedImmutable),
+        (
+            "view-state-set-id",
+            CutoverAuditDisposition::PreservedImmutable,
+        ),
+        (
+            "unrecord-suffixes",
+            CutoverAuditDisposition::PreservedImmutable,
+        ),
         ("raw-repo-path", CutoverAuditDisposition::PreservedImmutable),
         ("conflicts", CutoverAuditDisposition::PreservedImmutable),
         ("file-index-v2", CutoverAuditDisposition::RebuildableCache),
-        ("worktree-identity", CutoverAuditDisposition::PreservedImmutable),
-        ("operation-versions", CutoverAuditDisposition::PreservedImmutable),
+        (
+            "worktree-identity",
+            CutoverAuditDisposition::PreservedImmutable,
+        ),
+        (
+            "operation-versions",
+            CutoverAuditDisposition::PreservedImmutable,
+        ),
         ("attributes", CutoverAuditDisposition::PreservedImmutable),
         ("remote-capabilities", CutoverAuditDisposition::Refused),
         ("git-sha-index-bindings", CutoverAuditDisposition::Required),
-        ("trailer-bindings", CutoverAuditDisposition::PreservedImmutable),
+        (
+            "trailer-bindings",
+            CutoverAuditDisposition::PreservedImmutable,
+        ),
         ("aggregate-tag-bindings", CutoverAuditDisposition::Refused),
-        ("same-name-ambiguity", CutoverAuditDisposition::PreservedImmutable),
+        (
+            "same-name-ambiguity",
+            CutoverAuditDisposition::PreservedImmutable,
+        ),
     ];
     assert_eq!(audit.final_schema.len(), expected.len());
     for (item, disposition) in expected {
@@ -620,7 +633,7 @@ fn cutover_preserves_legacy_object_bytes_and_hashes() {
     // and working-copy records — keeps its exact bytes and hash across
     // the fence.
     let (temp, repo) = create_temp_repo();
-    let head = init_real_git_repo(temp.path(), &repo.current_view().to_string());
+    let head = init_real_git_repo(temp.path(), repo.current_view());
     install_bridge_evidence(&repo, temp.path(), &head);
 
     // A durable legacy change object (content-addressed bytes on disk).
@@ -681,7 +694,7 @@ fn hook_manager_symlinks_and_hookspath_are_active_surfaces() {
     // Matrix cell: hook managers that symlink dispatchers into hooks/ and
     // a configured core.hooksPath are both active surfaces.
     let (temp, repo) = create_temp_repo();
-    let head = init_real_git_repo(temp.path(), &repo.current_view().to_string());
+    let head = init_real_git_repo(temp.path(), repo.current_view());
     install_bridge_evidence(&repo, temp.path(), &head);
 
     // A symlinked hook dispatcher.
@@ -691,11 +704,7 @@ fn hook_manager_symlinks_and_hookspath_are_active_surfaces() {
     {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
-        std::os::unix::fs::symlink(
-            &target,
-            temp.path().join(".git/hooks/pre-push"),
-        )
-        .unwrap();
+        std::os::unix::fs::symlink(&target, temp.path().join(".git/hooks/pre-push")).unwrap();
     }
     let readiness = observe_colocated_git_readiness(temp.path());
     assert!(
@@ -725,18 +734,17 @@ fn cutover_lock_contention_returns_a_typed_retry_error() {
     // Matrix cell: lock contention — the cutover holds no mutation when
     // the common operation lock is contended.
     let (temp, repo) = create_temp_repo();
-    let head = init_real_git_repo(temp.path(), &repo.current_view().to_string());
+    let head = init_real_git_repo(temp.path(), repo.current_view());
     install_bridge_evidence(&repo, temp.path(), &head);
 
     // Hold the common operation lock; the cutover's lock acquisition
     // refuses with the typed contention error before any mutation.
     let _holder = repo.try_lock_common_operation().unwrap();
-    let error = match repo.execute_bridge_cutover() {
+    match repo.execute_bridge_cutover() {
         Ok(_) => panic!("cutover must refuse while the common lock is held"),
-        Err(RepositoryError::LockContended { .. }) => return,
+        Err(RepositoryError::LockContended { .. }) => {}
         Err(other) => panic!("expected typed lock contention, got {other}"),
-    };
-    let _ = error;
+    }
 }
 
 #[test]
@@ -757,7 +765,15 @@ fn linked_worktrees_share_the_cutover_fence() {
     let output = std::process::Command::new("git")
         .arg("-C")
         .arg(&primary)
-        .args(["worktree", "add", "-q", "-b", "linked-cutover-fence", linked.to_str().unwrap(), "main"])
+        .args([
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "linked-cutover-fence",
+            linked.to_str().unwrap(),
+            "main",
+        ])
         .output()
         .unwrap();
     assert!(
@@ -853,12 +869,12 @@ fn cutover_audit_evidence_digest_is_stable_and_sensitive() {
 /// (a typed fenced refusal under the held lock).
 #[test]
 fn shadow_writer_fails_closed_when_the_cutover_fences_between_observation_and_lock() {
-    use std::sync::Arc;
     use std::sync::mpsc::channel;
+    use std::sync::Arc;
     use std::time::Duration;
 
     let (temp, repo) = create_temp_repo();
-    let head = init_real_git_repo(temp.path(), &repo.current_view().to_string());
+    let head = init_real_git_repo(temp.path(), repo.current_view());
     install_bridge_evidence(&repo, temp.path(), &head);
     let repo = Arc::new(repo);
     assert_eq!(capability_row(&repo, CUTOVER_ID), None);
@@ -868,9 +884,7 @@ fn shadow_writer_fails_closed_when_the_cutover_fences_between_observation_and_lo
     let writer = {
         let repo = Arc::clone(&repo);
         std::thread::spawn(move || {
-            super::super::materialize::install_shadow_fence_interleave_window(
-                at_window, resume,
-            );
+            super::super::materialize::install_shadow_fence_interleave_window(at_window, resume);
             repo.try_lock_shadow_commit()
         })
     };
@@ -932,7 +946,7 @@ fn cutover_refuses_a_real_repository_without_bridge_evidence() {
     // A real Git repository but no verified checkpoint and no candidate
     // binding: the shadow pipeline never published here.
     let (temp, repo) = create_temp_repo();
-    init_real_git_repo(temp.path(), &repo.current_view().to_string());
+    init_real_git_repo(temp.path(), repo.current_view());
     expect_cutover_refusal(&repo, "verified bridge checkpoint");
 }
 
@@ -941,7 +955,7 @@ fn cutover_refuses_active_hook_surfaces() {
     // The audit labels hook migration Refused; the surface must actually
     // refuse execution instead of prose-only.
     let (temp, repo) = create_temp_repo();
-    let head = init_real_git_repo(temp.path(), &repo.current_view().to_string());
+    let head = init_real_git_repo(temp.path(), repo.current_view());
     install_bridge_evidence(&repo, temp.path(), &head);
     let hooks = temp.path().join(".git/hooks");
     std::fs::create_dir_all(&hooks).unwrap();
@@ -982,14 +996,17 @@ fn cutover_decommissions_owned_dispatchers_with_journaled_leases() {
     // migration-effect lease (exact bytes expected-old, Absent
     // expected-new) with an Applied receipt; the foreign hook refuses.
     let (temp, repo) = create_temp_repo();
-    let head = init_real_git_repo(temp.path(), &repo.current_view().to_string());
+    let head = init_real_git_repo(temp.path(), repo.current_view());
     install_bridge_evidence(&repo, temp.path(), &head);
     let hook_path = temp.path().join(".git/hooks/post-checkout");
     let bytes = install_owned_dispatcher(temp.path(), "post-checkout", "hook-post-checkout");
 
     let outcome = repo.execute_bridge_cutover().unwrap();
     let operation = outcome.operation.expect("cutover must be journaled");
-    assert!(!hook_path.exists(), "the owned dispatcher is decommissioned");
+    assert!(
+        !hook_path.exists(),
+        "the owned dispatcher is decommissioned"
+    );
     assert_eq!(capability_row(&repo, CUTOVER_ID), Some(1));
 
     // The decommission is journaled: the operation carries the effect and
@@ -997,9 +1014,10 @@ fn cutover_decommissions_owned_dispatchers_with_journaled_leases() {
     let details = repo.operation_details(operation).unwrap();
     assert_eq!(details.operation.payload().delta.effects.len(), 1);
     assert_eq!(details.verification, OperationVerificationState::Verified);
-    assert!(details.receipts.iter().any(|receipt| {
-        receipt.payload().kind == EffectReceiptKind::Applied
-    }));
+    assert!(details
+        .receipts
+        .iter()
+        .any(|receipt| { receipt.payload().kind == EffectReceiptKind::Applied }));
     let _ = bytes;
 }
 
@@ -1009,7 +1027,7 @@ fn cutover_rollback_restores_decommissioned_hooks_byte_for_byte() {
     // swapped effect plans from the cutover's retained backups, restoring
     // the dispatcher's exact bytes and mode.
     let (temp, mut repo) = create_temp_repo();
-    let head = init_real_git_repo(temp.path(), &repo.current_view().to_string());
+    let head = init_real_git_repo(temp.path(), repo.current_view());
     install_bridge_evidence(&repo, temp.path(), &head);
     let hook_path = temp.path().join(".git/hooks/post-checkout");
     let bytes = install_owned_dispatcher(temp.path(), "post-checkout", "hook-post-checkout");
@@ -1035,7 +1053,7 @@ fn restore_refuses_an_effect_bearing_operation() {
     // operation (the cutover's hook decommission) explicitly refuses
     // instead of restoring metadata without its external effects.
     let (temp, mut repo) = create_temp_repo();
-    let head = init_real_git_repo(temp.path(), &repo.current_view().to_string());
+    let head = init_real_git_repo(temp.path(), repo.current_view());
     install_bridge_evidence(&repo, temp.path(), &head);
     install_owned_dispatcher(temp.path(), "post-checkout", "hook-post-checkout");
 
@@ -1060,7 +1078,7 @@ fn cutover_recovery_restores_decommissioned_hooks_after_interruption() {
     // recovery replays the inverse effects (the dispatcher's exact bytes
     // restore) and reverts the fence; a fresh cutover then succeeds.
     let (temp, repo) = create_temp_repo();
-    let head = init_real_git_repo(temp.path(), &repo.current_view().to_string());
+    let head = init_real_git_repo(temp.path(), repo.current_view());
     install_bridge_evidence(&repo, temp.path(), &head);
     let hook_path = temp.path().join(".git/hooks/post-checkout");
     let bytes = install_owned_dispatcher(temp.path(), "post-checkout", "hook-post-checkout");
@@ -1097,7 +1115,7 @@ fn cutover_refuses_configured_remotes() {
     // The audit labels remote-capability negotiation Refused; a configured
     // remote must actually refuse execution.
     let (temp, repo) = create_temp_repo();
-    let head = init_real_git_repo(temp.path(), &repo.current_view().to_string());
+    let head = init_real_git_repo(temp.path(), repo.current_view());
     install_bridge_evidence(&repo, temp.path(), &head);
     let output = std::process::Command::new("git")
         .arg("-C")
@@ -1116,12 +1134,16 @@ fn cutover_fences_only_on_full_leased_readiness() {
     // live HEAD, a candidate binding that resolves, no hooks and no
     // remotes — only then does the fence land.
     let (temp, repo) = create_temp_repo();
-    let head = init_real_git_repo(temp.path(), &repo.current_view().to_string());
+    let head = init_real_git_repo(temp.path(), repo.current_view());
     install_bridge_evidence(&repo, temp.path(), &head);
 
     let audit = repo.audit_bridge_cutover().unwrap();
     assert_eq!(audit.colocated_git.form, ColocatedGitForm::Repository);
-    assert!(audit.readiness_refusals.is_empty(), "{:?}", audit.readiness_refusals);
+    assert!(
+        audit.readiness_refusals.is_empty(),
+        "{:?}",
+        audit.readiness_refusals
+    );
 
     let outcome = repo.execute_bridge_cutover().unwrap();
     assert!(!outcome.already_fenced);
@@ -1248,7 +1270,7 @@ fn cutover_resumes_an_interrupted_fence_before_the_receipt() {
     // the owning operation never finalized. Execution resumes the owning
     // operation in place instead of a no-op success.
     let (temp, repo) = create_temp_repo();
-    let head = init_real_git_repo(temp.path(), &repo.current_view().to_string());
+    let head = init_real_git_repo(temp.path(), repo.current_view());
     install_bridge_evidence(&repo, temp.path(), &head);
     let working_copy = repo.require_working_copy_id().unwrap();
 
@@ -1280,7 +1302,7 @@ fn cutover_refuses_to_prepare_over_an_interrupted_fence_before_the_landing() {
     // nothing landed. A fresh execution refuses at the incomplete-head
     // gate instead of preparing a second cutover or no-op succeeding.
     let (temp, repo) = create_temp_repo();
-    let head = init_real_git_repo(temp.path(), &repo.current_view().to_string());
+    let head = init_real_git_repo(temp.path(), repo.current_view());
     install_bridge_evidence(&repo, temp.path(), &head);
     let working_copy = repo.require_working_copy_id().unwrap();
 
@@ -1318,9 +1340,9 @@ fn cutover_refuses_to_prepare_over_an_interrupted_fence_before_the_landing() {
     assert_eq!(capability_row(&repo, CUTOVER_ID), None);
 
     let error = match repo.execute_bridge_cutover() {
-        Ok(outcome) => panic!(
-            "an execution over an interrupted pre-fence head must refuse: {outcome:?}"
-        ),
+        Ok(outcome) => {
+            panic!("an execution over an interrupted pre-fence head must refuse: {outcome:?}")
+        }
         Err(RepositoryError::InvalidOperation { message }) => message,
         Err(other) => panic!("expected typed invalid-operation error, got {other}"),
     };

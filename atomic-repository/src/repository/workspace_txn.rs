@@ -97,8 +97,7 @@ pub fn git_state_quiescent(observation: &super::git_observation::WorkspaceGitObs
         super::git_observation::WorkspaceGitObservation::Repository(repository) => {
             !repository.index_lock.is_present()
                 && !repository.operation.is_in_progress()
-                && match git_locks_present(&repository.common_dir, &repository.worktree_git_dir)
-                {
+                && match git_locks_present(&repository.common_dir, &repository.worktree_git_dir) {
                     // Fail closed: an uninspectable admin directory is busy.
                     Ok(locks) => locks.is_empty(),
                     Err(_) => false,
@@ -169,10 +168,7 @@ pub fn git_locks_present_proved(
         inspected: Vec::new(),
         skipped_symlink_dirs: Vec::new(),
     };
-    for (label, admin_dir) in [
-        ("worktree", worktree_git_dir),
-        ("common", common_dir),
-    ] {
+    for (label, admin_dir) in [("worktree", worktree_git_dir), ("common", common_dir)] {
         let head_ns = format!("{label}-head-lock");
         let head_ns: &'static str = Box::leak(head_ns.into_boxed_str());
         let packed_ns = format!("{label}-packed-refs-lock");
@@ -210,20 +206,6 @@ pub fn git_locks_present_proved(
     locks.sort();
     locks.dedup();
     Ok((locks, proof))
-}
-
-/// Recursively collect `*.lock` files, with a depth bound so a symlink or
-/// bind-mount cycle cannot recurse forever.
-fn collect_lock_files(
-    directory: &Path,
-    locks: &mut Vec<PathBuf>,
-    depth: u8,
-) -> Result<(), String> {
-    let mut proof = LockScanProof {
-        inspected: Vec::new(),
-        skipped_symlink_dirs: Vec::new(),
-    };
-    collect_lock_files_proved(directory, locks, depth, &mut proof)
 }
 
 /// The recursive lock collector recording the namespaces it walked and the
@@ -362,17 +344,18 @@ impl GitQuiescence {
                 }
                 // Fail closed: an administrative directory that cannot be
                 // inspected is busy, never silently quiescent (review R2).
-                let (locks, proof) =
-                    match git_locks_present_proved(&repository.common_dir, &repository.worktree_git_dir)
-                    {
-                        Ok((locks, proof)) => (locks, proof),
-                        Err(detail) => {
-                            return Self::Busy {
-                                reason: "lock_enumeration_failed",
-                                detail,
-                            }
+                let (locks, proof) = match git_locks_present_proved(
+                    &repository.common_dir,
+                    &repository.worktree_git_dir,
+                ) {
+                    Ok((locks, proof)) => (locks, proof),
+                    Err(detail) => {
+                        return Self::Busy {
+                            reason: "lock_enumeration_failed",
+                            detail,
                         }
-                    };
+                    }
+                };
                 if !locks.is_empty() {
                     return Self::Busy {
                         reason: "ref_locks",
@@ -416,6 +399,7 @@ enum HeadAdoptionAttempt {
 }
 
 /// Result of entering a workspace transaction boundary.
+#[allow(clippy::large_enum_variant)] // Ready carries the live workspace handle
 pub enum WorkspaceTxnStart {
     /// The observed workspace is stable and ready for command-specific work.
     Ready(WorkspaceTxn),
@@ -601,6 +585,7 @@ impl WorkspaceTxnMode {
 
 /// Mode-independent corrective information returned instead of unsafe mutation.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[allow(clippy::large_enum_variant)]
 pub enum WorkspaceRemediation {
     GitOperationInProgress {
         mode: WorkspaceTxnMode,
@@ -873,7 +858,12 @@ impl Repository {
         &mut self,
         budget: ReconcileEffectBudget,
     ) -> Result<WorkspaceTxnStart, RepositoryError> {
-        self.begin_workspace_txn_with_opt(WorkspaceTxnMode::Force, observe_git_metadata, true, budget)
+        self.begin_workspace_txn_with_opt(
+            WorkspaceTxnMode::Force,
+            observe_git_metadata,
+            true,
+            budget,
+        )
     }
 
     /// Test hook mirroring [`Self::begin_remediation_txn`] with observation
@@ -910,6 +900,7 @@ impl Repository {
 
     /// Test hook with observation injection under an explicit budget.
     #[cfg(test)]
+    #[allow(dead_code)] // seam kept for the next budget consumer
     pub(crate) fn begin_workspace_txn_budgeted_with<F>(
         &mut self,
         mode: WorkspaceTxnMode,
@@ -1110,9 +1101,7 @@ impl Repository {
                     // when pending work exists, deferring to the explicit
                     // command boundary instead.
                     if budget.is_metadata_only() {
-                        if let Some(detail) =
-                            self.pending_unsafe_recovery_work(working_copy)?
-                        {
+                        if let Some(detail) = self.pending_unsafe_recovery_work(working_copy)? {
                             return Err(RepositoryError::ReactiveDeferred { detail });
                         }
                     }
@@ -2396,11 +2385,7 @@ mod tests {
         assert!(git_state_quiescent(&with_dirs));
         fs::write(refs.join("main.lock"), b"").unwrap();
         assert!(!git_state_quiescent(&with_dirs));
-        let locks = git_locks_present(
-            &directory.path().to_path_buf(),
-            &directory.path().to_path_buf(),
-        )
-        .unwrap();
+        let locks = git_locks_present(directory.path(), directory.path()).unwrap();
         assert_eq!(locks, vec![refs.join("main.lock")]);
         match GitQuiescence::evaluate(&with_dirs) {
             GitQuiescence::Busy {
@@ -2472,7 +2457,6 @@ mod tests {
     /// retained lease — a HEAD.lock that appears after the caller's
     /// pre-entry quiescence wait is caught by the entry's revalidation
     /// under the metadata-only budget, before any effect.
-    
     /// CB-13D ::24 AC-2 namespace-completeness proof: the quiet-lock
     /// enumeration records WHICH namespaces it walked (all ten: head-lock,
     /// packed-refs-lock, reftable, refs, top-level × worktree/common) and
@@ -2486,8 +2470,7 @@ mod tests {
         let git_dir = directory.path().join("git");
         fs::create_dir_all(git_dir.join("refs/heads")).unwrap();
         fs::create_dir_all(git_dir.join("reftable")).unwrap();
-        let (locks, proof) =
-            git_locks_present_proved(&git_dir, &git_dir).unwrap();
+        let (locks, proof) = git_locks_present_proved(&git_dir, &git_dir).unwrap();
         assert!(locks.is_empty());
         assert!(
             proof.is_complete(),
@@ -2500,11 +2483,7 @@ mod tests {
         // into, never silently dropped).
         #[cfg(unix)]
         {
-            std::os::unix::fs::symlink(
-                directory.path(),
-                git_dir.join("refs/looped"),
-            )
-            .unwrap();
+            std::os::unix::fs::symlink(directory.path(), git_dir.join("refs/looped")).unwrap();
             let (_, proof) = git_locks_present_proved(&git_dir, &git_dir).unwrap();
             assert!(
                 proof
@@ -2551,7 +2530,7 @@ mod tests {
         }
     }
 
-#[test]
+    #[test]
     fn metadata_only_entry_revalidates_git_locks_under_the_lease() {
         let directory = tempfile::TempDir::new().unwrap();
         let mut repo = Repository::init(directory.path()).unwrap();

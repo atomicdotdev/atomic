@@ -276,10 +276,12 @@ fn watch_consent_revocation_while_running_exits_cleanly() {
     let content = fs::read_to_string(&config).unwrap();
     let revoked = content
         .lines()
-        .map(|line| if line.trim() == "enabled = true" {
-            "enabled = false"
-        } else {
-            line
+        .map(|line| {
+            if line.trim() == "enabled = true" {
+                "enabled = false"
+            } else {
+                line
+            }
         })
         .collect::<Vec<_>>()
         .join("\n");
@@ -287,10 +289,16 @@ fn watch_consent_revocation_while_running_exits_cleanly() {
 
     // The daemon consumes the revocation at the next poll and exits
     // cleanly (single-pass mode reports the refusal honestly).
-    let once = atomic(root.path(), home.path(), &["git", "bridge", "watch", "--once"]);
+    let once = atomic(
+        root.path(),
+        home.path(),
+        &["git", "bridge", "watch", "--once"],
+    );
     let once_text = atomic_text(&once);
     assert!(
-        once_text.contains("not enabled") || once_text.contains("disabled") || once.status.success(),
+        once_text.contains("not enabled")
+            || once_text.contains("disabled")
+            || once.status.success(),
         "the revoked daemon must report the withdrawal honestly: {once_text}"
     );
     // Commands remain the guarantee.

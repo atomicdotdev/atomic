@@ -14,8 +14,6 @@
 //!   incomplete; and the negative control proves no attribution is
 //!   manufactured (the unbound commit list is exactly the observed commit).
 
-use std::fs;
-use std::path::Path;
 use std::process::{Command, Output};
 
 const ATOMIC_BIN: &str = env!("CARGO_BIN_EXE_atomic");
@@ -30,6 +28,7 @@ fn atomic(root: &std::path::Path, home: &std::path::Path, args: &[&str]) -> Outp
         .expect("run atomic")
 }
 
+#[allow(dead_code)]
 fn atomic_text(output: &Output) -> String {
     format!(
         "{}{}",
@@ -119,7 +118,9 @@ fn write_managed_session(root: &std::path::Path, session_id: &str) -> String {
         .current_dir(root)
         .output()
         .expect("rev-parse tree");
-    let head_tree = String::from_utf8_lossy(&head_tree.stdout).trim().to_string();
+    let head_tree = String::from_utf8_lossy(&head_tree.stdout)
+        .trim()
+        .to_string();
     let branch = Command::new("git")
         .args(["rev-parse", "--abbrev-ref", "HEAD"])
         .current_dir(root)
@@ -298,7 +299,10 @@ fn managed_capture_commit_lands_and_atomic_finalization_is_durably_incomplete() 
     );
     // No exact attribution: the atomic view never claimed the commit.
     assert!(
-        value["turn_outcomes"].as_array().map(|a| a.is_empty()).unwrap_or(true),
+        value["turn_outcomes"]
+            .as_array()
+            .map(|a| a.is_empty())
+            .unwrap_or(true),
         "no turn outcome claims the commit exactly: {value:?}"
     );
 }
@@ -376,7 +380,10 @@ fn bypassed_commit_lands_and_finalization_keeps_durable_unattributed_incomplete(
     // The negative control: exactly the observed commit is named as unbound
     // — no invented attribution beyond the observation.
     assert!(
-        incomplete["unbound_commits"].as_array().map(|a| !a.is_empty()).unwrap_or(false),
+        incomplete["unbound_commits"]
+            .as_array()
+            .map(|a| !a.is_empty())
+            .unwrap_or(false),
         "the observed commit is retained as unbound evidence: {incomplete:?}"
     );
 }

@@ -8,12 +8,11 @@
 //! ac-4 deterministic matrix (linked worktrees, concurrent writers).
 
 use super::super::projection_effects::{
-    aligned_git_index_lease, observe_checkpoint_facts, observe_git_index_lease, read_head_target,
-    ProjectionCheckpointPlan,
+    aligned_git_index_lease, observe_git_index_lease, read_head_target, ProjectionCheckpointPlan,
 };
 use super::*;
 
-use atomic_core::operation::{DigestKind, EffectReceiptKind, EffectTarget, EffectValue};
+use atomic_core::operation::EffectTarget;
 use atomic_core::pristine::OperationTxnT;
 use std::fs;
 use std::process::Command;
@@ -68,7 +67,10 @@ fn colocated() -> (TempDir, Repository, git2::Repository) {
 
 fn run_git_init(directory: &TempDir) {
     run_git(directory.path(), &["init", "-b", "master"]);
-    run_git(directory.path(), &["config", "user.email", "tests@atomic.dev"]);
+    run_git(
+        directory.path(),
+        &["config", "user.email", "tests@atomic.dev"],
+    );
     run_git(directory.path(), &["config", "user.name", "Atomic Tests"]);
     fs::write(directory.path().join("tracked.txt"), b"tracked\n").unwrap();
     run_git(directory.path(), &["add", "tracked.txt"]);
@@ -88,13 +90,18 @@ fn direct(oid: git2::Oid) -> atomic_core::operation::GitRefTarget {
 }
 
 fn write_object(git: &git2::Repository, bytes: &[u8]) -> git2::Oid {
-    git.odb().unwrap().write(git2::ObjectType::Blob, bytes).unwrap()
+    git.odb()
+        .unwrap()
+        .write(git2::ObjectType::Blob, bytes)
+        .unwrap()
 }
 
 fn build_tree(git: &git2::Repository, entries: &[(&str, &[u8])]) -> git2::Oid {
     let mut builder = git.treebuilder(None).unwrap();
     for (name, bytes) in entries {
-        builder.insert(*name, write_object(git, bytes), 0o100644).unwrap();
+        builder
+            .insert(*name, write_object(git, bytes), 0o100644)
+            .unwrap();
     }
     builder.write().unwrap()
 }
@@ -139,7 +146,10 @@ fn checkpoint_only_plan_executes_and_finalizes() {
             evidence,
         )
         .unwrap();
-    assert!(prepared.checkpoint_plan, "the checkpoint effect must be journaled");
+    assert!(
+        prepared.checkpoint_plan,
+        "the checkpoint effect must be journaled"
+    );
     repo.execute_projection_publish(&prepared, &git).unwrap();
     repo.finalize_projection_publish(prepared, &git).unwrap();
     let checkpoint = super::super::workspace_txn::read_workspace_checkpoint(repo.root())
@@ -178,7 +188,10 @@ fn index_only_plan_executes_and_finalizes() {
     repo.finalize_projection_publish(prepared, &git).unwrap();
     let observed = observe_git_index_lease(&git).unwrap();
     let aligned = aligned_git_index_lease(&git, tree).unwrap();
-    assert_eq!(observed, aligned, "the replaced index holds the aligned tree");
+    assert_eq!(
+        observed, aligned,
+        "the replaced index holds the aligned tree"
+    );
 }
 
 #[test]
@@ -199,7 +212,8 @@ fn object_only_plan_is_idempotent_when_objects_already_landed() {
     let evidence = atomic_core::Hash::of(b"object-only");
     // The mapped ref already tips at the projection and no other lease
     // moves: the publication is a zero-op.
-    git.reference("refs/atomic/views/agent", commit_oid, true, "seed").unwrap();
+    git.reference("refs/atomic/views/agent", commit_oid, true, "seed")
+        .unwrap();
     let prepared = repo
         .prepare_projection_publication(
             working_copy,
@@ -260,7 +274,10 @@ fn ref_third_value_is_rejected_and_the_external_value_is_preserved() {
     )
     .unwrap();
     let error = repo.execute_projection_publish(&prepared, &git);
-    assert!(error.is_err(), "the third value must fail closed: {error:?}");
+    assert!(
+        error.is_err(),
+        "the third value must fail closed: {error:?}"
+    );
     assert_eq!(
         git.find_reference("refs/atomic/views/agent")
             .unwrap()
@@ -355,7 +372,10 @@ fn ref_cas_holds_the_ref_lock_through_the_comparison() {
         )
         .unwrap();
     let error = repo.execute_projection_publish(&prepared, &git);
-    assert!(error.is_err(), "the bounded budget must refuse a contended ref");
+    assert!(
+        error.is_err(),
+        "the bounded budget must refuse a contended ref"
+    );
     assert!(
         git.find_reference("refs/atomic/views/agent").is_err(),
         "the contended ref was never created behind the competitor's back"
@@ -427,7 +447,10 @@ fn head_cas_holds_the_head_lock_through_the_comparison() {
         )
         .unwrap();
     let error = repo.execute_projection_publish(&prepared, &git);
-    assert!(error.is_err(), "the bounded budget must refuse a contended HEAD");
+    assert!(
+        error.is_err(),
+        "the bounded budget must refuse a contended HEAD"
+    );
     drop(competitor);
     // Release the failed attempt's operation boundary before the retry: the
     // prepared guard holds the working-copy operation lock until it drops.
@@ -478,7 +501,8 @@ fn read_head_distinguishes_unborn_detached_and_attached_states() {
     git.set_head_detached(oid).unwrap();
     assert_eq!(read_head_target(&git).unwrap(), Some(direct(oid)));
     // An attached HEAD reads as its symbolic target once the branch exists.
-    git.reference("refs/heads/master", oid, true, "test seed").unwrap();
+    git.reference("refs/heads/master", oid, true, "test seed")
+        .unwrap();
     git.set_head("refs/heads/master").unwrap();
     assert_eq!(
         read_head_target(&git).unwrap(),
@@ -528,7 +552,9 @@ fn finalize_requires_every_effect_receipt() {
         .finalize_operation_verified(&prepared.lock, prepared.operation_id)
         .unwrap_err();
     assert!(
-        error.to_string().contains("cannot be verified before effect"),
+        error
+            .to_string()
+            .contains("cannot be verified before effect"),
         "missing-receipt finalization must refuse: {error}"
     );
 }
@@ -635,13 +661,8 @@ fn linked_worktree_publication_preserves_the_other_worktree_head_and_third_value
         .unwrap();
     // Inside the prepare→execute window the linked worktree moves the SHARED
     // ref (refs are common across worktrees) — a third value.
-    git.reference(
-        "refs/atomic/views/agent",
-        external,
-        true,
-        "linked writer",
-    )
-    .unwrap();
+    git.reference("refs/atomic/views/agent", external, true, "linked writer")
+        .unwrap();
     let error = repo.execute_projection_publish(&prepared, &git);
     assert!(
         error.is_err(),
@@ -747,7 +768,8 @@ fn concurrent_external_ref_writes_never_lose_updates_or_tear_the_projection() {
         .peel_to_commit()
         .unwrap()
         .id();
-    git.reference("refs/atomic/views/agent", seed, true, "seed").unwrap();
+    git.reference("refs/atomic/views/agent", seed, true, "seed")
+        .unwrap();
     // Four alternating external candidate commits.
     let externals: Vec<git2::Oid> = (0..4)
         .map(|index| {
@@ -880,6 +902,7 @@ fn concurrent_external_ref_writes_never_lose_updates_or_tear_the_projection() {
 // ── Review ATOM::aaron::2: inside-window external-writer regressions ────
 
 /// The effect receipt of one journaled operation, looked up by effect target.
+#[allow(dead_code)]
 fn receipt_for(
     repo: &Repository,
     operation_id: atomic_core::OperationId,
@@ -979,7 +1002,10 @@ fn ref_third_value_inside_the_lock_window_is_receipted_and_preserved() {
         Some(&external_value),
         "the receipt records the actual third value, not the stale pre-lock observation"
     );
-    assert_eq!(receipt.payload().observed_new.as_ref(), Some(&external_value));
+    assert_eq!(
+        receipt.payload().observed_new.as_ref(),
+        Some(&external_value)
+    );
     // Recovery preserves the newer external value — it never rolls the ref
     // back to the leased expected-old absence.
     drop(prepared);
@@ -1050,9 +1076,7 @@ fn head_third_value_inside_the_lock_window_is_receipted_and_preserved() {
     let (_, receipt) = receipt_for(
         &repo,
         prepared.operation_id,
-        &EffectTarget::GitHead {
-            working_copy,
-        },
+        &EffectTarget::GitHead { working_copy },
     );
     assert_eq!(receipt.payload().kind, EffectReceiptKind::LeaseRejected);
     let external_value = EffectValue::GitRef(direct(external));
@@ -1061,7 +1085,10 @@ fn head_third_value_inside_the_lock_window_is_receipted_and_preserved() {
         Some(&external_value),
         "the receipt records the actual detached HEAD, not the stale attached observation"
     );
-    assert_eq!(receipt.payload().observed_new.as_ref(), Some(&external_value));
+    assert_eq!(
+        receipt.payload().observed_new.as_ref(),
+        Some(&external_value)
+    );
     drop(prepared);
     let lock = repo.try_lock_operation(working_copy).unwrap();
     repo.recover_incomplete_operation(&lock).unwrap();
@@ -1229,8 +1256,9 @@ fn checkpoint_replaced_inside_the_write_window_is_preserved_and_receipted() {
     );
     // The rejection receipt records the actual external FACTS digest, read
     // back from the real on-disk bytes.
-    let external_digest =
-        observe_checkpoint_facts(repo.root()).unwrap().expect("external checkpoint on disk");
+    let external_digest = observe_checkpoint_facts(repo.root())
+        .unwrap()
+        .expect("external checkpoint on disk");
     let (_, receipt) = receipt_for(
         &repo,
         prepared.operation_id,
@@ -1249,7 +1277,10 @@ fn checkpoint_replaced_inside_the_write_window_is_preserved_and_receipted() {
         Some(&external_value),
         "the receipt records the actual external FACTS value"
     );
-    assert_eq!(receipt.payload().observed_new.as_ref(), Some(&external_value));
+    assert_eq!(
+        receipt.payload().observed_new.as_ref(),
+        Some(&external_value)
+    );
     // Recovery converges without publishing the prepared checkpoint.
     drop(prepared);
     let lock = repo.try_lock_operation(working_copy).unwrap();
@@ -1262,6 +1293,7 @@ fn checkpoint_replaced_inside_the_write_window_is_preserved_and_receipted() {
     );
 }
 
+#[allow(dead_code)]
 fn checkpoint_path_of(repo: &Repository) -> std::path::PathBuf {
     repo.root().join(".atomic/bridge/workspace.json")
 }

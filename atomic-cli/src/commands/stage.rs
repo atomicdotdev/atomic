@@ -380,6 +380,7 @@ fn path_relative_to_root(native: &Path, root: &Path) -> CliResult<PathBuf> {
 fn collect_tree_entries(
     repository: &GitRepository,
     tree: &git2::Tree<'_>,
+    #[allow(clippy::ptr_arg)] // recursive tree walker shares the Vec
     prefix: &mut Vec<u8>,
     output: &mut std::collections::BTreeMap<Vec<u8>, (Oid, u32)>,
 ) -> CliResult<()> {

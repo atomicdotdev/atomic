@@ -298,9 +298,7 @@ impl From<&MetadataTarget> for MetadataTargetDto {
                 name: name.clone(),
             },
             MetadataTarget::Remote { name } => Self::Remote { name: name.clone() },
-            MetadataTarget::RefMapping { view } => {
-                Self::RefMapping { view: view.clone() }
-            }
+            MetadataTarget::RefMapping { view } => Self::RefMapping { view: view.clone() },
             MetadataTarget::Capability { id } => Self::Capability { id: id.clone() },
         }
     }

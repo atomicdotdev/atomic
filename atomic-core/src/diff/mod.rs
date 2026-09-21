@@ -636,22 +636,25 @@ pub fn merge_text(base: &[u8], ours: &[u8], theirs: &[u8]) -> Result<Vec<u8>, St
     for op in a_delta.ops() {
         match op {
             DiffOp::Equal {
-                old_pos, new_pos, len, ..
+                old_pos,
+                new_pos,
+                len,
+                ..
             } => {
                 for i in 0..*len {
                     mapping.kept[*old_pos + i] = Some(*new_pos + i);
                 }
             }
             DiffOp::Insert {
-                old_pos, new_pos, len,
+                old_pos,
+                new_pos,
+                len,
             } => {
                 for i in 0..*len {
                     mapping.inserted[*old_pos].push(*new_pos + i);
                 }
             }
-            DiffOp::Delete {
-                old_pos, len, ..
-            } => {
+            DiffOp::Delete { old_pos, len, .. } => {
                 for i in 0..*len {
                     mapping.changed[*old_pos + i] = Some((ours_lines.len(), 0));
                 }
@@ -674,7 +677,7 @@ pub fn merge_text(base: &[u8], ours: &[u8], theirs: &[u8]) -> Result<Vec<u8>, St
     /// theirs change.
     fn emit_ours_region(
         mapping: &OursRender,
-        base_lines: &[Line],
+        _base_lines: &[Line],
         ours_lines: &[Line],
         output: &mut Vec<u8>,
         from: usize,
@@ -705,9 +708,7 @@ pub fn merge_text(base: &[u8], ours: &[u8], theirs: &[u8]) -> Result<Vec<u8>, St
     let mut parked_until = 0usize;
     for op in b_delta.ops() {
         match op {
-            DiffOp::Equal {
-                old_pos, len, ..
-            } => {
+            DiffOp::Equal { old_pos, len, .. } => {
                 // B kept this region: emit ours' rendering of it.
                 emit_ours_region(
                     &mapping,
@@ -740,9 +741,7 @@ pub fn merge_text(base: &[u8], ours: &[u8], theirs: &[u8]) -> Result<Vec<u8>, St
                     }
                 }
             }
-            DiffOp::Delete {
-                old_pos, len, ..
-            } => {
+            DiffOp::Delete { old_pos, len, .. } => {
                 emit_ours_region(
                     &mapping,
                     &base_lines,

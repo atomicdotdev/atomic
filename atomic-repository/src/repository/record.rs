@@ -108,7 +108,12 @@ impl Repository {
             )
             .map_err(|e| format!("cannot retrieve baseline for '{path}': {e}"))?;
 
-        self.record_foreign_modified_file(path, &old_content, new_content, conflict_baseline || had_fork_structure)
+        self.record_foreign_modified_file(
+            path,
+            &old_content,
+            new_content,
+            conflict_baseline || had_fork_structure,
+        )
     }
 
     /// Record a modified file against an explicit baseline while binding the
@@ -156,8 +161,7 @@ impl Repository {
         detected.inode = Some(inode);
         detected.position = Some(position);
         let options = if force_whole_file_replace {
-            atomic_core::record::workflow::RecordingOptions::new()
-                .force_whole_file_replace(true)
+            atomic_core::record::workflow::RecordingOptions::new().force_whole_file_replace(true)
         } else {
             atomic_core::record::workflow::RecordingOptions::new()
         };
@@ -248,8 +252,7 @@ impl Repository {
         detected.inode = Some(inode);
         detected.position = Some(position);
         let options = if force_whole_file_replace {
-            atomic_core::record::workflow::RecordingOptions::new()
-                .force_whole_file_replace(true)
+            atomic_core::record::workflow::RecordingOptions::new().force_whole_file_replace(true)
         } else {
             atomic_core::record::workflow::RecordingOptions::new()
         };
@@ -284,14 +287,7 @@ impl Repository {
         &self,
         view_name: &str,
         path: &str,
-    ) -> Result<
-        Option<(
-            atomic_core::pristine::PathClaimId,
-            Inode,
-            Position<NodeId>,
-        )>,
-        String,
-    > {
+    ) -> Result<Option<(atomic_core::pristine::PathClaimId, Inode, Position<NodeId>)>, String> {
         use atomic_core::pristine::ViewTxnT;
         let txn = self
             .pristine
@@ -324,7 +320,9 @@ impl Repository {
                 claims.len()
             ));
         }
-        Ok(claims.pop().map(|single| (single, claim.inode, claim.position)))
+        Ok(claims
+            .pop()
+            .map(|single| (single, claim.inode, claim.position)))
     }
 
     /// Record a foreign Git-detected rename through the native identity-
@@ -356,9 +354,7 @@ impl Repository {
         new_content: &[u8],
         force_whole_file_replace: bool,
     ) -> Result<atomic_core::record::workflow::RecordedFile, String> {
-        use atomic_core::record::workflow::{
-            record_moved_file, DetectedFile, RecordingOptions,
-        };
+        use atomic_core::record::workflow::{record_moved_file, DetectedFile, RecordingOptions};
         let txn = self
             .pristine
             .read_txn()
@@ -486,7 +482,7 @@ impl Repository {
         path: &str,
     ) -> Result<atomic_core::record::workflow::RecordedFile, String> {
         use atomic_core::change::FileOps;
-        use atomic_core::pristine::{GraphTxnT, TreeTxnT};
+        use atomic_core::pristine::TreeTxnT;
         let txn = self
             .pristine
             .read_txn()
@@ -503,8 +499,10 @@ impl Repository {
         let (existing_trunk_id, existing_branches) =
             self.resolve_existing_semantic_state(path, inode)?;
         let existing_trunk_id = existing_trunk_id.ok_or_else(|| {
-            format!("path '{path}' has no CRDT trunk; refusing a semantic deletion without \
-                     an existing semantic identity")
+            format!(
+                "path '{path}' has no CRDT trunk; refusing a semantic deletion without \
+                     an existing semantic identity"
+            )
         })?;
 
         let mut detected = atomic_core::record::workflow::DetectedFile::deleted(path);
@@ -512,8 +510,7 @@ impl Repository {
         detected.position = Some(position);
         let core_options = atomic_core::record::workflow::RecordingOptions::new();
         let mut recorded =
-            atomic_core::record::workflow::record_deleted_file(&detected, &core_options)
-                .map_err(|message| message)?;
+            atomic_core::record::workflow::record_deleted_file(&detected, &core_options)?;
         if recorded.is_empty() {
             return Err(format!(
                 "cannot import deletion '{path}': canonical FileDel is empty"
@@ -529,40 +526,40 @@ impl Repository {
     }
 
     /// Whether `path` carries persisted conflict state on `view_name` (review
-/// CB-11A). A conflicted path's rendered bytes are a conflict projection
-/// (marker lines with side provenance interleaved), not a plain file
-/// rendering: a positional diff against it cannot be mapped onto the
-/// graph's per-line vertices, so foreign deltas for such paths must be
-/// recorded as whole-file replacements instead.
-pub fn path_has_persisted_conflict(
-    &self,
-    path: &str,
-    view_name: &str,
-) -> Result<bool, RepositoryError> {
-    use atomic_core::pristine::{TreeTxnT, ViewTxnT};
-    let txn = self
-        .pristine
-        .read_txn()
-        .map_err(|e| RepositoryError::Database(e.to_string()))?;
-    let view = txn
-        .get_view(view_name)
-        .map_err(|e| RepositoryError::Database(e.to_string()))?
-        .ok_or_else(|| RepositoryError::ViewNotFound {
-            name: view_name.to_string(),
-        })?;
-    let Some(inode) = txn
-        .get_inode(path)
-        .map_err(|e| RepositoryError::Database(e.to_string()))?
-    else {
-        return Ok(false);
-    };
-    let conflicts = txn
-        .get_conflicts(view.id, inode.get())
-        .map_err(|e| RepositoryError::Database(e.to_string()))?;
-    Ok(!conflicts.is_empty())
-}
+    /// CB-11A). A conflicted path's rendered bytes are a conflict projection
+    /// (marker lines with side provenance interleaved), not a plain file
+    /// rendering: a positional diff against it cannot be mapped onto the
+    /// graph's per-line vertices, so foreign deltas for such paths must be
+    /// recorded as whole-file replacements instead.
+    pub fn path_has_persisted_conflict(
+        &self,
+        path: &str,
+        view_name: &str,
+    ) -> Result<bool, RepositoryError> {
+        use atomic_core::pristine::{TreeTxnT, ViewTxnT};
+        let txn = self
+            .pristine
+            .read_txn()
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        let view = txn
+            .get_view(view_name)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?
+            .ok_or_else(|| RepositoryError::ViewNotFound {
+                name: view_name.to_string(),
+            })?;
+        let Some(inode) = txn
+            .get_inode(path)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?
+        else {
+            return Ok(false);
+        };
+        let conflicts = txn
+            .get_conflicts(view.id, inode.get())
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        Ok(!conflicts.is_empty())
+    }
 
-/// Resolve the existing CRDT semantic state of a tracked path: the
+    /// Resolve the existing CRDT semantic state of a tracked path: the
     /// current trunk (path index first — the authoritative "trunk of this
     /// path" mapping; the inode index can lag when the CRDT layer allocated
     /// a parallel inode for synthesized flows) and its alive branches in
@@ -571,8 +568,13 @@ pub fn path_has_persisted_conflict(
         &self,
         path: &str,
         inode: atomic_core::types::Inode,
-    ) -> Result<(Option<atomic_core::crdt::TrunkId>, Vec<atomic_core::crdt::BranchId>), String>
-    {
+    ) -> Result<
+        (
+            Option<atomic_core::crdt::TrunkId>,
+            Vec<atomic_core::crdt::BranchId>,
+        ),
+        String,
+    > {
         use atomic_core::crdt::queries::iter_trunk_branches_in_file_order;
         use atomic_core::crdt::tables::{decode_trunk_id, encode_branch_id};
         use atomic_core::pristine::CrdtTxnT;
@@ -589,9 +591,7 @@ pub fn path_has_persisted_conflict(
                 _ => None,
             },
         };
-        let existing_branches: Vec<atomic_core::crdt::BranchId> = match existing_trunk_id
-            .as_ref()
-        {
+        let existing_branches: Vec<atomic_core::crdt::BranchId> = match existing_trunk_id.as_ref() {
             Some(trunk_id) => match iter_trunk_branches_in_file_order(&txn, *trunk_id) {
                 Ok(all) => {
                     let mut alive = Vec::with_capacity(all.len());
@@ -696,9 +696,7 @@ pub fn path_has_persisted_conflict(
         // any long-lived read transaction is opened so the journaled mutation
         // can take its own write boundary, and it only touches the named paths.
         let mut conflict_cleanup: Option<ConflictReconcileOutcome> = None;
-        if options.get_allow_conflict_markers()
-            && !options.all()
-            && !options.get_paths().is_empty()
+        if options.get_allow_conflict_markers() && !options.all() && !options.get_paths().is_empty()
         {
             if let Some(outcome) = self
                 .reconcile_explicit_conflicts(working_copy, options.get_paths())
@@ -2274,15 +2272,11 @@ pub fn path_has_persisted_conflict(
             // applied-then-compensated publication: no snapshot change that
             // depends on a snapshot-kind change is ever saved or applied.
             if lifecycle.is_snapshot_publication()
-                && outcome
-                    .change()
-                    .dependencies()
-                    .iter()
-                    .any(|dependency| {
-                        self.load_change(dependency)
-                            .map(|change| change.kind().is_snapshot())
-                            .unwrap_or(false)
-                    })
+                && outcome.change().dependencies().iter().any(|dependency| {
+                    self.load_change(dependency)
+                        .map(|change| change.kind().is_snapshot())
+                        .unwrap_or(false)
+                })
             {
                 self.abort_prepared_metadata_operation(&operation_lock, &operation)
                     .map_err(RecordError::Repository)?;
@@ -2981,6 +2975,7 @@ fn move_similarity(old: &[u8], new: &[u8]) -> (u16, crate::record::MoveBasis) {
     (score, MoveBasis::ContentSimilarity)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn prepare_name_resolution(
     txn: &atomic_core::pristine::ReadTxn,
     cached: &CachedGraphTxn<'_>,

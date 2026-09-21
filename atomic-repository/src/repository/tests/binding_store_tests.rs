@@ -1,7 +1,7 @@
 //! CB-6A binding storage and create-only publication tests (RFC §5.1, 7.2, 8.6).
 
 use atomic_core::operation::{GitHashAlgorithm, GitObjectId, GitRefTarget};
-use atomic_core::pristine::{BindingStoreOutcome, BindingTxnT};
+use atomic_core::pristine::BindingStoreOutcome;
 use atomic_core::types::OperationId;
 use atomic_core::Hash;
 
@@ -33,7 +33,7 @@ fn oid_bytes(seed: u8) -> String {
 
 /// A minimal well-formed binding for storage/publication tests.
 fn sample_binding(keypair: &KeyPair, commit_seed: u8) -> GitStateBinding {
-    let commit = GitOid::from_hex(&oid_bytes(commit_seed)).unwrap();
+    let _commit = GitOid::from_hex(&oid_bytes(commit_seed)).unwrap();
     let changes = vec![atomic_core::Hash::from_bytes([commit_seed; 32])];
     let mut payload = GitStateBindingPayload {
         version: BINDING_VERSION,
@@ -59,7 +59,9 @@ fn sample_binding(keypair: &KeyPair, commit_seed: u8) -> GitStateBinding {
         loss: vec![LossNote::Other {
             description: "test loss note".to_string(),
         }],
-        provenance_roots: vec![atomic_core::Hash::from_bytes([commit_seed.wrapping_add(5); 32])],
+        provenance_roots: vec![atomic_core::Hash::from_bytes(
+            [commit_seed.wrapping_add(5); 32],
+        )],
         attestation_roots: Vec::new(),
         signer: BindingSigner::for_keypair(keypair),
     };
@@ -86,7 +88,9 @@ fn stored_bindings_are_idempotent_and_survive_reopen() {
     let republished = {
         let binding_again = sample_binding(&keypair, 0x10);
         assert_eq!(binding_again.encode(), binding.encode());
-        repository.store_binding(&binding_again).expect("store again")
+        repository
+            .store_binding(&binding_again)
+            .expect("store again")
     };
     assert_eq!(republished, BindingStoreOutcome::Idempotent);
 
@@ -111,7 +115,10 @@ fn publication_creates_create_only_ref_and_is_idempotent() {
     let ref_name = Repository::binding_ref_name(&id);
     assert!(ref_name.starts_with("refs/atomic/bindings/"));
     // shard = first two hex characters of the binding id
-    assert_eq!(ref_name, format!("refs/atomic/bindings/{}/{}", &id.to_hex()[..2], id.to_hex()));
+    assert_eq!(
+        ref_name,
+        format!("refs/atomic/bindings/{}/{}", &id.to_hex()[..2], id.to_hex())
+    );
 
     let publication = repository
         .publish_binding(working_copy, &git, &binding, None)
@@ -175,11 +182,10 @@ fn signing_failure_publishes_nothing() {
             false,
         )
         .unwrap();
-    assert!(matches!(
-        heads.head_state,
-        OperationHeadState::Empty
-    ));
-    assert!(git.find_reference(&Repository::binding_ref_name(&forged.id())).is_err());
+    assert!(matches!(heads.head_state, OperationHeadState::Empty));
+    assert!(git
+        .find_reference(&Repository::binding_ref_name(&forged.id()))
+        .is_err());
 }
 
 #[test]
@@ -197,9 +203,7 @@ fn journal_failure_cannot_expose_a_valid_looking_publication() {
             working_copy,
             "refs/heads/main",
             None,
-            GitRefTarget::Direct(
-                GitObjectId::new(GitHashAlgorithm::Sha1, vec![0u8; 20]).unwrap(),
-            ),
+            GitRefTarget::Direct(GitObjectId::new(GitHashAlgorithm::Sha1, vec![0u8; 20]).unwrap()),
             Hash::of(b"competing evidence"),
         )
         .expect("hold the lock");
@@ -274,7 +278,7 @@ fn crash_between_journal_and_ref_write_gates_the_repository_with_the_ref_absent(
 
 #[test]
 fn old_bindings_survive_unrecord_and_new_projection() {
-    let keypair = test_keypair(8);
+    let _keypair = test_keypair(8);
     let (directory, repository, git) = create_temp_repo_with_git();
 
     // Produce a real recorded change, then bind the pre-change commit.
@@ -353,7 +357,14 @@ fn conflicting_ref_target_is_refused_and_the_newer_work_survives() {
     let tree = git.find_tree(tree).unwrap();
     let signature = git2::Signature::now("Competing", "competing@example.com").unwrap();
     let older_target = git
-        .commit(Some(&ref_name), &signature, &signature, "older binding", &tree, &[])
+        .commit(
+            Some(&ref_name),
+            &signature,
+            &signature,
+            "older binding",
+            &tree,
+            &[],
+        )
         .unwrap();
 
     let refused = repository.publish_binding(working_copy, &git, &binding, None);
@@ -362,7 +373,10 @@ fn conflicting_ref_target_is_refused_and_the_newer_work_survives() {
         "publishing over a different binding target must be refused"
     );
     // The older (newer-arrived) work is untouched.
-    assert_eq!(git.find_reference(&ref_name).unwrap().target(), Some(older_target));
+    assert_eq!(
+        git.find_reference(&ref_name).unwrap().target(),
+        Some(older_target)
+    );
 }
 
 #[test]
@@ -436,20 +450,19 @@ fn publication_with_a_signed_summary_carries_only_the_allowlisted_summary() {
     let decoded = crate::git_binding::SignedAttestationSummary::decode(summary_blob.content())
         .expect("decode signed summary");
     decoded
-        .verify_signature(&atomic_identity::keypair::PublicKey::from_bytes(
-            &binding.payload().signer.verifying_key,
+        .verify_signature(
+            &atomic_identity::keypair::PublicKey::from_bytes(
+                &binding.payload().signer.verifying_key,
+            )
+            .unwrap(),
         )
-        .unwrap())
         .expect("summary signature verifies");
     let decoded_summary = decoded.summary().expect("summary decodes");
     assert_eq!(decoded_summary.session_id, "session-cb6a");
     assert_eq!(decoded_summary.models.len(), 1);
     assert_eq!(decoded_summary.models[0].input_tokens, 120);
     assert_eq!(decoded_summary.models[0].output_tokens, 60);
-    assert_eq!(
-        decoded_summary.models[0].model,
-        "claude-sonnet-4-5"
-    );
+    assert_eq!(decoded_summary.models[0].model, "claude-sonnet-4-5");
     let summary_bytes = summary_blob.content();
     assert!(
         !contains_sentinel(summary_bytes),
@@ -560,7 +573,10 @@ fn legit_carrier_verifies_to_the_exact_publication_commit() {
         .expect("legit carrier validates")
         .expect("carrier present");
     assert_eq!(verified.binding, binding);
-    assert_eq!(verified.carrier_oid, target, "the carrier is the exact publication commit");
+    assert_eq!(
+        verified.carrier_oid, target,
+        "the carrier is the exact publication commit"
+    );
 }
 
 #[test]
@@ -587,7 +603,9 @@ fn carrier_with_unexpected_private_parent_refuses_verification() {
     let binding_tree = carrier_commit.tree_id();
     let blob = git.blob(b"PRIVATE_REVIEW_SENTINEL\n").unwrap();
     let mut builder = git.treebuilder(None).unwrap();
-    builder.insert("private.txt", blob, git2::FileMode::Blob.into()).unwrap();
+    builder
+        .insert("private.txt", blob, git2::FileMode::Blob.into())
+        .unwrap();
     let private_tree = builder.write().unwrap();
     let private_commit = git
         .commit(
@@ -609,7 +627,8 @@ fn carrier_with_unexpected_private_parent_refuses_verification() {
             &[&git.find_commit(private_commit).unwrap()],
         )
         .unwrap();
-    git.reference(&ref_name, hostile, true, "hostile carrier swap").unwrap();
+    git.reference(&ref_name, hostile, true, "hostile carrier swap")
+        .unwrap();
 
     let error = repository
         .verify_published_binding_carrier(&git, &id)
@@ -643,10 +662,14 @@ fn carrier_with_extra_tree_entry_refuses_verification() {
     let legit_tree = git.find_commit(legit).unwrap().tree().unwrap();
     let mut builder = git.treebuilder(None).unwrap();
     for entry in legit_tree.iter() {
-        builder.insert(entry.name().unwrap(), entry.id(), entry.filemode()).unwrap();
+        builder
+            .insert(entry.name().unwrap(), entry.id(), entry.filemode())
+            .unwrap();
     }
     let extra = git.blob(b"PRIVATE_REVIEW_SENTINEL\n").unwrap();
-    builder.insert("private.txt", extra, git2::FileMode::Blob.into()).unwrap();
+    builder
+        .insert("private.txt", extra, git2::FileMode::Blob.into())
+        .unwrap();
     let hostile_tree = builder.write().unwrap();
     let hostile = git
         .commit(
@@ -658,7 +681,8 @@ fn carrier_with_extra_tree_entry_refuses_verification() {
             &[],
         )
         .unwrap();
-    git.reference(&ref_name, hostile, true, "extra entry").unwrap();
+    git.reference(&ref_name, hostile, true, "extra entry")
+        .unwrap();
 
     let error = repository
         .verify_published_binding_carrier(&git, &id)

@@ -17,8 +17,8 @@ use atomic_core::Hash;
 use atomic_objects::{ObjectFamily, ObjectRecord};
 
 use crate::git_binding::{
-    assemble_changes_pack, BindingPackLimits, BindingSigner, CausalOrigin, GitObjectFormat,
-    GitOid, GitStateBinding, GitStateBindingPayload, LossNote, BINDING_VERSION,
+    assemble_changes_pack, BindingPackLimits, BindingSigner, CausalOrigin, GitObjectFormat, GitOid,
+    GitStateBinding, GitStateBindingPayload, LossNote, BINDING_VERSION,
 };
 use crate::repository::binding_fetch::{
     BindingChangeSource, ClosureReadiness, IncompletenessReason,
@@ -45,7 +45,7 @@ fn bind_commit(
     keypair: &atomic_identity::keypair::KeyPair,
 ) -> GitStateBinding {
     let commit = git.find_commit(commit_oid).expect("commit");
-    let tree_hex = commit.tree_id().to_string();
+    let _tree_hex = commit.tree_id().to_string();
     let parents: Vec<GitOid> = commit
         .parent_ids()
         .map(|oid| GitOid::from_hex(&oid.to_string()).expect("parent oid"))
@@ -110,11 +110,7 @@ fn publisher_with_binding(seed: u8, with_pack: bool) -> Publisher {
 /// A publisher: real Git repo + three recorded Atomic changes + a signed
 /// binding over HEAD, optionally published with a bounded `changes.pack`,
 /// in the requested Git object format (RFC §8.6 round trips both OID widths).
-fn publisher_with_binding_format(
-    seed: u8,
-    with_pack: bool,
-    format: GitObjectFormat,
-) -> Publisher {
+fn publisher_with_binding_format(seed: u8, with_pack: bool, format: GitObjectFormat) -> Publisher {
     let dir = tempfile::TempDir::new().unwrap();
     let root = dir.path().to_path_buf();
 
@@ -140,7 +136,9 @@ fn publisher_with_binding_format(
     };
     fs::write(root.join("seed.txt"), b"seed\n").expect("seed file");
     let mut index = git.index().expect("index");
-    index.add_path(std::path::Path::new("seed.txt")).expect("stage");
+    index
+        .add_path(std::path::Path::new("seed.txt"))
+        .expect("stage");
     index.write().expect("index write");
     let tree_oid = index.write_tree().expect("tree");
     let tree = git.find_tree(tree_oid).expect("tree");
@@ -161,8 +159,11 @@ fn publisher_with_binding_format(
     for (name, message) in [("a.txt", "one"), ("b.txt", "two"), ("c.txt", "three")] {
         fs::write(root.join(name), format!("{message}\n")).expect("write file");
         repo.add(name, Default::default()).expect("track file");
-        repo.record(atomic_core::change::ChangeHeader::new(message), RecordOptions::default())
-            .expect("record");
+        repo.record(
+            atomic_core::change::ChangeHeader::new(message),
+            RecordOptions::default(),
+        )
+        .expect("record");
     }
 
     let ordered: Vec<Hash> = repo
@@ -189,12 +190,18 @@ fn publisher_with_binding_format(
         let published = repo
             .publish_binding_with_changes_pack(repo.working_copy(), &git, &binding, None, &pack)
             .expect("publish with pack");
-        assert!(matches!(published, crate::BindingPublication::Published { .. }));
+        assert!(matches!(
+            published,
+            crate::BindingPublication::Published { .. }
+        ));
     } else {
         let published = repo
             .publish_binding(repo.working_copy(), &git, &binding, None)
             .expect("publish");
-        assert!(matches!(published, crate::BindingPublication::Published { .. }));
+        assert!(matches!(
+            published,
+            crate::BindingPublication::Published { .. }
+        ));
     }
 
     Publisher {
@@ -251,7 +258,11 @@ impl BindingChangeSource for FileRemoteSource {
                 Ok(bytes) => bytes,
                 Err(_) => continue, // the remote does not serve this change
             };
-            records.push(ObjectRecord::new(ObjectFamily::Change, hash.to_base32(), bytes));
+            records.push(ObjectRecord::new(
+                ObjectFamily::Change,
+                hash.to_base32(),
+                bytes,
+            ));
             self.served += 1;
             if let Some(limit) = self.fail_after {
                 if self.served >= limit {
@@ -300,11 +311,10 @@ fn transfer_to_client(publisher_root: &std::path::Path, binding: &GitStateBindin
         .expect("push binding ref to remote");
 
     let client_dir = tempfile::TempDir::new().unwrap();
-    let client_git =
-        git2::Repository::init(client_dir.path()).expect("init client git");
+    let client_git = git2::Repository::init(client_dir.path()).expect("init client git");
     let mut fetch_specs: Vec<String> =
         vec!["refs/atomic/bindings/*:refs/atomic/bindings/*".to_string()];
-    if let Some(branch) = &head_branch {
+    if let Some(_branch) = &head_branch {
         fetch_specs.push("refs/heads/*:refs/heads/*".to_string());
     }
     let fetch_specs: Vec<&str> = fetch_specs.iter().map(|s| s.as_str()).collect();
@@ -340,7 +350,8 @@ fn transfer_to_client(publisher_root: &std::path::Path, binding: &GitStateBindin
         );
     }
 
-    let repo = super::TestRepository::new(Repository::init(client_dir.path()).expect("init client"));
+    let repo =
+        super::TestRepository::new(Repository::init(client_dir.path()).expect("init client"));
     Client {
         _remote_dir: remote_dir,
         _dir: client_dir,
@@ -401,7 +412,11 @@ fn assert_exact_closure(
     assert_eq!(outcome.ordered_hashes, ordered, "exact ordered hashes");
     for hash in ordered {
         let change = client.repo.load_change(hash).expect("cached change");
-        assert_eq!(&change.hash().expect("identity"), hash, "identity preserved");
+        assert_eq!(
+            &change.hash().expect("identity"),
+            hash,
+            "identity preserved"
+        );
     }
     assert_eq!(
         outcome.raw_commit_object.as_deref(),
@@ -409,7 +424,10 @@ fn assert_exact_closure(
         "raw foreign commit bytes are byte-identical across acquisition modes"
     );
     let validation = outcome.validation.as_ref().expect("final validation ran");
-    assert!(validation.is_complete(), "validation agrees: {validation:?}");
+    assert!(
+        validation.is_complete(),
+        "validation agrees: {validation:?}"
+    );
 }
 
 /// AC-1 fixture: remote-only acquisition.
@@ -458,7 +476,12 @@ fn pack_only_fallback_restores_the_exact_closure() {
 
     let outcome = client
         .repo
-        .fetch_binding_closure(&client.git, &publisher.binding, None, &BindingPackLimits::default_limits())
+        .fetch_binding_closure(
+            &client.git,
+            &publisher.binding,
+            None,
+            &BindingPackLimits::default_limits(),
+        )
         .expect("fetch");
     assert_eq!(outcome.from_pack, 3, "the pack closed the closure");
     assert_eq!(outcome.from_remote, 0);
@@ -523,7 +546,10 @@ fn interrupted_download_resumes_from_the_verified_cache() {
             panic!("an interrupted fetch must not claim completeness")
         }
     };
-    assert_eq!(outcome.from_remote, 1, "the served change is cached for retry");
+    assert_eq!(
+        outcome.from_remote, 1,
+        "the served change is cached for retry"
+    );
     assert_eq!(missing.len(), 2, "the remainder is explicitly missing");
     assert!(
         reasons
@@ -564,7 +590,12 @@ fn missing_objects_and_unavailable_fallback_fail_explicitly() {
 
     let outcome = client
         .repo
-        .fetch_binding_closure(&client.git, &publisher.binding, None, &BindingPackLimits::default_limits())
+        .fetch_binding_closure(
+            &client.git,
+            &publisher.binding,
+            None,
+            &BindingPackLimits::default_limits(),
+        )
         .expect("the refusal is the outcome");
     match &outcome.readiness {
         ClosureReadiness::Incomplete { missing, reasons } => {
@@ -604,7 +635,12 @@ fn shallow_boundaries_fail_explicitly_despite_complete_objects() {
     let shallow = GitStateBinding::sign(payload, &keypair).expect("sign shallow binding");
     publisher
         .repo
-        .publish_binding(publisher.repo.working_copy(), &publisher.git, &shallow, None)
+        .publish_binding(
+            publisher.repo.working_copy(),
+            &publisher.git,
+            &shallow,
+            None,
+        )
         .expect("publish shallow binding");
 
     let client = transfer_to_client(&publisher.root, &shallow);
@@ -617,7 +653,12 @@ fn shallow_boundaries_fail_explicitly_despite_complete_objects() {
 
     let outcome = client
         .repo
-        .fetch_binding_closure(&client.git, &shallow, None, &BindingPackLimits::default_limits())
+        .fetch_binding_closure(
+            &client.git,
+            &shallow,
+            None,
+            &BindingPackLimits::default_limits(),
+        )
         .expect("fetch runs");
     match &outcome.readiness {
         ClosureReadiness::Incomplete { missing, reasons } => {
@@ -684,7 +725,12 @@ fn tampered_pack_fails_closed_without_mutation() {
     let client = transfer_to_client(&publisher.root, &publisher.binding);
     let outcome = client
         .repo
-        .fetch_binding_closure(&client.git, &publisher.binding, None, &BindingPackLimits::default_limits())
+        .fetch_binding_closure(
+            &client.git,
+            &publisher.binding,
+            None,
+            &BindingPackLimits::default_limits(),
+        )
         .expect("the refusal is the outcome");
     match &outcome.readiness {
         ClosureReadiness::Incomplete { reasons, .. } => assert!(
@@ -696,7 +742,10 @@ fn tampered_pack_fails_closed_without_mutation() {
         ClosureReadiness::Complete => panic!("a forged pack must not close the closure"),
     }
     for hash in &publisher.ordered {
-        assert!(!client.repo.has_change(hash), "no bytes from a refused pack");
+        assert!(
+            !client.repo.has_change(hash),
+            "no bytes from a refused pack"
+        );
     }
     assert_fetch_advances_nothing(&client, &publisher.binding);
 }
@@ -711,7 +760,12 @@ fn binding_trees_confine_to_the_allowlisted_public_blobs() {
 
     // Case 1: an extra, non-allowlisted entry (traversal payload carrier).
     {
-        let original = publisher.git.find_reference(&ref_name).unwrap().target().unwrap();
+        let original = publisher
+            .git
+            .find_reference(&ref_name)
+            .unwrap()
+            .target()
+            .unwrap();
         let commit = publisher.git.find_commit(original).unwrap();
         let old_tree = commit.tree().unwrap();
         let binding_entry = old_tree.get_name("binding.cbor").unwrap().clone();
@@ -722,7 +776,9 @@ fn binding_trees_confine_to_the_allowlisted_public_blobs() {
             .insert("binding.cbor", blob, git2::FileMode::Blob.into())
             .unwrap();
         let evil = publisher.git.blob(b"evil traversal payload").unwrap();
-        builder.insert("evil.bin", evil, git2::FileMode::Blob.into()).unwrap();
+        builder
+            .insert("evil.bin", evil, git2::FileMode::Blob.into())
+            .unwrap();
         let tree_oid = builder.write().unwrap();
         let tree = publisher.git.find_tree(tree_oid).unwrap();
         let forged = publisher
@@ -747,7 +803,12 @@ fn binding_trees_confine_to_the_allowlisted_public_blobs() {
     // Case 2: a subtree smuggled under an allowlisted name — the mode
     // confinement fires before any bytes are read (path-escape vector).
     {
-        let original = publisher.git.find_reference(&ref_name).unwrap().target().unwrap();
+        let original = publisher
+            .git
+            .find_reference(&ref_name)
+            .unwrap()
+            .target()
+            .unwrap();
         let commit = publisher.git.find_commit(original).unwrap();
         let old_tree = commit.tree().unwrap();
         let binding_entry = old_tree.get_name("binding.cbor").unwrap().clone();
@@ -844,16 +905,12 @@ fn sha256_oid_bindings_transport_their_pack_through_the_bounded_pipeline() {
 
     // The bounded pack: blake3-addressed change records, quarantined.
     let records = vec![record_a, record_b, record_c];
-    let pack = crate::git_binding::assemble_changes_pack(
-        &records,
-        &BindingPackLimits::default_limits(),
-    )
-    .expect("assemble pack");
-    let decoded = crate::git_binding::decode_changes_pack(
-        &pack,
-        &BindingPackLimits::default_limits(),
-    )
-    .expect("decode pack");
+    let pack =
+        crate::git_binding::assemble_changes_pack(&records, &BindingPackLimits::default_limits())
+            .expect("assemble pack");
+    let decoded =
+        crate::git_binding::decode_changes_pack(&pack, &BindingPackLimits::default_limits())
+            .expect("decode pack");
     let quarantined = crate::git_binding::QuarantinedPack::from_records(
         &decoded,
         &BindingPackLimits::default_limits(),
@@ -893,7 +950,11 @@ fn sha256_oid_bindings_transport_their_pack_through_the_bounded_pipeline() {
     assert_eq!(cached, 3, "every wanted change is cached");
     for hash in &ordered {
         let stored = repo.load_change(hash).expect("cached change");
-        assert_eq!(&stored.hash().unwrap(), hash, "identity preserved through ingest");
+        assert_eq!(
+            &stored.hash().unwrap(),
+            hash,
+            "identity preserved through ingest"
+        );
     }
 
     // The raw foreign commit bytes ride the binding byte-identically.

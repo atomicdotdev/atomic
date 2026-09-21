@@ -24,9 +24,7 @@
 //! inode-local then global lookup if the in-memory vertex index misses.
 
 use crate::pristine::{GraphTxnT, InodeGraphOps, PristineError, TreeTxnT};
-use crate::types::{
-    EdgeFlags, GraphNode, Hash, Inode, NodeId, Position, SerializedGraphEdge,
-};
+use crate::types::{EdgeFlags, GraphNode, Hash, Inode, NodeId, Position, SerializedGraphEdge};
 
 /// A graph transaction scoped to one inode for file-local traversal.
 pub struct InodeScopedGraph<'a, T> {
@@ -43,22 +41,16 @@ pub struct InodeScopedGraph<'a, T> {
 
 impl<'a, T> InodeScopedGraph<'a, T>
 where
-    T: GraphTxnT
-        + InodeGraphOps<InodeError = PristineError>
-        + TreeTxnT,
+    T: GraphTxnT + InodeGraphOps<InodeError = PristineError> + TreeTxnT,
 {
     /// Wrap `inner` so structural lookups are attempted in `inode` first.
     pub fn new(inner: &'a T, inode: Inode) -> Result<Self, PristineError> {
         let scoped = inner.inode_graph_is_populated(inode)?;
-        let mut adjacency: std::collections::HashMap<
-            GraphNode<NodeId>,
-            Vec<SerializedGraphEdge>,
-        > = std::collections::HashMap::new();
+        let mut adjacency: std::collections::HashMap<GraphNode<NodeId>, Vec<SerializedGraphEdge>> =
+            std::collections::HashMap::new();
         let mut vertices: Vec<GraphNode<NodeId>> = Vec::new();
         if scoped {
-            let iter = inner
-                .iter_inode_vertices(inode)
-                .map_err(PristineError::from)?;
+            let iter = inner.iter_inode_vertices(inode)?;
             for entry in iter {
                 let (node, edge) = entry?;
                 if !adjacency.contains_key(&node) {
@@ -132,9 +124,7 @@ where
 
 impl<'a, T> GraphTxnT for InodeScopedGraph<'a, T>
 where
-    T: GraphTxnT
-        + InodeGraphOps<InodeError = PristineError>
-        + TreeTxnT,
+    T: GraphTxnT + InodeGraphOps<InodeError = PristineError> + TreeTxnT,
 {
     type Adj = std::vec::IntoIter<Result<SerializedGraphEdge, PristineError>>;
 
@@ -196,14 +186,13 @@ where
         if self.scoped && self.adjacency.contains_key(&node) {
             return Ok(true);
         }
-        if self.scoped {
-            if self
+        if self.scoped
+            && self
                 .inner
                 .find_block_in_inode(self.inode, Position::new(node.change, node.start))?
                 .is_some()
-            {
-                return Ok(true);
-            }
+        {
+            return Ok(true);
         }
         self.inner.has_vertex(node)
     }

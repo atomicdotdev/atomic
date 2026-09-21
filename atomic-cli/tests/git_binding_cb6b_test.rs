@@ -88,13 +88,14 @@ fn setup_publisher(root: &Path, home: &Path) {
     }
 }
 
-fn binding_id(root: &Path, home: &Path) -> String {
+fn binding_id(root: &Path, _home: &Path) -> String {
     let repo = atomic_repository::Repository::open_readonly(root).expect("open atomic");
     let ids = repo.binding_ids().expect("binding ids");
     assert!(!ids.is_empty(), "a binding must be stored");
     ids[0].to_hex()
 }
 
+#[allow(dead_code)]
 fn all_git_objects(root: &Path) -> Vec<u8> {
     let out = Command::new("git")
         .args(["cat-file", "--batch-all-objects", "--batch"])
@@ -392,9 +393,11 @@ fn private_sidecars_never_enter_a_pack_and_sentinels_stay_out_of_git() {
             .expect("log");
         let hash = log.first().expect("a recorded change").hash;
         let mut change = repo.load_change(&hash).expect("load change");
-        let mut provenance = atomic_core::change::Provenance::default();
-        provenance.vendor = atomic_core::change::AIVendor::Anthropic;
-        provenance.prompt = atomic_core::change::PromptContent::Full(PROMPT_SENTINEL.to_string());
+        let provenance = atomic_core::change::Provenance {
+            vendor: atomic_core::change::AIVendor::Anthropic,
+            prompt: atomic_core::change::PromptContent::Full(PROMPT_SENTINEL.to_string()),
+            ..Default::default()
+        };
         change.add_provenance(provenance);
         repo.save_change(&change).expect("save private change");
 

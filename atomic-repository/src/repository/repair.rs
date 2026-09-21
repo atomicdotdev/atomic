@@ -8,16 +8,16 @@ use atomic_core::operation::{
     RepoStateRef,
 };
 use atomic_core::pristine::{
-    directory_flags, decode_path_claim_event, encode_path_claim_event, GraphTxnT,
+    decode_path_claim_event, directory_flags, encode_path_claim_event, GraphTxnT,
     GraphVisibilityClosure, InodeGraphOps, NativeDerivedIndexes, NativeDerivedIndexesMutTxnT,
-    OperationMutTxnT, PathClaimEntry, PathClaimKind, PathClaimTxnT, PristineError,
-    StoredConflict, StoredConflictKind, TreeTxnT, ViewTxnT, PATH_CLAIM_EVENT_SIZE,
+    OperationMutTxnT, PathClaimEntry, PathClaimKind, PathClaimTxnT, PristineError, StoredConflict,
+    StoredConflictKind, TreeTxnT, ViewTxnT, PATH_CLAIM_EVENT_SIZE,
 };
 use atomic_core::types::{Inode, NodeId, Position};
 use atomic_core::{Hash, OperationId};
 
-use super::*;
 use super::operation::{codec_error, pristine_error};
+use super::*;
 
 /// Native derived table audited by `atomic doctor`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -128,25 +128,22 @@ pub struct NativeIndexRepairOutcome {
 /// recovered inode owners for every structural claimant, and the derived
 /// claim events. Shared by the full native-index rebuild and the targeted
 /// PATH_CLAIMS repair so both use the identical derivation contract.
+#[allow(clippy::type_complexity)] // reconstructed claim index pairing
 fn derive_native_path_claim_authority<T>(
-repo: &Repository,
-txn: &T,
+    repo: &Repository,
+    txn: &T,
 ) -> Result<(Vec<PathClaimEntry>, HashMap<Position<NodeId>, Inode>), RepositoryError>
 where
-T: GraphTxnT
-        + TreeTxnT
-        + PathClaimTxnT
-        + ViewTxnT
-        + InodeGraphOps<InodeError = PristineError>,
+    T: GraphTxnT + TreeTxnT + PathClaimTxnT + ViewTxnT + InodeGraphOps<InodeError = PristineError>,
 {
-let view_snapshot = txn
+    let view_snapshot = txn
         .snapshot_views()
         .map_err(|error| RepositoryError::Database(error.to_string()))?;
-let view_names: Vec<String> = view_snapshot.iter().map(|(name, _)| name.clone()).collect();
+    let view_names: Vec<String> = view_snapshot.iter().map(|(name, _)| name.clone()).collect();
 
-let mut reachable = Vec::new();
-let mut reachable_set = HashSet::new();
-for view_name in &view_names {
+    let mut reachable = Vec::new();
+    let mut reachable_set = HashSet::new();
+    for view_name in &view_names {
         let view = txn
             .get_view(view_name)
             .map_err(|error| RepositoryError::Database(error.to_string()))?
@@ -159,11 +156,11 @@ for view_name in &view_names {
                 reachable.push(change_id);
             }
         }
-}
-let mut ordered = Vec::with_capacity(reachable.len());
-let mut visiting = HashSet::new();
-let mut visited = HashSet::new();
-for change_id in reachable {
+    }
+    let mut ordered = Vec::with_capacity(reachable.len());
+    let mut visiting = HashSet::new();
+    let mut visited = HashSet::new();
+    for change_id in reachable {
         visit_reachable_change(
             txn,
             change_id,
@@ -172,11 +169,11 @@ for change_id in reachable {
             &mut visited,
             &mut ordered,
         )?;
-}
+    }
 
-let mut changes = Vec::with_capacity(ordered.len());
-let mut root_kinds = BTreeMap::<Position<NodeId>, PathClaimKind>::new();
-for change_id in ordered {
+    let mut changes = Vec::with_capacity(ordered.len());
+    let mut root_kinds = BTreeMap::<Position<NodeId>, PathClaimKind>::new();
+    for change_id in ordered {
         let hash = txn
             .get_external(change_id)
             .map_err(|error| RepositoryError::Database(error.to_string()))?
@@ -218,17 +215,17 @@ for change_id in ordered {
             }
         }
         changes.push((change_id, change));
-}
-let inode_graph_keys = txn
+    }
+    let inode_graph_keys = txn
         .snapshot_inode_graph_keys()
         .map_err(|error| RepositoryError::Database(error.to_string()))?;
-let existing_rev_inodes: BTreeMap<_, _> = txn
+    let existing_rev_inodes: BTreeMap<_, _> = txn
         .snapshot_rev_inodes()
         .map_err(|error| RepositoryError::Database(error.to_string()))?
         .into_iter()
         .collect();
-let mut recovered = HashMap::<Position<NodeId>, Inode>::new();
-for position in root_kinds.keys().copied() {
+    let mut recovered = HashMap::<Position<NodeId>, Inode>::new();
+    for position in root_kinds.keys().copied() {
         let candidates: BTreeSet<Inode> = inode_graph_keys
             .iter()
             .filter(|(_, node)| {
@@ -289,19 +286,19 @@ for position in root_kinds.keys().copied() {
             });
         }
         recovered.insert(position, inode);
-}
-let mut claims = Vec::<PathClaimEntry>::new();
-for (change_id, change) in &changes {
+    }
+    let mut claims = Vec::<PathClaimEntry>::new();
+    for (change_id, change) in &changes {
         let mut change_claims =
             super::name_resolution::path_claim_events_for_change_with_prior_and_inodes(
                 txn, *change_id, change, &claims, &recovered,
             )?;
         claims.append(&mut change_claims);
-}
-claims.sort_by(|left, right| (&left.path, left.event).cmp(&(&right.path, right.event)));
-claims.dedup_by(|left, right| left.path == right.path && left.event == right.event);
+    }
+    claims.sort_by(|left, right| (&left.path, left.event).cmp(&(&right.path, right.event)));
+    claims.dedup_by(|left, right| left.path == right.path && left.event == right.event);
 
-for claim in &claims {
+    for claim in &claims {
         if !recovered.contains_key(&claim.event.claim.claimant) {
             return Err(RepositoryError::InvalidOperation {
                 message: format!(
@@ -310,10 +307,9 @@ for claim in &claims {
                 ),
             });
         }
+    }
+    Ok((claims, recovered))
 }
-Ok((claims, recovered))
-}
-
 
 impl Repository {
     /// Compare every native derived table with a deterministic graph projection.
@@ -391,8 +387,7 @@ impl Repository {
             },
         )?;
 
-        let (expected_claims, _recovered) =
-            derive_native_path_claim_authority(self, &*txn)?;
+        let (expected_claims, _recovered) = derive_native_path_claim_authority(self, &*txn)?;
 
         // Compare the derived authority against the live table, byte-exact.
         let mut current: std::collections::BTreeMap<String, Vec<[u8; PATH_CLAIM_EVENT_SIZE]>> =
@@ -411,10 +406,7 @@ impl Repository {
             std::collections::BTreeMap::new();
         for entry in &expected_claims {
             let encoded = encode_path_claim_event(&entry.event);
-            derived
-                .entry(entry.path.clone())
-                .or_default()
-                .push(encoded);
+            derived.entry(entry.path.clone()).or_default().push(encoded);
         }
         // Rows the live table holds that the derivation does not produce are
         // stale: a targeted repair cannot reconcile them and fails closed.
@@ -428,7 +420,7 @@ impl Repository {
         for (path, rows) in &current {
             let produced = derived.get(path);
             for encoded in rows {
-                if produced.map_or(true, |rows| !rows.contains(encoded)) {
+                if produced.is_none_or(|rows| !rows.contains(encoded)) {
                     // The row lease rejected the observed table: refuse
                     // without mutating anything and without journaling.
                     // Nothing was written, so there is no effect to report.
@@ -528,7 +520,9 @@ impl Repository {
             let mut sorted_rows = rows.clone();
             sorted_rows.sort();
             match after.get(path) {
-                Some(existing) if existing.len() == sorted_rows.len() && sorted_rows.iter().all(|r| existing.contains(r)) => {}
+                Some(existing)
+                    if existing.len() == sorted_rows.len()
+                        && sorted_rows.iter().all(|r| existing.contains(r)) => {}
                 _ => {
                     return Err(RepositoryError::InvalidOperation {
                         message: format!(
@@ -542,7 +536,10 @@ impl Repository {
         // evidence digests, then verify it — all inside the repair
         // transaction, so the journal entry exists only when the mutation it
         // describes is durable.
-        let after_digest = Hash::of(&canonical_tagged_bytes(b"repair:path-claims:after", &canonical_path_claim_rows_bytes(&after)));
+        let after_digest = Hash::of(&canonical_tagged_bytes(
+            b"repair:path-claims:after",
+            &canonical_path_claim_rows_bytes(&after),
+        ));
         let operation = Operation::new(OperationPayload {
             parents: vec![parent],
             kind: OperationKind::Repair,
@@ -571,10 +568,13 @@ impl Repository {
             lossy: Vec::new(),
         })
         .map_err(codec_error)?;
-        txn.put_operation(&operation)
-            .map_err(pristine_error)?;
-        txn.compare_and_set_operation_heads(OperationScope::Repository, &[parent], &[operation.id()])
-            .map_err(pristine_error)?;
+        txn.put_operation(&operation).map_err(pristine_error)?;
+        txn.compare_and_set_operation_heads(
+            OperationScope::Repository,
+            &[parent],
+            &[operation.id()],
+        )
+        .map_err(pristine_error)?;
         let verified = super::operation::deterministic_effect_receipt(
             &operation,
             None,
@@ -586,8 +586,8 @@ impl Repository {
             .map_err(pristine_error)?;
         txn.commit()
             .map_err(|error| RepositoryError::Database(error.to_string()))?;
-                self.store_path_claims_repair_inverse(&operation, &old_rows)?;
-Ok(NativeIndexRepairOutcome {
+        self.store_path_claims_repair_inverse(&operation, &old_rows)?;
+        Ok(NativeIndexRepairOutcome {
             problems_repaired: 1,
             rows_written: missing_count,
             already_healthy: false,
@@ -651,14 +651,11 @@ Ok(NativeIndexRepairOutcome {
             b"repair:tree-bijection:plan",
             &canonical_tree_bijection_rows_bytes(&stale, &missing),
         ));
-        let (removed, inserted) = (*txn)
-            .repair_rev_tree_bijection()
-            .map_err(pristine_error)?;
+        let (removed, inserted) = (*txn).repair_rev_tree_bijection().map_err(pristine_error)?;
 
         // Post-write verification: TREE and REV_TREE must now be exact
         // one-to-one inverses.
-        txn.validate_tree_bijection()
-            .map_err(pristine_error)?;
+        txn.validate_tree_bijection().map_err(pristine_error)?;
 
         let after_reverse: Vec<(u64, String)> = txn
             .iter_rev_tree_pairs()
@@ -698,10 +695,13 @@ Ok(NativeIndexRepairOutcome {
             lossy: Vec::new(),
         })
         .map_err(codec_error)?;
-        txn.put_operation(&operation)
-            .map_err(pristine_error)?;
-        txn.compare_and_set_operation_heads(OperationScope::Repository, &[parent], &[operation.id()])
-            .map_err(pristine_error)?;
+        txn.put_operation(&operation).map_err(pristine_error)?;
+        txn.compare_and_set_operation_heads(
+            OperationScope::Repository,
+            &[parent],
+            &[operation.id()],
+        )
+        .map_err(pristine_error)?;
         let verified = super::operation::deterministic_effect_receipt(
             &operation,
             None,
@@ -754,10 +754,7 @@ Ok(NativeIndexRepairOutcome {
         // Snapshot the live rows for the third-value lease check.
         let live: BTreeMap<String, Vec<[u8; PATH_CLAIM_EVENT_SIZE]>> = {
             let mut live: BTreeMap<String, Vec<[u8; PATH_CLAIM_EVENT_SIZE]>> = BTreeMap::new();
-            for entry in txn
-                .iter_path_claims()
-                .map_err(pristine_error)?
-            {
+            for entry in txn.iter_path_claims().map_err(pristine_error)? {
                 let encoded = encode_path_claim_event(&entry.event);
                 let rows = live.entry(entry.path).or_default();
                 if !rows.contains(&encoded) {
@@ -771,8 +768,7 @@ Ok(NativeIndexRepairOutcome {
         // derivation (the repair's post-state). Anything else (partially
         // undone, externally mutated) refuses without overwriting.
         let derived_rows: BTreeMap<String, Vec<[u8; PATH_CLAIM_EVENT_SIZE]>> = {
-            let (expected_claims, _recovered) =
-                derive_native_path_claim_authority(self, &*txn)?;
+            let (expected_claims, _recovered) = derive_native_path_claim_authority(self, &*txn)?;
             let mut derived: BTreeMap<String, Vec<[u8; PATH_CLAIM_EVENT_SIZE]>> = BTreeMap::new();
             for entry in &expected_claims {
                 let encoded = encode_path_claim_event(&entry.event);
@@ -816,8 +812,10 @@ Ok(NativeIndexRepairOutcome {
                 for encoded in rows {
                     let event = decode_path_claim_event(encoded)
                         .map_err(|error| RepositoryError::Database(error.to_string()))?;
-                    atomic_core::pristine::PathClaimMutTxnT::del_path_claim(&mut *txn, path, &event)
-                        .map_err(pristine_error)?;
+                    atomic_core::pristine::PathClaimMutTxnT::del_path_claim(
+                        &mut *txn, path, &event,
+                    )
+                    .map_err(pristine_error)?;
                     rows_written += 1;
                 }
                 continue;
@@ -826,8 +824,10 @@ Ok(NativeIndexRepairOutcome {
                 if !old.contains(encoded) {
                     let event = decode_path_claim_event(encoded)
                         .map_err(|error| RepositoryError::Database(error.to_string()))?;
-                    atomic_core::pristine::PathClaimMutTxnT::del_path_claim(&mut *txn, path, &event)
-                        .map_err(pristine_error)?;
+                    atomic_core::pristine::PathClaimMutTxnT::del_path_claim(
+                        &mut *txn, path, &event,
+                    )
+                    .map_err(pristine_error)?;
                     rows_written += 1;
                 }
             }
@@ -835,11 +835,13 @@ Ok(NativeIndexRepairOutcome {
         for (path, rows) in old_rows {
             let live_rows = live.get(path);
             for encoded in rows {
-                if live_rows.map(|live| !live.contains(encoded)).unwrap_or(true) {
+                if live_rows
+                    .map(|live| !live.contains(encoded))
+                    .unwrap_or(true)
+                {
                     let event = decode_path_claim_event(encoded)
                         .map_err(|error| RepositoryError::Database(error.to_string()))?;
-                    txn.put_path_claim(path, &event)
-                        .map_err(pristine_error)?;
+                    txn.put_path_claim(path, &event).map_err(pristine_error)?;
                     rows_written += 1;
                 }
             }
@@ -874,13 +876,14 @@ Ok(NativeIndexRepairOutcome {
         // repository-scope Repair head), so the provenance chain is
         // reconstructible.
         let target_operation = {
-            let log = self.operation_log(
-                atomic_core::operation::OperationScope::Repository,
-                None,
-                false,
-            )
-            .map_err(pristine_error)?;
-            let OperationHeadState::Single(head) = &log.head_state else {
+            let log = self
+                .operation_log(
+                    atomic_core::operation::OperationScope::Repository,
+                    None,
+                    false,
+                )
+                .map_err(pristine_error)?;
+            let OperationHeadState::Single(_head) = &log.head_state else {
                 return Err(RepositoryError::InvalidOperation {
                     message: "path-claims undo refused: no operation head to name".to_string(),
                 });
@@ -923,8 +926,12 @@ Ok(NativeIndexRepairOutcome {
         })
         .map_err(codec_error)?;
         txn.put_operation(&operation).map_err(pristine_error)?;
-        txn.compare_and_set_operation_heads(OperationScope::Repository, &[parent], &[operation.id()])
-            .map_err(pristine_error)?;
+        txn.compare_and_set_operation_heads(
+            OperationScope::Repository,
+            &[parent],
+            &[operation.id()],
+        )
+        .map_err(pristine_error)?;
         let verified = super::operation::deterministic_effect_receipt(
             &operation,
             None,
@@ -932,7 +939,8 @@ Ok(NativeIndexRepairOutcome {
             None,
             None,
         )?;
-        txn.append_effect_receipt(&verified).map_err(pristine_error)?;
+        txn.append_effect_receipt(&verified)
+            .map_err(pristine_error)?;
         txn.commit()
             .map_err(|error| RepositoryError::Database(error.to_string()))?;
         Ok(NativeIndexRepairOutcome {
@@ -971,32 +979,33 @@ Ok(NativeIndexRepairOutcome {
             return Ok(None);
         }
         // The inverse payload is stored beside the operation id.
-        let inverse_path = self
-            .dot_dir
-            .join("operation-recovery")
-            .join(format!("path-claims-repair-inverse-{}.json", operation.id()));
+        let inverse_path = self.dot_dir.join("operation-recovery").join(format!(
+            "path-claims-repair-inverse-{}.json",
+            operation.id()
+        ));
         let bytes = match std::fs::read(&inverse_path) {
             Ok(bytes) => bytes,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(_) => return Err(RepositoryError::InvalidOperation {
-                message: "cannot read the stored path-claims repair inverse".to_string(),
-            }),
+            Err(_) => {
+                return Err(RepositoryError::InvalidOperation {
+                    message: "cannot read the stored path-claims repair inverse".to_string(),
+                })
+            }
         };
-        let stored: BTreeMap<String, Vec<Vec<u8>>> = serde_json::from_slice(&bytes)
-            .map_err(|error| {
-                RepositoryError::InvalidOperation {
-                    message: format!("the stored path-claims repair inverse is malformed: {error}"),
-                }
+        let stored: BTreeMap<String, Vec<Vec<u8>>> =
+            serde_json::from_slice(&bytes).map_err(|error| RepositoryError::InvalidOperation {
+                message: format!("the stored path-claims repair inverse is malformed: {error}"),
             })?;
         let mut old_rows: BTreeMap<String, Vec<[u8; PATH_CLAIM_EVENT_SIZE]>> = BTreeMap::new();
         for (path, rows) in stored {
             let mut fixed = Vec::new();
             for row in rows {
-                let array: [u8; PATH_CLAIM_EVENT_SIZE] = row
-                    .try_into()
-                    .map_err(|_| RepositoryError::InvalidOperation {
-                        message: "the stored inverse row is not the claim-event width".to_string(),
-                    })?;
+                let array: [u8; PATH_CLAIM_EVENT_SIZE] =
+                    row.try_into()
+                        .map_err(|_| RepositoryError::InvalidOperation {
+                            message: "the stored inverse row is not the claim-event width"
+                                .to_string(),
+                        })?;
                 fixed.push(array);
             }
             old_rows.insert(path, fixed);
@@ -1014,9 +1023,8 @@ Ok(NativeIndexRepairOutcome {
         old_rows: &BTreeMap<String, Vec<[u8; PATH_CLAIM_EVENT_SIZE]>>,
     ) -> Result<(), RepositoryError> {
         let recovery_dir = self.dot_dir.join("operation-recovery");
-        std::fs::create_dir_all(&recovery_dir).map_err(|error| {
-            RepositoryError::Database(error.to_string())
-        })?;
+        std::fs::create_dir_all(&recovery_dir)
+            .map_err(|error| RepositoryError::Database(error.to_string()))?;
         let path = recovery_dir.join(format!(
             "path-claims-repair-inverse-{}.json",
             operation.id()
@@ -1035,19 +1043,16 @@ Ok(NativeIndexRepairOutcome {
                 )
             })
             .collect();
-        let bytes = serde_json::to_vec(&stored).map_err(|error| {
-            RepositoryError::Database(error.to_string())
-        })?;
+        let bytes = serde_json::to_vec(&stored)
+            .map_err(|error| RepositoryError::Database(error.to_string()))?;
         let temporary = recovery_dir.join(format!(
             ".path-claims-repair-inverse-{}.tmp",
             std::process::id()
         ));
-        std::fs::write(&temporary, &bytes).map_err(|error| {
-            RepositoryError::Database(error.to_string())
-        })?;
-        std::fs::rename(&temporary, &path).map_err(|error| {
-            RepositoryError::Database(error.to_string())
-        })?;
+        std::fs::write(&temporary, &bytes)
+            .map_err(|error| RepositoryError::Database(error.to_string()))?;
+        std::fs::rename(&temporary, &path)
+            .map_err(|error| RepositoryError::Database(error.to_string()))?;
         Ok(())
     }
 
@@ -1082,7 +1087,10 @@ Ok(NativeIndexRepairOutcome {
             });
         }
 
-        let before_digest = Hash::of(&canonical_tagged_bytes(b"repair:native-index:before", &canonical_index_problems_bytes(&before)));
+        let before_digest = Hash::of(&canonical_tagged_bytes(
+            b"repair:native-index:before",
+            &canonical_index_problems_bytes(&before),
+        ));
         (*txn)
             .replace_native_derived_indexes(&expected)
             .map_err(|error| RepositoryError::Database(error.to_string()))?;
@@ -1132,10 +1140,13 @@ Ok(NativeIndexRepairOutcome {
             lossy: Vec::new(),
         })
         .map_err(codec_error)?;
-        txn.put_operation(&operation)
-            .map_err(pristine_error)?;
-        txn.compare_and_set_operation_heads(OperationScope::Repository, &[parent], &[operation.id()])
-            .map_err(pristine_error)?;
+        txn.put_operation(&operation).map_err(pristine_error)?;
+        txn.compare_and_set_operation_heads(
+            OperationScope::Repository,
+            &[parent],
+            &[operation.id()],
+        )
+        .map_err(pristine_error)?;
         let verified = super::operation::deterministic_effect_receipt(
             &operation,
             None,
@@ -1162,7 +1173,7 @@ Ok(NativeIndexRepairOutcome {
         self.repair_native_derived_indexes_inner(true)
     }
 
-fn build_native_derived_indexes<T>(
+    fn build_native_derived_indexes<T>(
         &self,
         txn: &T,
     ) -> Result<NativeDerivedIndexes, RepositoryError>
@@ -1219,8 +1230,7 @@ fn build_native_derived_indexes<T>(
         let view_snapshot = txn
             .snapshot_views()
             .map_err(|error| RepositoryError::Database(error.to_string()))?;
-        let view_names: Vec<String> =
-            view_snapshot.iter().map(|(name, _)| name.clone()).collect();
+        let view_names: Vec<String> = view_snapshot.iter().map(|(name, _)| name.clone()).collect();
         for view_name in &view_names {
             let view = txn
                 .get_view(view_name)
@@ -1850,9 +1860,7 @@ fn canonical_tagged_bytes(tag: &[u8], body: &[u8]) -> Vec<u8> {
 
 /// Canonical bytes of a targeted repair plan (sorted path/event pairs), used
 /// as the immutable before-evidence digest of the journaled Repair operation.
-fn canonical_missing_rows_bytes(
-    rows: &[(String, [u8; PATH_CLAIM_EVENT_SIZE])],
-) -> Vec<u8> {
+fn canonical_missing_rows_bytes(rows: &[(String, [u8; PATH_CLAIM_EVENT_SIZE])]) -> Vec<u8> {
     let mut bytes = Vec::new();
     for (path, event) in rows {
         bytes.extend_from_slice(path.as_bytes());

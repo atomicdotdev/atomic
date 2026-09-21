@@ -139,10 +139,10 @@ pub mod team;
 // Re-export command structs for convenience
 pub use add::Add;
 pub use agent::Agent;
+pub use blame::Blame;
 pub use change::ChangeCmd;
 pub use clone::Clone;
 pub use completions::Completions;
-pub use blame::Blame;
 pub use conflicts::Conflicts;
 pub use diff::Diff;
 pub use doctor::Doctor;
@@ -317,9 +317,7 @@ pub fn find_repository_root_from(start_path: &Path) -> CliResult<PathBuf> {
         // The repository layer's layout detection is authoritative here; a
         // plain `git worktree` used to fall through to "not a repository".
         if current.join(".git").is_file() {
-            if let Ok(Some(root)) =
-                atomic_repository::detect_repository_root(&current)
-            {
+            if let Ok(Some(root)) = atomic_repository::detect_repository_root(&current) {
                 return Ok(root);
             }
         }

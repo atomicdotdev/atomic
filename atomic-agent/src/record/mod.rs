@@ -94,6 +94,7 @@ use provenance::{
 /// `ObservationOnly` or `RepositoryOperations`, never treated as "nothing
 /// happened" and never surfaced as an error.
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)] // Classified carries the RFC §10.2 ledger evidence inline
 pub enum TurnRecordResult {
     /// Durable content changes were recorded as Atomic changes.
     Recorded(TurnRecordOutcome),
@@ -136,7 +137,10 @@ pub fn capture_turn_boundary(
     let working_copy = match repo.require_working_copy_id() {
         Ok(working_copy) => working_copy.to_string(),
         Err(error) => {
-            log::warn!("Boundary capture: cannot resolve working-copy identity: {}", error);
+            log::warn!(
+                "Boundary capture: cannot resolve working-copy identity: {}",
+                error
+            );
             return None;
         }
     };
@@ -296,14 +300,18 @@ fn checkout_journaled(
     let (Some(start_oid), Some(end_oid)) = (start_oid, end_oid) else {
         return false;
     };
-    let journal = repo_root.join(".atomic").join("bridge").join("git-events.jsonl");
+    let journal = repo_root
+        .join(".atomic")
+        .join("bridge")
+        .join("git-events.jsonl");
     let Ok(bytes) = std::fs::read(&journal) else {
         return false;
     };
     // Bound the scan: the journal is append-only; a recent tail is enough.
     let tail_start = bytes.len().saturating_sub(256 * 1024);
     let tail = &bytes[tail_start..];
-    let worktree_root = std::fs::canonicalize(repo_root).unwrap_or_else(|_| repo_root.to_path_buf());
+    let worktree_root =
+        std::fs::canonicalize(repo_root).unwrap_or_else(|_| repo_root.to_path_buf());
     let now_unix = chrono::Utc::now().timestamp();
     let mut records = 0usize;
     for line in tail.split(|byte| *byte == b'\n') {
@@ -416,7 +424,7 @@ fn classify_git_transition(
     // attribution and a DURABLE incomplete status requiring review — never
     // exact attribution, never an approximate path-level split. The capture
     // hash is retained as recovery evidence.
-    if let Some(capture_hash) = capture.clone() {
+    if let Some(capture_hash) = capture {
         log::info!(
             "Verified commit-time capture binds the Git transition for session {} turn {}; \
              durable incomplete until the exact reassembly (RFC §10.3.2) attributes it \
@@ -554,7 +562,9 @@ fn classify_clean_turn(
     boundary_start: Option<TurnBoundary>,
     boundary_end: TurnBoundary,
 ) -> ClassifiedTurn {
-    let start_git = boundary_start.as_ref().and_then(|boundary| boundary.git.clone());
+    let start_git = boundary_start
+        .as_ref()
+        .and_then(|boundary| boundary.git.clone());
     let end_git = boundary_end.git.clone();
 
     // A repository without Git has no checkpoint to classify; a clean
@@ -624,7 +634,7 @@ fn classify_clean_turn(
         return ClassifiedTurn {
             outcome: ManagedTurnOutcome::RepositoryOperations {
                 operations: vec![
-                    "turn-end git observation failed; transition unverifiable".to_string(),
+                    "turn-end git observation failed; transition unverifiable".to_string()
                 ],
                 capture: None,
             },
@@ -920,27 +930,28 @@ pub fn record_turn(
             ));
     if session_view_needs_alignment {
         drop(repo);
-        let mut repair_repo =
-            atomic_repository::Repository::open_existing_wait(repo_root, std::time::Duration::from_secs(10))
-                .map_err(|error| {
-                AgentError::RecordFailed {
-                    session_id: options.session.session_id.clone(),
-                    turn_number: options.turn_number,
-                    reason: format!("Failed to open repository for view alignment: {}", error),
-                }
-            })?;
+        let mut repair_repo = atomic_repository::Repository::open_existing_wait(
+            repo_root,
+            std::time::Duration::from_secs(10),
+        )
+        .map_err(|error| AgentError::RecordFailed {
+            session_id: options.session.session_id.clone(),
+            turn_number: options.turn_number,
+            reason: format!("Failed to open repository for view alignment: {}", error),
+        })?;
         align_or_repair_session_view(&mut repair_repo, options)?;
         drop(repair_repo);
-        repo = atomic_repository::Repository::open_readonly_wait(repo_root, std::time::Duration::from_secs(10))
-            .map_err(|error| {
-            AgentError::RecordFailed {
-                session_id: options.session.session_id.clone(),
-                turn_number: options.turn_number,
-                reason: format!(
-                    "Failed to reopen repository after view alignment: {}",
-                    error
-                ),
-            }
+        repo = atomic_repository::Repository::open_readonly_wait(
+            repo_root,
+            std::time::Duration::from_secs(10),
+        )
+        .map_err(|error| AgentError::RecordFailed {
+            session_id: options.session.session_id.clone(),
+            turn_number: options.turn_number,
+            reason: format!(
+                "Failed to reopen repository after view alignment: {}",
+                error
+            ),
         })?;
     }
 
@@ -988,12 +999,17 @@ pub fn record_turn(
             repo_root,
             options,
             options.session.boundary_start.clone(),
-            capture_turn_boundary(&repo, repo_root, &options.session.session_id, options.turn_number)
-                .ok_or_else(|| AgentError::RecordFailed {
-                    session_id: options.session.session_id.clone(),
-                    turn_number: options.turn_number,
-                    reason: "Failed to capture turn-end boundary on a clean turn".to_string(),
-                })?,
+            capture_turn_boundary(
+                &repo,
+                repo_root,
+                &options.session.session_id,
+                options.turn_number,
+            )
+            .ok_or_else(|| AgentError::RecordFailed {
+                session_id: options.session.session_id.clone(),
+                turn_number: options.turn_number,
+                reason: "Failed to capture turn-end boundary on a clean turn".to_string(),
+            })?,
         )));
     }
 
@@ -1112,12 +1128,17 @@ pub fn record_turn(
             repo_root,
             options,
             options.session.boundary_start.clone(),
-            capture_turn_boundary(&repo, repo_root, &options.session.session_id, options.turn_number)
-                .ok_or_else(|| AgentError::RecordFailed {
-                    session_id: options.session.session_id.clone(),
-                    turn_number: options.turn_number,
-                    reason: "Failed to capture turn-end boundary on a clean turn".to_string(),
-                })?,
+            capture_turn_boundary(
+                &repo,
+                repo_root,
+                &options.session.session_id,
+                options.turn_number,
+            )
+            .ok_or_else(|| AgentError::RecordFailed {
+                session_id: options.session.session_id.clone(),
+                turn_number: options.turn_number,
+                reason: "Failed to capture turn-end boundary on a clean turn".to_string(),
+            })?,
         )));
     }
 
@@ -1168,7 +1189,8 @@ pub fn record_turn(
         record_options = record_options.with_all(false).paths(status_files.clone());
     }
 
-    let mut outcome = match repo.record(working_copy, header, record_options) {        Ok(outcome) => outcome,
+    let mut outcome = match repo.record(working_copy, header, record_options) {
+        Ok(outcome) => outcome,
         Err(atomic_repository::record::RecordError::NothingToRecord) => {
             // Nothing recorded even though status looked dirty — classify
             // instead of reporting an empty turn (RFC §10.2).
@@ -1177,12 +1199,17 @@ pub fn record_turn(
                 repo_root,
                 options,
                 options.session.boundary_start.clone(),
-                capture_turn_boundary(&repo, repo_root, &options.session.session_id, options.turn_number)
-                    .ok_or_else(|| AgentError::RecordFailed {
-                        session_id: options.session.session_id.clone(),
-                        turn_number: options.turn_number,
-                        reason: "Failed to capture turn-end boundary on a clean turn".to_string(),
-                    })?,
+                capture_turn_boundary(
+                    &repo,
+                    repo_root,
+                    &options.session.session_id,
+                    options.turn_number,
+                )
+                .ok_or_else(|| AgentError::RecordFailed {
+                    session_id: options.session.session_id.clone(),
+                    turn_number: options.turn_number,
+                    reason: "Failed to capture turn-end boundary on a clean turn".to_string(),
+                })?,
             )));
         }
         Err(e) => {

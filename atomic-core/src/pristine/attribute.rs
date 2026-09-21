@@ -400,11 +400,7 @@ mod tests {
         // id1 is an ancestor of id3: id3 dominates it.
         let frontier = attr_event_dependency_frontier(
             &txn,
-            vec![
-                event(id1, 0o644),
-                event(id2, 0o755),
-                event(id3, 0o700),
-            ],
+            vec![event(id1, 0o644), event(id2, 0o755), event(id3, 0o700)],
         )
         .unwrap();
         let writers: std::collections::HashSet<NodeId> =
@@ -413,16 +409,13 @@ mod tests {
 
         // Concurrent writers both stay, even when their values match: a new
         // write must dominate both writers.
-        let frontier = attr_event_dependency_frontier(
-            &txn,
-            vec![event(id1, 0o644), event(id2, 0o644)],
-        )
-        .unwrap();
+        let frontier =
+            attr_event_dependency_frontier(&txn, vec![event(id1, 0o644), event(id2, 0o644)])
+                .unwrap();
         assert_eq!(frontier.len(), 2);
 
         // A single writer is its own frontier.
-        let frontier =
-            attr_event_dependency_frontier(&txn, vec![event(id3, 0o700)]).unwrap();
+        let frontier = attr_event_dependency_frontier(&txn, vec![event(id3, 0o700)]).unwrap();
         assert_eq!(frontier.len(), 1);
         assert_eq!(frontier[0].introduced_by, id3);
     }

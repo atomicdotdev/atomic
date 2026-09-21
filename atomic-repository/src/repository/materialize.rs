@@ -242,7 +242,10 @@ fn shadow_fence_interleave_window() {
     let _ = at_window.send(());
     let deadline = Instant::now() + Duration::from_secs(30);
     while resume.recv_timeout(Duration::from_millis(50)).is_err() {
-        assert!(Instant::now() < deadline, "interleave window resume timed out");
+        assert!(
+            Instant::now() < deadline,
+            "interleave window resume timed out"
+        );
     }
     // Restore so further acquisitions on this thread pause again.
     SHADOW_FENCE_WINDOW.with(|slot| *slot.borrow_mut() = Some((at_window, resume)));
@@ -262,7 +265,7 @@ pub(crate) fn install_shadow_fence_interleave_window(
     });
 }
 
-/// Per-thread signal pair for [`shadow_fence_interleave_window`]. Test-only.
+// Per-thread signal pair for [`shadow_fence_interleave_window`]. Test-only.
 #[cfg(test)]
 thread_local! {
     static SHADOW_FENCE_WINDOW: std::cell::RefCell<
@@ -376,17 +379,13 @@ pub(super) fn capture_file_conflict_bytes<C: atomic_core::change::ChangeStore>(
     path: &str,
     inode: Inode,
     position: Position<NodeId>,
-) -> Result<
-    (
-        Vec<u8>,
-        Vec<super::conflict_object::CapturedRegion>,
-    ),
-    String,
-> {
-    use atomic_core::output::repo::{output_graph_content_resolved, resolve_conflicts_semantically};
+) -> Result<(Vec<u8>, Vec<super::conflict_object::CapturedRegion>), String> {
+    use super::conflict_object::ConflictCaptureWriter;
+    use atomic_core::output::repo::{
+        output_graph_content_resolved, resolve_conflicts_semantically,
+    };
     use atomic_core::output::{compute_order, retrieve_graph, RetrieveOptions};
     use atomic_core::pristine::InodePreloadTxn;
-    use super::conflict_object::ConflictCaptureWriter;
 
     let preloaded = InodePreloadTxn::from_table(txn, inode, inode_graph_table)
         .map_err(|e| format!("{}: conflict capture preload: {:?}", path, e))?;
@@ -1028,9 +1027,7 @@ impl Repository {
             let observed = self.observe_filesystem_effect(working_copy, &target)?;
             let mut expected_new = entry.expected_new;
             match (&observed, &mut expected_new) {
-                (EffectValue::Absent, EffectValue::File(new))
-                    if new.kind == FileKind::Symlink =>
-                {
+                (EffectValue::Absent, EffectValue::File(new)) if new.kind == FileKind::Symlink => {
                     // Linux `symlink(2)` ignores umask and yields the
                     // platform's full-permission creation mode; probing a
                     // directory's umask mask would mispredict the lease.
@@ -1485,15 +1482,16 @@ impl Repository {
                 let retrieve_ms = t_retrieve.elapsed();
                 let mut graph = retrieve_result.graph;
 
-                let (repository_content, order_ms, content_ms, rendered_conflicts) =
-                    if graph.is_empty() {
-                        (
-                            Vec::new(),
-                            std::time::Duration::ZERO,
-                            std::time::Duration::ZERO,
-                            false,
-                        )
-                    } else {
+                let (repository_content, order_ms, content_ms, rendered_conflicts) = if graph
+                    .is_empty()
+                {
+                    (
+                        Vec::new(),
+                        std::time::Duration::ZERO,
+                        std::time::Duration::ZERO,
+                        false,
+                    )
+                } else {
                     let t_order = std::time::Instant::now();
                     let order = compute_order(&mut graph);
                     let order_ms = t_order.elapsed();
@@ -1532,7 +1530,12 @@ impl Repository {
                     // lines (documentation examples, test fixtures) writes
                     // them through `output_line` and stays marker-free here.
                     let rendered_conflicts = writer.has_conflict_markers();
-                    (writer.into_inner(), order_ms, t_content.elapsed(), rendered_conflicts)
+                    (
+                        writer.into_inner(),
+                        order_ms,
+                        t_content.elapsed(),
+                        rendered_conflicts,
+                    )
                 };
 
                 let materialization = inode_materialization

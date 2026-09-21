@@ -130,10 +130,7 @@ pub(crate) fn verify_receive_updates(
 
     if !refusals.is_empty() {
         for refusal in &refusals {
-            print_warning(&format!(
-                "REFUSED {}: {}",
-                refusal.ref_name, refusal.reason
-            ));
+            print_warning(&format!("REFUSED {}: {}", refusal.ref_name, refusal.reason));
         }
         // CB-13C observability: publication refusals are recorded with
         // stable counts; refusal reasons stay in the command output, never
@@ -271,12 +268,16 @@ fn verify_ref_update(
     }
 }
 
-fn gate_config(repo: &Repository) -> atomic_repository::repository::provenance_gate::PublicationGateConfig {
+fn gate_config(
+    repo: &Repository,
+) -> atomic_repository::repository::provenance_gate::PublicationGateConfig {
     atomic_repository::repository::provenance_gate::PublicationGateConfig::from_repo(repo)
-        .unwrap_or(atomic_repository::repository::provenance_gate::PublicationGateConfig {
-            trust: Default::default(),
-            repository_identity: None,
-        })
+        .unwrap_or(
+            atomic_repository::repository::provenance_gate::PublicationGateConfig {
+                trust: Default::default(),
+                repository_identity: None,
+            },
+        )
 }
 
 /// Walk first-parent history from `tip` to the nearest projection commit and
@@ -286,8 +287,8 @@ fn resolve_projection_state(git_repo: &GitRepository, tip: git2::Oid) -> Option<
     for _ in 0..1000 {
         let message = commit.message().unwrap_or("");
         let view = parse_trailer(message, "Atomic-View");
-        let state = parse_trailer(message, "Atomic-State")
-            .and_then(|s| Merkle::from_base32(s.as_bytes()));
+        let state =
+            parse_trailer(message, "Atomic-State").and_then(|s| Merkle::from_base32(s.as_bytes()));
         if let (Some(view), Some(state)) = (view, state) {
             return Some((view, state));
         }
@@ -371,12 +372,9 @@ mod tests {
             .commit(Some("refs/heads/x"), &sig, &sig, "plain", &tree, &[])
             .unwrap();
         let zero = "0000000000000000000000000000000000000000";
-        let error = verify_receive_updates(
-            dir.path(),
-            &[],
-            &format!("{zero} {oid} refs/heads/main"),
-        )
-        .expect_err("unverifiable tip refuses");
+        let error =
+            verify_receive_updates(dir.path(), &[], &format!("{zero} {oid} refs/heads/main"))
+                .expect_err("unverifiable tip refuses");
         // The reason reaches stderr via the refusal warnings; the error is
         // the boundary's aggregate refusal.
         assert!(error.to_string().contains("refused 1 of 1"), "{error}");
@@ -420,7 +418,11 @@ mod tests {
         verify_receive_updates(dir.path(), &[], &format!("{zero} {oid} refs/heads/main"))
             .expect_err("the unverifiable tip refuses");
 
-        let journal = dir.path().join(".atomic").join("bridge").join("events.jsonl");
+        let journal = dir
+            .path()
+            .join(".atomic")
+            .join("bridge")
+            .join("events.jsonl");
         let text = std::fs::read_to_string(&journal).unwrap();
         let line = text
             .lines()
@@ -444,11 +446,8 @@ mod tests {
         let zero = "0000000000000000000000000000000000000000";
         let tip = "1111111111111111111111111111111111111111";
         // <tip> -> <zero> is a deletion: nothing to verify, accepted.
-        let result = verify_receive_updates(
-            dir.path(),
-            &[],
-            &format!("{tip} {zero} refs/heads/scratch"),
-        );
+        let result =
+            verify_receive_updates(dir.path(), &[], &format!("{tip} {zero} refs/heads/scratch"));
         assert!(result.is_ok(), "{result:?}");
     }
 }

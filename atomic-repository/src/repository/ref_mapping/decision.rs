@@ -92,9 +92,9 @@ pub fn classify_three_way(
 /// reconciliation returns both sides to `Synchronized`.
 pub fn status_for(action: ThreeWayAction) -> RefSyncStatus {
     match action {
-        ThreeWayAction::Noop
-        | ThreeWayAction::Import
-        | ThreeWayAction::Export => RefSyncStatus::Synchronized,
+        ThreeWayAction::Noop | ThreeWayAction::Import | ThreeWayAction::Export => {
+            RefSyncStatus::Synchronized
+        }
         ThreeWayAction::Diverged => RefSyncStatus::Diverged,
         ThreeWayAction::Unrepresentable => RefSyncStatus::Unrepresentable,
     }
@@ -201,10 +201,22 @@ mod tests {
 
     #[test]
     fn status_follows_outcome() {
-        assert_eq!(status_for(ThreeWayAction::Noop), RefSyncStatus::Synchronized);
-        assert_eq!(status_for(ThreeWayAction::Import), RefSyncStatus::Synchronized);
-        assert_eq!(status_for(ThreeWayAction::Export), RefSyncStatus::Synchronized);
-        assert_eq!(status_for(ThreeWayAction::Diverged), RefSyncStatus::Diverged);
+        assert_eq!(
+            status_for(ThreeWayAction::Noop),
+            RefSyncStatus::Synchronized
+        );
+        assert_eq!(
+            status_for(ThreeWayAction::Import),
+            RefSyncStatus::Synchronized
+        );
+        assert_eq!(
+            status_for(ThreeWayAction::Export),
+            RefSyncStatus::Synchronized
+        );
+        assert_eq!(
+            status_for(ThreeWayAction::Diverged),
+            RefSyncStatus::Diverged
+        );
         assert_eq!(
             status_for(ThreeWayAction::Unrepresentable),
             RefSyncStatus::Unrepresentable

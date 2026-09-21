@@ -14,7 +14,6 @@ use std::process::{Command, Output};
 
 use atomic_core::change::ChangeOrigin;
 use atomic_core::operation::{GitHashAlgorithm, GitObjectId, OperationKind, OperationScope};
-use atomic_core::types::Base32;
 use git2::Repository as GitRepository;
 
 const ATOMIC_BIN: &str = env!("CARGO_BIN_EXE_atomic");
@@ -309,7 +308,7 @@ fn git_import_preserves_the_foreign_object_database() {
         .find_commit(git2::Oid::from_str(&fixture.head).unwrap())
         .is_ok());
     assert_eq!(
-        git(&root, &["rev-parse", "HEAD^{tree}"]),
+        git(root, &["rev-parse", "HEAD^{tree}"]),
         fixture.head_tree,
         "the Git tree is untouched by synthesis"
     );
@@ -367,7 +366,7 @@ fn shallow_import_labels_the_boundary_and_deepening_is_refused() {
     let synthesized: Vec<atomic_core::change::Change> = entries
         .iter()
         .map(|entry| repo.load_change(&entry.hash).unwrap())
-        .filter(|change| change.origin().is_native() == false)
+        .filter(|change| !change.origin().is_native())
         .collect();
     assert_eq!(
         synthesized.len(),

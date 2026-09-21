@@ -30,13 +30,15 @@ fn sole_head(
         crate::OperationHeadState::Single(head) => head,
         other => panic!("expected one operation head, found {other:?}"),
     };
-    let details = repository.operation_details(head).expect("operation details");
+    let details = repository
+        .operation_details(head)
+        .expect("operation details");
     (head, details.operation.payload().kind)
 }
 
 #[test]
 fn bridge_git_ref_write_journals_operation_before_visibility_and_records_receipt() {
-    let (directory, repository) = create_temp_repo();
+    let (_directory, repository) = create_temp_repo();
     let working_copy = repository.working_copy();
     let old_oid = "1111111111111111111111111111111111111111";
     let new_oid = "2222222222222222222222222222222222222222";
@@ -82,15 +84,13 @@ fn bridge_git_ref_write_journals_operation_before_visibility_and_records_receipt
     repository
         .finalize_bridge_git_write(prepared, Some(sha1(new_oid)))
         .expect("verify the completed write");
-    let details = repository
-        .operation_details(operation_id)
-        .expect("details");
+    let details = repository.operation_details(operation_id).expect("details");
     assert_eq!(details.verification, OperationVerificationState::Verified);
 }
 
 #[test]
 fn bridge_git_write_with_unexpected_ref_target_fails_and_does_not_verify() {
-    let (directory, repository) = create_temp_repo();
+    let (_directory, repository) = create_temp_repo();
     let working_copy = repository.working_copy();
     let old_oid = "1111111111111111111111111111111111111111";
     let new_oid = "2222222222222222222222222222222222222222";
@@ -108,8 +108,10 @@ fn bridge_git_write_with_unexpected_ref_target_fails_and_does_not_verify() {
     // The caller observes a third value: someone else moved the ref between
     // observation and mutation. The receipt must be a durable rejection and
     // the operation must not verify.
-    let observed =
-        repository.record_bridge_git_ref_receipt(&prepared, Some(sha1("3333333333333333333333333333333333333333")));
+    let observed = repository.record_bridge_git_ref_receipt(
+        &prepared,
+        Some(sha1("3333333333333333333333333333333333333333")),
+    );
     assert!(observed.is_err(), "a third ref value must fail closed");
     let details = repository
         .operation_details(prepared.operation_id)
@@ -153,7 +155,7 @@ fn token_hex(token: &[u8; 32]) -> String {
 
 #[test]
 fn anchored_capture_authenticates_only_through_a_verified_active_operation() {
-    let (directory, repository) = create_temp_repo();
+    let (_directory, repository) = create_temp_repo();
     let working_copy = repository.working_copy();
     let old_oid = "1111111111111111111111111111111111111111";
     let new_oid = "2222222222222222222222222222222222222222";
@@ -265,7 +267,7 @@ fn anchored_capture_authenticates_only_through_a_verified_active_operation() {
 
 #[test]
 fn anchored_capture_refuses_an_operation_that_is_not_the_active_head() {
-    let (directory, repository) = create_temp_repo();
+    let (_directory, repository) = create_temp_repo();
     let working_copy = repository.working_copy();
 
     // Prepare a genuine operation, then replace its head with another one:
@@ -283,8 +285,14 @@ fn anchored_capture_refuses_an_operation_that_is_not_the_active_head() {
     // Finalize it so the head moves on (the finalization CAS advances the
     // scope past the prepared operation).
     let operation_id = prepared.operation_id;
-    let _ = repository.record_bridge_git_ref_receipt(&prepared, Some(sha1("2222222222222222222222222222222222222222")));
-    let _ = repository.finalize_bridge_git_write(prepared, Some(sha1("2222222222222222222222222222222222222222")));
+    let _ = repository.record_bridge_git_ref_receipt(
+        &prepared,
+        Some(sha1("2222222222222222222222222222222222222222")),
+    );
+    let _ = repository.finalize_bridge_git_write(
+        prepared,
+        Some(sha1("2222222222222222222222222222222222222222")),
+    );
 
     assert!(
         repository
@@ -301,7 +309,7 @@ fn anchored_capture_refuses_an_operation_that_is_not_the_active_head() {
 
 #[test]
 fn anchored_capture_refuses_conflicting_reanchoring() {
-    let (directory, repository) = create_temp_repo();
+    let (_directory, repository) = create_temp_repo();
     let working_copy = repository.working_copy();
     let old_oid = "1111111111111111111111111111111111111111";
     let new_oid = "2222222222222222222222222222222222222222";
@@ -401,7 +409,7 @@ fn anchored_capture_refuses_conflicting_reanchoring() {
 
 #[test]
 fn anchored_capture_refuses_events_the_operation_does_not_describe() {
-    let (directory, repository) = create_temp_repo();
+    let (_directory, repository) = create_temp_repo();
     let working_copy = repository.working_copy();
 
     // An active ExportGitRefs operation whose leases name 3333 -> 4444.
@@ -422,8 +430,7 @@ fn anchored_capture_refuses_events_the_operation_does_not_describe() {
     // it to an unrelated ref-write.
     let sibling_event = format!(
         "{} {}\n",
-        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
     );
     repository
         .capture_bridge_event(sibling_event.as_bytes())
@@ -485,7 +492,9 @@ fn anchored_capture_refuses_events_the_operation_does_not_describe() {
         .capture_bridge_event_anchored(&tokenless, prepared.operation_id)
         .expect_err("a matching-OID capture with no capture token must refuse");
     assert!(
-        error.to_string().contains("carry no operation capture token"),
+        error
+            .to_string()
+            .contains("carry no operation capture token"),
         "the refusal must name the missing capture context: {error}"
     );
 
@@ -513,7 +522,7 @@ fn anchored_capture_refuses_events_the_operation_does_not_describe() {
 // retroactively promoted into operation linkage.
 #[test]
 fn anchored_capture_refuses_an_advisory_capture_that_predates_the_operation() {
-    let (directory, repository) = create_temp_repo();
+    let (_directory, repository) = create_temp_repo();
     let working_copy = repository.working_copy();
     let old_oid = "1111111111111111111111111111111111111111";
     let new_oid = "2222222222222222222222222222222222222222";
@@ -556,7 +565,9 @@ fn anchored_capture_refuses_an_advisory_capture_that_predates_the_operation() {
         .capture_bridge_event_anchored(&advisory, prepared.operation_id)
         .expect_err("a pre-operation advisory capture must never anchor");
     assert!(
-        error.to_string().contains("carry no operation capture token"),
+        error
+            .to_string()
+            .contains("carry no operation capture token"),
         "the refusal must name the missing capture context: {error}"
     );
     assert_eq!(
@@ -603,7 +614,6 @@ fn anchored_capture_refuses_an_advisory_capture_that_predates_the_operation() {
         "the advisory capture never authenticates"
     );
 }
-
 
 // Review F2: an ordinary ExportGitRefs ref movement is NOT a rewrite
 // execution, so it mints no capture context and can never become rewrite

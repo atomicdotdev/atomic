@@ -31,11 +31,10 @@ impl fmt::Display for RepositoryLockKind {
             Self::Common => formatter.write_str("common repository operation lock"),
             Self::WorkingCopy { id } => write!(formatter, "working-copy operation lock for {id}"),
             Self::Shelf { id } => write!(formatter, "working-copy shelf lock for {id}"),
-            Self::DeferredTree => formatter.write_str("deferred-tree operation lock"),        }
+            Self::DeferredTree => formatter.write_str("deferred-tree operation lock"),
+        }
     }
 }
-
-
 
 /// Errors that can occur during repository operations
 #[derive(Debug, Error)]
@@ -299,9 +298,7 @@ pub enum RepositoryError {
         "ref mapping for view '{view}' moved since the caller observed it; \
          re-observe and rebuild the replacement (nothing was written)"
     )]
-    RefMappingObservationMoved {
-        view: String,
-    },
+    RefMappingObservationMoved { view: String },
 
     /// Legacy unscoped lock error.
     #[error("Repository is locked by another process")]

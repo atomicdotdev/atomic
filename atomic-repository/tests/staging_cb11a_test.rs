@@ -26,8 +26,7 @@ use atomic_core::change::ChangeHeader;
 use atomic_core::{GitHashAlgorithm, WorkingCopyId};
 use atomic_repository::record::RecordOptions;
 use atomic_repository::{
-    observe_staging_state, ConversionPolicy, Repository, StageCode,
-    StagingNotice, StagingState,
+    observe_staging_state, ConversionPolicy, Repository, StageCode, StagingNotice, StagingState,
 };
 use tempfile::TempDir;
 
@@ -155,7 +154,6 @@ impl Colocated {
     fn git_short(&self) -> String {
         git(&self.root, &["status", "--short"])
     }
-
 }
 
 fn entry<'a>(state: &'a StagingState, path: &str) -> &'a atomic_repository::StagingEntry {
@@ -181,10 +179,22 @@ fn synchronized_layers_are_clean_and_manifest_backed() {
     let fixture = Colocated::new();
     let state = fixture.observe();
 
-    assert!(state.is_clean(), "expected clean, got {:?}", fixture.git_short());
-    assert!(state.notices.is_empty(), "unexpected notices: {:?}", state.notices);
+    assert!(
+        state.is_clean(),
+        "expected clean, got {:?}",
+        fixture.git_short()
+    );
+    assert!(
+        state.notices.is_empty(),
+        "unexpected notices: {:?}",
+        state.notices
+    );
     let baseline = state.baseline_tree.as_ref().expect("HEAD exists").clone();
-    let index = state.index_tree.as_ref().expect("index tree computable").clone();
+    let index = state
+        .index_tree
+        .as_ref()
+        .expect("index tree computable")
+        .clone();
     assert_eq!(baseline, index, "clean: baseline tree == index tree");
     let root = state
         .durable_manifest_root
@@ -288,7 +298,11 @@ fn partial_staging_reports_both_columns_and_leaves_snapshot_complete() {
     let entry = entry(&state, "f.txt");
     // Baseline → index and index → worktree both differ: both columns report.
     assert_eq!(entry.x, StageCode::Modified, "staged hunk is the X column");
-    assert_eq!(entry.y, StageCode::Modified, "remaining hunk is the Y column");
+    assert_eq!(
+        entry.y,
+        StageCode::Modified,
+        "remaining hunk is the Y column"
+    );
     assert_eq!(fixture.git_short(), "MM f.txt");
 
     // The snapshot is the complete baseline→worktree patch, not staged
@@ -314,7 +328,11 @@ fn intent_to_add_records_intent_without_staged_content() {
     let state = fixture.observe();
     assert_eq!(fixture.git_short(), " A g.txt", "git unchanged");
     let entry = entry(&state, "g.txt");
-    assert_eq!(entry.x, StageCode::Unmodified, "intent-to-add stages nothing");
+    assert_eq!(
+        entry.x,
+        StageCode::Unmodified,
+        "intent-to-add stages nothing"
+    );
     assert_eq!(entry.y, StageCode::Added, "worktree holds unstaged content");
     assert!(entry.intent_to_add);
     assert!(!entry.durable_tracked, "not durably tracked yet");
@@ -347,7 +365,10 @@ fn skip_worktree_exempts_worktree_comparison() {
 #[test]
 fn assume_unchanged_exempt_from_change_detection() {
     let fixture = Colocated::new();
-    git(&fixture.root, &["update-index", "--assume-unchanged", "f.txt"]);
+    git(
+        &fixture.root,
+        &["update-index", "--assume-unchanged", "f.txt"],
+    );
     fs::write(fixture.root.join("f.txt"), b"l1\nLOCAL\nl3\nl4\nl5\n").unwrap();
 
     let state = fixture.observe();
@@ -374,7 +395,8 @@ fn sparse_index_entries_are_not_deletions() {
 
     // Re-track the new baseline so the durable layer matches.
     let repo = &fixture.repo;
-    repo.add(fixture.working_copy, "sub/deep.txt", Default::default()).unwrap();
+    repo.add(fixture.working_copy, "sub/deep.txt", Default::default())
+        .unwrap();
     repo.record(
         fixture.working_copy,
         ChangeHeader::new("track subtree"),
@@ -386,7 +408,16 @@ fn sparse_index_entries_are_not_deletions() {
     // when the sparse index is enabled (git >= 2.36).
     git(&fixture.root, &["config", "index.sparse", "true"]);
     git(&fixture.root, &["sparse-checkout", "init", "--cone"]);
-    git(&fixture.root, &["sparse-checkout", "set", "--cone", "--skip-checks", "nonexistent"]);
+    git(
+        &fixture.root,
+        &[
+            "sparse-checkout",
+            "set",
+            "--cone",
+            "--skip-checks",
+            "nonexistent",
+        ],
+    );
     let listing = git(&fixture.root, &["ls-files", "-t"]);
     assert!(
         listing.contains("S sub/"),
@@ -436,7 +467,10 @@ fn staged_delete_with_recreated_worktree_reports_untracked_too() {
     let entry = entry(&state, "f.txt");
     assert_eq!(entry.x, StageCode::Deleted);
     assert_eq!(entry.y, StageCode::Unmodified);
-    assert!(entry.durable_tracked, "index movement never untracks durably");
+    assert!(
+        entry.durable_tracked,
+        "index movement never untracks durably"
+    );
     assert!(state.staged().next().is_some());
     let root_before = fixture.durable_root();
     let tracked_before = fixture.durable_tracked_paths();
@@ -467,7 +501,9 @@ fn staged_delete_with_recreated_worktree_reports_untracked_too() {
 #[test]
 fn executable_mode_change_reports_modified_unstaged() {
     let fixture = Colocated::new();
-    let mut permissions = fs::metadata(fixture.root.join("f.txt")).unwrap().permissions();
+    let mut permissions = fs::metadata(fixture.root.join("f.txt"))
+        .unwrap()
+        .permissions();
     use std::os::unix::fs::PermissionsExt;
     permissions.set_mode(0o755);
     fs::set_permissions(fixture.root.join("f.txt"), permissions).unwrap();
@@ -476,7 +512,11 @@ fn executable_mode_change_reports_modified_unstaged() {
     let state = fixture.observe();
     let entry = entry(&state, "f.txt");
     assert_eq!(entry.x, StageCode::Unmodified);
-    assert_eq!(entry.y, StageCode::Modified, "mode change is M in the subset");
+    assert_eq!(
+        entry.y,
+        StageCode::Modified,
+        "mode change is M in the subset"
+    );
 }
 
 #[test]
@@ -505,21 +545,33 @@ fn index_movement_never_mutates_durable_tracking() {
     git(&fixture.root, &["add", "f.txt"]);
     let state = fixture.observe();
     assert_eq!(entry(&state, "f.txt").x, StageCode::Modified);
-    assert_eq!(fixture.durable_root(), root_before, "git add must not touch TREE");
+    assert_eq!(
+        fixture.durable_root(),
+        root_before,
+        "git add must not touch TREE"
+    );
     assert_eq!(fixture.durable_tracked_paths(), tracked_before);
 
     // git reset (unstage)
     git(&fixture.root, &["reset", "-q", "f.txt"]);
     let state = fixture.observe();
     assert_eq!(entry(&state, "f.txt").x, StageCode::Unmodified);
-    assert_eq!(fixture.durable_root(), root_before, "git reset must not touch TREE");
+    assert_eq!(
+        fixture.durable_root(),
+        root_before,
+        "git reset must not touch TREE"
+    );
 
     // git rm --cached (untrack in index only)
     git(&fixture.root, &["rm", "--cached", "-q", "f.txt"]);
     let state = fixture.observe();
     assert_eq!(entry(&state, "f.txt").x, StageCode::Deleted);
     assert!(entry(&state, "f.txt").durable_tracked);
-    assert_eq!(fixture.durable_root(), root_before, "git rm --cached must not touch TREE");
+    assert_eq!(
+        fixture.durable_root(),
+        root_before,
+        "git rm --cached must not touch TREE"
+    );
     assert_eq!(fixture.durable_tracked_paths(), tracked_before);
 }
 
@@ -532,9 +584,8 @@ fn only_stage_zero_projects_and_unmerged_stages_are_reported() {
     let theirs = git_hash_object(&fixture.root, "l1\nTHEIRS\nl3\nl4\nl5\n");
     // Feed stage 1/2/3 lines through stdin.
     git(&fixture.root, &["update-index", "--force-remove", "f.txt"]);
-    let info = format!(
-        "100644 {base} 1\tf.txt\n100644 {ours} 2\tf.txt\n100644 {theirs} 3\tf.txt\n"
-    );
+    let info =
+        format!("100644 {base} 1\tf.txt\n100644 {ours} 2\tf.txt\n100644 {theirs} 3\tf.txt\n");
     let mut child = Command::new("git")
         .arg("-C")
         .arg(&fixture.root)

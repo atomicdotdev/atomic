@@ -10,7 +10,7 @@
 //! stale pack, a corrupted pack, and missing sides.
 
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use atomic_core::change::ChangeHeader;
 use atomic_core::types::Base32;
@@ -20,13 +20,13 @@ use atomic_objects::{ObjectFamily, ObjectRecord};
 
 use crate::git_binding::{
     BindingSigner, CausalOrigin, GitObjectFormat, GitOid, GitStateBinding, GitStateBindingPayload,
-    LossNote, BINDING_VERSION, CONFLICTS_PACK_BLOB_NAME,
+    BINDING_VERSION, CONFLICTS_PACK_BLOB_NAME,
 };
 use crate::repository::conflict_object::ConflictSetObject;
 use crate::Repository;
 
-use crate::CrossViewInsertOptions;
 use super::{RecordOptions, TestRepository};
+use crate::CrossViewInsertOptions;
 
 fn test_keypair(seed: u8) -> atomic_identity::keypair::KeyPair {
     let mut secret = [0u8; 32];
@@ -63,12 +63,14 @@ fn publisher_conflicted(seed: u8, with_pack: bool, corrupt_pack: bool) -> Confli
 
     // Base: both files recorded on the shared view `dev`.
     repo.add("f.txt", Default::default()).expect("track f");
-    repo.add("keep.txt", Default::default()).expect("track keep");
+    repo.add("keep.txt", Default::default())
+        .expect("track keep");
     repo.record(ChangeHeader::new("base"), RecordOptions::default())
         .expect("record base");
 
     // Draft `feature`: edit A after line1.
-    repo.create_view_from("feature", "dev").expect("create view");
+    repo.create_view_from("feature", "dev")
+        .expect("create view");
     repo.switch_view("feature").expect("switch");
     fs::write(
         root.join("f.txt"),
@@ -109,9 +111,8 @@ fn publisher_conflicted(seed: u8, with_pack: bool, corrupt_pack: bool) -> Confli
     // The conflict snapshot commit: a real Git commit whose tree is the
     // marker projection of the conflicted state and whose message names
     // `atomic-conflict <hash>`.
-    let policy = crate::repository::ConversionPolicy::new(
-        atomic_core::operation::GitHashAlgorithm::Sha1,
-    );
+    let policy =
+        crate::repository::ConversionPolicy::new(atomic_core::operation::GitHashAlgorithm::Sha1);
     let projection = repo
         .prepare_conflict_snapshot_projection("dev", &policy)
         .expect("conflict snapshot projection");
@@ -143,8 +144,13 @@ fn publisher_conflicted(seed: u8, with_pack: bool, corrupt_pack: bool) -> Confli
             let last = bytes.len() - 1;
             bytes[last] ^= 0xff;
         }
-        let published = repo
-            .publish_binding_with_conflicts_pack(repo.working_copy(), &git, &binding, None, &bytes);
+        let published = repo.publish_binding_with_conflicts_pack(
+            repo.working_copy(),
+            &git,
+            &binding,
+            None,
+            &bytes,
+        );
         if corrupt_pack {
             assert!(
                 published.is_err(),
@@ -183,9 +189,7 @@ fn write_tree_and_commit(
             crate::GitObjectKind::Blob => git2::ObjectType::Blob,
             crate::GitObjectKind::Tree => git2::ObjectType::Tree,
         };
-        let written = odb
-            .write(git2_kind, &object.bytes)
-            .expect("write object");
+        let written = odb.write(git2_kind, &object.bytes).expect("write object");
         assert_eq!(
             written.as_bytes(),
             oid.as_bytes(),
@@ -337,12 +341,7 @@ fn fresh_store_restores_the_exact_conflict_state_from_the_complete_pack() {
     };
     fresh
         .repo
-        .resurrect_binding_exact(
-            &fresh_git,
-            &publisher.binding,
-            &view,
-            Some(&mut source),
-        )
+        .resurrect_binding_exact(&fresh_git, &publisher.binding, &view, Some(&mut source))
         .expect("exact resurrection in the fresh store");
 
     // ── The deep conflict-state proof (RFC §8.3 round-trip). ─────────────
@@ -360,18 +359,24 @@ fn fresh_store_restores_the_exact_conflict_state_from_the_complete_pack() {
     let publisher_bytes = fresh_repo_publisher_markers(&publisher, "f.txt");
     for side_bytes in ["AAA-inserted", "BBB-inserted"] {
         assert!(
-            restored_bytes.windows(side_bytes.len()).any(|w| w == side_bytes.as_bytes()),
+            restored_bytes
+                .windows(side_bytes.len())
+                .any(|w| w == side_bytes.as_bytes()),
             "restored markers must carry side {side_bytes}: {}",
             String::from_utf8_lossy(&restored_bytes)
         );
         assert!(
-            publisher_bytes.windows(side_bytes.len()).any(|w| w == side_bytes.as_bytes()),
+            publisher_bytes
+                .windows(side_bytes.len())
+                .any(|w| w == side_bytes.as_bytes()),
             "publisher markers must carry side {side_bytes}"
         );
     }
     assert!(
         restored_bytes.starts_with(b"line1\n>>>>>>>")
-            && restored_bytes.windows(16).any(|w| w == b"<<<<<<< 1\nline2\n"),
+            && restored_bytes
+                .windows(16)
+                .any(|w| w == b"<<<<<<< 1\nline2\n"),
         "the restored marker region must be structurally identical: {}",
         String::from_utf8_lossy(&restored_bytes)
     );
@@ -396,7 +401,10 @@ fn fresh_store_restores_the_exact_conflict_state_from_the_complete_pack() {
     let _ = CONFLICTS_PACK_BLOB_NAME;
 }
 
-fn fresh_repo_pack_bytes(publisher: &ConflictedPublisher, conflict_set: &ConflictSetObject) -> Vec<u8> {
+fn fresh_repo_pack_bytes(
+    publisher: &ConflictedPublisher,
+    conflict_set: &ConflictSetObject,
+) -> Vec<u8> {
     let _ = publisher;
     conflict_set.canonical_bytes().expect("canonical bytes")
 }
@@ -551,9 +559,8 @@ fn unrepresentable_conflict_states_refuse_projection_without_flattening() {
     let _git = git2::Repository::init(&root).expect("init git");
     let repo = super::TestRepository::new(Repository::init(&root).expect("init atomic"));
 
-    let policy = crate::repository::ConversionPolicy::new(
-        atomic_core::operation::GitHashAlgorithm::Sha1,
-    );
+    let policy =
+        crate::repository::ConversionPolicy::new(atomic_core::operation::GitHashAlgorithm::Sha1);
     // An empty conflict set is trivially representable.
     let empty = ConflictSetObject::empty();
     assert!(repo

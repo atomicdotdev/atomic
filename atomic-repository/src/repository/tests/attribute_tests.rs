@@ -313,7 +313,8 @@ fn sibling_mode_writers_never_become_foreign_assembly_dependencies() {
         let (temp, repo) = create_temp_repo();
         let path = temp.path().join("register.txt");
         std::fs::write(&path, b"content\n").unwrap();
-        repo.add("register.txt", TrackingOptions::default()).unwrap();
+        repo.add("register.txt", TrackingOptions::default())
+            .unwrap();
         let base = record_all(&repo, "add register file")
             .change()
             .hash()
@@ -323,7 +324,7 @@ fn sibling_mode_writers_never_become_foreign_assembly_dependencies() {
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
         let visible_writer = record_all(&repo, "visible chmod").change().hash().unwrap();
 
-        let siblings = {
+        let _siblings = {
             let txn = repo.pristine.read_txn().unwrap();
             let inode = txn.get_inode("register.txt").unwrap().unwrap();
             let position = txn.inode_position(inode).unwrap().unwrap();
@@ -336,7 +337,8 @@ fn sibling_mode_writers_never_become_foreign_assembly_dependencies() {
             [base, visible_writer].into_iter().collect();
         let actual: std::collections::HashSet<atomic_core::Hash> = deps.iter().copied().collect();
         assert_eq!(
-            actual, expected,
+            actual,
+            expected,
             "exact assembly visibility: the attribute write depends on the target \
              position's base change and the register's visible frontier writer — \
              never an invisible sibling (deps: {:?})",
@@ -352,13 +354,20 @@ fn sibling_mode_writers_never_become_foreign_assembly_dependencies() {
 #[test]
 fn sibling_kind_writers_never_become_foreign_assembly_dependencies() {
     for sibling_values in [
-        [InodeAttr::Kind(InodeKind::Symlink), InodeAttr::Kind(InodeKind::Gitlink)],
-        [InodeAttr::Kind(InodeKind::Gitlink), InodeAttr::Kind(InodeKind::Symlink)],
+        [
+            InodeAttr::Kind(InodeKind::Symlink),
+            InodeAttr::Kind(InodeKind::Gitlink),
+        ],
+        [
+            InodeAttr::Kind(InodeKind::Gitlink),
+            InodeAttr::Kind(InodeKind::Symlink),
+        ],
     ] {
         let (temp, repo) = create_temp_repo();
         let path = temp.path().join("register.txt");
         std::fs::write(&path, b"content\n").unwrap();
-        repo.add("register.txt", TrackingOptions::default()).unwrap();
+        repo.add("register.txt", TrackingOptions::default())
+            .unwrap();
         let base = record_all(&repo, "add register file")
             .change()
             .hash()
@@ -368,25 +377,26 @@ fn sibling_kind_writers_never_become_foreign_assembly_dependencies() {
         // the base-only view.
         std::fs::remove_file(&path).unwrap();
         std::os::unix::fs::symlink("target", &path).unwrap();
-        let visible_writer = record_all(&repo, "visible conversion").change().hash().unwrap();
+        let visible_writer = record_all(&repo, "visible conversion")
+            .change()
+            .hash()
+            .unwrap();
 
-        let siblings = {
+        let _siblings = {
             let inode = inode_of(&repo, "register.txt");
             let position = position_of(&repo, "register.txt");
             seed_invisible_siblings(&repo, inode, position, sibling_values)
         };
 
-        let change = assemble_attribute_write(
-            &repo,
-            "register.txt",
-            InodeAttr::Kind(InodeKind::Gitlink),
-        );
+        let change =
+            assemble_attribute_write(&repo, "register.txt", InodeAttr::Kind(InodeKind::Gitlink));
         let deps = change.dependencies();
         let expected: std::collections::HashSet<atomic_core::Hash> =
             [base, visible_writer].into_iter().collect();
         let actual: std::collections::HashSet<atomic_core::Hash> = deps.iter().copied().collect();
         assert_eq!(
-            actual, expected,
+            actual,
+            expected,
             "exact assembly visibility for the kind register: the base change and \
              the visible kind writer only — never an invisible sibling (deps: {:?})",
             deps.iter().map(|h| h.to_base32()).collect::<Vec<_>>()

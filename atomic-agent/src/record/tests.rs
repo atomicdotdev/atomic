@@ -1218,9 +1218,16 @@ mod cb12a_classification {
         let signature = git2::Signature::now("Turn Test", "turn@test.invalid").unwrap();
         let parent = git.head().ok().and_then(|head| head.peel_to_commit().ok());
         let parents: Vec<&git2::Commit> = parent.iter().collect();
-        git.commit(Some("HEAD"), &signature, &signature, "test commit", &tree, &parents)
-            .unwrap()
-            .to_string()
+        git.commit(
+            Some("HEAD"),
+            &signature,
+            &signature,
+            "test commit",
+            &tree,
+            &parents,
+        )
+        .unwrap()
+        .to_string()
     }
 
     fn make_options<'a>(
@@ -1255,7 +1262,8 @@ mod cb12a_classification {
         // worktree stays clean across the git-only turn.
         std::fs::write(dir.path().join(file), content).unwrap();
         let working_copy = repo.require_working_copy_id().unwrap();
-        repo.add(working_copy, file, TrackingOptions::default()).unwrap();
+        repo.add(working_copy, file, TrackingOptions::default())
+            .unwrap();
         repo.record(
             working_copy,
             atomic_core::change::ChangeHeader::new("baseline"),
@@ -1263,9 +1271,8 @@ mod cb12a_classification {
         )
         .unwrap();
 
-        let baseline =
-            crate::record::capture_turn_boundary(&repo, dir.path(), session_id, 1)
-                .expect("turn-start boundary captures on a real repository");
+        let baseline = crate::record::capture_turn_boundary(&repo, dir.path(), session_id, 1)
+            .expect("turn-start boundary captures on a real repository");
         session.set_boundary_start(baseline.clone());
         drop(repo);
 
@@ -1299,7 +1306,7 @@ mod cb12a_classification {
     #[test]
     fn clean_turn_with_unexplained_commit_is_incomplete() {
         let dir = TempDir::new().unwrap();
-        let (git, mut session) = setup(&dir, "sess-unexplained", "tracked.txt", "same\n");
+        let (git, session) = setup(&dir, "sess-unexplained", "tracked.txt", "same\n");
 
         // A commit happens inside the turn window without any pre-commit
         // capture (hook bypassed / --no-verify).
@@ -1311,17 +1318,23 @@ mod cb12a_classification {
         match record_turn(dir.path(), &options).unwrap() {
             TurnRecordResult::Classified(classified) => {
                 match &classified.outcome {
-                    ManagedTurnOutcome::RepositoryOperations { operations, capture } => {
+                    ManagedTurnOutcome::RepositoryOperations {
+                        operations,
+                        capture,
+                    } => {
                         assert!(capture.is_none());
                         assert!(
-                            operations.iter().any(|operation| operation.contains("HEAD")),
+                            operations
+                                .iter()
+                                .any(|operation| operation.contains("HEAD")),
                             "the observed HEAD transition must be described: {operations:?}"
                         );
                     }
                     other => panic!("expected RepositoryOperations, got {other:?}"),
                 }
-                let incomplete =
-                    classified.incomplete.expect("unexplained commit refuses attribution");
+                let incomplete = classified
+                    .incomplete
+                    .expect("unexplained commit refuses attribution");
                 assert_eq!(
                     incomplete.origin,
                     SessionIncompleteOrigin::UnattributedGitOperation
@@ -1339,7 +1352,7 @@ mod cb12a_classification {
     #[test]
     fn clean_turn_with_verified_capture_binds_but_never_claims_managed_capture() {
         let dir = TempDir::new().unwrap();
-        let (git, mut session) = setup(&dir, "sess-captured", "tracked.txt", "same\n");
+        let (git, session) = setup(&dir, "sess-captured", "tracked.txt", "same\n");
         let sessions_dir = dir.path().join(".atomic").join("sessions");
 
         // The pre-commit hook path: stage the exact tree, capture (HEAD =
@@ -1354,8 +1367,14 @@ mod cb12a_classification {
             let store = SessionStore::new(&sessions_dir).unwrap();
             let mut stored = store.load("sess-captured").unwrap().unwrap();
             let working_copy = stored.boundary_start.clone().unwrap().working_copy;
-            capture::write_capture(&sessions_dir, &mut stored, 1, working_copy, &commit_time_token)
-                .unwrap();
+            capture::write_capture(
+                &sessions_dir,
+                &mut stored,
+                1,
+                working_copy,
+                &commit_time_token,
+            )
+            .unwrap();
             store.save(&stored).unwrap();
         }
         {
@@ -1365,8 +1384,15 @@ mod cb12a_classification {
             let signature = git2::Signature::now("Turn Test", "turn@test.invalid").unwrap();
             let parent = git.head().ok().and_then(|head| head.peel_to_commit().ok());
             let parents: Vec<&git2::Commit> = parent.iter().collect();
-            git.commit(Some("HEAD"), &signature, &signature, "captured commit", &tree, &parents)
-                .unwrap();
+            git.commit(
+                Some("HEAD"),
+                &signature,
+                &signature,
+                "captured commit",
+                &tree,
+                &parents,
+            )
+            .unwrap();
         }
 
         let event = TurnEvent::new("sess-captured", HookType::TurnEnd);
@@ -1407,7 +1433,7 @@ mod cb12a_classification {
     #[test]
     fn clean_turn_with_tampered_capture_is_incomplete() {
         let dir = TempDir::new().unwrap();
-        let (git, mut session) = setup(&dir, "sess-tampered", "tracked.txt", "same\n");
+        let (git, session) = setup(&dir, "sess-tampered", "tracked.txt", "same\n");
         let sessions_dir = dir.path().join(".atomic").join("sessions");
 
         // Capture, then tamper with a covered field before the commit lands.
@@ -1424,11 +1450,13 @@ mod cb12a_classification {
             store.save(&stored).unwrap();
 
             let path = {
-                let files = std::fs::read_dir(capture::capture_dir(&sessions_dir, "sess-tampered").unwrap())
-                    .unwrap()
-                    .flatten()
-                    .map(|entry| entry.path())
-                    .collect::<Vec<_>>();
+                let files = std::fs::read_dir(
+                    capture::capture_dir(&sessions_dir, "sess-tampered").unwrap(),
+                )
+                .unwrap()
+                .flatten()
+                .map(|entry| entry.path())
+                .collect::<Vec<_>>();
                 assert_eq!(files.len(), 1, "exactly one capture attempt exists");
                 files.into_iter().next().unwrap()
             };
@@ -1444,8 +1472,15 @@ mod cb12a_classification {
             let signature = git2::Signature::now("Turn Test", "turn@test.invalid").unwrap();
             let parent = git.head().ok().and_then(|head| head.peel_to_commit().ok());
             let parents: Vec<&git2::Commit> = parent.iter().collect();
-            git.commit(Some("HEAD"), &signature, &signature, "tampered capture", &tree, &parents)
-                .unwrap();
+            git.commit(
+                Some("HEAD"),
+                &signature,
+                &signature,
+                "tampered capture",
+                &tree,
+                &parents,
+            )
+            .unwrap();
         }
 
         let event = TurnEvent::new("sess-tampered", HookType::TurnEnd);
@@ -1482,7 +1517,8 @@ mod cb12a_classification {
         // Baseline + first commit so HEAD is real.
         std::fs::write(dir.path().join("tracked.txt"), "same\n").unwrap();
         let working_copy = repo.require_working_copy_id().unwrap();
-        repo.add(working_copy, "tracked.txt", TrackingOptions::default()).unwrap();
+        repo.add(working_copy, "tracked.txt", TrackingOptions::default())
+            .unwrap();
         repo.record(
             working_copy,
             atomic_core::change::ChangeHeader::new("baseline"),
@@ -1492,8 +1528,8 @@ mod cb12a_classification {
         commit_file(&git, dir.path(), "tracked.txt", "same\n");
 
         // Boundary AFTER the first commit: the turn window starts at C1.
-        let baseline = crate::record::capture_turn_boundary(&repo, dir.path(), "sess-checkout", 1)
-            .unwrap();
+        let baseline =
+            crate::record::capture_turn_boundary(&repo, dir.path(), "sess-checkout", 1).unwrap();
         let start_oid = baseline.git.as_ref().unwrap().head_oid.clone().unwrap();
         session.set_boundary_start(baseline);
         drop(repo);
@@ -1555,7 +1591,8 @@ mod cb12a_classification {
 
         std::fs::write(dir.path().join("tracked.txt"), "same\n").unwrap();
         let working_copy = repo.require_working_copy_id().unwrap();
-        repo.add(working_copy, "tracked.txt", TrackingOptions::default()).unwrap();
+        repo.add(working_copy, "tracked.txt", TrackingOptions::default())
+            .unwrap();
         repo.record(
             working_copy,
             atomic_core::change::ChangeHeader::new("baseline"),
@@ -1564,8 +1601,8 @@ mod cb12a_classification {
         .unwrap();
         commit_file(&git, dir.path(), "tracked.txt", "same\n");
 
-        let baseline = crate::record::capture_turn_boundary(&repo, dir.path(), "sess-forged", 1)
-            .unwrap();
+        let baseline =
+            crate::record::capture_turn_boundary(&repo, dir.path(), "sess-forged", 1).unwrap();
         let start_oid = baseline.git.as_ref().unwrap().head_oid.clone().unwrap();
         session.set_boundary_start(baseline);
         drop(repo);
@@ -1614,7 +1651,7 @@ mod cb12a_classification {
     #[test]
     fn dirty_turn_with_unexplained_commit_marks_incomplete() {
         let dir = TempDir::new().unwrap();
-        let (git, mut session) = setup(&dir, "sess-dirty-bypass", "tracked.txt", "baseline\n");
+        let (git, session) = setup(&dir, "sess-dirty-bypass", "tracked.txt", "baseline\n");
 
         // Mixed turn: uncovered edit + Git commit inside the same window.
         std::fs::write(dir.path().join("tracked.txt"), "uncovered edit\n").unwrap();
@@ -1653,7 +1690,7 @@ mod cb12a_classification {
     #[test]
     fn dirty_turn_with_verified_capture_binds_transition() {
         let dir = TempDir::new().unwrap();
-        let (git, mut session) = setup(&dir, "sess-dirty-captured", "tracked.txt", "same\n");
+        let (git, session) = setup(&dir, "sess-dirty-captured", "tracked.txt", "same\n");
         let sessions_dir = dir.path().join(".atomic").join("sessions");
 
         // Capture at commit time (parent HEAD, index tree), then commit, then
@@ -1677,8 +1714,15 @@ mod cb12a_classification {
             let signature = git2::Signature::now("Turn Test", "turn@test.invalid").unwrap();
             let parent = git.head().ok().and_then(|head| head.peel_to_commit().ok());
             let parents: Vec<&git2::Commit> = parent.iter().collect();
-            git.commit(Some("HEAD"), &signature, &signature, "captured", &tree, &parents)
-                .unwrap();
+            git.commit(
+                Some("HEAD"),
+                &signature,
+                &signature,
+                "captured",
+                &tree,
+                &parents,
+            )
+            .unwrap();
         }
         // Additional content work after the commit, inside the same turn.
         std::fs::write(dir.path().join("extra.txt"), "later work\n").unwrap();
@@ -1719,7 +1763,7 @@ mod cb12a_classification {
     #[test]
     fn dirty_turn_with_verified_capture_and_no_remainder_is_exact() {
         let dir = TempDir::new().unwrap();
-        let (git, mut session) = setup(&dir, "sess-exact", "tracked.txt", "same\n");
+        let (git, session) = setup(&dir, "sess-exact", "tracked.txt", "same\n");
         let sessions_dir = dir.path().join(".atomic").join("sessions");
 
         // Change the tracked content, stage it, capture at commit time,
@@ -1747,7 +1791,14 @@ mod cb12a_classification {
             let parent = git.head().ok().and_then(|head| head.peel_to_commit().ok());
             let parents: Vec<&git2::Commit> = parent.iter().collect();
             let oid = git
-                .commit(Some("HEAD"), &signature, &signature, "captured exact", &tree, &parents)
+                .commit(
+                    Some("HEAD"),
+                    &signature,
+                    &signature,
+                    "captured exact",
+                    &tree,
+                    &parents,
+                )
                 .unwrap();
             oid.to_string()
         };
@@ -1826,7 +1877,11 @@ fn record_turn_resolves_content_clean_name_conflict_with_provenance() {
     let repo_root = dir.path();
     let _git = git2::Repository::init(repo_root).unwrap();
 
-    fn record_all(repo: &atomic_repository::Repository, wc: atomic_core::WorkingCopyId, message: &str) {
+    fn record_all(
+        repo: &atomic_repository::Repository,
+        wc: atomic_core::WorkingCopyId,
+        message: &str,
+    ) {
         let header = atomic_core::change::ChangeHeader::new(message);
         repo.record(
             wc,

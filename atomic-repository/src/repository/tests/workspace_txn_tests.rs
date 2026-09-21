@@ -139,7 +139,11 @@ fn rebase_marker_is_detected_even_when_libgit_reports_clean() {
 fn standalone_auto_merge_ref_permits_ready_entry() {
     let (directory, mut repo, head, tree) = initialized_colocated_repository();
     write_checkpoint(directory.path(), &repo, &head, &tree);
-    fs::write(directory.path().join(".git/AUTO_MERGE"), format!("{tree}\n")).unwrap();
+    fs::write(
+        directory.path().join(".git/AUTO_MERGE"),
+        format!("{tree}\n"),
+    )
+    .unwrap();
     let checkpoint_path = directory.path().join(".atomic/bridge/workspace.json");
     let checkpoint_before = fs::read(&checkpoint_path).unwrap();
     let tracked_before = fs::read(directory.path().join("tracked.txt")).unwrap();
@@ -174,7 +178,11 @@ fn merge_head_with_auto_merge_ref_still_refuses() {
         format!("{head}\n"),
     )
     .unwrap();
-    fs::write(directory.path().join(".git/AUTO_MERGE"), format!("{tree}\n")).unwrap();
+    fs::write(
+        directory.path().join(".git/AUTO_MERGE"),
+        format!("{tree}\n"),
+    )
+    .unwrap();
 
     let WorkspaceTxnStart::Remediation(WorkspaceRemediation::GitOperationInProgress {
         markers,
@@ -195,7 +203,11 @@ fn merge_head_with_auto_merge_ref_still_refuses() {
 fn unmerged_index_with_standalone_auto_merge_ref_still_refuses() {
     let (directory, mut repo, head, tree) = initialized_colocated_repository();
     write_checkpoint(directory.path(), &repo, &head, &tree);
-    fs::write(directory.path().join(".git/AUTO_MERGE"), format!("{tree}\n")).unwrap();
+    fs::write(
+        directory.path().join(".git/AUTO_MERGE"),
+        format!("{tree}\n"),
+    )
+    .unwrap();
     // Mirror the observer's unmerged-stage evidence without corrupting the
     // on-disk index: the boundary is driven purely by the observed stages.
     let mut stages = observe_git_metadata(directory.path()).unwrap();
@@ -249,7 +261,10 @@ fn head_mutation_between_observations_retries_at_most_three_times_and_never_muta
     let (directory, mut repo, head, tree) = initialized_colocated_repository();
     write_checkpoint(directory.path(), &repo, &head, &tree);
     let working_copy = repo.require_working_copy_id().unwrap();
-    let state_before = repo.working_copy_record(working_copy).unwrap().desired_state;
+    let state_before = repo
+        .working_copy_record(working_copy)
+        .unwrap()
+        .desired_state;
     let checkpoint_bytes =
         fs::read(directory.path().join(".atomic/bridge/workspace.json")).unwrap();
 
@@ -270,7 +285,9 @@ fn head_mutation_between_observations_retries_at_most_three_times_and_never_muta
         }
         Ok(observation)
     };
-    let start = repo.begin_workspace_txn_with(WorkspaceTxnMode::Reconcile, unstable).unwrap();
+    let start = repo
+        .begin_workspace_txn_with(WorkspaceTxnMode::Reconcile, unstable)
+        .unwrap();
     let WorkspaceTxnStart::Remediation(WorkspaceRemediation::ConcurrentGitMutation {
         attempts,
         ..
@@ -285,7 +302,9 @@ fn head_mutation_between_observations_retries_at_most_three_times_and_never_muta
 
     // Nothing was mutated by the refused boundary.
     assert_eq!(
-        repo.working_copy_record(working_copy).unwrap().desired_state,
+        repo.working_copy_record(working_copy)
+            .unwrap()
+            .desired_state,
         state_before
     );
     assert_eq!(
@@ -298,7 +317,8 @@ fn head_mutation_between_observations_retries_at_most_three_times_and_never_muta
     assert!(
         !log.entries
             .iter()
-            .any(|entry| entry.operation.payload().kind != atomic_core::operation::OperationKind::Anchor),
+            .any(|entry| entry.operation.payload().kind
+                != atomic_core::operation::OperationKind::Anchor),
         "an unstable boundary journals nothing beyond the anchor"
     );
 }

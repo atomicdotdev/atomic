@@ -1841,51 +1841,49 @@ async fn test_session_end_fails_closed_when_attestation_write_fails() {
 
 /// CB-13D: a pending bridge-watch notice round-trips, is consumed on
 /// read, and refuses to be delivered to a different session.
-
-    /// CB-13D ::24 R6 exactly-once replay: a notice claimed by a CRASHED
-    /// consumer (its claim file remains, the writer pid is gone) is
-    /// replayed on the next take. Failing before (the claim file was
-    /// ignored; the notice was lost), passing after.
-    
-    /// CB-13D ::24 R6: concurrent newer notices — a newer write over the
-    /// pending slot wins (the consumer takes the newest truth); the older
-    /// notice is never delivered after it.
-    #[test]
-    fn concurrent_newer_notice_wins_over_a_pending_one() {
-        let dir = TempDir::new().unwrap();
-        let store = SessionStore::for_repo(dir.path()).unwrap();
-        store
-            .write_watch_notice("sess-race", "external-head-change", "older truth", "older")
-            .unwrap();
-        store
-            .write_watch_notice("sess-race", "unsafe-state", "newer truth", "reconcile")
-            .unwrap();
-        let notice = store.take_watch_notice("sess-race").unwrap().unwrap();
-        assert_eq!(notice.detail, "newer truth");
-        assert!(store.take_watch_notice("sess-race").unwrap().is_none());
-    }
+/// CB-13D ::24 R6 exactly-once replay: a notice claimed by a CRASHED
+/// consumer (its claim file remains, the writer pid is gone) is
+/// replayed on the next take. Failing before (the claim file was
+/// ignored; the notice was lost), passing after.
+/// CB-13D ::24 R6: concurrent newer notices — a newer write over the
+/// pending slot wins (the consumer takes the newest truth); the older
+/// notice is never delivered after it.
+#[test]
+fn concurrent_newer_notice_wins_over_a_pending_one() {
+    let dir = TempDir::new().unwrap();
+    let store = SessionStore::for_repo(dir.path()).unwrap();
+    store
+        .write_watch_notice("sess-race", "external-head-change", "older truth", "older")
+        .unwrap();
+    store
+        .write_watch_notice("sess-race", "unsafe-state", "newer truth", "reconcile")
+        .unwrap();
+    let notice = store.take_watch_notice("sess-race").unwrap().unwrap();
+    assert_eq!(notice.detail, "newer truth");
+    assert!(store.take_watch_notice("sess-race").unwrap().is_none());
+}
 
 #[test]
-    fn crashed_consumer_claim_is_replayed_exactly_once() {
-        let dir = TempDir::new().unwrap();
-        let store = SessionStore::for_repo(dir.path()).unwrap();
-        store
-            .write_watch_notice("sess-crash", "unsafe-state", "head moved", "reconcile")
-            .unwrap();
-        // Simulate a crashed consumer: the pending notice was claimed
-        // (renamed into a claim file by a pid that no longer exists).
-        let notices = dir.path().join(".atomic/sessions/notices");
-        let pending = notices.join("sess-crash.json");
-        let dead_pid = 4_000_000_000u64; // far above any real pid
-        let claim = notices.join(format!("sess-crash.json.claim.{dead_pid}.0"));
-        std::fs::rename(&pending, &claim).unwrap();
+fn crashed_consumer_claim_is_replayed_exactly_once() {
+    let dir = TempDir::new().unwrap();
+    let store = SessionStore::for_repo(dir.path()).unwrap();
+    store
+        .write_watch_notice("sess-crash", "unsafe-state", "head moved", "reconcile")
+        .unwrap();
+    // Simulate a crashed consumer: the pending notice was claimed
+    // (renamed into a claim file by a pid that no longer exists).
+    let notices = dir.path().join(".atomic/sessions/notices");
+    let pending = notices.join("sess-crash.json");
+    let dead_pid = 4_000_000_000u64; // far above any real pid
+    let claim = notices.join(format!("sess-crash.json.claim.{dead_pid}.0"));
+    std::fs::rename(&pending, &claim).unwrap();
 
-        // The replay delivers the claimed notice exactly once.
-        let notice = store.take_watch_notice("sess-crash").unwrap().unwrap();
-        assert_eq!(notice.kind, "unsafe-state");
-        assert!(store.take_watch_notice("sess-crash").unwrap().is_none());
-        assert!(!claim.exists(), "the replayed claim is consumed");
-    }
+    // The replay delivers the claimed notice exactly once.
+    let notice = store.take_watch_notice("sess-crash").unwrap().unwrap();
+    assert_eq!(notice.kind, "unsafe-state");
+    assert!(store.take_watch_notice("sess-crash").unwrap().is_none());
+    assert!(!claim.exists(), "the replayed claim is consumed");
+}
 
 #[test]
 fn watch_notice_roundtrip_consumes_and_refuses_foreign_identity() {
@@ -2045,8 +2043,8 @@ fn evidence_roots_are_deterministic_and_content_bound() {
 
 #[test]
 fn did_signed_attestation_verifies_under_explicit_trust() {
-    use atomic_core::change::attestation::{AttestAgent, Attestation, TrustPolicy};
     use atomic_canonical::did::did_for_public_key;
+    use atomic_core::change::attestation::{AttestAgent, Attestation, TrustPolicy};
     use atomic_identity::KeyPair;
 
     // A real keypair from atomic-identity, signed through the core DID path.
@@ -2064,7 +2062,9 @@ fn did_signed_attestation_verifies_under_explicit_trust() {
 
     // Verifies under a policy that explicitly configures this DID.
     let policy = TrustPolicy::new().trust(&did, *keypair.public.as_bytes());
-    policy.verify(&attest).expect("DID-signed attestation under its configured trust");
+    policy
+        .verify(&attest)
+        .expect("DID-signed attestation under its configured trust");
 
     // Tampering any covered root breaks it.
     let mut tampered = attest.clone();

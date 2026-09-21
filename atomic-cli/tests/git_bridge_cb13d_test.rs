@@ -61,6 +61,7 @@ fn atomic_ok(root: &Path, home: &Path, args: &[&str]) -> String {
     atomic_text(&output)
 }
 
+#[allow(dead_code)]
 fn atomic_fail(root: &Path, home: &Path, args: &[&str]) -> String {
     let output = atomic(root, home, args);
     assert!(
@@ -256,6 +257,7 @@ impl WatchFixture {
         atomic_ok(self.root(), self.home(), args)
     }
 
+    #[allow(dead_code)]
     fn atomic_fails(&self, args: &[&str]) -> String {
         atomic_fail(self.root(), self.home(), args)
     }
@@ -263,12 +265,18 @@ impl WatchFixture {
     /// A linked worktree sharing this fixture's common .atomic (the
     /// linked-worktree equivalence corpus: the reactive pass runs in the
     /// linked tree through the SAME canonical store).
-    fn linked_worktree(&self, name: &str) -> Self {
+    fn linked_worktree(&self, _name: &str) -> Self {
         let linked_root = TempDir::new().expect("linked tempdir");
         let output = Command::new("git")
             .arg("-C")
             .arg(self.root())
-            .args(["worktree", "add", "-q", "--detach", linked_root.path().to_str().expect("utf8")])
+            .args([
+                "worktree",
+                "add",
+                "-q",
+                "--detach",
+                linked_root.path().to_str().expect("utf8"),
+            ])
             .env("GIT_AUTHOR_DATE", "@1726732800 +0000")
             .env("GIT_COMMITTER_DATE", "@1726732800 +0000")
             .output()
@@ -431,15 +439,14 @@ impl WatchFixture {
 }
 
 /// AC1: an external Git commit is reconciled reactively, metadata only.
-
-    /// CB-13D ::24 AC-5 crash-DURING-an-active-effect: the injected
-    /// failure fires while the reconcile's effect phase is mid-flight (the
-    /// adoption-test-injection failpoint ATOMIC_FAIL_ADOPTION_AFTER_SHELF),
-    /// NOT after successful reconciliation. The next command recovers
-    /// idempotently: the incomplete operation head is recovered, the
-    /// logical state converges to the reconciled truth, and no partial
-    /// bytes leak.
-    #[test]
+/// CB-13D ::24 AC-5 crash-DURING-an-active-effect: the injected
+/// failure fires while the reconcile's effect phase is mid-flight (the
+/// adoption-test-injection failpoint ATOMIC_FAIL_ADOPTION_AFTER_SHELF),
+/// NOT after successful reconciliation. The next command recovers
+/// idempotently: the incomplete operation head is recovered, the
+/// logical state converges to the reconciled truth, and no partial
+/// bytes leak.
+#[test]
 fn crash_during_effect_recovers_without_partial_bytes() {
     // The crash fires INSIDE the active effect (the export's ref move has
     // landed and its leased receipt is durable, but the operation finalize
@@ -459,8 +466,7 @@ fn crash_during_effect_recovers_without_partial_bytes() {
         .collect::<Vec<_>>()
         .join("\n");
     fs::write(&exclude, filtered).expect("write exclude");
-    fs::write(fixture.root().join("atomic-only.txt"), b"crash payload\n")
-        .expect("write");
+    fs::write(fixture.root().join("atomic-only.txt"), b"crash payload\n").expect("write");
     fixture.atomic(&["add", "atomic-only.txt"]);
     fixture.atomic(&["record", "-m", "crash source"]);
     // The durable-only record left the file staged in the git index; unstage
@@ -512,14 +518,6 @@ fn crash_during_effect_recovers_without_partial_bytes() {
     assert!(!tip.is_zero(), "the export landed and recovered");
 }
 
-/// CB-13D ::24 AC-5 linked-worktree equivalence: the
-/// reactive and command-boundary tiers through a LINKED worktree sharing
-/// the common .atomic. The 2026-09-20 run recorded an HONEST FAILURE —
-/// the bound-HEAD adoption inside a linked worktree does not yet resolve
-/// the shared anchor binding (DetachedHead remediation at the verified
-/// oid); the gap is named in the ::24 execution record and the RFC §21
-/// matrix. Failures are recorded as failures, never skipped-as-pass.
-#[test]
 /// CB-13D ::24 AC-5 linked-worktree equivalence: the reactive and
 /// command-boundary tiers through a LINKED worktree (the sandbox-style
 /// repository pointer; the shared canonical store). The 2026-09-20 pass
@@ -566,7 +564,11 @@ fn external_git_commit_reconciles_without_moving_refs_or_writing_bytes() {
     // A foreign ref exists before anything is pinned; it must survive the
     // reactive pass unchanged.
     let baseline_tip = fixture.tip("refs/heads/main").expect("baseline tip");
-    fixture.git(&["update-ref", "refs/heads/foreign", &baseline_tip.to_string()]);
+    fixture.git(&[
+        "update-ref",
+        "refs/heads/foreign",
+        &baseline_tip.to_string(),
+    ]);
     // Review R5: the ref set is pinned BEFORE the external transition, and
     // the post-run assertion compares against that pinned snapshot (with
     // only the externally moved branch tip substituted) — a self-derived
@@ -775,7 +777,7 @@ fn session_notice_written_and_killed_daemon_leaves_commands_unchanged() {
     fixture.add_active_session("sess-cb13d");
 
     let baseline = fixture.equivalence_identity();
-    let baseline_tip = fixture.tip("refs/heads/main").expect("baseline tip");
+    let _baseline_tip = fixture.tip("refs/heads/main").expect("baseline tip");
 
     // Start the real daemon in the background.
     let mut daemon = Command::new(ATOMIC_BIN)
@@ -875,7 +877,8 @@ fn git_watch_off_overrides_bridge_watch_consent() {
         atomic_text(&output)
     );
     assert!(
-        atomic_text(&output).contains("watch = \"off\"") || atomic_text(&output).contains("disabled by"),
+        atomic_text(&output).contains("watch = \"off\"")
+            || atomic_text(&output).contains("disabled by"),
         "the refusal must name the git.watch override:\n{}",
         atomic_text(&output)
     );
@@ -969,10 +972,9 @@ fn watch_once_never_shelves_ignored_artifacts_on_cross_view_head_adoption() {
 #[test]
 fn head_lock_blocks_reactive_import_until_git_releases_it() {
     let fixture = WatchFixture::new("head-lock");
-    let baseline_checkpoint = fs::read_to_string(
-        fixture.root().join(".atomic/bridge/workspace.json"),
-    )
-    .expect("checkpoint");
+    let baseline_checkpoint =
+        fs::read_to_string(fixture.root().join(".atomic/bridge/workspace.json"))
+            .expect("checkpoint");
     assert!(
         !baseline_checkpoint.contains("locked change"),
         "fixture sanity: the baseline checkpoint predates the locked change"
@@ -998,8 +1000,8 @@ fn head_lock_blocks_reactive_import_until_git_releases_it() {
         head_lock.exists(),
         "the daemon must never remove a Git-owned lock"
     );
-    let checkpoint =
-        fs::read_to_string(fixture.root().join(".atomic/bridge/workspace.json")).expect("checkpoint");
+    let checkpoint = fs::read_to_string(fixture.root().join(".atomic/bridge/workspace.json"))
+        .expect("checkpoint");
     assert!(
         !checkpoint.contains(external_tip.to_string().as_str()),
         "the reactive import must not advance the checkpoint while HEAD is locked:\n{checkpoint}"
@@ -1013,8 +1015,8 @@ fn head_lock_blocks_reactive_import_until_git_releases_it() {
         "the post-release pass must import normally:\n{}",
         atomic_text(&output)
     );
-    let checkpoint =
-        fs::read_to_string(fixture.root().join(".atomic/bridge/workspace.json")).expect("checkpoint");
+    let checkpoint = fs::read_to_string(fixture.root().join(".atomic/bridge/workspace.json"))
+        .expect("checkpoint");
     assert!(
         checkpoint.contains(external_tip.to_string().as_str()),
         "the post-release pass must reach the external tip:\n{checkpoint}"
@@ -1084,9 +1086,7 @@ fn corpus_identity(fixture: &WatchFixture) -> String {
     let mut binding_count = 0usize;
     identity.push_str("refs:\n");
     for line in refs.lines() {
-        let (refname, _target) = line
-            .split_once(' ')
-            .unwrap_or((line, ""));
+        let (refname, _target) = line.split_once(' ').unwrap_or((line, ""));
         if refname.starts_with("refs/atomic/bindings/") {
             binding_count += 1;
         } else {
@@ -1103,10 +1103,7 @@ fn corpus_identity(fixture: &WatchFixture) -> String {
     // Verified layers (base32-normalized) + physical bytes + change count.
     let verify = fixture.atomic(&["git", "bridge", "verify"]);
     identity.push_str(&format!("verify:\n{}\n", normalize_base32(&verify)));
-    identity.push_str(&format!(
-        "worktree:\n{}\n",
-        fixture.worktree_snapshot()
-    ));
+    identity.push_str(&format!("worktree:\n{}\n", fixture.worktree_snapshot()));
     let changes = fs::read_dir(fixture.root().join(".atomic/changes"))
         .map(|dirs| {
             dirs.flatten()
@@ -1168,8 +1165,7 @@ fn corpus_scenario_plain_edits(fixture: &WatchFixture) {
 /// Scenario 2 — rename + edit of the renamed file.
 fn corpus_scenario_rename_and_edit(fixture: &WatchFixture) {
     fixture.git(&["mv", "tracked.txt", "renamed.txt"]);
-    fs::write(fixture.root().join("renamed.txt"), b"renamed and edited\n")
-        .expect("edit renamed");
+    fs::write(fixture.root().join("renamed.txt"), b"renamed and edited\n").expect("edit renamed");
     fixture.git(&["add", "-A"]);
     fixture.git(&["commit", "-qm", "corpus 2: rename and edit"]);
 }

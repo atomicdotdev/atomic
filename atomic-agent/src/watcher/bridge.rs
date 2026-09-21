@@ -44,7 +44,10 @@ pub async fn with_bridge_state<T, E>(
     operation_id: &str,
     body: impl Future<Output = Result<T, E>>,
 ) -> Result<T, E> {
-    if let Err(error) = watcher.begin_turn(&bridge_state_session(operation_id)).await {
+    if let Err(error) = watcher
+        .begin_turn(&bridge_state_session(operation_id))
+        .await
+    {
         log::warn!(
             "atomic-bridge state-enter failed for operation {operation_id}: {error}; \
              continuing without the optional accelerator"

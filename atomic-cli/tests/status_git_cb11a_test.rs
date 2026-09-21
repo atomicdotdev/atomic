@@ -11,7 +11,6 @@
 //! `--git` XY subset; each row asserts its native column too.
 
 #![cfg(not(windows))]
-
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write as _;
@@ -338,7 +337,6 @@ fn row_regular_to_symlink_reports_t_in_git_inspired_and_native() {
     assert!(native_rows(&fixture).contains(&"T  tracked.txt".to_string()));
 }
 
-#[test]
 #[test]
 fn row_filemode_false_capability_ignores_exec_bit_everywhere() {
     let fixture = Fixture::colocated();
@@ -799,7 +797,7 @@ fn forensic_observe_reports_layers_without_mutation() {
     fixture.write("tracked.txt", "l1\nRAW\nl3\n");
     fixture.git_ok(&["commit", "-aqm", "raw git advance"]);
     let before = fixture.atomic_ok(&["op", "log", "--json"]).stdout;
-    let tracked_before = fixture.read("tracked.txt");
+    let _tracked_before = fixture.read("tracked.txt");
 
     let report = fixture.atomic_ok(&["status", "--no-reconcile"]);
     let text = output_text(&report);
@@ -909,8 +907,7 @@ fn bridge_verify_is_read_only_around_an_interrupted_switch() {
 
     // A draft feature projection whose switch back to main removes a tracked
     // path, so the deterministic switch failpoint interrupts mid-effect.
-    fixture
-        .atomic_ok(&["view", "create", "feature", "--draft", "--parent", "main"]);
+    fixture.atomic_ok(&["view", "create", "feature", "--draft", "--parent", "main"]);
     fixture.atomic_ok(&["view", "switch", "feature", "--force"]);
     fs::remove_file(fixture.root().join("tracked.txt")).expect("remove tracked file");
     fs::create_dir_all(fixture.root().join("feature-only")).expect("feature dir");

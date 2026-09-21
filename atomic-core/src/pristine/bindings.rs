@@ -41,8 +41,11 @@ pub trait BindingMutTxnT: BindingTxnT {
     ///
     /// Fails closed when a different binding already exists under `id`;
     /// never overwrites, never deletes.
-    fn insert_binding_bytes(&mut self, id: &[u8; 32], bytes: &[u8])
-        -> PristineResult<BindingStoreOutcome>;
+    fn insert_binding_bytes(
+        &mut self,
+        id: &[u8; 32],
+        bytes: &[u8],
+    ) -> PristineResult<BindingStoreOutcome>;
 }
 
 impl BindingStoreOutcome {

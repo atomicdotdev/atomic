@@ -123,7 +123,13 @@ impl Fixture {
         atomic_ok(
             root.path(),
             home.path(),
-            &["git", "bridge", "enable", "--binding-key-file", key.to_str().unwrap()],
+            &[
+                "git",
+                "bridge",
+                "enable",
+                "--binding-key-file",
+                key.to_str().unwrap(),
+            ],
         );
         // C1: a second bound commit that leaves tracked.txt unchanged.
         fs::write(root.path().join("other.txt"), b"v1\n").expect("write");
@@ -132,7 +138,14 @@ impl Fixture {
         atomic_ok(
             root.path(),
             home.path(),
-            &["git", "bridge", "binding", "publish", "--key-file", key.to_str().unwrap()],
+            &[
+                "git",
+                "bridge",
+                "binding",
+                "publish",
+                "--key-file",
+                key.to_str().unwrap(),
+            ],
         );
         Self { root, home, key }
     }
@@ -156,8 +169,7 @@ impl Fixture {
     fn checkpoint_view(&self) -> String {
         let bytes = fs::read_to_string(self.root().join(".atomic/bridge/workspace.json"))
             .expect("checkpoint");
-        serde_json::from_str::<serde_json::Value>(&bytes)
-            .expect("checkpoint json")["view"]
+        serde_json::from_str::<serde_json::Value>(&bytes).expect("checkpoint json")["view"]
             .as_str()
             .expect("view")
             .to_string()
@@ -166,24 +178,31 @@ impl Fixture {
     fn checkpoint_head(&self) -> String {
         let bytes = fs::read_to_string(self.root().join(".atomic/bridge/workspace.json"))
             .expect("checkpoint");
-        serde_json::from_str::<serde_json::Value>(&bytes)
-            .expect("checkpoint json")["git_head"]
+        serde_json::from_str::<serde_json::Value>(&bytes).expect("checkpoint json")["git_head"]
             .as_str()
             .expect("head")
             .to_string()
     }
 
     fn wip_refs(&self) -> Vec<String> {
-        git(self.root(), &["for-each-ref", "--format=%(refname)", "refs/atomic/wip/**"])
-            .lines()
-            .map(str::to_string)
-            .collect()
+        git(
+            self.root(),
+            &["for-each-ref", "--format=%(refname)", "refs/atomic/wip/**"],
+        )
+        .lines()
+        .map(str::to_string)
+        .collect()
     }
 
+    #[allow(dead_code)]
     fn wip_ref_values(&self) -> Vec<(String, String)> {
         git(
             self.root(),
-            &["for-each-ref", "--format=%(refname) %(objectname)", "refs/atomic/wip/**"],
+            &[
+                "for-each-ref",
+                "--format=%(refname) %(objectname)",
+                "refs/atomic/wip/**",
+            ],
         )
         .lines()
         .map(|line| {
@@ -197,13 +216,21 @@ impl Fixture {
     fn adoption_actors(&self) -> String {
         self.adoption_operation_ids("git-head-adoption-reassembly");
         self.adoption_operation_ids("git-head-adoption-unknown-origin");
-        let log = atomic_ok(self.root(), self.home(), &["op", "log", "--json", "-n", "60"]);
+        let log = atomic_ok(
+            self.root(),
+            self.home(),
+            &["op", "log", "--json", "-n", "60"],
+        );
         log
     }
 
     /// Operation IDs whose system actor matches `actor_name`.
     fn adoption_operation_ids(&self, actor_name: &str) -> Vec<String> {
-        let log = atomic_ok(self.root(), self.home(), &["op", "log", "--json", "-n", "60"]);
+        let log = atomic_ok(
+            self.root(),
+            self.home(),
+            &["op", "log", "--json", "-n", "60"],
+        );
         let value: serde_json::Value = serde_json::from_str(&log).expect("op log json");
         value["entries"]
             .as_array()
@@ -222,8 +249,7 @@ impl Fixture {
         use atomic_core::types::Base32;
         let repository =
             atomic_repository::Repository::open_readonly(self.root()).expect("open repository");
-        let hash =
-            atomic_core::types::Hash::from_base32(hash_hex.as_bytes()).expect("change hash");
+        let hash = atomic_core::types::Hash::from_base32(hash_hex.as_bytes()).expect("change hash");
         let change = repository.load_change(&hash).expect("load change");
         let mut bytes = change.contents.clone();
         bytes.extend_from_slice(&change.hashed.metadata);
@@ -284,8 +310,12 @@ fn known_carried_edit_reassembles_against_the_new_bound_baseline() {
     fs::write(fixture.root().join("tracked.txt"), b"anchor me\ncarried\n").expect("edit");
     fixture.capture();
     let evidence_bytes =
-        fs::read_to_string(fixture.root().join(".atomic/bridge/pre-transition.json")).expect("evidence");
-    assert!(evidence_bytes.contains("\"snapshot\""), "evidence carries a snapshot");
+        fs::read_to_string(fixture.root().join(".atomic/bridge/pre-transition.json"))
+            .expect("evidence");
+    assert!(
+        evidence_bytes.contains("\"snapshot\""),
+        "evidence carries a snapshot"
+    );
 
     // Checkout the older bound commit; the dirty file survives (identical in
     // both trees), so the workspace is not clean relative to the new HEAD.
@@ -306,12 +336,19 @@ fn known_carried_edit_reassembles_against_the_new_bound_baseline() {
         fs::read(fixture.root().join("tracked.txt")).expect("carried edit preserved"),
         b"anchor me\ncarried\n"
     );
-    assert_eq!(fixture.checkpoint_head(), c0, "checkpoint moved to the adopted HEAD");
+    assert_eq!(
+        fixture.checkpoint_head(),
+        c0,
+        "checkpoint moved to the adopted HEAD"
+    );
 
     // The carried edit is captured as a snapshot relative to the new baseline,
     // and the status proves the pending work is durably retained.
     let status = atomic_ok(fixture.root(), fixture.home(), &["status"]);
-    assert!(status.contains("Snapshot"), "active snapshot retained: {status}");
+    assert!(
+        status.contains("Snapshot"),
+        "active snapshot retained: {status}"
+    );
 
     // The new snapshot never depends on the superseded snapshot (§12.3).
     let snapshot_status = atomic_ok(fixture.root(), fixture.home(), &["status"]);
@@ -327,13 +364,28 @@ fn adjacent_intra_file_edits_merge_and_overlaps_refuse_structurally() {
     let fixture = Fixture::new("adjacent-merge");
 
     // C2 changes the BOTTOM of tracked.txt (bound after reconcile+publish).
-    fs::write(fixture.root().join("tracked.txt"), b"anchor me\nbottom v1\n").expect("edit");
+    fs::write(
+        fixture.root().join("tracked.txt"),
+        b"anchor me\nbottom v1\n",
+    )
+    .expect("edit");
     git_ok(fixture.root(), &["commit", "-qam", "C2 bottom change"]);
-    atomic_ok(fixture.root(), fixture.home(), &["git", "bridge", "reconcile"]);
     atomic_ok(
         fixture.root(),
         fixture.home(),
-        &["git", "bridge", "binding", "publish", "--key-file", fixture.key.to_str().unwrap()],
+        &["git", "bridge", "reconcile"],
+    );
+    atomic_ok(
+        fixture.root(),
+        fixture.home(),
+        &[
+            "git",
+            "bridge",
+            "binding",
+            "publish",
+            "--key-file",
+            fixture.key.to_str().unwrap(),
+        ],
     );
     let c2 = fixture.head();
 
@@ -403,13 +455,28 @@ fn intra_file_overlap_refuses_and_preserves_everything() {
     let fixture = Fixture::new("overlap");
 
     // C2 changes the middle line (bound).
-    fs::write(fixture.root().join("tracked.txt"), b"anchor me\nmiddle v1\n").expect("edit");
+    fs::write(
+        fixture.root().join("tracked.txt"),
+        b"anchor me\nmiddle v1\n",
+    )
+    .expect("edit");
     git_ok(fixture.root(), &["commit", "-qam", "C2 middle change"]);
-    atomic_ok(fixture.root(), fixture.home(), &["git", "bridge", "reconcile"]);
     atomic_ok(
         fixture.root(),
         fixture.home(),
-        &["git", "bridge", "binding", "publish", "--key-file", fixture.key.to_str().unwrap()],
+        &["git", "bridge", "reconcile"],
+    );
+    atomic_ok(
+        fixture.root(),
+        fixture.home(),
+        &[
+            "git",
+            "bridge",
+            "binding",
+            "publish",
+            "--key-file",
+            fixture.key.to_str().unwrap(),
+        ],
     );
 
     // A carried edit on the SAME region overlaps the baseline change. The
@@ -455,14 +522,21 @@ fn unknown_origin_fallback_marks_unexplained_differences() {
     let c0 = fixture.c0();
 
     // NO pre-capture: observe without reconciling (Observe never captures).
-    fs::write(fixture.root().join("tracked.txt"), b"anchor me\nunexplained\n").expect("edit");
+    fs::write(
+        fixture.root().join("tracked.txt"),
+        b"anchor me\nunexplained\n",
+    )
+    .expect("edit");
     atomic_ok(
         fixture.root(),
         fixture.home(),
         &["status", "--short", "--no-reconcile"],
     );
     assert!(
-        !fixture.root().join(".atomic/bridge/pre-transition.json").exists(),
+        !fixture
+            .root()
+            .join(".atomic/bridge/pre-transition.json")
+            .exists(),
         "Observe mode must not capture"
     );
 
@@ -486,11 +560,14 @@ fn unknown_origin_fallback_marks_unexplained_differences() {
     // locate the snapshot change object via the evidence and assert the
     // marker bytes are inside the content-addressed change.
     let status = atomic_ok(fixture.root(), fixture.home(), &["status"]);
-    assert!(status.contains("Snapshot"), "opaque snapshot retained: {status}");
+    assert!(
+        status.contains("Snapshot"),
+        "opaque snapshot retained: {status}"
+    );
     let evidence = fs::read_to_string(fixture.root().join(".atomic/bridge/pre-transition.json"))
         .expect("evidence after adoption");
-    let snapshot_hex = serde_json::from_str::<serde_json::Value>(&evidence)
-        .expect("evidence json")["snapshot"]
+    let snapshot_hex = serde_json::from_str::<serde_json::Value>(&evidence).expect("evidence json")
+        ["snapshot"]
         .as_str()
         .expect("snapshot hash")
         .to_string();
@@ -517,7 +594,10 @@ fn git_stages_one_to_three_refuse_adoption_even_under_repair() {
 
     // Simulate a conflicted index (stages 1–3) without a real merge.
     let ours = git(fixture.root(), &["rev-parse", "main:tracked.txt"]);
-    let theirs = git(fixture.root(), &["rev-parse", format!("{c0}:tracked.txt").as_str()]);
+    let theirs = git(
+        fixture.root(),
+        &["rev-parse", format!("{c0}:tracked.txt").as_str()],
+    );
     let info = format!(
         "100644 {ours} 1\ttracked.txt\n100644 {theirs} 2\ttracked.txt\n100644 {ours} 3\ttracked.txt\n"
     );
@@ -537,7 +617,11 @@ fn git_stages_one_to_three_refuse_adoption_even_under_repair() {
         .write_all(info.as_bytes())
         .expect("write index info");
     let done = child.wait_with_output().expect("update-index");
-    assert!(done.status.success(), "{}", String::from_utf8_lossy(&done.stderr));
+    assert!(
+        done.status.success(),
+        "{}",
+        String::from_utf8_lossy(&done.stderr)
+    );
     // Git itself refuses the checkout with a conflicted index; that is fine —
     // the point is that Atomic refuses too, in every mode.
     let _ = Command::new("git")
@@ -556,11 +640,14 @@ fn git_stages_one_to_three_refuse_adoption_even_under_repair() {
         "stages 1-3 are reported: {text}"
     );
     assert!(
-        fs::read_to_string(fixture.root().join(".atomic/bridge/pre-transition.json"))
-            .is_ok(),
+        fs::read_to_string(fixture.root().join(".atomic/bridge/pre-transition.json")).is_ok(),
         "evidence preserved"
     );
-    let repair = atomic(fixture.root(), fixture.home(), &["git", "bridge", "reconcile"]);
+    let repair = atomic(
+        fixture.root(),
+        fixture.home(),
+        &["git", "bridge", "reconcile"],
+    );
     assert!(
         !repair.status.success(),
         "the repair boundary must not bypass stages 1-3: {}",
@@ -584,7 +671,11 @@ fn index_movement_never_mutates_the_durable_view_state() {
     // Staged hunk + unstaged hunk on the same file.
     fs::write(fixture.root().join("tracked.txt"), b"anchor me\nstaged\n").expect("edit");
     git_ok(fixture.root(), &["add", "tracked.txt"]);
-    fs::write(fixture.root().join("tracked.txt"), b"anchor me\nstaged\nunstaged\n").expect("edit");
+    fs::write(
+        fixture.root().join("tracked.txt"),
+        b"anchor me\nstaged\nunstaged\n",
+    )
+    .expect("edit");
     fixture.capture();
 
     // Index movement must not change the durable view state.
@@ -620,7 +711,11 @@ fn ignored_artifacts_swap_shelves_between_mapped_views() {
 
     // An ignored artifact plus a carried tracked edit on the C1 baseline.
     fs::create_dir(fixture.root().join("build-cache")).expect("artifact");
-    fs::write(fixture.root().join("build-cache/old.txt"), b"old artifact\n").expect("write");
+    fs::write(
+        fixture.root().join("build-cache/old.txt"),
+        b"old artifact\n",
+    )
+    .expect("write");
     fs::write(fixture.root().join("tracked.txt"), b"anchor me\ncarried\n").expect("edit");
     fixture.capture();
 
@@ -676,9 +771,7 @@ fn collision_preserves_both_versions() {
     git_ok(fixture.root(), &["checkout", "-q", &c0]);
     // The adoption shelved the C1 artifact into the C1 view's shelf.
     // Recreate a C0-side shelf artifact directly (collision content).
-    let workspace_dir = fixture
-        .root()
-        .join(".atomic/working-copies");
+    let workspace_dir = fixture.root().join(".atomic/working-copies");
     let mut shelf_dir = None;
     for entry in fs::read_dir(&workspace_dir).expect("walk workspaces") {
         let ws = entry.expect("entry").path().join("workspaces");
@@ -733,7 +826,10 @@ fn wip_ref_protects_and_is_dropped_after_durable_snapshot() {
     let _ = fs::remove_file(fixture.root().join(".git/packed-refs.bak"));
     let output = atomic_ok(fixture.root(), fixture.home(), &["status", "--short"]);
     let _ = output;
-    assert!(fixture.wip_refs().iter().all(|ref_name| ref_name.starts_with("refs/atomic/wip/")));
+    assert!(fixture
+        .wip_refs()
+        .iter()
+        .all(|ref_name| ref_name.starts_with("refs/atomic/wip/")));
 }
 
 // R8: every test below that drives a crash/failure or race through an
@@ -919,11 +1015,22 @@ fn carried_deletion_converges_when_the_new_baseline_also_deleted_the_path() {
     let fixture = Fixture::new("r1-delete-delete");
     git_ok(fixture.root(), &["rm", "-q", "other.txt"]);
     git_ok(fixture.root(), &["commit", "-qm", "C2 deletes other.txt"]);
-    atomic_ok(fixture.root(), fixture.home(), &["git", "bridge", "reconcile"]);
     atomic_ok(
         fixture.root(),
         fixture.home(),
-        &["git", "bridge", "binding", "publish", "--key-file", fixture.key.to_str().unwrap()],
+        &["git", "bridge", "reconcile"],
+    );
+    atomic_ok(
+        fixture.root(),
+        fixture.home(),
+        &[
+            "git",
+            "bridge",
+            "binding",
+            "publish",
+            "--key-file",
+            fixture.key.to_str().unwrap(),
+        ],
     );
     let c2 = fixture.head();
 
@@ -1007,7 +1114,9 @@ fn tampered_index_facts_in_evidence_fall_back_to_unknown_origin() {
     );
     if !evidence.contains("\"git_index_digest\": \"AAAA\"") {
         // The digest was recorded as a real value: tamper it in place.
-        let start = evidence.find("\"git_index_digest\": \"").expect("digest field");
+        let start = evidence
+            .find("\"git_index_digest\": \"")
+            .expect("digest field");
         let rest = &evidence[start + "\"git_index_digest\": \"".len()..];
         let end = start + "\"git_index_digest\": \"".len() + rest.find('"').expect("closing quote");
         evidence = format!(
@@ -1086,8 +1195,11 @@ fn alternate_index_is_never_proof() {
 
     fs::write(fixture.root().join("tracked.txt"), b"anchor me\ncarried\n").expect("edit");
     fixture.capture();
-    fs::copy(fixture.root().join(".git/index"), fixture.root().join(".git/index.alt"))
-        .expect("alternate index");
+    fs::copy(
+        fixture.root().join(".git/index"),
+        fixture.root().join(".git/index.alt"),
+    )
+    .expect("alternate index");
     git_ok(fixture.root(), &["checkout", "-q", &c0]);
 
     let output = Command::new(ATOMIC_BIN)
@@ -1538,7 +1650,11 @@ fn staged_manifest_movement_still_adopts_and_preserves_the_split() {
 
     fs::write(fixture.root().join("tracked.txt"), b"anchor me\nstaged\n").expect("edit");
     git_ok(fixture.root(), &["add", "tracked.txt"]);
-    fs::write(fixture.root().join("tracked.txt"), b"anchor me\nstaged\nunstaged\n").expect("edit");
+    fs::write(
+        fixture.root().join("tracked.txt"),
+        b"anchor me\nstaged\nunstaged\n",
+    )
+    .expect("edit");
     fixture.capture();
     // Stage more AFTER the capture: index movement must not break adoption
     // (the durable reassembly is worktree-bound, not index-bound).
@@ -1691,7 +1807,8 @@ fn externally_moved_wip_ref_is_preserved_and_blocks_reuse() {
     );
     let refs = fixture.wip_ref_values();
     assert!(
-        refs.iter().any(|(name, oid)| name == &ref_name && oid == &foreign),
+        refs.iter()
+            .any(|(name, oid)| name == &ref_name && oid == &foreign),
         "R3: the externally moved ref is preserved: {refs:?}"
     );
     assert_eq!(
@@ -1709,19 +1826,24 @@ fn destination_shelf_artifacts_are_restored_by_adoption() {
 
     // Adoption #1 (C1 -> C0): shelf the C1-era artifact.
     fs::create_dir(fixture.root().join("build-cache")).expect("artifact dir");
-    fs::write(fixture.root().join("build-cache/old.txt"), b"old artifact\n").expect("write");
+    fs::write(
+        fixture.root().join("build-cache/old.txt"),
+        b"old artifact\n",
+    )
+    .expect("write");
     fs::write(fixture.root().join("tracked.txt"), b"anchor me\ncarried\n").expect("edit");
     fixture.capture();
     git_ok(fixture.root(), &["checkout", "-q", &c0]);
     let adopted = atomic(fixture.root(), fixture.home(), &["status", "--short"]);
     assert!(adopted.status.success(), "{}", atomic_text(&adopted));
-    assert!(!fixture.root().join("build-cache/old.txt").exists(), "shelved out");
     assert!(
-        fixture
-            .shelved_files()
-            .iter()
-            .any(|(path, bytes)| path.ends_with("build-cache/old.txt")
-                && bytes == b"old artifact\n"),
+        !fixture.root().join("build-cache/old.txt").exists(),
+        "shelved out"
+    );
+    assert!(
+        fixture.shelved_files().iter().any(
+            |(path, bytes)| path.ends_with("build-cache/old.txt") && bytes == b"old artifact\n"
+        ),
         "the artifact is shelved: {:?}",
         fixture.shelved_files()
     );
@@ -1747,13 +1869,28 @@ fn known_edit_adoption_with_destination_shelf_restores_and_keeps_attribution() {
     let fixture = Fixture::new("r4-known-dest-shelf");
 
     // C2 changes the BOTTOM of tracked.txt (bound after reconcile+publish).
-    fs::write(fixture.root().join("tracked.txt"), b"anchor me\nbottom v1\n").expect("edit");
+    fs::write(
+        fixture.root().join("tracked.txt"),
+        b"anchor me\nbottom v1\n",
+    )
+    .expect("edit");
     git_ok(fixture.root(), &["commit", "-qam", "C2 bottom change"]);
-    atomic_ok(fixture.root(), fixture.home(), &["git", "bridge", "reconcile"]);
     atomic_ok(
         fixture.root(),
         fixture.home(),
-        &["git", "bridge", "binding", "publish", "--key-file", fixture.key.to_str().unwrap()],
+        &["git", "bridge", "reconcile"],
+    );
+    atomic_ok(
+        fixture.root(),
+        fixture.home(),
+        &[
+            "git",
+            "bridge",
+            "binding",
+            "publish",
+            "--key-file",
+            fixture.key.to_str().unwrap(),
+        ],
     );
     let c2 = fixture.head();
     let c0 = fixture.c0();
@@ -1762,7 +1899,11 @@ fn known_edit_adoption_with_destination_shelf_restores_and_keeps_attribution() {
     // C2-era ignored artifact. The artifact is shelved into the C2 view's
     // workspace; the carried edit merges against the C0 baseline.
     fs::create_dir(fixture.root().join("build-cache")).expect("artifact dir");
-    fs::write(fixture.root().join("build-cache/dest.txt"), b"destination era\n").expect("write");
+    fs::write(
+        fixture.root().join("build-cache/dest.txt"),
+        b"destination era\n",
+    )
+    .expect("write");
     fs::write(
         fixture.root().join("tracked.txt"),
         b"top edit\nanchor me\nbottom v1\n",
@@ -1846,8 +1987,8 @@ fn known_edit_adoption_with_destination_shelf_restores_and_keeps_attribution() {
     // The replacement snapshot keeps the known-carried attribution.
     let evidence = fs::read_to_string(fixture.root().join(".atomic/bridge/pre-transition.json"))
         .expect("evidence after adoption");
-    let snapshot_hex = serde_json::from_str::<serde_json::Value>(&evidence)
-        .expect("evidence json")["snapshot"]
+    let snapshot_hex = serde_json::from_str::<serde_json::Value>(&evidence).expect("evidence json")
+        ["snapshot"]
         .as_str()
         .expect("snapshot hash")
         .to_string();
@@ -1899,9 +2040,16 @@ fn unknown_origin_adoption_swaps_shelves() {
     // An ignored artifact with NO pre-capture evidence: the unknown-origin
     // branch must still swap shelves (R4).
     fs::create_dir(fixture.root().join("build-cache")).expect("artifact dir");
-    fs::write(fixture.root().join("build-cache/data.txt"), b"unknown era artifact\n")
-        .expect("write");
-    fs::write(fixture.root().join("tracked.txt"), b"anchor me\nunexplained\n").expect("edit");
+    fs::write(
+        fixture.root().join("build-cache/data.txt"),
+        b"unknown era artifact\n",
+    )
+    .expect("write");
+    fs::write(
+        fixture.root().join("tracked.txt"),
+        b"anchor me\nunexplained\n",
+    )
+    .expect("edit");
     atomic_ok(
         fixture.root(),
         fixture.home(),
@@ -1910,11 +2058,7 @@ fn unknown_origin_adoption_swaps_shelves() {
     git_ok(fixture.root(), &["checkout", "-q", &c0]);
 
     let adopted = atomic(fixture.root(), fixture.home(), &["status", "--short"]);
-    assert!(
-        adopted.status.success(),
-        "{}",
-        atomic_text(&adopted)
-    );
+    assert!(adopted.status.success(), "{}", atomic_text(&adopted));
     assert!(
         !fixture.root().join("build-cache/data.txt").exists(),
         "R4: the unknown-origin branch must shelve the old-view artifact"
@@ -1942,8 +2086,11 @@ fn clean_adoption_swaps_shelves() {
     // A clean worktree (ignored artifacts do not affect the clean gate) on a
     // view-changing adoption: the clean import path must swap shelves too.
     fs::create_dir(fixture.root().join("build-cache")).expect("artifact dir");
-    fs::write(fixture.root().join("build-cache/clean.txt"), b"clean era artifact\n")
-        .expect("write");
+    fs::write(
+        fixture.root().join("build-cache/clean.txt"),
+        b"clean era artifact\n",
+    )
+    .expect("write");
     git_ok(fixture.root(), &["checkout", "-q", &c0]);
 
     let adopted = atomic(fixture.root(), fixture.home(), &["status", "--short"]);
@@ -2095,7 +2242,11 @@ fn unknown_origin_attribution_survives_entry_recapture() {
     let fixture = Fixture::new("attribution-stability");
     let c0 = fixture.c0();
 
-    fs::write(fixture.root().join("tracked.txt"), b"anchor me\nunexplained\n").expect("edit");
+    fs::write(
+        fixture.root().join("tracked.txt"),
+        b"anchor me\nunexplained\n",
+    )
+    .expect("edit");
     atomic_ok(
         fixture.root(),
         fixture.home(),
@@ -2111,8 +2262,9 @@ fn unknown_origin_attribution_survives_entry_recapture() {
     for round in 0..2 {
         eprintln!("=== attribution round {round}");
         let _ = atomic_ok(fixture.root(), fixture.home(), &["status", "--short"]);
-        let evidence = fs::read_to_string(fixture.root().join(".atomic/bridge/pre-transition.json"))
-            .expect("evidence after adoption");
+        let evidence =
+            fs::read_to_string(fixture.root().join(".atomic/bridge/pre-transition.json"))
+                .expect("evidence after adoption");
         let snapshot_hex = serde_json::from_str::<serde_json::Value>(&evidence)
             .expect("evidence json")["snapshot"]
             .as_str()
@@ -2150,7 +2302,11 @@ fn journal_binding_authenticates_the_capture_for_the_known_branch() {
         .expect("R2: v2 evidence names its immutable journal operation");
 
     // The named operation is in the journal under the capture actor.
-    let log = atomic_ok(fixture.root(), fixture.home(), &["op", "log", "--json", "-n", "60"]);
+    let log = atomic_ok(
+        fixture.root(),
+        fixture.home(),
+        &["op", "log", "--json", "-n", "60"],
+    );
     assert!(
         log.contains(journal) && log.contains("bridge-pre-transition-capture"),
         "the capture operation is journaled under the capture actor: {log}"
@@ -2184,9 +2340,13 @@ fn tampered_non_index_fact_fails_the_journal_binding() {
     fixture.capture();
     let evidence_path = fixture.root().join(".atomic/bridge/pre-transition.json");
     let evidence = fs::read_to_string(&evidence_path).expect("evidence");
-    let start = evidence.find("\"created_at_ms\": ").expect("timestamp field");
+    let start = evidence
+        .find("\"created_at_ms\": ")
+        .expect("timestamp field");
     let rest = &evidence[start + "\"created_at_ms\": ".len()..];
-    let end = rest.find(',').expect("timestamp ends before the next field");
+    let end = rest
+        .find(',')
+        .expect("timestamp ends before the next field");
     let tampered = format!(
         "{}1{}",
         &evidence[..start + "\"created_at_ms\": ".len()],
@@ -2264,7 +2424,9 @@ fn fabricated_journal_operation_is_not_proof() {
     fixture.capture();
     let evidence_path = fixture.root().join(".atomic/bridge/pre-transition.json");
     let evidence = fs::read_to_string(&evidence_path).expect("evidence");
-    let start = evidence.find("\"journal_operation\": \"").expect("binding field");
+    let start = evidence
+        .find("\"journal_operation\": \"")
+        .expect("binding field");
     let rest = &evidence[start + "\"journal_operation\": \"".len()..];
     let end = start + "\"journal_operation\": \"".len() + rest.find('"').expect("closing quote");
     let fabricated = format!(
@@ -2298,16 +2460,32 @@ fn fabricated_journal_operation_is_not_proof() {
 
 /// Two ignored shelve paths plus the carried edit, bound and ready for the
 /// C2 -> C0 adoption used by the per-shelf-ordinal crash tests.
+#[allow(dead_code)]
 fn shelf_ordinal_fixture(name: &str) -> (Fixture, String, String) {
     let fixture = Fixture::new(name);
     // C2 is bound (reconcile + publish) so the adoption target is bound.
-    fs::write(fixture.root().join("tracked.txt"), b"anchor me\nbottom v1\n").expect("edit");
+    fs::write(
+        fixture.root().join("tracked.txt"),
+        b"anchor me\nbottom v1\n",
+    )
+    .expect("edit");
     git_ok(fixture.root(), &["commit", "-qam", "C2 bottom change"]);
-    atomic_ok(fixture.root(), fixture.home(), &["git", "bridge", "reconcile"]);
     atomic_ok(
         fixture.root(),
         fixture.home(),
-        &["git", "bridge", "binding", "publish", "--key-file", fixture.key.to_str().unwrap()],
+        &["git", "bridge", "reconcile"],
+    );
+    atomic_ok(
+        fixture.root(),
+        fixture.home(),
+        &[
+            "git",
+            "bridge",
+            "binding",
+            "publish",
+            "--key-file",
+            fixture.key.to_str().unwrap(),
+        ],
     );
     let c2 = fixture.head();
     let c0 = fixture.c0();
@@ -2450,7 +2628,11 @@ fn crash_after_restore_ordinal_recovers_and_preserves_artifacts() {
 
     let retry = atomic(fixture.root(), fixture.home(), &["status", "--short"]);
     assert!(retry.status.success(), "{}", atomic_text(&retry));
-    assert_eq!(fixture.checkpoint_head(), c2, "the destination view was adopted");
+    assert_eq!(
+        fixture.checkpoint_head(),
+        c2,
+        "the destination view was adopted"
+    );
     // The destination shelf's artifacts are restored to the worktree, not
     // left in the shelf and never substituted with empty bytes.
     assert_eq!(
@@ -2494,7 +2676,11 @@ fn crash_after_wip_drop_receipt_rolls_back_and_recovers() {
     // recreates the exact WIP ref. The ref is present again, never deleted
     // for good, and the carried bytes are intact.
     let rolled_back = fixture.wip_ref_values();
-    assert_eq!(rolled_back.len(), 1, "the ref was rolled back: {rolled_back:?}");
+    assert_eq!(
+        rolled_back.len(),
+        1,
+        "the ref was rolled back: {rolled_back:?}"
+    );
     assert_eq!(
         fs::read(fixture.root().join("tracked.txt")).expect("carried preserved"),
         b"anchor me\ncarried\n"

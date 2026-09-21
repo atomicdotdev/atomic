@@ -827,6 +827,7 @@ impl Repository {
     /// `preserve_existing_tree_paths` is set, deletions and renames remain
     /// graph-only so importing into a foreign view cannot rewrite the active
     /// view's global TREE mappings.
+    #[allow(clippy::too_many_arguments)]
     pub fn write_import_recorded(
         &self,
         header: ChangeHeader,
@@ -1783,7 +1784,8 @@ impl Repository {
                     .unwrap_or(false)
             };
             if shared_target {
-                let closure = super::provenance_gate::reachable_closure(self, std::slice::from_ref(hash))?;
+                let closure =
+                    super::provenance_gate::reachable_closure(self, std::slice::from_ref(hash))?;
                 let provider = super::provenance_gate::local_session_mac_key_provider(self);
                 self.enforce_publication_gate("shared-view insertion", &closure, Some(&provider))?;
             }

@@ -274,9 +274,10 @@ impl OperationObservation {
     /// `AUTO_MERGE` is advisory and does not, by itself, count.
     pub fn is_in_progress(&self) -> bool {
         self.repository_state != "Clean"
-            || self.markers.iter().any(|marker| {
-                marker.is_present() && marker.marker.is_active_operation_evidence()
-            })
+            || self
+                .markers
+                .iter()
+                .any(|marker| marker.is_present() && marker.marker.is_active_operation_evidence())
     }
 
     /// Every present marker, including advisory ones, for reporting.
@@ -2031,7 +2032,11 @@ mod tests {
             .present_markers()
             .contains(&OperationMarkerKind::AutoMerge));
         assert!(observation.operation.active_markers().is_empty());
-        assert_eq!(before, snapshot_tree(directory.path()), "observation is read-only");
+        assert_eq!(
+            before,
+            snapshot_tree(directory.path()),
+            "observation is read-only"
+        );
     }
 
     #[test]

@@ -19,15 +19,17 @@ use atomic_core::operation::{
     RepoStateRef, WorkingCopyStateRef,
 };
 use atomic_core::pristine::{
-    CapabilityMutTxnT, CapabilityTxnT, GraphTxnT, MutTxnT, OperationMutTxnT, OperationTxnT,
-    RefMappingMutTxnT, RefMappingTxnT, SUPPORTED_REPOSITORY_CAPABILITIES, TagMutTxnT, TagTxnT,
-    ViewTxnT, WorkingCopyMutTxnT, WorkingCopyRecord, WorkingCopyTxnT,
+    CapabilityMutTxnT, GraphTxnT, MutTxnT, OperationMutTxnT, OperationTxnT, RefMappingMutTxnT,
+    RefMappingTxnT, TagMutTxnT, TagTxnT, ViewTxnT, WorkingCopyMutTxnT, WorkingCopyRecord,
+    WorkingCopyTxnT, SUPPORTED_REPOSITORY_CAPABILITIES,
 };
 use atomic_core::types::Base32;
 use atomic_core::{Hash, OperationId, WorkingCopyId};
 
 use super::locks::WorkingCopyOperationLockGuard;
-use super::workspace_txn::{read_workspace_checkpoint, write_workspace_checkpoint, WorkspaceCheckpoint};
+use super::workspace_txn::{
+    read_workspace_checkpoint, write_workspace_checkpoint, WorkspaceCheckpoint,
+};
 use super::Repository;
 use crate::RepositoryError;
 
@@ -191,6 +193,7 @@ pub(super) enum RecoveryOutcome {
 }
 
 #[derive(Debug)]
+#[allow(dead_code)] // discriminants select remediation; payloads surface via Debug
 enum ResolvedRecoveryTarget {
     Filesystem {
         path: PathBuf,
@@ -206,7 +209,9 @@ enum ResolvedRecoveryTarget {
     GitHead(WorkingCopyId),
     /// The derived bridge checkpoint file, addressed by content digest
     /// (R3: the adoption completion's verified checkpoint publish).
-    Checkpoint { working_copy: WorkingCopyId },
+    Checkpoint {
+        working_copy: WorkingCopyId,
+    },
     /// One content-addressed Git object creation (CB-8B: journaled projection
     /// objects). Presence is idempotent; the object is never deleted.
     GitObject(atomic_core::operation::GitObjectId),
@@ -566,6 +571,7 @@ impl Repository {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn prepare_bridge_git_write_impl(
         &self,
         mint_capture: bool,
@@ -626,10 +632,7 @@ impl Repository {
             token[..16].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
             token[16..].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
             {
-                let mut txn = self
-                    .pristine
-                    .write_txn()
-                    .map_err(pristine_error)?;
+                let mut txn = self.pristine.write_txn().map_err(pristine_error)?;
                 use atomic_core::pristine::BridgeEventCaptureMutTxnT;
                 txn.put_bridge_ref_capture_token(operation.operation.id().as_bytes(), &token)
                     .map_err(pristine_error)?;
@@ -1055,9 +1058,8 @@ impl Repository {
                             Ok(EffectPlan {
                                 ordinal: u32::try_from(ordinal).map_err(|_| {
                                     RepositoryError::InvalidOperation {
-                                        message:
-                                            "too many effects to construct the undo operation"
-                                                .to_string(),
+                                        message: "too many effects to construct the undo operation"
+                                            .to_string(),
                                     }
                                 })?,
                                 target: effect.target.clone(),
@@ -1497,7 +1499,7 @@ impl Repository {
         operation_lock: &WorkingCopyOperationLockGuard,
         state: &RepoStateRef,
     ) -> Result<OperationId, RepositoryError> {
-        let scope = OperationScope::Repository;
+        let _scope = OperationScope::Repository;
         let mut txn = operation_lock.begin_write_immediate()?;
         let head = self.ensure_repository_anchor_in_txn(&mut txn, state)?;
         txn.commit()?;
@@ -2367,61 +2369,73 @@ impl Repository {
         // recorded, not only successful recoveries. The journal is the
         // consent-gated automatic sink (`for_repository`).
         if let Err(error) = self.validate_operation_lock(operation_lock, &head_operation) {
-            self.emit_recovery_failure(&head_operation, super::observability::RecoveryFailureCode::LockValidation);
+            self.emit_recovery_failure(
+                &head_operation,
+                super::observability::RecoveryFailureCode::LockValidation,
+            );
             return Err(error);
         }
         if self.operation_is_verified(head)? {
             return Ok(RecoveryOutcome::AlreadyComplete { operation: head });
         }
 
-        let (original, recovery, created) =
-            if head_operation.payload().kind == OperationKind::Recover {
-                let original_id = sole_recovery_parent(&head_operation)?;
-                (self.load_operation(original_id)?, head_operation, false)
-            } else {
-                let recovery =
-                    match self.inverse_recovery_operation(&head_operation, working_copy) {
-                        Ok(recovery) => recovery,
-                        Err(error) => {
-                            // Review R5: the pre-recovery lease divergence
-                            // ("diverged before recovery") previously had
-                            // no terminal event.
-                            self.emit_recovery_failure(
-                                &head_operation,
-                                super::observability::RecoveryFailureCode::InverseConstruction,
-                            );
-                            return Err(error);
-                        }
-                    };
-                let mut txn = operation_lock.begin_write_immediate()?;
-                txn.put_operation(&recovery).map_err(pristine_error)?;
-                txn.compare_and_set_operation_heads(scope, &[head], &[recovery.id()])
-                    .map_err(pristine_error)?;
-                let repository_heads = txn
-                    .get_operation_heads(OperationScope::Repository)
-                    .map_err(pristine_error)?;
-                if repository_heads.as_slice() == [head] {
-                    txn.compare_and_set_operation_heads(
-                        OperationScope::Repository,
-                        &[head],
-                        &[recovery.id()],
-                    )
-                    .map_err(pristine_error)?;
+        let (original, recovery, created) = if head_operation.payload().kind
+            == OperationKind::Recover
+        {
+            let original_id = sole_recovery_parent(&head_operation)?;
+            (self.load_operation(original_id)?, head_operation, false)
+        } else {
+            let recovery = match self.inverse_recovery_operation(&head_operation, working_copy) {
+                Ok(recovery) => recovery,
+                Err(error) => {
+                    // Review R5: the pre-recovery lease divergence
+                    // ("diverged before recovery") previously had
+                    // no terminal event.
+                    self.emit_recovery_failure(
+                        &head_operation,
+                        super::observability::RecoveryFailureCode::InverseConstruction,
+                    );
+                    return Err(error);
                 }
-                txn.commit()?;
-                (head_operation, recovery, true)
             };
+            let mut txn = operation_lock.begin_write_immediate()?;
+            txn.put_operation(&recovery).map_err(pristine_error)?;
+            txn.compare_and_set_operation_heads(scope, &[head], &[recovery.id()])
+                .map_err(pristine_error)?;
+            let repository_heads = txn
+                .get_operation_heads(OperationScope::Repository)
+                .map_err(pristine_error)?;
+            if repository_heads.as_slice() == [head] {
+                txn.compare_and_set_operation_heads(
+                    OperationScope::Repository,
+                    &[head],
+                    &[recovery.id()],
+                )
+                .map_err(pristine_error)?;
+            }
+            txn.commit()?;
+            (head_operation, recovery, true)
+        };
 
         if let Err(error) = self.apply_operation_metadata_locked(operation_lock, recovery.id()) {
-            self.emit_recovery_failure(&original, super::observability::RecoveryFailureCode::RecoveryApply);
+            self.emit_recovery_failure(
+                &original,
+                super::observability::RecoveryFailureCode::RecoveryApply,
+            );
             return Err(error);
         }
         if let Err(error) = self.replay_filesystem_recovery(operation_lock, &original, &recovery) {
-            self.emit_recovery_failure(&original, super::observability::RecoveryFailureCode::FilesystemReplay);
+            self.emit_recovery_failure(
+                &original,
+                super::observability::RecoveryFailureCode::FilesystemReplay,
+            );
             return Err(error);
         }
         if let Err(error) = self.finalize_operation_verified(operation_lock, recovery.id()) {
-            self.emit_recovery_failure(&original, super::observability::RecoveryFailureCode::Finalize);
+            self.emit_recovery_failure(
+                &original,
+                super::observability::RecoveryFailureCode::Finalize,
+            );
             return Err(error);
         }
         // CB-13C observability: recovery outcomes are recorded with their
@@ -2438,12 +2452,7 @@ impl Repository {
     /// Record one executed recovery (consent-gated, lossy, advisory only).
     /// Skips silently when an operation ID somehow fails fixed-format
     /// validation: no free-form value can bypass the typed event surface.
-    fn emit_recovery_outcome(
-        &self,
-        original: &Operation,
-        recovery: &Operation,
-        created: bool,
-    ) {
+    fn emit_recovery_outcome(&self, original: &Operation, recovery: &Operation, created: bool) {
         if let (Some(original), Some(recovery)) = (
             super::observability::OpIdRef::new(&original.id().to_string()),
             super::observability::OpIdRef::new(&recovery.id().to_string()),
@@ -2468,10 +2477,7 @@ impl Repository {
     ) {
         if let Some(original) = super::observability::OpIdRef::new(&original.id().to_string()) {
             super::observability::BridgeEventJournal::for_repository(self).emit_lossy(
-                super::observability::BridgeEventKind::RecoveryFailure {
-                    original,
-                    reason,
-                },
+                super::observability::BridgeEventKind::RecoveryFailure { original, reason },
             );
         }
     }
@@ -2491,15 +2497,14 @@ impl Repository {
     ) -> Result<atomic_core::Hash, RepositoryError> {
         let bytes = std::fs::read(self.dot_dir.join("bridge/workspace.json")).map_err(|error| {
             RepositoryError::InvalidRepository {
-                reason: format!(
-                    "cannot read the bridge checkpoint for a lease: {error}"
-                ),
+                reason: format!("cannot read the bridge checkpoint for a lease: {error}"),
             }
         })?;
-        let checkpoint = read_workspace_checkpoint(&self.root)?
-            .ok_or_else(|| RepositoryError::InvalidRepository {
+        let checkpoint = read_workspace_checkpoint(&self.root)?.ok_or_else(|| {
+            RepositoryError::InvalidRepository {
                 reason: "the bridge checkpoint disappeared during adoption completion".to_string(),
-            })?;
+            }
+        })?;
         let _ = bytes;
         Ok(atomic_core::Hash::of(
             super::adoption::checkpoint_facts_bytes(&checkpoint)?.as_slice(),
@@ -2543,9 +2548,7 @@ impl Repository {
                 })
                 .transpose()
                 .map(|value| value.unwrap_or(MetadataValue::Absent)),
-            MetadataTarget::RefMapping { view } => {
-                observe_ref_mapping_value(&txn, view)
-            }
+            MetadataTarget::RefMapping { view } => observe_ref_mapping_value(&txn, view),
             MetadataTarget::Capability { id } => observe_capability_value(&txn, id),
             target => Err(unsupported_metadata_error(target)),
         }
@@ -2579,9 +2582,7 @@ impl Repository {
             });
         };
         let (symref, head_hex) = match &git.head {
-            GitHeadState::Attached { symref, oid } => {
-                (Some(symref.clone()), git_object_hex(oid)?)
-            }
+            GitHeadState::Attached { symref, oid } => (Some(symref.clone()), git_object_hex(oid)?),
             GitHeadState::Detached { oid } => (None, git_object_hex(oid)?),
             other => {
                 return Err(RepositoryError::InvalidOperation {
@@ -2592,11 +2593,10 @@ impl Repository {
                 })
             }
         };
-        let oid = git2::Oid::from_str(&head_hex).map_err(|error| {
-            RepositoryError::InvalidRepository {
+        let oid =
+            git2::Oid::from_str(&head_hex).map_err(|error| RepositoryError::InvalidRepository {
                 reason: format!("cannot parse restored HEAD '{head_hex}': {error}"),
-            }
-        })?;
+            })?;
         let commit = repo.find_commit(oid).map_err(|error| {
             RepositoryError::InvalidRepository {
                 reason: format!(
@@ -2615,12 +2615,9 @@ impl Repository {
                 .index
                 .as_ref()
                 .and_then(|index| index.tree.as_ref())
-                .map(|tree| git_object_hex(tree))
+                .map(git_object_hex)
                 .transpose()?,
-            git_index_digest: git
-                .index
-                .as_ref()
-                .map(|index| index.digest.to_base32()),
+            git_index_digest: git.index.as_ref().map(|index| index.digest.to_base32()),
         })
     }
 
@@ -2671,10 +2668,7 @@ impl Repository {
                 ),
             }
         })?;
-        let staging = git_dir.join(format!(
-            "atomic-index-restore.{}.tmp",
-            std::process::id()
-        ));
+        let staging = git_dir.join(format!("atomic-index-restore.{}.tmp", std::process::id()));
         let result = (|| -> Result<(), RepositoryError> {
             write_new_synced(&staging, &bytes)?;
             std::fs::rename(&staging, &index_path).map_err(|error| {
@@ -2746,7 +2740,10 @@ impl Repository {
         }
     }
 
-    pub(super) fn load_operation(&self, operation_id: OperationId) -> Result<Operation, RepositoryError> {
+    pub(super) fn load_operation(
+        &self,
+        operation_id: OperationId,
+    ) -> Result<Operation, RepositoryError> {
         let txn = self.pristine.read_txn().map_err(pristine_error)?;
         txn.get_operation(operation_id)
             .map_err(pristine_error)?
@@ -3008,7 +3005,7 @@ impl Repository {
             txn.get_effect_receipts(recovery.id())
                 .map_err(pristine_error)?
         };
-let completed: BTreeSet<u32> = receipts
+        let completed: BTreeSet<u32> = receipts
             .iter()
             .filter_map(|receipt| match receipt.payload().kind {
                 EffectReceiptKind::Applied
@@ -3272,10 +3269,8 @@ let completed: BTreeSet<u32> = receipts
                     "atomic: restore rolled-back completion ref",
                 )
                 .map(|_| ())
-                .map_err(|error| {
-                    RepositoryError::InvalidRepository {
-                        reason: format!("cannot restore Git ref '{name}': {error}"),
-                    }
+                .map_err(|error| RepositoryError::InvalidRepository {
+                    reason: format!("cannot restore Git ref '{name}': {error}"),
                 })
             }
             (EffectValue::Absent, ResolvedRecoveryTarget::GitRef(name)) => {
@@ -3286,11 +3281,13 @@ let completed: BTreeSet<u32> = receipts
                 })?;
                 let found = repo.find_reference(name);
                 match found {
-                    Ok(mut reference) => reference
-                        .delete()
-                        .map_err(|error| RepositoryError::InvalidRepository {
-                            reason: format!("cannot re-delete Git ref '{name}': {error}"),
-                        }),
+                    Ok(mut reference) => {
+                        reference
+                            .delete()
+                            .map_err(|error| RepositoryError::InvalidRepository {
+                                reason: format!("cannot re-delete Git ref '{name}': {error}"),
+                            })
+                    }
                     Err(error) if error.code() == git2::ErrorCode::NotFound => Ok(()),
                     Err(error) => Err(RepositoryError::InvalidRepository {
                         reason: format!("cannot read Git ref '{name}' during recovery: {error}"),
@@ -3311,16 +3308,18 @@ let completed: BTreeSet<u32> = receipts
                 match target {
                     GitRefTarget::Direct(object) => {
                         let oid = git_oid_from_object(&repo, object)?;
-                        repo.set_head_detached(oid)
-                            .map_err(|error| RepositoryError::InvalidRepository {
+                        repo.set_head_detached(oid).map_err(|error| {
+                            RepositoryError::InvalidRepository {
                                 reason: format!("cannot restore Git HEAD: {error}"),
+                            }
+                        })
+                    }
+                    GitRefTarget::Symbolic(symref) => {
+                        repo.set_head(symref)
+                            .map_err(|error| RepositoryError::InvalidRepository {
+                                reason: format!("cannot restore attached Git HEAD: {error}"),
                             })
                     }
-                    GitRefTarget::Symbolic(symref) => repo
-                        .set_head(symref)
-                        .map_err(|error| RepositoryError::InvalidRepository {
-                            reason: format!("cannot restore attached Git HEAD: {error}"),
-                        }),
                 }
             }
             // R3: the derived bridge checkpoint is restored to its
@@ -3668,12 +3667,11 @@ let completed: BTreeSet<u32> = receipts
                 let found = repo.find_reference(name);
                 match found {
                     Ok(reference) => {
-                        let oid =
-                            reference
-                                .target()
-                                .ok_or_else(|| RepositoryError::InvalidOperation {
-                                    message: format!("Git ref '{name}' has no direct target"),
-                                })?;
+                        let oid = reference.target().ok_or_else(|| {
+                            RepositoryError::InvalidOperation {
+                                message: format!("Git ref '{name}' has no direct target"),
+                            }
+                        })?;
                         let algorithm = match oid.as_bytes().len() {
                             20 => GitHashAlgorithm::Sha1,
                             32 => GitHashAlgorithm::Sha256,
@@ -3724,9 +3722,7 @@ let completed: BTreeSet<u32> = receipts
             ResolvedRecoveryTarget::GitHead(_) => {
                 let repo = git2::Repository::open(&self.root).map_err(|error| {
                     RepositoryError::InvalidRepository {
-                        reason: format!(
-                            "cannot open the Git repository for a HEAD lease: {error}"
-                        ),
+                        reason: format!("cannot open the Git repository for a HEAD lease: {error}"),
                     }
                 })?;
                 // The same lease protocol the projection executor records
@@ -3757,10 +3753,8 @@ let completed: BTreeSet<u32> = receipts
                 // component; the effect machinery's symlink-parent checks
                 // and per-ordinal backups apply unchanged.
                 let git_hook_effect = is_git_hooks_effect_path(path);
-                let relative = validate_relative_path(
-                    path,
-                    content_store_effect || git_hook_effect,
-                )?;
+                let relative =
+                    validate_relative_path(path, content_store_effect || git_hook_effect)?;
                 if relative.starts_with(Path::new(".atomic"))
                     && !relative.starts_with(Path::new(".atomic/changes"))
                 {
@@ -3856,7 +3850,9 @@ pub struct ViewLeaseValue {
     pub parent: Option<u64>,
 }
 
-fn encode_view_lease(view: &atomic_core::pristine::ViewState) -> Result<MetadataValue, RepositoryError> {
+fn encode_view_lease(
+    view: &atomic_core::pristine::ViewState,
+) -> Result<MetadataValue, RepositoryError> {
     let lease = ViewLeaseValue {
         parent: view.parent,
     };
@@ -3871,10 +3867,8 @@ fn decode_view_lease(value: &MetadataValue, name: &str) -> Result<ViewLeaseValue
             message: format!("view lease for '{name}' requires canonical bytes"),
         });
     };
-    postcard::from_bytes(bytes)
-        .map_err(|error| RepositoryError::Serialization(error.to_string()))
+    postcard::from_bytes(bytes).map_err(|error| RepositoryError::Serialization(error.to_string()))
 }
-
 
 fn decode_ref_mapping_value(
     value: &MetadataValue,
@@ -3901,10 +3895,7 @@ pub(super) fn visible_change_hashes(
         .map_err(|error| RepositoryError::Database(error.to_string()))?;
     let mut hashes = BTreeSet::new();
     for change_id in visibility.iter_dependency_first().copied() {
-        if let Some(hash) = txn
-            .get_external(change_id)
-            .map_err(pristine_error)?
-        {
+        if let Some(hash) = txn.get_external(change_id).map_err(pristine_error)? {
             hashes.insert(hash);
         }
     }
@@ -3947,9 +3938,7 @@ fn observe_metadata_value_in_write(
             })
             .transpose()
             .map(|value| value.unwrap_or(MetadataValue::Absent)),
-        MetadataTarget::RefMapping { view } => {
-            observe_ref_mapping_value(txn, view)
-        }
+        MetadataTarget::RefMapping { view } => observe_ref_mapping_value(txn, view),
         MetadataTarget::Capability { id } => observe_capability_value(txn, id),
         target => Err(unsupported_metadata_error(target)),
     }
@@ -4028,14 +4017,13 @@ fn validate_capability_lease(
                         "capability lease requires '{id}', which this build does not support"
                     ),
                 })?;
-            let requested = u32::try_from(*version).map_err(|_| {
-                RepositoryError::InvalidOperation {
+            let requested =
+                u32::try_from(*version).map_err(|_| RepositoryError::InvalidOperation {
                     message: format!(
                         "capability lease requires '{id}' version {version}, which exceeds the \
                          representable capability version range"
                     ),
-                }
-            })?;
+                })?;
             if requested > supported.minimum_version() {
                 return Err(RepositoryError::InvalidOperation {
                     message: format!(
@@ -4142,10 +4130,7 @@ fn apply_metadata_value_in_write(
             Ok(())
         }
         (MetadataTarget::RefMapping { view }, MetadataValue::Bytes(bytes)) => {
-            let mapping = decode_ref_mapping_value(
-                &MetadataValue::Bytes(bytes.clone()),
-                view,
-            )?;
+            let mapping = decode_ref_mapping_value(&MetadataValue::Bytes(bytes.clone()), view)?;
             if mapping.view_name != *view {
                 return Err(RepositoryError::InvalidOperation {
                     message: format!(
@@ -4200,12 +4185,13 @@ fn apply_metadata_value_in_write(
             // supported version here wrote a different value than the lease,
             // so replay observed a third value and diverged, and older valid
             // leases were silently raised to the build maximum (CB-13B R3).
-            let requested = u32::try_from(*version).map_err(|_| RepositoryError::InvalidOperation {
-                message: format!(
-                    "capability lease requires '{id}' version {version}, which exceeds the \
+            let requested =
+                u32::try_from(*version).map_err(|_| RepositoryError::InvalidOperation {
+                    message: format!(
+                        "capability lease requires '{id}' version {version}, which exceeds the \
                      representable capability version range"
-                ),
-            })?;
+                    ),
+                })?;
             txn.put_required_capability_exact(id, requested)
                 .map_err(pristine_error)?;
             Ok(())
@@ -4793,7 +4779,8 @@ fn is_git_hooks_effect_path(path: &str) -> bool {
     git && hooks && hook_file && components.next().is_none()
 }
 
-fn validate_relative_path(path: &str, allow_vcs_names: bool) -> Result<PathBuf, RepositoryError> {    if path.is_empty() {
+fn validate_relative_path(path: &str, allow_vcs_names: bool) -> Result<PathBuf, RepositoryError> {
+    if path.is_empty() {
         return Err(RepositoryError::InvalidOperation {
             message: "operation effect path cannot be empty".to_string(),
         });
@@ -5009,15 +4996,15 @@ fn write_atomic_regular(path: &Path, bytes: &[u8], mode: u32) -> Result<(), Repo
     temporary.as_file_mut().write_all(bytes)?;
     set_mode(temporary.path(), mode)?;
     temporary.as_file_mut().sync_all()?;
-    if matches!(fs::symlink_metadata(path), Ok(metadata) if metadata.is_dir()) {
-        if !remove_materialized_gitlink(path)? {
-            return Err(RepositoryError::InvalidOperation {
-                message: format!(
-                    "refusing to replace directory '{}' with a regular file",
-                    path.display()
-                ),
-            });
-        }
+    if matches!(fs::symlink_metadata(path), Ok(metadata) if metadata.is_dir())
+        && !remove_materialized_gitlink(path)?
+    {
+        return Err(RepositoryError::InvalidOperation {
+            message: format!(
+                "refusing to replace directory '{}' with a regular file",
+                path.display()
+            ),
+        });
     }
     temporary
         .persist(path)

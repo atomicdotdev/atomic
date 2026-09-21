@@ -7,7 +7,7 @@
 //!    `refs/atomic/views/*` fetch refspecs to a named remote. Idempotent:
 //!    existing identical refspecs are left alone and never duplicated.
 //!
-//! 2. **Bounded create-only publication queue** ([`BindingPublishQueue`]):
+//! 2. **Bounded create-only publication queue** (`BindingPublishQueue`):
 //!    stored bindings whose create-only ref is absent are published through
 //!    the journaled CAS machinery (CB-6A), bounded per run. With a remote,
 //!    the binding namespace transfers with create-only
@@ -37,16 +37,16 @@ use std::process::Command;
 
 use git2::Repository as GitRepository;
 
+use crate::output::print_warning;
+use atomic_core::types::Base32;
 use atomic_core::types::WorkingCopyId;
+use atomic_objects::{ObjectFamily, ObjectRecord};
+pub(crate) use atomic_repository::git_binding::DEGRADED_HEAD_BINDING_PREFIX;
 use atomic_repository::git_binding::{
     binding_id_from_ref_name, is_transferable_ref, namespace_rejection_diagnostic,
     transferable_binding_refs,
 };
-pub(crate) use atomic_repository::git_binding::DEGRADED_HEAD_BINDING_PREFIX;
-use atomic_core::types::Base32;
 use atomic_repository::BindingChangeSource;
-use atomic_objects::{ObjectFamily, ObjectRecord};
-use crate::output::print_warning;
 use atomic_repository::{BindingPublication, Repository};
 
 use crate::error::{CliError, CliResult};
@@ -76,9 +76,9 @@ pub fn configure_fetch_refspecs(git: &GitRepository, remote: &str) -> CliResult<
                 ),
             }
         })?;
-    let mut config = git
-        .config()
-        .map_err(|error| CliError::GitError { message: format!("cannot read Git config: {error}") })?;
+    let mut config = git.config().map_err(|error| CliError::GitError {
+        message: format!("cannot read Git config: {error}"),
+    })?;
     let existing: Vec<String> = config
         .entries(Some(&format!("remote.{remote}.fetch")))
         .and_then(|mut entries| {
@@ -91,7 +91,9 @@ pub fn configure_fetch_refspecs(git: &GitRepository, remote: &str) -> CliResult<
             }
             Ok(out)
         })
-        .map_err(|error| CliError::GitError { message: format!("cannot read remote refspecs: {error}") })?;
+        .map_err(|error| CliError::GitError {
+            message: format!("cannot read remote refspecs: {error}"),
+        })?;
     let mut added = 0;
     for refspec in [BINDING_REFSPEC, VIEWS_REFSPEC] {
         if existing.iter().any(|line| line == refspec) {
@@ -101,12 +103,19 @@ pub fn configure_fetch_refspecs(git: &GitRepository, remote: &str) -> CliResult<
         // unsupported, so use the git CLI's --add, which is exactly the RFC
         // §8.6 command and never rewrites existing values.
         let status = Command::new("git")
-            .args(["config", "--add", &format!("remote.{remote}.fetch"), refspec])
+            .args([
+                "config",
+                "--add",
+                &format!("remote.{remote}.fetch"),
+                refspec,
+            ])
             .current_dir(git.workdir().ok_or_else(|| CliError::GitError {
                 message: "Git repository has no working directory".to_string(),
             })?)
             .status()
-            .map_err(|error| CliError::GitError { message: format!("cannot run git config: {error}") })?;
+            .map_err(|error| CliError::GitError {
+                message: format!("cannot run git config: {error}"),
+            })?;
         if !status.success() {
             return Err(CliError::GitError {
                 message: format!("git config --add remote.{remote}.fetch {refspec} failed"),
@@ -174,9 +183,7 @@ pub fn run_local_publish_queue(
         }
         let Some(binding) = repo.load_binding(&id).map_err(CliError::Repository)? else {
             outcome.unresolvable += 1;
-            outcome
-                .refs
-                .push(Repository::binding_ref_name(&id));
+            outcome.refs.push(Repository::binding_ref_name(&id));
             continue;
         };
         let ref_name = Repository::binding_ref_name(&id);
@@ -255,14 +262,16 @@ pub fn transfer_binding_refs(
     degraded_fallback: bool,
 ) -> CliResult<Vec<String>> {
     // The advertised-ref surface: exactly the reviewed binding namespace.
-    let refs = transferable_binding_refs(git)
-        .map_err(|error| CliError::GitError { message: error })?;
+    let refs =
+        transferable_binding_refs(git).map_err(|error| CliError::GitError { message: error })?;
     if refs.is_empty() {
         return Ok(Vec::new());
     }
     let workdir = git
         .workdir()
-        .ok_or_else(|| CliError::GitError { message: "Git repository has no working directory".to_string() })?
+        .ok_or_else(|| CliError::GitError {
+            message: "Git repository has no working directory".to_string(),
+        })?
         .to_path_buf();
 
     let stored_ids: BTreeSet<String> = repo
@@ -275,15 +284,21 @@ pub fn transfer_binding_refs(
     // CB-10B review R8: per-ref transfer evidence. The journal is
     // consent-gated (the bridge opt-in) and lossy; every transferred ref
     // gets an event after its exact-target verification.
-    let journal = atomic_repository::repository::observability::BridgeEventJournal::for_repository(repo);
+    let journal =
+        atomic_repository::repository::observability::BridgeEventJournal::for_repository(repo);
     let transfer_event = |binding_id: &atomic_repository::git_binding::BindingId,
                           outcome: atomic_repository::repository::observability::EventOutcome,
                           destination: Option<String>| {
-        journal.emit_lossy(atomic_repository::repository::observability::BridgeEventKind::BindingTransfer {
-            binding: atomic_repository::repository::observability::HexBindingId::new(&binding_id.to_hex()).expect("validated binding id hex"),
-            outcome,
-            destination,
-        });
+        journal.emit_lossy(
+            atomic_repository::repository::observability::BridgeEventKind::BindingTransfer {
+                binding: atomic_repository::repository::observability::HexBindingId::new(
+                    &binding_id.to_hex(),
+                )
+                .expect("validated binding id hex"),
+                outcome,
+                destination,
+            },
+        );
     };
 
     let mut spec: Vec<(String, String)> = Vec::new();
@@ -342,10 +357,11 @@ pub fn transfer_binding_refs(
                 ),
             });
         }
-        let oid = git2::Oid::from_bytes(verified.carrier_oid.as_bytes())
-            .map_err(|error| CliError::GitError {
+        let oid = git2::Oid::from_bytes(verified.carrier_oid.as_bytes()).map_err(|error| {
+            CliError::GitError {
                 message: format!("binding carrier oid is invalid: {error}"),
-            })?;
+            }
+        })?;
         spec.push((name.clone(), oid.to_string()));
     }
 
@@ -361,7 +377,9 @@ pub fn transfer_binding_refs(
         .args(&args)
         .current_dir(&workdir)
         .status()
-        .map_err(|error| CliError::GitError { message: format!("cannot run git push: {error}") })?;
+        .map_err(|error| CliError::GitError {
+            message: format!("cannot run git push: {error}"),
+        })?;
     if !status.success() {
         // Namespace rejection: surface the explicit diagnostic. It never
         // retries through hidden branches and never starts a nested push.
@@ -430,8 +448,8 @@ fn publish_degraded_head_fallback(
             .arg(format!("{oid}:{degraded}"))
             .current_dir(repo_root)
             .status()
-            .map_err(|error| {
-                CliError::GitError { message: format!("cannot run degraded fallback push: {error}") }
+            .map_err(|error| CliError::GitError {
+                message: format!("cannot run degraded fallback push: {error}"),
             })?;
         if status.success() {
             pushed.push((degraded, oid.clone()));
@@ -451,20 +469,25 @@ fn publish_degraded_head_fallback(
     // target before any success is reported — a push that "succeeded" but
     // whose ref then disappeared (or landed at the wrong target) is a typed
     // failure, never a success.
-    let workdir = repo
-        .root()
-        .to_path_buf();
-    let verified = verify_remote_binding_refs_pattern(&workdir, remote, &pushed, &format!(
-        "{}*",
-        DEGRADED_HEAD_BINDING_PREFIX
-    ))?;
+    let workdir = repo.root().to_path_buf();
+    let verified = verify_remote_binding_refs_pattern(
+        &workdir,
+        remote,
+        &pushed,
+        &format!("{}*", DEGRADED_HEAD_BINDING_PREFIX),
+    )?;
     for name in &verified {
         if let Some(id) = binding_id_from_ref_name(name) {
-            journal.emit_lossy(atomic_repository::repository::observability::BridgeEventKind::BindingTransfer {
-                binding: atomic_repository::repository::observability::HexBindingId::new(&id.to_hex()).expect("validated binding id hex"),
-                outcome: atomic_repository::repository::observability::EventOutcome::Applied,
-                destination: Some(name.clone()),
-            });
+            journal.emit_lossy(
+                atomic_repository::repository::observability::BridgeEventKind::BindingTransfer {
+                    binding: atomic_repository::repository::observability::HexBindingId::new(
+                        &id.to_hex(),
+                    )
+                    .expect("validated binding id hex"),
+                    outcome: atomic_repository::repository::observability::EventOutcome::Applied,
+                    destination: Some(name.clone()),
+                },
+            );
         }
     }
     println!(
@@ -496,7 +519,9 @@ fn verify_remote_binding_refs_pattern(
         .args(["ls-remote", remote, pattern])
         .current_dir(workdir)
         .output()
-        .map_err(|error| CliError::GitError { message: format!("cannot run git ls-remote: {error}") })?;
+        .map_err(|error| CliError::GitError {
+            message: format!("cannot run git ls-remote: {error}"),
+        })?;
     if !output.status.success() {
         return Err(CliError::GitError {
             message: format!(
@@ -522,7 +547,9 @@ fn verify_remote_binding_refs_pattern(
             Some(actual) => gaps.push(format!(
                 "ref '{name}' holds {actual} but the local binding commit is {oid}"
             )),
-            None => gaps.push(format!("ref '{name}' is absent from the remote after transfer")),
+            None => gaps.push(format!(
+                "ref '{name}' is absent from the remote after transfer"
+            )),
         }
     }
     if !gaps.is_empty() {
@@ -543,12 +570,18 @@ fn verify_remote_binding_refs_pattern(
 /// `None` means the remote does not advertise the ref (create-only push
 /// territory); a transport failure is a typed error so the caller never
 /// mistakes an unreachable remote for an empty one.
-pub fn observe_remote_ref(workdir: &Path, remote: &str, remote_ref: &str) -> CliResult<Option<String>> {
+pub fn observe_remote_ref(
+    workdir: &Path,
+    remote: &str,
+    remote_ref: &str,
+) -> CliResult<Option<String>> {
     let output = Command::new("git")
         .args(["ls-remote", remote, remote_ref])
         .current_dir(workdir)
         .output()
-        .map_err(|error| CliError::GitError { message: format!("cannot run git ls-remote: {error}") })?;
+        .map_err(|error| CliError::GitError {
+            message: format!("cannot run git ls-remote: {error}"),
+        })?;
     if !output.status.success() {
         return Err(CliError::GitError {
             message: format!(
@@ -576,36 +609,15 @@ pub fn observe_remote_ref(workdir: &Path, remote: &str, remote_ref: &str) -> Cli
 /// refuses without overwriting newer external work). `None` → no lease: the
 /// caller must first observe the remote explicitly or push without force
 /// (Git's own non-fast-forward refusal still applies).
-pub fn remote_lease_refspec(last_observed_remote: Option<&str>, remote_ref: &str) -> Option<String> {
+pub fn remote_lease_refspec(
+    last_observed_remote: Option<&str>,
+    remote_ref: &str,
+) -> Option<String> {
     let expected = last_observed_remote?.trim();
     if expected.is_empty() {
         return None;
     }
     Some(format!("--force-with-lease={remote_ref}:{expected}"))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn lease_refspec_pins_the_expected_old_value() {
-        let lease = remote_lease_refspec(Some("abc123"), "refs/heads/main");
-        assert_eq!(lease.as_deref(), Some("--force-with-lease=refs/heads/main:abc123"));
-    }
-
-    #[test]
-    fn lease_refspec_is_none_without_an_observation() {
-        assert!(remote_lease_refspec(None, "refs/heads/main").is_none());
-        assert!(remote_lease_refspec(Some("   "), "refs/heads/main").is_none());
-    }
-
-    #[test]
-    fn create_only_refspecs_are_exact() {
-        assert_eq!(BINDING_REFSPEC, "+refs/atomic/bindings/*:refs/atomic/bindings/*");
-        assert_eq!(VIEWS_REFSPEC, "+refs/atomic/views/*:refs/atomic/views/*");
-        assert_eq!(QUEUE_MAX_DEFAULT, 64);
-    }
 }
 
 /// Atomic-remote closure source for the CLI (RFC §8.6 preferred transport).
@@ -659,13 +671,46 @@ impl HttpBindingChangeSource {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
-            .map_err(|error| atomic_repository::RepositoryError::InvalidOperation {
-                message: format!("cannot start HTTP runtime: {error}"),
-            })?;
-        let remote = atomic_remote::HttpRemote::new(&entry.url)
-            .map_err(|error| atomic_repository::RepositoryError::InvalidOperation {
+            .map_err(
+                |error| atomic_repository::RepositoryError::InvalidOperation {
+                    message: format!("cannot start HTTP runtime: {error}"),
+                },
+            )?;
+        let remote = atomic_remote::HttpRemote::new(&entry.url).map_err(|error| {
+            atomic_repository::RepositoryError::InvalidOperation {
                 message: format!("cannot connect to the Atomic remote '{remote_name}': {error}"),
-            })?;
+            }
+        })?;
         Ok(Some(Self { remote }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lease_refspec_pins_the_expected_old_value() {
+        let lease = remote_lease_refspec(Some("abc123"), "refs/heads/main");
+        assert_eq!(
+            lease.as_deref(),
+            Some("--force-with-lease=refs/heads/main:abc123")
+        );
+    }
+
+    #[test]
+    fn lease_refspec_is_none_without_an_observation() {
+        assert!(remote_lease_refspec(None, "refs/heads/main").is_none());
+        assert!(remote_lease_refspec(Some("   "), "refs/heads/main").is_none());
+    }
+
+    #[test]
+    fn create_only_refspecs_are_exact() {
+        assert_eq!(
+            BINDING_REFSPEC,
+            "+refs/atomic/bindings/*:refs/atomic/bindings/*"
+        );
+        assert_eq!(VIEWS_REFSPEC, "+refs/atomic/views/*:refs/atomic/views/*");
+        assert_eq!(QUEUE_MAX_DEFAULT, 64);
     }
 }

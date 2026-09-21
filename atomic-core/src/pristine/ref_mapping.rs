@@ -137,7 +137,10 @@ impl RefMapping {
         }
         if ViewScope::from_u8(self.scope).is_none() {
             return Err(PristineError::Serialization {
-                message: format!("ref mapping scope byte {} is not a known ViewScope", self.scope),
+                message: format!(
+                    "ref mapping scope byte {} is not a known ViewScope",
+                    self.scope
+                ),
             });
         }
         if self.view_name.is_empty() || self.view_name.bytes().any(|b| b < 0x20 || b == 0x7f) {
@@ -163,7 +166,10 @@ impl RefMapping {
         ] {
             validate_oid(oid)?;
         }
-        for state in [self.last_exported_state.as_deref(), self.last_observed_atomic.as_deref()] {
+        for state in [
+            self.last_exported_state.as_deref(),
+            self.last_observed_atomic.as_deref(),
+        ] {
             validate_state(state)?;
         }
         let mut bytes = Vec::with_capacity(128);
@@ -265,7 +271,10 @@ impl RefMapping {
         ] {
             validate_oid(oid)?;
         }
-        for state in [last_exported_state.as_deref(), last_observed_atomic.as_deref()] {
+        for state in [
+            last_exported_state.as_deref(),
+            last_observed_atomic.as_deref(),
+        ] {
             validate_state(state)?;
         }
         Ok(Self {
@@ -336,7 +345,9 @@ fn validate_ref_name(value: Option<&str>) -> PristineResult<()> {
         && !value.contains("//")
         && !value.contains("@{")
         && !value.ends_with(".lock")
-        && value.bytes().all(|b| b.is_ascii_graphic() && !forbidden.contains(&b));
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_graphic() && !forbidden.contains(&b));
     if !well_formed {
         return Err(PristineError::Serialization {
             message: format!("ref mapping ref name is not a well-formed Git reference: {value:?}"),
@@ -428,8 +439,9 @@ mod tests {
             last_exported_state: Some(
                 "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB".to_string(),
             ),
-            last_observed_atomic: Some("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-                .to_string()),
+            last_observed_atomic: Some(
+                "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string(),
+            ),
             status: RefSyncStatus::Synchronized,
         }
     }
@@ -567,7 +579,8 @@ mod tests {
         assert!(mapping.encode().is_err());
         mapping.last_exported_state = Some(String::new());
         assert!(mapping.encode().is_err());
-        mapping.last_exported_state = Some("BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB".to_string());
+        mapping.last_exported_state =
+            Some("BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB".to_string());
         let decoded = RefMapping::decode(&mapping.encode().unwrap()).unwrap();
         assert_eq!(
             decoded.last_exported_state.as_deref(),

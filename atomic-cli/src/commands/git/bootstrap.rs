@@ -17,7 +17,7 @@
 //!    desired view (closure fetch prefers an Atomic remote, then the
 //!    binding's bounded verified `changes.pack`), and the recomputed
 //!    projection must equal the bound tree before anything is adopted
-//!    ([`ExactResurrection`]'s projection proof);
+//!    (`ExactResurrection`'s projection proof);
 //! 6. with an explicit signing key, the CB-7A anchor phase proves complete
 //!    equivalence and creates the signed Anchor + verified checkpoint.
 //!
@@ -30,7 +30,9 @@ use std::path::Path;
 use std::process::Command;
 
 use atomic_core::operation::{GitHashAlgorithm, GitObjectId};
-use atomic_repository::git_binding::{binding_id_from_ref_name, GitStateBinding, BINDING_BLOB_NAME};
+use atomic_repository::git_binding::{
+    binding_id_from_ref_name, GitStateBinding, BINDING_BLOB_NAME,
+};
 use atomic_repository::{GitShaResolution, Repository};
 
 use git2::Repository as GitRepository;
@@ -152,10 +154,7 @@ pub(crate) fn fetch_binding_refs(
 /// undecodable, whose signature fails, or whose bound commit/tree OIDs do
 /// not match the live Git ODB **aborts the whole installation** — no
 /// partial install, no silent skip of a tampered binding.
-pub(crate) fn install_fetched_bindings(
-    repo: &Repository,
-    git: &GitRepository,
-) -> CliResult<usize> {
+pub(crate) fn install_fetched_bindings(repo: &Repository, git: &GitRepository) -> CliResult<usize> {
     let refs = atomic_repository::git_binding::transferable_binding_refs(git)
         .map_err(|error| CliError::GitError { message: error })?;
     install_binding_refs(repo, git, refs)
@@ -166,15 +165,18 @@ pub(crate) fn install_fetched_bindings(
 /// namespace — decode, canonical ref id, cryptography, live Git content,
 /// exact immutable carrier — only behind the explicit degraded-reader
 /// opt-in.
-pub(crate) fn install_degraded_bindings(repo: &Repository, git: &GitRepository) -> CliResult<usize> {
+pub(crate) fn install_degraded_bindings(
+    repo: &Repository,
+    git: &GitRepository,
+) -> CliResult<usize> {
     use atomic_repository::git_binding::DEGRADED_HEAD_BINDING_PREFIX;
     let mut names = Vec::new();
-    for reference in git
-        .references()
-        .map_err(|error| CliError::GitError { message: format!("cannot enumerate refs: {error}") })?
-    {
-        let reference = reference
-            .map_err(|error| CliError::GitError { message: format!("cannot read ref: {error}") })?;
+    for reference in git.references().map_err(|error| CliError::GitError {
+        message: format!("cannot enumerate refs: {error}"),
+    })? {
+        let reference = reference.map_err(|error| CliError::GitError {
+            message: format!("cannot read ref: {error}"),
+        })?;
         if let Some(name) = reference.name() {
             if let Some(rest) = name.strip_prefix(DEGRADED_HEAD_BINDING_PREFIX) {
                 let mut parts = rest.split('/');
@@ -200,44 +202,40 @@ fn install_binding_refs(
     for ref_name in refs {
         let target = git
             .find_reference(&ref_name)
-            .map_err(|error| {
-                CliError::GitError {
-                    message: format!("fetched binding ref '{ref_name}' is unreadable: {error}"),
-                }
+            .map_err(|error| CliError::GitError {
+                message: format!("fetched binding ref '{ref_name}' is unreadable: {error}"),
             })?
             .target()
-            .ok_or_else(|| {
-                CliError::GitError {
-                    message: format!("fetched binding ref '{ref_name}' has no direct target"),
-                }
+            .ok_or_else(|| CliError::GitError {
+                message: format!("fetched binding ref '{ref_name}' has no direct target"),
             })?;
-        let binding = load_binding_at_ref(git, &ref_name, target).map_err(|error| {
-            CliError::GitError {
+        let binding =
+            load_binding_at_ref(git, &ref_name, target).map_err(|error| CliError::GitError {
                 message: format!(
                     "fetched binding on '{ref_name}' is refused before installation: {error}"
                 ),
-            }
-        })?;
+            })?;
         // The ref name must canonically claim the binding it carries: a
         // re-shaped ref is not a valid publication surface. The degraded
         // namespace ref name is verified against the DEGRADED layout by
         // `binding_id_from_ref_name` for the primary namespace; degraded
         // refs are re-shaped by construction, so the id is taken from the
         // name and cross-checked with the payload id.
-        let id_from_ref = if ref_name.starts_with(atomic_repository::git_binding::DEGRADED_HEAD_BINDING_PREFIX) {
-            atomic_repository::git_binding::binding_id_from_ref_name(&ref_name.replace(
-                atomic_repository::git_binding::DEGRADED_HEAD_BINDING_PREFIX,
-                atomic_repository::BINDING_REF_PREFIX,
-            ))
-        } else {
-            atomic_repository::git_binding::binding_id_from_ref_name(&ref_name)
-        }
-        .ok_or_else(|| CliError::GitError {
-            message: format!(
-                "fetched binding ref '{ref_name}' does not carry a binding id in a canonical \
+        let id_from_ref =
+            if ref_name.starts_with(atomic_repository::git_binding::DEGRADED_HEAD_BINDING_PREFIX) {
+                atomic_repository::git_binding::binding_id_from_ref_name(&ref_name.replace(
+                    atomic_repository::git_binding::DEGRADED_HEAD_BINDING_PREFIX,
+                    atomic_repository::BINDING_REF_PREFIX,
+                ))
+            } else {
+                atomic_repository::git_binding::binding_id_from_ref_name(&ref_name)
+            }
+            .ok_or_else(|| CliError::GitError {
+                message: format!(
+                    "fetched binding ref '{ref_name}' does not carry a binding id in a canonical \
                  <shard>/<id> layout and is refused before installation"
-            ),
-        })?;
+                ),
+            })?;
         if id_from_ref != binding.id() {
             return Err(CliError::GitError {
                 message: format!(
@@ -281,9 +279,11 @@ fn install_binding_refs(
             .ok_or_else(|| CliError::GitError {
                 message: format!("fetched binding ref '{ref_name}' vanished during validation"),
             })?;
-        let verified_oid = git2::Oid::from_bytes(verified.carrier_oid.as_bytes())
-            .map_err(|error| CliError::GitError {
-                message: format!("fetched binding carrier oid is invalid: {error}"),
+        let verified_oid =
+            git2::Oid::from_bytes(verified.carrier_oid.as_bytes()).map_err(|error| {
+                CliError::GitError {
+                    message: format!("fetched binding carrier oid is invalid: {error}"),
+                }
             })?;
         if verified_oid != target {
             return Err(CliError::GitError {
@@ -309,27 +309,31 @@ fn load_binding_at_ref(
     ref_name: &str,
     target: git2::Oid,
 ) -> CliResult<GitStateBinding> {
-    let commit = git.find_commit(target).map_err(|error| CliError::GitError {
-        message: format!("binding ref '{ref_name}' points at a missing commit: {error}"),
-    })?;
+    let commit = git
+        .find_commit(target)
+        .map_err(|error| CliError::GitError {
+            message: format!("binding ref '{ref_name}' points at a missing commit: {error}"),
+        })?;
     let tree = commit.tree().map_err(|error| CliError::GitError {
         message: format!("binding ref '{ref_name}' commit has no tree: {error}"),
     })?;
-    let entry = tree.get_name(BINDING_BLOB_NAME).ok_or_else(|| CliError::GitError {
-        message: format!("binding ref '{ref_name}' tree does not contain {BINDING_BLOB_NAME}"),
-    })?;
+    let entry = tree
+        .get_name(BINDING_BLOB_NAME)
+        .ok_or_else(|| CliError::GitError {
+            message: format!("binding ref '{ref_name}' tree does not contain {BINDING_BLOB_NAME}"),
+        })?;
     if entry.filemode() != i32::from(git2::FileMode::Blob) {
         return Err(CliError::GitError {
             message: format!("binding ref '{ref_name}' entry is not a regular blob"),
         });
     }
-    let blob = git.find_blob(entry.id()).map_err(|error| CliError::GitError {
-        message: format!("binding ref '{ref_name}' blob is missing: {error}"),
-    })?;
+    let blob = git
+        .find_blob(entry.id())
+        .map_err(|error| CliError::GitError {
+            message: format!("binding ref '{ref_name}' blob is missing: {error}"),
+        })?;
     GitStateBinding::decode(blob.content()).map_err(|error| CliError::GitError {
-        message: format!(
-            "binding ref '{ref_name}' carries undecodable binding bytes: {error}"
-        ),
+        message: format!("binding ref '{ref_name}' carries undecodable binding bytes: {error}"),
     })
 }
 
@@ -381,9 +385,9 @@ pub(crate) fn adopt_git_checkout(
         }
     }
     {
-        let mut statuses = git
-            .statuses(None)
-            .map_err(|error| CliError::GitError { message: format!("cannot inspect the worktree: {error}") })?;
+        let mut statuses = git.statuses(None).map_err(|error| CliError::GitError {
+            message: format!("cannot inspect the worktree: {error}"),
+        })?;
         let dirty: Vec<String> = statuses
             .iter()
             .filter(|entry| {
@@ -420,7 +424,9 @@ pub(crate) fn adopt_git_checkout(
         installed += install_degraded_bindings(&repo, &git)?;
     }
     if installed > 0 {
-        print_info(&format!("Installed {installed} verified binding(s) from the fetched binding refs."));
+        print_info(&format!(
+            "Installed {installed} verified binding(s) from the fetched binding refs."
+        ));
     }
 
     // 3. Resolve Git HEAD against the verified store.
@@ -433,19 +439,23 @@ pub(crate) fn adopt_git_checkout(
             })
         }
     };
-    let tagged = GitObjectId::new(algorithm, head_oid.as_bytes().to_vec())
-        .map_err(|error| CliError::GitError { message: error.to_string() })?;
-    let resolution = repo.resolve_git_sha(&git, &tagged).map_err(CliError::Repository)?;
+    let tagged = GitObjectId::new(algorithm, head_oid.as_bytes().to_vec()).map_err(|error| {
+        CliError::GitError {
+            message: error.to_string(),
+        }
+    })?;
+    let resolution = repo
+        .resolve_git_sha(&git, &tagged)
+        .map_err(CliError::Repository)?;
     let binding = match resolution {
         GitShaResolution::VerifiedBinding { binding, .. } => binding,
         GitShaResolution::Cold => {
             return Ok(BootstrapOutcome::Unbound {
                 head: head_hex,
-                reason: format!(
-                    "no verified binding covers this commit; the supported foreign-synthesis \
+                reason: "no verified binding covers this commit; the supported foreign-synthesis \
                      path is 'atomic git import --incremental' (run it explicitly) — the \
                      clone is NOT labeled exact and nothing was silently merged"
-                ),
+                    .to_string(),
             });
         }
         GitShaResolution::Unresolved { detail } => {
@@ -464,8 +474,11 @@ pub(crate) fn adopt_git_checkout(
     //    recomputed SetId/closure-root/tree agreement, then journaled
     //    membership restoration. Any gap is a typed refusal.
     let view = {
-        let working_copy = repo.require_working_copy_id().map_err(CliError::Repository)?;
-        repo.desired_view_name(working_copy).map_err(CliError::Repository)?
+        let working_copy = repo
+            .require_working_copy_id()
+            .map_err(CliError::Repository)?;
+        repo.desired_view_name(working_copy)
+            .map_err(CliError::Repository)?
     };
     print_info(&format!(
         "Resurrecting binding {} ({} ordered change(s)) into view '{view}'",
@@ -484,7 +497,9 @@ pub(crate) fn adopt_git_checkout(
             &git,
             &binding,
             &view,
-            remote_source.as_mut().map(|source| source as &mut dyn atomic_repository::BindingChangeSource),
+            remote_source
+                .as_mut()
+                .map(|source| source as &mut dyn atomic_repository::BindingChangeSource),
         )
         .map_err(CliError::Repository)?;
     if outcome.proof.projected_tree != outcome.proof.bound_tree {
@@ -566,7 +581,9 @@ pub(crate) fn clone_git_url(
     include_degraded: bool,
 ) -> CliResult<BootstrapOutcome> {
     let mut repo = Repository::init(target).map_err(CliError::Repository)?;
-    let working_copy = repo.require_working_copy_id().map_err(CliError::Repository)?;
+    let working_copy = repo
+        .require_working_copy_id()
+        .map_err(CliError::Repository)?;
     if view_name != atomic_repository::DEFAULT_VIEW {
         repo.create_view(view_name).map_err(CliError::Repository)?;
         repo.align_to_view(working_copy, view_name)
@@ -580,5 +597,3 @@ pub(crate) fn clone_git_url(
 fn hex_encode(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
-
-

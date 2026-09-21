@@ -38,6 +38,13 @@
 //! atomic status
 //! ```
 
+//!
+//! Note: `CliError` intentionally carries the `ManagedAgentIncomplete`
+//! refusal payload inline (CB-12A/13D), which trips
+//! `clippy::result_large_err` on every `CliResult`. Errors are returned
+//! once per invocation and printed, never stored or passed through hot
+//! paths, so the ergonomic cost of boxing outweighs the benefit.
+#![allow(clippy::result_large_err)]
 // Many commands are scaffold/stub implementations with builder APIs not yet
 // fully wired up. Suppress dead_code and unused_imports until they are.
 #![allow(
@@ -58,8 +65,8 @@ use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use commands::{
     Add,
     Agent,
-    ChangeCmd,
     Blame,
+    ChangeCmd,
     Clone,
     Command,
     Completions,

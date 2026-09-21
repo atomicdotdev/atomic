@@ -10,7 +10,9 @@ use redb::ReadableTable;
 use crate::pristine::capability::RepositoryCapability;
 use crate::pristine::error::PristineResult;
 use crate::pristine::tables::PRISTINE_META;
-use crate::pristine::traits::capability_txn::{capability_metadata_key, CapabilityMutTxnT, CapabilityTxnT};
+use crate::pristine::traits::capability_txn::{
+    capability_metadata_key, CapabilityMutTxnT, CapabilityTxnT,
+};
 
 use super::WriteTxn;
 
@@ -25,10 +27,7 @@ impl CapabilityTxnT for WriteTxn<'_> {
 }
 
 impl CapabilityMutTxnT for WriteTxn<'_> {
-    fn put_required_capability(
-        &mut self,
-        capability: RepositoryCapability,
-    ) -> PristineResult<u32> {
+    fn put_required_capability(&mut self, capability: RepositoryCapability) -> PristineResult<u32> {
         let mut table = self.txn.open_table(PRISTINE_META)?;
         let key = capability_metadata_key(capability.id());
         let existing = table.get(key.as_str())?.map(|version| version.value());
@@ -42,11 +41,7 @@ impl CapabilityMutTxnT for WriteTxn<'_> {
         Ok(durable)
     }
 
-    fn put_required_capability_exact(
-        &mut self,
-        id: &str,
-        version: u32,
-    ) -> PristineResult<u32> {
+    fn put_required_capability_exact(&mut self, id: &str, version: u32) -> PristineResult<u32> {
         let mut table = self.txn.open_table(PRISTINE_META)?;
         table.insert(capability_metadata_key(id).as_str(), version)?;
         Ok(version)

@@ -8,7 +8,7 @@ use std::path::Path;
 use atomic_core::change::session::{ManagedTurnOutcome, SessionIncompleteOrigin};
 
 use crate::error::{AgentError, AgentResult};
-use crate::event::{HookType, TurnEvent};
+use crate::event::TurnEvent;
 use crate::record::{record_turn, TurnRecordOptions};
 use crate::turn::phase::{self, Action, Event, TransitionContext};
 use crate::turn::session::{IncompleteSession, TurnOutcomeEntry};
@@ -290,10 +290,8 @@ impl TurnOrchestrator {
                             )
                         });
                     if !pending_active {
-                        return Ok(
-                            DispatchResult::new(session_id, session.phase)
-                                .with_view(&session.view_name),
-                        );
+                        return Ok(DispatchResult::new(session_id, session.phase)
+                            .with_view(&session.view_name));
                     }
                     // Fall through: the ordinary path activates the pending turn.
                     // The load_or_create + Idle consultation below handles it.
@@ -865,7 +863,6 @@ impl TurnOrchestrator {
                 Err(error) => return Err(failure(error.to_string())),
             }
         }
-
     }
 
     fn try_turn_end_lock(&self, session_id: &str) -> TurnEndLock {

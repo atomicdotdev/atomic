@@ -487,7 +487,10 @@ fn executed_recovery_is_recorded_in_the_event_journal() {
         .expect("the recovery outcome is recorded");
     let event: serde_json::Value = serde_json::from_str(line).unwrap();
     assert_eq!(event["event"], "recovery");
-    assert_eq!(event["created"], true, "a new Recover operation was appended");
+    assert_eq!(
+        event["created"], true,
+        "a new Recover operation was appended"
+    );
     assert!(
         event["original"].as_str().is_some_and(|id| !id.is_empty()),
         "the original operation id is recorded"
@@ -517,7 +520,7 @@ fn opt_in_bridge_telemetry(root: &std::path::Path) {
 /// closed.
 #[test]
 fn failed_recovery_records_a_failure_event() {
-    let (temp, mut repo) = create_temp_repo();
+    let (temp, repo) = create_temp_repo();
     opt_in_bridge_telemetry(temp.path());
     let path = "tracked.txt";
     let old_bytes = b"old contents\n";
@@ -973,8 +976,8 @@ fn metadata_only_open_refuses_pending_recovery_instead_of_replaying() {
 
     // The metadata-only open refuses: no recovery ran, so the user's bytes
     // are exactly what the interrupted operation left on disk.
-    let error = Repository::open_with_budget(temp.path(), ReconcileEffectBudget::MetadataOnly)
-        .unwrap_err();
+    let error =
+        Repository::open_with_budget(temp.path(), ReconcileEffectBudget::MetadataOnly).unwrap_err();
     assert!(
         matches!(&error, RepositoryError::ReactiveDeferred { .. }),
         "the metadata-only open must defer pending recovery, got {error:?}"

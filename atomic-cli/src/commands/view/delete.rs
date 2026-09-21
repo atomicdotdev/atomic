@@ -181,8 +181,12 @@ impl Command for Delete {
         // deleted) view. A Shared view can never reach this point: deletion
         // is refused above and its mapping stays intact.
         if let Some(atomic_core::pristine::ViewScope::Draft) = scope {
-            repo.reconcile_mapping_after_view_delete(working_copy, name, atomic_core::pristine::ViewScope::Draft)
-                .map_err(CliError::Repository)?;
+            repo.reconcile_mapping_after_view_delete(
+                working_copy,
+                name,
+                atomic_core::pristine::ViewScope::Draft,
+            )
+            .map_err(CliError::Repository)?;
         }
 
         print_success(&format!("Deleted view: {}", style_view(name)));

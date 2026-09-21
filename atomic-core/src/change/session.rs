@@ -124,8 +124,10 @@ impl IncompleteSession {
     /// durable observation that the commit happened and no authenticated
     /// capture covers it (RFC §10.3.2, §10.5).
     pub fn with_unbound_commits(mut self, commits: Vec<String>) -> Self {
-        let mut commits: Vec<String> =
-            commits.into_iter().filter(|commit| !commit.is_empty()).collect();
+        let mut commits: Vec<String> = commits
+            .into_iter()
+            .filter(|commit| !commit.is_empty())
+            .collect();
         commits.sort();
         commits.dedup();
         self.unbound_commits = commits;
@@ -362,13 +364,15 @@ impl From<SessionRecordV2> for SessionRecord {
             // The refusal reason, paths and recovery ref survive the decode
             // (review R1: an exact pre-CB12A incomplete SessionRecord used to
             // decode as Active, discarding the refusal).
-            SessionStatusV2::Incomplete(incomplete) => SessionStatus::Incomplete(IncompleteSession {
-                reason: incomplete.reason,
-                paths: incomplete.paths,
-                recovery_ref: incomplete.recovery_ref,
-                origin: incomplete.origin,
-                unbound_commits: Vec::new(),
-            }),
+            SessionStatusV2::Incomplete(incomplete) => {
+                SessionStatus::Incomplete(IncompleteSession {
+                    reason: incomplete.reason,
+                    paths: incomplete.paths,
+                    recovery_ref: incomplete.recovery_ref,
+                    origin: incomplete.origin,
+                    unbound_commits: Vec::new(),
+                })
+            }
             SessionStatusV2::Active => SessionStatus::Active,
             SessionStatusV2::Ended => SessionStatus::Ended,
         };
@@ -1616,7 +1620,10 @@ mod tests {
             ManagedTurnOutcome::ObservationOnly,
         ];
         for outcome in outcomes {
-            assert_eq!(ManagedTurnOutcome::from_bytes(&outcome.to_bytes()).unwrap(), outcome);
+            assert_eq!(
+                ManagedTurnOutcome::from_bytes(&outcome.to_bytes()).unwrap(),
+                outcome
+            );
         }
     }
 
@@ -1629,7 +1636,10 @@ mod tests {
             SessionIncompleteOrigin::UnattributedGitOperation,
         )
         .with_unbound_commits(vec!["abc".into(), "abc".into(), "def".into()]);
-        assert_eq!(incomplete.unbound_commits, vec!["abc".to_string(), "def".to_string()]);
+        assert_eq!(
+            incomplete.unbound_commits,
+            vec!["abc".to_string(), "def".to_string()]
+        );
         let bytes = postcard::to_allocvec(&incomplete).unwrap();
         let loaded: IncompleteSession = postcard::from_bytes(&bytes).unwrap();
         assert_eq!(loaded, incomplete);
@@ -1716,7 +1726,10 @@ mod tests {
         assert_eq!(incomplete.reason, "retain refusal");
         assert_eq!(incomplete.paths, vec!["tracked.txt".to_string()]);
         assert_eq!(incomplete.recovery_ref, "refs/atomic/wip/old");
-        assert_eq!(incomplete.origin, SessionIncompleteOrigin::UnknownPostCheckout);
+        assert_eq!(
+            incomplete.origin,
+            SessionIncompleteOrigin::UnknownPostCheckout
+        );
         assert!(incomplete.unbound_commits.is_empty());
     }
 
@@ -1767,13 +1780,15 @@ mod tests {
             turn_count: 0,
             started_at: 7,
             ended_at: None,
-            status: SessionStatus::Incomplete(IncompleteSession::new(
-                "unexplained",
-                Vec::<String>::new(),
-                String::new(),
-                SessionIncompleteOrigin::UnattributedGitOperation,
-            )
-            .with_unbound_commits(vec!["abc".into()])),
+            status: SessionStatus::Incomplete(
+                IncompleteSession::new(
+                    "unexplained",
+                    Vec::<String>::new(),
+                    String::new(),
+                    SessionIncompleteOrigin::UnattributedGitOperation,
+                )
+                .with_unbound_commits(vec!["abc".into()]),
+            ),
         };
         let bytes = record.to_bytes();
         assert_eq!(SessionRecord::from_bytes(&bytes).unwrap(), record);

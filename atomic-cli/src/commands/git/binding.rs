@@ -24,10 +24,10 @@ use atomic_repository::git_binding::{
 use atomic_repository::{BindingPublication, ClosureReadiness, Repository};
 use git2::Repository as GitRepository;
 
+use super::transport::HttpBindingChangeSource;
 use crate::commands::workspace_txn::{boundary_mode, enter_workspace};
 use crate::commands::{find_repository_root, Command};
 use crate::error::{CliError, CliResult};
-use super::transport::HttpBindingChangeSource;
 use crate::output::{print_hint, print_info, print_success, print_warning};
 
 use clap::Subcommand;
@@ -258,7 +258,7 @@ pub(crate) fn assemble_changes_pack_from_view(
 }
 
 fn publish(key_file: PathBuf, with_changes_pack: bool, with_conflicts_pack: bool) -> CliResult<()> {
-        let keypair = load_signing_key(&key_file)?;
+    let keypair = load_signing_key(&key_file)?;
     let root = find_repository_root()?;
     let mut repo = Repository::open(root.clone()).map_err(CliError::from)?;
     let workspace = enter_workspace(&mut repo, atomic_repository::WorkspaceTxnMode::Reconcile)?;
@@ -393,7 +393,12 @@ fn publish(key_file: PathBuf, with_changes_pack: bool, with_conflicts_pack: bool
     let publication = match (&changes_pack, &conflicts_pack) {
         (Some(pack), Some(conflicts)) => repo
             .publish_binding_with_changes_and_conflicts_pack(
-                working_copy, &git, &binding, None, pack, conflicts,
+                working_copy,
+                &git,
+                &binding,
+                None,
+                pack,
+                conflicts,
             )
             .map_err(CliError::from)?,
         (Some(pack), None) => repo
@@ -863,7 +868,6 @@ fn fetch(id: &str, remote: Option<String>, timeout: u64, insecure: bool) -> CliR
     }
 }
 
-
 use atomic_repository::OperationHeadState;
 
 use super::bridge::open_git;
@@ -985,18 +989,12 @@ fn resurrect(
                 .load_binding_conflicts_pack(&git, &binding.id())
                 .map_err(CliError::Repository)?
             {
-                let expected =
-                    atomic_repository::repository::ConflictSetObject::decode(&pack).map_err(
-                        |error| {
-                            CliError::Repository(
-                                atomic_repository::RepositoryError::InvalidOperation {
-                                    message: format!(
-                                        "the binding's conflicts.pack is invalid: {error}"
-                                    ),
-                                },
-                            )
-                        },
-                    )?;
+                let expected = atomic_repository::repository::ConflictSetObject::decode(&pack)
+                    .map_err(|error| {
+                        CliError::Repository(atomic_repository::RepositoryError::InvalidOperation {
+                            message: format!("the binding's conflicts.pack is invalid: {error}"),
+                        })
+                    })?;
                 repo.verify_restored_conflict_state(&view, &expected)
                     .map_err(CliError::Repository)?;
                 print_success(&format!(
@@ -1034,8 +1032,7 @@ fn queue(remote: Option<&str>, max: usize, degraded_head_fallback: bool) -> CliR
     let working_copy = workspace.working_copy();
     let git = open_git(&root)?;
 
-    let outcome =
-        super::transport::run_local_publish_queue(&repo, working_copy, &git, max)?;
+    let outcome = super::transport::run_local_publish_queue(&repo, working_copy, &git, max)?;
 
     if !outcome.all_local_ok() {
         drop(workspace);
@@ -1065,8 +1062,13 @@ fn queue(remote: Option<&str>, max: usize, degraded_head_fallback: bool) -> CliR
     // CB-10B review R8: the workspace lease is retained through the NETWORK
     // transfer — the ordered boundary outlives the remote effects, so the
     // workspace is never dropped before network completion.
-    let transferred =
-        super::transport::transfer_binding_refs(&repo, &root, &git, remote_name, degraded_head_fallback)?;
+    let transferred = super::transport::transfer_binding_refs(
+        &repo,
+        &root,
+        &git,
+        remote_name,
+        degraded_head_fallback,
+    )?;
     drop(workspace);
     if transferred.is_empty() {
         print_info(&format!(

@@ -1,14 +1,14 @@
 //! CB-10A ref-mapping persistence, journaling, and lifecycle.
 
 use super::*;
+use crate::repository::ref_mapping::{
+    classify_three_way, Containment, ThreeWayAction, ThreeWayObservation,
+};
 use atomic_core::operation::{
     ActorRef, MetadataTarget, MetadataTransition, MetadataValue, OperationKind,
 };
 use atomic_core::pristine::{RefSyncStatus, REF_MAPPING_VERSION};
 use atomic_core::Hash;
-use crate::repository::ref_mapping::{
-    classify_three_way, Containment, ThreeWayAction, ThreeWayObservation,
-};
 
 fn mapping(view_id: u64) -> atomic_core::pristine::RefMapping {
     atomic_core::pristine::RefMapping {
@@ -21,8 +21,12 @@ fn mapping(view_id: u64) -> atomic_core::pristine::RefMapping {
         last_observed_local: Some("1111111111111111111111111111111111111111".to_string()),
         last_observed_remote: None,
         last_exported: Some("1111111111111111111111111111111111111111".to_string()),
-        last_exported_state: Some("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string()),
-        last_observed_atomic: Some("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string()),
+        last_exported_state: Some(
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string(),
+        ),
+        last_observed_atomic: Some(
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string(),
+        ),
         status: RefSyncStatus::Synchronized,
     }
 }
@@ -41,7 +45,7 @@ fn ref_mapping_persists_across_reopen_with_all_fields() {
     let working_copy = test_repo.working_copy();
     let repository = test_repo.deref_mut();
     let view_id = view_id_of(repository, "dev");
-    let mut mapping = mapping(view_id);
+    let mapping = mapping(view_id);
     repository
         .set_ref_mapping(working_copy, "dev", Some(mapping.clone()))
         .expect("write mapping");
@@ -67,10 +71,7 @@ fn ref_mapping_persists_across_reopen_with_all_fields() {
         other => panic!("expected one head, found {other:?}"),
     };
     let details = reopened.operation_details(head).expect("operation details");
-    assert_eq!(
-        details.operation.payload().kind,
-        OperationKind::RefMapping
-    );
+    assert_eq!(details.operation.payload().kind, OperationKind::RefMapping);
     assert_eq!(
         details.verification,
         super::operation::OperationVerificationState::Verified
@@ -91,7 +92,10 @@ fn identical_mapping_write_is_an_idempotent_noop() {
     let second = repository
         .set_ref_mapping(working_copy, "dev", Some(mapping))
         .expect("second write");
-    assert!(second.is_none(), "an identical write must not journal an op");
+    assert!(
+        second.is_none(),
+        "an identical write must not journal an op"
+    );
 }
 
 #[test]
@@ -103,7 +107,7 @@ fn mapping_write_refuses_a_stale_lease_without_overwriting() {
     let working_copy = test_repo.working_copy();
     let repository = test_repo.deref_mut();
     let view_id = view_id_of(repository, "dev");
-    let mut mapping = mapping(view_id);
+    let mapping = mapping(view_id);
     repository
         .set_ref_mapping(working_copy, "dev", Some(mapping.clone()))
         .expect("baseline write");
@@ -160,7 +164,10 @@ fn mapping_write_refuses_a_stale_lease_without_overwriting() {
         .get_ref_mapping("dev")
         .expect("read")
         .expect("row");
-    assert_eq!(stored.last_observed_local.as_deref(), Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
+    assert_eq!(
+        stored.last_observed_local.as_deref(),
+        Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+    );
 }
 
 fn mapping_encoding(mapping: &atomic_core::pristine::RefMapping) -> Vec<u8> {
@@ -303,7 +310,10 @@ fn refused_shared_delete_leaves_every_mapping_byte_untouched() {
         .get_ref_mapping("release")
         .expect("read")
         .expect("row");
-    assert_eq!(before, after, "a refused delete must not mutate the mapping");
+    assert_eq!(
+        before, after,
+        "a refused delete must not mutate the mapping"
+    );
     assert!(
         repository.view_exists("release").expect("view exists"),
         "the refused view must still exist"
@@ -354,7 +364,9 @@ fn a_stale_observation_cannot_clobber_a_newer_mapping_row() {
         .set_ref_mapping_from_observation(working_copy, "dev", Some(&observed), Some(replacement))
         .expect_err("the stale-built replacement must be refused");
     assert!(
-        error.to_string().contains("moved since the caller observed"),
+        error
+            .to_string()
+            .contains("moved since the caller observed"),
         "the typed observation-moved refusal must surface: {error}"
     );
     let stored = repository
@@ -362,8 +374,7 @@ fn a_stale_observation_cannot_clobber_a_newer_mapping_row() {
         .expect("read")
         .expect("row");
     assert_eq!(
-        stored,
-        moved,
+        stored, moved,
         "the interleaved newer row must survive untouched"
     );
     drop(directory);
@@ -371,7 +382,9 @@ fn a_stale_observation_cannot_clobber_a_newer_mapping_row() {
 
 #[test]
 fn incomplete_walks_and_stale_exports_never_prove_containment() {
-    use crate::repository::ref_mapping::{commits_added_since, git_contains_atomic_export, AddedCommits};
+    use crate::repository::ref_mapping::{
+        commits_added_since, git_contains_atomic_export, AddedCommits,
+    };
     use git2::Repository as GitRepository;
 
     // Real Git repository with a two-commit history.
@@ -379,13 +392,20 @@ fn incomplete_walks_and_stale_exports_never_prove_containment() {
     let git = GitRepository::init(directory.path()).expect("init git repo");
     let signature = git2::Signature::now("CB-10A Tests", "cb10a@example.com").expect("signature");
     let empty_tree = {
-        let mut builder = git.treebuilder(None).expect("treebuilder");
-        let tree_oid = builder.write().expect("empty tree");
-        tree_oid
+        let builder = git.treebuilder(None).expect("treebuilder");
+
+        builder.write().expect("empty tree")
     };
     let tree = git.find_tree(empty_tree).expect("empty tree");
     let base = git
-        .commit(Some("refs/heads/main"), &signature, &signature, "base", &tree, &[])
+        .commit(
+            Some("refs/heads/main"),
+            &signature,
+            &signature,
+            "base",
+            &tree,
+            &[],
+        )
         .expect("base commit");
     let child = git
         .commit(
@@ -420,7 +440,10 @@ fn incomplete_walks_and_stale_exports_never_prove_containment() {
         AddedCommits::Unprovable(_)
     ));
     // Neither side observable: genuinely nothing moved.
-    assert_eq!(commits_added_since(&git, None, None), AddedCommits::NoMovement);
+    assert_eq!(
+        commits_added_since(&git, None, None),
+        AddedCommits::NoMovement
+    );
 
     // A stale export (bound to an older state) cannot prove containment.
     assert_eq!(
@@ -473,33 +496,75 @@ fn three_way_classification_matrix_over_persisted_mapping() {
     };
 
     assert_eq!(
-        classify_three_way(&mapping, &observe(Some("1111111111111111111111111111111111111111"), "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"), proven(false, false))
-            .action,
+        classify_three_way(
+            &mapping,
+            &observe(
+                Some("1111111111111111111111111111111111111111"),
+                "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            ),
+            proven(false, false)
+        )
+        .action,
         ThreeWayAction::Noop
     );
     assert_eq!(
-        classify_three_way(&mapping, &observe(Some("2222222222222222222222222222222222222222"), "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"), proven(false, false))
-            .action,
+        classify_three_way(
+            &mapping,
+            &observe(
+                Some("2222222222222222222222222222222222222222"),
+                "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            ),
+            proven(false, false)
+        )
+        .action,
         ThreeWayAction::Import
     );
     assert_eq!(
-        classify_three_way(&mapping, &observe(Some("1111111111111111111111111111111111111111"), "moved-state"), proven(false, false))
-            .action,
+        classify_three_way(
+            &mapping,
+            &observe(
+                Some("1111111111111111111111111111111111111111"),
+                "moved-state"
+            ),
+            proven(false, false)
+        )
+        .action,
         ThreeWayAction::Export
     );
     assert_eq!(
-        classify_three_way(&mapping, &observe(Some("2222222222222222222222222222222222222222"), "moved-state"), proven(true, false))
-            .action,
+        classify_three_way(
+            &mapping,
+            &observe(
+                Some("2222222222222222222222222222222222222222"),
+                "moved-state"
+            ),
+            proven(true, false)
+        )
+        .action,
         ThreeWayAction::Export
     );
     assert_eq!(
-        classify_three_way(&mapping, &observe(Some("2222222222222222222222222222222222222222"), "moved-state"), proven(false, true))
-            .action,
+        classify_three_way(
+            &mapping,
+            &observe(
+                Some("2222222222222222222222222222222222222222"),
+                "moved-state"
+            ),
+            proven(false, true)
+        )
+        .action,
         ThreeWayAction::Import
     );
     assert_eq!(
-        classify_three_way(&mapping, &observe(Some("2222222222222222222222222222222222222222"), "moved-state"), proven(false, false))
-            .action,
+        classify_three_way(
+            &mapping,
+            &observe(
+                Some("2222222222222222222222222222222222222222"),
+                "moved-state"
+            ),
+            proven(false, false)
+        )
+        .action,
         ThreeWayAction::Diverged
     );
     // Unprovable containment (an added commit without verified closure)
@@ -518,8 +583,15 @@ fn three_way_classification_matrix_over_persisted_mapping() {
     let mut no_ref = mapping;
     no_ref.local_ref = None;
     assert_eq!(
-        classify_three_way(&no_ref, &observe(Some("2222222222222222222222222222222222222222"), "moved-state"), proven(true, true))
-            .action,
+        classify_three_way(
+            &no_ref,
+            &observe(
+                Some("2222222222222222222222222222222222222222"),
+                "moved-state"
+            ),
+            proven(true, true)
+        )
+        .action,
         ThreeWayAction::Unrepresentable
     );
 }

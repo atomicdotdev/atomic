@@ -9,12 +9,15 @@ use crate::operation::{
     decode_effect_receipt, decode_operation, decode_operation_heads, decode_operation_scope,
     EffectReceipt, Operation, OperationHeads, OperationScope,
 };
-use crate::pristine::tables::{BRIDGE_EVENT_CAPTURES, BRIDGE_EVENT_CAPTURE_ANCHORS, BRIDGE_REF_CAPTURE_TOKENS, REF_MAPPINGS, VAULT_ENTRIES, VAULT_MANIFEST};
-use crate::pristine::traits::tag::{BridgeEventCaptureTxnT, GitCommitClosureTxnT, GitShaIndexTxnT};
-use crate::pristine::traits::tag::TagRecord;
-use crate::pristine::traits::capability_txn::{capability_metadata_key, CapabilityTxnT};
-use crate::pristine::traits::{EmbeddingsTxnT, KgTxnT, TagTxnT, VaultEntryMeta, VaultTxnT};
 use crate::pristine::ref_mapping::RefMappingTxnT;
+use crate::pristine::tables::{
+    BRIDGE_EVENT_CAPTURES, BRIDGE_EVENT_CAPTURE_ANCHORS, BRIDGE_REF_CAPTURE_TOKENS, REF_MAPPINGS,
+    VAULT_ENTRIES, VAULT_MANIFEST,
+};
+use crate::pristine::traits::capability_txn::{capability_metadata_key, CapabilityTxnT};
+use crate::pristine::traits::tag::TagRecord;
+use crate::pristine::traits::tag::{BridgeEventCaptureTxnT, GitCommitClosureTxnT, GitShaIndexTxnT};
+use crate::pristine::traits::{EmbeddingsTxnT, KgTxnT, TagTxnT, VaultEntryMeta, VaultTxnT};
 use crate::pristine::vault::{EmbeddingRecord, KgEdge, KgNode, SearchResult};
 use crate::pristine::{
     decode_file_index_v2, decode_set_id_index_entry, FileIndexV2Entry, FileIndexV2Key,
@@ -294,8 +297,7 @@ impl GraphTxnT for ReadTxn {
         let upper = encode_vertex(change_id, target_pos, u64::MAX);
         if let Some((v_change, v_start, v_end)) = table
             .range::<&[u8; 24]>(&encode_vertex(change_id, 0, 0)..=&upper)?
-            .rev()
-            .next()
+            .next_back()
             .transpose()?
             .map(|(key, _values)| decode_vertex(key.value()))
         {
@@ -366,8 +368,7 @@ impl GraphTxnT for ReadTxn {
             let before_upper = encode_vertex(change_id, target_pos - 1, u64::MAX);
             if let Some((v_change, v_start, v_end)) = table
                 .range::<&[u8; 24]>(&encode_vertex(change_id, 0, 0)..=&before_upper)?
-                .rev()
-                .next()
+                .next_back()
                 .transpose()?
                 .map(|(key, _values)| decode_vertex(key.value()))
             {
@@ -384,8 +385,7 @@ impl GraphTxnT for ReadTxn {
         let contains_upper = encode_vertex(change_id, target_pos, u64::MAX);
         if let Some((v_change, v_start, v_end)) = table
             .range::<&[u8; 24]>(&encode_vertex(change_id, 0, 0)..=&contains_upper)?
-            .rev()
-            .next()
+            .next_back()
             .transpose()?
             .map(|(key, _values)| decode_vertex(key.value()))
         {
@@ -2098,7 +2098,6 @@ impl<'txn> TreeTxnT for CachedGraphTxn<'txn> {
     fn get_directory_flags(&self, inode: Inode) -> PristineResult<Option<u8>> {
         self.txn.get_directory_flags(inode)
     }
-
 
     fn get_path(&self, inode: Inode) -> PristineResult<Option<String>> {
         self.txn.get_path(inode)

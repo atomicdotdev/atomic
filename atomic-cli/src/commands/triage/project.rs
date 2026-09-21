@@ -750,17 +750,21 @@ pub fn build_report(
         candidate_hashes.sort();
         candidate_hashes.dedup();
         if !candidate_hashes.is_empty() {
-            let provider = atomic_repository::repository::provenance_gate::
-                local_session_mac_key_provider(repo);
+            let provider =
+                atomic_repository::repository::provenance_gate::local_session_mac_key_provider(
+                    repo,
+                );
             match repo.evaluate_publication_gate(
                 &candidate_hashes,
                 &atomic_repository::repository::provenance_gate::PublicationGateConfig::from_repo(
                     repo,
                 )
-                .unwrap_or(atomic_repository::repository::provenance_gate::PublicationGateConfig {
-                    trust: Default::default(),
-                    repository_identity: None,
-                }),
+                .unwrap_or(
+                    atomic_repository::repository::provenance_gate::PublicationGateConfig {
+                        trust: Default::default(),
+                        repository_identity: None,
+                    },
+                ),
                 Some(&provider),
             ) {
                 Ok(verdict) => {
@@ -780,14 +784,12 @@ pub fn build_report(
                     }
                 }
                 Err(error) => {
-                    findings.push(
-                        Finding::new(
-                            F_PUBLICATION_GATE,
-                            SEV_WARN,
-                            "publication-gate".to_string(),
-                            format!("gate evaluation failed (surface this to review): {error}"),
-                        ),
-                    );
+                    findings.push(Finding::new(
+                        F_PUBLICATION_GATE,
+                        SEV_WARN,
+                        "publication-gate".to_string(),
+                        format!("gate evaluation failed (surface this to review): {error}"),
+                    ));
                 }
             }
         }

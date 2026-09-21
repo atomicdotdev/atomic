@@ -707,9 +707,9 @@ impl Repository {
             // explicitly; every other directory is pruned only when its
             // `.git` marker is an actual repository, so incidental `.git`
             // markers never hide ordinary parent content.
-            let walker_options = options.clone().with_nested_repo_boundaries(
-                gitlink_paths.iter().cloned(),
-            );
+            let walker_options = options
+                .clone()
+                .with_nested_repo_boundaries(gitlink_paths.iter().cloned());
             let working_files =
                 collect_working_copy_files_with_rules(&self.root, &walker_options, rules.as_ref())
                     .map_err(|e| RepositoryError::Database(e.to_string()))?;
@@ -818,7 +818,11 @@ impl Repository {
         // Git representation, NOT Git unmerged stages 1-3: Git status is
         // clean for them and merge tools do not apply, while the Atomic
         // conflict remains unresolved until it is resolved in Atomic.
-        if status.entries().iter().any(|entry| entry.status() == FileStatus::Conflicted) {
+        if status
+            .entries()
+            .iter()
+            .any(|entry| entry.status() == FileStatus::Conflicted)
+        {
             let git_snapshot = git2::Repository::open(&self.root)
                 .ok()
                 .and_then(|git| {
@@ -1336,7 +1340,9 @@ mod change_source_convergence_tests {
 
         let source = selected(
             GitWatch::Fsmonitor,
-            Arc::new(FailingSource(ChangeSourceError::Unavailable("missing".into()))),
+            Arc::new(FailingSource(ChangeSourceError::Unavailable(
+                "missing".into(),
+            ))),
             Arc::new(CandidateSource(CandidateMutation::Exact)),
         );
         let status = repo

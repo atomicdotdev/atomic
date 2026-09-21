@@ -1,5 +1,5 @@
-use super::*;
 use super::operation::pristine_error;
+use super::*;
 use atomic_core::change::{CausalFrontier, ChangeKind, ChangeOrigin};
 use atomic_core::operation::{
     ActorRef, EffectPlan, EffectTarget, EffectValue, FileKind, FileState, OperationKind,
@@ -469,9 +469,7 @@ impl Repository {
             .iter()
             .skip(policy.keep_superseded)
             .copied()
-            .filter(|hash| {
-                !self.object_is_audit_retained(hash, policy.audit_retention_floor_unix)
-            })
+            .filter(|hash| !self.object_is_audit_retained(hash, policy.audit_retention_floor_unix))
             .collect::<Vec<_>>();
         if audit_expired.is_empty() {
             let retained = chain
@@ -498,10 +496,7 @@ impl Repository {
                     .to_string(),
             });
         }
-        let txn = self
-            .pristine
-            .read_txn()
-            .map_err(pristine_error)?;
+        let txn = self.pristine.read_txn().map_err(pristine_error)?;
         let mut candidates = Vec::new();
         for hash in &audit_expired {
             if self.snapshot_object_is_rooted(&txn, hash)? {
@@ -597,14 +592,12 @@ impl Repository {
         use atomic_core::operation::OperationScope;
         use atomic_core::pristine::{OperationTxnT, WorkingCopyTxnT};
 
-        let refusal = |scope: String| {
-            RepositoryError::InvalidOperation {
-                message: format!(
-                    "snapshot retention refused: operation {scope} is still completing \
+        let refusal = |scope: String| RepositoryError::InvalidOperation {
+            message: format!(
+                "snapshot retention refused: operation {scope} is still completing \
                      (incomplete head); run a writable command so recovery completes before \
                      destructive pruning"
-                ),
-            }
+            ),
         };
         if self.working_copy_operation_requires_recovery(working_copy)? {
             return Err(refusal(format!("working-copy:{working_copy}")));
@@ -662,11 +655,14 @@ impl Repository {
     /// referenced by it. A record that is behind (an interrupted switch, a
     /// historical state, or a dangling view reference) cannot be proven to
     /// exclude the candidate, and the caller must refuse destructive pruning.
-    fn retention_working_copy_states_provable(&self) -> Result<bool, RepositoryError> {        use atomic_core::pristine::{ViewTxnT, WorkingCopyTxnT};
+    fn retention_working_copy_states_provable(&self) -> Result<bool, RepositoryError> {
+        use atomic_core::pristine::{ViewTxnT, WorkingCopyTxnT};
 
         let txn = self.pristine.read_txn().map_err(pristine_error)?;
         for record in txn.list_working_copies().map_err(pristine_error)? {
-            let Some(view) = txn.get_view_by_id(record.desired_view).map_err(pristine_error)?
+            let Some(view) = txn
+                .get_view_by_id(record.desired_view)
+                .map_err(pristine_error)?
             else {
                 return Ok(false);
             };
@@ -714,7 +710,9 @@ impl Repository {
         //    liveness root — otherwise every change would be pinned forever
         //    by the record operation that created it.
         for operation in txn.list_operations().map_err(pristine_error)? {
-            let receipts = txn.get_effect_receipts(operation.id()).map_err(pristine_error)?;
+            let receipts = txn
+                .get_effect_receipts(operation.id())
+                .map_err(pristine_error)?;
             let verified = super::operation::has_operation_verified_receipt(&receipts);
             let payload = operation.payload();
             if !verified
@@ -787,7 +785,7 @@ impl Repository {
         //     ref target — are validated as DECODED root references, not
         //     raw byte scans. A session file that cannot be decoded cannot
         //     be proven clean and is conservatively a root.
-        if self.incomplete_session_roots_reference(&txn, hash, &base32)? {
+        if self.incomplete_session_roots_reference(txn, hash, &base32)? {
             return Ok(true);
         }
 
@@ -796,7 +794,7 @@ impl Repository {
         //    byte-scanned for the change hash, exactly like the binding
         //    scan above. Enumerating refs is read-only; an unreadable ref
         //    cannot be proven clean and counts as a root.
-        if self.git_keep_refs_reference(&txn, &base32)? {
+        if self.git_keep_refs_reference(txn, &base32)? {
             return Ok(true);
         }
         Ok(false)
@@ -832,7 +830,7 @@ impl Repository {
             Ok(git) => git,
             Err(_) => return Ok(false),
         };
-        let keep_prefix = "refs/atomic/keep/";
+        let _keep_prefix = "refs/atomic/keep/";
         let mut any_ref = false;
         for reference in git
             .references_glob("refs/atomic/keep/*")
@@ -844,15 +842,21 @@ impl Repository {
             let bytes: Vec<u8> = reference
                 .peel_to_commit()
                 .and_then(|commit| {
-                    let odb = git.odb().map_err(|e| git2::Error::from_str(&e.to_string()))?;
+                    let odb = git
+                        .odb()
+                        .map_err(|e| git2::Error::from_str(&e.to_string()))?;
                     odb.read(commit.id())
                         .map(|object| object.data().to_vec())
                         .map_err(|e| git2::Error::from_str(&e.to_string()))
                 })
                 .unwrap_or_default();
             // Byte scan: the raw 32-byte hash and its base32 text both pin.
-            if bytes.windows(32).any(|window| window == Hash::from_base32(base32.as_bytes()).map(|h| h.0).unwrap_or([0u8; 32]))
-                || String::from_utf8_lossy(&bytes).contains(base32)
+            if bytes.windows(32).any(|window| {
+                window
+                    == Hash::from_base32(base32.as_bytes())
+                        .map(|h| h.0)
+                        .unwrap_or([0u8; 32])
+            }) || String::from_utf8_lossy(&bytes).contains(base32)
             {
                 return Ok(true);
             }
@@ -1112,43 +1116,40 @@ pub(super) fn retention_tree_references(
     while let Some((directory, mut entries)) = pending.pop() {
         let _ = &directory;
         {
-        for entry in entries.by_ref() {
-            budget = budget.saturating_sub(1);
-            if budget == 0 {
-                return Ok(true);
-            }
-            let Ok(entry) = entry else {
-                return Ok(true);
-            };
-            let path = entry.path();
-            if path
-                .to_string_lossy()
-                .contains(needle)
-            {
-                return Ok(true);
-            }
-            let Ok(metadata) = std::fs::symlink_metadata(&path) else {
-                return Ok(true);
-            };
-            if metadata.is_dir() {
-                if let Ok(child_entries) = std::fs::read_dir(&path) {
-                    pending.push((path, child_entries));
-                } else {
+            for entry in entries.by_ref() {
+                budget = budget.saturating_sub(1);
+                if budget == 0 {
                     return Ok(true);
                 }
-                continue;
-            }
-            if !metadata.is_file() {
-                continue;
-            }
-            match std::fs::read(&path) {
-                Ok(bytes) if bytes.windows(needle.len()).any(|w| w == needle.as_bytes()) => {
-                    return Ok(true)
+                let Ok(entry) = entry else {
+                    return Ok(true);
+                };
+                let path = entry.path();
+                if path.to_string_lossy().contains(needle) {
+                    return Ok(true);
                 }
-                Ok(_) => {}
-                Err(_) => return Ok(true),
+                let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+                    return Ok(true);
+                };
+                if metadata.is_dir() {
+                    if let Ok(child_entries) = std::fs::read_dir(&path) {
+                        pending.push((path, child_entries));
+                    } else {
+                        return Ok(true);
+                    }
+                    continue;
+                }
+                if !metadata.is_file() {
+                    continue;
+                }
+                match std::fs::read(&path) {
+                    Ok(bytes) if bytes.windows(needle.len()).any(|w| w == needle.as_bytes()) => {
+                        return Ok(true)
+                    }
+                    Ok(_) => {}
+                    Err(_) => return Ok(true),
+                }
             }
-        }
         }
     }
     Ok(false)

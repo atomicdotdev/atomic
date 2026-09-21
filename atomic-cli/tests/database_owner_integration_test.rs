@@ -1632,7 +1632,10 @@ fn failed_frozen_read_resumes_recorded_changes_on_next_stop() {
         "{}",
         String::from_utf8_lossy(&retry.stderr)
     );
-    eprintln!("DEBUG retry stderr: {}", String::from_utf8_lossy(&retry.stderr));
+    eprintln!(
+        "DEBUG retry stderr: {}",
+        String::from_utf8_lossy(&retry.stderr)
+    );
     assert!(retry.stderr.is_empty());
     let shutdown2 = run_owner(&repository, "shutdown");
     let canonical_dot = std::fs::canonicalize(
@@ -1643,8 +1646,15 @@ fn failed_frozen_read_resumes_recorded_changes_on_next_stop() {
     let sock = std::path::Path::new("/tmp").join(format!("atomic-owner-{}.sock", &digest[..24]));
     eprintln!("DEBUG socket {} exists: {}", sock.display(), sock.exists());
     let ping2 = run_owner(&repository, "ping");
-    eprintln!("DEBUG ping2 status={:?} stderr={}", ping2.status, String::from_utf8_lossy(&ping2.stderr));
-    eprintln!("DEBUG shutdown2 stderr: {}", String::from_utf8_lossy(&shutdown2.stderr));
+    eprintln!(
+        "DEBUG ping2 status={:?} stderr={}",
+        ping2.status,
+        String::from_utf8_lossy(&ping2.stderr)
+    );
+    eprintln!(
+        "DEBUG shutdown2 stderr: {}",
+        String::from_utf8_lossy(&shutdown2.stderr)
+    );
     assert!(shutdown2.status.success());
     wait_for_shutdown(&repository);
     let store =

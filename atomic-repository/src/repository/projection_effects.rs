@@ -78,15 +78,9 @@ fn direct_target(oid: git2::Oid) -> Result<GitRefTarget, RepositoryError> {
     Ok(GitRefTarget::Direct(object))
 }
 
-fn read_ref(
-    git: &GitRepository,
-    name: &str,
-) -> Result<Option<GitRefTarget>, RepositoryError> {
+fn read_ref(git: &GitRepository, name: &str) -> Result<Option<GitRefTarget>, RepositoryError> {
     match git.find_reference(name) {
-        Ok(reference) => reference
-            .target()
-            .map(direct_target)
-            .transpose(),
+        Ok(reference) => reference.target().map(direct_target).transpose(),
         Err(error) if error.code() == git2::ErrorCode::NotFound => Ok(None),
         Err(error) => Err(git_map(format!("cannot read Git ref '{name}': {error}"))),
     }
@@ -96,7 +90,9 @@ fn read_ref(
 /// target when attached to an existing branch, and `Ok(None)` when HEAD is
 /// missing or unborn (its symbolic target does not resolve). Operational
 /// failures propagate as errors.
-pub(super) fn read_head_target(git: &GitRepository) -> Result<Option<GitRefTarget>, RepositoryError> {
+pub(super) fn read_head_target(
+    git: &GitRepository,
+) -> Result<Option<GitRefTarget>, RepositoryError> {
     match git.find_reference("HEAD") {
         Ok(head) => {
             if let Some(symref) = head.symbolic_target() {
@@ -106,9 +102,7 @@ pub(super) fn read_head_target(git: &GitRepository) -> Result<Option<GitRefTarge
                 return match git.find_reference(symref) {
                     Ok(_) => Ok(Some(GitRefTarget::Symbolic(symref.to_string()))),
                     Err(error) if error.code() == git2::ErrorCode::NotFound => Ok(None),
-                    Err(error) => {
-                        Err(git_map(format!("cannot read Git HEAD: {error}")))
-                    }
+                    Err(error) => Err(git_map(format!("cannot read Git HEAD: {error}"))),
                 };
             }
             head.target().map(direct_target).transpose()
@@ -316,7 +310,7 @@ fn prepared_checkpoint_from_plan(
         git_tree: git_object_hex(&plan.git_tree)?,
         git_index_tree: aligned_index
             .and_then(|index| index.tree.as_ref())
-            .map(|tree| git_object_hex(tree))
+            .map(git_object_hex)
             .transpose()?,
         git_index_digest: aligned_index.map(|index| index.digest.to_base32()),
     })
@@ -345,7 +339,11 @@ impl Repository {
         ref_name: &str,
         intended_ref: Option<GitRefTarget>,
         intended_head: Option<GitRefTarget>,
-        objects: Vec<(atomic_core::operation::GitObjectId, git2::ObjectType, Vec<u8>)>,
+        objects: Vec<(
+            atomic_core::operation::GitObjectId,
+            git2::ObjectType,
+            Vec<u8>,
+        )>,
         intended_index_tree: Option<git2::Oid>,
         checkpoint_plan: Option<ProjectionCheckpointPlan>,
         evidence: Hash,
@@ -384,15 +382,17 @@ impl Repository {
 
         // ── Ordinals 0..n: the object creations (absent objects only). ─────
         {
-            let odb = git
-                .odb()
-                .map_err(|error| git_map(format!("cannot open the Git object database: {error}")))?;
+            let odb = git.odb().map_err(|error| {
+                git_map(format!("cannot open the Git object database: {error}"))
+            })?;
             for (object, kind, bytes) in objects {
                 let oid = git_oid_from_object(git, &object)?;
                 if !odb.exists(oid) {
                     effects.push(atomic_core::operation::EffectPlan {
                         ordinal: effects.len() as u32,
-                        target: EffectTarget::GitObject { object: object.clone() },
+                        target: EffectTarget::GitObject {
+                            object: object.clone(),
+                        },
                         expected_old: EffectValue::Absent,
                         expected_new: EffectValue::GitObject(object.clone()),
                     });
@@ -454,13 +454,11 @@ impl Repository {
         // ── The checkpoint publish, when the live facts differ. ────────────
         let mut prepared_checkpoint = None;
         if let Some(plan) = &checkpoint_plan {
-            let view_state = state
-                .view
-                .as_ref()
-                .map(|view| view.state.clone())
-                .ok_or_else(|| RepositoryError::InvalidOperation {
+            let view_state = state.view.as_ref().map(|view| view.state).ok_or_else(|| {
+                RepositoryError::InvalidOperation {
                     message: "projection checkpoint plan requires the view state".to_string(),
-                })?;
+                }
+            })?;
             let checkpoint = prepared_checkpoint_from_plan(
                 &view_name,
                 &view_state,
@@ -543,8 +541,11 @@ impl Repository {
                 .map_err(|error| git_map(format!("cannot retain the object bytes: {error}")))?;
             write_new_synced(&entry.join(RETAINED_VALUE_FILE), bytes)
                 .map_err(|error| git_map(format!("cannot retain the object bytes: {error}")))?;
-            write_new_synced(&entry.join(RETAINED_KIND_FILE), object_kind_name(*kind).as_bytes())
-                .map_err(|error| git_map(format!("cannot retain the object kind: {error}")))?;
+            write_new_synced(
+                &entry.join(RETAINED_KIND_FILE),
+                object_kind_name(*kind).as_bytes(),
+            )
+            .map_err(|error| git_map(format!("cannot retain the object kind: {error}")))?;
         }
         if let Some(checkpoint) = &prepared_checkpoint {
             let Some(effect) = operation
@@ -597,7 +598,6 @@ impl Repository {
         })
     }
 
-
     /// Execute the journaled publication effects under their leases.
     ///
     /// Every planned effect — objects, index, refs, HEAD, and the checkpoint —
@@ -630,38 +630,26 @@ impl Repository {
                 EffectTarget::GitIndex { .. } => Some("ATOMIC_FAIL_PROJECTION_AFTER_INDEX"),
                 EffectTarget::GitRef { .. } => Some("ATOMIC_FAIL_PROJECTION_AFTER_REF"),
                 EffectTarget::GitHead { .. } => Some("ATOMIC_FAIL_PROJECTION_AFTER_HEAD"),
-                EffectTarget::Checkpoint { .. } => {
-                    Some("ATOMIC_FAIL_PROJECTION_AFTER_CHECKPOINT")
-                }
+                EffectTarget::Checkpoint { .. } => Some("ATOMIC_FAIL_PROJECTION_AFTER_CHECKPOINT"),
                 _ => None,
             };
             match &effect.target {
-                EffectTarget::GitObject { object } => self.execute_object_effect(
-                    &prepared.lock,
-                    &operation,
-                    effect,
-                    git,
-                    object,
-                )?,
+                EffectTarget::GitObject { object } => {
+                    self.execute_object_effect(&prepared.lock, &operation, effect, git, object)?
+                }
                 EffectTarget::GitIndex { .. } => {
                     self.execute_index_effect(&prepared.lock, &operation, effect, git)?
                 }
-                EffectTarget::GitRef { name } => self.execute_ref_effect(
-                    &prepared.lock,
-                    &operation,
-                    effect,
-                    git,
-                    name,
-                )?,
+                EffectTarget::GitRef { name } => {
+                    self.execute_ref_effect(&prepared.lock, &operation, effect, git, name)?
+                }
                 EffectTarget::GitHead { .. } => {
                     self.execute_head_effect(&prepared.lock, &operation, effect, git)?
                 }
                 EffectTarget::Checkpoint {
                     kind: atomic_core::operation::CheckpointKind::Bridge,
                     ..
-                } => {
-                    self.execute_checkpoint_effect(&prepared.lock, &operation, effect, git)?
-                }
+                } => self.execute_checkpoint_effect(&prepared.lock, &operation, effect, git)?,
                 other => {
                     return Err(RepositoryError::InvalidOperation {
                         message: format!(
@@ -871,8 +859,10 @@ impl Repository {
         name: &str,
     ) -> Result<(), RepositoryError> {
         let observed = read_ref(git, name)?;
-        let observed_value =
-            observed.clone().map(EffectValue::GitRef).unwrap_or(EffectValue::Absent);
+        let observed_value = observed
+            .clone()
+            .map(EffectValue::GitRef)
+            .unwrap_or(EffectValue::Absent);
         match classify_effect_lease(&observed_value, &effect.expected_old, &effect.expected_new) {
             LeaseClassification::AlreadyApplied | LeaseClassification::Diverged => {
                 // AlreadyApplied → Recovered; Diverged → the external
@@ -919,8 +909,10 @@ impl Repository {
             }
             // Under the lock: the bounded expected-old comparison.
             let current = read_ref(git, name)?;
-            let current_value =
-                current.clone().map(EffectValue::GitRef).unwrap_or(EffectValue::Absent);
+            let current_value = current
+                .clone()
+                .map(EffectValue::GitRef)
+                .unwrap_or(EffectValue::Absent);
             if current_value != effect.expected_old {
                 // Nothing was mutated, so the durable outcome records the
                 // ACTUAL under-lock value as both observed sides — never the
@@ -989,8 +981,10 @@ impl Repository {
         git: &GitRepository,
     ) -> Result<(), RepositoryError> {
         let observed = read_head_target(git)?;
-        let observed_value =
-            observed.clone().map(EffectValue::GitRef).unwrap_or(EffectValue::Absent);
+        let observed_value = observed
+            .clone()
+            .map(EffectValue::GitRef)
+            .unwrap_or(EffectValue::Absent);
         match classify_effect_lease(&observed_value, &effect.expected_old, &effect.expected_new) {
             LeaseClassification::AlreadyApplied | LeaseClassification::Diverged => {
                 self.record_effect_outcome(
@@ -1028,8 +1022,10 @@ impl Repository {
             }
             // Under the lock: the bounded expected-old comparison.
             let current = read_head_target(git)?;
-            let current_value =
-                current.clone().map(EffectValue::GitRef).unwrap_or(EffectValue::Absent);
+            let current_value = current
+                .clone()
+                .map(EffectValue::GitRef)
+                .unwrap_or(EffectValue::Absent);
             if current_value != effect.expected_old {
                 // Nothing was mutated: the durable outcome records the ACTUAL
                 // under-lock value as both observed sides — never the stale
@@ -1110,7 +1106,7 @@ impl Repository {
     ) -> Result<(), RepositoryError> {
         let observed_facts = observe_checkpoint_facts(self.root())?;
         match classify_effect_lease(
-            &checkpoint_value(observed_facts.clone()),
+            &checkpoint_value(observed_facts),
             &effect.expected_old,
             &effect.expected_new,
         ) {
@@ -1133,7 +1129,7 @@ impl Repository {
         // the unified facts encoding shared with prepare (CB-8B ac-3).
         let retained = self.load_retained_checkpoint(lock, operation, effect)?;
         let expected_digest = match &effect.expected_new {
-            EffectValue::Digest { hash, .. } => hash.clone(),
+            EffectValue::Digest { hash, .. } => *hash,
             other => {
                 return Err(RepositoryError::InvalidOperation {
                     message: format!("checkpoint lease expects a digest, found {other:?}"),
@@ -1216,9 +1212,7 @@ fn verify_checkpoint_live_facts(
         atomic_core::operation::GitHeadState::Detached { oid } => oid,
         other => {
             return Err(RepositoryError::InvalidOperation {
-                message: format!(
-                    "checkpoint facts require a resolvable Git HEAD, found {other:?}"
-                ),
+                message: format!("checkpoint facts require a resolvable Git HEAD, found {other:?}"),
             })
         }
     };
@@ -1319,8 +1313,13 @@ fn inject_external_ref_before_lock(git: &GitRepository) -> Result<(), Repository
             let oid: git2::Oid = oid
                 .parse()
                 .map_err(|error| git_map(format!("debug injection oid '{oid}': {error}")))?;
-            git.reference(name, oid, true, "external writer (injected inside the lease window)")
-                .map_err(|error| git_map(format!("debug injection ref '{name}': {error}")))?;
+            git.reference(
+                name,
+                oid,
+                true,
+                "external writer (injected inside the lease window)",
+            )
+            .map_err(|error| git_map(format!("debug injection ref '{name}': {error}")))?;
         }
     }
     #[cfg(not(feature = "adoption-test-injection"))]
@@ -1398,9 +1397,7 @@ impl GitIndexLockGuard {
                     if attempt + 1 == attempts {
                         return Ok(None);
                     }
-                    std::thread::sleep(std::time::Duration::from_millis(
-                        25 * (attempt as u64 + 1),
-                    ));
+                    std::thread::sleep(std::time::Duration::from_millis(25 * (attempt as u64 + 1)));
                 }
                 Err(error) => {
                     return Err(git_map(format!(
@@ -1429,10 +1426,9 @@ fn write_aligned_index(git: &GitRepository, tree_oid: git2::Oid) -> Result<(), R
             "cannot read the aligned projection tree while replacing the index: {error}"
         ))
     })?;
-    let staging = git.path().join(format!(
-        "atomic-index-replace.{}.tmp",
-        std::process::id()
-    ));
+    let staging = git
+        .path()
+        .join(format!("atomic-index-replace.{}.tmp", std::process::id()));
     let result = (|| -> Result<(), RepositoryError> {
         let mut index = git2::Index::open(&staging)
             .map_err(|error| git_map(format!("cannot stage the aligned index: {error}")))?;
@@ -1440,9 +1436,8 @@ fn write_aligned_index(git: &GitRepository, tree_oid: git2::Oid) -> Result<(), R
             .read_tree(&tree)
             .and_then(|()| index.write())
             .map_err(|error| git_map(format!("cannot serialize the aligned index: {error}")))?;
-        fs::rename(&staging, git.path().join("index")).map_err(|error| {
-            git_map(format!("cannot publish the aligned index: {error}"))
-        })
+        fs::rename(&staging, git.path().join("index"))
+            .map_err(|error| git_map(format!("cannot publish the aligned index: {error}")))
     })();
     if result.is_err() {
         let _ = fs::remove_file(&staging);
@@ -1469,8 +1464,10 @@ impl Repository {
         operation: &atomic_core::operation::Operation,
         effect: &atomic_core::operation::EffectPlan,
     ) -> Result<(Vec<u8>, git2::ObjectType), RepositoryError> {
-        let entry =
-            backup_entry_path(&self.projection_recovery_root(lock, operation), effect.ordinal);
+        let entry = backup_entry_path(
+            &self.projection_recovery_root(lock, operation),
+            effect.ordinal,
+        );
         let bytes = fs::read(entry.join(RETAINED_VALUE_FILE)).map_err(|error| {
             RepositoryError::InvalidOperation {
                 message: format!(
@@ -1480,22 +1477,22 @@ impl Repository {
                 ),
             }
         })?;
-        let kind = fs::read_to_string(entry.join(RETAINED_KIND_FILE))
-            .map_err(|error| RepositoryError::InvalidOperation {
+        let kind = fs::read_to_string(entry.join(RETAINED_KIND_FILE)).map_err(|error| {
+            RepositoryError::InvalidOperation {
                 message: format!(
                     "the retained object kind for operation {} effect {} is missing: {error}",
                     operation.id(),
                     effect.ordinal
                 ),
-            })?;
-        let kind = object_kind_of_name(kind.trim()).ok_or_else(|| {
-            RepositoryError::InvalidOperation {
+            }
+        })?;
+        let kind =
+            object_kind_of_name(kind.trim()).ok_or_else(|| RepositoryError::InvalidOperation {
                 message: format!(
                     "the retained object kind '{kind}' is unsupported for operation {}",
                     operation.id()
                 ),
-            }
-        })?;
+            })?;
         Ok((bytes, kind))
     }
 
@@ -1549,11 +1546,10 @@ impl Repository {
                 ),
             }
         })?;
-        let checkpoint =
-            super::workspace_txn::workspace_checkpoint_from_bytes(&bytes)?;
+        let checkpoint = super::workspace_txn::workspace_checkpoint_from_bytes(&bytes)?;
         let digest = checkpoint_facts_digest(&checkpoint)?;
         let expected = match &effect.expected_new {
-            EffectValue::Digest { hash, .. } => hash.clone(),
+            EffectValue::Digest { hash, .. } => *hash,
             other => {
                 return Err(RepositoryError::InvalidOperation {
                     message: format!("checkpoint lease expects a digest, found {other:?}"),

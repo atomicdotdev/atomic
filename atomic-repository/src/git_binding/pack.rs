@@ -111,9 +111,7 @@ pub struct ChangesPackV1 {
 /// Errors from the bounded binding-pack codec.
 #[derive(Debug, thiserror::Error)]
 pub enum BindingPackError {
-    #[error(
-        "binding pack is oversized: {found} bytes exceeds the {limit} byte transport budget"
-    )]
+    #[error("binding pack is oversized: {found} bytes exceeds the {limit} byte transport budget")]
     OversizedPack { limit: usize, found: usize },
     #[error(
         "binding pack inflates past the {limit} byte decompression ceiling (probable zip bomb)"
@@ -166,7 +164,9 @@ pub fn assemble_changes_pack(
 
     // Audited family + content-addressing gates (CB-6A privacy boundary).
     let allowed = binding_pack_records(candidates).map_err(|error| match error {
-        super::privacy::BindingTreeError::HashMismatch { key } => BindingPackError::HashMismatch { key },
+        super::privacy::BindingTreeError::HashMismatch { key } => {
+            BindingPackError::HashMismatch { key }
+        }
         other => BindingPackError::Refused {
             detail: other.to_string(),
         },
@@ -224,15 +224,16 @@ pub fn decode_changes_pack(
     }
 
     // 2. Streaming decompression with a hard output ceiling; 3. version gate.
-    let envelope = decode_with_limit::<ChangesPack>(bytes, limits.max_decompressed_bytes)
-        .map_err(|error| match error {
+    let envelope = decode_with_limit::<ChangesPack>(bytes, limits.max_decompressed_bytes).map_err(
+        |error| match error {
             atomic_objects::SyncError::TooLarge { limit } => {
                 BindingPackError::DecompressedTooLarge { limit }
             }
             other => BindingPackError::UnsupportedVersion {
                 reason: other.to_string(),
             },
-        })?;
+        },
+    )?;
     let ChangesPack::V1(v1) = envelope;
 
     // 4. Object-count gate.
@@ -294,7 +295,7 @@ pub fn decode_changes_pack(
 ///
 /// Quarantine verifies both: the record must be blake3-addressed by its key,
 /// and decoding must succeed (format negotiation fails closed on unsupported
-/// versions). The returned [`Hash`] is the *identity* hash callers index by.
+/// versions). The returned `Hash` is the *identity* hash callers index by.
 /// The privacy boundary (§12.13) is enforced before anything is returned.
 ///
 /// [`binding_pack_records`]: super::privacy::binding_pack_records
@@ -637,8 +638,12 @@ mod tests {
             .message(message)
             .author(Author::new("Test", Some("test@example.com")))
             .build();
-        let mut change =
-            Change::new(header, Vec::new(), format!("{message}\n").into_bytes(), deps);
+        let mut change = Change::new(
+            header,
+            Vec::new(),
+            format!("{message}\n").into_bytes(),
+            deps,
+        );
         change.unhashed = unhashed;
         let mut bytes = Vec::new();
         change
@@ -660,8 +665,8 @@ mod tests {
     fn pack_round_trips_through_the_bounded_envelope() {
         let (a, change_a) = plain_change("alpha");
         let (b, change_b) = plain_change("beta");
-        let bytes = assemble_changes_pack(&[a, b], &BindingPackLimits::default_limits())
-            .expect("assemble");
+        let bytes =
+            assemble_changes_pack(&[a, b], &BindingPackLimits::default_limits()).expect("assemble");
         let records =
             decode_changes_pack(&bytes, &BindingPackLimits::default_limits()).expect("decode");
         let pack = QuarantinedPack::from_records(&records, &BindingPackLimits::default_limits())
@@ -697,7 +702,9 @@ mod tests {
         // before the full output is materialized.
         let data = vec![b'x'; 4096];
         let huge = ObjectRecord::new(ObjectFamily::Change, Hash::of(&data).to_hex(), data);
-        let envelope = ChangesPack::V1(ChangesPackV1 { records: vec![huge] });
+        let envelope = ChangesPack::V1(ChangesPackV1 {
+            records: vec![huge],
+        });
         let bytes = encode(&envelope).unwrap();
         let mut limits = BindingPackLimits::default_limits();
         limits.max_decompressed_bytes = 1024;
@@ -719,8 +726,7 @@ mod tests {
             "a corrupted envelope must fail closed"
         );
         assert!(
-            decode_changes_pack(b"not a zstd frame", &BindingPackLimits::default_limits())
-                .is_err(),
+            decode_changes_pack(b"not a zstd frame", &BindingPackLimits::default_limits()).is_err(),
             "garbage must fail closed"
         );
     }
@@ -753,8 +759,8 @@ mod tests {
         let (a, _) = plain_change("alpha");
         let mut forged = a.clone();
         forged.key = Hash::of(b"other").to_hex();
-        let error = assemble_changes_pack(&[forged], &BindingPackLimits::default_limits())
-            .unwrap_err();
+        let error =
+            assemble_changes_pack(&[forged], &BindingPackLimits::default_limits()).unwrap_err();
         assert!(
             matches!(error, BindingPackError::HashMismatch { .. }),
             "{error}"
@@ -774,7 +780,10 @@ mod tests {
             &BindingPackLimits::default_limits(),
         )
         .unwrap_err();
-        assert!(matches!(error, BindingPackError::InvalidKey { .. }), "{error}");
+        assert!(
+            matches!(error, BindingPackError::InvalidKey { .. }),
+            "{error}"
+        );
         assert!(assemble_changes_pack(&[bad_key], &BindingPackLimits::default_limits()).is_err());
 
         let (c, _) = plain_change("gamma");
@@ -809,8 +818,10 @@ mod tests {
             .author(Author::new("Test", Some("t@e")))
             .build();
         let mut change = Change::new(header, Vec::new(), b"body\n".to_vec(), Vec::new());
-        let mut provenance = atomic_core::change::Provenance::default();
-        provenance.prompt = PromptContent::Full("PROMPT-SENTINEL-CB6B".to_string());
+        let provenance = atomic_core::change::Provenance {
+            prompt: PromptContent::Full("PROMPT-SENTINEL-CB6B".to_string()),
+            ..Default::default()
+        };
         change.add_provenance(provenance);
         let mut bytes = Vec::new();
         change
@@ -819,8 +830,11 @@ mod tests {
         // Pack records are addressed by blake3 of the exact file bytes.
         let record = ObjectRecord::new(ObjectFamily::Change, Hash::of(&bytes).to_hex(), bytes);
 
-        let error = assemble_changes_pack(&[record.clone()], &BindingPackLimits::default_limits())
-            .unwrap_err();
+        let error = assemble_changes_pack(
+            std::slice::from_ref(&record),
+            &BindingPackLimits::default_limits(),
+        )
+        .unwrap_err();
         assert!(
             matches!(error, BindingPackError::PrivateMaterial { .. }),
             "{error}"
@@ -832,9 +846,8 @@ mod tests {
             records: vec![record],
         });
         let bytes = encode(&envelope).unwrap();
-        let records =
-            decode_changes_pack(&bytes, &BindingPackLimits::default_limits())
-                .expect("transport-level gates pass");
+        let records = decode_changes_pack(&bytes, &BindingPackLimits::default_limits())
+            .expect("transport-level gates pass");
         let error = QuarantinedPack::from_records(&records, &BindingPackLimits::default_limits())
             .unwrap_err();
         assert!(
@@ -850,8 +863,8 @@ mod tests {
             Vec::new(),
             Some(serde_json::json!({ "transcript": "TRANSCRIPT-SENTINEL-CB6B" })),
         );
-        let error = assemble_changes_pack(&[record], &BindingPackLimits::default_limits())
-            .unwrap_err();
+        let error =
+            assemble_changes_pack(&[record], &BindingPackLimits::default_limits()).unwrap_err();
         assert!(
             matches!(error, BindingPackError::PrivateMaterial { .. }),
             "{error}"
@@ -909,10 +922,8 @@ mod tests {
         let hash_b = change_b.hash().unwrap();
 
         let payload = closure_payload(vec![hash_a, hash_b]);
-        let pack: HashMap<Hash, Change> = HashMap::from([
-            (hash_a, change_a.clone()),
-            (hash_b, change_b.clone()),
-        ]);
+        let pack: HashMap<Hash, Change> =
+            HashMap::from([(hash_a, change_a.clone()), (hash_b, change_b.clone())]);
         let mut source = |hash: &Hash| Ok(pack.get(hash).cloned());
         let report =
             validate_binding_closure(&payload, &mut source, &BindingPackLimits::default_limits())
@@ -928,15 +939,10 @@ mod tests {
         let (_, change_a) = plain_change("a");
         let hash_a = change_a.hash().unwrap();
         let payload = closure_payload(vec![hash_a]);
-        let mut source = |_hash: &Hash| -> Result<Option<Change>, BindingClosureError> {
-            Ok(None)
-        };
-        let report = validate_binding_closure(
-            &payload,
-            &mut source,
-            &BindingPackLimits::default_limits(),
-        )
-        .expect("incompleteness is an outcome, not an error");
+        let mut source = |_hash: &Hash| -> Result<Option<Change>, BindingClosureError> { Ok(None) };
+        let report =
+            validate_binding_closure(&payload, &mut source, &BindingPackLimits::default_limits())
+                .expect("incompleteness is an outcome, not an error");
         assert!(!report.is_complete());
         assert_eq!(report.missing, vec![hash_a]);
     }
@@ -953,12 +959,9 @@ mod tests {
 
         // Without A available anywhere: explicit incompleteness naming A.
         let mut source = |hash: &Hash| Ok(pack.get(hash).cloned());
-        let report = validate_binding_closure(
-            &payload,
-            &mut source,
-            &BindingPackLimits::default_limits(),
-        )
-        .expect("incompleteness is an outcome");
+        let report =
+            validate_binding_closure(&payload, &mut source, &BindingPackLimits::default_limits())
+                .expect("incompleteness is an outcome");
         assert_eq!(report.missing, vec![hash_a]);
 
         // With A resolvable (e.g. the local store) alongside the packed B:
@@ -974,12 +977,9 @@ mod tests {
                 None
             })
         };
-        let report = validate_binding_closure(
-            &payload,
-            &mut source,
-            &BindingPackLimits::default_limits(),
-        )
-        .expect("external dep available");
+        let report =
+            validate_binding_closure(&payload, &mut source, &BindingPackLimits::default_limits())
+                .expect("external dep available");
         assert!(report.is_complete());
         assert_eq!(report.external_deps, 1);
         let _ = change_b;
@@ -1007,14 +1007,12 @@ mod tests {
         let h3 = Hash::from_bytes([3u8; 32]);
         let h4 = Hash::from_bytes([4u8; 32]);
         // Chain of depth 4 against a budget of 3.
-        let edges = HashMap::from([
-            (h1, vec![h2]),
-            (h2, vec![h3]),
-            (h3, vec![h4]),
-            (h4, vec![]),
-        ]);
+        let edges = HashMap::from([(h1, vec![h2]), (h2, vec![h3]), (h3, vec![h4]), (h4, vec![])]);
         let error = check_depth_and_cycles(&edges, 3).unwrap_err();
-        assert!(matches!(error, BindingClosureError::ClosureTooDeep { .. }), "{error}");
+        assert!(
+            matches!(error, BindingClosureError::ClosureTooDeep { .. }),
+            "{error}"
+        );
         // Within budget it passes.
         assert_eq!(check_depth_and_cycles(&edges, 4).unwrap(), 4);
     }
@@ -1025,8 +1023,7 @@ mod tests {
         let hash_a = change_a.hash().unwrap();
         let mut payload = closure_payload(vec![hash_a]);
         payload.closure_root = Hash::from_bytes([7u8; 32]);
-        let mut absent =
-            |_hash: &Hash| -> Result<Option<Change>, BindingClosureError> { Ok(None) };
+        let mut absent = |_hash: &Hash| -> Result<Option<Change>, BindingClosureError> { Ok(None) };
         let error =
             validate_binding_closure(&payload, &mut absent, &BindingPackLimits::default_limits())
                 .unwrap_err();
@@ -1059,11 +1056,13 @@ mod tests {
         // Duplicate ordered entries are structurally refused by the payload
         // contract before the budget is even consulted.
         let duplicated = closure_payload(vec![hash_a; 2]);
-        let mut absent =
-            |_hash: &Hash| -> Result<Option<Change>, BindingClosureError> { Ok(None) };
-        let error =
-            validate_binding_closure(&duplicated, &mut absent, &BindingPackLimits::default_limits())
-                .unwrap_err();
+        let mut absent = |_hash: &Hash| -> Result<Option<Change>, BindingClosureError> { Ok(None) };
+        let error = validate_binding_closure(
+            &duplicated,
+            &mut absent,
+            &BindingPackLimits::default_limits(),
+        )
+        .unwrap_err();
         assert!(
             matches!(error, BindingClosureError::InvalidBinding(_)),
             "{error}"

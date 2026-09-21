@@ -79,10 +79,11 @@ pub struct PublicationGateConfig {
 impl PublicationGateConfig {
     /// Load the gate configuration from the repository's `.atomic/config.toml`.
     pub fn from_repo(repo: &Repository) -> Result<Self, RepositoryError> {
-        let config = atomic_config::RepoConfig::load(&repo.dot_dir().join("config.toml"))
-            .map_err(|error| RepositoryError::InvalidOperation {
+        let config = atomic_config::RepoConfig::load(&repo.dot_dir().join("config.toml")).map_err(
+            |error| RepositoryError::InvalidOperation {
                 message: error.to_string(),
-            })?;
+            },
+        )?;
         Ok(Self {
             repository_identity: config
                 .author
@@ -371,9 +372,7 @@ fn safe_session_id(session: &str) -> Option<&str> {
 /// The key authenticates evidence; it never decides trust. Sessions whose
 /// state file is absent (resumed elsewhere, or a receiving repository) yield
 /// `None`, which makes their attestations unverifiable — fail closed.
-pub fn local_session_mac_key_provider(
-    repo: &Repository,
-) -> impl Fn(&str) -> Option<String> + '_ {
+pub fn local_session_mac_key_provider(repo: &Repository) -> impl Fn(&str) -> Option<String> + '_ {
     let sessions_dir = repo.dot_dir().join("sessions");
     move |session: &str| {
         let session_id = safe_session_id(session)?;
@@ -435,8 +434,7 @@ impl Repository {
                 .provenance()
                 .iter()
                 .find_map(|prov| prov.session_id.clone());
-            let has_envelope_bytes =
-                SessionEnvelope::is_session_envelope(&change.hashed.metadata);
+            let has_envelope_bytes = SessionEnvelope::is_session_envelope(&change.hashed.metadata);
 
             if provenance_session.is_none() && !has_envelope_bytes {
                 // Unmanaged change: no provenance requirements apply.
@@ -453,15 +451,13 @@ impl Repository {
                         if let Some(envelope_session) = Some(envelope.session_id) {
                             match &session {
                                 Some(existing) if existing != &envelope_session => {
-                                    verdict
-                                        .blocks
-                                        .push(GateBlocker::TamperedSessionEnvelope {
-                                            change: change_b32.clone(),
-                                            reason: format!(
-                                                "envelope session {envelope_session} does not \
+                                    verdict.blocks.push(GateBlocker::TamperedSessionEnvelope {
+                                        change: change_b32.clone(),
+                                        reason: format!(
+                                            "envelope session {envelope_session} does not \
                                                  match provenance session {existing}"
-                                            ),
-                                        });
+                                        ),
+                                    });
                                     continue;
                                 }
                                 Some(_) => {}
@@ -590,9 +586,7 @@ impl Repository {
             // signature, trusted signer. EVERY same-session attestation must
             // verify: a second attestation that fails under the session key
             // is tamper/forgery evidence, never an alternative to trust.
-            let attestations = self
-                .find_attestations_for_change(hash)
-                .unwrap_or_default();
+            let attestations = self.find_attestations_for_change(hash).unwrap_or_default();
             let same_session: Vec<_> = attestations
                 .iter()
                 .filter(|(_, attest)| attest.session_id == session)
@@ -690,13 +684,15 @@ impl Repository {
                             .trust
                             .evaluate(&signer, config.repository_identity.as_deref());
                         if trust != SignerTrust::Trusted {
-                            verdict.blocks.push(GateBlocker::AttestationSignerUntrusted {
-                                change: change_b32.clone(),
-                                session: session.clone(),
-                                attestation: attest_b32,
-                                signer,
-                                verdict: trust_label(trust),
-                            });
+                            verdict
+                                .blocks
+                                .push(GateBlocker::AttestationSignerUntrusted {
+                                    change: change_b32.clone(),
+                                    session: session.clone(),
+                                    attestation: attest_b32,
+                                    signer,
+                                    verdict: trust_label(trust),
+                                });
                         }
                     }
                 }
@@ -737,10 +733,7 @@ impl Repository {
 /// Collect the transitive dependency closure of `roots` (inclusive), loading
 /// change bytes as needed. Used by publication boundaries so that gate
 /// coverage is never limited to selected tips.
-pub fn reachable_closure(
-    repo: &Repository,
-    roots: &[Hash],
-) -> Result<Vec<Hash>, RepositoryError> {
+pub fn reachable_closure(repo: &Repository, roots: &[Hash]) -> Result<Vec<Hash>, RepositoryError> {
     let mut seen: HashSet<Hash> = HashSet::new();
     let mut queue: std::collections::VecDeque<Hash> = roots.iter().copied().collect();
     while let Some(hash) = queue.pop_front() {
@@ -802,7 +795,8 @@ mod tests {
             .message(message)
             .author(Author::new("Test Author", Some("test@example.com")))
             .build();
-        let mut change = atomic_core::change::Change::new(header, Vec::new(), Vec::new(), Vec::new());
+        let mut change =
+            atomic_core::change::Change::new(header, Vec::new(), Vec::new(), Vec::new());
         change.hashed.provenance = vec![provenance];
         let envelope = SessionEnvelope::builder(SESSION, "test-agent")
             .build()
@@ -986,7 +980,11 @@ mod tests {
         let hash = repo.save_change(&change).expect("save");
 
         let verdict = repo
-            .evaluate_publication_gate(&[hash], &config_with_signer("session-mac:sess-gate"), Some(&provider))
+            .evaluate_publication_gate(
+                &[hash],
+                &config_with_signer("session-mac:sess-gate"),
+                Some(&provider),
+            )
             .expect("gate runs");
         assert!(!verdict.allowed());
         assert_eq!(verdict.managed_changes, 1);
@@ -995,7 +993,10 @@ mod tests {
         assert!(kinds.contains(&"ledger"), "{kinds:?}");
         assert!(kinds.contains(&"attestation"), "{kinds:?}");
         // Envelope is present and decodable here — no envelope blocker.
-        assert!(!kinds.contains(&"envelope") && !kinds.contains(&"tampered"), "{kinds:?}");
+        assert!(
+            !kinds.contains(&"envelope") && !kinds.contains(&"tampered"),
+            "{kinds:?}"
+        );
         // Content/provenance separation is stated, not implied.
         assert!(verdict
             .limitations
@@ -1034,7 +1035,11 @@ mod tests {
         let hash = repo.save_change(&change).expect("save");
 
         let verdict = repo
-            .evaluate_publication_gate(&[hash], &config_with_signer("session-mac:sess-gate"), Some(&provider))
+            .evaluate_publication_gate(
+                &[hash],
+                &config_with_signer("session-mac:sess-gate"),
+                Some(&provider),
+            )
             .expect("gate runs");
         assert!(blocker_kinds(&verdict).contains(&"tampered"), "{verdict:?}");
     }
@@ -1055,7 +1060,10 @@ mod tests {
             )
             .expect("gate runs");
         assert!(!verdict.allowed());
-        assert!(blocker_kinds(&verdict).contains(&"unverifiable"), "{verdict:?}");
+        assert!(
+            blocker_kinds(&verdict).contains(&"unverifiable"),
+            "{verdict:?}"
+        );
     }
 
     #[test]
@@ -1074,7 +1082,10 @@ mod tests {
             )
             .expect("gate runs");
         assert!(!verdict.allowed());
-        assert!(blocker_kinds(&verdict).contains(&"unverifiable"), "{verdict:?}");
+        assert!(
+            blocker_kinds(&verdict).contains(&"unverifiable"),
+            "{verdict:?}"
+        );
     }
 
     #[test]
@@ -1102,7 +1113,10 @@ mod tests {
                 Some(&provider),
             )
             .expect("gate runs");
-        assert!(blocker_kinds(&verdict).contains(&"signature"), "{verdict:?}");
+        assert!(
+            blocker_kinds(&verdict).contains(&"signature"),
+            "{verdict:?}"
+        );
     }
 
     #[test]
@@ -1152,8 +1166,7 @@ mod tests {
             "hook bypass produced an unbound commit",
             Vec::<String>::new(),
             "refs/atomic/wip/test",
-            atomic_core::change::session::SessionIncompleteOrigin::
-                UnattributedGitOperation,
+            atomic_core::change::session::SessionIncompleteOrigin::UnattributedGitOperation,
         )
         .with_unbound_commits(vec!["abcdef1234567890".to_string()]);
         repo.mark_session_incomplete(SESSION, None, None, &incomplete)
@@ -1204,7 +1217,10 @@ mod tests {
                 Some(&provider),
             )
             .expect("gate runs");
-        assert!(blocker_kinds(&verdict).contains(&"unexplained"), "{verdict:?}");
+        assert!(
+            blocker_kinds(&verdict).contains(&"unexplained"),
+            "{verdict:?}"
+        );
     }
 
     #[test]
@@ -1220,20 +1236,18 @@ mod tests {
             .message("unmanaged tip with managed dep")
             .author(Author::new("Test Author", Some("test@example.com")))
             .build();
-        let mut tip = atomic_core::change::Change::new(
-            header,
-            Vec::new(),
-            Vec::new(),
-            vec![dep_hash],
-        );
+        let mut tip =
+            atomic_core::change::Change::new(header, Vec::new(), Vec::new(), vec![dep_hash]);
         tip.hashed.metadata = Vec::new();
         let tip_hash = repo.save_change(&tip).expect("save tip");
 
         // Gate only the TIP: the closure must pull in the managed dependency
         // and refuse for it.
-        let closure =
-            reachable_closure(&repo, &[tip_hash]).expect("closure computes");
-        assert!(closure.contains(&dep_hash), "closure includes transitive dep");
+        let closure = reachable_closure(&repo, &[tip_hash]).expect("closure computes");
+        assert!(
+            closure.contains(&dep_hash),
+            "closure includes transitive dep"
+        );
         let verdict = repo
             .evaluate_publication_gate(
                 &closure,
@@ -1264,10 +1278,7 @@ mod tests {
 
         // Shared target: refused before mutation, nothing recorded.
         let error = repo
-            .insert_change(
-                &hash,
-                crate::InsertOptions::default().view("main"),
-            )
+            .insert_change(&hash, crate::InsertOptions::default().view("main"))
             .expect_err("shared insertion must refuse");
         assert!(
             matches!(error, RepositoryError::PublicationGateRefused { .. }),
@@ -1275,9 +1286,8 @@ mod tests {
         );
 
         // Draft target: the gate does not apply; insertion proceeds.
-        let draft = crate::CrossViewInsertOptions::new("main", "gate-draft");
-        repo.create_view("gate-draft")
-            .expect("draft view");
+        let _draft = crate::CrossViewInsertOptions::new("main", "gate-draft");
+        repo.create_view("gate-draft").expect("draft view");
         let outcome = repo.insert_change(&hash, crate::InsertOptions::default().view("gate-draft"));
         assert!(outcome.is_ok(), "draft insertion is not gated: {error:?}");
     }
@@ -1298,7 +1308,7 @@ mod privacy_tests {
         let secret_prompt = "SECRET-PROMPT-CONTENT-do-not-transport";
         let secret_transcript = "SECRET-TRANSCRIPT-BODY";
 
-        let envelope = SessionEnvelope::builder("sess-privacy", "test-agent")
+        let _envelope = SessionEnvelope::builder("sess-privacy", "test-agent")
             .prompt_summary(secret_prompt)
             .build();
         let mut attestation = Attestation::builder(

@@ -340,10 +340,7 @@ mod tests {
         // The publication gate's code is the newest member (appended last,
         // CB-12B); the review-coverage gate's code precedes it.
         assert_eq!(FINDING_CODE.last(), Some(&"PUBLICATION_GATE"));
-        assert_eq!(
-            FINDING_CODE[FINDING_CODE.len() - 2],
-            "UNREVIEWED_CHANGE"
-        );
+        assert_eq!(FINDING_CODE[FINDING_CODE.len() - 2], "UNREVIEWED_CHANGE");
 
         // The new edge and directive names joined their closed registries.
         assert!(is_known_edge("remediates"));

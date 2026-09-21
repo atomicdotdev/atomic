@@ -163,7 +163,7 @@ impl Repository {
     fn open_sandbox_with_mode(
         working_root: &Path,
         canonical: &Path,
-        view: &str,
+        _view: &str,
         read_only: bool,
     ) -> Result<Self, RepositoryError> {
         let working_root = working_root.to_path_buf();
@@ -190,16 +190,15 @@ impl Repository {
         // identity. Read-only opens resolve the canonical repository's
         // registered identity instead of demanding a writable migration;
         // writable opens keep requiring provisioning.
-        let (_working_copy_id, current_view) = match
-            working_copy::load_registered_identity(&pristine, &layout)
-        {
-            Ok(identity) => identity,
-            Err(RepositoryError::WorkingCopyMigrationRequired { .. }) if read_only => {
-                let canonical_layout = working_copy::discover_layout(&canonical_root)?;
-                working_copy::load_registered_identity(&pristine, &canonical_layout)?
-            }
-            Err(error) => return Err(error),
-        };
+        let (_working_copy_id, current_view) =
+            match working_copy::load_registered_identity(&pristine, &layout) {
+                Ok(identity) => identity,
+                Err(RepositoryError::WorkingCopyMigrationRequired { .. }) if read_only => {
+                    let canonical_layout = working_copy::discover_layout(&canonical_root)?;
+                    working_copy::load_registered_identity(&pristine, &canonical_layout)?
+                }
+                Err(error) => return Err(error),
+            };
 
         Ok(Self {
             root: working_root,

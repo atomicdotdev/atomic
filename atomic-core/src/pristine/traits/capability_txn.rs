@@ -24,10 +24,7 @@ pub trait CapabilityTxnT {
 pub trait CapabilityMutTxnT: CapabilityTxnT {
     /// Require `capability`, raising an existing lower requirement. Returns
     /// the durable requirement version after the write.
-    fn put_required_capability(
-        &mut self,
-        capability: RepositoryCapability,
-    ) -> PristineResult<u32>;
+    fn put_required_capability(&mut self, capability: RepositoryCapability) -> PristineResult<u32>;
 
     /// Require exactly `version` for capability `id`, replacing any existing
     /// row. Returns the durable requirement version after the write.
@@ -39,11 +36,7 @@ pub trait CapabilityMutTxnT: CapabilityTxnT {
     /// lowering it during an inverse — instead of silently substituting the
     /// build's maximum supported version for the leased one. Callers that do
     /// not hold such a lease must use [`Self::put_required_capability`].
-    fn put_required_capability_exact(
-        &mut self,
-        id: &str,
-        version: u32,
-    ) -> PristineResult<u32>;
+    fn put_required_capability_exact(&mut self, id: &str, version: u32) -> PristineResult<u32>;
 
     /// Remove the requirement for capability `id`. Returns whether a row was
     /// removed.

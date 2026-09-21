@@ -123,9 +123,9 @@ fn observe_git_index_via_plumbing(
             command.env_remove("GIT_INDEX_FILE");
         }
     }
-    let output = command.output().map_err(|error| ObservationError::GitIndex(
-        format!("cannot run git ls-files: {error}"),
-    ))?;
+    let output = command
+        .output()
+        .map_err(|error| ObservationError::GitIndex(format!("cannot run git ls-files: {error}")))?;
     if !output.status.success() {
         return Err(ObservationError::GitIndex(format!(
             "git ls-files failed: {}",
@@ -147,7 +147,10 @@ fn observe_git_index_via_plumbing(
         };
         let mut parts = meta.splitn(4, ' ');
         let tag = parts.next().unwrap_or("H");
-        let Some(mode) = parts.next().and_then(|mode| u32::from_str_radix(mode, 8).ok()) else {
+        let Some(mode) = parts
+            .next()
+            .and_then(|mode| u32::from_str_radix(mode, 8).ok())
+        else {
             return Err(ObservationError::GitIndex(format!(
                 "cannot parse ls-files mode: {line:?}"
             )));
@@ -168,7 +171,10 @@ fn observe_git_index_via_plumbing(
             intent_to_add: false,
             skip_worktree: tag == "S",
             // git ls-files -t reports assume-unchanged entries in lowercase.
-            assume_unchanged: tag.chars().next().is_some_and(|tag| tag.is_ascii_lowercase()),
+            assume_unchanged: tag
+                .chars()
+                .next()
+                .is_some_and(|tag| tag.is_ascii_lowercase()),
             sparse_directory: mode & 0o170000 == 0o040000,
         });
     }
@@ -176,7 +182,10 @@ fn observe_git_index_via_plumbing(
     // Intent-to-add records intent only; porcelain surfaces it as an
     // unstaged add (`XY` = ` A`). Read-only via --no-optional-locks.
     let mut status_command = Command::new("git");
-    status_command.arg("--no-optional-locks").arg("-C").arg(root);
+    status_command
+        .arg("--no-optional-locks")
+        .arg("-C")
+        .arg(root);
     match index_path {
         Some(path) => {
             status_command.env("GIT_INDEX_FILE", path);
@@ -209,10 +218,7 @@ fn observe_git_index_via_plumbing(
     });
     let tree = compute_index_tree(algorithm, &entries)?;
     // Detect the sparse-directory extension in the observed index file.
-    let index_file = index_path.map_or_else(
-        || repository_path_index(root),
-        Path::to_path_buf,
-    );
+    let index_file = index_path.map_or_else(|| repository_path_index(root), Path::to_path_buf);
     let sparse_index = fs::read(&index_file)
         .map(|bytes| bytes.windows(4).any(|window| window == b"sdir"))
         .unwrap_or(false);
@@ -233,8 +239,11 @@ fn repository_path_index(root: &Path) -> PathBuf {
 }
 
 /// Parse a lowercase hex Git object ID into an algorithm-tagged identity.
-fn parse_git_oid_hex(algorithm: GitHashAlgorithm, hex: &str) -> Result<GitObjectId, ObservationError> {
-    if hex.len() % 2 != 0 {
+fn parse_git_oid_hex(
+    algorithm: GitHashAlgorithm,
+    hex: &str,
+) -> Result<GitObjectId, ObservationError> {
+    if !hex.len().is_multiple_of(2) {
         return Err(ObservationError::GitIndex(format!(
             "odd-length object id: {hex}"
         )));
@@ -250,7 +259,8 @@ fn parse_git_oid_hex(algorithm: GitHashAlgorithm, hex: &str) -> Result<GitObject
             .ok_or_else(|| ObservationError::GitIndex(format!("invalid hex digit in {hex}")))?;
         bytes.push(((high << 4) | low) as u8);
     }
-    GitObjectId::new(algorithm, bytes).map_err(|error| ObservationError::GitIndex(error.to_string()))
+    GitObjectId::new(algorithm, bytes)
+        .map_err(|error| ObservationError::GitIndex(error.to_string()))
 }
 
 pub(super) fn observe_open_git_index(
@@ -385,9 +395,7 @@ fn insert_index_entry(
             }
         }
     }
-    let node = if mode == 0o040000 {
-        IndexNode::Object { mode, oid }
-    } else if matches!(mode, 0o100644 | 0o100755 | 0o120000 | 0o160000) {
+    let node = if mode == 0o040000 || matches!(mode, 0o100644 | 0o100755 | 0o120000 | 0o160000) {
         IndexNode::Object { mode, oid }
     } else {
         return Err(ObservationError::IndexTree(format!(
@@ -839,7 +847,7 @@ impl GitOperationObservation {
     ///
     /// True when libgit2 reports a non-`Clean` repository state, or when any
     /// present marker is authoritative evidence of an active operation
-    /// ([`GitOperationMarker::is_active_operation_evidence`]). A standalone
+    /// (`is_active_operation_evidence`). A standalone
     /// `AUTO_MERGE` does not, by itself, count: it is advisory.
     pub fn is_in_progress(&self) -> bool {
         self.repository_state != "Clean"
@@ -915,7 +923,8 @@ pub(super) fn observe_index_lease(
 }
 
 /// Observe HEAD, index identity, locks, and Git-owned sequence state without mutation.
-pub fn observe_git_metadata(root: &Path) -> Result<WorkspaceGitObservation, ObservationError> {    let git_marker_exists = fs::symlink_metadata(root.join(".git")).is_ok();
+pub fn observe_git_metadata(root: &Path) -> Result<WorkspaceGitObservation, ObservationError> {
+    let git_marker_exists = fs::symlink_metadata(root.join(".git")).is_ok();
     let repository = match git2::Repository::open(root) {
         Ok(repository) => repository,
         Err(error) if error.code() == git2::ErrorCode::NotFound && !git_marker_exists => {
@@ -1316,10 +1325,10 @@ pub fn observe_colocated_git_readiness(root: &Path) -> ColocatedGitReadiness {
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    let head = repository.head().ok().and_then(|head| {
-        head.target()
-            .map(|oid| oid.to_string())
-    });
+    let head = repository
+        .head()
+        .ok()
+        .and_then(|head| head.target().map(|oid| oid.to_string()));
     ColocatedGitReadiness {
         form: ColocatedGitForm::Repository,
         active_hooks,
@@ -1346,9 +1355,11 @@ mod tests {
             assume_unchanged: false,
             sparse_directory: false,
         };
-        assert!(compute_index_tree(GitHashAlgorithm::Sha1, &[base.clone()])
-            .unwrap()
-            .is_none());
+        assert!(
+            compute_index_tree(GitHashAlgorithm::Sha1, std::slice::from_ref(&base))
+                .unwrap()
+                .is_none()
+        );
         let mut intent = base;
         intent.stage = 0;
         intent.intent_to_add = true;

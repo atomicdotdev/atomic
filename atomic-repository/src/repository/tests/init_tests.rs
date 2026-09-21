@@ -62,10 +62,8 @@ fn test_canonical_change_store_path_follows_sandbox_pointer() {
     let repo_root = temp_dir.path().join("repo");
     let sandbox = temp_dir.path().join("agent-sandbox");
     let repo = Repository::init(&repo_root).unwrap();
-    let working_copy = repo
-            .require_working_copy_id()
-            .unwrap();
-        repo.provision_sandbox(working_copy, &sandbox, repo.current_view())
+    let working_copy = repo.require_working_copy_id().unwrap();
+    repo.provision_sandbox(working_copy, &sandbox, repo.current_view())
         .unwrap();
 
     assert_eq!(
@@ -153,10 +151,10 @@ fn test_is_internal_path() {
 /// so the bridge checkpoint verifier can reopen (CB-8A record projection).
 #[test]
 fn test_drop_after_record_releases_the_database_lock() {
-    let (temp_dir, repo) = create_temp_repo();
+    let (_temp_dir, repo) = create_temp_repo();
     let root = repo.root().to_path_buf();
     std::fs::write(root.join("file.txt"), b"content\n").unwrap();
-    repo.add(&root.join("file.txt"), Default::default()).unwrap();
+    repo.add(root.join("file.txt"), Default::default()).unwrap();
     let outcome = repo
         .record_with_message("record then reopen", Default::default())
         .unwrap();
@@ -172,16 +170,18 @@ fn test_drop_after_record_releases_the_database_lock() {
 /// drop, then a fresh writable open (the checkpoint verifier's) must succeed.
 #[test]
 fn test_workspace_record_then_reopen_releases_the_database_lock() {
-    let (temp_dir, repo) = create_temp_repo();
+    let (_temp_dir, repo) = create_temp_repo();
     let root = repo.root().to_path_buf();
     std::fs::write(root.join("file.txt"), b"content\n").unwrap();
-    repo.add(&root.join("file.txt"), Default::default()).unwrap();
+    repo.add(root.join("file.txt"), Default::default()).unwrap();
 
     // Mirror the record command: open_for_workspace_transaction, enter the
     // workspace, record, then drop everything.
     drop(repo);
     let mut repo = Repository::open_for_workspace_transaction(&root).unwrap();
-    let start = repo.begin_workspace_txn(WorkspaceTxnMode::Reconcile).unwrap();
+    let start = repo
+        .begin_workspace_txn(WorkspaceTxnMode::Reconcile)
+        .unwrap();
     let workspace = match start {
         crate::WorkspaceTxnStart::Ready(workspace) => workspace,
         crate::WorkspaceTxnStart::Remediation(_) => panic!("expected ready workspace"),

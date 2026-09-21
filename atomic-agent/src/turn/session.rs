@@ -1163,7 +1163,10 @@ impl SessionStore {
         };
         let bytes = std::fs::read(claim).map_err(|error| AgentError::SessionLoadFailed {
             session_id: session_id.to_string(),
-            reason: format!("cannot read a crashed consumer's watch notice claim: {}", error),
+            reason: format!(
+                "cannot read a crashed consumer's watch notice claim: {}",
+                error
+            ),
         })?;
         let notice: WatchNotice = serde_json::from_slice(&bytes)?;
         if notice.record_type != WATCH_NOTICE_RECORD_TYPE
@@ -1265,14 +1268,21 @@ pub(crate) fn validate_session_id(session_id: &str) -> AgentResult<()> {
     Ok(())
 }
 
+/// Whether a writer pid is still alive (CB-13D ::24 R6): a claim file
+/// whose writer is gone belongs to a crashed consumer and is replayed.
+#[cfg(unix)]
+fn pid_alive(pid: u64) -> bool {
+    std::path::Path::new("/proc").join(pid.to_string()).exists()
+}
+
 // Tests
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::turn::phase::SessionState;
     use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
-    use crate::turn::phase::SessionState;
     use tempfile::TempDir;
 
     fn make_session() -> AgentSession {
@@ -2187,13 +2197,6 @@ mod tests {
         // The pending path is empty after the final drain.
         assert!(!store.watch_notice_path(session_id).exists());
     }
-}
-
-/// Whether a writer pid is still alive (CB-13D ::24 R6): a claim file
-/// whose writer is gone belongs to a crashed consumer and is replayed.
-#[cfg(unix)]
-fn pid_alive(pid: u64) -> bool {
-    std::path::Path::new("/proc").join(pid.to_string()).exists()
 }
 
 #[cfg(not(unix))]

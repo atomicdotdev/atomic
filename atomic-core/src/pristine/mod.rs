@@ -205,15 +205,16 @@ pub use tables::directory_flags;
 pub use tables::*;
 pub use traits::{
     decode_working_copy_record, encode_working_copy_record, BridgeEventCaptureMutTxnT,
-    BridgeEventCaptureTxnT, CapabilityMutTxnT, CapabilityTxnT, CrdtTxnT, EffectiveProjectionClosure,
-    EmbeddingsMutTxnT, EmbeddingsTxnT, FileIndexEntry, FileIndexMetadata, FileIndexV2MutTxnT,
-    FileIndexV2TxnT, GitCommitClosureMutTxnT, GitCommitClosureTxnT, GitShaIndexMutTxnT,
-    GitShaIndexTxnT, GraphTxnT, GraphVisibilityClosure, KgMutTxnT, KgTxnT, MutTxnT,
-    NativeDerivedIndexes, NativeDerivedIndexesMutTxnT, OperationMutTxnT, OperationTxnT,
-    PathClaimMutTxnT, PathClaimTxnT, StoredConflict, StoredConflictKind, TagKind, TagMutTxnT,
-    TagRecord, TagTxnT, TreeTxnT, VaultEntryMeta, VaultMutTxnT, VaultTxnT, VertexExt,
-    ViewMembershipSet, ViewScope, ViewState, ViewTxnT, WorkingCopyMutTxnT, WorkingCopyRecord,
-    WorkingCopyTxnT, WORKING_COPY_RECORD_V1_SIZE, WORKING_COPY_RECORD_VERSION,
+    BridgeEventCaptureTxnT, CapabilityMutTxnT, CapabilityTxnT, CrdtTxnT,
+    EffectiveProjectionClosure, EmbeddingsMutTxnT, EmbeddingsTxnT, FileIndexEntry,
+    FileIndexMetadata, FileIndexV2MutTxnT, FileIndexV2TxnT, GitCommitClosureMutTxnT,
+    GitCommitClosureTxnT, GitShaIndexMutTxnT, GitShaIndexTxnT, GraphTxnT, GraphVisibilityClosure,
+    KgMutTxnT, KgTxnT, MutTxnT, NativeDerivedIndexes, NativeDerivedIndexesMutTxnT,
+    OperationMutTxnT, OperationTxnT, PathClaimMutTxnT, PathClaimTxnT, StoredConflict,
+    StoredConflictKind, TagKind, TagMutTxnT, TagRecord, TagTxnT, TreeTxnT, VaultEntryMeta,
+    VaultMutTxnT, VaultTxnT, VertexExt, ViewMembershipSet, ViewScope, ViewState, ViewTxnT,
+    WorkingCopyMutTxnT, WorkingCopyRecord, WorkingCopyTxnT, WORKING_COPY_RECORD_V1_SIZE,
+    WORKING_COPY_RECORD_VERSION,
 };
 pub use txn::{AdjIterator, CachedGraphTxn, InodePreloadTxn, Pristine, ReadTxn, WriteTxn};
 pub use vault::{

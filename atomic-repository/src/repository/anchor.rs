@@ -184,6 +184,7 @@ pub enum AdoptBoundHead {
 }
 
 /// The head → view mapping decision for one adoption.
+#[allow(dead_code)] // parent is parsed for future multi-level policy
 struct HeadTarget {
     view: String,
     ephemeral: bool,
@@ -576,9 +577,12 @@ impl Repository {
         changes_pack: &[u8],
     ) -> Result<BridgeAnchorOutcome, BridgeAnchorError> {
         if changes_pack.is_empty() {
-            return Err(BridgeAnchorError::Repository(RepositoryError::InvalidOperation {
-                message: "an empty changes.pack cannot be published; omit it instead".to_string(),
-            }));
+            return Err(BridgeAnchorError::Repository(
+                RepositoryError::InvalidOperation {
+                    message: "an empty changes.pack cannot be published; omit it instead"
+                        .to_string(),
+                },
+            ));
         }
         self.enable_bridge_anchor_inner(git, signer, Some(changes_pack))
     }
@@ -1682,7 +1686,6 @@ fn branch_is_newly_created(git: &GitRepository, branch: &str) -> bool {
     reflog
         .iter()
         .next()
-        .and_then(|entry| Some(entry))
         .and_then(|entry| entry.message().map(str::to_string))
         .is_some_and(|message| {
             let message = message.trim();

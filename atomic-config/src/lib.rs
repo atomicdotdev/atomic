@@ -413,7 +413,9 @@ where
     match value {
         serde_json::Value::Array(entries) => entries
             .into_iter()
-            .map(|entry| serde_json::from_value::<RemoteConfig>(entry).map_err(serde::de::Error::custom))
+            .map(|entry| {
+                serde_json::from_value::<RemoteConfig>(entry).map_err(serde::de::Error::custom)
+            })
             .collect(),
         serde_json::Value::Object(map) => {
             let mut remotes = Vec::new();
@@ -537,7 +539,7 @@ pub struct GitConfig {
 /// [git.bridge]
 /// enabled = true   # explicit per-repository opt-in; default false
 /// ```
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct GitBridgeConfig {
     /// Explicit opt-in for bridge workflows on this repository. Defaults
     /// to `false`; the bridge is never enabled by configuration alone.
@@ -549,15 +551,6 @@ pub struct GitBridgeConfig {
     /// as fully disabled.
     #[serde(default)]
     pub watch: BridgeWatchConfig,
-}
-
-impl Default for GitBridgeConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            watch: BridgeWatchConfig::default(),
-        }
-    }
 }
 
 /// Configuration for the optional metadata-only bridge watch daemon
@@ -831,7 +824,10 @@ mod trust_evaluation_tests {
             signer.evaluate("did:atomic:STRANGER", Some(repo_did)),
             SignerTrust::Unknown
         );
-        assert_eq!(signer.evaluate("did:atomic:STRANGER", None), SignerTrust::Unknown);
+        assert_eq!(
+            signer.evaluate("did:atomic:STRANGER", None),
+            SignerTrust::Unknown
+        );
 
         // Configured collaborator → trusted.
         assert_eq!(
@@ -868,7 +864,10 @@ mod trust_evaluation_tests {
             empty.evaluate(repo_did, Some(repo_did)),
             SignerTrust::Trusted
         );
-        assert_eq!(empty.evaluate("did:atomic:STRANGER", Some(repo_did)), SignerTrust::Unknown);
+        assert_eq!(
+            empty.evaluate("did:atomic:STRANGER", Some(repo_did)),
+            SignerTrust::Unknown
+        );
     }
 }
 
@@ -1059,10 +1058,7 @@ impl RepoConfig {
     /// a half-written consent state behind.
     pub fn save(&self, path: &std::path::Path) -> Result<(), ConfigError> {
         let content = toml::to_string_pretty(self)?;
-        let temporary = path.with_extension(format!(
-            "toml.tmp.{}",
-            std::process::id()
-        ));
+        let temporary = path.with_extension(format!("toml.tmp.{}", std::process::id()));
         {
             use std::io::Write;
             let mut file = std::fs::OpenOptions::new()

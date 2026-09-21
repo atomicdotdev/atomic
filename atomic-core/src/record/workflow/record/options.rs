@@ -154,13 +154,11 @@ impl RecordingOptions {
     /// let options = RecordingOptions::new().max_file_size(1024 * 1024);
     /// assert_eq!(options.get_max_file_size(), Some(1024 * 1024));
     /// ```
-    #[must_use]
     /// Remove the file-size cap entirely (no size refusal).
     ///
     /// The Git import path uses this: imported blobs are content-addressed
     /// and routed to opaque trunks, so the local-record safety cap must not
     /// refuse a large tracked binary (CB-9C 500 MB opaque corpus).
-    #[must_use]
     pub fn unlimited_file_size(mut self) -> Self {
         self.max_file_size = None;
         self

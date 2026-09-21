@@ -48,7 +48,6 @@
 //! telemetry (no fsync); it is not the durable operation/receipt journal
 //! and must not be presented as audit-retention or recovery authority.
 
-
 use super::{Repository, RepositoryError};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::OpenOptionsExt;
@@ -57,7 +56,6 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use fs2::FileExt;
 use serde::Serialize;
-
 
 /// Hard cap on the event journal. Past this bound new events are dropped
 /// instead of silently growing an unbounded file.
@@ -153,11 +151,7 @@ impl HexBindingId {
     }
 }
 
-fn valid_fixed_id(
-    raw: &str,
-    length: usize,
-    character_ok: &dyn Fn(char) -> bool,
-) -> Option<String> {
+fn valid_fixed_id(raw: &str, length: usize, character_ok: &dyn Fn(char) -> bool) -> Option<String> {
     if raw.len() != length || !raw.chars().all(|c| c.is_ascii() && character_ok(c)) {
         return None;
     }
@@ -165,14 +159,11 @@ fn valid_fixed_id(
 }
 
 fn crockford_char(character: char) -> bool {
-    character.is_ascii_digit()
-        || (character.is_ascii_uppercase()
-            && !"ILOU".contains(character))
+    character.is_ascii_digit() || (character.is_ascii_uppercase() && !"ILOU".contains(character))
 }
 
 fn base32_char(character: char) -> bool {
-    character.is_ascii_digit() && ('2'..='7').contains(&character)
-        || character.is_ascii_uppercase()
+    character.is_ascii_digit() && ('2'..='7').contains(&character) || character.is_ascii_uppercase()
 }
 
 /// Direction a reconcile run was classified into (closed code set).
@@ -711,7 +702,7 @@ impl BridgeEventJournal {
             .require_working_copy_id()
             .ok()
             .and_then(|id| UlidId::new(&id.to_string()));
-        Self::for_dot_dir(&repository.dot_dir(), working_copy)
+        Self::for_dot_dir(repository.dot_dir(), working_copy)
     }
 
     /// Consent-gated journal for a dot directory without a repository
@@ -783,7 +774,6 @@ impl BridgeEventJournal {
         self.open_anchored_ancestors()?;
         let mut file = std::fs::OpenOptions::new()
             .read(true)
-            .write(true)
             .create(true)
             .append(true)
             .custom_flags(OPEN_NO_FOLLOW | OPEN_NONBLOCK)
@@ -834,21 +824,18 @@ impl BridgeEventJournal {
     /// missing component is created with single-level `create_dir` and
     /// re-verified no-follow.
     fn open_anchored_ancestors(&self) -> Result<(), std::io::Error> {
-        let parent = self
-            .path
-            .parent()
-            .ok_or_else(|| std::io::Error::new(
+        let parent = self.path.parent().ok_or_else(|| {
+            std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "event journal path has no parent",
-            ))?;
-        let relative = parent
-            .strip_prefix(&self.dot_dir)
-            .map_err(|_| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "event journal path escapes the anchor dot directory",
-                )
-            })?;
+            )
+        })?;
+        let relative = parent.strip_prefix(&self.dot_dir).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "event journal path escapes the anchor dot directory",
+            )
+        })?;
         let mut prefix = self.dot_dir.to_path_buf();
         open_dir_no_follow(&prefix)?;
         for component in relative.components() {
@@ -867,11 +854,7 @@ impl BridgeEventJournal {
 
     /// Cap reservation, partial-tail repair and the single-record append.
     /// Caller holds the exclusive append lock.
-    fn append_locked(
-        &self,
-        file: &mut std::fs::File,
-        record: &[u8],
-    ) -> Result<(), std::io::Error> {
+    fn append_locked(&self, file: &mut std::fs::File, record: &[u8]) -> Result<(), std::io::Error> {
         let length = file.metadata()?.len();
         if length > 0 {
             let mut last = [0u8; 1];
@@ -983,12 +966,11 @@ impl Repository {
     ) -> Result<bool, RepositoryError> {
         let common = self.try_lock_common_operation()?;
         let config_path = self.dot_dir().join("config.toml");
-        let mut config =
-            atomic_config::RepoConfig::load(&config_path).map_err(|error| {
-                RepositoryError::InvalidRepository {
-                    reason: format!("cannot load the repository configuration: {error}"),
-                }
-            })?;
+        let mut config = atomic_config::RepoConfig::load(&config_path).map_err(|error| {
+            RepositoryError::InvalidRepository {
+                reason: format!("cannot load the repository configuration: {error}"),
+            }
+        })?;
         if let Some(expected) = expected_old {
             if config.git.bridge.enabled != expected {
                 return Err(RepositoryError::InvalidOperation {
@@ -1030,7 +1012,10 @@ fn open_dir_no_follow(path: &Path) -> Result<(), std::io::Error> {
     if !file.metadata()?.is_dir() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
-            format!("event journal ancestor '{}' is not a directory", path.display()),
+            format!(
+                "event journal ancestor '{}' is not a directory",
+                path.display()
+            ),
         ));
     }
     Ok(())
@@ -1048,7 +1033,10 @@ fn open_dir_no_follow(path: &Path) -> Result<(), std::io::Error> {
     if !metadata.is_dir() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
-            format!("event journal ancestor '{}' is not a directory", path.display()),
+            format!(
+                "event journal ancestor '{}' is not a directory",
+                path.display()
+            ),
         ));
     }
     Ok(())
@@ -1075,8 +1063,6 @@ fn now_timestamp_ms() -> u64 {
 mod tests {
     use super::*;
     use crate::repository::DOT_DIR;
-    
-use crate::RepositoryError;
 
     /// 64 lowercase hex characters — the real `BindingId::to_hex()` width.
     const BINDING_HEX: &str = "eea50ca11b98918aef4672da8179eb718f562585000000000000000000000000";
@@ -1091,7 +1077,6 @@ use crate::RepositoryError;
         );
         (directory, journal)
     }
-
 
     // ── CB-13C F1 regressions ───────────────────────────────────────────
 
@@ -1128,8 +1113,7 @@ use crate::RepositoryError;
         let _ = emitted;
         // And the journal file must not exist inside the external target.
         assert!(
-            !external.join("git-events.jsonl").exists()
-                || after == payload,
+            !external.join("git-events.jsonl").exists() || after == payload,
             "the external target must not gain or lose content"
         );
     }
@@ -1141,7 +1125,13 @@ use crate::RepositoryError;
     #[test]
     fn short_foreign_non_newline_tail_is_never_erased() {
         let directory = tempfile::tempdir().unwrap();
-        let (dot_dir, journal) = { let d = directory.path().join(DOT_DIR); std::fs::create_dir_all(&d).unwrap(); let j = BridgeEventJournal::new(&d, None); std::fs::create_dir_all(j.path().parent().unwrap()).unwrap(); (d, j) };
+        let (dot_dir, journal) = {
+            let d = directory.path().join(DOT_DIR);
+            std::fs::create_dir_all(&d).unwrap();
+            let j = BridgeEventJournal::new(&d, None);
+            std::fs::create_dir_all(j.path().parent().unwrap()).unwrap();
+            (d, j)
+        };
         let journal_path = journal.path().to_path_buf();
         let payload = b"totally foreign short content no newline";
         std::fs::write(&journal_path, payload).unwrap();
@@ -1161,7 +1151,7 @@ use crate::RepositoryError;
     /// event appends cleanly.
     #[test]
     fn owned_crash_fragment_is_repaired_and_the_event_appends() {
-        let directory = tempfile::tempdir().unwrap();
+        let _directory = tempfile::tempdir().unwrap();
         let (_dir, journal) = journal();
         std::fs::create_dir_all(journal.path().parent().unwrap()).unwrap();
         let journal_path = journal.path().to_path_buf();
@@ -1187,7 +1177,6 @@ use crate::RepositoryError;
         }
     }
 
-
     /// CB-13C F2: consent withdrawal under a held common lock refuses
     /// (typed contention) instead of rewriting the file outside the lock.
     /// Failing before (record_bridge_opt_in truncated the file without
@@ -1197,7 +1186,7 @@ use crate::RepositoryError;
         let directory = tempfile::tempdir().unwrap();
         let repo = Repository::init(directory.path()).unwrap();
         repo.set_bridge_consent(true, None).unwrap();
-        assert!(bridge_opted_in(&repo.dot_dir()));
+        assert!(bridge_opted_in(repo.dot_dir()));
 
         // Hold the common operation lock; the transition must refuse.
         let _holder = repo.try_lock_common_operation().unwrap();
@@ -1207,7 +1196,7 @@ use crate::RepositoryError;
             "{error}"
         );
         // The consent is unchanged.
-        assert!(bridge_opted_in(&repo.dot_dir()));
+        assert!(bridge_opted_in(repo.dot_dir()));
     }
 
     /// CB-13C F2: a previously enabled automatic sink performs no further
@@ -1225,7 +1214,9 @@ use crate::RepositoryError;
         assert!(!after_first.is_empty());
 
         repo.set_bridge_consent(false, Some(true)).unwrap();
-        journal.emit(reconcile()).expect("withdrawn consent drops silently");
+        journal
+            .emit(reconcile())
+            .expect("withdrawn consent drops silently");
         let after_second = std::fs::read(journal.path()).unwrap();
         assert_eq!(
             after_first, after_second,
@@ -1313,9 +1304,9 @@ use crate::RepositoryError;
                 merges: 2,
                 self_push_skipped: 0,
                 squash_inserted: 0,
-            resurrected_exact: 0,
-            correlation_id: "test".to_string(),
-            failed_after_landed: None,
+                resurrected_exact: 0,
+                correlation_id: "test".to_string(),
+                failed_after_landed: None,
             },
         ];
 
@@ -1341,16 +1332,12 @@ use crate::RepositoryError;
                 match value {
                     serde_json::Value::String(text) => {
                         assert!(
-                            !text.contains(' ')
-                                && !text.contains('\n')
-                                && text.is_ascii(),
+                            !text.contains(' ') && !text.contains('\n') && text.is_ascii(),
                             "free-form leaf string leaked into telemetry: {text:?}"
                         );
                     }
                     serde_json::Value::Array(items) => items.iter().for_each(walk),
-                    serde_json::Value::Object(fields) => {
-                        fields.values().for_each(walk)
-                    }
+                    serde_json::Value::Object(fields) => fields.values().for_each(walk),
                     _ => {}
                 }
             }
@@ -1400,7 +1387,7 @@ use crate::RepositoryError;
             // The serialized record is bounded by construction.
             let line = serde_json::to_string(&event).unwrap();
             assert!(
-                line.len() + 1 <= MAX_BRIDGE_EVENT_RECORD_BYTES,
+                line.len() < MAX_BRIDGE_EVENT_RECORD_BYTES,
                 "every valid record fits the record bound"
             );
         }
@@ -1417,9 +1404,9 @@ use crate::RepositoryError;
             "SECRET SENTINEL",
             "no-space-token",
             "",
-            "01ARZ3NDEKTSV4RRFFQ69G5FA", // 25 chars
+            "01ARZ3NDEKTSV4RRFFQ69G5FA",   // 25 chars
             "01ARZ3NDEKTSV4RRFFQ69G5FAVV", // 27 chars
-            "01ARZ3NDEKTSV4RRFFQ69G5FAI", // invalid Crockford char I
+            "01ARZ3NDEKTSV4RRFFQ69G5FAI",  // invalid Crockford char I
         ];
         for sentinel in &sentinels {
             assert!(UlidId::new(sentinel).is_none(), "{sentinel:?} accepted");
@@ -1433,14 +1420,20 @@ use crate::RepositoryError;
             "PRIVATE PROMPT SENTINEL",
             "short",
             "5DKNRTR6VBJVGA6K2JTNL2RJJKQITXPWQAX4HT2J2JTSIOKE727Q0", // 53 chars
-            "5dknrtr6vbjvga6k2jtnl2rjjkqitxpwqax4ht2j2jflhvplwmq",    // lowercase
+            "5dknrtr6vbjvga6k2jtnl2rjjkqitxpwqax4ht2j2jflhvplwmq",   // lowercase
         ];
         for sentinel in &op_sentinels {
             assert!(OpIdRef::new(sentinel).is_none(), "{sentinel:?} accepted");
         }
         assert!(OpIdRef::new("5DKNRTR6VBJVGA6K2JTNL2RJJKQITXPWQAX4HT2J2JTSIOKE727Q").is_some());
 
-        for sentinel in &["SECRET", "EEA50CA11B98918AEF4672DA8179EB718F562585000000000000000000000000", BINDING_HEX.to_uppercase().as_str(), "zz", ""] {
+        for sentinel in &[
+            "SECRET",
+            "EEA50CA11B98918AEF4672DA8179EB718F562585000000000000000000000000",
+            BINDING_HEX.to_uppercase().as_str(),
+            "zz",
+            "",
+        ] {
             assert!(
                 HexBindingId::new(sentinel).is_none(),
                 "{sentinel:?} accepted"
@@ -1611,8 +1604,11 @@ use crate::RepositoryError;
     fn journal_drops_events_past_retention_bound() {
         let (directory, journal) = journal();
         std::fs::create_dir_all(journal.path().parent().unwrap()).unwrap();
-        std::fs::write(journal.path(), vec![b'x'; MAX_BRIDGE_EVENT_JOURNAL_BYTES as usize])
-            .unwrap();
+        std::fs::write(
+            journal.path(),
+            vec![b'x'; MAX_BRIDGE_EVENT_JOURNAL_BYTES as usize],
+        )
+        .unwrap();
         let before = std::fs::read(journal.path()).unwrap();
 
         journal
@@ -1652,8 +1648,7 @@ use crate::RepositoryError;
         .unwrap();
         journal.emit(reconcile()).unwrap();
         assert!(
-            std::fs::metadata(journal.path()).unwrap().len()
-                <= MAX_BRIDGE_EVENT_JOURNAL_BYTES,
+            std::fs::metadata(journal.path()).unwrap().len() <= MAX_BRIDGE_EVENT_JOURNAL_BYTES,
             "the file never grows past the cap"
         );
 
@@ -1704,7 +1699,11 @@ use crate::RepositoryError;
         let bytes = std::fs::read(journal.path()).unwrap();
         let text = std::str::from_utf8(&bytes).unwrap();
         let lines: Vec<&str> = text.lines().collect();
-        assert_eq!(lines.first().unwrap(), &"{\"a\":1}", "complete history retained");
+        assert_eq!(
+            lines.first().unwrap(),
+            &"{\"a\":1}",
+            "complete history retained"
+        );
         for line in &lines[1..] {
             serde_json::from_str::<serde_json::Value>(line)
                 .unwrap_or_else(|error| panic!("line '{line}' is not JSON: {error}"));
@@ -1851,7 +1850,10 @@ use crate::RepositoryError;
         .unwrap();
         let consented = BridgeEventJournal::for_dot_dir(&dot_dir, None);
         assert!(consented.emit(reconcile()).is_ok());
-        assert!(consented.path().exists(), "explicit opt-in enables the sink");
+        assert!(
+            consented.path().exists(),
+            "explicit opt-in enables the sink"
+        );
         drop(directory);
     }
 }

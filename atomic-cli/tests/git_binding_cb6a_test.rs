@@ -13,7 +13,6 @@ use std::path::Path;
 use std::process::{Command, Output};
 
 use atomic_core::change::attestation::{AttestAgent, Attestation};
-use atomic_core::change::ProvenanceGraph;
 use atomic_core::change::{PromptContent, Provenance};
 use atomic_identity::keypair::{KeyPair, SecretKey};
 use tempfile::TempDir;
@@ -234,10 +233,12 @@ fn packed_git_objects_contain_no_private_sentinels() {
     const ATTESTATION_SENTINEL: &str = "ATTESTATION-NOTES-SENTINEL-CB6A-51de";
     let repo = atomic_repository::Repository::open(&root).expect("open atomic");
 
-    let mut provenance = Provenance::default();
-    provenance.vendor = atomic_core::change::AIVendor::Anthropic;
-    provenance.model = "claude-sonnet-4-5".to_string();
-    provenance.prompt = PromptContent::Full(PROMPT_SENTINEL.to_string());
+    let provenance = Provenance {
+        vendor: atomic_core::change::AIVendor::Anthropic,
+        model: "claude-sonnet-4-5".to_string(),
+        prompt: PromptContent::Full(PROMPT_SENTINEL.to_string()),
+        ..Default::default()
+    };
     let mut change = repo
         .load_change(&latest_change_hash(&repo))
         .expect("load recorded change");

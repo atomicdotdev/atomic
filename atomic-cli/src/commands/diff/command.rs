@@ -424,6 +424,7 @@ impl Diff {
 fn collect_baseline_blobs(
     repository: &git2::Repository,
     tree: &git2::Tree<'_>,
+    #[allow(clippy::ptr_arg)] // recursive tree walker shares the Vec
     prefix: &mut Vec<u8>,
     output: &mut std::collections::BTreeMap<String, (Vec<u8>, u32)>,
 ) -> CliResult<()> {
@@ -529,12 +530,11 @@ impl Command for Diff {
         // Open the repository and retain its stable workspace boundary for all diff work.
         let mode = self.workspace_mode();
         let mut repo = match mode {
-            WorkspaceTxnMode::Observe => {
-                crate::commands::open_readonly_repository(&repo_root)
-            }
-            WorkspaceTxnMode::Reconcile => {
-                Repository::open_for_workspace_transaction_wait(&repo_root, std::time::Duration::from_secs(10))
-            }
+            WorkspaceTxnMode::Observe => crate::commands::open_readonly_repository(&repo_root),
+            WorkspaceTxnMode::Reconcile => Repository::open_for_workspace_transaction_wait(
+                &repo_root,
+                std::time::Duration::from_secs(10),
+            ),
             WorkspaceTxnMode::Force => unreachable!("diff never forces workspace entry"),
         }
         .map_err(|e| CliError::InvalidRepository {

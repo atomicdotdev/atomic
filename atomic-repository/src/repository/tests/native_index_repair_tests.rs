@@ -772,11 +772,9 @@ fn targeted_path_claim_repair_refuses_stale_event_on_derived_path() {
     let repo = Repository::open_readonly_for_native_repair(temp.path()).unwrap();
     let report = repo.verify_native_derived_indexes().unwrap();
     assert!(
-        report
-            .problems
-            .iter()
-            .any(|problem| problem.index == NativeIndex::PathClaims
-                && problem.key.contains("f.txt")),
+        report.problems.iter().any(
+            |problem| problem.index == NativeIndex::PathClaims && problem.key.contains("f.txt")
+        ),
         "doctor must report the stale event, problems: {:?}",
         report.problems
     );
@@ -853,11 +851,9 @@ fn targeted_path_claim_repair_inserts_missing_rows_idempotently() {
     let repo = Repository::open_for_native_repair(temp.path()).unwrap();
     let report = repo.verify_native_derived_indexes().unwrap();
     assert!(
-        report
-            .problems
-            .iter()
-            .any(|problem| problem.index == NativeIndex::PathClaims
-                && problem.key.contains("a.txt")),
+        report.problems.iter().any(
+            |problem| problem.index == NativeIndex::PathClaims && problem.key.contains("a.txt")
+        ),
         "doctor must report the missing claims, problems: {:?}",
         report.problems
     );
@@ -1002,7 +998,10 @@ fn path_claims_repair_journals_reconstructible_inverse_and_undo_restores_it() {
     // restores the exact before-state (the claim row is gone again).
     drop(repo);
     let repo = Repository::open(temp.path()).unwrap();
-    let undo = repo.undo_last_path_claims_repair().unwrap().expect("the undo runs");
+    let undo = repo
+        .undo_last_path_claims_repair()
+        .unwrap()
+        .expect("the undo runs");
     assert!(!undo.already_healthy);
     assert!(undo.rows_written >= 1);
     drop(repo);
@@ -1029,6 +1028,10 @@ fn path_claims_repair_journals_reconstructible_inverse_and_undo_restores_it() {
     let healed = repo.repair_path_claims_index().unwrap();
     assert!(!healed.already_healthy);
     let healthy_again = repo.verify_native_derived_indexes().unwrap();
-    assert!(healthy_again.is_healthy(), "re-healed: {:?}", healthy_again.problems);
+    assert!(
+        healthy_again.is_healthy(),
+        "re-healed: {:?}",
+        healthy_again.problems
+    );
     assert!(repo.has_change(&recorded.hash().clone()));
 }

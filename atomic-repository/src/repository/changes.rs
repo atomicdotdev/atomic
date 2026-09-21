@@ -730,7 +730,13 @@ impl Repository {
             .write_txn()
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
         let attached = txn
-            .attach_turn_boundary(session_id, provenance_hash, boundary_start, boundary_end, outcome)
+            .attach_turn_boundary(
+                session_id,
+                provenance_hash,
+                boundary_start,
+                boundary_end,
+                outcome,
+            )
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
         txn.commit()
             .map_err(|e| RepositoryError::Database(e.to_string()))?;

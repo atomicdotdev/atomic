@@ -425,16 +425,15 @@ pub(crate) fn tagged_oid_hex(oid: &atomic_core::operation::GitObjectId) -> Strin
 pub(crate) fn tagged_oid_from_hex(hex: &str) -> Option<atomic_core::operation::GitObjectId> {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let decode = |nibble: u8| -> Option<u8> {
-        let value = HEX.iter().position(|candidate| candidate.eq_ignore_ascii_case(&nibble))?;
+        let value = HEX
+            .iter()
+            .position(|candidate| candidate.eq_ignore_ascii_case(&nibble))?;
         Some(value as u8)
     };
     let bytes: Vec<u8> = (0..hex.len())
         .step_by(2)
         .map(|offset| {
-            Some(
-                decode(hex.as_bytes()[offset])? * 16
-                    + decode(hex.as_bytes()[offset + 1])?,
-            )
+            Some(decode(hex.as_bytes()[offset])? * 16 + decode(hex.as_bytes()[offset + 1])?)
         })
         .collect::<Option<Vec<u8>>>()?;
     let algorithm = match bytes.len() {
@@ -794,7 +793,10 @@ impl ClosureLedger {
             .git_commit_closure(sha)
             .map_err(|e| CliError::Internal(e.into()))?
         {
-            trace_git_import(format!("closure {sha}: persisted {} hash(es)", persisted.len()));
+            trace_git_import(format!(
+                "closure {sha}: persisted {} hash(es)",
+                persisted.len()
+            ));
             closure.extend(persisted);
         } else if let Some(hash) = repo
             .checked_git_sha(sha)
@@ -841,11 +843,7 @@ impl ClosureLedger {
                     .map_err(|e| CliError::Internal(e.into()))?,
             );
         }
-        Ok(self
-            .member_origins
-            .as_ref()
-            .expect("loaded above")
-            .clone())
+        Ok(self.member_origins.as_ref().expect("loaded above").clone())
     }
 
     /// Changes in `target_view` (full ancestor chain included) that are NOT
@@ -1004,7 +1002,9 @@ impl ProspectiveImportPlan {
 
     /// The last verified commit's RAW Git tree OID (HEAD-stability anchor).
     pub(crate) fn raw_git_tree(&self) -> Option<GitObjectId> {
-        self.commits.last().map(|commit| commit.raw_tree_oid.clone())
+        self.commits
+            .last()
+            .map(|commit| commit.raw_tree_oid.clone())
     }
 
     pub(crate) fn changed_paths(&self) -> Vec<PathBuf> {
@@ -1107,13 +1107,10 @@ pub(crate) fn import_expected_tree_oid(
                     entries.push((
                         name,
                         entry.filemode() as u32,
-                        GitObjectId::new(
-                            policy.object_format,
-                            entry.id().as_bytes().to_vec(),
-                        )
-                        .map_err(|error| {
-                            git_error(format!("Git tree entry OID is invalid: {error}"))
-                        })?,
+                        GitObjectId::new(policy.object_format, entry.id().as_bytes().to_vec())
+                            .map_err(|error| {
+                                git_error(format!("Git tree entry OID is invalid: {error}"))
+                            })?,
                         false,
                     ));
                 }
@@ -1138,13 +1135,19 @@ pub(crate) fn import_expected_tree_oid(
         });
         let mut bytes = Vec::new();
         for (name, mode, oid, is_tree) in &entries {
-            bytes.extend_from_slice(format!("{mode:o} ", mode = if *is_tree { 0o040000 } else { *mode }).as_bytes());
+            bytes.extend_from_slice(
+                format!("{mode:o} ", mode = if *is_tree { 0o040000 } else { *mode }).as_bytes(),
+            );
             bytes.extend_from_slice(name);
             bytes.push(0);
             bytes.extend_from_slice(oid.as_bytes());
         }
         let oid = objects
-            .insert(policy.object_format, atomic_repository::repository::GitObjectKind::Tree, bytes)
+            .insert(
+                policy.object_format,
+                atomic_repository::repository::GitObjectKind::Tree,
+                bytes,
+            )
             .map_err(|error| git_error(format!("cannot hash expected Git tree: {error}")))?;
         Ok(Some(oid))
     }
@@ -1236,26 +1239,16 @@ fn repository_entries_from_git_tree(
                     let bytes = object
                         .as_blob()
                         .map(|blob| blob.content().to_vec())
-                        .ok_or_else(|| git_error(format!(
-                            "tree entry '{}' is not a blob",
-                            atomic_repository::escape_repo_path(name)
-                        )))?;
+                        .ok_or_else(|| {
+                            git_error(format!(
+                                "tree entry '{}' is not a blob",
+                                atomic_repository::escape_repo_path(name)
+                            ))
+                        })?;
                     let (kind, mode, gitlink) = match entry.filemode() {
-                        0o100644 => (
-                            atomic_core::change::InodeKind::Regular,
-                            0o644u16,
-                            None,
-                        ),
-                        0o100755 => (
-                            atomic_core::change::InodeKind::Regular,
-                            0o755u16,
-                            None,
-                        ),
-                        0o120000 => (
-                            atomic_core::change::InodeKind::Symlink,
-                            0o777u16,
-                            None,
-                        ),
+                        0o100644 => (atomic_core::change::InodeKind::Regular, 0o644u16, None),
+                        0o100755 => (atomic_core::change::InodeKind::Regular, 0o755u16, None),
+                        0o120000 => (atomic_core::change::InodeKind::Symlink, 0o777u16, None),
                         0o160000 => {
                             let oid = git_object_id(policy.object_format, entry.id())?;
                             let bytes = oid_bytes_as_hex(&oid);
@@ -1268,10 +1261,11 @@ fn repository_entries_from_git_tree(
                             )))
                         }
                     };
-                    let repository_entry = RepositoryEntry::new(
-                        path, bytes, mode, kind, gitlink, disposition,
-                    )
-                    .map_err(|e| git_error(format!("cannot build prospective entry: {e}")))?;
+                    let repository_entry =
+                        RepositoryEntry::new(path, bytes, mode, kind, gitlink, disposition)
+                            .map_err(|e| {
+                                git_error(format!("cannot build prospective entry: {e}"))
+                            })?;
                     entries.insert(repository_entry.path.clone(), repository_entry);
                 }
                 _ => {
@@ -1352,9 +1346,9 @@ impl ProspectiveProjectTree {
                          from stale ambient entries",
                     ));
                 };
-                let tree = git
-                    .find_tree(parent)
-                    .map_err(|error| git_error(format!("cannot read parent Git tree {parent}: {error}")))?;
+                let tree = git.find_tree(parent).map_err(|error| {
+                    git_error(format!("cannot read parent Git tree {parent}: {error}"))
+                })?;
                 self.entries = repository_entries_from_git_tree(git, tree, &self.policy)?;
             }
         } else {
@@ -1365,8 +1359,9 @@ impl ProspectiveProjectTree {
             if file.operation == FileOperation::Renamed {
                 if let Some(old_path) = &file.old_path {
                     self.entries.remove(
-                        &RepoPath::from_bytes(old_path.as_bytes())
-                            .map_err(|e| git_error(format!("invalid Git path '{old_path}': {e}")))?,
+                        &RepoPath::from_bytes(old_path.as_bytes()).map_err(|e| {
+                            git_error(format!("invalid Git path '{old_path}': {e}"))
+                        })?,
                     );
                 }
             }
@@ -1418,10 +1413,12 @@ impl ProspectiveProjectTree {
                 0o160000 => {
                     // The parsed bytes are the lowercase hex encoding of the
                     // tagged object id; decode them into the tagged identity.
-                    let hex = std::str::from_utf8(&bytes)
-                        .map_err(|e| git_error(format!("invalid gitlink target '{}': {e}", file.path)))?;
-                    let oid = tagged_oid_from_hex(hex)
-                        .ok_or_else(|| git_error(format!("invalid gitlink target '{}'", file.path)))?;
+                    let hex = std::str::from_utf8(&bytes).map_err(|e| {
+                        git_error(format!("invalid gitlink target '{}': {e}", file.path))
+                    })?;
+                    let oid = tagged_oid_from_hex(hex).ok_or_else(|| {
+                        git_error(format!("invalid gitlink target '{}'", file.path))
+                    })?;
                     (atomic_core::change::InodeKind::Gitlink, Some(oid))
                 }
                 0o120000 => (atomic_core::change::InodeKind::Symlink, None),
@@ -4189,7 +4186,7 @@ impl ParallelImporter {
                 .map_err(|error| git_error(format!("invalid changed path '{path}': {error}")))?;
             // CB-9C path fidelity: the disk holds the raw Git bytes; the
             // canonical String identity decodes before filesystem access.
-            let physical = root.join(canonical_tree_path(&path));
+            let physical = root.join(canonical_tree_path(path));
             let Some(entry) = expected.get(repo_path.as_bytes()) else {
                 if physical.symlink_metadata().is_ok() {
                     return Err(git_error(format!(
@@ -4357,10 +4354,11 @@ impl ParallelImporter {
         let working_copy = repo
             .require_working_copy_id()
             .map_err(|e| CliError::Internal(e.into()))?;
-        let mut stats = ImportStats::default();
-
-        stats.commits_found = plan.commits.len();
-        stats.commits_parsed = plan.commits.len();
+        let mut stats = ImportStats {
+            commits_found: plan.commits.len(),
+            commits_parsed: plan.commits.len(),
+            ..ImportStats::default()
+        };
         if plan.commits.is_empty() {
             return Ok(stats);
         }
@@ -4381,9 +4379,7 @@ impl ParallelImporter {
             stats.merge_commits = write_stats.merge_commits;
             stats.resurrected_exact = write_stats.resurrected_exact;
             stats.files_processed = write_stats.files_processed;
-            let landed = stats.changes_written
-                + stats.empty_commits
-                + stats.merge_commits;
+            let landed = stats.changes_written + stats.empty_commits + stats.merge_commits;
             // CB-13C F4: the partial failure is accounted — the aggregate
             // emits with the landed count before the error propagates.
             emit_import_synthesis(repo, &stats, Some(landed));
@@ -5048,6 +5044,7 @@ impl ParallelImporter {
     ///
     /// Returns metadata about the imported commit for post-import
     /// classification and ReviewGate tagging.
+    #[allow(clippy::too_many_arguments)]
     fn write_commit(
         &self,
         repo: &mut Repository,
@@ -5096,11 +5093,35 @@ impl ParallelImporter {
         // empty commits stay distinct through the synthesized empty-commit
         // writer.
         let info = if parsed.is_merge {
-            self.write_merge_resolution(repo, git, ledger, parsed, verified, prospective, boundaries)?
+            self.write_merge_resolution(
+                repo,
+                git,
+                ledger,
+                parsed,
+                verified,
+                prospective,
+                boundaries,
+            )?
         } else if !parsed.is_empty {
-            self.write_commit_synthesized(repo, git, ledger, parsed, verified, prospective, boundaries)?
+            self.write_commit_synthesized(
+                repo,
+                git,
+                ledger,
+                parsed,
+                verified,
+                prospective,
+                boundaries,
+            )?
         } else {
-            self.write_empty_commit_synthesized(repo, git, ledger, parsed, verified, prospective, boundaries)?
+            self.write_empty_commit_synthesized(
+                repo,
+                git,
+                ledger,
+                parsed,
+                verified,
+                prospective,
+                boundaries,
+            )?
         };
         ledger.record_introduced(&parsed.git_sha, info.atomic_hash, &self.options.target_view);
         Ok(info)
@@ -5163,8 +5184,7 @@ impl ParallelImporter {
         let mut restored_hashes: Vec<ContentHash> = outcome.inserted.clone();
         restored_hashes.extend(outcome.already_present.iter().copied());
         if !restored_hashes.is_empty() {
-            if let Err(error) = repo.record_git_commit_closure(&parsed.git_sha, &restored_hashes)
-            {
+            if let Err(error) = repo.record_git_commit_closure(&parsed.git_sha, &restored_hashes) {
                 print_warning(&format!(
                     "Resurrection {}: could not persist its interpretation closure ({error}); \
                      later incremental imports may refuse descendants of it.",
@@ -5227,6 +5247,7 @@ impl ParallelImporter {
     /// derivation, plus lossless raw foreign facts (review blocker 6); Git
     /// diff lines are never used to override the semantic layer, and Git
     /// parents never become Atomic dependencies.
+    #[allow(clippy::too_many_arguments)]
     fn write_commit_synthesized(
         &self,
         repo: &mut Repository,
@@ -5320,7 +5341,13 @@ impl ParallelImporter {
         // from the assembly visibility, so this leg anchors only within its
         // own Git parent's interpreted closure with Git parent-tree
         // baselines. Full ancestor chains participate through the filter.
-        let excluded = ledger.exclusions_for(repo, git, &parsed.git_sha, &target, !parsed.parent_oids.is_empty())?;
+        let excluded = ledger.exclusions_for(
+            repo,
+            git,
+            &parsed.git_sha,
+            &target,
+            !parsed.parent_oids.is_empty(),
+        )?;
         let leg_mode = !excluded.is_empty();
 
         enum EffectiveOp {
@@ -5352,6 +5379,7 @@ impl ParallelImporter {
         // so a chmod-only or kind-only delta records a standalone attribute
         // change instead of silently losing the mode (or failing the staged
         // tree check after publishing nothing).
+        #[allow(clippy::type_complexity)] // per-file effective op row
         let effective: CliResult<Vec<(&ParsedFile, EffectiveOp, Vec<u8>, Vec<atomic_core::change::InodeAttr>)>> = parsed
             .files
             .iter()
@@ -5505,7 +5533,9 @@ impl ParallelImporter {
                     }
                 }
                 EffectiveOp::Deleted => {
-                    *old_signature_multiplicity.entry(baseline.as_slice()).or_default() += 1;
+                    *old_signature_multiplicity
+                        .entry(baseline.as_slice())
+                        .or_default() += 1;
                 }
                 EffectiveOp::Added => {
                     if let Some(bytes) = file.new_content.as_deref() {
@@ -5526,8 +5556,16 @@ impl ParallelImporter {
             // RenameUnresolved. The multiplicity maps count Deleted and Added
             // operations alongside Renamed, so either-side alternatives are
             // visible here (OR is the minimum identical-byte correction).
-            old_signature_multiplicity.get(old_bytes).copied().unwrap_or(0) > 1
-                || new_signature_multiplicity.get(new_bytes).copied().unwrap_or(0) > 1
+            old_signature_multiplicity
+                .get(old_bytes)
+                .copied()
+                .unwrap_or(0)
+                > 1
+                || new_signature_multiplicity
+                    .get(new_bytes)
+                    .copied()
+                    .unwrap_or(0)
+                    > 1
         };
 
         // Pre-register added paths so tracking metadata exists before
@@ -5601,8 +5639,7 @@ impl ParallelImporter {
                         // graph-backed attributes differ: the attribute
                         // writes alone are the delta (CB-9C).
                         let mut attr_rec = RecordedFile::new(&file.path);
-                        attr_rec
-                            .set_kind(atomic_core::record::workflow::DetectionKind::Modified);
+                        attr_rec.set_kind(atomic_core::record::workflow::DetectionKind::Modified);
                         if let Some((inode, position)) = repo
                             .get_inode_and_position(&file.path)
                             .map_err(|e| CliError::Internal(e.into()))?
@@ -5690,8 +5727,7 @@ impl ParallelImporter {
                         .get_inode_and_position(old_path)
                         .map_err(|e| CliError::Internal(e.into()))?;
                     let new_bytes = file.new_content.as_deref().unwrap_or(&[]);
-                    let ambiguous =
-                        renamed_pairing_is_ambiguous(baseline.as_slice(), new_bytes);
+                    let ambiguous = renamed_pairing_is_ambiguous(baseline.as_slice(), new_bytes);
                     match (can_emit_move, inode_pos) {
                         (true, Some((inode, _pos))) if !ambiguous => {
                             // CB-9C: the structural FileMove is a
@@ -5781,10 +5817,9 @@ impl ParallelImporter {
                                 // R2) so the semantic lifecycle tombstones
                                 // instead of leaving the old trunk Alive.
                                 let deleted_record =
-                                    repo.record_foreign_deleted_file(old_path)
-                                        .map_err(|message| {
-                                            CliError::Internal(anyhow::anyhow!(message))
-                                        })?;
+                                    repo.record_foreign_deleted_file(old_path).map_err(
+                                        |message| CliError::Internal(anyhow::anyhow!(message)),
+                                    )?;
                                 if deleted_record.is_empty() {
                                     return Err(CliError::Internal(anyhow::anyhow!(
                                         "cannot import ambiguous rename source '{}': canonical FileDel is empty",
@@ -5810,13 +5845,10 @@ impl ParallelImporter {
                                 // source and destination paths — including the
                                 // cross-alternatives (a→d, b→c) the greedy
                                 // match discarded.
-                                let mut competing_sources: Vec<String> =
-                                    vec![old_path.to_string()];
+                                let mut competing_sources: Vec<String> = vec![old_path.to_string()];
                                 let mut competing_destinations: Vec<String> =
                                     vec![file.path.clone()];
-                                for (other, other_op, other_baseline, _other_attrs) in
-                                    &effective
-                                {
+                                for (other, other_op, other_baseline, _other_attrs) in &effective {
                                     if std::ptr::eq(other as *const _, file as *const _) {
                                         continue;
                                     }
@@ -5832,13 +5864,10 @@ impl ParallelImporter {
                                                     competing_sources.push(source);
                                                 }
                                             }
-                                            if other_new == Some(new_bytes) {
-                                                if !competing_destinations
-                                                    .contains(&other.path)
-                                                {
-                                                    competing_destinations
-                                                        .push(other.path.clone());
-                                                }
+                                            if other_new == Some(new_bytes)
+                                                && !competing_destinations.contains(&other.path)
+                                            {
+                                                competing_destinations.push(other.path.clone());
                                             }
                                         }
                                         EffectiveOp::Deleted => {
@@ -5848,13 +5877,12 @@ impl ParallelImporter {
                                                 competing_sources.push(other.path.clone());
                                             }
                                         }
-                                        EffectiveOp::Added => {
+                                        EffectiveOp::Added
                                             if other_new == Some(new_bytes)
-                                                && !competing_destinations.contains(&other.path)
-                                            {
-                                                competing_destinations
-                                                    .push(other.path.clone());
-                                            }
+                                                && !competing_destinations
+                                                    .contains(&other.path) =>
+                                        {
+                                            competing_destinations.push(other.path.clone());
                                         }
                                         _ => {}
                                     }
@@ -5870,9 +5898,7 @@ impl ParallelImporter {
                                         ));
                                     }
                                 }
-                                move_evidence.insert_loss(LossNote::rename_unresolved(
-                                    candidates,
-                                ));
+                                move_evidence.insert_loss(LossNote::rename_unresolved(candidates));
                             }
                             let content =
                                 match file.new_content.as_deref().or(file.old_content.as_deref()) {
@@ -5945,7 +5971,8 @@ impl ParallelImporter {
                     // only its first line). Route generated files through
                     // the whole-file replacement record — the same shape
                     // their add used.
-                    let recorded = if repo.get_inode_and_position(&file.path)
+                    let recorded = if repo
+                        .get_inode_and_position(&file.path)
                         .map_err(|e| CliError::Internal(e.into()))?
                         .is_some()
                     {
@@ -6006,8 +6033,7 @@ impl ParallelImporter {
                         // differ: the attribute writes alone are the delta
                         // (CB-9C chmod-only/kind-only commits).
                         let mut attr_rec = RecordedFile::new(&file.path);
-                        attr_rec
-                            .set_kind(atomic_core::record::workflow::DetectionKind::Modified);
+                        attr_rec.set_kind(atomic_core::record::workflow::DetectionKind::Modified);
                         if let Some((inode, position)) = repo
                             .get_inode_and_position(&file.path)
                             .map_err(|e| CliError::Internal(e.into()))?
@@ -6200,6 +6226,7 @@ impl ParallelImporter {
     /// committer identities and times — so distinct empty Git commits
     /// cannot collapse into one hash, and the raw foreign facts survive
     /// serialization.
+    #[allow(clippy::too_many_arguments)]
     fn write_empty_commit_synthesized(
         &self,
         repo: &mut Repository,
@@ -6262,8 +6289,8 @@ impl ParallelImporter {
             },
             raw_object_hex: hex_bytes(Some(&parsed.raw_object)),
         };
-        let hashed_metadata = serde_json::to_vec(&empty_facts)
-            .map_err(|e| CliError::Internal(e.into()))?;
+        let hashed_metadata =
+            serde_json::to_vec(&empty_facts).map_err(|e| CliError::Internal(e.into()))?;
 
         let metadata = git_synthesis_metadata(
             &origin,
@@ -6274,7 +6301,13 @@ impl ParallelImporter {
         // persisted interpretation closure (review R1): an empty commit
         // emits no graph facts but still persists its closure so descendants
         // reconstruct the exact parent visibility across runs.
-        let excluded = ledger.exclusions_for(repo, git, &parsed.git_sha, &self.options.target_view, !parsed.parent_oids.is_empty())?;
+        let excluded = ledger.exclusions_for(
+            repo,
+            git,
+            &parsed.git_sha,
+            &self.options.target_view,
+            !parsed.parent_oids.is_empty(),
+        )?;
         let parent_closure: Vec<atomic_core::types::Hash> = if parsed.parent_oids.is_empty() {
             Vec::new()
         } else {
@@ -6338,11 +6371,12 @@ impl ParallelImporter {
     /// the graph-safe path so the resolution carries regenerated semantic
     /// FileOps and stable CRDT identities (review blocker 3). Its
     /// dependencies remain context-derived from globalization, and its
-    /// hashed [`ChangeOrigin::GitResolution`] plus verified `CausalFrontier`
+    /// hashed `ChangeOrigin::GitResolution` plus verified `CausalFrontier`
     /// cover every parent closure. The staged projection is verified against
     /// the merge tree inside the applying transaction before publication,
     /// and the frontier is verified against the dependency index (review
     /// blocker 2); both fail closed.
+    #[allow(clippy::too_many_arguments)]
     fn write_merge_resolution(
         &self,
         repo: &mut Repository,
@@ -6416,7 +6450,8 @@ impl ParallelImporter {
                 parsed.git_sha
             )));
         }
-        let parent_closure: Vec<atomic_core::types::Hash> = parent_closure_set.into_iter().collect();
+        let parent_closure: Vec<atomic_core::types::Hash> =
+            parent_closure_set.into_iter().collect();
         repo.ensure_union_state(&target, &parent_closure)
             .map_err(|e| CliError::Internal(e.into()))?;
         let frontier = repo
@@ -6704,7 +6739,8 @@ impl ParallelImporter {
     ///    scanning the binding store independently of hooks. Tree equality
     ///    is an advisory hint that the squash carries a bound predecessor's
     ///    content; it is similarity-class evidence and never identity.
-    /// Collect the rewrite evidence for one parsed commit (CB-9B, review
+    ///
+    /// # Collect the rewrite evidence for one parsed commit (CB-9B, review
     /// blocker 4 / R4).
     ///
     /// Three evidence tiers plus an explicit untrusted tier, each with its
@@ -6909,6 +6945,9 @@ impl ParallelImporter {
     /// - every named predecessor is a locally interpreted commit (a
     ///   persisted closure row or a checked SHA index entry in the pristine
     ///   database).
+    ///
+    /// # Authentication limits (CB-9B review)
+    ///
     /// Git ancestry shape and object existence are NEVER authentication
     /// inputs: arbitrary sibling commits satisfy every ancestry-shape
     /// predicate, and a real-looking amend pair submitted directly to the
@@ -7998,12 +8037,15 @@ fn parse_diff_files(
                     })
                     .unwrap_or_default();
 
-                lines_by_path.entry(line_path).or_default().push(GitDiffLine {
-                    origin,
-                    content: line.content().to_vec(),
-                    old_lineno: line.old_lineno(),
-                    new_lineno: line.new_lineno(),
-                });
+                lines_by_path
+                    .entry(line_path)
+                    .or_default()
+                    .push(GitDiffLine {
+                        origin,
+                        content: line.content().to_vec(),
+                        old_lineno: line.old_lineno(),
+                        new_lineno: line.new_lineno(),
+                    });
                 true
             }),
         );
@@ -8043,8 +8085,7 @@ fn parse_diff_files(
 
         let new_mode = canonical_git_mode(new_file.mode());
         let old_mode = canonical_git_mode(old_file.mode());
-        let is_gitlink =
-            new_mode == 0o160000 || old_mode == 0o160000;
+        let is_gitlink = new_mode == 0o160000 || old_mode == 0o160000;
 
         // CB-9C gitlink fidelity: submodule entries are synthesized as
         // gitlink paths (lowercase hexadecimal object-ID repository bytes and
@@ -8089,7 +8130,9 @@ fn parse_diff_files(
                         .filter(|entry| entry.kind() == Some(git2::ObjectType::Commit))
                         .and_then(|entry| {
                             let algorithm = git_algorithm_for_sha(&entry.id().to_string()).ok()?;
-                            Some(oid_bytes_as_hex(&git_object_id(algorithm, entry.id()).ok()?))
+                            Some(oid_bytes_as_hex(
+                                &git_object_id(algorithm, entry.id()).ok()?,
+                            ))
                         })
                 })
             } else {
@@ -8190,14 +8233,9 @@ fn parse_diff_files(
     let mut normalized: Vec<ParsedFile> = Vec::with_capacity(files.len());
     for file in files {
         if file.operation == FileOperation::Added {
-            if let Some(previous) = normalized
-                .iter_mut()
-                .rev()
-                .find(|previous| {
-                    previous.path == file.path
-                        && previous.operation == FileOperation::Deleted
-                })
-            {
+            if let Some(previous) = normalized.iter_mut().rev().find(|previous| {
+                previous.path == file.path && previous.operation == FileOperation::Deleted
+            }) {
                 // Merge delete+add into one typechange modification.
                 previous.operation = FileOperation::Modified;
                 previous.new_content = file.new_content.clone();
@@ -8372,12 +8410,15 @@ fn similarity_bps(old_bytes: &[u8], new_bytes: &[u8]) -> u16 {
         .count();
     let denominator = old_bytes.len().max(new_bytes.len()) as u64;
     let shared = (common_prefix + common_suffix).min(denominator as usize) as u64;
-    let bps = if denominator == 0 {
+
+    if denominator == 0 {
         10_000
     } else {
-        ((shared * 10_000) / denominator).min(9_999) as u16
-    };
-    bps
+        shared
+            .checked_mul(10_000)
+            .map(|scaled| (scaled / denominator).min(9_999) as u16)
+            .unwrap_or(10_000)
+    }
 }
 
 /// The graph-backed materialization (kind + mode) one canonical Git mode
@@ -8477,7 +8518,8 @@ fn get_file_content(git_repo: &GitRepository, tree: &Tree, path: &str) -> CliRes
 }
 
 /// Parse a git commit message into subject and description.
-fn parse_commit_message(message: &str) -> (String, Option<String>) {    let lines: Vec<&str> = message.lines().collect();
+fn parse_commit_message(message: &str) -> (String, Option<String>) {
+    let lines: Vec<&str> = message.lines().collect();
 
     if lines.is_empty() {
         return ("(no message)".to_string(), None);
@@ -9302,7 +9344,7 @@ mod tests {
         );
         let tip = git
             .find_branch(
-                &git.head().unwrap().shorthand().unwrap_or_default(),
+                git.head().unwrap().shorthand().unwrap_or_default(),
                 git2::BranchType::Local,
             )
             .or_else(|_| git.find_branch("main", git2::BranchType::Local))
@@ -9329,8 +9371,7 @@ mod tests {
         drop(git);
         let git = GitRepository::open(clone_temp.path()).unwrap();
         let error = verify_commit_closure_objects_with_shallow(&git, &[tip], &HashSet::new())
-            .err()
-            .expect("an undeclared missing parent must refuse");
+            .expect_err("an undeclared missing parent must refuse");
         assert!(
             error.to_string().contains("closure boundary"),
             "explicit boundary diagnostic required, found: {error}"
@@ -9358,8 +9399,7 @@ mod tests {
         .unwrap();
         let indexed: HashSet<String> = [b.to_string()].into_iter().collect();
         let error = detect_deepened_history(&git, &ordered, &indexed)
-            .err()
-            .expect("deepened history must be refused");
+            .expect_err("deepened history must be refused");
         assert!(
             error.to_string().contains("deepened"),
             "explicit deepening diagnostic required, found: {error}"
@@ -9690,7 +9730,7 @@ Atomic-Changes: SECONDHASH, THIRDHASH
     fn similarity_bps_survives_the_corpus_scale_boundary() {
         let mut old_bytes = Vec::new();
         for _ in 0..450 {
-            old_bytes.extend(std::iter::repeat(b'x').take(1_000));
+            old_bytes.extend(std::iter::repeat_n(b'x', 1_000));
             old_bytes.push(b'\n');
         }
         assert_eq!(old_bytes.len(), 450_450, "the review fixture's exact size");
@@ -9717,6 +9757,9 @@ Atomic-Changes: SECONDHASH, THIRDHASH
         let mut bigger = big.clone();
         bigger.push(b'y');
         let score = similarity_bps(&big, &bigger);
-        assert_eq!(score, 9_999, "the exact former-overflow boundary stays capped");
+        assert_eq!(
+            score, 9_999,
+            "the exact former-overflow boundary stays capped"
+        );
     }
 }

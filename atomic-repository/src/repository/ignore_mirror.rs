@@ -109,9 +109,8 @@ fn split_managed_block(contents: &str) -> (Option<String>, Vec<String>, bool) {
 }
 
 fn exclude_path(root: &Path) -> Result<std::path::PathBuf, IgnoreMirrorError> {
-    let repository = git2::Repository::discover(root).map_err(|error| {
-        IgnoreMirrorError::GitDirectory(format!("{}: {error}", root.display()))
-    })?;
+    let repository = git2::Repository::discover(root)
+        .map_err(|error| IgnoreMirrorError::GitDirectory(format!("{}: {error}", root.display())))?;
     // `.git/info/exclude` lives in the common administrative directory so
     // linked worktrees share one managed block. git2 0.19 does not expose
     // `commondir()`, so resolve the `commondir` pointer file explicitly.
@@ -298,8 +297,7 @@ mod tests {
         let mirrored = mirror_ignores(temp.path()).unwrap();
         assert!(!mirrored.diverges());
         assert!(mirrored.managed_block_present);
-        let contents =
-            std::fs::read_to_string(temp.path().join(".git/info/exclude")).unwrap();
+        let contents = std::fs::read_to_string(temp.path().join(".git/info/exclude")).unwrap();
         assert!(contents.contains(MANAGED_BLOCK_BEGIN));
         assert!(contents.contains("target/"));
     }

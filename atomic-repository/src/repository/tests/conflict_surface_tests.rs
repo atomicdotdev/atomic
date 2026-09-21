@@ -553,7 +553,7 @@ fn test_record_refuses_markers_then_clears_on_resolution() {
 /// (see `test_conflict_is_persisted_and_surfaced_in_status`).
 #[test]
 fn marker_shaped_source_content_is_not_a_persisted_conflict() {
-    let (temp_dir, mut repo) = create_temp_repo();
+    let (temp_dir, repo) = create_temp_repo();
     let file = temp_dir.path().join("fixture.md");
     // Build the marker-shaped content from an array so that no line of *this
     // Rust source* begins with a marker (which would make this very test file
@@ -632,13 +632,16 @@ fn make_two_incarnation_name_conflict() -> (TempDir, TestRepository, std::path::
 /// timestamp) and the losing claims are superseded, not erased.
 #[test]
 fn content_clean_name_conflict_is_resolved_by_record() {
-    let (_temp, mut repo, new_file) = make_two_incarnation_name_conflict();
+    let (_temp, repo, new_file) = make_two_incarnation_name_conflict();
 
     // No materialize ran, so there is no persisted conflict row; the working
     // tree simply keeps one side's bytes.
     std::fs::write(&new_file, "from-base\n").unwrap();
     let on_disk = std::fs::read_to_string(&new_file).unwrap();
-    assert!(on_disk.contains("from-base"), "one side's bytes are on disk");
+    assert!(
+        on_disk.contains("from-base"),
+        "one side's bytes are on disk"
+    );
     assert!(!on_disk.contains("<<<<<<<"), "no markers remain on disk");
     assert!(
         repo.get_file_content("new.txt").is_err(),
@@ -676,7 +679,7 @@ fn content_clean_name_conflict_is_resolved_by_record() {
 /// keep both incarnations' history; only the intended path is affected.
 #[test]
 fn resolving_a_name_conflict_leaves_other_paths_untouched() {
-    let (_temp, mut repo, new_file) = make_two_incarnation_name_conflict();
+    let (_temp, repo, new_file) = make_two_incarnation_name_conflict();
 
     std::fs::write(&new_file, "from-base\n").unwrap();
     record_all(&repo, "resolve clean name conflict on dev").unwrap();
@@ -698,7 +701,7 @@ fn resolving_a_name_conflict_leaves_other_paths_untouched() {
 /// refused, never silently resolved to a lineage.
 #[test]
 fn third_value_name_conflict_is_refused_not_chosen() {
-    let (_temp, mut repo, new_file) = make_two_incarnation_name_conflict();
+    let (_temp, repo, new_file) = make_two_incarnation_name_conflict();
 
     std::fs::write(&new_file, "third-value\n").unwrap();
     let outcome = record_all(&repo, "third value must not resolve");
@@ -715,7 +718,6 @@ fn third_value_name_conflict_is_refused_not_chosen() {
         "a third value must leave the name conflict unresolved"
     );
 }
-
 
 /// Review ::15 blocker support (user decision "Preserve current files"):
 /// the explicit `resolve_name_conflicts` resolution resolves the survivor's
@@ -796,8 +798,7 @@ fn explicit_preserve_content_resolution_selects_tree_bound_incarnation() {
     // byte-equal content.
     let resolution = repo.record(
         ChangeHeader::new("preserve-content resolution"),
-        RecordOptions::new()
-            .resolve_name_conflicts(vec!["same.txt".to_string()]),
+        RecordOptions::new().resolve_name_conflicts(vec!["same.txt".to_string()]),
     );
     let resolution = match resolution {
         Ok(outcome) => outcome,
@@ -824,12 +825,9 @@ fn explicit_preserve_content_resolution_selects_tree_bound_incarnation() {
             .get_internal(op.inode.change.as_ref().expect("external hash"))
             .unwrap()
             .expect("surviving claimant change registered");
-        txn.position_inode(atomic_core::types::Position::new(
-            internal,
-            op.inode.pos,
-        ))
-        .unwrap()
-        .expect("the surviving claimant position resolves to an inode")
+        txn.position_inode(atomic_core::types::Position::new(internal, op.inode.pos))
+            .unwrap()
+            .expect("the surviving claimant position resolves to an inode")
     };
     assert_eq!(
         survivor_inode, fork2_inode,
@@ -842,7 +840,7 @@ fn explicit_preserve_content_resolution_selects_tree_bound_incarnation() {
     assert_eq!(std::fs::read(&file).unwrap(), b"shared bytes\n".to_vec());
     assert!(repo.load_change(fork1.hash()).is_ok());
     assert!(repo.load_change(fork2.hash()).is_ok());
-    let deps = resolution.change().dependencies().clone();
+    let deps = resolution.change().dependencies();
     for change in [fork1.hash(), fork2.hash()] {
         assert!(
             deps.contains(change),
@@ -890,8 +888,7 @@ fn explicit_preserve_content_resolution_refuses_missing_tree_binding() {
 
     let refused = repo.record(
         ChangeHeader::new("preserve-content resolution"),
-        RecordOptions::new()
-            .resolve_name_conflicts(vec!["same.txt".to_string()]),
+        RecordOptions::new().resolve_name_conflicts(vec!["same.txt".to_string()]),
     );
     let error = match refused {
         Err(error) => error,
@@ -979,8 +976,7 @@ fn explicit_preserve_content_resolution_refuses_stale_tree_binding() {
         .unwrap()
         .expect("the raw TREE binding must exist after the setup bind");
     assert_eq!(
-        tree_inode,
-        forks[3].2,
+        tree_inode, forks[3].2,
         "precondition: the TREE binding holds the last (stale-for-the-match) incarnation"
     );
 
@@ -989,8 +985,7 @@ fn explicit_preserve_content_resolution_refuses_stale_tree_binding() {
     std::fs::write(&file, "shared bytes\n").unwrap();
     let refused = repo.record(
         ChangeHeader::new("preserve-content resolution"),
-        RecordOptions::new()
-            .resolve_name_conflicts(vec!["same.txt".to_string()]),
+        RecordOptions::new().resolve_name_conflicts(vec!["same.txt".to_string()]),
     );
     let error = match refused {
         Err(error) => error,
@@ -1052,8 +1047,7 @@ fn explicit_preserve_content_resolution_refuses_zero_match() {
     std::fs::write(&file, "unrecorded working bytes\n").unwrap();
     let refused = repo.record(
         ChangeHeader::new("zero-match resolve"),
-        RecordOptions::new()
-            .resolve_name_conflicts(vec!["same.txt".to_string()]),
+        RecordOptions::new().resolve_name_conflicts(vec!["same.txt".to_string()]),
     );
     let error = match refused {
         Err(error) => error,

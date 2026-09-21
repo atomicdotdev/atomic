@@ -40,8 +40,8 @@ use atomic_repository::repository::ReconcileEffectBudget;
 use atomic_repository::Repository;
 
 use super::parallel::{
-    forecast_commit_kind, incremental_import_skips, trace_git_import, ForecastKind,
-    ImportStats, ParallelImportOptions, ParallelImporter, ProspectiveImportPlan,
+    forecast_commit_kind, incremental_import_skips, trace_git_import, ForecastKind, ImportStats,
+    ParallelImportOptions, ParallelImporter, ProspectiveImportPlan,
 };
 use crate::commands::workspace_txn::{
     enter_remediation_workspace, enter_remediation_workspace_budgeted, observe_workspace,
@@ -220,6 +220,7 @@ fn emit_import_synthesis(repo: &Repository, stats: &ImportStats) {
 
 impl Import {
     /// Import a single branch into an Atomic view using parallel processing.
+    #[allow(clippy::too_many_arguments)]
     fn import_branch(
         &self,
         git_repo: &GitRepository,
@@ -719,7 +720,8 @@ impl Command for Import {
             let open_result = if metadata_only {
                 Repository::open_with_budget(
                     workdir,
-                    self.reactive_budget.expect("metadata_only implies a budget"),
+                    self.reactive_budget
+                        .expect("metadata_only implies a budget"),
                 )
             } else {
                 Repository::open(workdir)
@@ -785,7 +787,7 @@ impl Command for Import {
                     message: "the bridge watch daemon never edits Git administrative files; \
                               the Git shadow exclude line is missing — run 'atomic git import' \
                               or 'atomic git bridge reconcile' explicitly once"
-                    .to_string(),
+                        .to_string(),
                 });
             }
         } else if ensure_git_shadow_excludes(git_repo.path())? {
@@ -820,7 +822,8 @@ impl Command for Import {
         let workspace = match if metadata_only {
             enter_remediation_workspace_budgeted(
                 &mut repo,
-                self.reactive_budget.expect("metadata_only implies a budget"),
+                self.reactive_budget
+                    .expect("metadata_only implies a budget"),
             )?
         } else {
             enter_remediation_workspace(&mut repo)?
@@ -1601,7 +1604,10 @@ mod tests {
         let config = root.path().join(".atomic/config.toml");
         {
             use std::io::Write as _;
-            let mut file = std::fs::OpenOptions::new().append(true).open(&config).unwrap();
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&config)
+                .unwrap();
             writeln!(file, "\n[git.bridge]\nenabled = true\n").unwrap();
         }
         fs::write(root.path().join("tracked.txt"), b"second\n").unwrap();

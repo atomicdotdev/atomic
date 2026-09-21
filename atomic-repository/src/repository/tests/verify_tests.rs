@@ -3,7 +3,6 @@
 
 use super::*;
 use crate::record::{RecordError, RecordOptions};
-use crate::repository::VerifyProblem;
 use atomic_core::change::ChangeHeader;
 use atomic_core::types::Hash;
 

@@ -364,8 +364,7 @@ mod tests {
 
         // Text content tokenizes into lines and tokens.
         let content = b"line one\nline two\n";
-        let _trunk_id =
-            builder.add_file_with_content("test.txt", content, Some(Encoding::Utf8));
+        let _trunk_id = builder.add_file_with_content("test.txt", content, Some(Encoding::Utf8));
 
         let result = builder.finish();
 
@@ -390,8 +389,16 @@ mod tests {
         let result = builder.finish();
 
         assert_eq!(result.file_count(), 1);
-        assert_eq!(result.stats().lines_added, 0, "no line ops for an opaque trunk");
-        assert_eq!(result.stats().tokens_added, 0, "no token ops for an opaque trunk");
+        assert_eq!(
+            result.stats().lines_added,
+            0,
+            "no line ops for an opaque trunk"
+        );
+        assert_eq!(
+            result.stats().tokens_added,
+            0,
+            "no token ops for an opaque trunk"
+        );
         match result.file_ops()[0].trunk_op().unwrap() {
             TrunkOp::Create { encoding, .. } => {
                 assert_eq!(*encoding, None, "the trunk records the opaque encoding");

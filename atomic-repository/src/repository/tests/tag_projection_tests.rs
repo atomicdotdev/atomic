@@ -59,13 +59,7 @@ fn tag_fixture(seed: u8, store_binding: bool) -> TagFixture {
             .unwrap();
         (tree_oid, commit_oid)
     };
-    let raw_commit = git
-        .odb()
-        .unwrap()
-        .read(commit_oid)
-        .unwrap()
-        .data()
-        .to_vec();
+    let raw_commit = git.odb().unwrap().read(commit_oid).unwrap().data().to_vec();
 
     let repo = TestRepository::new(Repository::init(dir.path()).unwrap());
     let tag = repo
@@ -259,11 +253,16 @@ fn review_gate_tags_produce_no_git_tag() {
         .unwrap();
     assert_eq!(
         outcome,
-        crate::repository::TagProjectionOutcome::AtomicOnly { kind: "review-gate" },
+        crate::repository::TagProjectionOutcome::AtomicOnly {
+            kind: "review-gate"
+        },
         "ReviewGate tags report Atomic-only"
     );
     assert!(
-        fixture.git.find_reference("refs/tags/pr-42-squash").is_err(),
+        fixture
+            .git
+            .find_reference("refs/tags/pr-42-squash")
+            .is_err(),
         "no Git tag may be created for a ReviewGate tag"
     );
     // The release tag's binding carrier is untouched by the refusal.
@@ -298,12 +297,15 @@ fn export_refuses_a_tag_whose_state_has_no_binding() {
 fn import_refuses_a_tag_on_an_unbound_commit() {
     let fixture = tag_fixture(0x60, true);
     // A second commit that no binding vouches for.
-    let tree = fixture.git.find_tree({
-        let blob = fixture.git.blob(b"unbound\n").unwrap();
-        let mut builder = fixture.git.treebuilder(None).unwrap();
-        builder.insert("other.txt", blob, 0o100644).unwrap();
-        builder.write().unwrap()
-    }).unwrap();
+    let tree = fixture
+        .git
+        .find_tree({
+            let blob = fixture.git.blob(b"unbound\n").unwrap();
+            let mut builder = fixture.git.treebuilder(None).unwrap();
+            builder.insert("other.txt", blob, 0o100644).unwrap();
+            builder.write().unwrap()
+        })
+        .unwrap();
     let signature = git2::Signature::now("CB-8A", "cb8a-tag@example.com").unwrap();
     let unbound_oid = fixture
         .git
@@ -329,7 +331,11 @@ fn import_refuses_a_tag_on_an_unbound_commit() {
         other => panic!("expected InvalidOperation, got: {other:?}"),
     }
     assert!(
-        fixture.repo.get_tag_from_view("loose", "dev").unwrap().is_none(),
+        fixture
+            .repo
+            .get_tag_from_view("loose", "dev")
+            .unwrap()
+            .is_none(),
         "a refused import must not create an Atomic tag"
     );
 }
@@ -365,7 +371,11 @@ fn import_rejects_an_annotated_tag_claiming_a_wrong_binding() {
         }
         other => panic!("expected InvalidOperation, got: {other:?}"),
     }
-    assert!(fixture.repo.get_tag_from_view("forged", "dev").unwrap().is_none());
+    assert!(fixture
+        .repo
+        .get_tag_from_view("forged", "dev")
+        .unwrap()
+        .is_none());
 }
 
 // ── Tag operations never touch HEAD, index, or private metadata (ac-4) ───
@@ -383,7 +393,14 @@ fn tag_projection_never_changes_git_head_index_or_private_metadata() {
     let tree = git.find_tree(tree_oid).unwrap();
     let signature = git2::Signature::now("CB-8A", "cb8a-tag@example.com").unwrap();
     let commit_oid = git
-        .commit(Some("refs/heads/main"), &signature, &signature, "bound commit", &tree, &[])
+        .commit(
+            Some("refs/heads/main"),
+            &signature,
+            &signature,
+            "bound commit",
+            &tree,
+            &[],
+        )
         .unwrap();
     git.set_head("refs/heads/main").unwrap();
     let raw_commit = git.odb().unwrap().read(commit_oid).unwrap().data().to_vec();
@@ -429,15 +446,17 @@ fn tag_projection_never_changes_git_head_index_or_private_metadata() {
 
     // Export + import the tag.
     let outcome = repo.export_tag_to_git("dev", "v1", &git).unwrap();
-    assert!(matches!(outcome, crate::repository::TagProjectionOutcome::Exported { .. }));
+    assert!(matches!(
+        outcome,
+        crate::repository::TagProjectionOutcome::Exported { .. }
+    ));
     let (_fresh_dir, fresh) = fresh_store_with_binding(&binding);
     fresh.import_git_tag_from_git("dev", &git, "v1").unwrap();
 
     let head_after = git.head().unwrap().target().unwrap();
     assert_eq!(head_before, head_after, "tag projection never moves HEAD");
     assert_eq!(
-        head_after,
-        commit_oid,
+        head_after, commit_oid,
         "HEAD still points at the bound commit"
     );
     let statuses_after = git
@@ -456,7 +475,12 @@ fn tag_projection_never_changes_git_head_index_or_private_metadata() {
     let raw_tag = git
         .odb()
         .unwrap()
-        .read(git.find_reference("refs/tags/v1").unwrap().target().unwrap())
+        .read(
+            git.find_reference("refs/tags/v1")
+                .unwrap()
+                .target()
+                .unwrap(),
+        )
         .unwrap()
         .data()
         .to_vec();

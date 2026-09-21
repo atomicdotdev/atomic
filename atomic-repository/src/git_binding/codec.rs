@@ -87,10 +87,9 @@ impl GitOid {
     pub fn from_git_object_id(object_id: &GitObjectId) -> Result<Self, BindingEncodeError> {
         match object_id.algorithm() {
             GitHashAlgorithm::Sha1 => {
-                let bytes: [u8; 20] = object_id
-                    .as_bytes()
-                    .try_into()
-                    .map_err(|_| BindingEncodeError::OidWidth("sha1", object_id.as_bytes().len()))?;
+                let bytes: [u8; 20] = object_id.as_bytes().try_into().map_err(|_| {
+                    BindingEncodeError::OidWidth("sha1", object_id.as_bytes().len())
+                })?;
                 Ok(GitOid::Sha1(bytes))
             }
             GitHashAlgorithm::Sha256 => {
@@ -124,7 +123,10 @@ impl GitOid {
 
     /// Lowercase hex encoding, as used in Git refs and messages.
     pub fn to_hex(&self) -> String {
-        self.as_bytes().iter().map(|byte| format!("{byte:02x}")).collect()
+        self.as_bytes()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
     }
 
     /// Parse from lowercase hex (40 or 64 characters).
@@ -368,11 +370,12 @@ impl GitStateBindingPayload {
     }
 
     fn validate_signer(&self) -> Result<(), BindingEncodeError> {
-        let public_key = PublicKey::from_bytes(&self.signer.verifying_key)
-            .map_err(|error| BindingEncodeError::SignerMismatch {
+        let public_key = PublicKey::from_bytes(&self.signer.verifying_key).map_err(|error| {
+            BindingEncodeError::SignerMismatch {
                 did: self.signer.did.clone(),
                 reason: error.to_string(),
-            })?;
+            }
+        })?;
         if !atomic_canonical::did::did_matches_public_key(&self.signer.did, &public_key) {
             return Err(BindingEncodeError::SignerMismatch {
                 did: self.signer.did.clone(),
@@ -450,7 +453,10 @@ impl GitStateBinding {
     ///
     /// The payload is validated first: an impossible binding can never be
     /// signed into existence.
-    pub fn sign(payload: GitStateBindingPayload, keypair: &KeyPair) -> Result<Self, BindingEncodeError> {
+    pub fn sign(
+        payload: GitStateBindingPayload,
+        keypair: &KeyPair,
+    ) -> Result<Self, BindingEncodeError> {
         payload.validate()?;
         let payload_bytes = payload.canonical_payload_bytes()?;
         let mut message = Vec::with_capacity(BINDING_SIGN_DOMAIN.len() + payload_bytes.len());
@@ -516,19 +522,21 @@ impl GitStateBinding {
         // Canonicality: re-encoding must reproduce the exact payload region,
         // so no alternative encoding of the same fields exists and no bytes
         // are smuggled between payload and signature.
-        let reencoded = payload
-            .canonical_payload_bytes()
-            .map_err(|error| BindingDecodeError::Malformed {
-                reason: error.to_string(),
-            })?;
+        let reencoded =
+            payload
+                .canonical_payload_bytes()
+                .map_err(|error| BindingDecodeError::Malformed {
+                    reason: error.to_string(),
+                })?;
         if bytes.len() != reencoded.len() + 64 || reencoded.as_slice() != &bytes[..reencoded.len()]
         {
             return Err(BindingDecodeError::NonCanonical);
         }
-        let signature = <[u8; 64]>::try_from(&bytes[signature_start..])
-            .map_err(|_| BindingDecodeError::Malformed {
+        let signature = <[u8; 64]>::try_from(&bytes[signature_start..]).map_err(|_| {
+            BindingDecodeError::Malformed {
                 reason: "signature is not exactly 64 bytes".to_string(),
-            })?;
+            }
+        })?;
         let binding = Self {
             payload,
             payload_bytes: bytes[..signature_start].to_vec(),
@@ -543,9 +551,11 @@ impl GitStateBinding {
 
     /// Verify the Ed25519 signature against the carried verifying key.
     pub fn verify_signature(&self) -> Result<(), BindingDecodeError> {
-        let public_key = PublicKey::from_bytes(&self.payload.signer.verifying_key)
-            .map_err(|error| BindingDecodeError::Signature {
-                reason: error.to_string(),
+        let public_key =
+            PublicKey::from_bytes(&self.payload.signer.verifying_key).map_err(|error| {
+                BindingDecodeError::Signature {
+                    reason: error.to_string(),
+                }
             })?;
         let signature = atomic_identity::signing::Signature::from_bytes(self.signature);
         let mut message = Vec::with_capacity(BINDING_SIGN_DOMAIN.len() + self.payload_bytes.len());
@@ -646,7 +656,6 @@ pub enum BindingDecodeError {
     Signature { reason: String },
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -727,7 +736,10 @@ mod tests {
             payload.git_commit.to_hex(),
             "1111111111111111111111111111111111111111"
         );
-        assert_eq!(payload.git_tree.to_hex(), "2222222222222222222222222222222222222222");
+        assert_eq!(
+            payload.git_tree.to_hex(),
+            "2222222222222222222222222222222222222222"
+        );
         assert_eq!(payload.git_parents.len(), 1);
         assert_eq!(payload.git_parents[0].to_hex(), PARENT_HEX);
         assert!(payload.raw_commit_object.is_none());
@@ -760,14 +772,11 @@ mod tests {
                 tampered[position] ^= flip;
                 // Every tampered object must either fail decoding outright or
                 // fail signature verification. Neither may silently pass.
-                match GitStateBinding::decode(&tampered) {
-                    Ok(decoded) => {
-                        assert!(
-                            decoded.verify_signature().is_err(),
-                            "tampered byte {position} (^{flip:#x}) decoded but must fail signature verification"
-                        );
-                    }
-                    Err(_) => {}
+                if let Ok(decoded) = GitStateBinding::decode(&tampered) {
+                    assert!(
+                        decoded.verify_signature().is_err(),
+                        "tampered byte {position} (^{flip:#x}) decoded but must fail signature verification"
+                    );
                 }
             }
         }
@@ -808,38 +817,62 @@ mod tests {
                         .push(oid("6666666666666666666666666666666666666666"));
                 }),
             ),
-            ("set_id", mutate(&|payload| {
-                payload.set_id = SetId::from_bytes([9u8; 32]);
-            })),
-            ("merkle_state", mutate(&|payload| {
-                payload.merkle_state = Merkle::from_bytes([8u8; 32]);
-            })),
-            ("view_hint", mutate(&|payload| {
-                payload.view_hint = Some("other-view".to_string());
-            })),
+            (
+                "set_id",
+                mutate(&|payload| {
+                    payload.set_id = SetId::from_bytes([9u8; 32]);
+                }),
+            ),
+            (
+                "merkle_state",
+                mutate(&|payload| {
+                    payload.merkle_state = Merkle::from_bytes([8u8; 32]);
+                }),
+            ),
+            (
+                "view_hint",
+                mutate(&|payload| {
+                    payload.view_hint = Some("other-view".to_string());
+                }),
+            ),
             (
                 "ordered_changes_order",
                 mutate(&|payload| {
                     payload.ordered_changes.reverse();
                 }),
             ),
-            ("operation", mutate(&|payload| {
-                payload.operation = OperationId::from_bytes([10u8; 32]);
-            })),
-            ("origin", mutate(&|payload| {
-                payload.origin = CausalOrigin::ForeignGitRoot;
-            })),
-            ("loss", mutate(&|payload| {
-                payload.loss = vec![LossNote::Other {
-                    description: "different loss".to_string(),
-                }];
-            })),
-            ("provenance_roots", mutate(&|payload| {
-                payload.provenance_roots.push(Hash::from_bytes([11u8; 32]));
-            })),
-            ("attestation_roots", mutate(&|payload| {
-                payload.attestation_roots.push(Hash::from_bytes([12u8; 32]));
-            })),
+            (
+                "operation",
+                mutate(&|payload| {
+                    payload.operation = OperationId::from_bytes([10u8; 32]);
+                }),
+            ),
+            (
+                "origin",
+                mutate(&|payload| {
+                    payload.origin = CausalOrigin::ForeignGitRoot;
+                }),
+            ),
+            (
+                "loss",
+                mutate(&|payload| {
+                    payload.loss = vec![LossNote::Other {
+                        description: "different loss".to_string(),
+                    }];
+                }),
+            ),
+            (
+                "provenance_roots",
+                mutate(&|payload| {
+                    payload.provenance_roots.push(Hash::from_bytes([11u8; 32]));
+                }),
+            ),
+            (
+                "attestation_roots",
+                mutate(&|payload| {
+                    payload.attestation_roots.push(Hash::from_bytes([12u8; 32]));
+                }),
+            ),
         ];
         for (field, tampered) in cases {
             assert_ne!(
@@ -914,7 +947,8 @@ mod tests {
     const FROZEN_GSB1_FIXTURE_HEX: &str = "4753423101000011111111111111111111111111111111111111110022222222222222222222222222222222222222220100333333333333333333333333333333333333333300010101010101010101010101010101010101010101010101010101010101010102020202020202020202020202020202020202020202020202020202020202020109666561747572652d780203030303030303030303030303030303030303030303030303030303030303030404040404040404040404040404040404040404040404040404040404040404fd20724dd0302291142d7210aec8961cda9eb87ad1cd8af3980c14acc401cfe20505050505050505050505050505050505050505050505050505050505050505020100076f6c642e7478740106060606060606060606060606060606060606060606060606060606060606060107070707070707070707070707070707070707070707070707070707070707073f6469643a61746f6d69633a4f444346575533455449583657444d5654363241563248374241594f434e324235484341554135504248423537434a504f5a4e41d785b49583ee736c66cf55dc87474f4f337c971bfc3d69cba1e21e67763653afadab9d1fced1e81ef6eb07bad492f852b0a815d098c894a192a8e570ad1bc6f0a5518d56dbc109b81c84814da3d21745930dc751e5c9b9108cec00b6e85b0e0b";
 
     /// Frozen binding id of the fixture vector.
-    const FROZEN_GSB1_ID_HEX: &str = "909193f4042c8deddb0491969a566a3a0ae07d0eae241c22043dfd15f75b2ca6";
+    const FROZEN_GSB1_ID_HEX: &str =
+        "909193f4042c8deddb0491969a566a3a0ae07d0eae241c22043dfd15f75b2ca6";
 
     #[test]
     fn frozen_codec_fixture_is_stable() {
@@ -1043,16 +1077,10 @@ mod tests {
         payload.closure_root = payload.compute_closure_root();
         let binding = GitStateBinding::sign(payload, &keypair).unwrap();
         let decoded = GitStateBinding::decode(&binding.encode()).unwrap();
-        assert_eq!(
-            decoded.payload().git_object_format,
-            GitObjectFormat::Sha256
-        );
+        assert_eq!(decoded.payload().git_object_format, GitObjectFormat::Sha256);
         assert_eq!(decoded.payload().git_commit.to_hex(), "b".repeat(64));
         assert_eq!(decoded.payload().git_parents[0].to_hex(), "d".repeat(64));
-        assert!(matches!(
-            decoded.payload().git_commit,
-            GitOid::Sha256(_)
-        ));
+        assert!(matches!(decoded.payload().git_commit, GitOid::Sha256(_)));
         assert!(decoded.verify_signature().is_ok());
     }
     #[test]

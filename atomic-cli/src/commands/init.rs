@@ -637,7 +637,6 @@ impl Command for Init {
             record_vault_state(&repo, working_copy)?;
         }
 
-
         // ── Status should be clean at this point ─────────────────────
 
         // ── CB-10B: --adopt-git shared bootstrap (RFC §7.3/§8.6) ─────
@@ -683,8 +682,9 @@ impl Command for Init {
                     // only AFTER the exact resurrection/adoption succeeded.
                     if defer_vault {
                         let repo = Repository::open(&target_path).map_err(CliError::Repository)?;
-                        let working_copy =
-                            repo.require_working_copy_id().map_err(CliError::Repository)?;
+                        let working_copy = repo
+                            .require_working_copy_id()
+                            .map_err(CliError::Repository)?;
                         record_vault_state(&repo, working_copy)?;
                     }
                 }
@@ -712,11 +712,13 @@ impl Command for Init {
     }
 }
 
-
 /// Create the vault, install defaults, track and record them as their own
 /// change (CB-10B review R5: the deferred default-init vault recording runs
 /// only after an --adopt-git exact resurrection when one applies).
-fn record_vault_state(repo: &Repository, working_copy: atomic_core::WorkingCopyId) -> CliResult<()> {
+fn record_vault_state(
+    repo: &Repository,
+    working_copy: atomic_core::WorkingCopyId,
+) -> CliResult<()> {
     // Create vault tables + directory structure + default files
     repo.init_vault().map_err(CliError::Repository)?;
 

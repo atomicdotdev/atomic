@@ -568,7 +568,7 @@ fn recording_works_on_the_detached_view_and_switch_c_renames_it() {
     let views = atomic_ok(fixture.root.path(), fixture.home.path(), &["view", "list"]);
     assert!(views.contains("topic"), "{views}");
     assert!(
-        !views.contains(&ephemeral.as_str()),
+        !views.contains(ephemeral.as_str()),
         "old name gone: {views}"
     );
     let map = head_map(fixture.root.path());

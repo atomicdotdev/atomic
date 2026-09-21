@@ -402,7 +402,6 @@ mod tests {
 
     // WatcherConfig tests
 
-
     /// CB-13D ::24 R4: a STUCK Watchman daemon (never answers, never
     /// exits) must not hang `create_watcher` — the bounded probe kills it
     /// after the timeout and the factory proceeds to the fallback with the
@@ -412,16 +411,12 @@ mod tests {
     fn stuck_watchman_daemon_cannot_hang_the_factory() {
         let shim_dir = tempfile::tempdir().unwrap();
         let shim = shim_dir.path().join("watchman");
-        std::fs::write(
-            &shim,
-            "#!/bin/sh\nsleep 300\n",
-        )
-        .unwrap();
+        std::fs::write(&shim, "#!/bin/sh\nsleep 300\n").unwrap();
         {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
-        let path_env = format!(
+        let _path_env = format!(
             "{}:{}",
             shim_dir.path().display(),
             std::env::var("PATH").unwrap_or_default()

@@ -154,6 +154,7 @@ where
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn verify_candidates_with_provider<F>(
     source: ChangeSourceResult,
     tracked: &[CanonicalTrackedPath],

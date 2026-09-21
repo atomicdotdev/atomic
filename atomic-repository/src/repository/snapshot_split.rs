@@ -343,7 +343,8 @@ impl Repository {
         working_copy: WorkingCopyId,
         snapshot: Hash,
     ) -> bool {
-        self.verify_snapshot_matches_worktree(working_copy, snapshot).is_ok()
+        self.verify_snapshot_matches_worktree(working_copy, snapshot)
+            .is_ok()
     }
 
     fn prepare_split_scratch(
@@ -394,6 +395,7 @@ impl Repository {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn publish_split(
         &self,
         working_copy: WorkingCopyId,

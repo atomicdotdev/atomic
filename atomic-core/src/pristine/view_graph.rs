@@ -489,7 +489,7 @@ impl<'a, T: crate::pristine::InodeAttrTxnT> crate::pristine::InodeAttrTxnT for V
     /// outside the view's closure is not an ancestor of the new change, and
     /// wiring it as a dependency leaks foreign causality into the assembly
     /// (review CB-9C R1). Event writers can never be ROOT
-    /// ([`InodeAttrEvent::new`] rejects it), so the closure check alone is
+    /// (`InodeAttrEvent::new` rejects it), so the closure check alone is
     /// exact.
     fn get_inode_attr_events(
         &self,
@@ -676,9 +676,7 @@ mod tests {
     #[test]
     fn register_events_are_visible_only_inside_the_view_closure() {
         use crate::change::InodeAttr;
-        use crate::pristine::{
-            InodeAttrEvent, InodeAttrMutTxnT, InodeAttrTxnT, MutTxnT, Pristine,
-        };
+        use crate::pristine::{InodeAttrEvent, InodeAttrMutTxnT, InodeAttrTxnT, MutTxnT, Pristine};
 
         let temp = tempfile::tempdir().unwrap();
         let pristine = Pristine::open(temp.path().join("vg-attrs.redb")).unwrap();

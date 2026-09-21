@@ -30,17 +30,16 @@ fn repository_error(error: RepositoryError) -> String {
 }
 
 fn binding_id_hex(id: &BindingId) -> String {
-    id.as_bytes().iter().map(|byte| format!("{byte:02x}")).collect()
+    id.as_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 /// Enumerate the census classes. `view_name` is the desired view of the
 /// inspecting working copy; its full history anchors the change coverage
 /// class.
-pub(crate) fn census_classes(
-    repo: &Repository,
-    root: &Path,
-    view_name: &str,
-) -> Vec<CensusClass> {
+pub(crate) fn census_classes(repo: &Repository, root: &Path, view_name: &str) -> Vec<CensusClass> {
     vec![
         change_coverage_class(repo, view_name),
         binding_census_class(repo),
@@ -157,11 +156,9 @@ fn working_copy_census_class(repo: &Repository, current_view: &str) -> CensusCla
         let mut stale: Vec<String> = Vec::new();
         for record in &records {
             // Resolve the desired view id to its name for the report.
-            let view_state = atomic_core::pristine::ViewTxnT::get_view_by_id(
-                &txn,
-                record.desired_view,
-            )
-            .map_err(|e| e.to_string())?;
+            let view_state =
+                atomic_core::pristine::ViewTxnT::get_view_by_id(&txn, record.desired_view)
+                    .map_err(|e| e.to_string())?;
             let Some(view_state) = view_state else {
                 broken.push(format!(
                     "{} desires missing view id {}",
@@ -180,8 +177,8 @@ fn working_copy_census_class(repo: &Repository, current_view: &str) -> CensusCla
                     "{} desires '{}' at {} (view is at {})",
                     record.id.as_ulid(),
                     view_state.name,
-                    record.desired_state.to_base32()[..12].to_string(),
-                    view_state.state.to_base32()[..12].to_string()
+                    &record.desired_state.to_base32()[..12],
+                    &view_state.state.to_base32()[..12]
                 ));
             }
         }
@@ -235,7 +232,10 @@ fn wip_census_class(repo: &Repository, root: &Path) -> CensusClass {
     let class = (|| -> Result<CensusClass, String> {
         let git = git2::Repository::open(root).map_err(|e| e.to_string())?;
         let mut refs: Vec<String> = Vec::new();
-        for reference in git.references_glob("refs/atomic/wip/*").map_err(|e| e.to_string())? {
+        for reference in git
+            .references_glob("refs/atomic/wip/*")
+            .map_err(|e| e.to_string())?
+        {
             let reference = reference.map_err(|e| e.to_string())?;
             if let Some(name) = reference.name() {
                 refs.push(name.to_string());

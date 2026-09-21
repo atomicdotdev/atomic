@@ -93,8 +93,7 @@ impl<'a> GraphTxnT for WriteTxn<'a> {
         let upper = encode_vertex(change_id, target_pos, u64::MAX);
         if let Some((v_change, v_start, v_end)) = table
             .range::<&[u8; 24]>(&encode_vertex(change_id, 0, 0)..=&upper)?
-            .rev()
-            .next()
+            .next_back()
             .transpose()?
             .map(|(key, _values)| decode_vertex(key.value()))
         {
@@ -187,8 +186,7 @@ impl<'a> GraphTxnT for WriteTxn<'a> {
             let before_upper = encode_vertex(change_id, target_pos - 1, u64::MAX);
             if let Some((v_change, v_start, v_end)) = table
                 .range::<&[u8; 24]>(&encode_vertex(change_id, 0, 0)..=&before_upper)?
-                .rev()
-                .next()
+                .next_back()
                 .transpose()?
                 .map(|(key, _values)| decode_vertex(key.value()))
             {
@@ -205,8 +203,7 @@ impl<'a> GraphTxnT for WriteTxn<'a> {
         let contains_upper = encode_vertex(change_id, target_pos, u64::MAX);
         if let Some((v_change, v_start, v_end)) = table
             .range::<&[u8; 24]>(&encode_vertex(change_id, 0, 0)..=&contains_upper)?
-            .rev()
-            .next()
+            .next_back()
             .transpose()?
             .map(|(key, _values)| decode_vertex(key.value()))
         {
@@ -424,15 +421,16 @@ mod tests {
                 let expected = scan_find_block(&vertices, change_id, pos.pos.get());
                 let actual = txn.find_block(pos).ok();
                 assert_eq!(
-                    expected, actual,
+                    expected,
+                    actual,
                     "case {case} find_block mismatch at pos {}",
                     pos.pos.get()
                 );
-                let expected_end =
-                    scan_find_block_end(&vertices, change_id, pos.pos.get());
+                let expected_end = scan_find_block_end(&vertices, change_id, pos.pos.get());
                 let actual_end = txn.find_block_end(pos).ok();
                 assert_eq!(
-                    expected_end, actual_end,
+                    expected_end,
+                    actual_end,
                     "case {case} find_block_end mismatch at pos {}",
                     pos.pos.get()
                 );

@@ -3,7 +3,6 @@
 //! turn boundaries under Git-owned partial operations.
 
 #![cfg(not(windows))]
-
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write as _;

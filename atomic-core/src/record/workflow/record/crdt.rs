@@ -692,8 +692,8 @@ pub(crate) fn build_crdt_ops_for_whole_file_replace(
     //    the graph; the branch → vertex mappings stay for blame history).
     if let Some(existing) = existing_branches {
         for (old_line_idx, branch_id) in existing.iter().enumerate() {
-            let line_op = BuilderLineOps::delete(*branch_id, Vec::new())
-                .with_old_line_num(old_line_idx + 1);
+            let line_op =
+                BuilderLineOps::delete(*branch_id, Vec::new()).with_old_line_num(old_line_idx + 1);
             file_ops.add_line_op(line_op);
             stats.lines_deleted += 1;
         }

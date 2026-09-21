@@ -6,7 +6,11 @@
 //! classify the three-way matrix, and expose the status/publish lifecycle
 //! surfaces.
 
-use atomic_core::pristine::{RefMapping, RefSyncStatus, ViewTxnT, ViewScope, REF_MAPPING_VERSION};
+use crate::commands::git::bridge::{
+    journal_and_create_branch_cas_with_mapping, journal_and_move_branch,
+};
+use crate::commands::workspace_txn::enter_workspace;
+use atomic_core::pristine::{RefMapping, RefSyncStatus, ViewScope, ViewTxnT, REF_MAPPING_VERSION};
 use atomic_core::types::Base32;
 use atomic_core::WorkingCopyId;
 use atomic_repository::repository::ref_mapping::{
@@ -14,8 +18,6 @@ use atomic_repository::repository::ref_mapping::{
     mapped_local_ref, AddedCommits, RefMappingDecision, ThreeWayObservation,
 };
 pub(crate) use atomic_repository::repository::ref_mapping::{Containment, ThreeWayAction};
-use crate::commands::git::bridge::{journal_and_create_branch_cas_with_mapping, journal_and_move_branch};
-use crate::commands::workspace_txn::enter_workspace;
 use atomic_repository::{Repository, WorkspaceTxnMode};
 use git2::Repository as GitRepository;
 
@@ -36,13 +38,16 @@ pub(crate) fn mapped_ref_for_view(repo: &Repository, view: &str) -> CliResult<Op
 
 /// The durable internal view id for `view` (mapping key identity).
 fn durable_view_id(repo: &Repository, view: &str) -> CliResult<u64> {
-    let txn = repo
-        .pristine()
-        .read_txn()
-        .map_err(|error| CliError::Repository(atomic_repository::RepositoryError::Database(error.to_string())))?;
+    let txn = repo.pristine().read_txn().map_err(|error| {
+        CliError::Repository(atomic_repository::RepositoryError::Database(
+            error.to_string(),
+        ))
+    })?;
     txn.get_view(view)
         .map_err(|error| {
-            CliError::Repository(atomic_repository::RepositoryError::Database(error.to_string()))
+            CliError::Repository(atomic_repository::RepositoryError::Database(
+                error.to_string(),
+            ))
         })?
         .map(|view_state| view_state.id)
         .ok_or(CliError::ViewNotFound {
@@ -65,11 +70,7 @@ fn observed_tip(git: &GitRepository, local_ref: Option<&str>) -> Option<String> 
 /// mapping row when one exists (an explicit publish/rename reconciled it),
 /// not from a recomputed scope policy that can disagree with the durable
 /// row.
-pub(crate) fn mapped_ref_tip(
-    git: &GitRepository,
-    repo: &Repository,
-    view: &str,
-) -> Option<String> {
+pub(crate) fn mapped_ref_tip(git: &GitRepository, repo: &Repository, view: &str) -> Option<String> {
     let persisted = repo
         .get_ref_mapping(view)
         .ok()
@@ -186,11 +187,13 @@ pub(crate) fn refresh_mapping_observation(
     // exact observation (CB-10A review R4): the verified tip must still be
     // the live mapped ref tip, or the previous binding stays untouched.
     let (bound_export, bound_state) = match exported_tip {
-        Some(verified) if Some(verified) == tip.as_ref().map(String::as_str) => {
+        Some(verified) if Some(verified) == tip.as_deref() => {
             (Some(verified.to_string()), Some(state.clone()))
         }
         _ => (
-            previous.as_ref().and_then(|mapping| mapping.last_exported.clone()),
+            previous
+                .as_ref()
+                .and_then(|mapping| mapping.last_exported.clone()),
             previous
                 .as_ref()
                 .and_then(|mapping| mapping.last_exported_state.clone()),
@@ -217,7 +220,7 @@ pub(crate) fn refresh_mapping_observation(
         view,
         previous.as_ref(),
         Some(mapping),
-        Some(&common),
+        Some(common),
     )
     .map_err(CliError::from)?;
     Ok(())
@@ -266,9 +269,13 @@ pub(crate) fn record_remote_push_observation(
             .and_then(|mapping| mapping.local_ref.clone())
             .or_else(|| mapped_local_ref(info.scope, view)),
         remote: Some((remote_name.to_string(), remote_ref.to_string())),
-        last_observed_local: previous.as_ref().and_then(|mapping| mapping.last_observed_local.clone()),
+        last_observed_local: previous
+            .as_ref()
+            .and_then(|mapping| mapping.last_observed_local.clone()),
         last_observed_remote: Some(new_remote_tip.to_string()),
-        last_exported: previous.as_ref().and_then(|mapping| mapping.last_exported.clone()),
+        last_exported: previous
+            .as_ref()
+            .and_then(|mapping| mapping.last_exported.clone()),
         last_exported_state: previous
             .as_ref()
             .and_then(|mapping| mapping.last_exported_state.clone()),
@@ -299,16 +306,16 @@ pub(crate) fn classify_mapping_direction(
             .and_then(|reference| reference.target())
             .map(|oid| oid.to_string())
     });
-    let current_atomic = repo.get_view_info(view).map_err(CliError::from)?.state.to_base32();
+    let current_atomic = repo
+        .get_view_info(view)
+        .map_err(CliError::from)?
+        .state
+        .to_base32();
     let observation = ThreeWayObservation {
         current_git: tip.clone(),
         current_atomic: current_atomic.clone(),
     };
-    let added = commits_added_since(
-        git,
-        mapping.last_observed_local.as_deref(),
-        tip.as_deref(),
-    );
+    let added = commits_added_since(git, mapping.last_observed_local.as_deref(), tip.as_deref());
     // CB-10A review R2: only a complete walk can carry a containment proof;
     // an unprovable movement (missing tip, unreachable baseline, missing
     // object, budget exhaustion) is never a positive result.
@@ -403,10 +410,7 @@ pub(crate) fn print_divergence_notices(repo: &Repository) -> CliResult<()> {
                 remediation_for(RefSyncStatus::Diverged)
             ));
         } else if orphaned {
-            let mapped_ref = mapping
-                .local_ref
-                .as_deref()
-                .unwrap_or("<no ref persisted>");
+            let mapped_ref = mapping.local_ref.as_deref().unwrap_or("<no ref persisted>");
             crate::output::print_warning(&format!(
                 "ref mapping for deleted view '{}' is Unrepresentable: its Git ref '{mapped_ref}' \
                  was left untouched. {}",
@@ -427,28 +431,32 @@ pub(crate) fn run_status() -> CliResult<()> {
 
     // Also report the current workspace view when it has no mapping yet.
     let working_copy = repo.require_working_copy_id().map_err(CliError::from)?;
-    let current_view = repo.desired_view_name(working_copy).map_err(CliError::from)?;
+    let current_view = repo
+        .desired_view_name(working_copy)
+        .map_err(CliError::from)?;
     let mut rows: Vec<(RefMapping, bool)> = mappings
         .into_iter()
         .map(|mapping| (mapping, true))
         .collect();
-    if !rows.iter().any(|(mapping, _)| mapping.view_name == current_view) {
-        if repo.view_exists(&current_view).map_err(CliError::from)? {
-            rows.push((
-                unpersisted_mapping(&repo, &current_view)?,
-                false,
-            ));
-        }
+    if !rows
+        .iter()
+        .any(|(mapping, _)| mapping.view_name == current_view)
+        && repo.view_exists(&current_view).map_err(CliError::from)?
+    {
+        rows.push((unpersisted_mapping(&repo, &current_view)?, false));
     }
 
     if rows.is_empty() {
         println!("no ref mappings (run 'atomic git bridge reconcile' to establish one)");
         return Ok(());
     }
-    let git = GitRepository::open(&root)
-        .map_err(|error| CliError::GitError { message: format!("cannot open Git repository: {error}") })?;
+    let git = GitRepository::open(&root).map_err(|error| CliError::GitError {
+        message: format!("cannot open Git repository: {error}"),
+    })?;
     for (mapping, persisted) in rows {
-        let view_exists = repo.view_exists(&mapping.view_name).map_err(CliError::from)?;
+        let view_exists = repo
+            .view_exists(&mapping.view_name)
+            .map_err(CliError::from)?;
         let (display_status, remediation) = if !view_exists {
             (
                 RefSyncStatus::Unrepresentable,
@@ -469,10 +477,7 @@ pub(crate) fn run_status() -> CliResult<()> {
                     RefSyncStatus::AtomicAhead,
                     remediation_for(RefSyncStatus::AtomicAhead),
                 ),
-                ThreeWayAction::Noop => (
-                    mapping.status,
-                    remediation_for(mapping.status),
-                ),
+                ThreeWayAction::Noop => (mapping.status, remediation_for(mapping.status)),
                 ThreeWayAction::Unrepresentable => (
                     RefSyncStatus::Unrepresentable,
                     remediation_for(RefSyncStatus::Unrepresentable),
@@ -486,9 +491,14 @@ pub(crate) fn run_status() -> CliResult<()> {
         );
         println!(
             "  scope:       {}",
-            ViewScope::from_u8(mapping.scope).map(|s| s.to_string()).unwrap_or_else(|| format!("unknown({})", mapping.scope))
+            ViewScope::from_u8(mapping.scope)
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| format!("unknown({})", mapping.scope))
         );
-        println!("  local ref:   {}", mapping.local_ref.as_deref().unwrap_or("<none>"));
+        println!(
+            "  local ref:   {}",
+            mapping.local_ref.as_deref().unwrap_or("<none>")
+        );
         println!(
             "  last observed local:   {}",
             mapping.last_observed_local.as_deref().unwrap_or("<none>")
@@ -566,8 +576,9 @@ pub(crate) fn run_publish(view: &str, branch: &str) -> CliResult<()> {
     // mutation; a refused publication mutates nothing.
     let workspace = enter_workspace(&mut repo, WorkspaceTxnMode::Reconcile)?;
     let working_copy = workspace.working_copy();
-    let git = GitRepository::open(&root)
-        .map_err(|error| CliError::GitError { message: format!("cannot open Git repository: {error}") })?;
+    let git = GitRepository::open(&root).map_err(|error| CliError::GitError {
+        message: format!("cannot open Git repository: {error}"),
+    })?;
     crate::commands::git::bridge::require_clean_git_worktree(&git)?;
 
     let target_ref = format!("refs/heads/{branch}");
@@ -586,7 +597,10 @@ pub(crate) fn run_publish(view: &str, branch: &str) -> CliResult<()> {
     }
 
     let (baseline, _) = ensure_baseline_mapping(&repo, working_copy, &git, view)?;
-    let draft_ref = baseline.local_ref.clone().unwrap_or_else(|| format!("refs/atomic/views/{view}"));
+    let draft_ref = baseline
+        .local_ref
+        .clone()
+        .unwrap_or_else(|| format!("refs/atomic/views/{view}"));
     let commit = git
         .find_reference(&draft_ref)
         .ok()
@@ -614,10 +628,12 @@ pub(crate) fn run_publish(view: &str, branch: &str) -> CliResult<()> {
     // `git update-ref refs/atomic/views/topic refs/heads/main`, then
     // `git bridge publish topic --branch …` — refuses here instead.
     let checkpoint = crate::commands::git::bridge::read_workspace_metadata(&root)?;
-    let checkpoint = checkpoint.ok_or_else(|| git_error(format!(
-        "refusing to publish view '{view}': there is no verified bridge checkpoint; \
+    let checkpoint = checkpoint.ok_or_else(|| {
+        git_error(format!(
+            "refusing to publish view '{view}': there is no verified bridge checkpoint; \
          run 'atomic git bridge reconcile' to verify the workspace first"
-    )))?;
+        ))
+    })?;
     if checkpoint.view != view {
         return Err(git_error(format!(
             "refusing to publish view '{view}': the verified bridge checkpoint names view '{}' \
@@ -631,8 +647,7 @@ pub(crate) fn run_publish(view: &str, branch: &str) -> CliResult<()> {
              verified projection commit {} of the current workspace state. The draft's mapped ref \
              moved outside a verified transition; run 'atomic git bridge reconcile' and re-verify \
              before publishing",
-            commit,
-            checkpoint.git_head
+            commit, checkpoint.git_head
         )));
     }
 
@@ -662,7 +677,9 @@ pub(crate) fn run_publish(view: &str, branch: &str) -> CliResult<()> {
     // The baseline row is always present here (ensure_baseline_mapping
     // created it); its canonical bytes are the expected-old lease.
     let expected_old = atomic_core::operation::MetadataValue::Bytes(
-        baseline.encode().map_err(|error| git_error(error.to_string()))?,
+        baseline
+            .encode()
+            .map_err(|error| git_error(error.to_string()))?,
     );
     let mapping_intent = atomic_core::operation::MetadataTransition {
         target: atomic_core::operation::MetadataTarget::RefMapping {
@@ -670,7 +687,9 @@ pub(crate) fn run_publish(view: &str, branch: &str) -> CliResult<()> {
         },
         expected_old,
         expected_new: atomic_core::operation::MetadataValue::Bytes(
-            mapping.encode().map_err(|error| git_error(error.to_string()))?,
+            mapping
+                .encode()
+                .map_err(|error| git_error(error.to_string()))?,
         ),
     };
     journal_and_create_branch_cas_with_mapping(

@@ -1095,7 +1095,10 @@ impl Repository {
         )
         .map_err(ProjectTreeError::from)?;
         if debug_tree {
-            eprintln!("PTREE claim_visibility ms={}", tree_start.elapsed().as_millis());
+            eprintln!(
+                "PTREE claim_visibility ms={}",
+                tree_start.elapsed().as_millis()
+            );
         }
         let projection = self
             .project_tree_for_visibility(&txn, &claim_visibility)
@@ -1259,7 +1262,13 @@ impl Repository {
             + atomic_core::pristine::InodeGraphOps<InodeError = atomic_core::pristine::PristineError>
             + atomic_core::pristine::InodeAttrTxnT,
     {
-        self.project_change_closure_with_conflict_markers(txn, view, roots, policy, &Default::default())
+        self.project_change_closure_with_conflict_markers(
+            txn,
+            view,
+            roots,
+            policy,
+            &Default::default(),
+        )
     }
 
     /// Project a change closure, substituting conflict-marker bytes for the
@@ -1317,10 +1326,7 @@ impl Repository {
             .collect();
         unresolved_claims.sort();
         if !unresolved_claims.is_empty() {
-            let paths: Vec<String> = unresolved_claims
-                .into_iter()
-                .map(|path| path.clone())
-                .collect();
+            let paths: Vec<String> = unresolved_claims.into_iter().cloned().collect();
             return Err(ProjectTreeError::Repository(format!(
                 "unresolved path claims: {}",
                 paths.join(", ")
@@ -1441,7 +1447,7 @@ fn parse_gitlink_bytes(
         )));
     }
     let mut decoded = Vec::with_capacity(expected / 2);
-    for pair in bytes.chunks_exact(2) {
+    for pair in bytes.as_chunks::<2>().0 {
         let text = std::str::from_utf8(pair).expect("ASCII hex checked");
         decoded.push(u8::from_str_radix(text, 16).expect("hex checked"));
     }

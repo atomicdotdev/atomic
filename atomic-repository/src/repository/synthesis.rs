@@ -21,7 +21,9 @@
 
 use unicode_normalization::UnicodeNormalization;
 
-use atomic_core::change::{CausalFrontier, Change, ChangeHeader, ChangeKind, ChangeOrigin, ChangeStore, GitDerivation};
+use atomic_core::change::{
+    CausalFrontier, Change, ChangeHeader, ChangeKind, ChangeOrigin, ChangeStore, GitDerivation,
+};
 use atomic_core::operation::{
     ActorRef, GitHashAlgorithm, GitObjectId, MetadataTarget, MetadataTransition, MetadataValue,
     OperationKind, RepoStateRef, ViewStateRef,
@@ -29,10 +31,10 @@ use atomic_core::operation::{
 use atomic_core::pristine::{GraphTxnT, MutTxnT, ViewTxnT};
 use atomic_core::types::{Base32, Hash, Merkle};
 
+use super::content::retrieve_content_with_filter_fast;
 use super::insert::validate_import_deleted_paths;
 use super::locks::WorkingCopyOperationLockGuard;
 use super::operation::{current_operation_timestamp_ms, working_copy_state_ref};
-use super::content::retrieve_content_with_filter_fast;
 use super::{ImportWriteOutcome, Repository, RepositoryError, WorkspaceTxn};
 
 /// Hashed origin facts for one synthesized Git commit.
@@ -99,10 +101,11 @@ impl GitResolutionOrigin {
 
     /// Validate the origin against the hashed classification contract.
     pub fn validated(&self) -> Result<ChangeOrigin, RepositoryError> {
-        ChangeOrigin::git_resolution(self.merge_commit.clone(), self.parents.clone())
-            .map_err(|error| RepositoryError::InvalidOperation {
+        ChangeOrigin::git_resolution(self.merge_commit.clone(), self.parents.clone()).map_err(
+            |error| RepositoryError::InvalidOperation {
                 message: format!("invalid Git resolution origin: {error}"),
-            })
+            },
+        )
     }
 }
 
@@ -145,7 +148,9 @@ impl SynthesisClassification {
                 );
                 git.insert(
                     "commit_algorithm".to_string(),
-                    serde_json::Value::String(git_algorithm_label(origin.commit.algorithm()).to_string()),
+                    serde_json::Value::String(
+                        git_algorithm_label(origin.commit.algorithm()).to_string(),
+                    ),
                 );
                 git.insert(
                     "tree".to_string(),
@@ -153,7 +158,9 @@ impl SynthesisClassification {
                 );
                 git.insert(
                     "tree_algorithm".to_string(),
-                    serde_json::Value::String(git_algorithm_label(origin.tree.algorithm()).to_string()),
+                    serde_json::Value::String(
+                        git_algorithm_label(origin.tree.algorithm()).to_string(),
+                    ),
                 );
                 git.insert(
                     "parents".to_string(),
@@ -260,14 +267,10 @@ impl GitSynthesisOrigin {
     /// that would fail change validation is refused before any bytes are
     /// written.
     pub fn validated(&self) -> Result<ChangeOrigin, RepositoryError> {
-        ChangeOrigin::git_synthesized(
-            self.commit.clone(),
-            self.parents.clone(),
-            self.derivation,
-        )
-        .map_err(|error| RepositoryError::InvalidOperation {
-            message: format!("invalid Git synthesis origin: {error}"),
-        })
+        ChangeOrigin::git_synthesized(self.commit.clone(), self.parents.clone(), self.derivation)
+            .map_err(|error| RepositoryError::InvalidOperation {
+                message: format!("invalid Git synthesis origin: {error}"),
+            })
     }
 }
 
@@ -340,14 +343,13 @@ pub(crate) fn compute_union_frontier<T: ViewTxnT>(
         .iter_changes(view, 0)
         .map_err(|e| RepositoryError::Database(e.to_string()))?
     {
-        let (_, change_id, _) =
-            entry.map_err(|e| RepositoryError::Database(e.to_string()))?;
+        let (_, change_id, _) = entry.map_err(|e| RepositoryError::Database(e.to_string()))?;
         let hash = txn
             .get_external(change_id)
             .map_err(|e| RepositoryError::Database(e.to_string()))?
-            .ok_or_else(|| RepositoryError::Database(format!(
-                "view member {change_id:?} has no external hash"
-            )))?;
+            .ok_or_else(|| {
+                RepositoryError::Database(format!("view member {change_id:?} has no external hash"))
+            })?;
         members.insert(hash);
         for dep in txn
             .get_change_deps(change_id)
@@ -356,7 +358,10 @@ pub(crate) fn compute_union_frontier<T: ViewTxnT>(
             depended.insert(dep);
         }
     }
-    let roots: Vec<Hash> = members.into_iter().filter(|hash| !depended.contains(hash)).collect();
+    let roots: Vec<Hash> = members
+        .into_iter()
+        .filter(|hash| !depended.contains(hash))
+        .collect();
     if roots.is_empty() {
         return Err(RepositoryError::InvalidOperation {
             message: "cannot compute a causal frontier for an empty view state".to_string(),
@@ -399,7 +404,10 @@ pub(crate) fn compute_union_frontier_for_hashes<T: GraphTxnT>(
             depended.insert(dep);
         }
     }
-    let roots: Vec<Hash> = members.into_iter().filter(|hash| !depended.contains(hash)).collect();
+    let roots: Vec<Hash> = members
+        .into_iter()
+        .filter(|hash| !depended.contains(hash))
+        .collect();
     if roots.is_empty() {
         return Err(RepositoryError::InvalidOperation {
             message: "cannot compute a causal frontier for an empty member set".to_string(),
@@ -475,9 +483,9 @@ pub fn git_resolution_metadata(
     )
 }
 
-/// Deterministic mutation-stage fault switch for tests only. When set, the
-/// apply stage fails after the `SynthesizeGit` intent was journaled, so
-/// recovery/containment can be exercised end to end.
+// Deterministic mutation-stage fault switch for tests only. When set, the
+// apply stage fails after the `SynthesizeGit` intent was journaled, so
+// recovery/containment can be exercised end to end.
 #[cfg(test)]
 thread_local! {
     pub(crate) static SYNTHESIS_APPLY_FAULT: std::cell::Cell<bool> =
@@ -599,7 +607,7 @@ pub(crate) mod failpoints {
         }
     }
 
-/// Injected semantic corruption (review F4, untouched path): repoints
+    /// Injected semantic corruption (review F4, untouched path): repoints
     /// every CRDT branch of the expectation's UNTOUCHED paths (expected
     /// entries this change did not record deltas for) to a wrong graph
     /// range, so the staged semantic reconstruction must refuse the
@@ -706,8 +714,7 @@ pub(crate) mod failpoints {
                     continue;
                 };
                 for branch_id in iter_trunk_branches_in_file_order(&*txn, trunk_id)? {
-                    let branch_key =
-                        atomic_core::crdt::tables::encode_branch_id(&branch_id);
+                    let branch_key = atomic_core::crdt::tables::encode_branch_id(&branch_id);
                     let leaf_keys: Vec<[u8; 12]> = txn
                         .iter_branch_leaves(&branch_key)?
                         .collect::<Result<Vec<_>, _>>()?;
@@ -740,8 +747,7 @@ pub(crate) mod failpoints {
                     continue;
                 };
                 for branch_id in iter_trunk_branches_in_file_order(&*txn, trunk_id)? {
-                    let branch_key =
-                        atomic_core::crdt::tables::encode_branch_id(&branch_id);
+                    let branch_key = atomic_core::crdt::tables::encode_branch_id(&branch_id);
                     let leaf_keys: Vec<[u8; 12]> = txn
                         .iter_branch_leaves(&branch_key)?
                         .collect::<Result<Vec<_>, _>>()?;
@@ -965,11 +971,8 @@ pub(crate) fn out_of_closure_writer_deleted_branch(
     visibility: &atomic_core::pristine::GraphVisibilityClosure,
 ) -> Result<bool, String> {
     use atomic_core::pristine::GraphTxnT;
-    for (change_id, hash) in txn
-        .list_registered_changes()
-        .map_err(|e| e.to_string())?
-    {
-        if visibility.contains(&change_id) {
+    for (change_id, hash) in txn.list_registered_changes().map_err(|e| e.to_string())? {
+        if visibility.contains(change_id) {
             continue;
         }
         // Review F1: a registered change is NOT an applied writer. The
@@ -1029,11 +1032,11 @@ fn applied_writer_deleted_branch(
     branch: atomic_core::crdt::BranchId,
 ) -> Result<bool, String> {
     use atomic_core::pristine::GraphTxnT;
-    for (change_id, hash) in txn
-        .list_registered_changes()
-        .map_err(|e| e.to_string())?
-    {
-        if !txn.has_change_in_graph(change_id).map_err(|e| e.to_string())? {
+    for (change_id, hash) in txn.list_registered_changes().map_err(|e| e.to_string())? {
+        if !txn
+            .has_change_in_graph(change_id)
+            .map_err(|e| e.to_string())?
+        {
             continue;
         }
         let Ok(change) = repo_change_loader(&hash) else {
@@ -1163,11 +1166,8 @@ pub(crate) fn out_of_closure_writer_deleted_trunk(
     visibility: &atomic_core::pristine::GraphVisibilityClosure,
 ) -> Result<bool, String> {
     use atomic_core::pristine::GraphTxnT;
-    for (change_id, hash) in txn
-        .list_registered_changes()
-        .map_err(|e| e.to_string())?
-    {
-        if visibility.contains(&change_id) {
+    for (change_id, hash) in txn.list_registered_changes().map_err(|e| e.to_string())? {
+        if visibility.contains(change_id) {
             continue;
         }
         // Review F1: same application proof as the branch scanner — a
@@ -1229,9 +1229,7 @@ fn change_wrote_branch_vertex_for_branch(
                 _ => continue,
             }
             if let Some((start, end)) = line_op.content_range() {
-                if start.get() as u64 == vertex.start.get()
-                    && end.get() as u64 == vertex.end.get()
-                {
+                if start.get() == vertex.start.get() && end.get() == vertex.end.get() {
                     return true;
                 }
             }
@@ -1269,10 +1267,8 @@ fn change_wrote_leaf(
                 _ => continue,
             };
             for leaf_op in content {
-                let is_writer_leaf = matches!(
-                    leaf_op,
-                    atomic_core::crdt::LeafOp::Insert { .. }
-                ) && is_target
+                let is_writer_leaf = matches!(leaf_op, atomic_core::crdt::LeafOp::Insert { .. })
+                    && is_target
                     && resolved == branch
                     && atomic_core::crdt::LeafId::new(owner, counter) == leaf;
                 if is_writer_leaf {
@@ -1327,10 +1323,7 @@ impl Repository {
             if present {
                 continue;
             }
-            self.insert_change_rec(
-                hash,
-                crate::InsertOptions::default().view(view.to_string()),
-            )?;
+            self.insert_change_rec(hash, crate::InsertOptions::default().view(view.to_string()))?;
             newly_referenced.push(*hash);
         }
         Ok(newly_referenced)
@@ -1629,26 +1622,26 @@ impl Repository {
         else {
             return Ok(false);
         };
-        let minted_hex = minted.iter().map(|b| format!("{b:02x}")).collect::<String>();
+        let minted_hex = minted
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>();
         if event_token != minted_hex {
             return Ok(false);
         }
         let Some(pairs) = post_rewrite_event_pairs(event_bytes) else {
             return Ok(false);
         };
-        Ok(matches!(stored.payload().kind, OperationKind::ExportGitRefs)
-            && pairs.iter().all(|(old_oid, new_oid)| {
-                stored
-                    .payload()
-                    .delta
-                    .effects
-                    .iter()
-                    .any(|effect| {
+        Ok(
+            matches!(stored.payload().kind, OperationKind::ExportGitRefs)
+                && pairs.iter().all(|(old_oid, new_oid)| {
+                    stored.payload().delta.effects.iter().any(|effect| {
                         matches!(effect.target, EffectTarget::GitRef { .. })
                             && effect_lease_matches_oid(&effect.expected_old, old_oid)
                             && effect_lease_matches_oid(&effect.expected_new, new_oid)
                     })
-            }))
+                }),
+        )
     }
 
     /// The operation id `event_bytes`' capture is anchored to, if any
@@ -1715,9 +1708,7 @@ impl Repository {
         let receipts = txn
             .get_effect_receipts(operation)
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
-        Ok(super::operation::has_operation_verified_receipt(
-            &receipts,
-        ))
+        Ok(super::operation::has_operation_verified_receipt(&receipts))
     }
 
     /// Find a locally stored, fully verified Git-state binding for `commit`.
@@ -2114,11 +2105,19 @@ impl Repository {
                                 change.hashed.header.message.lines().next().unwrap_or(""),
                                 change.hunks().len(),
                                 change.contents.len(),
-                                change.file_ops().iter().map(|o| o.path()).collect::<Vec<_>>()
+                                change
+                                    .file_ops()
+                                    .iter()
+                                    .map(|o| o.path())
+                                    .collect::<Vec<_>>()
                             );
                             for (idx, op) in change.hunks().iter().enumerate() {
                                 match &op {
-                                    atomic_core::change::GraphOp::Replacement { change: edge_update, replacement, .. } => {
+                                    atomic_core::change::GraphOp::Replacement {
+                                        change: edge_update,
+                                        replacement,
+                                        ..
+                                    } => {
                                         eprintln!(
                                             "    hunk {idx}: Replacement insert_range=({},{}) preds={:?} succs={:?} del_edges={}",
                                             replacement.start.get(),
@@ -2156,18 +2155,16 @@ impl Repository {
                     }
                 }
             };
-            let (final_change, v3_bytes, hash) = finalize_classified_change(
-                assembled,
-                &classification,
-                hashed_metadata,
-                unhashed,
-            )?;
+            let (final_change, v3_bytes, hash) =
+                finalize_classified_change(assembled, &classification, hashed_metadata, unhashed)?;
             // Fail fast on deleted-path leases before journaling anything.
             super::insert::validate_import_deleted_paths(&final_change, deleted_paths)?;
             (final_change, v3_bytes, hash, view.state, view.change_count)
         };
-        let mut timings = super::ImportWriteTimings::default();
-        timings.assemble_ms = assemble_start.elapsed().as_millis();
+        let timings = super::ImportWriteTimings {
+            assemble_ms: assemble_start.elapsed().as_millis(),
+            ..super::ImportWriteTimings::default()
+        };
 
         // 2. Idempotency: a change already referenced by the view is a no-op;
         // one applied to the global graph but absent from the view is
@@ -2219,9 +2216,7 @@ impl Repository {
                     if !survivors.is_empty() {
                         let named = survivors
                             .iter()
-                            .map(|(view, hash)| {
-                                format!("{} in view '{}'", hash.to_base32(), view)
-                            })
+                            .map(|(view, hash)| format!("{} in view '{}'", hash.to_base32(), view))
                             .collect::<Vec<_>>()
                             .join(", ");
                         return Err(RepositoryError::InvalidOperation {
@@ -2398,8 +2393,7 @@ impl Repository {
         // superseded exclusions compact the log (review B4): the removals
         // shift every later entry down, so the new change lands at
         // count − removals, not at the pre-put count.
-        let final_sequence =
-            sequence - removal_transitions.len() as u64;
+        let final_sequence = sequence - removal_transitions.len() as u64;
         let mut transitions = vec![MetadataTransition {
             target: MetadataTarget::ViewChange {
                 view: view_name.to_string(),
@@ -2627,8 +2621,7 @@ impl Repository {
             // the apply path's alignment contract.
             if supersede_excluded {
                 self.supersede_excluded_members_locked(&mut txn, view_name, assembly_excluded)?;
-                let survivors =
-                    self.surviving_exclusions(&*txn, view_name, assembly_excluded)?;
+                let survivors = self.surviving_exclusions(&*txn, view_name, assembly_excluded)?;
                 if !survivors.is_empty() {
                     let named = survivors
                         .iter()
@@ -2663,7 +2656,9 @@ impl Repository {
             self.verify_staged_projection(
                 &txn,
                 view_name,
-                &self.load_change(hash).map_err(|e| RepositoryError::Database(e.to_string()))?,
+                &self
+                    .load_change(hash)
+                    .map_err(|e| RepositoryError::Database(e.to_string()))?,
                 assembly_excluded,
                 expectation,
                 hash,
@@ -2784,7 +2779,7 @@ impl Repository {
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
         let tree_projection = self.plan_tree_projection(
-            &mut *txn,
+            &mut txn,
             change_id,
             *hash,
             final_change,
@@ -2811,7 +2806,12 @@ impl Repository {
             view.change_count = sequence;
             txn.update_view(&view)
                 .map_err(|e| RepositoryError::Database(e.to_string()))?;
-            crate::InsertOutcome::new(view.state, view.change_count, false, crate::InsertStats::new())
+            crate::InsertOutcome::new(
+                view.state,
+                view.change_count,
+                false,
+                crate::InsertStats::new(),
+            )
         } else {
             write_change_to_graph(
                 &mut txn,
@@ -2865,7 +2865,7 @@ impl Repository {
             failpoints::semantic_corrupt_trunk_deleted(&mut *txn, &untouched_paths)?;
         }
         self.apply_tree_projection(
-            &mut *txn,
+            &mut txn,
             &tree_projection,
             view_name,
             preserve_existing_tree_paths,
@@ -2880,15 +2880,14 @@ impl Repository {
         // aborts before commit, so no misaligned boundary or failing
         // successor is ever published.
         if supersede_excluded {
-            self.supersede_excluded_members_locked(&mut *txn, view_name, assembly_excluded)?;
+            self.supersede_excluded_members_locked(&mut txn, view_name, assembly_excluded)?;
             // Review C4: the alignment removes target-local members only.
             // An exclusion that also lives in an ANCESTOR view survives the
             // removal and would remain visible in the published effective
             // view while a filtered check hid it. Refuse before commit:
             // ancestor views are shared perspectives and are never
             // flattened or deleted to make alignment pass.
-            let survivors =
-                self.surviving_exclusions(&*txn, view_name, assembly_excluded)?;
+            let survivors = self.surviving_exclusions(&*txn, view_name, assembly_excluded)?;
             if !survivors.is_empty() {
                 let named = survivors
                     .iter()
@@ -2921,12 +2920,12 @@ impl Repository {
             hash,
             supersede_excluded,
         )
-            .map_err(|error| RepositoryError::InvalidOperation {
-                message: format!(
-                    "staged synthesis verification failed for {}: {error}",
-                    hash.to_base32()
-                ),
-            })?;
+        .map_err(|error| RepositoryError::InvalidOperation {
+            message: format!(
+                "staged synthesis verification failed for {}: {error}",
+                hash.to_base32()
+            ),
+        })?;
         let verify_done = commit_start.elapsed();
 
         txn.commit()
@@ -3092,6 +3091,7 @@ impl Repository {
     /// Content is read from the graph, never from the Git worktree: the Git
     /// side of the comparison is the expectation captured from the commit's
     /// tree, the Atomic side is the freshly applied graph state.
+    #[allow(clippy::too_many_arguments)]
     fn verify_staged_projection(
         &self,
         txn: &atomic_core::pristine::WriteTxn<'_>,
@@ -3105,14 +3105,18 @@ impl Repository {
         use atomic_core::pristine::TreeTxnT;
 
         // 1. Resolution frontier verification against the dependency index.
-        if matches!(final_change.origin(), atomic_core::change::ChangeOrigin::GitResolution { .. }) {
+        if matches!(
+            final_change.origin(),
+            atomic_core::change::ChangeOrigin::GitResolution { .. }
+        ) {
             // Failpoint: incomplete dependency index (test injection).
             #[cfg(feature = "adoption-test-injection")]
             failpoints::deps_index()?;
-            atomic_core::apply::verify_causal_frontier(txn, final_change)
-                .map_err(|error| RepositoryError::InvalidOperation {
+            atomic_core::apply::verify_causal_frontier(txn, final_change).map_err(|error| {
+                RepositoryError::InvalidOperation {
                     message: format!("causal frontier verification failed: {error}"),
-                })?;
+                }
+            })?;
         }
 
         // Failpoint: missing graph vertex during staged retrieval (test
@@ -3164,9 +3168,7 @@ impl Repository {
                         .inode_position(inode)
                         .map_err(|e| RepositoryError::Database(e.to_string()))?
                         .ok_or_else(|| RepositoryError::InvalidOperation {
-                            message: format!(
-                                "staged path '{path}' inode has no graph position"
-                            ),
+                            message: format!("staged path '{path}' inode has no graph position"),
                         })?;
                     let rendered = retrieve_content_with_filter_fast(
                         txn,
@@ -3205,7 +3207,10 @@ impl Repository {
                                     ),
                                 })?;
                             super::status::is_file_alive_via_retrieval(
-                                txn, inode, position, &visibility,
+                                txn,
+                                inode,
+                                position,
+                                &visibility,
                             )?
                         }
                     };
@@ -3236,6 +3241,7 @@ impl Repository {
     /// - **Semantic reconstruction**: each present path whose CRDT trunk is
     ///   text reconstructs line-by-line to exactly the expected bytes —
     ///   the semantic layer must agree with the graph, not just the bytes.
+    #[allow(unused_assignments, unused_variables)] // concurrent-writer instrumentation (RFC §17)
     fn verify_staged_full_tree(
         &self,
         txn: &atomic_core::pristine::WriteTxn<'_>,
@@ -3246,10 +3252,13 @@ impl Repository {
     ) -> Result<(), RepositoryError> {
         let verify_start = std::time::Instant::now();
         let projection = self.project_tree_for_visibility(txn, visibility)?;
-        let projection_ms = verify_start.elapsed().as_millis();
+        let _projection_ms = verify_start.elapsed().as_millis();
         if !projection.name_conflicts.is_empty() {
-            let mut conflicted_paths: Vec<&str> =
-                projection.name_conflicts.keys().map(String::as_str).collect();
+            let mut conflicted_paths: Vec<&str> = projection
+                .name_conflicts
+                .keys()
+                .map(String::as_str)
+                .collect();
             conflicted_paths.sort_unstable();
             return Err(RepositoryError::InvalidOperation {
                 message: format!(
@@ -3352,8 +3361,7 @@ impl Repository {
                 // must see the raw path bytes, never the escape text, or
                 // two raw paths that normalize together would report as
                 // distinct identities.
-                let text = match crate::repository::project_tree::unescape_repo_path(path)
-                {
+                let text = match crate::repository::project_tree::unescape_repo_path(path) {
                     Ok(raw) => String::from_utf8_lossy(&raw).into_owned(),
                     Err(_) => String::from_utf8_lossy(path.as_bytes()).into_owned(),
                 };
@@ -3489,11 +3497,7 @@ impl Repository {
         // when the apply reaches that entry: one counter per change,
         // advanced by every earlier entry's leaf ops), so each path replays
         // only its own entries without re-deriving the shared prefix.
-        let mut staged_closure: Vec<(
-            atomic_core::types::NodeId,
-            Change,
-            Vec<u32>,
-        )> = Vec::new();
+        let mut staged_closure: Vec<(atomic_core::types::NodeId, Change, Vec<u32>)> = Vec::new();
         {
             fn entry_counter_offsets(change: &Change) -> Vec<u32> {
                 let mut offsets = Vec::with_capacity(change.file_ops().len());
@@ -3522,12 +3526,8 @@ impl Repository {
                 let change_hash = txn
                     .get_external(change_id)
                     .map_err(|e| RepositoryError::Database(e.to_string()))?
-                    .ok_or_else(|| {
-                        RepositoryError::InvalidOperation {
-                            message: format!(
-                                "closure change {change_id:?} has no external hash"
-                            ),
-                        }
+                    .ok_or_else(|| RepositoryError::InvalidOperation {
+                        message: format!("closure change {change_id:?} has no external hash"),
                     })?;
                 let change = self.load_change(&change_hash).map_err(|e| {
                     RepositoryError::InvalidOperation {
@@ -3607,7 +3607,8 @@ impl Repository {
     /// The replay's own aggregate must equal the expected tree bytes: the
     /// closure's semantic operations must regenerate the commit tree, so a
     /// closure that disagrees with Git fails closed before publication.
-fn verify_staged_semantic_closure(
+    #[allow(clippy::too_many_arguments)]
+    fn verify_staged_semantic_closure(
         &self,
         txn: &atomic_core::pristine::WriteTxn<'_>,
         path: &str,
@@ -3642,10 +3643,7 @@ fn verify_staged_semantic_closure(
         ) -> Vec<ExpectedLeaf> {
             let mut leaves = Vec::new();
             for leaf_op in content {
-                if let atomic_core::crdt::LeafOp::Insert {
-                    kind, content, ..
-                } = leaf_op
-                {
+                if let atomic_core::crdt::LeafOp::Insert { kind, content, .. } = leaf_op {
                     // The apply keys leaf rows by the APPLYING change and its
                     // per-apply counter (review C1 source fix), so the replay
                     // derives the expected identity the same way.
@@ -3667,10 +3665,8 @@ fn verify_staged_semantic_closure(
         let mut expected_trunk_encoding: Option<u8> = None;
         let mut trunk_created = false;
         let mut trunk_deleted = false;
-        let mut branches: std::collections::BTreeMap<
-            atomic_core::crdt::BranchId,
-            ExpectedBranch,
-        > = std::collections::BTreeMap::new();
+        let mut branches: std::collections::BTreeMap<atomic_core::crdt::BranchId, ExpectedBranch> =
+            std::collections::BTreeMap::new();
         // Branch rows the closure CREATED (Insert ops): their `BRANCH_AFTER`
         // rows are this closure's own chain state, so their after-refs and
         // chain membership are enforced below.
@@ -3702,15 +3698,11 @@ fn verify_staged_semantic_closure(
         // the entry's path. A trunk whose final move retargets this path is
         // followed here; a trunk whose final move retargets any other path
         // left this path's domain for good.
-        let mut last_move: std::collections::BTreeMap<
-            atomic_core::crdt::TrunkId,
-            String,
-        > = std::collections::BTreeMap::new();
+        let mut last_move: std::collections::BTreeMap<atomic_core::crdt::TrunkId, String> =
+            std::collections::BTreeMap::new();
         for (change_id, change, _offsets) in staged_closure {
             for ops in change.file_ops() {
-                if let Some(atomic_core::crdt::TrunkOp::Move { trunk, new_path }) =
-                    ops.trunk_op()
-                {
+                if let Some(atomic_core::crdt::TrunkOp::Move { trunk, new_path }) = ops.trunk_op() {
                     let resolved = if trunk.change_id().is_root() {
                         atomic_core::crdt::TrunkId::new(*change_id, trunk.file_idx())
                     } else {
@@ -3720,18 +3712,16 @@ fn verify_staged_semantic_closure(
                 }
             }
         }
-        let mut identity_trunks: std::collections::HashSet<atomic_core::crdt::TrunkId> =
-            last_move
-                .iter()
-                .filter(|(_, target)| target.as_str() == path)
-                .map(|(trunk, _)| *trunk)
-                .collect();
-        let moved_away: std::collections::HashSet<atomic_core::crdt::TrunkId> =
-            last_move
-                .iter()
-                .filter(|(_, target)| target.as_str() != path)
-                .map(|(trunk, _)| *trunk)
-                .collect();
+        let identity_trunks: std::collections::HashSet<atomic_core::crdt::TrunkId> = last_move
+            .iter()
+            .filter(|(_, target)| target.as_str() == path)
+            .map(|(trunk, _)| *trunk)
+            .collect();
+        let moved_away: std::collections::HashSet<atomic_core::crdt::TrunkId> = last_move
+            .iter()
+            .filter(|(_, target)| target.as_str() != path)
+            .map(|(trunk, _)| *trunk)
+            .collect();
         if identity_trunks.len() > 1 {
             return Err(format!(
                 "{} distinct trunks' final moves retarget path '{path}' inside one \
@@ -3800,16 +3790,14 @@ fn verify_staged_semantic_closure(
                 };
                 let trunk_followed = identity_trunks.contains(&resolved_trunk)
                     && !moved_away.contains(&resolved_trunk);
-                let is_target = ((ops.path() == path
-                    && !moved_away.contains(&resolved_trunk))
+                let is_target = ((ops.path() == path && !moved_away.contains(&resolved_trunk))
                     || trunk_followed)
                     && !superseded.contains(&resolved_trunk);
                 if is_target {
                     match ops.trunk_op() {
                         Some(atomic_core::crdt::TrunkOp::Create { encoding, .. }) => {
                             trunk_created = true;
-                            expected_trunk_encoding =
-                                Some(crdt_encoding_u8(encoding.as_ref()));
+                            expected_trunk_encoding = Some(crdt_encoding_u8(encoding.as_ref()));
                         }
                         // Trunk lifecycle is part of the replayed domain
                         // (review C1): the closure's Delete/Undelete ops
@@ -3857,19 +3845,12 @@ fn verify_staged_semantic_closure(
                             };
                             let resolved_after = after.map(|id| {
                                 if id.change_id().is_root() {
-                                    atomic_core::crdt::BranchId::new(
-                                        change_id,
-                                        id.branch_idx(),
-                                    )
+                                    atomic_core::crdt::BranchId::new(change_id, id.branch_idx())
                                 } else {
                                     id
                                 }
                             });
-                            let leaves = expected_leaves(
-                                content,
-                                change_id,
-                                &mut leaf_counter,
-                            );
+                            let leaves = expected_leaves(content, change_id, &mut leaf_counter);
                             branches.insert(
                                 branch_id,
                                 ExpectedBranch {
@@ -3900,21 +3881,14 @@ fn verify_staged_semantic_closure(
                                 }
                                 None => (None, Vec::new()),
                             };
-                            let leaves = expected_leaves(
-                                new_content,
-                                change_id,
-                                &mut leaf_counter,
-                            );
+                            let leaves = expected_leaves(new_content, change_id, &mut leaf_counter);
                             match branches.get_mut(&branch_id) {
                                 Some(existing) => {
                                     // The apply tombstones the branch's
                                     // previous alive tokens when it rewrites
                                     // the line (review C1 source fix): the
                                     // replay mirrors that lifecycle.
-                                    let previous = std::mem::replace(
-                                        &mut existing.leaves,
-                                        leaves,
-                                    );
+                                    let previous = std::mem::replace(&mut existing.leaves, leaves);
                                     existing
                                         .dead_leaves
                                         .extend(previous.into_iter().map(|leaf| leaf.id));
@@ -3961,10 +3935,7 @@ fn verify_staged_semantic_closure(
                         atomic_core::crdt::BranchOp::Reparent { new_after, .. } => {
                             let resolved_after = new_after.map(|id| {
                                 if id.change_id().is_root() {
-                                    atomic_core::crdt::BranchId::new(
-                                        change_id,
-                                        id.branch_idx(),
-                                    )
+                                    atomic_core::crdt::BranchId::new(change_id, id.branch_idx())
                                 } else {
                                     id
                                 }
@@ -4101,7 +4072,7 @@ fn verify_staged_semantic_closure(
         // A branch whose global row is owned by an out-of-closure writer is
         // that writer's responsibility — concurrent semantic state is
         // preserved, not refused (review B2).
-        
+
         // Convert a semantic Encoding to its storage byte (the same mapping
         // the apply pass uses).
         fn crdt_encoding_u8(encoding: Option<&atomic_core::change::Encoding>) -> u8 {
@@ -4283,19 +4254,14 @@ fn verify_staged_semantic_closure(
                         )?,
                         None => false,
                     };
-                    let attributed = graph_proves_dead
-                        || {
-                            let loader = |hash: &Hash| -> Result<Change, String> {
-                                self.load_change(hash).map_err(|e| e.to_string())
-                            };
-                            out_of_closure_writer_deleted_branch(
-                                &loader,
-                                txn,
-                                path,
-                                *branch_id,
-                                visibility,
-                            )?
+                    let attributed = graph_proves_dead || {
+                        let loader = |hash: &Hash| -> Result<Change, String> {
+                            self.load_change(hash).map_err(|e| e.to_string())
                         };
+                        out_of_closure_writer_deleted_branch(
+                            &loader, txn, path, *branch_id, visibility,
+                        )?
+                    };
                     if !attributed {
                         return Err(
                             "a branch is marked Deleted but no applied change deleted it (the \
@@ -4337,10 +4303,8 @@ fn verify_staged_semantic_closure(
                     verify_branch_leaves(txn, *branch_id, &branch_key, &expected.leaves)?;
                     // The consumer renders the replay's own bytes for this
                     // line (review E1).
-                    consumer_domain.insert(
-                        *branch_id,
-                        ConsumerLine::Closure(expected.bytes.clone()),
-                    );
+                    consumer_domain
+                        .insert(*branch_id, ConsumerLine::Closure(expected.bytes.clone()));
                 } else {
                     // Review D2: a registered NodeId is NOT proof of a
                     // writer. The out-of-closure attribution requires a
@@ -4356,7 +4320,8 @@ fn verify_staged_semantic_closure(
                         && txn
                             .has_change_in_graph(row_node.change)
                             .map_err(|e| e.to_string())?;
-                    if writer_registered && writer_applied && !visibility.contains(&row_node.change) {
+                    if writer_registered && writer_applied && !visibility.contains(row_node.change)
+                    {
                         // A registered, applied change outside this closure
                         // claims the row. Attribution is by ACTUAL operations
                         // (review C1), not bare registered ids: the writer's
@@ -4373,10 +4338,7 @@ fn verify_staged_semantic_closure(
                             .load_change(&writer_hash)
                             .map_err(|e| format!("cannot load concurrent writer: {e}"))?;
                         if !change_wrote_branch_vertex_for_branch(
-                            &writer,
-                            path,
-                            *branch_id,
-                            *row_node,
+                            &writer, path, *branch_id, *row_node,
                         ) {
                             return Err(format!(
                                 "branch {branch_id:?} is bound to {row_node:?} but the \
@@ -4388,8 +4350,7 @@ fn verify_staged_semantic_closure(
                         // operations (review D2). The consumer renders the
                         // writer's own recorded content at its vertex
                         // (review E1).
-                        consumer_domain
-                            .insert(*branch_id, ConsumerLine::Writer(*row_node));
+                        consumer_domain.insert(*branch_id, ConsumerLine::Writer(*row_node));
                         concurrent_state = true;
                     } else if !writer_registered || !writer_applied {
                         // A binding that references no real applied change
@@ -4426,10 +4387,8 @@ fn verify_staged_semantic_closure(
                     ));
                 };
                 if expected.vertex.as_ref() == Some(row_node) {
-                    consumer_domain.insert(
-                        *branch_id,
-                        ConsumerLine::Closure(expected.bytes.clone()),
-                    );
+                    consumer_domain
+                        .insert(*branch_id, ConsumerLine::Closure(expected.bytes.clone()));
                 } else {
                     let writer_registered = !row_node.change.is_root()
                         && txn
@@ -4441,7 +4400,7 @@ fn verify_staged_semantic_closure(
                             .has_change_in_graph(row_node.change)
                             .map_err(|e| e.to_string())?;
                     if !(writer_registered && writer_applied)
-                        || visibility.contains(&row_node.change)
+                        || visibility.contains(row_node.change)
                     {
                         return Err(format!(
                             "branch {branch_id:?} was deleted by the closure but the staged \
@@ -4457,12 +4416,8 @@ fn verify_staged_semantic_closure(
                     let writer = self
                         .load_change(&writer_hash)
                         .map_err(|e| format!("cannot load concurrent writer: {e}"))?;
-                    if !change_wrote_branch_vertex_for_branch(
-                        &writer,
-                        path,
-                        *branch_id,
-                        *row_node,
-                    ) {
+                    if !change_wrote_branch_vertex_for_branch(&writer, path, *branch_id, *row_node)
+                    {
                         return Err(format!(
                             "branch {branch_id:?} was deleted by the closure but the staged \
                              row is alive bound to {row_node:?}; no applied out-of-closure \
@@ -4509,7 +4464,7 @@ fn verify_staged_semantic_closure(
             let expected_dead: std::collections::HashSet<[u8; 12]> = expected
                 .dead_leaves
                 .iter()
-                .map(|id| atomic_core::crdt::tables::encode_leaf_id(id))
+                .map(atomic_core::crdt::tables::encode_leaf_id)
                 .collect();
             let linked: Vec<[u8; 12]> = txn
                 .iter_branch_leaves(&branch_key)
@@ -4554,18 +4509,11 @@ fn verify_staged_semantic_closure(
                             let writer_hash = txn
                                 .get_external(leaf_id.change_id())
                                 .map_err(|e| e.to_string())?
-                                .ok_or_else(|| {
-                                    "leaf writer has no external hash".to_string()
-                                })?;
+                                .ok_or_else(|| "leaf writer has no external hash".to_string())?;
                             let writer = self
                                 .load_change(&writer_hash)
                                 .map_err(|e| format!("cannot load leaf writer: {e}"))?;
-                            change_wrote_leaf(
-                                &writer,
-                                path,
-                                *branch_id,
-                                leaf_id,
-                            )
+                            change_wrote_leaf(&writer, path, *branch_id, leaf_id)
                         };
                     if !attributed {
                         return Err(format!(
@@ -4603,8 +4551,8 @@ fn verify_staged_semantic_closure(
         // from the closure replay (each line's own writer blob slice); the
         // ORDER comes from the staged chain, so a corrupted after-chain
         // reorders or drops lines and fails closed here (review B2).
-        let actual_chain = iter_trunk_branches_in_file_order(txn, trunk_key)
-            .map_err(|e| e.to_string())?;
+        let actual_chain =
+            iter_trunk_branches_in_file_order(txn, trunk_key).map_err(|e| e.to_string())?;
         let mut replay_alive_bytes: Vec<u8> = Vec::new();
         let mut visited: std::collections::HashSet<atomic_core::crdt::BranchId> =
             std::collections::HashSet::new();
@@ -4641,15 +4589,13 @@ fn verify_staged_semantic_closure(
             }
         }
         if replay_alive_bytes.as_slice() != expected_bytes {
-            return Err(format!
-                (
-                    "the closure's semantic operations render {} byte(s) for the alive lines but \
+            return Err(format!(
+                "the closure's semantic operations render {} byte(s) for the alive lines but \
                      the commit tree expects {} byte(s); the semantic closure must regenerate \
                      the commit tree",
-                    replay_alive_bytes.len(),
-                    expected_bytes.len()
-                ),
-            );
+                replay_alive_bytes.len(),
+                expected_bytes.len()
+            ));
         }
         for branch_id in &replay_alive_ids {
             if !visited.contains(branch_id) {
@@ -4675,17 +4621,13 @@ fn verify_staged_semantic_closure(
         // corruption the row checks missed — an orphan branch, an unvalidated
         // chain entry, or a diverged payload — never a tolerated
         // reconstruction.
-        let actual = atomic_core::output::crdt::output_file_via_crdt(
-            txn,
-            &self.change_store,
-            path,
-        )
-        .map_err(|error| {
-            format!(
-                "the semantic reconstruction consumers read failed for '{path}': {error}; \
+        let actual = atomic_core::output::crdt::output_file_via_crdt(txn, &self.change_store, path)
+            .map_err(|error| {
+                format!(
+                    "the semantic reconstruction consumers read failed for '{path}': {error}; \
                  the staged CRDT state is corrupt"
-            )
-        })?;
+                )
+            })?;
         let mut expected_consumer_bytes: Vec<u8> = Vec::new();
         for branch_id in &actual_chain {
             match consumer_domain.get(branch_id) {
@@ -4710,6 +4652,9 @@ fn verify_staged_semantic_closure(
             ));
         }
 
+        // Concurrent-writer instrumentation read: the flag is informational
+        // today (set by validated out-of-closure writers; RFC §17).
+        let _ = concurrent_state;
         Ok(())
     }
 
@@ -4772,12 +4717,13 @@ fn verify_staged_semantic_closure(
                 .map_err(|e| e.to_string())?
                 .as_ref()
             {
-                Some(node) => graph_proves_dead_with_ownership(
-                    self, txn, path, branch, node, global_alive,
-                )?,
+                Some(node) => {
+                    graph_proves_dead_with_ownership(self, txn, path, branch, node, global_alive)?
+                }
                 None => false,
-            } || out_of_closure_writer_deleted_branch(&loader, txn, path, branch, visibility)?
-                || applied_writer_deleted_branch(&loader, txn, path, branch)?;
+            } || out_of_closure_writer_deleted_branch(
+                &loader, txn, path, branch, visibility,
+            )? || applied_writer_deleted_branch(&loader, txn, path, branch)?;
             if !attributed {
                 return Err(
                     "the staged file-order chain contains a branch the closure never wrote \
@@ -4806,7 +4752,7 @@ fn verify_staged_semantic_closure(
             && txn
                 .has_change_in_graph(row_node.change)
                 .map_err(|e| e.to_string())?;
-        if !(writer_registered && writer_applied) || visibility.contains(&row_node.change) {
+        if !(writer_registered && writer_applied) || visibility.contains(row_node.change) {
             return Err(format!(
                 "branch {branch:?} claims vertex {row_node:?} but the closure neither \
                  wrote it nor attributes it to an applied out-of-closure change; the \
@@ -4833,4 +4779,3 @@ fn verify_staged_semantic_closure(
         Ok(Some(row_node))
     }
 }
-

@@ -435,7 +435,7 @@ pub const BRIDGE_EVENT_CAPTURE_ANCHORS: TableDefinition<&[u8; 32], &[u8; 32]> =
 /// operation: an earlier advisory capture between the same OIDs can never be
 /// retroactively promoted onto a later ref-write (RFC §5.4 treats ref
 /// movement as a different tier from rewrite). The token is minted by
-/// [`Repository::prepare_bridge_git_ref_write`] at preparation time, handed to
+/// `Repository::prepare_bridge_git_ref_write` at preparation time, handed to
 /// the hook environment for the duration of the operation, and carried inside
 /// the captured event bytes. Anchoring refuses captures whose token does not
 /// match the operation's minted token, so only a capture produced within the

@@ -421,8 +421,14 @@ fn add_file_ops_placeholder_namespace_advances_by_exact_span_for_mixed_entries()
         // highest `after` index: a t-token line chains after-refs 0..t-2,
         // and a single-token line (no after ref) still occupies slot 0.
         leaf += (tokens.saturating_sub(1)).max(1) as u32;
-        assert_eq!(ctx.placeholder_branch_base, branch, "branch base after entry {idx}");
-        assert_eq!(ctx.placeholder_leaf_base, leaf, "leaf base after entry {idx}");
+        assert_eq!(
+            ctx.placeholder_branch_base, branch,
+            "branch base after entry {idx}"
+        );
+        assert_eq!(
+            ctx.placeholder_leaf_base, leaf,
+            "leaf base after entry {idx}"
+        );
         // The entry just added was renumbered into [base - span, base):
         // every branch placeholder in it must land inside its own span.
         let ops = ctx.file_ops.last().expect("entry recorded");

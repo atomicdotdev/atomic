@@ -273,9 +273,7 @@ mod tests {
 mod repair_tests {
     use super::*;
     use atomic_agent::turn::session::SessionStore;
-    use atomic_core::change::session::{
-        IncompleteSession, SessionIncompleteOrigin, SessionStatus,
-    };
+    use atomic_core::change::session::{IncompleteSession, SessionIncompleteOrigin, SessionStatus};
     use std::fs;
 
     /// CB-12A AC3: the repair session contract — resuming an incomplete
@@ -289,8 +287,11 @@ mod repair_tests {
         let sessions_dir = dir.path().join(".atomic").join("sessions");
         let store = SessionStore::new(&sessions_dir).unwrap();
 
-        let mut session =
-            atomic_agent::turn::session::AgentSession::new("sess-repair", "claude-code", "Claude Code");
+        let mut session = atomic_agent::turn::session::AgentSession::new(
+            "sess-repair",
+            "claude-code",
+            "Claude Code",
+        );
         session.view_name = "main".to_string();
         let incomplete = IncompleteSession::new(
             "unexplained Git transition (fixture)",
@@ -307,13 +308,15 @@ mod repair_tests {
         let stored = store.load("sess-repair").unwrap().unwrap();
         let prior_incomplete = stored.incomplete().cloned();
         let mut repaired = stored;
-        repaired.repair_history.push(atomic_agent::turn::session::RepairNote {
-            at_rfc3339: chrono::Utc::now().to_rfc3339(),
-            action: "resume".to_string(),
-            prior_status: repaired.status.label().to_string(),
-            retained_incomplete: prior_incomplete.clone(),
-            detail: String::new(),
-        });
+        repaired
+            .repair_history
+            .push(atomic_agent::turn::session::RepairNote {
+                at_rfc3339: chrono::Utc::now().to_rfc3339(),
+                action: "resume".to_string(),
+                prior_status: repaired.status.label().to_string(),
+                retained_incomplete: prior_incomplete.clone(),
+                detail: String::new(),
+            });
         repaired.status = SessionStatus::Active;
         repaired.evidence_retained = true;
         store.save(&repaired).unwrap();

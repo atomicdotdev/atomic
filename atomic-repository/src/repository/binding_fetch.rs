@@ -29,9 +29,8 @@ use atomic_core::Hash;
 use atomic_objects::{ObjectFamily, ObjectRecord};
 
 use crate::git_binding::{
-    decode_changes_pack, private_material_in_change, validate_binding_closure,
-    BindingPackLimits, ClosureChangeSource, ClosureValidation, GitStateBinding, LossNote,
-    QuarantinedPack,
+    decode_changes_pack, private_material_in_change, validate_binding_closure, BindingPackLimits,
+    ClosureChangeSource, ClosureValidation, GitStateBinding, LossNote, QuarantinedPack,
 };
 
 use super::Repository;
@@ -174,13 +173,8 @@ impl Repository {
                 continue;
             }
             let (change, identity) = Change::deserialize(&mut std::io::Cursor::new(&record.bytes))
-                .map_err(|error| {
-                    RepositoryError::InvalidOperation {
-                        message: format!(
-                            "remote change {} does not decode: {error}",
-                            record.key
-                        ),
-                    }
+                .map_err(|error| RepositoryError::InvalidOperation {
+                    message: format!("remote change {} does not decode: {error}", record.key),
                 })?;
             if identity != expected {
                 return Err(RepositoryError::InvalidOperation {
@@ -239,18 +233,14 @@ impl Repository {
         let binding_id = |binding: &crate::git_binding::GitStateBinding| {
             super::observability::HexBindingId::new(&binding.id().to_hex())
         };
-        let emit_refused =
-            |binding_id: &Option<super::observability::HexBindingId>,
-             reason: BindingFetchRefusalCode| {
-                if let Some(binding) = binding_id.clone() {
-                    BridgeEventJournal::for_repository(self).emit_lossy(
-                        super::observability::BridgeEventKind::BindingFetchRefused {
-                            binding,
-                            reason,
-                        },
-                    );
-                }
-            };
+        let emit_refused = |binding_id: &Option<super::observability::HexBindingId>,
+                            reason: BindingFetchRefusalCode| {
+            if let Some(binding) = binding_id.clone() {
+                BridgeEventJournal::for_repository(self).emit_lossy(
+                    super::observability::BridgeEventKind::BindingFetchRefused { binding, reason },
+                );
+            }
+        };
         let binding_id = binding_id(binding);
         // 1. The binding is the source of truth; verify it before use.
         if let Err(error) = crate::git_binding::verify_binding_cryptography(binding) {
@@ -375,10 +365,7 @@ impl Repository {
             Err(error) => {
                 emit_refused(&binding_id, BindingFetchRefusalCode::ClosureValidation);
                 return Err(RepositoryError::InvalidOperation {
-                    message: format!(
-                        "binding {} closure rejected: {error}",
-                        binding.id()
-                    ),
+                    message: format!("binding {} closure rejected: {error}", binding.id()),
                 });
             }
         };
@@ -386,7 +373,12 @@ impl Repository {
 
         // 6. Verdict — explicit, never silent.
         let mut reasons: Vec<IncompletenessReason> = Vec::new();
-        if missing.is_empty() && payload.loss.iter().any(|note| matches!(note, LossNote::TruncatedHistory { .. })) {
+        if missing.is_empty()
+            && payload
+                .loss
+                .iter()
+                .any(|note| matches!(note, LossNote::TruncatedHistory { .. }))
+        {
             reasons.push(IncompletenessReason::ShallowBoundary);
         }
         if !missing.is_empty() {
@@ -420,10 +412,7 @@ impl Repository {
         acquisition.readiness = if ready {
             ClosureReadiness::Complete
         } else {
-            ClosureReadiness::Incomplete {
-                missing,
-                reasons,
-            }
+            ClosureReadiness::Incomplete { missing, reasons }
         };
         if let Some(binding) = binding_id.clone() {
             super::observability::BridgeEventJournal::for_repository(self).emit_lossy(
@@ -448,7 +437,10 @@ struct StoreClosureSource<'a> {
 }
 
 impl ClosureChangeSource for StoreClosureSource<'_> {
-    fn get(&mut self, hash: &Hash) -> Result<Option<Change>, crate::git_binding::BindingClosureError> {
+    fn get(
+        &mut self,
+        hash: &Hash,
+    ) -> Result<Option<Change>, crate::git_binding::BindingClosureError> {
         if !self.repo.has_change(hash) {
             return Ok(None);
         }

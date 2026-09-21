@@ -19,13 +19,13 @@ use atomic_core::{Hash, OperationId, WorkingCopyId};
 
 use git2::Repository as GitRepository;
 
-use crate::git_binding::{BindingId, GitStateBinding};
 use crate::git_binding::{
     binding_tree_entries, conflicts_pack_self_validates, decode_changes_pack,
     verify_binding_cryptography, BindingPackLimits, QuarantinedPack, SignedAttestationSummary,
     ATTESTATION_SUMMARY_BLOB_NAME, BINDING_BLOB_NAME, CHANGES_PACK_BLOB_NAME,
     CONFLICTS_PACK_BLOB_NAME,
 };
+use crate::git_binding::{BindingId, GitStateBinding};
 use crate::RepositoryError;
 
 use super::Repository;
@@ -102,14 +102,14 @@ impl Repository {
         let bytes = txn.get_binding_bytes(id.as_bytes()).map_err(pristine_map)?;
         match bytes {
             None => Ok(None),
-            Some(bytes) => GitStateBinding::decode(&bytes)
-                .map(Some)
-                .map_err(|error| RepositoryError::InvalidOperation {
+            Some(bytes) => GitStateBinding::decode(&bytes).map(Some).map_err(|error| {
+                RepositoryError::InvalidOperation {
                     message: format!(
                         "stored binding {} failed revalidation: {error}",
                         id.to_hex()
                     ),
-                }),
+                }
+            }),
         }
     }
 
@@ -172,10 +172,10 @@ impl Repository {
     /// Publish a signed binding together with its optional complete
     /// conflict-object pack (RFC §8.3, CB-8B).
     ///
-    /// The pack bytes must be canonical [`ConflictSetObject`] encoding; they
+    /// The pack bytes must be canonical `ConflictSetObject` encoding; they
     /// are structurally revalidated here and identity-bound by the conflict
     /// snapshot commit's `atomic-conflict <hash>` header at restore time.
-    /// Everything else behaves exactly like [`publish_binding`].
+    /// Everything else behaves exactly like `publish_binding`.
     pub fn publish_binding_with_conflicts_pack(
         &self,
         working_copy: WorkingCopyId,
@@ -309,24 +309,27 @@ impl Repository {
         id: &BindingId,
     ) -> Result<Option<GitStateBinding>, RepositoryError> {
         let ref_name = Self::binding_ref_name(id);
-        let Some(target) = git.find_reference(&ref_name).ok().and_then(|r| r.target())
-        else {
+        let Some(target) = git.find_reference(&ref_name).ok().and_then(|r| r.target()) else {
             return Ok(None);
         };
         let commit = git.find_commit(target).map_err(|error| {
-            git_map(format!("binding ref '{ref_name}' points at a missing commit: {error}"))
+            git_map(format!(
+                "binding ref '{ref_name}' points at a missing commit: {error}"
+            ))
         })?;
-        let tree = commit
-            .tree()
-            .map_err(|error| git_map(format!("binding ref '{ref_name}' commit has no tree: {error}")))?;
+        let tree = commit.tree().map_err(|error| {
+            git_map(format!(
+                "binding ref '{ref_name}' commit has no tree: {error}"
+            ))
+        })?;
         let entry = tree.get_name(BINDING_BLOB_NAME).ok_or_else(|| {
             git_map(format!(
                 "binding ref '{ref_name}' tree does not contain {BINDING_BLOB_NAME}"
             ))
         })?;
-        let blob = git
-            .find_blob(entry.id())
-            .map_err(|error| git_map(format!("binding ref '{ref_name}' blob is missing: {error}")))?;
+        let blob = git.find_blob(entry.id()).map_err(|error| {
+            git_map(format!("binding ref '{ref_name}' blob is missing: {error}"))
+        })?;
         let binding = GitStateBinding::decode(blob.content()).map_err(|error| {
             git_map(format!(
                 "binding ref '{ref_name}' carries undecodable binding bytes: {error}"
@@ -374,10 +377,14 @@ impl Repository {
             return Ok(None);
         };
         let commit = git.find_commit(git2_oid(&target)?).map_err(|error| {
-            git_map(format!("binding ref '{ref_name}' points at a missing commit: {error}"))
+            git_map(format!(
+                "binding ref '{ref_name}' points at a missing commit: {error}"
+            ))
         })?;
         let tree = commit.tree().map_err(|error| {
-            git_map(format!("binding ref '{ref_name}' commit has no tree: {error}"))
+            git_map(format!(
+                "binding ref '{ref_name}' commit has no tree: {error}"
+            ))
         })?;
 
         // Transitive surface, part 1 — parentage: the published carrier is
@@ -402,7 +409,9 @@ impl Repository {
         let mut conflicts_pack: Option<Vec<u8>> = None;
         for entry in tree.iter() {
             let name = entry.name().ok_or_else(|| {
-                git_map(format!("binding ref '{ref_name}' tree holds a non-UTF-8 entry name"))
+                git_map(format!(
+                    "binding ref '{ref_name}' tree holds a non-UTF-8 entry name"
+                ))
             })?;
             let allowlisted = matches!(
                 name,
@@ -437,7 +446,7 @@ impl Repository {
                     // against the transport budget first, so an oversized
                     // pack is never copied into memory at all.
                     let limits = BindingPackLimits::default();
-                    if blob.size() as usize > limits.max_pack_bytes {
+                    if blob.size() > limits.max_pack_bytes {
                         return Err(git_map(format!(
                             "binding ref '{ref_name}' carries an oversized {name}: {} bytes \
                              exceeds the {} byte transport budget and is refused before any \
@@ -561,7 +570,7 @@ impl Repository {
     /// The pack bytes must already be the output of
     /// [`crate::git_binding::assemble_changes_pack`] — this function only
     /// places the blob into the binding tree; it performs no additional
-    /// quarantine. Everything else behaves exactly like [`publish_binding`]:
+    /// quarantine. Everything else behaves exactly like `publish_binding`:
     /// the create-only ref, the journal-before-visibility sequence, and
     /// idempotent retries are unchanged.
     pub fn publish_binding_with_changes_pack(
@@ -637,11 +646,15 @@ impl Repository {
             return Ok(None);
         };
         let commit = git.find_commit(target).map_err(|error| {
-            git_map(format!("binding ref '{ref_name}' points at a missing commit: {error}"))
+            git_map(format!(
+                "binding ref '{ref_name}' points at a missing commit: {error}"
+            ))
         })?;
-        let tree = commit
-            .tree()
-            .map_err(|error| git_map(format!("binding ref '{ref_name}' commit has no tree: {error}")))?;
+        let tree = commit.tree().map_err(|error| {
+            git_map(format!(
+                "binding ref '{ref_name}' commit has no tree: {error}"
+            ))
+        })?;
 
         let mut pack: Option<Vec<u8>> = None;
         for entry in tree.iter() {
@@ -674,13 +687,11 @@ impl Repository {
                 )));
             }
             if name == CHANGES_PACK_BLOB_NAME {
-                let blob = git
-                    .find_blob(entry.id())
-                    .map_err(|error| {
-                        git_map(format!(
-                            "binding ref '{ref_name}' pack blob is missing: {error}"
-                        ))
-                    })?;
+                let blob = git.find_blob(entry.id()).map_err(|error| {
+                    git_map(format!(
+                        "binding ref '{ref_name}' pack blob is missing: {error}"
+                    ))
+                })?;
                 pack = Some(blob.content().to_vec());
             }
         }
@@ -705,11 +716,15 @@ impl Repository {
             return Ok(None);
         };
         let commit = git.find_commit(target).map_err(|error| {
-            git_map(format!("binding ref '{ref_name}' points at a missing commit: {error}"))
+            git_map(format!(
+                "binding ref '{ref_name}' points at a missing commit: {error}"
+            ))
         })?;
-        let tree = commit
-            .tree()
-            .map_err(|error| git_map(format!("binding ref '{ref_name}' commit has no tree: {error}")))?;
+        let tree = commit.tree().map_err(|error| {
+            git_map(format!(
+                "binding ref '{ref_name}' commit has no tree: {error}"
+            ))
+        })?;
 
         let mut pack: Option<Vec<u8>> = None;
         for entry in tree.iter() {
@@ -739,13 +754,11 @@ impl Repository {
                 )));
             }
             if name == CONFLICTS_PACK_BLOB_NAME {
-                let blob = git
-                    .find_blob(entry.id())
-                    .map_err(|error| {
-                        git_map(format!(
-                            "binding ref '{ref_name}' conflicts.pack blob is missing: {error}"
-                        ))
-                    })?;
+                let blob = git.find_blob(entry.id()).map_err(|error| {
+                    git_map(format!(
+                        "binding ref '{ref_name}' conflicts.pack blob is missing: {error}"
+                    ))
+                })?;
                 pack = Some(blob.content().to_vec());
             }
         }
@@ -791,9 +804,8 @@ impl Repository {
         // pure function of the tree contents, so republishing the same
         // binding always targets the same commit (create-only idempotency).
         let time = git2::Time::new(0, 0);
-        let signature =
-            git2::Signature::new("Atomic Binding", "binding@atomic.local", &time)
-                .map_err(git_map)?;
+        let signature = git2::Signature::new("Atomic Binding", "binding@atomic.local", &time)
+            .map_err(git_map)?;
         let id = binding.id();
         let payload = binding.payload();
         let message = format!(

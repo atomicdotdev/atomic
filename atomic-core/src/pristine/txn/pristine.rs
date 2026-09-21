@@ -245,7 +245,7 @@ impl Pristine {
         // redb cache is 1 GB which causes excessive page eviction when
         // the GRAPH table grows beyond that during large imports.
         let cache_bytes = 8 * 1024 * 1024 * 1024; // 8 GiB
-        let db = open_database(path.as_ref(), true, cache_bytes)?;
+        let db = open_database(path, true, cache_bytes)?;
 
         // Existing repositories must be checked before the additive table-init
         // transaction starts. Binaries predating this generic fence cannot honor
@@ -535,7 +535,7 @@ impl Pristine {
             .collect::<Vec<_>>();
 
         let mut write_txn = self.db.writable_db()?.begin_write()?;
-        write_txn.set_durability(redb::Durability::Immediate);
+        let _ = write_txn.set_durability(redb::Durability::Immediate);
         let mut metadata = write_txn.open_table(PRISTINE_META)?;
 
         let mut existing_requirements = Vec::new();
@@ -621,7 +621,7 @@ impl Pristine {
         durability: redb::Durability,
     ) -> PristineResult<WriteTxn<'_>> {
         let mut txn = self.db.writable_db()?.begin_write()?;
-        txn.set_durability(durability);
+        let _ = txn.set_durability(durability);
         Ok(WriteTxn::new(
             txn,
             &self.next_node_id,
@@ -917,27 +917,27 @@ mod tests {
                 .unwrap();
             txn.open_table(redb_2_6::TableDefinition::<u64, &[u8; 16]>::new("inodes"))
                 .unwrap();
-            txn.open_table(redb_2_6::TableDefinition::<
-                &'static [u8; 16],
-                u64,
-            >::new("rev_inodes"))
+            txn.open_table(redb_2_6::TableDefinition::<&'static [u8; 16], u64>::new(
+                "rev_inodes",
+            ))
             .unwrap();
             txn.open_table(redb_2_6::TableDefinition::<&'static str, u64>::new("tree"))
                 .unwrap();
-            txn.open_table(redb_2_6::TableDefinition::<u64, &'static str>::new("rev_tree"))
-                .unwrap();
+            txn.open_table(redb_2_6::TableDefinition::<u64, &'static str>::new(
+                "rev_tree",
+            ))
+            .unwrap();
             txn.open_table(redb_2_6::TableDefinition::<u64, u8>::new("directories"))
                 .unwrap();
-            txn.open_table(redb_2_6::TableDefinition::<
-                &'static [u8; 16],
-                &'static [u8],
-            >::new("conflicts"))
+            txn.open_table(
+                redb_2_6::TableDefinition::<&'static [u8; 16], &'static [u8]>::new("conflicts"),
+            )
             .unwrap();
             txn.open_multimap_table(redb_2_6::MultimapTableDefinition::<
                 &'static [u8; 32],
                 &'static [u8; 24],
             >::new("inode_graph"))
-            .unwrap();
+                .unwrap();
             txn.commit().unwrap();
         }
         // The legacy fixture has no PATH_CLAIMS completion marker, so the

@@ -448,7 +448,10 @@ where
         if has_alive && has_dead {
             ambiguous.insert((path.clone(), inode));
             if debug_reduce {
-                let alive_count = maximal.iter().filter(|e| e.state == PathClaimState::Alive).count();
+                let alive_count = maximal
+                    .iter()
+                    .filter(|e| e.state == PathClaimState::Alive)
+                    .count();
                 eprintln!(
                     "REDUCE ambiguous path={path:?} inode={} alive_events={} dead_events={}",
                     inode.get(),

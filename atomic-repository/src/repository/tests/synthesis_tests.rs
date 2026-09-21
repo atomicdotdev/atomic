@@ -10,9 +10,7 @@ use std::fs;
 use std::path::Path;
 use std::process::Command;
 
-use atomic_core::change::{
-    CausalFrontier, ChangeKind, ChangeOrigin, GitDerivation,
-};
+use atomic_core::change::{ChangeKind, ChangeOrigin, GitDerivation};
 use atomic_core::operation::{GitHashAlgorithm, GitObjectId, OperationKind, OperationScope};
 use atomic_core::record::workflow::record::{
     record_added_file, record_deleted_file, record_modified_file,
@@ -25,7 +23,7 @@ use tempfile::TempDir;
 use super::super::synthesis::StagedExpectation;
 use super::*;
 use crate::git_binding::{BindingSigner, CausalOrigin, GitObjectFormat, GitOid, GitStateBinding};
-use crate::{InsertOptions, WorkspaceTxnStart, WorkspaceTxnMode};
+use crate::{InsertOptions, WorkspaceTxnMode, WorkspaceTxnStart};
 
 // ── Fixtures ────────────────────────────────────────────────────────────
 
@@ -60,6 +58,7 @@ fn empty_verification() -> crate::VerifiedProspectiveEquivalence {
     crate::verify_prospective_equivalence(&project, &expected).unwrap()
 }
 
+#[allow(dead_code)]
 fn oid32(seed: u8) -> GitObjectId {
     GitObjectId::new(GitHashAlgorithm::Sha256, vec![seed; 32]).unwrap()
 }
@@ -161,10 +160,7 @@ fn git(root: &Path, args: &[&str]) -> String {
 /// repository bytes/mode/kind, plus the delta paths that must carry
 /// regenerated FileOps. The touched-path contract stays empty: the
 /// full-tree check subsumes it.
-fn full_tree_expectation(
-    entries: &[(&str, &[u8])],
-    semantic_paths: &[&str],
-) -> StagedExpectation {
+fn full_tree_expectation(entries: &[(&str, &[u8])], semantic_paths: &[&str]) -> StagedExpectation {
     let mut tree_entries = std::collections::BTreeMap::new();
     for (path, bytes) in entries {
         tree_entries.insert(
@@ -224,8 +220,16 @@ fn write_checkpoint(root: &Path, repo: &Repository, head: &str, tree: &str) {
 fn fixed_header(message: &str) -> ChangeHeader {
     ChangeHeader::builder()
         .message(message)
-        .author(atomic_core::change::Author::new("Bridge Tests", Some("bridge@tests.dev")))
-        .timestamp(chrono::Utc.timestamp_opt(1_700_000_000, 0).single().unwrap())
+        .author(atomic_core::change::Author::new(
+            "Bridge Tests",
+            Some("bridge@tests.dev"),
+        ))
+        .timestamp(
+            chrono::Utc
+                .timestamp_opt(1_700_000_000, 0)
+                .single()
+                .unwrap(),
+        )
         .build()
 }
 
@@ -272,7 +276,7 @@ fn synthesized_multi_file_root_change_reconstructs_every_path() {
         &expectation,
         None,
         &[],
-   false,
+        false,
     )
     .expect("synthesize multi-file root change");
 
@@ -294,8 +298,7 @@ fn synthesized_root_change_carries_hashed_origin_tagged_oids_and_bridge_sequenci
     let repo = Repository::init(directory.path()).unwrap();
 
     let recorded = memory_add("src/domain/model.rs", b"pub struct Model;\n");
-    let origin =
-        GitSynthesisOrigin::root(oid20(0x11), oid20(0x22)).expect("root origin");
+    let origin = GitSynthesisOrigin::root(oid20(0x11), oid20(0x22)).expect("root origin");
     let unhashed = crate::git_synthesis_metadata(
         &origin,
         &["shallow"],
@@ -318,7 +321,7 @@ fn synthesized_root_change_carries_hashed_origin_tagged_oids_and_bridge_sequenci
             &single_file_expectation("src/domain/model.rs", b"pub struct Model;\n"),
             None,
             &[],
-       false,
+            false,
         )
         .expect("synthesize root change");
 
@@ -380,7 +383,7 @@ fn synthesized_root_change_carries_hashed_origin_tagged_oids_and_bridge_sequenci
         Some("sha1")
     );
     assert_eq!(
-        git_meta.get("parents").and_then(|v| v.as_array().map(Vec::clone)),
+        git_meta.get("parents").and_then(|v| v.as_array().cloned()),
         Some(vec![])
     );
     assert_eq!(
@@ -392,7 +395,9 @@ fn synthesized_root_change_carries_hashed_origin_tagged_oids_and_bridge_sequenci
         Some("bridge")
     );
     assert_eq!(
-        git_meta.get("boundaries").and_then(|v| v.as_array().map(Vec::clone)),
+        git_meta
+            .get("boundaries")
+            .and_then(|v| v.as_array().cloned()),
         Some(vec![serde_json::json!("shallow")])
     );
     // Legacy reader fields survive.
@@ -436,7 +441,7 @@ fn synthesized_first_parent_dependencies_come_from_graph_context_after_reopen() 
             &single_file_expectation("src/domain/model.rs", b"pub struct Model;\n"),
             None,
             &[],
-       false,
+            false,
         )
         .unwrap();
 
@@ -447,13 +452,14 @@ fn synthesized_first_parent_dependencies_come_from_graph_context_after_reopen() 
         .unwrap()
         .expect("repository bytes for the tracked file");
     assert_eq!(old, b"pub struct Model;\n");
-    let modify = memory_modify(&repo, "src/domain/model.rs", &old, b"pub struct Model;\npub enum Kind;\n");
-    let child_origin = GitSynthesisOrigin::first_parent(
-        oid20(0x41),
-        oid20(0x42),
-        oid20(0x31),
-    )
-    .unwrap();
+    let modify = memory_modify(
+        &repo,
+        "src/domain/model.rs",
+        &old,
+        b"pub struct Model;\npub enum Kind;\n",
+    );
+    let child_origin =
+        GitSynthesisOrigin::first_parent(oid20(0x41), oid20(0x42), oid20(0x31)).unwrap();
     let child_unhashed = crate::git_synthesis_metadata(&child_origin, &[], None);
     let child_outcome = repo
         .synthesize_git_change(
@@ -538,7 +544,7 @@ fn deletion_synthesis_uses_repository_state_and_canonical_filedel() {
         &single_file_expectation("plain.txt", b"payload\n"),
         None,
         &[],
-   false,
+        false,
     )
     .unwrap();
 
@@ -594,7 +600,7 @@ fn deletion_synthesis_uses_repository_state_and_canonical_filedel() {
 #[test]
 fn legacy_changes_are_never_rewritten_and_repeated_synthesis_is_idempotent() {
     let directory = TempDir::new().unwrap();
-    let mut repo = Repository::init(directory.path()).unwrap();
+    let repo = Repository::init(directory.path()).unwrap();
 
     // A legacy imported change (no Git origin) written through the
     // pre-CB-9A writer.
@@ -661,7 +667,10 @@ fn legacy_changes_are_never_rewritten_and_repeated_synthesis_is_idempotent() {
 
     // Repeated synthesis of the same commit is a no-op, not a rewrite.
     let working_copy = reopened.require_working_copy_id().unwrap();
-    let state_before = reopened.working_copy_record(working_copy).unwrap().desired_state;
+    let state_before = reopened
+        .working_copy_record(working_copy)
+        .unwrap()
+        .desired_state;
     let repeat = memory_add("synthesized.txt", b"synthesized\n");
     let origin = GitSynthesisOrigin::root(oid20(0x71), oid20(0x72)).unwrap();
     let unhashed = crate::git_synthesis_metadata(&origin, &[], None);
@@ -693,7 +702,10 @@ fn legacy_changes_are_never_rewritten_and_repeated_synthesis_is_idempotent() {
     assert!(again.operation.is_none());
     assert_eq!(again.write.hash, first.write.hash);
     assert_eq!(
-        reopened.working_copy_record(working_copy).unwrap().desired_state,
+        reopened
+            .working_copy_record(working_copy)
+            .unwrap()
+            .desired_state,
         state_before,
         "an idempotent re-synthesis must not advance the view"
     );
@@ -706,7 +718,10 @@ fn synthesis_failure_aborts_the_prepared_operation_without_view_advance() {
     let directory = TempDir::new().unwrap();
     let repo = Repository::init(directory.path()).unwrap();
     let working_copy = repo.require_working_copy_id().unwrap();
-    let state_before = repo.working_copy_record(working_copy).unwrap().desired_state;
+    let state_before = repo
+        .working_copy_record(working_copy)
+        .unwrap()
+        .desired_state;
 
     // Injected fault: the mutation stage fails after the SynthesizeGit
     // intent was journaled, exercising the immutable recovery path.
@@ -729,14 +744,16 @@ fn synthesis_failure_aborts_the_prepared_operation_without_view_advance() {
             &single_file_expectation("doomed.txt", b"doomed\n"),
             None,
             &[],
-       false,
+            false,
         )
         .expect_err("the injected mutation-stage fault must fail the synthesis");
     super::super::synthesis::SYNTHESIS_APPLY_FAULT.with(|cell| cell.set(false));
 
     // No unverified view/checkpoint advance survives.
     assert_eq!(
-        repo.working_copy_record(working_copy).unwrap().desired_state,
+        repo.working_copy_record(working_copy)
+            .unwrap()
+            .desired_state,
         state_before,
         "the failed synthesis must not advance the view state"
     );
@@ -778,7 +795,10 @@ fn synthesis_failure_aborts_the_prepared_operation_without_view_advance() {
         "the recovered head is a single verified operation"
     );
     assert_eq!(
-        reopened.working_copy_record(working_copy).unwrap().desired_state,
+        reopened
+            .working_copy_record(working_copy)
+            .unwrap()
+            .desired_state,
         state_before
     );
 }
@@ -789,8 +809,9 @@ fn synthesis_under_workspace_transaction_journals_synthesize_git_and_verifies() 
     write_checkpoint(directory.path(), &repo, &head, &tree);
     let working_copy = repo.require_working_copy_id().unwrap();
 
-    let WorkspaceTxnStart::Ready(workspace) =
-        repo.begin_workspace_txn(WorkspaceTxnMode::Reconcile).unwrap()
+    let WorkspaceTxnStart::Ready(workspace) = repo
+        .begin_workspace_txn(WorkspaceTxnMode::Reconcile)
+        .unwrap()
     else {
         panic!("a clean colocated workspace must be ready");
     };
@@ -830,7 +851,10 @@ fn synthesis_under_workspace_transaction_journals_synthesize_git_and_verifies() 
         .iter()
         .find(|entry| entry.operation.payload().kind == OperationKind::SynthesizeGit)
         .expect("SynthesizeGit operation in the working-copy log");
-    assert_eq!(synthesis.verification, crate::OperationVerificationState::Verified);
+    assert_eq!(
+        synthesis.verification,
+        crate::OperationVerificationState::Verified
+    );
     assert_ne!(outcome.write.insert.new_state, before_state);
 
     // The repository-scoped log also carries the operation (one causal order).
@@ -853,11 +877,18 @@ fn workspace_refusal_blocks_synthesis_entirely() {
     let (directory, mut repo, head, tree) = initialized_colocated_repository();
     write_checkpoint(directory.path(), &repo, &head, &tree);
     let working_copy = repo.require_working_copy_id().unwrap();
-    let state_before = repo.working_copy_record(working_copy).unwrap().desired_state;
+    let state_before = repo
+        .working_copy_record(working_copy)
+        .unwrap()
+        .desired_state;
 
     // Git-owned in-progress state (MERGE_HEAD): every mode must refuse —
     // including Force — and no synthesis may journal or mutate.
-    fs::write(directory.path().join(".git/MERGE_HEAD"), format!("{head}\n")).unwrap();
+    fs::write(
+        directory.path().join(".git/MERGE_HEAD"),
+        format!("{head}\n"),
+    )
+    .unwrap();
     let remediation = repo.begin_workspace_txn(WorkspaceTxnMode::Force).unwrap();
     assert!(matches!(
         remediation,
@@ -869,7 +900,9 @@ fn workspace_refusal_blocks_synthesis_entirely() {
 
     // The refused boundary leaves the workspace untouched.
     assert_eq!(
-        repo.working_copy_record(working_copy).unwrap().desired_state,
+        repo.working_copy_record(working_copy)
+            .unwrap()
+            .desired_state,
         state_before
     );
     let log = repo
@@ -893,7 +926,7 @@ fn signed_binding(
     ordered: Vec<atomic_core::types::Hash>,
     seed: u8,
 ) -> GitStateBinding {
-    use crate::git_binding::{BINDING_VERSION, GitStateBindingPayload};
+    use crate::git_binding::{GitStateBindingPayload, BINDING_VERSION};
 
     let commit = git_repo.find_commit(commit_oid).expect("commit");
     let mut secret = [0u8; 32];
@@ -955,7 +988,7 @@ fn verified_binding_takes_resurrection_over_synthesis() {
 
     // A fresh repository where the binding's closure is absent.
     let target_dir = TempDir::new().unwrap();
-    let mut target = Repository::init(target_dir.path()).unwrap();
+    let target = Repository::init(target_dir.path()).unwrap();
     for hash in [first.hash(), second.hash()] {
         let change = repo.load_change(hash).unwrap();
         target.save_change(&change).unwrap();
@@ -969,8 +1002,7 @@ fn verified_binding_takes_resurrection_over_synthesis() {
     index.write().unwrap();
     let tree_oid = index.write_tree().unwrap();
     let tree = git_repo.find_tree(tree_oid).unwrap();
-    let signature =
-        git2::Signature::now("Publisher", "pub@example.com").expect("signature");
+    let signature = git2::Signature::now("Publisher", "pub@example.com").expect("signature");
     let commit_oid = git_repo
         .commit(Some("HEAD"), &signature, &signature, "bound", &tree, &[])
         .unwrap();
@@ -997,12 +1029,12 @@ fn verified_binding_takes_resurrection_over_synthesis() {
         .expect("the verified binding is found for its commit");
 
     let outcome = target
-        .resurrect_binding_into_view(&found, &target.current_view())
+        .resurrect_binding_into_view(&found, target.current_view())
         .expect("resurrection references the verified closure");
     assert_eq!(outcome.inserted.len(), 2);
     assert!(outcome.already_present.is_empty());
     let second_outcome = target
-        .resurrect_binding_into_view(&found, &target.current_view())
+        .resurrect_binding_into_view(&found, target.current_view())
         .unwrap();
     assert!(second_outcome.inserted.is_empty());
     assert_eq!(second_outcome.already_present.len(), 2);
@@ -1044,14 +1076,13 @@ fn resurrection_fails_closed_when_the_closure_is_missing() {
         .unwrap()
         .expect("the binding verifies against the live Git object database");
     let error = target
-        .resurrect_binding_into_view(&found, &target.current_view())
+        .resurrect_binding_into_view(&found, target.current_view())
         .expect_err("a missing closure fails closed instead of synthesizing");
     assert!(
         error.to_string().contains("missing locally"),
         "explicit closure diagnostic required, found: {error}"
     );
 }
-
 
 // ── Review C4: the already-applied (reference) hash path carries the same
 // alignment + pre-publication verification duties as the apply path ──────
@@ -1069,7 +1100,7 @@ fn reference_registered_change_verifies_the_effective_projection_before_publicat
     // First synthesis publishes the change into the default view.
     repo.synthesize_git_change(
         fixed_header("import doc"),
-        &[recorded.clone()],
+        std::slice::from_ref(&recorded),
         origin.clone(),
         unhashed.clone(),
         Vec::new(),
@@ -1093,7 +1124,7 @@ fn reference_registered_change_verifies_the_effective_projection_before_publicat
         .expect("create the target view");
     repo.synthesize_git_change(
         fixed_header("import doc"),
-        &[recorded.clone()],
+        std::slice::from_ref(&recorded),
         origin.clone(),
         unhashed.clone(),
         Vec::new(),
@@ -1148,7 +1179,6 @@ fn reference_registered_change_verifies_the_effective_projection_before_publicat
     );
 }
 
-
 // ── Review C1: positive token-level equality after an edit flow — the
 // applier-keyed leaf rows must reconstruct the edited line's tokens exactly,
 // across a reload, with no stale predecessor tokens alive ────────────────
@@ -1160,7 +1190,7 @@ fn reference_registered_change_verifies_the_effective_projection_before_publicat
 #[test]
 fn edited_lines_render_exact_alive_tokens_after_reload() {
     let directory = TempDir::new().unwrap();
-    let mut repo = Repository::init(directory.path()).unwrap();
+    let repo = Repository::init(directory.path()).unwrap();
 
     // A base change adding two files, then an edit of the first file.
     let base_files = [
@@ -1248,8 +1278,8 @@ fn edited_lines_render_exact_alive_tokens_after_reload() {
         .expect("the edit is registered");
     let mut txn = reopened.pristine().write_txn().unwrap();
     for (path, expected_alive_lines) in [("f.txt", 2usize), ("g.txt", 1usize)] {
-        let lines = atomic_core::output::crdt::get_file_lines(&mut txn, path)
-            .expect("read semantic lines");
+        let lines =
+            atomic_core::output::crdt::get_file_lines(&mut txn, path).expect("read semantic lines");
         let alive: Vec<&atomic_core::output::crdt::Line> =
             lines.iter().filter(|line| line.state.is_alive()).collect();
         assert_eq!(
@@ -1278,7 +1308,10 @@ fn edited_lines_render_exact_alive_tokens_after_reload() {
     // namespace: the last-apply-wins re-keying defect is gone (review C1).
     let f_lines =
         atomic_core::output::crdt::get_file_lines(&mut txn, "f.txt").expect("f.txt lines");
-    let edited_line = f_lines.iter().find(|line| line.number == 2).expect("edited line");
+    let edited_line = f_lines
+        .iter()
+        .find(|line| line.number == 2)
+        .expect("edited line");
     for token in &edited_line.tokens {
         assert_eq!(
             token.id.change_id(),
@@ -1313,7 +1346,7 @@ fn view_members(repo: &Repository, view: &str) -> Vec<atomic_core::types::Hash> 
 fn reference_registered_change_with_target_local_removal_prepares_exact_leases() {
     let directory = TempDir::new().unwrap();
     let mut repo = Repository::init(directory.path()).unwrap();
-    let working_copy = repo.require_working_copy_id().unwrap();
+    let _working_copy = repo.require_working_copy_id().unwrap();
     let verification = empty_verification();
 
     // A is applied to the default view first, so referencing it into the
@@ -1324,7 +1357,7 @@ fn reference_registered_change_with_target_local_removal_prepares_exact_leases()
     let hash_a = repo
         .synthesize_git_change(
             fixed_header("import doc"),
-            &[recorded_a.clone()],
+            std::slice::from_ref(&recorded_a),
             origin_a.clone(),
             unhashed_a.clone(),
             Vec::new(),
@@ -1416,7 +1449,10 @@ fn reference_registered_change_with_target_local_removal_prepares_exact_leases()
             target_options("target"),
             &[hash_b],
             &full_tree_expectation(
-                &[("doc.txt", b"referenced content\n"), ("keep.txt", b"preserved\n")],
+                &[
+                    ("doc.txt", b"referenced content\n"),
+                    ("keep.txt", b"preserved\n"),
+                ],
                 &["doc.txt"],
             ),
             None,
@@ -1460,7 +1496,7 @@ fn already_in_view_refuses_a_diverged_expectation() {
     let correct = single_file_expectation("doc.txt", b"referenced content\n");
     repo.synthesize_git_change(
         fixed_header("import doc"),
-        &[recorded.clone()],
+        std::slice::from_ref(&recorded),
         origin.clone(),
         unhashed.clone(),
         Vec::new(),
@@ -1483,7 +1519,7 @@ fn already_in_view_refuses_a_diverged_expectation() {
     let error = repo
         .synthesize_git_change(
             fixed_header("import doc"),
-            &[recorded.clone()],
+            std::slice::from_ref(&recorded),
             origin.clone(),
             unhashed.clone(),
             Vec::new(),
@@ -1499,7 +1535,9 @@ fn already_in_view_refuses_a_diverged_expectation() {
         )
         .expect_err("a wrong already-present expectation must be refused");
     assert!(
-        error.to_string().contains("does not render the supplied expectation"),
+        error
+            .to_string()
+            .contains("does not render the supplied expectation"),
         "the refusal must come from the already-present verification: {error}"
     );
 
@@ -1530,7 +1568,7 @@ fn already_in_view_refuses_a_diverged_expectation() {
 fn reference_path_verification_failure_aborts_cleanly_and_retries() {
     let directory = TempDir::new().unwrap();
     let mut repo = Repository::init(directory.path()).unwrap();
-    let verification = empty_verification();
+    let _verification = empty_verification();
 
     // A is applied to the default view; the target view is empty.
     let recorded_a = memory_add("doc.txt", b"referenced content\n");
@@ -1538,7 +1576,7 @@ fn reference_path_verification_failure_aborts_cleanly_and_retries() {
     let unhashed_a = crate::git_synthesis_metadata(&origin_a, &[], None);
     repo.synthesize_git_change(
         fixed_header("import doc"),
-        &[recorded_a.clone()],
+        std::slice::from_ref(&recorded_a),
         origin_a.clone(),
         unhashed_a.clone(),
         Vec::new(),
@@ -1568,7 +1606,7 @@ fn reference_path_verification_failure_aborts_cleanly_and_retries() {
     let error = repo
         .synthesize_git_change(
             fixed_header("import doc"),
-            &[recorded_a.clone()],
+            std::slice::from_ref(&recorded_a),
             origin_a.clone(),
             unhashed_a.clone(),
             Vec::new(),
@@ -1588,8 +1626,8 @@ fn reference_path_verification_failure_aborts_cleanly_and_retries() {
         "the refusal must come from the staged verification: {error}"
     );
     drop(repo);
-    let mut repo = Repository::open(directory.path())
-        .expect("the aborted reference must not gate reopen");
+    let repo =
+        Repository::open(directory.path()).expect("the aborted reference must not gate reopen");
     let txn = repo.pristine().read_txn().unwrap();
     let view = txn.get_view("retry-target").unwrap().expect("view exists");
     assert_eq!(
@@ -1638,19 +1676,16 @@ struct CorruptedBase {
 impl CorruptedBase {
     fn new(binary: bool) -> Self {
         let directory = TempDir::new().unwrap();
-        let mut repo = Repository::init(directory.path()).unwrap();
+        let repo = Repository::init(directory.path()).unwrap();
         let f_bytes: &[u8] = if binary {
             &[0, 1, 2, 3]
         } else {
             b"inherited text\n"
         };
-        let recorded: Vec<RecordedFile> = [
-            ("f.txt", f_bytes),
-            ("g.txt", &b"other\n"[..]),
-        ]
-        .iter()
-        .map(|(path, bytes)| memory_add(path, bytes))
-        .collect();
+        let recorded: Vec<RecordedFile> = [("f.txt", f_bytes), ("g.txt", &b"other\n"[..])]
+            .iter()
+            .map(|(path, bytes)| memory_add(path, bytes))
+            .collect();
         let origin = GitSynthesisOrigin::root(oid20(0x31), oid20(0x32)).expect("root origin");
         let unhashed = crate::git_synthesis_metadata(&origin, &[], None);
         let expectation = full_tree_expectation(
@@ -1681,14 +1716,11 @@ impl CorruptedBase {
     /// `f_bytes` is the untouched inherited content of f.txt.
     fn finish_refusal(&mut self, f_bytes: &[u8], expected_fragment: &str) -> String {
         let recorded = memory_modify(&self.repo, "g.txt", b"other\n", b"successor\n");
-        let origin =
-            GitSynthesisOrigin::first_parent(oid20(0x33), oid20(0x34), oid20(0x11))
-                .expect("first-parent origin");
+        let origin = GitSynthesisOrigin::first_parent(oid20(0x33), oid20(0x34), oid20(0x11))
+            .expect("first-parent origin");
         let unhashed = crate::git_synthesis_metadata(&origin, &[], None);
-        let expectation = full_tree_expectation(
-            &[("f.txt", f_bytes), ("g.txt", b"successor\n")],
-            &["g.txt"],
-        );
+        let expectation =
+            full_tree_expectation(&[("f.txt", f_bytes), ("g.txt", b"successor\n")], &["g.txt"]);
         let error = self
             .repo
             .synthesize_git_change(
@@ -1718,7 +1750,10 @@ impl CorruptedBase {
 }
 
 /// f.txt's first branch: (encoded key, branch id, trunk id).
-fn first_branch(repo: &Repository, path: &str) -> (
+fn first_branch(
+    repo: &Repository,
+    path: &str,
+) -> (
     [u8; 12],
     atomic_core::crdt::BranchId,
     atomic_core::crdt::TrunkId,
@@ -1742,7 +1777,7 @@ fn staged_verification_refuses_an_unexpected_chain_branch() {
     use atomic_core::crdt::tables::{
         encode_branch_id, encode_branch_value, encode_trunk_id, SerializedBranch,
     };
-    use atomic_core::pristine::{CrdtTxnT, MutTxnT};
+    use atomic_core::pristine::MutTxnT;
 
     let mut base = CorruptedBase::new(false);
     let (first_key, _first_branch, trunk) = first_branch(&base.repo, "f.txt");
@@ -1758,7 +1793,8 @@ fn staged_verification_refuses_an_unexpected_chain_branch() {
             state: atomic_core::crdt::BranchState::Alive,
             line_hash: 0,
         };
-        txn.put_crdt_branch(&extra, &encode_branch_value(&row)).unwrap();
+        txn.put_crdt_branch(&extra, &encode_branch_value(&row))
+            .unwrap();
         txn.put_crdt_trunk_branch(&encode_trunk_id(&trunk), &extra)
             .unwrap();
         txn.put_crdt_branch_after(&extra, &first_key).unwrap();
@@ -1797,8 +1833,7 @@ fn staged_verification_refuses_an_unattributed_branch_tombstone_with_fake_vertex
             .unwrap();
         txn.commit().unwrap();
     }
-    let error =
-            base.finish_refusal(b"inherited text\n", "unattributed tombstone");
+    let error = base.finish_refusal(b"inherited text\n", "unattributed tombstone");
     assert!(
         error.contains("no applied change deleted it"),
         "the fake vertex must not attribute the tombstone: {error}"
@@ -1811,7 +1846,7 @@ fn staged_verification_refuses_an_unattributed_branch_tombstone_with_fake_vertex
 #[test]
 fn staged_verification_refuses_a_leaf_written_by_a_never_applied_change() {
     use atomic_core::crdt::tables::{encode_leaf_id, encode_leaf_value, SerializedLeaf};
-    use atomic_core::pristine::{CrdtTxnT, MutTxnT};
+    use atomic_core::pristine::MutTxnT;
 
     let mut base = CorruptedBase::new(false);
     let (branch_key, first_branch_id, _trunk) = first_branch(&base.repo, "f.txt");
@@ -1835,8 +1870,7 @@ fn staged_verification_refuses_a_leaf_written_by_a_never_applied_change() {
         txn.put_crdt_branch_leaf(&branch_key, &leaf).unwrap();
         txn.commit().unwrap();
     }
-    let error =
-            base.finish_refusal(b"inherited text\n", "token linkage corruption");
+    let error = base.finish_refusal(b"inherited text\n", "token linkage corruption");
     assert!(
         error.contains("no applied out-of-closure change recorded it"),
         "a registered NodeId is not proof of a writer: {error}"
@@ -1855,7 +1889,10 @@ fn staged_verification_refuses_a_tombstoned_opaque_trunk() {
     {
         let txn = base.repo.pristine();
         let mut txn = txn.write_txn().unwrap();
-        let trunk = txn.get_trunk_by_path("f.txt").unwrap().expect("trunk exists");
+        let trunk = txn
+            .get_trunk_by_path("f.txt")
+            .unwrap()
+            .expect("trunk exists");
         let key = encode_trunk_id(&trunk);
         let mut row = txn.get_crdt_trunk(&key).unwrap().unwrap();
         assert_eq!(row.encoding, 0, "the fixture trunk must be opaque");
@@ -1878,7 +1915,7 @@ fn staged_verification_refuses_a_tombstoned_opaque_trunk() {
 fn out_of_closure_tombstone_attribution_requires_an_applied_writer() {
     use atomic_core::change::{Change, ChangeHeader, FileOps, LineOps};
     use atomic_core::crdt::{BranchId, TrunkId};
-    use atomic_core::pristine::{GraphVisibilityClosure, GraphTxnT, MutTxnT};
+    use atomic_core::pristine::{GraphTxnT, GraphVisibilityClosure, MutTxnT};
     use atomic_core::types::{Hash, NodeId};
 
     let (_temp, repo) = create_temp_repo();
@@ -1910,20 +1947,25 @@ fn out_of_closure_tombstone_attribution_requires_an_applied_writer() {
         "the deleter must stay unapplied for this regression"
     );
 
-    let branch_attributed =
-        super::super::synthesis::out_of_closure_writer_deleted_branch(
-            &loader, &txn, "f.txt", branch, &visibility,
-        )
-        .unwrap();
+    let branch_attributed = super::super::synthesis::out_of_closure_writer_deleted_branch(
+        &loader,
+        &txn,
+        "f.txt",
+        branch,
+        &visibility,
+    )
+    .unwrap();
     assert!(
         !branch_attributed,
         "a registered-but-unapplied change must not attribute a branch tombstone"
     );
-    let trunk_attributed =
-        super::super::synthesis::out_of_closure_writer_deleted_trunk(
-            &loader, &txn, "f.txt", &visibility,
-        )
-        .unwrap();
+    let trunk_attributed = super::super::synthesis::out_of_closure_writer_deleted_trunk(
+        &loader,
+        &txn,
+        "f.txt",
+        &visibility,
+    )
+    .unwrap();
     assert!(
         !trunk_attributed,
         "a registered-but-unapplied change must not attribute a trunk tombstone"

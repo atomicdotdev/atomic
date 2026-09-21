@@ -721,7 +721,9 @@ impl Push {
             push_closure.dedup();
             if !push_closure.is_empty() {
                 let provider =
-                    atomic_repository::repository::provenance_gate::local_session_mac_key_provider(&repo);
+                    atomic_repository::repository::provenance_gate::local_session_mac_key_provider(
+                        &repo,
+                    );
                 repo.enforce_publication_gate("Atomic push", &push_closure, Some(&provider))
                     .map_err(CliError::Repository)?;
             }

@@ -86,11 +86,7 @@ pub fn capture_dir(sessions_dir: &Path, session_id: &str) -> AgentResult<PathBuf
 /// `turn-{turn}.attempt-{n}.json` and are created exclusively — a retried
 /// commit appends a new attempt instead of overwriting the previous
 /// attempt's evidence.
-pub fn capture_path(
-    sessions_dir: &Path,
-    session_id: &str,
-    turn: u32,
-) -> AgentResult<PathBuf> {
+pub fn capture_path(sessions_dir: &Path, session_id: &str, turn: u32) -> AgentResult<PathBuf> {
     Ok(capture_dir(sessions_dir, session_id)?.join(format!("turn-{turn}.json")))
 }
 
@@ -100,17 +96,12 @@ fn attempt_capture_path(
     turn: u32,
     attempt: u32,
 ) -> AgentResult<PathBuf> {
-    Ok(capture_dir(sessions_dir, session_id)?
-        .join(format!("turn-{turn}.attempt-{attempt}.json")))
+    Ok(capture_dir(sessions_dir, session_id)?.join(format!("turn-{turn}.attempt-{attempt}.json")))
 }
 
 /// Every stored capture for one turn, oldest first (legacy single file
 /// first, then per-attempt files in attempt order).
-fn capture_files(
-    sessions_dir: &Path,
-    session_id: &str,
-    turn: u32,
-) -> AgentResult<Vec<PathBuf>> {
+fn capture_files(sessions_dir: &Path, session_id: &str, turn: u32) -> AgentResult<Vec<PathBuf>> {
     let mut files = Vec::new();
     let legacy = capture_path(sessions_dir, session_id, turn)?;
     if legacy.exists() {
@@ -122,8 +113,13 @@ fn capture_files(
             .flatten()
             .filter_map(|entry| {
                 let name = entry.file_name().to_string_lossy().to_string();
-                let rest = name.strip_prefix(&prefix)?.strip_suffix(".json")?.to_string();
-                rest.parse::<u32>().ok().map(|attempt| (attempt, entry.path()))
+                let rest = name
+                    .strip_prefix(&prefix)?
+                    .strip_suffix(".json")?
+                    .to_string();
+                rest.parse::<u32>()
+                    .ok()
+                    .map(|attempt| (attempt, entry.path()))
             })
             .collect();
         attempts.sort_by_key(|(attempt, _)| *attempt);
@@ -283,7 +279,11 @@ pub fn write_capture(
     // Find the first attempt slot that does not exist yet, exclusively.
     for attempt in 1..=64u32 {
         let path = attempt_capture_path(sessions_dir, &session.session_id, turn, attempt)?;
-        match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
             Ok(mut file) => {
                 file.write_all(&capture.to_json()?)?;
                 file.sync_all()?;
@@ -332,10 +332,8 @@ pub fn verify_capture(
     let Some(path) = latest_capture_file(sessions_dir, &session.session_id, turn)? else {
         return Ok(None);
     };
-    let bytes = std::fs::read(&path).map_err(|error| {
-        crate::error::AgentError::CaptureInvalid {
-            reason: format!("cannot read capture {}: {}", path.display(), error),
-        }
+    let bytes = std::fs::read(&path).map_err(|error| crate::error::AgentError::CaptureInvalid {
+        reason: format!("cannot read capture {}: {}", path.display(), error),
     })?;
     let capture = ManagedCommitCapture::from_json(&bytes)?;
     if capture.version != CAPTURE_VERSION {
@@ -462,8 +460,14 @@ mod tests {
         let mut session = make_session("sess-cap-1");
         store.save(&session).unwrap();
 
-        let path = write_capture(dir.path(), &mut session, 3, "wc".to_string(), &sample_token())
-            .unwrap();
+        let path = write_capture(
+            dir.path(),
+            &mut session,
+            3,
+            "wc".to_string(),
+            &sample_token(),
+        )
+        .unwrap();
         // Persist the generated MAC key (the CLI hook does this after every
         // capture) — or the consumer cannot authenticate.
         store.save(&session).unwrap();
@@ -493,7 +497,16 @@ mod tests {
     fn missing_capture_is_none_not_error() {
         let dir = tempfile::TempDir::new().unwrap();
         let session = make_session("sess-cap-2");
-        let verified = verify_capture(dir.path(), &session, 1, "wc", Some(&"b".repeat(40)), Some("tree-index"), 0).unwrap();
+        let verified = verify_capture(
+            dir.path(),
+            &session,
+            1,
+            "wc",
+            Some(&"b".repeat(40)),
+            Some("tree-index"),
+            0,
+        )
+        .unwrap();
         assert!(verified.is_none(), "hook bypassed: no capture, no error");
     }
 
@@ -503,7 +516,14 @@ mod tests {
         let store = SessionStore::new(dir.path()).unwrap();
         let mut session = make_session("sess-cap-3");
         store.save(&session).unwrap();
-        write_capture(dir.path(), &mut session, 2, "wc".to_string(), &sample_token()).unwrap();
+        write_capture(
+            dir.path(),
+            &mut session,
+            2,
+            "wc".to_string(),
+            &sample_token(),
+        )
+        .unwrap();
         store.save(&session).unwrap();
 
         // Tamper with a covered field.
@@ -524,8 +544,7 @@ mod tests {
             Some("tree-index"),
             0,
         )
-        .err()
-        .expect("tampered capture must fail");
+        .expect_err("tampered capture must fail");
         assert!(
             error.to_string().contains("authentication"),
             "unexpected error: {error}"
@@ -538,7 +557,14 @@ mod tests {
         let store = SessionStore::new(dir.path()).unwrap();
         let mut session = make_session("sess-cap-4");
         store.save(&session).unwrap();
-        write_capture(dir.path(), &mut session, 1, "wc".to_string(), &sample_token()).unwrap();
+        write_capture(
+            dir.path(),
+            &mut session,
+            1,
+            "wc".to_string(),
+            &sample_token(),
+        )
+        .unwrap();
         store.save(&session).unwrap();
 
         let persisted = store.load("sess-cap-4").unwrap().unwrap();
@@ -557,7 +583,9 @@ mod tests {
         // ...but a capture copied to another turn's path is a replay: the
         // per-turn binding must fail even though the MAC itself is intact.
         std::fs::copy(
-            latest_capture_file(dir.path(), "sess-cap-4", 1).unwrap().unwrap(),
+            latest_capture_file(dir.path(), "sess-cap-4", 1)
+                .unwrap()
+                .unwrap(),
             attempt_capture_path(dir.path(), "sess-cap-4", 2, 1).unwrap(),
         )
         .unwrap();
@@ -570,9 +598,11 @@ mod tests {
             Some("tree-index"),
             0,
         )
-        .err()
-        .expect("replayed capture must fail");
-        assert!(error.to_string().contains("replayed"), "unexpected: {error}");
+        .expect_err("replayed capture must fail");
+        assert!(
+            error.to_string().contains("replayed"),
+            "unexpected: {error}"
+        );
     }
 
     #[test]
@@ -581,7 +611,14 @@ mod tests {
         let store = SessionStore::new(dir.path()).unwrap();
         let mut session = make_session("sess-cap-5");
         store.save(&session).unwrap();
-        write_capture(dir.path(), &mut session, 1, "wc".to_string(), &sample_token()).unwrap();
+        write_capture(
+            dir.path(),
+            &mut session,
+            1,
+            "wc".to_string(),
+            &sample_token(),
+        )
+        .unwrap();
         store.save(&session).unwrap();
 
         let impostor = make_session("sess-cap-6");
@@ -589,21 +626,23 @@ mod tests {
         // under the impostor's own MAC key.
         std::fs::create_dir_all(capture_dir(dir.path(), "sess-cap-6").unwrap()).unwrap();
         std::fs::copy(
-            latest_capture_file(dir.path(), "sess-cap-5", 1).unwrap().unwrap(),
+            latest_capture_file(dir.path(), "sess-cap-5", 1)
+                .unwrap()
+                .unwrap(),
             attempt_capture_path(dir.path(), "sess-cap-6", 1, 1).unwrap(),
         )
         .unwrap();
         assert!(
             verify_capture(
-            dir.path(),
-            &impostor,
-            1,
-            "wc",
-            Some(&"a".repeat(40)),
-            Some("tree-index"),
-            0,
-        )
-        .is_err(),
+                dir.path(),
+                &impostor,
+                1,
+                "wc",
+                Some(&"a".repeat(40)),
+                Some("tree-index"),
+                0,
+            )
+            .is_err(),
             "another session's MAC key must not authenticate the capture"
         );
     }
@@ -618,8 +657,22 @@ mod tests {
         let mut session = make_session("sess-cap-7");
         store.save(&session).unwrap();
 
-        write_capture(dir.path(), &mut session, 1, "wc".to_string(), &sample_token()).unwrap();
-        write_capture(dir.path(), &mut session, 1, "wc".to_string(), &sample_token()).unwrap();
+        write_capture(
+            dir.path(),
+            &mut session,
+            1,
+            "wc".to_string(),
+            &sample_token(),
+        )
+        .unwrap();
+        write_capture(
+            dir.path(),
+            &mut session,
+            1,
+            "wc".to_string(),
+            &sample_token(),
+        )
+        .unwrap();
 
         let files = capture_files(dir.path(), "sess-cap-7", 1).unwrap();
         assert_eq!(
@@ -630,10 +683,17 @@ mod tests {
         assert!(has_capture(dir.path(), "sess-cap-7", 1));
         store.save(&session).unwrap();
         let persisted = store.load("sess-cap-7").unwrap().unwrap();
-        let verified =
-            verify_capture(dir.path(), &persisted, 1, "wc", Some(&"a".repeat(40)), Some("tree-index"), 0)
-                .unwrap()
-                .expect("latest attempt verifies");
+        let verified = verify_capture(
+            dir.path(),
+            &persisted,
+            1,
+            "wc",
+            Some(&"a".repeat(40)),
+            Some("tree-index"),
+            0,
+        )
+        .unwrap()
+        .expect("latest attempt verifies");
         assert_eq!(verified.turn, 1);
     }
 
@@ -646,11 +706,20 @@ mod tests {
         let store = SessionStore::new(dir.path()).unwrap();
         let mut session = make_session("sess-cap-8");
         store.save(&session).unwrap();
-        write_capture(dir.path(), &mut session, 1, "wc".to_string(), &sample_token()).unwrap();
+        write_capture(
+            dir.path(),
+            &mut session,
+            1,
+            "wc".to_string(),
+            &sample_token(),
+        )
+        .unwrap();
         store.save(&session).unwrap();
 
         let key = session.mac_key.clone().unwrap();
-        let path = latest_capture_file(dir.path(), "sess-cap-8", 1).unwrap().unwrap();
+        let path = latest_capture_file(dir.path(), "sess-cap-8", 1)
+            .unwrap()
+            .unwrap();
         let mut capture = ManagedCommitCapture::from_json(&std::fs::read(&path).unwrap()).unwrap();
 
         // A future-dated but correctly-signed capture is fabrication, not
@@ -661,10 +730,18 @@ mod tests {
 
         let persisted = store.load("sess-cap-8").unwrap().unwrap();
         let error = verify_capture(
-            dir.path(), &persisted, 1, "wc", Some(&"a".repeat(40)), Some("tree-index"), 0,
+            dir.path(),
+            &persisted,
+            1,
+            "wc",
+            Some(&"a".repeat(40)),
+            Some("tree-index"),
+            0,
         )
-        .err()
-        .expect("future-dated capture must fail");
-        assert!(error.to_string().contains("future-dated"), "unexpected: {error}");
+        .expect_err("future-dated capture must fail");
+        assert!(
+            error.to_string().contains("future-dated"),
+            "unexpected: {error}"
+        );
     }
 }

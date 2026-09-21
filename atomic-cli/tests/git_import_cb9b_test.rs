@@ -17,6 +17,7 @@
 //!   their evidence and identity limits, and a captured post-rewrite event
 //!   with a locally known predecessor produces only a reviewable
 //!   RewriteCandidate link.
+#![allow(unused_must_use)] // CB-9B probes intentionally ignore non-fatal failures
 
 use std::fs;
 use std::io::Write;
@@ -25,9 +26,10 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
 use atomic_core::change::{ChangeOrigin, GitDerivation};
-use atomic_core::operation::{GitHashAlgorithm, GitObjectId, GitRefTarget, OperationKind, OperationScope};
+use atomic_core::operation::{
+    GitHashAlgorithm, GitObjectId, GitRefTarget, OperationKind, OperationScope,
+};
 use atomic_core::types::Base32;
-use git2::Repository as GitRepository;
 
 const ATOMIC_BIN: &str = env!("CARGO_BIN_EXE_atomic");
 
@@ -169,6 +171,7 @@ fn open_repo(root: &Path) -> atomic_repository::Repository {
     atomic_repository::Repository::open(root).unwrap()
 }
 
+#[allow(dead_code)]
 fn change_by_sha(
     repo: &atomic_repository::Repository,
     view: &str,
@@ -272,7 +275,9 @@ fn merge_imports_every_parent_closure_and_resolves_with_verified_frontier() {
         let hash = entries
             .iter()
             .find(|entry| {
-                repo.load_change(&entry.hash).unwrap().unhashed
+                repo.load_change(&entry.hash)
+                    .unwrap()
+                    .unhashed
                     .as_ref()
                     .and_then(|v| v.get("git"))
                     .and_then(|g| g.get("sha"))
@@ -288,7 +293,8 @@ fn merge_imports_every_parent_closure_and_resolves_with_verified_frontier() {
         let hash = entries
             .iter()
             .find(|entry| {
-                repo.load_change(&entry.hash).unwrap()
+                repo.load_change(&entry.hash)
+                    .unwrap()
                     .unhashed
                     .as_ref()
                     .and_then(|v| v.get("git"))
@@ -305,7 +311,8 @@ fn merge_imports_every_parent_closure_and_resolves_with_verified_frontier() {
         let hash = entries
             .iter()
             .find(|entry| {
-                repo.load_change(&entry.hash).unwrap()
+                repo.load_change(&entry.hash)
+                    .unwrap()
                     .unhashed
                     .as_ref()
                     .and_then(|v| v.get("git"))
@@ -322,7 +329,8 @@ fn merge_imports_every_parent_closure_and_resolves_with_verified_frontier() {
         let hash = entries
             .iter()
             .find(|entry| {
-                repo.load_change(&entry.hash).unwrap()
+                repo.load_change(&entry.hash)
+                    .unwrap()
                     .unhashed
                     .as_ref()
                     .and_then(|v| v.get("git"))
@@ -342,10 +350,7 @@ fn merge_imports_every_parent_closure_and_resolves_with_verified_frontier() {
             parents,
         } => {
             assert_eq!(*merge_commit, tagged(&fixture.merge));
-            assert_eq!(
-                parents,
-                &[tagged(&fixture.side_a), tagged(&fixture.side_b)]
-            );
+            assert_eq!(parents, &[tagged(&fixture.side_a), tagged(&fixture.side_b)]);
         }
         other => panic!("merge must be a GitResolution, found {other:?}"),
     }
@@ -419,11 +424,7 @@ fn octopus_merge_imports_all_three_parent_closures() {
     fs::write(root.join("base.txt"), b"base\n");
     git_commit(&root, "base");
 
-    for (branch, marker) in [
-        ("leg-a", "alpha"),
-        ("leg-b", "beta"),
-        ("leg-c", "gamma"),
-    ] {
+    for (branch, marker) in [("leg-a", "alpha"), ("leg-b", "beta"), ("leg-c", "gamma")] {
         git(&root, &["checkout", "-q", "-b", branch]);
         fs::write(root.join(format!("{marker}.txt")), format!("{marker}\n"));
         git_commit(&root, marker);
@@ -456,7 +457,8 @@ fn octopus_merge_imports_all_three_parent_closures() {
         let hash = entries
             .iter()
             .find(|entry| {
-                repo.load_change(&entry.hash).unwrap()
+                repo.load_change(&entry.hash)
+                    .unwrap()
                     .unhashed
                     .as_ref()
                     .and_then(|v| v.get("git"))
@@ -490,7 +492,8 @@ fn octopus_merge_imports_all_three_parent_closures() {
             entries
                 .iter()
                 .find(|entry| {
-                    repo.load_change(&entry.hash).unwrap()
+                    repo.load_change(&entry.hash)
+                        .unwrap()
                         .unhashed
                         .as_ref()
                         .and_then(|v| v.get("git"))
@@ -561,7 +564,11 @@ fn concurrent_change_conflicts_after_reload_and_resolution_never_replays() {
     git(&root, &["merge", "-q", "--ff-only", "leg-a"]);
 
     // Serialize/reload boundary: the merge imports in a fresh process.
-    atomic_ok(&root, &home, &["git", "import", "--incremental", "--no-vault"]);
+    atomic_ok(
+        &root,
+        &home,
+        &["git", "import", "--incremental", "--no-vault"],
+    );
 
     let repo = open_repo(&root);
     let merge_change = {
@@ -569,7 +576,8 @@ fn concurrent_change_conflicts_after_reload_and_resolution_never_replays() {
         let hash = entries
             .iter()
             .find(|entry| {
-                repo.load_change(&entry.hash).unwrap()
+                repo.load_change(&entry.hash)
+                    .unwrap()
                     .unhashed
                     .as_ref()
                     .and_then(|v| v.get("git"))
@@ -633,7 +641,7 @@ fn distinct_empty_commits_stay_distinct_and_carry_hashed_foreign_facts() {
 
     // Two empty commits with byte-identical messages, author, and dates —
     // the exact shape that collapsed into one hash before CB-9B.
-    let env = [
+    let _env = [
         ("GIT_AUTHOR_DATE", "2026-09-11T10:00:00 +0000"),
         ("GIT_COMMITTER_DATE", "2026-09-11T10:00:00 +0000"),
     ];
@@ -645,9 +653,17 @@ fn distinct_empty_commits_stay_distinct_and_carry_hashed_foreign_facts() {
         ("GIT_AUTHOR_DATE", "2026-09-11T10:00:00 +0000"),
         ("GIT_COMMITTER_DATE", "2026-09-11T10:00:00 +0000"),
     ];
-    git_env(&root, &env, &["commit", "-q", "--allow-empty", "-m", "mark"]);
+    git_env(
+        &root,
+        &env,
+        &["commit", "-q", "--allow-empty", "-m", "mark"],
+    );
     let empty1 = git(&root, &["rev-parse", "HEAD"]);
-    git_env(&root, &env, &["commit", "-q", "--allow-empty", "-m", "mark"]);
+    git_env(
+        &root,
+        &env,
+        &["commit", "-q", "--allow-empty", "-m", "mark"],
+    );
     let empty2 = git(&root, &["rev-parse", "HEAD"]);
     assert_ne!(empty1, empty2);
 
@@ -679,10 +695,7 @@ fn distinct_empty_commits_stay_distinct_and_carry_hashed_foreign_facts() {
     assert!(change1.hunks().is_empty() && change2.hunks().is_empty());
     assert!(!change1.has_file_ops() && !change2.has_file_ops());
 
-    for (change, sha, parent) in [
-        (&change1, &empty1, &base),
-        (&change2, &empty2, &empty1),
-    ] {
+    for (change, sha, parent) in [(&change1, &empty1, &base), (&change2, &empty2, &empty1)] {
         match change.origin() {
             ChangeOrigin::GitSynthesized {
                 commit,
@@ -790,7 +803,8 @@ fn unbound_squash_synthesizes_one_squash_derivation_and_review_surfaces_limits()
         let hash = entries
             .iter()
             .find(|entry| {
-                repo.load_change(&entry.hash).unwrap()
+                repo.load_change(&entry.hash)
+                    .unwrap()
                     .unhashed
                     .as_ref()
                     .and_then(|v| v.get("git"))
@@ -895,7 +909,16 @@ fn post_rewrite_event_creates_reviewable_candidate_link() {
     // Amend (a rewrite) with a squash-shaped message.
     fs::write(root.join("doc.md"), b"original\nrewritten\n").unwrap();
     git(&root, &["add", "."]);
-    git(&root, &["commit", "-q", "--amend", "-m", "Rewrite feature (#7)\n\n* one\n* two"]);
+    git(
+        &root,
+        &[
+            "commit",
+            "-q",
+            "--amend",
+            "-m",
+            "Rewrite feature (#7)\n\n* one\n* two",
+        ],
+    );
     let rewritten = git(&root, &["rev-parse", "HEAD"]);
     assert_ne!(original, rewritten);
 
@@ -921,7 +944,11 @@ fn post_rewrite_event_creates_reviewable_candidate_link() {
     let status = child.wait().expect("hook-post-rewrite status");
     assert!(status.success(), "hook-post-rewrite failed");
 
-    atomic_ok(&root, &home, &["git", "import", "--incremental", "--no-vault"]);
+    atomic_ok(
+        &root,
+        &home,
+        &["git", "import", "--incremental", "--no-vault"],
+    );
 
     let repo = open_repo(&root);
     let tags = repo.list_tags_for_view("main").unwrap();
@@ -968,7 +995,8 @@ fn post_rewrite_event_creates_reviewable_candidate_link() {
         let hash = entries
             .iter()
             .find(|entry| {
-                repo.load_change(&entry.hash).unwrap()
+                repo.load_change(&entry.hash)
+                    .unwrap()
                     .unhashed
                     .as_ref()
                     .and_then(|v| v.get("git"))
@@ -995,6 +1023,7 @@ fn post_rewrite_event_creates_reviewable_candidate_link() {
     assert!(review.contains("unauthenticated-evidence-only"), "{review}");
 }
 
+#[allow(dead_code)]
 fn atomic_env(root: &Path, home: &Path, args: &[&str], envs: &[(&str, &str)]) -> Output {
     Command::new(ATOMIC_BIN)
         .args(args)
@@ -1154,10 +1183,7 @@ fn merge_legs_record_no_sibling_dependency_in_both_orders() {
         // The merge resolution: GitResolution origin, context-derived deps,
         // and semantic FileOps (review blocker 3).
         let merge = change_of(&repo, "main", &fixture.merge);
-        assert!(matches!(
-            merge.origin(),
-            ChangeOrigin::GitResolution { .. }
-        ));
+        assert!(matches!(merge.origin(), ChangeOrigin::GitResolution { .. }));
         assert!(
             merge.has_file_ops(),
             "the merge resolution must emit semantic FileOps (review blocker 3)"
@@ -1212,7 +1238,7 @@ fn installed_reference_transaction_hooks_record_real_git_transitions() {
     atomic_ok(&root, &home, &["git", "import", "--no-vault"]);
 
     // Install the owned dispatchers.
-    let enable = atomic_ok(&root, &home, &["git", "bridge", "enable"]);
+    let _enable = atomic_ok(&root, &home, &["git", "bridge", "enable"]);
     let hooks_dir = root.join(".git/hooks");
     let hook_script = fs::read_to_string(hooks_dir.join("reference-transaction")).unwrap();
     assert!(
@@ -1223,10 +1249,7 @@ fn installed_reference_transaction_hooks_record_real_git_transitions() {
     // Committed ref creation: <old=zero> <new=sha> <ref> on stdin.
     let head = git(&root, &["rev-parse", "HEAD"]);
     let zero40 = "0".repeat(40);
-    git(
-        &root,
-        &["update-ref", "refs/heads/feature", &head],
-    );
+    git(&root, &["update-ref", "refs/heads/feature", &head]);
     let journal_path = root.join(".atomic/bridge/git-events.jsonl");
     let records = |path: &std::path::Path| -> Vec<serde_json::Value> {
         fs::read_to_string(path)
@@ -1252,7 +1275,10 @@ fn installed_reference_transaction_hooks_record_real_git_transitions() {
         entry.get("old_oid").and_then(|v| v.as_str()),
         Some(zero40.as_str())
     );
-    assert_eq!(entry.get("new_oid").and_then(|v| v.as_str()), Some(head.as_str()));
+    assert_eq!(
+        entry.get("new_oid").and_then(|v| v.as_str()),
+        Some(head.as_str())
+    );
     assert_eq!(
         entry.get("ref_name").and_then(|v| v.as_str()),
         Some("refs/heads/feature")
@@ -1408,7 +1434,10 @@ fn forged_and_partial_events_never_become_candidate_linkage() {
 
     fs::write(root.join("doc.md"), b"valid content\n");
     git(&root, &["add", "."]);
-    git(&root, &["commit", "-q", "-m", "Valid feature (#12)\n\n* two"]);
+    git(
+        &root,
+        &["commit", "-q", "-m", "Valid feature (#12)\n\n* two"],
+    );
     let valid = git(&root, &["rev-parse", "HEAD"]);
 
     // Journal the fully known pair through the real CLI wire format AFTER
@@ -1493,7 +1522,8 @@ fn forged_and_partial_events_never_become_candidate_linkage() {
             "the unauthenticated entry must not claim authentication: {entries:?}"
         );
         assert!(
-            entries[0].get("predecessor_oids")
+            entries[0]
+                .get("predecessor_oids")
                 .and_then(|v| v.as_array())
                 .is_none_or(|v| v.is_empty()),
             "the unauthenticated tier never names predecessors: {entries:?}"
@@ -1561,14 +1591,26 @@ fn binding_tree_match_creates_candidate_without_hooks() {
     git(&root, &["reset", "-q", "--hard", &base]);
     fs::write(root.join("code.rs"), b"fn v2() {}\n").unwrap();
     git(&root, &["add", "."]);
-    git(&root, &["commit", "-q", "-m", "Squashed feature (#9)\n\n* one\n* two"]);
+    git(
+        &root,
+        &[
+            "commit",
+            "-q",
+            "-m",
+            "Squashed feature (#9)\n\n* one\n* two",
+        ],
+    );
     let squashed = git(&root, &["rev-parse", "HEAD"]);
     assert!(
         !root.join(".atomic/bridge/git-events.jsonl").exists(),
         "the fixture must run with hooks off (no journal)"
     );
 
-    atomic_ok(&root, &home, &["git", "import", "--incremental", "--no-vault"]);
+    atomic_ok(
+        &root,
+        &home,
+        &["git", "import", "--incremental", "--no-vault"],
+    );
 
     let repo = open_repo(&root);
     let tags = repo.list_tags_for_view("main").unwrap();
@@ -1658,7 +1700,15 @@ fn binding_range_match_covers_known_intermediate_without_blob_or_message_similar
     git(&root, &["reset", "-q", "--hard", &base]);
     fs::write(root.join("code.rs"), b"fn v2() {}\nfn v3() {}\n").unwrap();
     git(&root, &["add", "."]);
-    git(&root, &["commit", "-q", "-m", "Squashed feature (#9)\n\n* one\n* two"]);
+    git(
+        &root,
+        &[
+            "commit",
+            "-q",
+            "-m",
+            "Squashed feature (#9)\n\n* one\n* two",
+        ],
+    );
     let squashed = git(&root, &["rev-parse", "HEAD"]);
     assert!(
         !root.join(".atomic/bridge/git-events.jsonl").exists(),
@@ -1668,7 +1718,11 @@ fn binding_range_match_covers_known_intermediate_without_blob_or_message_similar
     // The whole hooks-off range flow: the import itself must succeed (the
     // union already renders the squash tree for the tracked path, so no new
     // FileOps are required — review F2).
-    atomic_ok(&root, &home, &["git", "import", "--incremental", "--no-vault"]);
+    atomic_ok(
+        &root,
+        &home,
+        &["git", "import", "--incremental", "--no-vault"],
+    );
 
     let repo = open_repo(&root);
     let tags = repo.list_tags_for_view("main").unwrap();
@@ -1892,7 +1946,11 @@ fn explicit_insertion_reapplies_the_resolution_in_another_view() {
     git(&root, &["checkout", "-q", "main"]);
     git(&root, &["merge", "-q", "--ff-only", "leg-a"]);
 
-    atomic_ok(&root, &home, &["git", "import", "--incremental", "--no-vault"]);
+    atomic_ok(
+        &root,
+        &home,
+        &["git", "import", "--incremental", "--no-vault"],
+    );
     atomic_ok(&root, &home, &["git", "bridge", "reconcile"]);
 
     let repo = open_repo(&root);
@@ -2087,7 +2145,11 @@ fn synthesis_failpoints_fail_closed_and_publish_nothing() {
         );
 
         // A clean retry succeeds and the journal shows the recovery.
-        atomic_ok(&root, &home, &["git", "import", "--incremental", "--no-vault"]);
+        atomic_ok(
+            &root,
+            &home,
+            &["git", "import", "--incremental", "--no-vault"],
+        );
         let repo = open_repo(&root);
         assert_eq!(
             repo.effective_history(Some("main")).unwrap().len(),
@@ -2195,7 +2257,11 @@ fn merge_resolution_frontier_failpoint_fails_closed() {
     );
 
     // A clean retry publishes the verified resolution.
-    atomic_ok(&root, &home, &["git", "import", "--incremental", "--no-vault"]);
+    atomic_ok(
+        &root,
+        &home,
+        &["git", "import", "--incremental", "--no-vault"],
+    );
     let repo = open_repo(&root);
     let merge_change = change_of(&repo, "main", &merge);
     assert!(matches!(
@@ -2225,7 +2291,11 @@ fn ancestor_surviving_exclusion_refuses_before_publication() {
     fs::write(root.join("s.txt"), b"shared lineage\n").unwrap();
     git_commit(&root, "sibling lineage");
     let sibling = git(&root, &["rev-parse", "HEAD"]);
-    atomic_ok(&root, &home, &["git", "import", "--incremental", "--no-vault"]);
+    atomic_ok(
+        &root,
+        &home,
+        &["git", "import", "--incremental", "--no-vault"],
+    );
     let main_state = {
         let repo = open_repo(&root);
         let _ = change_of(&repo, "main", &sibling);
@@ -2235,7 +2305,11 @@ fn ancestor_surviving_exclusion_refuses_before_publication() {
     // A draft child view of `main` will be the import target: the rewrite
     // lands on a Git branch of the same name, so the import targets `work`
     // while `main` (its ancestor) keeps the pre-rewrite sibling change.
-    atomic_ok(&root, &home, &["view", "create", "work", "--draft", "--parent", "main"]);
+    atomic_ok(
+        &root,
+        &home,
+        &["view", "create", "work", "--draft", "--parent", "main"],
+    );
 
     // Rewrite the sibling commit on the `work` branch (amend): the old tip
     // leaves the new history, so a single-parent synthesis into the `work`
@@ -2244,11 +2318,18 @@ fn ancestor_surviving_exclusion_refuses_before_publication() {
     git(&root, &["checkout", "-q", "-b", "work"]);
     fs::write(root.join("s.txt"), b"rewritten lineage\n").unwrap();
     git(&root, &["add", "."]);
-    git(&root, &["commit", "-q", "--amend", "-m", "sibling lineage rewritten"]);
+    git(
+        &root,
+        &["commit", "-q", "--amend", "-m", "sibling lineage rewritten"],
+    );
     let rewritten = git(&root, &["rev-parse", "HEAD"]);
     assert_ne!(sibling, rewritten);
 
-    let failed = atomic(&root, &home, &["git", "import", "--incremental", "--no-vault"]);
+    let failed = atomic(
+        &root,
+        &home,
+        &["git", "import", "--incremental", "--no-vault"],
+    );
     assert!(
         !failed.status.success(),
         "the ancestor-surviving exclusion must refuse the synthesis: {}",
@@ -2315,7 +2396,10 @@ fn merge_with_empty_tip_parent_imports_both_closures() {
 
     git(&root, &["checkout", "-q", "main"]);
     git(&root, &["checkout", "-q", "-b", "side-b"]);
-    git(&root, &["commit", "-q", "--allow-empty", "-m", "side b empty"]);
+    git(
+        &root,
+        &["commit", "-q", "--allow-empty", "-m", "side b empty"],
+    );
     let side_b = git(&root, &["rev-parse", "HEAD"]);
 
     git(&root, &["checkout", "-q", "side-a"]);
@@ -2387,16 +2471,26 @@ fn hooks_off_bound_range_squash_imports_to_the_git_boundary() {
         fs::write(root.join("f.txt"), b"line one\nintermediate\n").unwrap();
         git_commit(&root, "intermediate")
     };
-    atomic_ok(&root, &home, &["git", "import", "--incremental", "--no-vault"]);
+    atomic_ok(
+        &root,
+        &home,
+        &["git", "import", "--incremental", "--no-vault"],
+    );
 
     // Publish a locally verified binding for the intermediate's state.
     let mut secret = [0u8; 32];
-    for (index, byte) in secret.iter_mut().enumerate() {
+    for byte in secret.iter_mut() {
         *byte = 0x19u8;
     }
     let key_file = home.join("binding-key.hex");
-    fs::write(&key_file, secret.iter().map(|b| format!("{b:02x}")).collect::<String>())
-        .unwrap();
+    fs::write(
+        &key_file,
+        secret
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>(),
+    )
+    .unwrap();
     atomic_ok(
         &root,
         &home,
@@ -2412,12 +2506,21 @@ fn hooks_off_bound_range_squash_imports_to_the_git_boundary() {
 
     // The final append and the squash: main is rewritten to one commit whose
     // parent is the base, hooks completely off.
-    fs::write(root.join("f.txt"), b"line one\nintermediate\nfinal addition\n").unwrap();
+    fs::write(
+        root.join("f.txt"),
+        b"line one\nintermediate\nfinal addition\n",
+    )
+    .unwrap();
     git(&root, &["add", "."]);
     git(&root, &["commit", "-q", "-m", "final"]);
     let squash = git_stdin_output(
         &root,
-        &["commit-tree", &git(&root, &["rev-parse", "HEAD^{tree}"]), "-p", &base],
+        &[
+            "commit-tree",
+            &git(&root, &["rev-parse", "HEAD^{tree}"]),
+            "-p",
+            &base,
+        ],
         b"Squashed feature (#9)\n\n* intermediate\n* final\n",
     );
     git(&root, &["update-ref", "refs/heads/main", &squash]);
@@ -2427,7 +2530,11 @@ fn hooks_off_bound_range_squash_imports_to_the_git_boundary() {
     );
 
     // The rewritten range imports cleanly to the Git boundary.
-    let imported = atomic(&root, &home, &["git", "import", "--incremental", "--no-vault"]);
+    let imported = atomic(
+        &root,
+        &home,
+        &["git", "import", "--incremental", "--no-vault"],
+    );
     assert!(
         imported.status.success(),
         "the canceled-intermediate range must import: {}",
@@ -2445,7 +2552,11 @@ fn hooks_off_bound_range_squash_imports_to_the_git_boundary() {
     atomic_ok(&root, &home, &["git", "bridge", "verify"]);
     fs::write(root.join("g.txt"), b"successor\n").unwrap();
     git_commit(&root, "successor");
-    atomic_ok(&root, &home, &["git", "import", "--incremental", "--no-vault"]);
+    atomic_ok(
+        &root,
+        &home,
+        &["git", "import", "--incremental", "--no-vault"],
+    );
     atomic_ok(&root, &home, &["git", "bridge", "verify"]);
 }
 
@@ -2469,15 +2580,25 @@ fn hooks_off_canceled_intermediate_range_imports_cleanly() {
         fs::write(root.join("f.txt"), b"intermediate\n").unwrap();
         git_commit(&root, "intermediate")
     };
-    atomic_ok(&root, &home, &["git", "import", "--incremental", "--no-vault"]);
+    atomic_ok(
+        &root,
+        &home,
+        &["git", "import", "--incremental", "--no-vault"],
+    );
 
     let mut secret = [0u8; 32];
     for byte in secret.iter_mut() {
         *byte = 0x19;
     }
     let key_file = home.join("binding-key.hex");
-    fs::write(&key_file, secret.iter().map(|b| format!("{b:02x}")).collect::<String>())
-        .unwrap();
+    fs::write(
+        &key_file,
+        secret
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>(),
+    )
+    .unwrap();
     atomic_ok(
         &root,
         &home,
@@ -2496,7 +2617,10 @@ fn hooks_off_canceled_intermediate_range_imports_cleanly() {
     fs::write(root.join("f.txt"), b"base\n").unwrap();
     fs::write(root.join("g.txt"), b"new\n").unwrap();
     git(&root, &["add", "."]);
-    git(&root, &["commit", "-qm", "revert intermediate and edit another file"]);
+    git(
+        &root,
+        &["commit", "-qm", "revert intermediate and edit another file"],
+    );
     let tree = git(&root, &["rev-parse", "HEAD^{tree}"]);
     let squash = git_stdin_output(
         &root,
@@ -2505,7 +2629,11 @@ fn hooks_off_canceled_intermediate_range_imports_cleanly() {
     );
     git(&root, &["update-ref", "refs/heads/main", &squash]);
 
-    let imported = atomic(&root, &home, &["git", "import", "--incremental", "--no-vault"]);
+    let imported = atomic(
+        &root,
+        &home,
+        &["git", "import", "--incremental", "--no-vault"],
+    );
     assert!(
         imported.status.success(),
         "the canceled-intermediate range must import: {}",
@@ -2559,13 +2687,23 @@ fn known_range_candidates_cover_canceled_and_multiple_intermediates() {
         *byte = 0x19;
     }
     let key_file = home.join("binding-key.hex");
-    fs::write(&key_file, secret.iter().map(|b| format!("{b:02x}")).collect::<String>())
-        .unwrap();
+    fs::write(
+        &key_file,
+        secret
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>(),
+    )
+    .unwrap();
     let first = {
         fs::write(root.join("f.txt"), b"first\n").unwrap();
         git_commit(&root, "first intermediate")
     };
-    atomic_ok(&root, &home, &["git", "import", "--incremental", "--no-vault"]);
+    atomic_ok(
+        &root,
+        &home,
+        &["git", "import", "--incremental", "--no-vault"],
+    );
     atomic_ok(
         &root,
         &home,
@@ -2582,7 +2720,11 @@ fn known_range_candidates_cover_canceled_and_multiple_intermediates() {
         fs::write(root.join("f.txt"), b"base\nsecond\n").unwrap();
         git_commit(&root, "second intermediate")
     };
-    atomic_ok(&root, &home, &["git", "import", "--incremental", "--no-vault"]);
+    atomic_ok(
+        &root,
+        &home,
+        &["git", "import", "--incremental", "--no-vault"],
+    );
     atomic_ok(
         &root,
         &home,
@@ -2603,7 +2745,14 @@ fn known_range_candidates_cover_canceled_and_multiple_intermediates() {
     fs::write(root.join("f.txt"), b"base\n").unwrap();
     fs::write(root.join("g.txt"), b"new\n").unwrap();
     git(&root, &["add", "."]);
-    git(&root, &["commit", "-qm", "cancel both intermediates, edit another file"]);
+    git(
+        &root,
+        &[
+            "commit",
+            "-qm",
+            "cancel both intermediates, edit another file",
+        ],
+    );
     let tree = git(&root, &["rev-parse", "HEAD^{tree}"]);
     let squash = git_stdin_output(
         &root,
@@ -2616,7 +2765,11 @@ fn known_range_candidates_cover_canceled_and_multiple_intermediates() {
         "the fixture must run with hooks off (no journal)"
     );
 
-    let imported = atomic(&root, &home, &["git", "import", "--incremental", "--no-vault"]);
+    let imported = atomic(
+        &root,
+        &home,
+        &["git", "import", "--incremental", "--no-vault"],
+    );
     assert!(
         imported.status.success(),
         "the canceled multi-intermediate range must import: {}",
@@ -2690,7 +2843,11 @@ fn hook_captured_pairs_without_an_active_operation_stay_unauthenticated() {
     fs::write(root.join("doc.md"), b"original\nvictim\n").unwrap();
     git_commit(&root, "victim");
     let victim = git(&root, &["rev-parse", "HEAD"]);
-    atomic_ok(&root, &home, &["git", "import", "--incremental", "--no-vault"]);
+    atomic_ok(
+        &root,
+        &home,
+        &["git", "import", "--incremental", "--no-vault"],
+    );
 
     fs::write(root.join("doc.md"), b"original\namended\n").unwrap();
     git(&root, &["add", "."]);
@@ -2719,7 +2876,11 @@ fn hook_captured_pairs_without_an_active_operation_stay_unauthenticated() {
         format!("{original} {amended}\n").as_bytes(),
     );
 
-    let imported = atomic(&root, &home, &["git", "import", "--incremental", "--no-vault"]);
+    let imported = atomic(
+        &root,
+        &home,
+        &["git", "import", "--incremental", "--no-vault"],
+    );
     assert!(
         imported.status.success(),
         "the amended boundary must import to the Git tree: {}",
@@ -2791,7 +2952,11 @@ fn ordinary_sibling_pairs_submitted_directly_stay_unauthenticated() {
     git(&root, &["checkout", "-q", "-b", "left"]);
     fs::write(root.join("left.txt"), b"left\n").unwrap();
     git_commit(&root, "left sibling");
-    atomic_ok(&root, &home, &["git", "import", "--incremental", "--no-vault"]);
+    atomic_ok(
+        &root,
+        &home,
+        &["git", "import", "--incremental", "--no-vault"],
+    );
 
     git(&root, &["checkout", "-q", "-b", "right", &base]);
     fs::write(root.join("right.txt"), b"right\n").unwrap();
@@ -2807,7 +2972,11 @@ fn ordinary_sibling_pairs_submitted_directly_stay_unauthenticated() {
         format!("{base} {right}\n").as_bytes(),
     );
 
-    let imported = atomic(&root, &home, &["git", "import", "--incremental", "--no-vault"]);
+    let imported = atomic(
+        &root,
+        &home,
+        &["git", "import", "--incremental", "--no-vault"],
+    );
     assert!(
         imported.status.success(),
         "the ordinary sibling must import: {}",
@@ -2842,7 +3011,11 @@ fn ordinary_sibling_pairs_submitted_directly_stay_unauthenticated() {
         "the unauthenticated tier never names the sibling as a predecessor: {entries:?}"
     );
     drop(repo);
-    let review = atomic_ok(&root, &home, &["git", "bridge", "review", "--view", "right"]);
+    let review = atomic_ok(
+        &root,
+        &home,
+        &["git", "bridge", "review", "--view", "right"],
+    );
     assert!(review.contains("unauthenticated-evidence-only"), "{review}");
     assert!(
         !review.contains("post-rewrite-event"),
@@ -2905,7 +3078,10 @@ fn root_spanning_squash_names_the_locally_published_root_binding() {
     let key_file = home.join("binding-key.hex");
     fs::write(
         &key_file,
-        secret.iter().map(|b| format!("{b:02x}")).collect::<String>(),
+        secret
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>(),
     )
     .unwrap();
     atomic_ok(
@@ -2936,7 +3112,11 @@ fn root_spanning_squash_names_the_locally_published_root_binding() {
     );
 
     // The root-spanning squash imports cleanly into the squashed boundary.
-    let imported = atomic(&root, &home, &["git", "import", "--incremental", "--no-vault"]);
+    let imported = atomic(
+        &root,
+        &home,
+        &["git", "import", "--incremental", "--no-vault"],
+    );
     assert!(
         imported.status.success(),
         "the root-spanning squash must import: {}",
@@ -2946,7 +3126,11 @@ fn root_spanning_squash_names_the_locally_published_root_binding() {
     // The reviewable root-range candidate exists, naming the locally
     // published root binding's commit — advisory and explicitly uncertain,
     // never identity (review D4).
-    let review = atomic_ok(&root, &home, &["git", "bridge", "review", "--view", "squashed"]);
+    let review = atomic_ok(
+        &root,
+        &home,
+        &["git", "bridge", "review", "--view", "squashed"],
+    );
     assert!(
         review.contains("binding-root-range-match"),
         "the root-spanning range candidate must be discoverable: {review}"
@@ -2995,22 +3179,26 @@ fn sibling_branches_sharing_a_base_import_all_both_orders(edit_f: &str, edit_g: 
     // so the assertion covers the persisted graph, not an in-memory cache.
     let repo = open_repo(&root);
     assert_eq!(
-        repo.get_file_content_via_crdt_on_view("f.txt", edit_f).unwrap(),
+        repo.get_file_content_via_crdt_on_view("f.txt", edit_f)
+            .unwrap(),
         Some(f_bytes.as_bytes().to_vec()),
         "the f-editing closure renders its own f bytes"
     );
     assert_eq!(
-        repo.get_file_content_via_crdt_on_view("g.txt", edit_f).unwrap(),
+        repo.get_file_content_via_crdt_on_view("g.txt", edit_f)
+            .unwrap(),
         Some(b"base g\n".to_vec()),
         "the f-editing closure renders the base g bytes, not the sibling's"
     );
     assert_eq!(
-        repo.get_file_content_via_crdt_on_view("g.txt", edit_g).unwrap(),
+        repo.get_file_content_via_crdt_on_view("g.txt", edit_g)
+            .unwrap(),
         Some(g_bytes.as_bytes().to_vec()),
         "the g-editing closure renders its own g bytes"
     );
     assert_eq!(
-        repo.get_file_content_via_crdt_on_view("f.txt", edit_g).unwrap(),
+        repo.get_file_content_via_crdt_on_view("f.txt", edit_g)
+            .unwrap(),
         Some(b"base f\n".to_vec()),
         "the g-editing closure renders the base f bytes, not the sibling's"
     );
@@ -3067,7 +3255,8 @@ fn ordinary_ref_movement_is_not_rewrite_authority_e2e() {
         )
         .expect("journal the ordinary ref movement");
     assert_eq!(
-        repo.bridge_ref_capture_token(ordinary.operation_id).unwrap(),
+        repo.bridge_ref_capture_token(ordinary.operation_id)
+            .unwrap(),
         None,
         "an ordinary ref movement must not mint rewrite authority"
     );
@@ -3133,8 +3322,7 @@ fn ordinary_ref_movement_is_not_rewrite_authority_e2e() {
     let event_bytes: Vec<u8> = fs::read_to_string(&journal)
         .unwrap()
         .lines()
-        .filter(|line| !line.is_empty())
-        .last()
+        .rfind(|line| !line.is_empty())
         .map(|line| line.as_bytes().to_vec())
         .expect("the rewrite capture is journaled");
     repo.capture_bridge_event_anchored(&event_bytes, rewrite.operation_id)
@@ -3146,20 +3334,32 @@ fn ordinary_ref_movement_is_not_rewrite_authority_e2e() {
         .unwrap();
     assert!(repo.operation_has_verified_receipt(rewrite_id).unwrap());
     assert!(
-        repo.bridge_anchor_binds_operation(&event_bytes, rewrite_id).unwrap(),
+        repo.bridge_anchor_binds_operation(&event_bytes, rewrite_id)
+            .unwrap(),
         "the rewrite-execution capture binds its operation"
     );
     drop(repo);
 
     // The import reviews the right branch; the ordinary movement never reads
     // as rewrite authority, while the genuine rewrite execution does.
-    atomic_ok(&root, &home, &["git", "import", "--incremental", "--no-vault"]);
-    let review = atomic_ok(&root, &home, &["git", "bridge", "review", "--view", "right"]);
+    atomic_ok(
+        &root,
+        &home,
+        &["git", "import", "--incremental", "--no-vault"],
+    );
+    let review = atomic_ok(
+        &root,
+        &home,
+        &["git", "bridge", "review", "--view", "right"],
+    );
     assert!(
         review.contains("class=post-rewrite-event"),
         "the genuine rewrite execution must authenticate its captured event: {review}"
     );
-    assert!(review.contains(&old), "the authenticated event names its predecessor: {review}");
+    assert!(
+        review.contains(&old),
+        "the authenticated event names its predecessor: {review}"
+    );
     assert!(
         !review.contains("forged-ref-only-movement"),
         "the ordinary ref movement is never rewrite authority: {review}"
@@ -3218,9 +3418,17 @@ fn tracked_cargo_lock_imports_with_exact_bytes() {
     // An incremental import preserving every tracked path (the new file is
     // non-generated: the lockfile-MODIFY path has a discovered pre-existing
     // assembly defect, recorded in the tracker as an open ::26 finding).
-    fs::write(root.join("src/second.rs"), b"pub fn second() -> u32 { 2 }\n").unwrap();
+    fs::write(
+        root.join("src/second.rs"),
+        b"pub fn second() -> u32 { 2 }\n",
+    )
+    .unwrap();
     git_commit(&root, "second file");
-    atomic_ok(&root, &home, &["git", "import", "--incremental", "--no-vault"]);
+    atomic_ok(
+        &root,
+        &home,
+        &["git", "import", "--incremental", "--no-vault"],
+    );
 
     let repo = open_repo(&root);
     for (path, wanted) in [
@@ -3309,9 +3517,17 @@ fn incremental_import_after_a_fresh_process_preserves_tracked_paths() {
     git_commit(&root, "base with a tracked lockfile");
     atomic_ok(&root, &home, &["git", "import", "--no-vault"]);
 
-    fs::write(root.join("src/second.rs"), b"pub fn second() -> u32 { 2 }\n").unwrap();
+    fs::write(
+        root.join("src/second.rs"),
+        b"pub fn second() -> u32 { 2 }\n",
+    )
+    .unwrap();
     git_commit(&root, "second file");
-    atomic_ok(&root, &home, &["git", "import", "--incremental", "--no-vault"]);
+    atomic_ok(
+        &root,
+        &home,
+        &["git", "import", "--incremental", "--no-vault"],
+    );
 
     let repo = open_repo(&root);
     let second = repo
@@ -3371,7 +3587,11 @@ fn delete_last_file_folds_to_the_canonical_empty_tree_and_back() {
     // tree; the projected (all-excluded) state folds to the same identity.
     fs::remove_file(root.join("only.txt")).unwrap();
     git_commit(&root, "delete the last file");
-    atomic_ok(&root, &home, &["git", "import", "--incremental", "--no-vault"]);
+    atomic_ok(
+        &root,
+        &home,
+        &["git", "import", "--incremental", "--no-vault"],
+    );
     let repo = open_repo(&root);
     assert_eq!(
         repo.get_file_content_on_view("only.txt", "main").unwrap(),
@@ -3383,7 +3603,11 @@ fn delete_last_file_folds_to_the_canonical_empty_tree_and_back() {
     // Transition back to non-empty.
     fs::write(root.join("back.txt"), b"back again\n").unwrap();
     git_commit(&root, "back to nonempty");
-    atomic_ok(&root, &home, &["git", "import", "--incremental", "--no-vault"]);
+    atomic_ok(
+        &root,
+        &home,
+        &["git", "import", "--incremental", "--no-vault"],
+    );
     let repo = open_repo(&root);
     assert_eq!(
         repo.get_file_content_on_view("back.txt", "main").unwrap(),
@@ -3423,7 +3647,11 @@ fn lockfile_only_modification_renders_exact_bytes() {
     let lock_v2 = b"# generated\nversion = 5\n\n[[package]]\nname = \"lf\"\nversion = \"0.2.0\"\n";
     fs::write(root.join("Cargo.lock"), lock_v2).unwrap();
     git_commit(&root, "lockfile only bump");
-    atomic_ok(&root, &home, &["git", "import", "--incremental", "--no-vault"]);
+    atomic_ok(
+        &root,
+        &home,
+        &["git", "import", "--incremental", "--no-vault"],
+    );
 
     // The recorded graph holds the exact new bytes.
     let repo = open_repo(&root);

@@ -106,7 +106,11 @@ fn repair_resumes_an_incomplete_session_and_retains_evidence() {
 
     // Verify-only: no state changes.
     let before = fs::read_to_string(&session_path).unwrap();
-    atomic_ok(&root, &home, &["agent", "repair", "sess-repair-e2e", "--verify-only"]);
+    atomic_ok(
+        &root,
+        &home,
+        &["agent", "repair", "sess-repair-e2e", "--verify-only"],
+    );
     let after = fs::read_to_string(&session_path).unwrap();
     assert_eq!(before, after, "verify-only never rewrites the session");
 

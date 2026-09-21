@@ -11,8 +11,6 @@ use crate::git_binding::{
 use atomic_config::{GitTrustConfig, SignerTrust};
 use atomic_identity::keypair::{KeyPair, SecretKey};
 
-use super::*;
-
 fn test_keypair(seed: u8) -> KeyPair {
     let mut secret = [0u8; 32];
     for (index, byte) in secret.iter_mut().enumerate() {
@@ -121,7 +119,11 @@ fn a_correct_binding_verifies_against_the_real_commit() {
 }
 
 fn commit_message_text(git: &git2::Repository, oid: &git2::Oid) -> String {
-    git.find_commit(*oid).unwrap().message().unwrap().to_string()
+    git.find_commit(*oid)
+        .unwrap()
+        .message()
+        .unwrap()
+        .to_string()
 }
 
 #[test]
@@ -241,7 +243,10 @@ fn unknown_and_revoked_signers_supply_content_but_stay_untrusted() {
     let unknown_keypair = test_keypair(4);
     let binding = binding_for_commit(&unknown_keypair, &commit, |_| {});
     let content_verified = verify_binding_content(&commit.git, &binding).is_ok();
-    assert!(content_verified, "content correctness is signer-independent");
+    assert!(
+        content_verified,
+        "content correctness is signer-independent"
+    );
 
     let repository_identity = "did:atomic:REPOSITORY";
     let policy = GitTrustConfig::default();
@@ -255,7 +260,10 @@ fn unknown_and_revoked_signers_supply_content_but_stay_untrusted() {
     );
     assert!(evaluation.signature_valid);
     assert_eq!(evaluation.signer_trust, SignerTrust::Unknown);
-    assert!(evaluation.content_usable(), "unknown signers still supply recomputed content");
+    assert!(
+        evaluation.content_usable(),
+        "unknown signers still supply recomputed content"
+    );
     assert!(!evaluation.provenance_trusted());
     assert!(
         !evaluation.can_satisfy_publication_gate(),

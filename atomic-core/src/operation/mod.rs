@@ -451,19 +451,33 @@ impl RepoStateDelta {
 /// Canonically ordered repository metadata addressed by a transition lease.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum MetadataTarget {
-    ViewChange { view: String, change: Hash },
-    View { name: String },
-    Tag { view: String, name: String },
-    Remote { name: String },
+    ViewChange {
+        view: String,
+        change: Hash,
+    },
+    View {
+        name: String,
+    },
+    Tag {
+        view: String,
+        name: String,
+    },
+    Remote {
+        name: String,
+    },
     /// CB-10A: the mutable ref mapping for `view`, keyed by durable view id.
     /// The value carries the complete versioned [`crate::pristine::RefMapping`]
     /// encoding (`Bytes`) or `Absent` when the mapping row is removed.
-    RefMapping { view: String },
+    RefMapping {
+        view: String,
+    },
     /// CB-13B: the `required-capability/<id>` row in `PRISTINE_META` whose
     /// value is the required minimum version (`Sequence`) or `Absent` when
     /// the requirement is rolled back. The capability fence makes clients
     /// without the capability fail closed on open.
-    Capability { id: String },
+    Capability {
+        id: String,
+    },
 }
 
 /// Typed expected value for a repository metadata transition.
@@ -613,9 +627,7 @@ pub fn parse_git_oid_hex(token: &str) -> Option<GitObjectId> {
 /// name exactly two full-length OIDs separated by whitespace — the Git
 /// post-rewrite wire format. `None` means the bytes cannot describe a
 /// rewrite pair at all.
-pub fn parse_post_rewrite_pair(
-    bytes: &[u8],
-) -> Option<(GitObjectId, GitObjectId)> {
+pub fn parse_post_rewrite_pair(bytes: &[u8]) -> Option<(GitObjectId, GitObjectId)> {
     let text = std::str::from_utf8(bytes).ok()?;
     let mut tokens = text.split_whitespace();
     let old = tokens.next()?;
@@ -635,9 +647,7 @@ pub fn parse_post_rewrite_pair(
 /// (`record_type: "post-rewrite"` with a `rewritten` pair array). Returns
 /// the named pairs, or `None` when the bytes cannot describe a rewrite
 /// event at all.
-pub fn post_rewrite_event_pairs(
-    bytes: &[u8],
-) -> Option<Vec<(GitObjectId, GitObjectId)>> {
+pub fn post_rewrite_event_pairs(bytes: &[u8]) -> Option<Vec<(GitObjectId, GitObjectId)>> {
     if let Ok(text) = std::str::from_utf8(bytes) {
         if !text.trim_start().starts_with('{') {
             let mut pairs = Vec::new();
@@ -700,10 +710,7 @@ pub fn post_rewrite_event_capture_token(bytes: &[u8]) -> Option<String> {
 
 /// Whether a Git-ref effect lease value equals the parsed OID (an all-zero
 /// OID matches the absent lease, matching Git's zero-OID ref conventions).
-pub fn effect_lease_matches_oid(
-    value: &EffectValue,
-    oid: &GitObjectId,
-) -> bool {
+pub fn effect_lease_matches_oid(value: &EffectValue, oid: &GitObjectId) -> bool {
     match value {
         EffectValue::GitRef(GitRefTarget::Direct(target)) => target == oid,
         EffectValue::Absent => oid.as_bytes().iter().all(|byte| *byte == 0),

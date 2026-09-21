@@ -593,9 +593,8 @@ impl Attestation {
         // the signature input (mirrors sign_with_mac).
         self.signer = Some(did.to_string());
         let input = self.did_signature_input();
-        self.signature = Some(data_encoding::BASE32_NOPAD.encode(
-            &signing_key.sign(&input).to_bytes(),
-        ));
+        self.signature =
+            Some(data_encoding::BASE32_NOPAD.encode(&signing_key.sign(&input).to_bytes()));
     }
 
     /// Verify a V4 DID signature against the signer's Ed25519 public key.
@@ -620,9 +619,10 @@ impl Attestation {
             return false;
         };
         verifying_key
-            .verify(&self.did_signature_input(), &ed25519_dalek::Signature::from_bytes(
-                &sig,
-            ))
+            .verify(
+                &self.did_signature_input(),
+                &ed25519_dalek::Signature::from_bytes(&sig),
+            )
             .is_ok()
     }
 
@@ -1133,7 +1133,7 @@ impl TrustPolicy {
     /// Verify an attestation under this policy, failing closed on every
     /// refusal path (see the type docs).
     pub fn verify(&self, attestation: &Attestation) -> Result<(), AttestationError> {
-        let Some(signature) = &attestation.signature else {
+        let Some(_signature) = &attestation.signature else {
             return Err(AttestationError::Unsigned);
         };
         let Some(signer) = attestation.signer.as_deref() else {
@@ -1809,9 +1809,23 @@ mod tests {
         attest.sign_with_mac(&key);
         assert!(attest.verify_mac(&key));
 
-        let tampered_ops = ["version", "timestamp", "session", "cost", "duration_api",
-            "duration_wall", "lines", "models", "changes", "previous", "notes",
-            "operations", "signer", "signature_cleared", "agent_fields"];
+        let tampered_ops = [
+            "version",
+            "timestamp",
+            "session",
+            "cost",
+            "duration_api",
+            "duration_wall",
+            "lines",
+            "models",
+            "changes",
+            "previous",
+            "notes",
+            "operations",
+            "signer",
+            "signature_cleared",
+            "agent_fields",
+        ];
         let mut rejected = 0usize;
         for field in tampered_ops {
             let mut changed = attest.clone();
@@ -1836,7 +1850,11 @@ mod tests {
                 rejected += 1;
             }
         }
-        assert_eq!(rejected, tampered_ops.len(), "every covered field must be bound by the signature");
+        assert_eq!(
+            rejected,
+            tampered_ops.len(),
+            "every covered field must be bound by the signature"
+        );
         // A tampered signature string itself also fails.
         let mut bad = attest.clone();
         bad.signature = Some("0".repeat(64));
@@ -1869,9 +1887,8 @@ mod tests {
         let signing = ed25519_dalek::SigningKey::from_bytes(&seed);
         let did = format!(
             "did:atomic:{}",
-            data_encoding::BASE32_NOPAD.encode(
-                blake3::hash(signing.verifying_key().as_bytes()).as_bytes()
-            )
+            data_encoding::BASE32_NOPAD
+                .encode(blake3::hash(signing.verifying_key().as_bytes()).as_bytes())
         );
         attest.sign_with_did(&did, &seed);
         did
@@ -1914,24 +1931,70 @@ mod tests {
         attest.sign_with_did("did:atomic:test", &seed);
         assert!(attest.verify_with_did(&public));
 
+        #[allow(clippy::type_complexity)] // tamper-mutation matrix
         let tampered: Vec<(&str, Box<dyn Fn(&mut Attestation)>)> = vec![
             ("version", Box::new(|a: &mut Attestation| a.version += 1)),
-            ("timestamp", Box::new(|a: &mut Attestation| a.timestamp += 1)),
-            ("session", Box::new(|a: &mut Attestation| a.session_id.push('x'))),
+            (
+                "timestamp",
+                Box::new(|a: &mut Attestation| a.timestamp += 1),
+            ),
+            (
+                "session",
+                Box::new(|a: &mut Attestation| a.session_id.push('x')),
+            ),
             ("cost", Box::new(|a: &mut Attestation| a.cost_usd += 1.0)),
-            ("duration_api", Box::new(|a: &mut Attestation| a.duration_api_ms += 1)),
-            ("duration_wall", Box::new(|a: &mut Attestation| a.duration_wall_ms += 1)),
-            ("lines", Box::new(|a: &mut Attestation| a.code_changes.lines_added += 1)),
-            ("models", Box::new(|a: &mut Attestation| a.models.push(ModelUsage::new("m")))),
-            ("changes", Box::new(|a: &mut Attestation| a.changes_covered.push(Hash::of(b"extra")))),
-            ("previous", Box::new(|a: &mut Attestation| a.previous_attestation = Some(Hash::of(b"o")))),
-            ("notes", Box::new(|a: &mut Attestation| a.notes = Some("edited".into()))),
-            ("operations", Box::new(|a: &mut Attestation| a.operations_covered.push("forged".into()))),
-            ("turn_outcomes_root", Box::new(|a: &mut Attestation| a.turn_outcomes_root = Some(Hash::of(b"forged")))),
-            ("capture_root", Box::new(|a: &mut Attestation| a.capture_root = Some(Hash::of(b"forged")))),
-            ("provenance_root", Box::new(|a: &mut Attestation| a.provenance_root = Some(Hash::of(b"forged")))),
-            ("signer", Box::new(|a: &mut Attestation| a.signer = Some("did:atomic:other".into()))),
-            ("signature_cleared", Box::new(|a: &mut Attestation| a.signature = None)),
+            (
+                "duration_api",
+                Box::new(|a: &mut Attestation| a.duration_api_ms += 1),
+            ),
+            (
+                "duration_wall",
+                Box::new(|a: &mut Attestation| a.duration_wall_ms += 1),
+            ),
+            (
+                "lines",
+                Box::new(|a: &mut Attestation| a.code_changes.lines_added += 1),
+            ),
+            (
+                "models",
+                Box::new(|a: &mut Attestation| a.models.push(ModelUsage::new("m"))),
+            ),
+            (
+                "changes",
+                Box::new(|a: &mut Attestation| a.changes_covered.push(Hash::of(b"extra"))),
+            ),
+            (
+                "previous",
+                Box::new(|a: &mut Attestation| a.previous_attestation = Some(Hash::of(b"o"))),
+            ),
+            (
+                "notes",
+                Box::new(|a: &mut Attestation| a.notes = Some("edited".into())),
+            ),
+            (
+                "operations",
+                Box::new(|a: &mut Attestation| a.operations_covered.push("forged".into())),
+            ),
+            (
+                "turn_outcomes_root",
+                Box::new(|a: &mut Attestation| a.turn_outcomes_root = Some(Hash::of(b"forged"))),
+            ),
+            (
+                "capture_root",
+                Box::new(|a: &mut Attestation| a.capture_root = Some(Hash::of(b"forged"))),
+            ),
+            (
+                "provenance_root",
+                Box::new(|a: &mut Attestation| a.provenance_root = Some(Hash::of(b"forged"))),
+            ),
+            (
+                "signer",
+                Box::new(|a: &mut Attestation| a.signer = Some("did:atomic:other".into())),
+            ),
+            (
+                "signature_cleared",
+                Box::new(|a: &mut Attestation| a.signature = None),
+            ),
         ];
         for (field, mutate) in &tampered {
             let mut changed = attest.clone();
@@ -1954,14 +2017,16 @@ mod tests {
         let public = signing.verifying_key().to_bytes();
         let did = format!(
             "did:atomic:{}",
-            data_encoding::BASE32_NOPAD.encode(
-                blake3::hash(signing.verifying_key().as_bytes()).as_bytes()
-            )
+            data_encoding::BASE32_NOPAD
+                .encode(blake3::hash(signing.verifying_key().as_bytes()).as_bytes())
         );
 
         // Unsigned → Unsigned.
         let unsigned = did_attestation();
-        let err = TrustPolicy::new().trust(&did, public).verify(&unsigned).unwrap_err();
+        let err = TrustPolicy::new()
+            .trust(&did, public)
+            .verify(&unsigned)
+            .unwrap_err();
         assert!(matches!(err, AttestationError::Unsigned));
 
         // Session-MAC signer → never trusted evidence, even if configured.
@@ -1972,7 +2037,10 @@ mod tests {
             .trust(mac_signed.signer.clone().unwrap(), public)
             .trust(&did, public);
         let err = policy.verify(&mac_signed).unwrap_err();
-        assert!(matches!(err, AttestationError::SessionMacSignerNotTrusted { .. }));
+        assert!(matches!(
+            err,
+            AttestationError::SessionMacSignerNotTrusted { .. }
+        ));
 
         // Unconfigured signer → SignerNotTrusted.
         let mut signed = did_attestation();
@@ -1983,12 +2051,17 @@ mod tests {
         // Configured under the WRONG key → SignatureVerificationFailed.
         let wrong_policy = TrustPolicy::new().trust(&did, test_seed(9));
         let err = wrong_policy.verify(&signed).unwrap_err();
-        assert!(matches!(err, AttestationError::SignatureVerificationFailed { .. }));
+        assert!(matches!(
+            err,
+            AttestationError::SignatureVerificationFailed { .. }
+        ));
 
         // The one accepted path: configured DID + genuine signature.
         let policy = TrustPolicy::new().trust(&did, public);
         assert_eq!(policy.len(), 1);
-        policy.verify(&signed).expect("genuine DID signature under configured trust");
+        policy
+            .verify(&signed)
+            .expect("genuine DID signature under configured trust");
 
         // Tampered payload under the correct policy still fails.
         let mut tampered = signed.clone();

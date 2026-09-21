@@ -254,7 +254,11 @@ impl RecordedFile {
     /// The same attribute name may appear at most once per record; a second
     /// value under one name would make the change self-conflicting.
     pub fn set_attr(&mut self, value: crate::change::InodeAttr) {
-        if !self.attrs.iter().any(|existing| existing.name() == value.name()) {
+        if !self
+            .attrs
+            .iter()
+            .any(|existing| existing.name() == value.name())
+        {
             self.attrs.push(value);
         }
     }

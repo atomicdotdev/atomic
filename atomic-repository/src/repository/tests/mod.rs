@@ -38,9 +38,9 @@ mod operation_routing_tests;
 mod operation_undo_tests;
 mod path_claim_migration_tests;
 mod projection_effects_tests;
-mod ref_mapping_tests;
 mod record_duplication_tests;
 mod record_tests;
+mod ref_mapping_tests;
 mod rename_tests;
 mod resurrection_tests;
 mod shadow_lock_tests;
@@ -64,7 +64,7 @@ mod workspace_txn_tests;
 ///
 /// Production APIs remain compile-time explicit; tests that use the shared fixture
 /// carry the capability in this wrapper instead of repeatedly rediscovering it.
-pub(super) struct TestRepository {
+pub(crate) struct TestRepository {
     repo: Repository,
     working_copy: WorkingCopyId,
 }
@@ -307,6 +307,7 @@ impl DerefMut for TestRepository {
     }
 }
 
+#[allow(private_interfaces)]
 pub(crate) fn create_temp_repo() -> (TempDir, TestRepository) {
     let temp_dir = TempDir::new().unwrap();
     let repo = Repository::init(temp_dir.path()).unwrap();

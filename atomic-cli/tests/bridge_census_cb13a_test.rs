@@ -93,7 +93,11 @@ fn census_reports_classes_read_only_and_clean_state_passes() {
     let root = tempfile::tempdir().unwrap().keep();
     let home = tempfile::tempdir().unwrap().keep();
     let git = || Command::new("git");
-    git().args(["init", "-q", "-b", "main"]).current_dir(&root).output().unwrap();
+    git()
+        .args(["init", "-q", "-b", "main"])
+        .current_dir(&root)
+        .output()
+        .unwrap();
     fs::write(root.join("seed.txt"), b"seed\n").unwrap();
     let commit = || {
         let out = git()
@@ -125,7 +129,10 @@ fn census_reports_classes_read_only_and_clean_state_passes() {
         "census/wip",
         "census/refs",
     ] {
-        assert!(verify.contains(&format!("layer {class}: ")), "{class} in: {verify}");
+        assert!(
+            verify.contains(&format!("layer {class}: ")),
+            "{class} in: {verify}"
+        );
         let line = verify
             .lines()
             .find(|line| line.contains(&format!("layer {class}: ")))
@@ -200,10 +207,18 @@ fn census_reports_incomplete_heads_in_other_working_copy_scopes() {
     let root = tempfile::tempdir().unwrap().keep();
     let home = tempfile::tempdir().unwrap().keep();
     let git = || Command::new("git");
-    git().args(["init", "-q", "-b", "main"]).current_dir(&root).output().unwrap();
+    git()
+        .args(["init", "-q", "-b", "main"])
+        .current_dir(&root)
+        .output()
+        .unwrap();
     fs::write(root.join("seed.txt"), b"seed\n").unwrap();
     let commit = || {
-        git().args(["add", "-A"]).current_dir(&root).output().unwrap();
+        git()
+            .args(["add", "-A"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
         let out = git()
             .args(["commit", "-q", "-m", "base"])
             .current_dir(&root)
@@ -224,9 +239,7 @@ fn census_reports_incomplete_heads_in_other_working_copy_scopes() {
     // is clean — the inspection path can no longer pass a head the writable
     // path would gate on.
     {
-        use atomic_core::pristine::{
-            MutTxnT, OperationMutTxnT, ViewTxnT, WorkingCopyRecord, WorkingCopyTxnT,
-        };
+        use atomic_core::pristine::{MutTxnT, OperationMutTxnT, ViewTxnT, WorkingCopyRecord};
         use atomic_core::types::WorkingCopyId;
         let repo = atomic_repository::Repository::open(&root).expect("writable open");
         let mut txn = repo.pristine().write_txn().expect("write txn");
@@ -328,7 +341,12 @@ fn census_reports_incomplete_heads_in_other_working_copy_scopes() {
         "the census must remain read-only across all scopes"
     );
     // Clean single-scope state: the census classes pass.
-    for class in ["census/changes", "census/bindings", "census/wip", "census/refs"] {
+    for class in [
+        "census/changes",
+        "census/bindings",
+        "census/wip",
+        "census/refs",
+    ] {
         let line = text
             .lines()
             .find(|line| line.contains(&format!("layer {class}: ")))

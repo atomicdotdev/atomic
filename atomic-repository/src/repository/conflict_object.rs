@@ -204,10 +204,7 @@ pub enum ConflictObjectError {
     #[error("cannot encode conflict object: {0}")]
     Encode(String),
     #[error("conflict object magic mismatch: expected {expected:?}, found {found:?}")]
-    Magic {
-        expected: [u8; 4],
-        found: [u8; 4],
-    },
+    Magic { expected: [u8; 4], found: [u8; 4] },
     #[error("conflict object version {found} is unsupported (supported: {supported})")]
     Version { found: u32, supported: u32 },
     #[error("conflict object payload failed to decode: {0}")]
@@ -215,10 +212,7 @@ pub enum ConflictObjectError {
     #[error("conflict object bytes are truncated")]
     Truncated,
     #[error("conflict object hash mismatch: header claims {claimed}, object hashes to {actual}")]
-    HashMismatch {
-        claimed: String,
-        actual: String,
-    },
+    HashMismatch { claimed: String, actual: String },
     #[error("conflict object {identity} lists side change {change} that is absent from the store")]
     MissingSide { identity: String, change: String },
     #[error("conflict entry {identity} has no sides; markers plus a hash alone cannot restore a conflict")]
@@ -312,7 +306,8 @@ impl ConflictSetObject {
                 supported: CONFLICT_SET_VERSION,
             });
         }
-        postcard::from_bytes(&bytes[8..]).map_err(|error| ConflictObjectError::Decode(error.to_string()))
+        postcard::from_bytes(&bytes[8..])
+            .map_err(|error| ConflictObjectError::Decode(error.to_string()))
     }
 
     /// The conflict-set identity: Blake3 over the domain-separated canonical
@@ -377,10 +372,7 @@ impl ConflictSetObject {
         for file in &self.files {
             if file.entries.is_empty() {
                 return Err(ConflictObjectError::NoSides {
-                    identity: format!(
-                        "path {}",
-                        String::from_utf8_lossy(&file.path)
-                    ),
+                    identity: format!("path {}", String::from_utf8_lossy(&file.path)),
                 });
             }
             for entry in &file.entries {
@@ -484,9 +476,12 @@ impl ConflictCaptureWriter {
             .extend_from_slice(format!("{marker} {id}").as_bytes());
         if let Some(hash) = changes.and_then(|c| c.first()) {
             let hash_str = hash.to_base32();
-            let short = if hash_str.len() > 8 { &hash_str[..8] } else { &hash_str };
-            self.out
-                .extend_from_slice(format!(" [{short}]").as_bytes());
+            let short = if hash_str.len() > 8 {
+                &hash_str[..8]
+            } else {
+                &hash_str
+            };
+            self.out.extend_from_slice(format!(" [{short}]").as_bytes());
         }
         self.out.push(b'\n');
         self.line += 1;
@@ -668,7 +663,10 @@ mod tests {
     fn canonical_bytes_are_deterministic_and_hash_stable() {
         let first = sample();
         let second = sample();
-        assert_eq!(first.canonical_bytes().unwrap(), second.canonical_bytes().unwrap());
+        assert_eq!(
+            first.canonical_bytes().unwrap(),
+            second.canonical_bytes().unwrap()
+        );
         assert_eq!(first.hash().unwrap(), second.hash().unwrap());
     }
 
@@ -763,12 +761,14 @@ mod tests {
     #[test]
     fn side_changes_are_collected_in_order() {
         let mut object = sample();
-        object.files[0].entries[0].claimants.push(ConflictClaimantObject {
-            change: Hash::of(b"atomic:claimant"),
-            inode: 9,
-            path: b"src/lib.rs".to_vec(),
-            directory: false,
-        });
+        object.files[0].entries[0]
+            .claimants
+            .push(ConflictClaimantObject {
+                change: Hash::of(b"atomic:claimant"),
+                inode: 9,
+                path: b"src/lib.rs".to_vec(),
+                directory: false,
+            });
         let changes = object.side_changes();
         assert_eq!(changes.len(), 3);
         assert_eq!(changes[0], Hash::of(b"atomic:side:1"));
@@ -779,8 +779,7 @@ mod tests {
     fn zombie_base_roundtrips() {
         let mut object = sample();
         object.files[0].entries[0].base = Some(side(3));
-        let decoded =
-            ConflictSetObject::decode(&object.canonical_bytes().unwrap()).unwrap();
+        let decoded = ConflictSetObject::decode(&object.canonical_bytes().unwrap()).unwrap();
         assert_eq!(decoded.normalized(), object.normalized());
     }
 }
@@ -823,7 +822,9 @@ pub enum ConflictProjectionError {
          markers; resolve the attribute conflict before projecting"
     )]
     AttributeConflict { path: String, attribute: String },
-    #[error("cannot materialize mixed file/directory name conflict '{path}' without choosing a side")]
+    #[error(
+        "cannot materialize mixed file/directory name conflict '{path}' without choosing a side"
+    )]
     MixedNameConflict { path: String },
     #[error("conflict capture for '{path}' failed: {message}")]
     Capture { path: String, message: String },
@@ -839,6 +840,8 @@ impl Repository {
     /// graph (side vertices, rendered side content). Capture is deterministic:
     /// the same visible state always yields byte-identical canonical bytes,
     /// and the marker bytes are byte-identical to materialization output.
+    #[allow(clippy::type_complexity)] // object + reconstructed sidecar table
+    #[allow(clippy::type_complexity)] // object + reconstructed sidecar table
     pub fn capture_view_conflict_set_with_markers(
         &self,
         view_name: &str,
@@ -868,6 +871,7 @@ impl Repository {
             .map(|(object, _)| object))
     }
 
+    #[allow(clippy::type_complexity)] // object + reconstructed sidecar table
     fn capture_view_conflict_set_inner(
         &self,
         view_name: &str,
@@ -1044,15 +1048,16 @@ impl Repository {
                         for region in regions {
                             let mut sides = Vec::with_capacity(region.sides.len());
                             for side in &region.sides {
-                                let change = external_hashes.get(&side.node.change).copied().ok_or_else(|| {
-                                    RepositoryError::InvalidOperation {
+                                let change = external_hashes
+                                    .get(&side.node.change)
+                                    .copied()
+                                    .ok_or_else(|| RepositoryError::InvalidOperation {
                                         message: format!(
                                             "conflict side change {} of '{path}' \
                                              has no external hash",
                                             side.node.change.get()
                                         ),
-                                    }
-                                })?;
+                                    })?;
                                 sides.push(ConflictSideObject {
                                     change,
                                     start: side.node.start.get(),
@@ -1094,10 +1099,7 @@ impl Repository {
                     marker_bytes.remove(&path);
                     continue;
                 }
-                if let Some(file) = files
-                    .iter_mut()
-                    .find(|file| file.path == path.as_bytes())
-                {
+                if let Some(file) = files.iter_mut().find(|file| file.path == path.as_bytes()) {
                     file.entries.push(entry);
                 } else {
                     files.push(ConflictFileObject {
@@ -1140,15 +1142,13 @@ impl Repository {
     ) -> Result<ConflictSnapshotProjection, ConflictProjectionError> {
         use atomic_core::pristine::{GraphTxnT, ViewTxnT};
 
-        let Some((conflict_set, marker_bytes)) =
-            self.capture_view_conflict_set_with_markers(view_name)
-                .map_err(ConflictProjectionError::Repository)?
+        let Some((conflict_set, marker_bytes)) = self
+            .capture_view_conflict_set_with_markers(view_name)
+            .map_err(ConflictProjectionError::Repository)?
         else {
             return Err(ConflictProjectionError::Repository(
                 RepositoryError::InvalidOperation {
-                    message: format!(
-                        "view '{view_name}' has no persisted conflicts to project"
-                    ),
+                    message: format!("view '{view_name}' has no persisted conflicts to project"),
                 },
             ));
         };
@@ -1186,18 +1186,26 @@ impl Repository {
                 let hash = txn
                     .get_external(change_id)
                     .map_err(|e| RepositoryError::Database(e.to_string()))?
-                    .ok_or_else(|| RepositoryError::Database("change has no external hash".to_string()))?;
+                    .ok_or_else(|| {
+                        RepositoryError::Database("change has no external hash".to_string())
+                    })?;
                 ordered.push(hash);
             }
             ordered
         };
         let project = self
-            .project_change_closure_with_conflict_markers(&txn, &view, &roots, policy, &marker_bytes)
-            .map_err(|error| ConflictProjectionError::Repository(
-                RepositoryError::InvalidOperation {
+            .project_change_closure_with_conflict_markers(
+                &txn,
+                &view,
+                &roots,
+                policy,
+                &marker_bytes,
+            )
+            .map_err(|error| {
+                ConflictProjectionError::Repository(RepositoryError::InvalidOperation {
                     message: error.to_string(),
-                },
-            ))?;
+                })
+            })?;
         Ok(ConflictSnapshotProjection {
             conflict_set,
             conflict_set_hash,

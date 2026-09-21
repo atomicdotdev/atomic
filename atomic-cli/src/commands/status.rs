@@ -221,7 +221,6 @@ pub struct Status {
     /// materializes, or mutates durable tracking.
     #[arg(long = "git", conflicts_with = "reindex")]
     pub git: bool,
-
 }
 
 impl Status {
@@ -640,11 +639,13 @@ impl Command for Status {
             }
         }
 
-        let mut repo =
-            Repository::open_for_workspace_transaction_wait(&repo_root, std::time::Duration::from_secs(10))
-                .map_err(|e| CliError::InvalidRepository {
-                    reason: e.to_string(),
-                })?;
+        let mut repo = Repository::open_for_workspace_transaction_wait(
+            &repo_root,
+            std::time::Duration::from_secs(10),
+        )
+        .map_err(|e| CliError::InvalidRepository {
+            reason: e.to_string(),
+        })?;
         let working_copy =
             repo.require_working_copy_id()
                 .map_err(|e| CliError::InvalidRepository {

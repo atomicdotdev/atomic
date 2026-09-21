@@ -105,7 +105,6 @@ use std::collections::HashMap;
 /// let result = retrieve_graph(&txn, file_pos, RetrieveOptions::default())?;
 /// println!("Retrieved {} vertices", result.graph.len_vertices());
 /// ```
-
 pub fn retrieve_graph<T: GraphTxnT>(
     txn: &T,
     start_pos: Position<NodeId>,
@@ -253,7 +252,13 @@ pub fn retrieve_graph<T: GraphTxnT>(
                 // additive model).  If the destination vertex is alive
                 // through some OTHER edge, the normal traversal will
                 // pick it up via that path.
-                let dest_alive = memo_vertex_alive(&options, txn, resolved_vertex, &mut alive_memo, &mut dep_memo)?;
+                let dest_alive = memo_vertex_alive(
+                    &options,
+                    txn,
+                    resolved_vertex,
+                    &mut alive_memo,
+                    &mut dep_memo,
+                )?;
 
                 if !dest_alive {
                     let successors = walk_through_dead(
@@ -292,7 +297,13 @@ pub fn retrieve_graph<T: GraphTxnT>(
                 // Otherwise, use the normal create_alive_vertex check.
                 let alive_vertex = if options.deletion_aware() {
                     // Full vertex aliveness check using typed parent iteration
-                    if !memo_vertex_alive(&options, txn, resolved_vertex, &mut alive_memo, &mut dep_memo)? {
+                    if !memo_vertex_alive(
+                        &options,
+                        txn,
+                        resolved_vertex,
+                        &mut alive_memo,
+                        &mut dep_memo,
+                    )? {
                         // Vertex was deleted at the target state.  Skip
                         // emitting it, but walk THROUGH it to find live
                         // successors so we don't lose unrelated downstream
@@ -462,6 +473,7 @@ fn memo_vertex_alive<T: GraphTxnT>(
     Ok(alive)
 }
 
+#[allow(clippy::too_many_arguments)] // memoised traversal; each param is a distinct cache
 fn walk_through_dead<T: GraphTxnT>(
     txn: &T,
     options: &RetrieveOptions,
@@ -476,7 +488,7 @@ fn walk_through_dead<T: GraphTxnT>(
 ) -> Result<Vec<VertexId>, PristineError> {
     use std::collections::HashSet;
     let mut live_successors: Vec<VertexId> = Vec::new();
-    
+
     // BFS through dead vertices, recording live ones we encounter.
     //
     // We track three sets separately:
@@ -533,7 +545,13 @@ fn walk_through_dead<T: GraphTxnT>(
                         crate::types::ParentEdgeKind::Block
                         | crate::types::ParentEdgeKind::Folder => {
                             let source_vertex = txn.find_block_end(parent.dest)?;
-                            if !memo_vertex_alive(options, txn, source_vertex, alive_memo, dep_memo)? {
+                            if !memo_vertex_alive(
+                                options,
+                                txn,
+                                source_vertex,
+                                alive_memo,
+                                dep_memo,
+                            )? {
                                 continue;
                             }
                             if source_vertex == owner_parent {
@@ -572,7 +590,13 @@ fn walk_through_dead<T: GraphTxnT>(
                     let mut shadowed_by_existing = false;
                     for existing_vid in live_successors.iter().copied() {
                         let existing_node = result.graph.get_vertex(existing_vid).node;
-                        if memo_visible_chain_reaches(txn, options, existing_node, next_vertex, chain_memo)? {
+                        if memo_visible_chain_reaches(
+                            txn,
+                            options,
+                            existing_node,
+                            next_vertex,
+                            chain_memo,
+                        )? {
                             shadowed_by_existing = true;
                             break;
                         }
@@ -582,7 +606,13 @@ fn walk_through_dead<T: GraphTxnT>(
                         let mut retained = Vec::with_capacity(live_successors.len());
                         for existing_vid in live_successors.drain(..) {
                             let existing_node = result.graph.get_vertex(existing_vid).node;
-                            if !memo_visible_chain_reaches(txn, options, next_vertex, existing_node, chain_memo)? {
+                            if !memo_visible_chain_reaches(
+                                txn,
+                                options,
+                                next_vertex,
+                                existing_node,
+                                chain_memo,
+                            )? {
                                 retained.push(existing_vid);
                             }
                         }

@@ -75,31 +75,33 @@ impl TurnOrchestrator {
         // turn and no turn is in flight, alignment and flush are skipped —
         // there is nothing owned to record.
         if !session.explicit_record_files || had_active_turn {
-        {
-            // Ensure a non-sandbox working copy still desires the session's
-            // agent view before recording. session-start aligns it, but that can
-            // drift back to the parent view by session end (observed with
-            // Cursor's CLI). A provisioned sandbox's persisted desired view is
-            // authoritative, so adopt it instead of overwriting it.
-            //
-            // This also answers "is there a worktree to protect?" for the
-            // failed-flush guard below, which is why it is captured rather than
-            // discarded. See there.
-            let has_worktree = match atomic_repository::Repository::open_existing(&self.repo_root) {
-                Ok(mut repo) => {
-                    if repo.is_sandbox() {
-                        let desired_view = repo.current_view().to_string();
-                        if desired_view != session.view_name {
-                            log::warn!(
+            {
+                // Ensure a non-sandbox working copy still desires the session's
+                // agent view before recording. session-start aligns it, but that can
+                // drift back to the parent view by session end (observed with
+                // Cursor's CLI). A provisioned sandbox's persisted desired view is
+                // authoritative, so adopt it instead of overwriting it.
+                //
+                // This also answers "is there a worktree to protect?" for the
+                // failed-flush guard below, which is why it is captured rather than
+                // discarded. See there.
+                let has_worktree = match atomic_repository::Repository::open_existing(
+                    &self.repo_root,
+                ) {
+                    Ok(mut repo) => {
+                        if repo.is_sandbox() {
+                            let desired_view = repo.current_view().to_string();
+                            if desired_view != session.view_name {
+                                log::warn!(
                                 "SessionEnd: sandbox desired view '{}' differs from session view '{}'; adopting the persisted sandbox view",
                                 desired_view,
                                 session.view_name,
                             );
-                            session.view_name = desired_view;
-                        }
-                    } else if repo.current_view() != session.view_name {
-                        let working_copy = repo.require_working_copy_id();
-                        match working_copy {
+                                session.view_name = desired_view;
+                            }
+                        } else if repo.current_view() != session.view_name {
+                            let working_copy = repo.require_working_copy_id();
+                            match working_copy {
                             Ok(working_copy) => {
                                 if let Err(e) =
                                     repo.align_to_view(working_copy, &session.view_name)
@@ -122,118 +124,121 @@ impl TurnOrchestrator {
                                 e,
                             ),
                         }
+                        }
+                        true
                     }
-                    true
-                }
-                Err(e) => {
-                    log::warn!(
-                        "SessionEnd: could not open repo to align view: {} (non-fatal)",
-                        e
-                    );
-                    false
-                }
-            };
-
-            // Flush only a turn actually in flight (review R3 fix-session):
-            // headless agents leave an active turn at SessionEnd. When every
-            // turn already recorded on `stop`, there is no pending turn —
-            // and with the baseline cleared after each turn, running the
-            // flush anyway would classify a fabricated baseline-less turn
-            // and mark every cleanly-recorded session incomplete.
-            if !session.is_turn_active() {
-                log::debug!(
-                    "SessionEnd for session {}: no turn in flight, nothing to flush",
-                    session_id
-                );
-            } else {
-            let prompt = event
-                .prompt
-                .clone()
-                .or_else(|| session.current_prompt.clone())
-                .or_else(|| session.first_prompt.clone());
-            let turn_number = session.turn_count + 1;
-            let turn_duration_ms = session.current_turn_duration_ms().unwrap_or(0);
-            if had_active_turn {
-                self.commit_turn_completion_events(&session, &event, turn_number)?;
-            }
-            let record_result = {
-                let record_options = TurnRecordOptions {
-                    session: &session,
-                    event: &event,
-                    turn_number,
-                    turn_duration_ms,
-                    prompt,
+                    Err(e) => {
+                        log::warn!(
+                            "SessionEnd: could not open repo to align view: {} (non-fatal)",
+                            e
+                        );
+                        false
+                    }
                 };
-                record_turn(&self.repo_root, &record_options)
-            };
-            match record_result {
-                Ok(crate::record::TurnRecordResult::Recorded(outcome)) => {
-                    session.end_turn();
-                    let recorded_files: Vec<String> = outcome.recorded_file_list().to_vec();
-                    session.add_files_touched(&recorded_files);
-                    session.recorded_change_hashes.push(outcome.hash);
-                    session.clear_current_prompt();
-                    self.inject_reasoning_nodes(session_id, &event);
-                    self.save_turn_provenance(session_id, &session, &outcome, &event, None)?;
-                    self.persist_content_turn_outcome(&mut session, &outcome, None);
-                    // Review R2: a mixed flushed turn's unexplained Git
-                    // transition refuses attribution just like a git-only
-                    // turn, even though its content recorded.
-                    if let Some(ref transition) = outcome.git_transition {
-                        if let Some(ref incomplete) = transition.incomplete {
-                            flush_incomplete =
-                                Some(self.persist_incomplete_refusal(&mut session, incomplete));
+
+                // Flush only a turn actually in flight (review R3 fix-session):
+                // headless agents leave an active turn at SessionEnd. When every
+                // turn already recorded on `stop`, there is no pending turn —
+                // and with the baseline cleared after each turn, running the
+                // flush anyway would classify a fabricated baseline-less turn
+                // and mark every cleanly-recorded session incomplete.
+                if !session.is_turn_active() {
+                    log::debug!(
+                        "SessionEnd for session {}: no turn in flight, nothing to flush",
+                        session_id
+                    );
+                } else {
+                    let prompt = event
+                        .prompt
+                        .clone()
+                        .or_else(|| session.current_prompt.clone())
+                        .or_else(|| session.first_prompt.clone());
+                    let turn_number = session.turn_count + 1;
+                    let turn_duration_ms = session.current_turn_duration_ms().unwrap_or(0);
+                    if had_active_turn {
+                        self.commit_turn_completion_events(&session, &event, turn_number)?;
+                    }
+                    let record_result = {
+                        let record_options = TurnRecordOptions {
+                            session: &session,
+                            event: &event,
+                            turn_number,
+                            turn_duration_ms,
+                            prompt,
+                        };
+                        record_turn(&self.repo_root, &record_options)
+                    };
+                    match record_result {
+                        Ok(crate::record::TurnRecordResult::Recorded(outcome)) => {
+                            session.end_turn();
+                            let recorded_files: Vec<String> = outcome.recorded_file_list().to_vec();
+                            session.add_files_touched(&recorded_files);
+                            session.recorded_change_hashes.push(outcome.hash);
+                            session.clear_current_prompt();
+                            self.inject_reasoning_nodes(session_id, &event);
+                            self.save_turn_provenance(
+                                session_id, &session, &outcome, &event, None,
+                            )?;
+                            self.persist_content_turn_outcome(&mut session, &outcome, None);
+                            // Review R2: a mixed flushed turn's unexplained Git
+                            // transition refuses attribution just like a git-only
+                            // turn, even though its content recorded.
+                            if let Some(ref transition) = outcome.git_transition {
+                                if let Some(ref incomplete) = transition.incomplete {
+                                    flush_incomplete = Some(
+                                        self.persist_incomplete_refusal(&mut session, incomplete),
+                                    );
+                                }
+                            }
+                            log::info!(
+                                "SessionEnd flushed a pending turn for session {}: {}",
+                                session_id,
+                                outcome
+                            );
+                        }
+                        Ok(crate::record::TurnRecordResult::Classified(classified)) => {
+                            // RFC §10.2: a clean turn is classified, never empty.
+                            session.end_turn();
+                            self.persist_classified_turn(&mut session, &classified);
+                            session.clear_current_prompt();
+                            // Review R3 (executed probe): the refusal is durably
+                            // persisted above, and it must ALSO surface in the
+                            // dispatch result — the CLI turns that into a nonzero
+                            // exit instead of a fresh success.
+                            flush_incomplete = classified.incomplete.clone();
+                            log::info!(
+                                "SessionEnd for session {}: clean turn classified as {:?}",
+                                session_id,
+                                classified.outcome
+                            );
+                        }
+                        Err(e) => {
+                            log::error!(
+                                "SessionEnd flush-record failed for session {}: {}",
+                                session_id,
+                                e
+                            );
+                            // Never finalize or attest a real repository after a
+                            // failed flush. Keep the session active and leave the
+                            // working copy on the agent view so its unrecorded work
+                            // remains visible and recoverable. Repo-less orchestrator
+                            // tests and integrations have no worktree to protect.
+                            //
+                            // This asks the question directly. It used to ask whether
+                            // the session had a `parent_view`, which was a stand-in
+                            // for the same thing — only the branch that opens a real
+                            // repository set one — and a stand-in that quietly
+                            // excluded sandboxes, whose unrecorded work is exactly
+                            // what most needs protecting. It would also have changed
+                            // meaning under anything that recorded a parent more
+                            // often, which is a trap for the next reader.
+                            if has_worktree {
+                                return Err(e);
+                            }
                         }
                     }
-                    log::info!(
-                        "SessionEnd flushed a pending turn for session {}: {}",
-                        session_id,
-                        outcome
-                    );
-                }
-                Ok(crate::record::TurnRecordResult::Classified(classified)) => {
-                    // RFC §10.2: a clean turn is classified, never empty.
-                    session.end_turn();
-                    self.persist_classified_turn(&mut session, &classified);
-                    session.clear_current_prompt();
-                    // Review R3 (executed probe): the refusal is durably
-                    // persisted above, and it must ALSO surface in the
-                    // dispatch result — the CLI turns that into a nonzero
-                    // exit instead of a fresh success.
-                    flush_incomplete = classified.incomplete.clone();
-                    log::info!(
-                        "SessionEnd for session {}: clean turn classified as {:?}",
-                        session_id,
-                        classified.outcome
-                    );
-                }
-                Err(e) => {
-                    log::error!(
-                        "SessionEnd flush-record failed for session {}: {}",
-                        session_id,
-                        e
-                    );
-                    // Never finalize or attest a real repository after a
-                    // failed flush. Keep the session active and leave the
-                    // working copy on the agent view so its unrecorded work
-                    // remains visible and recoverable. Repo-less orchestrator
-                    // tests and integrations have no worktree to protect.
-                    //
-                    // This asks the question directly. It used to ask whether
-                    // the session had a `parent_view`, which was a stand-in
-                    // for the same thing — only the branch that opens a real
-                    // repository set one — and a stand-in that quietly
-                    // excluded sandboxes, whose unrecorded work is exactly
-                    // what most needs protecting. It would also have changed
-                    // meaning under anything that recorded a parent more
-                    // often, which is a trap for the next reader.
-                    if has_worktree {
-                        return Err(e);
-                    }
-                }
+                } // turn-in-flight flush guard
             }
-            } // turn-in-flight flush guard
-        }
         } // scoped-session skip gate
 
         if had_active_turn {

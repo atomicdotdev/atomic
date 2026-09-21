@@ -126,8 +126,10 @@ impl Command for Push {
                 &view_changes,
             )
             .map_err(CliError::Repository)?;
-            let provider = atomic_repository::repository::provenance_gate::
-                local_session_mac_key_provider(&readonly_repo);
+            let provider =
+                atomic_repository::repository::provenance_gate::local_session_mac_key_provider(
+                    &readonly_repo,
+                );
             readonly_repo
                 .enforce_publication_gate("Git ref export", &closure, Some(&provider))
                 .map_err(CliError::Repository)?;
@@ -165,11 +167,9 @@ impl Command for Push {
                     .map_err(CliError::Repository)?
                     .expect("conflict presence checked above");
                 let set_hash = object.hash().map_err(|error| {
-                    CliError::Repository(
-                        atomic_repository::RepositoryError::InvalidOperation {
-                            message: format!("cannot hash the conflict set: {error}"),
-                        },
-                    )
+                    CliError::Repository(atomic_repository::RepositoryError::InvalidOperation {
+                        message: format!("cannot hash the conflict set: {error}"),
+                    })
                 })?;
                 let mut pack_current = false;
                 for id in readonly_repo.binding_ids().map_err(CliError::Repository)? {
@@ -177,11 +177,8 @@ impl Command for Push {
                         .load_binding_conflicts_pack(&git_for_conflicts, &id)
                         .map_err(CliError::Repository)?
                     {
-                        if atomic_repository::git_binding::validate_conflicts_pack(
-                            &pack,
-                            &set_hash,
-                        )
-                        .is_ok()
+                        if atomic_repository::git_binding::validate_conflicts_pack(&pack, &set_hash)
+                            .is_ok()
                         {
                             pack_current = true;
                             break;
@@ -380,7 +377,14 @@ impl Command for Push {
                         self.remote, target
                     ));
                 }
-                self.push_to_remote(&repo, &repo_root, &git_repo, target_override, &publication, &_shadow_lock)?;
+                self.push_to_remote(
+                    &repo,
+                    &repo_root,
+                    &git_repo,
+                    target_override,
+                    &publication,
+                    &_shadow_lock,
+                )?;
                 print_success(&format!("Pushed to {}/{}", self.remote, target));
                 return Ok(());
             }
@@ -436,7 +440,14 @@ impl Command for Push {
 
         // Push to remote unless --no-push
         if !self.no_push {
-            match self.push_to_remote(&repo, &repo_root, &git_repo, target_override, &publication, &_shadow_lock) {
+            match self.push_to_remote(
+                &repo,
+                &repo_root,
+                &git_repo,
+                target_override,
+                &publication,
+                &_shadow_lock,
+            ) {
                 Ok(()) => {
                     let target = self.target_branch(&git_repo, target_override);
                     print_success(&format!("Pushed to {}/{}", self.remote, target));
@@ -462,6 +473,7 @@ impl Push {
     /// next push can find this commit as its starting point. The RFC §8.2
     /// headers (`atomic-set`, `atomic-state`, `atomic-author`) are emitted
     /// alongside them, with identity resolved through the §5.5 map.
+    #[allow(clippy::too_many_arguments)]
     fn build_commit_message(
         &self,
         repo: &Repository,
@@ -732,10 +744,8 @@ impl Push {
         // mutable HEAD — the refspec names the exact commit the publication
         // snapshot verified, so a branch that moves after verification
         // cannot change what is pushed.
-        let verified_head = publication.git_head.ok_or_else(|| {
-            CliError::GitError {
-                message: "the verified publication carries no Git commit to push".to_string(),
-            }
+        let verified_head = publication.git_head.ok_or_else(|| CliError::GitError {
+            message: "the verified publication carries no Git commit to push".to_string(),
         })?;
         let refspec = format!("{}:{destination}", verified_head);
 
@@ -752,14 +762,25 @@ impl Push {
         // first, and the verified new tip is recorded back for the next
         // push. The working copy comes from the publication boundary.
         let current_view = publication.view().to_string();
-        let working_copy = repo.require_working_copy_id().map_err(CliError::Repository)?;
-        let mapping = match repo.get_ref_mapping(&current_view).map_err(CliError::Repository)? {
+        let working_copy = repo
+            .require_working_copy_id()
+            .map_err(CliError::Repository)?;
+        let mapping = match repo
+            .get_ref_mapping(&current_view)
+            .map_err(CliError::Repository)?
+        {
             Some(mapping) => Some(mapping),
             None => {
                 // First push for this view: create the baseline mapping so
                 // the remote observation below has a durable row to advance.
-                super::ref_mapping::ensure_baseline_mapping(repo, working_copy, git_repo, &current_view)?.0;
-                repo.get_ref_mapping(&current_view).map_err(CliError::Repository)?
+                super::ref_mapping::ensure_baseline_mapping(
+                    repo,
+                    working_copy,
+                    git_repo,
+                    &current_view,
+                )?;
+                repo.get_ref_mapping(&current_view)
+                    .map_err(CliError::Repository)?
             }
         };
         // The tracked remote pair: the mapping's pair when it matches this
@@ -786,7 +807,8 @@ impl Push {
                 // unrequested work (CB-10B review R2). The push runs
                 // without a lease, so Git's own fast-forward check refuses
                 // a non-descendant update.
-                let tip = super::transport::observe_remote_ref(&workdir, &self.remote, &destination)?;
+                let tip =
+                    super::transport::observe_remote_ref(workdir, &self.remote, &destination)?;
                 match tip {
                     None => Some(format!("--force-with-lease={destination}:")),
                     Some(_) => None,
@@ -815,31 +837,56 @@ impl Push {
             let verified = publication.git_head.ok_or_else(|| CliError::GitError {
                 message: "race fixture: no verified commit".to_string(),
             })?;
-            let signature = git2::Signature::now("Racer", "racer@example.com")
-                .map_err(|error| CliError::GitError { message: error.to_string() })?;
+            let signature =
+                git2::Signature::now("Racer", "racer@example.com").map_err(|error| {
+                    CliError::GitError {
+                        message: error.to_string(),
+                    }
+                })?;
             let tree_id = {
-                let mut builder = git_repo
-                    .treebuilder(None)
-                    .map_err(|error| CliError::GitError { message: error.to_string() })?;
-                builder
-                    .write()
-                    .map_err(|error| CliError::GitError { message: error.to_string() })?
+                let mut builder =
+                    git_repo
+                        .treebuilder(None)
+                        .map_err(|error| CliError::GitError {
+                            message: error.to_string(),
+                        })?;
+                builder.write().map_err(|error| CliError::GitError {
+                    message: error.to_string(),
+                })?
             };
             let tree = git_repo
                 .find_tree(tree_id)
-                .map_err(|error| CliError::GitError { message: error.to_string() })?;
+                .map_err(|error| CliError::GitError {
+                    message: error.to_string(),
+                })?;
             let parent = git_repo
                 .find_commit(verified)
-                .map_err(|error| CliError::GitError { message: error.to_string() })?;
+                .map_err(|error| CliError::GitError {
+                    message: error.to_string(),
+                })?;
             let moved = git_repo
-                .commit(None, &signature, &signature, "raced branch move", &tree, &[&parent])
-                .map_err(|error| CliError::GitError { message: error.to_string() })?;
-            let mut reference = git_repo
-                .find_reference(&branch_ref)
-                .map_err(|error| CliError::GitError { message: error.to_string() })?;
+                .commit(
+                    None,
+                    &signature,
+                    &signature,
+                    "raced branch move",
+                    &tree,
+                    &[&parent],
+                )
+                .map_err(|error| CliError::GitError {
+                    message: error.to_string(),
+                })?;
+            let mut reference =
+                git_repo
+                    .find_reference(&branch_ref)
+                    .map_err(|error| CliError::GitError {
+                        message: error.to_string(),
+                    })?;
             reference
                 .set_target(moved, "raced branch move after the publication snapshot")
-                .map_err(|error| CliError::GitError { message: error.to_string() })?;
+                .map_err(|error| CliError::GitError {
+                    message: error.to_string(),
+                })?;
         }
 
         let mut args: Vec<String> = vec!["push".to_string(), self.remote.clone()];
@@ -891,7 +938,7 @@ impl Push {
         // a concurrent branch move between the push and this observation
         // must not corrupt the verification).
         let pushed_oid = verified_head.to_string();
-        let remote_tip = super::transport::observe_remote_ref(&workdir, &self.remote, &destination)?;
+        let remote_tip = super::transport::observe_remote_ref(workdir, &self.remote, &destination)?;
         match remote_tip {
             Some(tip) if tip == pushed_oid => {
                 super::ref_mapping::record_remote_push_observation(

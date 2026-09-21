@@ -976,9 +976,8 @@ where
     // rendered", never as "source content happens to look like markers".
     if rendered_conflict && conflicts.is_empty() {
         conflict_id += 1;
-        conflicts.push(
-            FileConflict::new(String::new(), FileConflictType::Order).with_id(conflict_id),
-        );
+        conflicts
+            .push(FileConflict::new(String::new(), FileConflictType::Order).with_id(conflict_id));
     }
 
     Ok((content, conflicts, had_fork_structure))

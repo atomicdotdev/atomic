@@ -38,8 +38,8 @@ use atomic_core::operation::{
     RepoStateDelta, RepoStateRef, ViewStateRef,
 };
 use atomic_core::pristine::{
-    GraphVisibilityClosure, MutTxnT, OperationMutTxnT, ReadTxn, StoredConflict,
-    StoredConflictKind, ViewState,
+    GraphVisibilityClosure, MutTxnT, OperationMutTxnT, ReadTxn, StoredConflict, StoredConflictKind,
+    ViewState,
 };
 use atomic_core::OperationId;
 
@@ -351,12 +351,14 @@ impl Repository {
             });
         }
         for entry in &stale {
-            let inode = entry.inode.ok_or_else(|| RepositoryError::InvalidOperation {
-                message: format!(
-                    "refusing stale-conflict cleanup for '{}': no tracked inode",
-                    entry.path
-                ),
-            })?;
+            let inode = entry
+                .inode
+                .ok_or_else(|| RepositoryError::InvalidOperation {
+                    message: format!(
+                        "refusing stale-conflict cleanup for '{}': no tracked inode",
+                        entry.path
+                    ),
+                })?;
             let observed = txn
                 .get_conflicts(view_now.id, inode.get())
                 .map_err(|error| RepositoryError::Database(error.to_string()))?;
@@ -445,7 +447,10 @@ impl Repository {
         let cleared_inodes: std::collections::HashSet<(u64, Inode)> = stale
             .iter()
             .map(|entry| {
-                (view_now.id, entry.inode.expect("stale entry always carries an inode"))
+                (
+                    view_now.id,
+                    entry.inode.expect("stale entry always carries an inode"),
+                )
             })
             .collect();
         let expected_after: Vec<(u64, Inode, Vec<StoredConflict>)> = snapshot_before
@@ -539,9 +544,11 @@ impl Repository {
         paths: &[String],
     ) -> Result<Option<ConflictReconcileOutcome>, RepositoryError> {
         let report = self.inspect_stale_conflicts(working_copy, paths)?;
-        if report.paths.iter().any(|entry| {
-            entry.disposition == StaleConflictDisposition::GenuineConflict
-        }) {
+        if report
+            .paths
+            .iter()
+            .any(|entry| entry.disposition == StaleConflictDisposition::GenuineConflict)
+        {
             let blocker = report
                 .paths
                 .iter()
@@ -584,7 +591,7 @@ impl Repository {
     ///
     /// Git-owned state (an in-progress operation, unmerged index stages, an
     /// index lock, or administrative ref locks) refuses through
-    /// [`Self::reconcile_stale_conflicts_impl`] with a typed error; it is never
+    /// `Self::reconcile_stale_conflicts_impl` with a typed error; it is never
     /// skipped. Read-only inspection failures also fall back to the ordinary
     /// guard rather than fabricating a baseline.
     ///
@@ -615,8 +622,7 @@ impl Repository {
         if !metadata_only_report(&report) || !report.has_stale() {
             return Ok(None);
         }
-        let outcome =
-            self.reconcile_stale_conflicts_impl(working_copy, &explicit, true)?;
+        let outcome = self.reconcile_stale_conflicts_impl(working_copy, &explicit, true)?;
         if outcome.is_noop() {
             Ok(None)
         } else {
@@ -709,7 +715,9 @@ impl Repository {
                 inode: Some(inode),
                 disposition: StaleConflictDisposition::UnsupportedKind,
                 rows,
-                reason: Some("persisted name conflict; resolve it through the record path".to_string()),
+                reason: Some(
+                    "persisted name conflict; resolve it through the record path".to_string(),
+                ),
                 render_digest: None,
             });
         }
@@ -823,11 +831,10 @@ fn metadata_only_report(report: &StaleConflictReport) -> bool {
 /// while an in-progress Git operation, unmerged index stages, an index lock, or
 /// an administrative ref lock exists. The enumeration is fail-closed.
 fn ensure_git_quiescent_for_stale_cleanup(root: &Path) -> Result<(), RepositoryError> {
-    let observation = observe_git_metadata(root).map_err(|error| {
-        RepositoryError::InvalidRepository {
+    let observation =
+        observe_git_metadata(root).map_err(|error| RepositoryError::InvalidRepository {
             reason: format!("cannot observe Git state before stale-conflict cleanup: {error}"),
-        }
-    })?;
+        })?;
     if let WorkspaceGitObservation::Repository(git) = &observation {
         let conflict_stages = git.conflict_stages();
         if git.operation.is_in_progress() || !conflict_stages.is_empty() {
@@ -882,8 +889,8 @@ fn conflict_records_equal(left: &[StoredConflict], right: &[StoredConflict]) -> 
             record.sides.clone(),
         )
     }
-    let mut left: Vec<_> = left.iter().cloned().collect();
-    let mut right: Vec<_> = right.iter().cloned().collect();
+    let mut left: Vec<_> = left.to_vec();
+    let mut right: Vec<_> = right.to_vec();
     left.sort_by_key(sort_key);
     right.sort_by_key(sort_key);
     left == right

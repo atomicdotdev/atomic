@@ -65,6 +65,7 @@ pub(super) struct FinalResourceWriteTxn<'a> {
 }
 
 thread_local! {
+#[allow(clippy::type_complexity)] // (count, handle, reentrant) tuple is module-local
     static HELD_LOCKS: RefCell<HashMap<PathBuf, (usize, Weak<File>, bool)>> = RefCell::new(HashMap::new());
 }
 
@@ -91,9 +92,9 @@ impl AdvisoryFileLock {
                     // The outer guard always has a HELD_LOCKS entry; a
                     // missing entry means the alias is outliving its
                     // boundary, which the caller must never do.
-                    let entry = held
-                        .entry(self.path.clone())
-                        .or_insert((0usize, Weak::new(), false));
+                    let entry =
+                        held.entry(self.path.clone())
+                            .or_insert((0usize, Weak::new(), false));
                     entry.0 += 1;
                 }
             }
@@ -437,9 +438,7 @@ fn try_lock_file(
     let path = path.to_path_buf();
     let reentrant = HELD_LOCKS.with(|held| {
         let mut held = held.borrow_mut();
-        let Some((count, file, reentrant)) = held.get_mut(&path) else {
-            return None;
-        };
+        let (count, file, reentrant) = held.get_mut(&path)?;
         if !*reentrant {
             return None;
         }

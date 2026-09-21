@@ -9,9 +9,7 @@
 use super::*;
 use crate::record::{RecordError, RecordOptions};
 use atomic_core::change::ChangeHeader;
-use atomic_core::pristine::{
-    MutTxnT, StoredConflict, StoredConflictKind, TreeTxnT, ViewTxnT,
-};
+use atomic_core::pristine::{MutTxnT, StoredConflict, StoredConflictKind, TreeTxnT, ViewTxnT};
 
 fn record_all(repo: &Repository, message: &str) -> Result<RecordOutcome, RecordError> {
     let header = ChangeHeader::new(message);
@@ -153,7 +151,10 @@ fn stale_cleanup_is_idempotent() {
         .inspect_stale_conflicts(repo.working_copy(), &paths)
         .unwrap();
     assert!(!report.has_stale());
-    assert_eq!(report.paths[0].disposition, StaleConflictDisposition::AlreadyClean);
+    assert_eq!(
+        report.paths[0].disposition,
+        StaleConflictDisposition::AlreadyClean
+    );
 }
 
 #[test]
@@ -309,10 +310,7 @@ fn metadata_only_cleanup_clears_stale_and_then_noops() {
     inject_order_conflict(&repo, "fixture.md", 1);
 
     let outcome = repo
-        .record_metadata_only_conflict_cleanup(
-            repo.working_copy(),
-            &["fixture.md".to_string()],
-        )
+        .record_metadata_only_conflict_cleanup(repo.working_copy(), &["fixture.md".to_string()])
         .unwrap()
         .expect("a proven metadata-only plan clears the stale row");
     assert_eq!(outcome.cleared_paths, vec!["fixture.md".to_string()]);
@@ -328,10 +326,7 @@ fn metadata_only_cleanup_clears_stale_and_then_noops() {
     // Once cleared there is no metadata-only effect left; the ordinary guard
     // owns the request from here.
     let again = repo
-        .record_metadata_only_conflict_cleanup(
-            repo.working_copy(),
-            &["fixture.md".to_string()],
-        )
+        .record_metadata_only_conflict_cleanup(repo.working_copy(), &["fixture.md".to_string()])
         .unwrap();
     assert!(again.is_none());
 }

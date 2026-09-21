@@ -376,6 +376,7 @@ fn fresh_clone_resurrects_the_exact_closure_through_the_published_binding() {
 }
 
 /// The default view name on the client side.
+#[allow(dead_code)]
 const DEFAULT_VIEW_NAME: &str = "dev";
 
 #[test]
@@ -398,7 +399,7 @@ fn a_tampered_published_binding_fails_resurrection_closed() {
     {
         let repo = git2::Repository::open(&client).expect("open client git");
         let reference = repo
-            .find_reference(&format!("refs/atomic/bindings/{}/{}", &id[..2], &id))
+            .find_reference(&format!("refs/atomic/bindings/{}/{}", &id[..2], id))
             .expect("binding ref");
         let binding_commit = reference.peel_to_commit().expect("peel");
         let tree = binding_commit.tree().expect("tree");

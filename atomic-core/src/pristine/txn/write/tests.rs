@@ -1151,9 +1151,7 @@ mod tests {
 
     #[test]
     fn test_attach_turn_boundary_updates_only_existing_rows() {
-        use crate::change::session::{
-            GitBoundaryCheckpoint, ManagedTurnOutcome, TurnBoundary,
-        };
+        use crate::change::session::{GitBoundaryCheckpoint, ManagedTurnOutcome, TurnBoundary};
 
         let dir = tempdir().unwrap();
         let pristine = Pristine::open(dir.path().join("pristine")).unwrap();
@@ -1192,19 +1190,32 @@ mod tests {
             "sess-b",
             ".atomic/sessions/sess-b.json",
             &provenance,
-            &crate::change::provenance_graph::ProvenanceGraph::builder("sess-b", "claude-code").build(),
+            &crate::change::provenance_graph::ProvenanceGraph::builder("sess-b", "claude-code")
+                .build(),
         )
         .unwrap();
 
         // The row exists: the boundary pair and outcome attach.
         let attached = txn
-            .attach_turn_boundary("sess-b", &provenance, &boundary("sess-b", 1), &boundary("sess-b", 1), &outcome())
+            .attach_turn_boundary(
+                "sess-b",
+                &provenance,
+                &boundary("sess-b", 1),
+                &boundary("sess-b", 1),
+                &outcome(),
+            )
             .unwrap();
         assert!(attached);
 
         // Re-attaching identical evidence is an idempotent no-op.
         let attached = txn
-            .attach_turn_boundary("sess-b", &provenance, &boundary("sess-b", 1), &boundary("sess-b", 1), &outcome())
+            .attach_turn_boundary(
+                "sess-b",
+                &provenance,
+                &boundary("sess-b", 1),
+                &boundary("sess-b", 1),
+                &outcome(),
+            )
             .unwrap();
         assert!(attached);
 
@@ -1226,7 +1237,10 @@ mod tests {
         assert_eq!(turns.len(), 1);
         assert_eq!(turns[0].boundary_start.as_ref().unwrap().turn, 1);
         assert_eq!(turns[0].boundary_end.as_ref().unwrap().turn, 1);
-        assert!(matches!(turns[0].outcome, Some(ManagedTurnOutcome::ContentChanges { .. })));
+        assert!(matches!(
+            turns[0].outcome,
+            Some(ManagedTurnOutcome::ContentChanges { .. })
+        ));
         assert!(txn.get_session_turns("sess-other").unwrap().is_empty());
     }
 }

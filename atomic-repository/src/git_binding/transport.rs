@@ -40,9 +40,13 @@ pub fn is_transferable_ref(name: &str) -> bool {
     match (segments.next(), segments.next(), segments.next()) {
         (Some(shard), Some(id), None) => {
             shard.len() == 2
-                && shard.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                && shard
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
                 && id.len() == 64
-                && id.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                && id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
         }
         _ => false,
     }
@@ -77,8 +81,7 @@ pub fn transferable_binding_refs(git: &git2::Repository) -> Result<Vec<String>, 
         .references()
         .map_err(|error| format!("cannot enumerate refs: {error}"))?
     {
-        let reference =
-            reference.map_err(|error| format!("cannot read ref: {error}"))?;
+        let reference = reference.map_err(|error| format!("cannot read ref: {error}"))?;
         if let Some(name) = reference.name() {
             if is_transferable_ref(name) {
                 if names.len() >= MAX_TRANSFER_REFS {
@@ -116,8 +119,12 @@ pub fn binding_id_from_ref_name(name: &str) -> Option<BindingId> {
     }
     let mut bytes = [0u8; 32];
     for (index, pair) in id_hex.as_bytes().chunks(2).enumerate() {
-        let high = (pair[0] as char).to_digit(16).expect("hex digit checked above") as u8;
-        let low = (pair[1] as char).to_digit(16).expect("hex digit checked above") as u8;
+        let high = (pair[0] as char)
+            .to_digit(16)
+            .expect("hex digit checked above") as u8;
+        let low = (pair[1] as char)
+            .to_digit(16)
+            .expect("hex digit checked above") as u8;
         bytes[index] = (high << 4) | low;
     }
     let id = BindingId::from_bytes(bytes);
@@ -163,15 +170,13 @@ pub fn namespace_rejection_diagnostic(
         ref_name: ref_name.to_string(),
         detail: detail.to_string(),
         remediation: vec![
-            format!(
-                "configure an Atomic remote for this repository and push bindings through it \
+            "configure an Atomic remote for this repository and push bindings through it \
                  (the Atomic remote is the required transport for binding closures)"
-            ),
-            format!(
-                "or explicitly enable the degraded refs/heads/atomic/bindings/* hosting fallback \
+                .to_string(),
+            "or explicitly enable the degraded refs/heads/atomic/bindings/* hosting fallback \
                  (NOT semantically equivalent; visible to every Git client and must be \
                  deferred to an operator decision)"
-            ),
+                .to_string(),
         ],
     }
 }
@@ -245,10 +250,13 @@ mod tests {
 
         let id = binding_id(0x01);
         let binding_ref = binding_ref_name(&id);
-        git.reference(&binding_ref, commit, false, "binding").unwrap();
+        git.reference(&binding_ref, commit, false, "binding")
+            .unwrap();
         // Noise that must never be enumerated: WIP ref, branch, tag.
-        git.reference("refs/atomic/wip/ws/op", commit, false, "wip").unwrap();
-        git.reference("refs/heads/main", commit, false, "branch").unwrap();
+        git.reference("refs/atomic/wip/ws/op", commit, false, "wip")
+            .unwrap();
+        git.reference("refs/heads/main", commit, false, "branch")
+            .unwrap();
         git.reference("refs/tags/v1", commit, false, "tag").unwrap();
 
         let transferable = transferable_binding_refs(&git).unwrap();

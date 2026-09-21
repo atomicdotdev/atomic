@@ -1599,13 +1599,21 @@ mod tests {
         // A real nested repository (gitdir + HEAD + objects + refs) prunes.
         std::fs::create_dir_all(root.join("nested-repo/.git/objects")).unwrap();
         std::fs::create_dir_all(root.join("nested-repo/.git/refs")).unwrap();
-        std::fs::write(root.join("nested-repo/.git/HEAD"), b"ref: refs/heads/main\n").unwrap();
+        std::fs::write(
+            root.join("nested-repo/.git/HEAD"),
+            b"ref: refs/heads/main\n",
+        )
+        .unwrap();
         std::fs::write(root.join("nested-repo/hidden.txt"), b"foreign\n").unwrap();
         // A linked-worktree style gitdir FILE whose target is an actual Git
         // directory (with a commondir delegating objects/refs) prunes.
         std::fs::create_dir_all(root.join("shared-store/.git/objects")).unwrap();
         std::fs::create_dir_all(root.join("shared-store/.git/refs")).unwrap();
-        std::fs::write(root.join("shared-store/.git/HEAD"), b"ref: refs/heads/main\n").unwrap();
+        std::fs::write(
+            root.join("shared-store/.git/HEAD"),
+            b"ref: refs/heads/main\n",
+        )
+        .unwrap();
         std::fs::create_dir_all(root.join("shared-store/.git/worktrees/wt")).unwrap();
         std::fs::write(
             root.join("shared-store/.git/worktrees/wt/commondir"),
@@ -1658,11 +1666,7 @@ mod tests {
         std::fs::write(root.join("dangling/keep.txt"), b"visible\n").unwrap();
         // A `.git` directory containing ONLY a HEAD file.
         std::fs::create_dir_all(root.join("head-only/.git")).unwrap();
-        std::fs::write(
-            root.join("head-only/.git/HEAD"),
-            b"ref: refs/heads/main\n",
-        )
-        .unwrap();
+        std::fs::write(root.join("head-only/.git/HEAD"), b"ref: refs/heads/main\n").unwrap();
         std::fs::write(root.join("head-only/keep.txt"), b"visible\n").unwrap();
         // A real repository next door still prunes (control).
         std::fs::create_dir_all(root.join("real/.git/objects")).unwrap();
@@ -1699,8 +1703,7 @@ mod tests {
         std::fs::create_dir_all(root.join("ordinary")).unwrap();
         std::fs::write(root.join("ordinary/new.txt"), b"visible\n").unwrap();
 
-        let options = StatusOptions::default()
-            .with_nested_repo_boundaries([PathBuf::from("mod")]);
+        let options = StatusOptions::default().with_nested_repo_boundaries([PathBuf::from("mod")]);
         let files = collect_working_copy_files(root, &options).unwrap();
         assert!(!files.contains(&PathBuf::from("mod/inner.txt")));
         assert!(files.contains(&PathBuf::from("ordinary/new.txt")));
@@ -1752,12 +1755,12 @@ mod tests {
         // boundary.
         std::fs::create_dir_all(root.join("store/worktrees/wt")).unwrap();
         std::fs::write(root.join("store/worktrees/wt/commondir"), "../../\n").unwrap();
-        std::fs::write(root.join("store/worktrees/wt/HEAD"), b"ref: refs/heads/wt\n").unwrap();
         std::fs::write(
-            root.join("empty/.git"),
-            b"gitdir: ../store/worktrees/wt\n",
+            root.join("store/worktrees/wt/HEAD"),
+            b"ref: refs/heads/wt\n",
         )
         .unwrap();
+        std::fs::write(root.join("empty/.git"), b"gitdir: ../store/worktrees/wt\n").unwrap();
         assert!(establishes_repository_boundary(&root.join("empty/.git")));
         // Malformed gitdir body: not a boundary.
         std::fs::write(root.join("empty/.git"), b"gitdir:   \n").unwrap();

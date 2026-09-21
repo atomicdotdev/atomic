@@ -43,7 +43,10 @@ pub(crate) fn capture_root(
             }
             let name = entry.file_name().to_string_lossy().to_string();
             let bytes = std::fs::read(&path)?;
-            pairs.push((name, atomic_core::types::Hash::of(&bytes).as_bytes().to_vec()));
+            pairs.push((
+                name,
+                atomic_core::types::Hash::of(&bytes).as_bytes().to_vec(),
+            ));
         }
     }
     pairs.sort_by(|a, b| a.0.cmp(&b.0));
@@ -67,9 +70,7 @@ impl TurnOrchestrator {
     /// mismatch — yields `None` and the attestation falls back to the
     /// session MAC, which [`atomic_core::change::attestation::TrustPolicy`]
     /// then refuses as trusted evidence.
-    pub(crate) fn load_did_signing_identity(
-        &self,
-    ) -> Option<(String, atomic_identity::KeyPair)> {
+    pub(crate) fn load_did_signing_identity(&self) -> Option<(String, atomic_identity::KeyPair)> {
         let store = atomic_identity::IdentityStore::open_default().ok()?;
         // get_default resolves the configured default identity directly.
         let identity = store.get_default().ok()??;
@@ -275,8 +276,7 @@ impl TurnOrchestrator {
             let prov_json = serde_json::to_vec(change.provenance()).unwrap_or_default();
             provenance_buf.extend_from_slice(change_hash.as_bytes());
             provenance_buf.push(0);
-            provenance_buf
-                .extend_from_slice(atomic_core::types::Hash::of(&prov_json).as_bytes());
+            provenance_buf.extend_from_slice(atomic_core::types::Hash::of(&prov_json).as_bytes());
 
             // Aggregate provenance (model, tokens, cost) from each change
             for prov in change.provenance() {
@@ -409,8 +409,7 @@ impl TurnOrchestrator {
                 if !attestation.verify_mac(&mac_key) {
                     return Err(crate::error::AgentError::AttestationFailed {
                         session_id: session.session_id.clone(),
-                        reason: "attestation signature failed verification before save"
-                            .to_string(),
+                        reason: "attestation signature failed verification before save".to_string(),
                     });
                 }
                 log::debug!(

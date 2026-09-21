@@ -173,6 +173,7 @@ fn projected(
 
 /// Stable, dependency-free digest of a file's raw bytes: FNV-1a over the
 /// bytes plus the byte length (empty digest when absent).
+#[allow(dead_code)]
 fn digest_file(path: &Path) -> String {
     let bytes = fs::read(path).unwrap_or_default();
     let mut hash: u64 = 0xcbf29ce484222325;
@@ -187,6 +188,7 @@ fn digest_file(path: &Path) -> String {
 /// `.atomic/working-copies` tree, including file names and bytes. Empty when
 /// no shelves are populated (the digest still compares: a failure must not
 /// populate or depopulate shelves).
+#[allow(dead_code)]
 fn digest_populated_shelves(root: &Path) -> String {
     let workspaces = root.join(".atomic").join("working-copies");
     if !workspaces.is_dir() {
@@ -194,7 +196,7 @@ fn digest_populated_shelves(root: &Path) -> String {
     }
     let mut entries: Vec<(String, String)> = Vec::new();
     for entry in walkdir_all(&workspaces) {
-        let relative = entry.strip_prefix(&workspaces).unwrap_or(&entry);
+        let _relative = entry.strip_prefix(&workspaces).unwrap_or(&entry);
         if entry.is_dir() {
             entries.push((format!("{:?}", entry), "dir".to_string()));
         } else {
@@ -205,6 +207,7 @@ fn digest_populated_shelves(root: &Path) -> String {
 }
 
 /// Deterministic recursive listing of a directory tree.
+#[allow(dead_code)]
 fn walkdir_all(root: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     let stack = vec![root.to_path_buf()];
@@ -213,7 +216,10 @@ fn walkdir_all(root: &Path) -> Vec<PathBuf> {
         let Ok(read) = fs::read_dir(&dir) else {
             continue;
         };
-        let mut children: Vec<PathBuf> = read.filter_map(|entry| entry.ok()).map(|entry| entry.path()).collect();
+        let mut children: Vec<PathBuf> = read
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.path())
+            .collect();
         children.sort();
         for child in children {
             if child.is_dir() {
@@ -253,10 +259,7 @@ fn corpus() -> Corpus {
     let root = tempfile::tempdir().unwrap().keep();
     let home = tempfile::tempdir().unwrap().keep();
     git(&root, &["init", "-q", "-b", "main"]);
-    git(
-        &root,
-        &["config", "protocol.file.allow", "always"],
-    );
+    git(&root, &["config", "protocol.file.allow", "always"]);
 
     // Base tree.
     fs::create_dir_all(root.join("docs")).unwrap();
@@ -286,7 +289,9 @@ fn corpus() -> Corpus {
     let rename_edit = git_commit(&root, "rename edit");
 
     // Attribute-only: chmod +x on a tracked file (no byte change).
-    let mut perms = fs::metadata(root.join("src/entry.rs")).unwrap().permissions();
+    let mut perms = fs::metadata(root.join("src/entry.rs"))
+        .unwrap()
+        .permissions();
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -400,11 +405,13 @@ fn fidelity_corpus_projects_every_state_and_records_move_evidence() {
 
     // Final projection: bytes.
     assert_eq!(
-        repo.get_file_content_on_view("docs/intro.md", "main").unwrap(),
+        repo.get_file_content_on_view("docs/intro.md", "main")
+            .unwrap(),
         Some(b"gone\n".to_vec()),
     );
     assert_eq!(
-        repo.get_file_content_on_view("src/entry.rs", "main").unwrap(),
+        repo.get_file_content_on_view("src/entry.rs", "main")
+            .unwrap(),
         Some(b"../docs/intro.md".to_vec()),
         "the final file→symlink conversion projects the link target bytes"
     );
@@ -439,8 +446,7 @@ fn fidelity_corpus_projects_every_state_and_records_move_evidence() {
     let bin_attrs = projected(&repo, "bin.dat");
     assert_eq!(bin_attrs.kind, InodeKind::Regular);
     assert_eq!(
-        bin_attrs.mode,
-        0o644,
+        bin_attrs.mode, 0o644,
         "bin.dat never changed mode; the chmod commit touched entry.rs"
     );
 
@@ -448,7 +454,10 @@ fn fidelity_corpus_projects_every_state_and_records_move_evidence() {
     // repository bytes are the bumped target's lowercase hex OID.
     let mod_attrs = projected(&repo, "mod");
     assert_eq!(mod_attrs.kind, InodeKind::Gitlink);
-    let expected_oid = git(root, &["rev-parse", &format!("{}:mod", corpus.submodule_bump)]);
+    let expected_oid = git(
+        root,
+        &["rev-parse", &format!("{}:mod", corpus.submodule_bump)],
+    );
     assert_eq!(
         repo.get_file_content_on_view("mod", "main").unwrap(),
         Some(expected_oid.to_lowercase().into_bytes()),
@@ -519,7 +528,9 @@ fn fidelity_corpus_projects_every_state_and_records_move_evidence() {
         entries
             .iter()
             .find(|entry| {
-                repo.load_change(&entry.hash).unwrap().unhashed
+                repo.load_change(&entry.hash)
+                    .unwrap()
+                    .unhashed
                     .as_ref()
                     .and_then(|v| v.get("git"))
                     .and_then(|g| g.get("sha"))
@@ -693,7 +704,10 @@ fn ambiguous_identical_rename_candidates_emit_rename_unresolved_loss() {
             atomic_repository::LossNote::RenameUnresolved { candidates } => candidates
                 .iter()
                 .flat_map(|candidate| {
-                    [candidate.source_path.clone(), candidate.destination_path.clone()]
+                    [
+                        candidate.source_path.clone(),
+                        candidate.destination_path.clone(),
+                    ]
                 })
                 .collect::<Vec<String>>(),
             _ => Vec::new(),
@@ -701,7 +715,9 @@ fn ambiguous_identical_rename_candidates_emit_rename_unresolved_loss() {
         .collect();
     for path in ["a.txt", "b.txt", "c.txt", "d.txt"] {
         assert!(
-            candidate_paths.iter().any(|candidate| candidate.ends_with(path)),
+            candidate_paths
+                .iter()
+                .any(|candidate| candidate.ends_with(path)),
             "the RenameUnresolved evidence must name the ambiguous candidate {path}: \
              {candidate_paths:?}"
         );
@@ -716,8 +732,14 @@ fn ambiguous_identical_rename_candidates_emit_rename_unresolved_loss() {
         repo.get_file_content_on_view("d.txt", "main").unwrap(),
         Some(b"identical\n".to_vec()),
     );
-    assert_eq!(repo.get_file_content_on_view("a.txt", "main").unwrap(), None);
-    assert_eq!(repo.get_file_content_on_view("b.txt", "main").unwrap(), None);
+    assert_eq!(
+        repo.get_file_content_on_view("a.txt", "main").unwrap(),
+        None
+    );
+    assert_eq!(
+        repo.get_file_content_on_view("b.txt", "main").unwrap(),
+        None
+    );
     drop(repo);
     let _ = (&ambiguous, &home);
 }
@@ -733,7 +755,7 @@ fn large_rename_edit_imports_without_similarity_overflow() {
 
     let mut big = Vec::new();
     for _ in 0..450 {
-        big.extend(std::iter::repeat(b'x').take(1_000));
+        big.extend(std::iter::repeat_n(b'x', 1_000));
         big.push(b'\n');
     }
     assert_eq!(big.len(), 450_450);
@@ -828,7 +850,10 @@ fn incidental_nested_git_marker_does_not_hide_ordinary_status_entries() {
 fn sha256_repositories_fail_closed_at_discovery_instead_of_silent_import() {
     let root = tempfile::tempdir().unwrap().keep();
     let home = tempfile::tempdir().unwrap().keep();
-    git(&root, &["init", "-q", "-b", "main", "--object-format=sha256"]);
+    git(
+        &root,
+        &["init", "-q", "-b", "main", "--object-format=sha256"],
+    );
     fs::write(root.join("script.sh"), b"#!/bin/sh\necho hi\n").unwrap();
     let head = git_commit(&root, "rename and link");
     let _ = head;
@@ -902,7 +927,9 @@ fn raw_non_utf8_path_survives_as_reversible_escaped_identity() {
         .find_commit(git2::Oid::from_str(raw_path.as_str()).unwrap())
         .unwrap();
     let tree = commit.tree().unwrap();
-    let entry = tree.iter().find(|entry| entry.name_bytes() == b"inv\xffalid.txt");
+    let entry = tree
+        .iter()
+        .find(|entry| entry.name_bytes() == b"inv\xffalid.txt");
     assert!(entry.is_some(), "the source Git tree holds the raw name");
     drop(repo);
 }
@@ -938,8 +965,7 @@ fn raw_nested_and_percent_lookalike_paths_survive_the_fold() {
 
     let repo = open_repo(&root);
     // The nested raw path: escaped identity, exact bytes.
-    let nested_escaped =
-        atomic_repository::escape_repo_path(b"d\xffr/f\xffle.txt");
+    let nested_escaped = atomic_repository::escape_repo_path(b"d\xffr/f\xffle.txt");
     assert_eq!(nested_escaped, "d%FFr/f%FFle.txt");
     let nested_bytes = repo
         .get_file_content_on_view(&nested_escaped, "main")
@@ -949,8 +975,7 @@ fn raw_nested_and_percent_lookalike_paths_survive_the_fold() {
     // The literal lookalike: the canonical identity is the reversible ESCAPE
     // of the literal bytes ("%FF..." -> "%25FF..."), and unescaping it
     // recovers the exact literal bytes — decoding never becomes identity.
-    let lookalike_escaped =
-        atomic_repository::escape_repo_path(b"%FFliteral.txt");
+    let lookalike_escaped = atomic_repository::escape_repo_path(b"%FFliteral.txt");
     assert_eq!(lookalike_escaped, "%25FFliteral.txt");
     let lookalike_bytes = repo
         .get_file_content_on_view(&lookalike_escaped, "main")
@@ -962,8 +987,7 @@ fn raw_nested_and_percent_lookalike_paths_survive_the_fold() {
         b"%FFliteral.txt".to_vec(),
         "the escaped identity recovers the literal percent bytes"
     );
-    let nested_lookalike_escaped =
-        atomic_repository::escape_repo_path(b"%2Fdir/inner.txt");
+    let nested_lookalike_escaped = atomic_repository::escape_repo_path(b"%2Fdir/inner.txt");
     assert_eq!(nested_lookalike_escaped, "%252Fdir/inner.txt");
     let nested_lookalike = repo
         .get_file_content_on_view(&nested_lookalike_escaped, "main")
@@ -972,7 +996,13 @@ fn raw_nested_and_percent_lookalike_paths_survive_the_fold() {
     assert_eq!(nested_lookalike, b"nested lookalike\n".to_vec());
     // The Git tree still holds the exact raw bytes for every entry.
     let git = git2::Repository::open(&root).unwrap();
-    let head = git.head().unwrap().peel_to_commit().unwrap().tree().unwrap();
+    let head = git
+        .head()
+        .unwrap()
+        .peel_to_commit()
+        .unwrap()
+        .tree()
+        .unwrap();
     assert!(
         head.iter().any(|e| e.name_bytes() == b"d\xffr"),
         "the source Git tree holds the raw directory"
@@ -1037,7 +1067,9 @@ fn attribute_only_failpoint_fails_closed_and_retry_publishes() {
     // Attribute-only commit: chmod +x, no byte change. It is built on a side
     // branch so `main` stays at the base while the prefix is imported
     // (the import walks the branch ref, not the detached HEAD).
-    let mut perms = fs::metadata(root.join("tracked.txt")).unwrap().permissions();
+    let mut perms = fs::metadata(root.join("tracked.txt"))
+        .unwrap()
+        .permissions();
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -1076,7 +1108,11 @@ fn attribute_only_failpoint_fails_closed_and_retry_publishes() {
     #[cfg(unix)]
     let mode_before = {
         use std::os::unix::fs::PermissionsExt;
-        fs::metadata(root.join("tracked.txt")).unwrap().permissions().mode() & 0o777
+        fs::metadata(root.join("tracked.txt"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777
     };
     let view_list_before = atomic_stdout(&root, &home, &["view", "list"]);
     // Full failure-preservation oracle (review CB-9C R6): the Git staging
@@ -1130,9 +1166,15 @@ fn attribute_only_failpoint_fails_closed_and_retry_publishes() {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let mode_after =
-            fs::metadata(root.join("tracked.txt")).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode_after, mode_before, "the failed import must not rewrite modes");
+        let mode_after = fs::metadata(root.join("tracked.txt"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            mode_after, mode_before,
+            "the failed import must not rewrite modes"
+        );
     }
     let view_list_after = atomic_stdout(&root, &home, &["view", "list"]);
     assert_eq!(
@@ -1204,8 +1246,7 @@ fn attribute_only_failpoint_fails_closed_and_retry_publishes() {
         "the attribute-only commit must project without register conflicts"
     );
     assert_eq!(
-        entry_attrs.materialization.mode,
-        0o755,
+        entry_attrs.materialization.mode, 0o755,
         "the retried chmod commit projects the executable mode exactly"
     );
     assert_eq!(
@@ -1292,7 +1333,6 @@ fn attribute_only_failpoint_fails_closed_and_retry_publishes() {
 use atomic_core::change::GraphOp;
 use atomic_core::crdt::TrunkId;
 use atomic_core::pristine::CrdtTxnT;
-use atomic_core::types::NodeId;
 
 /// Build a one-file Git repository, import it, and return (root, home).
 fn single_file_repo(content: &[u8]) -> (tempfile::TempDir, tempfile::TempDir) {
@@ -1440,8 +1480,8 @@ fn unique_pure_rename_moves_semantic_trunk_to_destination() {
     fs::write(root.join("c.txt"), b"line one\nline two edited\n").unwrap();
     let _edit = git_commit(root, "edit after move");
     atomic_ok(root, home, &["git", "import", "--no-vault"]);
-    let (trunk_after, trunk_path_after) = trunk_facts(root, "c.txt")
-        .expect("the edited path still maps after reopen");
+    let (trunk_after, trunk_path_after) =
+        trunk_facts(root, "c.txt").expect("the edited path still maps after reopen");
     assert_eq!(trunk_path_after, "c.txt");
     assert_eq!(
         trunk_after, trunk,
@@ -1512,7 +1552,6 @@ fn unique_rename_with_edit_keeps_semantic_move_and_edit_below_it() {
     );
 }
 
-
 /// Review CB-9C R3 (re-review EYL): ambiguous byte-identical candidate sets
 /// must downgrade to canonical delete+add with RenameUnresolved loss when
 /// EITHER endpoint has alternatives. Parameterized over the four shapes:
@@ -1547,11 +1586,7 @@ fn one_sided_ambiguous_identical_rename_candidates_downgrade_to_delete_add() {
             fs::write(root.path().join(path), b"identical\n").unwrap();
         }
         let rename = git_commit(root.path(), &format!("{name} rename shape"));
-        atomic_ok(
-            root.path(),
-            home.path(),
-            &["git", "import", "--no-vault"],
-        );
+        atomic_ok(root.path(), home.path(), &["git", "import", "--no-vault"]);
 
         let repo = open_repo(root.path());
         let change = change_of(&repo, "main", rename.as_str());
@@ -1571,14 +1606,14 @@ fn one_sided_ambiguous_identical_rename_candidates_downgrade_to_delete_add() {
         // The trunk lifecycle facts are collected on the outer repo's handle —
         // never by re-opening the database while it is held (the held-handle
         // lock defect review CB-9C R6 pinned).
-        use atomic_core::crdt::tables::encode_trunk_id;
+
         let old_trunk_rows: Vec<(String, String, bool)> = if expect_move {
             Vec::new()
         } else {
             deleted
                 .iter()
                 .map(|old| {
-                    let (trunk, trunk_path, alive) = trunk_facts_on(&repo, old)
+                    let (_trunk, trunk_path, alive) = trunk_facts_on(&repo, old)
                         .unwrap_or_else(|| panic!("{name}: {old} trunk missing after import"));
                     (old.to_string(), trunk_path, alive)
                 })
@@ -1586,7 +1621,8 @@ fn one_sided_ambiguous_identical_rename_candidates_downgrade_to_delete_add() {
         };
         if expect_move {
             assert_eq!(
-                file_moves, 1,
+                file_moves,
+                1,
                 "{name}: the unique pairing selects the policy FileMove: {:?}",
                 change.hunks()
             );
@@ -1602,7 +1638,8 @@ fn one_sided_ambiguous_identical_rename_candidates_downgrade_to_delete_add() {
             );
         } else {
             assert_eq!(
-                file_moves, 0,
+                file_moves,
+                0,
                 "{name}: an ambiguous identical candidate set must remain canonical \
                  delete+add: {:?}",
                 change.hunks()
@@ -1664,11 +1701,9 @@ fn one_sided_ambiguous_identical_rename_candidates_downgrade_to_delete_add() {
                 let expected_pairs: std::collections::BTreeSet<(String, String)> = deleted
                     .iter()
                     .flat_map(|source| {
-                        added
-                            .iter()
-                            .map(move |destination| {
-                                ((*source).to_string(), destination.to_string())
-                            })
+                        added.iter().map(move |destination| {
+                            ((*source).to_string(), destination.to_string())
+                        })
                     })
                     .collect();
                 assert!(
@@ -1771,9 +1806,8 @@ fn empty_directory_projection_emits_loss_and_binding_round_trip_preserves_it() {
         "the emptied directory must surface an explicit EmptyDirectory loss: {notes:?}"
     );
     // (b) The Git projection fabricates no directory-only entry.
-    let policy = atomic_repository::ConversionPolicy::new(
-        atomic_core::operation::GitHashAlgorithm::Sha1,
-    );
+    let policy =
+        atomic_repository::ConversionPolicy::new(atomic_core::operation::GitHashAlgorithm::Sha1);
     let project = repo.project_tree("main", &policy).unwrap();
     let tree_bytes = &project
         .git
@@ -1925,12 +1959,11 @@ fn imported_bytes() -> Vec<u8> {
         state ^= state >> 7;
         state ^= state << 17;
         let chunk = shared_chunk(state);
-        let take = (len - out.len()).min(shared_chunk_len());
-        out.extend_from_slice(&slice_len(&chunk, some_len()));
+        let _take = (len - out.len()).min(shared_chunk_len());
+        out.extend_from_slice(slice_len(&chunk, some_len()));
     }
     out
 }
-
 
 /// Review ::26 N1 disposition, ::16 AC-2 (C3): serial replay must accumulate
 /// semantics per ACTUAL trunk/incarnation in dependency order — never union
@@ -2016,7 +2049,10 @@ fn serial_replay_counterexample_2_moved_path_attribution() {
         .get_file_content_on_view("d.txt", "main")
         .expect("d.txt readable")
         .expect("d.txt tracked");
-    assert_eq!(d_bytes, b"content a\n", "the a→c→d chain preserves a's content at d");
+    assert_eq!(
+        d_bytes, b"content a\n",
+        "the a→c→d chain preserves a's content at d"
+    );
     // The path `c` renders b's content (the b→c rename).
     let c_bytes = repo
         .get_file_content_on_view("c.txt", "main")
@@ -2094,7 +2130,6 @@ fn serial_replay_move_away_and_return() {
     assert_eq!(moved_bytes, b"moving away\n");
 }
 
-
 /// ::16 AC-4 (C5): malformed HEAD — a HEAD file containing garbage instead
 /// of a valid ref. The import must refuse with a typed error, not silently
 /// proceed with an undefined HEAD state.
@@ -2148,7 +2183,8 @@ fn detached_head_fails_closed_at_discovery() {
         .get_file_content_on_view("f.txt", "main")
         .expect("f.txt readable");
     assert_eq!(
-        f_bytes, Some(b"content\n".to_vec()),
+        f_bytes,
+        Some(b"content\n".to_vec()),
         "the detached HEAD import produces the detached commit's content"
     );
     let _ = text;
@@ -2216,7 +2252,11 @@ fn core_filemode_false_ignores_mode_only_changes() {
         restore.set_mode(0o644);
         fs::set_permissions(root.join("script.sh"), restore).unwrap();
     }
-    atomic_ok(&root, &home, &["git", "import", "--incremental", "--no-vault"]);
+    atomic_ok(
+        &root,
+        &home,
+        &["git", "import", "--incremental", "--no-vault"],
+    );
 
     // The graph's recorded content is unchanged (the chmod was invisible
     // to git with core.fileMode=false, and the import has no new commits).
@@ -2247,7 +2287,11 @@ fn blame_attributes_lines_across_imports_and_reload() {
     )
     .unwrap();
     let second = git_commit(&root, "edit middle line");
-    atomic_ok(&root, &home, &["git", "import", "--incremental", "--no-vault"]);
+    atomic_ok(
+        &root,
+        &home,
+        &["git", "import", "--incremental", "--no-vault"],
+    );
 
     // Blame output: lines 1 and 3 owned by the base import's change, line 2
     // by the incremental edit's change. The hashes printed are the real
@@ -2259,11 +2303,24 @@ fn blame_attributes_lines_across_imports_and_reload() {
     assert_eq!(lines.len(), 3, "three alive lines attributed: {out:?}");
     let base_owner = lines[0].split(' ').next().expect("line 1 hash");
     let edit_owner = lines[1].split(' ').next().expect("line 2 hash");
-    assert_eq!(lines[2].split(' ').next(), Some(base_owner), "line 3 attributes to the base change: {out:?}");
-    assert_ne!(base_owner, edit_owner, "line 2 attributes to the edit change: {out:?}");
-    assert_eq!(base_owner.len(), 52, "the default blame prints the full change hash");
+    assert_eq!(
+        lines[2].split(' ').next(),
+        Some(base_owner),
+        "line 3 attributes to the base change: {out:?}"
+    );
+    assert_ne!(
+        base_owner, edit_owner,
+        "line 2 attributes to the edit change: {out:?}"
+    );
+    assert_eq!(
+        base_owner.len(),
+        52,
+        "the default blame prints the full change hash"
+    );
     assert!(
-        lines[0].contains("line one") && lines[1].contains("line two (edited)") && lines[2].contains("line three"),
+        lines[0].contains("line one")
+            && lines[1].contains("line two (edited)")
+            && lines[2].contains("line three"),
         "the line contents render: {out:?}"
     );
 
@@ -2316,7 +2373,14 @@ fn filter_driven_content_imports_repository_bytes_exactly() {
         perms.set_mode(perms.mode() | 0o111);
         fs::set_permissions(&filter_script, perms).unwrap();
     }
-    git(&root, &["config", "filter.mockupper.clean", filter_script.to_str().unwrap()]);
+    git(
+        &root,
+        &[
+            "config",
+            "filter.mockupper.clean",
+            filter_script.to_str().unwrap(),
+        ],
+    );
     git(&root, &["config", "filter.mockupper.required", "true"]);
     fs::write(
         root.join(".gitattributes"),
@@ -2395,14 +2459,19 @@ fn filter_driven_content_imports_repository_bytes_exactly() {
             .expect("git cat-file blob");
         out.stdout
     };
-    assert_eq!(upper_blob, b"SHOUT THIS\n".to_vec(), "the external clean filter ran at add time");
+    assert_eq!(
+        upper_blob,
+        b"SHOUT THIS\n".to_vec(),
+        "the external clean filter ran at add time"
+    );
     // The LFS pointer is opaque pointer text, byte-exact.
     let lfs_graph = repo
         .get_file_content_on_view("model.bin.lfs", "main")
         .expect("read")
         .expect("tracked");
     assert!(
-        String::from_utf8_lossy(&lfs_graph).starts_with("version https://git-lfs.github.com/spec/v1"),
+        String::from_utf8_lossy(&lfs_graph)
+            .starts_with("version https://git-lfs.github.com/spec/v1"),
         "the LFS pointer shape is retained as opaque text"
     );
 }
@@ -2424,7 +2493,14 @@ fn filter_removed_after_commit_imports_stored_blob_bytes() {
         perms.set_mode(perms.mode() | 0o111);
         fs::set_permissions(&filter_script, perms).unwrap();
     }
-    git(&root, &["config", "filter.gone.clean", filter_script.to_str().unwrap()]);
+    git(
+        &root,
+        &[
+            "config",
+            "filter.gone.clean",
+            filter_script.to_str().unwrap(),
+        ],
+    );
     fs::write(root.join(".gitattributes"), "*.dat filter=gone\n").unwrap();
     fs::write(root.join("payload.dat"), b"stored bytes\n").unwrap();
     git(&root, &["add", "-A"]);
@@ -2446,7 +2522,10 @@ fn filter_removed_after_commit_imports_stored_blob_bytes() {
         .get_file_content_on_view("payload.dat", "main")
         .expect("read")
         .expect("tracked");
-    assert_eq!(graph_bytes, stored, "the stored blob bytes import unchanged");
+    assert_eq!(
+        graph_bytes, stored,
+        "the stored blob bytes import unchanged"
+    );
 }
 
 /// CB-9C ac-3: case/normalization collisions are surfaced explicitly by the
@@ -2530,7 +2609,11 @@ fn conversion_policy_fingerprint_covers_object_format() {
     // fingerprint differently.
     let config = root.join(".git/config");
     let original = fs::read_to_string(&config).unwrap();
-    fs::write(&config, format!("{original}[extensions]\n\tobjectFormat = sha256\n")).unwrap();
+    fs::write(
+        &config,
+        format!("{original}[extensions]\n\tobjectFormat = sha256\n"),
+    )
+    .unwrap();
     let sha256 = atomic_repository::change_source::conversion_policy_fingerprint(&root, &tracked)
         .expect("sha256 fingerprint");
     assert_ne!(
@@ -2552,7 +2635,15 @@ fn signed_raw_commit_corpus_preserves_gpgsig_bytes() {
     let key = tempfile::tempdir().unwrap().keep();
     let key_path = key.as_path().join("signing_ed25519");
     let keygen = Command::new("ssh-keygen")
-        .args(["-t", "ed25519", "-N", "", "-q", "-f", key_path.to_str().unwrap()])
+        .args([
+            "-t",
+            "ed25519",
+            "-N",
+            "",
+            "-q",
+            "-f",
+            key_path.to_str().unwrap(),
+        ])
         .output()
         .expect("run ssh-keygen");
     assert!(keygen.status.success(), "ssh-keygen must succeed");
@@ -2572,11 +2663,17 @@ fn signed_raw_commit_corpus_preserves_gpgsig_bytes() {
             .env("GIT_CONFIG_KEY_1", "gpg.ssh.allowSignForKeyfile")
             .env("GIT_CONFIG_VALUE_1", "true")
             .env("GIT_CONFIG_KEY_2", "user.signingkey")
-            .env("GIT_CONFIG_VALUE_2", format!("{}.pub", key_path.to_str().unwrap()))
+            .env(
+                "GIT_CONFIG_VALUE_2",
+                format!("{}.pub", key_path.to_str().unwrap()),
+            )
             .output()
             .expect("signed commit");
-        assert!(out.status.success(), "the signed commit must succeed: {}",
-            String::from_utf8_lossy(&out.stderr));
+        assert!(
+            out.status.success(),
+            "the signed commit must succeed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
         git(&root, &["rev-parse", "HEAD"])
     };
     let raw_signed: Vec<u8> = {
@@ -2603,13 +2700,12 @@ fn signed_raw_commit_corpus_preserves_gpgsig_bytes() {
     drop(repo);
     let facts: serde_json::Value = serde_json::from_slice(&change.hashed.metadata)
         .expect("the hashed synthesis metadata decodes");
-    let raw_hex_value = find_raw_object_hex_value(&facts)
-        .unwrap_or_else(|| {
-            panic!(
-                "the raw signed object must survive in the change metadata: {}",
-                serde_json::to_string_pretty(&facts).unwrap_or_default()
-            )
-        });
+    let raw_hex_value = find_raw_object_hex_value(&facts).unwrap_or_else(|| {
+        panic!(
+            "the raw signed object must survive in the change metadata: {}",
+            serde_json::to_string_pretty(&facts).unwrap_or_default()
+        )
+    });
     assert_eq!(
         raw_hex_value.to_lowercase(),
         raw_hex.to_lowercase(),
@@ -2621,13 +2717,18 @@ fn hex_encode(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
+#[allow(dead_code)]
 fn find_raw_object_hex(value: &serde_json::Value, expected: &str) -> bool {
     match value {
         serde_json::Value::String(text) => {
             text.len() >= expected.len() && text.to_lowercase().contains(&expected.to_lowercase())
         }
-        serde_json::Value::Array(items) => items.iter().any(|item| find_raw_object_hex(item, expected)),
-        serde_json::Value::Object(map) => map.values().any(|item| find_raw_object_hex(item, expected)),
+        serde_json::Value::Array(items) => {
+            items.iter().any(|item| find_raw_object_hex(item, expected))
+        }
+        serde_json::Value::Object(map) => {
+            map.values().any(|item| find_raw_object_hex(item, expected))
+        }
         _ => false,
     }
 }
@@ -2660,14 +2761,26 @@ fn watcher_off_interleaving_verifies_identically() {
     atomic_ok(&root, &home, &["git", "import", "--no-vault"]);
     fs::write(root.join("b.txt"), b"two\n").unwrap();
     git_commit(&root, "two");
-    atomic_ok(&root, &home, &["git", "import", "--incremental", "--no-vault"]);
+    atomic_ok(
+        &root,
+        &home,
+        &["git", "import", "--incremental", "--no-vault"],
+    );
     let status = atomic_stdout(&root, &home, &["status", "-s"]);
-    assert!(status.trim().is_empty(), "watcher-off status is clean: {status:?}");
+    assert!(
+        status.trim().is_empty(),
+        "watcher-off status is clean: {status:?}"
+    );
 
     let repo = open_repo(&root);
-    for (path, expected) in [("a.txt", b"one\n".as_slice()), ("b.txt", b"two\n".as_slice())] {
+    for (path, expected) in [
+        ("a.txt", b"one\n".as_slice()),
+        ("b.txt", b"two\n".as_slice()),
+    ] {
         assert_eq!(
-            repo.get_file_content_on_view(path, "main").expect("read").expect("tracked"),
+            repo.get_file_content_on_view(path, "main")
+                .expect("read")
+                .expect("tracked"),
             expected,
             "{path} byte-exact under watcher-off"
         );
@@ -2690,7 +2803,14 @@ fn core_symlinks_false_imports_link_entries_as_regular_files() {
     fs::write(root.join("target.txt"), b"real bytes\n").unwrap();
     // Git records a symlink entry but checks out a regular text file.
     let out = Command::new("git")
-        .args(["update-index", "--add", "--cacheinfo", "120000", "dummy", "link"])
+        .args([
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            "120000",
+            "dummy",
+            "link",
+        ])
         .current_dir(&root)
         .output()
         .expect("update-index");

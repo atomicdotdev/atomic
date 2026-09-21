@@ -7,7 +7,9 @@
 
 use atomic_core::operation::GitHashAlgorithm;
 
-use super::codec::{commit_object_digest, BindingDecodeError, GitObjectFormat, GitOid, GitStateBinding};
+use super::codec::{
+    commit_object_digest, BindingDecodeError, GitObjectFormat, GitOid, GitStateBinding,
+};
 
 /// Verify the cryptographic layer of a binding: canonical decoding, bound
 /// derived-field recomputation, and the Ed25519 signature.
@@ -58,22 +60,27 @@ pub fn verify_binding_content(
     }
 
     let commit_oid = git2_oid(&payload.git_commit)?;
-    let commit = git.find_commit(commit_oid).map_err(|error| {
-        BindingVerificationError::Git {
+    let commit = git
+        .find_commit(commit_oid)
+        .map_err(|error| BindingVerificationError::Git {
             message: format!(
                 "bound commit {} is absent: {error}",
                 payload.git_commit.to_hex()
             ),
-        }
-    })?;
+        })?;
     let odb = git.odb().map_err(|error| BindingVerificationError::Git {
         message: error.to_string(),
     })?;
-    let raw = odb.read(commit_oid).map_err(|error| {
-        BindingVerificationError::Git {
-            message: format!("bound commit {} is unreadable: {error}", payload.git_commit.to_hex()),
-        }
-    })?.data().to_vec();
+    let raw = odb
+        .read(commit_oid)
+        .map_err(|error| BindingVerificationError::Git {
+            message: format!(
+                "bound commit {} is unreadable: {error}",
+                payload.git_commit.to_hex()
+            ),
+        })?
+        .data()
+        .to_vec();
 
     // Tree: the binding must name the commit's actual tree.
     let actual_tree = commit.tree_id();
@@ -86,10 +93,10 @@ pub fn verify_binding_content(
 
     // Complete ordered parents: count and order both matter.
     let parent_count = commit.parent_count();
-    if parent_count as usize != payload.git_parents.len() {
+    if parent_count != payload.git_parents.len() {
         return Err(BindingVerificationError::ParentMismatch {
             expected: payload.git_parents.len(),
-            found: parent_count as usize,
+            found: parent_count,
         });
     }
     for (index, parent) in commit.parents().enumerate() {

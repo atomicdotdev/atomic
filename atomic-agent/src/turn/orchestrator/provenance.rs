@@ -612,7 +612,6 @@ impl TurnOrchestrator {
     ///
     /// Best-effort: any failure leaves the turn recording what the plugin
     /// sent.
-
     pub(crate) fn enrich_opencode_turn(
         &self,
         session: &mut AgentSession,
@@ -903,10 +902,8 @@ impl TurnOrchestrator {
         session: &AgentSession,
         outcome: &TurnRecordOutcome,
         event: &TurnEvent,
-        boundary_end: Option<atomic_core::change::session::TurnBoundary>,
+        _boundary_end: Option<atomic_core::change::session::TurnBoundary>,
     ) -> AgentResult<()> {
-        use atomic_core::types::Base32;
-
         // Owner-backed journal (dev path): the sink state machine owns
         // provenance and the ledger turn exclusively, and its failures are
         // fatal — a failed record is not a finished turn (retry resumes).

@@ -70,7 +70,10 @@ fn prepare_reconcile(
     target: &ViewState,
     before: &WorkingCopyStateRef,
     after: &WorkingCopyStateRef,
-) -> (PreparedSwitchOperation, super::super::locks::WorkingCopyOperationLockGuard) {
+) -> (
+    PreparedSwitchOperation,
+    super::super::locks::WorkingCopyOperationLockGuard,
+) {
     let lock = repo.try_lock_operation(repo.working_copy()).unwrap();
     let before_state = RepoStateRef {
         view: Some(ViewStateRef {
@@ -119,7 +122,12 @@ fn prepare_reconcile(
 fn transition_refs(
     repo: &TestRepository,
     target_name: &str,
-) -> (ViewState, ViewState, WorkingCopyStateRef, WorkingCopyStateRef) {
+) -> (
+    ViewState,
+    ViewState,
+    WorkingCopyStateRef,
+    WorkingCopyStateRef,
+) {
     let record = repo.working_copy_record(repo.working_copy()).unwrap();
     let previous = view_state(repo, "dev");
     let target = view_state(repo, target_name);
@@ -332,7 +340,9 @@ fn moved_target_view_state_is_refused_at_finalize() {
     let advanced = advance_view_state(&repo, "recon-target");
     assert_ne!(advanced, target.state);
 
-    let refused = repo.finalize_operation_verified(&lock, operation).unwrap_err();
+    let refused = repo
+        .finalize_operation_verified(&lock, operation)
+        .unwrap_err();
     assert!(
         matches!(refused, RepositoryError::InvalidOperation { .. }),
         "unexpected error: {refused:?}"

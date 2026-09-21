@@ -74,6 +74,7 @@ fn key_file(home: &Path) -> std::path::PathBuf {
     path
 }
 
+#[allow(dead_code)]
 fn git(root: &Path, args: &[&str]) {
     let output = Command::new("git")
         .arg("-C")
@@ -164,11 +165,7 @@ fn cutover_requires_the_explicit_opt_in_consent() {
     assert!(git_ok(&root, &["commit", "-qm", "anchor base"]));
     atomic_ok(root.path(), home.path(), &["init", "--no-vault"]);
 
-    let output = atomic_fail(
-        root.path(),
-        home.path(),
-        &["git", "bridge", "cutover"],
-    );
+    let output = atomic_fail(root.path(), home.path(), &["git", "bridge", "cutover"]);
     assert!(
         output.contains("explicit opt-in consent"),
         "the consent precondition must refuse: {output}"
@@ -254,7 +251,10 @@ fn cutover_rollback_lifts_the_fence_and_restores_the_legacy_writer() {
     let dispatcher = colocated.root().join(".git/hooks/post-checkout");
     let original = fs::read(&dispatcher).expect("the fixture installed the dispatcher");
     colocated.atomic(&["git", "bridge", "cutover"]);
-    assert!(!dispatcher.exists(), "the cutover decommissioned the dispatcher");
+    assert!(
+        !dispatcher.exists(),
+        "the cutover decommissioned the dispatcher"
+    );
 
     // Immediately after the cutover (no later operation), the rollback
     // runs: the shared head still denotes the cutover, and the leased

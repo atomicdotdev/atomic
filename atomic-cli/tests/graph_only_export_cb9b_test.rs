@@ -125,11 +125,7 @@ fn clear_worktree(root: &Path) {
 }
 
 /// Export a set of paths from the recorded graph and return the bytes.
-fn graph_export(
-    root: &Path,
-    view: &str,
-    paths: &[&str],
-) -> (Vec<(String, Vec<u8>)>, Duration) {
+fn graph_export(root: &Path, view: &str, paths: &[&str]) -> (Vec<(String, Vec<u8>)>, Duration) {
     let repo = open_repo(root);
     let start = Instant::now();
     let mut out = Vec::new();
@@ -143,20 +139,14 @@ fn graph_export(
     (out, start.elapsed())
 }
 
-fn assert_export_matches(
-    root: &Path,
-    view: &str,
-    expected: &[(&str, Vec<u8>)],
-    bound: Duration,
-) {
+fn assert_export_matches(root: &Path, view: &str, expected: &[(&str, Vec<u8>)], bound: Duration) {
     clear_worktree(root);
     let paths: Vec<&str> = expected.iter().map(|(p, _)| *p).collect();
     let (exported, elapsed) = graph_export(root, view, &paths);
     for ((path, wanted), (got_path, got)) in expected.iter().zip(exported.iter()) {
         assert_eq!(path, got_path);
         assert_eq!(
-            wanted,
-            got,
+            wanted, got,
             "graph-only export of '{path}' diverged from the recorded tree"
         );
     }
@@ -165,7 +155,10 @@ fn assert_export_matches(
         "graph-only export of {} paths took {elapsed:?}; bound {bound:?}",
         expected.len()
     );
-    println!("GRAPH_ONLY_EXPORT view={view} paths={} elapsed={elapsed:?}", expected.len());
+    println!(
+        "GRAPH_ONLY_EXPORT view={view} paths={} elapsed={elapsed:?}",
+        expected.len()
+    );
 }
 
 const SCALAR_FILES: [&str; 13] = [
@@ -209,10 +202,7 @@ fn graph_only_export_of_thirteen_paths_is_bounded_and_worktree_independent() {
         .enumerate()
         .map(|(index, path)| (path.to_string(), file_bytes(path, &format!("v1 {index}"))))
         .collect();
-    let refs: Vec<(&str, Vec<u8>)> = owned
-        .iter()
-        .map(|(p, b)| (p.as_str(), b.clone()))
-        .collect();
+    let refs: Vec<(&str, Vec<u8>)> = owned.iter().map(|(p, b)| (p.as_str(), b.clone())).collect();
     write_tree(&root, &refs);
     git_commit(&root, "thirteen scoped paths");
     atomic_ok(&root, &home, &["git", "import", "--no-vault"]);
@@ -338,8 +328,9 @@ fn graph_only_export_matrix_from_recorded_graph() {
             let want = sha.to_lowercase();
             for entry in entries.iter() {
                 let change = repo.load_change(&entry.hash).unwrap();
-                if let ChangeOrigin::GitSynthesized { commit, derivation, .. } =
-                    &change.hashed.origin
+                if let ChangeOrigin::GitSynthesized {
+                    commit, derivation, ..
+                } = &change.hashed.origin
                 {
                     let recorded = commit
                         .as_bytes()
@@ -348,7 +339,10 @@ fn graph_only_export_matrix_from_recorded_graph() {
                         .collect::<String>();
                     if recorded == want {
                         let _ = derivation;
-                        return (change.hashed.origin.clone(), change.hashed.dependencies.clone());
+                        return (
+                            change.hashed.origin.clone(),
+                            change.hashed.dependencies.clone(),
+                        );
                     }
                 }
             }
@@ -358,7 +352,10 @@ fn graph_only_export_matrix_from_recorded_graph() {
         assert!(
             matches!(
                 &squash_origin,
-                ChangeOrigin::GitSynthesized { derivation: GitDerivation::Squash, .. }
+                ChangeOrigin::GitSynthesized {
+                    derivation: GitDerivation::Squash,
+                    ..
+                }
             ),
             "the squash-shaped unbound commit must derive Squash: {squash_origin:?}"
         );
@@ -366,7 +363,10 @@ fn graph_only_export_matrix_from_recorded_graph() {
         assert!(
             matches!(
                 &two_origin,
-                ChangeOrigin::GitSynthesized { derivation: GitDerivation::FirstParent, .. }
+                ChangeOrigin::GitSynthesized {
+                    derivation: GitDerivation::FirstParent,
+                    ..
+                }
             ),
             "the prior ordinary commit derives FirstParent: {two_origin:?}"
         );
@@ -374,7 +374,10 @@ fn graph_only_export_matrix_from_recorded_graph() {
         assert!(
             matches!(
                 &base_origin,
-                ChangeOrigin::GitSynthesized { derivation: GitDerivation::Root, .. }
+                ChangeOrigin::GitSynthesized {
+                    derivation: GitDerivation::Root,
+                    ..
+                }
             ),
             "the root commit derives Root: {base_origin:?}"
         );
@@ -393,7 +396,7 @@ fn graph_only_export_matrix_from_recorded_graph() {
                         .map(|b| format!("{b:02x}"))
                         .collect::<String>();
                     if recorded == want {
-                        found = Some(entry.hash.clone());
+                        found = Some(entry.hash);
                         break;
                     }
                 }
@@ -420,7 +423,15 @@ fn graph_only_export_matrix_from_recorded_graph() {
         let key = tempfile::tempdir().unwrap().keep();
         let key_path = key.as_path().join("signing_ed25519");
         let keygen = Command::new("ssh-keygen")
-            .args(["-t", "ed25519", "-N", "", "-q", "-f", key_path.to_str().unwrap()])
+            .args([
+                "-t",
+                "ed25519",
+                "-N",
+                "",
+                "-q",
+                "-f",
+                key_path.to_str().unwrap(),
+            ])
             .output()
             .expect("run ssh-keygen");
         assert!(
@@ -556,8 +567,11 @@ fn graph_only_export_matrix_from_recorded_graph() {
         write_tree(&root, &[("f.txt", b"base\n".to_vec())]);
         git_commit(&root, "base");
         atomic_ok(&root, &home, &["git", "import", "--no-vault"]);
-        write_tree(&root, &[("f.txt", b"base\nkilled at the boundary\n".to_vec())]);
-        let bump_sha = git_commit(&root, "the killed import");
+        write_tree(
+            &root,
+            &[("f.txt", b"base\nkilled at the boundary\n".to_vec())],
+        );
+        let _bump_sha = git_commit(&root, "the killed import");
 
         // Snapshot the pre-kill view state via the graph (the checkpoint
         // assertion needs it).
@@ -605,7 +619,12 @@ fn graph_only_export_matrix_from_recorded_graph() {
                 .unwrap()
                 .filter_map(|e| e.ok())
                 .map(|e| e.path())
-                .flat_map(|p| fs::read_dir(p).unwrap().filter_map(|f| f.ok()).map(|f| f.path()))
+                .flat_map(|p| {
+                    fs::read_dir(p)
+                        .unwrap()
+                        .filter_map(|f| f.ok())
+                        .map(|f| f.path())
+                })
                 .filter(|p| p.extension().map(|x| x == "change").unwrap_or(false))
                 .count();
             assert!(
@@ -642,12 +661,20 @@ fn graph_only_export_matrix_from_recorded_graph() {
         );
         // The dead process needs a beat to release the kernel-side redb
         // lock; if the first retry races it, wait and retry once more.
-        let first_retry = atomic(&root, &home, &["git", "import", "--incremental", "--no-vault"]);
+        let first_retry = atomic(
+            &root,
+            &home,
+            &["git", "import", "--incremental", "--no-vault"],
+        );
         if !first_retry.status.success()
             && String::from_utf8_lossy(&first_retry.stderr).contains("Cannot acquire lock")
         {
             std::thread::sleep(std::time::Duration::from_millis(500));
-            atomic_ok(&root, &home, &["git", "import", "--incremental", "--no-vault"]);
+            atomic_ok(
+                &root,
+                &home,
+                &["git", "import", "--incremental", "--no-vault"],
+            );
         } else {
             assert!(
                 first_retry.status.success(),
@@ -699,7 +726,11 @@ fn graph_only_export_matrix_from_recorded_graph() {
             .status()
             .expect("run failing import");
         assert!(!failed.success(), "the injected fault must fail closed");
-        atomic_ok(&root, &home, &["git", "import", "--incremental", "--no-vault"]);
+        atomic_ok(
+            &root,
+            &home,
+            &["git", "import", "--incremental", "--no-vault"],
+        );
         assert_export_matches(
             &root,
             "main",
@@ -765,7 +796,5 @@ fn graph_only_export_builds_a_fresh_crate_from_the_recorded_graph() {
         "the graph-only exported crate must build: {}",
         String::from_utf8_lossy(&build.stderr)
     );
-    println!(
-        "GRAPH_ONLY_BUILD export={export_elapsed:?} build=ok"
-    );
+    println!("GRAPH_ONLY_BUILD export={export_elapsed:?} build=ok");
 }

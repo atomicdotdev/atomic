@@ -226,16 +226,15 @@ fn observe_raw_layers(root: &Path, policy: &ConversionPolicy) -> Result<RawLayer
                 let tree = commit.tree().map_err(|error| {
                     StagingError::HeadTree(format!("cannot read HEAD tree: {error}"))
                 })?;
-                let tree_oid = GitObjectId::new(
-                    policy.object_format,
-                    tree.id().as_bytes().to_vec(),
-                )
-                .map_err(|_| {
-                    StagingError::HeadTree(format!(
-                        "HEAD tree id does not match algorithm {:?}",
-                        policy.object_format
-                    ))
-                })?;
+                let tree_oid =
+                    GitObjectId::new(policy.object_format, tree.id().as_bytes().to_vec()).map_err(
+                        |_| {
+                            StagingError::HeadTree(format!(
+                                "HEAD tree id does not match algorithm {:?}",
+                                policy.object_format
+                            ))
+                        },
+                    )?;
                 let mut baseline = Vec::new();
                 collect_baseline_tree(
                     &repository,
@@ -301,6 +300,7 @@ fn collect_baseline_tree(
     repository: &git2::Repository,
     tree: &git2::Tree<'_>,
     algorithm: &GitHashAlgorithm,
+    #[allow(clippy::ptr_arg)] // recursive builder shares the Vec
     prefix: &mut Vec<u8>,
     output: &mut Vec<BaselineEntry>,
 ) -> Result<(), StagingError> {
@@ -317,11 +317,12 @@ fn collect_baseline_tree(
             })?;
             collect_baseline_tree(repository, &child, algorithm, &mut path, output)?;
         } else {
-            let oid = GitObjectId::new(*algorithm, entry.id().as_bytes().to_vec()).map_err(|_| {
-                StagingError::HeadTree(format!(
-                    "HEAD tree object id does not match algorithm {algorithm:?}"
-                ))
-            })?;
+            let oid =
+                GitObjectId::new(*algorithm, entry.id().as_bytes().to_vec()).map_err(|_| {
+                    StagingError::HeadTree(format!(
+                        "HEAD tree object id does not match algorithm {algorithm:?}"
+                    ))
+                })?;
             output.push(BaselineEntry {
                 path: RepoPath::from_bytes(&path)
                     .map_err(|error| StagingError::HeadTree(error.to_string()))?,
@@ -411,7 +412,14 @@ pub fn observe_git_staging_state(
     policy: &ConversionPolicy,
 ) -> Result<StagingState, StagingError> {
     let raw = observe_raw_layers(root, policy)?;
-    build_staging_state(raw, std::collections::BTreeSet::new(), None, None, None, policy)
+    build_staging_state(
+        raw,
+        std::collections::BTreeSet::new(),
+        None,
+        None,
+        None,
+        policy,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -559,7 +567,10 @@ fn build_staging_state(
             y: StageCode::Unmerged,
             baseline_mode: baseline_entry.map(|entry| entry.mode),
             index_mode: None,
-            worktree_mode: worktree.get(path).and_then(|entry| entry.mode).map(u32::from),
+            worktree_mode: worktree
+                .get(path)
+                .and_then(|entry| entry.mode)
+                .map(u32::from),
             durable_tracked: durable.contains(path),
             intent_to_add: false,
             skip_worktree: false,
@@ -614,10 +625,7 @@ fn build_staging_state(
             }
             continue;
         }
-        if matches!(
-            worktree_entry.disposition,
-            ManifestDisposition::Excluded(_)
-        ) {
+        if matches!(worktree_entry.disposition, ManifestDisposition::Excluded(_)) {
             continue;
         }
         covered.insert(path.clone());
@@ -657,7 +665,9 @@ fn build_staging_state(
         });
     }
     if !sparse_paths.is_empty() {
-        notices.push(StagingNotice::SparseIndexEntries { paths: sparse_paths });
+        notices.push(StagingNotice::SparseIndexEntries {
+            paths: sparse_paths,
+        });
     } else if raw.index.sparse_index {
         // The index used sparse-directory entries that were observed through
         // read-only in-memory expansion; the covered paths are exactly the
@@ -674,7 +684,9 @@ fn build_staging_state(
         });
     }
     if !intent_paths.is_empty() {
-        notices.push(StagingNotice::IntentToAdd { paths: intent_paths });
+        notices.push(StagingNotice::IntentToAdd {
+            paths: intent_paths,
+        });
     }
     if raw.alternate_index_used {
         if let Some(index_path) = &raw.index_path {
@@ -685,9 +697,7 @@ fn build_staging_state(
     }
     if let (Some(message), Some(oid)) = (&raw.head_commit_message, &raw.head_commit_oid) {
         if message.contains("atomic-conflict") {
-            notices.push(StagingNotice::CommittedConflictSnapshot {
-                head: oid.clone(),
-            });
+            notices.push(StagingNotice::CommittedConflictSnapshot { head: oid.clone() });
         }
     }
 

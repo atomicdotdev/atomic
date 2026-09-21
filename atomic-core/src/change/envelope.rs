@@ -738,45 +738,29 @@ mod tests {
     fn test_decode_too_short() {
         // Just magic, no payload
         let err = SessionEnvelope::decode(b"ATSE").unwrap_err();
-        match err {
-            SessionEnvelopeError { reason } => {
-                assert!(reason.contains("too short"));
-            }
-            other => panic!("Expected EnvelopeCodecError, got: {:?}", other),
-        }
+        let SessionEnvelopeError { reason } = err;
+        assert!(reason.contains("too short"));
     }
 
     #[test]
     fn test_decode_empty() {
         let err = SessionEnvelope::decode(b"").unwrap_err();
-        match err {
-            SessionEnvelopeError { reason } => {
-                assert!(reason.contains("too short"));
-            }
-            other => panic!("Expected EnvelopeCodecError, got: {:?}", other),
-        }
+        let SessionEnvelopeError { reason } = err;
+        assert!(reason.contains("too short"));
     }
 
     #[test]
     fn test_decode_three_bytes() {
         let err = SessionEnvelope::decode(b"ATS").unwrap_err();
-        match err {
-            SessionEnvelopeError { reason } => {
-                assert!(reason.contains("too short"));
-            }
-            other => panic!("Expected EnvelopeCodecError, got: {:?}", other),
-        }
+        let SessionEnvelopeError { reason } = err;
+        assert!(reason.contains("too short"));
     }
 
     #[test]
     fn test_decode_wrong_magic() {
         let err = SessionEnvelope::decode(b"XXXXmore data here").unwrap_err();
-        match err {
-            SessionEnvelopeError { reason } => {
-                assert!(reason.contains("invalid magic"));
-            }
-            other => panic!("Expected EnvelopeCodecError, got: {:?}", other),
-        }
+        let SessionEnvelopeError { reason } = err;
+        assert!(reason.contains("invalid magic"));
     }
 
     #[test]
@@ -785,13 +769,9 @@ mod tests {
         // Bump version to something unsupported
         bytes[4] = 99;
         let err = SessionEnvelope::decode(&bytes).unwrap_err();
-        match err {
-            SessionEnvelopeError { reason } => {
-                assert!(reason.contains("unsupported schema version"));
-                assert!(reason.contains("99"));
-            }
-            other => panic!("Expected EnvelopeCodecError, got: {:?}", other),
-        }
+        let SessionEnvelopeError { reason } = err;
+        assert!(reason.contains("unsupported schema version"));
+        assert!(reason.contains("99"));
     }
 
     #[test]
@@ -1049,13 +1029,9 @@ mod tests {
         bytes.extend_from_slice(MAGIC);
         bytes.extend_from_slice(&payload);
         let err = SessionEnvelope::decode(&bytes).unwrap_err();
-        match err {
-            SessionEnvelopeError { reason } => {
-                assert!(reason.contains("unsupported schema version"));
-                assert!(reason.contains("99"));
-            }
-            other => panic!("Expected EnvelopeCodecError, got: {:?}", other),
-        }
+        let SessionEnvelopeError { reason } = err;
+        assert!(reason.contains("unsupported schema version"));
+        assert!(reason.contains("99"));
     }
 
     #[test]

@@ -34,17 +34,16 @@ impl Command for Repair {
         // shared workspace boundary — the same ordered lease every other
         // mutating command holds (CB-12A AC3 "resumes under leases").
         {
-            let mut repo = atomic_repository::Repository::open_for_workspace_transaction(
-                &repo_root,
-            )
-            .map_err(CliError::Repository)?;
-            let _workspace = enter_workspace(&mut repo, atomic_repository::WorkspaceTxnMode::Reconcile)?;
+            let mut repo =
+                atomic_repository::Repository::open_for_workspace_transaction(&repo_root)
+                    .map_err(CliError::Repository)?;
+            let _workspace =
+                enter_workspace(&mut repo, atomic_repository::WorkspaceTxnMode::Reconcile)?;
         }
 
-        let sessions_dir: PathBuf =
-            atomic_repository::Repository::canonical_dot_dir(&repo_root)
-                .map(|dot| dot.join("sessions"))
-                .unwrap_or_else(|_| repo_root.join(".atomic").join("sessions"));
+        let sessions_dir: PathBuf = atomic_repository::Repository::canonical_dot_dir(&repo_root)
+            .map(|dot| dot.join("sessions"))
+            .unwrap_or_else(|_| repo_root.join(".atomic").join("sessions"));
         let store = SessionStore::new(&sessions_dir).map_err(|error| {
             CliError::Internal(anyhow::anyhow!(
                 "cannot open the session store at {}: {error}",
@@ -71,8 +70,7 @@ impl Command for Repair {
         // ── Evidence verification (report only; never modified). ────────
         let mut findings: Vec<String> = Vec::new();
 
-        if let (Some(last), Some(key)) = (session.last_attestation.clone(), session.mac_key.clone())
-        {
+        if let (Some(last), Some(key)) = (session.last_attestation, session.mac_key.clone()) {
             // Content-addressed attestations load through the repository's
             // change store (read-only reopen: the workspace lease above was
             // released with its guard).
@@ -99,9 +97,8 @@ impl Command for Repair {
                 )),
             }
         } else {
-            findings.push(
-                "no attestation/key pair to verify (git-only or fresh session)".to_string(),
-            );
+            findings
+                .push("no attestation/key pair to verify (git-only or fresh session)".to_string());
         }
 
         let capture_dir = sessions_dir.join("captures").join(&self.session);
@@ -126,7 +123,10 @@ impl Command for Repair {
                 ));
             }
             if !incomplete.paths.is_empty() {
-                report.push_str(&format!("  unrecorded paths: {}\n", incomplete.paths.join(", ")));
+                report.push_str(&format!(
+                    "  unrecorded paths: {}\n",
+                    incomplete.paths.join(", ")
+                ));
             }
             report.push_str(
                 "  review path: an independent review must discharge this evidence before\n  \
@@ -149,7 +149,10 @@ impl Command for Repair {
         }
 
         // ── Resume: append-only note + retention lease. ──────────────────
-        if matches!(session.status, atomic_core::change::session::SessionStatus::Incomplete(_)) {
+        if matches!(
+            session.status,
+            atomic_core::change::session::SessionStatus::Incomplete(_)
+        ) {
             session.repair_history.push(RepairNote {
                 at_rfc3339: chrono::Utc::now().to_rfc3339(),
                 action: "resume".to_string(),

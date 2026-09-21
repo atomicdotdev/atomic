@@ -226,21 +226,20 @@ impl AssemblyContext {
         // Checked before the shifts so every individual `base + local`
         // substitution inside renumber_placeholder_ids stays in range: each
         // local index is < span, so base + span is the upper bound.
-        let next_branch_base = branch_base
-            .checked_add(branch_span)
-            .ok_or(AssemblyError::PlaceholderNamespaceExhausted {
+        let next_branch_base = branch_base.checked_add(branch_span).ok_or(
+            AssemblyError::PlaceholderNamespaceExhausted {
                 namespace: "branch",
                 next_index: branch_base as u64 + branch_span as u64,
                 limit: u32::MAX as u64,
-            })?;
-        let next_leaf_base =
-            leaf_base
-                .checked_add(leaf_span)
-                .ok_or(AssemblyError::PlaceholderNamespaceExhausted {
-                    namespace: "leaf",
-                    next_index: leaf_base as u64 + leaf_span as u64,
-                    limit: u32::MAX as u64,
-                })?;
+            },
+        )?;
+        let next_leaf_base = leaf_base.checked_add(leaf_span).ok_or(
+            AssemblyError::PlaceholderNamespaceExhausted {
+                namespace: "leaf",
+                next_index: leaf_base as u64 + leaf_span as u64,
+                limit: u32::MAX as u64,
+            },
+        )?;
         ops.renumber_placeholder_ids(trunk_file_idx, branch_base, leaf_base);
         self.placeholder_branch_base = next_branch_base;
         self.placeholder_leaf_base = next_leaf_base;
@@ -440,14 +439,18 @@ where
     let target = if let Some(position) = file.position() {
         AttrTarget::Existing(position)
     } else {
-        let created = ctx.hunks().iter().rev().find_map(|operation| match operation {
-            GraphOp::FileAdd {
-                add_inode,
-                path: added,
-                ..
-            } if added == file.path() => Some(add_inode.start.get()),
-            _ => None,
-        });
+        let created = ctx
+            .hunks()
+            .iter()
+            .rev()
+            .find_map(|operation| match operation {
+                GraphOp::FileAdd {
+                    add_inode,
+                    path: added,
+                    ..
+                } if added == file.path() => Some(add_inode.start.get()),
+                _ => None,
+            });
         created.map(AttrTarget::Created).ok_or_else(|| {
             invalid("attribute target has no inode binding and no FileAdd in this change".into())
         })?
@@ -475,14 +478,12 @@ where
                         path: path.clone(),
                         source: super::globalize::GlobalizeError::Pristine(Box::new(error)),
                     })?;
-                let frontier = crate::pristine::attr_event_dependency_frontier(
-                    glob_ctx.txn(),
-                    existing,
-                )
-                .map_err(|error| AssemblyError::Globalize {
-                    path: path.clone(),
-                    source: super::globalize::GlobalizeError::Pristine(Box::new(error)),
-                })?;
+                let frontier =
+                    crate::pristine::attr_event_dependency_frontier(glob_ctx.txn(), existing)
+                        .map_err(|error| AssemblyError::Globalize {
+                            path: path.clone(),
+                            source: super::globalize::GlobalizeError::Pristine(Box::new(error)),
+                        })?;
                 for event in frontier {
                     glob_ctx
                         .add_dependency_by_id(event.introduced_by)
@@ -491,11 +492,12 @@ where
                             source: error,
                         })?;
                 }
-                globalize_set_attr(glob_ctx, *position, path.clone(), *value)
-                    .map_err(|error| AssemblyError::Globalize {
+                globalize_set_attr(glob_ctx, *position, path.clone(), *value).map_err(|error| {
+                    AssemblyError::Globalize {
                         path: path.clone(),
                         source: error,
-                    })?
+                    }
+                })?
             }
             AttrTarget::Created(offset) => GraphOp::SetAttr {
                 inode: Position {
@@ -511,15 +513,13 @@ where
         let semantic = match value {
             crate::change::InodeAttr::Mode(mode) => FileOps::set_mode(trunk, path.clone(), *mode)
                 .map_err(|error| AssemblyError::Globalize {
+                path: path.clone(),
+                source: super::globalize::GlobalizeError::InvalidAttribute {
                     path: path.clone(),
-                    source: super::globalize::GlobalizeError::InvalidAttribute {
-                        path: path.clone(),
-                        reason: error.to_string(),
-                    },
-                })?,
-            crate::change::InodeAttr::Kind(kind) => {
-                FileOps::set_kind(trunk, path.clone(), *kind)
-            }
+                    reason: error.to_string(),
+                },
+            })?,
+            crate::change::InodeAttr::Kind(kind) => FileOps::set_kind(trunk, path.clone(), *kind),
         };
         ctx.add_file_ops(semantic)?;
     }
@@ -833,11 +833,13 @@ pub fn create_empty_change(header: ChangeHeader) -> Change {
 /// saturates and the entry cannot fit — reported as exhaustion rather than
 /// wrapping into a reused namespace.
 fn checked_placeholder_span(max_index: u32) -> AssemblyResult<u32> {
-    max_index.checked_add(1).ok_or(AssemblyError::PlaceholderNamespaceExhausted {
-        namespace: "branch",
-        next_index: u32::MAX as u64 + 1,
-        limit: u32::MAX as u64,
-    })
+    max_index
+        .checked_add(1)
+        .ok_or(AssemblyError::PlaceholderNamespaceExhausted {
+            namespace: "branch",
+            next_index: u32::MAX as u64 + 1,
+            limit: u32::MAX as u64,
+        })
 }
 
 /// The highest ROOT-placeholder branch index used in `ops` (CB-9B review F4).
@@ -890,7 +892,10 @@ fn copy_branch(id: BranchId) -> BranchId {
 fn max_placeholder_leaf_index(ops: &FileOps) -> u32 {
     let mut max = 0u32;
     let mut consider = |leaf: &LeafOp| {
-        if let LeafOp::Insert { after: Some(id), .. } = leaf {
+        if let LeafOp::Insert {
+            after: Some(id), ..
+        } = leaf
+        {
             if id.change_id().is_root() && id.leaf_idx() > max {
                 max = id.leaf_idx();
             }

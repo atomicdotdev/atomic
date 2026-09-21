@@ -277,7 +277,8 @@ pub fn write_change_to_graph(
             change,
             &verified_frontier,
             options,
-        )?;    }
+        )?;
+    }
 
     // Compute new state
     log::debug!("write_change_to_graph: computing new state + updating view");
@@ -374,8 +375,8 @@ fn apply_change_hunks_locked(
     // opened twice per change instead of ~6 times per hunk. The scope ends
     // before the FileOps/view-update phase, which needs `&mut txn` again.
     {
-        let mut cached = CachedWriteGraphTxn::new(&*txn)
-            .map_err(|e| InsertError::Database(e.to_string()))?;
+        let mut cached =
+            CachedWriteGraphTxn::new(&*txn).map_err(|e| InsertError::Database(e.to_string()))?;
         for (hunk_idx, graph_op) in hunks.iter().enumerate() {
             if trace_record && (hunk_idx == 0 || (hunk_idx + 1) % 1_000 == 0) {
                 eprintln!(

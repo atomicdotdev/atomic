@@ -30,11 +30,16 @@ fn persisted_change_bytes(repo: &Repository, hash: &Hash) -> Vec<u8> {
     std::fs::read(repo.change_store().change_path(hash)).unwrap()
 }
 
-fn snapshot_chain(directory: &tempfile::TempDir, repo: &mut TestRepository, values: &[&[u8]]) -> Vec<Hash> {
+fn snapshot_chain(
+    directory: &tempfile::TempDir,
+    repo: &mut TestRepository,
+    values: &[&[u8]],
+) -> Vec<Hash> {
     let working_copy = repo.working_copy();
     let path = directory.path().join("retention.txt");
     std::fs::write(&path, b"baseline\n").unwrap();
-    repo.add("retention.txt", TrackingOptions::default()).unwrap();
+    repo.add("retention.txt", TrackingOptions::default())
+        .unwrap();
     repo.record(ChangeHeader::new("baseline"), record_options())
         .unwrap();
     let mut snapshots = Vec::new();
@@ -42,7 +47,11 @@ fn snapshot_chain(directory: &tempfile::TempDir, repo: &mut TestRepository, valu
         std::fs::write(&path, value).unwrap();
         snapshots.push(
             *repo
-                .snapshot(working_copy, ChangeHeader::new("snapshot"), record_options())
+                .snapshot(
+                    working_copy,
+                    ChangeHeader::new("snapshot"),
+                    record_options(),
+                )
                 .unwrap()
                 .hash(),
         );
@@ -486,7 +495,13 @@ fn snapshot_retention_deletes_old_objects_through_verified_effects() {
     let status = repo.snapshot_status(working_copy).unwrap();
     assert_eq!(status.superseded_snapshots, 2);
     let retained = repo
-        .prune_superseded_snapshots(working_copy, SnapshotRetentionPolicy { keep_superseded: 1, audit_retention_floor_unix: None })
+        .prune_superseded_snapshots(
+            working_copy,
+            SnapshotRetentionPolicy {
+                keep_superseded: 1,
+                audit_retention_floor_unix: None,
+            },
+        )
         .unwrap();
     assert_eq!(retained.retained, vec![snapshots[1]]);
     assert_eq!(retained.deleted, vec![snapshots[0]]);
@@ -575,7 +590,10 @@ fn snapshot_retention_never_collects_view_pinned_superseded_object() {
     let outcome = repo
         .prune_superseded_snapshots(
             working_copy,
-            SnapshotRetentionPolicy { keep_superseded: 0, audit_retention_floor_unix: None },
+            SnapshotRetentionPolicy {
+                keep_superseded: 0,
+                audit_retention_floor_unix: None,
+            },
         )
         .unwrap();
     assert!(
@@ -621,7 +639,13 @@ fn snapshot_retention_recomputes_a_root_pinned_after_observation() {
     let before_bytes = persisted_change_bytes(&repo, &pinned);
 
     let outcome = repo
-        .prune_superseded_snapshots(working_copy, SnapshotRetentionPolicy { keep_superseded: 0, audit_retention_floor_unix: None })
+        .prune_superseded_snapshots(
+            working_copy,
+            SnapshotRetentionPolicy {
+                keep_superseded: 0,
+                audit_retention_floor_unix: None,
+            },
+        )
         .unwrap();
     assert!(
         outcome.deleted.is_empty(),
@@ -644,8 +668,7 @@ fn snapshot_retention_recomputes_a_root_pinned_after_observation() {
 fn snapshot_retention_refuses_and_preserves_objects_rooted_by_an_interrupted_operation() {
     let (directory, mut repo) = create_temp_repo();
     let working_copy = repo.working_copy();
-    let snapshots =
-        snapshot_chain(&directory, &mut repo, &[b"one\n", b"two\n", b"three\n"]);
+    let snapshots = snapshot_chain(&directory, &mut repo, &[b"one\n", b"two\n", b"three\n"]);
     let rooted_candidate = snapshots[0];
     let deletable_candidate = snapshots[1];
     let before_bytes = persisted_change_bytes(&repo, &rooted_candidate);
@@ -656,9 +679,7 @@ fn snapshot_retention_refuses_and_preserves_objects_rooted_by_an_interrupted_ope
     let record = repo.working_copy_record(working_copy).unwrap();
     let state = RepoStateRef {
         view: None,
-        working_copy: Some(super::super::operation::working_copy_state_ref(
-            record,
-        )),
+        working_copy: Some(super::super::operation::working_copy_state_ref(record)),
         git: None,
     };
     let change_path = repo.change_store().change_path(&rooted_candidate);
@@ -671,7 +692,11 @@ fn snapshot_retention_refuses_and_preserves_objects_rooted_by_an_interrupted_ope
     #[cfg(unix)]
     let mode = {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::metadata(&change_path).unwrap().permissions().mode() & 0o7777
+        std::fs::metadata(&change_path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777
     };
     #[cfg(not(unix))]
     let mode = 0o644;
@@ -704,7 +729,13 @@ fn snapshot_retention_refuses_and_preserves_objects_rooted_by_an_interrupted_ope
 
     // Destructive retention refuses while the head is incomplete.
     let error = repo
-        .prune_superseded_snapshots(working_copy, SnapshotRetentionPolicy { keep_superseded: 1, audit_retention_floor_unix: None })
+        .prune_superseded_snapshots(
+            working_copy,
+            SnapshotRetentionPolicy {
+                keep_superseded: 1,
+                audit_retention_floor_unix: None,
+            },
+        )
         .unwrap_err();
     let message = error.to_string();
     assert!(
@@ -729,11 +760,7 @@ fn snapshot_retention_refuses_and_preserves_objects_rooted_by_an_interrupted_ope
     let inspection = Repository::open_readonly_for_operation_inspection(directory.path()).unwrap();
     let working_copy_id = inspection.require_working_copy_id().unwrap();
     let log = inspection
-        .operation_log(
-            OperationScope::WorkingCopy(working_copy_id),
-            None,
-            false,
-        )
+        .operation_log(OperationScope::WorkingCopy(working_copy_id), None, false)
         .unwrap();
     let incomplete = log
         .entries
@@ -742,7 +769,10 @@ fn snapshot_retention_refuses_and_preserves_objects_rooted_by_an_interrupted_ope
         .map(|entry| entry.verification)
         .collect::<Vec<_>>();
     assert!(
-        !incomplete.is_empty() && incomplete.iter().all(|state| *state != crate::OperationVerificationState::Verified),
+        !incomplete.is_empty()
+            && incomplete
+                .iter()
+                .all(|state| *state != crate::OperationVerificationState::Verified),
         "the inspection log must show the unverified head: {incomplete:?}"
     );
     drop(inspection);
@@ -753,12 +783,21 @@ fn snapshot_retention_refuses_and_preserves_objects_rooted_by_an_interrupted_ope
     let repo = Repository::open(directory.path()).unwrap();
     assert!(repo.has_change(&rooted_candidate));
     let outcome = repo
-        .prune_superseded_snapshots(working_copy, SnapshotRetentionPolicy { keep_superseded: 0, audit_retention_floor_unix: None })
+        .prune_superseded_snapshots(
+            working_copy,
+            SnapshotRetentionPolicy {
+                keep_superseded: 0,
+                audit_retention_floor_unix: None,
+            },
+        )
         .unwrap();
     assert_eq!(outcome.deleted, vec![deletable_candidate]);
     assert!(!repo.has_change(&deletable_candidate));
     assert!(repo.has_change(&rooted_candidate));
-    assert_eq!(persisted_change_bytes(&repo, &rooted_candidate), before_bytes);
+    assert_eq!(
+        persisted_change_bytes(&repo, &rooted_candidate),
+        before_bytes
+    );
 }
 
 /// CB-13A R1 (incomplete-session root): an old session record that references
@@ -787,7 +826,13 @@ fn snapshot_retention_preserves_an_object_rooted_by_an_incomplete_session_record
     .unwrap();
 
     let outcome = repo
-        .prune_superseded_snapshots(working_copy, SnapshotRetentionPolicy { keep_superseded: 0, audit_retention_floor_unix: None })
+        .prune_superseded_snapshots(
+            working_copy,
+            SnapshotRetentionPolicy {
+                keep_superseded: 0,
+                audit_retention_floor_unix: None,
+            },
+        )
         .unwrap();
     assert!(
         outcome.deleted.is_empty(),
@@ -997,7 +1042,10 @@ fn snapshot_retention_honors_decoded_incomplete_session_attestation_root() {
     let outcome = repo
         .prune_superseded_snapshots(
             working_copy,
-            SnapshotRetentionPolicy { keep_superseded: 0, audit_retention_floor_unix: None },
+            SnapshotRetentionPolicy {
+                keep_superseded: 0,
+                audit_retention_floor_unix: None,
+            },
         )
         .unwrap();
     assert!(
@@ -1040,7 +1088,10 @@ fn snapshot_retention_refuses_when_enumeration_fails() {
 
     let outcome = repo.prune_superseded_snapshots(
         working_copy,
-        SnapshotRetentionPolicy { keep_superseded: 0, audit_retention_floor_unix: None },
+        SnapshotRetentionPolicy {
+            keep_superseded: 0,
+            audit_retention_floor_unix: None,
+        },
     );
     // Restore permissions FIRST (drop needs to clean the temp dir).
     std::fs::set_permissions(&unreadable, PermissionsExt::from_mode(original_mode)).unwrap();

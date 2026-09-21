@@ -508,27 +508,24 @@ fn can_batch_apply_file_ops(file_ops: &[FileOps]) -> bool {
         // per-op table-reopening path (the 1 MB binary add took 36s there).
         matches!(
             ops.trunk_op(),
-            None
-                | Some(TrunkOp::Create { .. })
+            None | Some(TrunkOp::Create { .. })
                 | Some(TrunkOp::SetMode { .. })
                 | Some(TrunkOp::SetKind { .. })
-        )
-            && ops.line_ops().iter().all(|line_ops| {
-                matches!(
-                    line_ops.operation(),
-                    BranchOp::Insert { content, .. }
-                        if content
-                            .iter()
-                            .all(|leaf_op| matches!(leaf_op, LeafOp::Insert { .. }))
-                )
-            })
+        ) && ops.line_ops().iter().all(|line_ops| {
+            matches!(
+                line_ops.operation(),
+                BranchOp::Insert { content, .. }
+                    if content
+                        .iter()
+                        .all(|leaf_op| matches!(leaf_op, LeafOp::Insert { .. }))
+            )
+        })
     });
     if trace_crdt && !outcome {
         for (ops_index, ops) in file_ops.iter().enumerate() {
             let trunk_ok = matches!(
                 ops.trunk_op(),
-                None
-                    | Some(TrunkOp::Create { .. })
+                None | Some(TrunkOp::Create { .. })
                     | Some(TrunkOp::SetMode { .. })
                     | Some(TrunkOp::SetKind { .. })
             );

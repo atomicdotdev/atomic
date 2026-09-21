@@ -46,17 +46,21 @@ struct LineAttribution {
 impl Command for Blame {
     fn run(&self) -> CliResult<()> {
         let repo_root = find_repository_root()?;
-        let repo = Repository::open_readonly(&repo_root).map_err(|e| CliError::InvalidRepository {
-            reason: e.to_string(),
-        })?;
+        let repo =
+            Repository::open_readonly(&repo_root).map_err(|e| CliError::InvalidRepository {
+                reason: e.to_string(),
+            })?;
         let working_copy = repo
             .require_working_copy_id()
-            .map_err(|e| CliError::Repository(e.into()))?;
+            .map_err(CliError::Repository)?;
         let view = repo
             .desired_view_name(working_copy)
-            .map_err(|e| CliError::Repository(e.into()))?;
+            .map_err(CliError::Repository)?;
 
-        let txn = repo.pristine().read_txn().map_err(|e| CliError::Repository(e.into()))?;
+        let txn = repo
+            .pristine()
+            .read_txn()
+            .map_err(|e| CliError::Repository(e.into()))?;
         let view_state = txn
             .get_view(&view)
             .map_err(|e| CliError::Repository(e.into()))?
@@ -73,16 +77,18 @@ impl Command for Blame {
             .get_trunk_by_path(&self.path)
             .map_err(|e| CliError::Repository(e.into()))?
             .ok_or_else(|| CliError::InvalidArgument {
-                message: format!("'{path}' is not a tracked text file (no semantic trunk)", path = self.path),
+                message: format!(
+                    "'{path}' is not a tracked text file (no semantic trunk)",
+                    path = self.path
+                ),
             })?;
 
-        let branch_ids: Vec<atomic_core::crdt::BranchId> = iter_trunk_branches_in_file_order(
-            &txn, trunk,
-        )
-        .map_err(|e| CliError::Repository(e.into()))?;
+        let branch_ids: Vec<atomic_core::crdt::BranchId> =
+            iter_trunk_branches_in_file_order(&txn, trunk)
+                .map_err(|e| CliError::Repository(e.into()))?;
         let branch_keys: Vec<[u8; 12]> = branch_ids
             .iter()
-            .map(|id| atomic_core::crdt::tables::encode_branch_id(id))
+            .map(atomic_core::crdt::tables::encode_branch_id)
             .collect();
 
         let mut changes: HashMap<Hash, Change> = HashMap::new();
@@ -112,9 +118,7 @@ impl Command for Blame {
             };
             let change = match changes.get(&owner) {
                 Some(change) => change.clone(),
-                None => repo
-                    .load_change(&owner)
-                    .map_err(|e| CliError::Repository(e.into()))?,
+                None => repo.load_change(&owner).map_err(CliError::Repository)?,
             };
             let start = usize::try_from(vertex.start.get()).unwrap_or(0);
             let end = usize::try_from(vertex.end.get()).unwrap_or(0);
@@ -123,7 +127,7 @@ impl Command for Blame {
             } else {
                 Vec::new()
             };
-            changes.insert(owner.clone(), change);
+            changes.insert(owner, change);
             let decoded = decode_branch_id(&branch_key);
             lines.push(LineAttribution {
                 line_number: decoded.branch_idx() as usize + 1,

@@ -22,8 +22,8 @@
 //!                (Base trait)
 //! ```
 
-mod crdt_read;
 pub(crate) mod capability_txn;
+mod crdt_read;
 mod embeddings;
 mod file_index_v2;
 mod graph;

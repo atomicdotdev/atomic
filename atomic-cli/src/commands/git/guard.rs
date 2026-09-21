@@ -2,7 +2,6 @@
 //!
 //! Command wiring is intentionally delivered by later CB-0C tasks.
 #![allow(dead_code)]
-
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 

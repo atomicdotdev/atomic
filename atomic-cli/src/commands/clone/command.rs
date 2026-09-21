@@ -35,8 +35,8 @@
 //! ensures the partially created directory is removed.
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
 use std::path::Path;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -366,7 +366,7 @@ impl Clone {
             validate_existing_git_checkout(target_path)?;
         }
         let view_name = {
-            let git = git2::Repository::open(&target_path).map_err(|error| CliError::GitError {
+            let git = git2::Repository::open(target_path).map_err(|error| CliError::GitError {
                 message: format!("cannot open the cloned Git checkout: {error}"),
             })?;
             git.head()
@@ -375,7 +375,7 @@ impl Clone {
                 .unwrap_or_else(|| self.view.clone())
         };
         let outcome = crate::commands::git::bootstrap::clone_git_url(
-            &target_path,
+            target_path,
             &view_name,
             self.binding_key_file.as_deref(),
             self.include_degraded_binding_reads,
@@ -397,7 +397,9 @@ impl Clone {
                 if provenance_trusted {
                     print_info("Binding provenance is trusted under the configured policy.");
                 } else {
-                    print_warning("Binding provenance is UNTRUSTED (content was independently verified).");
+                    print_warning(
+                        "Binding provenance is UNTRUSTED (content was independently verified).",
+                    );
                 }
             }
             crate::commands::git::bootstrap::BootstrapOutcome::Unbound { head, reason } => {
@@ -950,9 +952,7 @@ impl Clone {
         // shared binding-first anchoring; everything else stays on the
         // atomic-api path below.
         let provisional_target = resolve_target_path(&self.url, self.path.clone());
-        if self.git
-            || crate::commands::git::bootstrap::is_git_url(&self.url, &provisional_target)
-        {
+        if self.git || crate::commands::git::bootstrap::is_git_url(&self.url, &provisional_target) {
             return self.run_git_bootstrap(&provisional_target);
         }
 
@@ -1000,11 +1000,10 @@ impl Clone {
         // its authority for the whole body. A fresh clone is anchored to the
         // working-copy record, never to current_view.
         let workspace =
-            enter_workspace(&mut repo, WorkspaceTxnMode::Reconcile).map_err(|error| {
+            enter_workspace(&mut repo, WorkspaceTxnMode::Reconcile).inspect_err(|error| {
                 if let Some(guard) = guard.as_ref() {
                     log::info!("clone cleanup guard engaged after workspace refusal");
                 }
-                error
             })?;
         let working_copy = workspace.working_copy();
 

@@ -5,7 +5,7 @@
 //! correctness is *never* derived from the signature: the bound Git tree is
 //! always recomputed and compared (§5.2). The Ed25519 signature only
 //! authenticates provenance — who claims this binding — and gates whether the
-//! provenance/attestation roots may be trusted (§5.6, [`crate::git_binding::trust`]).
+//! provenance/attestation roots may be trusted (§5.6, `crate::git_binding::trust`).
 //!
 //! # Canonical encoding and the non-circular identity contract
 //!
@@ -47,10 +47,10 @@
 //!
 //! Binding trees carry only required public binding data, provenance/
 //! attestation *hashes*, and a separately signed summary
-//! ([`crate::git_binding::summary`]) containing model vendor/name, token
+//! (`crate::git_binding::summary`) containing model vendor/name, token
 //! counts, cost, and session id. Transcripts, prompts, decision graphs, and
 //! unhashed private bodies never enter Git objects — see
-//! [`crate::git_binding::privacy`] for the enforced serialization boundary.
+//! `crate::git_binding::privacy` for the enforced serialization boundary.
 
 mod codec;
 mod pack;
@@ -66,9 +66,10 @@ pub use codec::{
     BINDING_MAGIC, BINDING_SIGN_DOMAIN, BINDING_VERSION, CLOSURE_ROOT_DOMAIN, ID_DOMAIN,
 };
 pub use pack::{
-    assemble_changes_pack, decode_changes_pack, private_material_in_change, quarantine_change_record,
-    validate_binding_closure, BindingClosureError, BindingPackError, BindingPackLimits,
-    ChangesPack, ChangesPackV1, ClosureChangeSource, ClosureValidation, QuarantinedPack,
+    assemble_changes_pack, decode_changes_pack, private_material_in_change,
+    quarantine_change_record, validate_binding_closure, BindingClosureError, BindingPackError,
+    BindingPackLimits, ChangesPack, ChangesPackV1, ClosureChangeSource, ClosureValidation,
+    QuarantinedPack,
 };
 pub use privacy::{
     binding_pack_records, binding_tree_entries, conflicts_pack_self_validates,

@@ -15,8 +15,8 @@ use atomic_core::pristine::{TagKind, TagRecord};
 use atomic_core::types::{Base32, Merkle};
 use chrono::Utc;
 
-use crate::git_binding::{binding_hint_mismatches_commit, verify_binding_content, GitOid};
 use crate::error::RepositoryError;
+use crate::git_binding::{binding_hint_mismatches_commit, verify_binding_content, GitOid};
 use crate::repository::Repository;
 
 /// The annotated-tag trailer that names the immutable binding.
@@ -58,10 +58,14 @@ impl Repository {
     ) -> Result<TagProjectionOutcome, RepositoryError> {
         let tag = self
             .get_tag_from_view(name, view)?
-            .ok_or(RepositoryError::TagNotFound { name: name.to_string() })?;
+            .ok_or(RepositoryError::TagNotFound {
+                name: name.to_string(),
+            })?;
         // ReviewGate/aggregate tags are Atomic-only: they project nothing.
         if matches!(tag.kind, TagKind::ReviewGate) {
-            return Ok(TagProjectionOutcome::AtomicOnly { kind: "review-gate" });
+            return Ok(TagProjectionOutcome::AtomicOnly {
+                kind: "review-gate",
+            });
         }
         // The tagged state must be bound: the annotated tag message names the
         // immutable binding, so a bookmark for an unbound state is refused
@@ -76,10 +80,7 @@ impl Repository {
                 ),
             })?;
         let binding_hex = binding.id().to_hex();
-        if git
-            .find_reference(&format!("refs/tags/{name}"))
-            .is_ok()
-        {
+        if git.find_reference(&format!("refs/tags/{name}")).is_ok() {
             return Err(RepositoryError::InvalidOperation {
                 message: format!(
                     "Git tag '{name}' already exists; Atomic tags never overwrite \
@@ -119,9 +120,11 @@ impl Repository {
         name: &str,
     ) -> Result<TagRecord, RepositoryError> {
         let reference_name = format!("refs/tags/{name}");
-        let reference = git
-            .find_reference(&reference_name)
-            .map_err(|_| RepositoryError::TagNotFound { name: name.to_string() })?;
+        let reference =
+            git.find_reference(&reference_name)
+                .map_err(|_| RepositoryError::TagNotFound {
+                    name: name.to_string(),
+                })?;
         let target = reference
             .peel_to_commit()
             .map_err(|error| git_map(error.to_string()))?
@@ -146,7 +149,7 @@ impl Repository {
         let annotation_message: Option<String> = reference
             .peel(git2::ObjectType::Tag)
             .ok()
-            .and_then(|object| object.as_tag().map(|tag| tag).cloned())
+            .and_then(|object| object.as_tag().cloned())
             .map(|tag| {
                 String::from_utf8_lossy(tag.message_bytes().unwrap_or_default()).to_string()
             });
@@ -216,9 +219,10 @@ impl Repository {
 /// The annotated tag's message: the Atomic tag message as body, the immutable
 /// binding as the `atomic-binding` trailer a fresh store restores from.
 fn export_tag_message(view: &str, tag: &TagRecord, binding_hex: &str) -> String {
-    let body = tag.message.clone().unwrap_or_else(|| {
-        format!("Atomic state tag '{}' on view '{}'", tag.name, view)
-    });
+    let body = tag
+        .message
+        .clone()
+        .unwrap_or_else(|| format!("Atomic state tag '{}' on view '{}'", tag.name, view));
     format!("{body}\n\n{BINDING_HINT_KEY} {binding_hex}\n")
 }
 

@@ -2,7 +2,10 @@
 
 use super::*;
 
-use crate::pristine::tables::{GIT_SHA_INDEX, GIT_COMMIT_CLOSURES, BRIDGE_EVENT_CAPTURES, BRIDGE_EVENT_CAPTURE_ANCHORS, TAG_NAME_INDEX, TAG_RECORDS};
+use crate::pristine::tables::{
+    BRIDGE_EVENT_CAPTURES, BRIDGE_EVENT_CAPTURE_ANCHORS, GIT_COMMIT_CLOSURES, GIT_SHA_INDEX,
+    TAG_NAME_INDEX, TAG_RECORDS,
+};
 use crate::pristine::traits::tag::{
     BridgeEventCaptureMutTxnT, BridgeEventCaptureTxnT, GitCommitClosureMutTxnT,
     GitCommitClosureTxnT, GitShaIndexMutTxnT, GitShaIndexTxnT, TagMutTxnT, TagRecord, TagTxnT,
@@ -455,14 +458,12 @@ impl<'a> BridgeEventCaptureMutTxnT for WriteTxn<'a> {
         // active head of its scope (review C2): this is the RFC §5.4
         // "during an active captured operation" precondition, enforced at
         // write time inside the same transaction that writes the anchor.
-        let stored = self
-            .get_operation(*operation)?
-            .ok_or_else(|| {
-                PristineError::Serialization {
+        let stored =
+            self.get_operation(*operation)?
+                .ok_or_else(|| PristineError::Serialization {
                     message: "cannot anchor a bridge event capture to an unknown operation"
                         .to_string(),
-                }
-            })?;
+                })?;
         let scope = match stored.payload().working_copy {
             Some(working_copy) => OperationScope::WorkingCopy(working_copy),
             None => OperationScope::Repository,
@@ -481,9 +482,7 @@ impl<'a> BridgeEventCaptureMutTxnT for WriteTxn<'a> {
         if self
             .get_effect_receipts(*operation)?
             .iter()
-            .any(|receipt| {
-                receipt.payload().kind == crate::operation::EffectReceiptKind::Verified
-            })
+            .any(|receipt| receipt.payload().kind == crate::operation::EffectReceiptKind::Verified)
         {
             return Err(PristineError::Serialization {
                 message: "cannot anchor a bridge event capture to an operation that is \
@@ -502,25 +501,19 @@ impl<'a> BridgeEventCaptureMutTxnT for WriteTxn<'a> {
         // never be promoted by anchoring it to an unrelated active ref-write
         // (fixture cb9b-current-reanchored-sibling anchored an ordinary
         // sibling pair to refs/heads/UNRELATED operations this way).
-        let pairs = post_rewrite_event_pairs(bytes).ok_or_else(|| {
-            PristineError::Serialization {
+        let pairs =
+            post_rewrite_event_pairs(bytes).ok_or_else(|| PristineError::Serialization {
                 message: "cannot anchor a bridge event capture whose bytes do not name a \
                           post-rewrite rewrite pair of full-length OIDs"
                     .to_string(),
-            }
-        })?;
+            })?;
         let describes_operation = matches!(stored.payload().kind, OperationKind::ExportGitRefs)
             && pairs.iter().all(|(old_oid, new_oid)| {
-                stored
-                    .payload()
-                    .delta
-                    .effects
-                    .iter()
-                    .any(|effect| {
-                        matches!(effect.target, EffectTarget::GitRef { .. })
-                            && effect_lease_matches_oid(&effect.expected_old, old_oid)
-                            && effect_lease_matches_oid(&effect.expected_new, new_oid)
-                    })
+                stored.payload().delta.effects.iter().any(|effect| {
+                    matches!(effect.target, EffectTarget::GitRef { .. })
+                        && effect_lease_matches_oid(&effect.expected_old, old_oid)
+                        && effect_lease_matches_oid(&effect.expected_new, new_oid)
+                })
             });
         if !describes_operation {
             return Err(PristineError::Serialization {
@@ -565,16 +558,14 @@ impl<'a> BridgeEventCaptureMutTxnT for WriteTxn<'a> {
         // foreign token are refused.
         let minted = self
             .get_bridge_ref_capture_token(operation.as_bytes())?
-            .ok_or_else(|| {
-                PristineError::Serialization {
-                    message: "cannot anchor a bridge event capture to an operation with no \
+            .ok_or_else(|| PristineError::Serialization {
+                message: "cannot anchor a bridge event capture to an operation with no \
                               minted capture context; only a capture produced within the \
                               operation's prepared capture context can bind to it"
-                        .to_string(),
-                }
+                    .to_string(),
             })?;
-        let event_token = crate::operation::post_rewrite_event_capture_token(bytes)
-            .ok_or_else(|| {
+        let event_token =
+            crate::operation::post_rewrite_event_capture_token(bytes).ok_or_else(|| {
                 PristineError::Serialization {
                     message: "cannot anchor a bridge event capture whose bytes carry no \
                               operation capture token; a capture produced outside the \
@@ -583,7 +574,10 @@ impl<'a> BridgeEventCaptureMutTxnT for WriteTxn<'a> {
                         .to_string(),
                 }
             })?;
-        let minted_hex = minted.iter().map(|b| format!("{b:02x}")).collect::<String>();
+        let minted_hex = minted
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>();
         if event_token != minted_hex {
             return Err(PristineError::Serialization {
                 message: "cannot anchor a bridge event capture whose capture token does not \

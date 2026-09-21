@@ -211,6 +211,7 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
+    #[allow(clippy::drop_non_drop)] // drop is deliberate scope documentation
     fn token_reopens_updates_and_is_source_scoped() {
         let dir = tempdir().unwrap();
         let working_copy = WorkingCopyId::new();

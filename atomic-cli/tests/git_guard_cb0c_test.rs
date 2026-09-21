@@ -1,7 +1,6 @@
 //! CB-0C end-to-end coverage for the shared stale-baseline guard.
 
 #![cfg(not(windows))]
-
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write as _;

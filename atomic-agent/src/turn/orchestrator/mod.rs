@@ -522,7 +522,8 @@ impl TurnOrchestrator {
 
     /// Route provenance mutations through a committed repository owner.
     pub fn set_journal_sink(&mut self, sink: Arc<dyn ProvenanceJournalSink>) {
-        self.journal_sink = Some(sink);    }
+        self.journal_sink = Some(sink);
+    }
 
     /// Record that the embedding process already holds the turn
     /// publication lock (see [`Self::set_journal_sink`] callers in the CLI).
@@ -644,7 +645,11 @@ impl TurnOrchestrator {
     ///
     /// The first durable incomplete outcome remains authoritative: an
     /// existing refusal is never overwritten by a later classification.
-    pub(crate) fn persist_classified_turn(&self, session: &mut AgentSession, classified: &ClassifiedTurn) {
+    pub(crate) fn persist_classified_turn(
+        &self,
+        session: &mut AgentSession,
+        classified: &ClassifiedTurn,
+    ) {
         let entry = TurnOutcomeEntry {
             turn: classified.turn(),
             outcome: classified.outcome.clone(),

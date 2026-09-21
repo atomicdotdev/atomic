@@ -79,8 +79,10 @@ use crate::RepositoryError;
 
 // ── Sub-modules (new) ───────────────────────────────────────────────────
 
-mod anchor;
 mod adoption;
+mod anchor;
+mod binding_fetch;
+mod binding_store;
 mod conflict_object;
 mod conflict_reconcile;
 mod cutover;
@@ -88,10 +90,8 @@ mod deferred_tree;
 mod equivalence;
 mod file_index_v2;
 mod filter;
-mod ignore_mirror;
 mod git_observation;
-mod binding_fetch;
-mod binding_store;
+mod ignore_mirror;
 mod locks;
 mod materialize;
 mod migration;
@@ -104,6 +104,7 @@ mod projection_commit;
 mod projection_effects;
 pub mod ref_mapping;
 mod repair;
+mod resurrection;
 mod sandbox;
 mod semantic_materialize;
 mod set_id;
@@ -111,9 +112,8 @@ mod snapshot;
 mod snapshot_split;
 mod split;
 mod staging;
-mod synthesis;
-mod resurrection;
 mod switch;
+mod synthesis;
 mod tag_projection;
 mod views;
 mod working_copy;
@@ -122,15 +122,14 @@ mod workspace_txn;
 
 // Re-export public items so external callers and sibling sub-modules that
 // use `use super::*;` continue to resolve them at `crate::repository::…`.
-pub use workspace_txn::{
-    git_state_quiescent, git_locks_present, GitQuiescence, ReconcileEffectBudget,
-    MIN_REACTIVE_QUIESCENCE_MS,
+pub use anchor::{AdoptBoundHead, DetachedImportTarget};
+pub use conflict_reconcile::{
+    ConflictReconcileOutcome, StaleConflictDisposition, StaleConflictPath, StaleConflictReport,
 };
 pub use cutover::{
     BridgeCutoverAudit, BridgeCutoverOutcome, BridgeCutoverPlan, CutoverAuditDisposition,
     CutoverSchemaAudit,
 };
-pub use anchor::{AdoptBoundHead, DetachedImportTarget};
 pub use equivalence::{
     compare_project_state, compare_project_to_index, compare_project_to_worktree,
     verify_prospective_equivalence, EquivalenceClaims, EquivalenceLayer, EquivalenceMismatch,
@@ -142,21 +141,18 @@ pub use filter::{
     graph_visibility_closure, graph_visibility_from_membership, view_membership,
     view_membership_at_sequence,
 };
+pub use git_observation::{
+    observe_colocated_git_readiness, observe_git_index, observe_git_metadata, observe_worktree,
+    ColocatedGitForm, ColocatedGitReadiness, GitAdminEntryKind, GitAdminPathObservation,
+    GitHeadObservation, GitObservationToken, GitOperationMarker, GitOperationMarkerObservation,
+    GitOperationObservation, ObservationError, OwnedHookDispatcher, WorkspaceGitObservation,
+    WorkspaceGitRepositoryObservation, ATOMIC_DISPATCHER_MARKER, ATOMIC_LEGACY_MARKER_BEGIN,
+};
 pub use ignore_mirror::{
     check_ignore_policy, mirror_ignores, IgnoreMirrorError, IgnorePolicyReport,
     MANAGED_BLOCK_BEGIN, MANAGED_BLOCK_END,
 };
-pub use git_observation::{
-    observe_colocated_git_readiness, observe_git_index, observe_git_metadata, observe_worktree,
-    ATOMIC_DISPATCHER_MARKER, ATOMIC_LEGACY_MARKER_BEGIN, ColocatedGitForm,
-    ColocatedGitReadiness, GitAdminEntryKind, GitAdminPathObservation, GitHeadObservation,
-    GitObservationToken, GitOperationMarker, GitOperationMarkerObservation, GitOperationObservation,
-    ObservationError, OwnedHookDispatcher, WorkspaceGitObservation,
-    WorkspaceGitRepositoryObservation,
-};
 pub use locks::RepositoryCommonLockGuard;
-pub use working_copy::detect_repository_root;
-pub use working_copy::canonical_dot_dir_for;
 pub use operation::{
     OperationDetails, OperationHeadState, OperationLog, OperationLogEntry,
     OperationVerificationState, PreparedBridgeGitWrite, PreparedRemoteOperation,
@@ -179,6 +175,7 @@ pub use projection_commit::{
     ProjectionSigning, WholeViewMergeProof, ATOMIC_SIGNATURE_BEGIN, ATOMIC_SIGNATURE_END,
     COMMIT_SIGNATURE_DOMAIN,
 };
+pub use projection_effects::{PreparedProjectionPublish, ProjectionCheckpointPlan};
 pub use sandbox::{SealOptions, SealResult, StageOptions, StageResult, SANDBOX_POINTER};
 pub use set_id::{effective_projection_identity, view_set_id, ViewIdentity};
 pub use snapshot::{
@@ -188,20 +185,20 @@ pub use snapshot_split::{
     IndexEntryState, IndexManifest, IndexManifestEntry, SnapshotSplitRefusal, SplitSnapshotError,
     SplitSnapshotOutcome, INDEX_MANIFEST_VERSION,
 };
+pub use split::{SplitChange, SplitOptions, SplitOutcome};
 pub use staging::{
     format_two_column, git_object_id_hex, observe_git_staging_state, observe_staging_state,
     quote_path, BaselineEntry, StageCode, StagingEntry, StagingError, StagingNotice, StagingState,
     ASSUME_VALID_FLAG, INTENT_TO_ADD_FLAG, SKIP_WORKTREE_FLAG, STAGING_STATE_VERSION,
 };
-pub use split::{SplitChange, SplitOptions, SplitOutcome};
-pub use projection_effects::{PreparedProjectionPublish, ProjectionCheckpointPlan};
 pub use tag_projection::TagProjectionOutcome;
-pub use conflict_reconcile::{
-    ConflictReconcileOutcome, StaleConflictDisposition, StaleConflictPath, StaleConflictReport,
-};
 pub use views::{ManifestApplyOutcome, ViewInfo};
-pub use working_copy_reconcile::{
-    WorkingCopyReconcileOutcome, WorkingCopyRegistrationDiagnosis,
+pub use working_copy::canonical_dot_dir_for;
+pub use working_copy::detect_repository_root;
+pub use working_copy_reconcile::{WorkingCopyReconcileOutcome, WorkingCopyRegistrationDiagnosis};
+pub use workspace_txn::{
+    git_locks_present, git_state_quiescent, GitQuiescence, ReconcileEffectBudget,
+    MIN_REACTIVE_QUIESCENCE_MS,
 };
 pub use workspace_txn::{
     GitOperationDisposition, UnanchoredWorkspace, WorkspaceCheckpoint, WorkspaceEntryPlan,
@@ -239,30 +236,35 @@ mod vault_kg_enrich;
 mod vault_names;
 mod vault_triples;
 mod verify;
+pub use anchor::{
+    conversion_policy_for_git, format_equivalence_report, read_head_map, BridgeAnchorError,
+    BridgeAnchorOutcome, BridgeAnchorRefusal, HeadMapEntry,
+};
+pub use binding_fetch::{
+    BindingChangeSource, ClosureAcquisition, ClosureReadiness, IncompletenessReason,
+};
+pub use binding_store::{BindingPublication, VerifiedPublishedBinding, BINDING_REF_PREFIX};
+pub use conflict_object::{
+    ConflictClaimantObject, ConflictEntryKind, ConflictEntryObject, ConflictFileObject,
+    ConflictObjectError, ConflictRepresentability, ConflictSetObject, ConflictSideObject,
+    CONFLICT_SET_MAGIC, CONFLICT_SET_VERSION,
+};
 pub use insert::{
     ImportLineIndexSeed, ImportLineIndexSeedLine, ImportWriteOutcome, ImportWriteTimings,
 };
+pub use provenance_gate::{GateBlocker, GateVerdict, MacKeyProvider, PublicationGateConfig};
+pub use provenance_summary::ProvenanceSummary;
+pub use repair::{
+    NativeIndex, NativeIndexProblem, NativeIndexProblemKind, NativeIndexRepairOutcome,
+    NativeIndexReport,
+};
+pub use resurrection::{ExactResurrection, GitShaResolution, ProjectionProof};
+pub use semantic_materialize::{CrdtMaterializeOptions, CrdtMaterializeOutcome};
 pub use synthesis::{
     git_resolution_metadata, git_synthesis_metadata, GitResolutionOrigin, GitSynthesisOrigin,
     ResurrectionOutcome, StagedExpectation, StagedPathExpectation, StagedTreeExpectation,
     SynthesisOutcome,
 };
-pub use resurrection::{
-    ExactResurrection, GitShaResolution, ProjectionProof,
-};
-pub use anchor::{
-    conversion_policy_for_git, format_equivalence_report, read_head_map,
-    BridgeAnchorError, BridgeAnchorOutcome, BridgeAnchorRefusal, HeadMapEntry,
-};
-pub use provenance_summary::ProvenanceSummary;
-pub use provenance_gate::{
-    GateBlocker, GateVerdict, MacKeyProvider, PublicationGateConfig,
-};
-pub use repair::{
-    NativeIndex, NativeIndexProblem, NativeIndexProblemKind, NativeIndexRepairOutcome,
-    NativeIndexReport,
-};
-pub use semantic_materialize::{CrdtMaterializeOptions, CrdtMaterializeOutcome};
 pub use tags::{deserialize_tag, serialize_tag};
 pub use triage::{BaggageEntry, CandidateSet, Coverage};
 pub use vault_embeddings::{hash_embed, EmbedConfig, TextChunk};
@@ -275,15 +277,6 @@ pub use vault_intent::{
 };
 pub use vault_kg_enrich::KgEnrichStats;
 pub use vault_names::{derive_intent_prefix, generate_goal_name};
-pub use binding_fetch::{
-    BindingChangeSource, ClosureAcquisition, ClosureReadiness, IncompletenessReason,
-};
-pub use binding_store::{BindingPublication, VerifiedPublishedBinding, BINDING_REF_PREFIX};
-pub use conflict_object::{
-    ConflictClaimantObject, ConflictEntryKind, ConflictEntryObject, ConflictFileObject,
-    ConflictObjectError, ConflictRepresentability, ConflictSetObject, ConflictSideObject,
-    CONFLICT_SET_MAGIC, CONFLICT_SET_VERSION,
-};
 pub use verify::{VerifyProblem, VerifyReport};
 
 #[cfg(test)]

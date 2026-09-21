@@ -23,7 +23,6 @@
 use std::fs;
 use std::path::Path;
 use std::process::{Command, Output};
-use std::str::FromStr;
 
 use atomic_core::types::Base32;
 
@@ -83,12 +82,20 @@ fn git(root: &Path, args: &[&str]) -> Output {
 
 fn assert_git(root: &Path, args: &[&str], context: &str) {
     let out = git(root, args);
-    assert!(out.status.success(), "{context} failed: {}", output_text(&out));
+    assert!(
+        out.status.success(),
+        "{context} failed: {}",
+        output_text(&out)
+    );
 }
 
 fn git_text(root: &Path, args: &[&str]) -> String {
     let out = git(root, args);
-    assert!(out.status.success(), "git {args:?} failed: {}", output_text(&out));
+    assert!(
+        out.status.success(),
+        "git {args:?} failed: {}",
+        output_text(&out)
+    );
     String::from_utf8_lossy(&out.stdout).to_string()
 }
 
@@ -111,7 +118,10 @@ fn setup_import_publisher(root: &Path, home: &Path) {
     }
 
     assert_success(&atomic(root, home, &["init"]), "atomic init");
-    assert_success(&atomic(root, home, &["git", "import", "--no-vault"]), "git import");
+    assert_success(
+        &atomic(root, home, &["git", "import", "--no-vault"]),
+        "git import",
+    );
 
     fs::write(root.join("feature.txt"), b"feature bytes\n").expect("write file");
     assert_success(&atomic(root, home, &["add", "feature.txt"]), "add");
@@ -133,7 +143,10 @@ fn setup_native_publisher(root: &Path, home: &Path, key: &Path) {
     );
     fs::write(root.join("tracked.txt"), b"tracked bytes\n").expect("write file");
     assert_success(&atomic(root, home, &["add", "tracked.txt"]), "add tracked");
-    assert_success(&atomic(root, home, &["record", "-m", "base"]), "record base");
+    assert_success(
+        &atomic(root, home, &["record", "-m", "base"]),
+        "record base",
+    );
 
     assert_git(root, &["init", "-q"], "git init");
     assert_git(root, &["add", "tracked.txt"], "stage tracked");
@@ -192,7 +205,13 @@ fn enable_configures_both_refspecs_idempotently() {
         &atomic(
             &publisher,
             &home,
-            &["git", "bridge", "enable", "--binding-key-file", key.to_str().unwrap()],
+            &[
+                "git",
+                "bridge",
+                "enable",
+                "--binding-key-file",
+                key.to_str().unwrap(),
+            ],
         ),
         "bridge enable with remote",
     );
@@ -214,7 +233,13 @@ fn enable_configures_both_refspecs_idempotently() {
         &atomic(
             &publisher,
             &home,
-            &["git", "bridge", "enable", "--binding-key-file", key.to_str().unwrap()],
+            &[
+                "git",
+                "bridge",
+                "enable",
+                "--binding-key-file",
+                key.to_str().unwrap(),
+            ],
         ),
         "repeat bridge enable",
     );
@@ -229,7 +254,19 @@ fn enable_configures_both_refspecs_idempotently() {
     );
 
     // A missing remote is a warning, not a crash.
-    let missing = atomic(&publisher, &home, &["git", "bridge", "enable", "--remote", "nowhere", "--binding-key-file", key.to_str().unwrap()]);
+    let missing = atomic(
+        &publisher,
+        &home,
+        &[
+            "git",
+            "bridge",
+            "enable",
+            "--remote",
+            "nowhere",
+            "--binding-key-file",
+            key.to_str().unwrap(),
+        ],
+    );
     assert!(
         missing.status.success(),
         "a missing remote must be a notice, not a failure: {}",
@@ -274,14 +311,20 @@ fn queue_republishes_missing_refs_idempotently_and_refuses_conflicting_targets()
         let ids = repo.binding_ids().expect("ids");
         assert!(!ids.is_empty(), "the publisher must store a binding");
         let id = ids[0].to_hex();
-        format!("refs/atomic/bindings/{}/{}", &id[..2], &id)
+        format!("refs/atomic/bindings/{}/{}", &id[..2], id)
     };
 
     // Simulate an interrupted transfer: the binding is stored but its
     // create-only ref is missing.
-    assert_git(&publisher, &["update-ref", "-d", &binding_ref], "delete binding ref");
+    assert_git(
+        &publisher,
+        &["update-ref", "-d", &binding_ref],
+        "delete binding ref",
+    );
     assert!(
-        git_text(&publisher, &["for-each-ref", &binding_ref]).trim().is_empty(),
+        git_text(&publisher, &["for-each-ref", &binding_ref])
+            .trim()
+            .is_empty(),
         "the ref must be gone before the queue runs"
     );
 
@@ -293,7 +336,9 @@ fn queue_republishes_missing_refs_idempotently_and_refuses_conflicting_targets()
         "the queue must report the republication: {}",
         output_text(&queue)
     );
-    assert!(!git_text(&publisher, &["for-each-ref", &binding_ref]).trim().is_empty());
+    assert!(!git_text(&publisher, &["for-each-ref", &binding_ref])
+        .trim()
+        .is_empty());
 
     // Retry is idempotent: nothing new is published.
     let retry = atomic(&publisher, &home, &["git", "bridge", "binding", "queue"]);
@@ -308,7 +353,11 @@ fn queue_republishes_missing_refs_idempotently_and_refuses_conflicting_targets()
     let foreign = {
         let other = git2::Repository::open(&publisher).expect("open git");
         let signature = git2::Signature::now("Test", "test@example.com").expect("signature");
-        let tree_id = other.treebuilder(None).expect("treebuilder").write().expect("write tree");
+        let tree_id = other
+            .treebuilder(None)
+            .expect("treebuilder")
+            .write()
+            .expect("write tree");
         let tree = other.find_tree(tree_id).expect("find tree");
         let commit = other
             .commit(None, &signature, &signature, "foreign", &tree, &[])
@@ -319,7 +368,11 @@ fn queue_republishes_missing_refs_idempotently_and_refuses_conflicting_targets()
         commit
     };
 
-    let refused = atomic(&publisher, &home, &["git", "bridge", "binding", "queue", "--max", "1"]);
+    let refused = atomic(
+        &publisher,
+        &home,
+        &["git", "bridge", "binding", "queue", "--max", "1"],
+    );
     assert!(
         !refused.status.success(),
         "a conflicting ref target must refuse: {}",
@@ -367,19 +420,30 @@ fn queue_remote_transfer_is_create_only_and_verified_before_publication_report()
     make_remote_and_fetch_refspecs(&publisher, &remote_dir, "origin");
 
     // First transfer: succeeds and verifies.
-    let queue = atomic(&publisher, &home, &["git", "bridge", "binding", "queue", "--remote", "origin"]);
+    let queue = atomic(
+        &publisher,
+        &home,
+        &["git", "bridge", "binding", "queue", "--remote", "origin"],
+    );
     assert_success(&queue, "queue --remote");
     assert!(
         output_text(&queue).contains("Verified"),
         "publication must be reported only after remote verification: {}",
         output_text(&queue)
     );
-    let binding_ref = git_text(&publisher, &["for-each-ref", "--format=%(refname)", "refs/atomic/bindings"])
-        .lines()
-        .next()
-        .expect("one binding ref")
-        .trim()
-        .to_string();
+    let binding_ref = git_text(
+        &publisher,
+        &[
+            "for-each-ref",
+            "--format=%(refname)",
+            "refs/atomic/bindings",
+        ],
+    )
+    .lines()
+    .next()
+    .expect("one binding ref")
+    .trim()
+    .to_string();
     let remote_refs = git_text(&remote_dir, &["for-each-ref", "--format=%(refname)"]);
     assert!(
         remote_refs.contains(&binding_ref),
@@ -396,7 +460,11 @@ fn queue_remote_transfer_is_create_only_and_verified_before_publication_report()
     let foreign = {
         let git_repo = git2::Repository::open_bare(&remote_dir).expect("open remote");
         let signature = git2::Signature::now("Test", "test@example.com").expect("signature");
-        let tree_id = git_repo.treebuilder(None).expect("treebuilder").write().expect("write tree");
+        let tree_id = git_repo
+            .treebuilder(None)
+            .expect("treebuilder")
+            .write()
+            .expect("write tree");
         let tree = git_repo.find_tree(tree_id).expect("find tree");
         let commit = git_repo
             .commit(None, &signature, &signature, "hostile", &tree, &[])
@@ -406,7 +474,11 @@ fn queue_remote_transfer_is_create_only_and_verified_before_publication_report()
             .expect("force the hostile target onto the remote binding ref");
         commit
     };
-    let queue = atomic(&publisher, &home, &["git", "bridge", "binding", "queue", "--remote", "origin"]);
+    let queue = atomic(
+        &publisher,
+        &home,
+        &["git", "bridge", "binding", "queue", "--remote", "origin"],
+    );
     assert!(
         !queue.status.success(),
         "the create-only transfer must refuse a moved remote ref: {}",
@@ -434,7 +506,9 @@ fn push_lease_creates_remote_branch_and_records_the_observation() {
 
     let remote_dir = temp.path().join("origin.git");
     make_remote_and_fetch_refspecs(&publisher, &remote_dir, "origin");
-    let head = git_text(&publisher, &["rev-parse", "HEAD"]).trim().to_string();
+    let head = git_text(&publisher, &["rev-parse", "HEAD"])
+        .trim()
+        .to_string();
 
     // The leased publication creates the remote branch at the current HEAD
     // and records the verified remote observation.
@@ -484,7 +558,9 @@ fn push_lease_refuses_stale_remote_without_overwriting() {
     // Push 1 establishes the honest remote observation (create-only lease).
     let push = atomic(&publisher, &home, &["git", "push", "--branch", "pub"]);
     assert_success(&push, "first atomic git push --branch pub");
-    let head = git_text(&publisher, &["rev-parse", "HEAD"]).trim().to_string();
+    let head = git_text(&publisher, &["rev-parse", "HEAD"])
+        .trim()
+        .to_string();
     let observed = git_text(&remote_dir, &["rev-parse", "refs/heads/pub"]);
     assert_eq!(observed.trim(), head);
 
@@ -500,7 +576,14 @@ fn push_lease_refuses_stale_remote_without_overwriting() {
             .expect("write tree");
         let tree = git_repo.find_tree(tree_id).expect("find tree");
         let commit = git_repo
-            .commit(None, &signature, &signature, "hostile external move", &tree, &[])
+            .commit(
+                None,
+                &signature,
+                &signature,
+                "hostile external move",
+                &tree,
+                &[],
+            )
             .expect("create hostile commit");
         git_repo
             .reference("refs/heads/pub", commit, true, "hostile external move")
@@ -555,7 +638,7 @@ fn clone_git_url_restores_exact_bound_state() {
         &publisher,
         &[
             "push",
-            &remote_dir.to_str().unwrap(),
+            remote_dir.to_str().unwrap(),
             "refs/heads/*:refs/heads/*",
             "refs/atomic/bindings/*:refs/atomic/bindings/*",
         ],
@@ -570,7 +653,7 @@ fn clone_git_url_restores_exact_bound_state() {
         &home,
         &[
             "clone",
-            &remote_dir.to_str().unwrap(),
+            remote_dir.to_str().unwrap(),
             clone_dir.to_str().unwrap(),
             "--git",
             "--binding-key-file",
@@ -648,7 +731,7 @@ fn clone_unbound_history_refuses_with_explicit_foreign_synthesis_guidance() {
         &publisher,
         &[
             "push",
-            &remote_dir.to_str().unwrap(),
+            remote_dir.to_str().unwrap(),
             "refs/heads/*:refs/heads/*",
         ],
         "push branch only",
@@ -661,7 +744,7 @@ fn clone_unbound_history_refuses_with_explicit_foreign_synthesis_guidance() {
         &home,
         &[
             "clone",
-            &remote_dir.to_str().unwrap(),
+            remote_dir.to_str().unwrap(),
             clone_dir.to_str().unwrap(),
             "--git",
             "--binding-key-file",
@@ -716,7 +799,7 @@ fn git_clone_then_init_adopt_git_bootstraps_through_the_same_anchoring() {
         &publisher,
         &[
             "push",
-            &remote_dir.to_str().unwrap(),
+            remote_dir.to_str().unwrap(),
             "refs/heads/*:refs/heads/*",
             "refs/atomic/bindings/*:refs/atomic/bindings/*",
         ],
@@ -728,11 +811,7 @@ fn git_clone_then_init_adopt_git_bootstraps_through_the_same_anchoring() {
     let clone_dir = temp.path().join("adopted");
     assert_git(
         temp.path(),
-        &[
-            "clone",
-            &remote_dir.to_str().unwrap(),
-            "adopted",
-        ],
+        &["clone", remote_dir.to_str().unwrap(), "adopted"],
         "plain git clone",
     );
     let clone_key = write_key_file(temp.path(), "adopt-key.hex", 0x5A);
@@ -785,7 +864,7 @@ fn tampered_fetched_binding_is_refused_before_installation() {
         &publisher,
         &[
             "push",
-            &remote_dir.to_str().unwrap(),
+            remote_dir.to_str().unwrap(),
             "refs/heads/*:refs/heads/*",
             "refs/atomic/bindings/*:refs/atomic/bindings/*",
         ],
@@ -794,19 +873,29 @@ fn tampered_fetched_binding_is_refused_before_installation() {
 
     // Hostile host: rebuild the binding commit with tampered binding bytes
     // under the same ref name (the signed bytes no longer match the blob).
-    let binding_ref = git_text(&publisher, &["for-each-ref", "--format=%(refname)", "refs/atomic/bindings"])
-        .lines()
-        .next()
-        .expect("one binding ref")
-        .trim()
-        .to_string();
+    let binding_ref = git_text(
+        &publisher,
+        &[
+            "for-each-ref",
+            "--format=%(refname)",
+            "refs/atomic/bindings",
+        ],
+    )
+    .lines()
+    .next()
+    .expect("one binding ref")
+    .trim()
+    .to_string();
     {
         let git_repo = git2::Repository::open_bare(&remote_dir).expect("open remote");
-        let signature = git2::Signature::now("Attacker", "attacker@example.com").expect("signature");
+        let signature =
+            git2::Signature::now("Attacker", "attacker@example.com").expect("signature");
         let mut builder = git_repo.treebuilder(None).expect("treebuilder");
         let tampered = b"tampered binding bytes that never verify";
         let blob = git_repo.blob(tampered).expect("blob");
-        builder.insert("binding.cbor", blob, i32::from(git2::FileMode::Blob)).expect("insert");
+        builder
+            .insert("binding.cbor", blob, i32::from(git2::FileMode::Blob))
+            .expect("insert");
         let tree_id = builder.write().expect("write tree");
         let tree = git_repo.find_tree(tree_id).expect("find tree");
         let commit = git_repo
@@ -823,13 +912,22 @@ fn tampered_fetched_binding_is_refused_before_installation() {
     let clone_dir = temp.path().join("victim");
     assert_git(
         temp.path(),
-        &["clone", &remote_dir.to_str().unwrap(), "victim"],
+        &["clone", remote_dir.to_str().unwrap(), "victim"],
         "git clone with the tampered ref",
     );
     // The clone fetched the binding ref because git's default refspec does
     // not include custom namespaces; configure + fetch explicitly like the
     // bootstrap does.
-    assert_git(&clone_dir, &["config", "--add", "remote.origin.fetch", "+refs/atomic/bindings/*:refs/atomic/bindings/*"], "refspec");
+    assert_git(
+        &clone_dir,
+        &[
+            "config",
+            "--add",
+            "remote.origin.fetch",
+            "+refs/atomic/bindings/*:refs/atomic/bindings/*",
+        ],
+        "refspec",
+    );
     assert_git(&clone_dir, &["fetch", "origin"], "fetch tampered binding");
 
     let clone_key = write_key_file(temp.path(), "victim-key.hex", 0x5C);
@@ -912,10 +1010,18 @@ fn namespace_rejection_is_explicit_and_degraded_fallback_needs_opt_in() {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).expect("chmod");
     }
-    assert_git(&publisher, &["remote", "add", "origin", remote_dir.to_str().unwrap()], "add remote");
+    assert_git(
+        &publisher,
+        &["remote", "add", "origin", remote_dir.to_str().unwrap()],
+        "add remote",
+    );
 
     // Without the opt-in: explicit diagnostic, NO degraded publication.
-    let refused = atomic(&publisher, &home, &["git", "bridge", "binding", "queue", "--remote", "origin"]);
+    let refused = atomic(
+        &publisher,
+        &home,
+        &["git", "bridge", "binding", "queue", "--remote", "origin"],
+    );
     assert!(
         !refused.status.success(),
         "a namespace-rejecting host must fail the queue: {}",
@@ -976,7 +1082,14 @@ fn binding_trees_hold_only_allowlisted_public_blobs() {
     let key = write_key_file(temp.path(), "key.hex", 0x59);
     setup_native_publisher(&publisher, &home, &key);
 
-    let refs = git_text(&publisher, &["for-each-ref", "--format=%(refname)", "refs/atomic/bindings"]);
+    let refs = git_text(
+        &publisher,
+        &[
+            "for-each-ref",
+            "--format=%(refname)",
+            "refs/atomic/bindings",
+        ],
+    );
     assert!(!refs.trim().is_empty(), "a binding ref must exist");
     for reference in refs.lines() {
         let listing = git_text(&publisher, &["ls-tree", "-r", reference]);
@@ -1030,20 +1143,33 @@ fn hostile_carrier_with_private_wip_parent_never_transfers() {
     // Control: the unchanged, legit carrier still transfers and verifies.
     let origin_dir = temp.path().join("origin.git");
     make_remote_and_fetch_refspecs(&publisher, &origin_dir, "origin");
-    let control = atomic(&publisher, &home, &["git", "bridge", "binding", "queue", "--remote", "origin"]);
+    let control = atomic(
+        &publisher,
+        &home,
+        &["git", "bridge", "binding", "queue", "--remote", "origin"],
+    );
     assert_success(&control, "unchanged-carrier control queue --remote origin");
     assert!(
         output_text(&control).contains("Verified"),
         "the legit carrier must still verify: {}",
         output_text(&control)
     );
-    let binding_ref = git_text(&publisher, &["for-each-ref", "--format=%(refname)", "refs/atomic/bindings"])
-        .lines()
-        .next()
-        .expect("one binding ref")
+    let binding_ref = git_text(
+        &publisher,
+        &[
+            "for-each-ref",
+            "--format=%(refname)",
+            "refs/atomic/bindings",
+        ],
+    )
+    .lines()
+    .next()
+    .expect("one binding ref")
+    .trim()
+    .to_string();
+    let legit_target = git_text(&publisher, &["rev-parse", &binding_ref])
         .trim()
         .to_string();
-    let legit_target = git_text(&publisher, &["rev-parse", &binding_ref]).trim().to_string();
 
     // Build the hostile carrier: the SAME valid binding tree, but a parent
     // chain holding PRIVATE_REVIEW_SENTINEL, itself held under a local WIP
@@ -1057,7 +1183,9 @@ fn hostile_carrier_with_private_wip_parent_never_transfers() {
             .find_commit(git2::Oid::from_str(&legit_target).expect("legit carrier oid"))
             .expect("legit carrier commit");
         let binding_tree = carrier.tree_id();
-        let blob = git_repo.blob(b"PRIVATE_REVIEW_SENTINEL\n").expect("private blob");
+        let blob = git_repo
+            .blob(b"PRIVATE_REVIEW_SENTINEL\n")
+            .expect("private blob");
         let mut builder = git_repo.treebuilder(None).expect("treebuilder");
         builder
             .insert("private.txt", blob, git2::FileMode::Blob.into())
@@ -1069,7 +1197,9 @@ fn hostile_carrier_with_private_wip_parent_never_transfers() {
                 &signature,
                 &signature,
                 "private WIP",
-                &git_repo.find_tree(private_tree).expect("private tree object"),
+                &git_repo
+                    .find_tree(private_tree)
+                    .expect("private tree object"),
                 &[],
             )
             .expect("private WIP commit");
@@ -1088,8 +1218,12 @@ fn hostile_carrier_with_private_wip_parent_never_transfers() {
                 &signature,
                 &signature,
                 "same binding with private parent",
-                &git_repo.find_tree(binding_tree).expect("binding tree object"),
-                &[&git_repo.find_commit(private_commit).expect("private commit")],
+                &git_repo
+                    .find_tree(binding_tree)
+                    .expect("binding tree object"),
+                &[&git_repo
+                    .find_commit(private_commit)
+                    .expect("private commit")],
             )
             .expect("hostile carrier commit");
         git_repo
@@ -1105,8 +1239,16 @@ fn hostile_carrier_with_private_wip_parent_never_transfers() {
         .args(["init", "--bare", "-q", leak_dir.to_str().unwrap()])
         .output()
         .expect("init bare leak remote");
-    assert_git(&publisher, &["remote", "add", "leak", leak_dir.to_str().unwrap()], "add leak remote");
-    let refused = atomic(&publisher, &home, &["git", "bridge", "binding", "queue", "--remote", "leak"]);
+    assert_git(
+        &publisher,
+        &["remote", "add", "leak", leak_dir.to_str().unwrap()],
+        "add leak remote",
+    );
+    let refused = atomic(
+        &publisher,
+        &home,
+        &["git", "bridge", "binding", "queue", "--remote", "leak"],
+    );
     assert!(
         !refused.status.success(),
         "the queue must refuse a carrier with unexpected parentage: {}",
@@ -1133,7 +1275,11 @@ fn hostile_carrier_with_private_wip_parent_never_transfers() {
 
     // A hostile local carrier also refuses against the remote that already
     // holds the legit carrier, and that remote stays untouched.
-    let retry = atomic(&publisher, &home, &["git", "bridge", "binding", "queue", "--remote", "origin"]);
+    let retry = atomic(
+        &publisher,
+        &home,
+        &["git", "bridge", "binding", "queue", "--remote", "origin"],
+    );
     assert!(
         !retry.status.success(),
         "a hostile local carrier must refuse even against a synchronized remote: {}",
@@ -1174,12 +1320,15 @@ fn unregistered_binding_ref_is_never_transferred() {
     );
 
     // An unregistered, valid-shaped binding ref holding a private blob.
-    let unregistered = "refs/atomic/bindings/ff/ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+    let unregistered =
+        "refs/atomic/bindings/ff/ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
     let unregistered_blob;
     {
         let git_repo = git2::Repository::open(&publisher).expect("open publisher");
         let signature = git2::Signature::now("Test", "test@example.com").expect("signature");
-        let blob = git_repo.blob(b"UNREGISTERED_PRIVATE_SENTINEL\n").expect("blob");
+        let blob = git_repo
+            .blob(b"UNREGISTERED_PRIVATE_SENTINEL\n")
+            .expect("blob");
         let mut builder = git_repo.treebuilder(None).unwrap();
         builder
             .insert("leak.txt", blob, git2::FileMode::Blob.into())
@@ -1203,7 +1352,11 @@ fn unregistered_binding_ref_is_never_transferred() {
 
     let remote_dir = temp.path().join("origin.git");
     make_remote_and_fetch_refspecs(&publisher, &remote_dir, "origin");
-    let refused = atomic(&publisher, &home, &["git", "bridge", "binding", "queue", "--remote", "origin"]);
+    let refused = atomic(
+        &publisher,
+        &home,
+        &["git", "bridge", "binding", "queue", "--remote", "origin"],
+    );
     assert!(
         !refused.status.success(),
         "an unregistered binding ref must refuse the transfer: {}",
@@ -1261,7 +1414,14 @@ fn ahead_unobserved_remote_is_never_granted_force_authority() {
             .expect("write tree");
         let tree = git_repo.find_tree(tree_id).expect("find tree");
         let commit = git_repo
-            .commit(None, &signature, &signature, "ahead remote work", &tree, &[])
+            .commit(
+                None,
+                &signature,
+                &signature,
+                "ahead remote work",
+                &tree,
+                &[],
+            )
             .expect("create the ahead commit");
         git_repo
             .reference("refs/heads/pub", commit, true, "ahead remote work")
@@ -1306,18 +1466,25 @@ fn push_publishes_the_pinned_verified_oid_not_mutable_head() {
     // Push 1 establishes the published state at the verified commit.
     let push = atomic(&publisher, &home, &["git", "push", "--branch", "pub"]);
     assert_success(&push, "baseline push");
-    let verified = git_text(&publisher, &["rev-parse", "HEAD"]).trim().to_string();
+    let verified = git_text(&publisher, &["rev-parse", "HEAD"])
+        .trim()
+        .to_string();
 
     // New clean local work advances the branch through the managed record
     // flow (the record projects the verified publication and moves the
     // branch + checkpoint together).
     fs::write(publisher.join("advance.txt"), b"advance\n").expect("advance file");
-    assert_success(&atomic(&publisher, &home, &["add", "advance.txt"]), "atomic add");
+    assert_success(
+        &atomic(&publisher, &home, &["add", "advance.txt"]),
+        "atomic add",
+    );
     assert_success(
         &atomic(&publisher, &home, &["record", "-m", "advance work"]),
         "atomic record",
     );
-    let advanced = git_text(&publisher, &["rev-parse", "HEAD"]).trim().to_string();
+    let advanced = git_text(&publisher, &["rev-parse", "HEAD"])
+        .trim()
+        .to_string();
     assert_ne!(
         advanced, verified,
         "the managed record must advance the branch"
@@ -1342,7 +1509,9 @@ fn push_publishes_the_pinned_verified_oid_not_mutable_head() {
 
     // The remote holds exactly the verified commit; the raced move (HEAD)
     // was never published.
-    let pushed = git_text(&remote_dir, &["rev-parse", "refs/heads/pub"]).trim().to_string();
+    let pushed = git_text(&remote_dir, &["rev-parse", "refs/heads/pub"])
+        .trim()
+        .to_string();
     assert_eq!(
         pushed, advanced,
         "the push must publish the verified branch tip, not the raced mutable HEAD"
@@ -1365,34 +1534,36 @@ fn local_git_source_routes_to_the_git_transport_bootstrap() {
     fs::create_dir_all(&home).expect("home");
     let source = temp.path().join("local-git-source");
     fs::create_dir_all(&source).expect("source dir");
-    assert!(
-        Command::new("git")
-            .args(["init", "-q", "-b", "main"])
-            .current_dir(&source)
-            .output()
-            .expect("git init")
-            .status
-            .success()
-    );
+    assert!(Command::new("git")
+        .args(["init", "-q", "-b", "main"])
+        .current_dir(&source)
+        .output()
+        .expect("git init")
+        .status
+        .success());
     fs::write(source.join("seed.txt"), b"local git source\n").expect("seed");
-    assert!(
-        Command::new("git")
-            .args(["add", "-A"])
-            .current_dir(&source)
-            .output()
-            .expect("git add")
-            .status
-            .success()
-    );
-    assert!(
-        Command::new("git")
-            .args(["-c", "user.email=t@t", "-c", "user.name=T", "commit", "-qm", "seed"])
-            .current_dir(&source)
-            .output()
-            .expect("git commit")
-            .status
-            .success()
-    );
+    assert!(Command::new("git")
+        .args(["add", "-A"])
+        .current_dir(&source)
+        .output()
+        .expect("git add")
+        .status
+        .success());
+    assert!(Command::new("git")
+        .args([
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=T",
+            "commit",
+            "-qm",
+            "seed"
+        ])
+        .current_dir(&source)
+        .output()
+        .expect("git commit")
+        .status
+        .success());
 
     // The destination does not exist yet; the SOURCE is a Git repository.
     let destination = temp.path().join("fresh-clone");
@@ -1402,7 +1573,7 @@ fn local_git_source_routes_to_the_git_transport_bootstrap() {
     // foreign-synthesis guidance — the old destination-based detection would
     // have mis-routed the local Git source to the Atomic-API path instead.
     let clone = atomic(
-        &temp.path(),
+        temp.path(),
         &home,
         &[
             "clone",
@@ -1435,34 +1606,36 @@ fn bootstrap_preflight_refuses_active_merge_and_dirty_worktree() {
     // Case 1: dirty tracked worktree.
     let checkout = temp.path().join("dirty-checkout");
     fs::create_dir_all(&checkout).expect("checkout");
-    assert!(
-        Command::new("git")
-            .args(["init", "-q", "-b", "main"])
-            .current_dir(&checkout)
-            .output()
-            .expect("git init")
-            .status
-            .success()
-    );
+    assert!(Command::new("git")
+        .args(["init", "-q", "-b", "main"])
+        .current_dir(&checkout)
+        .output()
+        .expect("git init")
+        .status
+        .success());
     fs::write(checkout.join("tracked.txt"), b"base\n").expect("seed");
-    assert!(
-        Command::new("git")
-            .args(["add", "-A"])
-            .current_dir(&checkout)
-            .output()
-            .expect("add")
-            .status
-            .success()
-    );
-    assert!(
-        Command::new("git")
-            .args(["-c", "user.email=t@t", "-c", "user.name=T", "commit", "-qm", "base"])
-            .current_dir(&checkout)
-            .output()
-            .expect("commit")
-            .status
-            .success()
-    );
+    assert!(Command::new("git")
+        .args(["add", "-A"])
+        .current_dir(&checkout)
+        .output()
+        .expect("add")
+        .status
+        .success());
+    assert!(Command::new("git")
+        .args([
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=T",
+            "commit",
+            "-qm",
+            "base"
+        ])
+        .current_dir(&checkout)
+        .output()
+        .expect("commit")
+        .status
+        .success());
     fs::write(checkout.join("tracked.txt"), b"uncommitted local edit\n").expect("dirty");
     let bootstrap = atomic(
         &checkout,
@@ -1487,34 +1660,36 @@ fn bootstrap_preflight_refuses_active_merge_and_dirty_worktree() {
     // Case 2: an active merge (MERGE_HEAD present) refuses.
     let merged = temp.path().join("merge-checkout");
     fs::create_dir_all(&merged).expect("checkout");
-    assert!(
-        Command::new("git")
-            .args(["init", "-q", "-b", "main"])
-            .current_dir(&merged)
-            .output()
-            .expect("git init")
-            .status
-            .success()
-    );
+    assert!(Command::new("git")
+        .args(["init", "-q", "-b", "main"])
+        .current_dir(&merged)
+        .output()
+        .expect("git init")
+        .status
+        .success());
     fs::write(merged.join("tracked.txt"), b"base\n").expect("seed");
-    assert!(
-        Command::new("git")
-            .args(["add", "-A"])
-            .current_dir(&merged)
-            .output()
-            .expect("add")
-            .status
-            .success()
-    );
-    assert!(
-        Command::new("git")
-            .args(["-c", "user.email=t@t", "-c", "user.name=T", "commit", "-qm", "base"])
-            .current_dir(&merged)
-            .output()
-            .expect("commit")
-            .status
-            .success()
-    );
+    assert!(Command::new("git")
+        .args(["add", "-A"])
+        .current_dir(&merged)
+        .output()
+        .expect("add")
+        .status
+        .success());
+    assert!(Command::new("git")
+        .args([
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=T",
+            "commit",
+            "-qm",
+            "base"
+        ])
+        .current_dir(&merged)
+        .output()
+        .expect("commit")
+        .status
+        .success());
     fs::write(
         merged.join(".git/MERGE_HEAD"),
         b"0123456789abcdef0123456789abcdef01234567\n",
@@ -1554,15 +1729,23 @@ fn oversized_pack_is_refused_before_the_bulk_copy() {
     // The oversized pack blob (beyond the 64 MiB default transport budget).
     let oversized = vec![0u8; 64 * 1024 * 1024 + 1];
     let odb = git.odb().expect("odb");
-    let oversized_oid = odb.write(git2::ObjectType::Blob, oversized.as_slice()).expect("write pack blob");
-    let binding_oid = odb.write(git2::ObjectType::Blob, b"not-a-real-binding" as &[u8]).expect("write binding blob");
+    let oversized_oid = odb
+        .write(git2::ObjectType::Blob, oversized.as_slice())
+        .expect("write pack blob");
+    let binding_oid = odb
+        .write(git2::ObjectType::Blob, b"not-a-real-binding" as &[u8])
+        .expect("write binding blob");
 
     let mut builder = git.treebuilder(None).expect("treebuilder");
     builder
         .insert("binding.cbor", binding_oid, i32::from(git2::FileMode::Blob))
         .expect("insert binding entry");
     builder
-        .insert("changes.pack", oversized_oid, i32::from(git2::FileMode::Blob))
+        .insert(
+            "changes.pack",
+            oversized_oid,
+            i32::from(git2::FileMode::Blob),
+        )
         .expect("insert oversized pack entry");
     let tree_id = builder.write().expect("write tree");
 
@@ -1577,9 +1760,11 @@ fn oversized_pack_is_refused_before_the_bulk_copy() {
     // because the size check runs during the tree walk, before any decode.
     let id_hex = "a".repeat(64);
     let refname = format!("refs/atomic/bindings/aa/{}", id_hex);
-    git.reference(&refname, commit, true, "oversize probe").expect("binding ref");
+    git.reference(&refname, commit, true, "oversize probe")
+        .expect("binding ref");
 
-    let repo = atomic_repository::Repository::init(&repo_root).expect("init atomic over the carrier repo");
+    let repo =
+        atomic_repository::Repository::init(&repo_root).expect("init atomic over the carrier repo");
     let id = atomic_repository::git_binding::BindingId::from_bytes([0xaa; 32]);
     let error = repo
         .verify_published_binding_carrier(&git, &id)

@@ -310,7 +310,12 @@ impl FileOps {
     /// branch/leaf placeholders shift by the running bases of all
     /// placeholder identities emitted so far. Real (non-placeholder) ids —
     /// e.g. delete ops bound to existing branches — are left untouched.
-    pub fn renumber_placeholder_ids(&mut self, trunk_file_idx: u32, branch_base: u32, leaf_base: u32) {
+    pub fn renumber_placeholder_ids(
+        &mut self,
+        trunk_file_idx: u32,
+        branch_base: u32,
+        leaf_base: u32,
+    ) {
         if self.trunk_id.change_id().is_root() {
             self.trunk_id = TrunkId::new(self.trunk_id.change_id(), trunk_file_idx);
         }
@@ -669,7 +674,10 @@ impl LineOps {
     /// Shifts every ROOT-placeholder identity in this operation by `base`.
     pub(crate) fn renumber_placeholder_ids(&mut self, branch_base: u32, leaf_base: u32) {
         if self.branch_id.change_id().is_root() {
-            self.branch_id = BranchId::new(self.branch_id.change_id(), branch_base + self.branch_id.branch_idx());
+            self.branch_id = BranchId::new(
+                self.branch_id.change_id(),
+                branch_base + self.branch_id.branch_idx(),
+            );
         }
         match &mut self.operation {
             BranchOp::Insert { after, content } => {
@@ -707,17 +715,13 @@ impl LineOps {
                     *branch = BranchId::new(branch.change_id(), branch_base + branch.branch_idx());
                 }
             }
-            BranchOp::Reparent {
-                branch,
-                new_after,
-            } => {
+            BranchOp::Reparent { branch, new_after } => {
                 if branch.change_id().is_root() {
                     *branch = BranchId::new(branch.change_id(), branch_base + branch.branch_idx());
                 }
                 if let Some(after) = new_after {
                     if after.change_id().is_root() {
-                        *after =
-                            BranchId::new(after.change_id(), branch_base + after.branch_idx());
+                        *after = BranchId::new(after.change_id(), branch_base + after.branch_idx());
                     }
                 }
             }

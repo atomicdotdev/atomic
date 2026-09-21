@@ -782,7 +782,7 @@ impl Repository {
 
 #[cfg(test)]
 mod batch_scaling_tests {
-    use super::*;
+
     use crate::repository::Repository;
     use tempfile::TempDir;
 

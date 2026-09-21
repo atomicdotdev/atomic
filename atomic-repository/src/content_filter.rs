@@ -361,18 +361,13 @@ impl ContentFilter for GitAttributesFilter {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 enum TextAttribute {
+    #[default]
     Unspecified,
     Set,
     Auto,
     Unset,
-}
-
-impl Default for TextAttribute {
-    fn default() -> Self {
-        Self::Unspecified
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -669,7 +664,7 @@ fn git_blob_sha1(content: &[u8]) -> String {
         0x10325476,
         0xc3d2e1f0,
     ];
-    for chunk in input.chunks_exact(64) {
+    for chunk in input.as_chunks::<64>().0 {
         let mut words = [0u32; 80];
         for (index, word) in words[..16].iter_mut().enumerate() {
             *word = u32::from_be_bytes(chunk[index * 4..index * 4 + 4].try_into().unwrap());

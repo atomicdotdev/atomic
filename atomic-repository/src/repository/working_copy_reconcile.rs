@@ -35,7 +35,7 @@ use atomic_core::operation::{
     ActorRef, EffectPlan, EffectTarget, EffectValue, OperationKind, RepoStateRef, ViewStateRef,
     WorkingCopyStateRef,
 };
-use atomic_core::pristine::{WorkingCopyRecord, ViewState};
+use atomic_core::pristine::{ViewState, WorkingCopyRecord};
 use atomic_core::OperationId;
 
 const RECONCILE_ACTOR: &str = "working-copy-registration-reconcile";
@@ -388,12 +388,12 @@ impl Repository {
             Some(value) if value == target_view => Ok(()),
             Some(value) if value == previous_view => self.write_current_view(target_view),
             None => self.write_current_view(target_view),
-        Some(other) => Err(RepositoryError::InvalidRepository {
-            reason: format!(
-                "refusing to overwrite compatibility pointer '{other}' \
+            Some(other) => Err(RepositoryError::InvalidRepository {
+                reason: format!(
+                    "refusing to overwrite compatibility pointer '{other}' \
                  (expected '{previous_view}' or '{target_view}')"
-            ),
-        }),
+                ),
+            }),
         }
     }
 }

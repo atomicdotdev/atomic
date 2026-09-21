@@ -17,7 +17,6 @@
 //! 5. write nothing on `--dry-run`.
 
 #![cfg(not(windows))]
-
 use std::fs;
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
@@ -74,7 +73,10 @@ impl Fixture {
             fs::remove_dir_all(&bridge).expect("remove bridge checkpoint");
         }
         assert!(
-            !fixture.root().join(".atomic/bridge/workspace.json").exists(),
+            !fixture
+                .root()
+                .join(".atomic/bridge/workspace.json")
+                .exists(),
             "fixture must be unanchored (MissingCheckpoint)"
         );
         fixture
@@ -147,9 +149,7 @@ fn combined(output: &Output) -> String {
 /// Inject one persisted `Order` conflict row directly into the repository's
 /// view for `path`. Test-only: production never writes this row.
 fn inject_order_conflict(root: &Path, path: &str, line: u32) {
-    use atomic_core::pristine::{
-        MutTxnT, StoredConflict, StoredConflictKind, TreeTxnT, ViewTxnT,
-    };
+    use atomic_core::pristine::{MutTxnT, StoredConflict, StoredConflictKind, TreeTxnT, ViewTxnT};
 
     let view_name = desired_view(root);
     let pristine = atomic_core::pristine::Pristine::open(root.join(".atomic/pristine.redb"))
@@ -261,7 +261,10 @@ fn scoped_flag_clears_stale_metadata_on_unanchored_workspace() {
         "the Git index is untouched"
     );
     assert!(
-        !fixture.root().join(".atomic/bridge/workspace.json").exists(),
+        !fixture
+            .root()
+            .join(".atomic/bridge/workspace.json")
+            .exists(),
         "no checkpoint is fabricated"
     );
 }
@@ -310,7 +313,10 @@ fn mixed_scope_clears_nothing() {
         "fixture.md",
         "other.txt",
     ]);
-    assert!(!output.status.success(), "a mixed scope is not metadata-only");
+    assert!(
+        !output.status.success(),
+        "a mixed scope is not metadata-only"
+    );
     assert_eq!(
         persisted_conflict_count(fixture.root(), "fixture.md"),
         1,
@@ -332,7 +338,10 @@ fn untracked_named_path_clears_nothing() {
         "fixture.md",
         "untracked.txt",
     ]);
-    assert!(!output.status.success(), "an untracked path is not metadata-only");
+    assert!(
+        !output.status.success(),
+        "an untracked path is not metadata-only"
+    );
     assert_eq!(
         persisted_conflict_count(fixture.root(), "fixture.md"),
         1,
@@ -382,7 +391,10 @@ fn git_active_operation_refuses_and_clears_nothing() {
     ]);
     let _ = fs::remove_file(&merge_head);
 
-    assert!(!output.status.success(), "an active Git operation must refuse");
+    assert!(
+        !output.status.success(),
+        "an active Git operation must refuse"
+    );
     assert_eq!(
         persisted_conflict_count(fixture.root(), "fixture.md"),
         1,
@@ -420,7 +432,10 @@ fn dry_run_writes_nothing() {
         "a dry run leaves Git untouched"
     );
     assert!(
-        !fixture.root().join(".atomic/bridge/workspace.json").exists(),
+        !fixture
+            .root()
+            .join(".atomic/bridge/workspace.json")
+            .exists(),
         "a dry run writes no checkpoint"
     );
 }

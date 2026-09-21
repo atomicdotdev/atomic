@@ -27,7 +27,8 @@ fn sandbox_database_wait_uses_the_canonical_database() {
     let sandbox = temp.path().join("sandbox");
     let held = Repository::init(&root).unwrap();
     let working_copy = held.require_working_copy_id().unwrap();
-    held.provision_sandbox(working_copy, &sandbox, "dev").unwrap();
+    held.provision_sandbox(working_copy, &sandbox, "dev")
+        .unwrap();
     assert_eq!(
         Repository::canonical_dot_dir(&sandbox).unwrap(),
         held.dot_dir()

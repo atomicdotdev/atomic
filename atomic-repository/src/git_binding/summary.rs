@@ -22,8 +22,7 @@ use serde::{Deserialize, Serialize};
 pub const ATTESTATION_SUMMARY_MAGIC: &[u8; 4] = b"GAS1";
 
 /// Domain separator for the summary's own Ed25519 signature.
-pub const ATTESTATION_SUMMARY_SIGN_DOMAIN: &[u8] =
-    b"atomic:binding-attestation-summary:sign:v1\0";
+pub const ATTESTATION_SUMMARY_SIGN_DOMAIN: &[u8] = b"atomic:binding-attestation-summary:sign:v1\0";
 
 /// Current summary codec version.
 pub const ATTESTATION_SUMMARY_VERSION: u32 = 1;
@@ -114,8 +113,16 @@ impl BindingAttestationSummary {
                 entry.cache_write_tokens += usage.cache_write_tokens;
                 entry.cost_usd += usage.cost_usd;
             }
-            total_input_tokens += attestation.models.iter().map(|m| m.input_tokens).sum::<u64>();
-            total_output_tokens += attestation.models.iter().map(|m| m.output_tokens).sum::<u64>();
+            total_input_tokens += attestation
+                .models
+                .iter()
+                .map(|m| m.input_tokens)
+                .sum::<u64>();
+            total_output_tokens += attestation
+                .models
+                .iter()
+                .map(|m| m.output_tokens)
+                .sum::<u64>();
             total_cache_read_tokens += attestation
                 .models
                 .iter()

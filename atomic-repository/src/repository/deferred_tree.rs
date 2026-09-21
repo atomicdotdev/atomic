@@ -37,7 +37,8 @@ pub(super) struct DeferredTreeOp {
     /// contain it and must prove the kind through DIRECTORIES instead.
     #[serde(default)]
     pub(super) directory: Option<bool>,
-    pub(super) action: DeferredTreeAction,}
+    pub(super) action: DeferredTreeAction,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct DeferredTreeJournal {
@@ -705,7 +706,7 @@ impl Repository {
         &self,
         view_name: &str,
     ) -> Result<Vec<crate::record::LossNote>, RepositoryError> {
-        use atomic_core::pristine::{GraphTxnT, TreeTxnT, ViewTxnT};
+        use atomic_core::pristine::ViewTxnT;
         let txn = self
             .pristine
             .read_txn()
@@ -740,7 +741,9 @@ impl Repository {
                     && path.as_str().starts_with(&prefix)
             });
             if !holds_files {
-                notes.push(crate::record::LossNote::empty_directory(directory.to_string()));
+                notes.push(crate::record::LossNote::empty_directory(
+                    directory.to_string(),
+                ));
             }
         }
         Ok(notes)
@@ -967,9 +970,7 @@ impl Repository {
         T: GraphTxnT
             + TreeTxnT
             + PathClaimTxnT
-            + atomic_core::pristine::InodeGraphOps<
-                InodeError = atomic_core::pristine::PristineError,
-            >,
+            + atomic_core::pristine::InodeGraphOps<InodeError = atomic_core::pristine::PristineError>,
     {
         self.project_tree_for_visibility_scoped(txn, visibility, None)
     }
@@ -995,9 +996,7 @@ impl Repository {
         T: GraphTxnT
             + TreeTxnT
             + PathClaimTxnT
-            + atomic_core::pristine::InodeGraphOps<
-                InodeError = atomic_core::pristine::PristineError,
-            >,
+            + atomic_core::pristine::InodeGraphOps<InodeError = atomic_core::pristine::PristineError>,
     {
         let reduced = super::name_resolution::reduce_path_claims(txn, visibility)?;
         if std::env::var("ATOMIC_DEBUG_PROJECTION").is_ok() {
@@ -1096,9 +1095,7 @@ impl Repository {
             .sort_by(|left, right| left.path().cmp(right.path()));
         projection.name_conflicts = name_conflicts;
         if debug_projection {
-            eprintln!(
-                "PTV done absent_checks={absent_checks} absent_check_ms={absent_check_ms}"
-            );
+            eprintln!("PTV done absent_checks={absent_checks} absent_check_ms={absent_check_ms}");
         }
         Ok(projection)
     }

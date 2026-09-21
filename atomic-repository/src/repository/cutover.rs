@@ -44,7 +44,9 @@ use atomic_core::pristine::{
 };
 use atomic_core::{Hash, OperationId, WorkingCopyId};
 
-use super::git_observation::{observe_colocated_git_readiness, ColocatedGitForm, ColocatedGitReadiness};
+use super::git_observation::{
+    observe_colocated_git_readiness, ColocatedGitForm, ColocatedGitReadiness,
+};
 use super::operation::{current_operation_timestamp_ms, pristine_error, working_copy_state_ref};
 use super::workspace_txn::read_workspace_checkpoint;
 use super::{OperationVerificationState, Repository, RepositoryCommonLockGuard};
@@ -328,11 +330,8 @@ impl Repository {
         let views = txn.list_views().map_err(pristine_error)?;
         let view_count = views.len();
         let conflicts = txn.snapshot_conflicts().map_err(pristine_error)?.len();
-        let git_sha_rows = txn.list_git_shas().map_err(pristine_error)?.len();
-        let working_copies = txn
-            .list_working_copies()
-            .map_err(pristine_error)?
-            .len();
+        let _git_sha_rows = txn.list_git_shas().map_err(pristine_error)?.len();
+        let working_copies = txn.list_working_copies().map_err(pristine_error)?.len();
         let view_state = txn.get_view(&self.current_view).map_err(pristine_error)?;
         let file_index_rows = match &view_state {
             Some(_) => txn
@@ -350,7 +349,10 @@ impl Repository {
         // Operation payload versions across both head scopes: the journal
         // is append-only and the cutover never rewrites it.
         let mut operation_versions = std::collections::BTreeSet::new();
-        for scope in [OperationScope::Repository, OperationScope::WorkingCopy(working_copy)] {
+        for scope in [
+            OperationScope::Repository,
+            OperationScope::WorkingCopy(working_copy),
+        ] {
             let log = self.operation_log(scope, None, false)?;
             for entry in &log.entries {
                 operation_versions.insert(entry.operation.encoding_version());
@@ -455,7 +457,7 @@ impl Repository {
     /// — never a binding by convention.
     fn binding_census(
         &self,
-        readiness: &ColocatedGitReadiness,
+        _readiness: &ColocatedGitReadiness,
     ) -> Result<Vec<CutoverSchemaAudit>, RepositoryError> {
         let txn = self.pristine.read_txn().map_err(pristine_error)?;
         let git_sha_rows = txn.list_git_shas().map_err(pristine_error)?.len();
@@ -628,18 +630,21 @@ impl Repository {
             .iter()
             .enumerate()
             .map(|(ordinal, hook)| {
-                let path = hook.path.clone().ok_or_else(|| {
-                    RepositoryError::InvalidOperation {
+                let path = hook
+                    .path
+                    .clone()
+                    .ok_or_else(|| RepositoryError::InvalidOperation {
                         message: format!(
                             "the Atomic-owned dispatcher '{}' lives outside the worktree \
                              root; it cannot carry a journaled migration effect",
                             hook.name
                         ),
-                    }
-                })?;
+                    })?;
                 Ok(EffectPlan {
-                    ordinal: u32::try_from(ordinal).map_err(|_| RepositoryError::InvalidOperation {
-                        message: "too many owned dispatchers for one cutover".to_string(),
+                    ordinal: u32::try_from(ordinal).map_err(|_| {
+                        RepositoryError::InvalidOperation {
+                            message: "too many owned dispatchers for one cutover".to_string(),
+                        }
                     })?,
                     target: EffectTarget::FilesystemPath { path },
                     expected_old: EffectValue::File(FileState {
@@ -889,11 +894,10 @@ impl Repository {
         }
         let Some(operation) = owning else {
             return Ok(CutoverFenceProof::Refused {
-                reason: format!(
-                    "bridge cutover refused: the requirement row is durable but no owning \
+                reason: "bridge cutover refused: the requirement row is durable but no owning \
                      Cutover operation exists in the journal; a fence without its owning \
                      operation cannot be resumed through this journal"
-                ),
+                    .to_string(),
             });
         };
         let details = self.operation_details(operation)?;
@@ -1030,7 +1034,7 @@ pub(crate) fn install_cutover_interrupt_before_finalize() {
     CUTOVER_INTERRUPT.with(|slot| slot.set(true));
 }
 
-/// Per-thread flag for [`cutover_interrupt_before_finalize`]. Test-only.
+// Per-thread flag for [`cutover_interrupt_before_finalize`]. Test-only.
 #[cfg(test)]
 thread_local! {
     static CUTOVER_INTERRUPT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };

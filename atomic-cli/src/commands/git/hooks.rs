@@ -25,7 +25,8 @@ use crate::error::{CliError, CliResult};
 use crate::output::{print_info, print_warning};
 
 use atomic_repository::repository::{
-    ATOMIC_DISPATCHER_MARKER as DISPATCHER_MARKER, ATOMIC_LEGACY_MARKER_BEGIN as LEGACY_MARKER_BEGIN,
+    ATOMIC_DISPATCHER_MARKER as DISPATCHER_MARKER,
+    ATOMIC_LEGACY_MARKER_BEGIN as LEGACY_MARKER_BEGIN,
 };
 
 const LEGACY_MARKER_END: &str = "# atomic:git:end";
@@ -200,9 +201,12 @@ pub(crate) fn enable_bridge(root: &Path, mirror_ignores: bool) -> CliResult<()> 
                 hook_path.display()
             )),
             DispatcherInstall::Unmanaged => {
-                let command = format!("{} git bridge {subcommand} || true", shell_quote(&binary).map_err(|error| {
-                    git_error(format!("cannot quote the binary path: {error}"))
-                })?);
+                let command = format!(
+                    "{} git bridge {subcommand} || true",
+                    shell_quote(&binary).map_err(|error| {
+                        git_error(format!("cannot quote the binary path: {error}"))
+                    })?
+                );
                 print_warning(&format!(
                     "existing {hook_name} hook '{}' is not Atomic-owned and was left untouched",
                     hook_path.display()
@@ -313,10 +317,14 @@ exit 0\n"
 /// `reference-transaction`). Stdin is forwarded so Git's evidence lines
 /// reach the journal; every failure stays advisory.
 ///
-/// Git passes the `reference-transaction` state as argv[1] (review blocker
+/// Git passes the `reference-transaction` state as `argv[1]` (review blocker
 /// 5): when `forward_state_arg` is set, `"$1"` is forwarded as the
 /// subcommand's state argument. `post-rewrite` takes no argv.
-fn stdin_dispatcher_script(binary: &Path, subcommand: &str, forward_state_arg: bool) -> io::Result<String> {
+fn stdin_dispatcher_script(
+    binary: &Path,
+    subcommand: &str,
+    forward_state_arg: bool,
+) -> io::Result<String> {
     stdin_dispatcher_script_ext(binary, subcommand, forward_state_arg, false)
 }
 
@@ -333,7 +341,11 @@ fn stdin_dispatcher_script_ext(
 ) -> io::Result<String> {
     let binary = shell_quote(binary)?;
     let state_arg = if forward_state_arg { " \"$1\"" } else { "" };
-    let failure = if propagate_exit { " || exit $?" } else { " || true" };
+    let failure = if propagate_exit {
+        " || exit $?"
+    } else {
+        " || true"
+    };
     Ok(format!(
         "#!/bin/sh\n{DISPATCHER_MARKER}\n\
 {binary} git bridge {subcommand}{state_arg}{failure}\n\
@@ -704,7 +716,7 @@ struct RefTransactionEventEvidence {
     advisory: bool,
     worktree_root: PathBuf,
     interpretation: &'static str,
-    /// The transaction state Git passed as argv[1] (review blocker 5).
+    /// The transaction state Git passed as `argv[1]` (review blocker 5).
     state: String,
     transactions: Vec<RefTransactionEntry>,
 }
@@ -825,18 +837,19 @@ pub(crate) fn run_pre_push_verification_with_input(root: &Path, input: &str) -> 
                 message: format!("cannot open the Git repository for pre-push binding: {e}"),
             })?;
             let policy = super::parallel::conversion_policy(&git)?;
-            let verified_tree = verified.git_tree.as_bytes().iter().map(|byte| format!("{byte:02x}")).collect::<String>();
+            let verified_tree = verified
+                .git_tree
+                .as_bytes()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
             for (local_ref, oid) in &proposed_content_refs {
                 let binds = git2::Oid::from_str(oid)
                     .ok()
                     .and_then(|commit_oid| git.find_commit(commit_oid).ok())
                     .and_then(|commit| {
-                        super::parallel::import_expected_tree_oid(
-                            &git,
-                            commit.tree_id(),
-                            &policy,
-                        )
-                        .ok()
+                        super::parallel::import_expected_tree_oid(&git, commit.tree_id(), &policy)
+                            .ok()
                     })
                     .map(|expected| expected.as_bytes() == verified.git_tree.as_bytes())
                     .unwrap_or(false);
@@ -858,11 +871,9 @@ pub(crate) fn run_pre_push_verification_with_input(root: &Path, input: &str) -> 
         .into_iter()
         .map(|(_seq, hash)| hash)
         .collect();
-    let closure = atomic_repository::repository::provenance_gate::reachable_closure(
-        &repo,
-        &view_changes,
-    )
-    .map_err(CliError::Repository)?;
+    let closure =
+        atomic_repository::repository::provenance_gate::reachable_closure(&repo, &view_changes)
+            .map_err(CliError::Repository)?;
     let provider =
         atomic_repository::repository::provenance_gate::local_session_mac_key_provider(&repo);
     match repo.evaluate_publication_gate(&closure, &gate_config(&repo), Some(&provider)) {
@@ -918,13 +929,16 @@ fn gate_config(
     repo: &atomic_repository::Repository,
 ) -> atomic_repository::repository::provenance_gate::PublicationGateConfig {
     atomic_repository::repository::provenance_gate::PublicationGateConfig::from_repo(repo)
-        .unwrap_or(atomic_repository::repository::provenance_gate::PublicationGateConfig {
-            trust: Default::default(),
-            repository_identity: None,
-        })
+        .unwrap_or(
+            atomic_repository::repository::provenance_gate::PublicationGateConfig {
+                trust: Default::default(),
+                repository_identity: None,
+            },
+        )
 }
 
-pub(crate) fn record_pre_commit(root: &Path) -> CliResult<()> {    let root = canonical_root(root)?;
+pub(crate) fn record_pre_commit(root: &Path) -> CliResult<()> {
+    let root = canonical_root(root)?;
     let sessions_dir = match atomic_repository::Repository::canonical_dot_dir(&root) {
         Ok(dot_dir) => dot_dir.join("sessions"),
         Err(_) => return Ok(()), // not an Atomic repository — nothing to capture
@@ -1074,9 +1088,8 @@ pub(crate) fn record_post_rewrite(root: &Path) -> CliResult<()> {
     // process and proves nothing by itself, so operation-linkage reading
     // authenticates a line only against this capture. Capture failure never
     // breaks Git: the line stays journal-only and reads as unauthenticated.
-    let event_bytes = serde_json::to_vec(&event).map_err(|error| {
-        git_error(format!("cannot encode post-rewrite evidence: {error}"))
-    })?;
+    let event_bytes = serde_json::to_vec(&event)
+        .map_err(|error| git_error(format!("cannot encode post-rewrite evidence: {error}")))?;
     append_journal_record(&root, &event)?;
     capture_event_bytes(&root, &event_bytes)
 }
@@ -1104,7 +1117,7 @@ fn capture_event_bytes(root: &Path, event_bytes: &[u8]) -> CliResult<()> {
 }
 
 /// CB-9B: journal `reference-transaction` evidence from Git's actual wire
-/// format (review blocker 5): the transaction state arrives as argv[1] and
+/// format (review blocker 5): the transaction state arrives as `argv[1]` and
 /// stdin carries `<old-oid> <new-oid> <ref-name>` lines.
 ///
 /// This is authoritative evidence only that a *committed* ref transaction
@@ -1270,9 +1283,7 @@ pub(crate) fn run_bridge_review(root: &Path, view: Option<&str>) -> CliResult<()
                 ));
             }
             atomic_core::change::ChangeOrigin::GitSynthesized {
-                commit,
-                derivation,
-                ..
+                commit, derivation, ..
             } => match derivation {
                 atomic_core::change::GitDerivation::Squash => {
                     squashes += 1;
@@ -1820,19 +1831,18 @@ mod tests {
         let script = dispatcher_script(Path::new("/usr/bin/atomic"), "hook-pre-commit").unwrap();
         assert!(script.starts_with("#!/bin/sh\n# atomic:git-bridge-dispatcher:v1"));
         assert!(script.contains("'/usr/bin/atomic' git bridge hook-pre-commit"));
-        assert!(script.contains("\"$@\" || true"), "capture evidence is advisory");
+        assert!(
+            script.contains("\"$@\" || true"),
+            "capture evidence is advisory"
+        );
         assert!(script.ends_with("exit 0\n"));
     }
 
     #[test]
     fn pre_push_dispatcher_propagates_local_refusals_but_stays_advisory_to_the_guarantee() {
-        let script = stdin_dispatcher_script_ext(
-            Path::new("/usr/bin/atomic"),
-            "hook-pre-push",
-            false,
-            true,
-        )
-        .unwrap();
+        let script =
+            stdin_dispatcher_script_ext(Path::new("/usr/bin/atomic"), "hook-pre-push", false, true)
+                .unwrap();
         assert!(script.contains("'/usr/bin/atomic' git bridge hook-pre-push"));
         assert!(
             script.contains(" || exit $?"),
@@ -1843,9 +1853,13 @@ mod tests {
             "the dispatcher must never start a nested push: {script}"
         );
         // Every other advisory dispatcher stays `|| true`.
-        let advisory =
-            stdin_dispatcher_script_ext(Path::new("/usr/bin/atomic"), "hook-post-rewrite", false, false)
-                .unwrap();
+        let advisory = stdin_dispatcher_script_ext(
+            Path::new("/usr/bin/atomic"),
+            "hook-post-rewrite",
+            false,
+            false,
+        )
+        .unwrap();
         assert!(advisory.contains(" || true"));
         assert!(!advisory.contains(" || exit $?"));
     }
@@ -1910,7 +1924,10 @@ mod tests {
         // bridge-enabled repository.
         let symbolic = "refs/heads/feature refs/heads/main HEAD";
         let entries = reference_transaction_entries(symbolic).expect("symbolic updates skip");
-        assert!(entries.is_empty(), "no OID movement is recorded: {entries:?}");
+        assert!(
+            entries.is_empty(),
+            "no OID movement is recorded: {entries:?}"
+        );
 
         // OID movements (including zero-OID create/delete) stay recorded.
         let zero = "0000000000000000000000000000000000000000";
@@ -2011,7 +2028,10 @@ mod tests {
         // receipt binds to its own event id.
         run_deferred_observation(root.path(), &second.request_path).unwrap();
         let after_second = fs::read(&journal).unwrap();
-        assert!(after_second.starts_with(&base), "the journal stays append-only");
+        assert!(
+            after_second.starts_with(&base),
+            "the journal stays append-only"
+        );
         let text = String::from_utf8(after_second).unwrap();
         let receipts: Vec<&str> = text
             .lines()
@@ -2065,10 +2085,9 @@ mod tests {
 
         // Review R9: attempts are create-only files; the first attempt of a
         // turn lands at turn-1.attempt-1.json.
-        let active_capture =
-            capture::capture_dir(&sessions_dir, "sess-active")
-                .unwrap()
-                .join("turn-1.attempt-1.json");
+        let active_capture = capture::capture_dir(&sessions_dir, "sess-active")
+            .unwrap()
+            .join("turn-1.attempt-1.json");
         assert!(
             active_capture.exists(),
             "an active session must get a commit-time capture at {}",
@@ -2106,7 +2125,10 @@ mod tests {
         fs::create_dir_all(&sessions_dir).unwrap();
         let mut active = AgentSession::new("sess-noop", "claude-code", "Claude Code");
         active.phase = Phase::Active;
-        SessionStore::new(&sessions_dir).unwrap().save(&active).unwrap();
+        SessionStore::new(&sessions_dir)
+            .unwrap()
+            .save(&active)
+            .unwrap();
 
         // No working_copy_id file: the hook must stay advisory and quiet.
         record_pre_commit(root.path()).unwrap();
@@ -2134,7 +2156,6 @@ mod tests {
         // Advisory: capture evidence never blocks a commit.
         assert!(script.contains("|| true"));
     }
-
 }
 
 #[cfg(test)]
@@ -2165,7 +2186,8 @@ mod pre_push_tests {
             .message("managed without evidence")
             .author(atomic_core::change::Author::new("A", Some("a@example.com")))
             .build();
-        let mut change = atomic_core::change::Change::new(header, Vec::new(), Vec::new(), Vec::new());
+        let mut change =
+            atomic_core::change::Change::new(header, Vec::new(), Vec::new(), Vec::new());
         change.hashed.provenance = vec![provenance];
         change.hashed.metadata = SessionEnvelope::builder("sess-pre-push", "test-agent")
             .build()
@@ -2222,8 +2244,11 @@ mod pre_push_tests {
             let working_copy = repo.require_working_copy_id().unwrap();
             repo.desired_view_name(working_copy).unwrap()
         };
-        repo.insert_change(&hash, atomic_repository::InsertOptions::default().view(&view))
-            .unwrap();
+        repo.insert_change(
+            &hash,
+            atomic_repository::InsertOptions::default().view(&view),
+        )
+        .unwrap();
         drop(repo);
 
         // Publication verification needs a Git repository (shadow checks).
@@ -2258,12 +2283,16 @@ mod pre_push_tests {
         // An unmanaged view so the provenance gate is not the blocker; the
         // exact-OID binding is what must refuse.
         let bogus = git2::Oid::from_str("0123456789012345678901234567890123456789").unwrap();
-        let input = format!("refs/heads/main {bogus} refs/heads/main 0000000000000000000000000000000000000000\n");
+        let input = format!(
+            "refs/heads/main {bogus} refs/heads/main 0000000000000000000000000000000000000000\n"
+        );
         let error = run_pre_push_verification_with_input(&root, &input)
             .expect_err("a proposed OID off the verified projection must refuse");
         let text = error.to_string();
         assert!(
-            text.contains("does not carry the verified manifest state") || text.contains("no verified projection") || text.contains("not the verified projection"),
+            text.contains("does not carry the verified manifest state")
+                || text.contains("no verified projection")
+                || text.contains("not the verified projection"),
             "the refusal names the exact-OID binding: {text}"
         );
     }

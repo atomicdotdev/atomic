@@ -145,11 +145,12 @@ pub(super) fn checkpoint_facts_bytes(
             // hex; normalize it to base32 so both encodings lease the same
             // facts.
             let bytes = hex_decode_bytes(digest)?;
-            let bytes: [u8; 32] = bytes.try_into().map_err(|_| {
-                RepositoryError::InvalidRepository {
-                    reason: format!("'{digest}' is neither base32 nor a 32-byte hex digest"),
-                }
-            })?;
+            let bytes: [u8; 32] =
+                bytes
+                    .try_into()
+                    .map_err(|_| RepositoryError::InvalidRepository {
+                        reason: format!("'{digest}' is neither base32 nor a 32-byte hex digest"),
+                    })?;
             normalized.git_index_digest = Some(atomic_core::types::Merkle(bytes).to_base32());
         }
     }
@@ -323,14 +324,15 @@ fn record_map(error: super::RecordError) -> RepositoryError {
 
 /// The conversion policy content key for one capture boundary.
 fn policy_root_for_capture(root: &std::path::Path) -> Result<String, RepositoryError> {
-    let policy = super::conversion_policy_for_git(
-        &git2::Repository::discover(root).map_err(|error| RepositoryError::InvalidRepository {
-            reason: format!("cannot open the Git repository for capture: {error}"),
-        })?,
-    )
-    .map_err(|error| RepositoryError::InvalidOperation {
-        message: format!("cannot compute conversion policy for capture: {error}"),
-    })?;
+    let policy =
+        super::conversion_policy_for_git(&git2::Repository::discover(root).map_err(|error| {
+            RepositoryError::InvalidRepository {
+                reason: format!("cannot open the Git repository for capture: {error}"),
+            }
+        })?)
+        .map_err(|error| RepositoryError::InvalidOperation {
+            message: format!("cannot compute conversion policy for capture: {error}"),
+        })?;
     Ok(policy.root().content_key)
 }
 
@@ -582,26 +584,26 @@ pub(super) fn plan_carried_reassembly_trees<'a>(
     // string and would alias inside this plan (and downstream in shelf
     // effects), so every unsupported path is refused here — before any
     // mutation, lease, or filesystem effect exists.
-        let mut plan = CarriedReassemblyPlan::default();
-        let mut refused: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
-        for tree in [old_manifest, carried_manifest, new_manifest] {
-            for entry in &tree.manifest.entries {
-                if entry.disposition != super::ManifestDisposition::Included {
-                    continue;
-                }
-                if std::str::from_utf8(entry.path.as_bytes()).is_err()
-                    && refused.insert(entry.path.as_bytes().to_vec())
-                {
-                    plan.conflicts.push(CarriedConflict {
-                        path: String::from_utf8_lossy(entry.path.as_bytes()).into_owned(),
-                        reason: "path is not valid UTF-8; raw path identity cannot be preserved \
+    let mut plan = CarriedReassemblyPlan::default();
+    let mut refused: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+    for tree in [old_manifest, carried_manifest, new_manifest] {
+        for entry in &tree.manifest.entries {
+            if entry.disposition != super::ManifestDisposition::Included {
+                continue;
+            }
+            if std::str::from_utf8(entry.path.as_bytes()).is_err()
+                && refused.insert(entry.path.as_bytes().to_vec())
+            {
+                plan.conflicts.push(CarriedConflict {
+                    path: String::from_utf8_lossy(entry.path.as_bytes()).into_owned(),
+                    reason: "path is not valid UTF-8; raw path identity cannot be preserved \
                                  through the reassembly plan, so adoption refuses before any \
                                  mutation"
-                            .to_string(),
-                    });
-                }
+                        .to_string(),
+                });
             }
         }
+    }
     if !plan.conflicts.is_empty() {
         return plan;
     }
@@ -906,8 +908,7 @@ impl Repository {
         let Some(hex) = &evidence.journal_operation else {
             return false;
         };
-        let Some(operation_id) = OperationId::from_base32(hex.as_bytes())
-        else {
+        let Some(operation_id) = OperationId::from_base32(hex.as_bytes()) else {
             return false;
         };
         let operation = match self.load_operation(operation_id) {
@@ -985,7 +986,10 @@ impl Repository {
                 status
                     .entries()
                     .iter()
-                    .map(|entry| (entry.path().display().to_string(), entry.status().short_code()))
+                    .map(|entry| (
+                        entry.path().display().to_string(),
+                        entry.status().short_code()
+                    ))
                     .collect::<Vec<_>>()
             );
         }
@@ -1082,13 +1086,15 @@ impl Repository {
             );
         }
         let snapshot_hash = match snapshot_status.snapshot {
-            Some(existing) if {
-                let covers = self.snapshot_covers_worktree(working_copy, existing);
-                if std::env::var_os("ATOMIC_TRACE_CAPTURE").is_some() {
-                    eprintln!("[capture] covers({existing:?})={covers}");
-                }
-                covers
-            } => {
+            Some(existing)
+                if {
+                    let covers = self.snapshot_covers_worktree(working_copy, existing);
+                    if std::env::var_os("ATOMIC_TRACE_CAPTURE").is_some() {
+                        eprintln!("[capture] covers({existing:?})={covers}");
+                    }
+                    covers
+                } =>
+            {
                 // The active snapshot already covers the current content;
                 // keep it and refresh only the evidence facts.
                 existing
@@ -1396,8 +1402,7 @@ impl Repository {
             return Ok(false);
         };
         let change = self.load_change(&hash)?;
-        let Ok(value) = serde_json::from_slice::<serde_json::Value>(&change.hashed.metadata)
-        else {
+        let Ok(value) = serde_json::from_slice::<serde_json::Value>(&change.hashed.metadata) else {
             return Ok(false);
         };
         let Some(published_head) = value
@@ -1456,7 +1461,7 @@ impl Repository {
                     &super::view_membership(&txn, &view)?,
                 )?;
                 let projection = self.project_tree_for_visibility(&txn, &visibility)?;
-                for (path, _item) in &projection.present {
+                for path in projection.present.keys() {
                     let Some(path) = std::str::from_utf8(path.as_bytes()).ok() else {
                         return Err(RepositoryError::InvalidOperation {
                             message: format!(
@@ -2696,6 +2701,7 @@ impl Repository {
     ///    digest derived at prepare time and re-derived at execute time (a
     ///    moved HEAD or index fails the lease instead of publishing moved
     ///    facts).
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn run_adoption_completion(
         &mut self,
         operation_lock: &WorkingCopyOperationLockGuard,
@@ -2733,7 +2739,7 @@ impl Repository {
             git: Some(before_git),
         };
         let derived = self.derive_workspace_checkpoint(&git, new_view, &new_state)?;
-        let derived_bytes = super::workspace_txn::workspace_checkpoint_bytes(&derived)?;
+        let _derived_bytes = super::workspace_txn::workspace_checkpoint_bytes(&derived)?;
         let after_state = RepoStateRef {
             view: Some(atomic_core::operation::ViewStateRef {
                 name: new_view.to_string(),
@@ -2776,9 +2782,7 @@ impl Repository {
                 },
                 expected_new: EffectValue::Digest {
                     kind: DigestKind::Checkpoint,
-                    hash: atomic_core::Hash::of(
-                        checkpoint_facts_bytes(&derived)?.as_slice(),
-                    ),
+                    hash: atomic_core::Hash::of(checkpoint_facts_bytes(&derived)?.as_slice()),
                 },
             },
         ];
@@ -2831,14 +2835,11 @@ impl Repository {
                             ),
                         }
                     })?;
-                    reference.delete().map_err(|error| {
-                        RepositoryError::InvalidRepository {
-                            reason: format!(
-                                "cannot drop the WIP ref '{}': {error}",
-                                wip.ref_name
-                            ),
-                        }
-                    })?;
+                    reference
+                        .delete()
+                        .map_err(|error| RepositoryError::InvalidRepository {
+                            reason: format!("cannot drop the WIP ref '{}': {error}", wip.ref_name),
+                        })?;
                     EffectValue::Absent
                 } else {
                     observed.clone()
@@ -2895,6 +2896,7 @@ impl From<RepositoryError> for AdoptKnownEditError {
 
 /// The outcome of a dirty bound adoption (§7.3 branches 2–3).
 #[derive(Debug)]
+#[allow(dead_code)] // diagnostic payload; consumers read Debug output today
 pub struct AdoptedEditOutcome {
     pub origin: AdoptionOrigin,
     /// The replacement snapshot, when the carried/unexplained content differs
@@ -2932,6 +2934,7 @@ fn new_state_for_view(
 /// recovery ref it does not own. The reflog retains the drop evidence.
 /// Returns `Ok(true)` when the leased drop executed, `Ok(false)` when the
 /// ref was retained (absent or externally moved).
+#[allow(dead_code)] // kept for upcoming cleanup CLI
 pub(crate) fn drop_wip_ref(
     root: &std::path::Path,
     ref_name: &str,
@@ -3153,10 +3156,7 @@ pub(super) fn checkpoint_git_state(
         },
         None => GitHeadState::Detached { oid },
     };
-    let index = match (
-        &checkpoint.git_index_digest,
-        &checkpoint.git_index_tree,
-    ) {
+    let index = match (&checkpoint.git_index_digest, &checkpoint.git_index_tree) {
         (Some(digest), tree) => {
             let digest = digest_from_evidence_string(digest)?;
             let tree = tree
@@ -3183,9 +3183,11 @@ fn digest_from_evidence_string(value: &str) -> Result<atomic_core::types::Merkle
         return Ok(hash);
     }
     let bytes = hex_decode_bytes(value)?;
-    let bytes: [u8; 32] = bytes.try_into().map_err(|_| RepositoryError::InvalidRepository {
-        reason: format!("'{value}' is neither base32 nor a 32-byte hex digest"),
-    })?;
+    let bytes: [u8; 32] = bytes
+        .try_into()
+        .map_err(|_| RepositoryError::InvalidRepository {
+            reason: format!("'{value}' is neither base32 nor a 32-byte hex digest"),
+        })?;
     Ok(atomic_core::types::Merkle(bytes))
 }
 
@@ -3207,7 +3209,7 @@ fn git_object_id_from_hex(hex: &str) -> Result<GitObjectId, RepositoryError> {
 }
 
 fn hex_decode_bytes(hex: &str) -> Result<Vec<u8>, RepositoryError> {
-    if hex.len() % 2 != 0 || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+    if !hex.len().is_multiple_of(2) || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return Err(RepositoryError::InvalidRepository {
             reason: format!("'{hex}' is not a hex Git object id"),
         });
@@ -3215,16 +3217,18 @@ fn hex_decode_bytes(hex: &str) -> Result<Vec<u8>, RepositoryError> {
     let mut bytes = Vec::with_capacity(hex.len() / 2);
     let byte_values = hex.as_bytes();
     for pair in byte_values.chunks(2) {
-        let high = (pair[0] as char).to_digit(16).ok_or_else(|| {
-            RepositoryError::InvalidRepository {
-                reason: format!("'{hex}' is not a hex Git object id"),
-            }
-        })?;
-        let low = (pair[1] as char).to_digit(16).ok_or_else(|| {
-            RepositoryError::InvalidRepository {
-                reason: format!("'{hex}' is not a hex Git object id"),
-            }
-        })?;
+        let high =
+            (pair[0] as char)
+                .to_digit(16)
+                .ok_or_else(|| RepositoryError::InvalidRepository {
+                    reason: format!("'{hex}' is not a hex Git object id"),
+                })?;
+        let low =
+            (pair[1] as char)
+                .to_digit(16)
+                .ok_or_else(|| RepositoryError::InvalidRepository {
+                    reason: format!("'{hex}' is not a hex Git object id"),
+                })?;
         bytes.push(((high << 4) | low) as u8);
     }
     Ok(bytes)
@@ -3333,9 +3337,7 @@ fn walk_unexplained_worktree(
 /// walker uses. The scanner never descends into these paths, whether the
 /// submodule owns a `.git` gitfile, an embedded `.git` directory, or no
 /// on-disk marker at all (uninitialized submodule).
-fn manifest_gitlink_paths(
-    trees: &[&super::ProjectTree],
-) -> std::collections::BTreeSet<String> {
+fn manifest_gitlink_paths(trees: &[&super::ProjectTree]) -> std::collections::BTreeSet<String> {
     trees
         .iter()
         .flat_map(|tree| tree.manifest.entries.iter())
@@ -3364,7 +3366,9 @@ mod tests {
             git_head: format!("{:040}", 0),
             git_tree: format!("{:040}", 1),
             git_index_tree: None,
-            git_index_digest: Some("BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB".to_string()),
+            git_index_digest: Some(
+                "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB".to_string(),
+            ),
             git_index_path: Some(".git/index".to_string()),
             policy_root: "p".to_string(),
             created_at_ms: 1,
@@ -3404,7 +3408,9 @@ mod tests {
             .unwrap()
             .get_effect_receipts(operation_id)
             .unwrap();
-        assert!(super::super::operation::has_operation_verified_receipt(&receipts));
+        assert!(super::super::operation::has_operation_verified_receipt(
+            &receipts
+        ));
     }
 
     #[test]
@@ -3440,12 +3446,12 @@ mod tests {
 
     // ── R1: carried-deletion reassembly semantics ─────────────────────────
 
-    use atomic_core::operation::GitHashAlgorithm;
-    use atomic_core::types::SetId;
     use crate::repository::{
         ConversionPolicy, GitTree, ManifestDisposition, ProjectTree, RepoPath, RepositoryEntry,
         RepositoryManifest,
     };
+    use atomic_core::operation::GitHashAlgorithm;
+    use atomic_core::types::SetId;
 
     fn plan_entry(path: &[u8], bytes: &[u8]) -> RepositoryEntry {
         RepositoryEntry::new(
@@ -3468,11 +3474,8 @@ mod tests {
             manifest,
             git: GitTree {
                 algorithm: GitHashAlgorithm::Sha1,
-                root: atomic_core::operation::GitObjectId::new(
-                    GitHashAlgorithm::Sha1,
-                    vec![0; 20],
-                )
-                .unwrap(),
+                root: atomic_core::operation::GitObjectId::new(GitHashAlgorithm::Sha1, vec![0; 20])
+                    .unwrap(),
                 objects: Default::default(),
             },
         }
@@ -3502,7 +3505,9 @@ mod tests {
         let new = plan_tree(vec![plan_entry(b"f.txt", b"v2\n")]);
         let plan = plan_carried_reassembly_trees(&old, &carried, &new);
         assert!(!plan.is_separable(), "delete/modify must refuse");
-        assert!(plan.conflicts[0].reason.contains("without losing either version"));
+        assert!(plan.conflicts[0]
+            .reason
+            .contains("without losing either version"));
     }
 
     #[test]
@@ -3540,9 +3545,14 @@ mod tests {
         let new = plan_tree(vec![plan_entry(b"kept.txt", b"kept\n")]);
         let plan = plan_carried_reassembly_trees(&old, &carried, &new);
         assert!(plan.is_separable(), "{:?}", plan.conflicts);
-        assert_eq!(planned(&plan, "gone.txt"), Some(&CarriedEntry::AlreadyCurrent));
+        assert_eq!(
+            planned(&plan, "gone.txt"),
+            Some(&CarriedEntry::AlreadyCurrent)
+        );
         match planned(&plan, "kept.txt") {
-            Some(CarriedEntry::Write { repository_bytes, .. }) => {
+            Some(CarriedEntry::Write {
+                repository_bytes, ..
+            }) => {
                 assert_eq!(repository_bytes, b"kept\ncarried\n");
             }
             other => panic!("expected carried write for kept.txt, got {other:?}"),
@@ -3579,9 +3589,10 @@ mod tests {
             plan.entries
         );
         assert_eq!(plan.conflicts.len(), 2, "{:?}", plan.conflicts);
-        assert!(plan.conflicts.iter().all(|conflict| {
-            conflict.reason.contains("not valid UTF-8")
-        }));
+        assert!(plan
+            .conflicts
+            .iter()
+            .all(|conflict| { conflict.reason.contains("not valid UTF-8") }));
     }
 
     // ── R3: the WIP drop lease ────────────────────────────────────────────
@@ -3639,7 +3650,10 @@ mod tests {
         assert_ne!(foreign, original);
         run(&["update-ref", ref_name, &foreign]);
         let dropped = drop_wip_ref(root.path(), ref_name, &original).unwrap();
-        assert!(!dropped, "a moved ref must not be deleted under a stale lease");
+        assert!(
+            !dropped,
+            "a moved ref must not be deleted under a stale lease"
+        );
         assert_eq!(run(&["rev-parse", ref_name]), foreign);
 
         // The leased drop deletes only the exact captured OID.
@@ -3764,7 +3778,9 @@ mod tests {
             "R7: symlinked directories must not be recursed: {unexplained:?}"
         );
         assert!(
-            !unexplained.iter().any(|path| path.starts_with("loop-dir/up/")),
+            !unexplained
+                .iter()
+                .any(|path| path.starts_with("loop-dir/up/")),
             "R7: a symlink must never be recursed (loop or not): {unexplained:?}"
         );
         assert_eq!(
@@ -3808,8 +3824,8 @@ mod tests {
 
         // Without the known entry the gitlink itself is unexplained — but its
         // INTERNALS still are not reported.
-        let unexplained = walk_scan(root, root, &BTreeSet::new(), &BTreeSet::new(), None)
-            .expect("walk");
+        let unexplained =
+            walk_scan(root, root, &BTreeSet::new(), &BTreeSet::new(), None).expect("walk");
         assert!(
             unexplained.iter().any(|path| path == "sub"),
             "an unknown gitlink is itself unexplained: {unexplained:?}"
@@ -3846,8 +3862,8 @@ mod tests {
 
         // Unknown variant: the directory itself is unexplained, its
         // internals still are not.
-        let unexplained = walk_scan(root, root, &BTreeSet::new(), &BTreeSet::new(), None)
-            .expect("walk");
+        let unexplained =
+            walk_scan(root, root, &BTreeSet::new(), &BTreeSet::new(), None).expect("walk");
         assert!(
             unexplained.iter().any(|path| path == "sub"),
             "an unknown embedded repository is itself unexplained: {unexplained:?}"
@@ -3867,7 +3883,11 @@ mod tests {
         // `.git`-marker probe would treat it as an ordinary directory and
         // scan (and misattribute) its contents.
         std::fs::create_dir_all(root.join("sub")).unwrap();
-        std::fs::write(root.join("sub/inner.txt"), b"uninitialized submodule bytes\n").unwrap();
+        std::fs::write(
+            root.join("sub/inner.txt"),
+            b"uninitialized submodule bytes\n",
+        )
+        .unwrap();
 
         let known: BTreeSet<String> = ["sub".to_string()].into();
         let gitlinks: BTreeSet<String> = ["sub".to_string()].into();
@@ -3881,8 +3901,8 @@ mod tests {
         // Sanity: an unknown ordinary directory (no marker, not a declared
         // gitlink) is still scanned — the R7 unknown-directory coverage is
         // preserved.
-        let unexplained = walk_scan(root, root, &BTreeSet::new(), &BTreeSet::new(), None)
-            .expect("walk");
+        let unexplained =
+            walk_scan(root, root, &BTreeSet::new(), &BTreeSet::new(), None).expect("walk");
         assert!(
             unexplained.iter().any(|path| path == "sub/inner.txt"),
             "an unknown ordinary directory is still scanned: {unexplained:?}"

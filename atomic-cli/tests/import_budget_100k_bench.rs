@@ -145,10 +145,7 @@ fn print_environment(corpus_root: &Path) {
         );
     }
     if let Ok(output) = Command::new("git").arg("--version").output() {
-        println!(
-            "git: {}",
-            String::from_utf8_lossy(&output.stdout).trim()
-        );
+        println!("git: {}", String::from_utf8_lossy(&output.stdout).trim());
     }
     if let Ok(release) = fs::read_to_string("/proc/sys/kernel/osrelease") {
         println!("kernel: {}", release.trim());
@@ -167,7 +164,9 @@ fn make_corpus(root: &Path, dirs: usize, files_per_dir: usize, tag: &str) {
         for file in 0..files_per_dir {
             fs::write(
                 dir_path.join(format!("file-{file:05}.txt")),
-                format!("{tag} content for dir-{dir:04} file-{file:05} — measured-budget corpus row\n"),
+                format!(
+                    "{tag} content for dir-{dir:04} file-{file:05} — measured-budget corpus row\n"
+                ),
             )
             .expect("write corpus file");
         }
@@ -182,9 +181,7 @@ fn change_count(root: &Path) -> usize {
                 .filter_map(|d| fs::read_dir(d.path()).ok())
                 .flatten()
                 .filter_map(|f| f.ok())
-                .filter(|f| {
-                    f.path().extension().map(|x| x == "change").unwrap_or(false)
-                })
+                .filter(|f| f.path().extension().map(|x| x == "change").unwrap_or(false))
                 .count()
         })
         .unwrap_or(0)
@@ -216,12 +213,18 @@ fn measured_100k_import_budgets_real_filesystem() {
 
     // Cold: the first import builds the full change store from nothing.
     let (cold_s, cold_out) = timed_atomic(root, home, &["git", "import", "--no-vault"]);
-    assert!(cold_out.status.success(), "cold import failed:\n{cold_out:?}");
+    assert!(
+        cold_out.status.success(),
+        "cold import failed:\n{cold_out:?}"
+    );
     println!("COLD_IMPORT_S {cold_s:.3}");
 
     // Warm: re-import with no working-copy or Git change.
     let (warm_s, warm_out) = timed_atomic(root, home, &["git", "import", "--no-vault"]);
-    assert!(warm_out.status.success(), "warm import failed:\n{warm_out:?}");
+    assert!(
+        warm_out.status.success(),
+        "warm import failed:\n{warm_out:?}"
+    );
     println!("WARM_IMPORT_S {warm_s:.3}");
 
     // Incremental (scan tier): edit a small set, commit, re-import with
@@ -241,8 +244,11 @@ fn measured_100k_import_budgets_real_filesystem() {
     }
     git_ok(root, &["add", "-A"]);
     git_ok(root, &["commit", "-qm", "incremental edits v2"]);
-    let (incremental_s, incremental_out) =
-        timed_atomic(root, home, &["git", "import", "--no-vault", "--incremental"]);
+    let (incremental_s, incremental_out) = timed_atomic(
+        root,
+        home,
+        &["git", "import", "--no-vault", "--incremental"],
+    );
     assert!(
         incremental_out.status.success(),
         "incremental import failed:\n{incremental_out:?}"
@@ -359,10 +365,16 @@ impl EquivFixture {
     /// The external Git transition both fixtures run (deterministic dates
     /// make the commit OIDs identical across the two repositories).
     fn external_commit(&self) {
-        fs::write(self.root().join("dir-0000").join("file-00000.txt"), "EXTERNAL EDIT v2\n")
-            .expect("external edit");
+        fs::write(
+            self.root().join("dir-0000").join("file-00000.txt"),
+            "EXTERNAL EDIT v2\n",
+        )
+        .expect("external edit");
         git_ok(self.root(), &["add", "-A"]);
-        git_ok(self.root(), &["commit", "-qm", "external equivalence commit"]);
+        git_ok(
+            self.root(),
+            &["commit", "-qm", "external equivalence commit"],
+        );
     }
 
     /// The logical state identity (mirrors the CB-13D harness): the
@@ -370,9 +382,8 @@ impl EquivFixture {
     /// binding refs normalized to their class, the base32-normalized
     /// verify output, the worktree byte snapshot, and the change count.
     fn equivalence_identity(&self) -> String {
-        let checkpoint =
-            fs::read_to_string(self.root().join(".atomic/bridge/workspace.json"))
-                .expect("checkpoint");
+        let checkpoint = fs::read_to_string(self.root().join(".atomic/bridge/workspace.json"))
+            .expect("checkpoint");
         let mut identity = String::new();
         for line in checkpoint.lines() {
             let trimmed = line.trim();
@@ -395,7 +406,10 @@ impl EquivFixture {
             }
         }
         let refs = {
-            let output = git(self.root(), &["for-each-ref", "--format=%(refname) %(objectname)"]);
+            let output = git(
+                self.root(),
+                &["for-each-ref", "--format=%(refname) %(objectname)"],
+            );
             assert!(
                 output.status.success(),
                 "for-each-ref failed: {}",
@@ -548,10 +562,7 @@ fn measured_watcher_off_equivalence_real_cli() {
 
     // Path B: watcher on (scan tier) — one reactive daemon pass.
     let (on_s, on_out) = timed_atomic(on.root(), on.home(), &["git", "bridge", "watch", "--once"]);
-    assert!(
-        on_out.status.success(),
-        "watch-on pass failed:\n{on_out:?}"
-    );
+    assert!(on_out.status.success(), "watch-on pass failed:\n{on_out:?}");
     println!("WATCH_ON_ONCE_S {on_s:.3}");
 
     // Identical logical state, byte-for-byte on every identity field.

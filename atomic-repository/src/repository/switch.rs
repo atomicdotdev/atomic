@@ -1488,7 +1488,7 @@ impl Repository {
             .collect()
     }
 
-        pub(super) fn collect_ignored_paths_in_workspace(&self, root: &Path) -> Vec<String> {
+    pub(super) fn collect_ignored_paths_in_workspace(&self, root: &Path) -> Vec<String> {
         // R4/CB-7B: the worktree's own ignore rules — but when the rules
         // file itself was shelved into a view workspace (it is an ignored
         // path like any other), the shelved artifacts must stay discoverable

@@ -519,7 +519,7 @@ where
     // branches (the proven shape every plain-file modify uses), and the
     // final content fidelity is identical.
     if super::globalize::should_use_opaque_generated_vertices(&detected.path)
-        && existing_branches.map_or(true, |branches| branches.is_empty())
+        && existing_branches.is_none_or(|branches| branches.is_empty())
     {
         let mut replace_hunk = BuiltHunk::new_replace_with_lines(
             Local::new(&detected.path, 1),

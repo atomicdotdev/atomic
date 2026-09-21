@@ -55,10 +55,7 @@ pub fn binding_tree_entries(
     binding: &super::codec::GitStateBinding,
     summary: Option<&super::summary::SignedAttestationSummary>,
 ) -> Result<Vec<(&'static str, Vec<u8>)>, BindingTreeError> {
-    let mut entries = vec![(
-        BINDING_BLOB_NAME,
-        binding.encode(),
-    )];
+    let mut entries = vec![(BINDING_BLOB_NAME, binding.encode())];
     if let Some(summary) = summary {
         entries.push((ATTESTATION_SUMMARY_BLOB_NAME, summary.encode()));
     }
@@ -81,9 +78,9 @@ pub fn binding_pack_records(
             ObjectFamily::Change => {}
             family => {
                 return Err(BindingTreeError::Encode(format!(
-                    "binding pack refused {family:?} object {key}: only V3 change files may enter Git",
-                    key = record.key
-                )))
+                "binding pack refused {family:?} object {key}: only V3 change files may enter Git",
+                key = record.key
+            )))
             }
         }
         if Hash::of(&record.bytes).to_hex() != record.key {
@@ -102,9 +99,7 @@ pub fn binding_pack_records(
 /// self-check; the identity check against the projection commit's
 /// `atomic-conflict <hash>` header happens wherever both the header and the
 /// pack are known (projection, fetch, restore).
-pub fn conflicts_pack_self_validates(
-    bytes: &[u8],
-) -> Result<atomic_core::Hash, ConflictPackError> {
+pub fn conflicts_pack_self_validates(bytes: &[u8]) -> Result<atomic_core::Hash, ConflictPackError> {
     use crate::repository::ConflictSetObject;
     let object = ConflictSetObject::decode(bytes)
         .map_err(|error| ConflictPackError::Decode(error.to_string()))?;
@@ -169,7 +164,11 @@ mod tests {
 
         for family in [provenance, attest, view] {
             let refused = binding_pack_records(std::slice::from_ref(&family));
-            assert!(refused.is_err(), "{:?} must not enter a binding pack", family.family);
+            assert!(
+                refused.is_err(),
+                "{:?} must not enter a binding pack",
+                family.family
+            );
         }
     }
 

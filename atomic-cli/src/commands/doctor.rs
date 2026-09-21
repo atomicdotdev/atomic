@@ -1,7 +1,7 @@
 //! Repository diagnostic and repair commands.
 
-use atomic_repository::CrdtMaterializeOptions;
 use atomic_core::WorkingCopyId;
+use atomic_repository::CrdtMaterializeOptions;
 use clap::{Args, Subcommand};
 
 use crate::commands::{
@@ -172,7 +172,9 @@ impl Command for UndoPathClaimsRepair {
                 print_warning(&format!(
                     "The path-claims undo refused (third-value rejection or failure): {error}"
                 ));
-                print_hint("The live table was not overwritten. Inspect with 'atomic doctor check' first.");
+                print_hint(
+                    "The live table was not overwritten. Inspect with 'atomic doctor check' first.",
+                );
                 return Err(crate::error::CliError::Repository(error));
             }
         }
@@ -208,8 +210,7 @@ impl Command for RepairTreeBijection {
         } else {
             print_success(&format!(
                 "TREE/REV_TREE bijection repaired ({} rows written); journaled as operation {:?}",
-                outcome.rows_written,
-                outcome.operation
+                outcome.rows_written, outcome.operation
             ));
         }
         Ok(())
@@ -323,13 +324,12 @@ impl Command for Check {
 
 impl Command for ReconcileWorkingCopy {
     fn run(&self) -> CliResult<()> {
-        let working_copy: WorkingCopyId =
-            self.working_copy.trim().parse().map_err(|error| {
-                CliError::Internal(anyhow::anyhow!(
-                    "invalid --working-copy '{}': {error}",
-                    self.working_copy
-                ))
-            })?;
+        let working_copy: WorkingCopyId = self.working_copy.trim().parse().map_err(|error| {
+            CliError::Internal(anyhow::anyhow!(
+                "invalid --working-copy '{}': {error}",
+                self.working_copy
+            ))
+        })?;
 
         if self.dry_run {
             let repo = require_repository_readonly(None)?;
@@ -370,9 +370,7 @@ impl Command for ReconcileWorkingCopy {
             .map_err(CliError::Repository)?
         {
             atomic_repository::WorkingCopyReconcileOutcome::AlreadyReconciled { .. } => {
-                print_success(
-                    "Registration already matches the target view; nothing was written.",
-                );
+                print_success("Registration already matches the target view; nothing was written.");
             }
             atomic_repository::WorkingCopyReconcileOutcome::Reconciled {
                 operation,
@@ -421,7 +419,9 @@ fn print_diagnosis(diagnosis: &atomic_repository::WorkingCopyRegistrationDiagnos
         diagnosis.target_view_state,
     ));
     if diagnosis.desired_view_is_stale {
-        print_warning("The recorded desired state no longer matches its view (stale registration).");
+        print_warning(
+            "The recorded desired state no longer matches its view (stale registration).",
+        );
     }
 }
 
@@ -494,9 +494,9 @@ impl Command for RepairPathClaims {
             }
         };
         if outcome.already_healthy {
-            print_success(&format!(
-                "Path-claim index is already consistent (0 rows written; derived rows verified)."
-            ));
+            print_success(
+                "Path-claim index is already consistent (0 rows written; derived rows verified).",
+            );
         } else {
             print_success(&format!(
                 "Repaired the path-claim index; wrote {} missing rows atomically (existing rows verified byte-exact){}.",

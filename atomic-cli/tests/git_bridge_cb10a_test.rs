@@ -74,10 +74,14 @@ impl Colocated {
     fn new(name: &str) -> Self {
         let root = TempDir::new().expect("repo tempdir");
         let home = TempDir::new().expect("home tempdir");
-        assert!(git(root.path(), &["init", "-q", "-b", "main"]).status.success());
+        assert!(git(root.path(), &["init", "-q", "-b", "main"])
+            .status
+            .success());
         fs::write(root.path().join("tracked.txt"), b"anchor me\n").expect("write file");
         assert!(git(root.path(), &["add", "tracked.txt"]).status.success());
-        assert!(git(root.path(), &["commit", "-qm", "anchor base"]).status.success());
+        assert!(git(root.path(), &["commit", "-qm", "anchor base"])
+            .status
+            .success());
         atomic_ok(root.path(), home.path(), &["init", "--no-vault"]);
         fs::remove_file(root.path().join(".atomicignore")).expect("remove atomicignore");
         atomic_ok(root.path(), home.path(), &["git", "import", "--no-vault"]);
@@ -140,6 +144,7 @@ impl Colocated {
             .and_then(|reference| reference.target())
     }
 
+    #[allow(dead_code)]
     fn status_text(&self) -> String {
         self.atomic(&["git", "bridge", "status"])
     }
@@ -184,7 +189,14 @@ fn commit_file(repository: &GitRepository, path: &str, content: &[u8], message: 
         .and_then(|oid| repository.find_commit(oid).ok());
     match parent.as_ref() {
         Some(parent) => repository
-            .commit(Some("HEAD"), &signature, &signature, message, &tree, &[parent])
+            .commit(
+                Some("HEAD"),
+                &signature,
+                &signature,
+                message,
+                &tree,
+                &[parent],
+            )
             .expect("commit with parent"),
         None => repository
             .commit(Some("HEAD"), &signature, &signature, message, &tree, &[])
@@ -249,7 +261,12 @@ fn git_only_movement_imports_and_refreshes_the_mapping() {
 
     // Git-only movement: a plain user commit on the mapped branch.
     let repository = GitRepository::open(fixture.root()).expect("git repo");
-    let moved = commit_file(&repository, "tracked.txt", b"git moved\n", "git-side commit");
+    let moved = commit_file(
+        &repository,
+        "tracked.txt",
+        b"git moved\n",
+        "git-side commit",
+    );
     drop(repository);
 
     // Reconcile imports the Git movement.
@@ -335,7 +352,12 @@ fn incompatible_both_moved_persists_diverged_and_moves_neither_side() {
     fixture.atomic(&["add", "atomic-only.txt"]);
     fixture.atomic(&["record", "-m", "divergent atomic change"]);
     let repository = GitRepository::open(fixture.root()).expect("git repo");
-    let git_moved = commit_file(&repository, "tracked.txt", b"git diverged\n", "divergent git commit");
+    let git_moved = commit_file(
+        &repository,
+        "tracked.txt",
+        b"git diverged\n",
+        "divergent git commit",
+    );
     drop(repository);
 
     let atomic_state_before = view_merkle(&fixture);
@@ -381,7 +403,12 @@ fn equal_trees_with_different_closures_still_reconcile_as_diverged() {
     fs::write(fixture.root().join("tracked.txt"), b"atomic moved\n").expect("write");
     fixture.atomic(&["record", "-m", "atomic reaches same tree"]);
     let repository = GitRepository::open(fixture.root()).expect("git repo");
-    let git_moved = commit_file(&repository, "tracked.txt", b"atomic moved\n", "git reaches same tree");
+    let git_moved = commit_file(
+        &repository,
+        "tracked.txt",
+        b"atomic moved\n",
+        "git reaches same tree",
+    );
     drop(repository);
 
     let failure = fixture.atomic_fails(&["git", "bridge", "reconcile"]);
@@ -419,14 +446,23 @@ fn draft_publication_is_explicit_and_routes_through_the_mapping() {
     fixture.atomic(&["add", "feature.txt"]);
     fixture.atomic(&["record", "-m", "draft change"]);
 
-    let draft_ref = fixture.tip("refs/atomic/views/feature-auth").expect("draft ref");
+    let draft_ref = fixture
+        .tip("refs/atomic/views/feature-auth")
+        .expect("draft ref");
     assert!(
         fixture.tip("refs/heads/feature-auth").is_none(),
         "drafts never publish implicitly"
     );
 
     // Explicit publication creates the branch at the projection commit.
-    fixture.atomic(&["git", "bridge", "publish", "feature-auth", "--branch", "published"]);
+    fixture.atomic(&[
+        "git",
+        "bridge",
+        "publish",
+        "feature-auth",
+        "--branch",
+        "published",
+    ]);
     assert_eq!(fixture.tip("refs/heads/published"), Some(draft_ref));
     assert!(
         fixture.tip("refs/atomic/views/feature-auth").is_some(),
@@ -447,7 +483,10 @@ fn draft_publication_is_explicit_and_routes_through_the_mapping() {
     fixture.atomic(&["add", "feature.txt"]);
     fixture.atomic(&["record", "-m", "second draft change"]);
     let advanced = fixture.tip("refs/heads/published").expect("published tip");
-    assert_ne!(advanced, draft_ref, "published branch must track draft work");
+    assert_ne!(
+        advanced, draft_ref,
+        "published branch must track draft work"
+    );
     let status = fixture.atomic(&["git", "bridge", "status"]);
     assert!(status.contains("synchronized"), "{status}");
     assert!(
@@ -567,7 +606,6 @@ fn journaled_mapping_writes_are_leased_and_idempotent() {
     );
 }
 
-
 #[test]
 fn detached_draft_head_reconciles_through_the_mapping() {
     let fixture = Colocated::new("detached");
@@ -629,7 +667,10 @@ fn the_mapping_lives_in_the_shared_pristine_not_working_copy_storage() {
         .get_ref_mapping("main")
         .expect("read")
         .expect("mapping row");
-    assert_eq!(stored.last_observed_local.as_deref(), Some("fedcba9876543210fedcba9876543210fedcba98"));
+    assert_eq!(
+        stored.last_observed_local.as_deref(),
+        Some("fedcba9876543210fedcba9876543210fedcba98")
+    );
     drop(reopened);
     let _ = fixture.atomic(&["git", "bridge", "status"]);
 }
@@ -644,7 +685,12 @@ fn both_moved_incompatible_after_import_and_record_persists_diverged() {
     // neither side.
     let fixture = Colocated::new("both-moved");
     let repository = GitRepository::open(fixture.root()).expect("git repo");
-    let imported = commit_file(&repository, "tracked.txt", b"imported work\n", "to be imported");
+    let _imported = commit_file(
+        &repository,
+        "tracked.txt",
+        b"imported work\n",
+        "to be imported",
+    );
     drop(repository);
     fixture.atomic(&["git", "bridge", "reconcile"]);
 
@@ -657,7 +703,12 @@ fn both_moved_incompatible_after_import_and_record_persists_diverged() {
 
     // Git moves again with a commit that is never imported (no closure).
     let repository = GitRepository::open(fixture.root()).expect("git repo");
-    let git_moved = commit_file(&repository, "tracked.txt", b"git diverged\n", "divergent git commit");
+    let git_moved = commit_file(
+        &repository,
+        "tracked.txt",
+        b"git diverged\n",
+        "divergent git commit",
+    );
     drop(repository);
 
     let failure = fixture.atomic_fails(&["git", "bridge", "reconcile"]);
@@ -671,8 +722,6 @@ fn both_moved_incompatible_after_import_and_record_persists_diverged() {
     assert!(status.contains("diverged"), "{status}");
 }
 
-#[test]
-
 /// CB-13C F3: the reconcile divergence branch PERSISTS the divergence
 /// status before its terminal event, so the honest outcome is `failed`
 /// — `Refused` would promise before-any-mutation falsely. Pinned against
@@ -681,7 +730,12 @@ fn both_moved_incompatible_after_import_and_record_persists_diverged() {
 fn diverged_reconcile_emits_failed_not_refused_after_persisting_status() {
     let fixture = Colocated::new("both-moved-f3");
     let repository = GitRepository::open(fixture.root()).expect("git repo");
-    let _ = commit_file(&repository, "tracked.txt", b"imported work\n", "to be imported");
+    let _ = commit_file(
+        &repository,
+        "tracked.txt",
+        b"imported work\n",
+        "to be imported",
+    );
     drop(repository);
     fixture.atomic(&["git", "bridge", "reconcile"]);
 
@@ -691,7 +745,12 @@ fn diverged_reconcile_emits_failed_not_refused_after_persisting_status() {
     fixture.atomic(&["record", "-m", "divergent atomic change"]);
 
     let repository = GitRepository::open(fixture.root()).expect("git repo");
-    let _ = commit_file(&repository, "tracked.txt", b"git diverged\n", "divergent git commit");
+    let _ = commit_file(
+        &repository,
+        "tracked.txt",
+        b"git diverged\n",
+        "divergent git commit",
+    );
     drop(repository);
 
     let failure = fixture.atomic_fails(&["git", "bridge", "reconcile"]);
@@ -704,8 +763,7 @@ fn diverged_reconcile_emits_failed_not_refused_after_persisting_status() {
         .expect("the journal exists");
     let last_reconcile = journal
         .lines()
-        .filter(|line| line.contains("\"event\":\"reconcile\""))
-        .last()
+        .rfind(|line| line.contains("\"event\":\"reconcile\""))
         .expect("a reconcile event was journaled");
     let value: serde_json::Value = serde_json::from_str(last_reconcile).unwrap();
     assert_eq!(
@@ -720,6 +778,7 @@ fn diverged_reconcile_emits_failed_not_refused_after_persisting_status() {
     );
 }
 
+#[allow(dead_code)]
 fn stale_bookkeeping_heals_but_an_unreachable_baseline_fails_closed() {
     // Two honest stale-row semantics (CB-10A review R2/R4):
     //
@@ -735,7 +794,7 @@ fn stale_bookkeeping_heals_but_an_unreachable_baseline_fails_closed() {
     // observed ref tip stays real: the verified pair is aligned, so the
     // reconcile is a healing no-op.
     let repo = atomic_repository::Repository::open(fixture.root()).expect("open repository");
-    let working_copy = repo.require_working_copy_id().expect("working copy");
+    let _working_copy = repo.require_working_copy_id().expect("working copy");
     let main_tip = fixture.tip("refs/heads/main").expect("main tip");
     {
         use atomic_core::pristine::{MutTxnT, RefMappingMutTxnT, ViewTxnT};
@@ -746,7 +805,8 @@ fn stale_bookkeeping_heals_but_an_unreachable_baseline_fails_closed() {
             .expect("read")
             .expect("mapping")
             .clone();
-        stale.last_observed_atomic = Some("BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB".to_string());
+        stale.last_observed_atomic =
+            Some("BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB".to_string());
         stale.last_exported = None;
         stale.last_exported_state = None;
         txn.put_ref_mapping_bytes(view.id, &stale.encode().expect("encode"))
@@ -837,7 +897,9 @@ fn forged_atomic_state_header_cannot_authorize_import() {
     index
         .add_path(Path::new("tracked.txt"))
         .expect("stage tracked");
-    index.add_path(Path::new("atomic.txt")).expect("stage atomic");
+    index
+        .add_path(Path::new("atomic.txt"))
+        .expect("stage atomic");
     index.write().expect("write index");
     drop(index);
     drop(repository);
@@ -905,7 +967,9 @@ fn publish_refuses_an_occupied_target_branch() {
     fs::write(fixture.root().join("feature.txt"), b"draft work\n").expect("write");
     fixture.atomic(&["add", "feature.txt"]);
     fixture.atomic(&["record", "-m", "draft change"]);
-    let draft_ref = fixture.tip("refs/atomic/views/feature-occupied").expect("draft ref");
+    let draft_ref = fixture
+        .tip("refs/atomic/views/feature-occupied")
+        .expect("draft ref");
 
     // The target branch already exists.
     fixture.git(&["branch", "occupied"]);
@@ -949,7 +1013,9 @@ fn publish_refuses_during_a_git_sequence_operation_then_succeeds_clean() {
     fs::write(fixture.root().join("feature.txt"), b"draft work\n").expect("write");
     fixture.atomic(&["add", "feature.txt"]);
     fixture.atomic(&["record", "-m", "draft change"]);
-    let draft_ref = fixture.tip("refs/atomic/views/feature-seq").expect("draft ref");
+    let draft_ref = fixture
+        .tip("refs/atomic/views/feature-seq")
+        .expect("draft ref");
 
     // A merge in progress (MERGE_HEAD present) refuses publication.
     fs::write(
@@ -976,7 +1042,14 @@ fn publish_refuses_during_a_git_sequence_operation_then_succeeds_clean() {
     fs::remove_file(fixture.root().join(".git/MERGE_HEAD")).expect("clear MERGE_HEAD");
 
     // With the marker cleared, publication proceeds create-only.
-    fixture.atomic(&["git", "bridge", "publish", "feature-seq", "--branch", "published"]);
+    fixture.atomic(&[
+        "git",
+        "bridge",
+        "publish",
+        "feature-seq",
+        "--branch",
+        "published",
+    ]);
     assert_eq!(fixture.tip("refs/heads/published"), Some(draft_ref));
 }
 
@@ -993,7 +1066,9 @@ fn detached_mapped_ref_movement_is_not_falsely_synchronized() {
     fs::write(fixture.root().join("topic.txt"), b"topic work\n").expect("write");
     fixture.atomic(&["add", "topic.txt"]);
     fixture.atomic(&["record", "-m", "topic change"]);
-    let projection = fixture.tip("refs/atomic/views/topic").expect("draft projection");
+    let projection = fixture
+        .tip("refs/atomic/views/topic")
+        .expect("draft projection");
     fixture.atomic(&["git", "bridge", "publish", "topic", "--branch", "published"]);
     assert_eq!(fixture.tip("refs/heads/published"), Some(projection));
 
@@ -1110,7 +1185,14 @@ fn stale_draft_ref_source_is_refused_by_publish() {
 
     // Publication refuses: the candidate commit is not the verified
     // projection commit, and NOTHING is written.
-    let output = fixture.atomic_output(&["git", "bridge", "publish", "topic", "--branch", "stale-published"]);
+    let output = fixture.atomic_output(&[
+        "git",
+        "bridge",
+        "publish",
+        "topic",
+        "--branch",
+        "stale-published",
+    ]);
     assert!(
         !output.status.success(),
         "the stale-source publication must refuse"
@@ -1153,7 +1235,10 @@ fn expected_absent_baseline_creation_refuses_after_a_concurrent_write() {
 
     // A observes absence on a view that has no mapping row yet.
     let observed_by_a = repo.get_ref_mapping("secondary").expect("read");
-    assert!(observed_by_a.is_none(), "the fresh view has no mapping row yet");
+    assert!(
+        observed_by_a.is_none(),
+        "the fresh view has no mapping row yet"
+    );
 
     // B writes the row (the concurrent winner).
     let baseline = {
@@ -1238,7 +1323,6 @@ fn crash_before_the_ref_write_leaves_no_branch_and_a_recoverable_intent() {
         GitHashAlgorithm, GitObjectId, GitRefTarget, MetadataTarget, MetadataTransition,
         MetadataValue,
     };
-    use atomic_core::types::Base32;
 
     let fixture = Colocated::new("crash-a");
     let tip: Oid = fixture.tip("refs/heads/main").expect("main tip");
@@ -1268,8 +1352,7 @@ fn crash_before_the_ref_write_leaves_no_branch_and_a_recoverable_intent() {
                 "refs/heads/never-created",
                 None,
                 GitRefTarget::Direct(
-                    GitObjectId::new(GitHashAlgorithm::Sha1, tip.as_bytes().to_vec())
-                        .expect("oid"),
+                    GitObjectId::new(GitHashAlgorithm::Sha1, tip.as_bytes().to_vec()).expect("oid"),
                 ),
                 atomic_core::Hash::of(b"crash-window-a"),
                 vec![intent],
@@ -1420,31 +1503,32 @@ fn linked_worktree_shares_the_mapping_and_stale_writes_refuse() {
         }
     }
     let _cleanup = CleanupWorktree(linked_root.clone());
-    assert!(linked_root.join(".git").exists(), "the linked worktree exists");
+    assert!(
+        linked_root.join(".git").exists(),
+        "the linked worktree exists"
+    );
     fs::remove_file(linked_root.join(".atomicignore")).ok();
 
     // The linked worktree's atomic directory points at the common pristine:
     // its mapping writes land in the SHARED row.
     {
         let repo = atomic_repository::Repository::open(&linked_root).expect("open the worktree");
-        let working_copy = repo.require_working_copy_id().expect("worktree working copy");
+        let working_copy = repo
+            .require_working_copy_id()
+            .expect("worktree working copy");
         let mapping = repo
             .get_ref_mapping("main")
             .expect("read the shared row from the worktree")
             .expect("the shared baseline row is visible from the linked worktree");
         let mut advanced = mapping.clone();
-        advanced.last_observed_local =
-            Some("1234123412341234123412341234123412341234".to_string());
+        advanced.last_observed_local = Some("1234123412341234123412341234123412341234".to_string());
         repo.set_ref_mapping(working_copy, "main", Some(advanced))
             .expect("write through the linked worktree");
     }
 
     // A second worktree handle observes the shared row...
     let repo = atomic_repository::Repository::open(fixture.root()).expect("reopen main");
-    let stored = repo
-        .get_ref_mapping("main")
-        .expect("read")
-        .expect("row");
+    let stored = repo.get_ref_mapping("main").expect("read").expect("row");
     assert_eq!(
         stored.last_observed_local.as_deref(),
         Some("1234123412341234123412341234123412341234"),

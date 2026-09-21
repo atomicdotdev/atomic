@@ -47,7 +47,7 @@ impl SyntheticFilesystem {
         let index = Self::index(path);
         let changed = self.metadata_changed == Some(index);
         ObservedFile {
-            native_path: PathBuf::from(path.to_native().unwrap()),
+            native_path: path.to_native().unwrap(),
             device: Some(7),
             inode: Some(index as u64 + 1),
             mtime: Some(FileIndexTimestamp {

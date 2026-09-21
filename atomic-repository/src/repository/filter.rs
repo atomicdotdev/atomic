@@ -118,8 +118,7 @@ pub(crate) fn assembly_visibility_excluding<T: ViewTxnT>(
             .iter_changes(&member_view, 0)
             .map_err(|e| RepositoryError::Database(e.to_string()))?
         {
-            let (_, change_id, _) =
-                entry.map_err(|e| RepositoryError::Database(e.to_string()))?;
+            let (_, change_id, _) = entry.map_err(|e| RepositoryError::Database(e.to_string()))?;
             if !excluded_ids.contains(&change_id) {
                 kept.push(change_id);
             }

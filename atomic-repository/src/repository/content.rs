@@ -113,14 +113,11 @@ impl Repository {
     ) -> Result<bool, RepositoryError>
     where
         T: atomic_core::pristine::GraphTxnT
-            + atomic_core::pristine::InodeGraphOps<
-                InodeError = atomic_core::pristine::PristineError,
-            >
+            + atomic_core::pristine::InodeGraphOps<InodeError = atomic_core::pristine::PristineError>
             + atomic_core::pristine::TreeTxnT,
     {
-        let options =
-            atomic_core::output::alive::RetrieveOptions::new()
-                .with_graph_visibility(visibility.clone());
+        let options = atomic_core::output::alive::RetrieveOptions::new()
+            .with_graph_visibility(visibility.clone());
         match try_retrieve_linear_content_with_filter(
             txn,
             &self.change_store,
@@ -394,8 +391,7 @@ impl Repository {
             .ok_or_else(|| RepositoryError::ViewNotFound {
                 name: view_name.to_string(),
             })?;
-        let visibility =
-            super::filter::assembly_visibility_excluding(&txn, &view, excluded)?;
+        let visibility = super::filter::assembly_visibility_excluding(&txn, &view, excluded)?;
         let projection = self.project_tree_for_visibility(&txn, &visibility)?;
         if projection.name_conflicts.contains_key(&normalized) {
             return Err(RepositoryError::InvalidOperation {
@@ -416,8 +412,7 @@ impl Repository {
             &self.change_store,
             item.inode,
             item.position,
-            atomic_core::output::alive::RetrieveOptions::new()
-                .with_graph_visibility(visibility),
+            atomic_core::output::alive::RetrieveOptions::new().with_graph_visibility(visibility),
         )
         .map_err(|error| RepositoryError::Database(error.to_string()))?;
         Ok(Some(bytes))
@@ -448,8 +443,7 @@ impl Repository {
             .ok_or_else(|| RepositoryError::ViewNotFound {
                 name: view_name.to_string(),
             })?;
-        let visibility =
-            super::filter::assembly_visibility_excluding(&txn, &view, excluded)?;
+        let visibility = super::filter::assembly_visibility_excluding(&txn, &view, excluded)?;
         let projection = self.project_tree_for_visibility(&txn, &visibility)?;
         if projection.name_conflicts.contains_key(&normalized) {
             return Err(RepositoryError::InvalidOperation {
@@ -917,7 +911,8 @@ impl Repository {
     }
 }
 
-pub(crate) fn retrieve_content_with_filter_fast<T, C>(    txn: &T,
+pub(crate) fn retrieve_content_with_filter_fast<T, C>(
+    txn: &T,
     changes: &C,
     inode: Inode,
     position: Position<NodeId>,
@@ -991,10 +986,16 @@ where
         // unscoped walk is orders of magnitude slower. `InodeScopedGraph`
         // falls back to the global lookup per call when the inode index is
         // not populated, so the result is unchanged.
-        Ok(scoped) => atomic_core::record::workflow::retrieve::
-            retrieve_content_with_filter_and_fork_info(&scoped, changes, position, options),
-        Err(_) => atomic_core::record::workflow::retrieve::
-            retrieve_content_with_filter_and_fork_info(txn, changes, position, options),
+        Ok(scoped) => {
+            atomic_core::record::workflow::retrieve::retrieve_content_with_filter_and_fork_info(
+                &scoped, changes, position, options,
+            )
+        }
+        Err(_) => {
+            atomic_core::record::workflow::retrieve::retrieve_content_with_filter_and_fork_info(
+                txn, changes, position, options,
+            )
+        }
     };
     if debug_retrieve && retrieve_start.elapsed().as_millis() > 200 {
         eprintln!(
@@ -1169,29 +1170,18 @@ where
             return Err(atomic_core::pristine::PristineError::InvalidVertex {
                 message: format!(
                     "content span {}..{} for {} is inverted in change {}",
-                    start,
-                    end,
-                    node,
-                    hash
+                    start, end, node, hash
                 ),
             }
             .into());
         }
         let mut span = vec![0u8; end - start];
         let copied = changes
-            .get_contents(
-                |id| txn.get_external(id).ok().flatten(),
-                node,
-                &mut span,
-            )
+            .get_contents(|id| txn.get_external(id).ok().flatten(), node, &mut span)
             .map_err(|error| {
                 atomic_core::record::RecordError::Io(std::io::Error::other(format!(
                     "content span {}..{} for {} exceeds change {} content length: {}",
-                    start,
-                    end,
-                    node,
-                    hash,
-                    error
+                    start, end, node, hash, error
                 )))
             })?;
         if copied != end - start {

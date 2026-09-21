@@ -4,14 +4,11 @@
 //! dependencies, frontiers, semantic identities, membership order, Merkle
 //! state, SetId, persisted conflicts — never merely matching text.
 
-use std::collections::HashMap;
 use std::fs;
-use std::path::PathBuf;
 
-use atomic_core::change::Change;
 use atomic_core::operation::{GitHashAlgorithm, GitObjectId};
-use atomic_core::types::OperationId;
 use atomic_core::pristine::ViewTxnT;
+use atomic_core::types::OperationId;
 use atomic_core::types::{Base32, Hash, Merkle, SetId};
 
 use crate::git_binding::{
@@ -21,7 +18,7 @@ use crate::git_binding::{
 use crate::record::RecordOptions;
 use crate::repository::project_tree::ConversionPolicy;
 use crate::repository::synthesis::git_oid_hex;
-use crate::{ExactResurrection, GitShaResolution, Repository};
+use crate::{GitShaResolution, Repository};
 
 use super::*;
 
@@ -90,6 +87,7 @@ fn bind_projection_to_commit(
 }
 
 /// Assemble a signed binding payload from explicit identity facts.
+#[allow(clippy::too_many_arguments)]
 fn signed_binding(
     seed: u8,
     git_object_format: GitObjectFormat,
@@ -214,7 +212,10 @@ impl Target {
         // The bound commit projects from the PUBLISHER: the target's graph is
         // still empty; resurrection applies the closure in isolation.
         let policy = ConversionPolicy::new(GitHashAlgorithm::Sha1);
-        let project = publisher.repo.project_tree(&publisher.view, &policy).unwrap();
+        let project = publisher
+            .repo
+            .project_tree(&publisher.view, &policy)
+            .unwrap();
         let (commit, raw) = bind_projection_to_commit(&git, &project);
         Self {
             repo,
@@ -339,14 +340,23 @@ fn fresh_repository_restores_the_exact_squashed_closure_from_a_binding() {
         .resurrect_binding_exact(&target.git, &binding, target.view(), None)
         .unwrap();
 
-    assert_eq!(outcome.inserted, publisher.ordered, "inserted in binding order");
+    assert_eq!(
+        outcome.inserted, publisher.ordered,
+        "inserted in binding order"
+    );
     assert!(outcome.already_present.is_empty());
     assert_eq!(outcome.provenance_roots, vec![Hash::of(b"provenance-root")]);
-    assert_eq!(outcome.attestation_roots, vec![Hash::of(b"attestation-root")]);
+    assert_eq!(
+        outcome.attestation_roots,
+        vec![Hash::of(b"attestation-root")]
+    );
     assert_eq!(outcome.proof.bound_tree, outcome.proof.projected_tree);
     assert_eq!(outcome.proof.merkle_state, publisher.merkle);
     assert!(outcome.operation.is_some(), "publication is journaled");
-    assert!(!outcome.provenance_trusted, "unknown test signer stays untrusted");
+    assert!(
+        !outcome.provenance_trusted,
+        "unknown test signer stays untrusted"
+    );
     assert_exact_restoration(&target.repo, target.view(), &publisher);
 
     // Deep equality survives close/reopen.
@@ -448,7 +458,10 @@ fn alternate_valid_merkle_orders_restore_their_own_order() {
     assert_eq!(outcome.inserted, reordered);
     let identity = target.repo.view_identity(target.view()).unwrap();
     assert_eq!(identity.merkle, state);
-    assert_eq!(identity.set_id, publisher.set_id, "SetId is order-invariant");
+    assert_eq!(
+        identity.set_id, publisher.set_id,
+        "SetId is order-invariant"
+    );
 }
 
 #[test]
@@ -570,7 +583,8 @@ fn projection_mismatch_is_rejected_without_publishing_anything() {
     let wrong_tree_oid = builder.write().unwrap();
     let wrong_tree = target.git.find_tree(wrong_tree_oid).unwrap();
     let signature = git2::Signature::now("Publisher", "pub@example.com").unwrap();
-    let commit = target.git
+    let commit = target
+        .git
         .commit(
             Some("refs/heads/main"),
             &signature,
@@ -581,7 +595,14 @@ fn projection_mismatch_is_rejected_without_publishing_anything() {
         )
         .unwrap();
     target.git.set_head("refs/heads/main").unwrap();
-    let raw = target.git.odb().unwrap().read(commit).unwrap().data().to_vec();
+    let raw = target
+        .git
+        .odb()
+        .unwrap()
+        .read(commit)
+        .unwrap()
+        .data()
+        .to_vec();
 
     let binding = signed_binding(
         0x46,
@@ -619,7 +640,10 @@ fn projection_mismatch_is_rejected_without_publishing_anything() {
     );
     drop(txn);
     for hash in &publisher.ordered {
-        assert!(target.repo.has_change(hash), "the retry cache keeps changes");
+        assert!(
+            target.repo.has_change(hash),
+            "the retry cache keeps changes"
+        );
     }
     let worktree: Vec<_> = fs::read_dir(destination.path())
         .unwrap()
@@ -634,20 +658,23 @@ fn projection_mismatch_is_rejected_without_publishing_anything() {
 
     // The rejection is recoverable evidence: the operation journal shows a
     // Recover child, not a half-applied head.
-    assert!(matches!(
-        target
-            .repo
-            .operation_log(
-                atomic_core::operation::OperationScope::WorkingCopy(
-                    target.repo.require_working_copy_id().unwrap()
-                ),
-                Some(1),
-                false,
-            )
-            .unwrap()
-            .head_state,
-        crate::OperationHeadState::Single(_)
-    ), "the aborted attempt was recovered (no diverged head)");
+    assert!(
+        matches!(
+            target
+                .repo
+                .operation_log(
+                    atomic_core::operation::OperationScope::WorkingCopy(
+                        target.repo.require_working_copy_id().unwrap()
+                    ),
+                    Some(1),
+                    false,
+                )
+                .unwrap()
+                .head_state,
+            crate::OperationHeadState::Single(_)
+        ),
+        "the aborted attempt was recovered (no diverged head)"
+    );
 }
 
 #[test]
@@ -784,7 +811,10 @@ fn an_incomplete_closure_is_an_explicit_refusal() {
         .resurrect_binding_exact(&target.git, &binding, target.view(), None)
         .unwrap_err();
     assert!(
-        matches!(error, crate::RepositoryError::BindingClosureIncomplete { .. }),
+        matches!(
+            error,
+            crate::RepositoryError::BindingClosureIncomplete { .. }
+        ),
         "expected an explicit incomplete-closure refusal, got: {error}"
     );
     let identity = target.repo.view_identity(target.view()).unwrap();
@@ -805,7 +835,8 @@ fn persisted_conflicts_are_restored_exactly() {
     let working_copy = repo.require_working_copy_id().unwrap();
 
     fs::write(&file, "line1\nline2\nline3\n").unwrap();
-    repo.add(working_copy, "f.txt", TrackingOptions::default()).unwrap();
+    repo.add(working_copy, "f.txt", TrackingOptions::default())
+        .unwrap();
     repo.record_with_message(
         working_copy,
         "base",
@@ -835,7 +866,8 @@ fn persisted_conflicts_are_restored_exactly() {
     // Join the competing change into dev: a genuine persisted conflict.
     repo.insert_from_view(crate::apply::CrossViewInsertOptions::new("feature", &dev))
         .unwrap();
-    repo.materialize(repo.require_working_copy_id().unwrap()).unwrap();
+    repo.materialize(repo.require_working_copy_id().unwrap())
+        .unwrap();
 
     let publisher_conflicts = {
         let txn = repo.pristine.read_txn().unwrap();
@@ -906,7 +938,7 @@ fn persisted_conflicts_are_restored_exactly() {
             .find_tree(git2::Oid::from_bytes(project.git.root.as_bytes()).unwrap())
             .unwrap();
         let signature = git2::Signature::now("Publisher", "pub@example.com").unwrap();
-        let target_commit = target_git
+        let _target_commit = target_git
             .commit(
                 Some("refs/heads/main"),
                 &signature,
@@ -941,10 +973,7 @@ fn persisted_conflicts_are_restored_exactly() {
         .unwrap();
     let restored_conflicts = {
         let txn = target_repo.pristine.read_txn().unwrap();
-        let view_state = txn
-            .get_view(target_repo.current_view())
-            .unwrap()
-            .unwrap();
+        let view_state = txn.get_view(target_repo.current_view()).unwrap().unwrap();
         txn.iter_conflicts(view_state.id).unwrap().len()
     };
     assert_eq!(
@@ -978,7 +1007,9 @@ fn the_checked_sha_cache_never_outruns_a_verified_binding() {
     // Cold cache: the binding is found and verified.
     let cold = target.repo.resolve_git_sha(&target.git, &commit).unwrap();
     match &cold {
-        GitShaResolution::VerifiedBinding { index_candidate, .. } => {
+        GitShaResolution::VerifiedBinding {
+            index_candidate, ..
+        } => {
             assert!(!index_candidate, "cold lookup has no index tie");
         }
         other => panic!("expected a verified binding, got {other:?}"),
@@ -990,16 +1021,17 @@ fn the_checked_sha_cache_never_outruns_a_verified_binding() {
     {
         use atomic_core::pristine::GitShaIndexMutTxnT;
         let mut txn = target.repo.pristine.write_txn().unwrap();
-        let change_id = txn
-            .register_change(&publisher.ordered[0])
-            .unwrap();
+        let change_id = txn.register_change(&publisher.ordered[0]).unwrap();
         txn.put_git_sha(&sha, change_id).unwrap();
         txn.commit().unwrap();
     }
     let warm = target.repo.resolve_git_sha(&target.git, &commit).unwrap();
     match (&cold, &warm) {
         (
-            GitShaResolution::VerifiedBinding { binding: cold_binding, .. },
+            GitShaResolution::VerifiedBinding {
+                binding: cold_binding,
+                ..
+            },
             GitShaResolution::VerifiedBinding {
                 binding: warm_binding,
                 index_candidate,
@@ -1050,7 +1082,7 @@ fn missing_stale_and_malicious_index_rows_are_dropped_like_a_cold_cache() {
     repo.index_git_sha(&forged_sha, &recorded_hash).unwrap();
 
     // Missing/stale: a row whose change is no longer registered at all.
-    use atomic_core::pristine::{GitShaIndexMutTxnT, GitShaIndexTxnT};
+    use atomic_core::pristine::GitShaIndexMutTxnT;
     let ghost_sha = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee".to_string();
     {
         let mut txn = repo.pristine.write_txn().unwrap();
@@ -1128,6 +1160,7 @@ fn a_forged_binding_is_refused_and_never_blessed() {
     assert_eq!(identity.merkle, Merkle::ZERO);
 }
 
+#[allow(dead_code)]
 fn hex_of_bytes(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }

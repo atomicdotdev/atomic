@@ -93,9 +93,9 @@ pub(crate) fn journal_and_move_branch(
     // ref lock, and a symbolic ref (or any moved target) fails the
     // transaction instead of being observed-then-set.
     {
-        let mut transaction = git
-            .transaction()
-            .map_err(|error| git_error(format!("cannot start a Git reference transaction: {error}")))?;
+        let mut transaction = git.transaction().map_err(|error| {
+            git_error(format!("cannot start a Git reference transaction: {error}"))
+        })?;
         transaction.lock_ref(target_ref).map_err(|error| {
             git_error(format!(
                 "cannot lock '{target_ref}' for the transaction: {error}"
@@ -312,9 +312,11 @@ pub(crate) fn journal_and_create_branch_cas_with_mapping(
             evidence,
             vec![mapping_intent],
         )
-        .map_err(|error| git_error(format!(
-            "cannot journal '{target_ref}' (with its mapping intent) before writing: {error}"
-        )))?;
+        .map_err(|error| {
+            git_error(format!(
+                "cannot journal '{target_ref}' (with its mapping intent) before writing: {error}"
+            ))
+        })?;
 
     let mut transaction = git
         .transaction()
@@ -496,7 +498,7 @@ pub enum BridgeCommand {
     HookPreCommit,
     /// Internal callback used only by the Atomic-owned reference-transaction
     /// dispatcher: journals ref movement evidence only. Git passes the
-    /// transaction state as argv[1] (review blocker 5) and the
+    /// transaction state as `argv[1]` (review blocker 5) and the
     /// `<old> <new> <ref>` lines on stdin.
     #[command(hide = true)]
     HookReferenceTransaction {
@@ -777,8 +779,8 @@ pub(crate) fn bridge_config(root: &Path) -> CliResult<atomic_config::RepoConfig>
 /// caller's observed consent state is the lease, so a concurrent consent
 /// change refuses instead of being overwritten.
 fn record_bridge_opt_in(root: &Path, enabled: bool) -> CliResult<bool> {
-    let observed = bridge_config(&root)?.git.bridge.enabled;
-    let repo = Repository::open(&root).map_err(CliError::from)?;
+    let observed = bridge_config(root)?.git.bridge.enabled;
+    let repo = Repository::open(root).map_err(CliError::from)?;
     repo.set_bridge_consent(enabled, Some(observed))
         .map_err(CliError::from)
 }
@@ -818,9 +820,7 @@ fn run_cutover(rollback: bool) -> CliResult<()> {
                 .unwrap_or_default()
         ));
     } else if outcome.already_fenced {
-        print_info(
-            "The repository is already cut over to the colocated bridge; nothing to do.",
-        );
+        print_info("The repository is already cut over to the colocated bridge; nothing to do.");
     } else {
         print_success(&format!(
             "Cutover {} journaled and verified: the colocated bridge now owns writes and \
@@ -878,7 +878,6 @@ pub(crate) type WatchNoticeSink<'s> = dyn Fn(WatchNoticeKind, &str) + 's;
 /// boundary, observation, classification, and import code — but never
 /// exports and never materializes: an export-classified run is refused
 /// with a journal event and a session notice instead of moving refs.
-
 /// CB-13D ::24 R4: the suppression attribution marker — the JOURNAL
 /// OperationId of the just-completed bridge operation and the working-copy
 /// heads it advanced, so watcher self-event matching binds observed changes
@@ -890,7 +889,11 @@ pub(crate) fn record_last_bridge_operation(root: &Path) {
         let repo = Repository::open_readonly(root).map_err(CliError::from)?;
         let working_copy = repo.require_working_copy_id().map_err(CliError::from)?;
         let log = repo
-            .operation_log(atomic_core::operation::OperationScope::WorkingCopy(working_copy), Some(1), true)
+            .operation_log(
+                atomic_core::operation::OperationScope::WorkingCopy(working_copy),
+                Some(1),
+                true,
+            )
             .map_err(CliError::from)?;
         let head = match &log.head_state {
             atomic_repository::repository::OperationHeadState::Single(id) => id.to_string(),
@@ -917,7 +920,6 @@ pub(crate) fn record_last_bridge_operation(root: &Path) {
         log::warn!("bridge watch: could not record the suppression attribution: {error}");
     }
 }
-
 
 pub(crate) fn reconcile_transaction_budgeted(
     root: &Path,
@@ -1042,7 +1044,11 @@ pub(crate) fn reconcile_transaction_budgeted(
             super::ref_mapping::ensure_baseline_mapping(&repo, working_copy, &git, &current.view)?;
         let decision =
             super::ref_mapping::classify_mapping_direction(&repo, &git, &current.view, &mapping)?;
-        Ok((current, direction, Some((mapping, decision, baseline_journaled))))
+        Ok((
+            current,
+            direction,
+            Some((mapping, decision, baseline_journaled)),
+        ))
     })() {
         Ok(observation) => observation,
         Err(error) => {
@@ -1062,18 +1068,18 @@ pub(crate) fn reconcile_transaction_budgeted(
         Some((_, _, journaled)) => *journaled,
         None => false,
     };
-    let refused_after_observation = |direction: ReconcileDirectionCode,
-                                     refusal_class: RefusalClass| {
-        journal.emit_lossy(BridgeEventKind::Reconcile {
-            direction,
-            outcome: if baseline_journaled {
-                EventOutcome::Failed
-            } else {
-                EventOutcome::Refused
-            },
-            refusal_class: Some(refusal_class),
-        });
-    };
+    let refused_after_observation =
+        |direction: ReconcileDirectionCode, refusal_class: RefusalClass| {
+            journal.emit_lossy(BridgeEventKind::Reconcile {
+                direction,
+                outcome: if baseline_journaled {
+                    EventOutcome::Failed
+                } else {
+                    EventOutcome::Refused
+                },
+                refusal_class: Some(refusal_class),
+            });
+        };
 
     // CB-10A: the persisted ref mapping decides the three-way ref
     // reconciliation (RFC §8.5).
@@ -1186,8 +1192,7 @@ pub(crate) fn reconcile_transaction_budgeted(
             // that IS the verified HEAD commit may be bound as the exported
             // state; anything else keeps the previous export binding.
             {
-                let repo =
-                    Repository::open_with_budget(root, budget).map_err(CliError::from)?;
+                let repo = Repository::open_with_budget(root, budget).map_err(CliError::from)?;
                 let working_copy = repo.require_working_copy_id().map_err(CliError::from)?;
                 let git = open_git(root)?;
                 let verified_export = match &mapping_outcome {
@@ -1291,8 +1296,8 @@ pub(crate) fn reconcile_transaction_budgeted(
                 // lease and the snapshot verified HEAD; record the fresh
                 // Synchronized observation bound to that exact verified tip.
                 {
-                    let repo = Repository::open_with_budget(root, budget)
-                        .map_err(CliError::from)?;
+                    let repo =
+                        Repository::open_with_budget(root, budget).map_err(CliError::from)?;
                     let working_copy = repo.require_working_copy_id().map_err(CliError::from)?;
                     let git = open_git(root)?;
                     super::ref_mapping::refresh_mapping_observation(
@@ -1470,14 +1475,15 @@ fn switch_transaction(root: &Path, target: &str) -> CliResult<()> {
     Ok(())
 }
 
-
 /// The projection commit's committer signature: Git config first, then the
 /// repository's configured default author, then the system identity. The
 /// projection commits are DERIVED artifacts of Atomic's verified state —
 /// with no Git config (a fresh machine or an isolated test HOME) they must
 /// not refuse; they commit as the system rather than fabricating user
 /// attribution (review CB-9C hermeticity).
-pub(crate) fn projection_signature(git: &GitRepository) -> Result<git2::Signature<'static>, CliError> {
+pub(crate) fn projection_signature(
+    git: &GitRepository,
+) -> Result<git2::Signature<'static>, CliError> {
     if let Ok(signature) = git.signature() {
         return Ok(signature);
     }
@@ -2137,14 +2143,12 @@ fn operation_layer_verdict(
         .pristine()
         .read_txn()
         .and_then(|txn| {
-            atomic_core::pristine::WorkingCopyTxnT::list_working_copies(&txn)
-                .map(|records| {
-                    records
-                        .into_iter()
-                        .map(|record| OperationScope::WorkingCopy(record.id))
-                        .collect::<Vec<_>>()
-                })
-                .map_err(atomic_core::pristine::PristineError::from)
+            atomic_core::pristine::WorkingCopyTxnT::list_working_copies(&txn).map(|records| {
+                records
+                    .into_iter()
+                    .map(|record| OperationScope::WorkingCopy(record.id))
+                    .collect::<Vec<_>>()
+            })
         })
         .unwrap_or_default();
     for scope in all_scopes {
@@ -3136,70 +3140,72 @@ fn git_error(message: impl Into<String>) -> CliError {
 
 #[cfg(test)]
 mod tests {
-#[cfg(test)]
-fn record_last_bridge_operation_probe(root: &std::path::Path) -> CliResult<()> {
-    // The marker writer is best-effort (returns ()). For the regression we
-    // verify the WRITE against a real repository: the marker must appear.
-    record_last_bridge_operation(root);
-    let marker = Repository::canonical_dot_dir(root)
-        .map_err(CliError::from)?
-        .join("bridge/suppressed-operation.json");
-    if marker.exists() {
-        Ok(())
-    } else {
-        Err(git_error("the suppression attribution marker was not written"))
+    #[cfg(test)]
+    fn record_last_bridge_operation_probe(root: &std::path::Path) -> CliResult<()> {
+        // The marker writer is best-effort (returns ()). For the regression we
+        // verify the WRITE against a real repository: the marker must appear.
+        record_last_bridge_operation(root);
+        let marker = Repository::canonical_dot_dir(root)
+            .map_err(CliError::from)?
+            .join("bridge/suppressed-operation.json");
+        if marker.exists() {
+            Ok(())
+        } else {
+            Err(git_error(
+                "the suppression attribution marker was not written",
+            ))
+        }
     }
-}
 
-/// CB-13D ::24 AC-4 regression: a reconciled pass records the JOURNAL
-/// OperationId of its just-completed operation (plus the working-copy
-/// heads) in the suppression attribution marker — never an invocation or
-/// pid label. Failing before (no marker existed), passing after.
-#[test]
-fn reconciled_pass_attributes_its_journal_operation_for_suppression() {
-    let directory = TestDirectory::new();
-    let root = directory.0.clone();
-    let mut repo = Repository::init_with_view(&root, "main").unwrap();
-    let working_copy = repo.require_working_copy_id().unwrap();
-    // A journaled metadata operation (the ref-mapping lease) gives the
-    // attribution a real just-completed journal head.
-    repo.set_ref_mapping(
-        working_copy,
-        "main",
-        Some(atomic_core::pristine::RefMapping {
-            version: atomic_core::pristine::REF_MAPPING_VERSION,
-            view_id: {
-                let txn = repo.pristine().read_txn().unwrap();
-                txn.get_view("main").unwrap().unwrap().id
-            },
-            view_name: "main".to_string(),
-            scope: 1,
-            local_ref: Some("refs/heads/main".to_string()),
-            remote: None,
-            last_observed_local: None,
-            last_observed_remote: None,
-            last_exported: None,
-            last_exported_state: None,
-            last_observed_atomic: None,
-            status: atomic_core::pristine::RefSyncStatus::Synchronized,
-        }),
-    )
-    .unwrap();
-    drop(repo);
-    assert!(record_last_bridge_operation_probe(&root).is_ok());
+    /// CB-13D ::24 AC-4 regression: a reconciled pass records the JOURNAL
+    /// OperationId of its just-completed operation (plus the working-copy
+    /// heads) in the suppression attribution marker — never an invocation or
+    /// pid label. Failing before (no marker existed), passing after.
+    #[test]
+    fn reconciled_pass_attributes_its_journal_operation_for_suppression() {
+        let directory = TestDirectory::new();
+        let root = directory.0.clone();
+        let mut repo = Repository::init_with_view(&root, "main").unwrap();
+        let working_copy = repo.require_working_copy_id().unwrap();
+        // A journaled metadata operation (the ref-mapping lease) gives the
+        // attribution a real just-completed journal head.
+        repo.set_ref_mapping(
+            working_copy,
+            "main",
+            Some(atomic_core::pristine::RefMapping {
+                version: atomic_core::pristine::REF_MAPPING_VERSION,
+                view_id: {
+                    let txn = repo.pristine().read_txn().unwrap();
+                    txn.get_view("main").unwrap().unwrap().id
+                },
+                view_name: "main".to_string(),
+                scope: 1,
+                local_ref: Some("refs/heads/main".to_string()),
+                remote: None,
+                last_observed_local: None,
+                last_observed_remote: None,
+                last_exported: None,
+                last_exported_state: None,
+                last_observed_atomic: None,
+                status: atomic_core::pristine::RefSyncStatus::Synchronized,
+            }),
+        )
+        .unwrap();
+        drop(repo);
+        assert!(record_last_bridge_operation_probe(&root).is_ok());
 
-    let marker = root.join(".atomic/bridge/suppressed-operation.json");
-    let bytes = std::fs::read_to_string(&marker).expect("the attribution marker exists");
-    let value: serde_json::Value = serde_json::from_str(&bytes).unwrap();
-    let operation_id = value
-        .get("operation_id")
-        .and_then(|id| id.as_str())
-        .expect("the marker carries the journal OperationId");
-    assert!(
-        operation_id.len() >= 32 && operation_id.bytes().all(|b| b.is_ascii_alphanumeric()),
-        "the attribution is a journal OperationId, not a pid/label: {operation_id}"
-    );
-}
+        let marker = root.join(".atomic/bridge/suppressed-operation.json");
+        let bytes = std::fs::read_to_string(&marker).expect("the attribution marker exists");
+        let value: serde_json::Value = serde_json::from_str(&bytes).unwrap();
+        let operation_id = value
+            .get("operation_id")
+            .and_then(|id| id.as_str())
+            .expect("the marker carries the journal OperationId");
+        assert!(
+            operation_id.len() >= 32 && operation_id.bytes().all(|b| b.is_ascii_alphanumeric()),
+            "the attribution is a journal OperationId, not a pid/label: {operation_id}"
+        );
+    }
 
     use super::*;
     use git2::Signature;

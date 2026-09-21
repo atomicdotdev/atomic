@@ -1,7 +1,7 @@
 //! Shared CB-5B/CB-5C entry adapter for working-copy command boundaries.
 
 use atomic_repository::{
-    Repository, ReconcileEffectBudget, WorkspaceRemediation, WorkspaceTxn, WorkspaceTxnMode,
+    ReconcileEffectBudget, Repository, WorkspaceRemediation, WorkspaceTxn, WorkspaceTxnMode,
     WorkspaceTxnStart,
 };
 
@@ -68,7 +68,7 @@ pub(crate) fn enter_remediation_workspace(
 ///
 /// Under [`ReconcileEffectBudget::MetadataOnly`] the entry refuses
 /// effect-bearing adoption and pending recovery before any of it runs; a
-/// [`RepositoryError::ReactiveDeferred`] surfaces as the typed CLI error.
+/// `RepositoryError::ReactiveDeferred` surfaces as the typed CLI error.
 pub(crate) fn enter_remediation_workspace_budgeted(
     repository: &mut Repository,
     budget: ReconcileEffectBudget,

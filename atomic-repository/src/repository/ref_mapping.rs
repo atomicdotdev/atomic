@@ -100,7 +100,13 @@ impl Repository {
         view: &str,
         mapping: Option<RefMapping>,
     ) -> Result<Option<atomic_core::OperationId>, RepositoryError> {
-        self.set_ref_mapping_under_lease(working_copy, view, MappingLease::Unconditional, mapping, None)
+        self.set_ref_mapping_under_lease(
+            working_copy,
+            view,
+            MappingLease::Unconditional,
+            mapping,
+            None,
+        )
     }
 
     /// [`Self::set_ref_mapping`] for a caller that already holds the common
@@ -113,13 +119,7 @@ impl Repository {
         mapping: Option<RefMapping>,
         common: Option<&super::locks::RepositoryCommonLockGuard>,
     ) -> Result<Option<atomic_core::OperationId>, RepositoryError> {
-        self.set_ref_mapping_from_observation_with_common(
-            working_copy,
-            view,
-            None,
-            mapping,
-            common,
-        )
+        self.set_ref_mapping_from_observation_with_common(working_copy, view, None, mapping, common)
     }
 
     /// [`Self::set_ref_mapping`] pinned to the observation the replacement
@@ -327,12 +327,11 @@ impl Repository {
         changes: &[Hash],
     ) -> Result<bool, RepositoryError> {
         let txn = self.pristine.read_txn().map_err(pristine_error)?;
-        let view_state = txn
-            .get_view(view)
-            .map_err(pristine_error)?
-            .ok_or_else(|| RepositoryError::ViewNotFound {
+        let view_state = txn.get_view(view).map_err(pristine_error)?.ok_or_else(|| {
+            RepositoryError::ViewNotFound {
                 name: view.to_string(),
-            })?;
+            }
+        })?;
         let visibility = super::operation::visible_change_hashes(&txn, &view_state)?;
         Ok(changes.iter().all(|change| visibility.contains(change)))
     }
@@ -363,8 +362,9 @@ impl Repository {
         let observed = self.get_ref_mapping(view)?;
         match scope {
             ViewScope::Shared => {
-                let mut mapping =
-                    observed.clone().unwrap_or_else(|| fallback_mapping(view, scope));
+                let mut mapping = observed
+                    .clone()
+                    .unwrap_or_else(|| fallback_mapping(view, scope));
                 mapping.status = RefSyncStatus::Unrepresentable;
                 self.set_ref_mapping_from_observation(
                     working_copy,
@@ -373,12 +373,9 @@ impl Repository {
                     Some(mapping),
                 )
             }
-            ViewScope::Draft => self.set_ref_mapping_from_observation(
-                working_copy,
-                view,
-                observed.as_ref(),
-                None,
-            ),
+            ViewScope::Draft => {
+                self.set_ref_mapping_from_observation(working_copy, view, observed.as_ref(), None)
+            }
         }
     }
 
@@ -397,7 +394,10 @@ impl Repository {
         if std::env::var_os("ATOMIC_TRACE_MAPPING").is_some() {
             for sha in added_commits {
                 let closure = self.bound_closure_for_commit(sha)?;
-                eprintln!("[mapping-trace] sha={sha} closure={:?}", closure.map(|c| c.len()));
+                eprintln!(
+                    "[mapping-trace] sha={sha} closure={:?}",
+                    closure.map(|c| c.len())
+                );
             }
         }
         if added_commits.is_empty() {
@@ -428,7 +428,7 @@ fn decode_mapping(bytes: &[u8]) -> Result<RefMapping, RepositoryError> {
 /// current mapped-ref tip (CB-10A containment input, review R2).
 ///
 /// The walk is bounded: it stops at the last mutually observed tip, at a
-/// missing commit object, or at [`MAX_ADDED_COMMITS`] commits (a
+/// missing commit object, or at `MAX_ADDED_COMMITS` commits (a
 /// rewritten/foreign ref must not make reconciliation walk unbounded history).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AddedCommits {
@@ -491,9 +491,7 @@ pub fn commits_added_since(
                 continue;
             }
             if baseline.len() > MAX_ADDED_COMMITS {
-                return AddedCommits::Unprovable(
-                    "the bounded baseline-closure walk was exhausted",
-                );
+                return AddedCommits::Unprovable("the bounded baseline-closure walk was exhausted");
             }
             let Ok(commit) = git.find_commit(oid) else {
                 return AddedCommits::Unprovable(
@@ -609,7 +607,6 @@ fn fallback_mapping(view: &str, scope: ViewScope) -> RefMapping {
     }
 }
 
-
 /// Shared sample-mapping builder for decision tests.
 pub mod tests_support {
     use super::*;
@@ -654,7 +651,7 @@ mod containment_tests {
 
     fn commit_on(git: &GitRepository, message: &str, parents: &[git2::Oid]) -> git2::Oid {
         let tree_id = if parents.is_empty() {
-            let mut builder = git.treebuilder(None).unwrap();
+            let builder = git.treebuilder(None).unwrap();
             builder.write().unwrap()
         } else {
             git.find_commit(parents[0]).unwrap().tree_id()
@@ -683,7 +680,11 @@ mod containment_tests {
         let c = commit_on(&git, "C", &[a]);
         let m = commit_on(&git, "M", &[b, c]);
 
-        let added = commits_added_since(&git, Some(b.to_string().as_str()), Some(m.to_string().as_str()));
+        let added = commits_added_since(
+            &git,
+            Some(b.to_string().as_str()),
+            Some(m.to_string().as_str()),
+        );
         let mut expected = vec![m.to_string(), c.to_string()];
         expected.sort();
         assert_eq!(
@@ -722,7 +723,11 @@ mod containment_tests {
         std::fs::remove_file(&object_path).expect("remove the commit object");
         drop(git);
         let git = GitRepository::open(dir.path()).unwrap();
-        let added = commits_added_since(&git, Some(a.to_string().as_str()), Some(c.to_string().as_str()));
+        let added = commits_added_since(
+            &git,
+            Some(a.to_string().as_str()),
+            Some(c.to_string().as_str()),
+        );
         assert!(
             matches!(added, AddedCommits::Unprovable(_)),
             "a missing object must fail closed, got {added:?}"
@@ -743,8 +748,11 @@ mod containment_tests {
             deep = commit_on(&git, &format!("deep {index}"), &[deep]);
         }
         let observed = commit_on(&git, "observed", &[root]);
-        let added =
-            commits_added_since(&git, Some(observed.to_string().as_str()), Some(deep.to_string().as_str()));
+        let added = commits_added_since(
+            &git,
+            Some(observed.to_string().as_str()),
+            Some(deep.to_string().as_str()),
+        );
         assert!(
             matches!(added, AddedCommits::Unprovable(_)),
             "an over-budget walk must be unprovable, got {added:?}"

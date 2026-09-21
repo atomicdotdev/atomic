@@ -304,11 +304,13 @@ fn verify_git_publication_with_policy(
                     )?;
                     let projection = repo
                         .prepare_conflict_snapshot_projection(view, &conflict_policy)
-                        .map_err(|error| CliError::Repository(
-                            atomic_repository::RepositoryError::InvalidOperation {
-                                message: error.to_string(),
-                            },
-                        ))?;
+                        .map_err(|error| {
+                            CliError::Repository(
+                                atomic_repository::RepositoryError::InvalidOperation {
+                                    message: error.to_string(),
+                                },
+                            )
+                        })?;
                     projection.project
                 }
                 None => repo.project_tree(view, &policy).map_err(|error| {
@@ -733,9 +735,7 @@ pub(crate) fn sync_git_projection_after_record(
     {
         Some(guard) => guard,
         None => {
-            print_info(
-                "Another shadow materialize is in flight; skipping the record projection.",
-            );
+            print_info("Another shadow materialize is in flight; skipping the record projection.");
             return Ok(());
         }
     };
@@ -820,7 +820,15 @@ pub(crate) fn project_view_to_git(
     view: &str,
     record_metadata: Option<RecordProjectionMetadata>,
 ) -> CliResult<ShadowSwitchReceipt> {
-    project_view_to_git_with_conflicts(repo, repo_root, git_repo, view, record_metadata, false, None)
+    project_view_to_git_with_conflicts(
+        repo,
+        repo_root,
+        git_repo,
+        view,
+        record_metadata,
+        false,
+        None,
+    )
 }
 
 /// The projection path for a caller that already holds the repo-scoped
@@ -847,6 +855,7 @@ pub(crate) fn project_view_to_git_under_shadow_lock(
 }
 
 /// Resolution of a view's conflict state before projection (RFC §8.3, CB-8B).
+#[allow(clippy::large_enum_variant)] // the snapshot carries the projected tree by value
 enum ConflictExport {
     /// No persisted conflicts: the ordinary clean-state projection.
     Clean,
@@ -877,7 +886,10 @@ fn resolve_conflict_export(
     let Some(object) = captured else {
         return Ok(ConflictExport::Clean);
     };
-    let scope = repo.get_view_info(view).map_err(CliError::Repository)?.scope;
+    let scope = repo
+        .get_view_info(view)
+        .map_err(CliError::Repository)?
+        .scope;
     if scope.is_shared() && !allow_conflicts {
         return Err(CliError::Repository(
             atomic_repository::RepositoryError::InvalidOperation {
@@ -893,9 +905,11 @@ fn resolve_conflict_export(
     }
     let projection = repo
         .prepare_conflict_snapshot_projection(view, policy)
-        .map_err(|error| CliError::Repository(
-            atomic_repository::RepositoryError::InvalidOperation { message: error.to_string() },
-        ))?;
+        .map_err(|error| {
+            CliError::Repository(atomic_repository::RepositoryError::InvalidOperation {
+                message: error.to_string(),
+            })
+        })?;
     if projection.conflict_set != object {
         return Err(git_error(
             "conflict snapshot preparation disagreed with the captured conflict state",
@@ -956,16 +970,10 @@ pub(crate) fn project_view_to_git_with_conflicts(
             refuse_conflict_markers(repo, repo_root, view)?;
         }
         let publication = match &conflict_export {
-            ConflictExport::Clean => {
-                verify_git_publication_mode(repo, repo_root, view, false)?
+            ConflictExport::Clean => verify_git_publication_mode(repo, repo_root, view, false)?,
+            ConflictExport::Snapshot { project, .. } => {
+                verify_git_publication_with_project(repo, repo_root, view, project.clone(), false)?
             }
-            ConflictExport::Snapshot { project, .. } => verify_git_publication_with_project(
-                repo,
-                repo_root,
-                view,
-                project.clone(),
-                false,
-            )?,
         };
 
         let target_ref = match &head_policy {
@@ -1006,7 +1014,9 @@ pub(crate) fn project_view_to_git_with_conflicts(
                     view,
                     &target_ref,
                     None,
-                    Some(atomic_core::operation::GitRefTarget::Direct(to_core_oid(commit.id())?)),
+                    Some(atomic_core::operation::GitRefTarget::Direct(to_core_oid(
+                        commit.id(),
+                    )?)),
                     Vec::new(),
                     Some(commit.tree_id()),
                     Some(atomic_repository::ProjectionCheckpointPlan {
@@ -1031,20 +1041,23 @@ pub(crate) fn project_view_to_git_with_conflicts(
         // written only by the receipted executor. Already-landed objects are
         // idempotent Recovered receipts; the tree must be durable before
         // staging/validation or the commit builder can read it.
-        let project_objects: Vec<(atomic_core::operation::GitObjectId, git2::ObjectType, Vec<u8>)> =
-            publication
-                .project
-                .git
-                .objects
-                .iter()
-                .map(|(oid, object)| {
-                    let kind = match object.kind {
-                        GitObjectKind::Blob => git2::ObjectType::Blob,
-                        GitObjectKind::Tree => git2::ObjectType::Tree,
-                    };
-                    (oid.clone(), kind, object.bytes.clone())
-                })
-                .collect();
+        let project_objects: Vec<(
+            atomic_core::operation::GitObjectId,
+            git2::ObjectType,
+            Vec<u8>,
+        )> = publication
+            .project
+            .git
+            .objects
+            .iter()
+            .map(|(oid, object)| {
+                let kind = match object.kind {
+                    GitObjectKind::Blob => git2::ObjectType::Blob,
+                    GitObjectKind::Tree => git2::ObjectType::Tree,
+                };
+                (oid.clone(), kind, object.bytes.clone())
+            })
+            .collect();
         if !project_objects.is_empty() {
             journal_projection_publication(
                 repo,
@@ -1096,21 +1109,32 @@ pub(crate) fn project_view_to_git_with_conflicts(
             record_metadata.as_ref(),
             conflict_set_hash,
         )?;
-        let mut objects: Vec<(atomic_core::operation::GitObjectId, git2::ObjectType, Vec<u8>)> =
-            Vec::new();
+        let mut objects: Vec<(
+            atomic_core::operation::GitObjectId,
+            git2::ObjectType,
+            Vec<u8>,
+        )> = Vec::new();
         if let Some((commit_oid, commit_bytes)) = &commit_object {
-            objects.push((commit_oid.clone(), git2::ObjectType::Commit, commit_bytes.clone()));
+            objects.push((
+                commit_oid.clone(),
+                git2::ObjectType::Commit,
+                commit_bytes.clone(),
+            ));
         }
         // A shared view's HEAD is symbolic on its mapped branch (the branch
         // advance is the ref effect); a Draft's HEAD is detached at the
         // projection commit. Both are journaled HEAD effects (RFC §8.1).
         let (intended_head, checkpoint_symref) = match &head_policy {
             HeadPolicy::SharedBranch { branch_ref } => (
-                Some(atomic_core::operation::GitRefTarget::Symbolic(branch_ref.clone())),
+                Some(atomic_core::operation::GitRefTarget::Symbolic(
+                    branch_ref.clone(),
+                )),
                 Some(branch_ref.clone()),
             ),
             HeadPolicy::Draft { .. } | HeadPolicy::Ephemeral { .. } => (
-                Some(atomic_core::operation::GitRefTarget::Direct(commit_oid.clone())),
+                Some(atomic_core::operation::GitRefTarget::Direct(
+                    commit_oid.clone(),
+                )),
                 None,
             ),
         };
@@ -1120,7 +1144,9 @@ pub(crate) fn project_view_to_git_with_conflicts(
             git_repo,
             view,
             &target_ref,
-            Some(atomic_core::operation::GitRefTarget::Direct(commit_oid.clone())),
+            Some(atomic_core::operation::GitRefTarget::Direct(
+                commit_oid.clone(),
+            )),
             intended_head,
             objects,
             Some(tree_oid),
@@ -1221,12 +1247,12 @@ fn resolve_head_policy(
     if let Ok(Some(mapping)) = repo.get_ref_mapping(view) {
         if let Some(local_ref) = mapping.local_ref.clone() {
             return match scope {
-                atomic_core::pristine::ViewScope::Shared => {
-                    Ok(HeadPolicy::SharedBranch { branch_ref: local_ref })
-                }
-                atomic_core::pristine::ViewScope::Draft => {
-                    Ok(HeadPolicy::Draft { view_ref: local_ref })
-                }
+                atomic_core::pristine::ViewScope::Shared => Ok(HeadPolicy::SharedBranch {
+                    branch_ref: local_ref,
+                }),
+                atomic_core::pristine::ViewScope::Draft => Ok(HeadPolicy::Draft {
+                    view_ref: local_ref,
+                }),
             };
         }
     }
@@ -1272,6 +1298,7 @@ pub(crate) fn ephemeral_original_commit(git_repo: &GitRepository, view: &str) ->
 /// new object must be created, its exact bytes; `None` means the mapped ref
 /// already tips at the projection and no object write is needed.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::type_complexity)] // (tip, optional parent tree) projection pair
 fn build_switch_projection(
     repo: &Repository,
     repo_root: &Path,
@@ -1286,10 +1313,7 @@ fn build_switch_projection(
     conflict_set_hash: Option<atomic_core::Hash>,
 ) -> CliResult<(
     atomic_core::operation::GitObjectId,
-    Option<(
-        atomic_core::operation::GitObjectId,
-        Vec<u8>,
-    )>,
+    Option<(atomic_core::operation::GitObjectId, Vec<u8>)>,
 )> {
     if publication.view() != view || publication.git_tree_oid()? != tree_oid {
         return Err(git_error(
@@ -1388,9 +1412,7 @@ fn build_switch_projection(
                 })
                 .unwrap_or_else(|| ("atomic".to_string(), "atomic@invalid".to_string()));
             if std::env::var_os("ATOMIC_TRACE_APPLY_CRDT").is_some() {
-                eprintln!(
-                    "[shadow-projection] using projection committer {name} <{email}>"
-                );
+                eprintln!("[shadow-projection] using projection committer {name} <{email}>");
             }
             git2::Signature::now(&name, &email).map_err(|error| {
                 git_error(format!(
@@ -1427,7 +1449,7 @@ fn build_switch_projection(
             set_id,
             state: state_merkle,
             binding_id: None,
-            conflict_set_hash: conflict_set_hash,
+            conflict_set_hash,
             author: projection_author(repo, repo_root, signature.name(), signature.email()),
             timestamp: chrono::Utc::now().timestamp(),
             timestamp_offset: local_utc_offset_minutes(),
@@ -1438,10 +1460,7 @@ fn build_switch_projection(
             "cannot construct the local shadow projection for view '{view}': {error}"
         ))
     })?;
-    Ok((
-        commit_oid.clone(),
-        Some((commit_oid, commit_bytes)),
-    ))
+    Ok((commit_oid.clone(), Some((commit_oid, commit_bytes))))
 }
 
 fn projection_message_for(
@@ -1475,15 +1494,20 @@ fn journal_projection_publication(
     ref_name: &str,
     intended_ref: Option<atomic_core::operation::GitRefTarget>,
     intended_head: Option<atomic_core::operation::GitRefTarget>,
-    objects: Vec<(atomic_core::operation::GitObjectId, git2::ObjectType, Vec<u8>)>,
+    objects: Vec<(
+        atomic_core::operation::GitObjectId,
+        git2::ObjectType,
+        Vec<u8>,
+    )>,
     intended_index_tree: Option<git2::Oid>,
     checkpoint_plan: Option<atomic_repository::ProjectionCheckpointPlan>,
     held_common: Option<&atomic_repository::RepositoryCommonLockGuard>,
 ) -> CliResult<Option<atomic_core::OperationId>> {
-    let working_copy = repo.require_working_copy_id().map_err(CliError::Repository)?;
-    let evidence = atomic_core::Hash::of(
-        format!("atomic:projection-publish:{view}:{ref_name}").as_bytes(),
-    );
+    let working_copy = repo
+        .require_working_copy_id()
+        .map_err(CliError::Repository)?;
+    let evidence =
+        atomic_core::Hash::of(format!("atomic:projection-publish:{view}:{ref_name}").as_bytes());
     let prepared = repo
         .prepare_projection_publication(
             working_copy,

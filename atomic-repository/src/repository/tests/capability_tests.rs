@@ -1,5 +1,5 @@
-use redb::ReadableDatabase;
 use super::*;
+use redb::ReadableDatabase;
 
 use atomic_core::pristine::{
     PristineError, RequiredRepositoryCapability, CHANGE_FORMAT_VNEXT_CAPABILITY,

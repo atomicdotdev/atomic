@@ -40,15 +40,15 @@
 //! view-name hint, a trailer, or an index row can never authorize identity.
 
 use atomic_core::operation::{
-    ActorRef, MetadataTarget, MetadataTransition, RepoStateRef, ViewStateRef, OperationKind,
+    ActorRef, MetadataTarget, MetadataTransition, OperationKind, RepoStateRef, ViewStateRef,
 };
 use atomic_core::pristine::{GraphTxnT, MutTxnT, ViewTxnT};
 use atomic_core::types::{Base32, Hash};
 use atomic_core::verify_causal_frontier;
 
 use crate::git_binding::{
-    evaluate_binding_trust, validate_binding_closure, verify_binding_cryptography,
-    verify_binding_content, BindingClosureError, BindingPackError, BindingPackLimits,
+    evaluate_binding_trust, validate_binding_closure, verify_binding_content,
+    verify_binding_cryptography, BindingClosureError, BindingPackError, BindingPackLimits,
     ClosureChangeSource, ClosureValidation, GitObjectFormat, GitStateBinding,
 };
 use crate::repository::conflict_object::ConflictSetObject;
@@ -63,6 +63,7 @@ pub(crate) const RESURRECTION_MAX_ATTEMPTS: u8 = 3;
 /// A prepared conflict-snapshot restore: the decoded complete conflict
 /// object, its verified identity, and the marker bytes read from the bound
 /// snapshot tree.
+#[allow(dead_code)] // object/hash re-verified during restore; kept for diagnostics
 pub(super) struct ConflictSnapshotRestore {
     pub(super) object: ConflictSetObject,
     pub(super) hash: atomic_core::Hash,
@@ -74,31 +75,33 @@ fn bound_commit_conflict_hash(
     git: &git2::Repository,
     binding: &GitStateBinding,
 ) -> Result<Option<atomic_core::Hash>, RepositoryError> {
-    let commit_oid = git2::Oid::from_bytes(binding.payload().git_commit.as_bytes())
-        .map_err(|error| RepositoryError::ResurrectionRejected {
-            id: binding.id().to_hex(),
-            reason: format!("the bound commit OID is invalid: {error}"),
+    let commit_oid =
+        git2::Oid::from_bytes(binding.payload().git_commit.as_bytes()).map_err(|error| {
+            RepositoryError::ResurrectionRejected {
+                id: binding.id().to_hex(),
+                reason: format!("the bound commit OID is invalid: {error}"),
+            }
         })?;
-    let commit = git.find_commit(commit_oid).map_err(|error| {
-        RepositoryError::ResurrectionRejected {
-            id: binding.id().to_hex(),
-            reason: format!("the bound commit is unreadable: {error}"),
-        }
-    })?;
+    let commit =
+        git.find_commit(commit_oid)
+            .map_err(|error| RepositoryError::ResurrectionRejected {
+                id: binding.id().to_hex(),
+                reason: format!("the bound commit is unreadable: {error}"),
+            })?;
     let message = commit.message().unwrap_or("");
     for line in message.lines() {
         if let Some(value) = line.trim().strip_prefix("atomic-conflict ") {
-            return Ok(atomic_core::types::Merkle::from_base32(value.trim().as_bytes()));
+            return Ok(atomic_core::types::Merkle::from_base32(
+                value.trim().as_bytes(),
+            ));
         }
     }
     Ok(None)
 }
 
 fn git2_oid_of(oid: &atomic_core::operation::GitObjectId) -> Result<git2::Oid, RepositoryError> {
-    git2::Oid::from_bytes(oid.as_bytes()).map_err(|error| {
-        RepositoryError::InvalidOperation {
-            message: format!("invalid Git OID: {error}"),
-        }
+    git2::Oid::from_bytes(oid.as_bytes()).map_err(|error| RepositoryError::InvalidOperation {
+        message: format!("invalid Git OID: {error}"),
     })
 }
 
@@ -146,6 +149,7 @@ pub struct ExactResurrection {
 
 /// What a Git SHA lookup may conclude (checked cache only, RFC §5.4/§12.8).
 #[derive(Debug, Clone, PartialEq)]
+#[allow(clippy::large_enum_variant)] // binding returned by reference
 pub enum GitShaResolution {
     /// No binding candidate and no usable index row: the cold-cache result.
     Cold,
@@ -174,15 +178,16 @@ impl ClosureChangeSource for LocalClosureSource<'_> {
         if !self.repo.has_change(hash) {
             return Ok(None);
         }
-        self.repo.load_change(hash).map(Some).map_err(|error| {
-            BindingClosureError::Quarantine {
+        self.repo
+            .load_change(hash)
+            .map(Some)
+            .map_err(|error| BindingClosureError::Quarantine {
                 hash: hash.to_base32(),
                 source: BindingPackError::ChangeDecode {
                     key: hash.to_base32(),
                     reason: error.to_string(),
                 },
-            }
-        })
+            })
     }
 }
 
@@ -194,18 +199,18 @@ fn database_map(error: impl std::fmt::Display) -> RepositoryError {
     RepositoryError::Database(error.to_string())
 }
 
-/// Deterministic fault switch for tests only: when set, the isolated build
-/// fails after the `ResurrectBinding` intent was journaled, so rejection and
-/// recovery can be exercised end to end.
+// Deterministic fault switch for tests only: when set, the isolated build
+// fails after the `ResurrectBinding` intent was journaled, so rejection and
+// recovery can be exercised end to end.
 #[cfg(test)]
 thread_local! {
     pub(crate) static RESURRECTION_APPLY_FAULT: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
 }
 
-/// Deterministic contention hook for tests only: a positive counter makes the
-/// first `n` attempts observe a Git lease mismatch after the projection
-/// proof, exercising the three-attempt guard.
+// Deterministic contention hook for tests only: a positive counter makes the
+// first `n` attempts observe a Git lease mismatch after the projection
+// proof, exercising the three-attempt guard.
 #[cfg(test)]
 thread_local! {
     pub(crate) static RESURRECTION_CONTENTION_ATTEMPTS: std::cell::Cell<u8> =
@@ -273,10 +278,22 @@ impl Repository {
         loop {
             attempts += 1;
             let lease = self.observe_git_lease(git)?;
-            match self.resurrect_attempt(None, git, binding, view, &policy, lease, conflicts.as_ref()) {
+            match self.resurrect_attempt(
+                None,
+                git,
+                binding,
+                view,
+                &policy,
+                lease,
+                conflicts.as_ref(),
+            ) {
                 Ok(outcome) => {
                     return Ok(exact_outcome(
-                        binding, outcome, restored_raw_commit, trust, None,
+                        binding,
+                        outcome,
+                        restored_raw_commit,
+                        trust,
+                        None,
                     ));
                 }
                 Err(AttemptFailure::Contended) if attempts < RESURRECTION_MAX_ATTEMPTS => continue,
@@ -312,11 +329,21 @@ impl Repository {
             attempts += 1;
             let lease = self.observe_git_lease(git)?;
             match self.resurrect_attempt_locked(
-                operation_lock, git, binding, view, &policy, lease, conflicts.as_ref(),
+                operation_lock,
+                git,
+                binding,
+                view,
+                &policy,
+                lease,
+                conflicts.as_ref(),
             ) {
                 Ok(outcome) => {
                     return Ok(exact_outcome(
-                        binding, outcome, restored_raw_commit, trust, None,
+                        binding,
+                        outcome,
+                        restored_raw_commit,
+                        trust,
+                        None,
                     ));
                 }
                 Err(AttemptFailure::Contended) if attempts < RESURRECTION_MAX_ATTEMPTS => continue,
@@ -359,15 +386,18 @@ impl Repository {
             }
             return Ok(None);
         };
-        let object = ConflictSetObject::decode(&pack)
-            .map_err(|error| RepositoryError::ResurrectionRejected {
+        let object = ConflictSetObject::decode(&pack).map_err(|error| {
+            RepositoryError::ResurrectionRejected {
                 id: binding.id().to_hex(),
                 reason: format!("the binding's conflicts.pack failed to decode: {error}"),
-            })?;
-        let hash = object.hash().map_err(|error| RepositoryError::ResurrectionRejected {
-            id: binding.id().to_hex(),
-            reason: format!("the binding's conflicts.pack failed to hash: {error}"),
+            }
         })?;
+        let hash = object
+            .hash()
+            .map_err(|error| RepositoryError::ResurrectionRejected {
+                id: binding.id().to_hex(),
+                reason: format!("the binding's conflicts.pack failed to hash: {error}"),
+            })?;
         let claimed = bound_commit_conflict_hash(git, binding)?.ok_or_else(|| {
             RepositoryError::ResurrectionRejected {
                 id: binding.id().to_hex(),
@@ -387,19 +417,21 @@ impl Repository {
                 ),
             });
         }
-        object.validate().map_err(|error| RepositoryError::ResurrectionRejected {
-            id: binding.id().to_hex(),
-            reason: format!("the conflicts.pack is structurally invalid: {error}"),
-        })?;
+        object
+            .validate()
+            .map_err(|error| RepositoryError::ResurrectionRejected {
+                id: binding.id().to_hex(),
+                reason: format!("the conflicts.pack is structurally invalid: {error}"),
+            })?;
         // Marker bytes come from the bound tree itself: the snapshot commit's
         // tree IS the marker materialization.
         let tree_oid = bound_tree_oid(binding)?;
-        let tree = git
-            .find_tree(git2_oid_of(&tree_oid)?)
-            .map_err(|error| RepositoryError::ResurrectionRejected {
+        let tree = git.find_tree(git2_oid_of(&tree_oid)?).map_err(|error| {
+            RepositoryError::ResurrectionRejected {
                 id: binding.id().to_hex(),
                 reason: format!("the bound tree is unreadable: {error}"),
-            })?;
+            }
+        })?;
         let mut marker_bytes = std::collections::BTreeMap::new();
         for file in &object.files {
             let path = String::from_utf8_lossy(&file.path).to_string();
@@ -421,12 +453,12 @@ impl Repository {
                     ),
                 });
             }
-            let blob = git
-                .find_blob(entry.id())
-                .map_err(|error| RepositoryError::ResurrectionRejected {
+            let blob = git.find_blob(entry.id()).map_err(|error| {
+                RepositoryError::ResurrectionRejected {
                     id: binding.id().to_hex(),
                     reason: format!("conflicted path '{path}' blob is unreadable: {error}"),
-                })?;
+                }
+            })?;
             marker_bytes.insert(path, blob.content().to_vec());
         }
         Ok(Some(ConflictSnapshotRestore {
@@ -469,10 +501,18 @@ impl Repository {
                      restored {} file(s)/{} entr{}, packed {} file(s)/{} entr{}",
                     actual.files.len(),
                     actual.entry_count(),
-                    if actual.entry_count() == 1 { "y" } else { "ies" },
+                    if actual.entry_count() == 1 {
+                        "y"
+                    } else {
+                        "ies"
+                    },
                     expected.files.len(),
                     expected.entry_count(),
-                    if expected.entry_count() == 1 { "y" } else { "ies" },
+                    if expected.entry_count() == 1 {
+                        "y"
+                    } else {
+                        "ies"
+                    },
                 ),
             }),
             None => Err(RepositoryError::ResurrectionRejected {
@@ -513,7 +553,7 @@ impl Repository {
     ) -> Result<GitShaResolution, RepositoryError> {
         // Candidates from stored bindings whose bound commit matches.
         let mut candidates: Vec<GitStateBinding> = Vec::new();
-        let mut index_candidate;
+
         for id in self.binding_ids()? {
             let Ok(Some(binding)) = self.load_binding(&id) else {
                 continue;
@@ -531,7 +571,7 @@ impl Repository {
         // still fully re-verified below, which is what makes the cache
         // checked rather than authoritative.
         let sha = crate::repository::synthesis::git_oid_hex(commit);
-        index_candidate = self.raw_git_sha_row(&sha)?.is_some();
+        let index_candidate = self.raw_git_sha_row(&sha)?.is_some();
         if candidates.is_empty() {
             if let Some(change) = self.raw_git_sha_row(&sha)? {
                 for id in self.binding_ids()? {
@@ -664,10 +704,8 @@ impl Repository {
                     Ok(value) => value,
                     Err(_) => return false,
                 };
-                let hash: Option<Hash> = change_id.and_then(|id| match txn.get_external(id) {
-                    Ok(value) => value,
-                    Err(_) => None,
-                });
+                let hash: Option<Hash> =
+                    change_id.and_then(|id| txn.get_external(id).unwrap_or_default());
                 match hash {
                     Some(hash) => !self.has_change(&hash),
                     None => true,
@@ -729,11 +767,13 @@ impl Repository {
                 reason: format!("malformed bound commit OID: {error}"),
             }
         })?;
-        let odb = git.odb().map_err(|error| RepositoryError::BindingRejected {
-            id: binding.id().to_hex(),
-            commit: payload.git_commit.to_hex(),
-            reason: format!("git odb unavailable: {error}"),
-        })?;
+        let odb = git
+            .odb()
+            .map_err(|error| RepositoryError::BindingRejected {
+                id: binding.id().to_hex(),
+                commit: payload.git_commit.to_hex(),
+                reason: format!("git odb unavailable: {error}"),
+            })?;
         if odb.exists(oid) {
             return Ok(false);
         }
@@ -741,10 +781,9 @@ impl Repository {
             return Err(RepositoryError::BindingRejected {
                 id: binding.id().to_hex(),
                 commit: payload.git_commit.to_hex(),
-                reason:
-                    "the bound commit is absent from the Git object database and the binding \
+                reason: "the bound commit is absent from the Git object database and the binding \
                      preserves no raw commit bytes; the identity cannot be restored"
-                        .to_string(),
+                    .to_string(),
             });
         };
         let digest = crate::git_binding::commit_object_digest(payload.git_object_format, raw)
@@ -763,12 +802,13 @@ impl Repository {
                 ),
             });
         }
-        odb.write(git2::ObjectType::Commit, raw)
-            .map_err(|error| RepositoryError::BindingRejected {
+        odb.write(git2::ObjectType::Commit, raw).map_err(|error| {
+            RepositoryError::BindingRejected {
                 id: binding.id().to_hex(),
                 commit: payload.git_commit.to_hex(),
                 reason: format!("cannot restore the raw commit bytes into the Git odb: {error}"),
-            })?;
+            }
+        })?;
         Ok(true)
     }
 
@@ -850,12 +890,11 @@ impl Repository {
         // members, and do the members form a prefix of the binding order?
         let (view_id, base_state, base_count, to_insert, already_present) = {
             let txn = self.pristine.read_txn().map_err(database_map)?;
-            let view = txn
-                .get_view(view_name)
-                .map_err(database_map)?
-                .ok_or(RepositoryError::ViewNotFound {
+            let view = txn.get_view(view_name).map_err(database_map)?.ok_or(
+                RepositoryError::ViewNotFound {
                     name: view_name.to_string(),
-                })?;
+                },
+            )?;
             let mut to_insert = Vec::with_capacity(ordered.len());
             let mut already_present = Vec::with_capacity(ordered.len());
             for hash in ordered {
@@ -872,7 +911,13 @@ impl Repository {
                     to_insert.push(*hash);
                 }
             }
-            (view.id, view.state, view.change_count, to_insert, already_present)
+            (
+                view.id,
+                view.state,
+                view.change_count,
+                to_insert,
+                already_present,
+            )
         };
         let mut saw_gap = false;
         for hash in ordered.iter() {
@@ -906,10 +951,7 @@ impl Repository {
                         reason: format!(
                             "view '{view_name}' identity (merkle {}, set {}) diverges from the \
                              binding's (merkle {}, set {}); refusing to bless a foreign membership",
-                            identity.merkle,
-                            identity.set_id,
-                            payload.merkle_state,
-                            payload.set_id
+                            identity.merkle, identity.set_id, payload.merkle_state, payload.set_id
                         ),
                     },
                 ));
@@ -917,12 +959,11 @@ impl Repository {
             let project = match conflicts {
                 Some(restore) => {
                     let txn = self.pristine.read_txn().map_err(database_map)?;
-                    let view = txn
-                        .get_view(view_name)
-                        .map_err(database_map)?
-                        .ok_or(RepositoryError::ViewNotFound {
+                    let view = txn.get_view(view_name).map_err(database_map)?.ok_or(
+                        RepositoryError::ViewNotFound {
                             name: view_name.to_string(),
-                        })?;
+                        },
+                    )?;
                     self.project_change_closure_with_conflict_markers(
                         &txn,
                         &view,
@@ -930,9 +971,11 @@ impl Repository {
                         policy,
                         &restore.marker_bytes,
                     )
-                    .map_err(|error| RepositoryError::ResurrectionRejected {
-                        id: binding.id().to_hex(),
-                        reason: format!("conflict projection failed: {error}"),
+                    .map_err(|error| {
+                        RepositoryError::ResurrectionRejected {
+                            id: binding.id().to_hex(),
+                            reason: format!("conflict projection failed: {error}"),
+                        }
                     })?
                 }
                 None => self
@@ -1010,7 +1053,13 @@ impl Repository {
                 let working_copy = self.require_working_copy_id()?;
                 let operation_lock = self.try_lock_operation(working_copy)?;
                 self.resurrect_attempt_locked(
-                    &operation_lock, git, binding, view_name, policy, lease, conflicts,
+                    &operation_lock,
+                    git,
+                    binding,
+                    view_name,
+                    policy,
+                    lease,
+                    conflicts,
                 )
             }
         }
@@ -1183,18 +1232,15 @@ impl Repository {
         // apply its prerequisites (which install the position→inode mapping
         // SetAttr events resolve), then apply the hunks.
         for hash in &ordered {
-            let change_id = txn
-                .get_internal(hash)
-                .map_err(pristine_map)?
-                .ok_or(RepositoryError::ChangeNotFound {
+            let change_id = txn.get_internal(hash).map_err(pristine_map)?.ok_or(
+                RepositoryError::ChangeNotFound {
                     hash: hash.to_base32(),
-                })?;
+                },
+            )?;
             let change = self.load_change(hash)?;
-            let already_applied = txn
-                .has_change_in_graph(change_id)
-                .map_err(pristine_map)?;
+            let already_applied = txn.has_change_in_graph(change_id).map_err(pristine_map)?;
             let tree_projection =
-                self.plan_tree_projection(&mut *txn, change_id, *hash, &change, &[], false)?;
+                self.plan_tree_projection(&mut txn, change_id, *hash, &change, &[], false)?;
             tree_projection.apply_prerequisites(&mut *txn)?;
             if already_applied {
                 continue;
@@ -1227,27 +1273,25 @@ impl Repository {
         // Pass 2: publish each change's tree projection once every hunk pass
         // has run, so the shared deferred journal's rows always resolve.
         for hash in &ordered {
-            let change_id = txn
-                .get_internal(hash)
-                .map_err(pristine_map)?
-                .ok_or(RepositoryError::ChangeNotFound {
+            let change_id = txn.get_internal(hash).map_err(pristine_map)?.ok_or(
+                RepositoryError::ChangeNotFound {
                     hash: hash.to_base32(),
-                })?;
+                },
+            )?;
             let change = self.load_change(hash)?;
             let tree_projection =
-                self.plan_tree_projection(&mut *txn, change_id, *hash, &change, &[], false)?;
-            self.apply_tree_projection(&mut *txn, &tree_projection, view_name, false)?;
+                self.plan_tree_projection(&mut txn, change_id, *hash, &change, &[], false)?;
+            self.apply_tree_projection(&mut txn, &tree_projection, view_name, false)?;
         }
 
         // ── The mandatory projection proof (RFC §5.2, §12.5): recompute the
         //    full projected tree under the current conversion policy from
         //    the restored closure and compare tree OID and SetId.
-        let view = txn
-            .get_view(view_name)
-            .map_err(pristine_map)?
-            .ok_or(RepositoryError::ViewNotFound {
+        let view = txn.get_view(view_name).map_err(pristine_map)?.ok_or(
+            RepositoryError::ViewNotFound {
                 name: view_name.to_string(),
-            })?;
+            },
+        )?;
         let project = match conflicts {
             Some(restore) => self
                 .project_change_closure_with_conflict_markers(
@@ -1270,7 +1314,7 @@ impl Repository {
         };
         let bound_tree = bound_tree_oid(binding)?;
         let projected_tree = project.git.root.clone();
-        if &projected_tree != &bound_tree {
+        if projected_tree != bound_tree {
             return Err(RepositoryError::ResurrectionRejected {
                 id: binding.id().to_hex(),
                 reason: format!(
@@ -1294,16 +1338,13 @@ impl Repository {
 
         // ── Publish membership in binding Merkle order, inside the same
         //    transaction. The final state must land exactly on the binding's.
-        let mut view = txn
-            .open_or_create_view(view_name)
-            .map_err(pristine_map)?;
+        let mut view = txn.open_or_create_view(view_name).map_err(pristine_map)?;
         for hash in to_insert {
-            let change_id = txn
-                .get_internal(hash)
-                .map_err(pristine_map)?
-                .ok_or(RepositoryError::ChangeNotFound {
+            let change_id = txn.get_internal(hash).map_err(pristine_map)?.ok_or(
+                RepositoryError::ChangeNotFound {
                     hash: hash.to_base32(),
-                })?;
+                },
+            )?;
             txn.put_change(&mut view, change_id, hash)
                 .map_err(pristine_map)?;
         }
@@ -1423,5 +1464,8 @@ fn bound_tree_oid(
 
 /// Lowercase hex of a core-tagged Git object id.
 fn hex_oid(oid: &atomic_core::operation::GitObjectId) -> String {
-    oid.as_bytes().iter().map(|byte| format!("{byte:02x}")).collect()
+    oid.as_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }

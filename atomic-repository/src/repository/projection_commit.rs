@@ -181,7 +181,9 @@ impl ProjectionParents {
     pub fn oids(&self) -> Vec<GitObjectId> {
         match self {
             Self::Single { parent } => vec![parent.clone()],
-            Self::Merge { mainline, merged, .. } => vec![mainline.clone(), merged.clone()],
+            Self::Merge {
+                mainline, merged, ..
+            } => vec![mainline.clone(), merged.clone()],
         }
     }
 }
@@ -267,6 +269,7 @@ pub fn projection_commit_message(input: &ProjectionCommitInput) -> String {
 }
 
 /// Signing policy for one projected commit (RFC §8.2).
+#[allow(clippy::large_enum_variant)] // KeyPair inline by design
 pub enum ProjectionSigning {
     /// Publish the commit unsigned.
     Unsigned,
@@ -302,10 +305,9 @@ pub fn unarmor_commit_signature(header_value: &str) -> Option<[u8; 64]> {
         return None;
     }
     let mut signature = [0u8; 64];
-    for (index, pair) in encoded.as_bytes().chunks_exact(2).enumerate() {
-        signature[index] =
-            u8::from_str_radix(std::str::from_utf8(pair).expect("hex checked"), 16)
-                .expect("hex checked");
+    for (index, pair) in encoded.as_bytes().as_chunks::<2>().0.iter().enumerate() {
+        signature[index] = u8::from_str_radix(std::str::from_utf8(pair).expect("hex checked"), 16)
+            .expect("hex checked");
     }
     Some(signature)
 }
@@ -337,24 +339,18 @@ pub fn build_projected_commit(
     for oid in &parent_oids {
         let object = git
             .find_object(to_git2_oid(oid)?, Some(ObjectType::Commit))
-            .map_err(|error| {
-                ProjectionCommitError::ParentNotCommit(format!("{oid:?}: {error}"))
-            })?;
-        let commit = object
-            .into_commit()
-            .map_err(|_| {
-                ProjectionCommitError::ParentNotCommit(format!(
-                    "{oid:?} did not peel to a commit"
-                ))
-            })?;
+            .map_err(|error| ProjectionCommitError::ParentNotCommit(format!("{oid:?}: {error}")))?;
+        let commit = object.into_commit().map_err(|_| {
+            ProjectionCommitError::ParentNotCommit(format!("{oid:?} did not peel to a commit"))
+        })?;
         git_parents.push(commit);
     }
     let git_tree = git.find_tree(to_git2_oid(tree_oid)?).map_err(git_error)?;
     let parent_refs: Vec<&git2::Commit> = git_parents.iter().collect();
 
     let time = git2::Time::new(input.timestamp, input.timestamp_offset);
-    let signature = git2::Signature::new(&input.author.name, &input.author.email, &time)
-        .map_err(git_error)?;
+    let signature =
+        git2::Signature::new(&input.author.name, &input.author.email, &time).map_err(git_error)?;
     let unsigned = git
         .commit_create_buffer(
             &signature,
@@ -399,24 +395,18 @@ pub fn write_projected_commit(
     for oid in &parent_oids {
         let object = git
             .find_object(to_git2_oid(oid)?, Some(ObjectType::Commit))
-            .map_err(|error| {
-                ProjectionCommitError::ParentNotCommit(format!("{oid:?}: {error}"))
-            })?;
-        let commit = object
-            .into_commit()
-            .map_err(|_| {
-                ProjectionCommitError::ParentNotCommit(format!(
-                    "{oid:?} did not peel to a commit"
-                ))
-            })?;
+            .map_err(|error| ProjectionCommitError::ParentNotCommit(format!("{oid:?}: {error}")))?;
+        let commit = object.into_commit().map_err(|_| {
+            ProjectionCommitError::ParentNotCommit(format!("{oid:?} did not peel to a commit"))
+        })?;
         git_parents.push(commit);
     }
     let git_tree = git.find_tree(to_git2_oid(tree_oid)?).map_err(git_error)?;
     let parent_refs: Vec<&git2::Commit> = git_parents.iter().collect();
 
     let time = git2::Time::new(input.timestamp, input.timestamp_offset);
-    let signature = git2::Signature::new(&input.author.name, &input.author.email, &time)
-        .map_err(git_error)?;
+    let signature =
+        git2::Signature::new(&input.author.name, &input.author.email, &time).map_err(git_error)?;
 
     // The unsigned payload is constructed first; the signature, when
     // required, covers exactly these bytes.
@@ -438,10 +428,11 @@ pub fn write_projected_commit(
             .write(ObjectType::Commit, unsigned_bytes)
             .map_err(git_error)?,
         ProjectionSigning::RequiredAtomic { keypair } => {
-            let mut message = Vec::with_capacity(COMMIT_SIGNATURE_DOMAIN.len() + unsigned_bytes.len());
+            let mut message =
+                Vec::with_capacity(COMMIT_SIGNATURE_DOMAIN.len() + unsigned_bytes.len());
             message.extend_from_slice(COMMIT_SIGNATURE_DOMAIN);
             message.extend_from_slice(unsigned_bytes);
-            let signer = atomic_identity::Signer::new(&keypair);
+            let signer = atomic_identity::Signer::new(keypair);
             let signature = signer.sign(&message);
             let armored = armor_commit_signature(signature.as_bytes());
             git.commit_signed(
@@ -472,8 +463,7 @@ pub fn verify_commit_signature(
     let Some(signature) = unarmor_commit_signature(signature_header_value) else {
         return Err(ProjectionCommitError::SignatureHeaderMissing);
     };
-    let mut message =
-        Vec::with_capacity(COMMIT_SIGNATURE_DOMAIN.len() + unsigned_payload.len());
+    let mut message = Vec::with_capacity(COMMIT_SIGNATURE_DOMAIN.len() + unsigned_payload.len());
     message.extend_from_slice(COMMIT_SIGNATURE_DOMAIN);
     message.extend_from_slice(unsigned_payload);
     public_key
@@ -485,9 +475,11 @@ pub fn verify_commit_signature(
 /// its `gpgsig` header (Git's rule for signed content).
 pub fn strip_signature_header(raw_commit_bytes: &[u8]) -> Vec<u8> {
     let mut output = Vec::with_capacity(raw_commit_bytes.len());
-    let mut lines = raw_commit_bytes.split_inclusive(|byte| *byte == b'\n').peekable();
+    let lines = raw_commit_bytes
+        .split_inclusive(|byte| *byte == b'\n')
+        .peekable();
     let mut in_signature = false;
-    while let Some(line) = lines.next() {
+    for line in lines {
         if in_signature {
             if line.starts_with(b" ") {
                 // Signature continuation line: dropped.
@@ -675,7 +667,10 @@ fn to_git2_oid(oid: &GitObjectId) -> Result<git2::Oid, ProjectionCommitError> {
 }
 
 pub(super) fn hex_oid(oid: &GitObjectId) -> String {
-    oid.as_bytes().iter().map(|byte| format!("{byte:02x}")).collect()
+    oid.as_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 #[cfg(test)]
@@ -697,9 +692,7 @@ mod tests {
     fn tree_with_file(git: &git2::Repository, name: &str, bytes: &[u8]) -> GitObjectId {
         let blob = git.blob(bytes).expect("blob");
         let mut builder = git.treebuilder(None).expect("treebuilder");
-        builder
-            .insert(name, blob, 0o100644)
-            .expect("insert entry");
+        builder.insert(name, blob, 0o100644).expect("insert entry");
         let oid = builder.write().expect("tree");
         GitObjectId::new(GitHashAlgorithm::Sha1, oid.as_bytes().to_vec()).unwrap()
     }
@@ -769,7 +762,9 @@ mod tests {
             write_projected_commit(
                 &git,
                 &tree,
-                ProjectionParents::Single { parent: parent.clone() },
+                ProjectionParents::Single {
+                    parent: parent.clone(),
+                },
                 &input("m", Merkle::of(b"s"), author(), timestamp),
                 &ProjectionSigning::Unsigned,
             )
@@ -826,17 +821,16 @@ mod tests {
         let oid = write_projected_commit(
             &git,
             &tree,
-            ProjectionParents::Single { parent: parent.clone() },
+            ProjectionParents::Single {
+                parent: parent.clone(),
+            },
             &input("m", Merkle::ZERO, author(), 0),
             &ProjectionSigning::Unsigned,
         )
         .unwrap();
         let commit = git.find_commit(to_git2_oid(&oid).unwrap()).unwrap();
         assert_eq!(commit.parent_count(), 1);
-        assert_eq!(
-            commit.parent_id(0).unwrap(),
-            to_git2_oid(&parent).unwrap()
-        );
+        assert_eq!(commit.parent_id(0).unwrap(), to_git2_oid(&parent).unwrap());
     }
 
     #[test]
@@ -892,7 +886,10 @@ mod tests {
         .unwrap();
         let commit = git.find_commit(to_git2_oid(&oid).unwrap()).unwrap();
         assert_eq!(commit.parent_count(), 2);
-        assert_eq!(commit.parent_id(0).unwrap(), to_git2_oid(&mainline).unwrap());
+        assert_eq!(
+            commit.parent_id(0).unwrap(),
+            to_git2_oid(&mainline).unwrap()
+        );
         assert_eq!(commit.parent_id(1).unwrap(), to_git2_oid(&merged).unwrap());
     }
 
@@ -901,7 +898,10 @@ mod tests {
     #[test]
     fn message_carries_binding_set_state_and_author_headers() {
         let mut map = BTreeMap::new();
-        map.insert("aaron@atomic.dev".to_string(), "did:atomic:U4NN".to_string());
+        map.insert(
+            "aaron@atomic.dev".to_string(),
+            "did:atomic:U4NN".to_string(),
+        );
         let mapped = ProjectionAuthor::resolve(
             &ProjectionIdentityMap::new(map),
             "Aaron Ogle",
@@ -1036,7 +1036,12 @@ mod tests {
         tampered[position..position + 6].copy_from_slice(b"tamper");
         assert!(verify_commit_signature(&tampered, &header, &verification_keypair.public).is_err());
         // A different key fails.
-        assert!(verify_commit_signature(&unsigned, &header, &atomic_identity::KeyPair::generate().public).is_err());
+        assert!(verify_commit_signature(
+            &unsigned,
+            &header,
+            &atomic_identity::KeyPair::generate().public
+        )
+        .is_err());
     }
 
     #[test]
@@ -1071,11 +1076,15 @@ mod tests {
         let mut binding_message = b"atomic-binding-domain-v1\0".to_vec();
         binding_message.extend_from_slice(&payload);
         assert!(
-            keypair.verify(&binding_message, commit_signature.as_bytes()).is_err(),
+            keypair
+                .verify(&binding_message, commit_signature.as_bytes())
+                .is_err(),
             "a commit signature never verifies as a binding signature"
         );
         assert!(
-            keypair.verify(&payload, commit_signature.as_bytes()).is_err(),
+            keypair
+                .verify(&payload, commit_signature.as_bytes())
+                .is_err(),
             "the raw payload alone does not verify without the domain separator"
         );
         keypair
@@ -1119,7 +1128,8 @@ mod tests {
             .commit_create_buffer(&signature, &signature, "foreign signed", &tree, &[])
             .unwrap();
         let content = String::from_utf8(unsigned.to_vec()).unwrap();
-        let armored = "-----BEGIN PGP SIGNATURE-----\nforeign-signature\n-----END PGP SIGNATURE-----\n";
+        let armored =
+            "-----BEGIN PGP SIGNATURE-----\nforeign-signature\n-----END PGP SIGNATURE-----\n";
         let oid = git.commit_signed(&content, armored, None).unwrap();
         let original = raw_bytes_of(&git, oid);
 
@@ -1186,5 +1196,4 @@ mod tests {
         assert!(stripped.starts_with("tree 1111"), "{stripped}");
         assert!(stripped.ends_with("\nbody\n"), "{stripped}");
     }
-
 }

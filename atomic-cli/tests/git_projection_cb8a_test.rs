@@ -73,12 +73,14 @@ fn git(root: &Path, args: &[&str]) -> String {
         .to_string()
 }
 
+#[allow(dead_code)]
 fn git_ok(root: &Path, args: &[&str]) {
     let _ = git(root, args);
 }
 
 /// Run git without asserting success (for commands that may legitimately
 /// fail, like `symbolic-ref` on a detached HEAD).
+#[allow(dead_code)]
 fn git_probe(root: &Path, args: &[&str]) -> Output {
     Command::new("git")
         .args(args)
@@ -396,7 +398,7 @@ fn draft_switch_projection_commits_are_operation_specific_not_setid_derived() {
     assert_eq!(first, second, "equal valid sets project equal results");
 
     // The draft view ref still points at that one commit.
-    let view_ref = fixture.git(&["rev-parse", "refs/atomic/views/feature"]);
+    let _view_ref = fixture.git(&["rev-parse", "refs/atomic/views/feature"]);
     assert_eq!(
         second,
         view_ref_target_of(&fixture, "refs/atomic/views/feature")
@@ -532,7 +534,7 @@ fn index_manifest_alone_projects_to_stage_zero() {
         fixture.home(),
         &["view", "switch", "--force", "side"],
     );
-    let text = atomic_text(&switched);
+    let _text = atomic_text(&switched);
     assert!(
         switched.status.success(),
         "switch with pending snapshot: {}",
@@ -541,7 +543,7 @@ fn index_manifest_alone_projects_to_stage_zero() {
 
     // The snapshot bytes are still in the worktree (they were never
     // committed) and the index was aligned to the projected view tree.
-    let index_after = index_tree_oid(&fixture);
+    let _index_after = index_tree_oid(&fixture);
     assert!(
         !String::from_utf8_lossy(index_before.as_bytes()).contains("pending snapshot edit"),
         "snapshot content never enters the index: {index_before}"
