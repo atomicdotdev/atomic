@@ -455,6 +455,25 @@ fn crash_during_effect_recovers_without_partial_bytes() {
     // and no partial bytes leak.
     let fixture = WatchFixture::new("crash-during-effect");
 
+    // Deterministic crash target: the reactive daemon must not win the race
+    // to reconcile the record (a no-op reconcile never reaches the effect
+    // phase the failpoint fires in). Disable watch consent for the crash
+    // window and restore it after recovery.
+    let watch_config = fixture.root().join(".atomic/config.toml");
+    let watch_config_before = fs::read_to_string(&watch_config).expect("read config");
+    let watch_config_disabled = watch_config_before
+        .lines()
+        .map(|line| {
+            if line.trim() == "enabled = true" {
+                "enabled = false".to_string()
+            } else {
+                line.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    fs::write(&watch_config, &watch_config_disabled).expect("disable watch");
+
     // Atomic moves without projecting: remove the shadow-sync marker so
     // `record` is durable-only, then the reconcile performs the export
     // (the effect phase the crash interrupts).
@@ -491,6 +510,10 @@ fn crash_during_effect_recovers_without_partial_bytes() {
         !crashed.status.success(),
         "the injected effect-phase crash must fail the run"
     );
+
+    // Restore watch consent for the recovery passes (the same consent state
+    // the other cells exercise).
+    fs::write(&watch_config, &watch_config_before).expect("restore watch");
 
     // Recovery: each retry pass makes progress (the open-time recovery
     // completes the interrupted operation; the plain git reset clears the
