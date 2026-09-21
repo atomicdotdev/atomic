@@ -2074,6 +2074,10 @@ fn scoped_record_recovers_session_touched_deletions_after_claim_loss() {
     let mine_event =
         make_event().with_raw_json(serde_json::json!({"record_files":{"mine.txt":scope::fingerprint(dir.path(),"mine.txt").unwrap()}}));
     let outcome = record_turn(dir.path(), &make_options(&session, &mine_event)).unwrap();
+    let outcome = match outcome {
+        crate::record::TurnRecordResult::Recorded(outcome) => outcome,
+        other => panic!("expected recorded outcome, got {other:?}"),
+    };
     session.add_files_touched(outcome.recorded_file_list());
 
     // Another session records foreign.txt.
@@ -2094,11 +2098,19 @@ fn scoped_record_recovers_session_touched_deletions_after_claim_loss() {
     // mine.txt is still attributable from the session state and records as a
     // deletion instead of stranding; foreign.txt stays out of scope.
     let outcome = record_turn(dir.path(), &make_options(&session, &empty)).unwrap();
+    let outcome = match outcome {
+        crate::record::TurnRecordResult::Recorded(outcome) => outcome,
+        other => panic!("expected recorded outcome, got {other:?}"),
+    };
     assert_eq!(outcome.recorded_file_list(), &["mine.txt".to_string()]);
 
     let repo = atomic_repository::Repository::open_existing(dir.path()).unwrap();
+    let working_copy = repo.require_working_copy_id().unwrap();
     let status = repo
-        .status(atomic_repository::status::StatusOptions::default().with_untracked(true))
+        .status(
+            working_copy,
+            atomic_repository::status::StatusOptions::default().with_untracked(true),
+        )
         .unwrap();
     let pending: Vec<String> = status
         .entries()
