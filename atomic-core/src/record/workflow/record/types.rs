@@ -10,7 +10,7 @@ use crate::pristine::PathClaimId;
 use crate::record::workflow::crdt::CrdtBuildStats;
 use crate::record::workflow::detect::DetectionKind;
 use crate::record::workflow::graph_op::BuiltHunk;
-use crate::types::{Hash, Inode, NodeId, Position};
+use crate::types::{GraphNode, Hash, Inode, NodeId, Position};
 
 // ============================================================================
 // RECORDING STATS
@@ -189,6 +189,10 @@ pub struct RecordedFile {
     /// graph and CRDT detail is not worth the cost.
     opaque_generated: bool,
 
+    /// Select an identity while unlinking competing name vertices.
+    name_conflict_resolution: Option<Position<NodeId>>,
+    name_conflict_bindings: Vec<GraphNode<NodeId>>,
+
     /// Pre-globalized graph operations.  When set, `assemble_change` uses
     /// these directly instead of calling `globalize_recorded_file`, which
     /// avoids re-walking the graph.  Produced by the record path when it
@@ -243,6 +247,8 @@ impl RecordedFile {
             crdt_ops: None,
             crdt_stats: None,
             opaque_generated: false,
+            name_conflict_resolution: None,
+            name_conflict_bindings: Vec::new(),
             pre_globalized: None,
             undelete_changes: Vec::new(),
             attrs: Vec::new(),
@@ -271,6 +277,25 @@ impl RecordedFile {
     /// Set the old (pristine) line count.
     pub fn set_old_line_count(&mut self, count: usize) {
         self.old_line_count = Some(count);
+    }
+
+    /// Resolve competing names without deleting their inode or content. The
+    /// bindings must be live name vertices from the recording view's filter.
+    pub fn set_name_conflict_resolution(
+        &mut self,
+        retained: Position<NodeId>,
+        bindings: Vec<GraphNode<NodeId>>,
+    ) {
+        self.name_conflict_resolution = Some(retained);
+        self.name_conflict_bindings = bindings;
+    }
+
+    pub fn name_conflict_resolution(&self) -> Option<Position<NodeId>> {
+        self.name_conflict_resolution
+    }
+
+    pub fn name_conflict_bindings(&self) -> &[GraphNode<NodeId>] {
+        &self.name_conflict_bindings
     }
 
     /// Get the old (pristine) line count.
@@ -556,13 +581,14 @@ impl RecordedFile {
 
     /// Check if empty (no hunks).
     ///
-    /// Note: Moved files are never considered empty even if they have no hunks,
-    /// because the move itself is a meaningful operation that must be recorded.
+    /// Moves and name resolutions are meaningful namespace operations even
+    /// when there are no content hunks.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         if matches!(self.kind, Some(DetectionKind::Moved))
             || self.is_undelete()
             || !self.attrs.is_empty()
+            || self.name_conflict_resolution.is_some()
         {
             return false;
         }

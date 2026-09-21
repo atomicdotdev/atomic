@@ -296,13 +296,24 @@ mod tests {
         let first = txn.alloc_inode().unwrap();
         let second = txn.alloc_inode().unwrap();
         txn.put_tree("same.txt", first).unwrap();
-        txn.put_tree("same.txt", second).unwrap();
+        txn.put_tree("other.txt", second).unwrap();
 
-        txn.del_tree_binding("same.txt", first).unwrap();
+        // This branch's put_tree enforces the TREE/REV_TREE bijection: a
+        // second inode can never silently seize an occupied path (the #206
+        // duplication state is refused at the write, not repaired after).
+        // `del_tree_binding` must therefore be a targeted no-op when the
+        // named inode does not own the path — it removes only the binding
+        // rows it actually owns and never disturbs the current occupant.
+        txn.del_tree_binding("same.txt", second).unwrap();
 
-        assert_eq!(txn.get_inode("same.txt").unwrap(), Some(second));
-        assert_eq!(txn.get_path(first).unwrap(), None);
-        assert_eq!(txn.get_path(second).unwrap().as_deref(), Some("same.txt"));
+        assert_eq!(txn.get_inode("same.txt").unwrap(), Some(first));
+        assert_eq!(txn.get_path(first).unwrap().as_deref(), Some("same.txt"));
+        assert_eq!(txn.get_path(second).unwrap().as_deref(), Some("other.txt"));
+
+        // Removing the binding it DOES own unbinds both directions cleanly.
+        txn.del_tree_binding("other.txt", second).unwrap();
+        assert_eq!(txn.get_inode("other.txt").unwrap(), Some(first));
+        assert_eq!(txn.get_path(second).unwrap(), None);
     }
 
     #[test]

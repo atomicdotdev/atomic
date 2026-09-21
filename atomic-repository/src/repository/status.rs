@@ -1088,6 +1088,48 @@ pub(crate) fn is_file_alive_via_retrieval<T: GraphTxnT>(
     Ok(retrieved.graph.total_bytes() > 0)
 }
 
+/// Dev #203 adapter: NodeId-set visibility (collect_name_conflicts callers).
+pub(crate) fn is_file_alive_via_changes<T: GraphTxnT>(
+    txn: &T,
+    position: Position<NodeId>,
+    visible_changes: &HashSet<NodeId>,
+) -> bool {
+    try_is_file_alive_via_retrieval(txn, position, visible_changes).unwrap_or(false)
+}
+
+/// Dev #203: supersession-aware aliveness probe against an explicit NodeId
+/// change filter (no GraphVisibilityClosure construction).
+pub(crate) fn try_is_file_alive_via_retrieval<T: GraphTxnT>(
+    txn: &T,
+    position: Position<NodeId>,
+    visible_changes: &HashSet<NodeId>,
+) -> Result<bool, atomic_core::pristine::PristineError> {
+    use atomic_core::output::alive::RetrieveOptions;
+
+    let inode_node = position.inode_node();
+    let options = RetrieveOptions::new().with_change_filter(visible_changes.clone());
+
+    // Check forward edges from the inode vertex.  If any destination
+    // content vertex is alive (per the full supersession logic), the
+    // file has live content.
+    let edges = txn.iter_forward(inode_node, false)?;
+
+    for edge in &edges {
+        // Only consider edges introduced by visible changes
+        if !edge.introduced_by.is_root() && !visible_changes.contains(&edge.introduced_by) {
+            continue;
+        }
+        // Build the destination vertex from the edge
+        let dest_vertex = txn.find_block(edge.dest)?;
+        // Use the retrieval pipeline's supersession-aware aliveness check
+        if options.is_vertex_alive(txn, dest_vertex)? {
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
+}
+
 fn map_change_source_error(error: crate::change_source::ChangeSourceError) -> RepositoryError {
     RepositoryError::Output(error.to_string())
 }

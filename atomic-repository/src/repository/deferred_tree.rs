@@ -18,8 +18,16 @@ const DEFERRED_TREE_ALIGNMENT_PENDING: &str = "deferred-tree-alignment.pending";
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub(super) enum DeferredTreeAction {
-    Set { path: String },
+    Set {
+        path: String,
+    },
     Delete,
+    /// Unbind `path` from the inode's desired state — a name-conflict
+    /// resolution that surrenders the name keeps the inode's identity
+    /// (and its REV_TREE claim) while ceasing to occupy the path.
+    UnlinkName {
+        path: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -185,6 +193,11 @@ where
                     DeferredTreeAction::Set { path } => {
                         (Some(path.clone()), Some(path.clone()), false, false)
                     }
+                    DeferredTreeAction::UnlinkName { path } => {
+                        // A name-conflict resolution that surrenders the name
+                        // keeps the inode's identity while vacating the path.
+                        (None, Some(path.clone()), true, false)
+                    }
                     DeferredTreeAction::Delete => {
                         let mut predecessors = Vec::new();
                         for (set_index, set_op) in &visible {
@@ -228,7 +241,9 @@ where
                             .iter()
                             .filter_map(|op| match &op.action {
                                 DeferredTreeAction::Set { path } => Some(path.clone()),
-                                DeferredTreeAction::Delete => None,
+                                DeferredTreeAction::Delete | DeferredTreeAction::UnlinkName { .. } => {
+                                    None
+                                }
                             })
                             .collect();
                         if prior_paths.len() > 1 {
@@ -604,6 +619,25 @@ pub(super) fn collect_tree_ops<T: GraphTxnT + TreeTxnT>(
                 // deferred rename for views where it is visible.
                 push_unique(&mut ops, op);
             }
+            GraphOp::SolveNameConflict { name, path } => {
+                if let Ok(inode) = external_position(change_hash, name.inode) {
+                    push_unique(
+                        &mut ops,
+                        DeferredTreeOp {
+                            change: change_hash,
+                            inode,
+                            baseline_path: current_path_for_position(txn, inode)?
+                                .or_else(|| Some(path.clone())),
+                            directory: None,
+                            action: if name.edges.is_empty() {
+                                DeferredTreeAction::Set { path: path.clone() }
+                            } else {
+                                DeferredTreeAction::UnlinkName { path: path.clone() }
+                            },
+                        },
+                    );
+                }
+            }
             GraphOp::FileDel { del, path, .. } | GraphOp::DirDel { del, path } => {
                 let inode = external_position(change_hash, del.inode)?;
                 let directory = matches!(graph_op, GraphOp::DirDel { .. });
@@ -688,6 +722,41 @@ impl PreparedTreeProjection {
     ) -> Result<(), RepositoryError> {
         self.prerequisites.apply(txn).map_err(projection_error)
     }
+}
+
+/// Materialize explicit name selections into TREE using stable graph identity.
+/// Recording and cross-view insertion share this operation; no content is copied
+/// (dev #203: name conflicts resolve as namespace patches).
+pub(super) fn apply_name_selections<T: MutTxnT>(
+    txn: &mut T,
+    change_id: NodeId,
+    change: &Change,
+) -> Result<(), RepositoryError> {
+    for op in change.hunks() {
+        let GraphOp::SolveNameConflict { name, path } = op else {
+            continue;
+        };
+        if !name.edges.is_empty() {
+            continue;
+        }
+        let unresolved = || RepositoryError::InvalidOperation {
+            message: format!("cannot resolve retained identity for {path}: name conflict"),
+        };
+        let inode_change = match name.inode.change {
+            Some(hash) => txn
+                .get_internal(&hash)
+                .map_err(|e| RepositoryError::Database(e.to_string()))?
+                .ok_or_else(unresolved)?,
+            None => change_id,
+        };
+        let inode = txn
+            .position_inode(Position::new(inode_change, name.inode.pos))
+            .map_err(|e| RepositoryError::Database(e.to_string()))?
+            .ok_or_else(unresolved)?;
+        txn.put_tree(path, inode)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+    }
+    Ok(())
 }
 
 impl Repository {

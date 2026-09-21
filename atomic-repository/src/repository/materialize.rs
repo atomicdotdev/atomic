@@ -273,6 +273,85 @@ thread_local! {
     > = const { std::cell::RefCell::new(None) };
 }
 
+pub(crate) type NameConflicts = std::collections::HashMap<String, Vec<(Inode, Position<NodeId>)>>;
+
+pub(crate) fn live_names_for_path<T: GraphTxnT, C: atomic_core::change::ChangeStore>(
+    txn: &T,
+    store: &C,
+    position: Position<NodeId>,
+    path: &str,
+    filter: &HashSet<NodeId>,
+) -> Result<Vec<atomic_core::types::GraphNode<NodeId>>, RepositoryError> {
+    let options = atomic_core::output::RetrieveOptions::new().with_change_filter(filter.clone());
+    let names = atomic_core::output::repo::live_inode_names(txn, position, &options)
+        .map_err(|e| RepositoryError::Database(format!("{path}: {e}")))?;
+    let filename = path.rsplit('/').next().unwrap_or(path).as_bytes();
+    let mut matching = Vec::new();
+    for name in names {
+        let mut bytes = vec![0; (name.end.get() - name.start.get()) as usize];
+        store
+            .get_contents(|id| txn.get_external(id).ok().flatten(), name, &mut bytes)
+            .map_err(|e| RepositoryError::Database(format!("{path}: {e}")))?;
+        if bytes == filename {
+            matching.push(name);
+        }
+    }
+    Ok(matching)
+}
+
+/// Find all live identities for same-path creates using the current view's
+/// filter. Both record and materialize must see the identities hidden by TREE.
+pub(crate) fn collect_name_conflicts<C: atomic_core::change::ChangeStore>(
+    txn: &atomic_core::pristine::ReadTxn,
+    store: &C,
+    paths: &HashSet<&str>,
+    filter: &HashSet<NodeId>,
+) -> Result<NameConflicts, RepositoryError> {
+    let mut by_path: std::collections::HashMap<String, Vec<Inode>> =
+        std::collections::HashMap::new();
+    for (inode, path) in txn
+        .iter_rev_tree()
+        .map_err(|e| RepositoryError::Database(e.to_string()))?
+    {
+        if paths.contains(path.as_str()) {
+            by_path.entry(path).or_default().push(inode);
+        }
+    }
+    let mut conflicts = std::collections::HashMap::new();
+    for (path, candidates) in by_path {
+        if candidates.len() < 2 {
+            continue;
+        }
+        let mut live = Vec::new();
+        for inode in candidates {
+            let Some(pos) = txn
+                .inode_position(inode)
+                .map_err(|e| RepositoryError::Database(format!("{path}: {e}")))?
+            else {
+                continue;
+            };
+            if !pos.change.is_root() && !filter.contains(&pos.change) {
+                continue;
+            }
+            if live_names_for_path(txn, store, pos, &path, filter)?.is_empty() {
+                continue;
+            }
+            if super::status::try_is_file_alive_via_retrieval(txn, pos, filter).map_err(|e| {
+                RepositoryError::Database(format!(
+                    "cannot resolve recorded baseline for {path}: name conflict: {e}"
+                ))
+            })? {
+                live.push((inode, pos));
+            }
+        }
+        if live.len() >= 2 {
+            live.sort_by_key(|(inode, pos)| (pos.change.get(), pos.pos.get(), inode.get()));
+            conflicts.insert(path, live);
+        }
+    }
+    Ok(conflicts)
+}
+
 /// Render a name conflict: two or more inodes are alive at the same path on
 /// this view, so instead of silently emitting whichever inode `TREE` happened
 /// to keep, wrap every side's materialized content in conflict markers.
@@ -1354,7 +1433,6 @@ impl Repository {
 
         // Name conflicts come from the causal PATH_CLAIMS projection. TREE and
         // REV_TREE are strict one-to-one caches and are never consulted here.
-
         let mut result = MaterializeResult::new();
         result.files_skipped += skipped_in_filter;
 

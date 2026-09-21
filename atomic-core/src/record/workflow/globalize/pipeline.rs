@@ -399,6 +399,63 @@ where
                 field: "position",
             })?;
 
+        if let Some(retained) = recorded.name_conflict_resolution() {
+            ctx.add_dependency_by_id(retained.change)?;
+            ctx.add_dependency_by_id(inode_pos.change)?;
+            // Selection is explicit; the other operations unlink only the
+            // conflicting names. A concurrent rename must keep its content.
+            result.add_hunk(GraphOp::SolveNameConflict {
+                name: EdgeUpdate {
+                    edges: Vec::new(),
+                    inode: position_to_option_hash_resolved(ctx.txn(), retained, None),
+                },
+                path: path.to_string(),
+            });
+            let mut edges = Vec::new();
+            for &name in recorded.name_conflict_bindings() {
+                ctx.add_dependency_by_id(name.change)?;
+                for parent in ctx.txn().get_edges(name)? {
+                    let flag = parent.flag();
+                    if !flag.contains(EdgeFlags::PARENT | EdgeFlags::FOLDER)
+                        || flag.intersects(EdgeFlags::DELETED | EdgeFlags::PSEUDO)
+                    {
+                        continue;
+                    }
+                    ctx.add_dependency_by_id(parent.introduced_by())?;
+                    ctx.add_dependency_by_id(parent.dest().change)?;
+                    let previous = flag - EdgeFlags::PARENT;
+                    edges.push(crate::change::NewEdge {
+                        previous,
+                        flag: previous | EdgeFlags::DELETED,
+                        from: position_to_option_hash_resolved(ctx.txn(), parent.dest(), None),
+                        to: GraphNode {
+                            change: ctx.get_external(name.change),
+                            start: name.start,
+                            end: name.end,
+                        },
+                        introduced_by: ctx.get_external(parent.introduced_by()),
+                    });
+                }
+            }
+            if edges.is_empty() {
+                return Err(GlobalizeError::MissingField {
+                    path: path.to_string(),
+                    field: "live name binding for name-conflict resolution",
+                });
+            }
+            result.add_hunk(GraphOp::SolveNameConflict {
+                name: EdgeUpdate {
+                    edges,
+                    inode: position_to_option_hash_resolved(ctx.txn(), inode_pos, None),
+                },
+                path: path.to_string(),
+            });
+            if let Some(ops) = recorded.crdt_ops().cloned() {
+                result.set_file_ops(ops);
+            }
+            return Ok(result);
+        }
+
         // Track content positions for each hunk to enrich FileOps later
         let mut hunk_content_ranges: Vec<HunkContentRange> = Vec::new();
 

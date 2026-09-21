@@ -144,13 +144,11 @@ impl RetrieveOptions {
         self
     }
 
-    #[cfg(test)]
-    pub(crate) fn with_change_filter(self, filter: std::collections::HashSet<NodeId>) -> Self {
+    pub fn with_change_filter(self, filter: std::collections::HashSet<NodeId>) -> Self {
         self.with_graph_visibility(GraphVisibilityClosure::from_ordered_unchecked(filter))
     }
 
-    #[cfg(test)]
-    pub(crate) fn with_change_filter_arc(
+    pub fn with_change_filter_arc(
         self,
         filter: std::sync::Arc<std::collections::HashSet<NodeId>>,
     ) -> Self {

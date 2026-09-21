@@ -32,6 +32,7 @@ use crate::apply::{
     write_change_to_graph, CrossViewInsertOptions, CrossViewInsertOutcome, InsertOptions,
     InsertOutcome, InsertStats,
 };
+use crate::repository::deferred_tree::{apply_name_selections, collect_tree_ops};
 
 use atomic_core::change::Insertion;
 use atomic_core::pristine::InodeGraphOps;

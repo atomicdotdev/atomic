@@ -266,8 +266,9 @@ impl EffectiveProjectionClosure {
         &self.data.membership
     }
 
-    /// Construct a closure without dependency validation for core unit tests.
-    #[cfg(test)]
+    /// Construct a closure without dependency validation. Production
+    /// change-filter callers (dev #203) prove dependency completeness from
+    /// the view membership upstream; unit tests use it directly.
     pub(crate) fn from_ordered_unchecked<I>(changes: I) -> Self
     where
         I: IntoIterator<Item = NodeId>,
