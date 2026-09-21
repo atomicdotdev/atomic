@@ -51,6 +51,7 @@
 
 use std::io::{Read, Write};
 use std::process::{Command as ProcessCommand, Stdio};
+use std::sync::Arc;
 
 use anyhow::anyhow;
 use clap::Args;
@@ -134,6 +135,26 @@ impl Command for Hooks {
         // handoff. A governed ending stays in the foreground so a typed guard
         // refusal can reach the lifecycle caller.
         let mut managed = super::lifecycle::find_governing_lifecycle_for_hook(&self.agent_name);
+        if self.agent_name == "opencode" && self.verb == "file-snapshot" {
+            let value: serde_json::Value =
+                serde_json::from_slice(&input).map_err(|e| CliError::Internal(anyhow!(e)))?;
+            let cwd = value
+                .get("cwd")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| CliError::Internal(anyhow!("file-snapshot requires cwd")))?;
+            let extra: Vec<String> = serde_json::from_value(
+                value
+                    .get("paths")
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!([])),
+            )
+            .map_err(|e| CliError::Internal(anyhow!(e)))?;
+            let snapshot = atomic_agent::record::scope::snapshot(std::path::Path::new(cwd), &extra)
+                .map_err(|e| CliError::Internal(anyhow!(e)))?;
+            println!("{}", snapshot);
+            return Ok(());
+        }
+
         if self.should_handoff_codex_lifecycle(managed.is_some()) {
             return self.handoff_codex_lifecycle(&input);
         }
@@ -220,6 +241,16 @@ impl Command for Hooks {
             );
         }
 
+        // Terminal hooks hold cross-process publication coordination BEFORE
+        // the workspace boundary guard (dev-sync ordering): a Stop blocked on
+        // a transient writer must be observable as holding its publication
+        // lock, and a killed Stop releases it by process death alone.
+        let _publication_guard = if matches!(hook_type, HookType::TurnEnd | HookType::SessionEnd) {
+            hold_turn_publication_lock(&repo_root)?
+        } else {
+            None
+        };
+
         // CB-0C owns the only stale-baseline classification at agent ending
         // boundaries. It runs before orchestrator construction, so no watcher
         // flush, status, view alignment, record, provenance, or attestation can
@@ -259,6 +290,11 @@ impl Command for Hooks {
             // Set the agent identity so new sessions get the correct name
             // (e.g., "claude-code" / "Claude Code" instead of "unknown")
             orchestrator.set_agent(&agent_name, &agent_display);
+            orchestrator
+                .set_journal_sink(Arc::new(super::owner::OwnerJournalSink::new(&repo_root)));
+            if _publication_guard.is_some() {
+                orchestrator.set_publication_lock_held();
+            }
 
             // Under a managed lifecycle, sessions adopt the declared view
             // and carry the run stamp (see lifecycle module docs).
@@ -351,6 +387,53 @@ impl Command for Hooks {
     }
 }
 
+/// Cross-process publication coordination for terminal hooks.
+///
+/// The orchestrator acquires the same `turn-publication.lock` inside
+/// `handle_turn_end`; acquiring it HERE (before the workspace boundary
+/// guard) mirrors the dev-sync ordering: a Stop blocked on a transient
+/// writer must still be observable as holding its publication lock, and a
+/// killed Stop must release it by process death alone.
+pub(crate) struct TurnPublicationLock(std::fs::File);
+pub(crate) fn hold_turn_publication_lock(
+    repository_root: &std::path::Path,
+) -> CliResult<Option<TurnPublicationLock>> {
+    use fs2::FileExt;
+    let canonical = match atomic_repository::Repository::canonical_dot_dir(repository_root) {
+        Ok(dot) => dot,
+        Err(_) => return Ok(None),
+    };
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(canonical.join("turn-publication.lock"))
+        .map_err(|error| CliError::Internal(anyhow!("failed to open publication lock: {error}")))?;
+    let start = std::time::Instant::now();
+    let timeout = std::time::Duration::from_secs(10);
+    loop {
+        match file.try_lock_exclusive() {
+            Ok(()) => return Ok(Some(TurnPublicationLock(file))),
+            Err(error)
+                if error.kind() == std::io::ErrorKind::WouldBlock
+                    || error.raw_os_error() == fs2::lock_contended_error().raw_os_error() =>
+            {
+                if start.elapsed() >= timeout {
+                    return Err(CliError::Internal(anyhow!(
+                        "timed out waiting for another Stop to publish; retry this Stop"
+                    )));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(error) => {
+                return Err(CliError::Internal(anyhow!(
+                    "publication lock unavailable: {error}"
+                )))
+            }
+        }
+    }
+}
+
 pub(crate) fn guard_agent_boundary(
     repository_root: &std::path::Path,
     managed: &mut Option<super::lifecycle::ManagedLifecycle>,
@@ -373,12 +456,18 @@ pub(crate) fn guard_agent_boundary(
         return Ok(Some(existing.outcome.clone()));
     }
 
-    let mut repository =
-        Repository::open(repository_root).map_err(|error| CliError::StaleBaseline {
-            report: format!(
-                "Unsafe operation: {operation}\nGuard failed before agent boundary: {error}"
-            ),
-        })?;
+    // A transient writer (stop checkpoint publication, recording) must not
+    // fail the guard: wait for it inside the opener so the stop hook can
+    // acquire its publication coordination first (dev-sync behavior).
+    let mut repository = Repository::open_for_workspace_transaction_wait(
+        repository_root,
+        std::time::Duration::from_secs(10),
+    )
+    .map_err(|error| CliError::StaleBaseline {
+        report: format!(
+            "Unsafe operation: {operation}\nGuard failed before agent boundary: {error}"
+        ),
+    })?;
     let boundary_start = repository
         .begin_workspace_txn(WorkspaceTxnMode::Reconcile)
         .map_err(|error| CliError::StaleBaseline {
@@ -641,6 +730,7 @@ mod tests {
             created_at: now,
             updated_at: now,
             expires_at: now + 60,
+            stop_state: None,
         }
     }
 

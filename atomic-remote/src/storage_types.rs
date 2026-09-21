@@ -126,6 +126,86 @@ pub struct IdentityInfo {
     pub name: String,
     pub status: String,
     pub created_at: DateTime<Utc>,
+    /// Canonical base32-encoded Ed25519 public key (52 chars, no padding).
+    ///
+    /// Only present when the serving server supports public-key lookup
+    /// (newer servers); older servers omit the field entirely, so it is
+    /// optional for forward/backward compatibility.
+    #[serde(default, alias = "public_key")]
+    pub public_key: Option<String>,
+}
+
+/// An agent identity enrolled under a human identity.
+///
+/// Agents are never tenants: enrolling one records a key and its parent, and
+/// grants nothing. Whatever the agent may do comes from the delegation
+/// certificate intersected with the parent's own access.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentIdentityInfo {
+    pub id: uuid::Uuid,
+    pub name: String,
+    /// `did:atomic:...` for the agent's key.
+    pub did: String,
+    /// The human identity this agent acts on behalf of.
+    pub parent_identity_id: uuid::Uuid,
+    /// Software agent label, e.g. `urn:atomic:agent:claude-code`.
+    pub software_agent: Option<String>,
+    pub status: String,
+    pub created_at: DateTime<Utc>,
+    /// Grants issued to this agent before this instant are rejected.
+    #[serde(default)]
+    pub delegations_valid_from: Option<DateTime<Utc>>,
+    /// Grants a client chose to **publish**, newest first.
+    ///
+    /// Advisory and usually incomplete — publishing is optional, so this is a
+    /// visibility aid and never the set of valid grants.
+    #[serde(default)]
+    pub published_delegations: Vec<DelegationInfo>,
+}
+
+/// A delegation certificate as the server holds it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DelegationInfo {
+    /// `urn:atomic:delegation:<base32>`.
+    pub id: String,
+    pub delegator_identity_id: uuid::Uuid,
+    pub delegate_identity_id: uuid::Uuid,
+    /// `active` | `expired` | `revoked` | `superseded`.
+    pub status: String,
+    pub issued_at: DateTime<Utc>,
+    pub expires_at: Option<DateTime<Utc>>,
+    /// The signed certificate itself, verbatim. Returned so a client can
+    /// re-verify rather than trust the parsed fields above.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub certificate: Option<serde_json::Value>,
+}
+
+/// The result of setting or clearing an epoch.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EpochInfo {
+    pub identity_id: uuid::Uuid,
+    /// `None` means the epoch was cleared — grants are governed by their own
+    /// expiry alone again.
+    pub delegations_valid_from: Option<DateTime<Utc>>,
+}
+
+/// Public status of a delegation, for third-party verification.
+///
+/// Deliberately thin: it answers "is this still good?" for someone checking a
+/// change's `delegation_id` and nothing more.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DelegationStatusInfo {
+    pub id: String,
+    /// Whether the grant is on the server's deny-list.
+    ///
+    /// Deliberately the only field: the endpoint is unauthenticated, so an
+    /// unknown id and a live one answer identically and nothing about scope,
+    /// parties or expiry leaks.
+    pub revoked: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -468,4 +548,38 @@ mod tests {
         assert!(!out.contains("workspace_id"));
         assert!(!out.contains("default_view"));
     }
+}
+
+/// Request body for enrolling an agent identity.
+///
+/// The certificate is the load-bearing field: the server verifies its proof
+/// against the *registered* public key of the caller, which is what ties the
+/// agent key to a human it already knows. `publicKey` is carried separately
+/// only so the server can reject a body whose two halves disagree before doing
+/// crypto.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EnrollAgentRequest {
+    pub name: String,
+    pub email: Option<String>,
+    /// Base32 Ed25519 public key of the agent.
+    pub public_key: String,
+    /// The signed `AgentDelegation` document.
+    pub certificate: serde_json::Value,
+}
+
+/// Request body for issuing or renewing a delegation on an existing agent.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PushDelegationRequest {
+    /// The signed `AgentDelegation` document.
+    pub certificate: serde_json::Value,
+}
+
+/// Request body for revoking a delegation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RevokeDelegationRequest {
+    /// The signed `DelegationRevocation` document.
+    pub revocation: serde_json::Value,
 }

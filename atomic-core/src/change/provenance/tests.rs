@@ -379,3 +379,91 @@ fn test_very_small_cost() {
     assert!(!cost.is_zero());
     assert_eq!(cost.micro_usd, 1);
 }
+
+#[test]
+fn postcard_decoder_reads_current_provenance() {
+    let expected = Provenance::builder()
+        .vendor(AIVendor::Anthropic)
+        .model("claude-sonnet")
+        .tool(AITool::cli("atomic"))
+        .reasoning_tokens(42)
+        .agent_mode("build")
+        .build();
+    let bytes = postcard::to_allocvec(&vec![expected.clone()]).unwrap();
+
+    let decoded = deserialize_postcard(&bytes).unwrap();
+
+    assert_eq!(decoded, vec![expected]);
+}
+
+#[test]
+fn postcard_decoder_reads_provenance_before_reasoning_fields() {
+    let legacy = ProvenanceV0 {
+        vendor: AIVendorV0::OpenAI,
+        model: "gpt-4".to_string(),
+        model_version: Some("legacy".to_string()),
+        tool: AITool::cli("opencode"),
+        suggestion_type: SuggestionType::Complete,
+        prompt: PromptContent::None,
+        system_prompt_hash: None,
+        tokens: TokenUsageV0 {
+            input_tokens: 100,
+            output_tokens: 25,
+            total_tokens: 125,
+            cache_read_tokens: 10,
+            cache_write_tokens: 5,
+        },
+        cost: Cost::from_micro_usd(1250),
+        temperature: Some(700),
+        timestamp: Some(1_700_000_000),
+        request_id: Some("request-1".to_string()),
+        session_id: Some("session-1".to_string()),
+        metadata: vec![("source".to_string(), "legacy".to_string())],
+    };
+    let bytes = postcard::to_allocvec(&vec![legacy]).unwrap();
+
+    let decoded = deserialize_postcard(&bytes).unwrap();
+
+    assert_eq!(decoded.len(), 1);
+    let provenance = &decoded[0];
+    assert_eq!(provenance.model, "gpt-4");
+    assert_eq!(provenance.tokens.total_tokens, 125);
+    assert_eq!(provenance.tokens.reasoning_tokens, 0);
+    assert_eq!(provenance.agent_mode, None);
+    assert_eq!(provenance.request_id.as_deref(), Some("request-1"));
+}
+
+#[test]
+fn postcard_decoder_preserves_vendor_from_before_xai_variant_was_inserted() {
+    let legacy = ProvenanceBeforeXai {
+        vendor: AIVendorV0::Other("openrouter".to_string()),
+        model: "openai/gpt-5.6-sol".to_string(),
+        model_version: None,
+        tool: AITool::cli("opencode"),
+        suggestion_type: SuggestionType::Complete,
+        prompt: PromptContent::None,
+        system_prompt_hash: None,
+        tokens: TokenUsage::full(100, 25, 10, 5, 2),
+        cost: Cost::zero(),
+        temperature: None,
+        timestamp: Some(1_700_000_000),
+        request_id: None,
+        session_id: Some("session-1".to_string()),
+        metadata: vec![("turn_number".to_string(), "1".to_string())],
+        agent_mode: None,
+        finish_reason: None,
+        step_count: None,
+        session_slug: None,
+        reasoning_signature: None,
+        reasoning_text: None,
+        task_plan: Some("[]".to_string()),
+    };
+    let bytes = postcard::to_allocvec(&vec![legacy]).unwrap();
+
+    let decoded = deserialize_postcard(&bytes).unwrap();
+
+    assert_eq!(decoded.len(), 1);
+    assert_eq!(decoded[0].vendor, AIVendor::Other("openrouter".to_string()));
+    assert_eq!(decoded[0].model, "openai/gpt-5.6-sol");
+    assert_eq!(decoded[0].tokens.reasoning_tokens, 10);
+}

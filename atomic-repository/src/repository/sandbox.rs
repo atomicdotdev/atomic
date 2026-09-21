@@ -137,8 +137,9 @@ impl Repository {
     /// Its local `.atomic/current_view` is derived compatibility output; the
     /// canonical working copy's record and compatibility file remain untouched.
     ///
-    /// redb serialises writers, so concurrent `record`s from several agents
-    /// take turns; reads run concurrently via MVCC.
+    /// This writable open requires exclusive process access to the canonical
+    /// database. Read-only sandbox queries use `open_readonly` to share access
+    /// with other readers.
     pub fn open_sandbox<P, Q>(
         working_root: P,
         canonical: Q,
@@ -148,14 +149,34 @@ impl Repository {
         P: AsRef<Path>,
         Q: AsRef<Path>,
     {
-        let working_root = working_root.as_ref().to_path_buf();
-        let canonical_root = Self::find_root(canonical.as_ref())?;
+        Self::open_sandbox_with_mode(working_root.as_ref(), canonical.as_ref(), _view, false)
+    }
+
+    pub(super) fn open_sandbox_readonly(
+        working_root: PathBuf,
+        canonical: PathBuf,
+        view: &str,
+    ) -> Result<Self, RepositoryError> {
+        Self::open_sandbox_with_mode(&working_root, &canonical, view, true)
+    }
+
+    fn open_sandbox_with_mode(
+        working_root: &Path,
+        canonical: &Path,
+        view: &str,
+        read_only: bool,
+    ) -> Result<Self, RepositoryError> {
+        let working_root = working_root.to_path_buf();
+        let canonical_root = Self::find_root(canonical)?;
         let dot_dir = canonical_root.join(DOT_DIR);
 
-        let pristine = Arc::new(
-            Pristine::open_existing(dot_dir.join("pristine.redb"))
-                .map_err(RepositoryError::from)?,
-        );
+        let path = dot_dir.join("pristine.redb");
+        let pristine = if read_only {
+            Pristine::open_readonly(path)
+        } else {
+            Pristine::open_existing(path)
+        };
+        let pristine = Arc::new(pristine.map_err(RepositoryError::from)?);
         let change_store = ChangeStore::new(dot_dir.join("changes"), DEFAULT_CACHE_CAPACITY)
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
         let layout = working_copy::layout_for_paths(
@@ -164,8 +185,21 @@ impl Repository {
             working_root.join(DOT_DIR),
             false,
         )?;
-        let (_working_copy_id, current_view) =
-            working_copy::load_registered_identity(&pristine, &layout)?;
+        // A bare sandbox pointer (`.atomic-sandbox` written by a foreign
+        // harness or an older integration) has no local working-copy
+        // identity. Read-only opens resolve the canonical repository's
+        // registered identity instead of demanding a writable migration;
+        // writable opens keep requiring provisioning.
+        let (_working_copy_id, current_view) = match
+            working_copy::load_registered_identity(&pristine, &layout)
+        {
+            Ok(identity) => identity,
+            Err(RepositoryError::WorkingCopyMigrationRequired { .. }) if read_only => {
+                let canonical_layout = working_copy::discover_layout(&canonical_root)?;
+                working_copy::load_registered_identity(&pristine, &canonical_layout)?
+            }
+            Err(error) => return Err(error),
+        };
 
         Ok(Self {
             root: working_root,

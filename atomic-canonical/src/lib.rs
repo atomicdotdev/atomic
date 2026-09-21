@@ -29,6 +29,7 @@
 //! any attested node is trusted in a real/shared setting.
 
 pub mod context;
+pub mod delegation;
 pub mod did;
 pub mod directive;
 pub mod error;

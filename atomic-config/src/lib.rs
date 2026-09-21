@@ -109,6 +109,19 @@ pub struct ServerConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub identity: Option<String>,
 
+    /// Agent identity that recording hooks sign as against this server.
+    ///
+    /// Set by `atomic identity agent create`. Deliberately separate from
+    /// `identity`, which stays the *human* the agent acts on behalf of:
+    /// enrollment, renewal and revocation all authenticate as the human, while
+    /// day-to-day recording and pushing authenticate as the agent. One field
+    /// could not express "this machine holds both keys", which is the normal
+    /// case on a developer laptop.
+    ///
+    /// Example: `agent_identity = "alice+claude"`
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_identity: Option<String>,
+
     /// Whether the server is a single-tenant deployment.
     ///
     /// Single-tenant servers (reported by the registration response's
@@ -1374,6 +1387,7 @@ mod tests {
             default_org: Some("alice".to_string()),
             default_workspaces: BTreeMap::new(),
             identity: None,
+            agent_identity: None,
             single_tenant: false,
         };
         assert!(config.is_configured());
@@ -1384,6 +1398,7 @@ mod tests {
             default_org: None,
             default_workspaces: BTreeMap::new(),
             identity: None,
+            agent_identity: None,
             single_tenant: false,
         };
         assert!(!partial.is_configured());
@@ -1394,6 +1409,7 @@ mod tests {
             default_org: Some("alice".to_string()),
             default_workspaces: BTreeMap::new(),
             identity: None,
+            agent_identity: None,
             single_tenant: false,
         };
         assert!(!partial.is_configured());
@@ -1406,6 +1422,7 @@ mod tests {
             default_org: Some("alice".to_string()),
             default_workspaces: BTreeMap::new(),
             identity: None,
+            agent_identity: None,
             single_tenant: false,
         };
         assert_eq!(
@@ -1425,6 +1442,7 @@ mod tests {
             default_org: None,
             default_workspaces: BTreeMap::new(),
             identity: None,
+            agent_identity: None,
             single_tenant: false,
         };
         assert_eq!(
@@ -1440,6 +1458,7 @@ mod tests {
             default_org: Some("alice".to_string()),
             default_workspaces: BTreeMap::new(),
             identity: None,
+            agent_identity: None,
             single_tenant: false,
         };
         assert_eq!(
@@ -1453,6 +1472,7 @@ mod tests {
             default_org: None,
             default_workspaces: BTreeMap::new(),
             identity: None,
+            agent_identity: None,
             single_tenant: false,
         };
         assert!(config.default_org_base_url().is_none());
@@ -1465,6 +1485,7 @@ mod tests {
             default_org: Some("alice".to_string()),
             default_workspaces: BTreeMap::new(),
             identity: None,
+            agent_identity: None,
             single_tenant: false,
         };
 
@@ -1490,6 +1511,7 @@ mod tests {
                 default_org: Some("alice".to_string()),
                 default_workspaces: BTreeMap::new(),
                 identity: None,
+                agent_identity: None,
                 single_tenant: false,
             },
             ..GlobalConfig::default()
@@ -1515,6 +1537,7 @@ mod tests {
             default_org: Some("alice".to_string()),
             default_workspaces: BTreeMap::new(),
             identity: None,
+            agent_identity: None,
             single_tenant: false,
         };
         let toml_str = toml::to_string_pretty(&config).unwrap();
@@ -1532,6 +1555,7 @@ mod tests {
             default_org: Some("alice".to_string()),
             default_workspaces: workspaces,
             identity: None,
+            agent_identity: None,
             single_tenant: false,
         };
 
@@ -1569,6 +1593,7 @@ mod tests {
                 default_org: None,
                 default_workspaces: BTreeMap::new(),
                 identity: Some("continuouslee".to_string()),
+                agent_identity: None,
                 single_tenant: false,
             },
         );
@@ -1668,6 +1693,7 @@ email = "test@example.com"
             default_org: Some("acme".to_string()),
             default_workspaces: BTreeMap::new(),
             identity: None,
+            agent_identity: None,
             single_tenant: true,
         };
         // Single-tenant: the bare host is already tenant-scoped — no org prefix.
@@ -1693,6 +1719,7 @@ email = "test@example.com"
             default_org: Some("acme".to_string()),
             default_workspaces: BTreeMap::new(),
             identity: None,
+            agent_identity: None,
             single_tenant: true,
         };
         assert_eq!(

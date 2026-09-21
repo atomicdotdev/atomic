@@ -9,7 +9,7 @@ use atomic_core::pristine::{
     PATH_CLAIM_SCHEMA_VERSION, PRISTINE_META, REV_INODES, REV_TREE, TREE,
 };
 use atomic_core::ChangePosition;
-use redb::{ReadableMultimapTable, ReadableTable};
+use redb::{ReadableDatabase, ReadableMultimapTable, ReadableTable};
 
 pub(super) fn migrate_path_claims_if_required(
     pristine_path: &Path,

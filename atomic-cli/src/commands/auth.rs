@@ -33,6 +33,13 @@ use url::Url;
 
 use crate::error::{CliError, CliResult};
 
+/// Environment override naming the agent identity to authenticate as.
+///
+/// For machines with no config to bind — CI runners, containers — where the
+/// agent's key is delivered as a secret and there is no interactive step in
+/// which to write a profile.
+pub const AGENT_IDENTITY_ENV: &str = "ATOMIC_AGENT_IDENTITY";
+
 /// One `[server]`/`[servers.*]` profile that declares an identity: its host,
 /// its bound identity, and whether it is the active profile (the one
 /// `default_server` selects, or the legacy block when no name is set).
@@ -40,6 +47,14 @@ use crate::error::{CliError, CliResult};
 struct ServerBinding {
     host: String,
     identity: String,
+    /// The agent identity bound to this profile, when one has been created.
+    ///
+    /// Only the *repository* protocol (push/pull/clone) prefers it. Management
+    /// commands resolve through `client.rs` and stay on the human, because
+    /// enrolling, renewing and revoking a delegation are things only the human
+    /// may do — an agent authorized to widen its own certificate would defeat
+    /// the point of having one.
+    agent_identity: Option<String>,
     active: bool,
 }
 
@@ -65,6 +80,16 @@ fn resolve_identity_name_with_override(
 ) -> Option<String> {
     if let Some(name) = identity_override {
         return Some(name.to_string());
+    }
+    // A CI runner has no config to bind and no interactive step to write one;
+    // an env var is the only handle it has. Behind --identity, ahead of config,
+    // because a runner setting it means it.
+    if let Ok(name) = std::env::var(AGENT_IDENTITY_ENV) {
+        let name = name.trim();
+        if !name.is_empty() {
+            log::debug!("Using agent identity from {AGENT_IDENTITY_ENV}: {name}");
+            return Some(name.to_string());
+        }
     }
     resolve_identity_from_url(remote_url, &configured_server_identity_bindings())
 }
@@ -100,6 +125,7 @@ fn configured_server_identity_bindings() -> Vec<ServerBinding> {
             bindings.push(ServerBinding {
                 host,
                 identity: identity.clone(),
+                agent_identity: server.agent_identity.clone(),
                 active,
             });
         }
@@ -174,7 +200,15 @@ fn match_server_identity(remote_host: &str, servers: &[ServerBinding]) -> Option
         .iter()
         .filter(|b| host_is_under(remote_host, &b.host))
         .max_by_key(|b| (b.host.len(), b.active))
-        .map(|b| b.identity.clone())
+        // An agent bound to this profile is the one that should be signing
+        // repository traffic: that is the whole reason it was created. The
+        // human binding remains the fallback, so a profile with no agent
+        // behaves exactly as before.
+        .map(|b| {
+            b.agent_identity
+                .clone()
+                .unwrap_or_else(|| b.identity.clone())
+        })
 }
 
 /// Whether `remote_host` is the server host itself or a subdomain of it,
@@ -373,7 +407,18 @@ pub async fn attach_identity(
     match crate::commands::token::get_token(&server, &identity).await {
         Ok(jwt) => {
             log::debug!("Attaching Bearer JWT for identity '{}'", identity_name);
-            config.with_header("Authorization", format!("Bearer {}", jwt))
+            let config = config.with_header("Authorization", format!("Bearer {}", jwt));
+
+            // An agent also presents the certificate it acts under. The server
+            // verifies it per request against the delegator's registered key,
+            // which is what lets a grant be issued without telling the server
+            // first.
+            match delegation_header(&store, &identity, &server) {
+                Some(encoded) => {
+                    config.with_header(atomic_canonical::delegation::DELEGATION_HEADER, encoded)
+                }
+                None => config,
+            }
         }
         Err(e) => {
             // Non-fatal: a server that doesn't require auth still works for
@@ -381,6 +426,32 @@ pub async fn attach_identity(
             // clear 401 from the server.
             log::debug!("Could not obtain JWT for '{}': {}", identity_name, e);
             config
+        }
+    }
+}
+
+/// The encoded certificate an agent identity should present, if any.
+///
+/// `None` for a human — they have no certificate and need none. `None` too when
+/// an agent has no usable certificate, because the resulting 401 from the
+/// server ("carries no certificate") names the problem better than anything we
+/// could raise here, and a read against a public project may not need one at
+/// all.
+fn delegation_header(store: &IdentityStore, identity: &Identity, server: &str) -> Option<String> {
+    if !identity.identity_type.is_delegated() {
+        return None;
+    }
+
+    match crate::commands::delegation::active_for(store, identity, Some(server)) {
+        Ok(resolved) => Some(atomic_canonical::delegation::encode_for_transport(
+            &resolved.document,
+        )),
+        Err(e) => {
+            log::debug!(
+                "No usable delegation for agent '{}' against {server}: {e}",
+                identity.name
+            );
+            None
         }
     }
 }
@@ -856,10 +927,54 @@ mod tests {
 
     // -- configured server-host identity binding --
 
+    /// Repository traffic signs as the agent when one is bound: that is the
+    /// entire reason `atomic identity agent create` writes the binding.
+    #[test]
+    fn an_agent_binding_wins_over_the_human_for_repository_traffic() {
+        let bindings = vec![ServerBinding {
+            host: "atomic.storage".to_string(),
+            identity: "alice".to_string(),
+            agent_identity: Some("alice+claude".to_string()),
+            active: true,
+        }];
+        assert_eq!(
+            resolve_identity_from_url("https://acme.atomic.storage/x", &bindings).as_deref(),
+            Some("alice+claude")
+        );
+    }
+
+    /// A profile with no agent behaves exactly as it did before agents existed.
+    #[test]
+    fn without_an_agent_binding_the_human_is_used() {
+        let bindings = vec![ServerBinding {
+            host: "atomic.storage".to_string(),
+            identity: "alice".to_string(),
+            agent_identity: None,
+            active: true,
+        }];
+        assert_eq!(
+            resolve_identity_from_url("https://acme.atomic.storage/x", &bindings).as_deref(),
+            Some("alice")
+        );
+    }
+
+    /// An explicit --identity still beats everything, agent binding included —
+    /// otherwise there would be no way to push as yourself from a machine where
+    /// an agent is configured.
+    #[test]
+    fn an_explicit_identity_overrides_the_agent_binding() {
+        assert_eq!(
+            resolve_identity_name_with_override("https://acme.atomic.storage/x", Some("alice"))
+                .as_deref(),
+            Some("alice")
+        );
+    }
+
     fn binding(host: &str, identity: &str) -> ServerBinding {
         ServerBinding {
             host: host.to_string(),
             identity: identity.to_string(),
+            agent_identity: None,
             active: false,
         }
     }
@@ -922,6 +1037,7 @@ mod tests {
         active_legacy.push(ServerBinding {
             host: "localhost".to_string(),
             identity: "legacy-identity".to_string(),
+            agent_identity: None,
             active: true,
         });
         active_legacy.push(binding("localhost", "named-identity"));
@@ -939,6 +1055,7 @@ mod tests {
         active_named.push(ServerBinding {
             host: "localhost".to_string(),
             identity: "named-identity".to_string(),
+            agent_identity: None,
             active: true,
         });
         assert_eq!(
@@ -972,6 +1089,7 @@ mod tests {
         let bindings = vec![ServerBinding {
             host: "localhost".to_string(),
             identity: "leefaus".to_string(),
+            agent_identity: None,
             active: true,
         }];
         let url = "http://localhost:8444/workspaces/w/projects/p/code";

@@ -91,6 +91,12 @@ impl Repository {
         if updates.is_empty() && deletions.is_empty() {
             return Ok(());
         }
+        // A read-only pristine cannot persist the derived index; the next
+        // writable status recomputes it. Failing closed here would turn
+        // ordinary read-only opens (status/log/diff) into hard errors.
+        if self.pristine.is_read_only() {
+            return Ok(());
+        }
         let updates = updates
             .iter()
             .map(|(path, entry)| {

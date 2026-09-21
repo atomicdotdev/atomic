@@ -4,7 +4,7 @@ use atomic_core::change::provenance_graph as pg;
 use atomic_core::types::{Base32, Hash};
 
 use super::helpers::{convert_edge_kind, convert_node_kind};
-use super::{ProvenanceAccumulator, GRAPH_FILENAME};
+use super::{PreparedProvenanceGraph, ProvenanceAccumulator, GRAPH_FILENAME};
 use crate::error::{AgentError, AgentResult};
 use crate::provenance::types::{GraphNode, NodeKind, SerializedGraph};
 
@@ -53,75 +53,101 @@ impl ProvenanceAccumulator {
         agent_vendor: &str,
         changes_explained: &[Hash],
     ) -> pg::ProvenanceGraph {
+        let prepared = self.prepare_provenance_graph(
+            agent_name,
+            agent_display_name,
+            agent_vendor,
+            changes_explained,
+        );
+        self.nodes_saved_count = prepared.nodes_end;
+        self.edges_saved_count = prepared.edges_end;
+        prepared.graph
+    }
+
+    /// Build the next per-turn graph without advancing durable accumulator cursors.
+    pub fn prepare_provenance_graph(
+        &self,
+        agent_name: &str,
+        agent_display_name: &str,
+        agent_vendor: &str,
+        changes_explained: &[Hash],
+    ) -> PreparedProvenanceGraph {
         let previous = self
             .last_provenance_hash
             .as_ref()
             .and_then(|s| Hash::from_base32(s.as_bytes()));
-
-        // Only export nodes/edges added since the last save (per-turn delta).
         let new_nodes = &self.nodes[self.nodes_saved_count..];
         let new_edges = &self.edges[self.edges_saved_count..];
-
-        // Collect IDs of new nodes for edge filtering
         let new_node_ids: std::collections::HashSet<&str> =
-            new_nodes.iter().map(|n| n.id.as_str()).collect();
-
-        // Only include edges where BOTH endpoints are in the new node set.
-        // Cross-turn edges (e.g., goal from turn 1 → exploration in turn 2)
-        // are dropped — each turn's graph is self-contained.
+            new_nodes.iter().map(|node| node.id.as_str()).collect();
         let relevant_edges: Vec<&super::super::types::GraphEdge> = new_edges
             .iter()
-            .filter(|e| {
-                new_node_ids.contains(e.from.as_str()) || new_node_ids.contains(e.to.as_str())
+            .filter(|edge| {
+                new_node_ids.contains(edge.from.as_str()) || new_node_ids.contains(edge.to.as_str())
             })
             .collect();
-
-        let nodes: Vec<pg::ProvenanceNode> = new_nodes
+        let nodes = new_nodes
             .iter()
-            .map(|n| pg::ProvenanceNode {
-                id: n.id.clone(),
-                kind: convert_node_kind(n.kind),
-                timestamp: n.timestamp,
-                summary: n.summary.clone(),
-                detail: n.detail.as_ref().map(|d| d.to_string()),
-                change_hash: n
+            .map(|node| pg::ProvenanceNode {
+                id: node.id.clone(),
+                kind: convert_node_kind(node.kind),
+                timestamp: node.timestamp,
+                summary: node.summary.clone(),
+                detail: node.detail.as_ref().map(ToString::to_string),
+                change_hash: node
                     .change_hash
                     .as_ref()
-                    .and_then(|s| Hash::from_base32(s.as_bytes())),
-                tool_name: n.tool_name.clone(),
-                tool_call_id: n.tool_call_id.clone(),
-                duration_ms: n.duration_ms,
-                classified: n.classified,
-                confidence: n.confidence,
-                consolidated_from: n.consolidated_from.clone(),
+                    .and_then(|hash| Hash::from_base32(hash.as_bytes())),
+                tool_name: node.tool_name.clone(),
+                tool_call_id: node.tool_call_id.clone(),
+                duration_ms: node.duration_ms,
+                classified: node.classified,
+                confidence: node.confidence,
+                consolidated_from: node.consolidated_from.clone(),
             })
             .collect();
-
-        let edges: Vec<pg::ProvenanceEdge> = relevant_edges
+        let edges = relevant_edges
             .iter()
-            .map(|e| pg::ProvenanceEdge {
-                from: e.from.clone(),
-                to: e.to.clone(),
-                kind: convert_edge_kind(e.kind),
+            .map(|edge| pg::ProvenanceEdge {
+                from: edge.from.clone(),
+                to: edge.to.clone(),
+                kind: convert_edge_kind(edge.kind),
             })
             .collect();
-
-        // Mark the save point so the next call only exports new nodes
-        self.nodes_saved_count = self.nodes.len();
-        self.edges_saved_count = self.edges.len();
-
+        let timestamp = new_nodes
+            .iter()
+            .map(|node| node.timestamp)
+            .max()
+            .unwrap_or(0);
         let mut builder = pg::ProvenanceGraph::builder(&self.session_id, agent_name)
             .agent_display_name(agent_display_name)
             .agent_vendor(agent_vendor)
             .nodes(nodes)
             .edges(edges)
-            .changes_explained(changes_explained.to_vec());
-
-        if let Some(prev) = previous {
-            builder = builder.previous(prev);
+            .changes_explained(changes_explained.to_vec())
+            .timestamp(timestamp);
+        if let Some(previous) = previous {
+            builder = builder.previous(previous);
         }
+        PreparedProvenanceGraph {
+            graph: builder.build(),
+            nodes_end: self.nodes.len(),
+            edges_end: self.edges.len(),
+        }
+    }
 
-        builder.build()
+    /// Advance cursors only after the prepared graph and session head publish.
+    pub fn acknowledge_prepared_graph(&mut self, prepared: &PreparedProvenanceGraph, hash: Hash) {
+        self.nodes_saved_count = self.nodes_saved_count.max(prepared.nodes_end);
+        self.edges_saved_count = self.edges_saved_count.max(prepared.edges_end);
+        self.last_provenance_hash = Some(hash.to_base32());
+    }
+
+    /// Advance all current cursors after an externally prepared graph publishes.
+    pub fn acknowledge_published_graph(&mut self, hash: Hash) {
+        self.nodes_saved_count = self.nodes.len();
+        self.edges_saved_count = self.edges.len();
+        self.last_provenance_hash = Some(hash.to_base32());
     }
 
     /// Record the hash of a saved ProvenanceGraph artifact so subsequent
@@ -137,9 +163,9 @@ impl ProvenanceAccumulator {
     // Serialization
     // =========================================================================
 
-    /// Persist the graph to disk at `{session_dir}/graph.json`.
+    /// Write the legacy graph encoding for migration tooling and fixtures.
     ///
-    /// Uses atomic write (temp file + rename) to prevent corruption.
+    /// Production hook dispatch never calls this after the redb cutover.
     pub fn save(&self, session_dir: &Path) -> AgentResult<()> {
         // Ensure the session directory exists
         std::fs::create_dir_all(session_dir).map_err(|e| AgentError::SessionSaveFailed {

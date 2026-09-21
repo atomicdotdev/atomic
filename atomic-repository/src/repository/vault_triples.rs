@@ -1149,7 +1149,8 @@ fn project_intent_semantics(
     // (outgoing from the intent subject, cleaned on re-index/delete), so no
     // extra bookkeeping is needed.
     for r in &node.depends_on {
-        let target = rdf_target_to_kg_id(&r.to, manifest);
+        let to = canonical_ref_target(&r.to);
+        let target = rdf_target_to_kg_id(&to, manifest);
         let kind = match r.edge.as_str() {
             "blockedBy" => edge_kind::BLOCKED_BY,
             "remediates" => edge_kind::REMEDIATES,
@@ -1220,6 +1221,26 @@ fn child_kg_id(urn: &str) -> String {
 /// The label for a `<kind>:<local>` KG id is the part after the first colon.
 fn kg_label(id: &str) -> &str {
     id.split_once(':').map(|(_, l)| l).unwrap_or(id)
+}
+
+/// Canonicalize a `:::ref{to=}` target to an intent URN.
+///
+/// Every `:::ref` edge kind is intent→intent (BLOCKED_BY, DEPENDS_ON,
+/// REMEDIATES, REVIEWS), so a target written without a `urn:` scheme is an
+/// intent named bare — a ULID or a human key.
+///
+/// Without this a bare target fell through [`rdf_target_to_kg_id`]
+/// untouched and the edge landed on `01ABC…` while every reader looks for
+/// `intent:01ABC…`. The edge existed and matched nothing, so triage's
+/// `UNREVIEWED_CHANGE` could never clear — and the bare form is exactly
+/// what `atomic intent new --review <ULID>` scaffolds.
+fn canonical_ref_target(target: &str) -> String {
+    let t = target.trim();
+    if t.starts_with("urn:") {
+        t.to_string()
+    } else {
+        format!("urn:atomic:intent:{t}")
+    }
 }
 
 fn rdf_target_to_kg_id(target: &str, manifest: Option<&VaultManifest>) -> String {
@@ -1807,6 +1828,52 @@ Remediates a defect delivered by DEMO-A.\n\
         assert!(
             !edge_exists("intent:DEMO-B", "intent:DEMO-A"),
             "edge must be removed when the remediation intent is deleted"
+        );
+    }
+
+    /// A `:::ref` target named BARE — no `urn:` scheme — must still land on
+    /// the intent node.
+    ///
+    /// This is the shape `atomic intent new --review <ULID>` scaffolds and
+    /// the shape triage's own remediation hint used to tell people to type.
+    /// It projected an edge to `01ABC…` while every reader looks for
+    /// `intent:01ABC…`, so the edge existed, matched nothing, and triage's
+    /// `UNREVIEWED_CHANGE` could never be cleared — the review gate was
+    /// unsatisfiable by the documented command.
+    #[test]
+    fn test_bare_ref_target_resolves_to_the_intent_node() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        repo.init_vault().unwrap();
+
+        let fm_r =
+            r#"{"id":"DEMO-R","title":"Review the work","status":"in-progress","kind":"review"}"#;
+        // Bare target: no `urn:atomic:intent:` prefix.
+        let body_r = "\
+:::why\n\
+Reviews DEMO-T.\n\
+:::\n\n\
+:::ref{to=DEMO-T edge=reviews}\n\
+:::";
+        repo.vault_store(
+            "intents/demo-r/intent.md",
+            VaultEntryType::Intent,
+            body_r.as_bytes().to_vec(),
+            fm_r.to_string(),
+        )
+        .unwrap();
+
+        let txn = repo.pristine().read_txn().unwrap();
+        let edges = txn.get_kg_edges_from("intent:DEMO-R").unwrap();
+        let reviews: Vec<&str> = edges
+            .iter()
+            .filter(|e| e.kind == edge_kind::REVIEWS)
+            .map(|e| e.to_id.as_str())
+            .collect();
+        assert_eq!(
+            reviews,
+            vec!["intent:DEMO-T"],
+            "a bare target must be namespaced, not passed through raw"
         );
     }
 

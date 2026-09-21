@@ -628,6 +628,33 @@ pub enum RefUpdate {
 }
 
 impl RemoteViewInfo {
+    /// Parse a view-inventory row without silently accepting malformed data.
+    pub fn parse_strict(line: &str) -> Result<Self, String> {
+        let line = line.trim();
+        if line.is_empty() {
+            return Err("row is empty".to_string());
+        }
+
+        let fields: Vec<_> = line.split('\t').map(str::trim).collect();
+        if !(5..=6).contains(&fields.len()) {
+            return Err(format!(
+                "expected 5 or 6 tab-separated fields, got {}",
+                fields.len()
+            ));
+        }
+        if fields[0].is_empty() {
+            return Err("view name is empty".to_string());
+        }
+        if !fields[1].eq_ignore_ascii_case("shared") && !fields[1].eq_ignore_ascii_case("draft") {
+            return Err(format!("unsupported view scope '{}'", fields[1]));
+        }
+        fields[3]
+            .parse::<u64>()
+            .map_err(|_| format!("invalid change count '{}'", fields[3]))?;
+
+        Self::parse(line).ok_or_else(|| "invalid view inventory row".to_string())
+    }
+
     /// Parse one protocol line into a [`RemoteViewInfo`].
     ///
     /// Wire format (tab-separated):

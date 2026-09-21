@@ -124,33 +124,18 @@ else
     _fail "session transcript_path points at the synthesized transcript" "got: $tp"
 fi
 
-# #1 + #4 (graph side) — llm_response and decision nodes present.
-graph=".atomic/sessions/ses_harness/graph.json"
-if python3 - "$graph" <<'EOF'
-import json, sys
-kinds = [n["kind"] for n in json.load(open(sys.argv[1]))["nodes"]]
-assert "llm_response" in kinds, kinds
-assert "decision" in kinds, kinds
-EOF
-then
-    _pass "graph has llm_response and decision nodes"
+# Finalized history remains readable through the immutable session ledger.
+HASH="$(atomic log -f json 2>/dev/null | python3 -c "import json,sys; print(json.load(sys.stdin)[0]['hash'])")"
+ledger_json="$(atomic session show ses_harness --json 2>/dev/null)"
+if echo "$ledger_json" | python3 -c "import json,sys; d=json.load(sys.stdin); assert len(d[1]) == 1; assert d[1][0]['provenance_hash']"; then
+    _pass "finalized provenance is readable from the session ledger"
 else
-    _fail "graph has llm_response and decision nodes" "$(cat "$graph" 2>/dev/null | head -3)"
+    _fail "finalized provenance is readable from the session ledger"
 fi
-if python3 - "$graph" <<'EOF'
-import json, sys
-nodes = json.load(open(sys.argv[1]))["nodes"]
-resp = next(n for n in nodes if n["kind"] == "llm_response")
-assert resp["summary"] == "The widget is fixed.", resp["summary"]
-EOF
-then
-    _pass "llm_response carries the store response text"
-else
-    _fail "llm_response carries the store response text"
-fi
+assert_file_not_exists "graph.json removed after owner-journal cutover" ".atomic/sessions/ses_harness/graph.json"
+assert_file_not_exists "graph.lock removed after owner-journal cutover" ".atomic/sessions/ses_harness/graph.lock"
 
 # #4 (change side) — reasoning_text, tokens, cost, steps on the provenance.
-HASH="$(atomic log -f json 2>/dev/null | python3 -c "import json,sys; print(json.load(sys.stdin)[0]['hash'])")"
 prov_json="$(atomic change "$HASH" -f json 2>/dev/null)"
 if echo "$prov_json" | python3 -c "
 import json, sys
@@ -168,21 +153,6 @@ else
         "$(echo "$prov_json" | head -3)"
 fi
 
-# Tool nodes recorded from the thin payload get their command and output back
-# from the store, matched on the tool call id.
-if python3 - "$graph" <<'EOF'
-import json, sys
-nodes = json.load(open(sys.argv[1]))["nodes"]
-node = next(n for n in nodes if n.get("tool_call_id") == "call_h1")
-assert "cargo test" in node["summary"], node["summary"]
-assert node["detail"]["command"] == "cargo test", node["detail"]
-assert "12 passed" in node["detail"]["output_summary"], node["detail"]
-EOF
-then
-    _pass "tool node enriched from the store (command + output)"
-else
-    _fail "tool node enriched from the store (command + output)"
-fi
 
 # #2 — agent_turn persisted inside the change file (unhashed section).
 change_file="$(find .atomic/changes -name "$HASH.change" | head -1)"
@@ -240,22 +210,17 @@ else
     _fail "transcript_path applied from the Stop event" "got: $after"
 fi
 
-# #1 (transcript fallback) — response derived from the last assistant entry.
-cc_graph=".atomic/sessions/cc-harness/graph.json"
-if python3 - "$cc_graph" <<'EOF'
-import json, sys
-nodes = json.load(open(sys.argv[1]))["nodes"]
-resp = next(n for n in nodes if n["kind"] == "llm_response")
-assert resp["summary"] == "The parser is patched and verified.", resp["summary"]
-EOF
-then
-    _pass "llm_response derived from the transcript fallback"
+# #1 (transcript fallback) — immutable turn exists; agent_turn below checks text.
+CC_HASH="$(atomic log -f json 2>/dev/null | python3 -c "import json,sys; print(json.load(sys.stdin)[0]['hash'])")"
+cc_ledger="$(atomic session show cc-harness --json 2>/dev/null)"
+if echo "$cc_ledger" | python3 -c "import json,sys; d=json.load(sys.stdin); assert len(d[1]) == 1; assert d[1][0]['provenance_hash']"; then
+    _pass "claude finalized provenance is readable from the session ledger"
 else
-    _fail "llm_response derived from the transcript fallback"
+    _fail "claude finalized provenance is readable from the session ledger"
 fi
+assert_file_not_exists "claude graph.json removed after cutover" ".atomic/sessions/cc-harness/graph.json"
 
 # #2 — agent_turn persisted for the claude-code change too.
-CC_HASH="$(atomic log -f json 2>/dev/null | python3 -c "import json,sys; print(json.load(sys.stdin)[0]['hash'])")"
 cc_file="$(find .atomic/changes -name "$CC_HASH.change" | head -1)"
 if last_section_json "$cc_file" | python3 -c "
 import json, sys

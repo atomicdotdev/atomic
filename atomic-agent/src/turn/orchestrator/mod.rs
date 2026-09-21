@@ -81,17 +81,20 @@ pub(crate) fn is_lock_contended(e: &std::io::Error) -> bool {
 }
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use atomic_core::change::session::{ManagedTurnOutcome, TurnBoundary};
 
 use crate::error::AgentResult;
-use crate::event::{HookType, TurnEvent};
+use crate::event::{HookType, ProvenanceJournalEnvelope, TurnEvent};
 use crate::record::{ClassifiedTurn, TurnRecordOutcome};
 use crate::turn::phase::Phase;
 use crate::turn::session::{
     AgentSession, IncompleteSession, ManagedRunStamp, SessionStatus, SessionStore, TurnOutcomeEntry,
 };
 use crate::watcher::{self, FileWatcher, WatcherConfig};
+use atomic_core::change::session::SessionTurn;
+use atomic_core::types::Hash;
 
 // ═══════════════════════════════════════════════════════════════════════
 // ManagedRunContext
@@ -242,6 +245,154 @@ impl std::fmt::Display for DispatchResult {
 ///
 /// The orchestrator does NOT persist across hook calls — each invocation is
 /// independent. Session state is persisted to disk via `SessionStore`.
+/// Owner-assigned identity and fencing generation for a journaled turn.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct JournalTurnReservation {
+    pub provenance_id: u64,
+    pub generation: u64,
+}
+
+/// Durable acknowledgement for one idempotent journal event.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct JournalAppendAck {
+    pub event_id: String,
+    pub sequence: u64,
+}
+
+/// Immutable graph-building inputs persisted with a checkpoint attempt.
+#[derive(Clone, Debug, PartialEq)]
+pub struct JournalCheckpointSource {
+    pub agent_name: String,
+    pub agent_display_name: String,
+    pub agent_vendor: String,
+    pub change_hashes: Vec<Hash>,
+    pub previous_provenance: Option<Hash>,
+    pub plan_id: Option<String>,
+    pub ledger_turn_number: u32,
+}
+
+/// Owner-persisted checkpoint frontier used to resume finalization.
+#[derive(Clone, Debug, PartialEq)]
+pub struct JournalCheckpointAttempt {
+    pub provenance_id: u64,
+    pub attempt_generation: u64,
+    pub frozen_event_count: u64,
+    pub source: JournalCheckpointSource,
+    pub provenance_hash: Option<Hash>,
+    pub session_turn: Option<SessionTurn>,
+    pub manifest_hash: Option<Hash>,
+}
+
+/// Why an active turn was interrupted before checkpoint publication.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JournalStopCause {
+    UserRequested,
+    LeaseExpired,
+    ProcessExited,
+    HookFailure,
+    SystemShutdown,
+    Abandoned,
+}
+
+/// Persisted lifecycle state returned by the repository owner.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum JournalTurnLifecycle {
+    Running,
+    Stopped {
+        cause: JournalStopCause,
+        observed_at: i64,
+        last_event_seq: Option<u64>,
+        resumable: bool,
+    },
+    Checkpointing,
+    Completed,
+    Abandoned {
+        observed_at: i64,
+        last_event_seq: Option<u64>,
+    },
+}
+
+/// Current owner state for one external session turn.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct JournalTurnStatus {
+    pub provenance_id: u64,
+    pub generation: u64,
+    pub lifecycle: JournalTurnLifecycle,
+}
+
+/// Committed provenance-journal boundary supplied by the CLI owner client.
+pub trait ProvenanceJournalSink: Send + Sync {
+    fn reserve_turn(
+        &self,
+        session_id: &str,
+        turn_number: u32,
+        now: i64,
+    ) -> Result<JournalTurnReservation, String>;
+
+    fn append(
+        &self,
+        reservation: JournalTurnReservation,
+        envelopes: Vec<ProvenanceJournalEnvelope>,
+        now: i64,
+    ) -> Result<Vec<JournalAppendAck>, String>;
+
+    fn prepare_checkpoint(
+        &self,
+        reservation: JournalTurnReservation,
+        source: JournalCheckpointSource,
+        now: i64,
+    ) -> Result<JournalCheckpointAttempt, String>;
+
+    fn load_frozen_envelopes(
+        &self,
+        checkpoint: &JournalCheckpointAttempt,
+    ) -> Result<Vec<Vec<u8>>, String>;
+
+    fn bind_checkpoint_hash(
+        &self,
+        checkpoint: &JournalCheckpointAttempt,
+        hash: Hash,
+        session_turn: SessionTurn,
+        now: i64,
+    ) -> Result<JournalCheckpointAttempt, String>;
+
+    fn acknowledge_checkpoint(
+        &self,
+        checkpoint: &JournalCheckpointAttempt,
+        manifest_hash: Hash,
+        completed_at: i64,
+    ) -> Result<(), String>;
+
+    fn stop_turn(
+        &self,
+        session_id: &str,
+        turn_number: u32,
+        cause: JournalStopCause,
+        resumable: bool,
+        observed_at: i64,
+    ) -> Result<Option<JournalTurnStatus>, String>;
+
+    fn resume_turn(
+        &self,
+        session_id: &str,
+        turn_number: u32,
+        now: i64,
+    ) -> Result<Option<JournalTurnStatus>, String>;
+
+    fn abandon_turn(
+        &self,
+        session_id: &str,
+        turn_number: u32,
+        observed_at: i64,
+    ) -> Result<Option<JournalTurnStatus>, String>;
+
+    fn turn_status(
+        &self,
+        session_id: &str,
+        turn_number: u32,
+    ) -> Result<Option<JournalTurnStatus>, String>;
+}
+
 pub struct TurnOrchestrator {
     /// Path to the repository root (where `.atomic/` lives).
     pub(crate) repo_root: PathBuf,
@@ -269,6 +420,17 @@ pub struct TurnOrchestrator {
     /// turn/session boundary. This is independent of managed-run ownership so
     /// unmanaged agent endings fail closed through the same durable path.
     pub(crate) boundary_refusal: Option<IncompleteSession>,
+
+    /// Required committed journal sink for mutable provenance. Legacy JSON is
+    /// accepted only as a one-time import before the next hook event.
+    pub(crate) journal_sink: Option<Arc<dyn ProvenanceJournalSink>>,
+
+    /// Set when the embedding process already holds the turn publication
+    /// lock (CLI hooks acquire it before the boundary guard). The
+    /// orchestrator must not re-acquire it — fs2 locks are per file
+    /// descriptor, so a second open in the same process deadlocks on
+    /// itself.
+    pub(crate) publication_lock_held: bool,
 }
 
 impl TurnOrchestrator {
@@ -307,6 +469,8 @@ impl TurnOrchestrator {
             agent_display_name: "Unknown Agent".to_string(),
             managed_run: None,
             boundary_refusal: None,
+            journal_sink: None,
+            publication_lock_held: false,
         })
     }
 
@@ -327,6 +491,8 @@ impl TurnOrchestrator {
             agent_display_name: "Unknown Agent".to_string(),
             managed_run: None,
             boundary_refusal: None,
+            journal_sink: None,
+            publication_lock_held: false,
         }
     }
 
@@ -352,6 +518,16 @@ impl TurnOrchestrator {
     /// recording, provenance, or attestation work.
     pub fn set_boundary_refusal(&mut self, refusal: IncompleteSession) {
         self.boundary_refusal = Some(refusal);
+    }
+
+    /// Route provenance mutations through a committed repository owner.
+    pub fn set_journal_sink(&mut self, sink: Arc<dyn ProvenanceJournalSink>) {
+        self.journal_sink = Some(sink);    }
+
+    /// Record that the embedding process already holds the turn
+    /// publication lock (see [`Self::set_journal_sink`] callers in the CLI).
+    pub fn set_publication_lock_held(&mut self) {
+        self.publication_lock_held = true;
     }
 
     /// The view declared by the governing managed run, if any.
@@ -626,13 +802,22 @@ impl TurnOrchestrator {
     /// it is classified as `RepositoryOperations` instead of being silently
     /// skipped. Pure observation-only turns (checkpoint equal) stay skipped.
     pub(crate) fn has_working_copy_or_git_changes(&self, session_id: &str) -> bool {
-        if self.has_working_copy_changes() {
-            return true;
+        self.has_working_copy_changes() || self.has_git_checkpoint_moved(session_id)
+    }
+
+    /// Whether the Git checkpoint moved since the turn-start baseline
+    /// (observation only — never reconciles). Unknown states report as
+    /// moved so the record path classifies the gap explicitly.
+    pub(crate) fn has_git_checkpoint_moved(&self, session_id: &str) -> bool {
+        // A repository without Git has no checkpoint to move; clean turns
+        // there keep the plain read-only/retry semantics.
+        if !self.repo_root.join(".git").exists() {
+            return false;
         }
         // Working copy is clean. Compare the Git checkpoint against the
         // turn-start baseline (observation only — never reconciles).
         let Some(session) = self.session_store.load(session_id).ok().flatten() else {
-            return false;
+            return true;
         };
         let Some(baseline) = session.boundary_start.as_ref().and_then(|b| b.git.as_ref()) else {
             // No baseline to compare (observation gap): let the record path

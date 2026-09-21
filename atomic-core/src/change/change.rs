@@ -648,7 +648,12 @@ impl Change {
                             "duplicate V2 PROVENANCE section".to_string(),
                         ));
                     }
-                    provenance = section.deserialize()?;
+                    provenance = super::provenance::deserialize_postcard(&section.payload)
+                        .map_err(|error| {
+                            ChangeError::Invalid(format!(
+                                "failed to deserialize provenance section: {error}"
+                            ))
+                        })?;
                 }
                 SectionType::Graph => {
                     graph_count += 1;

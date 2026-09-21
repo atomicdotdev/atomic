@@ -89,6 +89,19 @@ atomic status
 
 # Show short/compact output
 atomic status --short
+
+# Emit the versioned integration document used by IDEs
+atomic status --json
+```
+
+`--json` includes the repository root, current view and state, reindex metadata,
+and a structured entry for every changed path. The document carries a
+`schema_version` so integrations can reject incompatible formats explicitly.
+
+View metadata is available through the matching integration command:
+
+```bash
+atomic view list --json
 ```
 
 #### `atomic add <PATHS>`

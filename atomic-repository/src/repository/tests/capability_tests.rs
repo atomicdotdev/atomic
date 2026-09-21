@@ -1,3 +1,4 @@
+use redb::ReadableDatabase;
 use super::*;
 
 use atomic_core::pristine::{

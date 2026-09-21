@@ -529,8 +529,12 @@ impl Command for Diff {
         // Open the repository and retain its stable workspace boundary for all diff work.
         let mode = self.workspace_mode();
         let mut repo = match mode {
-            WorkspaceTxnMode::Observe => Repository::open_readonly(&repo_root),
-            WorkspaceTxnMode::Reconcile => Repository::open_for_workspace_transaction(&repo_root),
+            WorkspaceTxnMode::Observe => {
+                crate::commands::open_readonly_repository(&repo_root)
+            }
+            WorkspaceTxnMode::Reconcile => {
+                Repository::open_for_workspace_transaction_wait(&repo_root, std::time::Duration::from_secs(10))
+            }
             WorkspaceTxnMode::Force => unreachable!("diff never forces workspace entry"),
         }
         .map_err(|e| CliError::InvalidRepository {
@@ -545,7 +549,6 @@ impl Command for Diff {
             WorkspaceTxnMode::Reconcile => Some(enter_workspace(&mut repo, mode)?),
             WorkspaceTxnMode::Force => unreachable!("diff never forces workspace entry"),
         };
-
         // Parse algorithm
         let algorithm = self.parse_algorithm()?;
 

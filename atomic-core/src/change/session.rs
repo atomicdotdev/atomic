@@ -410,7 +410,7 @@ impl From<SessionRecordV1> for SessionRecord {
 }
 
 /// Index entry connecting one session turn to its immutable Atomic objects.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionTurn {
     pub session_id: String,
     pub turn_number: u32,
@@ -434,6 +434,13 @@ pub struct SessionTurn {
     /// Semantic classification of the turn (RFC §10.2; replaces `EmptyTurn`).
     #[serde(default)]
     pub outcome: Option<ManagedTurnOutcome>,
+}
+
+/// Result of atomically appending one checkpoint turn and advancing its head.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionCheckpointPublication {
+    pub turn: SessionTurn,
+    pub manifest_hash: Hash,
 }
 
 /// Return a deterministic, causality-aware ordering for a session's turns.

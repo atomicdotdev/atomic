@@ -43,8 +43,18 @@ impl TurnOrchestrator {
             }
         };
 
+        let had_active_turn = session.is_turn_active();
+        let journal_turn = if had_active_turn {
+            session.turn_count.saturating_add(1)
+        } else {
+            session.turn_count.max(1)
+        };
+        if had_active_turn {
+            self.commit_hook_event(&event, journal_turn)?;
+        }
+
         // If a turn is still active, cancel the watcher
-        if session.is_turn_active() {
+        if had_active_turn {
             if let Err(e) = self.watcher.cancel_turn().await {
                 log::warn!(
                     "Failed to cancel turn watcher for session {}: {}",
@@ -61,6 +71,10 @@ impl TurnOrchestrator {
         // recorded each turn on `stop` leave a clean working copy here, so
         // `record_turn` returns `EmptyTurn` and this is a no-op for them.
         let mut flush_incomplete: Option<crate::turn::session::IncompleteSession> = None;
+        // Scoped sessions (dev sync): when hook file ownership narrows the
+        // turn and no turn is in flight, alignment and flush are skipped —
+        // there is nothing owned to record.
+        if !session.explicit_record_files || had_active_turn {
         {
             // Ensure a non-sandbox working copy still desires the session's
             // agent view before recording. session-start aligns it, but that can
@@ -139,6 +153,9 @@ impl TurnOrchestrator {
                 .or_else(|| session.first_prompt.clone());
             let turn_number = session.turn_count + 1;
             let turn_duration_ms = session.current_turn_duration_ms().unwrap_or(0);
+            if had_active_turn {
+                self.commit_turn_completion_events(&session, &event, turn_number)?;
+            }
             let record_result = {
                 let record_options = TurnRecordOptions {
                     session: &session,
@@ -157,7 +174,7 @@ impl TurnOrchestrator {
                     session.recorded_change_hashes.push(outcome.hash);
                     session.clear_current_prompt();
                     self.inject_reasoning_nodes(session_id, &event);
-                    self.save_turn_provenance(session_id, &session, &outcome, &event, None);
+                    self.save_turn_provenance(session_id, &session, &outcome, &event, None)?;
                     self.persist_content_turn_outcome(&mut session, &outcome, None);
                     // Review R2: a mixed flushed turn's unexplained Git
                     // transition refuses attribution just like a git-only
@@ -216,6 +233,17 @@ impl TurnOrchestrator {
                 }
             }
             } // turn-in-flight flush guard
+        }
+        } // scoped-session skip gate
+
+        if had_active_turn {
+            self.stop_journal_turn(
+                session_id,
+                journal_turn,
+                super::JournalStopCause::ProcessExited,
+                true,
+                event.timestamp.timestamp(),
+            )?;
         }
 
         // State machine transition and finalization happen only after the

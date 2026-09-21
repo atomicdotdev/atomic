@@ -167,6 +167,15 @@ pub enum AgentError {
         session_id: String,
     },
 
+    /// The repository owner rejected or failed a provenance journal operation.
+    #[error("Provenance journal operation failed for session '{session_id}': {reason}")]
+    ProvenanceJournalFailed {
+        /// The session whose journal could not be committed.
+        session_id: String,
+        /// Owner transport, fencing, or storage failure.
+        reason: String,
+    },
+
     /// Multiple concurrent sessions detected that may conflict.
     #[error(
         "Concurrent session conflict: session '{existing}' is already active in this workspace"
@@ -215,6 +224,17 @@ pub enum AgentError {
         turn_number: u32,
         /// What went wrong.
         reason: String,
+    },
+
+    /// A scoped turn declared no files or the turn produced no changes.
+    /// This is informational, not a fatal error. The orchestrator
+    /// silently skips empty turns.
+    #[error("Turn {turn_number} for session '{session_id}' had no file changes")]
+    EmptyTurn {
+        /// The session ID.
+        session_id: String,
+        /// The turn number.
+        turn_number: u32,
     },
 
     /// A stored commit-time capture exists but does not authenticate

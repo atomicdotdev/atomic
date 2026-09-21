@@ -436,6 +436,388 @@ impl fmt::Display for TurnEvent {
     }
 }
 
+// ProvenanceJournalEnvelope
+
+/// Current wire and storage version for provenance journal envelopes.
+pub const PROVENANCE_JOURNAL_VERSION: u16 = 1;
+
+/// Whether a tool event describes invocation or its completed result.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProvenanceToolPhase {
+    Before,
+    After,
+}
+
+/// Lossless semantic payload for one provenance journal event.
+///
+/// Typed variants retain the source fields needed to rebuild graph semantics.
+/// `GraphDelta` is the compatibility escape hatch for existing or external
+/// provenance nodes whose schema is richer than the normalized variants.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ProvenanceJournalEvent {
+    Goal {
+        prompt: String,
+    },
+    Tool {
+        phase: ProvenanceToolPhase,
+        tool_name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tool_call_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        input: Option<serde_json::Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        output: Option<serde_json::Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        status: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        duration_ms: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        raw: Option<serde_json::Value>,
+    },
+    ToolEnrichment {
+        tool_call_id: String,
+        tool_name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        input: Option<serde_json::Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        output: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        status: Option<String>,
+    },
+    Reasoning {
+        text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        duration_ms: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        signature: Option<String>,
+    },
+    Response {
+        text: String,
+    },
+    Todo {
+        todo: atomic_core::change::session::SessionTodo,
+    },
+    HumanGate {
+        reason: String,
+    },
+    HumanGateResolution {
+        gate_event_id: String,
+        resolution: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<serde_json::Value>,
+    },
+    PatchProposal {
+        change_hash: String,
+        files: Vec<String>,
+    },
+    Terminal {
+        hook_type: HookType,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        payload: Option<serde_json::Value>,
+    },
+    GraphDelta {
+        nodes: Vec<crate::provenance::types::GraphNode>,
+        edges: Vec<crate::provenance::types::GraphEdge>,
+    },
+    LegacyGraphImport {
+        nodes: Vec<crate::provenance::types::GraphNode>,
+        edges: Vec<crate::provenance::types::GraphEdge>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        previous_provenance: Option<String>,
+    },
+}
+
+/// Versioned, idempotent event stored in the pending provenance journal.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ProvenanceJournalEnvelope {
+    #[serde(alias = "version")]
+    pub schema_version: u16,
+    pub event_id: String,
+    pub session_id: String,
+    pub turn_number: u32,
+    #[serde(default = "default_provenance_generation")]
+    pub generation: u64,
+    pub timestamp_ms: i64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub causal_parent_ids: Vec<String>,
+    pub event: ProvenanceJournalEvent,
+}
+
+const fn default_provenance_generation() -> u64 {
+    1
+}
+
+/// Validation or replay ordering failure for provenance journal envelopes.
+#[derive(Debug, thiserror::Error)]
+pub enum ProvenanceJournalError {
+    #[error("unsupported provenance journal schema version {0}")]
+    UnsupportedVersion(u16),
+    #[error("provenance journal event id cannot be empty")]
+    EmptyEventId,
+    #[error("provenance journal session id cannot be empty")]
+    EmptySessionId,
+    #[error("provenance journal generation must be at least one")]
+    InvalidGeneration,
+    #[error("conflicting provenance journal event id '{0}'")]
+    ConflictingEventId(String),
+    #[error("provenance event '{event_id}' references missing causal parent '{parent_id}'")]
+    MissingCausalParent { event_id: String, parent_id: String },
+    #[error("provenance journal contains a causal cycle")]
+    CausalCycle,
+    #[error("provenance journal mixes session or turn identities")]
+    MixedTurnIdentity,
+    #[error("invalid provenance journal JSON: {0}")]
+    Json(#[from] serde_json::Error),
+    #[error("provenance graph delta conflicts for node '{0}'")]
+    ConflictingGraphNode(String),
+    #[error("human gate event '{0}' has no replayed graph node")]
+    MissingHumanGate(String),
+}
+
+impl ProvenanceJournalEnvelope {
+    pub fn new(
+        event_id: impl Into<String>,
+        session_id: impl Into<String>,
+        turn_number: u32,
+        generation: u64,
+        timestamp_ms: i64,
+        event: ProvenanceJournalEvent,
+    ) -> Self {
+        Self {
+            schema_version: PROVENANCE_JOURNAL_VERSION,
+            event_id: event_id.into(),
+            session_id: session_id.into(),
+            turn_number,
+            generation,
+            timestamp_ms,
+            causal_parent_ids: Vec::new(),
+            event,
+        }
+    }
+
+    #[must_use]
+    pub fn with_causal_parents<I, S>(mut self, parents: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.causal_parent_ids = parents.into_iter().map(Into::into).collect();
+        self.causal_parent_ids.sort();
+        self.causal_parent_ids.dedup();
+        self
+    }
+
+    /// Derive a retry-stable ID from turn identity and the complete event body.
+    pub fn deterministic_id(
+        session_id: &str,
+        turn_number: u32,
+        generation: u64,
+        timestamp_ms: i64,
+        event: &ProvenanceJournalEvent,
+    ) -> Result<String, ProvenanceJournalError> {
+        let bytes =
+            serde_json::to_vec(&(session_id, turn_number, generation, timestamp_ms, event))?;
+        let digest = blake3::hash(&bytes).to_hex().to_string();
+        Ok(format!("pj-{}", &digest[..32]))
+    }
+
+    pub fn validate(&self) -> Result<(), ProvenanceJournalError> {
+        if self.schema_version != PROVENANCE_JOURNAL_VERSION {
+            return Err(ProvenanceJournalError::UnsupportedVersion(
+                self.schema_version,
+            ));
+        }
+        if self.event_id.trim().is_empty() {
+            return Err(ProvenanceJournalError::EmptyEventId);
+        }
+        if self.session_id.trim().is_empty() {
+            return Err(ProvenanceJournalError::EmptySessionId);
+        }
+        if self.generation == 0 {
+            return Err(ProvenanceJournalError::InvalidGeneration);
+        }
+        Ok(())
+    }
+
+    pub fn to_json_bytes(&self) -> Result<Vec<u8>, ProvenanceJournalError> {
+        self.validate()?;
+        Ok(serde_json::to_vec(self)?)
+    }
+
+    pub fn from_json_bytes(bytes: &[u8]) -> Result<Self, ProvenanceJournalError> {
+        let envelope: Self = serde_json::from_slice(bytes)?;
+        envelope.validate()?;
+        Ok(envelope)
+    }
+
+    /// Adapt a normalized hook event without discarding its raw payload.
+    ///
+    /// Turn starts become goals, tool hooks retain before/after phase and full
+    /// input/output JSON, and lifecycle boundaries remain terminal events.
+    pub fn from_turn_event(
+        event_id: impl Into<String>,
+        turn_number: u32,
+        generation: u64,
+        event: &TurnEvent,
+    ) -> Self {
+        let raw = event.raw_json.clone();
+        let journal_event = match event.event_type {
+            HookType::TurnStart if event.prompt.is_some() => ProvenanceJournalEvent::Goal {
+                prompt: event.prompt.clone().unwrap_or_default(),
+            },
+            HookType::PreToolUse | HookType::PostToolUse => {
+                let input = raw.as_ref().and_then(|value| {
+                    value
+                        .get("tool_input")
+                        .or_else(|| value.get("input"))
+                        .or_else(|| value.get("arguments"))
+                        .cloned()
+                });
+                let output = raw.as_ref().and_then(|value| {
+                    value
+                        .get("tool_output")
+                        .or_else(|| value.get("output"))
+                        .or_else(|| value.get("result"))
+                        .cloned()
+                });
+                let status = raw
+                    .as_ref()
+                    .and_then(|value| value.get("status"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(ToOwned::to_owned);
+                let duration_ms = raw
+                    .as_ref()
+                    .and_then(|value| value.get("duration_ms").or_else(|| value.get("duration")))
+                    .and_then(serde_json::Value::as_u64);
+                ProvenanceJournalEvent::Tool {
+                    phase: if event.event_type == HookType::PreToolUse {
+                        ProvenanceToolPhase::Before
+                    } else {
+                        ProvenanceToolPhase::After
+                    },
+                    tool_name: event.tool_name.clone().unwrap_or_default(),
+                    tool_call_id: event.tool_use_id.clone(),
+                    input,
+                    output,
+                    status,
+                    duration_ms,
+                    raw,
+                }
+            }
+            _ => ProvenanceJournalEvent::Terminal {
+                hook_type: event.event_type,
+                reason: raw
+                    .as_ref()
+                    .and_then(|value| value.get("reason"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(ToOwned::to_owned),
+                payload: raw,
+            },
+        };
+        Self::new(
+            event_id,
+            &event.session_id,
+            turn_number,
+            generation,
+            event.timestamp.timestamp_millis(),
+            journal_event,
+        )
+    }
+}
+
+/// Deduplicate and causally order a complete turn journal.
+///
+/// Ready events are ordered by generation, timestamp, then stable event ID, so
+/// process arrival order cannot affect replay. Causal parents always precede
+/// children even when clocks are tied or skewed.
+pub fn canonicalize_provenance_journal(
+    envelopes: Vec<ProvenanceJournalEnvelope>,
+) -> Result<Vec<ProvenanceJournalEnvelope>, ProvenanceJournalError> {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    let mut by_id = BTreeMap::<String, ProvenanceJournalEnvelope>::new();
+    for mut envelope in envelopes {
+        envelope.validate()?;
+        envelope.causal_parent_ids.sort();
+        envelope.causal_parent_ids.dedup();
+        match by_id.get(&envelope.event_id) {
+            Some(existing) if existing == &envelope => continue,
+            Some(_) => {
+                return Err(ProvenanceJournalError::ConflictingEventId(
+                    envelope.event_id,
+                ))
+            }
+            None => {
+                by_id.insert(envelope.event_id.clone(), envelope);
+            }
+        }
+    }
+    let Some(first) = by_id.values().next() else {
+        return Ok(Vec::new());
+    };
+    if by_id
+        .values()
+        .any(|event| event.session_id != first.session_id || event.turn_number != first.turn_number)
+    {
+        return Err(ProvenanceJournalError::MixedTurnIdentity);
+    }
+
+    let mut indegree = BTreeMap::<String, usize>::new();
+    let mut children = BTreeMap::<String, Vec<String>>::new();
+    for envelope in by_id.values() {
+        indegree.insert(envelope.event_id.clone(), envelope.causal_parent_ids.len());
+        for parent in &envelope.causal_parent_ids {
+            if !by_id.contains_key(parent) {
+                return Err(ProvenanceJournalError::MissingCausalParent {
+                    event_id: envelope.event_id.clone(),
+                    parent_id: parent.clone(),
+                });
+            }
+            children
+                .entry(parent.clone())
+                .or_default()
+                .push(envelope.event_id.clone());
+        }
+    }
+
+    let mut ready = BTreeSet::<(u64, i64, String)>::new();
+    for envelope in by_id.values() {
+        if indegree[&envelope.event_id] == 0 {
+            ready.insert((
+                envelope.generation,
+                envelope.timestamp_ms,
+                envelope.event_id.clone(),
+            ));
+        }
+    }
+
+    let mut ordered = Vec::with_capacity(by_id.len());
+    while let Some(key) = ready.pop_first() {
+        let event_id = key.2;
+        let envelope = by_id[&event_id].clone();
+        ordered.push(envelope);
+        if let Some(next_events) = children.get(&event_id) {
+            for child_id in next_events {
+                let degree = indegree.get_mut(child_id).expect("known journal child");
+                *degree -= 1;
+                if *degree == 0 {
+                    let child = &by_id[child_id];
+                    ready.insert((child.generation, child.timestamp_ms, child.event_id.clone()));
+                }
+            }
+        }
+    }
+
+    if ordered.len() != by_id.len() {
+        return Err(ProvenanceJournalError::CausalCycle);
+    }
+    Ok(ordered)
+}
+
 // TurnChanges
 
 /// Files that changed during a single agent turn.

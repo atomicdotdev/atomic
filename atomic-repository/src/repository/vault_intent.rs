@@ -155,14 +155,30 @@ impl Repository {
                 .get_vault_manifest()
                 .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
-            // Set the project code on first use, derived from the project dir.
+            // Set the project code on first use.
+            //
+            // `ATOMIC_PROJECT_CODE` wins when set, because the directory name
+            // is not always the project's name: an agent sandbox roots the
+            // repository at the sandbox directory, so the first intent created
+            // inside one stamped every intent in that project `SAND::…`
+            // forever (the prefix is set once and kept). Callers that know the
+            // real project — an orchestrator working from a project slug — set
+            // the variable and get a stable, meaningful code.
             if manifest.intent_prefix.is_empty() {
-                let project_name = self
-                    .root
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("vault");
-                manifest.intent_prefix = VaultManifest::derive_intent_prefix(project_name);
+                let from_env = std::env::var("ATOMIC_PROJECT_CODE")
+                    .ok()
+                    .map(|v| v.trim().to_string())
+                    .filter(|v| !v.is_empty());
+                let project_name = match from_env {
+                    Some(code) => code,
+                    None => self
+                        .root
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("vault")
+                        .to_string(),
+                };
+                manifest.intent_prefix = VaultManifest::derive_intent_prefix(&project_name);
                 if manifest.intent_prefix.is_empty() {
                     manifest.intent_prefix = "VAULT".to_string();
                 }
@@ -778,6 +794,13 @@ impl Repository {
         let asserting_done =
             explicit_grant || (options.content.is_some() && resulting_status == "done");
 
+        // A `needs-review` flip is the review handoff — implementation
+        // complete, awaiting independent review. It is NOT a grant (no
+        // substance pin is stamped), but it gets the same write-time checklist
+        // guard as a done grant so an incomplete intent cannot be flagged
+        // ready for review.
+        let asserting_handoff = options.status.as_deref() == Some("needs-review");
+
         // Lift once from the post-edit frontmatter+body; reused by the rollup
         // gate, the done-grant stamp, and the lapse check. A body we cannot lift
         // carries no canonical checklist/substance, so all three become no-ops;
@@ -786,7 +809,7 @@ impl Repository {
         let body_str = String::from_utf8_lossy(&new_content).into_owned();
         let lifted = atomic_canonical::lift::lift_intent(&fm, &body_str).ok();
 
-        if asserting_done {
+        if asserting_done || asserting_handoff {
             if let Some(ref node) = lifted {
                 let report = atomic_canonical::validate_intent(node);
                 let blocking: Vec<_> = report
@@ -805,8 +828,8 @@ impl Repository {
                         .join("\n");
                     return Err(RepositoryError::InvalidOperation {
                         message: format!(
-                            "Intent '{}' cannot be marked done: its checklist is not complete.\n{}",
-                            full_id, details
+                            "Intent '{}' cannot be marked {}: its checklist is not complete.\n{}",
+                            full_id, resulting_status, details
                         ),
                     });
                 }
@@ -1832,6 +1855,69 @@ Login attempts are rate-limited.\n:::\n\n\
             )
             .unwrap();
         assert_eq!(updated.status, "done");
+    }
+
+    #[test]
+    fn test_intent_update_needs_review_rejected_when_task_incomplete() {
+        let dir = tempdir().unwrap();
+        let repo = init_repo_with_vault(dir.path());
+        let result = repo
+            .vault_intent_create(create_opts("Rate limiting"))
+            .unwrap();
+
+        // A canonical body whose task is still open while we flag
+        // `needs-review` — the same write-time guard as a done grant.
+        let body = "\
+:::why\nNeed rate limiting.\n:::\n\n\
+:::acceptance-criterion{#ac-1 status=met verifiedBy=did:atomic:lee evidence=urn:atomic:change:01J8}\n\
+Login attempts are rate-limited.\n:::\n\n\
+:::task{#t1 status=open satisfies=ac-1}\nAdd rate limiter middleware.\n:::";
+
+        let err = repo
+            .vault_intent_update(
+                &result.id,
+                IntentUpdateOptions {
+                    status: Some("needs-review".to_string()),
+                    content: Some(body.to_string()),
+                    ..Default::default()
+                },
+            )
+            .unwrap_err();
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("checklist is not complete") && msg.contains("every task must be done"),
+            "unexpected error: {msg}"
+        );
+
+        // The rejected write must not have flipped the manifest status.
+        let manifest = repo.vault_manifest().unwrap();
+        assert_ne!(manifest.intents[&result.id].status, "needs-review");
+    }
+
+    #[test]
+    fn test_intent_update_needs_review_allowed_when_checklist_complete() {
+        let dir = tempdir().unwrap();
+        let repo = init_repo_with_vault(dir.path());
+        let result = repo
+            .vault_intent_create(create_opts("Rate limiting"))
+            .unwrap();
+
+        let updated = repo
+            .vault_intent_update(
+                &result.id,
+                IntentUpdateOptions {
+                    status: Some("needs-review".to_string()),
+                    content: Some(DONE_BODY.to_string()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(updated.status, "needs-review");
+
+        // A handoff is not a grant: no done-substance pin is stamped.
+        let manifest = repo.vault_manifest().unwrap();
+        assert!(manifest.intents[&result.id].done_substance_hash.is_none());
     }
 
     /// A canonical intent body whose checklist is complete (every AC met, every

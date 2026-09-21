@@ -135,6 +135,23 @@ impl Register {
                 })?
         };
 
+        // 2b. An agent must never mint a tenant. Registration creates one
+        //     whose slug is the identity name, so letting an agent through
+        //     here would give a delegated key its own top-level namespace —
+        //     the opposite of "an agent can never exceed its human".
+        if identity.identity_type.is_delegated() || identity.identity_type.is_agent() {
+            return Err(CliError::InvalidArgument {
+                message: format!(
+                    "'{}' is an agent identity, and registering creates a tenant.\n  \
+                     Enroll it under a human instead:\n    \
+                     atomic identity agent create <name>\n  \
+                     or, for a key generated elsewhere:\n    \
+                     atomic identity delegation push",
+                    identity.name
+                ),
+            });
+        }
+
         // 3. Load the keypair (needs the secret key for signing).
         let keypair = store.load_keypair(&identity.id, None).map_err(|e| {
             CliError::Internal(anyhow::anyhow!(
@@ -367,6 +384,9 @@ fn apply_registration(
             default_org: Some(slug.to_string()),
             default_workspaces: std::collections::BTreeMap::new(),
             identity: Some(identity_name.to_string()),
+            // Registration binds the human; `atomic identity agent create`
+            // binds an agent later, if one is ever created for this server.
+            agent_identity: None,
             single_tenant,
         };
         config.servers.insert(name.to_string(), profile);

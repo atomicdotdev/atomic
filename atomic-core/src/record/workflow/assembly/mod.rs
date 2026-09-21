@@ -665,14 +665,14 @@ where
             }
             emit_recorded_attributes(&mut ctx, &mut glob_ctx, file)?;
             let glob_ms = glob_start.elapsed().as_millis();
-            if glob_ms > 100 {
-                eprintln!(
-                    "[assemble] pre-globalized '{}' {}ms ({} hunks)",
-                    file.path(),
-                    glob_ms,
-                    pre_ops.len(),
-                );
-            }
+            log::debug!(
+                "assemble_change: pre-globalized file {}/{} '{}' in {}ms ({} hunks)",
+                file_idx + 1,
+                total_files,
+                file.path(),
+                glob_ms,
+                pre_ops.len(),
+            );
             stats.record_file();
             continue;
         }
@@ -731,32 +731,15 @@ where
                 }
                 emit_recorded_attributes(&mut ctx, &mut glob_ctx, file)?;
 
-                if glob_ms > 100 {
-                    eprintln!(
-                        "[assemble] SLOW '{}' {}ms ({} hunks)",
-                        file.path(),
-                        glob_ms,
-                        hunk_count,
-                    );
-                    log::warn!(
-                        "assemble_change: SLOW file {}/{} '{}' took {}ms ({} hunks, {} bytes added)",
-                        file_idx + 1,
-                        total_files,
-                        file.path(),
-                        glob_ms,
-                        hunk_count,
-                        globalized.bytes_added(),
-                    );
-                } else {
-                    log::debug!(
-                        "assemble_change: file {}/{} '{}' globalized in {}ms ({} hunks)",
-                        file_idx + 1,
-                        total_files,
-                        file.path(),
-                        glob_ms,
-                        hunk_count,
-                    );
-                }
+                log::debug!(
+                    "assemble_change: file {}/{} '{}' globalized in {}ms ({} hunks, {} bytes added)",
+                    file_idx + 1,
+                    total_files,
+                    file.path(),
+                    glob_ms,
+                    hunk_count,
+                    globalized.bytes_added(),
+                );
 
                 stats.add_content_bytes(globalized.bytes_added());
                 globalized_files.push(globalized);

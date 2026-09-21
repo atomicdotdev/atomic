@@ -253,6 +253,8 @@ impl ServerCmd {
             default_org: add.org.clone(),
             default_workspaces: std::collections::BTreeMap::new(),
             identity: add.identity.clone(),
+            // Bound when an agent is created against this profile, not here.
+            agent_identity: None,
             // Auto-detected at registration; manual profiles default to
             // multi-tenant URL semantics.
             single_tenant: false,

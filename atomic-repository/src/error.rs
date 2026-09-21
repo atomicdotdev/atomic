@@ -31,10 +31,11 @@ impl fmt::Display for RepositoryLockKind {
             Self::Common => formatter.write_str("common repository operation lock"),
             Self::WorkingCopy { id } => write!(formatter, "working-copy operation lock for {id}"),
             Self::Shelf { id } => write!(formatter, "working-copy shelf lock for {id}"),
-            Self::DeferredTree => formatter.write_str("deferred-tree operation lock"),
-        }
+            Self::DeferredTree => formatter.write_str("deferred-tree operation lock"),        }
     }
 }
+
+
 
 /// Errors that can occur during repository operations
 #[derive(Debug, Error)]
@@ -338,6 +339,10 @@ pub enum RepositoryError {
     #[error("Database error: {0}")]
     Database(String),
 
+    /// Another process holds an incompatible pristine database handle.
+    #[error("Database already open. Cannot acquire lock.")]
+    DatabaseBusy,
+
     /// Walkdir error (during file traversal)
     #[error("Directory traversal error: {0}")]
     WalkDir(#[from] walkdir::Error),
@@ -512,11 +517,17 @@ impl RepositoryError {
 
 impl From<PristineError> for RepositoryError {
     fn from(error: PristineError) -> Self {
-        match error {
-            source @ PristineError::UnsupportedRequiredCapabilities { .. } => {
-                Self::UnsupportedRequiredCapabilities { source }
+        if matches!(&error, PristineError::Database(inner)
+            if matches!(inner.as_ref(), redb::DatabaseError::DatabaseAlreadyOpen))
+        {
+            Self::DatabaseBusy
+        } else {
+            match error {
+                source @ PristineError::UnsupportedRequiredCapabilities { .. } => {
+                    Self::UnsupportedRequiredCapabilities { source }
+                }
+                other => Self::Database(other.to_string()),
             }
-            other => Self::Database(other.to_string()),
         }
     }
 }

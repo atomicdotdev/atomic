@@ -7,7 +7,8 @@
 //!
 //! For commands that only need to read data (like `status`, `diff`, `log`),
 //! use `Pristine::open_readonly()` which doesn't acquire a write lock and
-//! can run concurrently with other readers or a single writer.
+//! can run concurrently with other readers. A writable handle still requires
+//! exclusive process access; redb 4.2 does not allow readers alongside it.
 //!
 //! ```ignore
 //! // For read-only operations (status, diff, log, change)
@@ -22,7 +23,10 @@
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use redb::{Builder, Database, ReadTransaction, ReadableMultimapTable, ReadableTable};
+use redb::{
+    Builder, Database, ReadOnlyDatabase, ReadTransaction, ReadableDatabase, ReadableMultimapTable,
+    ReadableTable,
+};
 
 use crate::pristine::capability::{
     unsupported_requirements, RepositoryCapability, RequiredRepositoryCapability,
@@ -44,9 +48,8 @@ fn next_id(max_id: u64) -> PristineResult<u64> {
 }
 
 fn collect_required_repository_capabilities(
-    db: &Database,
+    read_txn: &ReadTransaction,
 ) -> PristineResult<Vec<RequiredRepositoryCapability>> {
-    let read_txn = db.begin_read()?;
     let metadata = match read_txn.open_table(PRISTINE_META) {
         Ok(table) => table,
         Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
@@ -76,12 +79,11 @@ fn ensure_supported_repository_capabilities(
     }
 }
 
-fn require_supported_repository_capabilities(db: &Database) -> PristineResult<()> {
-    ensure_supported_repository_capabilities(&collect_required_repository_capabilities(db)?)
+fn require_supported_repository_capabilities(read_txn: &ReadTransaction) -> PristineResult<()> {
+    ensure_supported_repository_capabilities(&collect_required_repository_capabilities(read_txn)?)
 }
 
-fn require_path_claim_schema(db: &Database) -> PristineResult<()> {
-    let read_txn = db.begin_read()?;
+fn require_path_claim_schema(read_txn: &ReadTransaction) -> PristineResult<()> {
     let metadata = match read_txn.open_table(PRISTINE_META) {
         Ok(table) => table,
         Err(redb::TableError::TableDoesNotExist(_)) => {
@@ -97,6 +99,39 @@ fn require_path_claim_schema(db: &Database) -> PristineResult<()> {
     match read_txn.open_multimap_table(PATH_CLAIMS) {
         Ok(_) => Ok(()),
         Err(redb::TableError::TableDoesNotExist(_)) => Err(path_claim_schema_error(version)),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn legacy_upgrade_error(error: impl std::fmt::Display) -> PristineError {
+    PristineError::Io(std::io::Error::other(format!(
+        "failed to upgrade legacy redb database: {error}"
+    )))
+}
+
+fn upgrade_legacy_database(path: &Path) -> PristineResult<()> {
+    let mut legacy = redb_2_6::Database::open(path).map_err(legacy_upgrade_error)?;
+    legacy.upgrade().map_err(legacy_upgrade_error)?;
+    Ok(())
+}
+
+fn open_database(path: &Path, create: bool, cache_bytes: usize) -> PristineResult<Database> {
+    let open = || {
+        let mut builder = Builder::new();
+        builder.set_cache_size(cache_bytes);
+        if create {
+            builder.create(path)
+        } else {
+            builder.open(path)
+        }
+    };
+
+    match open() {
+        Ok(database) => Ok(database),
+        Err(redb::DatabaseError::UpgradeRequired(_)) => {
+            upgrade_legacy_database(path)?;
+            Ok(open()?)
+        }
         Err(error) => Err(error.into()),
     }
 }
@@ -158,13 +193,45 @@ fn next_inode_id(read_txn: &ReadTransaction) -> PristineResult<u64> {
 /// write_txn.commit()?;
 /// ```
 pub struct Pristine {
-    db: Database,
+    db: PristineDatabase,
     /// Counter for allocating node IDs
     pub(crate) next_node_id: AtomicU64,
     /// Counter for allocating view IDs
     pub(crate) next_view_id: AtomicU64,
     /// Counter for allocating inodes
     pub(crate) next_inode: AtomicU64,
+}
+
+enum PristineDatabase {
+    Writable(Database),
+    ReadOnly(ReadOnlyDatabase),
+}
+
+impl Pristine {
+    /// Whether this handle shares redb's read lock instead of the write lock.
+    pub fn is_read_only(&self) -> bool {
+        matches!(self.db, PristineDatabase::ReadOnly(_))
+    }
+}
+
+impl PristineDatabase {
+    fn begin_read(&self) -> Result<redb::ReadTransaction, redb::TransactionError> {
+        match self {
+            Self::Writable(db) => db.begin_read(),
+            Self::ReadOnly(db) => db.begin_read(),
+        }
+    }
+
+    /// The writable database handle, or an error for read-only pristines.
+    fn writable_db(&self) -> PristineResult<&Database> {
+        match self {
+            Self::Writable(db) => Ok(db),
+            Self::ReadOnly(_) => Err(PristineError::Io(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "cannot write through a read-only pristine handle",
+            ))),
+        }
+    }
 }
 
 impl Pristine {
@@ -178,13 +245,14 @@ impl Pristine {
         // redb cache is 1 GB which causes excessive page eviction when
         // the GRAPH table grows beyond that during large imports.
         let cache_bytes = 8 * 1024 * 1024 * 1024; // 8 GiB
-        let db = Builder::new().set_cache_size(cache_bytes).create(path)?;
+        let db = open_database(path.as_ref(), true, cache_bytes)?;
 
         // Existing repositories must be checked before the additive table-init
         // transaction starts. Binaries predating this generic fence cannot honor
         // an additive marker; fence-aware binaries always fail closed here.
         if !is_new_database {
-            require_supported_repository_capabilities(&db)?;
+            let capabilities_txn = db.begin_read()?;
+            require_supported_repository_capabilities(&capabilities_txn)?;
         }
 
         // Initialize all tables. Re-check in the write transaction so a
@@ -296,7 +364,7 @@ impl Pristine {
         // repository-level change files have been replayed into PATH_CLAIMS.
         // `open` returns a writable handle so that backfill can happen in one
         // transaction; read-only/open-existing modes reject the incomplete schema.
-        Self::scan_ids(db, false)
+        Self::scan_ids(PristineDatabase::Writable(db), false)
     }
 
     /// Open an existing pristine database without the table-init write lock.
@@ -305,12 +373,10 @@ impl Pristine {
     /// table-initialization transaction.  It assumes all tables already exist
     /// (true for any database previously created by `open` or `init`).
     ///
-    /// The returned `Pristine` still supports [`write_txn`](Self::write_txn)
-    /// — the write lock is deferred until you actually need one.  This is
-    /// critical for the agent hook path where `Repository::open()` is called
-    /// from a short-lived process: `begin_write()` blocks **indefinitely**
-    /// if another process holds a write transaction, so skipping the
-    /// init-only write eliminates the most common cause of hook hangs.
+    /// The returned `Pristine` supports [`write_txn`](Self::write_txn) and holds
+    /// redb's exclusive process lock for its lifetime. Skipping table setup
+    /// avoids a redundant write transaction, but does not permit another
+    /// process to open this database.
     ///
     /// # Errors
     ///
@@ -327,6 +393,15 @@ impl Pristine {
     /// repair write transaction.
     pub fn open_existing_for_repair<P: AsRef<Path>>(path: P) -> PristineResult<Self> {
         Self::open_existing_with_schema_check(path, false)
+    }
+
+    fn open_existing_with_schema_check<P: AsRef<Path>>(
+        path: P,
+        require_complete_path_claims: bool,
+    ) -> PristineResult<Self> {
+        let cache_bytes = 8 * 1024 * 1024 * 1024; // 8 GiB
+        let db = open_database(path.as_ref(), false, cache_bytes)?;
+        Self::scan_ids(PristineDatabase::Writable(db), require_complete_path_claims)
     }
 
     /// Open an existing pristine database in read-only mode
@@ -350,7 +425,7 @@ impl Pristine {
     /// // Read operations...
     /// ```
     pub fn open_readonly<P: AsRef<Path>>(path: P) -> PristineResult<Self> {
-        Self::open_existing_with_schema_check(path, true)
+        Self::open_readonly_with_schema_check(path, true)
     }
 
     /// Open an existing database for read-only repair inspection without
@@ -358,16 +433,28 @@ impl Pristine {
     ///
     /// This method performs no writes.
     pub fn open_readonly_for_repair<P: AsRef<Path>>(path: P) -> PristineResult<Self> {
-        Self::open_existing_with_schema_check(path, false)
+        Self::open_readonly_with_schema_check(path, false)
     }
 
-    fn open_existing_with_schema_check<P: AsRef<Path>>(
+    fn open_readonly_with_schema_check<P: AsRef<Path>>(
         path: P,
         require_complete_path_claims: bool,
     ) -> PristineResult<Self> {
         let cache_bytes = 8 * 1024 * 1024 * 1024; // 8 GiB
-        let db = Builder::new().set_cache_size(cache_bytes).open(path)?;
-        Self::scan_ids(db, require_complete_path_claims)
+        let mut builder = Builder::new();
+        builder.set_cache_size(cache_bytes);
+        let db = match builder.open_read_only(path.as_ref()) {
+            Ok(db) => db,
+            Err(redb::DatabaseError::UpgradeRequired(_) | redb::DatabaseError::RepairAborted) => {
+                // Migration and crash recovery need a writable handle. Close
+                // it cleanly to persist allocator state before acquiring the
+                // shared read lock. Never retry ordinary lock contention here.
+                drop(open_database(path.as_ref(), false, cache_bytes)?);
+                builder.open_read_only(path.as_ref())?
+            }
+            Err(error) => return Err(error.into()),
+        };
+        Self::scan_ids(PristineDatabase::ReadOnly(db), require_complete_path_claims)
     }
 
     /// Scan existing tables for the next available IDs.
@@ -375,10 +462,13 @@ impl Pristine {
     /// Shared implementation for `open_existing` and `open_readonly` — both
     /// skip the table-init write transaction and only need a read pass to
     /// discover the max allocated node, view, and inode IDs.
-    fn scan_ids(db: Database, require_complete_path_claims: bool) -> PristineResult<Self> {
-        require_supported_repository_capabilities(&db)?;
-        if require_complete_path_claims {
-            require_path_claim_schema(&db)?;
+    fn scan_ids(db: PristineDatabase, require_complete_path_claims: bool) -> PristineResult<Self> {
+        {
+            let capabilities_txn = db.begin_read()?;
+            require_supported_repository_capabilities(&capabilities_txn)?;
+            if require_complete_path_claims {
+                require_path_claim_schema(&capabilities_txn)?;
+            }
         }
         let read_txn = db.begin_read()?;
 
@@ -417,12 +507,14 @@ impl Pristine {
     pub fn required_repository_capabilities(
         &self,
     ) -> PristineResult<Vec<RequiredRepositoryCapability>> {
-        collect_required_repository_capabilities(&self.db)
+        let read_txn = self.db.begin_read()?;
+        collect_required_repository_capabilities(&read_txn)
     }
 
     /// Reject requirements unsupported by this Atomic build.
     pub fn ensure_supported_repository_capabilities(&self) -> PristineResult<()> {
-        require_supported_repository_capabilities(&self.db)
+        let read_txn = self.db.begin_read()?;
+        require_supported_repository_capabilities(&read_txn)
     }
 
     /// Durably declare or raise repository capability requirements.
@@ -442,7 +534,7 @@ impl Pristine {
             })
             .collect::<Vec<_>>();
 
-        let mut write_txn = self.db.begin_write()?;
+        let mut write_txn = self.db.writable_db()?.begin_write()?;
         write_txn.set_durability(redb::Durability::Immediate);
         let mut metadata = write_txn.open_table(PRISTINE_META)?;
 
@@ -509,7 +601,11 @@ impl Pristine {
     /// must be explicitly committed with `commit()` or it will be rolled back
     /// when dropped.
     pub fn write_txn(&self) -> PristineResult<WriteTxn<'_>> {
-        self.write_txn_with_durability(redb::Durability::Eventual)
+        // redb 4.2 removed `Durability::Eventual`: every commit is durable
+        // (fsynced) now. The historical write-vs-write_immediate split
+        // therefore collapses onto the same durable commit, which only
+        // strengthens the receipt contract.
+        self.write_txn_with_durability(redb::Durability::Immediate)
     }
 
     /// Begin a repair write transaction with immediate durability.
@@ -524,7 +620,7 @@ impl Pristine {
         &self,
         durability: redb::Durability,
     ) -> PristineResult<WriteTxn<'_>> {
-        let mut txn = self.db.begin_write()?;
+        let mut txn = self.db.writable_db()?.begin_write()?;
         txn.set_durability(durability);
         Ok(WriteTxn::new(
             txn,
@@ -674,7 +770,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("pristine");
         let pristine = Pristine::open(&db_path).unwrap();
-        let write_txn = pristine.db.begin_write().unwrap();
+        let write_txn = pristine.db.writable_db().unwrap().begin_write().unwrap();
         {
             let mut metadata = write_txn.open_table(PRISTINE_META).unwrap();
             metadata
@@ -700,7 +796,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("pristine");
         let pristine = Pristine::open(&db_path).unwrap();
-        let write_txn = pristine.db.begin_write().unwrap();
+        let write_txn = pristine.db.writable_db().unwrap().begin_write().unwrap();
         {
             let mut metadata = write_txn.open_table(PRISTINE_META).unwrap();
             metadata
@@ -786,6 +882,101 @@ mod tests {
                 .unwrap()
                 .is_empty());
         }
+    }
+
+    #[test]
+    fn read_only_handles_share_access_and_reject_writes() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("pristine");
+        drop(Pristine::open(&path).unwrap());
+        let first = Pristine::open_readonly(&path).unwrap();
+        let second = Pristine::open_readonly(&path).unwrap();
+        assert!(first.read_txn().is_ok());
+        assert!(second.read_txn().is_ok());
+        assert!(
+            matches!(first.write_txn(), Err(PristineError::Io(error)) if error.kind() == std::io::ErrorKind::PermissionDenied)
+        );
+        assert!(Pristine::open_existing(&path).is_err());
+        drop(first);
+        drop(second);
+        assert!(Pristine::open_existing(&path).is_ok());
+    }
+
+    #[test]
+    fn read_only_open_upgrades_legacy_v2_database() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("pristine");
+        {
+            let db = redb_2_6::Database::create(&path).unwrap();
+            let txn = db.begin_write().unwrap();
+            txn.open_table(redb_2_6::TableDefinition::<u64, &[u8; 32]>::new("external"))
+                .unwrap()
+                .insert(7, &[42u8; 32])
+                .unwrap();
+            txn.open_table(redb_2_6::TableDefinition::<&str, &[u8]>::new("views"))
+                .unwrap();
+            txn.open_table(redb_2_6::TableDefinition::<u64, &[u8; 16]>::new("inodes"))
+                .unwrap();
+            txn.open_table(redb_2_6::TableDefinition::<
+                &'static [u8; 16],
+                u64,
+            >::new("rev_inodes"))
+            .unwrap();
+            txn.open_table(redb_2_6::TableDefinition::<&'static str, u64>::new("tree"))
+                .unwrap();
+            txn.open_table(redb_2_6::TableDefinition::<u64, &'static str>::new("rev_tree"))
+                .unwrap();
+            txn.open_table(redb_2_6::TableDefinition::<u64, u8>::new("directories"))
+                .unwrap();
+            txn.open_table(redb_2_6::TableDefinition::<
+                &'static [u8; 16],
+                &'static [u8],
+            >::new("conflicts"))
+            .unwrap();
+            txn.open_multimap_table(redb_2_6::MultimapTableDefinition::<
+                &'static [u8; 32],
+                &'static [u8; 24],
+            >::new("inode_graph"))
+            .unwrap();
+            txn.commit().unwrap();
+        }
+        // The legacy fixture has no PATH_CLAIMS completion marker, so the
+        // schema-strict read-only open correctly refuses it. The repair
+        // variant still exercises the read-only upgrade path end to end.
+        let db = Pristine::open_readonly_for_repair(&path).unwrap();
+        assert_eq!(db.peek_next_node_id(), 8);
+        let txn = db.read_txn().unwrap();
+        let table = txn.txn.open_table(EXTERNAL).unwrap();
+        assert_eq!(table.get(7).unwrap().unwrap().value(), &[42u8; 32]);
+    }
+
+    #[test]
+    fn test_open_upgrades_legacy_v2_database() {
+        use redb_2_6::Database as LegacyDatabase;
+
+        const LEGACY_EXTERNAL: redb_2_6::TableDefinition<u64, &[u8; 32]> =
+            redb_2_6::TableDefinition::new("external");
+
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("pristine");
+        let expected_hash = [42u8; 32];
+
+        {
+            let legacy = LegacyDatabase::create(&db_path).unwrap();
+            let txn = legacy.begin_write().unwrap();
+            {
+                let mut external = txn.open_table(LEGACY_EXTERNAL).unwrap();
+                external.insert(7, &expected_hash).unwrap();
+            }
+            txn.commit().unwrap();
+        }
+
+        let pristine = Pristine::open(&db_path).unwrap();
+        assert_eq!(pristine.peek_next_node_id(), 8);
+
+        let txn = pristine.read_txn().unwrap();
+        let external = txn.txn.open_table(EXTERNAL).unwrap();
+        assert_eq!(external.get(7).unwrap().unwrap().value(), &expected_hash);
     }
 
     #[test]

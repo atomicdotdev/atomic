@@ -43,6 +43,7 @@ mod enable;
 mod explain;
 mod hooks;
 mod lifecycle;
+mod owner;
 mod repair;
 mod status;
 
@@ -219,6 +220,10 @@ pub enum AgentCommands {
     /// nothing is suppressed; `lifecycle end --json` returns the run summary.
     Lifecycle(Lifecycle),
 
+    /// Run or inspect the repository-local redb database owner.
+    #[command(name = "database-owner", hide = true)]
+    DatabaseOwner(owner::DatabaseOwner),
+
     /// Internal hook handlers (called by agent hooks).
     ///
     /// These commands are invoked by the hooks installed in agent
@@ -241,6 +246,7 @@ impl Command for Agent {
             AgentCommands::Attest(cmd) => cmd.run(),
             AgentCommands::Repair(cmd) => cmd.run(),
             AgentCommands::Lifecycle(cmd) => cmd.run(),
+            AgentCommands::DatabaseOwner(cmd) => cmd.run(),
             AgentCommands::Hooks(cmd) => cmd.run(),
         }
     }

@@ -6,6 +6,7 @@ use atomic_core::pristine::{
     DIRECTORIES, INODES, INODE_GRAPH, PATH_CLAIMS, PATH_CLAIM_EVENT_SIZE, PATH_CLAIM_SCHEMA_KEY,
     PRISTINE_META, REV_INODES, REV_TREE, TREE,
 };
+use redb::ReadableDatabase;
 use redb::ReadableMultimapTable;
 
 use crate::apply::CrossViewInsertOptions;

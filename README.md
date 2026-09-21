@@ -41,6 +41,47 @@ atomic agent enable
 #   - Provenance graph (why the agent made each decision)
 ```
 
+### Repository owner locks and connection recovery
+
+Agent hooks are short-lived processes, while redb permits only one writable process to open a database. Atomic therefore starts one long-lived **database owner per canonical repository**. Hooks send committed provenance requests to that owner instead of opening the repository's redb change store directly.
+
+Each repository has an independent ownership namespace:
+
+| Resource | Location | Purpose |
+|---|---|---|
+| redb change store | `.atomic/changes.redb` | Mutable provenance journal and checkpoint state |
+| owner election lock | `.atomic/changes-owner.lock` | OS-backed authority deciding which process may own that database |
+| Unix endpoint | `/tmp/atomic-owner-<repository-digest>.sock` | Local IPC transport on macOS and Linux |
+| Windows endpoint | `\\.\pipe\atomic-owner-<repository-digest>` | Local IPC transport on Windows |
+
+These runtime resources do **not** require `sudo`. The owner process runs as the current user: it creates the repository lock and database under the user-writable `.atomic` directory and creates its Unix socket in `/tmp`, which is a shared, sticky-bit-protected runtime directory. Elevated privileges are only needed when installing or replacing the `atomic` executable in a system-owned prefix such as `/usr/local/bin`; they are unrelated to socket creation or owner election.
+
+The endpoint digest is derived from the canonical `.atomic` path and uses 96 bits of BLAKE3 output. Different project paths therefore get different owners, locks, databases, and endpoints. Multiple agents working in one project intentionally share that project's owner; agents working in other projects use different owners and proceed independently. Agent sandboxes and symlinked paths resolve back to the canonical repository, so they share its owner rather than creating competing databases. A clone at a different path gets its own owner.
+
+```text
+Agent A ─┐                         Agent C ─┐
+Agent B ─┴─> Project 1 owner       Agent D ─┴─> Project 2 owner
+                 │                                  │
+                 v                                  v
+       Project 1 changes.redb             Project 2 changes.redb
+```
+
+The **lock is the authority; the socket or named pipe is only transport**. The lock file may remain on disk after normal operation, but an unlocked file does not block a new owner. If an owner crashes, the OS releases its lock automatically. Recovery then proceeds as follows:
+
+1. A hook cannot reach the old endpoint and starts or reconnects to an owner.
+2. Owner candidates race for that repository's `changes-owner.lock`.
+3. Only the lock winner may open `changes.redb`.
+4. On Unix, the winner removes any stale socket left by the dead owner and binds a fresh endpoint.
+5. The hook retries with the same request/event ID, so a request committed before the crash is acknowledged once rather than applied twice.
+
+Within one repository, redb write transactions are serialized by design, while reads and independent repositories can proceed concurrently. Startup, reconnect, and retry loops are bounded so a broken owner fails instead of hanging hooks indefinitely. Checkpoint attempts, event cutoffs, and fencing generations let interrupted turns resume without rewriting completed session turns.
+
+Current operational considerations:
+
+- Owners remain alive until explicitly shut down; an idle timeout or user-level owner registry is a future resource-management improvement for machines that touch many repositories.
+- Unix endpoints use `/tmp` to stay below macOS Unix-socket path limits. A future hardening step should move them into a user-private runtime directory where available, enforce restrictive socket permissions, and validate peer credentials.
+- A 96-bit endpoint digest makes accidental cross-project collisions extraordinarily unlikely, but the repository-local lock remains the final ownership check.
+
 ### Provenance Graphs
 
 Every agent session builds a causal decision DAG. Not just *what* changed, but *why*:
@@ -330,7 +371,7 @@ Every change stores two parallel representations:
 |---------|-------------|
 | `atomic agent enable` | Install agent hooks (auto-detect or `--agent claude-code`) |
 | `atomic agent disable` | Remove agent hooks |
-| `atomic agent status` | Show active sessions and hook status |
+| `atomic agent status` | Show active sessions and hook status (`--json` for tooling) |
 | `atomic agent explain <id>` | Generate AI reasoning summary for a session |
 | `atomic agent attest` | List and inspect attestations |
 
@@ -379,12 +420,24 @@ cargo build --release
 # Run tests
 cargo test
 
-# Install CLI
+# User-local install to ~/.cargo/bin (normally no sudo)
 cargo install --path atomic-cli
 
 # Verify installation
 atomic --version
 ```
+
+To install a locally built binary system-wide, the destination directory may require administrator privileges. On macOS, replacing the file rather than overwriting its existing inode also avoids retaining stale Gatekeeper provenance metadata:
+
+```bash
+cargo build -p atomic-cli --release
+sudo rm -f /usr/local/bin/atomic
+sudo cp -X target/release/atomic /usr/local/bin/atomic
+sudo chmod 0755 /usr/local/bin/atomic
+/usr/local/bin/atomic --version
+```
+
+Do not run normal Atomic commands or the database owner with `sudo`. Repository state, owner locks, and `/tmp/atomic-owner-*.sock` endpoints should remain owned by the user running Atomic.
 
 ## Project Structure
 

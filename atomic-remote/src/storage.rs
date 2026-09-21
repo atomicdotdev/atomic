@@ -7,13 +7,20 @@
 //!
 //! The VCS protocol (push/pull/clone) uses `HttpRemote` instead.
 
-use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
 use serde::{de::DeserializeOwned, Serialize};
 
 use crate::error::RemoteError;
+/// The delegation header name, lowercased — `HeaderName::from_static` requires
+/// it. Kept in step with `atomic_canonical::delegation::DELEGATION_HEADER` by
+/// the test at the bottom of this file.
+const DELEGATION_HEADER_LOWER: &str = "atomic-delegation";
+
 use crate::storage_types::{
-    ApiResponse, CreateProjectRequest, CreateWorkspaceRequest, IdentityInfo, ProjectInfo,
-    UpdateProjectRequest, UpdateWorkspaceRequest, WorkspaceInfo,
+    AgentIdentityInfo, ApiResponse, CreateProjectRequest, CreateWorkspaceRequest, DelegationInfo,
+    DelegationStatusInfo, EnrollAgentRequest, EpochInfo, IdentityInfo, ProjectInfo,
+    PushDelegationRequest, RevokeDelegationRequest, UpdateProjectRequest, UpdateWorkspaceRequest,
+    WorkspaceInfo,
 };
 
 /// How much of an undeserializable response body to quote in the error.
@@ -77,7 +84,32 @@ impl StorageClient {
     /// `https://alice.atomic.storage`. The `bearer_token` is a short-lived,
     /// client-self-signed EdDSA JWT (see `atomic-cli`'s `commands::token`).
     pub fn new(base_url: &str, org_slug: &str, bearer_token: &str) -> Result<Self, RemoteError> {
+        Self::with_delegation(base_url, org_slug, bearer_token, None)
+    }
+
+    /// Create a client that also presents a delegation certificate.
+    ///
+    /// `delegation` is the base64url-encoded certificate an agent acts under.
+    /// It travels on every request because the server verifies it there and
+    /// then, against the delegator's registered key — grants are presented, not
+    /// registered, which is what makes issuing one free of a server round trip.
+    ///
+    /// `None` is an ordinary, non-delegated client.
+    pub fn with_delegation(
+        base_url: &str,
+        org_slug: &str,
+        bearer_token: &str,
+        delegation: Option<&str>,
+    ) -> Result<Self, RemoteError> {
         let mut headers = HeaderMap::new();
+        if let Some(encoded) = delegation {
+            headers.insert(
+                HeaderName::from_static(DELEGATION_HEADER_LOWER),
+                HeaderValue::from_str(encoded).map_err(|e| {
+                    RemoteError::other(format!("invalid delegation certificate: {}", e))
+                })?,
+            );
+        }
         headers.insert(
             AUTHORIZATION,
             HeaderValue::from_str(&format!("Bearer {}", bearer_token))
@@ -395,11 +427,163 @@ impl StorageClient {
         ))
         .await
     }
+
+    // -----------------------------------------------------------------------
+    // Agent identities and delegations
+    //
+    // These are apex endpoints (no org subdomain): an agent belongs to a human,
+    // not to an org, and the same agent may be used across every org that human
+    // is a member of.
+    // -----------------------------------------------------------------------
+
+    /// Enroll an agent identity under the authenticated human identity.
+    ///
+    /// The caller must be the delegator named in the certificate — the server
+    /// verifies the proof against the public key it has on record for the
+    /// caller, so a certificate signed by anyone else is rejected no matter who
+    /// presents it.
+    pub async fn enroll_agent(
+        &self,
+        req: &EnrollAgentRequest,
+    ) -> Result<AgentIdentityInfo, RemoteError> {
+        self.post("/identities/agents", req).await
+    }
+
+    /// List the agents enrolled under the authenticated identity.
+    pub async fn list_agents(&self) -> Result<Vec<AgentIdentityInfo>, RemoteError> {
+        self.get("/identities/agents").await
+    }
+
+    /// Fetch one agent by its identity UUID.
+    pub async fn get_agent(&self, agent_id: &str) -> Result<AgentIdentityInfo, RemoteError> {
+        self.get(&format!("/identities/agents/{agent_id}")).await
+    }
+
+    /// Retire an agent: revoke its delegations and mark the key unusable.
+    ///
+    /// Past work stays attributable — the identity row is not deleted, so a
+    /// change recorded last month still resolves to a name rather than a
+    /// dangling key.
+    pub async fn retire_agent(&self, agent_id: &str) -> Result<(), RemoteError> {
+        self.delete(&format!("/identities/agents/{agent_id}")).await
+    }
+
+    /// Upload a new or renewed delegation certificate.
+    pub async fn push_delegation(
+        &self,
+        req: &PushDelegationRequest,
+    ) -> Result<DelegationInfo, RemoteError> {
+        self.post("/delegations", req).await
+    }
+
+    /// List the delegations issued by the authenticated identity.
+    pub async fn list_delegations(&self) -> Result<Vec<DelegationInfo>, RemoteError> {
+        self.get("/delegations").await
+    }
+
+    /// Revoke a delegation by presenting a signed revocation document.
+    pub async fn revoke_delegation(
+        &self,
+        delegation_id: &str,
+        req: &RevokeDelegationRequest,
+    ) -> Result<DelegationInfo, RemoteError> {
+        self.post(
+            &format!("/delegations/{}/revoke", urlencoding::encode(delegation_id)),
+            req,
+        )
+        .await
+    }
+
+    /// Bump an agent's epoch: every grant issued to it before now is dead.
+    ///
+    /// The only mechanism that reaches grants the server has never seen — which
+    /// is most of them, since grants are presented rather than registered. Use
+    /// it whenever a narrowing or a withdrawal has to take effect immediately
+    /// rather than when certificates happen to expire.
+    pub async fn set_agent_epoch(&self, agent_id: &str) -> Result<EpochInfo, RemoteError> {
+        self.post_empty(&format!("/identities/agents/{agent_id}/epoch"))
+            .await
+    }
+
+    /// Clear an agent's epoch, bringing unexpired grants back.
+    pub async fn clear_agent_epoch(&self, agent_id: &str) -> Result<(), RemoteError> {
+        self.delete(&format!("/identities/agents/{agent_id}/epoch"))
+            .await
+    }
+
+    /// Invalidate every grant the caller has ever issued, to every agent.
+    ///
+    /// The key-compromise button. If your signing key leaks, an attacker can
+    /// mint grants nobody knows about and there is no list to revoke — this is
+    /// the one action that covers them.
+    pub async fn set_delegator_epoch(&self) -> Result<EpochInfo, RemoteError> {
+        self.post_empty("/delegations/epoch").await
+    }
+
+    /// Check whether a delegation is still good.
+    ///
+    /// Unauthenticated on the server side, so anyone auditing a change's
+    /// `delegation_id` can check it without an account.
+    pub async fn delegation_status(
+        &self,
+        delegation_id: &str,
+    ) -> Result<DelegationStatusInfo, RemoteError> {
+        self.get(&format!(
+            "/delegations/{}/status",
+            urlencoding::encode(delegation_id)
+        ))
+        .await
+    }
+
+    /// Resolve an identity by its base32-encoded Ed25519 public key.
+    ///
+    /// Reverse of the name/email resolution: given the key (the same value
+    /// used as the JWT `kid`), returns the registered identity together with
+    /// its canonical public key. Base32 keys are URL-safe (A-Z2-7), so the
+    /// key can be embedded in the path without encoding. The endpoint is
+    /// unauthenticated — a caller must already possess the key to learn
+    /// anything from the lookup.
+    pub async fn resolve_identity_by_public_key(
+        &self,
+        public_key: &str,
+    ) -> Result<IdentityInfo, RemoteError> {
+        self.get(&format!("/identities/by-key/{public_key}")).await
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `HeaderName::from_static` demands lowercase, so this module cannot use
+    /// the canonical constant directly. Pin them together instead of hoping.
+    #[test]
+    fn the_delegation_header_matches_the_canonical_spelling() {
+        assert_eq!(
+            DELEGATION_HEADER_LOWER,
+            atomic_canonical::delegation::DELEGATION_HEADER.to_ascii_lowercase()
+        );
+    }
+
+    #[test]
+    fn a_client_without_a_delegation_sends_no_such_header() {
+        // A human's requests must be byte-identical to before agents existed.
+        let client = StorageClient::new("https://example.com", "acme", "tok").unwrap();
+        assert_eq!(client.base_url(), "https://example.com");
+    }
+
+    #[test]
+    fn an_invalid_delegation_is_rejected_at_construction() {
+        // A newline in a header value would be a request-splitting vector, so
+        // it must fail here rather than at send time.
+        assert!(StorageClient::with_delegation(
+            "https://example.com",
+            "acme",
+            "tok",
+            Some("bad\nvalue")
+        )
+        .is_err());
+    }
 
     #[test]
     fn new_trims_trailing_slash() {

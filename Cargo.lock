@@ -123,7 +123,7 @@ dependencies = [
 
 [[package]]
 name = "atomic-agent"
-version = "0.17.1"
+version = "0.18.2"
 dependencies = [
  "anyhow",
  "atomic-canonical",
@@ -143,6 +143,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serial_test",
+ "sha2",
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
@@ -154,7 +155,7 @@ dependencies = [
 
 [[package]]
 name = "atomic-canonical"
-version = "0.17.1"
+version = "0.18.2"
 dependencies = [
  "atomic-identity",
  "blake3",
@@ -168,7 +169,7 @@ dependencies = [
 
 [[package]]
 name = "atomic-cli"
-version = "0.17.1"
+version = "0.18.2"
 dependencies = [
  "anyhow",
  "atomic-agent",
@@ -191,6 +192,7 @@ dependencies = [
  "dialoguer",
  "dirs",
  "env_logger",
+ "fs2",
  "git2",
  "indicatif",
  "libc",
@@ -206,11 +208,12 @@ dependencies = [
  "tokio",
  "url",
  "uuid",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
 name = "atomic-config"
-version = "0.17.1"
+version = "0.18.2"
 dependencies = [
  "anyhow",
  "dirs",
@@ -224,7 +227,7 @@ dependencies = [
 
 [[package]]
 name = "atomic-core"
-version = "0.17.1"
+version = "0.18.2"
 dependencies = [
  "anyhow",
  "bitflags 2.13.2",
@@ -239,7 +242,8 @@ dependencies = [
  "quickcheck",
  "quickcheck_macros",
  "rayon",
- "redb",
+ "redb 2.6.3",
+ "redb 4.2.0",
  "serde",
  "serde_json",
  "similar",
@@ -252,11 +256,12 @@ dependencies = [
 
 [[package]]
 name = "atomic-identity"
-version = "0.17.1"
+version = "0.18.2"
 dependencies = [
  "anyhow",
  "atomic-config",
  "blake3",
+ "bs58",
  "chrono",
  "data-encoding",
  "dirs",
@@ -273,7 +278,7 @@ dependencies = [
 
 [[package]]
 name = "atomic-objects"
-version = "0.17.1"
+version = "0.18.2"
 dependencies = [
  "blake3",
  "data-encoding",
@@ -294,9 +299,10 @@ dependencies = [
 
 [[package]]
 name = "atomic-remote"
-version = "0.17.1"
+version = "0.18.2"
 dependencies = [
  "anyhow",
+ "atomic-canonical",
  "atomic-core",
  "atomic-objects",
  "bytes",
@@ -317,7 +323,7 @@ dependencies = [
 
 [[package]]
 name = "atomic-repository"
-version = "0.17.1"
+version = "0.18.2"
 dependencies = [
  "anyhow",
  "atomic-canonical",
@@ -337,7 +343,7 @@ dependencies = [
  "postcard",
  "rand 0.8.8",
  "rayon",
- "redb",
+ "redb 4.2.0",
  "reflink-copy",
  "reqwest",
  "serde",
@@ -359,7 +365,7 @@ dependencies = [
 
 [[package]]
 name = "atomic-semantic"
-version = "0.17.1"
+version = "0.18.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -376,7 +382,7 @@ dependencies = [
 
 [[package]]
 name = "atomic-teams"
-version = "0.17.1"
+version = "0.18.2"
 dependencies = [
  "atomic-remote",
  "chrono",
@@ -2324,6 +2330,15 @@ name = "redb"
 version = "2.6.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8eca1e9d98d5a7e9002d0013e18d5a9b000aee942eb134883a82f06ebffb6c01"
+dependencies = [
+ "libc",
+]
+
+[[package]]
+name = "redb"
+version = "4.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "de6c3b63e007e90ce536ec2ae4690826136a20ec8dbbbb400daef1bb999d2e36"
 dependencies = [
  "libc",
 ]

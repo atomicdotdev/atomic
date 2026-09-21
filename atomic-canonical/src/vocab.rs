@@ -38,8 +38,18 @@ impl NodeType {
 }
 
 /// Intent status value set (mirrors the doc's `IntentShape` `sh:in`).
-/// `icebox` is a terminal state (an intent reviewed and set aside — not built).
-pub const INTENT_STATUS: &[&str] = &["backlog", "todo", "in_progress", "done", "icebox"];
+/// `needs-review` is the review handoff — implementation complete (every
+/// task done, every criterion met) and signed, awaiting independent review;
+/// `done` is granted by that review. `icebox` is a terminal state (an intent
+/// reviewed and set aside — not built).
+pub const INTENT_STATUS: &[&str] = &[
+    "backlog",
+    "todo",
+    "in_progress",
+    "needs-review",
+    "done",
+    "icebox",
+];
 
 /// Intent classification (`kind`) value set — the work taxonomy. `feature` is
 /// the default (an ordinary unit of work); `review` classifies an intent whose

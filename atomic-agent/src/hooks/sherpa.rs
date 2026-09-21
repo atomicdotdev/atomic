@@ -119,6 +119,20 @@ struct SherpaHookInput {
     /// Used as the atomic record commit message on `turn-end`.
     #[serde(default)]
     intent_title: Option<String>,
+
+    /// Absolute path to the turn's transcript file, when the harness
+    /// wrote one.
+    ///
+    /// Sherpa writes Claude Code-shaped JSONL, which is what
+    /// `format_for_agent("sherpa")` selects. Without this the turn is
+    /// recorded with a message and a file list but no account of the
+    /// assistant's replies or its tool calls — the provenance Claude Code
+    /// and OpenCode turns both carry.
+    ///
+    /// Aliased because the harness has always sent the field as
+    /// `trace_file`.
+    #[serde(default, alias = "trace_file")]
+    transcript_path: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -204,6 +218,14 @@ impl AgentHook for SherpaHook {
         }
 
         let mut event = TurnEvent::new(parsed.session_id.clone(), hook_type).with_raw_json(raw);
+
+        // Same as Claude Code: whichever hook carries the transcript sets
+        // it, and the session keeps the first one it sees.
+        if let Some(path) = &parsed.transcript_path {
+            if !path.is_empty() {
+                event = event.with_transcript_path(path.clone());
+            }
+        }
 
         // Stamp model and provider so the orchestrator can persist them on
         // the AgentSession — same pattern as OpenCode.
@@ -340,6 +362,42 @@ mod tests {
     #[test]
     fn test_display_name() {
         assert_eq!(make_hook().display_name(), "Sherpa");
+    }
+
+    // --- transcript_path ---
+
+    #[test]
+    fn test_turn_end_carries_transcript_path() {
+        let input = br#"{"session_id":"s-1","turn_number":2,"transcript_path":"/w/.atomic/sessions/s-1/turn-1.jsonl"}"#;
+        let event = make_hook()
+            .parse_event(HookType::TurnEnd, input)
+            .expect("parse");
+        assert_eq!(
+            event.transcript_path.as_deref(),
+            Some(std::path::Path::new("/w/.atomic/sessions/s-1/turn-1.jsonl")),
+        );
+    }
+
+    #[test]
+    fn test_trace_file_is_accepted_as_an_alias() {
+        // The harness has always named the field `trace_file`.
+        let input = br#"{"session_id":"s-1","trace_file":"/w/turn-1.jsonl"}"#;
+        let event = make_hook()
+            .parse_event(HookType::TurnEnd, input)
+            .expect("parse");
+        assert_eq!(
+            event.transcript_path.as_deref(),
+            Some(std::path::Path::new("/w/turn-1.jsonl")),
+        );
+    }
+
+    #[test]
+    fn test_transcript_path_absent_stays_none() {
+        let input = br#"{"session_id":"s-1"}"#;
+        let event = make_hook()
+            .parse_event(HookType::TurnEnd, input)
+            .expect("parse");
+        assert!(event.transcript_path.is_none());
     }
 
     // --- supported_hooks ---

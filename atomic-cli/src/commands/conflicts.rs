@@ -44,10 +44,11 @@ impl Conflicts {
 impl Command for Conflicts {
     fn run(&self) -> CliResult<()> {
         let repo_root = find_repository_root()?;
-        let repo =
-            Repository::open_readonly(&repo_root).map_err(|e| CliError::InvalidRepository {
+        let repo = crate::commands::open_readonly_repository(&repo_root).map_err(|e| {
+            CliError::InvalidRepository {
                 reason: e.to_string(),
-            })?;
+            }
+        })?;
 
         let working_copy = repo
             .require_working_copy_id()

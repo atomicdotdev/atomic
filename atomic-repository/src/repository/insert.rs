@@ -912,7 +912,6 @@ impl Repository {
             preserve_existing_tree_paths,
         )?;
         tree_projection.apply_prerequisites(&mut txn)?;
-
         let apply_start = std::time::Instant::now();
         let (insert, direct_graph_ms, direct_crdt_ms) = if import_direct_can_apply(&final_change) {
             let (insert, graph_ms, crdt_ms) = self.write_import_direct_add_chain(
@@ -1085,7 +1084,6 @@ impl Repository {
         )?;
 
         tree_projection.apply_prerequisites(&mut txn)?;
-
         let apply_start = std::time::Instant::now();
         let insert = if import_graph_first_can_apply(&final_change) {
             let (insert, graph_ms, crdt_ms) = self.write_import_graph_first_direct(
@@ -1972,7 +1970,6 @@ impl Repository {
             preserve_existing_tree_paths,
         )?;
         tree_projection.apply_prerequisites(&mut txn)?;
-
         // Apply to the graph (skips hunk application if already_in_graph)
         let t_graph = std::time::Instant::now();
         let outcome = write_change_to_graph(
@@ -2292,7 +2289,6 @@ impl Repository {
             preserve_existing_tree_paths,
         )?;
         tree_projection.apply_prerequisites(&mut txn)?;
-
         // Apply to the graph
         // For write_recorded, the change is always new (just recorded), so
         // already_in_graph is always false.

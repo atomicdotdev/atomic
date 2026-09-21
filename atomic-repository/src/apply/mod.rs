@@ -277,8 +277,7 @@ pub fn write_change_to_graph(
             change,
             &verified_frontier,
             options,
-        )?;
-    }
+        )?;    }
 
     // Compute new state
     log::debug!("write_change_to_graph: computing new state + updating view");

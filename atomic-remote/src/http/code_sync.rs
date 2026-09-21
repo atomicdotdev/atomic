@@ -12,7 +12,9 @@
 //! - [`HttpRemote::sync_pull`] `GET`s with a [`SyncWants`] body and decodes the
 //!   returned [`SyncPack`] (the objects the client is missing + ref targets).
 
-use atomic_objects::{SyncPack, SyncWants, PROTOCOL_HEADER, PROTOCOL_SYNC_V1, SYNC_MEDIA_TYPE};
+use atomic_objects::{
+    SyncError, SyncPack, SyncWants, PROTOCOL_HEADER, PROTOCOL_SYNC_V1, SYNC_MEDIA_TYPE,
+};
 use reqwest::header::CONTENT_TYPE;
 use reqwest::StatusCode;
 use serde::Deserialize;
@@ -89,14 +91,21 @@ impl HttpRemote {
             .await
             .map_err(|e| RemoteError::connection_failed(&url, e))?;
         crate::check_min_version_header(response.headers());
+        // Capture the server's reported min-version before consuming the body,
+        // so we can include it in a version-mismatch error if decode fails.
+        let server_version = crate::read_min_version_header(response.headers());
         match response.status() {
             StatusCode::OK => {
                 let bytes = response
                     .bytes()
                     .await
                     .map_err(|e| RemoteError::connection_failed(&url, e))?;
-                SyncPack::decode(&bytes)
-                    .map_err(|e| RemoteError::protocol(format!("failed to decode sync pack: {e}")))
+                SyncPack::decode(&bytes).map_err(|e| match e {
+                    SyncError::Compression(_) | SyncError::Codec(_) => {
+                        RemoteError::version_mismatch(crate::VERSION, server_version, e.to_string())
+                    }
+                    _ => RemoteError::protocol(format!("failed to decode sync pack: {e}")),
+                })
             }
             StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => Err(RemoteError::auth_failed(
                 &url,

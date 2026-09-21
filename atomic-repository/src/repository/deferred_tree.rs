@@ -25,10 +25,10 @@ pub(super) enum DeferredTreeAction {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub(super) struct DeferredTreeOp {
     /// Change whose visibility activates this TREE operation.
-    change: Hash,
+    pub(super) change: Hash,
     /// Stable inode position, stored with an external change hash so the
     /// journal never depends on process-local lookup state.
-    inode: Position<Hash>,
+    pub(super) inode: Position<Hash>,
     /// Path visible before this inode's first journaled operation. Only the
     /// first event for an inode uses this baseline; later events are selected
     /// solely by change visibility.
@@ -36,9 +36,8 @@ pub(super) struct DeferredTreeOp {
     /// Stable node kind carried by operation metadata. Legacy journals may not
     /// contain it and must prove the kind through DIRECTORIES instead.
     #[serde(default)]
-    directory: Option<bool>,
-    action: DeferredTreeAction,
-}
+    pub(super) directory: Option<bool>,
+    pub(super) action: DeferredTreeAction,}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct DeferredTreeJournal {
@@ -501,11 +500,54 @@ fn push_delete_for_path<T: GraphTxnT + TreeTxnT>(
 /// Collect graph-backed lifecycle metadata for the canonical tree projection.
 /// Recording every add, delete, move, and undelete lets native record, import,
 /// insert, and deferred replay derive the same cache state from visibility.
+fn push_occupant_baseline<T: GraphTxnT + TreeTxnT>(
+    txn: &T,
+    activating_change: Hash,
+    path: &str,
+    exclude: Option<Position<Hash>>,
+    visible_on_target: Option<&HashSet<Hash>>,
+    ops: &mut Vec<DeferredTreeOp>,
+) -> Result<(), RepositoryError> {
+    let Some(inode) = txn
+        .get_inode(path)
+        .map_err(|e| RepositoryError::Database(e.to_string()))?
+    else {
+        return Ok(());
+    };
+    let Ok(position) = external_inode_position(txn, inode) else {
+        return Ok(());
+    };
+    if Some(position) == exclude {
+        return Ok(());
+    }
+    if visible_on_target.is_some_and(|visible| visible.contains(&position.change)) {
+        // The current occupant belongs to the target view; it is a real owner,
+        // not a foreign draft binding. Never manufacture a reverse delete.
+        return Ok(());
+    }
+    push_unique(
+        ops,
+        DeferredTreeOp {
+            change: activating_change,
+            inode: position,
+            baseline_path: Some(path.to_string()),
+            directory: None,
+            action: DeferredTreeAction::Delete,
+        },
+    );
+    Ok(())
+}
+
+/// Collect view-scoped TREE lifecycle events before applying hunk-level TREE
+/// mutations. Recording all adds, moves, and deletes, not just deferred Git
+/// imports, keeps replay baselines valid when a later foreground change moves
+/// the same inode on another view.
 pub(super) fn collect_tree_ops<T: GraphTxnT + TreeTxnT>(
     txn: &T,
     change_hash: Hash,
     change: &Change,
     deleted_paths: &[String],
+    visible_on_target: Option<&HashSet<Hash>>,
 ) -> Result<Vec<DeferredTreeOp>, RepositoryError> {
     let mut ops = Vec::new();
 
@@ -519,6 +561,14 @@ pub(super) fn collect_tree_ops<T: GraphTxnT + TreeTxnT>(
             } => {
                 let added_position = Position::new(change_hash, add_inode.start);
                 let directory = matches!(graph_op, GraphOp::DirAdd { .. });
+                push_occupant_baseline(
+                    txn,
+                    change_hash,
+                    path,
+                    Some(added_position),
+                    visible_on_target,
+                    &mut ops,
+                )?;
                 push_unique(
                     &mut ops,
                     DeferredTreeOp {
@@ -532,6 +582,14 @@ pub(super) fn collect_tree_ops<T: GraphTxnT + TreeTxnT>(
             }
             GraphOp::FileMove { add, path, .. } => {
                 let external_position = external_position(change_hash, add.inode)?;
+                push_occupant_baseline(
+                    txn,
+                    change_hash,
+                    path,
+                    Some(external_position),
+                    visible_on_target,
+                    &mut ops,
+                )?;
                 let op = DeferredTreeOp {
                     change: change_hash,
                     inode: external_position,
@@ -697,7 +755,7 @@ impl Repository {
         deleted_paths: &[String],
         preserve_existing_tree_paths: bool,
     ) -> Result<PreparedTreeProjection, RepositoryError> {
-        let ops = collect_tree_ops(&*txn, change_hash, change, deleted_paths)?;
+        let ops = collect_tree_ops(&*txn, change_hash, change, deleted_paths, None)?;
         let mut additions = Vec::<(Position<NodeId>, String, TreeProjectionKind)>::new();
         for graph_op in change.hunks() {
             match graph_op {

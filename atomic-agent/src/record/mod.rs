@@ -58,6 +58,7 @@
 pub mod message;
 pub mod options;
 pub mod provenance;
+pub mod scope;
 
 #[cfg(test)]
 mod tests;
@@ -556,6 +557,18 @@ fn classify_clean_turn(
     let start_git = boundary_start.as_ref().and_then(|boundary| boundary.git.clone());
     let end_git = boundary_end.git.clone();
 
+    // A repository without Git has no checkpoint to classify; a clean
+    // turn there is a legitimate ObservationOnly, never an observation
+    // gap. Only a Git-bearing repository refuses unverifiable transitions.
+    if !repo_root.join(".git").exists() {
+        return ClassifiedTurn {
+            outcome: ManagedTurnOutcome::ObservationOnly,
+            boundary_start,
+            boundary_end: Some(boundary_end),
+            incomplete: None,
+        };
+    }
+
     // No baseline: refuse to claim ObservationOnly, record the observation
     // gap explicitly, and durably refuse attribution (review R3: the missing
     // observation is itself evidence, never a silent success).
@@ -869,15 +882,30 @@ pub fn record_turn(
     repo_root: &Path,
     options: &TurnRecordOptions<'_>,
 ) -> AgentResult<TurnRecordResult> {
-    // Step 1: Open the repository read-only for the initial status check.
-    // This avoids blocking on the redb write lock — we only need read access
-    // to decide whether there's work to do and which files are untracked.
-    let mut repo = atomic_repository::Repository::open_readonly(repo_root).map_err(|e| {
-        AgentError::RecordFailed {
-            session_id: options.session.session_id.clone(),
-            turn_number: options.turn_number,
-            reason: format!("Failed to open repository (readonly): {}", e),
+    // Scoped manifest gating (dev sync): hook-provided file ownership narrows
+    // what this turn may record. `manifest()` returns None for plain turns,
+    // making the gate an identity pass-through for unscoped callers.
+    let manifest = scope::manifest(options)?;
+    if let Some(files) = &manifest {
+        scope::validate(repo_root, files, options)?;
+        if files.is_empty() {
+            return Err(AgentError::EmptyTurn {
+                session_id: options.session.session_id.clone(),
+                turn_number: options.turn_number,
+            });
         }
+    }
+    // Step 1: Open the repository read-only for the initial status check.
+    // This can coexist with other readers. Wait for a transient incompatible
+    // writer before deciding whether work or untracked files exist.
+    let mut repo = atomic_repository::Repository::open_readonly_wait(
+        repo_root,
+        std::time::Duration::from_secs(10),
+    )
+    .map_err(|e| AgentError::RecordFailed {
+        session_id: options.session.session_id.clone(),
+        turn_number: options.turn_number,
+        reason: format!("Failed to open repository (readonly): {}", e),
     })?;
 
     // Preserve the read-only fast path when the persisted desired view already
@@ -893,7 +921,8 @@ pub fn record_turn(
     if session_view_needs_alignment {
         drop(repo);
         let mut repair_repo =
-            atomic_repository::Repository::open_existing(repo_root).map_err(|error| {
+            atomic_repository::Repository::open_existing_wait(repo_root, std::time::Duration::from_secs(10))
+                .map_err(|error| {
                 AgentError::RecordFailed {
                     session_id: options.session.session_id.clone(),
                     turn_number: options.turn_number,
@@ -902,7 +931,8 @@ pub fn record_turn(
             })?;
         align_or_repair_session_view(&mut repair_repo, options)?;
         drop(repair_repo);
-        repo = atomic_repository::Repository::open_readonly(repo_root).map_err(|error| {
+        repo = atomic_repository::Repository::open_readonly_wait(repo_root, std::time::Duration::from_secs(10))
+            .map_err(|error| {
             AgentError::RecordFailed {
                 session_id: options.session.session_id.clone(),
                 turn_number: options.turn_number,
@@ -940,6 +970,8 @@ pub fn record_turn(
             turn_number: options.turn_number,
             reason: format!("Failed to get repository status: {}", e),
         })?;
+
+    let status = scope::filter(status, manifest.as_ref());
 
     // Check if there's anything to record at all. A clean turn is classified
     // (RFC §10.2), never reported as empty.
@@ -1004,12 +1036,14 @@ pub fn record_turn(
     // skips the table-init `begin_write()` that `open()` does — the tables
     // already exist and that write lock is the primary cause of hook hangs
     // when another process holds a transaction.
-    let mut repo = atomic_repository::Repository::open_existing(repo_root).map_err(|e| {
-        AgentError::RecordFailed {
-            session_id: options.session.session_id.clone(),
-            turn_number: options.turn_number,
-            reason: format!("Failed to open repository for recording: {}", e),
-        }
+    let mut repo = atomic_repository::Repository::open_existing_wait(
+        repo_root,
+        std::time::Duration::from_secs(10),
+    )
+    .map_err(|e| AgentError::RecordFailed {
+        session_id: options.session.session_id.clone(),
+        turn_number: options.turn_number,
+        reason: format!("Failed to open repository for recording: {}", e),
     })?;
 
     // Re-resolve the identity for this newly opened handle. Non-sandbox turns
@@ -1029,6 +1063,10 @@ pub fn record_turn(
     } else {
         align_or_repair_session_view(&mut repo, options)?
     };
+
+    if let Some(files) = &manifest {
+        scope::validate(repo_root, files, options)?;
+    }
 
     if !untracked_paths.is_empty() {
         log::info!(
@@ -1067,6 +1105,7 @@ pub fn record_turn(
             reason: format!("Failed to refresh repository status after add: {}", e),
         })?;
 
+    let status = scope::filter(status, manifest.as_ref());
     if status.is_clean() && status.conflicted_count() == 0 {
         return Ok(TurnRecordResult::Classified(classify_clean_turn(
             &repo,
@@ -1112,7 +1151,7 @@ pub fn record_turn(
     // HashedChange.metadata — part of the change's cryptographic identity.
     // This means session structure (turn number, timing, files, agent name)
     // is tamper-evident and commutes via patch theory.
-    let record_options = atomic_repository::record::RecordOptions::new()
+    let mut record_options = atomic_repository::record::RecordOptions::new()
         .with_all(true)
         .view(options.session.view_name.clone())
         .apply_after_record(true)
@@ -1125,8 +1164,11 @@ pub fn record_turn(
         .provenance(vec![provenance_entry])
         .metadata_bytes(envelope_bytes);
 
-    let mut outcome = match repo.record(working_copy, header, record_options) {
-        Ok(outcome) => outcome,
+    if manifest.is_some() {
+        record_options = record_options.with_all(false).paths(status_files.clone());
+    }
+
+    let mut outcome = match repo.record(working_copy, header, record_options) {        Ok(outcome) => outcome,
         Err(atomic_repository::record::RecordError::NothingToRecord) => {
             // Nothing recorded even though status looked dirty — classify
             // instead of reporting an empty turn (RFC §10.2).
