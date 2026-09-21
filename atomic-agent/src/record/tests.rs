@@ -2055,6 +2055,61 @@ fn scoped_record_empty_missing_invalid_or_stale_manifest_never_sweeps() {
 }
 
 #[test]
+fn scoped_record_recovers_session_touched_deletions_after_claim_loss() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = atomic_repository::Repository::init(dir.path()).unwrap();
+    let mut session = make_session();
+    session.view_name = repo.current_view().to_string();
+    session.explicit_record_files = true;
+    drop(repo);
+    std::fs::write(dir.path().join("mine.txt"), "recorded by this session").unwrap();
+    std::fs::write(
+        dir.path().join("foreign.txt"),
+        "recorded by another session",
+    )
+    .unwrap();
+
+    // This session records mine.txt; the recorded paths land in the
+    // persisted session state (files_touched), like the orchestrator does.
+    let mine_event =
+        make_event().with_raw_json(serde_json::json!({"record_files":{"mine.txt":scope::fingerprint(dir.path(),"mine.txt").unwrap()}}));
+    let outcome = record_turn(dir.path(), &make_options(&session, &mine_event)).unwrap();
+    session.add_files_touched(outcome.recorded_file_list());
+
+    // Another session records foreign.txt.
+    let mut other = AgentSession::new("other-session", "opencode", "OpenCode");
+    other.view_name = session.view_name.clone();
+    other.explicit_record_files = true;
+    let foreign_event = make_event().with_raw_json(
+        serde_json::json!({"record_files":{"foreign.txt":scope::fingerprint(dir.path(),"foreign.txt").unwrap()}}),
+    );
+    record_turn(dir.path(), &make_options(&other, &foreign_event)).unwrap();
+
+    // Both files are deleted on disk. The plugin restarted, so the stop
+    // manifest arrives EMPTY — every ownership claim was lost.
+    std::fs::remove_file(dir.path().join("mine.txt")).unwrap();
+    std::fs::remove_file(dir.path().join("foreign.txt")).unwrap();
+    let empty = make_event().with_raw_json(serde_json::json!({"record_files":{}}));
+
+    // mine.txt is still attributable from the session state and records as a
+    // deletion instead of stranding; foreign.txt stays out of scope.
+    let outcome = record_turn(dir.path(), &make_options(&session, &empty)).unwrap();
+    assert_eq!(outcome.recorded_file_list(), &["mine.txt".to_string()]);
+
+    let repo = atomic_repository::Repository::open_existing(dir.path()).unwrap();
+    let status = repo
+        .status(atomic_repository::status::StatusOptions::default().with_untracked(true))
+        .unwrap();
+    let pending: Vec<String> = status
+        .entries()
+        .iter()
+        .map(|e| e.path().to_string_lossy().to_string())
+        .collect();
+    assert!(!pending.contains(&"mine.txt".to_string()));
+    assert!(pending.contains(&"foreign.txt".to_string()));
+}
+
+#[test]
 fn scoped_snapshot_includes_requested_files_restored_to_clean_and_deletions() {
     let dir = tempfile::tempdir().unwrap();
     drop(atomic_repository::Repository::init(dir.path()).unwrap());
