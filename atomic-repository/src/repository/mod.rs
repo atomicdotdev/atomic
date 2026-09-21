@@ -1176,7 +1176,8 @@ default = "{}"
         target.desired_state = target_view.state;
         target.materialized_state = None;
         target.materialized_manifest = None;
-        self.apply_working_copy_state_locked(&operation_lock, &target)    }
+        self.apply_working_copy_state_locked(&operation_lock, &target)
+    }
 
     /// Set the current view on this handle only.
     ///

@@ -1012,7 +1012,8 @@ impl Repository {
         let working_copy = operation_lock.working_copy();
         let source_target = EffectTarget::WorkspacePath {
             working_copy,
-            path: path.to_string(),        };
+            path: path.to_string(),
+        };
         let shelf_target = EffectTarget::ShelfPath {
             working_copy,
             view: old_view.to_string(),
