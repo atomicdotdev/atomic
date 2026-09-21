@@ -879,6 +879,7 @@ fn sha256_repositories_fail_closed_at_discovery_instead_of_silent_import() {
 /// A Git delta path that is not valid UTF-8 fails closed with an explicit
 /// diagnostic — never a silent lossy conversion of identity bytes.
 #[test]
+#[cfg(target_os = "linux")] // macOS/APFS refuses non-UTF8 and case-fold-ambiguous paths (EILSEQ)
 fn raw_non_utf8_path_survives_as_reversible_escaped_identity() {
     use std::os::unix::ffi::OsStrExt;
 
@@ -940,6 +941,7 @@ fn raw_non_utf8_path_survives_as_reversible_escaped_identity() {
 /// bytes — the fold never lossy-decodes identity and never re-encodes a
 /// literal `%` (the reversible escape is display-only).
 #[test]
+#[cfg(target_os = "linux")] // macOS/APFS refuses non-UTF8 and case-fold-ambiguous paths (EILSEQ)
 fn raw_nested_and_percent_lookalike_paths_survive_the_fold() {
     use std::os::unix::ffi::OsStrExt;
 
@@ -2532,6 +2534,7 @@ fn filter_removed_after_commit_imports_stored_blob_bytes() {
 /// per-state full-tree check — the paths still import byte-exact on a
 /// case-sensitive filesystem, but the check reports every folding class.
 #[test]
+#[cfg(target_os = "linux")] // macOS/APFS refuses non-UTF8 and case-fold-ambiguous paths (EILSEQ)
 fn case_and_normalization_collisions_are_surfaced_explicitly() {
     let root = tempfile::tempdir().unwrap().keep();
     let home = tempfile::tempdir().unwrap().keep();

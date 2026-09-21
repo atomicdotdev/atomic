@@ -3,6 +3,7 @@ use crate::record::RecordOptions;
 use crate::status::FileStatus;
 use atomic_core::change::{GraphOp, InodeAttr, InodeKind};
 
+#[cfg(unix)] // consumed by unix-gated attribute tests only
 fn record_all(repo: &TestRepository, message: &str) -> crate::record::RecordOutcome {
     repo.record(
         ChangeHeader::new(message),
@@ -413,6 +414,7 @@ fn inode_of(repo: &TestRepository, path: &str) -> atomic_core::types::Inode {
     txn.get_inode(path).unwrap().unwrap()
 }
 
+#[cfg(unix)]
 fn position_of(
     repo: &TestRepository,
     path: &str,
