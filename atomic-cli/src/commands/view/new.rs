@@ -137,9 +137,11 @@ fn validate_view_name(name: &str) -> Result<(), String> {
 
 /// Create a new view.
 ///
-/// Creates a new view in the repository. By default, the new view starts
-/// empty (with no changes inserted). Use `--from` to fork from an existing
-/// view, copying all its changes to the new view.
+/// A view is a filter over the global graph: every change and node it
+/// exposes already lives in the graph. Creation always makes a DRAFT
+/// overlay — anchored on a parent — whose change-set membership optionally
+/// starts SEEDED from an existing view's membership (`--from`). The new
+/// view owns nothing; it selects.
 #[derive(Parser, Debug, Default)]
 #[command(name = "create")]
 pub struct New {
@@ -152,12 +154,11 @@ pub struct New {
 
     /// Fork from a specific view instead of the current one.
     ///
-    /// By default, `view create` forks from the current view.  Use
-    /// `--from <VIEW>` to fork from a different view instead.
-    ///
-    /// The new view inherits all changes from the source and gets
-    /// its own view filter on the canonical `GRAPH` so that future
-    /// changes recorded on it are invisible to the source.
+    /// Seeds the new view's change-set membership from `<VIEW>`: the view
+    /// exposes the source's nodes through its own filter. Nothing is copied
+    /// out of the graph — the edges, hunks, and content already live in it —
+    /// and the source keeps every one of its nodes. Recording on the new
+    /// view afterwards writes draft edges the source cannot see.
     #[arg(long, value_name = "VIEW", add = ArgValueCompleter::new(complete_view_names))]
     pub from: Option<String>,
 
@@ -182,12 +183,15 @@ pub struct New {
     /// instead of the global graph. When deleted, all their edges are
     /// cascade-removed with zero orphans.
     ///
-    /// Without this flag, views are created as **shared** (permanent).
+    /// Draft is the ONLY creation scope — every view is born a draft
+    /// (an overlay filter over the graph) and may be promoted to a Shared
+    /// root scope with `view promote`. This flag is accepted for clarity
+    /// and symmetry.
     ///
     /// # Examples
     ///
     /// ```text
-    /// # Create a draft feature view parented on dev
+    /// # Create a draft feature view anchored on dev
     /// atomic view create feature-auth --draft
     ///
     /// # Create a draft workspace with an explicit parent
@@ -198,21 +202,21 @@ pub struct New {
 
     /// Parent view for the new view.
     ///
-    /// Sets the parent in the view hierarchy. The parent determines
-    /// the overlay chain for graph traversal: a draft workspace sees
-    /// its own edges plus its parent's effective view (recursively).
+    /// Anchors the overlay chain: a draft exposes its own change-set plus
+    /// its parent's effective set (recursively back to the nearest Shared
+    /// view). Every node it exposes already lives in the graph — a child
+    /// never copies or owns its parent's nodes.
     ///
-    /// Defaults to the current view. Use `--parent` to specify a
-    /// different parent explicitly.
+    /// Defaults to the nearest Shared ancestor of the current view.
     ///
     /// # Examples
     ///
     /// ```text
-    /// # Parent on a long-lived service view
-    /// atomic view create feature-login --draft --parent service-auth
+    /// # Anchor on a long-lived service view
+    /// atomic view create feature-login --parent service-auth
     ///
-    /// # Parent on dev (the default if dev is current)
-    /// atomic view create bugfix-123 --draft --parent dev
+    /// # Anchor on dev (the default if dev is current)
+    /// atomic view create bugfix-123 --parent dev
     /// ```
     #[arg(long, value_name = "VIEW", add = ArgValueCompleter::new(complete_view_names))]
     pub parent: Option<String>,
@@ -247,55 +251,6 @@ impl New {
     pub fn with_switch(mut self, switch: bool) -> Self {
         self.switch = switch;
         self
-    }
-
-    /// Two-tier view creation: --draft and/or --parent
-    fn run_two_tier(&self, name: &str, repo: &mut Repository) -> CliResult<()> {
-        use atomic_core::pristine::{MutTxnT, ViewScope, ViewTxnT};
-
-        let kind = if self.draft {
-            ViewScope::Draft
-        } else {
-            ViewScope::Shared
-        };
-
-        // Resolve the parent view name → ID
-        let parent_name = self
-            .parent
-            .clone()
-            .unwrap_or_else(|| repo.current_view().to_string());
-
-        let mut txn = repo
-            .pristine()
-            .write_txn()
-            .map_err(|e| CliError::Internal(e.into()))?;
-
-        let parent_view = txn
-            .get_view(&parent_name)
-            .map_err(|e| CliError::Internal(e.into()))?
-            .ok_or_else(|| CliError::ViewNotFound {
-                name: parent_name.clone(),
-            })?;
-
-        let parent_id = parent_view.id;
-
-        // Create the view with explicit kind and parent
-        let _view = txn
-            .create_view(name, kind, Some(parent_id))
-            .map_err(|e| CliError::Internal(e.into()))?;
-
-        txn.commit().map_err(|e| CliError::Internal(e.into()))?;
-
-        let kind_label = if kind.is_draft() { "draft" } else { "shared" };
-
-        print_success(&format!(
-            "Created {} view: {} (parent: {})",
-            kind_label,
-            style_view(name),
-            style_view(&parent_name),
-        ));
-
-        self.maybe_switch(name, repo)
     }
 
     /// Optionally switch to the new view and print hint.
@@ -346,76 +301,67 @@ impl Command for New {
             });
         }
 
-        // If --draft or --parent is specified, use the two-tier create path
-        if self.draft || self.parent.is_some() {
-            return self.run_two_tier(name, &mut repo);
-        }
-
-        // Determine how to create the new view:
+        // ONE creation concept: a Draft overlay whose filter is anchored on a
+        // parent and may be SEEDED from a source view's change-set
+        // membership.  The graph holds every node a view exposes; --from only
+        // selects which EXISTING changes the new view's filter starts with.
         //
-        //   --from X → create Draft parented on X, insert X's changes
-        //   default  → create Draft parented on nearest Shared ancestor,
-        //              with an EMPTY change log (no files until `insert`)
-        //
-        // The new view is a Draft workspace whose edges go to
-        // GRAPH (filtered by this view's change set).  The parent link
-        // gives the overlay chain read-access to the shared graph for
-        // record-time diff computation.
-        //
-        // When --from is specified, the source's changes are inserted
-        // immediately so the new view starts with the source's files.
-        // Without --from, the change log starts empty — the user brings
-        // in changes explicitly via `insert from-view`.  This is the
-        // normal workflow:
-        //
-        //   atomic view create feature          # empty workspace
-        //   atomic insert from-view dev         # inherit dev's files
-        //   # ... make changes, record ...
-        //   atomic insert from-view feature --to-view dev  # promote
+        //   --from S              → anchor on S, seed from S
+        //   --from S --parent P   → anchor on P, seed from S
+        //   --parent P | --draft  → anchor on P, empty membership
+        //   (default)             → anchor on nearest Shared, empty membership
+        //                           (bring files in with
+        //                            `atomic insert from-view dev`)
         if let Some(ref source) = self.from {
-            // Explicit --from: fork from the specified view.
             if !repo.view_exists(source).map_err(CliError::Repository)? {
                 return Err(CliError::ViewNotFound {
                     name: source.to_string(),
                 });
             }
+        }
 
-            let source_info = repo.get_view_info(source).map_err(CliError::Repository)?;
-            let change_count = source_info.change_count;
+        let (anchor, seed) = resolve_overlay_creation(self.from.as_deref(), self.parent.as_deref());
 
-            // create_stack_from creates a Draft workspace parented on
-            // the source, with the source's change log copied over.
-            repo.create_view_from(name, source)
-                .map_err(CliError::Repository)?;
+        let source_info = if let Some(seed_view) = seed.as_deref() {
+            Some(
+                repo.get_view_info(seed_view)
+                    .map_err(CliError::Repository)?,
+            )
+        } else {
+            None
+        };
 
-            if change_count > 0 {
+        repo.create_overlay_view(name, anchor.as_deref(), seed.as_deref())
+            .map_err(CliError::Repository)?;
+
+        if let Some(info) = source_info {
+            if info.change_count > 0 {
                 print_success(&format!(
-                    "Created view: {} (forked from {} with {} changes)",
+                    "Created view: {} (seeded from {} - {} changes)",
                     style_view(name),
-                    style_view(source),
-                    change_count,
+                    style_view(&info.name),
+                    info.change_count,
                 ));
             } else {
                 print_success(&format!(
-                    "Created view: {} (forked from {} - empty)",
+                    "Created view: {} (seeded from {} - empty)",
                     style_view(name),
-                    style_view(source),
+                    style_view(&info.name),
                 ));
             }
         } else {
-            // No --from: create an empty Draft workspace parented on the
-            // nearest Shared ancestor.  No changes are inherited — the
-            // user inserts them explicitly.
-            repo.create_view(name).map_err(CliError::Repository)?;
-
+            let anchored = if let Some(a) = anchor.as_deref() {
+                a.to_string()
+            } else {
+                match repo.nearest_shared_ancestor(repo.current_view()) {
+                    Ok(name) => name,
+                    Err(_) => repo.current_view().to_string(),
+                }
+            };
             print_success(&format!(
-                "Created view: {} (forked from {} - empty)",
+                "Created view: {} (empty workspace, anchored on {})",
                 style_view(name),
-                style_view(
-                    &repo
-                        .nearest_shared_ancestor(repo.current_view())
-                        .unwrap_or_else(|_| repo.current_view().to_string())
-                ),
+                style_view(&anchored),
             ));
         }
 
@@ -424,6 +370,28 @@ impl Command for New {
 }
 
 // Tests
+
+/// Resolve how a new view is anchored and seeded.
+///
+/// Returns `(anchor, seed)`: the overlay-chain anchor view (`None` means the
+/// repository default — the nearest Shared ancestor of the current view) and
+/// the view whose change-set membership seeds the new view's filter.
+///
+/// # Model
+///
+/// A view is a filter over the global graph: every node it exposes already
+/// lives in the graph. Creation selects where the overlay chain anchors and,
+/// optionally, which EXISTING changes the new view's filter starts with —
+/// nothing is copied out of the graph; no node is ever owned by two views.
+pub fn resolve_overlay_creation(
+    from: Option<&str>,
+    parent: Option<&str>,
+) -> (Option<String>, Option<String>) {
+    // --from anchors on its source unless an explicit --parent overrides;
+    // the seed is always the --from source.
+    let anchor = parent.or(from).map(|s| s.to_string());
+    (anchor, from.map(|s| s.to_string()))
+}
 
 #[cfg(test)]
 mod tests {
@@ -766,5 +734,31 @@ mod tests {
             }
             other => panic!("Expected ViewNotFound, got: {:?}", other),
         }
+    }
+    // -------------------------------------------------------------------------
+    // View kind resolution for the two-tier (--draft/--parent) path
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn overlay_creation_anchors_and_seeds() {
+        // --from S: anchored on S and seeded from S.
+        let (anchor, seed) = resolve_overlay_creation(Some("dev"), None);
+        assert_eq!(anchor, Some("dev".into()));
+        assert_eq!(seed, Some("dev".into()));
+
+        // --from S --parent P: anchored on P, seeded from S.
+        let (anchor, seed) = resolve_overlay_creation(Some("dev"), Some("staging"));
+        assert_eq!(anchor, Some("staging".into()));
+        assert_eq!(seed, Some("dev".into()));
+
+        // --parent P only: anchored on P, empty membership.
+        let (anchor, seed) = resolve_overlay_creation(None, Some("staging"));
+        assert_eq!(anchor, Some("staging".into()));
+        assert_eq!(seed, None);
+
+        // default: repository chooses the nearest Shared ancestor; no seed.
+        let (anchor, seed) = resolve_overlay_creation(None, None);
+        assert_eq!(anchor, None);
+        assert_eq!(seed, None);
     }
 }

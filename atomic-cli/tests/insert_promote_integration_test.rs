@@ -204,11 +204,13 @@ fn insert_change_alias_pick_still_parses() {
 }
 
 #[test]
-fn bare_insert_shared_to_shared_requires_confirmation() {
+fn parented_view_is_draft_and_bare_insert_needs_no_confirmation() {
     let dir = repo_with_base();
     let root = dir.path();
 
-    // Create a *shared* view parented on dev and switch to it.
+    // `--parent` creates a Draft (overlay) workspace parented on dev — not a
+    // broken Shared view — so the view must list as [draft] and a bare insert
+    // into the shared parent (the safe draft path) needs NO confirmation.
     assert!(
         atomic(
             root,
@@ -216,8 +218,15 @@ fn bare_insert_shared_to_shared_requires_confirmation() {
         )
         .status
         .success(),
-        "create shared staging"
+        "create staging (parented on dev)"
     );
+
+    let listed = combined(&atomic(root, &["view", "list", "-a"]));
+    assert!(
+        listed.contains("staging") && listed.to_lowercase().contains("draft"),
+        "a --parent view must be a draft (overlay) workspace:\n{listed}"
+    );
+
     std::fs::write(root.join("staging.txt"), b"staging work\n").unwrap();
     assert!(
         atomic(root, &["add", "staging.txt"]).status.success(),
@@ -230,24 +239,12 @@ fn bare_insert_shared_to_shared_requires_confirmation() {
         "record staging change"
     );
 
-    // Non-interactive (piped stdin): without --confirm this must refuse.
-    let refused = atomic(root, &["insert"]);
-    let refused_text = combined(&refused);
-    assert!(
-        !refused.status.success(),
-        "shared->shared insert without --confirm should fail:\n{refused_text}"
-    );
-    assert!(
-        refused_text.to_lowercase().contains("confirm"),
-        "error should point at --confirm:\n{refused_text}"
-    );
-
-    // With --confirm it proceeds in one line.
-    let ok = atomic(root, &["insert", "--confirm"]);
+    // Bare insert (draft → shared parent) proceeds without --confirm.
+    let ok = atomic(root, &["insert"]);
     let ok_text = combined(&ok);
     assert!(
         ok.status.success(),
-        "insert --confirm should succeed:\n{ok_text}"
+        "bare insert from a parented draft must not require --confirm:\n{ok_text}"
     );
     assert!(
         ok_text.contains("Inserted") && ok_text.contains("change"),

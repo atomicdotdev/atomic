@@ -205,3 +205,67 @@ fn test_view_info_state_methods() {
     // For an empty view
     assert!(info.is_empty());
 }
+
+/// The atomic model, operationalized: a view is a FILTER over the graph —
+/// `--from` seeds the new draft's change-set membership from the source
+/// without the draft owning a single node; the parent chain renders the
+/// source's nodes via the overlay. Recording afterwards writes ONLY draft
+/// edges (own changes), and the absorbed holder keeps its identity.
+#[test]
+fn test_create_overlay_view_seeds_membership_without_owning_nodes() {
+    use crate::record::RecordOptions;
+    use atomic_core::change::ChangeHeader;
+
+    let (_temp_dir, mut repo) = create_temp_repo();
+
+    // dev owns one change (base.txt).
+    let base = _temp_dir.path().join("base.txt");
+    std::fs::write(&base, "base\n").unwrap();
+    repo.add("base.txt", TrackingOptions::default()).unwrap();
+    let header = ChangeHeader::new("base change");
+    repo.record(
+        header.clone(),
+        RecordOptions::new().with_all(true).save_to_store(true),
+    )
+    .unwrap();
+
+    // Seed a child overlay from dev: membership is copied, nodes are not.
+    repo.create_overlay_view("child", None, Some("dev"))
+        .unwrap();
+    let child = repo.get_view_info("child").unwrap();
+    assert!(child.scope.is_draft(), "a creation-scoped view is a draft");
+    assert_eq!(
+        child.own_change_count, 0,
+        "seeding copies MEMBERSHIP, not ownership"
+    );
+    assert_eq!(
+        child.inherited_change_count,
+        repo.get_view_info("dev").unwrap().change_count,
+        "the overlay chain renders the parent's nodes"
+    );
+
+    // The child's filter renders dev's file, though the child owns nothing.
+    let visible = repo.visible_file_paths("child").unwrap();
+    assert!(
+        visible.contains("base.txt"),
+        "child filter must render the parent's nodes"
+    );
+
+    // Recording on the child writes a draft edge — an own change, nothing
+    // else is duplicated.
+    repo.switch_view("child").unwrap();
+    let own = _temp_dir.path().join("own.txt");
+    std::fs::write(&own, "child work\n").unwrap();
+    repo.add("own.txt", TrackingOptions::default()).unwrap();
+    repo.record(
+        header,
+        RecordOptions::new().with_all(true).save_to_store(true),
+    )
+    .unwrap();
+    let after = repo.get_view_info("child").unwrap();
+    assert_eq!(after.own_change_count, 1, "one draft edge recorded");
+    assert!(
+        repo.get_view_info("dev").unwrap().change_count == child.inherited_change_count,
+        "the parent held every one of its nodes"
+    );
+}
