@@ -585,7 +585,9 @@ fn draft_branch_publication_is_explicit_and_refuses_conflicts() {
     );
 
     // The view is still a Draft: no branch was silently created by Atomic's
-    // own bookkeeping; publication is the user's explicit push.
-    let atomic_status = atomic_ok(fixture.root(), fixture.home(), &["view", "list"]);
+    // own bookkeeping; publication is the user's explicit push. The merged
+    // view list hides zero-change drafts by default (dev-sync UX), so the
+    // existence assertion uses the explicit --all rendering.
+    let atomic_status = atomic_ok(fixture.root(), fixture.home(), &["view", "list", "--all"]);
     assert!(atomic_status.contains("feature"), "{atomic_status}");
 }

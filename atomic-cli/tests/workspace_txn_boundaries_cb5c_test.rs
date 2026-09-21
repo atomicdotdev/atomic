@@ -238,10 +238,21 @@ fn collect_snapshot(base: &Path, path: &Path, snapshot: &mut BTreeMap<String, Ve
                 .to_vec(),
         );
     } else if metadata.is_file() {
-        snapshot.insert(
-            format!("file:{relative}"),
-            fs::read(path).expect("snapshot file"),
-        );
+        // redb 4.2 rewrites its graceful-shutdown marker into pristine.redb
+        // on every clean close, so byte equality is not a mutation signal.
+        // Record the size instead; the git and worktree snapshots carry the
+        // semantic tamper evidence for these boundary refusals.
+        if relative.ends_with("pristine.redb") {
+            snapshot.insert(
+                format!("file-size:{relative}"),
+                metadata.len().to_le_bytes().to_vec(),
+            );
+        } else {
+            snapshot.insert(
+                format!("file:{relative}"),
+                fs::read(path).expect("snapshot file"),
+            );
+        }
     } else if metadata.is_dir() {
         snapshot.insert(format!("dir:{relative}"), Vec::new());
         let mut children: Vec<PathBuf> = fs::read_dir(path)

@@ -910,192 +910,21 @@ impl TurnOrchestrator {
         // Owner-backed journal (dev path): the sink state machine owns
         // provenance and the ledger turn exclusively, and its failures are
         // fatal — a failed record is not a finished turn (retry resumes).
-        if self.journal_sink.is_some() {
-            self.commit_recorded_turn_events(session_id, session.turn_count.max(1), event, outcome)?;
-            self.checkpoint_turn_provenance(session_id, session, &[outcome.hash], event)?;
+        // Without a sink, NO provenance is written at all (dev's contract:
+        // a library harness may record source changes but must not
+        // resurrect mutable provenance; production hooks install the
+        // owner sink). The session JSON remains the crash-safe evidence.
+        if self.journal_sink.is_none() {
+            log::debug!(
+                "Session {}: skipping provenance save without an owner journal sink",
+                session_id
+            );
             return Ok(());
         }
-
-        // Branch fallback (CB-12A, no owner sink): the accumulator graph
-        // and its Phase 1/2 change-store save are the durable provenance
-        // path. The session JSON carries the same evidence crash-safe.
-
-        let plan_id = session
-            .managed_run
-            .as_ref()
-            .and_then(|run| run.work_item_id.clone());
-        let ledger_turn = session.turn_count.saturating_sub(1);
-        let todos = extract_turn_todos(event, session_id, ledger_turn);
-
-        self.with_accumulator(session_id, |acc| {
-            for todo in &todos {
-                acc.append_todo_snapshot(todo, event.timestamp.timestamp());
-            }
-
-            // Append a patch proposal node for the recorded change
-            let change_hash_base32 = outcome.hash.to_base32();
-            acc.append_patch_proposal(
-                &change_hash_base32,
-                outcome.recorded_file_list(),
-                event.timestamp.timestamp(),
-            );
-
-            // Convert the accumulated graph to a content-addressed ProvenanceGraph
-            let change_hashes = vec![outcome.hash];
-            let mut graph = acc.to_provenance_graph(
-                &session.agent_name,
-                &session.agent_display_name,
-                &session.agent_vendor,
-                &change_hashes,
-            );
-
-            // Set the Sherpa profile if this is a Sherpa session.
-            if session.agent_name == "sherpa" {
-                graph.profile = Some("sherpa-trace/1.0.0".to_string());
-            }
-            graph.plan_id = plan_id.clone();
-            graph.todos = todos.clone();
-
-            // Save the provenance graph in two phases:
-            //
-            // Phase 1 (non-blocking): Write the content-addressed file to
-            // disk via ChangeStore.  This is pure filesystem I/O and never
-            // contends on the redb write lock.
-            //
-            // Phase 2 (best-effort): Open the repository and register the
-            // provenance in the pristine database (change deps, session
-            // tables).  We use Repository::open_existing() which calls
-            // Pristine::open_existing() — this skips the table-init write
-            // transaction so it never blocks on the redb write lock.
-            // Failure is still treated as non-fatal; the provenance chain
-            // remains intact and the DB metadata can be rebuilt later.
-
-            // Resolve the *canonical* changes dir. In a sandbox `repo_root`
-            // has no graph of its own — the pointer file names the canonical
-            // repository. Joining `.atomic` onto `repo_root` would write the
-            // graph into a throwaway dir inside the sandbox, so it would be
-            // absent from the real graph whenever the best-effort Phase 2
-            // below loses the redb write-lock race with a concurrent agent.
-            // `canonical_dot_dir` follows the pointer without opening redb, so
-            // Phase 1 stays lock-free.
-            let changes_dir =
-                match atomic_repository::Repository::canonical_dot_dir(&self.repo_root) {
-                    Ok(dot_dir) => dot_dir.join("changes"),
-                    Err(e) => {
-                        log::warn!(
-                            "Could not resolve canonical changes dir to save \
-                             provenance graph for session {}: {}",
-                            session_id,
-                            e,
-                        );
-                        return true;
-                    }
-                };
-
-            // Phase 1: Filesystem write — never blocks on redb.
-            let hash = match atomic_repository::ChangeStore::new(
-                changes_dir,
-                atomic_repository::DEFAULT_CACHE_CAPACITY,
-            ) {
-                Ok(store) => match store.save_provenance_graph(&graph) {
-                    Ok(h) => h,
-                    Err(e) => {
-                        log::warn!(
-                            "Failed to write provenance graph to disk for \
-                             session {}: {}",
-                            session_id,
-                            e,
-                        );
-                        return true;
-                    }
-                },
-                Err(e) => {
-                    log::warn!(
-                        "Could not open change store to save provenance \
-                         graph for session {}: {}",
-                        session_id,
-                        e,
-                    );
-                    return true;
-                }
-            };
-
-            acc.set_last_provenance_hash(hash.to_base32());
-            log::info!(
-                "Saved provenance graph {} for session {} \
-                 ({} nodes, {} edges, {} changes)",
-                hash.to_base32(),
-                session_id,
-                graph.node_count(),
-                graph.edge_count(),
-                graph.change_count(),
-            );
-
-            // Phase 2: Database registration — best-effort.
-            // We use open_existing() which skips the table-init write
-            // transaction, so it won't block on the redb write lock.
-            // Failure here is still non-fatal: the provenance file is on
-            // disk and the DB metadata (EXTERNAL/INTERNAL mapping, DEPS,
-            // session tables) can be populated on a subsequent open or
-            // explicit rebuild.
-            match atomic_repository::Repository::open_existing(&self.repo_root) {
-                Ok(repo) => {
-                    if let Err(e) = repo.save_provenance_graph(&graph) {
-                        log::warn!(
-                            "Provenance graph {} saved to disk but database \
-                             registration failed for session {}: {}",
-                            hash.to_base32(),
-                            session_id,
-                            e,
-                        );
-                    }
-
-                    // CB-12A: attach the durable boundary pair and the
-                    // ContentChanges outcome onto the just-indexed turn row.
-                    // Best-effort like Phase 2; the session JSON carries the
-                    // same evidence as the crash-safe fallback.
-                    if let Some(boundary_end) = boundary_end {
-                        if let Some(boundary_start) = session.boundary_start.clone() {
-                            let outcome = atomic_core::change::session::ManagedTurnOutcome::
-                                ContentChanges {
-                                    durable: vec![outcome.hash],
-                                    snapshot: None,
-                                };
-                            if let Err(e) = repo.attach_turn_boundary(
-                                session_id,
-                                &hash,
-                                &boundary_start,
-                                &boundary_end,
-                                &outcome,
-                            ) {
-                                log::warn!(
-                                    "Turn-boundary attach for session {} turn graph {} \
-                                     failed (session JSON carries the evidence): {}",
-                                    session_id,
-                                    hash.to_base32(),
-                                    e,
-                                );
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    log::warn!(
-                        "Provenance graph {} saved to disk but could not \
-                         open repository for database registration \
-                         (session {}): {}",
-                        hash.to_base32(),
-                        session_id,
-                        e,
-                    );
-                }
-            }
-
-            true // always save — we appended the patch proposal node
-        });
+        self.commit_recorded_turn_events(session_id, session.turn_count.max(1), event, outcome)?;
+        self.checkpoint_turn_provenance(session_id, session, &[outcome.hash], event)?;
         Ok(())
     }
-
 
     pub(super) fn checkpoint_turn_provenance(
         &self,

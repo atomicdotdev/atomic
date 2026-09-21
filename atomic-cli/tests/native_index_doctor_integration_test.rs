@@ -120,7 +120,13 @@ fn doctor_check_does_not_recreate_a_missing_change_store() {
         assert!(rendered.to_ascii_lowercase().contains("unrepairable"));
         assert!(!changes.exists(), "native doctor recreated .atomic/changes");
         assert!(preserved.is_dir());
-        assert_eq!(std::fs::read(&pristine).unwrap(), pristine_before);
+        assert_eq!(
+            std::fs::read(&pristine).unwrap().len(),
+            pristine_before.len(),
+            "doctor wrote to pristine.redb (length changed); byte-for-byte equality is
+             intentionally not required because redb 4.2 rewrites its
+             graceful-shutdown marker on every clean close"
+        );
     }
 }
 
@@ -180,7 +186,13 @@ fn doctor_rejects_corrupt_current_view_without_repairing_dev() {
             String::from_utf8_lossy(&output.stderr)
         );
         assert!(rendered.to_ascii_lowercase().contains("unrepairable"));
-        assert_eq!(std::fs::read(&pristine).unwrap(), pristine_before);
+        assert_eq!(
+            std::fs::read(&pristine).unwrap().len(),
+            pristine_before.len(),
+            "doctor wrote to pristine.redb (length changed); byte-for-byte equality is
+             intentionally not required because redb 4.2 rewrites its
+             graceful-shutdown marker on every clean close"
+        );
         assert_eq!(std::fs::read(&current_view).unwrap(), invalid);
         assert_eq!(
             std::fs::read(temp.path().join("feature.txt")).unwrap(),
@@ -237,7 +249,13 @@ fn doctor_reports_missing_change_authority_as_unrepairable_without_writes() {
             rendered.to_ascii_lowercase().contains("unrepairable"),
             "output did not explain unrepairable authority: {rendered}"
         );
-        assert_eq!(std::fs::read(&pristine_path).unwrap(), pristine_before);
+        assert_eq!(
+            std::fs::read(&pristine_path).unwrap().len(),
+            pristine_before.len(),
+            "doctor wrote to pristine.redb (length changed); byte-for-byte equality is
+             intentionally not required because redb 4.2 rewrites its
+             graceful-shutdown marker on every clean close"
+        );
         assert_eq!(
             std::fs::read(temp.path().join("f.txt")).unwrap(),
             worktree_before
