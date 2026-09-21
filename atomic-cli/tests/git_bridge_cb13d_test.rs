@@ -875,20 +875,34 @@ fn session_notice_written_and_killed_daemon_leaves_commands_unchanged() {
 
     // The killed daemon left the workspace in a command-boundary-clean
     // state: the next command outcome is unchanged versus the baseline.
-    // If the kill landed mid-checkpoint-write, the open-time recovery
-    // completes the interrupted operation and the boundary reconcile
-    // re-adopts the external commit on a subsequent pass — poll for the
-    // converged checkpoint instead of assuming the first pass lands it.
+    // The invariant is ANCESTRY, not an exact tip: the reactive pass may
+    // have projected past the external commit (a new commit on top, with a
+    // fresh oid), and a kill mid-checkpoint-write converges through the
+    // open-time recovery. Poll until refs/heads/main's history CONTAINS
+    // the external commit and the checkpoint references that head.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    let checkpoint = loop {
+    let head_contains_external = loop {
         fixture.atomic(&["git", "bridge", "reconcile"]);
         fixture.atomic(&["git", "bridge", "verify"]);
-        let checkpoint = fs::read_to_string(fixture.root().join(".atomic/bridge/workspace.json"))
-            .expect("checkpoint");
-        if checkpoint.contains(external_tip.to_string().as_str())
-            || std::time::Instant::now() > deadline
-        {
-            break checkpoint;
+        let head = fixture.tip("refs/heads/main").expect("head after recovery");
+        if head == external_tip {
+            break true;
+        }
+        let is_ancestor = Command::new("git")
+            .args(["-C", fixture.root().to_str().expect("utf8 root")])
+            .args([
+                "merge-base",
+                "--is-ancestor",
+                external_tip.to_string().as_str(),
+                "refs/heads/main",
+            ])
+            .output()
+            .expect("run git merge-base");
+        if is_ancestor.status.success() {
+            break true;
+        }
+        if std::time::Instant::now() > deadline {
+            break false;
         }
         std::thread::sleep(std::time::Duration::from_millis(200));
     };
@@ -897,9 +911,16 @@ fn session_notice_written_and_killed_daemon_leaves_commands_unchanged() {
         after, baseline,
         "the external commit must be reflected after the boundary reconcile"
     );
+    let checkpoint = fs::read_to_string(fixture.root().join(".atomic/bridge/workspace.json"))
+        .expect("checkpoint");
     assert!(
-        checkpoint.contains(&external_tip.to_string()),
-        "the checkpoint must reference the external tip after the killed daemon:\n{checkpoint}"
+        head_contains_external,
+        "the killed daemon must not lose the external commit from main's history"
+    );
+    let head = fixture.tip("refs/heads/main").expect("head");
+    assert!(
+        checkpoint.contains(&head.to_string()),
+        "the checkpoint must reference main's current head:\n{checkpoint}"
     );
 }
 
