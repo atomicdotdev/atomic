@@ -8,11 +8,11 @@
 //! ac-4 deterministic matrix (linked worktrees, concurrent writers).
 
 use super::super::projection_effects::{
-    aligned_git_index_lease, observe_git_index_lease, read_head_target, ProjectionCheckpointPlan,
+    aligned_git_index_lease, observe_checkpoint_facts, observe_git_index_lease, read_head_target, ProjectionCheckpointPlan,
 };
 use super::*;
 
-use atomic_core::operation::EffectTarget;
+use atomic_core::operation::{DigestKind, EffectReceiptKind, EffectTarget, EffectValue};
 use atomic_core::pristine::OperationTxnT;
 use std::fs;
 use std::process::Command;
