@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 39_view_switch_name_conflict.sh
+# 41_view_switch_name_conflict.sh
 #
 # Regression: a view switch must NOT delete a file that has a materialization
 # name-conflict when that file IS in the target view's inherited state.
@@ -17,7 +17,7 @@
 # set is EMPTY — switching into it deletes the entire working tree, which is
 # a different (broader) defect not covered here.
 #
-# Run against the harness binary: ATOMIC_BIN=path/to/atomic ./39_view_switch_name_conflict.sh
+# Run against the harness binary: ATOMIC_BIN=path/to/atomic ./41_view_switch_name_conflict.sh
 # Pre-fix builds fail at "f.txt survives the switch".
 
 HARNESS_DIR="$(cd "$(dirname "$0")" && pwd)"
