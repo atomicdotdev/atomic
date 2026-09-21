@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 41_record_status_name_conflict.sh
+# 44_record_status_name_conflict.sh
 # Regression: resolving a same-path, independent-inode name conflict must not
 # leave status saying modified while record silently says the tree is clean.
 

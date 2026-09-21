@@ -7,7 +7,7 @@ changes into one view, materialization reports a name conflict. Replacing the
 markers with the content of the identity selected by `TREE` leaves `status`
 reporting a modification, but `record` previously returned “Nothing to record”.
 
-The regression is `tests/harness/41_record_status_name_conflict.sh`. It first
+The regression is `tests/harness/44_record_status_name_conflict.sh`. It first
 reproduced that failure against the unchanged parent branch, before the
 implementation was modified.
 
@@ -36,7 +36,7 @@ inactive for the current view.
 
 These are asserted directly in
 `atomic-repository/tests/causal_file_identity_test.rs`, in addition to the CLI
-scenarios in harness 41.
+scenarios in harness 44.
 
 ## Atomic representation
 
