@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 40_view_create_parent.sh
+# 43_view_create_parent.sh
 #
 # Regression: `atomic view create <name> --parent <p>` must create a child
 # view that INHERITS the parent's state — not an empty view. Switching into
@@ -10,7 +10,7 @@
 # draft/overlay views). `view switch` into it then deleted EVERY tracked
 # file from the working tree (`old_files - ∅`).
 #
-# Run against the harness binary: ATOMIC_BIN=path/to/atomic ./40_view_create_parent.sh
+# Run against the harness binary: ATOMIC_BIN=path/to/atomic ./43_view_create_parent.sh
 # Pre-fix builds fail at "seed.txt survives the switch into --parent child".
 
 HARNESS_DIR="$(cd "$(dirname "$0")" && pwd)"
