@@ -1683,3 +1683,96 @@ async fn resume_view_recovers_completed_materialization_after_interrupted_cleanu
         "keep me\n"
     );
 }
+
+#[tokio::test]
+async fn resume_view_allows_materialized_conflicts_to_be_resolved() {
+    let dir = TempDir::new().unwrap();
+    let mut repo = Repository::init(dir.path()).unwrap();
+    let path = dir.path().join("conflict.txt");
+    fs::write(&path, "line1\nline2\nline3\nline4\nline5\n").unwrap();
+    repo.add(
+        "conflict.txt",
+        atomic_repository::TrackingOptions::default(),
+    )
+    .unwrap();
+    let record = |repo: &Repository, message: &str| {
+        repo.record(
+            atomic_core::change::ChangeHeader::new(message),
+            atomic_repository::RecordOptions::new()
+                .with_all(true)
+                .save_to_store(true)
+                .apply_after_record(true),
+        )
+        .unwrap();
+    };
+    record(&repo, "base");
+    repo.create_view_from("feature-a", "dev").unwrap();
+    repo.create_view_from("feature-b", "dev").unwrap();
+    repo.switch_view("feature-a").unwrap();
+    fs::write(&path, "line1\nAAA\nline2\nline3\nline4\nline5\n").unwrap();
+    record(&repo, "edit A");
+    repo.switch_view("feature-b").unwrap();
+    fs::write(&path, "line1\nBBB\nline2\nline3\nline4\nline5\n").unwrap();
+    record(&repo, "edit B");
+    repo.insert_from_view(atomic_repository::apply::CrossViewInsertOptions::new(
+        "feature-a",
+        "feature-b",
+    ))
+    .unwrap();
+    repo.materialize().unwrap();
+    assert!(fs::read_to_string(&path).unwrap().contains(">>>>>>>"));
+    repo.switch_view("dev").unwrap();
+    drop(repo);
+
+    let mut orch = make_orchestrator(&dir);
+    let mut session = AgentSession::new("conflict-session", "opencode", "OpenCode");
+    session.view_name = "feature-b".into();
+    session.set_parent_view("dev");
+    orch.session_store.save(&session).unwrap();
+    orch.dispatch(session_start_event("conflict-session"))
+        .await
+        .unwrap();
+    let rendered = fs::read_to_string(&path).unwrap();
+    assert!(rendered.contains("AAA") && rendered.contains("BBB") && rendered.contains(">>>>>>>"));
+    assert!(Repository::open_readonly(dir.path())
+        .unwrap()
+        .status(atomic_repository::status::StatusOptions::default())
+        .unwrap()
+        .has_conflicts());
+    assert!(!dir
+        .path()
+        .join(".atomic")
+        .join(crate::record::VIEW_PREPARATION_PENDING_FILE)
+        .exists());
+    orch.dispatch(turn_start_event("conflict-session", "resolve the conflict"))
+        .await
+        .unwrap();
+    orch.dispatch(TurnEvent::new("conflict-session", HookType::PreToolUse).with_tool_name("edit"))
+        .await
+        .unwrap();
+    fs::write(&path, "line1\nAAA\nBBB\nline2\nline3\nline4\nline5\n").unwrap();
+    assert!(orch
+        .dispatch(turn_end_event("conflict-session"))
+        .await
+        .unwrap()
+        .was_recorded());
+    let status = Repository::open_readonly(dir.path())
+        .unwrap()
+        .status(atomic_repository::status::StatusOptions::default())
+        .unwrap();
+    assert!(status.is_clean() && !status.has_conflicts());
+}
+
+#[tokio::test]
+async fn resume_view_materializer_reports_a_failed_file_write() {
+    let (dir, _orch, view, _) = resume_view_fixture().await;
+    fs::create_dir(dir.path().join("session-only.txt")).unwrap();
+    let mut repo = Repository::open_existing(dir.path()).unwrap();
+    let error = repo.switch_view(&view).unwrap_err();
+    assert!(error.to_string().contains("session-only.txt"), "{error}");
+    assert!(dir.path().join("session-only.txt").is_dir());
+    assert_eq!(
+        fs::read_to_string(dir.path().join("base.txt")).unwrap(),
+        "base\n"
+    );
+}

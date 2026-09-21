@@ -54,7 +54,9 @@ impl TurnOrchestrator {
             let status = repo
                 .status(StatusOptions::default().with_untracked(true))
                 .map_err(|e| fail(format!("view restoration is incomplete: {e}")))?;
-            if !status.is_clean() || status.has_untracked() || status.has_conflicts() {
+            // A rendered conflict is valid view output. Allow tools to resolve it;
+            // the repository still refuses to record unresolved conflict markers.
+            if !status.is_clean() || status.has_untracked() {
                 return Err(fail(
                     "view restoration is incomplete; files do not match the selected view. Resolve filesystem obstructions, restore missing files, and preserve any other edits before retrying this session. Automatic recording is blocked".into(),
                 ));
@@ -107,8 +109,8 @@ impl TurnOrchestrator {
         sync_view_preparation_dir(&dot_dir).map_err(|e| fail(e.to_string()))?;
         repo.switch_view(&session.view_name)
             .map_err(|e| fail(format!("view restoration is incomplete: {e}")))?;
-        // The current materializer may warn and skip a failed file while
-        // returning Ok. Success must be established from the resulting files.
+        // Verify the resulting working copy before clearing the durable marker,
+        // including after a later retry of an interrupted transition.
         verify_restored(&repo)?;
         clear_pending()
     }

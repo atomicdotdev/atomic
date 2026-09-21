@@ -811,6 +811,8 @@ impl Repository {
         let mut conflicts_by_path: std::collections::HashMap<String, u32> =
             std::collections::HashMap::new();
 
+        let mut failed_files = 0usize;
+        let mut first_file_error = None;
         for file_result in file_results {
             match file_result {
                 Ok(Some((path, bytes, content_hash, was_written, marker_line))) => {
@@ -849,7 +851,8 @@ impl Repository {
                 }
                 Err(e) => {
                     log::warn!("Parallel materialize failed for file: {}", e);
-                    result.files_skipped += 1;
+                    failed_files += 1;
+                    first_file_error.get_or_insert(e);
                 }
             }
         }
@@ -876,6 +879,13 @@ impl Repository {
             log::warn!("failed to persist conflict state: {}", e);
         }
 
+        // Preserve index/conflict information for files that did finish, but
+        // never report a partially restored working copy as a successful render.
+        if let Some(error) = first_file_error {
+            return Err(RepositoryError::Output(format!(
+                "Failed to materialize {failed_files} file(s): {error}"
+            )));
+        }
         Ok(result)
     }
 

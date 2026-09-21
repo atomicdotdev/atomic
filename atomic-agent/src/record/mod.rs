@@ -110,8 +110,8 @@ fn build_turn_header(
         .build()
 }
 
-// Operational completion marker only: it names a target view, never paths,
-// inode ownership, inverse changes, or file-history baselines.
+// Marks a session view restore that has not completed. Contains the target
+// view; removed only after the restored working-copy files are verified.
 pub(crate) const VIEW_PREPARATION_PENDING_FILE: &str = "agent-view-prepare.pending";
 
 // Hooks that have not opened a repository yet only pay for a database read
