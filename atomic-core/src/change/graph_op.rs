@@ -247,6 +247,7 @@ pub enum GraphOp<H> {
     /// resolves the conflict by choosing one version.
     SolveNameConflict {
         /// The resolution operation
+        /// (an empty edge list selects `inode` as the surviving path identity).
         name: EdgeUpdate<H>,
         /// Path where conflict occurred
         path: String,

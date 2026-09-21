@@ -94,6 +94,85 @@ impl Repository {
     }
 }
 
+pub(crate) type NameConflicts = std::collections::HashMap<String, Vec<(Inode, Position<NodeId>)>>;
+
+pub(crate) fn live_names_for_path<T: GraphTxnT, C: atomic_core::change::ChangeStore>(
+    txn: &T,
+    store: &C,
+    position: Position<NodeId>,
+    path: &str,
+    filter: &HashSet<NodeId>,
+) -> Result<Vec<atomic_core::types::GraphNode<NodeId>>, RepositoryError> {
+    let options = atomic_core::output::RetrieveOptions::new().with_change_filter(filter.clone());
+    let names = atomic_core::output::repo::live_inode_names(txn, position, &options)
+        .map_err(|e| RepositoryError::Database(format!("{path}: {e}")))?;
+    let filename = path.rsplit('/').next().unwrap_or(path).as_bytes();
+    let mut matching = Vec::new();
+    for name in names {
+        let mut bytes = vec![0; (name.end.get() - name.start.get()) as usize];
+        store
+            .get_contents(|id| txn.get_external(id).ok().flatten(), name, &mut bytes)
+            .map_err(|e| RepositoryError::Database(format!("{path}: {e}")))?;
+        if bytes == filename {
+            matching.push(name);
+        }
+    }
+    Ok(matching)
+}
+
+/// Find all live identities for same-path creates using the current view's
+/// filter. Both record and materialize must see the identities hidden by TREE.
+pub(crate) fn collect_name_conflicts<C: atomic_core::change::ChangeStore>(
+    txn: &atomic_core::pristine::ReadTxn,
+    store: &C,
+    paths: &HashSet<&str>,
+    filter: &HashSet<NodeId>,
+) -> Result<NameConflicts, RepositoryError> {
+    let mut by_path: std::collections::HashMap<String, Vec<Inode>> =
+        std::collections::HashMap::new();
+    for (inode, path) in txn
+        .iter_rev_tree()
+        .map_err(|e| RepositoryError::Database(e.to_string()))?
+    {
+        if paths.contains(path.as_str()) {
+            by_path.entry(path).or_default().push(inode);
+        }
+    }
+    let mut conflicts = std::collections::HashMap::new();
+    for (path, candidates) in by_path {
+        if candidates.len() < 2 {
+            continue;
+        }
+        let mut live = Vec::new();
+        for inode in candidates {
+            let Some(pos) = txn
+                .inode_position(inode)
+                .map_err(|e| RepositoryError::Database(format!("{path}: {e}")))?
+            else {
+                continue;
+            };
+            if !pos.change.is_root() && !filter.contains(&pos.change) {
+                continue;
+            }
+            if live_names_for_path(txn, store, pos, &path, filter)?.is_empty() {
+                continue;
+            }
+            if super::status::try_is_file_alive_via_retrieval(txn, pos, filter).map_err(|e| {
+                RepositoryError::Database(format!(
+                    "cannot resolve recorded baseline for {path}: name conflict: {e}"
+                ))
+            })? {
+                live.push((inode, pos));
+            }
+        }
+        if live.len() >= 2 {
+            live.sort_by_key(|(inode, pos)| (pos.change.get(), pos.pos.get(), inode.get()));
+            conflicts.insert(path, live);
+        }
+    }
+    Ok(conflicts)
+}
+
 /// Render a name conflict: two or more inodes are alive at the same path on
 /// this view, so instead of silently emitting whichever inode `TREE` happened
 /// to keep, wrap every side's materialized content in conflict markers.
@@ -536,46 +615,12 @@ impl Repository {
         //
         // The (relatively expensive) aliveness probe runs ONLY for paths with
         // ≥ 2 candidate inodes, so the common single-inode file pays nothing.
-        let name_conflicts: std::collections::HashMap<String, Vec<(Inode, Position<NodeId>)>> = {
-            use atomic_core::pristine::TreeTxnT;
-            let mut by_path: std::collections::HashMap<String, Vec<Inode>> =
-                std::collections::HashMap::new();
-            if let Ok(pairs) = txn.iter_rev_tree() {
-                for (inode, path) in pairs {
-                    by_path.entry(path).or_default().push(inode);
-                }
-            }
-            let filter = change_filter_arc.as_ref();
-            let mut conflicts: std::collections::HashMap<String, Vec<(Inode, Position<NodeId>)>> =
-                std::collections::HashMap::new();
-            for item in &file_items {
-                let candidates = match by_path.get(&item.path) {
-                    Some(c) if c.len() >= 2 => c,
-                    _ => continue,
-                };
-                let mut live: Vec<(Inode, Position<NodeId>)> = Vec::new();
-                for &inode in candidates {
-                    let pos = match txn.inode_position(inode) {
-                        Ok(Some(p)) => p,
-                        _ => continue,
-                    };
-                    if !pos.change.is_root() && !filter.contains(&pos.change) {
-                        continue; // not visible on this view
-                    }
-                    if crate::repository::status::is_file_alive_via_retrieval(
-                        &txn, inode, pos, filter,
-                    ) {
-                        live.push((inode, pos));
-                    }
-                }
-                if live.len() >= 2 {
-                    // Deterministic order: creating change, then position, then inode.
-                    live.sort_by_key(|(ino, p)| (p.change.get(), p.pos.get(), ino.get()));
-                    conflicts.insert(item.path.clone(), live);
-                }
-            }
-            conflicts
-        };
+        let name_conflicts = collect_name_conflicts(
+            &txn,
+            &self.change_store,
+            &file_items.iter().map(|item| item.path.as_str()).collect(),
+            &change_filter_arc,
+        )?;
 
         // Phase 3: Create directories needed by passing files
         let mut result = MaterializeResult::new();
