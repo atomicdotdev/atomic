@@ -439,14 +439,11 @@ switch_view "$BASE_VIEW" >/dev/null
 mv orig.txt base-name.txt
 record_change "rename orig->base-name" >/dev/null
 atomic insert "$A11_HASH" >/dev/null 2>&1
-# Correct = a surfaced name conflict, OR both destination names preserved.
-pred_a11_name_conflict_surfaced() {
-    if atomic conflicts --short 2>/dev/null | grep -qE ':'; then
-        return 0   # some conflict surfaced
-    fi
-    [[ -f feat-name.txt && -f base-name.txt ]]   # both names preserved
-}
-xfail_correct "A11: rename-vs-rename surfaces a name conflict" pred_a11_name_conflict_surfaced
+# Concurrent destinations are incomparable, so both names remain live and
+# materialize the same stable inode content.
+assert_file_content "A11: feature destination is preserved" feat-name.txt "shared content"
+assert_file_content "A11: base destination is preserved" base-name.txt "shared content"
+assert_file_not_exists "A11: superseded original path is absent" orig.txt
 
 if [[ "${KNOWN_BUGS:-0}" -gt 0 ]]; then
     echo ""

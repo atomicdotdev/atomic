@@ -1516,6 +1516,28 @@ impl<'a> MutTxnT for WriteTxn<'a> {
         Ok(inode)
     }
 
+    fn del_tree_binding(&mut self, path: &str, inode: Inode) -> PristineResult<()> {
+        {
+            let mut table = self.txn.open_table(TREE)?;
+            let owns_forward = table
+                .get(path)?
+                .is_some_and(|value| value.value() == inode.get());
+            if owns_forward {
+                table.remove(path)?;
+            }
+        }
+        {
+            let mut table = self.txn.open_table(REV_TREE)?;
+            let matches_path = table
+                .get(inode.get())?
+                .is_some_and(|value| value.value() == path);
+            if matches_path {
+                table.remove(inode.get())?;
+            }
+        }
+        Ok(())
+    }
+
     fn put_file_index(
         &mut self,
         path: &str,
