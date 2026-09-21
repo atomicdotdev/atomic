@@ -1,5 +1,7 @@
 use std::collections::HashSet;
 
+use atomic_core::pristine::ViewState;
+
 use super::*;
 
 impl Repository {
@@ -307,8 +309,11 @@ impl Repository {
 
         // Get the view
         let mut view = txn
-            .open_or_create_view(view_name)
-            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+            .get_view(view_name)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?
+            .ok_or_else(|| RepositoryError::ViewNotFound {
+                name: view_name.to_string(),
+            })?;
 
         // Get internal ID
         let change_id = txn
@@ -317,6 +322,10 @@ impl Repository {
             .ok_or_else(|| RepositoryError::ChangeNotFound {
                 hash: hash.to_base32(),
             })?;
+
+        // Validate under the same write transaction used for removal. Preview
+        // and execution must reject the same unsafe operations.
+        self.check_unrecord_safety(&txn, &view, hash, change_id)?;
 
         // Check if this is a dry run
         if options.dry_run {
@@ -373,6 +382,84 @@ impl Repository {
         outcome.stats.direct_unrecords = 1;
 
         Ok(outcome)
+    }
+
+    fn check_unrecord_safety<T: ViewTxnT>(
+        &self,
+        txn: &T,
+        view: &ViewState,
+        hash: &Hash,
+        change_id: NodeId,
+    ) -> Result<(), RepositoryError> {
+        if txn.get_change_seq(view, change_id)?.is_none() {
+            return Err(RepositoryError::Unrecord(format!(
+                "Change {} is not in view '{}'",
+                hash.to_base32(),
+                view.name
+            )));
+        }
+
+        // Forked views can contain copied references to ancestor changes.
+        // Removing that copy cannot hide the inherited change, so refuse it.
+        let mut remaining_ids = collect_view_change_ids(txn, view)?;
+        let mut ancestor = if view.kind.is_draft() {
+            view.parent
+        } else {
+            None
+        };
+        let mut seen_views = HashSet::from([view.id]);
+        while let Some(id) = ancestor {
+            if !seen_views.insert(id) {
+                return Err(RepositoryError::Unrecord("Cyclic view ancestry".into()));
+            }
+            let parent = txn
+                .get_view_by_id(id)?
+                .ok_or_else(|| RepositoryError::Unrecord(format!("Missing ancestor view {id}")))?;
+            if txn.get_change_seq(&parent, change_id)?.is_some() {
+                return Err(RepositoryError::Unrecord(format!(
+                    "Change {} is inherited from view '{}'; unrecord it there instead",
+                    hash.to_base32(),
+                    parent.name
+                )));
+            }
+            remaining_ids.extend(collect_view_change_ids(txn, &parent)?);
+            ancestor = if parent.kind.is_draft() {
+                parent.parent
+            } else {
+                None
+            };
+        }
+
+        let mut pending = Vec::new();
+        for id in remaining_ids {
+            if id != change_id {
+                let candidate = txn.get_external(id)?.ok_or_else(|| {
+                    RepositoryError::Unrecord(format!("Missing hash for change {id}"))
+                })?;
+                pending.push(candidate);
+            }
+        }
+        let mut checked = HashSet::new();
+        while let Some(candidate) = pending.pop() {
+            if !checked.insert(candidate) {
+                continue;
+            }
+            let id = txn.get_internal(&candidate)?;
+            let dependencies = match id {
+                Some(id) if txn.is_change_deps_indexed(id)? => txn.get_change_deps(id)?,
+                // Old repositories can predate the dependency index. Never
+                // mistake an unindexed change for one with no dependencies.
+                _ => self.load_change(&candidate)?.dependencies().to_vec(),
+            };
+            if dependencies.contains(hash) {
+                return Err(RepositoryError::Unrecord(format!(
+                    "Cannot unrecord {}: change {} in the dependency closure of view '{}' depends on it; unrecord dependent changes first",
+                    hash.to_base32(), candidate.to_base32(), view.name
+                )));
+            }
+            pending.extend(dependencies);
+        }
+        Ok(())
     }
 
     /// Unrecord the last change from the current view.
