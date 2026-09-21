@@ -237,6 +237,10 @@ fn merge_fixture() -> MergeFixture {
     let merge_out = Command::new("git")
         .args(["merge", "--no-ff", "side-b", "-m", "merge side work"])
         .current_dir(&root)
+        .env("GIT_AUTHOR_NAME", "CB-9B Tests")
+        .env("GIT_AUTHOR_EMAIL", "cb9b@example.com")
+        .env("GIT_COMMITTER_NAME", "CB-9B Tests")
+        .env("GIT_COMMITTER_EMAIL", "cb9b@example.com")
         .output()
         .expect("git merge");
     assert!(
@@ -438,6 +442,10 @@ fn octopus_merge_imports_all_three_parent_closures() {
     let octopus_out = Command::new("git")
         .args(["merge", "--no-ff", "leg-b", "leg-c", "-m", "octopus merge"])
         .current_dir(&root)
+        .env("GIT_AUTHOR_NAME", "CB-9B Tests")
+        .env("GIT_AUTHOR_EMAIL", "cb9b@example.com")
+        .env("GIT_COMMITTER_NAME", "CB-9B Tests")
+        .env("GIT_COMMITTER_EMAIL", "cb9b@example.com")
         .output()
         .expect("git octopus merge");
     assert!(
