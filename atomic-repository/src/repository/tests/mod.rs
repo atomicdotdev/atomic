@@ -19,7 +19,7 @@ mod record_tests;
 mod rename_tests;
 mod shadow_lock_tests;
 mod status_tests;
-
+mod switch_file_loss_tests;
 mod tracking_tests;
 mod verify_tests;
 mod view_tests;
