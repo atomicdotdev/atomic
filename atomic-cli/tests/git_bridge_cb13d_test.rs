@@ -485,23 +485,37 @@ fn crash_during_effect_recovers_without_partial_bytes() {
         .collect::<Vec<_>>()
         .join("\n");
     fs::write(&exclude, filtered).expect("write exclude");
-    fs::write(fixture.root().join("atomic-only.txt"), b"crash payload\n").expect("write");
-    fixture.atomic(&["add", "atomic-only.txt"]);
-    fixture.atomic(&["record", "-m", "crash source"]);
-    // The durable-only record left the file staged in the git index; unstage
-    // it so the export's clean-index gate passes.
-    fixture.git(&["reset", "-q"]);
-
-    // The crashing reconcile: the effect lands, the failpoint fires.
-    let crashed = Command::new(ATOMIC_BIN)
-        .args(["git", "bridge", "reconcile"])
-        .current_dir(fixture.root())
-        .env("HOME", fixture.home())
-        .env("ATOMIC_HOME", fixture.home().join(".atomic"))
-        .env("ATOMIC_FAIL_RECONCILE_EXPORT_MID_EFFECT", "1")
-        .output()
-        .expect("run the crashing reconcile");
-    let crash_text = atomic_text(&crashed);
+    // Durable delta + crashing reconcile, with one retry: if a reactive
+    // pass already projected the first delta (the reconcile then becomes a
+    // plain no-op projection that never reaches the export effect), record
+    // a fresh delta and try again. The failpoint lives on the ref-move
+    // effect path, so the crash needs an actual pending export.
+    let crash_once = |index: usize| -> (Output, String) {
+        fs::write(
+            fixture.root().join(format!("atomic-only-{index}.txt")),
+            format!("crash payload {index}\n"),
+        )
+        .expect("write");
+        fixture.atomic(&["add", &format!("atomic-only-{index}.txt")]);
+        fixture.atomic(&["record", "-m", &format!("crash source {index}")]);
+        // The durable-only record left the file staged in the git index;
+        // unstage it so the export's clean-index gate passes.
+        fixture.git(&["reset", "-q"]);
+        let output = Command::new(ATOMIC_BIN)
+            .args(["git", "bridge", "reconcile"])
+            .current_dir(fixture.root())
+            .env("HOME", fixture.home())
+            .env("ATOMIC_HOME", fixture.home().join(".atomic"))
+            .env("ATOMIC_FAIL_RECONCILE_EXPORT_MID_EFFECT", "1")
+            .output()
+            .expect("run the crashing reconcile");
+        let text = atomic_text(&output);
+        (output, text)
+    };
+    let (mut crashed, mut crash_text) = crash_once(1);
+    if !crash_text.contains("ATOMIC_FAIL_RECONCILE_EXPORT_MID_EFFECT") {
+        (crashed, crash_text) = crash_once(2);
+    }
     assert!(
         crash_text.contains("ATOMIC_FAIL_RECONCILE_EXPORT_MID_EFFECT"),
         "the crash must be the injected effect-phase failpoint: {crash_text}"
@@ -535,8 +549,9 @@ fn crash_during_effect_recovers_without_partial_bytes() {
         recovery.contains("matches") || recovery.contains("Reconciled"),
         "the recovery must converge: {recovery}"
     );
-    let crash_file = fs::read_to_string(fixture.root().join("atomic-only.txt")).unwrap();
-    assert_eq!(crash_file, "crash payload\n");
+    let crash_file = fs::read_to_string(fixture.root().join("atomic-only-1.txt"))
+        .unwrap_or_else(|_| fs::read_to_string(fixture.root().join("atomic-only-2.txt")).unwrap());
+    assert!(crash_file.starts_with("crash payload"));
     let tip = fixture.tip("refs/heads/main").expect("the exported tip");
     assert!(!tip.is_zero(), "the export landed and recovered");
 }

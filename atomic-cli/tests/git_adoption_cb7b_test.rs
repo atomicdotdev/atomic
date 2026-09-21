@@ -2118,6 +2118,7 @@ fn clean_adoption_swaps_shelves() {
 // ── R5: raw path identity ────────────────────────────────────────────────
 
 #[test]
+#[cfg(target_os = "linux")] // macOS FS refuses invalid-UTF8 byte paths (EILSEQ)
 fn distinct_invalid_utf8_paths_never_alias_or_lose_versions() {
     use std::ffi::OsString;
     use std::os::unix::ffi::OsStringExt;
