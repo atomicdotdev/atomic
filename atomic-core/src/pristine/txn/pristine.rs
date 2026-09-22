@@ -91,6 +91,9 @@ fn open_database(path: &Path, create: bool, cache_bytes: usize) -> PristineResul
 /// ```
 pub struct Pristine {
     db: PristineDatabase,
+    /// Redb commit durability. Tests lower this to skip fsync per commit,
+    /// which dominates the runtime of filesystem-heavy suites on Windows.
+    durability: redb::Durability,
     /// Counter for allocating node IDs
     pub(crate) next_node_id: AtomicU64,
     /// Counter for allocating view IDs
@@ -222,6 +225,7 @@ impl Pristine {
 
         Ok(Self {
             db: PristineDatabase::Writable(db),
+            durability: redb::Durability::Immediate,
             next_node_id,
             next_view_id,
             next_inode,
@@ -328,10 +332,17 @@ impl Pristine {
 
         Ok(Self {
             db,
+            durability: redb::Durability::Immediate,
             next_node_id,
             next_view_id,
             next_inode,
         })
+    }
+
+    /// Override the redb commit durability for this handle. Tests use this
+    /// to skip per-commit fsync; production keeps the durable default.
+    pub fn set_durability(&mut self, durability: redb::Durability) {
+        self.durability = durability;
     }
 
     /// Begin a read-only transaction
@@ -355,7 +366,9 @@ impl Pristine {
                 "cannot write through a read-only pristine handle",
             )));
         };
-        let txn = db.begin_write()?;
+        let mut txn = db.begin_write()?;
+        txn.set_durability(self.durability)
+            .map_err(|e| PristineError::Io(std::io::Error::other(e.to_string())))?;
         Ok(WriteTxn::new(
             txn,
             &self.next_node_id,

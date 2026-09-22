@@ -275,6 +275,19 @@ impl Repository {
         path: P,
         view_name: &str,
     ) -> Result<Self, RepositoryError> {
+        Self::init_with_view_durability(path, view_name, redb::Durability::Immediate)
+    }
+
+    /// Like [`Self::init_with_view`], with an explicit redb commit durability.
+    ///
+    /// Tests pass [`redb::Durability::None`] to skip per-commit fsync, which
+    /// dominates the runtime of filesystem-heavy repository suites (notably
+    /// on Windows). Production callers keep the durable default.
+    pub fn init_with_view_durability<P: AsRef<Path>>(
+        path: P,
+        view_name: &str,
+        durability: redb::Durability,
+    ) -> Result<Self, RepositoryError> {
         let root = path.as_ref().to_path_buf();
         let dot_dir = root.join(DOT_DIR);
 
@@ -307,10 +320,12 @@ default = "{}"
         std::fs::write(&wc_id_path, "")?;
 
         // Initialize the pristine database (redb creates the file)
-        let pristine = Arc::new(
-            Pristine::open(dot_dir.join("pristine.redb"))
-                .map_err(|e| RepositoryError::Database(e.to_string()))?,
-        );
+        let pristine = {
+            let mut pristine = Pristine::open(dot_dir.join("pristine.redb"))
+                .map_err(|e| RepositoryError::Database(e.to_string()))?;
+            pristine.set_durability(durability);
+            Arc::new(pristine)
+        };
 
         // Create the default view and its workspace directory
         {

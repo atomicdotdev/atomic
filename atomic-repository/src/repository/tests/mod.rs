@@ -28,7 +28,14 @@ mod view_tests;
 
 pub(super) fn create_temp_repo() -> (TempDir, Repository) {
     let temp_dir = TempDir::new().unwrap();
-    let repo = Repository::init(temp_dir.path()).unwrap();
+    // Durability::None skips per-commit fsync, which dominates these
+    // filesystem-heavy tests (especially on Windows). Redb still makes
+    // commits visible to later handles through the OS page cache, so
+    // reopen-style tests remain correct; only crash-durability is lost,
+    // which tests never need.
+    let repo =
+        Repository::init_with_view_durability(temp_dir.path(), "dev", redb::Durability::None)
+            .unwrap();
     (temp_dir, repo)
 }
 
