@@ -250,8 +250,16 @@ fn linked_git_worktree_requires_writable_registration_and_gets_distinct_identity
     let linked_id = linked_repo.require_working_copy_id().unwrap();
     assert_ne!(linked_id, primary_id);
     assert!(linked.join(".atomic/repository").is_file());
-    assert_eq!(linked_repo.dot_dir(), primary.join(".atomic"));
-    assert_eq!(linked_repo.working_copy_dot_dir(), linked.join(".atomic"));
+    // dot_dir is canonicalized by the repository (macOS tempdirs live
+    // behind /var → /private/var); compare canonicalized on both sides.
+    assert_eq!(
+        std::fs::canonicalize(linked_repo.dot_dir()).unwrap(),
+        std::fs::canonicalize(primary.join(".atomic")).unwrap()
+    );
+    assert_eq!(
+        std::fs::canonicalize(linked_repo.working_copy_dot_dir()).unwrap(),
+        std::fs::canonicalize(linked.join(".atomic")).unwrap()
+    );
     linked_repo.validate_working_copy(linked_id).unwrap();
 
     let txn = linked_repo.pristine().read_txn().unwrap();

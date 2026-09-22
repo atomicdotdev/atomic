@@ -1796,7 +1796,9 @@ mod tests {
             matches!(
                 error.kind(),
                 std::io::ErrorKind::AlreadyExists | std::io::ErrorKind::Unsupported
-            ) || error.raw_os_error() == Some(40), // ELOOP
+            ) // ELOOP (40) is the no-follow refusal; macOS reports it as
+            // FilesystemLoop whose raw code is still ELOOP.
+            || error.raw_os_error() == Some(40),
             "unexpected refusal kind: {error:?}"
         );
         assert_eq!(

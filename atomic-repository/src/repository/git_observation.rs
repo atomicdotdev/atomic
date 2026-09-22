@@ -1296,10 +1296,23 @@ pub fn observe_colocated_git_readiness(root: &Path) -> ColocatedGitReadiness {
             if owned_dispatcher_content(&bytes) {
                 // The decommission effect must address the file relative
                 // to the worktree root; a linked worktree's common gitdir
-                // is outside it and stays an explicit refusal.
+                // is outside it and stays an explicit refusal. git2's
+                // repository path is canonicalized, so strip against BOTH
+                // the canonical root and the caller's root (macOS tempdirs
+                // live behind /var → /private/var).
+                let root_canonical = root
+                    .canonicalize()
+                    .unwrap_or_else(|_| root.to_path_buf());
                 let path = entry
                     .path()
-                    .strip_prefix(root)
+                    .strip_prefix(&root_canonical)
+                    .map(|relative| relative.to_path_buf())
+                    .or_else(|_| {
+                        entry
+                            .path()
+                            .strip_prefix(root)
+                            .map(|relative| relative.to_path_buf())
+                    })
                     .ok()
                     .map(|relative| relative.to_string_lossy().to_string());
                 owned_dispatchers.push(OwnedHookDispatcher {

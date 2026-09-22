@@ -33,7 +33,12 @@ fn test_open_existing() {
     drop(repo);
 
     let opened = Repository::open(temp_dir.path()).unwrap();
-    assert_eq!(opened.root(), root);
+    // The repository canonicalizes its root (macOS tempdirs live behind
+    // /var → /private/var); compare canonicalized on both sides.
+    assert_eq!(
+        std::fs::canonicalize(opened.root()).unwrap(),
+        std::fs::canonicalize(&root).unwrap()
+    );
     assert_eq!(opened.current_view(), DEFAULT_STACK);
 }
 
@@ -66,9 +71,16 @@ fn test_canonical_change_store_path_follows_sandbox_pointer() {
     repo.provision_sandbox(working_copy, &sandbox, repo.current_view())
         .unwrap();
 
+    // Compare canonical dot_dirs (macOS tempdirs live behind
+    // /var → /private/var); the change-store file itself is created lazily,
+    // so canonicalize the directory rather than the file.
+    assert_eq!(
+        std::fs::canonicalize(Repository::canonical_dot_dir(&sandbox).unwrap()).unwrap(),
+        std::fs::canonicalize(repo.dot_dir()).unwrap()
+    );
     assert_eq!(
         Repository::canonical_change_store_path(&sandbox).unwrap(),
-        repo.redb_change_store_path()
+        Repository::canonical_dot_dir(&sandbox).unwrap().join("changes.redb")
     );
 }
 
