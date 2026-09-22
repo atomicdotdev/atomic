@@ -40,23 +40,24 @@
 
 use clap::Parser;
 
-use atomic_core::types::Base32;
+use atomic_core::types::{Base32, Hash};
 use atomic_repository::unrecord::UnrecordOptions;
-use atomic_repository::{Repository, WorkspaceTxnMode};
+use atomic_repository::{Repository, RepositoryError, WorkspaceTxnMode};
 
 use crate::commands::workspace_txn::enter_workspace;
 use crate::commands::{find_repository_root, Command};
 use crate::error::{CliError, CliResult};
 use crate::output::{print_success, print_warning};
 
-/// Remove the last change from the current view.
+/// Remove a change from the current view (default: the last change).
 ///
 /// The change is removed from the view's change log but NOT deleted
 /// from the change store. It can be re-inserted later with `atomic insert`.
 ///
-/// This is the inverse of `atomic record` — it "un-records" a change,
-/// reverting the view to the state before that change was applied.
+/// This is the inverse of `atomic record` — it "un-records" the selected
+/// change while retaining the other changes on the view.
 /// The working copy is NOT modified; files remain on disk as-is.
+/// Changes required by other changes in this view cannot be unrecorded.
 ///
 /// # Workflow
 ///
@@ -109,14 +110,10 @@ impl Command for Unrecord {
         }
         .view(workspace.view().name.clone());
 
-        let outcome = if let Some(ref _prefix) = self.change {
-            // TODO: support unrecording a specific change by hash prefix
-            // once hash_from_prefix is available on the transaction trait.
-            return Err(CliError::InvalidArgument {
-                message: "Unrecording a specific change by hash is not yet supported. \
-                          Use `atomic unrecord` (no argument) to unrecord the last change."
-                    .to_string(),
-            });
+        let outcome = if let Some(ref prefix) = self.change {
+            let hash = resolve_change(&repo, prefix)?;
+            repo.unrecord(&hash, options)
+                .map_err(CliError::Repository)?
         } else {
             // Unrecord the most recent change
             repo.unrecord_last(options).map_err(|e| match e {
@@ -142,6 +139,35 @@ impl Command for Unrecord {
         }
 
         Ok(())
+    }
+}
+
+fn resolve_change(repo: &Repository, prefix: &str) -> CliResult<Hash> {
+    // Validate input shape first for a precise error — the shared resolver
+    // treats malformed input as "no match".
+    let prefix = prefix.to_ascii_uppercase();
+    if prefix.is_empty()
+        || prefix.len() > 52
+        || !prefix
+            .bytes()
+            .all(|b| b.is_ascii_uppercase() || (b'2'..=b'7').contains(&b))
+    {
+        return Err(CliError::InvalidArgument {
+            message: "Expected a Base32 change hash or a non-empty unique prefix".into(),
+        });
+    }
+
+    // The repository's shared, case-insensitive prefix resolver (the same
+    // one `atomic insert` uses) matches against the whole change store, so a
+    // hash that exists only on another view still resolves here and then
+    // hits the repository's explicit membership guard in `unrecord`.
+    match repo.find_change_by_prefix(&prefix) {
+        Ok(Some(hash)) => Ok(hash),
+        Ok(None) => Err(CliError::ChangeNotFound { hash: prefix }),
+        Err(RepositoryError::AmbiguousHash { prefix, matches }) => Err(CliError::AmbiguousHash {
+            hash: format!("{prefix} (matches: {})", matches.join(", ")),
+        }),
+        Err(e) => Err(CliError::Internal(anyhow::anyhow!("{e}"))),
     }
 }
 

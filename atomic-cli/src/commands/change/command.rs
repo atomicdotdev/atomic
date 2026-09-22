@@ -210,33 +210,22 @@ impl ChangeCmd {
         view_name: &str,
         prefix: &str,
     ) -> CliResult<(Hash, Option<u64>)> {
-        // Search for matching changes
-        let mut matches: Vec<Hash> = Vec::new();
-
-        for result in repo.iter_changes() {
-            let hash = result.map_err(|e| CliError::Internal(anyhow::anyhow!("{}", e)))?;
-            let hash_str = hash.to_base32();
-            if hash_str.starts_with(prefix) {
-                matches.push(hash);
-            }
-        }
-
-        match matches.len() {
-            0 => Err(CliError::ChangeNotFound {
-                hash: prefix.to_string(),
-            }),
-            1 => {
-                let hash = matches[0];
+        // The repository's shared, case-insensitive prefix resolver (the
+        // same one `atomic insert` and `atomic unrecord` use).
+        match repo.find_change_by_prefix(prefix) {
+            Ok(Some(hash)) => {
                 let seq = self.find_sequence_for_hash(repo, view_name, &hash)?;
                 Ok((hash, seq))
             }
-            _ => {
-                // Format the matches for display in the error message
-                let match_list: Vec<String> = matches.iter().map(|h| h.to_base32()).collect();
+            Ok(None) => Err(CliError::ChangeNotFound {
+                hash: prefix.to_string(),
+            }),
+            Err(atomic_repository::RepositoryError::AmbiguousHash { prefix, matches }) => {
                 Err(CliError::AmbiguousHash {
-                    hash: format!("{} (matches: {})", prefix, match_list.join(", ")),
+                    hash: format!("{prefix} (matches: {})", matches.join(", ")),
                 })
             }
+            Err(e) => Err(CliError::Internal(anyhow::anyhow!("{e}"))),
         }
     }
 

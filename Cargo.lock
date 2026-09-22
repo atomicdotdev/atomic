@@ -123,7 +123,7 @@ dependencies = [
 
 [[package]]
 name = "atomic-agent"
-version = "0.18.2"
+version = "0.18.3"
 dependencies = [
  "anyhow",
  "atomic-canonical",
@@ -155,7 +155,7 @@ dependencies = [
 
 [[package]]
 name = "atomic-canonical"
-version = "0.18.2"
+version = "0.18.3"
 dependencies = [
  "atomic-identity",
  "blake3",
@@ -169,7 +169,7 @@ dependencies = [
 
 [[package]]
 name = "atomic-cli"
-version = "0.18.2"
+version = "0.18.3"
 dependencies = [
  "anyhow",
  "atomic-agent",
@@ -213,7 +213,7 @@ dependencies = [
 
 [[package]]
 name = "atomic-config"
-version = "0.18.2"
+version = "0.18.3"
 dependencies = [
  "anyhow",
  "dirs",
@@ -227,7 +227,7 @@ dependencies = [
 
 [[package]]
 name = "atomic-core"
-version = "0.18.2"
+version = "0.18.3"
 dependencies = [
  "anyhow",
  "bitflags 2.13.2",
@@ -256,7 +256,7 @@ dependencies = [
 
 [[package]]
 name = "atomic-identity"
-version = "0.18.2"
+version = "0.18.3"
 dependencies = [
  "anyhow",
  "atomic-config",
@@ -278,7 +278,7 @@ dependencies = [
 
 [[package]]
 name = "atomic-objects"
-version = "0.18.2"
+version = "0.18.3"
 dependencies = [
  "blake3",
  "data-encoding",
@@ -299,7 +299,7 @@ dependencies = [
 
 [[package]]
 name = "atomic-remote"
-version = "0.18.2"
+version = "0.18.3"
 dependencies = [
  "anyhow",
  "atomic-canonical",
@@ -323,7 +323,7 @@ dependencies = [
 
 [[package]]
 name = "atomic-repository"
-version = "0.18.2"
+version = "0.18.3"
 dependencies = [
  "anyhow",
  "atomic-canonical",
@@ -365,7 +365,7 @@ dependencies = [
 
 [[package]]
 name = "atomic-semantic"
-version = "0.18.2"
+version = "0.18.3"
 dependencies = [
  "serde",
  "serde_json",
@@ -382,7 +382,7 @@ dependencies = [
 
 [[package]]
 name = "atomic-teams"
-version = "0.18.2"
+version = "0.18.3"
 dependencies = [
  "atomic-remote",
  "chrono",
