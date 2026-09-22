@@ -1300,9 +1300,7 @@ pub fn observe_colocated_git_readiness(root: &Path) -> ColocatedGitReadiness {
                 // repository path is canonicalized, so strip against BOTH
                 // the canonical root and the caller's root (macOS tempdirs
                 // live behind /var → /private/var).
-                let root_canonical = root
-                    .canonicalize()
-                    .unwrap_or_else(|_| root.to_path_buf());
+                let root_canonical = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
                 let path = entry
                     .path()
                     .strip_prefix(&root_canonical)

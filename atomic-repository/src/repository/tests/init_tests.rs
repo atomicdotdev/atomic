@@ -80,7 +80,9 @@ fn test_canonical_change_store_path_follows_sandbox_pointer() {
     );
     assert_eq!(
         Repository::canonical_change_store_path(&sandbox).unwrap(),
-        Repository::canonical_dot_dir(&sandbox).unwrap().join("changes.redb")
+        Repository::canonical_dot_dir(&sandbox)
+            .unwrap()
+            .join("changes.redb")
     );
 }
 
