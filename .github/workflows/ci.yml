@@ -54,7 +54,7 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-test-
 
-      - name: Windows: opt out of real-time scanning for cache and temp
+      - name: Windows opt out of real-time scanning for cache and temp
         if: matrix.os == 'windows-latest'
         shell: pwsh
         run: |
