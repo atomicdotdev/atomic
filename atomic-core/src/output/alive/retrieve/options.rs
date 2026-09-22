@@ -361,7 +361,13 @@ fn change_depends_on<T: GraphTxnT>(
     }
     visiting.push(descendant);
 
-    let dependencies = txn.get_indexed_change_deps(descendant)?;
+    // Legacy repositories predate the dependency index; the indexed read
+    // fails closed on them. Use the raw dependency rows here — they are
+    // populated for indexed changes and empty for unindexed ones, so the
+    // causal-maximality probe degrades to "no supersession knowledge"
+    // instead of erroring (dev #196/#206 parity; the unrecord-safety
+    // legacy fixtures exercise this).
+    let dependencies = txn.get_change_deps(descendant)?;
     for dependency in dependencies {
         let dependency_id = txn.get_internal(&dependency)?.ok_or_else(|| {
             PristineError::MissingRegisteredDependency {

@@ -18,5 +18,10 @@ pub fn effective_projection_closure<T: ViewTxnT>(
     view: &atomic_core::pristine::ViewState,
 ) -> Result<EffectiveProjectionClosure, RepositoryError> {
     let membership = view_membership(txn, view)?;
-    EffectiveProjectionClosure::try_from_membership(txn, &membership).map_err(map_pristine_error)
+    // Legacy repositories predate the dependency index; the strict
+    // construction fails closed on unindexed members. Degrade them to
+    // leaves here (dev #196/#206 parity). Frontier verification keeps the
+    // strict path.
+    EffectiveProjectionClosure::try_from_membership_lenient(txn, &membership)
+        .map_err(map_pristine_error)
 }

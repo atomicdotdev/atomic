@@ -26,8 +26,10 @@ fn run(root: &Path, args: &[&str], succeeds: bool) -> String {
 }
 
 fn record(repo: &Repository, message: &str) -> Hash {
+    let working_copy = repo.require_working_copy_id().unwrap();
     *repo
         .record(
+            working_copy,
             ChangeHeader::builder()
                 .message(message)
                 .author(Author::new("Test", Some("test@example.com")))
@@ -44,7 +46,12 @@ fn fixture() -> (TempDir, Vec<Hash>) {
     let mut hashes = Vec::new();
     for name in ["a.txt", "b.txt", "c.txt"] {
         fs::write(dir.path().join(name), name).unwrap();
-        repo.add(name, Default::default()).unwrap();
+        repo.add(
+            repo.require_working_copy_id().unwrap(),
+            name,
+            Default::default(),
+        )
+        .unwrap();
         hashes.push(record(&repo, name));
     }
     (dir, hashes)
@@ -232,7 +239,8 @@ fn inherited_changes_are_rejected_in_forked_view() {
         let mut repo = Repository::open(dir.path()).unwrap();
         let source = repo.current_view().to_string();
         repo.create_view_from("child", &source).unwrap();
-        repo.switch_view("child").unwrap();
+        repo.switch_view(repo.require_working_copy_id().unwrap(), "child")
+            .unwrap();
     }
     for dry in [false, true] {
         let hash = hashes[2].to_base32();

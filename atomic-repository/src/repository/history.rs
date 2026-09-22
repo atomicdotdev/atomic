@@ -308,6 +308,15 @@ impl Repository {
                 .ok_or_else(|| RepositoryError::ViewNotFound {
                     name: view_name.clone(),
                 })?;
+            // Dev #196 parity: preview and execution reject the same unsafe
+            // operations — the inherited-change guard runs here too.
+            let change_id = txn
+                .get_internal(hash)
+                .map_err(|error| RepositoryError::Database(error.to_string()))?
+                .ok_or_else(|| RepositoryError::ChangeNotFound {
+                    hash: hash.to_base32(),
+                })?;
+            self.check_unrecord_safety(&txn, &view, hash, change_id)?;
             return crate::unrecord::preview_unrecord(&txn, &view, &[*hash], &options)
                 .map_err(|error| RepositoryError::Unrecord(error.to_string()));
         }
@@ -337,6 +346,11 @@ impl Repository {
             .ok_or_else(|| RepositoryError::ChangeNotFound {
                 hash: hash.to_base32(),
             })?;
+
+        // Dev #196 parity: the inherited-change guard must run on the
+        // preflight path too — preview and execution reject the same unsafe
+        // operations before any journal lease is prepared.
+        self.check_unrecord_safety(&preflight_txn, &view, hash, change_id)?;
 
         let original_seq = preflight_txn
             .get_change_seq(&view, change_id)

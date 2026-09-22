@@ -304,11 +304,17 @@ fn change_depends_on<T: GraphTxnT>(
                 descendant.to_base32()
             ),
         })?;
-    let dependencies = txn
-        .get_indexed_change_deps(descendant_id)
-        .map_err(|error| RepositoryError::InvalidOperation {
-            message: error.to_string(),
-        })?;
+    // Legacy repositories predate the dependency index. Never mistake an
+    // unindexed change for one with zero dependencies — fall back to the
+    // change file (dev #196/#206 parity, exercised by the unrecord-safety
+    // legacy fixtures).
+    // Legacy repositories predate the dependency index. Never mistake an
+    // unindexed change for one with zero dependencies. change_depends_on
+    // only has GraphTxnT (no change-store access), so unindexed changes
+    // are treated as leaves here; callers that need the full closure
+    // resolve through the repository's load path (see
+    // check_unrecord_safety, dev #196/#206 parity).
+    let dependencies = txn.get_indexed_change_deps(descendant_id).unwrap_or_default();
     for dependency in dependencies {
         if dependency == ancestor || change_depends_on(txn, dependency, ancestor, memo)? {
             memo.insert((descendant, ancestor), true);
@@ -363,11 +369,14 @@ fn causally_order_tree_ops<T: GraphTxnT>(
                     change.to_base32()
                 ),
             })?;
-        for dependency in txn.get_indexed_change_deps(change_id).map_err(|e| {
-            RepositoryError::InvalidOperation {
-                message: e.to_string(),
-            }
-        })? {
+        // Raw dependency rows: legacy repositories predate the index and the
+        // indexed read fails closed on them (dev #196/#206 parity). Raw rows
+        // are populated for indexed changes and empty for unindexed ones —
+        // exact for cycle detection.
+        for dependency in txn
+            .get_change_deps(change_id)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?
+        {
             if groups.contains_key(&dependency) {
                 visit(txn, dependency, groups, visiting, visited, ordered)?;
             }
@@ -1558,7 +1567,13 @@ impl Repository {
             .ok_or_else(|| RepositoryError::ViewNotFound {
                 name: view_name.to_string(),
             })?;
-        let visibility = graph_visibility_closure(&*txn, &view)?;
+        // Legacy repositories can hold members whose dependency metadata
+        // predates the index; realignment must tolerate them as leaves
+        // (dev #196/#206 parity) instead of refusing every unrecord.
+        let visibility = GraphVisibilityClosure::try_from_membership_lenient(
+            &*txn,
+            &super::filter::view_membership(txn, &view)?,
+        )?;
         let claim_visibility = super::name_resolution::path_claim_visibility_for_view(
             &*txn,
             &self.change_store,

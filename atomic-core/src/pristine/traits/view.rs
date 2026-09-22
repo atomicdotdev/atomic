@@ -266,6 +266,109 @@ impl EffectiveProjectionClosure {
         &self.data.membership
     }
 
+    /// Construct a closure tolerating members whose dependency metadata
+    /// predates the index (legacy repositories). Unindexed members become
+    /// their own frames — the walk degrades to "no supersession knowledge"
+    /// for them instead of refusing the whole projection. Frontier
+    /// verification keeps the strict `try_from_membership`.
+    pub fn try_from_membership_lenient<T: GraphTxnT>(
+        txn: &T,
+        membership: &ViewMembershipSet,
+    ) -> Result<Self, PristineError> {
+        fn load_frame<T: GraphTxnT>(
+            txn: &T,
+            change_id: NodeId,
+        ) -> Result<(NodeId, Vec<NodeId>), PristineError> {
+            if txn.get_external(change_id)?.is_none() {
+                return Err(PristineError::ChangeNotFound {
+                    id: change_id.get(),
+                });
+            }
+            let dep_hashes = match txn.get_indexed_change_deps(change_id) {
+                Ok(deps) => deps,
+                Err(_) => txn.get_change_deps(change_id)?,
+            };
+            let mut dependencies = Vec::with_capacity(dep_hashes.len());
+            for dep_hash in dep_hashes {
+                dependencies.push(txn.get_internal(&dep_hash)?.ok_or_else(|| {
+                    PristineError::MissingRegisteredDependency {
+                        change_id: change_id.get(),
+                        dependency: dep_hash.to_string(),
+                    }
+                })?);
+            }
+            Ok((change_id, dependencies))
+        }
+
+        struct Frame {
+            change_id: NodeId,
+            dependencies: Vec<NodeId>,
+            next_dependency: usize,
+        }
+
+        let mut colors: HashMap<NodeId, u8> = HashMap::new();
+        const WHITE: u8 = 0;
+        const GRAY: u8 = 1;
+        const BLACK: u8 = 2;
+
+        let mut dependency_first = Vec::new();
+        let mut closure_membership = HashSet::new();
+
+        for root_id in membership.iter().copied() {
+            let root_color = colors.get(&root_id).copied().unwrap_or(WHITE);
+            if root_color == BLACK {
+                continue;
+            }
+            let (id, deps) = load_frame(txn, root_id)?;
+            colors.insert(root_id, GRAY);
+            let mut stack = vec![Frame {
+                change_id: id,
+                dependencies: deps,
+                next_dependency: 0,
+            }];
+
+            while let Some(frame) = stack.last_mut() {
+                if frame.next_dependency == frame.dependencies.len() {
+                    let completed_id = frame.change_id;
+                    stack.pop();
+                    colors.insert(completed_id, BLACK);
+                    if closure_membership.insert(completed_id) {
+                        dependency_first.push(completed_id);
+                    }
+                    continue;
+                }
+                let next = frame.dependencies[frame.next_dependency];
+                frame.next_dependency += 1;
+                let next_color = colors.get(&next).copied().unwrap_or(WHITE);
+                match next_color {
+                    BLACK => continue,
+                    GRAY => {
+                        return Err(PristineError::DependencyCycle {
+                            cycle: vec![next.get(), root_id.get()],
+                        })
+                    }
+                    // WHITE and any unexpected color: visit.
+                    _ => {
+                        let (next_id, next_deps) = load_frame(txn, next)?;
+                        colors.insert(next, GRAY);
+                        stack.push(Frame {
+                            change_id: next_id,
+                            dependencies: next_deps,
+                            next_dependency: 0,
+                        });
+                    }
+                }
+            }
+        }
+
+        Ok(Self {
+            data: Arc::new(EffectiveProjectionData {
+                dependency_first,
+                membership: closure_membership,
+            }),
+        })
+    }
+
     /// Construct a closure without dependency validation. Production
     /// change-filter callers (dev #203) prove dependency completeness from
     /// the view membership upstream; unit tests use it directly.

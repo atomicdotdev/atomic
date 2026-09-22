@@ -99,7 +99,9 @@ where
         }
     }
     let membership = ViewMembershipSet::from_ordered(membership);
-    GraphVisibilityClosure::try_from_membership(txn, &membership)
+    // Legacy tolerance: members can predate the dependency index; degrade
+    // them to leaves instead of refusing the projection (dev #196/#206).
+    GraphVisibilityClosure::try_from_membership_lenient(txn, &membership)
         .map_err(|error| RepositoryError::Database(error.to_string()))
 }
 
@@ -1026,8 +1028,14 @@ fn change_depends_on<T: GraphTxnT>(
                 ancestor.get()
             ))
         })?;
+    // Use the RAW dependency rows, not the indexed accessor: legacy
+    // repositories predate the dependency index, and the indexed read
+    // fails closed on them (dev #196/#206 parity, exercised by the
+    // unrecord-safety legacy fixtures). Raw rows return empty for
+    // unindexed changes, matching dev's fallback semantics for this
+    // supersession probe.
     for dependency in txn
-        .get_indexed_change_deps(descendant)
+        .get_change_deps(descendant)
         .map_err(|error| RepositoryError::Database(error.to_string()))?
     {
         let dependency_id = txn

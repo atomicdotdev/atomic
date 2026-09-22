@@ -536,8 +536,15 @@ impl Repository {
 
             let old_membership = view_membership(&txn, &old_view)?;
             let new_membership = view_membership(&txn, &new_view)?;
-            let old_visibility = graph_visibility_from_membership(&txn, &old_membership)?;
-            let new_visibility = graph_visibility_from_membership(&txn, &new_membership)?;
+            // Legacy tolerance: members can predate the dependency index;
+            // degrade them to leaves instead of refusing the switch
+            // (dev #196/#206 parity — the unrecord-safety legacy fixtures).
+            let old_visibility =
+                GraphVisibilityClosure::try_from_membership_lenient(&txn, &old_membership)
+                    .map_err(|e| RepositoryError::Database(e.to_string()))?;
+            let new_visibility =
+                GraphVisibilityClosure::try_from_membership_lenient(&txn, &new_membership)
+                    .map_err(|e| RepositoryError::Database(e.to_string()))?;
             let old_projection = self.project_tree_for_visibility(&txn, &old_visibility)?;
             let new_projection = self.project_tree_for_visibility(&txn, &new_visibility)?;
             let mut old_files = HashSet::new();
