@@ -462,6 +462,13 @@ default = "{}"
         let (_working_copy_id, current_view) =
             working_copy::migrate_identity(&pristine, &layout, view_name)?;
 
+        // Align the stored root with `open`: the layout discovery canonicalizes
+        // the working root (e.g. macOS `/var` → `/private/var`), and a
+        // repository initialized through a symlinked path must report the same
+        // root as one opened from disk.
+        let root = layout.working_root.clone();
+        let dot_dir = root.join(DOT_DIR);
+
         // Initialize the change store
         let change_store = ChangeStore::new(dot_dir.join("changes"), DEFAULT_CACHE_CAPACITY)
             .map_err(|e| RepositoryError::Database(e.to_string()))?;

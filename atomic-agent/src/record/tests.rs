@@ -1544,17 +1544,25 @@ mod cb12a_classification {
         assert_ne!(start_oid, end_oid);
 
         // A genuine-shape journal row: real worktree root, in-window time.
+        // Built through serde_json so windows backslash paths are escaped
+        // correctly (a raw format! emitted invalid JSON escapes on windows
+        // and the reader dropped the row as unparsable).
         let journal = dir.path().join(".atomic").join("bridge");
         std::fs::create_dir_all(&journal).unwrap();
         let recorded_at = chrono::Utc::now().to_rfc3339();
-        let record = format!(
-            "{{\"version\":1,\"record_type\":\"post-checkout\",\"event_id\":\"e1\",\
-             \"recorded_at\":\"{recorded_at}\",\"advisory\":true,\
-             \"old_head\":\"{start_oid}\",\"new_head\":\"{end_oid}\",\
-             \"checkout_kind\":\"branch\",\"worktree_root\":\"{}\"}}\n",
-            dir.path().display()
-        );
-        std::fs::write(journal.join("git-events.jsonl"), record).unwrap();
+        let record = serde_json::json!({
+            "version": 1,
+            "record_type": "post-checkout",
+            "event_id": "e1",
+            "recorded_at": recorded_at,
+            "advisory": true,
+            "old_head": start_oid,
+            "new_head": end_oid,
+            "checkout_kind": "branch",
+            "worktree_root": dir.path().display().to_string(),
+        })
+        .to_string();
+        std::fs::write(journal.join("git-events.jsonl"), format!("{record}\n")).unwrap();
 
         let event = TurnEvent::new("sess-checkout", HookType::TurnEnd);
         let options = make_options(&session, &event, 1);

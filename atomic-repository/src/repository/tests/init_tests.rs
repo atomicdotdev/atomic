@@ -135,7 +135,10 @@ fn test_change_path() {
 fn test_to_relative() {
     let (temp_dir, repo) = create_temp_repo();
 
-    let abs_path = temp_dir.path().join("src").join("main.rs");
+    // repo.root() is canonical (e.g. macOS /var -> /private/var); derive
+    // the input from the canonical root so the comparison is platform-fair.
+    let root = std::fs::canonicalize(temp_dir.path()).unwrap();
+    let abs_path = root.join("src").join("main.rs");
     let rel_path = repo.to_relative(&abs_path).unwrap();
 
     assert_eq!(rel_path, PathBuf::from("src/main.rs"));
@@ -148,7 +151,9 @@ fn test_to_absolute() {
     let rel_path = PathBuf::from("src/main.rs");
     let abs_path = repo.to_absolute(&rel_path);
 
-    assert_eq!(abs_path, temp_dir.path().join("src/main.rs"));
+    // repo.root() is canonical (e.g. macOS /var -> /private/var).
+    let root = std::fs::canonicalize(temp_dir.path()).unwrap();
+    assert_eq!(abs_path, root.join("src/main.rs"));
 }
 
 #[test]

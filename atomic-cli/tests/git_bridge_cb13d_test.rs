@@ -1248,11 +1248,19 @@ fn corpus_scenario_mode_and_new_file(fixture: &WatchFixture) {
     fs::write(&script, b"#!/bin/sh\necho corpus\n").expect("script");
     fixture.git(&["add", "-A"]);
     fixture.git(&["commit", "-qm", "corpus 3: script"]);
-    // chmod-only delta on a tracked file.
+    // chmod-only delta on a tracked file. Without a real mode change the
+    // delta is empty, which still exercises the watcher on windows.
     let mut permissions = fs::metadata(&script).unwrap().permissions();
-    use std::os::unix::fs::PermissionsExt as _;
-    permissions.set_mode(0o755);
-    fs::set_permissions(&script, permissions).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script, permissions).unwrap();
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = &mut permissions;
+    }
     fixture.git(&["add", "-A"]);
     fixture.git(&["commit", "-qm", "corpus 3b: mode change"]);
 }

@@ -5022,6 +5022,8 @@ fn write_atomic_symlink(path: &Path, target: &[u8]) -> Result<(), RepositoryErro
     let staging = tempfile::Builder::new()
         .prefix(".atomic-link-")
         .tempdir_in(parent)?;
+    // The staged path is referenced by both cfg arms (symlink on unix,
+    // unused-variable suppression on windows), so it must be unconditional.
     let prepared = staging.path().join(BACKUP_VALUE);
     #[cfg(unix)]
     {
@@ -5031,13 +5033,20 @@ fn write_atomic_symlink(path: &Path, target: &[u8]) -> Result<(), RepositoryErro
     #[cfg(not(unix))]
     {
         let _ = target;
+        let _ = staging;
+        // Unreachable on this platform, but the compiler cannot see through
+        // the cfg gate — reference the locals so -D warnings is satisfied.
+        let _ = &prepared;
         return Err(RepositoryError::InvalidOperation {
             message: "symlink effects are unsupported on this platform".to_string(),
         });
     }
-    remove_filesystem_effect_path(path)?;
-    fs::rename(&prepared, path)?;
-    sync_directory(parent)
+    #[cfg(unix)]
+    {
+        remove_filesystem_effect_path(path)?;
+        fs::rename(&prepared, path)?;
+        sync_directory(parent)
+    }
 }
 
 fn write_atomic_gitlink(path: &Path, object_id: &[u8], mode: u32) -> Result<(), RepositoryError> {

@@ -18,6 +18,7 @@
 //!   `ManagedGitCommitCaptured`.
 
 use std::collections::HashSet;
+#[cfg(unix)]
 use std::ffi::OsString;
 use std::path::{Component, Path, PathBuf};
 

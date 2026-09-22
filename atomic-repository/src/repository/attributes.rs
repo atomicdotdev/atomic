@@ -34,7 +34,10 @@ pub(super) fn working_inode_attrs(path: &Path) -> Result<WorkingInodeAttrs, Repo
     let mode = if metadata.permissions().readonly() {
         0o444
     } else {
-        0o644
+        // Must match `operation.rs::metadata_mode`: the effect executor
+        // observes writable windows files as 0o666, so the canonical mode
+        // stored at record time has to agree or every write lease diverges.
+        0o666
     };
 
     Ok(WorkingInodeAttrs { mode, kind })

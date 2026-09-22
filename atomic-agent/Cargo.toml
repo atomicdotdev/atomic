@@ -58,8 +58,13 @@ dirs = { workspace = true }
 # Read-only access to OpenCode's session store (transcript recovery)
 rusqlite = { workspace = true }
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Threading"] }
+
 [dev-dependencies]
 tempfile = { workspace = true }
 git2 = { workspace = true }
+
 serial_test = { workspace = true }
+
 tokio = { version = "1.36", features = ["full", "test-util"] }

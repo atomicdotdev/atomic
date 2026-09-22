@@ -314,7 +314,9 @@ fn change_depends_on<T: GraphTxnT>(
     // are treated as leaves here; callers that need the full closure
     // resolve through the repository's load path (see
     // check_unrecord_safety, dev #196/#206 parity).
-    let dependencies = txn.get_indexed_change_deps(descendant_id).unwrap_or_default();
+    let dependencies = txn
+        .get_indexed_change_deps(descendant_id)
+        .unwrap_or_default();
     for dependency in dependencies {
         if dependency == ancestor || change_depends_on(txn, dependency, ancestor, memo)? {
             memo.insert((descendant, ancestor), true);
@@ -1975,7 +1977,14 @@ impl Repository {
         }
 
         let mut txn = write.try_lock_deferred_tree()?;
-        let full_visibility = graph_visibility_closure(&*txn, &target_view)?;
+        // Legacy tolerance: members can predate the dependency index; degrade
+        // them to leaves instead of refusing the switch (dev #196/#206 parity
+        // — unrecord-safety legacy fixtures).
+        let full_visibility = GraphVisibilityClosure::try_from_membership_lenient(
+            &*txn,
+            &super::filter::view_membership(&*txn, &target_view)?,
+        )
+        .map_err(|error| RepositoryError::Database(error.to_string()))?;
         let claim_visibility = super::name_resolution::path_claim_visibility_for_view(
             &*txn,
             &self.change_store,

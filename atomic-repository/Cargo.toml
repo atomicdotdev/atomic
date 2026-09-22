@@ -41,6 +41,7 @@ uuid = { version = "1.0", features = ["v4"] }
 reflink-copy = "0.1"
 ignore = { workspace = true }
 git2 = { workspace = true }
+
 syntext = { workspace = true }
 tempfile = { workspace = true }
 log = { workspace = true }
@@ -54,6 +55,9 @@ sha1 = "0.10"
 sha2 = "0.10"
 fs2 = "0.4"
 blake3 = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
 
 [dev-dependencies]
 tempfile = { workspace = true }

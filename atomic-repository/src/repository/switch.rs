@@ -65,25 +65,25 @@ fn ensure_working_copy_workspace_dir(
 /// orchestration level and makes the cleanup logic reusable for other
 /// operations (e.g. `atomic clean`).
 fn rename_and_sync(source: &Path, destination: &Path) -> Result<(), RepositoryError> {
-    let source_parent = source
-        .parent()
-        .ok_or_else(|| RepositoryError::InvalidOperation {
-            message: format!("rename source has no parent: {}", source.display()),
-        })?;
-    let destination_parent =
-        destination
-            .parent()
-            .ok_or_else(|| RepositoryError::InvalidOperation {
-                message: format!(
-                    "rename destination has no parent: {}",
-                    destination.display()
-                ),
-            })?;
     std::fs::rename(source, destination)?;
     #[cfg(unix)]
     {
+        let source_parent = source
+            .parent()
+            .ok_or_else(|| RepositoryError::InvalidOperation {
+                message: format!("rename source has no parent: {}", source.display()),
+            })?;
         std::fs::File::open(source_parent)?.sync_all()?;
-        if source_parent != destination_parent {
+        if source_parent != destination {
+            let destination_parent =
+                destination
+                    .parent()
+                    .ok_or_else(|| RepositoryError::InvalidOperation {
+                        message: format!(
+                            "rename destination has no parent: {}",
+                            destination.display()
+                        ),
+                    })?;
             std::fs::File::open(destination_parent)?.sync_all()?;
         }
     }

@@ -2199,6 +2199,33 @@ mod tests {
     }
 }
 
+#[cfg(windows)]
+fn pid_alive(pid: u64) -> bool {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    const STILL_ACTIVE: u32 = 259;
+    if pid > u32::MAX as u64 {
+        return false;
+    }
+    // SAFETY: querying another process's exit code needs no mutation.
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid as u32) };
+    if handle.is_null() {
+        // A dead pid fails the open; an access-denied open also returns null,
+        // and treating it as alive is the conservative no-steal choice.
+        return false;
+    }
+    let mut exit_code: u32 = 0;
+    let ok = unsafe { GetExitCodeProcess(handle, &mut exit_code) };
+    unsafe { CloseHandle(handle) };
+    if ok == 0 {
+        return true;
+    }
+    exit_code == STILL_ACTIVE
+}
+
+#[cfg(not(windows))]
 #[cfg(not(unix))]
 fn pid_alive(_pid: u64) -> bool {
     // Without a liveness probe the replay scanner cannot distinguish a

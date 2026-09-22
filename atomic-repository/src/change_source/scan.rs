@@ -699,14 +699,30 @@ fn observe_metadata(native_path: std::path::PathBuf, metadata: &fs::Metadata) ->
 
 #[cfg(not(unix))]
 fn observe_metadata(native_path: std::path::PathBuf, metadata: &fs::Metadata) -> ObservedFile {
+    // Mode uses the same windows mapping as `attributes::working_inode_attrs`
+    // and `operation.rs::metadata_mode` (readonly → 0o444, writable → 0o666)
+    // so scan, record, and effect observation agree on canonical modes.
+    let mode: u16 = if metadata.permissions().readonly() {
+        0o444
+    } else {
+        0o666
+    };
+    // FILE_INDEX_V2 leases need a stable file identity: without it every
+    // entry fails the `complete` invariant and every status/record run
+    // degrades into identity errors. Windows exposes the volume serial
+    // number and file index through GetFileInformationByHandle (the NTFS
+    // analog of st_dev/st_ino); with FILE_FLAG_OPEN_REPARSE_POINT the
+    // identity is the link's own, matching the symlink_metadata the unix
+    // branch observes.
+    let (device, inode) = windows_file_identity(&native_path);
     ObservedFile {
         native_path,
-        device: None,
-        inode: None,
-        mtime: None,
-        ctime: None,
+        device,
+        inode,
+        mtime: windows_file_index_timestamp(metadata.modified().ok()),
+        ctime: windows_file_index_timestamp(metadata.created().ok()),
         size: metadata.len(),
-        mode: None,
+        mode: Some(mode),
         kind: if metadata.file_type().is_symlink() {
             ObservedKind::Symlink
         } else if metadata.is_file() {
@@ -717,6 +733,58 @@ fn observe_metadata(native_path: std::path::PathBuf, metadata: &fs::Metadata) ->
             ObservedKind::Other
         },
     }
+}
+
+#[cfg(windows)]
+fn windows_file_index_timestamp(
+    time: Option<std::time::SystemTime>,
+) -> Option<atomic_core::pristine::FileIndexTimestamp> {
+    let since_epoch = time?.duration_since(std::time::UNIX_EPOCH).ok()?;
+    let seconds = i64::try_from(since_epoch.as_secs()).ok()?;
+    let nanoseconds = u32::try_from(since_epoch.subsec_nanos()).ok()?;
+    FileIndexTimestamp::new(seconds, nanoseconds).ok()
+}
+
+/// The NTFS analog of `(st_dev, st_ino)`: volume serial number plus the
+/// 64-bit file index, read without following reparse points so a symlink's
+/// identity is the link itself.
+#[cfg(windows)]
+fn windows_file_identity(path: &std::path::Path) -> (Option<u64>, Option<u64>) {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE,
+        FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+    };
+
+    let wide: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let handle = unsafe {
+        CreateFileW(
+            wide.as_ptr(),
+            0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            (FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT) as u32,
+            std::ptr::null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE || handle.is_null() {
+        return (None, None);
+    }
+    let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    let ok = unsafe { GetFileInformationByHandle(handle, &mut info) };
+    unsafe { CloseHandle(handle) };
+    if ok == 0 {
+        return (None, None);
+    }
+    let inode = ((info.nFileIndexHigh as u64) << 32) | (info.nFileIndexLow as u64);
+    (Some(info.dwVolumeSerialNumber as u64), Some(inode))
 }
 
 fn root_row(

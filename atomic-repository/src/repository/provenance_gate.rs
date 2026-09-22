@@ -763,7 +763,10 @@ mod tests {
     use atomic_core::change::{Author, ChangeHeader};
 
     const SESSION: &str = "sess-gate";
-    const MAC_KEY: &str = "aa11"; // 4 hex chars are enough for a test MAC.
+    // A long, distinctive key: a short MAC key can appear inside the pack
+    // bytes by coincidence (the signature is carried, only the key must not
+    // be), which made this assertion flaky by construction.
+    const MAC_KEY: &str = "deadbeefcafebabe0123456789abcdef-mac-key-never-ships";
 
     fn provider(_session: &str) -> Option<String> {
         Some(MAC_KEY.to_string())

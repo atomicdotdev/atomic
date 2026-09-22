@@ -21,6 +21,7 @@
 
 use std::fs;
 use std::io::Write;
+#[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -1819,15 +1820,20 @@ fn raw_foreign_facts_survive_without_the_source_odb() {
     git_commit(&root, "seed");
 
     // An empty commit with a non-UTF-8 author name and a +05:45 timezone.
+    // Raw bytes need unix; windows links git with an ASCII stand-in.
+    #[cfg(unix)]
     let non_utf8_name: &[u8] = b"J\xf8rgen <b\xFCrger@example.com>";
     let date = "2026-09-11T12:34:56+05:45";
+    // A non-UTF-8 env value requires unix raw bytes; windows falls back to
+    // the lossy UTF-8 spelling (the assertion below is unix-gated).
+    #[cfg(unix)]
+    let author_name = std::ffi::OsStr::from_bytes(non_utf8_name);
+    #[cfg(not(unix))]
+    let author_name = std::ffi::OsStr::new("CB-9B Lossy Author");
     let output = Command::new("git")
         .args(["commit", "-q", "--allow-empty", "-m", "mark"])
         .current_dir(&root)
-        .env(
-            std::ffi::OsStr::new("GIT_AUTHOR_NAME"),
-            std::ffi::OsStr::from_bytes(non_utf8_name),
-        )
+        .env(std::ffi::OsStr::new("GIT_AUTHOR_NAME"), author_name)
         .env("GIT_COMMITTER_NAME", "CB-9B Tests")
         .env("GIT_COMMITTER_EMAIL", "cb9b@example.com")
         .env("GIT_AUTHOR_EMAIL", "cb9b@example.com")

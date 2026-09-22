@@ -65,10 +65,9 @@ fn init_writes_canonical_identity_record_and_reopens_stably() {
     assert_eq!(identity, format!("{id}\n"));
     assert_eq!(identity.trim().parse::<WorkingCopyId>().unwrap(), id);
     assert_eq!(repo.working_copy_id(), Some(id));
-    assert_eq!(
-        repo.working_copy_dot_dir(),
-        directory.path().join(".atomic")
-    );
+    // repo.root() is canonical (e.g. macOS /var -> /private/var).
+    let canonical = std::fs::canonicalize(directory.path()).unwrap();
+    assert_eq!(repo.working_copy_dot_dir(), canonical.join(".atomic"));
     repo.validate_working_copy(id).unwrap();
 
     let record = repo.working_copy_record(id).unwrap();

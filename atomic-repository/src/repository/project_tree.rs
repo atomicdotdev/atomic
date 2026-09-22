@@ -77,10 +77,18 @@ impl RepoPath {
         Self::from_bytes(path.as_os_str().as_bytes())
     }
 
-    /// Native paths are refused where Rust cannot promise lossless Unix bytes.
+    /// Windows native paths are WTF-16, so exact bytes are only available
+    /// when the path is valid Unicode. Every path this repository stores
+    /// (REV_TREE values) is UTF-8 by construction, so the UTF-8 round-trip
+    /// is exact for all real repositories; non-Unicode paths are refused
+    /// just like the unix variant refuses non-representable bytes.
     #[cfg(not(unix))]
-    pub fn from_native(_path: &Path) -> Result<Self, ProjectTreeError> {
-        Err(ProjectTreeError::UnsupportedPlatformPath)
+    pub fn from_native(path: &Path) -> Result<Self, ProjectTreeError> {
+        let text = path
+            .as_os_str()
+            .to_str()
+            .ok_or(ProjectTreeError::UnsupportedPlatformPath)?;
+        Self::from_bytes(text.as_bytes())
     }
 
     #[cfg(unix)]
@@ -89,9 +97,13 @@ impl RepoPath {
         Ok(PathBuf::from(std::ffi::OsString::from_vec(self.0.clone())))
     }
 
+    /// Inverse of [`Self::from_native`]: exact for the UTF-8 byte strings
+    /// this repository stores; non-UTF-8 bytes are refused on windows.
     #[cfg(not(unix))]
     pub fn to_native(&self) -> Result<PathBuf, ProjectTreeError> {
-        Err(ProjectTreeError::UnsupportedPlatformPath)
+        let text =
+            std::str::from_utf8(&self.0).map_err(|_| ProjectTreeError::UnsupportedPlatformPath)?;
+        Ok(PathBuf::from(text))
     }
 
     pub fn escaped(&self) -> String {

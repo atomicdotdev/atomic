@@ -8024,15 +8024,20 @@ fn parse_diff_files(
                     .path()
                     .or_else(|| delta.old_file().path())
                     .map(|p| {
-                        use std::os::unix::ffi::OsStrExt;
-                        let raw = p.as_os_str().as_bytes();
+                        #[cfg(unix)]
+                        let raw = {
+                            use std::os::unix::ffi::OsStrExt;
+                            p.as_os_str().as_bytes().to_vec()
+                        };
+                        #[cfg(not(unix))]
+                        let raw = p.as_os_str().to_string_lossy().into_owned().into_bytes();
                         let needs_escaping = raw
                             .iter()
                             .any(|byte| !byte.is_ascii_graphic() || *byte == b'%');
                         if needs_escaping {
-                            atomic_repository::escape_repo_path(raw)
+                            atomic_repository::escape_repo_path(&raw)
                         } else {
-                            String::from_utf8_lossy(raw).into_owned()
+                            String::from_utf8_lossy(&raw).into_owned()
                         }
                     })
                     .unwrap_or_default();
@@ -8064,16 +8069,23 @@ fn parse_diff_files(
         let Some(path) = file.path() else {
             return Ok(None);
         };
-        use std::os::unix::ffi::OsStrExt;
-        let raw = path.as_os_str().as_bytes();
+        // Raw bytes are unix-only; windows paths are always well-formed UTF-16
+        // round-trips, so the escape is applied to the UTF-8 bytes instead.
+        #[cfg(unix)]
+        let raw = {
+            use std::os::unix::ffi::OsStrExt;
+            path.as_os_str().as_bytes().to_vec()
+        };
+        #[cfg(not(unix))]
+        let raw = path.as_os_str().to_string_lossy().into_owned().into_bytes();
         let needs_escaping = raw
             .iter()
             .any(|byte| !byte.is_ascii_graphic() || *byte == b'%');
         if needs_escaping {
-            Ok(Some(atomic_repository::escape_repo_path(raw)))
+            Ok(Some(atomic_repository::escape_repo_path(&raw)))
         } else {
             // ASCII-safe and UTF-8 by construction.
-            Ok(Some(String::from_utf8_lossy(raw).into_owned()))
+            Ok(Some(String::from_utf8_lossy(&raw).into_owned()))
         }
     };
 
@@ -8486,8 +8498,16 @@ fn tree_entry_exists(_git_repo: &GitRepository, tree: &Tree, path: &str) -> bool
 fn canonical_tree_path(path: &str) -> PathBuf {
     match atomic_repository::unescape_repo_path(path) {
         Ok(raw) => {
-            use std::os::unix::ffi::OsStringExt;
-            PathBuf::from(std::ffi::OsString::from_vec(raw))
+            #[cfg(unix)]
+            {
+                use std::os::unix::ffi::OsStringExt;
+                PathBuf::from(std::ffi::OsString::from_vec(raw))
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = raw;
+                PathBuf::from(path)
+            }
         }
         Err(_) => PathBuf::from(path),
     }

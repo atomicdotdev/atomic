@@ -89,6 +89,7 @@ rayon = { workspace = true }
 # Git interop
 git2 = { workspace = true }
 
+
 # Unix signal disposition (SIGPIPE) for pipeline-safe CLI output.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

@@ -407,6 +407,7 @@ mod tests {
     /// after the timeout and the factory proceeds to the fallback with the
     /// honest tier. Failing before (the probe blocked forever on
     /// `Command::output`), passing after.
+    #[cfg(unix)] // the shim is a /bin/sh script; the probe is unix-only
     #[test]
     fn stuck_watchman_daemon_cannot_hang_the_factory() {
         let shim_dir = tempfile::tempdir().unwrap();

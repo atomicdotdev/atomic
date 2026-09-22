@@ -1,3 +1,5 @@
+#![cfg(unix)] // the fixture relies on unix permissions and symlinks
+
 use std::fs;
 
 use atomic_core::change::{Author, ChangeHeader, InodeKind};

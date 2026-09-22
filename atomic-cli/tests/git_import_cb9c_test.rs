@@ -289,6 +289,7 @@ fn corpus() -> Corpus {
     let rename_edit = git_commit(&root, "rename edit");
 
     // Attribute-only: chmod +x on a tracked file (no byte change).
+    #[cfg(unix)]
     let mut perms = fs::metadata(root.join("src/entry.rs"))
         .unwrap()
         .permissions();
@@ -296,8 +297,8 @@ fn corpus() -> Corpus {
     {
         use std::os::unix::fs::PermissionsExt;
         perms.set_mode(0o755);
+        fs::set_permissions(root.join("src/entry.rs"), perms).unwrap();
     }
-    fs::set_permissions(root.join("src/entry.rs"), perms).unwrap();
     let chmod_on = git_commit(&root, "chmod executable");
 
     // Symlinks: relative dangling and absolute targets.
@@ -1069,6 +1070,7 @@ fn attribute_only_failpoint_fails_closed_and_retry_publishes() {
     // Attribute-only commit: chmod +x, no byte change. It is built on a side
     // branch so `main` stays at the base while the prefix is imported
     // (the import walks the branch ref, not the detached HEAD).
+    #[cfg(unix)]
     let mut perms = fs::metadata(root.join("tracked.txt"))
         .unwrap()
         .permissions();
@@ -1076,8 +1078,8 @@ fn attribute_only_failpoint_fails_closed_and_retry_publishes() {
     {
         use std::os::unix::fs::PermissionsExt;
         perms.set_mode(0o755);
+        fs::set_permissions(root.join("tracked.txt"), perms).unwrap();
     }
-    fs::set_permissions(root.join("tracked.txt"), perms).unwrap();
     git(&root, &["checkout", "-q", "-b", "next"]);
     let chmod = git_commit(&root, "chmod executable");
     git(&root, &["checkout", "-q", "main"]);

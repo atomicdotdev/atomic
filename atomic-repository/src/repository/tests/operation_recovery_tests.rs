@@ -573,9 +573,12 @@ fn recovery_handles_current_new_without_original_receipt() {
     let new_bytes = b"new contents\n";
     std::fs::write(temp.path().join(path), old_bytes).unwrap();
     let (prepared, _) = prepare_file_switch(&repo, path, new_bytes);
+    // repo.root() is canonical (e.g. macOS /var -> /private/var); the
+    // expected backup root must be derived from the canonical root.
+    let canonical_root = std::fs::canonicalize(temp.path()).unwrap();
     assert_eq!(
         prepared.backup_root(),
-        temp.path()
+        canonical_root
             .join(".atomic/working-copies")
             .join(repo.working_copy().to_string())
             .join("operation-recovery")

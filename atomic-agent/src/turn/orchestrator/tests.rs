@@ -1827,6 +1827,7 @@ async fn test_session_end_surfaces_incomplete_from_git_only_flush() {
 /// Review R3/R6 (executed probe): when the attestation cannot be written,
 /// SessionEnd must fail closed — typed error plus durable refusal — instead
 /// of returning success with one unattested operation and no evidence.
+#[cfg(unix)] // the write denial is a unix chmod; windows cannot reproduce it
 #[tokio::test]
 async fn test_session_end_fails_closed_when_attestation_write_fails() {
     let dir = TempDir::new().unwrap();

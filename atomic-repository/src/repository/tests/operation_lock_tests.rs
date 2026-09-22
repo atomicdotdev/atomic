@@ -403,7 +403,10 @@ fn linked_worktrees_share_common_lock_path_and_use_distinct_working_copy_locks()
         linked_repo.working_copy_operation_lock_path(linked_id),
         primary_working_copy_path
     );
-    assert!(primary_common_path.starts_with(primary.join(".atomic")));
+    // repo.root() is canonical (e.g. macOS /var -> /private/var), so the
+    // expected prefix must be canonicalized too.
+    let primary_canonical = std::fs::canonicalize(&primary).expect("canonicalize primary worktree");
+    assert!(primary_common_path.starts_with(primary_canonical.join(".atomic")));
     assert!(!linked.join(".atomic/bridge.lock").exists());
 
     let linked_guard = linked_repo

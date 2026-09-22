@@ -1,9 +1,10 @@
+#![cfg(unix)] // every attribute test uses chmod; non-unix builds skip the module
+
 use super::*;
 use crate::record::RecordOptions;
 use crate::status::FileStatus;
 use atomic_core::change::{GraphOp, InodeAttr, InodeKind};
 
-#[cfg(unix)] // consumed by unix-gated attribute tests only
 fn record_all(repo: &TestRepository, message: &str) -> crate::record::RecordOutcome {
     repo.record(
         ChangeHeader::new(message),

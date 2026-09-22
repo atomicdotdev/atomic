@@ -1,5 +1,6 @@
 //! Persistent working-copy identity and repository layout discovery.
 
+#[cfg(unix)]
 use std::ffi::OsString;
 use std::io::Write;
 use std::path::{Path, PathBuf};
