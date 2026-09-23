@@ -350,6 +350,119 @@ fn legacy_checkpoint_is_read_without_rewrite() {
     assert_eq!(fs::read(path).unwrap(), bytes);
 }
 
+/// RFC §2 scopes the bridge to explicitly configured colocated workspaces
+/// and `[git.bridge] enabled` defaults to false (CB-13C): a `.git` directory
+/// alone is not consent. Without the opt-in and without a checkpoint written
+/// by an explicit bridge command, ordinary boundaries treat the working copy
+/// as native — for an unborn HEAD (fresh `git init`) and for existing history.
+#[test]
+fn colocated_git_without_bridge_opt_in_enters_as_native_workspace() {
+    for with_history in [false, true] {
+        let directory = TempDir::new().unwrap();
+        let mut repo = Repository::init(directory.path()).unwrap();
+        git(directory.path(), &["init", "-b", "dev"]);
+        if with_history {
+            git(
+                directory.path(),
+                &["config", "user.email", "tests@atomic.dev"],
+            );
+            git(directory.path(), &["config", "user.name", "Atomic Tests"]);
+            fs::write(directory.path().join("tracked.txt"), b"tracked\n").unwrap();
+            git(directory.path(), &["add", "tracked.txt"]);
+            git(directory.path(), &["commit", "-m", "initial"]);
+        }
+        assert!(
+            !repo.bridge_workspace_active().unwrap(),
+            "a bare .git directory must not activate the bridge (history: {with_history})"
+        );
+
+        for mode in [WorkspaceTxnMode::Observe, WorkspaceTxnMode::Reconcile] {
+            let start = repo.begin_workspace_txn(mode).unwrap();
+            let WorkspaceTxnStart::Ready(txn) = start else {
+                panic!("non-bridge colocated workspace must enter natively ({mode:?}, history: {with_history}): {start:?}");
+            };
+            assert!(matches!(txn.git(), WorkspaceGitObservation::NoGit { .. }));
+            assert!(txn.checkpoint().is_none());
+        }
+        assert!(
+            !directory
+                .path()
+                .join(".atomic/bridge/workspace.json")
+                .exists(),
+            "a native entry must not fabricate a bridge checkpoint"
+        );
+    }
+}
+
+#[test]
+fn bridge_opt_in_without_checkpoint_refuses_with_actionable_remediation() {
+    let (_directory, mut repo, _head, _tree) = initialized_colocated_repository();
+    repo.set_bridge_consent(true, None).unwrap();
+    assert!(repo.bridge_workspace_active().unwrap());
+
+    let start = repo
+        .begin_workspace_txn(WorkspaceTxnMode::Reconcile)
+        .unwrap();
+    let WorkspaceTxnStart::Remediation(remediation) = start else {
+        panic!("an opted-in but unanchored workspace must refuse: {start:?}");
+    };
+    assert!(matches!(
+        &remediation,
+        WorkspaceRemediation::Unanchored {
+            state: UnanchoredWorkspace::MissingCheckpoint,
+            ..
+        }
+    ));
+    let text = remediation.describe();
+    assert!(text.contains("atomic git bridge reconcile"), "{text}");
+    assert!(text.contains("atomic git bridge disable"), "{text}");
+}
+
+#[test]
+fn bridge_opt_in_on_unborn_head_names_the_first_commit_remediation() {
+    let directory = TempDir::new().unwrap();
+    let mut repo = Repository::init(directory.path()).unwrap();
+    git(directory.path(), &["init", "-b", "dev"]);
+    repo.set_bridge_consent(true, None).unwrap();
+
+    let start = repo
+        .begin_workspace_txn(WorkspaceTxnMode::Reconcile)
+        .unwrap();
+    let WorkspaceTxnStart::Remediation(remediation) = start else {
+        panic!("an opted-in unborn workspace must refuse: {start:?}");
+    };
+    assert!(matches!(
+        &remediation,
+        WorkspaceRemediation::Unanchored {
+            state: UnanchoredWorkspace::UnbornHead { .. },
+            ..
+        }
+    ));
+    let text = remediation.describe();
+    assert!(text.contains("first Git commit"), "{text}");
+    assert!(text.contains("atomic git bridge reconcile"), "{text}");
+    assert!(text.contains("atomic git bridge disable"), "{text}");
+}
+
+/// A checkpoint is only ever written by an explicit bridge command
+/// (reconcile, import, anchor, clone bootstrap); such a workspace keeps the
+/// stale-baseline guard even though `[git.bridge] enabled` is still false.
+#[test]
+fn bridge_checkpoint_without_opt_in_keeps_the_stale_baseline_guard() {
+    let (directory, mut repo, _head, tree) = initialized_colocated_repository();
+    write_checkpoint(directory.path(), &repo, &"0".repeat(40), &tree);
+    assert!(repo.bridge_workspace_active().unwrap());
+
+    let start = repo.begin_workspace_txn(WorkspaceTxnMode::Observe).unwrap();
+    assert!(
+        matches!(
+            start,
+            WorkspaceTxnStart::Remediation(WorkspaceRemediation::Unanchored { .. })
+        ),
+        "a checkpointed workspace must still refuse a stale baseline: {start:?}"
+    );
+}
+
 fn initialized_colocated_repository() -> (TempDir, Repository, String, String) {
     let directory = TempDir::new().unwrap();
     let repo = Repository::init(directory.path()).unwrap();

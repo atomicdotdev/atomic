@@ -690,9 +690,15 @@ impl WorkspaceRemediation {
                 }
                 description
             }
-            Self::Unanchored { state, .. } => format!(
-                "workspace is not anchored to a verified Git baseline: {state:?}"
-            ),
+            Self::Unanchored { state, .. } => {
+                let mut description =
+                    format!("workspace is not anchored to a verified Git baseline: {state:?}");
+                if let Some(remediation) = state.remediation() {
+                    description.push_str("\n\n");
+                    description.push_str(&remediation);
+                }
+                description
+            }
             Self::OperationHeadsDiverged { heads } => format!(
                 "operation heads diverged; resolve the competing leases instead of retrying a stale plan: {}",
                 heads.iter().map(ToString::to_string).collect::<Vec<_>>().join(", ")
@@ -783,6 +789,31 @@ pub enum UnanchoredWorkspace {
     },
 }
 
+impl UnanchoredWorkspace {
+    /// Commands that resolve this state when a single safe path exists.
+    ///
+    /// Ordinary boundaries only observe Git for bridge workspaces
+    /// ([`Repository::bridge_workspace_active`]), so these states are reached
+    /// after an explicit opt-in or anchoring.
+    pub fn remediation(&self) -> Option<String> {
+        const DISABLE: &str = "To use Atomic without the Git bridge in a workspace that was never \
+anchored:\n  atomic git bridge disable";
+        match self {
+            Self::MissingCheckpoint => Some(format!(
+                "The Git bridge is enabled for this repository, but this workspace has no \
+verified Git baseline yet. Anchor it to the current Git HEAD (imports the Git \
+history into the current view):\n  atomic git bridge reconcile\n{DISABLE}"
+            )),
+            Self::UnbornHead { symref } => Some(format!(
+                "{symref} has no commits yet, so there is no Git baseline to anchor to. \
+Create the first Git commit (or switch to a branch that has commits), then \
+anchor the workspace:\n  git add <paths> && git commit\n  atomic git bridge reconcile\n{DISABLE}"
+            )),
+            _ => None,
+        }
+    }
+}
+
 /// Checkpoint fields needed by the entry protocol. Reading never rewrites legacy data.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WorkspaceCheckpoint {
@@ -830,7 +861,39 @@ impl Repository {
         mode: WorkspaceTxnMode,
         budget: ReconcileEffectBudget,
     ) -> Result<WorkspaceTxnStart, RepositoryError> {
-        self.begin_workspace_txn_with_opt(mode, observe_git_metadata, false, budget)
+        // RFC §2 scopes the bridge to explicitly configured colocated
+        // workspaces: Git metadata of a working copy that never enrolled is
+        // not interpreted, so ordinary commands keep native behavior instead
+        // of refusing for a Git anchor the user never asked for.
+        let observe: fn(&Path) -> Result<WorkspaceGitObservation, super::ObservationError> =
+            if self.bridge_workspace_active()? {
+                observe_git_metadata
+            } else {
+                observe_native_workspace
+            };
+        self.begin_workspace_txn_with_opt(mode, observe, false, budget)
+    }
+
+    /// Whether this working copy participates in the colocated Git bridge.
+    ///
+    /// The bridge is explicit per-repository opt-in (RFC §2; CB-13C
+    /// `[git.bridge] enabled`, default `false`): a `.git` directory next to
+    /// `.atomic` is not consent. A working copy participates once the user
+    /// recorded the opt-in (`atomic git bridge enable`) or an explicit bridge
+    /// command (`git bridge reconcile`, `git import`, anchoring, clone
+    /// bootstrap / `--adopt-git`) wrote the verified checkpoint that the
+    /// stale-baseline guard protects. The explicit repair boundary
+    /// ([`Self::begin_remediation_txn`]) always observes Git.
+    pub fn bridge_workspace_active(&self) -> Result<bool, RepositoryError> {
+        if read_workspace_checkpoint(self.root())?.is_some() {
+            return Ok(true);
+        }
+        let config = atomic_config::RepoConfig::load(&self.dot_dir().join("config.toml")).map_err(
+            |error| RepositoryError::InvalidRepository {
+                reason: format!("cannot load the repository configuration: {error}"),
+            },
+        )?;
+        Ok(config.git.bridge.enabled)
     }
 
     /// Enter the explicit repair boundary used by the bridge remediation path.
@@ -1597,6 +1660,16 @@ fn head_symref(head: &GitHeadObservation) -> Option<&str> {
         | GitHeadObservation::MissingTarget { symref } => Some(symref),
         GitHeadObservation::Detached { .. } => None,
     }
+}
+
+/// Observation for a working copy outside the bridge: its Git metadata
+/// belongs to the user and ordinary Atomic boundaries do not interpret it.
+fn observe_native_workspace(
+    root: &Path,
+) -> Result<WorkspaceGitObservation, super::ObservationError> {
+    Ok(WorkspaceGitObservation::NoGit {
+        root: root.to_path_buf(),
+    })
 }
 
 fn unanchored(
