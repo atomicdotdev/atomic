@@ -256,6 +256,18 @@ fn project_tag_to_git_if_colocated(
     view: &str,
     name: &str,
 ) {
+    // RFC §2/§8.4: tag projection is bridge behavior; a working copy that
+    // never enrolled keeps its tags Atomic-only.
+    match repo.bridge_workspace_active() {
+        Ok(true) => {}
+        Ok(false) => return,
+        Err(error) => {
+            print_warning(&format!(
+                "Atomic tag '{name}' created; skipped Git tag export: {error}"
+            ));
+            return;
+        }
+    }
     let Ok(git) = git2::Repository::open(repo_root) else {
         return;
     };

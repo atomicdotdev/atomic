@@ -188,6 +188,9 @@ pub(crate) struct GuardEvidence {
 pub(crate) enum GuardPassReason {
     Bypass,
     NoGit,
+    /// Colocated with Git, but the working copy never enrolled in the bridge
+    /// (RFC §2): the stale-baseline guard has no baseline to protect.
+    BridgeNotEnabled,
     Unchanged,
     AtomicAdvanced,
     EquivalentView,
@@ -479,6 +482,14 @@ pub(crate) fn guard_working_copy(request: GuardRequest<'_>) -> Result<GuardOutco
         atomic,
         git: GuardGitEvidence::Repository(Box::new(git_evidence(&repository))),
     };
+    if !bridge_workspace_active(request.root)? {
+        return Ok(GuardOutcome::Pass(Box::new(GuardPass {
+            operation: request.operation,
+            reason: GuardPassReason::BridgeNotEnabled,
+            old: None,
+            current: Some(current),
+        })));
+    }
     let checkpoint = checkpoint::read_checkpoint(request.root)?;
     let mut outcome = classify_guard(request.operation, checkpoint.as_ref(), &current);
 
@@ -499,6 +510,17 @@ pub(crate) fn guard_working_copy(request: GuardRequest<'_>) -> Result<GuardOutco
     }
 
     Ok(outcome)
+}
+
+/// Whether the working copy at `root` enrolled in the Git bridge (explicit
+/// opt-in or a checkpoint written by an explicit bridge command).
+fn bridge_workspace_active(root: &Path) -> Result<bool, GuardError> {
+    let repository = atomic_repository::Repository::open_readonly(root).map_err(|error| {
+        CheckpointError::Atomic(format!("cannot open repository read-only: {error}"))
+    })?;
+    repository
+        .bridge_workspace_active()
+        .map_err(|error| CheckpointError::Atomic(error.to_string()).into())
 }
 
 /// Pure causal-baseline classifier used by every future command boundary.
