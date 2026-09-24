@@ -11,7 +11,7 @@ use std::collections::BTreeSet;
 
 use atomic_core::change::ChangeStore as _;
 use atomic_core::pristine::slice::{GraphSlice, ViewSnapshotRows};
-use atomic_core::pristine::{decode_vertex, GraphTxnT, MutTxnT, ViewTxnT};
+use atomic_core::pristine::{decode_vertex, GraphTxnT, MutTxnT, TreeTxnT, ViewTxnT};
 use atomic_core::types::{GraphNode, Hash, NodeId};
 use serde::{Deserialize, Serialize};
 
@@ -56,6 +56,41 @@ mod serde_bytes_b64 {
             .decode(s.as_bytes())
             .map_err(serde::de::Error::custom)
     }
+}
+
+/// Why the repository refused a sandbox's change. Nothing is written when
+/// a change is refused.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
+pub enum SubmitRejection {
+    #[error("the change's bytes hash to {computed}, not {claimed}")]
+    HashMismatch { claimed: String, computed: String },
+    #[error("not a change: {0}")]
+    Malformed(String),
+    #[error("the view has moved on (now {current}); fetch and record again")]
+    StaleView { current: String },
+    #[error("change {0} is not on this view")]
+    ForeignChange(String),
+    #[error("node {0} is not on this view")]
+    ForeignNode(u64),
+    #[error("a change may not touch {0}")]
+    ForbiddenPath(String),
+    #[error("change {0} is already in the repository")]
+    AlreadyPresent(String),
+}
+
+/// A submitted change, applied.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Submitted {
+    pub hash: Hash,
+    /// The view's state after it, base32.
+    pub state: String,
+}
+
+/// Paths only the repository's own machinery writes.
+fn forbidden_path(path: &str) -> bool {
+    path.split('/').any(|part| {
+        part == crate::DOT_DIR || part == super::SANDBOX_POINTER || part == super::SANDBOX_CACHE_DIR
+    })
 }
 
 fn db(e: impl std::fmt::Display) -> RepositoryError {
@@ -115,7 +150,18 @@ impl Repository {
                     name: view.to_string(),
                 })?;
         let visible: BTreeSet<u64> = self.sandbox_visible(&txn, &state)?.into_iter().collect();
-        let rows = txn.export_graph_slice(inodes, state.id).map_err(db)?;
+        // Only files the view has: an inode another view introduced is not
+        // this sandbox's to read.
+        let mut on_view = Vec::with_capacity(inodes.len());
+        for &inode in inodes {
+            let position = txn
+                .inode_position(atomic_core::types::Inode::new(inode))
+                .map_err(db)?;
+            if position.is_some_and(|p| p.change.is_root() || visible.contains(&p.change.get())) {
+                on_view.push(inode);
+            }
+        }
+        let rows = txn.export_graph_slice(&on_view, state.id).map_err(db)?;
         let mut spans = Vec::new();
         for (key, _) in &rows.graph {
             let (change, start, end) = decode_vertex(key);
@@ -141,6 +187,125 @@ impl Repository {
             });
         }
         Ok(SandboxSlice { rows, spans })
+    }
+
+    /// Serve side: take a change a remote sandbox recorded on `view` and
+    /// apply it there — if it is exactly what it claims, recorded against
+    /// the view as it is now, and names nothing outside the view.
+    ///
+    /// The checks, in order: the bytes hash to `hash`; the view is still at
+    /// `base_state` (otherwise the sandbox fetches and records again); every
+    /// change it depends on or refers to that the repository knows is
+    /// visible on the view; every node its file operations name is a visible
+    /// change's; no path touches `.atomic`, `.atomic-sandbox` or
+    /// `.atomic-sandbox.d`; and it is new. Then it is saved and inserted
+    /// into `view`. Callers serialize submissions (one writer).
+    pub fn insert_submitted_change(
+        &self,
+        view: &str,
+        base_state: &str,
+        hash: &Hash,
+        bytes: &[u8],
+    ) -> Result<Result<Submitted, SubmitRejection>, RepositoryError> {
+        use atomic_core::change::format_v3::reader::ChangeReader;
+        use atomic_core::types::Base32;
+
+        let (change, computed) = match atomic_core::change::Change::deserialize(&mut &bytes[..]) {
+            Ok(parsed) => parsed,
+            Err(e) => return Ok(Err(SubmitRejection::Malformed(e.to_string()))),
+        };
+        if computed != *hash {
+            return Ok(Err(SubmitRejection::HashMismatch {
+                claimed: hash.to_base32(),
+                computed: computed.to_base32(),
+            }));
+        }
+        let referenced: Vec<Hash> = match ChangeReader::open(&mut &bytes[..]) {
+            Ok(reader) => reader
+                .hash_table()
+                .hashes()
+                .iter()
+                .map(|h| Hash::from(*h))
+                .filter(|h| h != hash)
+                .collect(),
+            Err(e) => return Ok(Err(SubmitRejection::Malformed(e.to_string()))),
+        };
+
+        {
+            let txn = self.pristine.read_txn().map_err(db)?;
+            let state =
+                txn.get_view(view)
+                    .map_err(db)?
+                    .ok_or_else(|| RepositoryError::ViewNotFound {
+                        name: view.to_string(),
+                    })?;
+            let current = state.state.to_base32();
+            if current != base_state {
+                return Ok(Err(SubmitRejection::StaleView { current }));
+            }
+            if txn.get_internal(hash).map_err(db)?.is_some() {
+                return Ok(Err(SubmitRejection::AlreadyPresent(hash.to_base32())));
+            }
+            let visible = super::collect_visible_change_ids(&txn, &state)?;
+            for dep in change.dependencies() {
+                match txn.get_internal(dep).map_err(db)? {
+                    Some(id) if visible.contains(&id) => {}
+                    _ => return Ok(Err(SubmitRejection::ForeignChange(dep.to_base32()))),
+                }
+            }
+            for other in &referenced {
+                if let Some(id) = txn.get_internal(other).map_err(db)? {
+                    if !visible.contains(&id) {
+                        return Ok(Err(SubmitRejection::ForeignChange(other.to_base32())));
+                    }
+                }
+            }
+            for ops in change.file_ops() {
+                if let Some(id) = ops
+                    .referenced_node_ids()
+                    .into_iter()
+                    .find(|id| !visible.contains(id))
+                {
+                    return Ok(Err(SubmitRejection::ForeignNode(id.get())));
+                }
+                if forbidden_path(ops.path()) {
+                    return Ok(Err(SubmitRejection::ForbiddenPath(ops.path().to_string())));
+                }
+            }
+            for hunk in change.hunks() {
+                if let Some(path) = hunk.path().filter(|p| forbidden_path(p)) {
+                    return Ok(Err(SubmitRejection::ForbiddenPath(path.to_string())));
+                }
+            }
+        }
+
+        self.save_change_bytes(hash, bytes, &change)?;
+        let outcome = match self.insert_change(hash, crate::InsertOptions::default().view(view)) {
+            Ok(outcome) => outcome,
+            Err(e) => {
+                // Nothing of it stays: the change file goes with the failure.
+                let _ = std::fs::remove_file(self.change_store.change_path(hash));
+                return Err(e);
+            }
+        };
+        Ok(Ok(Submitted {
+            hash: *hash,
+            state: outcome.new_state.to_base32(),
+        }))
+    }
+
+    /// Cache side: the view's state as the cache has it (base32) — what a
+    /// change recorded here is recorded against.
+    pub fn remote_sandbox_view_state(&self) -> Result<String, RepositoryError> {
+        use atomic_core::types::Base32;
+        let txn = self.pristine.read_txn().map_err(db)?;
+        let state = txn
+            .get_view(self.current_view())
+            .map_err(db)?
+            .ok_or_else(|| RepositoryError::ViewNotFound {
+                name: self.current_view().to_string(),
+            })?;
+        Ok(state.state.to_base32())
     }
 
     /// Cache side: replace this cache's tree and view with `skeleton`'s.

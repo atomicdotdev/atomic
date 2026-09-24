@@ -40,7 +40,13 @@ impl Command for Record {
         let header = header_builder.build();
 
         // Build record options
-        let options = self.build_options()?;
+        let mut options = self.build_options()?;
+        // A remote sandbox records against its cache and hands the change
+        // to the repository's owner; nothing is saved or applied here.
+        let remote = repo.is_remote_sandbox();
+        if remote {
+            options = options.save_to_store(false).apply_after_record(false);
+        }
 
         // If --all, first add all untracked files
         if self.all {
@@ -54,6 +60,11 @@ impl Command for Record {
                     print_warning(&format!("Failed to add '{}': {}", path.display(), e));
                 }
             }
+        }
+
+        if remote {
+            crate::commands::agent::owner::hydrate_remote_sandbox(&repo)
+                .map_err(CliError::Internal)?;
         }
 
         // Record the changes.
@@ -105,6 +116,21 @@ impl Command for Record {
                 | RE::Database(_)) => CliError::Internal(anyhow::anyhow!("{}", other)),
             }
         })?;
+
+        if remote {
+            let bytes = outcome
+                .v3_bytes()
+                .ok_or_else(|| CliError::Internal(anyhow::anyhow!("the change has no bytes")))?
+                .to_vec();
+            crate::commands::agent::owner::submit_from_remote_sandbox(
+                &repo,
+                *outcome.hash(),
+                bytes,
+            )
+            .map_err(CliError::Internal)?;
+            // What was just recorded is the new baseline.
+            repo.reindex_working_copy().map_err(CliError::Repository)?;
+        }
 
         // Display result
         let output = self.format_outcome(&repo, &outcome);

@@ -69,7 +69,9 @@ pub(crate) fn authorize(
     };
     match &frame.request {
         OwnerRequest::Ping => {}
-        OwnerRequest::Materialize { view: asked } => {
+        OwnerRequest::Materialize { view: asked }
+        | OwnerRequest::FileStates { view: asked, .. }
+        | OwnerRequest::SubmitChange { view: asked, .. } => {
             if asked.as_deref().is_some_and(|v| v != view) {
                 return Err(forbidden("that view"));
             }
@@ -268,14 +270,21 @@ where
     let render = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
         let repo = Repository::open_readonly(&root)?;
         let mut entries = 0u64;
+        let mut live = std::collections::BTreeSet::new();
         let rendered = repo.materialize_view_entries(&view, |entry| {
             entries += 1;
+            live.insert(entry.inode);
             tx.blocking_send(OwnerResponse::MaterializeEntry { entry })
                 .map_err(|_| ())
         })?;
         match rendered {
             Ok(snapshot) => {
-                let _ = tx.blocking_send(OwnerResponse::Materialized { snapshot, entries });
+                let skeleton = Box::new(repo.export_sandbox_skeleton(&view, &live)?);
+                let _ = tx.blocking_send(OwnerResponse::Materialized {
+                    snapshot,
+                    entries,
+                    skeleton,
+                });
                 Ok(())
             }
             Err(()) => Err(anyhow::anyhow!("the client went away")),
@@ -290,6 +299,81 @@ where
     }
 }
 
+/// `FileStates` and `SubmitChange`: the view is the token's (remote) or
+/// the one named (local).
+pub(crate) async fn record_request(
+    owner: &OwnerState,
+    grant: Option<Grant>,
+    request: OwnerRequest,
+) -> OwnerResponse {
+    let named = match &request {
+        OwnerRequest::FileStates { view, .. } | OwnerRequest::SubmitChange { view, .. } => {
+            view.clone()
+        }
+        _ => None,
+    };
+    let Some(view) = grant.map(|g| g.view).or(named) else {
+        return error("view", "name the view");
+    };
+    let root = owner.root.clone();
+    match request {
+        OwnerRequest::FileStates { inodes, .. } => {
+            let read = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+                let repo = Repository::open_readonly(&root)?;
+                Ok(repo.export_sandbox_slice(&view, &inodes)?)
+            });
+            match read.await {
+                Ok(Ok(slice)) => OwnerResponse::FileStates {
+                    slice: Box::new(slice),
+                },
+                Ok(Err(e)) => error("file-states", format!("{e:#}")),
+                Err(e) => error("internal", e.to_string()),
+            }
+        }
+        OwnerRequest::SubmitChange {
+            base_state,
+            hash,
+            bytes,
+            ..
+        } => {
+            let _one_at_a_time = owner.submissions.lock().await;
+            let write = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+                let repo =
+                    Repository::open_existing_wait(&root, std::time::Duration::from_secs(30))?;
+                match repo.insert_submitted_change(&view, &base_state, &hash, &bytes)? {
+                    Ok(submitted) => {
+                        let skeleton =
+                            repo.export_sandbox_skeleton(&view, &live_inodes(&repo, &view)?)?;
+                        Ok(Ok((submitted, skeleton)))
+                    }
+                    Err(rejection) => Ok(Err(rejection)),
+                }
+            });
+            match write.await {
+                Ok(Ok(Ok((submitted, skeleton)))) => OwnerResponse::ChangeSubmitted {
+                    submitted,
+                    skeleton: Box::new(skeleton),
+                },
+                Ok(Ok(Err(rejection))) => OwnerResponse::ChangeRefused { rejection },
+                Ok(Err(e)) => error("submit", format!("{e:#}")),
+                Err(e) => error("internal", e.to_string()),
+            }
+        }
+        other => error("internal", format!("not a record request: {other:?}")),
+    }
+}
+
+/// The inodes `view`'s tree holds.
+fn live_inodes(repo: &Repository, view: &str) -> anyhow::Result<std::collections::BTreeSet<u64>> {
+    let mut live = std::collections::BTreeSet::new();
+    repo.materialize_view_entries::<()>(view, |entry| {
+        live.insert(entry.inode);
+        Ok(())
+    })?
+    .map_err(|()| anyhow::anyhow!("unreachable"))?;
+    Ok(live)
+}
+
 /// Client side of `Materialize`: write the view's tree into `dir` and return
 /// how many entries it had. Files already at those paths are overwritten;
 /// nothing else in `dir` is touched.
@@ -297,7 +381,7 @@ pub(crate) async fn receive_materialized<S>(
     stream: &mut S,
     request_id: &str,
     dir: &Path,
-) -> anyhow::Result<u64>
+) -> anyhow::Result<(u64, atomic_repository::SandboxSkeleton)>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -350,12 +434,14 @@ where
                 }
                 written += 1;
             }
-            OwnerResponse::Materialized { entries, .. } => {
+            OwnerResponse::Materialized {
+                entries, skeleton, ..
+            } => {
                 stream.shutdown().await.ok();
                 if entries != written {
                     anyhow::bail!("owner sent {written} entries but said {entries}");
                 }
-                return Ok(written);
+                return Ok((written, *skeleton));
             }
             OwnerResponse::Error { code, message } => {
                 anyhow::bail!("database owner materialize failed [{code}]: {message}")
