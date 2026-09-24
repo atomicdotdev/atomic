@@ -125,6 +125,13 @@ pub struct Change {
     /// Useful for storing editor metadata, review comments, AI transcripts, etc.
     pub unhashed: Option<serde_json::Value>,
 
+    /// Optional Ed25519 signature over the change's content hash.
+    ///
+    /// Excluded from the change hash (the SIGNATURE section is unhashed), so
+    /// re-signing with a different key never changes the change's identity.
+    /// `None` for unsigned (legacy) changes.
+    pub signature: Option<format_v3::ChangeSignature>,
+
     /// Binary content blob
     ///
     /// This contains the actual file content referenced by hunks.
@@ -180,6 +187,7 @@ impl Change {
                 contents_hash,
             },
             unhashed: None,
+            signature: None,
             contents,
         }
     }
@@ -200,6 +208,7 @@ impl Change {
                 contents_hash: Hash::of(&[]),
             },
             unhashed: None,
+            signature: None,
             contents: Vec::new(),
         }
     }
@@ -326,6 +335,7 @@ impl Change {
         // 2. Compute section counts
         let has_provenance = !self.hashed.provenance.is_empty();
         let has_unhashed = self.unhashed.is_some();
+        let has_signature = self.signature.is_some();
         let has_content = !self.contents.is_empty();
 
         // Chunk content with FastCDC for delta transfer + parallel compression
@@ -361,6 +371,9 @@ impl Change {
         if has_unhashed {
             file_header_builder = file_header_builder.with_unhashed();
         }
+        if has_signature {
+            file_header_builder = file_header_builder.with_signature();
+        }
 
         let file_header = file_header_builder.build();
 
@@ -384,6 +397,12 @@ impl Change {
         // Write provenance if present
         if has_provenance {
             change_writer.write_provenance(&self.hashed.provenance)?;
+        }
+
+        // Write signature if present (unhashed section — does not affect the
+        // change hash; must be written while still in WRITING_METADATA state)
+        if let Some(ref signature) = self.signature {
+            change_writer.write_signature(signature)?;
         }
 
         // 6. Write GRAPH section(s) — compact graph ops
@@ -501,9 +520,13 @@ impl Change {
         let mut file_ops: Vec<FileOps> = Vec::new();
         let mut contents: Vec<u8> = Vec::new();
         let mut unhashed: Option<serde_json::Value> = None;
+        let mut signature: Option<format_v3::ChangeSignature> = None;
 
         while let Some(section) = change_reader.next_section()? {
             let section_type = section.section_type;
+            if std::env::var("ATOMIC_DEBUG_SECTIONS").is_ok() {
+                eprintln!("[sections] type={:?} len={}", section_type, section.payload.len());
+            }
             match section_type {
                 SectionType::Header => {
                     header = Some(section.deserialize().map_err(|error| {
@@ -559,6 +582,18 @@ impl Change {
                 SectionType::Unhashed => {
                     unhashed = Some(serde_json::from_slice(&section.payload)?);
                 }
+                SectionType::Signature => {
+                    if std::env::var("ATOMIC_DEBUG_SECTIONS").is_ok() {
+                        eprintln!("[sig] payload head: {:02x?}", &section.payload[..24.min(section.payload.len())]);
+                    }
+                    signature = Some(
+                        postcard::from_bytes(&section.payload).map_err(|error| {
+                            ChangeError::Invalid(format!(
+                                "failed to deserialize {section_type} section: {error}"
+                            ))
+                        })?,
+                    );
+                }
             }
         }
 
@@ -586,6 +621,7 @@ impl Change {
                 contents_hash,
             },
             unhashed,
+            signature,
             contents,
         };
 
@@ -595,6 +631,31 @@ impl Change {
     /// Check if this change depends on another change.
     pub fn depends_on(&self, hash: &Hash) -> bool {
         self.hashed.dependencies.contains(hash)
+    }
+
+    /// Sign this change in place with an Ed25519 secret key.
+    ///
+    /// Computes the change's content hash (unaffected by signatures — the
+    /// SIGNATURE section is unhashed), signs it, and attaches the signature.
+    /// The change's identity does not change.
+    ///
+    /// Used by record and revise paths that bypass the assemble/serialize
+    /// pipeline (e.g. `revise --reword`).
+    pub fn sign_with(
+        &mut self,
+        signer_did: &str,
+        secret_key_bytes: &[u8; 32],
+        timestamp: i64,
+    ) -> Result<Hash, ChangeError> {
+        let hash = self.hash()?;
+        let signature = crate::change::signing::sign_change(
+            signer_did,
+            secret_key_bytes,
+            &hash,
+            timestamp,
+        );
+        self.signature = Some(signature);
+        Ok(hash)
     }
 
     /// Check if this change knows about another change.

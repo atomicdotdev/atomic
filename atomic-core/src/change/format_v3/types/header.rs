@@ -27,11 +27,12 @@ use std::io::{Read, Write};
 /// | 0 | `HAS_PROVENANCE` | Provenance section is present |
 /// | 1 | `HAS_SEMANTIC` | Semantic sections are present |
 /// | 2 | `HAS_UNHASHED` | Unhashed section is present |
-/// | 3-31 | Reserved | Must be zero |
+/// | 3 | `HAS_SIGNATURE` | Signature section is present |
+/// | 4-31 | Reserved | Must be zero |
 ///
 /// # Forward Compatibility
 ///
-/// Readers MUST ignore unknown flags (bits 3-31). This allows newer writers
+/// Readers MUST ignore unknown flags (bits 4-31). This allows newer writers
 /// to set flags that older readers don't understand without breaking them.
 /// If a future flag requires breaking changes, the `version` field should
 /// be incremented instead.
@@ -51,8 +52,14 @@ impl FileHeaderFlags {
     /// Unhashed section is present in the file.
     pub const HAS_UNHASHED: u32 = 1 << 2;
 
+    /// Signature section is present in the file.
+    pub const HAS_SIGNATURE: u32 = 1 << 3;
+
     /// Mask of all known flags (for validation).
-    const KNOWN_MASK: u32 = Self::HAS_PROVENANCE | Self::HAS_SEMANTIC | Self::HAS_UNHASHED;
+    const KNOWN_MASK: u32 = Self::HAS_PROVENANCE
+        | Self::HAS_SEMANTIC
+        | Self::HAS_UNHASHED
+        | Self::HAS_SIGNATURE;
 
     /// Create flags from a raw `u32` value.
     ///
@@ -112,6 +119,9 @@ impl fmt::Display for FileHeaderFlags {
         }
         if self.has(Self::HAS_UNHASHED) {
             parts.push("UNHASHED");
+        }
+        if self.has(Self::HAS_SIGNATURE) {
+            parts.push("SIGNATURE");
         }
         if parts.is_empty() {
             write!(f, "(none)")
@@ -366,6 +376,9 @@ impl FileHeader {
         count += self.semantic_section_count;
         count += self.contents_chunks;
         if self.flags.has(FileHeaderFlags::HAS_UNHASHED) {
+            count += 1;
+        }
+        if self.flags.has(FileHeaderFlags::HAS_SIGNATURE) {
             count += 1;
         }
         count

@@ -1,7 +1,7 @@
 //! Query, statistics, and export operations for the redb change store.
 
 use atomic_core::change::format_v3::{
-    ChangeWriter, FileHeader, HashDedupTable, SectionType, WriterOptions,
+    ChangeSignature, ChangeWriter, FileHeader, HashDedupTable, SectionType, WriterOptions,
 };
 use atomic_core::change::Change;
 use atomic_core::pristine::tables;
@@ -400,6 +400,9 @@ impl RedbChangeStore {
         if meta.has_unhashed {
             file_header_builder = file_header_builder.with_unhashed();
         }
+        if meta.has_signature {
+            file_header_builder = file_header_builder.with_signature();
+        }
 
         let file_header = file_header_builder.build();
 
@@ -416,8 +419,26 @@ impl RedbChangeStore {
         // Write DEPS section
         writer.write_dependencies(&meta.dependency_indices)?;
 
-        // Write GRAPH sections
+        // Write SIGNATURE section (metadata phase — before GRAPH). The
+        // payload is the stored postcard ChangeSignature; decompress from
+        // CHANGE_SIGNATURES and write as the SIGNATURE section.
         let txn = self.db().begin_read()?;
+        {
+            let sig_table = txn.open_table(tables::CHANGE_SIGNATURES)?;
+            if let Some(value) = sig_table.get(hash)? {
+                let compressed = value.value();
+                let sig_bytes = zstd::decode_all(compressed).map_err(|e| {
+                    RedbStoreError::Corrupt(format!("signature decompression failed: {}", e))
+                })?;
+                let signature: ChangeSignature = postcard::from_bytes(&sig_bytes)
+                    .map_err(|e| {
+                        RedbStoreError::Corrupt(format!("signature deserialization failed: {}", e))
+                    })?;
+                writer.write_signature(&signature)?;
+            }
+        }
+
+        // Write GRAPH sections
         {
             let graph_table = txn.open_table(tables::CHANGE_GRAPH)?;
             for idx in 0..meta.graph_section_count {

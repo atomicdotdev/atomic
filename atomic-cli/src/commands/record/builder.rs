@@ -112,6 +112,55 @@ impl Record {
         Ok(None)
     }
 
+    /// Resolve the signing identity for this change.
+    ///
+    /// Mirrors `resolve_author`'s precedence: `--identity` flag, then
+    /// `--usage` default, then the global default identity. Loads the
+    /// identity's keypair from the store. Returns `None` when no identity is
+    /// available (the change records unsigned, with a warning).
+    pub(super) fn resolve_signing_identity(
+        &self,
+    ) -> CliResult<Option<atomic_repository::record::SigningIdentity>> {
+        use atomic_canonical::did::did_for_public_key;
+
+        let store = match IdentityStore::open_default() {
+            Ok(store) => store,
+            Err(_) => return Ok(None),
+        };
+
+        // 1. --identity flag
+        let identity = if let Some(identity_name) = &self.identity {
+            store
+                .load_by_name(identity_name)
+                .map_err(|_| CliError::IdentityNotFound(identity_name.clone()))?
+        // 2. --usage default
+        } else if let Some(usage_str) = &self.usage {
+            let usage = IdentityUsage::parse(usage_str);
+            match store.get_default_for_usage(&usage) {
+                Ok(Some(identity)) => identity,
+                _ => return Ok(None),
+            }
+        // 3. Global default
+        } else {
+            match store.get_default() {
+                Ok(Some(identity)) => identity,
+                _ => return Ok(None),
+            }
+        };
+
+        // Load the private key. A verification-only identity (no secret key
+        // on disk) cannot sign — record unsigned rather than fail.
+        let keypair = match store.load_keypair(&identity.id, None) {
+            Ok(keypair) => keypair,
+            Err(_) => return Ok(None),
+        };
+
+        Ok(Some(atomic_repository::record::SigningIdentity {
+            signer_did: did_for_public_key(&identity.public_key),
+            secret_key: *keypair.secret.as_bytes(),
+        }))
+    }
+
     /// Get the commit message, potentially from editor.
     pub(super) fn get_message(&self) -> CliResult<String> {
         // If message was provided, use it
