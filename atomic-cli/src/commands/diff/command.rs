@@ -228,7 +228,8 @@ impl Command for Diff {
         // is about to compare against, so it opens writable.
         let repo = if atomic_repository::remote_cache_root(&repo_root).is_dir() {
             let repo = Repository::open(&repo_root).map_err(CliError::Repository)?;
-            crate::commands::hydrate_if_remote(&repo)?;
+            repo.hydrate_remote_sandbox()
+                .map_err(CliError::Repository)?;
             repo
         } else {
             crate::commands::open_readonly_repository(&repo_root).map_err(|e| {

@@ -279,3 +279,96 @@ fn a_remote_sandbox_reaches_its_view_through_the_owner_and_nothing_else() {
     );
     assert!(refused.contains("unauthorized"), "{refused}");
 }
+
+fn hook(cwd: &Path, verb: &str, payload: Value) -> Output {
+    use std::io::Write;
+    let mut child = Command::new(env!("CARGO_BIN_EXE_atomic"))
+        .args(["agent", "hooks", "sherpa", verb])
+        .current_dir(cwd)
+        .env("ATOMIC_OWNER_IROH_OFFLINE", "1")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("run atomic agent hooks");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(payload.to_string().as_bytes())
+        .unwrap();
+    child.wait_with_output().unwrap()
+}
+
+#[test]
+fn an_agent_turn_in_a_remote_sandbox_lands_with_its_provenance() {
+    let host = TempDir::new().unwrap();
+    repository(host.path());
+    let _owner = Owner(host.path());
+    let vm = TempDir::new().unwrap();
+    let vm_dir = vm.path().join("work");
+    ok(
+        atomic(
+            host.path(),
+            &[
+                "sandbox",
+                "create",
+                "exp-1",
+                "--remote",
+                "--view",
+                "dev",
+                "--dest",
+                vm_dir.to_str().unwrap(),
+            ],
+        ),
+        "sandbox create --remote",
+    );
+    ok(atomic(&vm_dir, &["sandbox", "materialize"]), "materialize");
+
+    let cwd = vm_dir.to_str().unwrap();
+    let now = "2026-01-01T00:00:00Z";
+    let turn = |n: u32| {
+        serde_json::json!({
+            "session_id": "agent-session", "cwd": cwd, "model": "m", "provider": "p",
+            "turn_number": n, "intent_title": "greet the reader", "timestamp": now,
+        })
+    };
+    ok(
+        hook(
+            &vm_dir,
+            "session-start",
+            serde_json::json!({
+                "session_id": "agent-session", "cwd": cwd, "model": "m", "provider": "p",
+                "turn_number": 0, "timestamp": now,
+            }),
+        ),
+        "session-start",
+    );
+    ok(hook(&vm_dir, "turn-start", turn(1)), "turn-start");
+    std::fs::write(vm_dir.join("README.md"), "hello\nreader\n").unwrap();
+    ok(hook(&vm_dir, "turn-end", turn(1)), "turn-end");
+    ok(
+        hook(
+            &vm_dir,
+            "session-end",
+            serde_json::json!({
+                "session_id": "agent-session", "cwd": cwd, "turn_number": 1, "timestamp": now,
+            }),
+        ),
+        "session-end",
+    );
+
+    // The turn's change is on the view, and its provenance is in the
+    // repository — not only in the sandbox.
+    let log = ok(atomic(host.path(), &["log"]), "host log");
+    assert!(log.contains("greet the reader"), "{log}");
+    let session = ok(
+        atomic(host.path(), &["session", "show", "agent-session"]),
+        "host session",
+    );
+    assert!(session.contains("Turns: 1"), "{session}");
+    assert!(
+        session.contains("Goal marker: greet the reader"),
+        "{session}"
+    );
+}
