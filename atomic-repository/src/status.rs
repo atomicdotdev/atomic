@@ -89,8 +89,10 @@ use crate::ignore::IgnoreRules;
 
 // Constants
 
-/// Patterns that are always ignored (internal directories)
-const ALWAYS_IGNORED: &[&str] = &[".atomic", ".git"];
+/// Patterns that are always ignored: internal directories, and a sandbox's
+/// pointer and local cache — the pointer can carry a credential, and neither
+/// belongs in history.
+const ALWAYS_IGNORED: &[&str] = &[".atomic", ".git", ".atomic-sandbox", ".atomic-sandbox.d"];
 
 // Error Types
 
@@ -1255,10 +1257,15 @@ mod tests {
         assert!(is_always_ignored(Path::new("src/.atomic/test")));
         assert!(is_always_ignored(Path::new(".git")));
         assert!(is_always_ignored(Path::new(".git/objects")));
+        assert!(is_always_ignored(Path::new(".atomic-sandbox")));
+        assert!(is_always_ignored(Path::new(
+            ".atomic-sandbox.d/pristine.redb"
+        )));
 
         assert!(!is_always_ignored(Path::new("src")));
         assert!(!is_always_ignored(Path::new("src/main.rs")));
         assert!(!is_always_ignored(Path::new("atomic")));
+        assert!(!is_always_ignored(Path::new(".atomic-sandbox-notes")));
     }
 
     #[test]
