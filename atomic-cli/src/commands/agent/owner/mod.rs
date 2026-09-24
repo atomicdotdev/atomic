@@ -218,6 +218,12 @@ enum OwnerRequest {
         view: Option<String>,
         inodes: Vec<u64>,
     },
+    /// The change files of `hashes`, each on the view.
+    Changes {
+        #[serde(default)]
+        view: Option<String>,
+        hashes: Vec<Hash>,
+    },
     /// A change a sandbox recorded against `base_state`, as its V3 bytes.
     SubmitChange {
         #[serde(default)]
@@ -227,6 +233,14 @@ enum OwnerRequest {
         #[serde(with = "base64_bytes")]
         bytes: Vec<u8>,
     },
+}
+
+/// A change file on the wire.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct WireChange {
+    hash: Hash,
+    #[serde(with = "base64_bytes")]
+    bytes: Vec<u8>,
 }
 
 /// Bytes as base64 in the JSON frames.
@@ -322,6 +336,9 @@ pub(crate) enum OwnerResponse {
     },
     ChangeRefused {
         rejection: atomic_repository::SubmitRejection,
+    },
+    Changes {
+        changes: Vec<WireChange>,
     },
     Error {
         code: String,
@@ -1114,6 +1131,31 @@ pub(crate) fn hydrate_remote_sandbox(repo: &Repository) -> anyhow::Result<()> {
     }
 }
 
+/// In a remote sandbox: fetch the change files its view has and it
+/// doesn't (for `log` and anything else that reads changes).
+pub(crate) fn fetch_remote_sandbox_changes(repo: &Repository) -> anyhow::Result<usize> {
+    let missing = repo.missing_sandbox_changes()?;
+    for batch in missing.chunks(32) {
+        match request(
+            repo.root(),
+            OwnerRequest::Changes {
+                view: None,
+                hashes: batch.to_vec(),
+            },
+        )? {
+            OwnerResponse::Changes { changes } => {
+                let changes: Vec<_> = changes.into_iter().map(|c| (c.hash, c.bytes)).collect();
+                repo.hold_sandbox_changes(&changes)?;
+            }
+            OwnerResponse::ChangeRefused { rejection } => {
+                return Err(anyhow!("the repository refused: {rejection}"))
+            }
+            other => return Err(unexpected_response("changes", other)),
+        }
+    }
+    Ok(missing.len())
+}
+
 /// In a remote sandbox: hand a recorded change to the repository's owner.
 /// On success the cache takes the view as it now is.
 pub(crate) fn submit_from_remote_sandbox(
@@ -1559,6 +1601,7 @@ fn handle_request(store: &RedbChangeStore, frame: RequestFrame) -> (ResponseFram
         | OwnerRequest::CloseSandbox { .. }
         | OwnerRequest::Materialize { .. }
         | OwnerRequest::FileStates { .. }
+        | OwnerRequest::Changes { .. }
         | OwnerRequest::SubmitChange { .. } => (
             OwnerResponse::Error {
                 code: "internal".to_string(),
@@ -1683,7 +1726,9 @@ where
             let response = sandbox::admin(&owner, request.request.clone()).await;
             write_frame(&mut stream, &respond(request.request_id, response)).await?;
         }
-        OwnerRequest::FileStates { .. } | OwnerRequest::SubmitChange { .. }
+        OwnerRequest::FileStates { .. }
+        | OwnerRequest::Changes { .. }
+        | OwnerRequest::SubmitChange { .. }
             if request.version == PROTOCOL_VERSION =>
         {
             let request_id = request.request_id.clone();

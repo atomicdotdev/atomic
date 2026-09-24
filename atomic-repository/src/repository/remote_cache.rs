@@ -78,6 +78,9 @@ pub enum SubmitRejection {
     AlreadyPresent(String),
 }
 
+/// A change file: its hash and V3 bytes.
+pub type ChangeFile = (Hash, Vec<u8>);
+
 /// A submitted change, applied.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Submitted {
@@ -292,6 +295,73 @@ impl Repository {
             hash: *hash,
             state: outcome.new_state.to_base32(),
         }))
+    }
+
+    /// Serve side: the V3 bytes of each of `hashes` — changes `view` can
+    /// see, and only those (anything else is refused, whole).
+    pub fn export_sandbox_changes(
+        &self,
+        view: &str,
+        hashes: &[Hash],
+    ) -> Result<Result<Vec<ChangeFile>, SubmitRejection>, RepositoryError> {
+        use atomic_core::types::Base32;
+        let txn = self.pristine.read_txn().map_err(db)?;
+        let state =
+            txn.get_view(view)
+                .map_err(db)?
+                .ok_or_else(|| RepositoryError::ViewNotFound {
+                    name: view.to_string(),
+                })?;
+        let visible = super::collect_visible_change_ids(&txn, &state)?;
+        let mut out = Vec::with_capacity(hashes.len());
+        for hash in hashes {
+            match txn.get_internal(hash).map_err(db)? {
+                Some(id) if visible.contains(&id) => {}
+                _ => return Ok(Err(SubmitRejection::ForeignChange(hash.to_base32()))),
+            }
+            out.push((*hash, std::fs::read(self.change_store.change_path(hash))?));
+        }
+        Ok(Ok(out))
+    }
+
+    /// Cache side: the changes the view has that this cache holds no file
+    /// for.
+    pub fn missing_sandbox_changes(&self) -> Result<Vec<Hash>, RepositoryError> {
+        let txn = self.pristine.read_txn().map_err(db)?;
+        let state = txn
+            .get_view(self.current_view())
+            .map_err(db)?
+            .ok_or_else(|| RepositoryError::ViewNotFound {
+                name: self.current_view().to_string(),
+            })?;
+        let mut missing = Vec::new();
+        for id in super::collect_visible_change_ids(&txn, &state)? {
+            if let Some(hash) = txn.get_external(id).map_err(db)? {
+                if !self.change_store.has_change(&hash) {
+                    missing.push(hash);
+                }
+            }
+        }
+        Ok(missing)
+    }
+
+    /// Cache side: keep change files the owner sent — each only if its
+    /// bytes hash to what it claims.
+    pub fn hold_sandbox_changes(&self, changes: &[ChangeFile]) -> Result<(), RepositoryError> {
+        use atomic_core::types::Base32;
+        for (hash, bytes) in changes {
+            let (change, computed) = atomic_core::change::Change::deserialize(&mut &bytes[..])
+                .map_err(|e| RepositoryError::Database(e.to_string()))?;
+            if computed != *hash {
+                return Err(RepositoryError::Database(format!(
+                    "the owner sent {} as {}",
+                    computed.to_base32(),
+                    hash.to_base32()
+                )));
+            }
+            self.save_change_bytes(hash, bytes, &change)?;
+        }
+        Ok(())
     }
 
     /// Cache side: the view's state as the cache has it (base32) — what a

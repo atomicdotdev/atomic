@@ -192,6 +192,32 @@ fn a_remote_sandbox_reaches_its_view_through_the_owner_and_nothing_else() {
         atomic(&vm_dir, &["record", "-a", "-m", "again from the sandbox"]),
         "second record in the sandbox",
     );
+    // Reading the recorded state works in the sandbox too: diff against
+    // the view, restore from it, and the view's history.
+    std::fs::write(
+        vm_dir.join("README.md"),
+        "hello\nfrom the sandbox\nuncommitted\n",
+    )
+    .unwrap();
+    let diff = ok(atomic(&vm_dir, &["diff"]), "diff in the sandbox");
+    assert!(
+        diff.contains("+uncommitted") && !diff.contains("+hello"),
+        "{diff}"
+    );
+    ok(
+        atomic(&vm_dir, &["restore", "README.md"]),
+        "restore in the sandbox",
+    );
+    assert_eq!(
+        std::fs::read_to_string(vm_dir.join("README.md")).unwrap(),
+        "hello\nfrom the sandbox\n"
+    );
+    let log = ok(atomic(&vm_dir, &["log"]), "log in the sandbox");
+    assert!(
+        log.contains("again from the sandbox") && log.contains("first"),
+        "{log}"
+    );
+
     let log = ok(atomic(host.path(), &["log"]), "host log");
     assert!(
         log.contains("from the sandbox") && log.contains("again from the sandbox"),
