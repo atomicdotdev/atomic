@@ -358,6 +358,17 @@ pub fn open_repository(path: Option<&Path>) -> CliResult<Repository> {
     Repository::open(&repo_path).map_err(CliError::from)
 }
 
+/// In a remote sandbox, load what reading the working tree's recorded
+/// state needs (old content for `diff`, `restore`) into its cache; the cache
+/// holds a view's rows, not its content, until a command asks. Elsewhere,
+/// nothing.
+pub fn hydrate_if_remote(repo: &Repository) -> CliResult<()> {
+    if repo.is_remote_sandbox() {
+        agent::owner::hydrate_remote_sandbox(repo).map_err(CliError::Internal)?;
+    }
+    Ok(())
+}
+
 /// Acquire a read-only repository for a CLI query, allowing short-lived writers
 /// (such as Stop checkpoint publication) to finish first. Only typed database
 /// contention is retried, for at most ten seconds; all other errors propagate

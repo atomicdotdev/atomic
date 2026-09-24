@@ -71,6 +71,7 @@ pub(crate) fn authorize(
         OwnerRequest::Ping => {}
         OwnerRequest::Materialize { view: asked }
         | OwnerRequest::FileStates { view: asked, .. }
+        | OwnerRequest::Changes { view: asked, .. }
         | OwnerRequest::SubmitChange { view: asked, .. } => {
             if asked.as_deref().is_some_and(|v| v != view) {
                 return Err(forbidden("that view"));
@@ -307,9 +308,9 @@ pub(crate) async fn record_request(
     request: OwnerRequest,
 ) -> OwnerResponse {
     let named = match &request {
-        OwnerRequest::FileStates { view, .. } | OwnerRequest::SubmitChange { view, .. } => {
-            view.clone()
-        }
+        OwnerRequest::FileStates { view, .. }
+        | OwnerRequest::Changes { view, .. }
+        | OwnerRequest::SubmitChange { view, .. } => view.clone(),
         _ => None,
     };
     let Some(view) = grant.map(|g| g.view).or(named) else {
@@ -327,6 +328,23 @@ pub(crate) async fn record_request(
                     slice: Box::new(slice),
                 },
                 Ok(Err(e)) => error("file-states", format!("{e:#}")),
+                Err(e) => error("internal", e.to_string()),
+            }
+        }
+        OwnerRequest::Changes { hashes, .. } => {
+            let read = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+                let repo = Repository::open_readonly(&root)?;
+                Ok(repo.export_sandbox_changes(&view, &hashes)?)
+            });
+            match read.await {
+                Ok(Ok(Ok(changes))) => OwnerResponse::Changes {
+                    changes: changes
+                        .into_iter()
+                        .map(|(hash, bytes)| super::WireChange { hash, bytes })
+                        .collect(),
+                },
+                Ok(Ok(Err(rejection))) => OwnerResponse::ChangeRefused { rejection },
+                Ok(Err(e)) => error("changes", format!("{e:#}")),
                 Err(e) => error("internal", e.to_string()),
             }
         }
