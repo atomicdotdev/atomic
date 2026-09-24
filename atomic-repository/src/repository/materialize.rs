@@ -1083,6 +1083,35 @@ mod serde_bytes_vec {
 }
 
 impl Repository {
+    /// The entries `view_name` has, from TREE as that view projects it.
+    ///
+    /// TREE is the checked-out view's projection; another view's structural
+    /// operations (files it added, moved or deleted) wait in the deferred
+    /// tree journal until a switch applies them. For another view they are
+    /// applied here in a write transaction that is thrown away, so the
+    /// listing is that view's and nothing on disk changes. A read-only handle
+    /// can't do that and lists TREE as it is.
+    fn view_tree_items(
+        &self,
+        txn: &atomic_core::pristine::ReadTxn,
+        view_name: &str,
+        options: &atomic_core::output::repo::MaterializeOptions,
+    ) -> Result<Vec<atomic_core::output::repo::OutputItem>, RepositoryError> {
+        use atomic_core::output::repo::collect_children;
+        let db = |e: atomic_core::pristine::PristineError| RepositoryError::Database(e.to_string());
+        if view_name != self.current_view {
+            let journal = self.load_deferred_tree_journal()?;
+            if let Ok(mut projected) = self.pristine.write_txn() {
+                self.apply_deferred_tree_ops_in_txn(&mut projected, &journal, view_name)?;
+                let items = collect_children(&projected, Inode::ROOT, "", options).map_err(db)?;
+                use atomic_core::pristine::MutTxnT;
+                projected.abort().map_err(db)?;
+                return Ok(items);
+            }
+        }
+        collect_children(txn, Inode::ROOT, "", options).map_err(db)
+    }
+
     /// Render every entry of `view` and hand each to `sink`, in path order
     /// (a directory before what it contains), touching nothing: no working
     /// tree, no stat cache, no conflict state. Read-only, so it runs beside
@@ -1096,7 +1125,7 @@ impl Repository {
         view_name: &str,
         mut sink: impl FnMut(ViewEntry) -> Result<(), E>,
     ) -> Result<Result<ViewSnapshot, E>, RepositoryError> {
-        use atomic_core::output::repo::{collect_children, MaterializeOptions};
+        use atomic_core::output::repo::MaterializeOptions;
         use atomic_core::types::Base32;
         use rayon::prelude::*;
 
@@ -1114,8 +1143,7 @@ impl Repository {
             })?;
         let change_filter_arc = Arc::new(collect_visible_change_ids(&txn, &view)?);
         let options = MaterializeOptions::new().with_change_filter_arc(change_filter_arc.clone());
-        let mut items = collect_children(&txn, Inode::ROOT, "", &options)
-            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        let mut items = self.view_tree_items(&txn, view_name, &options)?;
         items.sort_by(|a, b| a.path.cmp(&b.path));
 
         let visible = |item: &atomic_core::output::repo::OutputItem| {
@@ -1249,7 +1277,7 @@ fn render_view_file<C: atomic_core::change::ChangeStore>(
     // in a single range scan, then run retrieve_graph over the
     // in-memory HashMap. O(M) scan + O(1) lookups vs O(V×log N)
     // individual B-tree probes.
-    let preloaded = InodePreloadTxn::from_table(&txn, item.inode, &inode_graph_table)
+    let preloaded = InodePreloadTxn::from_table(txn, item.inode, inode_graph_table)
         .map_err(|e| format!("{}: preload: {:?}", item.path, e))?;
 
     let t_retrieve = std::time::Instant::now();
@@ -1294,10 +1322,10 @@ fn render_view_file<C: atomic_core::change::ChangeStore>(
     // surfaced instead of silently collapsed (rubric A12).
     let content = match name_conflicts.get(&item.path) {
         Some(sides) => render_name_conflict(
-            &txn,
+            txn,
             store,
-            &inode_graph_table,
-            &change_filter_arc,
+            inode_graph_table,
+            change_filter_arc,
             &item.path,
             sides,
         )
