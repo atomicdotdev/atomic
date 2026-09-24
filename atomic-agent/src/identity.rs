@@ -125,7 +125,20 @@ pub fn resolve_agent_author(options: &AgentAuthorOptions<'_>) -> Author {
         return author;
     }
 
-    // Otherwise: plus-tag the human's identity. Legible, not provable.
+    // An agent identity was named but can't be used (missing, not an agent,
+    // unreadable). Never fall back to the human's key then: that would put a
+    // person's key on work they didn't do, exactly when the caller said it
+    // was an agent's. Record it unkeyed — honestly anonymous — instead.
+    if requested_agent_identity(options).is_some() {
+        log::warn!(
+            "agent identity {:?} is not usable; recording without a key rather than as the human",
+            requested_agent_identity(options)
+        );
+        return fallback_agent_author(options);
+    }
+
+    // No agent identity asked for: plus-tag the human's identity. Legible,
+    // not provable.
     match load_default_user_identity(options.identity_dir.as_deref()) {
         Some(user) => derive_agent_author(&user, options),
         None => fallback_agent_author(options),
@@ -173,13 +186,19 @@ pub const AGENT_IDENTITY_ENV: &str = "ATOMIC_AGENT_IDENTITY";
 /// unreadable. Recording a turn must not break because an agent identity was
 /// mistyped; falling back to the plus-tag author keeps the work attributed to
 /// *someone* and leaves a debug log explaining why it is not keyed.
-fn delegated_agent_author(options: &AgentAuthorOptions<'_>) -> Option<Author> {
-    let name = options
+/// The agent identity the caller asked for, explicitly or via
+/// `ATOMIC_AGENT_IDENTITY`.
+fn requested_agent_identity(options: &AgentAuthorOptions<'_>) -> Option<String> {
+    options
         .agent_identity
         .clone()
         .or_else(|| std::env::var(AGENT_IDENTITY_ENV).ok())
         .map(|n| n.trim().to_string())
-        .filter(|n| !n.is_empty())?;
+        .filter(|n| !n.is_empty())
+}
+
+fn delegated_agent_author(options: &AgentAuthorOptions<'_>) -> Option<Author> {
+    let name = requested_agent_identity(options)?;
 
     let store = match options.identity_dir.as_deref() {
         Some(dir) => atomic_identity::IdentityStore::open(dir),
@@ -782,6 +801,40 @@ mod tests {
         // And the public entry point still produces a usable author.
         let author = resolve_agent_author(&options);
         assert_eq!(author.name, "Claude Code");
+    }
+
+    /// Named but unusable, with a human default present: the work must not
+    /// be put on the human's key.
+    #[test]
+    fn an_unusable_agent_identity_never_falls_back_to_the_human_key() {
+        use atomic_identity::{Identity, IdentityStore, KeyPair};
+
+        let dir = TempDir::new().unwrap();
+        let mut store = IdentityStore::open(dir.path()).unwrap();
+        let key = KeyPair::generate();
+        let human = Identity::builder("alice")
+            .email("alice@example.com")
+            .public_key(key.public.clone())
+            .build()
+            .unwrap();
+        store.save_with_keypair(&human, &key, None).unwrap();
+        store.set_default(&human.id).unwrap();
+
+        for requested in ["nobody+here", "alice"] {
+            let author = resolve_agent_author(&AgentAuthorOptions {
+                agent_name: "claude-code",
+                agent_display_name: "Claude Code",
+                session_id: "sess1234",
+                identity_dir: Some(dir.path().to_path_buf()),
+                agent_identity: Some(requested.to_string()),
+            });
+            assert_ne!(
+                author.identity.as_deref(),
+                Some(human.public_key_base32().as_str()),
+                "{requested}: agent work must not carry the human's key"
+            );
+            assert_eq!(author.name, "Claude Code");
+        }
     }
 
     /// No agent identity configured: unchanged behavior.
