@@ -345,6 +345,7 @@ dependencies = [
  "atomic-identity",
  "atomic-semantic",
  "chrono",
+ "data-encoding",
  "dirs",
  "flate2",
  "fs2",

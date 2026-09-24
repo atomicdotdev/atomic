@@ -79,6 +79,7 @@ use crate::RepositoryError;
 mod deferred_tree;
 mod filter;
 mod materialize;
+pub use materialize::{ViewEntry, ViewEntryKind, ViewSnapshot};
 mod sandbox;
 mod semantic_materialize;
 mod split;
