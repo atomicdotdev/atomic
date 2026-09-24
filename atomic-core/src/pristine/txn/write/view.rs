@@ -28,13 +28,26 @@ impl<'a> ViewTxnT for WriteTxn<'a> {
         }
     }
 
-    fn list_views(&self) -> PristineResult<Vec<String>> {
+    fn snapshot_views(&self) -> PristineResult<Vec<(String, ViewState)>> {
         let table = self.txn.open_table(VIEWS)?;
-        let mut names = Vec::new();
-        for (k, _) in table.iter()?.filter_map(|r| r.ok()) {
-            names.push(k.value().to_string());
+        let mut rows = Vec::new();
+        for entry in table.iter()? {
+            let (name, value) = entry?;
+            rows.push((
+                name.value().to_string(),
+                deserialize_view_state(value.value())?,
+            ));
         }
-        Ok(names)
+        rows.sort_by(|left, right| left.0.cmp(&right.0));
+        Ok(rows)
+    }
+
+    fn list_views(&self) -> PristineResult<Vec<String>> {
+        Ok(self
+            .snapshot_views()?
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect())
     }
 
     fn get_conflicts(&self, view_id: u64, inode: u64) -> PristineResult<Vec<StoredConflict>> {
@@ -61,6 +74,22 @@ impl<'a> ViewTxnT for WriteTxn<'a> {
             }
         }
         Ok(out)
+    }
+
+    fn snapshot_conflicts(&self) -> PristineResult<Vec<(u64, Inode, Vec<StoredConflict>)>> {
+        let table = self.txn.open_table(CONFLICTS)?;
+        let mut rows = Vec::new();
+        for entry in table.iter()? {
+            let (key, value) = entry?;
+            let (view_id, inode) = decode_view_seq(key.value());
+            rows.push((
+                view_id,
+                Inode::new(inode),
+                deserialize_conflicts(value.value())?,
+            ));
+        }
+        rows.sort_by_key(|(view_id, inode, _)| (*view_id, *inode));
+        Ok(rows)
     }
 
     fn get_change_seq(&self, view: &ViewState, change_id: NodeId) -> PristineResult<Option<u64>> {

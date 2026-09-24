@@ -110,6 +110,9 @@ impl Command for Create {
     fn run(&self) -> CliResult<()> {
         let root = find_repository_root()?;
         let mut repo = Repository::open(&root).map_err(CliError::Repository)?;
+        let working_copy = repo
+            .require_working_copy_id()
+            .map_err(CliError::Repository)?;
 
         let dest = self
             .dest
@@ -131,15 +134,15 @@ impl Command for Create {
                 .map_err(CliError::Repository)?;
             (self.name.clone(), true)
         } else {
-            let v = self
-                .view
-                .clone()
-                .unwrap_or_else(|| repo.current_view().to_string());
+            let v = self.view.clone().unwrap_or(
+                repo.desired_view_name(working_copy)
+                    .map_err(CliError::Repository)?,
+            );
             (v, false)
         };
 
         let count = repo
-            .provision_sandbox(&dest, &view)
+            .provision_sandbox(working_copy, &dest, &view)
             .map_err(CliError::Repository)?;
 
         println!("Sandbox '{}' created", self.name);

@@ -2,6 +2,32 @@ use super::*;
 use crate::record::RecordOptions;
 
 #[test]
+fn test_record_all_includes_untracked_without_pre_add() {
+    let (temp_dir, repo) = create_temp_repo();
+    std::fs::write(temp_dir.path().join("untracked.txt"), b"new content\n").unwrap();
+
+    let outcome = repo
+        .record(
+            ChangeHeader::new("record all"),
+            RecordOptions::new()
+                .with_all(true)
+                .include_untracked(true)
+                .save_to_store(true)
+                .apply_after_record(true),
+        )
+        .unwrap();
+
+    assert!(outcome.change().hunks().iter().any(
+        |operation| matches!(operation, GraphOp::FileAdd { path, .. } if path == "untracked.txt")
+    ));
+    assert!(repo.is_tracked("untracked.txt").unwrap());
+    assert!(repo
+        .status(crate::status::StatusOptions::default())
+        .unwrap()
+        .is_clean());
+}
+
+#[test]
 fn test_write_recorded_creates_tree_entries() {
     let (temp_dir, repo) = create_temp_repo();
 

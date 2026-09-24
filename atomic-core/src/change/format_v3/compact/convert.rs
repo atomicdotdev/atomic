@@ -5,7 +5,7 @@
 //! operation. They live in a separate file to keep `compactor.rs` under
 //! the 500-line limit.
 
-use super::super::error::FormatResult;
+use super::super::error::{FormatError, FormatResult};
 use super::compactor::Compactor;
 use super::graph_op::CompactGraphOp;
 
@@ -24,6 +24,11 @@ impl<'t> Compactor<'t> {
     /// Returns an error if any hash referenced by the graph operation
     /// is not found in the dedup table.
     pub fn compact_graph_op(&self, op: &GraphOp<Option<Hash>>) -> FormatResult<CompactGraphOp> {
+        op.validate_serialized_name_conflict()
+            .map_err(|reason| FormatError::InvalidGraphOp {
+                operation: op.type_name(),
+                reason,
+            })?;
         match op {
             GraphOp::FileAdd {
                 add_name,
@@ -165,6 +170,12 @@ impl<'t> Compactor<'t> {
                 name: self.compact_edge_update(name)?,
                 inode: self.compact_edge_update(inode)?,
             }),
+
+            GraphOp::SetAttr { inode, path, value } => Ok(CompactGraphOp::SetAttr {
+                inode: self.compact_position(inode)?,
+                path: path.clone(),
+                value: *value,
+            }),
         }
     }
 
@@ -179,7 +190,12 @@ impl<'t> Compactor<'t> {
     /// Returns an error if any hash index in the compact operation
     /// is out of bounds for the dedup table.
     pub fn expand_graph_op(&self, op: &CompactGraphOp) -> FormatResult<GraphOp<Option<Hash>>> {
-        match op {
+        op.validate_serialized_name_conflict()
+            .map_err(|reason| FormatError::InvalidGraphOp {
+                operation: op.type_name(),
+                reason,
+            })?;
+        let expanded: FormatResult<GraphOp<Option<Hash>>> = match op {
             CompactGraphOp::FileAdd {
                 add_name,
                 add_inode,
@@ -320,6 +336,20 @@ impl<'t> Compactor<'t> {
                 name: self.expand_edge_update(name)?,
                 inode: self.expand_edge_update(inode)?,
             }),
-        }
+
+            CompactGraphOp::SetAttr { inode, path, value } => Ok(GraphOp::SetAttr {
+                inode: self.expand_position(inode)?,
+                path: path.clone(),
+                value: *value,
+            }),
+        };
+        let expanded = expanded?;
+        expanded
+            .validate_serialized_name_conflict()
+            .map_err(|reason| FormatError::InvalidGraphOp {
+                operation: expanded.type_name(),
+                reason,
+            })?;
+        Ok(expanded)
     }
 }

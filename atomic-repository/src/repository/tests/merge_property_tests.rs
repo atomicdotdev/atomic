@@ -6,11 +6,11 @@
 //! seeded, reproducible generator so a failure prints the seed and case.
 //!
 //! Laws exercised:
-//!   * round-trip identity — record → retrieve reproduces the exact bytes
-//!   * commutation         — disjoint edits merge to the same bytes in any
-//!                           insert order, matching an independent oracle
-//!   * idempotence         — re-inserting a present change is a no-op
-//!   * honesty             — status ⇔ on-disk markers ⇔ list_conflicts
+//! * round-trip identity — record → retrieve reproduces the exact bytes
+//! * commutation — disjoint edits merge to the same bytes in any insert order,
+//!   matching an independent oracle
+//! * idempotence — re-inserting a present change is a no-op
+//! * honesty — status ⇔ on-disk markers ⇔ list_conflicts
 //!
 //! The commutation oracle is a plain line-replacement computed here, NOT a
 //! call back into the code under test, so a bug cannot satisfy the property
@@ -26,11 +26,12 @@ use rand::{Rng, SeedableRng};
 
 /// Fixed default seed so the suite is deterministic. Printed in every failure
 /// message; override locally to reproduce a shrunk case.
-const SEED: u64 = 0x5EED_A70_C0FFEE;
+const SEED: u64 = 0x0005_EEDA_70C0_FFEE;
 
 fn record_all(repo: &Repository, message: &str) -> Result<RecordOutcome, RecordError> {
     let header = ChangeHeader::new(message);
     repo.record(
+        repo.require_working_copy_id().unwrap(),
         header,
         RecordOptions::new()
             .with_all(true)
@@ -156,12 +157,20 @@ fn build_commuting(
 
     repo.create_view_from("va", "dev").unwrap();
     repo.switch_view("va").unwrap();
-    std::fs::write(&file, assemble(&apply_line_edits(base, &[edit_a.clone()]))).unwrap();
+    std::fs::write(
+        &file,
+        assemble(&apply_line_edits(base, std::slice::from_ref(&edit_a))),
+    )
+    .unwrap();
     record_all(&repo, "edit a").unwrap();
 
     repo.create_view_from("vb", "dev").unwrap();
     repo.switch_view("vb").unwrap();
-    std::fs::write(&file, assemble(&apply_line_edits(base, &[edit_b.clone()]))).unwrap();
+    std::fs::write(
+        &file,
+        assemble(&apply_line_edits(base, std::slice::from_ref(&edit_b))),
+    )
+    .unwrap();
     record_all(&repo, "edit b").unwrap();
 
     repo.switch_view("dev").unwrap();

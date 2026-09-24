@@ -6,6 +6,7 @@ impl Repository {
     ///
     /// # Arguments
     ///
+    /// * `working_copy` - Validated identity of the source working directory
     /// * `destination` - Path to the output archive or directory
     /// * `options` - Options controlling archive creation
     ///
@@ -17,22 +18,25 @@ impl Repository {
     ///
     /// ```rust,ignore
     /// // Archive to a tarball
-    /// let outcome = repo.archive("release.tar.gz", ArchiveOptions::default())?;
+    /// let outcome = repo.archive(working_copy, "release.tar.gz", ArchiveOptions::default())?;
     ///
     /// // Archive to a directory
-    /// let outcome = repo.archive("./release/", ArchiveOptions::directory())?;
+    /// let outcome = repo.archive(working_copy, "./release/", ArchiveOptions::directory())?;
     ///
     /// // Archive with a prefix
-    /// let outcome = repo.archive("myproject-1.0.tar.gz",
+    /// let outcome = repo.archive(working_copy, "myproject-1.0.tar.gz",
     ///     ArchiveOptions::default().with_prefix("myproject-1.0/"))?;
     /// ```
     pub fn archive<P: AsRef<Path>>(
         &self,
+        working_copy: WorkingCopyId,
         destination: P,
         options: ArchiveOptions,
     ) -> Result<ArchiveOutcome, RepositoryError> {
         use std::time::Instant;
 
+        self.validate_working_copy(working_copy)?;
+        let desired_view = self.desired_view_name(working_copy)?;
         let start = Instant::now();
         let dest_path = destination.as_ref();
 
@@ -42,7 +46,7 @@ impl Repository {
             .read_txn()
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
-        let view_name = options.view.as_deref().unwrap_or(&self.current_view);
+        let view_name = options.view.as_deref().unwrap_or(&desired_view);
         let view = txn
             .get_view(view_name)
             .map_err(|e| RepositoryError::Database(e.to_string()))?

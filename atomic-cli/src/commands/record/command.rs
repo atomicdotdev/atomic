@@ -1,5 +1,9 @@
 use super::*;
 
+use atomic_repository::WorkspaceTxnMode;
+
+use crate::commands::workspace_txn::enter_workspace;
+
 impl Command for Record {
     /// Execute the record command.
     ///
@@ -8,20 +12,64 @@ impl Command for Record {
     /// 1. Find and open the repository
     /// 2. Get the commit message (from argument, editor, or prompt)
     /// 3. Detect changes in the working copy
-    /// 4. If --all, add untracked files
-    /// 5. If --dry-run, display preview and exit
-    /// 6. Create the change from modifications
-    /// 7. Save the change to the store
-    /// 8. Apply the change to the current view
-    /// 9. Display the result
+    /// 4. If --dry-run, display preview and exit
+    /// 5. Create the change from modifications (including untracked files for --all)
+    /// 6. Save the change to the store
+    /// 7. Apply the change to the current view
+    /// 8. Display the result
     fn run(&self) -> CliResult<()> {
         // Find repository
         let repo_root = find_repository_root()?;
-        let repo = Repository::open(&repo_root).map_err(CliError::Repository)?;
+
+        let mode = if self.dry_run {
+            WorkspaceTxnMode::Observe
+        } else {
+            WorkspaceTxnMode::Reconcile
+        };
+        let mut repo = if self.dry_run {
+            Repository::open_readonly(&repo_root)
+        } else {
+            Repository::open_for_workspace_transaction(&repo_root)
+        }
+        .map_err(CliError::Repository)?;
+
+        // Narrow metadata-only route: an explicit, scoped
+        // `record --allow-conflict-markers <paths>` whose preflight proves every
+        // named path is already recorded (working bytes equal the canonical
+        // render, no graph conflict) and only stale CONFLICTS metadata needs to
+        // change. That administrative cleanup needs no anchored Git baseline and
+        // must not execute the workspace boundary's recovery/import effects, so
+        // it runs through the leased reconcile API directly. Anything not proven
+        // metadata-only falls through to the ordinary boundary and record path,
+        // which clears nothing when it refuses.
+        if !self.dry_run && self.allow_conflict_markers && !self.all && !self.files.is_empty() {
+            let working_copy = repo
+                .require_working_copy_id()
+                .map_err(CliError::Repository)?;
+            if let Some(cleanup) = repo
+                .record_metadata_only_conflict_cleanup(working_copy, &self.files)
+                .map_err(CliError::Repository)?
+            {
+                print!(
+                    "{}",
+                    super::format::format_conflict_cleanup(
+                        &cleanup.view,
+                        &cleanup.cleared_paths,
+                        cleanup.cleared_rows,
+                        cleanup.operation,
+                    )
+                );
+                return Ok(());
+            }
+        }
+
+        let workspace = enter_workspace(&mut repo, mode)?;
+        let working_copy = workspace.working_copy();
+        let view_name = workspace.view().name.clone();
 
         // Handle dry run
         if self.dry_run {
-            return self.display_dry_run(&repo);
+            return self.display_dry_run(&repo, working_copy);
         }
 
         // Get commit message
@@ -42,19 +90,8 @@ impl Command for Record {
         // Build record options
         let options = self.build_options()?;
 
-        // If --all, first add all untracked files
-        if self.all {
-            let status = repo
-                .status(StatusOptions::default())
-                .map_err(CliError::Repository)?;
-
-            for entry in status.untracked() {
-                let path = entry.path();
-                if let Err(e) = repo.add(path, Default::default()) {
-                    print_warning(&format!("Failed to add '{}': {}", path.display(), e));
-                }
-            }
-        }
+        // Repository::record owns --all inclusion so rename classification runs
+        // before any untracked destination could be staged as a fresh inode.
 
         // Record the changes.
         //
@@ -65,7 +102,7 @@ impl Command for Record {
         // defaulted to accusing Atomic of a bug. `FileTooLarge` reached users
         // that way. Keeping the match exhaustive makes the compiler demand a
         // classification decision for each variant added from here on.
-        let outcome = repo.record(header, options).map_err(|e| {
+        let outcome = repo.record(working_copy, header, options).map_err(|e| {
             use atomic_repository::record::RecordError as RE;
             match e {
                 RE::NothingToRecord | RE::NoFilesMatched => CliError::NothingToRecord,
@@ -107,7 +144,7 @@ impl Command for Record {
         })?;
 
         // Display result
-        let output = self.format_outcome(&repo, &outcome);
+        let output = self.format_outcome(&view_name, &outcome);
         print!("{}", output);
 
         // Show any errors that occurred during recording
@@ -126,6 +163,25 @@ impl Command for Record {
                 "{} skipped (unchanged, empty, binary, or too large)",
                 format_count(outcome.skipped_files().len(), "file")
             ));
+        }
+
+        // CB-8A (RFC §7.6, §8.1): an Atomic-origin record is a bridge
+        // transition. In an active Git shadow the recorded durable state is
+        // projected immediately — an operation-specific commit on the view's
+        // mapped ref with the scope-correct HEAD placement and the index
+        // aligned to the projected tree — so `git status` and `atomic
+        // status` are both clean afterwards. Partial user staging is
+        // intentionally preserved (never staged over) and skips only the
+        // projection, never the record itself.
+        let recorded_something =
+            !outcome.recorded_files().is_empty() || !outcome.deleted_files().is_empty();
+        let recorded_hash = recorded_something.then(|| *outcome.hash());
+        drop(workspace);
+        drop(repo);
+        if let Some(hash) = recorded_hash {
+            crate::commands::git::shadow::sync_git_projection_after_record(
+                &repo_root, &view_name, &hash,
+            )?;
         }
 
         Ok(())

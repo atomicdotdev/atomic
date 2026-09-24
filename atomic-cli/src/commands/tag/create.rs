@@ -36,11 +36,12 @@
 
 use clap::Parser;
 
-use atomic_repository::{Repository, TagKind};
+use atomic_repository::{Repository, TagKind, WorkspaceTxnMode};
 
+use crate::commands::workspace_txn::enter_workspace;
 use crate::commands::{find_repository_root, Command};
 use crate::error::{CliError, CliResult};
-use crate::output::{emphasis, print_success};
+use crate::output::{emphasis, print_info, print_success, print_warning};
 
 #[cfg(test)]
 use std::path::PathBuf;
@@ -176,27 +177,36 @@ impl Command for Create {
 
         // Find the repository
         let repo_root = find_repository_root()?;
-        let repo = Repository::open(&repo_root).map_err(|e| match e {
-            atomic_repository::RepositoryError::NotFound { path } => CliError::RepositoryNotFound {
-                searched_path: path.into(),
-            },
-            other => CliError::Repository(other),
-        })?;
+        let mut repo =
+            Repository::open_for_workspace_transaction(&repo_root).map_err(|e| match e {
+                atomic_repository::RepositoryError::NotFound { path } => {
+                    CliError::RepositoryNotFound {
+                        searched_path: path.into(),
+                    }
+                }
+                other => CliError::Repository(other),
+            })?;
 
-        // Check for existing tag — fail unless --force
-        if let Ok(Some(_)) = repo.get_tag(name) {
-            if self.force {
-                let _ = repo.delete_tag(name);
-            } else {
-                return Err(CliError::InvalidArgument {
-                    message: format!("Tag '{}' already exists. Use --force to overwrite.", name),
-                });
-            }
+        let workspace = enter_workspace(&mut repo, WorkspaceTxnMode::Reconcile)?;
+        let workspace_view = &workspace.view().name;
+        let target_view = self.view.as_deref().unwrap_or(workspace_view);
+
+        // Check for an existing tag. Forced replacement is performed by one
+        // leased repository transition rather than a delete/create pair.
+        if !self.force
+            && repo
+                .get_tag_from_view(name, target_view)
+                .map_err(CliError::Repository)?
+                .is_some()
+        {
+            return Err(CliError::InvalidArgument {
+                message: format!("Tag '{}' already exists. Use --force to overwrite.", name),
+            });
         }
 
         // Create the tag
         let tag = repo
-            .create_tag(name, self.message.as_deref(), TagKind::Release)
+            .create_tag_on_view(target_view, name, self.message.as_deref(), TagKind::Release)
             .map_err(|e| match e {
                 atomic_repository::RepositoryError::TagAlreadyExists { name } => {
                     CliError::InvalidArgument {
@@ -224,7 +234,55 @@ impl Command for Create {
             print_success(&format!("Created tag: {}", emphasis(&tag.name)));
         }
 
+        // CB-8A (RFC §8.4): when this Atomic repository is colocated with a
+        // Git checkout, project the new state tag as a binding-bearing Git
+        // annotated tag. ReviewGate tags stay Atomic-only by policy; refusals
+        // (unbound state, existing Git tag) are reported, never silently
+        // promoted. The tag creation itself always stands.
+        project_tag_to_git_if_colocated(&repo, &repo_root, target_view, name);
+
         Ok(())
+    }
+}
+
+/// Export a just-created Atomic state tag to a colocated Git checkout.
+///
+/// A Git tag is a bookmark: this never moves Git HEAD, the Git index, or any
+/// Atomic view membership. Repositories without a colocated Git checkout
+/// simply keep the tag Atomic-only.
+fn project_tag_to_git_if_colocated(
+    repo: &Repository,
+    repo_root: &std::path::Path,
+    view: &str,
+    name: &str,
+) {
+    let Ok(git) = git2::Repository::open(repo_root) else {
+        return;
+    };
+    match repo.export_tag_to_git(view, name, &git) {
+        Ok(atomic_repository::repository::TagProjectionOutcome::Exported {
+            tag_ref,
+            binding_id,
+            ..
+        }) => {
+            print_info(&format!(
+                "Exported Git annotated tag '{}' (binding {})",
+                emphasis(&tag_ref),
+                emphasis(&binding_id)
+            ));
+        }
+        Ok(atomic_repository::repository::TagProjectionOutcome::AtomicOnly { kind }) => {
+            print_info(&format!(
+                "Tag '{}' is Atomic-only ({kind}); no Git tag was created.",
+                emphasis(name)
+            ));
+        }
+        Err(error) => {
+            print_warning(&format!(
+                "Git tag projection refused for tag '{}': {error}",
+                emphasis(name)
+            ));
+        }
     }
 }
 

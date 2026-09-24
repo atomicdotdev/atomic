@@ -429,7 +429,9 @@ mod tests {
             let repo = Repository::init(repo_path).unwrap();
             // Add a file
             std::fs::write(repo_path.join("test.txt"), "Hello").unwrap();
-            repo.add("test.txt", Default::default()).unwrap();
+            let working_copy = repo.require_working_copy_id().unwrap();
+            repo.add(working_copy, "test.txt", Default::default())
+                .unwrap();
         }
 
         std::env::set_current_dir(repo_path).unwrap();
@@ -453,7 +455,9 @@ mod tests {
         {
             let repo = Repository::init(repo_path).unwrap();
             std::fs::write(repo_path.join("test.txt"), "Hello, World!").unwrap();
-            repo.add("test.txt", Default::default()).unwrap();
+            let working_copy = repo.require_working_copy_id().unwrap();
+            repo.add(working_copy, "test.txt", Default::default())
+                .unwrap();
         }
 
         std::env::set_current_dir(repo_path).unwrap();
@@ -480,8 +484,11 @@ mod tests {
             let repo = Repository::init(repo_path).unwrap();
             std::fs::write(repo_path.join("file1.txt"), "Content 1").unwrap();
             std::fs::write(repo_path.join("file2.txt"), "Content 2").unwrap();
-            repo.add("file1.txt", Default::default()).unwrap();
-            repo.add("file2.txt", Default::default()).unwrap();
+            let working_copy = repo.require_working_copy_id().unwrap();
+            repo.add(working_copy, "file1.txt", Default::default())
+                .unwrap();
+            repo.add(working_copy, "file2.txt", Default::default())
+                .unwrap();
         }
 
         std::env::set_current_dir(repo_path).unwrap();

@@ -3,7 +3,7 @@
 //! `TreeTxnT` maps file paths to inodes (stable file identifiers) and
 //! inodes to graph positions, enabling efficient file-level operations.
 
-use crate::types::{GraphNode, Hash, Inode, NodeId, Position, SerializedGraphEdge};
+use crate::types::{GraphNode, Hash, Inode, NodeId, Position, SerializedGraphEdge, WorkingCopyId};
 
 use crate::pristine::error::PristineError;
 
@@ -119,6 +119,43 @@ pub trait TreeTxnT: GraphTxnT {
     /// This is the inverse of `inode_position`.
     fn position_inode(&self, pos: Position<NodeId>) -> Result<Option<Inode>, PristineError>;
 
+    /// Return every INODES row in deterministic key order.
+    fn snapshot_inodes(&self) -> Result<Vec<(Inode, Position<NodeId>)>, PristineError> {
+        Err(PristineError::Inconsistent {
+            message: "complete INODES snapshots are unavailable for this transaction wrapper"
+                .to_string(),
+        })
+    }
+
+    /// Return every REV_INODES row in deterministic key order.
+    fn snapshot_rev_inodes(&self) -> Result<Vec<(Position<NodeId>, Inode)>, PristineError> {
+        Err(PristineError::Inconsistent {
+            message: "complete REV_INODES snapshots are unavailable for this transaction wrapper"
+                .to_string(),
+        })
+    }
+
+    /// Return every DIRECTORIES row in deterministic key order.
+    fn snapshot_directories(&self) -> Result<Vec<(Inode, u8)>, PristineError> {
+        Err(PristineError::Inconsistent {
+            message: "complete DIRECTORIES snapshots are unavailable for this transaction wrapper"
+                .to_string(),
+        })
+    }
+
+    /// Return every distinct INODE_GRAPH key in deterministic key order.
+    ///
+    /// Keys retain both inode ownership and the exact graph node, allowing
+    /// callers to recover and validate candidate inode roots without trusting
+    /// the potentially damaged INODES index.
+    fn snapshot_inode_graph_keys(&self) -> Result<Vec<(Inode, GraphNode<NodeId>)>, PristineError> {
+        Err(PristineError::Inconsistent {
+            message:
+                "complete INODE_GRAPH key snapshots are unavailable for this transaction wrapper"
+                    .to_string(),
+        })
+    }
+
     /// Iterate over all files in the tree.
     ///
     /// Returns an iterator over (path, inode) pairs for all tracked files.
@@ -171,4 +208,44 @@ pub trait TreeTxnT: GraphTxnT {
     /// This is a sequential B-tree scan — much faster than individual get_file_index
     /// lookups for bulk operations like status.
     fn iter_file_index(&self) -> Result<Vec<FileIndexEntry>, PristineError>;
+
+    /// Get a file-index entry scoped to one persistent working copy.
+    ///
+    /// The legacy unscoped namespace remains readable for format compatibility,
+    /// but working-copy-aware callers must use this method so one worktree's
+    /// filesystem metadata can never classify another worktree's files.
+    fn get_working_copy_file_index(
+        &self,
+        working_copy: WorkingCopyId,
+        path: &str,
+    ) -> Result<Option<FileIndexMetadata>, PristineError> {
+        self.get_file_index(&working_copy_file_index_key(working_copy, path))
+    }
+
+    /// Iterate file-index entries belonging to one persistent working copy.
+    fn iter_working_copy_file_index(
+        &self,
+        working_copy: WorkingCopyId,
+    ) -> Result<Vec<FileIndexEntry>, PristineError> {
+        let prefix = working_copy_file_index_prefix(working_copy);
+        Ok(self
+            .iter_file_index()?
+            .into_iter()
+            .filter_map(|(key, secs, nanos, size, hash)| {
+                key.strip_prefix(&prefix)
+                    .map(|path| (path.to_string(), secs, nanos, size, hash))
+            })
+            .collect())
+    }
+}
+
+/// Encode an unambiguous key in the shared FILE_INDEX table.
+#[inline]
+pub(crate) fn working_copy_file_index_key(working_copy: WorkingCopyId, path: &str) -> String {
+    format!("{}\0{}", working_copy, path)
+}
+
+#[inline]
+fn working_copy_file_index_prefix(working_copy: WorkingCopyId) -> String {
+    format!("{}\0", working_copy)
 }

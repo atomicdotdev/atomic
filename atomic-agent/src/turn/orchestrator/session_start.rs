@@ -229,15 +229,14 @@ impl TurnOrchestrator {
             ) {
                 Ok(repo) if repo.is_sandbox() => {
                     // A sandbox is a materialized copy of the project; `record`
-                    // writes to the *canonical* graph (shared pristine +
-                    // changes), on the view named in the `.atomic-sandbox`
-                    // pointer. The agent is already on that view, so adopt it
-                    // for recording and do NOT fork or switch:
+                    // writes to the shared canonical graph on the desired view
+                    // stored in the sandbox's persistent working-copy record.
+                    // provision_sandbox registered that record, so adopt its
+                    // authoritative view and do NOT fork or realign:
                     //   * create_view_from would inject a spurious view into
                     //     the canonical graph, and
-                    //   * set_current_view writes the *canonical*
-                    //     .atomic/current_view, clobbering the real user's
-                    //     current view.
+                    //   * align_to_view would overwrite the sandbox lifecycle's
+                    //     explicit desired-view choice.
                     let current = repo.current_view().to_string();
                     if let Some(declared) = self.managed_view() {
                         if declared != current {
@@ -326,20 +325,31 @@ impl TurnOrchestrator {
                         }
                     }
 
-                    // Switch to the agent view so that all file writes during
-                    // the session (tool calls, npm install, builds, etc.) happen
-                    // while current_view points to the agent view. This ensures
-                    // status/add/record see the right view. The working copy
-                    // stays on the agent view after session-end so the user
-                    // lands where the agent's work happened.
-                    if let Err(e) = repo.align_to_view(&session.view_name) {
-                        log::warn!(
-                            "Could not align to agent view '{}': {} (non-fatal)",
+                    // Select the agent view as this working copy's persisted
+                    // desired view before tools start writing files. This keeps
+                    // status/add/record on the same explicit working-copy state.
+                    // The working copy stays on the agent view after session-end
+                    // so the user lands where the agent's work happened.
+                    let working_copy = repo.require_working_copy_id();
+                    match working_copy {
+                        Ok(working_copy) => {
+                            if let Err(e) =
+                                repo.align_to_view(working_copy, &session.view_name)
+                            {
+                                log::warn!(
+                                    "Could not align to agent view '{}': {} (non-fatal)",
+                                    session.view_name,
+                                    e,
+                                );
+                            } else {
+                                log::info!("Aligned to agent view '{}'", session.view_name,);
+                            }
+                        }
+                        Err(e) => log::warn!(
+                            "Could not resolve working-copy identity before aligning to agent view '{}': {} (non-fatal)",
                             session.view_name,
                             e,
-                        );
-                    } else {
-                        log::info!("Aligned to agent view '{}'", session.view_name,);
+                        ),
                     }
                 }
                 Err(e) => {
@@ -462,11 +472,10 @@ impl TurnOrchestrator {
                     let current = repo.current_view().to_string();
 
                     if repo.is_sandbox() {
-                        // Sandboxes already operate on the view named in their
-                        // pointer file and record into the canonical graph.
-                        // Adopt that view verbatim; never fork or switch
-                        // (set_current_view writes the canonical
-                        // .atomic/current_view the sandbox shares).
+                        // Sandboxes already operate on the authoritative desired
+                        // view in their persistent working-copy record and record
+                        // into the shared canonical graph. Adopt that view
+                        // verbatim; never fork or realign it.
                         log::info!(
                             "Fallback sandbox session {} adopting provisioned view '{}'",
                             session_id,
@@ -494,13 +503,26 @@ impl TurnOrchestrator {
                             );
                         }
 
-                        if let Err(e) = repo.set_current_view(&session.view_name) {
-                            log::warn!(
-                                "Fallback session {} could not switch to '{}': {} (non-fatal)",
+                        let working_copy = repo.require_working_copy_id();
+                        match working_copy {
+                            Ok(working_copy) => {
+                                if let Err(e) =
+                                    repo.align_to_view(working_copy, &session.view_name)
+                                {
+                                    log::warn!(
+                                        "Fallback session {} could not align to '{}': {} (non-fatal)",
+                                        session_id,
+                                        session.view_name,
+                                        e,
+                                    );
+                                }
+                            }
+                            Err(e) => log::warn!(
+                                "Fallback session {} could not resolve working-copy identity before aligning to '{}': {} (non-fatal)",
                                 session_id,
                                 session.view_name,
                                 e,
-                            );
+                            ),
                         }
                     } else if current != "dev" && current != "main" && current != "release" {
                         // Adopt the existing agent view (session-start
@@ -536,15 +558,28 @@ impl TurnOrchestrator {
                             }
                         }
 
-                        // Switch to the agent view so status/add/record
-                        // target the right view.
-                        if let Err(e) = repo.align_to_view(&session.view_name) {
-                            log::warn!(
-                                "Fallback session {} could not align to '{}': {} (non-fatal)",
+                        // Persist the agent view as this working copy's desired
+                        // view so status/add/record target it explicitly.
+                        let working_copy = repo.require_working_copy_id();
+                        match working_copy {
+                            Ok(working_copy) => {
+                                if let Err(e) =
+                                    repo.align_to_view(working_copy, &session.view_name)
+                                {
+                                    log::warn!(
+                                        "Fallback session {} could not align to '{}': {} (non-fatal)",
+                                        session_id,
+                                        session.view_name,
+                                        e,
+                                    );
+                                }
+                            }
+                            Err(e) => log::warn!(
+                                "Fallback session {} could not resolve working-copy identity before aligning to '{}': {} (non-fatal)",
                                 session_id,
                                 session.view_name,
                                 e,
-                            );
+                            ),
                         }
                     }
                 }

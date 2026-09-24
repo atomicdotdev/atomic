@@ -44,6 +44,7 @@ mod explain;
 mod hooks;
 mod lifecycle;
 mod owner;
+mod repair;
 mod status;
 
 use clap::{Args, Subcommand};
@@ -194,6 +195,23 @@ pub enum AgentCommands {
     /// ```
     Attest(Attest),
 
+    /// Resume a managed session under leases while retaining every piece of
+    /// durable evidence (CB-12A AC3).
+    ///
+    /// The session's incomplete evidence is snapshotted verbatim into an
+    /// append-only repair note, the retention lease is set (cleanup must
+    /// never discard the only unbound copy), and the attestation/capture
+    /// evidence is verified and reported. Repair NEVER erases or
+    /// manufactures attribution.
+    ///
+    /// # Examples
+    ///
+    /// ```text
+    /// atomic agent repair <session-id>
+    /// atomic agent repair <session-id> --verify-only
+    /// ```
+    Repair(repair::Repair),
+
     /// Declare managed runs for orchestrated agents.
     ///
     /// Used by outer orchestrators such as Sherpa/noname before launching an
@@ -226,6 +244,7 @@ impl Command for Agent {
             AgentCommands::Status(cmd) => cmd.run(),
             AgentCommands::Explain(cmd) => cmd.run(),
             AgentCommands::Attest(cmd) => cmd.run(),
+            AgentCommands::Repair(cmd) => cmd.run(),
             AgentCommands::Lifecycle(cmd) => cmd.run(),
             AgentCommands::DatabaseOwner(cmd) => cmd.run(),
             AgentCommands::Hooks(cmd) => cmd.run(),
@@ -247,5 +266,76 @@ mod tests {
         let _disable = AgentCommands::Disable(Disable::default_for_test());
         let _status = AgentCommands::Status(AgentStatus::default_for_test());
         let _explain = AgentCommands::Explain(Explain::default_for_test());
+    }
+}
+
+#[cfg(test)]
+mod repair_tests {
+    use super::*;
+    use atomic_agent::turn::session::SessionStore;
+    use atomic_core::change::session::{IncompleteSession, SessionIncompleteOrigin, SessionStatus};
+    use std::fs;
+
+    /// CB-12A AC3: the repair session contract — resuming an incomplete
+    /// session RETAINS the incomplete evidence verbatim in an append-only
+    /// note, sets the retention lease, and never rewrites history. (The CLI
+    /// e2e path exercises the same contract through the integration suite;
+    /// this unit test pins the store/session invariants.)
+    #[test]
+    fn repair_resumes_incomplete_session_and_retains_evidence() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let sessions_dir = dir.path().join(".atomic").join("sessions");
+        let store = SessionStore::new(&sessions_dir).unwrap();
+
+        let mut session = atomic_agent::turn::session::AgentSession::new(
+            "sess-repair",
+            "claude-code",
+            "Claude Code",
+        );
+        session.view_name = "main".to_string();
+        let incomplete = IncompleteSession::new(
+            "unexplained Git transition (fixture)",
+            Vec::<String>::new(),
+            String::new(),
+            SessionIncompleteOrigin::UnattributedGitOperation,
+        )
+        .with_unbound_commits(vec!["deadbeefcafe".to_string()]);
+        session.mark_incomplete(incomplete);
+        store.save(&session).unwrap();
+
+        // The repair verb's resume action: append-only note with the
+        // retained evidence, then resume, then the never-cleared lease.
+        let stored = store.load("sess-repair").unwrap().unwrap();
+        let prior_incomplete = stored.incomplete().cloned();
+        let mut repaired = stored;
+        repaired
+            .repair_history
+            .push(atomic_agent::turn::session::RepairNote {
+                at_rfc3339: chrono::Utc::now().to_rfc3339(),
+                action: "resume".to_string(),
+                prior_status: repaired.status.label().to_string(),
+                retained_incomplete: prior_incomplete.clone(),
+                detail: String::new(),
+            });
+        repaired.status = SessionStatus::Active;
+        repaired.evidence_retained = true;
+        store.save(&repaired).unwrap();
+
+        let reloaded = store.load("sess-repair").unwrap().unwrap();
+        assert!(matches!(reloaded.status, SessionStatus::Active));
+        assert!(reloaded.evidence_retained, "the retention lease is set");
+        assert_eq!(reloaded.repair_history.len(), 1, "one append-only note");
+        let note = &reloaded.repair_history[0];
+        let retained = note
+            .retained_incomplete
+            .as_ref()
+            .expect("the repair note retains the incomplete evidence verbatim");
+        assert_eq!(
+            retained.reason, "unexplained Git transition (fixture)",
+            "the retained evidence is byte-for-byte the prior refusal"
+        );
+        assert_eq!(retained.unbound_commits, vec!["deadbeefcafe".to_string()]);
+        assert_eq!(note.action, "resume");
+        assert_eq!(note.prior_status, "incomplete");
     }
 }

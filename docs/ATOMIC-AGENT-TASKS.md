@@ -1,5 +1,15 @@
 # Atomic Agent: Task List
 
+> **Agent operating notes (CB-13C, 2026-09-14):** agents run under the
+> managed-session contract. Hooks (capture, event journal) and watchers are
+> **optional evidence and accelerators — never the guarantee**; an arbitrary
+> Git push to a server without its own enforcement is outside the protection
+> guarantee. Incomplete turns persist as WIP refs with durable `Incomplete`
+> sessions (age never deletes unbound work). Working agreements, trust/
+> provenance rules, recovery and privacy rules for agent-driven Git use live
+> in the [bridge operating guide](bridge-operating-guide.md). The reactive
+> `atomic bridge watch` daemon is CB-13D and does not exist in this release.
+
 > **Goal**: Absorb Entire CLI's capabilities directly into Atomic using Watchman as the file-watching engine. Turns become changes, sessions become stacks, rewind becomes unrecord, metadata lives inside the change itself. No git involvement. No side branches. No parallel VCS.
 
 ## What Entire CLI Does That Atomic Needs to Absorb

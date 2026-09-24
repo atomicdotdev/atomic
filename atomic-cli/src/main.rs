@@ -38,6 +38,13 @@
 //! atomic status
 //! ```
 
+//!
+//! Note: `CliError` intentionally carries the `ManagedAgentIncomplete`
+//! refusal payload inline (CB-12A/13D), which trips
+//! `clippy::result_large_err` on every `CliResult`. Errors are returned
+//! once per invocation and printed, never stored or passed through hot
+//! paths, so the ergonomic cost of boxing outweighs the benefit.
+#![allow(clippy::result_large_err)]
 // Many commands are scaffold/stub implementations with builder APIs not yet
 // fully wired up. Suppress dead_code and unused_imports until they are.
 #![allow(
@@ -58,6 +65,7 @@ use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use commands::{
     Add,
     Agent,
+    Blame,
     ChangeCmd,
     Clone,
     Command,
@@ -73,6 +81,7 @@ use commands::{
     Log,
     Memory,
     Move,
+    Op,
     ProjectCmd,
     Provenance,
     Pull,
@@ -87,11 +96,13 @@ use commands::{
     ServerCmd,
     Session,
     Split,
+    Stage,
     Stash,
     Status,
     Tag,
     Triage,
     Unrecord,
+    Unstage,
     Update,
     Vault,
     View,
@@ -238,6 +249,15 @@ enum Commands {
     /// Adds files to Atomic's internal tree so their changes can be recorded.
     Add(Add),
 
+    /// Stage worktree content into the Git index (colocated mode).
+    ///
+    /// Stages content of tracked or intent-to-add paths. Staging never
+    /// creates durable tracking; run `atomic add` for that.
+    Stage(Stage),
+
+    /// Move Git index entries back to the baseline without touching the worktree.
+    Unstage(Unstage),
+
     /// Remove files from tracking.
     ///
     /// Stops tracking files in the repository. Files can either be deleted
@@ -373,6 +393,9 @@ enum Commands {
     /// Displays the log of changes inserted into the current view.
     Log(Log),
 
+    /// Inspect the immutable repository operation journal.
+    Op(Op),
+
     /// Show details for a specific change.
     ///
     /// Displays detailed information about a change by hash, hash prefix,
@@ -439,6 +462,20 @@ enum Commands {
     /// atomic diff --algorithm patience
     /// ```
     Diff(Diff),
+
+    /// Show line-level ownership for a tracked text file.
+    ///
+    /// Attributes every alive line to the change that introduced it, using
+    /// the CRDT semantic layer (review CB-9C: word-diff and blame work on
+    /// supported imported text after reload).
+    ///
+    /// # Examples
+    ///
+    /// ```text
+    /// atomic blame src/main.rs
+    /// atomic blame --short src/main.rs
+    /// ```
+    Blame(Blame),
 
     /// Diagnose and repair repository indexes.
     ///
@@ -933,6 +970,16 @@ fn init_logging() {
 }
 
 fn main() {
+    // Unix CLI convention: a closed downstream pipe is a silent exit, not a
+    // Rust panic. Shells routinely run `atomic … | head`/`awk` pipelines that
+    // close the pipe after the first lines; without the default disposition
+    // `println!` panics on the broken pipe and the pipeline dies with exit
+    // 101 instead of the consumer's status.
+    #[cfg(unix)]
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+
     // Initialize logging
     init_logging();
 
@@ -993,6 +1040,8 @@ fn main() {
         Commands::Session(session) => session.run(),
 
         Commands::Split(split) => split.run(),
+        Commands::Stage(stage) => stage.run(),
+        Commands::Unstage(unstage) => unstage.run(),
 
         Commands::Record(record) => record.run(),
 
@@ -1000,9 +1049,13 @@ fn main() {
 
         Commands::Log(log) => log.run(),
 
+        Commands::Op(op) => op.run(),
+
         Commands::Change(change) => change.run(),
 
         Commands::Diff(diff) => diff.run(),
+
+        Commands::Blame(blame) => blame.run(),
 
         Commands::Doctor(doctor) => doctor.run(),
 

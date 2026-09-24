@@ -253,6 +253,9 @@ impl Repository {
                 name: name.to_string(),
             })?;
 
+        if scope.is_shared() {
+            self.ensure_view_has_no_snapshots(&txn, &view)?;
+        }
         view.kind = scope;
         // Clear parent when promoting to Shared root view
         if scope.is_shared() {
@@ -310,6 +313,9 @@ impl Repository {
             None => None,
         };
 
+        if scope.is_shared() {
+            self.ensure_view_has_no_snapshots(&txn, &view)?;
+        }
         view.kind = scope;
         // A Shared view is a root; it never carries a parent.
         view.parent = if scope.is_shared() { None } else { parent_id };
@@ -616,22 +622,26 @@ impl Repository {
         // actual graph membership rather than by assuming the own log is a
         // superset of the parent (which only holds for `create_view_from`
         // drafts, not for record- or split-created drafts).
+        let membership = view_membership(&txn, &view)?;
         let (parent_name, own_change_count, inherited_change_count) = match view.parent {
             Some(parent_id) => {
-                match txn
+                let parent = txn
                     .get_view_by_id(parent_id)
                     .map_err(|e| RepositoryError::Database(e.to_string()))?
-                {
-                    Some(parent) => {
-                        let parent_visible = collect_visible_change_ids(&txn, &parent)?;
-                        let own_ids = collect_view_change_ids(&txn, &view)?;
-                        let own = own_ids.difference(&parent_visible).count() as u64;
-                        (Some(parent.name), own, parent_visible.len() as u64)
-                    }
-                    None => (None, view.change_count, 0),
-                }
+                    .ok_or_else(|| {
+                        RepositoryError::Database(format!(
+                            "view '{}' ({}) references missing parent {}",
+                            view.name, view.id, parent_id
+                        ))
+                    })?;
+                let inherited = view_membership(&txn, &parent)?;
+                let own = membership
+                    .iter()
+                    .filter(|change_id| !inherited.contains(**change_id))
+                    .count() as u64;
+                (Some(parent.name), own, inherited.len() as u64)
             }
-            None => (None, view.change_count, 0),
+            None => (None, membership.len() as u64, 0),
         };
 
         Ok(ViewInfo {
@@ -665,7 +675,7 @@ impl Repository {
     /// Create a view with an explicit scope and optional named parent.
     ///
     /// The view's change log starts empty; this only establishes identity.
-    fn create_view_with_identity(
+    pub fn create_view_with_identity(
         &mut self,
         name: &str,
         scope: ViewScope,
@@ -717,6 +727,11 @@ impl Repository {
     /// The exported manifest is verified before it is returned, so a
     /// corrupted log surfaces here rather than on the receiving end.
     pub fn view_manifest(&self, name: &str) -> Result<ViewManifest, RepositoryError> {
+        if name.starts_with("wc/") {
+            return Err(RepositoryError::InvalidOperation {
+                message: format!("private working-copy view '{}' cannot be exported", name),
+            });
+        }
         let txn = self
             .pristine
             .read_txn()
@@ -728,6 +743,24 @@ impl Repository {
             .ok_or_else(|| RepositoryError::ViewNotFound {
                 name: name.to_string(),
             })?;
+
+        // Export is allowed only after the complete projection domain has been
+        // dependency-validated. The manifest still carries this view's own log;
+        // parent manifests carry inherited membership during root-to-leaf sync.
+        let projection = effective_projection_closure(&txn, &view)?;
+        for change_id in projection.iter_dependency_first().copied() {
+            let hash = txn
+                .get_external(change_id)
+                .map_err(|e| RepositoryError::Database(e.to_string()))?
+                .ok_or_else(|| {
+                    RepositoryError::Database(format!(
+                        "change {} in view '{}' projection has no external hash",
+                        change_id.get(),
+                        name
+                    ))
+                })?;
+            self.ensure_exchangeable_change(&hash)?;
+        }
 
         let parent = match view.parent {
             Some(parent_id) => txn
@@ -792,6 +825,15 @@ impl Repository {
                     view: manifest.name.clone(),
                     count: 1,
                     first: hash.to_base32(),
+                });
+            }
+            if self.load_change(hash)?.kind().is_snapshot() {
+                return Err(RepositoryError::InvalidOperation {
+                    message: format!(
+                        "private snapshot {} cannot be imported into view '{}'",
+                        hash.to_base32(),
+                        manifest.name
+                    ),
                 });
             }
         }
@@ -910,6 +952,15 @@ impl Repository {
             let mut seen: HashSet<Hash> = HashSet::with_capacity(manifest.changes.len());
             for hash in &manifest.changes {
                 let change = self.load_change(hash)?;
+                if change.kind().is_snapshot() {
+                    return Err(RepositoryError::InvalidOperation {
+                        message: format!(
+                            "private snapshot {} cannot be imported into view '{}'",
+                            hash.to_base32(),
+                            manifest.name
+                        ),
+                    });
+                }
                 for dep in change.dependencies() {
                     if seen.contains(dep) {
                         continue;

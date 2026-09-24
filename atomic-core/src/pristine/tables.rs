@@ -6,12 +6,16 @@
 //! - **ID Mappings**: `EXTERNAL`, `INTERNAL` - map between internal NodeIds and external Hashes
 //! - **Graph**: `GRAPH`, `INODE_GRAPH` - store vertices and edges
 //! - **Views**: `VIEWS`, `VIEW_CHANGES`, `REV_VIEW_CHANGES` - view metadata
-//! - **File Tree**: `TREE`, `REV_TREE`, `INODES`, `REV_INODES`, `DIRECTORIES` - file system mappings
+//! - **File Tree**: `PATH_CLAIMS`, `TREE`, `REV_TREE`, `INODES`, `REV_INODES`, `DIRECTORIES` - file system mappings
 //! - **Dependencies**: `DEPS`, `REV_DEPS` - node dependency tracking for attestations/provenance
 //! - **Change Dependencies**: `CHANGE_DEPS`, `REV_CHANGE_DEPS`, `CHANGE_DEPS_INDEXED` - normal change dependency index
 //! - **State**: `STATES`, `MERKLE_CHAIN` - view state and Merkle chain
 
 use redb::{MultimapTableDefinition, TableDefinition};
+
+use crate::types::{EffectReceiptId, OperationId};
+
+use super::path_claim::PATH_CLAIM_EVENT_SIZE;
 
 // ID Mapping Tables
 
@@ -63,6 +67,17 @@ pub const GRAPH: MultimapTableDefinition<&[u8; 24], &[u8; 24]> =
 pub const INODE_GRAPH: MultimapTableDefinition<&[u8; 32], &[u8; 24]> =
     MultimapTableDefinition::new("inode_graph");
 
+/// Additive inode-attribute events keyed by `(graph inode position, attribute)`.
+pub const POSITION_ATTRS: MultimapTableDefinition<&[u8; 17], &[u8; 13]> =
+    MultimapTableDefinition::new("position_attrs");
+
+/// Secondary inode-attribute index keyed by `(repository inode, attribute)`.
+///
+/// This is the metadata counterpart to `INODE_GRAPH`: callers materializing a
+/// known repository inode can retrieve its attributes without a global scan.
+pub const INODE_ATTRS: MultimapTableDefinition<&[u8; 9], &[u8; 13]> =
+    MultimapTableDefinition::new("inode_attrs");
+
 // View Tables
 
 /// View metadata
@@ -74,6 +89,33 @@ pub const INODE_GRAPH: MultimapTableDefinition<&[u8; 32], &[u8; 24]> =
 /// Views are perspectives of the graph - they represent which changes have been applied
 /// in what order, not forks of the underlying data.
 pub const VIEWS: TableDefinition<&str, &[u8]> = TableDefinition::new("views");
+
+/// Persistent working-copy records keyed by canonical 16-byte ULID.
+///
+/// Values use the explicitly versioned canonical codec exposed by
+/// `pristine::WorkingCopyRecord`. The variable-width value type permits later
+/// record versions without changing the redb table schema.
+pub const WORKING_COPIES: TableDefinition<&[u8; 16], &[u8]> =
+    TableDefinition::new("working_copies");
+
+/// Immutable operations keyed by their domain-separated content address.
+///
+/// Values use the strict versioned canonical operation codec. The value omits
+/// the derived ID; reads recompute it and compare it with the table key.
+pub const OPERATIONS: TableDefinition<&[u8; 32], &[u8]> = TableDefinition::new("operations");
+
+/// Mutable versioned sorted operation-head sets keyed by operation scope.
+///
+/// Scope keys are a one-byte tag plus either zero padding for repository scope
+/// or a canonical 16-byte working-copy ULID.
+pub const OP_HEADS: TableDefinition<&[u8; 17], &[u8]> = TableDefinition::new("op_heads");
+
+/// Immutable effect receipts keyed by `(OperationId, EffectReceiptId)`.
+///
+/// The operation-first composite key permits efficient prefix range scans while
+/// the receipt ID keeps each row content-addressed and append-only.
+pub const EFFECT_RECEIPTS: TableDefinition<&[u8; 64], &[u8]> =
+    TableDefinition::new("effect_receipts");
 
 /// View change log: (view_id, sequence) → change_id
 ///
@@ -92,6 +134,14 @@ pub const VIEW_CHANGES: TableDefinition<&[u8; 16], u64> = TableDefinition::new("
 pub const REV_VIEW_CHANGES: TableDefinition<&[u8; 16], u64> =
     TableDefinition::new("rev_view_changes");
 
+/// Derived order-invariant identity for each view.
+///
+/// Key: view id. Value: explicitly versioned bytes from
+/// `pristine::set_id_index`; this table is independent of order-sensitive
+/// `STATES` and may be cleared/rebuilt transactionally.
+pub const VIEW_SET_ID_INDEX: TableDefinition<u64, &[u8]> =
+    TableDefinition::new("view_set_id_index");
+
 /// Per-view conflict state: (view_id, inode) → serialized `Vec<StoredConflict>`
 ///
 /// Key: 16 bytes encoding (view_id: u64, inode: u64) via [`encode_view_seq`].
@@ -105,6 +155,21 @@ pub const REV_VIEW_CHANGES: TableDefinition<&[u8; 16], u64> =
 pub const CONFLICTS: TableDefinition<&[u8; 16], &[u8]> = TableDefinition::new("conflicts");
 
 // File Tree Tables
+
+/// Repository metadata and pristine schema completion markers.
+///
+/// Derived-index keys store completed schema versions. Keys prefixed with
+/// `required-capability/` store the minimum capability version required to
+/// open the repository. Missing capability entries identify legacy repositories.
+pub const PRISTINE_META: TableDefinition<&str, u32> = TableDefinition::new("pristine_meta");
+
+/// Additive path-claim transitions keyed by repository-relative path.
+///
+/// Values use the fixed-width V1 codec from `pristine::path_claim`. The table
+/// intentionally stores all transitions without view filtering; callers apply
+/// visibility and causal reduction.
+pub const PATH_CLAIMS: MultimapTableDefinition<&str, &[u8; PATH_CLAIM_EVENT_SIZE]> =
+    MultimapTableDefinition::new("path_claims");
 
 /// File tree: path → inode
 ///
@@ -314,6 +379,99 @@ pub const TAG_NAME_INDEX: TableDefinition<&str, u64> = TableDefinition::new("tag
 /// the O(n) `get_imported_shas()` scan with O(1) lookups.
 pub const GIT_SHA_INDEX: TableDefinition<&str, u64> = TableDefinition::new("git_sha_index");
 
+/// Persistent Git commit interpretation closures (CB-9B, review R1).
+///
+/// Maps a full hex Git commit SHA to the complete set of Atomic change hashes
+/// that importing that commit contributed to its interpreted state: the
+/// union of its ordered parents' closures plus the change (if any) the import
+/// itself wrote. Rows persist across runs, bindings, and views, so a commit
+/// imported in an earlier run reconstructs the exact parent visibility a
+/// sibling lineage must be excluded against — a per-run ledger cannot.
+///
+/// Value encoding: little-endian u32 count, then that many 32-byte change
+/// hashes concatenated (canonical order is the caller's responsibility; the
+/// count makes decoding total).
+pub const GIT_COMMIT_CLOSURES: TableDefinition<&str, &[u8]> =
+    TableDefinition::new("git_commit_closures");
+
+// ============================================================================
+// Bridge event captures (RFC-ATOMIC-GIT-CAUSAL-BRIDGE §5.4, review R4)
+// ============================================================================
+
+/// Immutable captured bridge hook events: blake3(canonical event bytes) →
+/// the exact captured event bytes.
+///
+/// The advisory JSONL journal (`.atomic/bridge/git-events.jsonl`) is writable
+/// by any process and therefore proves nothing by itself. When the Atomic hook
+/// journals a post-rewrite event it also captures the exact event bytes here,
+/// through the repository library, inside the pristine database. A journal
+/// line is operation-linkage evidence only when its canonical bytes have a
+/// matching capture row; anything else is an unauthenticated hint and must be
+/// labeled as such downstream. Rows are insert-only: an identical re-capture
+/// is a no-op and different bytes for an existing hash are refused.
+pub const BRIDGE_EVENT_CAPTURES: TableDefinition<&[u8; 32], &[u8]> =
+    TableDefinition::new("bridge_event_captures");
+
+/// Immutable operation anchors for captured bridge hook events (review C2):
+/// blake3(canonical event bytes) → the OperationId the capture was anchored
+/// to.
+///
+/// RFC §5.4 grants the operation-linkage tier only to a post-rewrite event
+/// captured DURING AN ACTIVE CAPTURED OPERATION. A capture written by the
+/// advisory hook path (no active operation) has no anchor row and reads as
+/// unauthenticated evidence downstream, whatever Git ancestry shape its OIDs
+/// happen to describe. The anchor row is written only through
+/// [`crate::pristine::BridgeEventCaptureMutTxnT::
+/// put_anchored_bridge_event_capture`], which refuses nonexistent or
+/// already-finalized operations; rows are insert-only.
+pub const BRIDGE_EVENT_CAPTURE_ANCHORS: TableDefinition<&[u8; 32], &[u8; 32]> =
+    TableDefinition::new("bridge_event_capture_anchors");
+
+/// Immutable capture-token bindings for prepared bridge Git-ref operations
+/// (review E2): OperationId → the 32-byte capture token minted when the
+/// operation was prepared.
+///
+/// Matching OID leases alone do not prove a captured event belongs to an
+/// operation: an earlier advisory capture between the same OIDs can never be
+/// retroactively promoted onto a later ref-write (RFC §5.4 treats ref
+/// movement as a different tier from rewrite). The token is minted by
+/// `Repository::prepare_bridge_git_ref_write` at preparation time, handed to
+/// the hook environment for the duration of the operation, and carried inside
+/// the captured event bytes. Anchoring refuses captures whose token does not
+/// match the operation's minted token, so only a capture produced within the
+/// prepared operation's capture context can ever be bound to it. Rows are
+/// insert-only: the same token is idempotent, a different token for an
+/// existing operation is corruption and refused.
+pub const BRIDGE_REF_CAPTURE_TOKENS: TableDefinition<&[u8; 32], &[u8; 32]> =
+    TableDefinition::new("bridge_ref_capture_tokens");
+
+// ============================================================================
+// Git State Bindings (RFC-ATOMIC-GIT-CAUSAL-BRIDGE §5.1)
+// ============================================================================
+
+/// Immutable Git state bindings: BindingId (Blake3 of canonical encoding) →
+/// canonical signed binding bytes.
+///
+/// Rows are insert-only facts about foreign Git commits. Storage never mutates
+/// or deletes a row: an identical insert is an idempotent no-op and conflicting
+/// bytes for an existing id are refused (hash collision or corruption). The
+/// value is the complete canonical signed encoding so the stored bytes are
+/// byte-for-byte what the signer signed and what a Git binding ref publishes.
+pub const BINDINGS: TableDefinition<&[u8; 32], &[u8]> = TableDefinition::new("bindings");
+
+// ============================================================================
+// Ref/View Mappings (RFC-ATOMIC-GIT-CAUSAL-BRIDGE §8.1, CB-10A)
+// ============================================================================
+
+/// Mutable view ↔ Git ref mappings: internal view id → versioned mapping
+/// bytes (CB-10A).
+///
+/// Rows are durable bookkeeping keyed by the internal view id, so they are
+/// shared across reopen and linked worktrees and survive view renames. They
+/// are mutable (unlike BINDINGS) because they record the *last observed*
+/// mutable state; immutable Git state bindings stay in their own table.
+pub const REF_MAPPINGS: TableDefinition<u64, &[u8]> = TableDefinition::new("ref_mappings");
+
 // File Mtime Cache Table
 //
 // Stores the last-recorded filesystem modification time for each tracked file.
@@ -353,6 +511,12 @@ pub const GIT_SHA_INDEX: TableDefinition<&str, u64> = TableDefinition::new("git_
 /// the on-disk hash to detect true modifications without reconstructing
 /// graph content.
 pub const FILE_INDEX: TableDefinition<&str, &[u8; 52]> = TableDefinition::new("file_index");
+
+/// Versioned working-copy filesystem index keyed by encoded raw repository path.
+///
+/// This table is intentionally separate from [`FILE_INDEX`], whose key/value
+/// schema and bytes remain legacy-format authoritative.
+pub const FILE_INDEX_V2: TableDefinition<&[u8], &[u8]> = TableDefinition::new("file_index_v2");
 
 /// Encode file metadata for the FILE_INDEX table.
 ///
@@ -903,6 +1067,23 @@ pub fn decode_view_seq(key: &[u8; 16]) -> (u64, u64) {
     let view_id = u64::from_be_bytes(key[0..8].try_into().unwrap());
     let seq = u64::from_be_bytes(key[8..16].try_into().unwrap());
     (view_id, seq)
+}
+
+/// Encode an operation/receipt pair for operation-prefix range scans.
+#[inline]
+pub fn encode_effect_receipt_key(operation: OperationId, receipt: EffectReceiptId) -> [u8; 64] {
+    let mut key = [0u8; 64];
+    key[..OperationId::SIZE].copy_from_slice(operation.as_bytes());
+    key[OperationId::SIZE..].copy_from_slice(receipt.as_bytes());
+    key
+}
+
+/// Decode an operation/receipt composite key.
+#[inline]
+pub fn decode_effect_receipt_key(key: &[u8; 64]) -> (OperationId, EffectReceiptId) {
+    let operation = OperationId::from_bytes(key[..OperationId::SIZE].try_into().unwrap());
+    let receipt = EffectReceiptId::from_bytes(key[OperationId::SIZE..].try_into().unwrap());
+    (operation, receipt)
 }
 
 /// Encode a view-merkle pair as 40 bytes

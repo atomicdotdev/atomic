@@ -2,12 +2,13 @@
 
 use super::*;
 use crate::change::{Encoding, Local};
-use crate::crdt::BranchOp;
+use crate::crdt::{BranchOp, TrunkId, TrunkOp};
 use crate::diff::Algorithm;
 use crate::output::Memory;
+use crate::pristine::PathClaimId;
 use crate::record::workflow::detect::{DetectedFile, DetectionKind};
 use crate::record::workflow::graph_op::BuiltHunk;
-use crate::types::Inode;
+use crate::types::{ChangePosition, GraphNode, Inode, NodeId, Position};
 
 // ========================================================================
 // RecordingOptions tests
@@ -541,6 +542,88 @@ fn test_record_modified_file_with_diff() {
     let recorded = result.unwrap();
     // Should have hunks for the modification
     assert!(recorded.hunk_count() > 0);
+}
+
+// ========================================================================
+// record_moved_file tests
+// ========================================================================
+
+fn move_identity() -> (Inode, Position<NodeId>, PathClaimId, TrunkId) {
+    let change = NodeId::new(7);
+    let position = Position::new(change, ChangePosition::new(12));
+    let claim = PathClaimId::new(
+        position,
+        GraphNode::new(change, ChangePosition::new(0), ChangePosition::new(0)),
+        GraphNode::new(change, ChangePosition::new(0), ChangePosition::new(6)),
+        change,
+    );
+    (Inode::new(42), position, claim, TrunkId::new(change, 0))
+}
+
+#[test]
+fn test_record_moved_file_pure_move_preserves_identity_and_semantic_move() {
+    let wc = Memory::new();
+    wc.add_file("new.rs", b"fn unchanged() {}\n");
+    let detected = DetectedFile::moved("old.rs", "new.rs");
+    let (inode, position, claim, trunk_id) = move_identity();
+
+    let recorded = record_moved_file(
+        &wc,
+        &detected,
+        b"fn unchanged() {}\n",
+        None,
+        &RecordingOptions::new(),
+        inode,
+        position,
+        claim,
+        trunk_id,
+        None,
+    )
+    .unwrap();
+
+    assert_eq!(recorded.kind(), Some(DetectionKind::Moved));
+    assert_eq!(recorded.old_path(), Some("old.rs"));
+    assert_eq!(recorded.inode(), Some(inode));
+    assert_eq!(recorded.position(), Some(position));
+    assert_eq!(recorded.exact_source_claim(), Some(claim));
+    assert_eq!(recorded.hunk_count(), 0);
+
+    let file_ops = recorded.crdt_ops().expect("pure move must emit FileOps");
+    assert_eq!(file_ops.trunk_id(), trunk_id);
+    assert!(matches!(
+        file_ops.trunk_op(),
+        Some(TrunkOp::Move { trunk, new_path })
+            if *trunk == trunk_id && new_path == "new.rs"
+    ));
+    assert_eq!(recorded.crdt_stats().unwrap().files_moved, 1);
+}
+
+#[test]
+fn test_record_moved_file_retains_generated_line_and_token_ops() {
+    let wc = Memory::new();
+    wc.add_file("new.rs", b"alpha\nnew value\nomega\n");
+    let detected = DetectedFile::moved("old.rs", "new.rs");
+    let (inode, position, claim, trunk_id) = move_identity();
+
+    let recorded = record_moved_file(
+        &wc,
+        &detected,
+        b"alpha\nold value\nomega\n",
+        None,
+        &RecordingOptions::new(),
+        inode,
+        position,
+        claim,
+        trunk_id,
+        None,
+    )
+    .unwrap();
+
+    assert!(recorded.hunk_count() > 0);
+    let file_ops = recorded.crdt_ops().expect("edited move must emit FileOps");
+    assert!(file_ops.is_move());
+    assert!(file_ops.line_count() > 0);
+    assert!(file_ops.token_count() > 0);
 }
 
 // ========================================================================

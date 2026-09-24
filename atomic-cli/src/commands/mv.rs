@@ -15,16 +15,16 @@
 //!
 //! Options:
 //!   -n, --dry-run  Show what would be moved without doing it
-//!   -f, --force    Force move even if destination exists
+//!   -f, --force    Overwrite an existing untracked destination
 //!   -h, --help     Print help information
 //! ```
 //!
 //! # Behavior
 //!
 //! The `move` command:
-//! 1. Updates the tracking to reflect the new path
-//! 2. Moves the actual file on disk
-//! 3. Preserves the file's history (same inode)
+//! 1. Refuses tracked or unsafe destinations
+//! 2. Moves the file on disk and stages its original inode at the new path
+//! 3. Preserves the file's history when the move is recorded
 //!
 //! # Examples
 //!
@@ -57,13 +57,13 @@ use atomic_repository::Repository;
 
 use crate::commands::{find_repository_root, Command};
 use crate::error::{CliError, CliResult};
-use crate::output::{print_hint, print_success};
+use crate::output::{print_hint, print_success, print_warning};
 
 // Move Command
 
-/// Move or rename tracked files.
+/// Move or rename a tracked file.
 ///
-/// The `move` command moves or renames files while preserving their version
+/// The `move` command moves or renames a file while preserving its version
 /// history. This is the recommended way to rename files in an Atomic repository.
 ///
 /// # Behavior
@@ -75,14 +75,14 @@ use crate::output::{print_hint, print_success};
 /// # Options
 ///
 /// - `--dry-run` / `-n`: Preview what would be moved
-/// - `--force` / `-f`: Force move even if destination exists (overwrite tracking)
+/// - `--force` / `-f`: Overwrite an existing untracked destination
 #[derive(Parser, Debug, Clone)]
 #[command(name = "move")]
 #[derive(Default)]
 pub struct Move {
-    /// Source file or directory to move.
+    /// Source file to move.
     ///
-    /// Must be a tracked file or directory.
+    /// Must be a tracked regular file.
     #[arg(value_name = "SOURCE")]
     pub source: String,
 
@@ -99,11 +99,10 @@ pub struct Move {
     #[arg(short = 'n', long = "dry-run")]
     pub dry_run: bool,
 
-    /// Force move even if destination tracking exists.
+    /// Overwrite an existing untracked destination on disk.
     ///
-    /// This will overwrite the destination's tracking entry if it exists.
-    /// The destination file on disk is NOT overwritten unless you explicitly
-    /// remove it first.
+    /// A tracked destination is always refused because replacing its identity
+    /// requires an explicit remove/resolve operation.
     #[arg(short = 'f', long = "force")]
     pub force: bool,
 }
@@ -180,6 +179,21 @@ impl Move {
 
         std::fs::rename(&from_path, &to_path)
     }
+
+    fn restore_after_staging_failure(
+        source: &Path,
+        destination: &Path,
+        destination_backup: Option<&Path>,
+    ) -> std::io::Result<()> {
+        // Restore the source first. If that fails, leave its bytes at the
+        // destination and the original destination in the backup; restoring the
+        // backup at that point could overwrite the only surviving source copy.
+        std::fs::rename(destination, source)?;
+        if let Some(backup) = destination_backup {
+            std::fs::rename(backup, destination)?;
+        }
+        Ok(())
+    }
 }
 
 impl Command for Move {
@@ -198,6 +212,9 @@ impl Command for Move {
         // Find repository
         let repo_root = find_repository_root()?;
         let repo = Repository::open(&repo_root).map_err(CliError::Repository)?;
+        let working_copy = repo
+            .require_working_copy_id()
+            .map_err(CliError::Repository)?;
 
         // Normalize paths
         let source = self.normalize_path(&repo_root, &self.source)?;
@@ -217,14 +234,43 @@ impl Command for Move {
             return Err(CliError::FileNotFound { path: source_path });
         }
 
-        // Check if destination is already tracked (unless force)
-        if !self.force
-            && repo
-                .is_tracked(&destination)
-                .map_err(CliError::Repository)?
+        if source_path.is_dir() {
+            return Err(CliError::InvalidArgument {
+                message: "directory moves are not yet supported; move tracked files individually"
+                    .to_string(),
+            });
+        }
+
+        // Never overwrite another tracked identity, even with --force. For an
+        // untracked filesystem destination, require --force before rename(2)
+        // can replace its bytes on platforms where that is the default.
+        if repo
+            .is_tracked(&destination)
+            .map_err(CliError::Repository)?
         {
             return Err(CliError::FileAlreadyTracked {
                 path: PathBuf::from(&destination),
+            });
+        }
+        let destination_path = repo_root.join(&destination);
+        let destination_metadata = std::fs::symlink_metadata(&destination_path).ok();
+        if destination_metadata.is_some() && !self.force {
+            return Err(CliError::InvalidArgument {
+                message: format!(
+                    "destination '{}' already exists; use --force only for untracked content",
+                    destination
+                ),
+            });
+        }
+        if destination_metadata
+            .as_ref()
+            .is_some_and(|metadata| !metadata.file_type().is_file())
+        {
+            return Err(CliError::InvalidArgument {
+                message: format!(
+                    "destination '{}' is not a regular file and cannot be replaced safely",
+                    destination
+                ),
             });
         }
 
@@ -239,23 +285,82 @@ impl Command for Move {
         // Perform the move
         println!("Moving: {} → {}", source, destination);
 
-        // Move the file on disk ONLY. We deliberately do NOT eagerly update
-        // tracking (no `repo.move_file`): doing so would rewrite TREE (drop
-        // old, add new) and thereby hide the rename from `record`'s move
-        // detection, which pairs a tracked-but-missing (Deleted) path with an
-        // untracked on-disk (Untracked) path of identical content into a
-        // single `GraphOp::FileMove` that preserves the inode. Leaving the
-        // working copy in that raw-rename shape lets the next `record` capture
-        // it as a genuine move. This mirrors the git importer, which also
-        // records a FileMove and lets apply update TREE rather than calling
-        // `move_file`. (Until you record, `atomic status` will show the old
-        // path as Deleted and the new path as Untracked — expected; there is
-        // no `Moved` status yet.)
-        if let Err(e) = self.move_file_on_disk(&repo_root, &source, &destination) {
+        // Preserve a forced destination until both filesystem movement and
+        // stable-inode staging succeed. This makes a later staging failure fully
+        // reversible instead of losing the overwritten bytes.
+        let destination_backup = if destination_metadata.is_some() {
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos();
+            let backup = destination_path.with_file_name(format!(
+                ".atomic-mv-backup-{}-{}",
+                std::process::id(),
+                nonce
+            ));
+            if std::fs::symlink_metadata(&backup).is_ok() {
+                return Err(CliError::Internal(anyhow::anyhow!(
+                    "refusing move because rollback path already exists: {}",
+                    backup.display()
+                )));
+            }
+            std::fs::rename(&destination_path, &backup).map_err(|error| {
+                CliError::Internal(anyhow::anyhow!(
+                    "Failed to preserve forced destination '{}': {}",
+                    destination,
+                    error
+                ))
+            })?;
+            Some(backup)
+        } else {
+            None
+        };
+
+        // Move the file first, then stage the same stable inode at the new path.
+        // Repository::record compares this staged TREE relationship with the
+        // graph-backed source claim, so the next record can authoritatively emit
+        // FileMove plus any intervening content edits.
+        if let Err(error) = self.move_file_on_disk(&repo_root, &source, &destination) {
+            if let Some(backup) = &destination_backup {
+                if let Err(restore_error) = std::fs::rename(backup, &destination_path) {
+                    return Err(CliError::Internal(anyhow::anyhow!(
+                        "Failed to move '{} -> {}': {}; restoring destination also failed: {}",
+                        source,
+                        destination,
+                        error,
+                        restore_error
+                    )));
+                }
+            }
             return Err(CliError::Internal(anyhow::anyhow!(
                 "Failed to move file on disk: {}",
-                e
+                error
             )));
+        }
+        if let Err(error) = repo.move_file(working_copy, &source, &destination) {
+            if let Err(rollback_error) = Self::restore_after_staging_failure(
+                &source_path,
+                &destination_path,
+                destination_backup.as_deref(),
+            ) {
+                return Err(CliError::Internal(anyhow::anyhow!(
+                    "Failed to stage move '{} -> {}': {}; filesystem rollback also failed: {}",
+                    source,
+                    destination,
+                    error,
+                    rollback_error
+                )));
+            }
+            return Err(CliError::Repository(error));
+        }
+        if let Some(backup) = destination_backup {
+            if let Err(error) = std::fs::remove_file(&backup) {
+                print_warning(&format!(
+                    "Move succeeded, but preserved destination backup could not be removed: {} ({})",
+                    backup.display(),
+                    error
+                ));
+            }
         }
 
         println!();
@@ -361,6 +466,43 @@ mod tests {
     }
 
     // Clone Tests
+
+    #[test]
+    fn test_staging_failure_restores_source_and_forced_destination() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source.txt");
+        let destination = temp.path().join("destination.txt");
+        let backup = temp.path().join(".destination.backup");
+        std::fs::write(&source, b"source bytes").unwrap();
+        std::fs::write(&destination, b"destination bytes").unwrap();
+
+        // Reproduce the filesystem state immediately before stable-inode
+        // staging: the old destination is preserved and source occupies dest.
+        std::fs::rename(&destination, &backup).unwrap();
+        std::fs::rename(&source, &destination).unwrap();
+        Move::restore_after_staging_failure(&source, &destination, Some(&backup)).unwrap();
+
+        assert_eq!(std::fs::read(&source).unwrap(), b"source bytes");
+        assert_eq!(std::fs::read(&destination).unwrap(), b"destination bytes");
+        assert!(!backup.exists());
+    }
+
+    #[test]
+    fn test_failed_source_restore_preserves_both_payloads() {
+        let temp = tempfile::tempdir().unwrap();
+        let missing_source = temp.path().join("missing/source.txt");
+        let destination = temp.path().join("destination.txt");
+        let backup = temp.path().join(".destination.backup");
+        std::fs::write(&destination, b"source bytes").unwrap();
+        std::fs::write(&backup, b"destination bytes").unwrap();
+
+        assert!(
+            Move::restore_after_staging_failure(&missing_source, &destination, Some(&backup),)
+                .is_err()
+        );
+        assert_eq!(std::fs::read(&destination).unwrap(), b"source bytes");
+        assert_eq!(std::fs::read(&backup).unwrap(), b"destination bytes");
+    }
 
     #[test]
     fn test_move_clone() {

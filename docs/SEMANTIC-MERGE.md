@@ -370,14 +370,17 @@ conflict markers in the working copy file.
 
 **Format**:
 
+(marker lines below are backslash-escaped so this example doesn't itself
+read as an unresolved conflict to Atomic's own marker scanner)
+
 ```
-<<<<<<< agent-a (change ABCDEF12)
+\<<<<<<< agent-a (change ABCDEF12)
 const x = { a: 100, b: 2 };
-||||||| base (change 12345678)
+\||||||| base (change 12345678)
 const x = { a: 1, b: 2 };
-=======
+\=======
 const x = { a: 1, b: 200 };
->>>>>>> agent-b (change 9ABCDEF0)
+\>>>>>>> agent-b (change 9ABCDEF0)
 ```
 
 This is the three-way format (with base) so the developer can see what

@@ -4,6 +4,7 @@
 //! [`InodeVertex`], [`InodeAdjState`], [`InodeGraphStats`], the [`InodeGraphOps`]
 //! trait, [`InodeEdgeIter`], and the [`IntoInodeVertex`] conversion trait.
 
+use crate::pristine::{PristineError, TreeTxnT};
 use crate::types::{EdgeFlags, GraphNode, Inode, NodeId, Position, SerializedGraphEdge};
 
 // INODE VERTEX COMPOSITE KEY
@@ -422,7 +423,8 @@ pub trait InodeGraphOps {
     ///
     /// # Returns
     ///
-    /// An iterator over all matching edges for the file.
+    /// An iterator over all matching edges for the file. The first storage
+    /// error is yielded and terminates the iterator.
     fn iter_inode_edges(
         &self,
         inode: Inode,
@@ -430,42 +432,48 @@ pub trait InodeGraphOps {
         max_flag: EdgeFlags,
     ) -> Result<InodeEdgeIter<'_, Self>, Self::InodeError>
     where
-        Self: Sized,
+        Self: Sized + TreeTxnT,
+        Self::InodeError: From<PristineError>,
     {
+        let vertices =
+            TreeTxnT::iter_inode_vertices(self, inode).map_err(Self::InodeError::from)?;
         Ok(InodeEdgeIter {
-            ops: self,
-            inode,
+            vertices,
             min_flag,
             max_flag,
-            current_adj: None,
             exhausted: false,
+            ops: std::marker::PhantomData,
         })
     }
 }
 
 // INODE EDGE ITERATOR
 
+type InodeVertexIter<'a> =
+    Box<dyn Iterator<Item = Result<(GraphNode<NodeId>, SerializedGraphEdge), PristineError>> + 'a>;
+
 /// Iterator over edges within an inode scope.
 ///
 /// This iterator uses the `InodeGraphOps` trait to efficiently iterate
 /// over all edges belonging to a file.
-#[allow(dead_code)]
 pub struct InodeEdgeIter<'a, T: InodeGraphOps> {
-    /// Reference to the graph operations provider.
-    ops: &'a T,
-    /// The inode being iterated.
-    inode: Inode,
+    /// All inode vertices and their edges in storage order.
+    vertices: InodeVertexIter<'a>,
     /// Minimum edge flags.
     min_flag: EdgeFlags,
     /// Maximum edge flags.
     max_flag: EdgeFlags,
-    /// Current adjacency state.
-    current_adj: Option<InodeAdjState>,
     /// Whether iteration is exhausted.
     exhausted: bool,
+    /// Associates the iterator error type with its operations provider.
+    ops: std::marker::PhantomData<&'a T>,
 }
 
-impl<'a, T: InodeGraphOps> Iterator for InodeEdgeIter<'a, T> {
+impl<'a, T> Iterator for InodeEdgeIter<'a, T>
+where
+    T: InodeGraphOps,
+    T::InodeError: From<PristineError>,
+{
     type Item = Result<SerializedGraphEdge, T::InodeError>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -473,16 +481,24 @@ impl<'a, T: InodeGraphOps> Iterator for InodeEdgeIter<'a, T> {
             return None;
         }
 
-        // If we have a current adjacency state, try to get the next edge
-        if let Some(ref mut adj) = self.current_adj {
-            if let Some(result) = self.ops.next_inode_adj(adj) {
-                return Some(result);
+        loop {
+            match self.vertices.next() {
+                Some(Ok((_node, edge))) => {
+                    let flag = edge.flag();
+                    if flag >= self.min_flag && flag <= self.max_flag {
+                        return Some(Ok(edge));
+                    }
+                }
+                Some(Err(error)) => {
+                    self.exhausted = true;
+                    return Some(Err(T::InodeError::from(error)));
+                }
+                None => {
+                    self.exhausted = true;
+                    return None;
+                }
             }
         }
-
-        // Adjacency exhausted, mark as done
-        self.exhausted = true;
-        None
     }
 }
 
@@ -505,5 +521,66 @@ impl IntoInodeVertex for Position<NodeId> {
     #[inline]
     fn into_inode_vertex(self, inode: Inode) -> InodeVertex {
         InodeVertex::new(inode, self.inode_node())
+    }
+}
+
+#[cfg(test)]
+mod edge_iter_tests {
+    use super::*;
+    use crate::types::ChangePosition;
+
+    struct DummyOps;
+
+    impl InodeGraphOps for DummyOps {
+        type InodeError = PristineError;
+
+        fn init_inode_adj(
+            &self,
+            inode: Inode,
+            node: GraphNode<NodeId>,
+            min_flag: EdgeFlags,
+            max_flag: EdgeFlags,
+        ) -> Result<InodeAdjState, Self::InodeError> {
+            Ok(InodeAdjState::new(inode, node, min_flag, max_flag))
+        }
+
+        fn next_inode_adj(
+            &self,
+            _adj: &mut InodeAdjState,
+        ) -> Option<Result<SerializedGraphEdge, Self::InodeError>> {
+            None
+        }
+
+        fn find_block_in_inode(
+            &self,
+            _inode: Inode,
+            _pos: Position<NodeId>,
+        ) -> Result<Option<GraphNode<NodeId>>, Self::InodeError> {
+            Ok(None)
+        }
+
+        fn count_inode_vertices(&self, _inode: Inode) -> Result<usize, Self::InodeError> {
+            Ok(0)
+        }
+    }
+
+    #[test]
+    fn inode_edge_iter_is_terminal_after_vertex_stream_error() {
+        let edge = SerializedGraphEdge::new(
+            EdgeFlags::BLOCK,
+            Position::new(NodeId::ROOT, ChangePosition::new(0)),
+            NodeId::ROOT,
+        );
+        let error = PristineError::BlockNotFound { change: 1, pos: 0 };
+        let mut iter = InodeEdgeIter::<DummyOps> {
+            vertices: Box::new(vec![Err(error), Ok((GraphNode::ROOT, edge))].into_iter()),
+            min_flag: EdgeFlags::empty(),
+            max_flag: EdgeFlags::all(),
+            exhausted: false,
+            ops: std::marker::PhantomData,
+        };
+
+        assert!(matches!(iter.next(), Some(Err(_))));
+        assert!(iter.next().is_none());
     }
 }

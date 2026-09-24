@@ -296,13 +296,24 @@ mod tests {
         let first = txn.alloc_inode().unwrap();
         let second = txn.alloc_inode().unwrap();
         txn.put_tree("same.txt", first).unwrap();
-        txn.put_tree("same.txt", second).unwrap();
+        txn.put_tree("other.txt", second).unwrap();
 
-        txn.del_tree_binding("same.txt", first).unwrap();
+        // This branch's put_tree enforces the TREE/REV_TREE bijection: a
+        // second inode can never silently seize an occupied path (the #206
+        // duplication state is refused at the write, not repaired after).
+        // `del_tree_binding` must therefore be a targeted no-op when the
+        // named inode does not own the path — it removes only the binding
+        // rows it actually owns and never disturbs the current occupant.
+        txn.del_tree_binding("same.txt", second).unwrap();
 
-        assert_eq!(txn.get_inode("same.txt").unwrap(), Some(second));
-        assert_eq!(txn.get_path(first).unwrap(), None);
-        assert_eq!(txn.get_path(second).unwrap().as_deref(), Some("same.txt"));
+        assert_eq!(txn.get_inode("same.txt").unwrap(), Some(first));
+        assert_eq!(txn.get_path(first).unwrap().as_deref(), Some("same.txt"));
+        assert_eq!(txn.get_path(second).unwrap().as_deref(), Some("other.txt"));
+
+        // Removing the binding it DOES own unbinds both directions cleanly.
+        txn.del_tree_binding("other.txt", second).unwrap();
+        assert_eq!(txn.get_inode("other.txt").unwrap(), None);
+        assert_eq!(txn.get_path(second).unwrap(), None);
     }
 
     #[test]
@@ -662,6 +673,24 @@ mod tests {
         assert_eq!(txn.inode_position(inode).unwrap(), None);
 
         txn.commit().unwrap();
+    }
+
+    #[test]
+    fn pending_inode_reset_cas_refuses_to_lower_concurrently_advanced_counter() {
+        let shared = AtomicU64::new(500);
+        let mut pending = PendingInodeReset::new(500, 1);
+
+        assert_eq!(pending.allocate().unwrap().get(), 1);
+        assert_eq!(pending.allocate().unwrap().get(), 2);
+
+        // Simulate another writer allocating after redb commit but before reset publication.
+        assert_eq!(allocate_shared_inode(&shared).unwrap().get(), 500);
+        assert_eq!(shared.load(Ordering::SeqCst), 501);
+        assert!(!pending.publish(&shared));
+        assert_eq!(shared.load(Ordering::SeqCst), 501);
+
+        assert_eq!(allocate_shared_inode(&shared).unwrap().get(), 501);
+        assert_eq!(shared.load(Ordering::SeqCst), 502);
     }
 
     #[test]
@@ -1089,5 +1118,159 @@ mod tests {
         }
 
         txn.commit().unwrap();
+    }
+
+    #[test]
+    fn test_mark_session_incomplete_is_first_writer_idempotent() {
+        use crate::change::session::{IncompleteSession, SessionIncompleteOrigin, SessionStatus};
+
+        let dir = tempdir().unwrap();
+        let pristine = Pristine::open(dir.path().join("pristine")).unwrap();
+        let first = IncompleteSession::new(
+            "checkout drift",
+            vec!["src/lib.rs".into()],
+            "refs/atomic/wip/first",
+            SessionIncompleteOrigin::UnknownPostCheckout,
+        );
+        let later = IncompleteSession::new(
+            "later duplicate",
+            vec!["src/other.rs".into()],
+            "refs/atomic/wip/later",
+            SessionIncompleteOrigin::UnknownPostCheckout,
+        );
+
+        let mut txn = pristine.write_txn().unwrap();
+        let persisted = txn
+            .mark_session_incomplete(
+                "sess-incomplete",
+                ".atomic/sessions/sess-incomplete.json",
+                Some("agent-view".into()),
+                Some("main".into()),
+                &first,
+            )
+            .unwrap();
+        assert_eq!(persisted, first);
+
+        let duplicate = txn
+            .mark_session_incomplete(
+                "sess-incomplete",
+                ".atomic/sessions/sess-incomplete.json",
+                Some("agent-view".into()),
+                Some("main".into()),
+                &later,
+            )
+            .unwrap();
+        assert_eq!(duplicate, first, "the original recovery object must win");
+
+        txn.upsert_session_lifecycle(
+            "sess-incomplete",
+            ".atomic/sessions/sess-incomplete.json",
+            None,
+            None,
+            Some(123),
+        )
+        .unwrap();
+        txn.commit().unwrap();
+
+        let txn = pristine.read_txn().unwrap();
+        let record = txn.get_session_record("sess-incomplete").unwrap().unwrap();
+        assert_eq!(record.status, SessionStatus::Incomplete(first));
+        assert_eq!(record.turn_count, 0);
+        assert!(txn.get_session_turns("sess-incomplete").unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_attach_turn_boundary_updates_only_existing_rows() {
+        use crate::change::session::{GitBoundaryCheckpoint, ManagedTurnOutcome, TurnBoundary};
+
+        let dir = tempdir().unwrap();
+        let pristine = Pristine::open(dir.path().join("pristine")).unwrap();
+        let provenance = crate::types::Hash::of(b"provenance");
+
+        let boundary = |session: &str, turn: u32| TurnBoundary {
+            working_copy: "01ABCDEF26CHARSULID0000000".into(),
+            operation: None,
+            view: "main".into(),
+            view_state: None,
+            set_id: None,
+            snapshot: None,
+            git: Some(GitBoundaryCheckpoint {
+                head_oid: Some("a".repeat(40)),
+                head_symref: None,
+                head_tree: None,
+                index_digest: None,
+                index_tree: None,
+                index_locked: false,
+                repository_state: String::new(),
+                markers: vec![],
+            }),
+            manifest: None,
+            conversion_policy: None,
+            session_id: session.into(),
+            turn,
+            at: 7,
+        };
+        let outcome = || ManagedTurnOutcome::ContentChanges {
+            durable: vec![crate::types::Hash::of(b"change")],
+            snapshot: None,
+        };
+
+        let mut txn = pristine.write_txn().unwrap();
+        txn.index_session_turn(
+            "sess-b",
+            ".atomic/sessions/sess-b.json",
+            &provenance,
+            &crate::change::provenance_graph::ProvenanceGraph::builder("sess-b", "claude-code")
+                .build(),
+        )
+        .unwrap();
+
+        // The row exists: the boundary pair and outcome attach.
+        let attached = txn
+            .attach_turn_boundary(
+                "sess-b",
+                &provenance,
+                &boundary("sess-b", 1),
+                &boundary("sess-b", 1),
+                &outcome(),
+            )
+            .unwrap();
+        assert!(attached);
+
+        // Re-attaching identical evidence is an idempotent no-op.
+        let attached = txn
+            .attach_turn_boundary(
+                "sess-b",
+                &provenance,
+                &boundary("sess-b", 1),
+                &boundary("sess-b", 1),
+                &outcome(),
+            )
+            .unwrap();
+        assert!(attached);
+
+        // Unknown provenance / session: nothing is created.
+        let missing = txn
+            .attach_turn_boundary(
+                "sess-other",
+                &provenance,
+                &boundary("sess-other", 1),
+                &boundary("sess-other", 1),
+                &outcome(),
+            )
+            .unwrap();
+        assert!(!missing);
+        txn.commit().unwrap();
+
+        let txn = pristine.read_txn().unwrap();
+        let turns = txn.get_session_turns("sess-b").unwrap();
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].boundary_start.as_ref().unwrap().turn, 1);
+        assert_eq!(turns[0].boundary_end.as_ref().unwrap().turn, 1);
+        assert!(matches!(
+            turns[0].outcome,
+            Some(ManagedTurnOutcome::ContentChanges { .. })
+        ));
+        assert!(txn.get_session_turns("sess-other").unwrap().is_empty());
     }
 }

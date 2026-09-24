@@ -6,10 +6,11 @@
 //! - [`RecordingResult`]: The complete result of recording detected changes
 
 use crate::change::{Encoding, FileOps};
+use crate::pristine::PathClaimId;
 use crate::record::workflow::crdt::CrdtBuildStats;
 use crate::record::workflow::detect::DetectionKind;
 use crate::record::workflow::graph_op::BuiltHunk;
-use crate::types::{GraphNode, Inode, NodeId, Position};
+use crate::types::{GraphNode, Hash, Inode, NodeId, Position};
 
 // ============================================================================
 // RECORDING STATS
@@ -143,6 +144,13 @@ pub struct RecordedFile {
     /// Previous path (for moves/renames).
     old_path: Option<String>,
 
+    /// Exact causally maximal structural source for a move.
+    ///
+    /// When present, globalization must delete this parent-to-name claim rather
+    /// than reconstructing a name vertex from the stable inode's original
+    /// position.
+    exact_source_claim: Option<PathClaimId>,
+
     /// Hunks generated for this file.
     hunks: Vec<BuiltHunk>,
 
@@ -190,6 +198,22 @@ pub struct RecordedFile {
     /// avoids re-walking the graph.  Produced by the record path when it
     /// has a vertex map from content retrieval.
     pre_globalized: Option<Vec<crate::change::GraphOp<Option<crate::types::Hash>>>>,
+
+    /// Causally maximal deletions this record restores.
+    ///
+    /// Empty means this is an ordinary add/edit/delete. Undelete keeps the
+    /// original inode and reverses only graph edges introduced by these
+    /// visible deletion changes.
+    undelete_changes: Vec<Hash>,
+
+    /// Graph-backed inode attribute writes (mode/kind) this record makes.
+    ///
+    /// Emitted by assembly as `GraphOp::SetAttr` hunks plus semantic
+    /// `SetMode`/`SetKind` FileOps. Import paths use this to carry Git
+    /// executable bits, symlink kinds, and gitlink kinds; the native
+    /// working-copy record path computes attributes itself and does not
+    /// populate this field.
+    attrs: Vec<crate::change::InodeAttr>,
 }
 
 impl RecordedFile {
@@ -212,6 +236,7 @@ impl RecordedFile {
         Self {
             path: path.into(),
             old_path: None,
+            exact_source_claim: None,
             hunks: Vec::new(),
             content: Vec::new(),
             encoding: None,
@@ -225,7 +250,28 @@ impl RecordedFile {
             name_conflict_resolution: None,
             name_conflict_bindings: Vec::new(),
             pre_globalized: None,
+            undelete_changes: Vec::new(),
+            attrs: Vec::new(),
         }
+    }
+
+    /// Register an inode attribute write for this file.
+    ///
+    /// The same attribute name may appear at most once per record; a second
+    /// value under one name would make the change self-conflicting.
+    pub fn set_attr(&mut self, value: crate::change::InodeAttr) {
+        if !self
+            .attrs
+            .iter()
+            .any(|existing| existing.name() == value.name())
+        {
+            self.attrs.push(value);
+        }
+    }
+
+    /// The inode attribute writes this record carries.
+    pub fn attrs(&self) -> &[crate::change::InodeAttr] {
+        &self.attrs
     }
 
     /// Set the old (pristine) line count.
@@ -310,6 +356,21 @@ impl RecordedFile {
         recorded
     }
 
+    /// Create a recorded directory restoration with its original identity.
+    #[must_use]
+    pub fn new_undeleted_directory(
+        path: impl Into<String>,
+        inode: Inode,
+        position: Position<NodeId>,
+        deleted_by: Vec<Hash>,
+    ) -> Self {
+        let mut recorded = Self::new_directory(path);
+        recorded.inode = Some(inode);
+        recorded.position = Some(position);
+        recorded.undelete_changes = deleted_by;
+        recorded
+    }
+
     /// Check if this recorded file represents a directory.
     ///
     /// A directory is identified by having `Added` kind with no content.
@@ -326,6 +387,29 @@ impl RecordedFile {
         matches!(self.kind, Some(DetectionKind::Deleted))
             && self.content.is_empty()
             && self.hunks.is_empty()
+    }
+
+    /// Check if this record restores a deleted path.
+    #[must_use]
+    pub fn is_undelete(&self) -> bool {
+        !self.undelete_changes.is_empty()
+    }
+
+    /// Check if this record restores a deleted directory.
+    #[must_use]
+    pub fn is_undeleted_directory(&self) -> bool {
+        self.is_undelete() && self.encoding.is_none() && self.hunks.is_empty()
+    }
+
+    /// Replace the deletion changes restored by this record.
+    pub fn set_undelete_changes(&mut self, changes: Vec<Hash>) {
+        self.undelete_changes = changes;
+    }
+
+    /// Return the deletion changes restored by this record.
+    #[must_use]
+    pub fn undelete_changes(&self) -> &[Hash] {
+        &self.undelete_changes
     }
 
     /// Add a graph_op to this file.
@@ -363,6 +447,11 @@ impl RecordedFile {
         self.old_path = Some(path);
     }
 
+    /// Set the exact causally maximal structural source for a move.
+    pub fn set_exact_source_claim(&mut self, claim: PathClaimId) {
+        self.exact_source_claim = Some(claim);
+    }
+
     /// Set the CRDT operations for this file.
     pub fn set_crdt_ops(&mut self, ops: FileOps) {
         self.crdt_ops = Some(ops);
@@ -394,6 +483,12 @@ impl RecordedFile {
     #[must_use]
     pub fn old_path(&self) -> Option<&str> {
         self.old_path.as_deref()
+    }
+
+    /// Return the exact structural source claim for a move, when supplied.
+    #[must_use]
+    pub fn exact_source_claim(&self) -> Option<PathClaimId> {
+        self.exact_source_claim
     }
 
     /// Get the hunks.
@@ -491,6 +586,8 @@ impl RecordedFile {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         if matches!(self.kind, Some(DetectionKind::Moved))
+            || self.is_undelete()
+            || !self.attrs.is_empty()
             || self.name_conflict_resolution.is_some()
         {
             return false;

@@ -29,6 +29,7 @@
 //! assert!(path_err.is_not_found());
 //! ```
 
+use crate::merge::SemanticMergeError;
 use crate::pristine::PristineError;
 use crate::types::Inode;
 use std::fmt;
@@ -332,6 +333,15 @@ impl From<std::io::Error> for OutputError {
 impl From<PristineError> for OutputError {
     fn from(err: PristineError) -> Self {
         Self::Pristine(Box::new(err))
+    }
+}
+
+impl From<SemanticMergeError> for OutputError {
+    fn from(err: SemanticMergeError) -> Self {
+        match err {
+            SemanticMergeError::Pristine(err) => Self::Pristine(Box::new(err)),
+            SemanticMergeError::ChangeStore(err) => Self::ChangeStore(err),
+        }
     }
 }
 

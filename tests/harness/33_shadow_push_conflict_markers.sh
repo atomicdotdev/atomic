@@ -54,14 +54,20 @@ begin_section "Shadow push aborts on unresolved conflict markers"
 
 # Atomic's markers are numbered and change-hash-tagged (SPEC §4):
 #   >>>>>>> N   /   ======= N [HASH]   /   <<<<<<< N
-cat > src/app.ts <<'MARKERS'
+#
+# Built from variables (not written literally here) so this test's own
+# source doesn't read as an unresolved conflict to Atomic's marker scanner.
+MARK_GT='>>>>>>>'
+MARK_EQ='======='
+MARK_LT='<<<<<<<'
+cat > src/app.ts <<EOF
 const shared = 1;
->>>>>>> 1
+$MARK_GT 1
 const a = 2;
-======= 1 [C2YTBAHQ]
+$MARK_EQ 1 [C2YTBAHQ]
 const b = 3;
-<<<<<<< 1
-MARKERS
+$MARK_LT 1
+EOF
 
 # Capture the aborted push once (output + rc + commit count around it).
 set +e

@@ -3,19 +3,20 @@
 //! This module contains [`RetrieveOptions`] for configuring graph retrieval
 //! and [`RetrieveResult`] for returning the retrieved graph with statistics.
 
+use std::collections::HashMap;
+
 use super::super::graph::AliveGraph;
-use crate::pristine::{GraphTxnT, PristineError};
-use crate::types::{ForwardEdge, GraphNode, NodeId, ParentEdgeKind};
-use std::collections::HashSet;
-use std::sync::Arc;
+use crate::pristine::{GraphTxnT, GraphVisibilityClosure, PristineError};
+use crate::types::{ForwardEdge, GraphNode, NodeId, ParentEdge, ParentEdgeKind};
 
 // RETRIEVE OPTIONS
 
 /// Options for graph retrieval.
 ///
 /// These options control what content is included in the retrieved graph.
-/// The `change_filter` option enables state-based content retrieval, which
-/// is essential for showing what a specific change modified.
+/// The `graph_visibility` option enables state-based content retrieval with a
+/// validated dependency closure, which is essential for showing what a
+/// specific change modified.
 ///
 /// # State-Based Retrieval
 ///
@@ -23,8 +24,8 @@ use std::sync::Arc;
 /// 1. The file content BEFORE the change (parent state)
 /// 2. The file content AFTER the change (current state)
 ///
-/// This is achieved by setting `change_filter` to only include vertices
-/// from changes applied up to a certain point:
+/// This is achieved by setting `graph_visibility` to the validated closure
+/// for changes applied up to a certain point:
 ///
 /// ```text
 /// Change Sequence:  [0]  [1]  [2]  [3]  [4]  [5]  ...
@@ -41,17 +42,14 @@ use std::sync::Arc;
 ///
 /// ```rust,ignore
 /// use atomic_core::output::alive::{retrieve_graph, RetrieveOptions};
-/// use std::collections::HashSet;
+/// use atomic_core::pristine::GraphVisibilityClosure;
 ///
-/// // Retrieve content at a specific state (e.g., before change at seq 5)
-/// let changes_before: HashSet<NodeId> = get_changes_up_to_sequence(&txn, &view, 5)?;
-/// let options = RetrieveOptions::new().with_change_filter(changes_before);
+/// // Retrieve content at a specific state (e.g., before change at seq 5).
+/// let membership_before = get_membership_up_to_sequence(&txn, &view, 5)?;
+/// let visibility_before =
+///     GraphVisibilityClosure::try_from_membership(&txn, &membership_before)?;
+/// let options = RetrieveOptions::new().with_graph_visibility(visibility_before);
 /// let parent_graph = retrieve_graph(&txn, file_pos, options)?;
-///
-/// // Retrieve content after the change (includes change at seq 5)
-/// let changes_after: HashSet<NodeId> = get_changes_up_to_sequence(&txn, &view, 6)?;
-/// let options = RetrieveOptions::new().with_change_filter(changes_after);
-/// let current_graph = retrieve_graph(&txn, file_pos, options)?;
 /// ```
 #[derive(Debug, Clone, Default)]
 pub struct RetrieveOptions {
@@ -67,23 +65,17 @@ pub struct RetrieveOptions {
     /// prevent runaway retrieval on corrupted or very large files.
     pub max_vertices: Option<usize>,
 
-    /// Optional filter to only include vertices from specific changes.
+    /// Optional validated dependency closure for graph traversal.
     ///
-    /// When set, only vertices whose `change_id` is in this set (or is ROOT)
-    /// will be included in the retrieved graph. This enables state-based
-    /// content retrieval for showing what a specific change modified.
-    ///
-    /// # Usage
-    ///
-    /// - To get content at parent state: filter = changes applied BEFORE the change
-    /// - To get content at current state: filter = changes applied UP TO AND INCLUDING the change
-    ///
-    /// The filter is wrapped in `Arc` for efficient cloning and sharing.
-    pub change_filter: Option<Arc<HashSet<NodeId>>>,
+    /// When set, only vertices whose `change_id` is in this closure (or is
+    /// ROOT) are included. `None` explicitly means the ambient graph is read
+    /// without visibility filtering; `Some(GraphVisibilityClosure::empty())`
+    /// is an active filter that permits only ROOT.
+    pub graph_visibility: Option<GraphVisibilityClosure>,
 
-    /// Treat every visible deletion as authoritative, without a change set.
+    /// Treat every visible deletion as authoritative, without a closure.
     ///
-    /// This applies the same aliveness semantics as a change filter that
+    /// This applies the same aliveness semantics as graph visibility that
     /// contains every visible change: any `BLOCK|DELETED` parent edge the
     /// transaction can see marks the vertex dead, and retrieval walks
     /// through it to its live successors instead of surfacing it as a
@@ -93,11 +85,22 @@ pub struct RetrieveOptions {
     /// caller needs the graph to match what a filtered materialization
     /// renders.
     ///
-    /// Without this (and without a `change_filter`), the additive edge
+    /// Without this (and without `graph_visibility`), the additive edge
     /// model keeps a deleted vertex "alive": its original parent edge
     /// remains next to the deletion marker, so it is retrieved as a
     /// zombie and occupies a position in the output order.
     pub deletions_final: bool,
+
+    /// Stop the traversal as soon as the graph holds at least one alive
+    /// non-empty content vertex.
+    ///
+    /// This is an optional liveness fast path (review E4): a caller that only
+    /// needs "does this position render any alive bytes?" (for example the
+    /// path-projection's absent-entry resurrection check) can request the
+    /// early exit instead of walking every vertex of a long-history file. The
+    /// returned graph is PARTIAL and must not be used as content — only its
+    /// `total_bytes() > 0` verdict is meaningful.
+    pub stop_at_first_content: bool,
 }
 
 impl RetrieveOptions {
@@ -124,35 +127,34 @@ impl RetrieveOptions {
         self
     }
 
-    /// Set a change filter for state-based content retrieval.
-    ///
-    /// Only vertices from changes in this set (or ROOT) will be included.
-    /// This enables retrieving file content at a specific historical state.
-    ///
-    /// # Arguments
-    ///
-    /// * `filter` - Set of change NodeIds to include
-    ///
-    /// # Example
-    ///
-    /// ```rust,ignore
-    /// // Get changes applied before sequence 5
-    /// let changes = get_changes_up_to_sequence(&txn, &view, 5)?;
-    /// let options = RetrieveOptions::new().with_change_filter(changes);
-    /// let graph = retrieve_graph(&txn, pos, options)?;
-    /// ```
-    pub fn with_change_filter(mut self, filter: HashSet<NodeId>) -> Self {
-        self.change_filter = Some(Arc::new(filter));
+    /// Request the liveness fast path: stop as soon as the traversal has
+    /// recorded one alive non-empty content vertex (review E4).
+    pub fn stop_at_first_content(mut self, stop: bool) -> Self {
+        self.stop_at_first_content = stop;
         self
     }
 
-    /// Set a change filter from an existing Arc (avoids cloning).
+    /// Set validated graph visibility for state-based content retrieval.
     ///
-    /// Use this when you want to share the same filter across multiple
-    /// retrieval operations for efficiency.
-    pub fn with_change_filter_arc(mut self, filter: Arc<HashSet<NodeId>>) -> Self {
-        self.change_filter = Some(filter);
+    /// The closure must be constructed through
+    /// [`GraphVisibilityClosure::try_from_membership`], which proves indexed
+    /// dependency completeness before traversal starts.
+    pub fn with_graph_visibility(mut self, visibility: GraphVisibilityClosure) -> Self {
+        self.graph_visibility = Some(visibility);
         self
+    }
+
+    pub fn with_change_filter(self, filter: std::collections::HashSet<NodeId>) -> Self {
+        self.with_graph_visibility(GraphVisibilityClosure::from_ordered_unchecked(filter))
+    }
+
+    pub fn with_change_filter_arc(
+        self,
+        filter: std::sync::Arc<std::collections::HashSet<NodeId>>,
+    ) -> Self {
+        self.with_graph_visibility(GraphVisibilityClosure::from_ordered_unchecked(
+            filter.iter().copied(),
+        ))
     }
 
     /// Treat every visible deletion as authoritative (see
@@ -164,42 +166,42 @@ impl RetrieveOptions {
 
     /// Whether vertex aliveness uses the deletion-aware (filtered) logic.
     pub(crate) fn deletion_aware(&self) -> bool {
-        self.change_filter.is_some() || self.deletions_final
+        self.graph_visibility.is_some() || self.deletions_final
     }
 
-    /// Check if a change ID passes the filter.
+    /// Check if a change ID passes graph visibility.
     ///
     /// Returns true if:
-    /// - No filter is set (all changes pass)
+    /// - No closure is set (the ambient graph is unfiltered)
     /// - The change_id is ROOT (NodeId(0), always passes)
-    /// - The change_id is in the filter set
+    /// - The change_id is in the validated closure
     pub fn passes_filter(&self, change_id: NodeId) -> bool {
-        match &self.change_filter {
-            None => true, // No filter, all pass
-            Some(filter) => {
+        match &self.graph_visibility {
+            None => true, // Explicitly unfiltered ambient graph.
+            Some(visibility) => {
                 // ROOT always passes (it's the origin of the graph)
                 if change_id == NodeId::ROOT {
                     return true;
                 }
-                filter.contains(&change_id)
+                visibility.contains(change_id)
             }
         }
     }
 
-    /// Check if a filter is active.
+    /// Check if graph visibility filtering is active.
     pub fn has_filter(&self) -> bool {
-        self.change_filter.is_some()
+        self.graph_visibility.is_some()
     }
 
     /// Whether `iter_forward` should include deleted edges.
     ///
-    /// When a change filter is active, we always include deleted edges
+    /// When graph visibility is active, we always include deleted edges
     /// because we need to traverse them to find content that was deleted
     /// by changes OUTSIDE our filter (which means the content was still
     /// alive at the target state). Same when `include_deleted` is
     /// explicitly set.
     pub(crate) fn include_deleted_edges(&self) -> bool {
-        self.include_deleted || self.change_filter.is_some() || self.deletions_final
+        self.include_deleted || self.graph_visibility.is_some() || self.deletions_final
     }
 
     // ------------------------------------------------------------------
@@ -231,7 +233,7 @@ impl RetrieveOptions {
     /// Check if a vertex is alive by examining all its parent edges.
     ///
     /// A vertex is alive if it has at least one live parent AND was not
-    /// deleted by a change in our view's filter.
+    /// deleted by a change in the active visibility closure.
     ///
     /// Uses typed [`ParentEdgeKind`] matching instead of raw `EdgeFlags`
     /// bitflag checks, so every case is visible and the compiler rejects
@@ -240,9 +242,9 @@ impl RetrieveOptions {
     /// # Logic
     ///
     /// - **Non-deleted parent edge** → live parent
-    /// - **DELETED parent, introduced OUTSIDE filter** → live parent
+    /// - **DELETED parent, introduced OUTSIDE visibility** → live parent
     ///   (the deletion is "in the future" from our perspective)
-    /// - **DELETED parent, introduced IN filter** → marks vertex dead
+    /// - **DELETED parent, introduced IN visibility** → marks vertex dead
     ///
     /// The vertex is alive when it has at least one live parent AND
     /// was not deleted by an in-filter change.
@@ -250,6 +252,21 @@ impl RetrieveOptions {
         &self,
         txn: &T,
         vertex: GraphNode<NodeId>,
+    ) -> Result<bool, PristineError> {
+        let mut memo = HashMap::new();
+        self.is_vertex_alive_with_memo(txn, vertex, &mut memo)
+    }
+
+    /// Vertex aliveness with a caller-owned dependency memo.
+    ///
+    /// `change_depends_on` is a pure function of the change pair; sharing the
+    /// memo across a whole retrieval avoids re-resolving the same causal
+    /// dominance questions for every vertex of a heavily edited file.
+    pub fn is_vertex_alive_with_memo<T: GraphTxnT>(
+        &self,
+        txn: &T,
+        vertex: GraphNode<NodeId>,
+        memo: &mut HashMap<(NodeId, NodeId), bool>,
     ) -> Result<bool, PristineError> {
         // Without a filter (and without deletions_final), delegate to the
         // unfiltered classifier. With deletions_final set, the logic below
@@ -264,48 +281,111 @@ impl RetrieveOptions {
             return Ok(true);
         }
 
-        // Include deleted parents so we can distinguish "deleted by us"
-        // from "deleted by someone outside our filter".
-        let parents = txn.iter_parents(vertex, true)?;
+        // Edge updates are additive. Keep only causally maximal visible parent
+        // states so A -> delete(A) -> undelete(delete) resolves to the final
+        // alive state without using view order. Sibling-only updates are ignored.
+        let parents: Vec<ParentEdge> = txn
+            .iter_parents(vertex, true)?
+            .into_iter()
+            .filter(|parent| self.passes_filter(parent.introduced_by))
+            .collect();
+        let mut visiting = Vec::new();
+        let mut maximal = Vec::new();
+        for (index, candidate) in parents.iter().enumerate() {
+            let mut superseded = false;
+            for (other_index, other) in parents.iter().enumerate() {
+                if index == other_index || candidate.introduced_by == other.introduced_by {
+                    continue;
+                }
+                if change_depends_on(
+                    txn,
+                    other.introduced_by,
+                    candidate.introduced_by,
+                    memo,
+                    &mut visiting,
+                )? {
+                    superseded = true;
+                    break;
+                }
+            }
+            if !superseded {
+                maximal.push(*candidate);
+            }
+        }
 
         let mut has_live_parent = false;
-        let mut deleted_by_filter_change = false;
-
-        for parent in &parents {
-            let introduced_by = parent.introduced_by;
-            let in_filter = self.passes_filter(introduced_by);
-
+        let mut has_deleted_parent = false;
+        for parent in maximal {
             match parent.kind {
-                // Non-deleted parent edges — vertex is connected (alive)
-                ParentEdgeKind::Block | ParentEdgeKind::Folder => {
-                    has_live_parent = true;
-                }
-                // Pseudo parents count for empty vertices (inodes)
+                ParentEdgeKind::Block | ParentEdgeKind::Folder => has_live_parent = true,
                 ParentEdgeKind::PseudoBlock | ParentEdgeKind::PseudoFolder => {
                     if vertex.is_empty() {
                         has_live_parent = true;
                     }
                 }
-                // Deleted parent — check who deleted it
                 ParentEdgeKind::BlockDeleted | ParentEdgeKind::FolderDeleted => {
-                    if in_filter {
-                        // Deletion from a change in our filter → vertex is dead
-                        deleted_by_filter_change = true;
-                    } else {
-                        // Deletion from a change OUTSIDE our filter.
-                        // From our perspective that deletion hasn't happened yet,
-                        // so this edge still counts as a live connection.
-                        has_live_parent = true;
-                    }
+                    has_deleted_parent = true;
                 }
             }
         }
 
-        // Vertex is alive if it has at least one live parent (non-deleted
-        // or deleted-by-outside-change) AND was not explicitly deleted by
-        // a change in our filter.
-        Ok(has_live_parent && !deleted_by_filter_change)
+        // Concurrent maximal delete and alive states remain conservatively dead;
+        // conflict handling may surface surviving descendants separately.
+        Ok(has_live_parent && !has_deleted_parent)
     }
+}
+
+fn change_depends_on<T: GraphTxnT>(
+    txn: &T,
+    descendant: NodeId,
+    ancestor: NodeId,
+    memo: &mut HashMap<(NodeId, NodeId), bool>,
+    visiting: &mut Vec<NodeId>,
+) -> Result<bool, PristineError> {
+    if descendant == ancestor {
+        return Ok(true);
+    }
+    if descendant.is_root() || ancestor.is_root() {
+        return Ok(false);
+    }
+    if let Some(result) = memo.get(&(descendant, ancestor)) {
+        return Ok(*result);
+    }
+    if let Some(start) = visiting.iter().position(|change| *change == descendant) {
+        let mut cycle: Vec<u64> = visiting[start..]
+            .iter()
+            .map(|change| change.get())
+            .collect();
+        cycle.push(descendant.get());
+        return Err(PristineError::DependencyCycle { cycle });
+    }
+    visiting.push(descendant);
+
+    // Legacy repositories predate the dependency index; the indexed read
+    // fails closed on them. Use the raw dependency rows here — they are
+    // populated for indexed changes and empty for unindexed ones, so the
+    // causal-maximality probe degrades to "no supersession knowledge"
+    // instead of erroring (dev #196/#206 parity; the unrecord-safety
+    // legacy fixtures exercise this).
+    let dependencies = txn.get_change_deps(descendant)?;
+    for dependency in dependencies {
+        let dependency_id = txn.get_internal(&dependency)?.ok_or_else(|| {
+            PristineError::MissingRegisteredDependency {
+                change_id: descendant.get(),
+                dependency: dependency.to_string(),
+            }
+        })?;
+        if dependency_id == ancestor
+            || change_depends_on(txn, dependency_id, ancestor, memo, visiting)?
+        {
+            visiting.pop();
+            memo.insert((descendant, ancestor), true);
+            return Ok(true);
+        }
+    }
+    visiting.pop();
+    memo.insert((descendant, ancestor), false);
+    Ok(false)
 }
 
 impl PartialEq for RetrieveOptions {
@@ -313,11 +393,7 @@ impl PartialEq for RetrieveOptions {
         self.include_deleted == other.include_deleted
             && self.max_vertices == other.max_vertices
             && self.deletions_final == other.deletions_final
-            && match (&self.change_filter, &other.change_filter) {
-                (None, None) => true,
-                (Some(a), Some(b)) => Arc::ptr_eq(a, b) || *a == *b,
-                _ => false,
-            }
+            && self.graph_visibility == other.graph_visibility
     }
 }
 
@@ -340,7 +416,7 @@ pub struct RetrieveResult {
     /// Number of edges traversed.
     pub edges_traversed: usize,
 
-    /// Whether a change_filter was active during retrieval.
+    /// Whether graph visibility filtering was active during retrieval.
     ///
     /// When `true` and `graph.is_empty()`, it means the file has no
     /// content on the target view (all vertices were filtered out).

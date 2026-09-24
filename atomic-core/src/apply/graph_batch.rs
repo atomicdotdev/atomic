@@ -244,7 +244,8 @@ impl<'txn, 'a> GraphTxnT for CachedWriteGraphTxn<'txn, 'a> {
 
     fn has_vertex(&self, node: GraphNode<NodeId>) -> PristineResult<bool> {
         let key = encode_vertex(node.change.get(), node.start.get(), node.end.get());
-        Ok(self.graph.get(&key)?.next().is_some())
+        let has = self.graph.get(&key)?.next().transpose()?.is_some();
+        Ok(has)
     }
 
     fn get_node_type(&self, node_id: NodeId) -> PristineResult<Option<u8>> {
@@ -270,11 +271,13 @@ impl<'txn, 'a> GraphTxnT for CachedWriteGraphTxn<'txn, 'a> {
     fn has_change_in_graph(&self, change_id: NodeId) -> PristineResult<bool> {
         let start_key = encode_vertex(change_id.get(), 0, 0);
         let end_key = encode_vertex(change_id.get(), u64::MAX, u64::MAX);
-        Ok(self
+        let has = self
             .graph
             .range::<&[u8; 24]>(&start_key..=&end_key)?
             .next()
-            .is_some())
+            .transpose()?
+            .is_some();
+        Ok(has)
     }
 }
 

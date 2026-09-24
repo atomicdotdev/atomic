@@ -56,8 +56,10 @@ use clap_complete::engine::ArgValueCompleter;
 
 use crate::commands::complete::complete_view_names;
 
-use atomic_repository::Repository;
+use atomic_core::pristine::ViewScope;
+use atomic_repository::{Repository, WorkspaceTxnMode};
 
+use crate::commands::workspace_txn::enter_workspace;
 use crate::commands::{find_repository_root, Command};
 use crate::error::{CliError, CliResult};
 use crate::output::{print_hint, print_success, view as style_view};
@@ -253,10 +255,73 @@ impl New {
         self
     }
 
-    /// Optionally switch to the new view and print hint.
-    fn maybe_switch(&self, name: &str, repo: &mut Repository) -> CliResult<()> {
+    /// Two-tier view creation: --draft and/or --parent.
+    fn run_two_tier(
+        &self,
+        name: &str,
+        repo: &mut Repository,
+        working_copy: atomic_core::WorkingCopyId,
+        workspace_view: &str,
+    ) -> CliResult<bool> {
+        let kind = if self.draft {
+            ViewScope::Draft
+        } else {
+            ViewScope::Shared
+        };
+        let parent_name = self.parent.as_deref().unwrap_or(workspace_view);
+
+        repo.create_view_with_identity(name, kind, Some(parent_name))
+            .map_err(CliError::Repository)?;
+
+        let kind_label = if kind.is_draft() { "draft" } else { "shared" };
+
+        print_success(&format!(
+            "Created {} view: {} (parent: {})",
+            kind_label,
+            style_view(name),
+            style_view(parent_name),
+        ));
+
         if self.switch {
-            let result = repo.switch_view(name).map_err(CliError::Repository)?;
+            let result = repo
+                .switch_view(working_copy, name)
+                .map_err(CliError::Repository)?;
+            print_success(&format!(
+                "Switched to view: {} ({} files updated)",
+                style_view(name),
+                result.files_written,
+            ));
+            let repo_root = find_repository_root()?;
+            if crate::commands::git::shadow::bridge_publication_required(&repo_root) {
+                let shadow_sync =
+                    crate::commands::git::shadow::sync_git_head_to_view(repo, &repo_root, name)?;
+                drop(shadow_sync);
+                // The projected switch moved Git HEAD; the checkpoint
+                // verifier takes its own redb lock, so the caller refreshes
+                // it after releasing this repository handle.
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Optionally switch to the new view and print hint.
+    ///
+    /// The switch coordinates the Git shadow exactly like `atomic view
+    /// switch` does (CB-8A): the materialized view projects onto its mapped
+    /// ref with the scope-correct HEAD policy and a verified checkpoint, so
+    /// the next workspace entry stays anchored.
+    fn maybe_switch(
+        &self,
+        name: &str,
+        repo: &mut Repository,
+        working_copy: atomic_core::WorkingCopyId,
+        repo_root: &std::path::Path,
+    ) -> CliResult<()> {
+        if self.switch {
+            let result = repo
+                .switch_view(working_copy, name)
+                .map_err(CliError::Repository)?;
             print_success(&format!(
                 "Switched to view: {} ({} files updated)",
                 style_view(name),
@@ -287,12 +352,19 @@ impl Command for New {
 
         // Find the repository
         let repo_root = find_repository_root()?;
-        let mut repo = Repository::open(&repo_root).map_err(|e| match e {
-            atomic_repository::RepositoryError::NotFound { path } => CliError::RepositoryNotFound {
-                searched_path: path.into(),
-            },
-            other => CliError::Repository(other),
-        })?;
+        let mut repo =
+            Repository::open_for_workspace_transaction(&repo_root).map_err(|e| match e {
+                atomic_repository::RepositoryError::NotFound { path } => {
+                    CliError::RepositoryNotFound {
+                        searched_path: path.into(),
+                    }
+                }
+                other => CliError::Repository(other),
+            })?;
+
+        let workspace = enter_workspace(&mut repo, WorkspaceTxnMode::Reconcile)?;
+        let working_copy = workspace.working_copy();
+        let workspace_view = workspace.view().name.clone();
 
         // Check if the view already exists
         if repo.view_exists(name).map_err(CliError::Repository)? {
@@ -301,10 +373,50 @@ impl Command for New {
             });
         }
 
-        // ONE creation concept: a Draft overlay whose filter is anchored on a
-        // parent and may be SEEDED from a source view's change-set
-        // membership.  The graph holds every node a view exposes; --from only
-        // selects which EXISTING changes the new view's filter starts with.
+        // If --from is specified, use dev's seeded-overlay path: the new
+        // view's filter starts with the source's change-set membership,
+        // anchored on --parent (or the source). The two-tier path below
+        // handles plain --draft/--parent creation.
+        if let Some(source) = self.from.clone() {
+            if !repo.view_exists(&source).map_err(CliError::Repository)? {
+                return Err(CliError::ViewNotFound { name: source });
+            }
+            let (anchor, seed) =
+                resolve_overlay_creation(self.from.as_deref(), self.parent.as_deref());
+            let source_info = seed
+                .as_deref()
+                .map(|seed_view| repo.get_view_info(seed_view))
+                .transpose()
+                .map_err(CliError::Repository)?;
+            repo.create_overlay_view(name, anchor.as_deref(), seed.as_deref())
+                .map_err(CliError::Repository)?;
+            if let Some(info) = source_info {
+                if info.change_count > 0 {
+                    print_success(&format!(
+                        "Created view: {} (seeded from {} - {} changes)",
+                        style_view(name),
+                        style_view(&info.name),
+                        info.change_count,
+                    ));
+                } else {
+                    print_success(&format!(
+                        "Created view: {} (seeded from {} - empty)",
+                        style_view(name),
+                        style_view(&info.name),
+                    ));
+                }
+            } else {
+                print_success(&format!(
+                    "Created view: {} (anchored on {})",
+                    style_view(name),
+                    style_view(&anchor.unwrap_or_default()),
+                ));
+            }
+            self.maybe_switch(name, &mut repo, working_copy, &repo_root)?;
+            return Ok(());
+        }
+
+        // Determine how to create the new view:
         //
         //   --from S              → anchor on S, seed from S
         //   --from S --parent P   → anchor on P, seed from S
@@ -350,13 +462,11 @@ impl Command for New {
                 ));
             }
         } else {
-            let anchored = if let Some(a) = anchor.as_deref() {
-                a.to_string()
-            } else {
-                match repo.nearest_shared_ancestor(repo.current_view()) {
-                    Ok(name) => name,
-                    Err(_) => repo.current_view().to_string(),
-                }
+            // No --from: the overlay anchors on the nearest Shared ancestor
+            // with empty membership — the user inserts changes explicitly.
+            let anchored = match repo.nearest_shared_ancestor(&workspace_view) {
+                Ok(name) => name,
+                Err(_) => workspace_view.clone(),
             };
             print_success(&format!(
                 "Created view: {} (empty workspace, anchored on {})",
@@ -365,24 +475,14 @@ impl Command for New {
             ));
         }
 
-        self.maybe_switch(name, &mut repo)
+        self.maybe_switch(name, &mut repo, working_copy, &repo_root)
     }
 }
 
-// Tests
-
-/// Resolve how a new view is anchored and seeded.
+/// Resolve how a new view is anchored and seeded (dev #200 overlay model).
 ///
-/// Returns `(anchor, seed)`: the overlay-chain anchor view (`None` means the
-/// repository default — the nearest Shared ancestor of the current view) and
-/// the view whose change-set membership seeds the new view's filter.
-///
-/// # Model
-///
-/// A view is a filter over the global graph: every node it exposes already
-/// lives in the graph. Creation selects where the overlay chain anchors and,
-/// optionally, which EXISTING changes the new view's filter starts with —
-/// nothing is copied out of the graph; no node is ever owned by two views.
+/// Returns `(anchor, seed)`: the overlay-chain anchor view and the view whose
+/// change-set membership seeds the new view's filter.
 pub fn resolve_overlay_creation(
     from: Option<&str>,
     parent: Option<&str>,
@@ -393,6 +493,7 @@ pub fn resolve_overlay_creation(
     (anchor, from.map(|s| s.to_string()))
 }
 
+// Tes
 #[cfg(test)]
 mod tests {
     use super::*;

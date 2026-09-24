@@ -28,22 +28,28 @@
 //!   is synthesized and derived on demand. Use `--with-crdt` to pre-materialize
 //!   it for token-level blame and word-diff.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::ErrorKind;
 use std::path::Path;
 
 use clap::Parser;
 use git2::{Repository as GitRepository, Sort};
 
+use atomic_core::types::WorkingCopyId;
+use atomic_repository::repository::ReconcileEffectBudget;
 use atomic_repository::Repository;
 
 use super::parallel::{
-    forecast_commit_kind, incremental_import_skips, ForecastKind, ParallelImportOptions,
-    ParallelImporter,
+    forecast_commit_kind, incremental_import_skips, trace_git_import, ForecastKind, ImportStats,
+    ParallelImportOptions, ParallelImporter, ProspectiveImportPlan,
+};
+use crate::commands::workspace_txn::{
+    enter_remediation_workspace, enter_remediation_workspace_budgeted, observe_workspace,
+    remediation_error,
 };
 use crate::commands::{find_repository_root, Command};
 use crate::error::{CliError, CliResult};
-use crate::output::{print_hint, print_info, print_success, print_warning};
+use crate::output::{emphasis, print_hint, print_info, print_success, print_warning};
 
 /// Import a Git repository into Atomic.
 ///
@@ -111,46 +117,25 @@ pub struct Import {
     /// the semantic layer regardless of this flag.
     #[arg(long = "with-crdt")]
     pub with_crdt: bool,
-}
 
-fn import_ignore_patterns(workdir: &Path, kind: Option<&str>) -> Vec<String> {
-    const COMMON_IMPORT_IGNORES: &[&str] = &[
-        "node_modules/",
-        "bower_components/",
-        ".yarn/cache/",
-        ".pnpm-store/",
-    ];
+    /// Internal bridge imports align and checkpoint in their outer operation.
+    #[arg(skip)]
+    pub(crate) skip_checkpoint_refresh: bool,
 
-    let template = if let Some(kind) = kind {
-        super::super::init::get_ignore_template(kind)
-    } else if workdir.join("Cargo.toml").exists() {
-        super::super::init::get_ignore_template("rust")
-    } else if workdir.join("package.json").exists() {
-        super::super::init::get_ignore_template("node")
-    } else if workdir.join("go.mod").exists() {
-        super::super::init::get_ignore_template("go")
-    } else if workdir.join("setup.py").exists() || workdir.join("pyproject.toml").exists() {
-        super::super::init::get_ignore_template("python")
-    } else {
-        None
-    };
+    /// Internal §7.5 detached-HEAD import tip: the commits behind this commit
+    /// import into `branch`'s view even though no local branch carries it.
+    /// Never set from the command line; only the bridge reconcile path uses it
+    /// after resolving the §7.5 view mapping, and it never invents Git refs.
+    #[arg(skip)]
+    pub(crate) detached_tip: Option<String>,
 
-    let mut patterns: Vec<String> = COMMON_IMPORT_IGNORES
-        .iter()
-        .map(|pattern| (*pattern).to_string())
-        .collect();
-
-    patterns.extend(
-        template
-            .unwrap_or(".atomic\n.git\n")
-            .lines()
-            .map(str::trim)
-            .filter(|line| !line.is_empty() && !line.starts_with('#'))
-            .map(ToOwned::to_owned),
-    );
-    patterns.sort();
-    patterns.dedup();
-    patterns
+    /// Internal effect budget (CB-13D review R1): set only by the
+    /// metadata-only bridge watch reconcile path. Under
+    /// [`ReconcileEffectBudget::MetadataOnly`] the import refuses every
+    /// command-boundary effect — repository bootstrap, Git exclude writes,
+    /// and working-copy materialization — and runs metadata-only work only.
+    #[arg(skip)]
+    pub(crate) reactive_budget: Option<atomic_repository::repository::ReconcileEffectBudget>,
 }
 
 fn current_git_branch(git_repo: &GitRepository) -> Option<String> {
@@ -206,8 +191,36 @@ pub(crate) fn ensure_git_shadow_excludes(git_dir: &Path) -> CliResult<bool> {
     Ok(true)
 }
 
+/// Read-only variant of [`ensure_git_shadow_excludes`]: reports whether the
+/// Git exclude file is missing any shadow-exclude pattern, without writing
+/// anything (CB-13D review R1: the metadata-only watch path must never edit
+/// Git administrative files; it defers instead).
+fn ensure_git_shadow_excludes_needed(git_dir: &Path) -> CliResult<bool> {
+    let exclude_path = git_dir.join("info").join("exclude");
+    let content = match std::fs::read_to_string(&exclude_path) {
+        Ok(content) => content,
+        Err(e) if e.kind() == ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e.into()),
+    };
+    Ok(GIT_SHADOW_EXCLUDE_PATTERNS
+        .iter()
+        .any(|pattern| !content.lines().any(|line| line.trim() == *pattern)))
+}
+
+/// Record one import run's synthesis aggregation (review R5): the real
+/// per-branch import statistics, one bounded structured event, emitted
+/// only for repositories that opted in (consent-gated, lossy). The loss
+/// observable remains the per-fetch `binding_fetch` loss flag: an import
+/// never fetches bindings, so there is no per-import loss counter.
+fn emit_import_synthesis(repo: &Repository, stats: &ImportStats) {
+    // CB-13C F4: the shared emitter (partial failures pass
+    // `failed_after_landed` at their own site inside the writer).
+    super::parallel::emit_import_synthesis(repo, stats, None);
+}
+
 impl Import {
     /// Import a single branch into an Atomic view using parallel processing.
+    #[allow(clippy::too_many_arguments)]
     fn import_branch(
         &self,
         git_repo: &GitRepository,
@@ -216,7 +229,8 @@ impl Import {
         imported_shas: &HashSet<String>,
         known_states: &HashSet<atomic_core::types::Merkle>,
         mode: BranchImportMode,
-    ) -> CliResult<usize> {
+        plan: ProspectiveImportPlan,
+    ) -> CliResult<ImportStats> {
         // Get repository name from remote URL or working directory
         let repo_name = self.get_repo_name(git_repo);
 
@@ -225,23 +239,21 @@ impl Import {
             incremental: self.incremental,
             imported_shas: imported_shas.clone(),
             repo_name,
-            ignored_path_patterns: import_ignore_patterns(
-                git_repo.workdir().unwrap_or_else(|| repo.root()),
-                self.kind.as_deref(),
-            ),
             mainline_only: mode.mainline_only,
             graph_only: !self.with_crdt,
             preserve_working_copy: mode.preserve_working_copy,
             target_view: branch_name.to_string(),
             known_states: known_states.clone(),
+            validate_equivalence: true,
         };
 
         let importer = ParallelImporter::new(git_repo, options);
 
         // Run the three-phase parallel import
-        let stats = importer.import_branch(branch_name, repo)?;
-        // Return total changes created (written + empty + merge)
-        Ok(stats.changes_written + stats.empty_commits + stats.merge_commits)
+        let stats = importer.import_prevalidated(branch_name, repo, plan)?;
+        // Full per-import synthesis counters (review R5: the per-import
+        // aggregation wires the real import statistics, not inferred ones).
+        Ok(stats)
     }
 
     /// Get repository name from remote URL or working directory.
@@ -286,24 +298,39 @@ impl Import {
         view_name: &str,
         repair_index: bool,
     ) -> CliResult<(HashSet<String>, HashSet<atomic_core::types::Merkle>)> {
-        use atomic_repository::HistoryOptions;
-
-        let mut shas = HashSet::new();
+        let started = std::time::Instant::now();
+        // CB-6C: the GIT_SHA_INDEX is a checked cache, never authority. Every
+        // row is validated against hash-authoritative change bytes before it
+        // may act as an import marker; stale rows are repaired and invalid
+        // rows are dropped, so a corrupt cache produces exactly the same
+        // skip decisions as a cold cache (the legacy backfill below).
+        let (indexed, dropped) = repo
+            .checked_git_sha_markers()
+            .map_err(|error| CliError::Internal(error.into()))?;
+        for sha in dropped.iter().take(3) {
+            log::warn!(
+                "Dropped unverifiable GIT_SHA_INDEX row for {} (same treatment as a cold cache)",
+                &sha[..8.min(sha.len())]
+            );
+        }
+        let mut shas: HashSet<String> = indexed.into_iter().collect();
+        let _ = dropped;
         let mut states = HashSet::new();
         let mut index_repairs = Vec::new();
 
-        // Query the explicit target instead of the current view. Agent drafts
-        // intentionally hide inherited changes from their default log, so
-        // scanning the current draft makes already-imported parent commits look
-        // new and duplicates them onto the Git branch view.
-        let options = HistoryOptions::default()
-            .view(view_name)
-            .include_inherited(true);
+        // Query the target's effective root-to-leaf states without opening every
+        // historical change file. Imported SHAs come from GIT_SHA_INDEX, making
+        // the normal one-commit incremental path a single B-tree scan. Only
+        // repositories with no index rows take the legacy backfill path.
         let entries = repo
-            .log(options)
+            .effective_history(Some(view_name))
             .map_err(|error| CliError::Internal(error.into()))?;
+        let needs_legacy_backfill = shas.is_empty() && !entries.is_empty();
         for entry in entries {
             states.insert(entry.state);
+            if !needs_legacy_backfill {
+                continue;
+            }
             let change = repo
                 .load_change(&entry.hash)
                 .map_err(|error| CliError::Internal(error.into()))?;
@@ -351,6 +378,12 @@ impl Import {
             }
         }
 
+        trace_git_import(format!(
+            "incremental markers: {:?} (shas={}, states={})",
+            started.elapsed(),
+            shas.len(),
+            states.len()
+        ));
         Ok((shas, states))
     }
 
@@ -555,6 +588,7 @@ impl Import {
 
 impl Command for Import {
     fn run(&self) -> CliResult<()> {
+        let run_start = std::time::Instant::now();
         // Open Git repository
         let git_repo = GitRepository::discover(".").map_err(|_| CliError::GitError {
             message: "Not a git repository (or any parent up to mount point)".to_string(),
@@ -563,6 +597,10 @@ impl Command for Import {
         let workdir = git_repo.workdir().ok_or_else(|| CliError::GitError {
             message: "Git repository has no working directory (bare repository?)".to_string(),
         })?;
+        trace_git_import(format!(
+            "discover Git repository: {:?}",
+            run_start.elapsed()
+        ));
 
         // Dry run mode
         if self.dry_run {
@@ -579,12 +617,21 @@ impl Command for Import {
             // read-only so we can subtract what each branch's view already
             // contains. A fresh (not-yet-initialized) repo has nothing
             // imported, so the forecast is the full history — which is correct.
-            let repo = if self.incremental && workdir.join(".atomic").join("pristine.redb").exists()
-            {
-                Repository::open_readonly(workdir).ok()
-            } else {
-                None
-            };
+            // The dry run selects the explicit Observe mode: it never mutates.
+            let mut repo =
+                if self.incremental && workdir.join(".atomic").join("pristine.redb").exists() {
+                    Repository::open_readonly(workdir).ok()
+                } else {
+                    None
+                };
+            if let Some(repository) = repo.as_mut() {
+                if let Err(remediation) = observe_workspace(repository)? {
+                    print_warning(&format!(
+                        "Forensic Git import forecast observed an unsafe workspace baseline: {}",
+                        remediation.describe()
+                    ));
+                }
+            }
 
             for branch_name in &branches {
                 if let Ok(reference) = git_repo.find_branch(branch_name, git2::BranchType::Local) {
@@ -633,20 +680,127 @@ impl Command for Import {
             return Ok(());
         }
 
-        if ensure_git_shadow_excludes(git_repo.path())? {
+        // Validate the complete prospective import before Git excludes, Atomic
+        // initialization, view creation, graph/change publication, derived-index
+        // writes, or materialization. Existing repositories are opened read-only
+        // solely to seed the isolated prospective projection.
+        let default_branch = self.get_default_branch(&git_repo)?;
+        // §7.5: a detached tip imports behind an explicit commit instead of a
+        // branch reference; the view name is resolved by the caller.
+        let detached_tip = match self.detached_tip.as_deref() {
+            None => None,
+            Some(hex) => Some(
+                git2::Oid::from_str(hex).map_err(|error| CliError::GitError {
+                    message: format!(
+                        "detached import tip '{hex}' is not a valid object ID: {error}"
+                    ),
+                })?,
+            ),
+        };
+        if detached_tip.is_some() && self.branch.is_none() {
+            return Err(CliError::GitError {
+                message: "a detached import tip requires an explicit target view name".to_string(),
+            });
+        }
+        let repo_exists = workdir.join(".atomic").join("pristine.redb").exists();
+        // CB-13D review R1: the metadata-only watch path never bootstraps a
+        // repository — init, ignore templates, and vault setup are
+        // command-boundary effects.
+        let metadata_only = self
+            .reactive_budget
+            .is_some_and(|budget| budget.is_metadata_only());
+        if metadata_only && !repo_exists {
+            return Err(CliError::GitError {
+                message: "the bridge watch daemon imports metadata only and never bootstraps \
+                          an Atomic repository; run 'atomic git import' explicitly"
+                    .to_string(),
+            });
+        }
+        let mut preopened_repo = if repo_exists {
+            let open_result = if metadata_only {
+                Repository::open_with_budget(
+                    workdir,
+                    self.reactive_budget
+                        .expect("metadata_only implies a budget"),
+                )
+            } else {
+                Repository::open(workdir)
+            };
+            Some(open_result.map_err(CliError::from)?)
+        } else {
+            None
+        };
+        let prospective_branches = if self.all_branches {
+            if detached_tip.is_some() {
+                return Err(CliError::GitError {
+                    message: "a detached import tip cannot be combined with --all".to_string(),
+                });
+            }
+            self.get_all_branches(&git_repo)?
+        } else {
+            vec![self
+                .branch
+                .clone()
+                .unwrap_or_else(|| default_branch.clone())]
+        };
+        let mut prospective_plans = HashMap::new();
+        let preflight_start = std::time::Instant::now();
+        for branch_name in &prospective_branches {
+            // CB-9A: the already-imported marker set is loaded for every real
+            // import, not only incremental ones. The deepening guard and the
+            // deterministic sequencing need the indexed closure even in full
+            // import mode: legacy bytes stay authoritative, and history that
+            // deepens below an indexed commit is refused instead of silently
+            // re-derived. (Dry-run forecasts keep their own semantics.)
+            let (imported_shas, known_states) = match preopened_repo.as_ref() {
+                Some(repo) if repo.view_exists(branch_name).map_err(CliError::from)? => {
+                    self.get_incremental_markers(repo, branch_name, false)?
+                }
+                _ => (HashSet::new(), HashSet::new()),
+            };
+            let options = ParallelImportOptions {
+                incremental: self.incremental,
+                imported_shas: imported_shas.clone(),
+                repo_name: self.get_repo_name(&git_repo),
+                mainline_only: !self.all_branches,
+                graph_only: !self.with_crdt,
+                preserve_working_copy: true,
+                target_view: branch_name.clone(),
+                known_states: known_states.clone(),
+                validate_equivalence: false,
+            };
+            let plan = ParallelImporter::new(&git_repo, options)
+                .validate_branch_prospectively_for_tip(
+                    branch_name,
+                    preopened_repo.as_ref(),
+                    detached_tip,
+                )?;
+            prospective_plans.insert(branch_name.clone(), (plan, imported_shas, known_states));
+        }
+        trace_git_import(format!("import preflight: {:?}", preflight_start.elapsed()));
+        // CB-13D review R1: the metadata-only watch path never edits Git
+        // administrative files. If the shadow-exclude line is missing, defer
+        // to the explicit command instead of writing it.
+        if metadata_only {
+            if ensure_git_shadow_excludes_needed(git_repo.path())? {
+                return Err(CliError::GitError {
+                    message: "the bridge watch daemon never edits Git administrative files; \
+                              the Git shadow exclude line is missing — run 'atomic git import' \
+                              or 'atomic git bridge reconcile' explicitly once"
+                        .to_string(),
+                });
+            }
+        } else if ensure_git_shadow_excludes(git_repo.path())? {
             print_info("Configured Git to ignore Atomic local state.");
         }
-
-        // Determine Git's default branch up front so a fresh Atomic repo can
-        // adopt it as its default view (rather than the generic `dev` view).
-        let default_branch = self.get_default_branch(&git_repo)?;
 
         // Check if Atomic repository exists in THIS directory (not parent dirs).
         // Don't use find_repository_root() — it walks up and might find
         // ~/.atomic/ (global config dir) which isn't a repo.
-        let repo_exists = workdir.join(".atomic").join("pristine.redb").exists();
         let mut repo = if repo_exists {
-            Repository::open(workdir).map_err(|e| CliError::Internal(e.into()))?
+            preopened_repo
+                .take()
+                .expect("existing repository opened once")
         } else {
             print_info(&format!(
                 "Initializing Atomic repository (default view '{}')...",
@@ -658,7 +812,27 @@ impl Command for Import {
                 .map_err(|e| CliError::Internal(e.into()))?
         };
 
-        let original_view = repo.current_view().to_string();
+        // Enter the shared workspace boundary. Import is also the bootstrap
+        // remediation path for a Git checkout that has no bridge checkpoint
+        // yet, so it uses the explicit repair entry: it still refuses Git-owned
+        // operations, index locks, and diverged operation heads, but tolerates
+        // the unanchored baseline it exists to establish. The metadata-only
+        // watch budget refuses effect-bearing adoption and recovery before
+        // any of it runs (CB-13D review R1).
+        let workspace = match if metadata_only {
+            enter_remediation_workspace_budgeted(
+                &mut repo,
+                self.reactive_budget
+                    .expect("metadata_only implies a budget"),
+            )?
+        } else {
+            enter_remediation_workspace(&mut repo)?
+        } {
+            Ok(workspace) => workspace,
+            Err(remediation) => return Err(remediation_error(remediation)),
+        };
+        let working_copy = workspace.working_copy();
+        let original_view = workspace.view().name.clone();
         let preserve_current_view = repo_exists && self.incremental;
 
         if self.with_crdt {
@@ -672,6 +846,7 @@ impl Command for Import {
             );
         }
 
+        let mut checkpoint_refreshed = false;
         if self.all_branches {
             // Import all branches
             let branches = self.get_all_branches(&git_repo)?;
@@ -680,6 +855,12 @@ impl Command for Import {
             for branch_name in branches {
                 let preserve_branch_working_copy =
                     preserve_current_view && original_view != branch_name;
+                let (plan, imported_shas, known_states) =
+                    prospective_plans.remove(&branch_name).ok_or_else(|| {
+                        CliError::Internal(anyhow::anyhow!(
+                            "missing prevalidated import plan for '{branch_name}'"
+                        ))
+                    })?;
 
                 // Ensure the view exists
                 if !repo
@@ -690,19 +871,13 @@ impl Command for Import {
                         .map_err(|e| CliError::Internal(e.into()))?;
                 }
 
-                let (imported_shas, known_states) = if self.incremental {
-                    self.get_incremental_markers(&repo, &branch_name, true)?
-                } else {
-                    (HashSet::new(), HashSet::new())
-                };
-
                 // Existing incremental imports are background bookkeeping.
                 // Select the target only on this handle so concurrent hooks
                 // and crashes never observe a temporary global view pointer.
                 if preserve_branch_working_copy {
                     repo.set_current_view_in_memory(&branch_name);
                 } else {
-                    repo.align_to_view(&branch_name)
+                    repo.align_to_view(working_copy, &branch_name)
                         .map_err(|e| CliError::Internal(e.into()))?;
                 }
 
@@ -721,12 +896,15 @@ impl Command for Import {
                         mainline_only: false,
                         preserve_working_copy: preserve_branch_working_copy,
                     },
+                    plan,
                 );
                 if preserve_branch_working_copy {
                     repo.set_current_view_in_memory(&original_view);
                 }
-                let count = import_result?;
-                total_imported += count;
+                let stats = import_result?;
+                total_imported += stats.changes_written + stats.empty_commits + stats.merge_commits;
+                emit_import_synthesis(&repo, &stats);
+                import_git_tags_into_view(&mut repo, &git_repo, &branch_name);
             }
 
             if preserve_current_view {
@@ -738,16 +916,27 @@ impl Command for Import {
                     "Preserved current Atomic view '{}'.",
                     original_view
                 ));
+            } else if matches!(self.reactive_budget, Some(budget) if !budget.allows_materialization())
+            {
+                // CB-13D ::24 R1: the metadata-only budget adopts
+                // bookkeeping only — working-copy materialization is a
+                // command-boundary filesystem effect and is deferred with
+                // an explicit notice instead of executing (the latent
+                // internal hole: the all-branches materialization branch
+                // had no budget guard).
+                print_info(
+                    "Working copy materialization deferred to the explicit command boundary (metadata-only reactive budget).",
+                );
             } else {
                 // Materialize the working copy from the graph
                 print_info("Materializing working copy...");
-                match repo.materialize() {
+                match repo.materialize(working_copy) {
                     Ok(result) => {
                         print_info(&format!("Materialized {} files", result.files_written))
                     }
                     Err(e) => print_warning(&format!("Working copy materialization failed: {}", e)),
                 }
-                reindex_working_copy(&repo);
+                reindex_working_copy(&repo, working_copy);
             }
 
             // Initialize .atomicignore + vault AFTER import + materialize.
@@ -758,6 +947,7 @@ impl Command for Import {
                     workdir,
                     self.kind.as_deref(),
                     self.no_vault,
+                    working_copy,
                 )?;
             }
 
@@ -765,7 +955,7 @@ impl Command for Import {
             // Runs AFTER vault init so the KG tables exist.
             if repo.has_vault().unwrap_or(false) {
                 print_info("Enriching knowledge graph...");
-                match repo.kg_enrich_from_vcs() {
+                match repo.kg_enrich_from_vcs(working_copy) {
                     Ok(stats) => print_info(&format!("KG enriched: {}", stats)),
                     Err(e) => log::warn!("KG enrichment failed: {}", e),
                 }
@@ -779,27 +969,44 @@ impl Command for Import {
             // Import single branch
             let branch_name = self.branch.clone().unwrap_or(default_branch);
 
-            // Validate branch exists
-            git_repo
-                .find_branch(&branch_name, git2::BranchType::Local)
-                .map_err(|_| CliError::GitError {
-                    message: format!("Branch '{}' not found", branch_name),
-                })?;
+            // Validate branch exists. A detached tip (§7.5) imports behind an
+            // explicit commit and skips the branch reference check.
+            if detached_tip.is_none() {
+                git_repo
+                    .find_branch(&branch_name, git2::BranchType::Local)
+                    .map_err(|_| CliError::GitError {
+                        message: format!("Branch '{}' not found", branch_name),
+                    })?;
+            }
 
-            // Ensure the view exists with the branch name
+            let (plan, imported_shas, known_states) =
+                prospective_plans.remove(&branch_name).ok_or_else(|| {
+                    CliError::Internal(anyhow::anyhow!(
+                        "missing prevalidated import plan for '{branch_name}'"
+                    ))
+                })?;
+            let changed_paths = plan.changed_paths();
+            let expected_git_tree = plan.expected_git_tree();
+            let raw_git_tree = plan.raw_git_tree();
+
+            // Ensure the view exists with the branch name. A detached tip
+            // (§7.5) targets an ephemeral Draft view the caller must have
+            // created with the right scope and parent; import never invents
+            // one as Shared behind the caller's back.
             if !repo
                 .view_exists(&branch_name)
                 .map_err(|e| CliError::Internal(e.into()))?
             {
+                if detached_tip.is_some() {
+                    return Err(CliError::GitError {
+                        message: format!(
+                            "detached import refused: target view '{branch_name}' does not exist; resolve the §7.5 mapping first"
+                        ),
+                    });
+                }
                 repo.create_shared_view(&branch_name)
                     .map_err(|e| CliError::Internal(e.into()))?;
             }
-
-            let (imported_shas, known_states) = if self.incremental {
-                self.get_incremental_markers(&repo, &branch_name, true)?
-            } else {
-                (HashSet::new(), HashSet::new())
-            };
 
             let restore_original_view = preserve_current_view && original_view != branch_name;
 
@@ -808,12 +1015,13 @@ impl Command for Import {
             } else {
                 // User-facing/new imports still publish the selected branch;
                 // materialization or reindexing below makes disk match it.
-                repo.align_to_view(&branch_name)
+                repo.align_to_view(working_copy, &branch_name)
                     .map_err(|e| CliError::Internal(e.into()))?;
             }
 
             // Import
-            let count = self.import_branch(
+            let write_start = std::time::Instant::now();
+            let stats = self.import_branch(
                 &git_repo,
                 &branch_name,
                 &mut repo,
@@ -823,7 +1031,14 @@ impl Command for Import {
                     mainline_only: true,
                     preserve_working_copy: restore_original_view,
                 },
+                plan,
             )?;
+            let count = stats.changes_written + stats.empty_commits + stats.merge_commits;
+            emit_import_synthesis(&repo, &stats);
+            trace_git_import(format!(
+                "import write/finalize: {:?}",
+                write_start.elapsed()
+            ));
 
             if restore_original_view {
                 print_info(&format!(
@@ -832,17 +1047,32 @@ impl Command for Import {
                 ));
             } else if current_git_branch(&git_repo).as_deref() == Some(branch_name.as_str()) {
                 print_info("Using Git working copy as imported materialization.");
-                reindex_working_copy(&repo);
+                if self.incremental {
+                    trace_git_import("deferred full FILE_INDEX rebuild after incremental import");
+                } else {
+                    reindex_working_copy(&repo, working_copy);
+                }
             } else {
                 // Importing a non-checked-out branch must update disk from Atomic.
+                // CB-13D review R1: the metadata-only watch path never
+                // materializes — materializing a non-checked-out target is a
+                // command-boundary filesystem effect.
+                if metadata_only {
+                    return Err(CliError::GitError {
+                        message: "the bridge watch daemon reconciles metadata only and never \
+                                  materializes a non-checked-out target; run 'atomic git import' \
+                                  explicitly to materialize"
+                            .to_string(),
+                    });
+                }
                 print_info("Materializing working copy...");
-                match repo.materialize() {
+                match repo.materialize(working_copy) {
                     Ok(result) => {
                         print_info(&format!("Materialized {} files", result.files_written))
                     }
                     Err(e) => print_warning(&format!("Working copy materialization failed: {}", e)),
                 }
-                reindex_working_copy(&repo);
+                reindex_working_copy(&repo, working_copy);
             }
 
             // Initialize .atomicignore + vault AFTER import + materialize
@@ -852,6 +1082,7 @@ impl Command for Import {
                     workdir,
                     self.kind.as_deref(),
                     self.no_vault,
+                    working_copy,
                 )?;
             }
 
@@ -859,7 +1090,7 @@ impl Command for Import {
             // Runs AFTER vault init so the KG tables exist.
             if repo.has_vault().unwrap_or(false) {
                 print_info("Enriching knowledge graph...");
-                match repo.kg_enrich_from_vcs() {
+                match repo.kg_enrich_from_vcs(working_copy) {
                     Ok(stats) => print_info(&format!("KG enriched: {}", stats)),
                     Err(e) => log::warn!("KG enrichment failed: {}", e),
                 }
@@ -869,20 +1100,116 @@ impl Command for Import {
                 repo.set_current_view_in_memory(&original_view);
             }
 
-            // Build the content search index (syntext)
-            print_info("Building content search index...");
-            match atomic_repository::build_content_index(workdir) {
-                Ok(()) => print_info("Content index built."),
-                Err(e) => log::warn!("Content index build failed: {}", e),
+            if self.incremental {
+                log::debug!(
+                    "deferred content-index maintenance for {} imported path(s)",
+                    changed_paths.len()
+                );
+            } else {
+                print_info("Building content search index...");
+                // RFC §21 measured budgets (CB-13C AC-3): refresh, not
+                // unconditional full rebuild. The full walk-and-rebuild was
+                // re-run on every non-incremental import — the measured
+                // warm 100k-file import spent 45s+ of CPU in it. The
+                // refresh is HEAD-based: it is a no-op when the index is
+                // already current and a full rebuild only when the index is
+                // missing or the Git HEAD moved.
+                match atomic_repository::refresh_content_index(workdir) {
+                    Ok(()) => print_info("Content index built."),
+                    Err(e) => log::warn!("Content index build failed: {}", e),
+                }
             }
 
             print_success(&format!(
                 "Imported {} changes from branch '{}'",
                 count, branch_name
             ));
+            // CB-8A (RFC §8.4): restore Git tags as bound Atomic state tags.
+            import_git_tags_into_view(&mut repo, &git_repo, &branch_name);
+            trace_git_import(format!(
+                "import command before checkpoint: {:?}",
+                run_start.elapsed()
+            ));
+            if !self.skip_checkpoint_refresh {
+                if let (Some(expected_tree), Some(git_tree)) =
+                    (expected_git_tree.as_ref(), raw_git_tree.as_ref())
+                {
+                    super::bridge::refresh_checkpoint_after_verified_import(
+                        &repo,
+                        working_copy,
+                        &git_repo,
+                        &branch_name,
+                        expected_tree,
+                        git_tree,
+                    )?;
+                    checkpoint_refreshed = true;
+                }
+            }
+        }
+
+        // Standalone imports establish or refresh the bridge checkpoint only
+        // when Git and the persisted Atomic working-copy view are fully
+        // aligned. During bridge raw-switch adoption the incremental import
+        // deliberately preserves the old Atomic view, so this returns the
+        // intentional mismatch no-op; `import_git_to_atomic` aligns and
+        // checkpoints afterward.
+        if !self.skip_checkpoint_refresh && !checkpoint_refreshed {
+            let checkpoint_root = workdir.to_path_buf();
+            // Drop the repository and the workspace transaction first: the
+            // workspace's ordered lock guard holds the pristine open, and the
+            // checkpoint publication re-opens the repository in this process.
+            drop(workspace);
+            drop(repo);
+            drop(git_repo);
+            let _ = super::bridge::refresh_checkpoint_if_aligned(&checkpoint_root)?;
         }
 
         Ok(())
+    }
+}
+
+/// Import Git tags from the imported repository into an Atomic view.
+///
+/// CB-8A (RFC §8.4): a Git tag whose peeled commit carries a verified Git
+/// state binding restores the exact bound Merkle state as an Atomic tag.
+/// Tags on unbound commits — or annotated tags claiming a wrong binding —
+/// are refused with a warning, never approximated, and never abort the
+/// surrounding import.
+fn import_git_tags_into_view(repo: &mut Repository, git_repo: &GitRepository, view: &str) {
+    let Ok(tag_refs) = git_repo.references_glob("refs/tags/*") else {
+        return;
+    };
+    let mut imported = 0usize;
+    let mut refused = 0usize;
+    for reference in tag_refs.flatten() {
+        let Some(name) = reference.shorthand().map(str::to_string) else {
+            continue;
+        };
+        match repo.import_git_tag_from_git(view, git_repo, &name) {
+            Ok(tag) => {
+                imported += 1;
+                print_info(&format!(
+                    "Imported Git tag '{}' as an Atomic state tag on view '{}'.",
+                    emphasis(&name),
+                    emphasis(view)
+                ));
+                if let Some(message) = tag.message.as_deref() {
+                    trace_git_import(format!("tag '{name}' annotation: {message}"));
+                }
+            }
+            Err(error) => {
+                refused += 1;
+                print_warning(&format!(
+                    "Git tag '{}' not imported: {error}",
+                    emphasis(&name)
+                ));
+            }
+        }
+    }
+    if imported > 0 || refused > 0 {
+        trace_git_import(format!(
+            "git tag import into '{view}': {imported} imported, {refused} refused"
+        ));
     }
 }
 
@@ -892,8 +1219,9 @@ impl Command for Import {
 /// authoritative Git checkout for the imported branch, so there is no reason
 /// to materialize the same content back out of Atomic. Indexing the tracked
 /// files makes the post-import `atomic status` baseline clean.
-fn reindex_working_copy(repo: &Repository) {
+fn reindex_working_copy(repo: &Repository, working_copy: WorkingCopyId) {
     use atomic_core::types::Hash;
+    let started = std::time::Instant::now();
     use std::time::SystemTime;
 
     let repo_root = repo.root().to_path_buf();
@@ -920,8 +1248,13 @@ fn reindex_working_copy(repo: &Repository) {
     }
 
     if !entries.is_empty() {
-        let _ = repo.update_file_index(&entries);
+        let _ = repo.update_file_index(working_copy, &entries);
     }
+    trace_git_import(format!(
+        "reindex working copy: {:?} (files={})",
+        started.elapsed(),
+        entries.len()
+    ));
 }
 
 /// Create .atomicignore and initialize vault AFTER git import + materialize.
@@ -936,6 +1269,7 @@ fn init_atomicignore_and_vault(
     workdir: &std::path::Path,
     kind: Option<&str>,
     no_vault: bool,
+    working_copy: WorkingCopyId,
 ) -> CliResult<()> {
     // Step 1: .atomicignore
     {
@@ -959,6 +1293,7 @@ fn init_atomicignore_and_vault(
         }
 
         let _ = repo.add(
+            working_copy,
             ".atomicignore",
             atomic_repository::TrackingOptions::default(),
         );
@@ -966,7 +1301,7 @@ fn init_atomicignore_and_vault(
         let options = atomic_repository::RecordOptions::new()
             .add_path(".atomicignore")
             .detect_raw_renames(false);
-        match repo.record(header, options) {
+        match repo.record(working_copy, header, options) {
             Ok(_) => print_info("Recorded .atomicignore"),
             Err(atomic_repository::RecordError::NothingToRecord) => {}
             Err(e) => log::warn!("Failed to record .atomicignore: {}", e),
@@ -983,17 +1318,24 @@ fn init_atomicignore_and_vault(
             print_info("Initialized vault at .vault/");
 
             // Add all vault files
-            fn add_dir_recursive(repo: &Repository, dir: &std::path::Path) {
+            fn add_dir_recursive(
+                repo: &Repository,
+                working_copy: WorkingCopyId,
+                dir: &std::path::Path,
+            ) {
                 if let Ok(entries) = std::fs::read_dir(dir) {
                     for entry in entries.flatten() {
                         let path = entry.path();
                         if path.is_dir() {
-                            add_dir_recursive(repo, &path);
+                            add_dir_recursive(repo, working_copy, &path);
                         } else if path.is_file() {
                             if let Ok(rel) = path.strip_prefix(repo.root()) {
                                 let rel_str = rel.to_string_lossy().replace('\\', "/");
-                                let _ = repo
-                                    .add(&rel_str, atomic_repository::TrackingOptions::default());
+                                let _ = repo.add(
+                                    working_copy,
+                                    &rel_str,
+                                    atomic_repository::TrackingOptions::default(),
+                                );
                             }
                         }
                     }
@@ -1001,14 +1343,14 @@ fn init_atomicignore_and_vault(
             }
             let vault_dir = repo.vault_dir();
             if vault_dir.exists() {
-                add_dir_recursive(repo, &vault_dir);
+                add_dir_recursive(repo, working_copy, &vault_dir);
             }
 
             let header = atomic_core::change::ChangeHeader::new("Initialize vault");
             let options = atomic_repository::RecordOptions::new()
                 .add_path(".vault")
                 .detect_raw_renames(false);
-            match repo.record(header, options) {
+            match repo.record(working_copy, header, options) {
                 Ok(_) => print_info("Recorded vault defaults"),
                 Err(atomic_repository::RecordError::NothingToRecord) => {}
                 Err(e) => log::warn!("Failed to record vault files: {}", e),
@@ -1022,7 +1364,183 @@ fn init_atomicignore_and_vault(
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    use std::path::PathBuf;
+    use std::process::Command as ProcessCommand;
+
+    use atomic_core::types::Base32;
+    use serial_test::serial;
+
     use super::*;
+
+    struct DirGuard(PathBuf);
+
+    impl DirGuard {
+        fn new() -> Self {
+            Self(std::env::current_dir().unwrap())
+        }
+    }
+
+    impl Drop for DirGuard {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(&self.0);
+        }
+    }
+
+    fn git_ok(root: &Path, args: &[&str]) {
+        let output = ProcessCommand::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn init_git(root: &Path) {
+        git_ok(root, &["init", "-q"]);
+        git_ok(root, &["symbolic-ref", "HEAD", "refs/heads/main"]);
+        git_ok(root, &["config", "user.name", "Atomic Test"]);
+        git_ok(root, &["config", "user.email", "atomic@example.com"]);
+    }
+
+    fn assert_rejected_before_atomic_init(root: &Path, import: Import) {
+        let _dir_guard = DirGuard::new();
+        std::env::set_current_dir(root).unwrap();
+        assert!(import.run().is_err());
+        assert!(
+            !root.join(".atomic").exists(),
+            "failed prospective verification must not initialize Atomic"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn forged_self_push_header_is_rejected_without_atomic_mutation() {
+        let root = tempfile::tempdir().unwrap();
+        init_git(root.path());
+        fs::write(root.path().join("tracked.txt"), b"forged\n").unwrap();
+        git_ok(root.path(), &["add", "tracked.txt"]);
+        let message = format!(
+            "forged\n\nAtomic-View: main\nAtomic-State: {}",
+            atomic_core::types::Merkle::ZERO.to_base32()
+        );
+        git_ok(root.path(), &["commit", "-q", "-m", &message]);
+        assert_rejected_before_atomic_init(
+            root.path(),
+            Import {
+                incremental: true,
+                no_vault: true,
+                ..Import::default()
+            },
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn forged_squash_header_is_rejected_without_atomic_mutation() {
+        let root = tempfile::tempdir().unwrap();
+        init_git(root.path());
+        fs::write(root.path().join("tracked.txt"), b"forged squash\n").unwrap();
+        git_ok(root.path(), &["add", "tracked.txt"]);
+        let missing = atomic_core::types::Hash::of(b"missing-change").to_base32();
+        let message = format!("forged squash\n\nAtomic-Changes: {missing}");
+        git_ok(root.path(), &["commit", "-q", "-m", &message]);
+        assert_rejected_before_atomic_init(
+            root.path(),
+            Import {
+                incremental: true,
+                no_vault: true,
+                ..Import::default()
+            },
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn stale_mode_link_and_empty_projection_is_rejected_without_atomic_mutation() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        // CB-9C: the supported corpus now covers executables, symlinks, and
+        // empty tracked files — the old CB-9A capability fence that refused
+        // them was superseded by graph-backed mode/kind registers. The same
+        // fixture now imports, and the fence still refuses genuinely
+        // unsupported tree modes (a set-id bit cannot appear in a normal Git
+        // tree, so it is simulated by the delta-level mode validator through
+        // the rejected case below).
+        let root = tempfile::tempdir().unwrap();
+        init_git(root.path());
+        fs::write(root.path().join("executable"), b"#!/bin/sh\n").unwrap();
+        fs::set_permissions(
+            root.path().join("executable"),
+            fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        fs::write(root.path().join("empty"), b"").unwrap();
+        symlink("empty", root.path().join("link")).unwrap();
+        git_ok(root.path(), &["add", "executable", "empty", "link"]);
+        git_ok(root.path(), &["commit", "-q", "-m", "modes links empties"]);
+        let _dir_guard = DirGuard::new();
+        std::env::set_current_dir(root.path()).unwrap();
+        let import = Import {
+            no_vault: true,
+            ..Import::default()
+        };
+        assert!(
+            import.run().is_ok(),
+            "the CB-9C supported corpus imports executables, symlinks, and empty files"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn required_filter_failure_rejects_incremental_import_without_view_mutation() {
+        let _dir_guard = DirGuard::new();
+        let root = tempfile::tempdir().unwrap();
+        init_git(root.path());
+        fs::write(root.path().join("base.txt"), b"base\n").unwrap();
+        git_ok(root.path(), &["add", "base.txt"]);
+        git_ok(root.path(), &["commit", "-q", "-m", "base"]);
+        std::env::set_current_dir(root.path()).unwrap();
+        drop(Repository::init_with_view(root.path(), "main").unwrap());
+
+        let before = Repository::open_readonly(root.path())
+            .unwrap()
+            .get_view_info("main")
+            .unwrap()
+            .state;
+        let config_path = root.path().join(".atomic/config.toml");
+        let mut config = fs::read_to_string(&config_path).unwrap();
+        config.push_str("\n[filters.drivers.blocked]\nrequired = true\n");
+        fs::write(config_path, config).unwrap();
+        fs::write(
+            root.path().join(".gitattributes"),
+            b"*.dat filter=blocked\n",
+        )
+        .unwrap();
+        fs::write(root.path().join("payload.dat"), b"payload\n").unwrap();
+        git_ok(root.path(), &["add", ".gitattributes", "payload.dat"]);
+        git_ok(root.path(), &["commit", "-q", "-m", "required filter"]);
+
+        let result = Import {
+            incremental: true,
+            no_vault: true,
+            ..Import::default()
+        }
+        .run();
+        assert!(result.is_err());
+        let after = Repository::open_readonly(root.path())
+            .unwrap()
+            .get_view_info("main")
+            .unwrap()
+            .state;
+        assert_eq!(before, after);
+    }
 
     #[test]
     fn test_default_import() {
@@ -1031,6 +1549,7 @@ mod tests {
         assert!(!import.all_branches);
         assert!(!import.incremental);
         assert!(import.branch.is_none());
+        assert!(!import.skip_checkpoint_refresh);
     }
 
     #[test]
@@ -1053,12 +1572,198 @@ mod tests {
     }
 
     #[test]
-    fn test_import_ignore_patterns_always_exclude_dependency_dirs() {
-        let patterns = import_ignore_patterns(Path::new("."), Some("go"));
+    #[serial]
+    fn import_records_a_per_import_synthesis_aggregation() {
+        // Review R5: the per-import synthesis aggregation is wired from
+        // the real import statistics and is consent-gated. Failing before
+        // the fix: no aggregation event existed at all.
+        let _dir_guard = DirGuard::new();
+        let root = tempfile::tempdir().unwrap();
+        init_git(root.path());
+        fs::write(root.path().join("tracked.txt"), b"first\n").unwrap();
+        git_ok(root.path(), &["add", "tracked.txt"]);
+        git_ok(root.path(), &["commit", "-q", "-m", "first"]);
+        std::env::set_current_dir(root.path()).unwrap();
 
-        assert!(patterns.iter().any(|p| p == "node_modules/"));
-        assert!(patterns.iter().any(|p| p == ".yarn/cache/"));
-        assert!(patterns.iter().any(|p| p == "vendor/"));
+        Import {
+            no_vault: true,
+            ..Import::default()
+        }
+        .run()
+        .unwrap();
+
+        // Un-consented: the automatic sink writes nothing (review R1/R4).
+        let journal = root.path().join(".atomic/bridge/events.jsonl");
+        assert!(
+            !journal.exists(),
+            "an un-opted repository must not record import synthesis"
+        );
+
+        // Opt in exactly as `atomic git bridge enable` records the consent,
+        // then import a second commit.
+        let config = root.path().join(".atomic/config.toml");
+        {
+            use std::io::Write as _;
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&config)
+                .unwrap();
+            writeln!(file, "\n[git.bridge]\nenabled = true\n").unwrap();
+        }
+        fs::write(root.path().join("tracked.txt"), b"second\n").unwrap();
+        git_ok(root.path(), &["add", "tracked.txt"]);
+        git_ok(root.path(), &["commit", "-q", "-m", "second"]);
+        Import {
+            no_vault: true,
+            ..Import::default()
+        }
+        .run()
+        .unwrap();
+
+        let text = fs::read_to_string(&journal).unwrap();
+        let line = text
+            .lines()
+            .find(|line| line.contains("import_synthesis"))
+            .expect("the per-import synthesis aggregation is recorded");
+        let event: serde_json::Value = serde_json::from_str(line).unwrap();
+        assert_eq!(event["event"], "import_synthesis");
+        // Real counters from the import run, not constructed booleans: the
+        // run imported the second commit (one parsed commit, one written
+        // change).
+        assert_eq!(event["written"], 1);
+        assert_eq!(event["empty"], 0);
+        assert_eq!(event["merges"], 0);
+        assert_eq!(
+            event["commits_found"].as_u64().unwrap()
+                - event["self_push_skipped"].as_u64().unwrap()
+                - event["squash_inserted"].as_u64().unwrap()
+                - event["written"].as_u64().unwrap()
+                - event["empty"].as_u64().unwrap()
+                - event["merges"].as_u64().unwrap(),
+            0,
+            "every found commit is accounted for by the aggregation"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn standalone_import_refreshes_v2_checkpoint_before_status() {
+        let _dir_guard = DirGuard::new();
+        let root = tempfile::tempdir().unwrap();
+        git_ok(root.path(), &["init", "-q"]);
+        git_ok(root.path(), &["symbolic-ref", "HEAD", "refs/heads/main"]);
+        git_ok(root.path(), &["config", "user.name", "Atomic Test"]);
+        git_ok(root.path(), &["config", "user.email", "atomic@example.com"]);
+        fs::write(root.path().join("tracked.txt"), b"tracked\n").unwrap();
+        git_ok(root.path(), &["add", "tracked.txt"]);
+        git_ok(root.path(), &["commit", "-q", "-m", "initial"]);
+        std::env::set_current_dir(root.path()).unwrap();
+
+        Import {
+            no_vault: true,
+            ..Import::default()
+        }
+        .run()
+        .unwrap();
+
+        let checkpoint = super::super::checkpoint::read_checkpoint(root.path())
+            .unwrap()
+            .expect("standalone import must publish a checkpoint");
+        assert_eq!(
+            checkpoint.version,
+            super::super::checkpoint::CHECKPOINT_VERSION
+        );
+        assert_eq!(checkpoint.view, "main");
+        crate::commands::status::Status::new()
+            .with_short(true)
+            .run()
+            .expect("guarded status must pass immediately after import");
+    }
+
+    #[test]
+    #[serial]
+    fn one_line_incremental_import_finishes_within_debug_budget() {
+        let _dir_guard = DirGuard::new();
+        let root = tempfile::tempdir().unwrap();
+        git_ok(root.path(), &["init", "-q"]);
+        git_ok(root.path(), &["symbolic-ref", "HEAD", "refs/heads/main"]);
+        git_ok(root.path(), &["config", "user.name", "Atomic Test"]);
+        git_ok(root.path(), &["config", "user.email", "atomic@example.com"]);
+        fs::write(root.path().join("tracked.txt"), b"first\n").unwrap();
+        git_ok(root.path(), &["add", "tracked.txt"]);
+        git_ok(root.path(), &["commit", "-q", "-m", "initial"]);
+        std::env::set_current_dir(root.path()).unwrap();
+
+        Import {
+            no_vault: true,
+            ..Import::default()
+        }
+        .run()
+        .unwrap();
+
+        fs::write(root.path().join("tracked.txt"), b"second\n").unwrap();
+        git_ok(root.path(), &["add", "tracked.txt"]);
+        git_ok(root.path(), &["commit", "-q", "-m", "one line"]);
+
+        let started = std::time::Instant::now();
+        Import {
+            incremental: true,
+            no_vault: true,
+            ..Import::default()
+        }
+        .run()
+        .unwrap();
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "one-line incremental import took {elapsed:?}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn mismatched_incremental_import_does_not_publish_checkpoint_before_alignment() {
+        let _dir_guard = DirGuard::new();
+        let root = tempfile::tempdir().unwrap();
+        git_ok(root.path(), &["init", "-q"]);
+        git_ok(root.path(), &["symbolic-ref", "HEAD", "refs/heads/main"]);
+        git_ok(root.path(), &["config", "user.name", "Atomic Test"]);
+        git_ok(root.path(), &["config", "user.email", "atomic@example.com"]);
+        fs::write(root.path().join("tracked.txt"), b"main\n").unwrap();
+        git_ok(root.path(), &["add", "tracked.txt"]);
+        git_ok(root.path(), &["commit", "-q", "-m", "main"]);
+        std::env::set_current_dir(root.path()).unwrap();
+        Import {
+            no_vault: true,
+            ..Import::default()
+        }
+        .run()
+        .unwrap();
+        let before = super::super::checkpoint::read_checkpoint(root.path())
+            .unwrap()
+            .unwrap();
+
+        git_ok(root.path(), &["switch", "-q", "-c", "topic"]);
+        fs::write(root.path().join("tracked.txt"), b"topic\n").unwrap();
+        git_ok(root.path(), &["add", "tracked.txt"]);
+        git_ok(root.path(), &["commit", "-q", "-m", "topic"]);
+        Import {
+            branch: Some("topic".to_string()),
+            incremental: true,
+            no_vault: true,
+            skip_checkpoint_refresh: true,
+            ..Import::default()
+        }
+        .run()
+        .unwrap();
+
+        let after = super::super::checkpoint::read_checkpoint(root.path())
+            .unwrap()
+            .unwrap();
+        assert_eq!(after, before, "mismatched import must not move checkpoint");
+        let repo = Repository::open(root.path()).unwrap();
+        assert_eq!(repo.current_view(), "main");
     }
 
     #[test]

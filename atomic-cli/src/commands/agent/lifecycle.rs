@@ -24,6 +24,7 @@ use serde::{Deserialize, Serialize};
 use atomic_agent::turn::orchestrator::ManagedRunContext;
 use atomic_agent::turn::session::{AgentSession, ManagedRunStamp, SessionStore};
 use atomic_agent::{JournalStopCause, JournalTurnLifecycle, ProvenanceJournalSink};
+use atomic_core::change::session::{IncompleteSession, SessionStatus};
 use atomic_core::types::Base32;
 
 use crate::commands::Command;
@@ -180,7 +181,7 @@ struct Status {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct ManagedStopState {
+pub(super) struct ManagedStopState {
     cause: JournalStopCauseWire,
     observed_at: i64,
     resumable: bool,
@@ -198,6 +199,12 @@ enum JournalStopCauseWire {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub(super) struct ManagedBoundaryRefusal {
+    pub session_id: String,
+    pub outcome: IncompleteSession,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(super) struct ManagedLifecycle {
     pub run_id: String,
     pub owner_agent: String,
@@ -208,12 +215,15 @@ pub(super) struct ManagedLifecycle {
     pub work_item_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub view: Option<String>,
+    /// First WIP-backed refusal observed for this run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refusal: Option<ManagedBoundaryRefusal>,
     pub workdir: PathBuf,
     pub created_at: i64,
     pub updated_at: i64,
     pub expires_at: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    stop_state: Option<ManagedStopState>,
+    pub(super) stop_state: Option<ManagedStopState>,
 }
 
 impl ManagedLifecycle {
@@ -264,6 +274,7 @@ struct RunSessionSummary {
     agent_name: String,
     view: String,
     turn_count: u32,
+    status: SessionStatus,
     change_hashes: Vec<String>,
 }
 
@@ -366,6 +377,7 @@ impl Begin {
                 executor_agent: self.executor.clone(),
                 work_item_id: self.work_item.clone(),
                 view: self.view.clone(),
+                refusal: None,
                 workdir,
                 created_at: now,
                 updated_at: now,
@@ -514,6 +526,25 @@ impl End {
             change_hashes,
             views,
         };
+        let incomplete_error = result
+            .lifecycle
+            .as_ref()
+            .and_then(|lifecycle| lifecycle.refusal.as_ref())
+            .map(|refusal| CliError::ManagedAgentIncomplete {
+                session_id: refusal.session_id.clone(),
+                outcome: refusal.outcome.clone(),
+            })
+            .or_else(|| {
+                result.sessions.iter().find_map(|session| {
+                    session
+                        .status
+                        .incomplete()
+                        .map(|outcome| CliError::ManagedAgentIncomplete {
+                            session_id: session.session_id.clone(),
+                            outcome: outcome.clone(),
+                        })
+                })
+            });
 
         if self.json {
             println!("{}", serde_json::to_string(&result).unwrap());
@@ -525,6 +556,9 @@ impl End {
             );
         } else {
             println!("No active managed lifecycle with that run id.");
+        }
+        if let Some(error) = incomplete_error {
+            return Err(error);
         }
         Ok(())
     }
@@ -640,6 +674,46 @@ pub(super) fn find_governing_lifecycle_for_hook(agent_name: &str) -> Option<Mana
         .max_by_key(|l| (l.workdir.components().count(), l.created_at))
 }
 
+/// Persist the first WIP-backed refusal for a managed run.
+///
+/// The recovery ref must already exist before this is called. Repeated hook
+/// delivery reuses the first refusal instead of replacing its recovery root.
+pub(super) fn persist_refusal(
+    repository_root: &Path,
+    lifecycle: &ManagedLifecycle,
+    session_id: &str,
+    refusal: IncompleteSession,
+) -> CliResult<ManagedLifecycle> {
+    let dot_dir =
+        atomic_repository::Repository::canonical_dot_dir(repository_root).map_err(|e| {
+            CliError::Internal(anyhow!(
+                "cannot resolve managed lifecycle store for refusal: {}",
+                e
+            ))
+        })?;
+    let dir = lifecycle_dir(&dot_dir);
+    let mut current =
+        load_lifecycle(&dir, &lifecycle.run_id)?.ok_or_else(|| CliError::InvalidArgument {
+            message: format!(
+                "managed lifecycle '{}' ended before its refusal could be persisted",
+                lifecycle.run_id
+            ),
+        })?;
+    if current.refusal.is_none() {
+        current.refusal = Some(persist_first_refusal(
+            &dir,
+            &lifecycle.run_id,
+            ManagedBoundaryRefusal {
+                session_id: session_id.to_string(),
+                outcome: refusal,
+            },
+        )?);
+        current.updated_at = now_secs();
+        save_lifecycle(&dir, &current)?;
+    }
+    Ok(current)
+}
+
 fn resolve_dot_dir() -> CliResult<PathBuf> {
     let cwd = std::env::current_dir().map_err(CliError::Io)?;
     atomic_repository::Repository::canonical_dot_dir(&cwd).map_err(|e| {
@@ -653,6 +727,10 @@ fn lifecycle_dir(dot_dir: &Path) -> PathBuf {
 
 fn lifecycle_path(dir: &Path, run_id: &str) -> PathBuf {
     dir.join(format!("{}.json", run_id))
+}
+
+fn lifecycle_refusal_path(dir: &Path, run_id: &str) -> PathBuf {
+    dir.join(format!("{}.refusal", run_id))
 }
 
 fn validate_name(label: &str, value: &str) -> CliResult<()> {
@@ -702,13 +780,49 @@ fn list_lifecycles(dir: &Path) -> Vec<ManagedLifecycle> {
         let Ok(data) = fs::read_to_string(&path) else {
             continue;
         };
-        let Ok(lifecycle) = serde_json::from_str::<ManagedLifecycle>(&data) else {
+        let Ok(mut lifecycle) = serde_json::from_str::<ManagedLifecycle>(&data) else {
             log::warn!("skipping unparseable lifecycle file {}", path.display());
             continue;
         };
+        if lifecycle.refusal.is_none() {
+            lifecycle.refusal = load_first_refusal(dir, &lifecycle.run_id)
+                .inspect_err(|error| {
+                    log::warn!(
+                        "could not read refusal for managed lifecycle '{}': {}",
+                        lifecycle.run_id,
+                        error,
+                    );
+                })
+                .ok()
+                .flatten();
+        }
         lifecycles.push(lifecycle);
     }
     lifecycles
+}
+
+fn cleanup_expired(dir: &Path, now: i64) {
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let expired = fs::read_to_string(&path)
+            .ok()
+            .and_then(|data| serde_json::from_str::<ManagedLifecycle>(&data).ok())
+            .map(|l| l.is_expired(now))
+            .unwrap_or(false);
+        if expired {
+            if let Some(run_id) = path.file_stem().and_then(|stem| stem.to_str()) {
+                let _ = fs::remove_file(lifecycle_refusal_path(dir, run_id));
+            }
+            let _ = fs::remove_file(&path);
+        }
+    }
 }
 
 fn list_by_state(dir: &Path, now: i64) -> (Vec<ManagedLifecycle>, Vec<ManagedLifecycle>) {
@@ -734,13 +848,16 @@ fn load_lifecycle(dir: &Path, run_id: &str) -> CliResult<Option<ManagedLifecycle
             e
         ))
     })?;
-    let lifecycle = serde_json::from_str(&data).map_err(|e| {
+    let mut lifecycle: ManagedLifecycle = serde_json::from_str(&data).map_err(|e| {
         CliError::Internal(anyhow!(
             "failed to parse managed lifecycle '{}': {}",
             path.display(),
             e
         ))
     })?;
+    if lifecycle.refusal.is_none() {
+        lifecycle.refusal = load_first_refusal(dir, run_id)?;
+    }
     Ok(Some(lifecycle))
 }
 
@@ -759,13 +876,87 @@ fn save_lifecycle(dir: &Path, lifecycle: &ManagedLifecycle) -> CliResult<()> {
 fn remove_lifecycle(dir: &Path, run_id: &str) -> CliResult<()> {
     validate_run_id(run_id)?;
     match fs::remove_file(lifecycle_path(dir, run_id)) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(CliError::Internal(anyhow!(
+                "failed to remove managed lifecycle '{}': {}",
+                run_id,
+                e
+            )))
+        }
+    }
+    match fs::remove_file(lifecycle_refusal_path(dir, run_id)) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(CliError::Internal(anyhow!(
-            "failed to remove managed lifecycle '{}': {}",
+            "failed to remove managed lifecycle refusal '{}': {}",
             run_id,
             e
         ))),
+    }
+}
+
+fn load_first_refusal(dir: &Path, run_id: &str) -> CliResult<Option<ManagedBoundaryRefusal>> {
+    validate_run_id(run_id)?;
+    let path = lifecycle_refusal_path(dir, run_id);
+    let data = match fs::read(&path) {
+        Ok(data) => data,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(CliError::Io(error)),
+    };
+    serde_json::from_slice(&data).map(Some).map_err(|error| {
+        CliError::Internal(anyhow!(
+            "failed to parse managed lifecycle refusal '{}': {}",
+            path.display(),
+            error,
+        ))
+    })
+}
+
+fn persist_first_refusal(
+    dir: &Path,
+    run_id: &str,
+    candidate: ManagedBoundaryRefusal,
+) -> CliResult<ManagedBoundaryRefusal> {
+    validate_run_id(run_id)?;
+    fs::create_dir_all(dir)?;
+    let path = lifecycle_refusal_path(dir, run_id);
+    if let Some(existing) = load_first_refusal(dir, run_id)? {
+        return Ok(existing);
+    }
+
+    let temp = dir.join(format!(".{}.{}.refusal.tmp", run_id, uuid::Uuid::new_v4()));
+    let data = serde_json::to_vec_pretty(&candidate).map_err(|error| {
+        CliError::Internal(anyhow!(
+            "failed to serialize managed lifecycle refusal: {}",
+            error,
+        ))
+    })?;
+    fs::write(&temp, data)?;
+    fs::File::open(&temp)?.sync_all()?;
+
+    let won = match fs::hard_link(&temp, &path) {
+        Ok(()) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => false,
+        Err(error) => {
+            let _ = fs::remove_file(&temp);
+            return Err(CliError::Io(error));
+        }
+    };
+    let _ = fs::remove_file(&temp);
+
+    if won {
+        #[cfg(unix)]
+        fs::File::open(dir)?.sync_all()?;
+        Ok(candidate)
+    } else {
+        load_first_refusal(dir, run_id)?.ok_or_else(|| {
+            CliError::Internal(anyhow!(
+                "managed lifecycle refusal '{}' disappeared after concurrent creation",
+                run_id,
+            ))
+        })
     }
 }
 
@@ -937,6 +1128,7 @@ fn collect_run_sessions(dot_dir: &Path, run_id: &str) -> Vec<RunSessionSummary> 
             agent_name: s.agent_name.clone(),
             view: s.view_name.clone(),
             turn_count: s.turn_count,
+            status: s.status.clone(),
             change_hashes: s
                 .recorded_change_hashes
                 .iter()
@@ -981,6 +1173,7 @@ mod tests {
             executor_agent: None,
             work_item_id: None,
             view: Some("sherpa-run".to_string()),
+            refusal: None,
             workdir: workdir.to_path_buf(),
             created_at: 1,
             updated_at: 1,
@@ -1117,6 +1310,7 @@ mod tests {
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].session_id, "sess-in-run");
         assert_eq!(sessions[0].agent_name, "codex");
+        assert_eq!(sessions[0].status, SessionStatus::Active);
         assert_eq!(sessions[0].change_hashes.len(), 1);
 
         assert!(collect_run_sessions(&dot_dir, "run-other").is_empty());
@@ -1142,11 +1336,107 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let mut l = lifecycle("run-a", "sherpa", temp.path(), now_secs() + 60);
         l.work_item_id = Some("NONA-12".to_string());
-
         let ctx = l.to_managed_run_context();
         assert_eq!(ctx.stamp.run_id, "run-a");
         assert_eq!(ctx.stamp.owner_agent, "sherpa");
         assert_eq!(ctx.stamp.work_item_id.as_deref(), Some("NONA-12"));
         assert_eq!(ctx.view.as_deref(), Some("sherpa-run"));
+    }
+
+    #[test]
+    fn persist_refusal_keeps_first_session_and_recovery() {
+        let temp = TempDir::new().unwrap();
+        atomic_repository::Repository::init(temp.path()).unwrap();
+        let dot_dir = temp.path().join(".atomic");
+        let dir = lifecycle_dir(&dot_dir);
+        let lifecycle = lifecycle("run-a", "sherpa", temp.path(), now_secs() + 60);
+        save_lifecycle(&dir, &lifecycle).unwrap();
+
+        let first = IncompleteSession::new(
+            "first refusal",
+            vec!["src/first.rs".into()],
+            "refs/atomic/wip/first",
+            atomic_core::change::session::SessionIncompleteOrigin::UnknownPostCheckout,
+        );
+        let later = IncompleteSession::new(
+            "later refusal",
+            vec!["src/later.rs".into()],
+            "refs/atomic/wip/later",
+            atomic_core::change::session::SessionIncompleteOrigin::UnknownPostCheckout,
+        );
+
+        let persisted =
+            persist_refusal(temp.path(), &lifecycle, "session-first", first.clone()).unwrap();
+        let persisted = persist_refusal(temp.path(), &persisted, "session-later", later).unwrap();
+        let refusal = persisted.refusal.unwrap();
+        assert_eq!(refusal.session_id, "session-first");
+        assert_eq!(refusal.outcome, first);
+    }
+
+    #[test]
+    fn immutable_refusal_survives_crash_before_lifecycle_json_update() {
+        let temp = TempDir::new().unwrap();
+        let dir = temp.path().join(LIFECYCLE_DIR);
+        let lifecycle = lifecycle("run-crash", "sherpa", temp.path(), now_secs() + 60);
+        save_lifecycle(&dir, &lifecycle).unwrap();
+        let first = ManagedBoundaryRefusal {
+            session_id: "session-first".to_string(),
+            outcome: IncompleteSession::new(
+                "first refusal",
+                vec!["src/first.rs".into()],
+                "refs/atomic/wip/first",
+                atomic_core::change::session::SessionIncompleteOrigin::UnknownPostCheckout,
+            ),
+        };
+
+        persist_first_refusal(&dir, &lifecycle.run_id, first.clone()).unwrap();
+        let recovered = load_lifecycle(&dir, &lifecycle.run_id)
+            .unwrap()
+            .unwrap()
+            .refusal
+            .unwrap();
+        assert_eq!(recovered.session_id, first.session_id);
+        assert_eq!(recovered.outcome, first.outcome);
+    }
+
+    #[test]
+    fn lifecycle_without_refusal_field_still_decodes() {
+        let json = r#"{
+            "run_id":"legacy",
+            "owner_agent":"sherpa",
+            "owner_session_id":"owner-session",
+            "workdir":"/tmp/project",
+            "created_at":1,
+            "updated_at":1,
+            "expires_at":2
+        }"#;
+        let decoded: ManagedLifecycle = serde_json::from_str(json).unwrap();
+        assert!(decoded.refusal.is_none());
+    }
+
+    #[test]
+    fn incomplete_run_summary_does_not_invent_change_hashes() {
+        let temp = TempDir::new().unwrap();
+        let dot_dir = temp.path().join(".atomic");
+        let store = SessionStore::new(dot_dir.join("sessions")).unwrap();
+        let mut session = AgentSession::new("sess-incomplete", "codex", "Codex");
+        session.managed_run = Some(ManagedRunStamp {
+            run_id: "run-a".to_string(),
+            owner_agent: "sherpa".to_string(),
+            owner_session_id: "owner-session".to_string(),
+            work_item_id: None,
+        });
+        session.mark_incomplete(IncompleteSession::new(
+            "checkout drift",
+            vec!["src/lib.rs".into()],
+            "refs/atomic/wip/run-a",
+            atomic_core::change::session::SessionIncompleteOrigin::UnknownPostCheckout,
+        ));
+        store.save(&session).unwrap();
+
+        let sessions = collect_run_sessions(&dot_dir, "run-a");
+        assert_eq!(sessions.len(), 1);
+        assert!(matches!(&sessions[0].status, SessionStatus::Incomplete(_)));
+        assert!(sessions[0].change_hashes.is_empty());
     }
 }

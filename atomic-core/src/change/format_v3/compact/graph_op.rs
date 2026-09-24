@@ -4,8 +4,11 @@
 //! but uses compact types for all position, node, and hash references.
 
 use super::types::{CompactAtom, CompactEdgeUpdate, CompactInsertion};
+use crate::change::attribute::InodeAttr;
 use crate::change::encoding::Encoding;
+use crate::change::format_v3::types::CompactPosition;
 use crate::change::local::Local;
+use crate::EdgeFlags;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
@@ -124,19 +127,19 @@ pub enum CompactGraphOp {
         encoding: Option<Encoding>,
     },
 
-    /// Solve a name conflict.
+    /// Retain `name.inode` at `path` and tombstone all losing claim edges.
     SolveNameConflict {
-        /// The resolution operation.
+        /// Non-empty exact `FOLDER | BLOCK` to deleted claim transitions.
         name: CompactEdgeUpdate,
-        /// Path where conflict occurred.
+        /// Path retained by the surviving claimant.
         path: String,
     },
 
-    /// Reopen a solved name conflict.
+    /// Restore all losing claim edges tombstoned by a resolution.
     UnsolveNameConflict {
-        /// The operation to undo the resolution.
+        /// Non-empty exact inverse transitions for the losing claims.
         name: CompactEdgeUpdate,
-        /// Path where conflict is.
+        /// Path of the previously selected claimant.
         path: String,
     },
 
@@ -182,9 +185,75 @@ pub enum CompactGraphOp {
         /// Inode edges to delete.
         inode: CompactEdgeUpdate,
     },
+
+    /// Add a causal value to an inode attribute register.
+    SetAttr {
+        /// Stable graph position of the inode.
+        inode: CompactPosition,
+        /// Path for human-readable output.
+        path: String,
+        /// Canonical attribute value.
+        value: InodeAttr,
+    },
 }
 
 impl CompactGraphOp {
+    pub(super) fn validate_serialized_name_conflict(&self) -> Result<(), String> {
+        if let CompactGraphOp::SetAttr { inode, path, value } = self {
+            if path.is_empty() {
+                return Err("SetAttr requires a non-empty path".to_string());
+            }
+            // Compact HASH_INDEX_NONE is the legacy self-reference sentinel;
+            // ROOT versus self can only be validated after hash-table expansion.
+            let _ = inode;
+            value.validate().map_err(|error| error.to_string())?;
+        }
+        let alive = (EdgeFlags::FOLDER | EdgeFlags::BLOCK).bits();
+        let deleted = (EdgeFlags::FOLDER | EdgeFlags::BLOCK | EdgeFlags::DELETED).bits();
+        let (operation, name, path, expected_previous, expected_flag) = match self {
+            CompactGraphOp::SolveNameConflict { name, path } => {
+                ("SolveNameConflict", name, path, alive, deleted)
+            }
+            CompactGraphOp::UnsolveNameConflict { name, path } => {
+                ("UnsolveNameConflict", name, path, deleted, alive)
+            }
+            _ => return Ok(()),
+        };
+
+        if path.is_empty() {
+            return Err(format!("{operation} requires a non-empty surviving path"));
+        }
+        if name.edges.is_empty() {
+            return Err(format!(
+                "{operation} requires at least one losing name claim"
+            ));
+        }
+        // Hash indices cannot be classified as ROOT versus an explicit change
+        // without the accompanying table. Production V3 writers place the
+        // Hash::NONE placeholder at index 0, while Option::None uses the legacy
+        // HASH_INDEX_NONE sentinel. Validate references after expansion, where
+        // their actual Option<Hash> meaning is available.
+        for (index, edge) in name.edges.iter().enumerate() {
+            if edge.previous != expected_previous || edge.flag != expected_flag {
+                return Err(format!(
+                    "{operation} edge {index} must transition exactly from 0x{expected_previous:02X} to 0x{expected_flag:02X}, got 0x{:02X} to 0x{:02X}",
+                    edge.previous, edge.flag
+                ));
+            }
+            if edge.to.start >= edge.to.end {
+                return Err(format!(
+                    "{operation} edge {index} must target a non-empty name vertex"
+                ));
+            }
+            if name.edges[..index].contains(edge) {
+                return Err(format!(
+                    "{operation} edge {index} duplicates an earlier losing claim"
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Returns the path associated with this operation, if any.
     pub fn path(&self) -> Option<&str> {
         match self {
@@ -202,6 +271,7 @@ impl CompactGraphOp {
             | CompactGraphOp::SolveOrderConflict { local, .. }
             | CompactGraphOp::UnsolveOrderConflict { local, .. }
             | CompactGraphOp::ResurrectZombies { local, .. } => Some(&local.path),
+            CompactGraphOp::SetAttr { path, .. } => Some(path),
             CompactGraphOp::AddRoot { .. } | CompactGraphOp::DelRoot { .. } => None,
         }
     }
@@ -225,6 +295,7 @@ impl CompactGraphOp {
             CompactGraphOp::ResurrectZombies { .. } => "ResurrectZombies",
             CompactGraphOp::AddRoot { .. } => "AddRoot",
             CompactGraphOp::DelRoot { .. } => "DelRoot",
+            CompactGraphOp::SetAttr { .. } => "SetAttr",
         }
     }
 }

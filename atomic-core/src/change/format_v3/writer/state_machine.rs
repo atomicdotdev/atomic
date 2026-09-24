@@ -4,9 +4,12 @@
 //! and all public methods for writing sections of a V3 change file.
 //! Private helper methods live in the sibling `helpers` module.
 
-use super::super::error::{FormatError, FormatResult};
+use super::super::error::{FormatError, FormatResult, FORMAT_VERSION};
 use super::super::hash_table::HashDedupTable;
-use super::super::types::{FileHeader, SectionHeader, SectionType, Trailer, HASH_INDEX_NONE};
+use super::super::types::{
+    envelope::encode_native_change_header_v2, FileHeader, SectionHeader, SectionType, Trailer,
+    HASH_INDEX_NONE,
+};
 use super::options::{WriteOutcome, WriterOptions, WriterStats};
 use crate::change::header::ChangeHeader;
 use crate::change::provenance::Provenance;
@@ -216,6 +219,15 @@ impl<'w, W: Write> ChangeWriter<'w, W> {
     /// - I/O errors from the underlying writer.
     pub fn write_file_header(&mut self, header: &FileHeader) -> FormatResult<()> {
         self.expect_state(WriterState::Created, "write_file_header")?;
+        header.validate()?;
+        if header.version != FORMAT_VERSION {
+            return Err(FormatError::InvalidHeader {
+                reason: format!(
+                    "schema version {} is read-only; writers emit version {}",
+                    header.version, FORMAT_VERSION
+                ),
+            });
+        }
 
         header.write_to(self.writer)?;
         self.stats.total_bytes_written += FileHeader::SIZE as u64;
@@ -279,6 +291,12 @@ impl<'w, W: Write> ChangeWriter<'w, W> {
     /// - Zstd compression errors.
     /// - I/O errors.
     pub fn write_change_header(&mut self, header: &ChangeHeader) -> FormatResult<()> {
+        let payload = encode_native_change_header_v2(header)?;
+        self.write_change_header_v2_payload(&payload)
+    }
+
+    /// Write a pre-encoded frozen schema-version-2 HEADER envelope.
+    pub(crate) fn write_change_header_v2_payload(&mut self, payload: &[u8]) -> FormatResult<()> {
         if self.state != WriterState::HashTableWritten && self.state != WriterState::WritingMetadata
         {
             return Err(FormatError::UnexpectedSection {
@@ -297,7 +315,7 @@ impl<'w, W: Write> ChangeWriter<'w, W> {
             });
         }
 
-        self.write_postcard_section(SectionType::Header, header)?;
+        self.write_raw_section(SectionType::Header, payload)?;
         self.wrote_header_section = true;
         self.state = WriterState::WritingMetadata;
         Ok(())
@@ -341,14 +359,24 @@ impl<'w, W: Write> ChangeWriter<'w, W> {
             });
         }
 
-        // Filter out HASH_INDEX_NONE — it's a sentinel, not a real dependency
-        let clean: Vec<u16> = dependency_indices
-            .iter()
-            .copied()
-            .filter(|&i| i != HASH_INDEX_NONE)
-            .collect();
+        for (position, index) in dependency_indices.iter().copied().enumerate() {
+            if index == HASH_INDEX_NONE || index == 0 {
+                return Err(FormatError::InvalidChangeMetadata {
+                    reason: format!(
+                        "dependency at position {position} uses reserved hash index {index}"
+                    ),
+                });
+            }
+            if position > 0 && dependency_indices[position - 1] >= index {
+                return Err(FormatError::InvalidChangeMetadata {
+                    reason: format!(
+                        "dependency indices are not strictly ordered at position {position}"
+                    ),
+                });
+            }
+        }
 
-        self.write_postcard_section(SectionType::Dependencies, &clean)?;
+        self.write_postcard_section(SectionType::Dependencies, &dependency_indices.to_vec())?;
         self.wrote_deps_section = true;
         Ok(())
     }

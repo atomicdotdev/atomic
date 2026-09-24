@@ -308,7 +308,8 @@ impl WriteTxn<'_> {
             "rdf_type": entity_type::SESSION,
             "view": record.view_name,
             "parent_view": record.parent_view,
-            "status": if record.ended_at.is_some() { "ended" } else { "active" },
+            "status": record.status.label(),
+            "incomplete": record.status.incomplete(),
             "turn_count": record.turn_count,
             "json_path": record.json_path,
         }));

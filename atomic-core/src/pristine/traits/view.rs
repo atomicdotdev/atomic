@@ -3,11 +3,388 @@
 //! Contains `ViewScope`, `ViewState` (view metadata), and `ViewTxnT`
 //! (the read-only trait for querying views and their change logs).
 
-use crate::types::{Merkle, NodeId};
+use std::borrow::Borrow;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+
+use crate::types::{Inode, Merkle, NodeId};
 
 use crate::pristine::error::PristineError;
 
 use super::graph::GraphTxnT;
+
+/// Ordered direct membership collected from view change logs.
+///
+/// This type deliberately represents only changes named by a view and its
+/// parent chain. It is not dependency-expanded and therefore cannot be passed
+/// to graph traversal APIs that require [`GraphVisibilityClosure`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ViewMembershipSet {
+    ordered: Vec<NodeId>,
+    membership: HashSet<NodeId>,
+}
+
+impl ViewMembershipSet {
+    /// Build membership in the supplied order, keeping the first occurrence of
+    /// every change.
+    pub fn from_ordered<I>(changes: I) -> Self
+    where
+        I: IntoIterator<Item = NodeId>,
+    {
+        let mut ordered = Vec::new();
+        let mut membership = HashSet::new();
+        for change_id in changes {
+            if membership.insert(change_id) {
+                ordered.push(change_id);
+            }
+        }
+        Self {
+            ordered,
+            membership,
+        }
+    }
+
+    /// Return whether this membership directly names `change_id`.
+    pub fn contains(&self, change_id: impl Borrow<NodeId>) -> bool {
+        self.membership.contains(change_id.borrow())
+    }
+
+    /// Return the number of directly named changes.
+    pub fn len(&self) -> usize {
+        self.ordered.len()
+    }
+
+    /// Return whether no changes are directly named.
+    pub fn is_empty(&self) -> bool {
+        self.ordered.is_empty()
+    }
+
+    /// Iterate direct members in root-to-leaf view-log order.
+    pub fn iter(&self) -> std::slice::Iter<'_, NodeId> {
+        self.ordered.iter()
+    }
+
+    /// Return membership with one directly named change removed.
+    pub fn without(&self, change_id: impl Borrow<NodeId>) -> Self {
+        let change_id = change_id.borrow();
+        Self::from_ordered(
+            self.ordered
+                .iter()
+                .copied()
+                .filter(|candidate| candidate != change_id),
+        )
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct EffectiveProjectionData {
+    dependency_first: Vec<NodeId>,
+    membership: HashSet<NodeId>,
+}
+
+/// Validated dependency closure used by every projection consumer.
+///
+/// Construction verifies that every reachable change has a complete indexed
+/// dependency list, that every dependency is registered locally, and that the
+/// dependency graph is acyclic. Cloning is O(1) because the immutable data is
+/// shared through an [`Arc`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EffectiveProjectionClosure {
+    data: Arc<EffectiveProjectionData>,
+}
+
+/// Compatibility name for graph APIs migrated before the projection domain was
+/// shared with attributes, semantics, SetId, export, and bindings.
+pub type GraphVisibilityClosure = EffectiveProjectionClosure;
+
+impl Default for EffectiveProjectionClosure {
+    fn default() -> Self {
+        Self::empty()
+    }
+}
+
+impl EffectiveProjectionClosure {
+    /// Build a validated, deterministic dependency closure from direct view
+    /// membership.
+    ///
+    /// Direct dependency hashes are sorted before traversal. The resulting
+    /// order always places dependencies before dependents while preserving the
+    /// membership order wherever dependency constraints permit.
+    pub fn try_from_membership<T: GraphTxnT>(
+        txn: &T,
+        membership: &ViewMembershipSet,
+    ) -> Result<Self, PristineError> {
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        enum VisitColor {
+            White,
+            Gray,
+            Black,
+        }
+
+        struct VisitFrame {
+            change_id: NodeId,
+            dependencies: Vec<crate::types::Hash>,
+            next_dependency: usize,
+        }
+
+        fn load_frame<T: GraphTxnT>(
+            txn: &T,
+            change_id: NodeId,
+        ) -> Result<VisitFrame, PristineError> {
+            if txn.get_external(change_id)?.is_none() {
+                return Err(PristineError::ChangeNotFound {
+                    id: change_id.get(),
+                });
+            }
+            Ok(VisitFrame {
+                change_id,
+                dependencies: txn.get_indexed_change_deps(change_id)?,
+                next_dependency: 0,
+            })
+        }
+
+        let mut colors = HashMap::new();
+        let mut dependency_first = Vec::new();
+        let mut closure_membership = HashSet::new();
+
+        for root_id in membership.iter().copied() {
+            let root_color = colors.get(&root_id).copied().unwrap_or(VisitColor::White);
+            if root_color == VisitColor::Black {
+                continue;
+            }
+
+            let root_frame = load_frame(txn, root_id)?;
+            colors.insert(root_id, VisitColor::Gray);
+            let mut stack = vec![root_frame];
+
+            while let Some(frame) = stack.last_mut() {
+                if frame.next_dependency == frame.dependencies.len() {
+                    let completed_id = frame.change_id;
+                    stack.pop();
+                    colors.insert(completed_id, VisitColor::Black);
+                    if closure_membership.insert(completed_id) {
+                        dependency_first.push(completed_id);
+                    }
+                    continue;
+                }
+
+                let change_id = frame.change_id;
+                let dependency_hash = frame.dependencies[frame.next_dependency];
+                frame.next_dependency += 1;
+
+                let dependency_id = txn.get_internal(&dependency_hash)?.ok_or_else(|| {
+                    PristineError::MissingRegisteredDependency {
+                        change_id: change_id.get(),
+                        dependency: dependency_hash.to_string(),
+                    }
+                })?;
+                let registered_hash = txn.get_external(dependency_id)?;
+                if registered_hash.as_ref() != Some(&dependency_hash) {
+                    return Err(PristineError::MissingRegisteredDependency {
+                        change_id: change_id.get(),
+                        dependency: dependency_hash.to_string(),
+                    });
+                }
+
+                match colors
+                    .get(&dependency_id)
+                    .copied()
+                    .unwrap_or(VisitColor::White)
+                {
+                    VisitColor::Black => {}
+                    VisitColor::Gray => {
+                        let cycle_start = stack
+                            .iter()
+                            .position(|candidate| candidate.change_id == dependency_id)
+                            .unwrap_or(0);
+                        let mut cycle = stack[cycle_start..]
+                            .iter()
+                            .map(|candidate| candidate.change_id.get())
+                            .collect::<Vec<_>>();
+                        cycle.push(dependency_id.get());
+                        return Err(PristineError::DependencyCycle { cycle });
+                    }
+                    VisitColor::White => {
+                        let dependency_frame = load_frame(txn, dependency_id)?;
+                        colors.insert(dependency_id, VisitColor::Gray);
+                        stack.push(dependency_frame);
+                    }
+                }
+            }
+        }
+
+        Ok(Self {
+            data: Arc::new(EffectiveProjectionData {
+                dependency_first,
+                membership: closure_membership,
+            }),
+        })
+    }
+
+    /// Return an explicitly filtered closure containing no changes.
+    pub fn empty() -> Self {
+        Self {
+            data: Arc::new(EffectiveProjectionData {
+                dependency_first: Vec::new(),
+                membership: HashSet::new(),
+            }),
+        }
+    }
+
+    /// Return whether `change_id` is in the validated closure.
+    pub fn contains(&self, change_id: impl Borrow<NodeId>) -> bool {
+        self.data.membership.contains(change_id.borrow())
+    }
+
+    /// Return the number of changes in the validated closure.
+    pub fn len(&self) -> usize {
+        self.data.dependency_first.len()
+    }
+
+    /// Return whether the validated closure contains no changes.
+    pub fn is_empty(&self) -> bool {
+        self.data.dependency_first.is_empty()
+    }
+
+    /// Iterate the closure in deterministic dependency-first order.
+    pub fn iter_dependency_first(&self) -> std::slice::Iter<'_, NodeId> {
+        self.data.dependency_first.iter()
+    }
+
+    /// Visibility domain for graph traversal.
+    pub fn graph_visibility(&self) -> &GraphVisibilityClosure {
+        self
+    }
+
+    /// Visibility domain for causal inode attributes.
+    pub fn attribute_visibility(&self) -> &HashSet<NodeId> {
+        &self.data.membership
+    }
+
+    /// Visibility domain for trunk/branch/leaf semantic projection.
+    pub fn semantic_visibility(&self) -> &HashSet<NodeId> {
+        &self.data.membership
+    }
+
+    /// Construct a closure tolerating members whose dependency metadata
+    /// predates the index (legacy repositories). Unindexed members become
+    /// their own frames — the walk degrades to "no supersession knowledge"
+    /// for them instead of refusing the whole projection. Frontier
+    /// verification keeps the strict `try_from_membership`.
+    pub fn try_from_membership_lenient<T: GraphTxnT>(
+        txn: &T,
+        membership: &ViewMembershipSet,
+    ) -> Result<Self, PristineError> {
+        fn load_frame<T: GraphTxnT>(
+            txn: &T,
+            change_id: NodeId,
+        ) -> Result<(NodeId, Vec<NodeId>), PristineError> {
+            if txn.get_external(change_id)?.is_none() {
+                return Err(PristineError::ChangeNotFound {
+                    id: change_id.get(),
+                });
+            }
+            let dep_hashes = match txn.get_indexed_change_deps(change_id) {
+                Ok(deps) => deps,
+                Err(_) => txn.get_change_deps(change_id)?,
+            };
+            let mut dependencies = Vec::with_capacity(dep_hashes.len());
+            for dep_hash in dep_hashes {
+                dependencies.push(txn.get_internal(&dep_hash)?.ok_or_else(|| {
+                    PristineError::MissingRegisteredDependency {
+                        change_id: change_id.get(),
+                        dependency: dep_hash.to_string(),
+                    }
+                })?);
+            }
+            Ok((change_id, dependencies))
+        }
+
+        struct Frame {
+            change_id: NodeId,
+            dependencies: Vec<NodeId>,
+            next_dependency: usize,
+        }
+
+        let mut colors: HashMap<NodeId, u8> = HashMap::new();
+        const WHITE: u8 = 0;
+        const GRAY: u8 = 1;
+        const BLACK: u8 = 2;
+
+        let mut dependency_first = Vec::new();
+        let mut closure_membership = HashSet::new();
+
+        for root_id in membership.iter().copied() {
+            let root_color = colors.get(&root_id).copied().unwrap_or(WHITE);
+            if root_color == BLACK {
+                continue;
+            }
+            let (id, deps) = load_frame(txn, root_id)?;
+            colors.insert(root_id, GRAY);
+            let mut stack = vec![Frame {
+                change_id: id,
+                dependencies: deps,
+                next_dependency: 0,
+            }];
+
+            while let Some(frame) = stack.last_mut() {
+                if frame.next_dependency == frame.dependencies.len() {
+                    let completed_id = frame.change_id;
+                    stack.pop();
+                    colors.insert(completed_id, BLACK);
+                    if closure_membership.insert(completed_id) {
+                        dependency_first.push(completed_id);
+                    }
+                    continue;
+                }
+                let next = frame.dependencies[frame.next_dependency];
+                frame.next_dependency += 1;
+                let next_color = colors.get(&next).copied().unwrap_or(WHITE);
+                match next_color {
+                    BLACK => continue,
+                    GRAY => {
+                        return Err(PristineError::DependencyCycle {
+                            cycle: vec![next.get(), root_id.get()],
+                        })
+                    }
+                    // WHITE and any unexpected color: visit.
+                    _ => {
+                        let (next_id, next_deps) = load_frame(txn, next)?;
+                        colors.insert(next, GRAY);
+                        stack.push(Frame {
+                            change_id: next_id,
+                            dependencies: next_deps,
+                            next_dependency: 0,
+                        });
+                    }
+                }
+            }
+        }
+
+        Ok(Self {
+            data: Arc::new(EffectiveProjectionData {
+                dependency_first,
+                membership: closure_membership,
+            }),
+        })
+    }
+
+    /// Construct a closure without dependency validation. Production
+    /// change-filter callers (dev #203) prove dependency completeness from
+    /// the view membership upstream; unit tests use it directly.
+    pub(crate) fn from_ordered_unchecked<I>(changes: I) -> Self
+    where
+        I: IntoIterator<Item = NodeId>,
+    {
+        let membership = ViewMembershipSet::from_ordered(changes);
+        Self {
+            data: Arc::new(EffectiveProjectionData {
+                dependency_first: membership.ordered,
+                membership: membership.membership,
+            }),
+        }
+    }
+}
 
 /// Controls the lifecycle and change-filter strategy for a view.
 ///
@@ -397,6 +774,59 @@ pub trait ViewTxnT: GraphTxnT {
         Ok(chain)
     }
 
+    /// Resolve every view from the hierarchy root through `view`.
+    ///
+    /// Unlike [`Self::resolve_view_chain`], this includes both Shared and Draft
+    /// views, works identically for every scope, and returns root-to-leaf order.
+    /// Missing parents and cycles are reported instead of being treated as an
+    /// implicit ambient-graph base.
+    fn resolve_full_view_chain(&self, view: &ViewState) -> Result<Vec<ViewState>, PristineError> {
+        let mut leaf_to_root = vec![view.clone()];
+        let mut seen = HashSet::new();
+        seen.insert(view.id);
+
+        let mut child = view.clone();
+        while let Some(parent_id) = child.parent {
+            let parent =
+                self.get_view_by_id(parent_id)?
+                    .ok_or_else(|| PristineError::BrokenViewParent {
+                        view_id: child.id,
+                        view_name: child.name.clone(),
+                        parent_id,
+                    })?;
+
+            if !seen.insert(parent.id) {
+                return Err(PristineError::ViewCycleDetected {
+                    name: child.name,
+                    parent_name: parent.name,
+                });
+            }
+
+            child = parent.clone();
+            leaf_to_root.push(parent);
+        }
+
+        leaf_to_root.reverse();
+        Ok(leaf_to_root)
+    }
+
+    /// Collect ordered direct membership from the full parent chain.
+    ///
+    /// Each view log is read in sequence order from hierarchy root to leaf.
+    /// If malformed or legacy logs name a change more than once, the first
+    /// occurrence wins.
+    fn view_membership_set(&self, view: &ViewState) -> Result<ViewMembershipSet, PristineError> {
+        let chain = self.resolve_full_view_chain(view)?;
+        let mut ordered = Vec::new();
+        for chain_view in &chain {
+            for entry in self.iter_changes(chain_view, 0)? {
+                let (_sequence, change_id, _state) = entry?;
+                ordered.push(change_id);
+            }
+        }
+        Ok(ViewMembershipSet::from_ordered(ordered))
+    }
+
     /// Find all views that have the given view as their parent.
     ///
     /// Used during view deletion to check for child views that would be
@@ -433,8 +863,32 @@ pub trait ViewTxnT: GraphTxnT {
         view_id: u64,
     ) -> Result<Vec<(u64, Vec<StoredConflict>)>, PristineError>;
 
+    /// Return every CONFLICTS row in deterministic key order.
+    ///
+    /// Unlike [`Self::iter_conflicts`], this is a complete storage snapshot: it
+    /// includes rows for orphan view IDs and rows with empty conflict lists.
+    /// Malformed stored payloads are returned as errors rather than skipped.
+    #[allow(clippy::type_complexity)]
+    fn snapshot_conflicts(&self) -> Result<Vec<(u64, Inode, Vec<StoredConflict>)>, PristineError> {
+        Err(PristineError::Inconsistent {
+            message: "complete CONFLICTS snapshots are unavailable for this transaction wrapper"
+                .to_string(),
+        })
+    }
+
     /// Get a view by name.
     fn get_view(&self, name: &str) -> Result<Option<ViewState>, PristineError>;
+
+    /// Return every VIEWS row in deterministic key order.
+    ///
+    /// The stored key and decoded state are both returned so repair can inspect
+    /// key/value inconsistencies. Malformed values are returned as errors.
+    fn snapshot_views(&self) -> Result<Vec<(String, ViewState)>, PristineError> {
+        Err(PristineError::Inconsistent {
+            message: "complete VIEWS snapshots are unavailable for this transaction wrapper"
+                .to_string(),
+        })
+    }
 
     /// List all view names.
     ///
@@ -488,4 +942,351 @@ pub trait ViewTxnT: GraphTxnT {
         Box<dyn Iterator<Item = Result<(u64, NodeId, Merkle), PristineError>> + '_>,
         PristineError,
     >;
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use crate::types::{EdgeFlags, GraphNode, Hash, Position, SerializedGraphEdge};
+
+    use super::*;
+
+    #[derive(Default)]
+    struct MockTxn {
+        external: HashMap<NodeId, Hash>,
+        internal: HashMap<Hash, NodeId>,
+        dependencies: HashMap<NodeId, Vec<Hash>>,
+        indexed_counts: HashMap<NodeId, u64>,
+        views: HashMap<u64, ViewState>,
+        logs: HashMap<u64, Vec<NodeId>>,
+    }
+
+    impl MockTxn {
+        fn register(&mut self, id: u64, hash: Hash, dependencies: Vec<Hash>) {
+            let id = NodeId::new(id);
+            self.external.insert(id, hash);
+            self.internal.insert(hash, id);
+            self.indexed_counts.insert(id, dependencies.len() as u64);
+            self.dependencies.insert(id, dependencies);
+        }
+
+        fn add_view(&mut self, view: ViewState, changes: Vec<NodeId>) {
+            self.logs.insert(view.id, changes);
+            self.views.insert(view.id, view);
+        }
+    }
+
+    impl GraphTxnT for MockTxn {
+        type Adj = std::iter::Empty<Result<SerializedGraphEdge, PristineError>>;
+
+        fn get_external(&self, id: NodeId) -> Result<Option<Hash>, PristineError> {
+            Ok(self.external.get(&id).copied())
+        }
+
+        fn get_internal(&self, hash: &Hash) -> Result<Option<NodeId>, PristineError> {
+            Ok(self.internal.get(hash).copied())
+        }
+
+        fn iter_adjacent(
+            &self,
+            _node: GraphNode<NodeId>,
+            _min_flag: EdgeFlags,
+            _max_flag: EdgeFlags,
+        ) -> Result<Self::Adj, PristineError> {
+            Ok(std::iter::empty())
+        }
+
+        fn find_block(&self, _pos: Position<NodeId>) -> Result<GraphNode<NodeId>, PristineError> {
+            Err(PristineError::BlockNotFound { change: 0, pos: 0 })
+        }
+
+        fn find_block_end(
+            &self,
+            _pos: Position<NodeId>,
+        ) -> Result<GraphNode<NodeId>, PristineError> {
+            Err(PristineError::BlockNotFound { change: 0, pos: 0 })
+        }
+
+        fn has_vertex(&self, _node: GraphNode<NodeId>) -> Result<bool, PristineError> {
+            Ok(false)
+        }
+
+        fn get_node_type(&self, node_id: NodeId) -> Result<Option<u8>, PristineError> {
+            Ok(self.external.contains_key(&node_id).then_some(0))
+        }
+
+        fn get_rev_deps(&self, _dep_id: NodeId) -> Result<Vec<NodeId>, PristineError> {
+            Ok(Vec::new())
+        }
+
+        fn get_change_deps(&self, change_id: NodeId) -> Result<Vec<Hash>, PristineError> {
+            Ok(self
+                .dependencies
+                .get(&change_id)
+                .cloned()
+                .unwrap_or_default())
+        }
+
+        fn change_deps_indexed_count(
+            &self,
+            change_id: NodeId,
+        ) -> Result<Option<u64>, PristineError> {
+            Ok(self.indexed_counts.get(&change_id).copied())
+        }
+
+        fn get_rev_change_deps(&self, _dep_hash: &Hash) -> Result<Vec<NodeId>, PristineError> {
+            Ok(Vec::new())
+        }
+
+        fn has_change_in_graph(&self, _change_id: NodeId) -> Result<bool, PristineError> {
+            Ok(false)
+        }
+    }
+
+    impl ViewTxnT for MockTxn {
+        fn get_view_by_id(&self, id: u64) -> Result<Option<ViewState>, PristineError> {
+            Ok(self.views.get(&id).cloned())
+        }
+
+        fn get_conflicts(
+            &self,
+            _view_id: u64,
+            _inode: u64,
+        ) -> Result<Vec<StoredConflict>, PristineError> {
+            Ok(Vec::new())
+        }
+
+        fn iter_conflicts(
+            &self,
+            _view_id: u64,
+        ) -> Result<Vec<(u64, Vec<StoredConflict>)>, PristineError> {
+            Ok(Vec::new())
+        }
+
+        fn get_view(&self, name: &str) -> Result<Option<ViewState>, PristineError> {
+            Ok(self.views.values().find(|view| view.name == name).cloned())
+        }
+
+        fn list_views(&self) -> Result<Vec<String>, PristineError> {
+            Ok(self.views.values().map(|view| view.name.clone()).collect())
+        }
+
+        fn get_change_seq(
+            &self,
+            view: &ViewState,
+            change_id: NodeId,
+        ) -> Result<Option<u64>, PristineError> {
+            Ok(self.logs.get(&view.id).and_then(|changes| {
+                changes
+                    .iter()
+                    .position(|candidate| *candidate == change_id)
+                    .map(|sequence| sequence as u64)
+            }))
+        }
+
+        fn get_change_at_seq(
+            &self,
+            view: &ViewState,
+            seq: u64,
+        ) -> Result<Option<NodeId>, PristineError> {
+            Ok(self
+                .logs
+                .get(&view.id)
+                .and_then(|changes| changes.get(seq as usize))
+                .copied())
+        }
+
+        fn iter_changes(
+            &self,
+            view: &ViewState,
+            from_seq: u64,
+        ) -> Result<
+            Box<dyn Iterator<Item = Result<(u64, NodeId, Merkle), PristineError>> + '_>,
+            PristineError,
+        > {
+            let entries = self
+                .logs
+                .get(&view.id)
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .enumerate()
+                .skip(from_seq as usize)
+                .map(|(sequence, change_id)| Ok((sequence as u64, change_id, Merkle::ZERO)));
+            Ok(Box::new(entries))
+        }
+    }
+
+    fn hash(byte: u8) -> Hash {
+        Hash::from_bytes([byte; 32])
+    }
+
+    fn chain_hash(id: u64) -> Hash {
+        let mut bytes = [0u8; 32];
+        bytes[..8].copy_from_slice(&id.to_le_bytes());
+        bytes[8..17].copy_from_slice(b"n13-chain");
+        Hash::from_bytes(bytes)
+    }
+
+    #[test]
+    fn membership_preserves_first_occurrence_and_without_order() {
+        let membership = ViewMembershipSet::from_ordered([
+            NodeId::new(1),
+            NodeId::new(2),
+            NodeId::new(1),
+            NodeId::new(3),
+        ]);
+
+        assert_eq!(membership.len(), 3);
+        assert!(membership.contains(NodeId::new(2)));
+        assert_eq!(
+            membership.iter().copied().collect::<Vec<_>>(),
+            vec![NodeId::new(1), NodeId::new(2), NodeId::new(3)]
+        );
+        assert_eq!(
+            membership
+                .without(NodeId::new(2))
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![NodeId::new(1), NodeId::new(3)]
+        );
+    }
+
+    #[test]
+    fn closure_is_deterministic_dependency_first_and_clone_is_shared() {
+        let mut txn = MockTxn::default();
+        txn.register(1, hash(1), Vec::new());
+        txn.register(2, hash(2), vec![hash(1)]);
+        txn.register(3, hash(3), vec![hash(2), hash(1)]);
+
+        let membership = ViewMembershipSet::from_ordered([NodeId::new(3)]);
+        let closure = GraphVisibilityClosure::try_from_membership(&txn, &membership).unwrap();
+        assert_eq!(
+            closure.iter_dependency_first().copied().collect::<Vec<_>>(),
+            vec![NodeId::new(1), NodeId::new(2), NodeId::new(3)]
+        );
+        assert!(closure.contains(NodeId::new(2)));
+
+        let cloned = closure.clone();
+        assert!(Arc::ptr_eq(&closure.data, &cloned.data));
+    }
+
+    #[test]
+    fn closure_handles_long_linear_chain_without_call_stack_growth() {
+        const CHAIN_LEN: u64 = 25_000;
+
+        let mut txn = MockTxn::default();
+        for id in 1..=CHAIN_LEN {
+            let dependencies = if id == 1 {
+                Vec::new()
+            } else {
+                vec![chain_hash(id - 1)]
+            };
+            txn.register(id, chain_hash(id), dependencies);
+        }
+
+        let membership = ViewMembershipSet::from_ordered([NodeId::new(CHAIN_LEN)]);
+        let closure = GraphVisibilityClosure::try_from_membership(&txn, &membership).unwrap();
+
+        assert_eq!(closure.len(), CHAIN_LEN as usize);
+        assert!(closure
+            .iter_dependency_first()
+            .enumerate()
+            .all(|(index, change_id)| change_id.get() == index as u64 + 1));
+    }
+
+    #[test]
+    fn closure_rejects_unindexed_count_mismatch_missing_and_cycles() {
+        let mut unindexed = MockTxn::default();
+        unindexed.external.insert(NodeId::new(1), hash(1));
+        unindexed.internal.insert(hash(1), NodeId::new(1));
+        let membership = ViewMembershipSet::from_ordered([NodeId::new(1)]);
+        assert!(matches!(
+            GraphVisibilityClosure::try_from_membership(&unindexed, &membership),
+            Err(PristineError::UnindexedChangeDependencies { change_id: 1 })
+        ));
+
+        let mut mismatched = MockTxn::default();
+        mismatched.register(1, hash(1), vec![hash(2)]);
+        mismatched.indexed_counts.insert(NodeId::new(1), 2);
+        assert!(matches!(
+            GraphVisibilityClosure::try_from_membership(&mismatched, &membership),
+            Err(PristineError::ChangeDependencyCountMismatch {
+                change_id: 1,
+                expected: 2,
+                actual: 1
+            })
+        ));
+
+        let mut missing = MockTxn::default();
+        missing.register(1, hash(1), vec![hash(2)]);
+        assert!(matches!(
+            GraphVisibilityClosure::try_from_membership(&missing, &membership),
+            Err(PristineError::MissingRegisteredDependency { change_id: 1, .. })
+        ));
+
+        let mut cyclic = MockTxn::default();
+        cyclic.register(1, hash(1), vec![hash(2)]);
+        cyclic.register(2, hash(2), vec![hash(1)]);
+        assert!(matches!(
+            GraphVisibilityClosure::try_from_membership(&cyclic, &membership),
+            Err(PristineError::DependencyCycle { .. })
+        ));
+    }
+
+    #[test]
+    fn full_chain_and_membership_include_every_scope_root_to_leaf() {
+        let mut txn = MockTxn::default();
+        let main = ViewState::with_scope(1, "main".into(), ViewScope::Shared, None);
+        let dev = ViewState::with_scope(2, "dev".into(), ViewScope::Shared, Some(1));
+        let feature = ViewState::with_scope(3, "feature".into(), ViewScope::Draft, Some(2));
+        txn.add_view(main, vec![NodeId::new(10), NodeId::new(20)]);
+        txn.add_view(dev, vec![NodeId::new(20), NodeId::new(30)]);
+        txn.add_view(feature.clone(), vec![NodeId::new(40)]);
+
+        let chain = txn.resolve_full_view_chain(&feature).unwrap();
+        assert_eq!(
+            chain.iter().map(|view| view.id).collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        assert_eq!(
+            txn.view_membership_set(&feature)
+                .unwrap()
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![
+                NodeId::new(10),
+                NodeId::new(20),
+                NodeId::new(30),
+                NodeId::new(40)
+            ]
+        );
+    }
+
+    #[test]
+    fn full_chain_rejects_missing_parent_and_cycles() {
+        let txn = MockTxn::default();
+        let broken = ViewState::with_scope(3, "broken".into(), ViewScope::Draft, Some(99));
+        assert!(matches!(
+            txn.resolve_full_view_chain(&broken),
+            Err(PristineError::BrokenViewParent {
+                view_id: 3,
+                parent_id: 99,
+                ..
+            })
+        ));
+
+        let mut txn = MockTxn::default();
+        let a = ViewState::with_scope(1, "a".into(), ViewScope::Shared, Some(2));
+        let b = ViewState::with_scope(2, "b".into(), ViewScope::Draft, Some(1));
+        txn.add_view(a.clone(), Vec::new());
+        txn.add_view(b, Vec::new());
+        assert!(matches!(
+            txn.resolve_full_view_chain(&a),
+            Err(PristineError::ViewCycleDetected { .. })
+        ));
+    }
 }

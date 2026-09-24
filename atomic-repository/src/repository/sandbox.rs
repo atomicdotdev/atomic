@@ -25,13 +25,17 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use atomic_core::pristine::Pristine;
+use atomic_core::output::alive::RetrieveOptions;
+use atomic_core::pristine::{CachedGraphTxn, Pristine, ViewTxnT};
+use atomic_core::WorkingCopyId;
+
 use serde::{Deserialize, Serialize};
 
 use crate::changestore::{ChangeStore, DEFAULT_CACHE_CAPACITY};
 use crate::oci::{self, OciImageConfig};
 
-use super::{Repository, DOT_DIR};
+use super::content::retrieve_content_with_filter_fast;
+use super::{graph_visibility_closure, working_copy, Repository, DOT_DIR};
 use crate::RepositoryError;
 
 /// Options for [`Repository::stage`].
@@ -129,9 +133,9 @@ impl Repository {
     /// `changes` store, so there is exactly one graph. `view` selects which
     /// view this sandbox operates on (typically the agent's own draft view).
     ///
-    /// The canonical `current_view` file on disk is left untouched — the view
-    /// is held in memory for this handle only, so concurrent agents on
-    /// different views never clobber one another.
+    /// The sandbox's persistent working-copy record selects its desired view.
+    /// Its local `.atomic/current_view` is derived compatibility output; the
+    /// canonical working copy's record and compatibility file remain untouched.
     ///
     /// This writable open requires exclusive process access to the canonical
     /// database. Read-only sandbox queries use `open_readonly` to share access
@@ -139,13 +143,13 @@ impl Repository {
     pub fn open_sandbox<P, Q>(
         working_root: P,
         canonical: Q,
-        view: &str,
+        _view: &str,
     ) -> Result<Self, RepositoryError>
     where
         P: AsRef<Path>,
         Q: AsRef<Path>,
     {
-        Self::open_sandbox_with_mode(working_root.as_ref(), canonical.as_ref(), view, false)
+        Self::open_sandbox_with_mode(working_root.as_ref(), canonical.as_ref(), _view, false)
     }
 
     pub(super) fn open_sandbox_readonly(
@@ -159,7 +163,7 @@ impl Repository {
     fn open_sandbox_with_mode(
         working_root: &Path,
         canonical: &Path,
-        view: &str,
+        _view: &str,
         read_only: bool,
     ) -> Result<Self, RepositoryError> {
         let working_root = working_root.to_path_buf();
@@ -175,11 +179,31 @@ impl Repository {
         let pristine = Arc::new(pristine.map_err(RepositoryError::from)?);
         let change_store = ChangeStore::new(dot_dir.join("changes"), DEFAULT_CACHE_CAPACITY)
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        let layout = working_copy::layout_for_paths(
+            working_root.clone(),
+            dot_dir.clone(),
+            working_root.join(DOT_DIR),
+            false,
+        )?;
+        // A bare sandbox pointer (`.atomic-sandbox` written by a foreign
+        // harness or an older integration) has no local working-copy
+        // identity. Read-only opens resolve the canonical repository's
+        // registered identity instead of demanding a writable migration;
+        // writable opens keep requiring provisioning.
+        let (_working_copy_id, current_view) =
+            match working_copy::load_registered_identity(&pristine, &layout) {
+                Ok(identity) => identity,
+                Err(RepositoryError::WorkingCopyMigrationRequired { .. }) if read_only => {
+                    let canonical_layout = working_copy::discover_layout(&canonical_root)?;
+                    working_copy::load_registered_identity(&pristine, &canonical_layout)?
+                }
+                Err(error) => return Err(error),
+            };
 
         Ok(Self {
             root: working_root,
             dot_dir,
-            current_view: view.to_string(),
+            current_view,
             pristine,
             change_store,
             is_sandbox: true,
@@ -195,6 +219,7 @@ impl Repository {
     /// directory is **never** cloned — the sandbox shares the canonical graph
     /// via [`Repository::open_sandbox`].
     ///
+    /// `working_copy` identifies and validates the source directory being cloned.
     /// Returns the number of files provisioned.
     ///
     /// Also writes a [`SANDBOX_POINTER`] file into `dest` so that `atomic`
@@ -202,10 +227,25 @@ impl Repository {
     /// graph and the given `view`.
     pub fn provision_sandbox<P: AsRef<Path>>(
         &self,
+        working_copy: WorkingCopyId,
         dest: P,
         view: &str,
     ) -> Result<usize, RepositoryError> {
+        self.validate_working_copy(working_copy)?;
         let dest = dest.as_ref();
+        {
+            let txn = self
+                .pristine
+                .read_txn()
+                .map_err(|e| RepositoryError::Database(e.to_string()))?;
+            let view_state = txn
+                .get_view(view)
+                .map_err(|e| RepositoryError::Database(e.to_string()))?
+                .ok_or_else(|| RepositoryError::ViewNotFound {
+                    name: view.to_string(),
+                })?;
+            graph_visibility_closure(&txn, &view_state)?;
+        }
         let count = provision_working_tree(&self.root, dest)?;
 
         let pointer = SandboxPointer {
@@ -216,7 +256,68 @@ impl Repository {
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
         std::fs::write(dest.join(SANDBOX_POINTER), bytes)?;
 
+        let layout = working_copy::layout_for_paths(
+            dest.to_path_buf(),
+            self.dot_dir.clone(),
+            dest.join(DOT_DIR),
+            false,
+        )?;
+        working_copy::migrate_identity(&self.pristine, &layout, view)?;
+
         Ok(count)
+    }
+
+    fn materialized_view_files(
+        &self,
+        view_name: &str,
+    ) -> Result<BTreeMap<String, Vec<u8>>, RepositoryError> {
+        let txn = self
+            .pristine
+            .read_txn()
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        let view = txn
+            .get_view(view_name)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?
+            .ok_or_else(|| RepositoryError::ViewNotFound {
+                name: view_name.to_string(),
+            })?;
+        let visibility = graph_visibility_closure(&txn, &view)?;
+        let projection = self.project_tree_for_visibility(&txn, &visibility)?;
+        let cached_txn =
+            CachedGraphTxn::new(&txn).map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+        let mut files = BTreeMap::new();
+        for item in projection.present.into_values() {
+            if item.is_directory {
+                continue;
+            }
+            let options = RetrieveOptions::new().with_graph_visibility(visibility.clone());
+            let bytes = retrieve_content_with_filter_fast(
+                &cached_txn,
+                &self.change_store,
+                item.inode,
+                item.position,
+                options,
+            )
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+            files.insert(item.path, bytes);
+        }
+        Ok(files)
+    }
+
+    fn write_materialized_files(
+        dir: &Path,
+        files: &BTreeMap<String, Vec<u8>>,
+    ) -> Result<(), RepositoryError> {
+        std::fs::create_dir_all(dir)?;
+        for (path, bytes) in files {
+            let target = dir.join(path);
+            if let Some(parent) = target.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(target, bytes)?;
+        }
+        Ok(())
     }
 
     /// Materialize a view's visible file content into `dir` (created if needed).
@@ -225,23 +326,9 @@ impl Repository {
     /// view's own changes plus its parent chain). Returns the number of files
     /// written.
     pub fn materialize_view_to(&self, view: &str, dir: &Path) -> Result<usize, RepositoryError> {
-        std::fs::create_dir_all(dir)?;
-
-        let mut count = 0usize;
-        for path in self.visible_file_paths(view)? {
-            let bytes = match self.get_file_content_on_view(&path, view)? {
-                Some(bytes) => bytes,
-                None => continue,
-            };
-            let target = dir.join(&path);
-            if let Some(parent) = target.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            std::fs::write(&target, &bytes)?;
-            count += 1;
-        }
-
-        Ok(count)
+        let files = self.materialized_view_files(view)?;
+        Self::write_materialized_files(dir, &files)?;
+        Ok(files.len())
     }
 
     /// Produce a two-layer OCI image: a base layer (the `base_view`
@@ -253,32 +340,29 @@ impl Repository {
     /// delta. Provenance (view names and Merkle states) is recorded in the
     /// manifest annotations. Returns the manifest digest and base `diff_id`.
     pub fn stage(&self, opts: StageOptions) -> Result<StageResult, RepositoryError> {
+        // Resolve both snapshots before creating output state. Each snapshot
+        // builds and validates its view closure once.
+        let base_files = self.materialized_view_files(&opts.base_view)?;
+        let view_files = self.materialized_view_files(&opts.view)?;
+
         // 1. Base layer: materialize the shared base view to a temp dir.
         let base_dir = tempfile::tempdir()?;
-        self.materialize_view_to(&opts.base_view, base_dir.path())?;
+        Self::write_materialized_files(base_dir.path(), &base_files)?;
         let base_layer = oci::layer_from_dir(base_dir.path())?;
         let base_diff_id = base_layer.diff_id.clone();
 
         // 2. Delta: files new or changed on `view` vs. `base_view`, plus
         //    whiteouts for files present on the base but gone on `view`.
-        let view_paths = self.visible_file_paths(&opts.view)?;
-        let base_paths = self.visible_file_paths(&opts.base_view)?;
-
         let mut changed: Vec<(String, Vec<u8>)> = Vec::new();
-        for path in &view_paths {
-            let view_bytes = match self.get_file_content_on_view(path, &opts.view)? {
-                Some(bytes) => bytes,
-                None => continue,
-            };
-            let base_bytes = self.get_file_content_on_view(path, &opts.base_view)?;
-            if base_bytes.as_deref() != Some(view_bytes.as_slice()) {
-                changed.push((path.clone(), view_bytes));
+        for (path, view_bytes) in &view_files {
+            if base_files.get(path) != Some(view_bytes) {
+                changed.push((path.clone(), view_bytes.clone()));
             }
         }
 
         let mut whiteouts: Vec<String> = Vec::new();
-        for path in &base_paths {
-            if !view_paths.contains(path) {
+        for path in base_files.keys() {
+            if !view_files.contains_key(path) {
                 whiteouts.push(path.clone());
             }
         }
@@ -328,8 +412,10 @@ impl Repository {
     /// Provenance (view name and Merkle state) is recorded in the manifest
     /// annotations. Returns the manifest digest and file count.
     pub fn seal(&self, opts: SealOptions) -> Result<SealResult, RepositoryError> {
+        let materialized = self.materialized_view_files(&opts.view)?;
+        let files = materialized.len();
         let work_dir = tempfile::tempdir()?;
-        let files = self.materialize_view_to(&opts.view, work_dir.path())?;
+        Self::write_materialized_files(work_dir.path(), &materialized)?;
         let layer = oci::layer_from_dir(work_dir.path())?;
 
         let view_info = self.get_view_info(&opts.view)?;
@@ -446,13 +532,20 @@ mod tests {
         }
         std::fs::write(&path, contents).unwrap();
 
-        repo.add(rel, TrackingOptions::default()).unwrap();
+        repo.add(
+            repo.require_working_copy_id().unwrap(),
+            rel,
+            TrackingOptions::default(),
+        )
+        .unwrap();
         let header = ChangeHeader::new("add file");
         let options = RecordOptions::new()
             .with_all(true)
             .save_to_store(true)
             .apply_after_record(false);
-        let outcome = repo.record(header, options).unwrap();
+        let outcome = repo
+            .record(repo.require_working_copy_id().unwrap(), header, options)
+            .unwrap();
         repo.write_recorded(&outcome, InsertOptions::default())
             .unwrap();
 

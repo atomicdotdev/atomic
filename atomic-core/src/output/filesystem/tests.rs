@@ -256,6 +256,28 @@ fn test_file_metadata_permissions() {
 
 #[cfg(unix)]
 #[test]
+fn dangling_symlink_is_walked_read_and_replaced_safely() {
+    use crate::types::Inode;
+    use std::io::Write;
+
+    let (dir, fs) = temp_fs();
+    fs.write_symlink("link", std::path::Path::new("missing-target"))
+        .unwrap();
+    assert!(fs.exists("link"));
+    assert_eq!(fs.walk_files("").unwrap(), vec!["link"]);
+    let mut target = Vec::new();
+    fs.read_file("link", &mut target).unwrap();
+    assert_eq!(target, b"missing-target");
+
+    let mut writer = fs.write_file("link", Inode::new(1)).unwrap();
+    writer.write_all(b"regular").unwrap();
+    writer.finish().unwrap();
+    assert!(!fs.file_metadata("link").unwrap().is_symlink);
+    assert_eq!(std::fs::read(dir.path().join("link")).unwrap(), b"regular");
+}
+
+#[cfg(unix)]
+#[test]
 fn test_file_metadata_symlink() {
     let (dir, fs) = temp_fs();
     std::fs::write(dir.path().join("target.txt"), "content").unwrap();

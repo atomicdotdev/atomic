@@ -5,7 +5,7 @@
 //! [`FileHeaderBuilder`] provides a fluent API for constructing headers.
 
 use super::super::error::{
-    FormatError, FormatResult, FORMAT_VERSION, MAGIC, MAX_HASH_TABLE_ENTRIES,
+    FormatError, FormatResult, FORMAT_VERSION, LEGACY_FORMAT_VERSION, MAGIC, MAX_HASH_TABLE_ENTRIES,
 };
 use super::builder::FileHeaderBuilder;
 use std::fmt;
@@ -140,7 +140,7 @@ impl fmt::Display for FileHeaderFlags {
 /// Offset  Size  Field
 /// ──────  ────  ─────
 ///   0       4   magic: b"ATOM"
-///   4       4   version: u32 LE (= 1)
+///   4       4   version: u32 LE (= 2 for new objects; 1 accepted read-only)
 ///   8       4   flags: u32 LE (FileHeaderFlags bitfield)
 ///  12       4   hash_table_entries: u32 LE
 ///  16       4   graph_section_count: u32 LE
@@ -182,7 +182,7 @@ pub struct FileHeader {
     /// Magic bytes — always `b"ATOM"`.
     pub magic: [u8; 4],
 
-    /// Format version — always `1` for V3.
+    /// ATOM schema version. Readers accept 1 and 2; writers emit 2.
     pub version: u32,
 
     /// Feature flags (see [`FileHeaderFlags`]).
@@ -263,7 +263,7 @@ impl FileHeader {
     /// # Errors
     ///
     /// - [`FormatError::InvalidMagic`] if the first 4 bytes aren't `b"ATOM"`
-    /// - [`FormatError::UnsupportedVersion`] if the version isn't `1`
+    /// - [`FormatError::UnsupportedVersion`] if the version isn't `1` or `2`
     ///
     /// # Examples
     ///
@@ -273,7 +273,7 @@ impl FileHeader {
     /// let header = FileHeader::default();
     /// let bytes = header.to_bytes();
     /// let decoded = FileHeader::from_bytes(&bytes).unwrap();
-    /// assert_eq!(decoded.version, 1);
+    /// assert_eq!(decoded.version, 2);
     /// ```
     pub fn from_bytes(bytes: &[u8; Self::SIZE]) -> FormatResult<Self> {
         let mut magic = [0u8; 4];
@@ -283,7 +283,7 @@ impl FileHeader {
         }
 
         let version = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
-        if version != FORMAT_VERSION {
+        if version != LEGACY_FORMAT_VERSION && version != FORMAT_VERSION {
             return Err(FormatError::UnsupportedVersion {
                 expected: FORMAT_VERSION,
                 got: version,
@@ -332,7 +332,7 @@ impl FileHeader {
 
     /// Read a header from a reader.
     ///
-    /// Reads exactly 64 bytes and validates magic + version.
+    /// Reads exactly 64 bytes and validates magic plus supported schema version.
     ///
     /// # Errors
     ///
@@ -347,7 +347,7 @@ impl FileHeader {
 
     /// Create a builder for constructing a `FileHeader`.
     ///
-    /// The builder sets sensible defaults (magic = `b"ATOM"`, version = 1,
+    /// The builder sets sensible defaults (magic = `b"ATOM"`, version = 2,
     /// flags = auto-computed, reserved = zeros) and lets you configure
     /// the section counts.
     pub fn builder() -> FileHeaderBuilder {

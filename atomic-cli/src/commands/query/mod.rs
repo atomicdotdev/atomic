@@ -1558,9 +1558,12 @@ mod enrich_tests {
         repo.init_kg().unwrap();
 
         std::fs::write(temp.path().join("lesson.txt"), "durable fact\n").unwrap();
-        repo.add("lesson.txt", Default::default()).unwrap();
+        let working_copy = repo.require_working_copy_id().unwrap();
+        repo.add(working_copy, "lesson.txt", Default::default())
+            .unwrap();
         let outcome = repo
             .record(
+                working_copy,
                 ChangeHeader::builder()
                     .message("Agent-authored change")
                     .build(),
@@ -1589,6 +1592,9 @@ impl Command for QueryEnrich {
     fn run(&self) -> CliResult<()> {
         let root = find_repository_root()?;
         let repo = Repository::open(&root).map_err(CliError::Repository)?;
+        let working_copy = repo
+            .require_working_copy_id()
+            .map_err(CliError::Repository)?;
 
         // Agent stop hooks intentionally record with KG enrichment disabled to
         // keep their latency low. Consumers that need immediate RDF lineage can
@@ -1602,7 +1608,8 @@ impl Command for QueryEnrich {
                 .collect::<CliResult<Vec<_>>>()?;
 
             for hash in &hashes {
-                repo.enrich_change(hash).map_err(CliError::Repository)?;
+                repo.enrich_change(working_copy, hash)
+                    .map_err(CliError::Repository)?;
             }
 
             println!("Enriched {} change(s).", hashes.len());
@@ -1633,7 +1640,7 @@ impl Command for QueryEnrich {
 
         // Phase 2: Files
         let spinner = create_spinner("Enriching files...");
-        match repo.kg_enrich_files() {
+        match repo.kg_enrich_files(working_copy) {
             Ok(n) => {
                 total.files = n;
                 finish_success(&spinner, &format!("{} file(s)", n));
@@ -1643,7 +1650,7 @@ impl Command for QueryEnrich {
 
         // Phase 3: Modules + PART_OF edges
         let spinner = create_spinner("Enriching modules...");
-        match repo.kg_enrich_modules() {
+        match repo.kg_enrich_modules(working_copy) {
             Ok(n) => {
                 total.modules = n;
                 finish_success(&spinner, &format!("{} module(s)", n));
@@ -1653,7 +1660,7 @@ impl Command for QueryEnrich {
 
         // Phase 4: Changes
         let spinner = create_spinner("Enriching changes...");
-        match repo.kg_enrich_changes() {
+        match repo.kg_enrich_changes(working_copy) {
             Ok(n) => {
                 total.changes = n;
                 finish_success(&spinner, &format!("{} change(s)", n));
@@ -1663,7 +1670,7 @@ impl Command for QueryEnrich {
 
         // Phase 5: AST entities
         let spinner = create_spinner("Extracting entities (tree-sitter)...");
-        match repo.kg_enrich_entities() {
+        match repo.kg_enrich_entities(working_copy) {
             Ok(n) => {
                 total.entities = n;
                 finish_success(&spinner, &format!("{} entit(ies)", n));
@@ -1673,7 +1680,7 @@ impl Command for QueryEnrich {
 
         // Phase 6: INCLUDES edges
         let spinner = create_spinner("Resolving includes...");
-        match repo.kg_enrich_includes() {
+        match repo.kg_enrich_includes(working_copy) {
             Ok(n) => {
                 total.includes = n;
                 finish_success(&spinner, &format!("{} include(s)", n));
@@ -1683,7 +1690,7 @@ impl Command for QueryEnrich {
 
         // Phase 7: CALLS edges (caller entity → callee entity)
         let spinner = create_spinner("Resolving call sites...");
-        match repo.kg_enrich_calls() {
+        match repo.kg_enrich_calls(working_copy) {
             Ok(n) => {
                 total.calls = n;
                 finish_success(&spinner, &format!("{} call(s)", n));

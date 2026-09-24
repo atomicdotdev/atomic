@@ -16,14 +16,18 @@ use crate::crdt::tables::{
 
 use crate::types::{
     ChangePosition, EdgeFlags, GraphNode, Hash, Inode, Merkle, NodeId, Position,
-    SerializedGraphEdge,
+    SerializedGraphEdge, WorkingCopyId,
 };
 
 use crate::pristine::error::{PristineError, PristineResult};
+use crate::pristine::path_claim::tree_bijection_error;
 use crate::pristine::tables::*;
 use crate::pristine::traits::{
-    FileIndexEntry, FileIndexMetadata, GraphTxnT, KgMutTxnT, MutTxnT, StoredConflict, TreeTxnT,
-    ViewScope, ViewState, ViewTxnT,
+    FileIndexEntry, FileIndexMetadata, FileIndexV2MutTxnT, FileIndexV2TxnT, GraphTxnT, KgMutTxnT,
+    MutTxnT, StoredConflict, TreeTxnT, ViewScope, ViewState, ViewTxnT, WorkingCopyTxnT,
+};
+use crate::pristine::{
+    decode_file_index_v2, encode_file_index_v2, FileIndexV2Entry, FileIndexV2Key,
 };
 
 use super::helpers::{
@@ -32,6 +36,59 @@ use super::helpers::{
 };
 
 const SESSION_LEDGER_SCHEMA_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PendingInodeReset {
+    expected: u64,
+    next: u64,
+}
+
+impl PendingInodeReset {
+    fn new(expected: u64, next: u64) -> Self {
+        Self { expected, next }
+    }
+
+    fn expected(self) -> u64 {
+        self.expected
+    }
+
+    fn allocate(&mut self) -> PristineResult<Inode> {
+        let inode = self.next.max(1);
+        self.next = inode
+            .checked_add(1)
+            .ok_or(PristineError::IdSpaceExhausted)?;
+        Ok(Inode::new(inode))
+    }
+
+    fn publish(self, shared: &AtomicU64) -> bool {
+        match shared.compare_exchange(self.expected, self.next, Ordering::SeqCst, Ordering::SeqCst)
+        {
+            Ok(_) => true,
+            Err(actual) => {
+                if actual < self.next {
+                    shared.fetch_max(self.next, Ordering::SeqCst);
+                }
+                false
+            }
+        }
+    }
+}
+
+fn allocate_shared_inode(next_inode: &AtomicU64) -> PristineResult<Inode> {
+    loop {
+        let current = next_inode.load(Ordering::SeqCst);
+        let inode = current.max(1);
+        let next = inode
+            .checked_add(1)
+            .ok_or(PristineError::IdSpaceExhausted)?;
+        if next_inode
+            .compare_exchange_weak(current, next, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            return Ok(Inode::new(inode));
+        }
+    }
+}
 
 /// Read-write transaction
 ///
@@ -42,6 +99,7 @@ pub struct WriteTxn<'a> {
     pub(crate) next_node_id: &'a AtomicU64,
     pub(crate) next_view_id: &'a AtomicU64,
     pub(crate) next_inode: &'a AtomicU64,
+    pub(crate) pending_next_inode: Option<PendingInodeReset>,
 }
 
 impl<'a> WriteTxn<'a> {
@@ -57,6 +115,7 @@ impl<'a> WriteTxn<'a> {
             next_node_id,
             next_view_id,
             next_inode,
+            pending_next_inode: None,
         }
     }
 
@@ -588,6 +647,7 @@ impl<'a> WriteTxn<'a> {
                     turn_count: 0,
                     started_at: turn.timestamp,
                     ended_at: None,
+                    status: crate::change::session::SessionStatus::Active,
                 });
             self.append_session_turn(record, turn.clone(), &turns)?;
             self.mark_current_session_ledger_schema(&turn.session_id)?;
@@ -668,6 +728,7 @@ impl<'a> WriteTxn<'a> {
                 turn_count: 0,
                 started_at: graph.timestamp,
                 ended_at: None,
+                status: crate::change::session::SessionStatus::Active,
             });
 
         if record.json_path.is_empty() {
@@ -694,6 +755,9 @@ impl<'a> WriteTxn<'a> {
             timestamp: graph.timestamp,
             plan_id: graph.plan_id.clone(),
             todos: graph.todos.clone(),
+            boundary_start: None,
+            boundary_end: None,
+            outcome: None,
         };
 
         self.index_session_turn_candidate(record, turns, candidate)
@@ -731,6 +795,7 @@ impl<'a> WriteTxn<'a> {
                 turn_count: 0,
                 started_at: turn.timestamp,
                 ended_at: None,
+                status: crate::change::session::SessionStatus::Active,
             });
 
         if record.json_path.is_empty() {
@@ -768,6 +833,7 @@ impl<'a> WriteTxn<'a> {
             turn_count: 0,
             started_at: chrono::Utc::now().timestamp(),
             ended_at: None,
+            status: crate::change::session::SessionStatus::Active,
         };
         let bytes = record.to_bytes();
         sessions.insert(session_id, bytes.as_slice())?;
@@ -808,6 +874,7 @@ impl<'a> WriteTxn<'a> {
                 turn_count: 0,
                 started_at: chrono::Utc::now().timestamp(),
                 ended_at: None,
+                status: crate::change::session::SessionStatus::Active,
             },
         };
 
@@ -821,8 +888,20 @@ impl<'a> WriteTxn<'a> {
             record.parent_view = parent_view;
         }
         // Explicit assignment: Some(ts) ends the session, None clears a
-        // stale end marker when a session is re-entered.
+        // stale end marker when a session is re-entered. An incomplete outcome
+        // is terminal until explicit recovery policy exists, so ordinary
+        // lifecycle callbacks must not erase it.
         record.ended_at = ended_at;
+        if !matches!(
+            &record.status,
+            crate::change::session::SessionStatus::Incomplete(_)
+        ) {
+            record.status = if ended_at.is_some() {
+                crate::change::session::SessionStatus::Ended
+            } else {
+                crate::change::session::SessionStatus::Active
+            };
+        }
 
         let bytes = record.to_bytes();
         sessions.insert(session_id, bytes.as_slice())?;
@@ -831,6 +910,125 @@ impl<'a> WriteTxn<'a> {
         drop(sessions);
         self.emit_session_node(&record)?;
         Ok(())
+    }
+
+    /// Persist a managed-agent refusal without creating a turn or provenance.
+    ///
+    /// The first incomplete outcome wins. Repeated turn-end/session-end hooks
+    /// therefore return the same recovery object and cannot duplicate or
+    /// rewrite forensic state.
+    pub fn mark_session_incomplete(
+        &mut self,
+        session_id: &str,
+        json_path: &str,
+        view_name: Option<String>,
+        parent_view: Option<String>,
+        incomplete: &crate::change::session::IncompleteSession,
+    ) -> PristineResult<crate::change::session::IncompleteSession> {
+        use crate::change::session::{SessionRecord, SessionStatus};
+
+        let mut sessions = self.txn.open_table(SESSIONS)?;
+        let mut record = match sessions.get(session_id)? {
+            Some(value) => SessionRecord::from_bytes(value.value()).map_err(|e| {
+                PristineError::Serialization {
+                    message: format!("session record decode: {}", e),
+                }
+            })?,
+            None => SessionRecord {
+                session_id: session_id.to_string(),
+                json_path: json_path.to_string(),
+                view_name: None,
+                parent_view: None,
+                first_provenance: None,
+                latest_provenance: None,
+                turn_count: 0,
+                started_at: chrono::Utc::now().timestamp(),
+                ended_at: None,
+                status: SessionStatus::Active,
+            },
+        };
+
+        if record.json_path.is_empty() {
+            record.json_path = json_path.to_string();
+        }
+        if view_name.is_some() {
+            record.view_name = view_name;
+        }
+        if parent_view.is_some() {
+            record.parent_view = parent_view;
+        }
+
+        let existing = record.status.incomplete().cloned();
+        let persisted = if let Some(existing) = existing {
+            existing
+        } else {
+            record.status = SessionStatus::Incomplete(incomplete.clone());
+            incomplete.clone()
+        };
+
+        let bytes = record.to_bytes();
+        sessions.insert(session_id, bytes.as_slice())?;
+        drop(sessions);
+        self.emit_session_node(&record)?;
+        Ok(persisted)
+    }
+
+    /// Attach durable turn boundaries and the semantic outcome to an already
+    /// indexed turn row (CB-12A, RFC §10.1/§10.2).
+    ///
+    /// The row is located by its immutable provenance hash; nothing is
+    /// created. Turns without recorded provenance (git-only or
+    /// observation-only outcomes) have no ledger row by design — their
+    /// boundaries/outcomes live in the session record and attestation instead.
+    /// Attaching is idempotent: re-attaching the same evidence is a no-op.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attach_turn_boundary(
+        &mut self,
+        session_id: &str,
+        provenance_hash: &crate::types::Hash,
+        boundary_start: &crate::change::session::TurnBoundary,
+        boundary_end: &crate::change::session::TurnBoundary,
+        outcome: &crate::change::session::ManagedTurnOutcome,
+    ) -> PristineResult<bool> {
+        use crate::change::session::{
+            encode_session_turn_key, session_turn_namespace, SessionTurn,
+        };
+
+        let mut turns = self.txn.open_table(SESSION_TURNS)?;
+        let namespace = session_turn_namespace(session_id);
+        let scan_start = encode_session_turn_key(namespace, 0);
+        let scan_end = encode_session_turn_key(namespace, u32::MAX);
+
+        let mut matches: Vec<([u8; 40], SessionTurn)> = Vec::new();
+        for row in turns.range::<&[u8; 40]>(&scan_start..=&scan_end)? {
+            let (key, value) = row?;
+            let turn = SessionTurn::from_bytes(value.value()).map_err(|e| {
+                PristineError::Serialization {
+                    message: format!("session turn decode: {}", e),
+                }
+            })?;
+            if turn.session_id == session_id && turn.provenance_hash == *provenance_hash {
+                matches.push((*key.value(), turn));
+            }
+        }
+
+        let Some((key, mut turn)) = matches.into_iter().next() else {
+            return Ok(false);
+        };
+
+        let unchanged = turn.boundary_start.as_ref() == Some(boundary_start)
+            && turn.boundary_end.as_ref() == Some(boundary_end)
+            && turn.outcome.as_ref() == Some(outcome);
+        if unchanged {
+            return Ok(true);
+        }
+
+        turn.boundary_start = Some(boundary_start.clone());
+        turn.boundary_end = Some(boundary_end.clone());
+        turn.outcome = Some(outcome.clone());
+        turns.insert(&key, turn.to_bytes().as_slice())?;
+        drop(turns);
+        Ok(true)
     }
 
     /// Store an immutable session manifest and advance its convenience head.
@@ -855,17 +1053,36 @@ fn format_timestamp_ms(epoch_ms: i64) -> String {
         .unwrap_or_else(|| format!("{}", epoch_ms))
 }
 
+mod bindings;
+mod capability;
 mod embeddings;
 mod graph;
+mod native_derived;
+mod operation;
+mod path_claim;
+mod ref_mapping;
 mod session_kg;
+mod set_id_index;
 mod tag;
 mod tree;
 mod triples;
 mod vault;
 mod view;
+mod working_copy;
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+impl<'a> WriteTxn<'a> {
+    /// Test-only raw table access (corruption seeding for repair tests).
+    pub(crate) fn open_table_for_test<'t, K: redb::Key + 'static, V: redb::Value + 'static>(
+        &'t mut self,
+        definition: redb::TableDefinition<'static, K, V>,
+    ) -> Result<redb::Table<'t, K, V>, redb::TableError> {
+        self.txn.open_table(definition)
+    }
+}
 
 // Entity registration helper
 
@@ -1384,6 +1601,19 @@ impl<'a> MutTxnT for WriteTxn<'a> {
             });
         }
 
+        let mut working_copy_ids = WorkingCopyTxnT::list_working_copies(self)?
+            .into_iter()
+            .filter(|record| record.desired_view == view.id)
+            .map(|record| record.id.to_string())
+            .collect::<Vec<_>>();
+        if !working_copy_ids.is_empty() {
+            working_copy_ids.sort();
+            return Err(PristineError::ViewHasWorkingCopies {
+                name: view.name.clone(),
+                working_copy_ids,
+            });
+        }
+
         // Remove from VIEWS table
         {
             let mut table = self.txn.open_table(VIEWS)?;
@@ -1490,6 +1720,64 @@ impl<'a> MutTxnT for WriteTxn<'a> {
     }
 
     fn put_tree(&mut self, path: &str, inode: Inode) -> PristineResult<()> {
+        let forward = {
+            let table = self.txn.open_table(TREE)?;
+            let value = table.get(path)?.map(|value| Inode::new(value.value()));
+            value
+        };
+        let reverse = {
+            let table = self.txn.open_table(REV_TREE)?;
+            let value = table
+                .get(inode.get())?
+                .map(|value| value.value().to_string());
+            value
+        };
+
+        match (forward, reverse.as_deref()) {
+            (Some(existing), _) if existing != inode => {
+                return Err(tree_bijection_error(format!(
+                    "cannot bind '{}' to inode {} because inode {} already owns the path",
+                    path,
+                    inode.get(),
+                    existing.get()
+                )));
+            }
+            (None, Some(existing)) if existing != path => {
+                return Err(tree_bijection_error(format!(
+                    "cannot bind inode {} to '{}' because it is already bound to '{}'",
+                    inode.get(),
+                    path,
+                    existing
+                )));
+            }
+            (Some(existing), Some(reverse_path)) if existing == inode && reverse_path == path => {
+                return Ok(());
+            }
+            (Some(_), None) => {
+                return Err(tree_bijection_error(format!(
+                    "TREE maps '{}' to inode {}, but REV_TREE has no row",
+                    path,
+                    inode.get()
+                )));
+            }
+            (None, Some(existing)) => {
+                return Err(tree_bijection_error(format!(
+                    "REV_TREE maps inode {} to '{}', but TREE has no matching row",
+                    inode.get(),
+                    existing
+                )));
+            }
+            (Some(_), Some(existing)) => {
+                return Err(tree_bijection_error(format!(
+                    "TREE/REV_TREE disagree while binding inode {} to '{}': reverse path is '{}'",
+                    inode.get(),
+                    path,
+                    existing
+                )));
+            }
+            (None, None) => {}
+        }
+
         {
             let mut table = self.txn.open_table(TREE)?;
             table.insert(path, inode.get())?;
@@ -1503,17 +1791,126 @@ impl<'a> MutTxnT for WriteTxn<'a> {
 
     fn del_tree(&mut self, path: &str) -> PristineResult<Option<Inode>> {
         let inode = {
-            let mut table = self.txn.open_table(TREE)?;
-            let removed = table.remove(path)?;
-            removed.map(|value| Inode::new(value.value()))
+            let table = self.txn.open_table(TREE)?;
+            let value = table.get(path)?.map(|value| Inode::new(value.value()));
+            value
         };
 
-        if let Some(inode) = inode {
-            let mut table = self.txn.open_table(REV_TREE)?;
-            table.remove(inode.get())?;
+        let Some(inode) = inode else {
+            let reverse_only = {
+                let table = self.txn.open_table(REV_TREE)?;
+                let mut found = None;
+                for row in table.iter()? {
+                    let (candidate, reverse_path) = row?;
+                    if reverse_path.value() == path {
+                        found = Some(Inode::new(candidate.value()));
+                        break;
+                    }
+                }
+                found
+            };
+            if let Some(reverse_inode) = reverse_only {
+                return Err(tree_bijection_error(format!(
+                    "REV_TREE maps inode {} to '{}', but TREE has no row",
+                    reverse_inode.get(),
+                    path
+                )));
+            }
+            return Ok(None);
+        };
+
+        // Performance (RFC §21 measured budgets, CB-13C AC-3): the former
+        // competing-reverse check scanned the ENTIRE REV_TREE table per
+        // delete — O(n) per call, O(n²) per batch (measured: 4000 deletes
+        // spent 19.5s here). Two other inode→path rows mapping to the same
+        // path is a bijection violation that `validate_tree_bijection`
+        // catches in full (and which `TreeProjectionPlan::apply` runs after
+        // every projection), so the point checks below suffice on the hot
+        // path.
+        let reverse = {
+            let table = self.txn.open_table(REV_TREE)?;
+            let result = table
+                .get(inode.get())?
+                .map(|value| value.value().to_string());
+            result
+        };
+        if reverse.as_deref() != Some(path) {
+            return Err(tree_bijection_error(format!(
+                "cannot delete '{}': TREE maps it to inode {}, but REV_TREE maps that inode to {:?}",
+                path,
+                inode.get(),
+                reverse
+            )));
         }
 
-        Ok(inode)
+        {
+            let mut table = self.txn.open_table(TREE)?;
+            let removed = table.remove(path)?;
+            if removed.as_ref().map(|value| value.value()) != Some(inode.get()) {
+                return Err(tree_bijection_error(format!(
+                    "TREE changed while deleting '{}' for inode {}",
+                    path,
+                    inode.get()
+                )));
+            }
+        }
+        {
+            let mut table = self.txn.open_table(REV_TREE)?;
+            let removed = table.remove(inode.get())?;
+            if removed.as_ref().map(|value| value.value()) != Some(path) {
+                return Err(tree_bijection_error(format!(
+                    "REV_TREE changed while deleting inode {} from '{}'",
+                    inode.get(),
+                    path
+                )));
+            }
+        }
+
+        Ok(Some(inode))
+    }
+
+    fn repair_rev_tree_bijection(&mut self) -> PristineResult<(usize, usize)> {
+        let forward: std::collections::BTreeMap<String, u64> = {
+            let table = self.txn.open_table(TREE)?;
+            let mut forward = std::collections::BTreeMap::new();
+            for row in table.iter()? {
+                let (key, value) = row?;
+                forward.insert(key.value().to_string(), value.value());
+            }
+            forward
+        };
+        let reverse: Vec<(u64, String)> = {
+            let table = self.txn.open_table(REV_TREE)?;
+            let mut reverse = Vec::new();
+            for row in table.iter()? {
+                let (key, value) = row?;
+                reverse.push((key.value(), value.value().to_string()));
+            }
+            reverse
+        };
+        let mut removed_stale = 0usize;
+        {
+            let mut table = self.txn.open_table(REV_TREE)?;
+            for (inode, reverse_path) in &reverse {
+                if forward.get(reverse_path).copied() == Some(*inode) {
+                    continue;
+                }
+                table.remove(inode)?;
+                removed_stale += 1;
+            }
+        }
+        let mut inserted_missing = 0usize;
+        {
+            let mut table = self.txn.open_table(REV_TREE)?;
+            for (path, inode) in &forward {
+                if table.get(inode)?.is_some() {
+                    continue;
+                }
+                table.insert(inode, path.as_str())?;
+                inserted_missing += 1;
+            }
+        }
+        Ok((removed_stale, inserted_missing))
     }
 
     fn del_tree_binding(&mut self, path: &str, inode: Inode) -> PristineResult<()> {
@@ -1620,6 +2017,10 @@ impl<'a> MutTxnT for WriteTxn<'a> {
     }
 
     fn put_change_deps(&mut self, change_id: NodeId, deps: &[Hash]) -> PristineResult<()> {
+        let mut unique_deps = deps.to_vec();
+        unique_deps.sort_unstable();
+        unique_deps.dedup();
+
         let existing: Vec<[u8; 32]> = {
             let table = self.txn.open_multimap_table(CHANGE_DEPS)?;
             let iter = table.get(change_id.get())?;
@@ -1647,27 +2048,29 @@ impl<'a> MutTxnT for WriteTxn<'a> {
 
         {
             let mut table = self.txn.open_multimap_table(CHANGE_DEPS)?;
-            for dep in deps {
+            for dep in &unique_deps {
                 table.insert(change_id.get(), dep.as_bytes())?;
             }
         }
         {
             let mut table = self.txn.open_multimap_table(REV_CHANGE_DEPS)?;
-            for dep in deps {
+            for dep in &unique_deps {
                 table.insert(dep.as_bytes(), change_id.get())?;
             }
         }
         {
             let mut table = self.txn.open_table(CHANGE_DEPS_INDEXED)?;
-            table.insert(change_id.get(), deps.len() as u64)?;
+            table.insert(change_id.get(), unique_deps.len() as u64)?;
         }
 
         Ok(())
     }
 
     fn alloc_inode(&mut self) -> PristineResult<Inode> {
-        let id = self.next_inode.fetch_add(1, Ordering::SeqCst);
-        Ok(Inode::new(id))
+        match self.pending_next_inode.as_mut() {
+            Some(pending) => pending.allocate(),
+            None => allocate_shared_inode(self.next_inode),
+        }
     }
 
     fn put_directory(&mut self, inode: Inode, flags: u8) -> PristineResult<()> {
@@ -1785,7 +2188,12 @@ impl<'a> MutTxnT for WriteTxn<'a> {
     }
 
     fn commit(self) -> PristineResult<()> {
+        let pending_next_inode = self.pending_next_inode;
+        let shared_next_inode = self.next_inode;
         self.txn.commit()?;
+        if let Some(pending) = pending_next_inode {
+            pending.publish(shared_next_inode);
+        }
         Ok(())
     }
 

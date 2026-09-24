@@ -36,6 +36,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -48,6 +49,7 @@ use atomic_objects::{ObjectFamily, SyncPack, SyncWants, ViewSnapshot};
 use atomic_remote::{HttpRemote, HttpRemoteConfig, RemoteError};
 use atomic_repository::{ManifestApplyOutcome, Repository, ViewManifest};
 
+use crate::commands::workspace_txn::{enter_workspace, remediation_error};
 use crate::commands::Command;
 use crate::error::{CliError, CliResult};
 use crate::output::{
@@ -55,7 +57,9 @@ use crate::output::{
     hint, print_blank, print_hint, print_info, print_success, print_warning, success,
     view as style_view,
 };
+use atomic_repository::WorkspaceTxnMode;
 
+use super::helpers::CloneBootstrapBoundary;
 use super::helpers::{
     change_union, classify_inventory, convert_remote_error, format_bytes, format_count,
     infer_repo_name, manifest_apply_order, parse_remote_manifest, resolve_target_path,
@@ -166,6 +170,28 @@ pub struct Clone {
     #[arg(long, requires = "path", conflicts_with = "download_only")]
     pub into_existing: bool,
 
+    /// Force the Git-transport bootstrap: run `git clone <url>` and then the
+    /// shared binding-first anchoring in the fresh checkout (CB-10B, RFC
+    /// §7.3/§8.6). Without this flag, URLs ending in `.git`, scp-like
+    /// `git@…` forms, and existing local Git repositories are detected
+    /// automatically.
+    #[arg(long, conflicts_with = "download_only", conflicts_with = "all_views")]
+    pub git: bool,
+
+    /// Explicit Ed25519 key file for the clone bootstrap's Anchor binding
+    /// (Git-transport path only; the bridge stays unanchored without it).
+    #[arg(long, requires = "git")]
+    pub binding_key_file: Option<PathBuf>,
+
+    /// Also read the DEGRADED binding namespace
+    /// (`refs/heads/atomic/bindings/*`) during the Git-transport bootstrap
+    /// (CB-10B review R9): an explicit degraded-reader opt-in — the refs
+    /// install through the same fail-closed validation as the primary
+    /// namespace, and the clone is never labeled exact on degraded reads
+    /// alone.
+    #[arg(long, requires = "git")]
+    pub include_degraded_binding_reads: bool,
+
     /// Also clone every other view the remote exposes, not just `--view`.
     ///
     /// Each additional view is created locally and populated from the
@@ -252,6 +278,9 @@ impl Clone {
             timeout: DEFAULT_TIMEOUT_SECS,
             download_only: false,
             into_existing: false,
+            git: false,
+            binding_key_file: None,
+            include_degraded_binding_reads: false,
             all_views: false,
         }
     }
@@ -311,6 +340,80 @@ impl Clone {
 
         // Clone uses the URL directly — identity inferred from subdomain only.
         crate::commands::auth::attach_identity(config, &self.url, None).await
+    }
+
+    /// CB-10B Git-transport bootstrap (RFC §7.3/§8.6): `git clone` the
+    /// checkout, initialize Atomic with the checked-out branch's view, and
+    /// run the shared binding-first anchoring. A verified binding restores
+    /// the exact state; an unbound history is an explicit typed refusal
+    /// naming the supported foreign-synthesis path — never a silent merge or
+    /// a false exact label.
+    fn run_git_bootstrap(&self, target_path: &Path) -> CliResult<()> {
+        // The view name for the scaffold: the checked-out branch when Git is
+        // already present (`--into-existing`), else the remote HEAD branch —
+        // read from the cloned checkout after cloning.
+        if !self.into_existing {
+            println!(
+                "Cloning Git repository {} into {}...",
+                hint(&self.url),
+                style_view(target_path.display())
+            );
+            validate_target_path(target_path)?;
+            // `git clone` creates (and cleans up) the target itself: a failed
+            // clone must never leave a partially initialized directory behind.
+            crate::commands::git::bootstrap::git_clone(&self.url, target_path)?;
+        } else {
+            validate_existing_git_checkout(target_path)?;
+        }
+        let view_name = {
+            let git = git2::Repository::open(target_path).map_err(|error| CliError::GitError {
+                message: format!("cannot open the cloned Git checkout: {error}"),
+            })?;
+            git.head()
+                .ok()
+                .and_then(|head| head.shorthand().map(str::to_owned))
+                .unwrap_or_else(|| self.view.clone())
+        };
+        let outcome = crate::commands::git::bootstrap::clone_git_url(
+            target_path,
+            &view_name,
+            self.binding_key_file.as_deref(),
+            self.include_degraded_binding_reads,
+        )?;
+        match outcome {
+            crate::commands::git::bootstrap::BootstrapOutcome::Bound {
+                binding_id,
+                view,
+                provenance_trusted,
+                anchored,
+            } => {
+                print_success(&format!(
+                    "Bootstrap complete: exact bound restoration of binding {binding_id} into view '{view}'{}",
+                    anchored
+                        .as_ref()
+                        .map(|id| format!(" (anchored with binding {id})"))
+                        .unwrap_or_default(),
+                ));
+                if provenance_trusted {
+                    print_info("Binding provenance is trusted under the configured policy.");
+                } else {
+                    print_warning(
+                        "Binding provenance is UNTRUSTED (content was independently verified).",
+                    );
+                }
+            }
+            crate::commands::git::bootstrap::BootstrapOutcome::Unbound { head, reason } => {
+                return Err(CliError::GitError {
+                    message: format!(
+                        "Git bootstrap of {head} is unbound: {reason}\
+                         \nHint: 'atomic git import --incremental' performs the explicit \
+                         supported foreign synthesis; the checkout is never labeled exact \
+                         without a verified binding."
+                    ),
+                });
+            }
+        }
+        Ok(())
     }
 
     /// Get the display name for the repository.
@@ -630,10 +733,16 @@ impl Clone {
             return Ok(());
         }
 
-        // The scaffold may be the current view (init leaves it current),
-        // and the current view cannot be deleted — park on a temporary
+        // The scaffold may be the desired view (init leaves it current),
+        // and the desired view cannot be deleted — park on a temporary
         // root view first. It is removed again before clone finishes.
-        if repo.current_view() == manifest.name {
+        let working_copy = repo
+            .require_working_copy_id()
+            .map_err(CliError::Repository)?;
+        let desired_view = repo
+            .desired_view_name(working_copy)
+            .map_err(CliError::Repository)?;
+        if desired_view == manifest.name {
             if !repo
                 .view_exists(SCAFFOLD_PARK_VIEW)
                 .map_err(CliError::Repository)?
@@ -641,7 +750,7 @@ impl Clone {
                 repo.create_shared_view(SCAFFOLD_PARK_VIEW)
                     .map_err(CliError::Repository)?;
             }
-            repo.align_to_view(SCAFFOLD_PARK_VIEW)
+            repo.align_to_view(working_copy, SCAFFOLD_PARK_VIEW)
                 .map_err(CliError::Repository)?;
         }
 
@@ -837,6 +946,16 @@ impl Clone {
     /// This is the main entry point for the clone operation. It coordinates
     /// all the steps required to create a local copy of a remote repository.
     async fn run_async(&self) -> CliResult<()> {
+        // CB-10B: the Git-transport bootstrap (RFC §7.3/§8.6). Explicit
+        // `--git`, `.git`-suffixed URLs, scp-like `git@…` forms, and existing
+        // local Git repositories clone via Git and bootstrap through the
+        // shared binding-first anchoring; everything else stays on the
+        // atomic-api path below.
+        let provisional_target = resolve_target_path(&self.url, self.path.clone());
+        if self.git || crate::commands::git::bootstrap::is_git_url(&self.url, &provisional_target) {
+            return self.run_git_bootstrap(&provisional_target);
+        }
+
         // Resolve target path
         let target_path = resolve_target_path(&self.url, self.path.clone());
         let display_name = self.get_display_name();
@@ -848,6 +967,13 @@ impl Clone {
             style_view(&display_name)
         );
         print_blank();
+
+        // Explicit bootstrap boundary: transport runs before any persistent
+        // working copy exists, so this boundary holds no working-copy ID and
+        // none is fabricated.
+        let bootstrap = CloneBootstrapBoundary::begin(target_path.clone());
+        debug_assert!(bootstrap.working_copy().is_none());
+        drop(bootstrap);
 
         let guard = if self.into_existing {
             validate_existing_git_checkout(&target_path)?;
@@ -868,6 +994,18 @@ impl Clone {
             CliError::Repository(e)
         })?;
         finish_success(&spinner, "Repository initialized");
+
+        // From here the clone is repository-local (view alignment,
+        // materialization): enter the shared workspace transaction and retain
+        // its authority for the whole body. A fresh clone is anchored to the
+        // working-copy record, never to current_view.
+        let workspace =
+            enter_workspace(&mut repo, WorkspaceTxnMode::Reconcile).inspect_err(|error| {
+                if let Some(guard) = guard.as_ref() {
+                    log::info!("clone cleanup guard engaged after workspace refusal");
+                }
+            })?;
+        let working_copy = workspace.working_copy();
 
         // The requested view is NOT pre-created here: its manifest declares
         // its identity (scope + parent), and `apply_view_manifest` creates it
@@ -930,7 +1068,7 @@ impl Clone {
                 repo.create_shared_view(&self.view)
                     .map_err(CliError::Repository)?;
             }
-            repo.align_to_view(&self.view)
+            repo.align_to_view(working_copy, &self.view)
                 .map_err(CliError::Repository)?;
 
             // Configure remote as "origin" even for empty repositories
@@ -1001,7 +1139,7 @@ impl Clone {
                 repo.create_shared_view(&self.view)
                     .map_err(CliError::Repository)?;
             }
-            repo.align_to_view(&self.view)
+            repo.align_to_view(working_copy, &self.view)
                 .map_err(CliError::Repository)?;
 
             // Sidecars (provenance, attestations) still land in the store.
@@ -1065,7 +1203,7 @@ impl Clone {
 
             // Make the requested view current.
             if apply_errors.is_empty() {
-                if let Err(e) = repo.align_to_view(&self.view) {
+                if let Err(e) = repo.align_to_view(working_copy, &self.view) {
                     apply_errors.push(format!("align to view '{}': {}", self.view, e));
                 }
             }
@@ -1075,7 +1213,7 @@ impl Clone {
                     print_info("Preserving the existing Git working copy.");
                 } else {
                     // Output the working copy — reconstruct files from the graph
-                    match repo.materialize() {
+                    match repo.materialize(working_copy) {
                         Ok(output) => {
                             log::info!(
                                 "Output working copy: {} files, {} dirs",
@@ -1192,7 +1330,7 @@ impl Clone {
             if let Err(e) = repo.init_kg() {
                 log::warn!("KG table init failed: {}", e);
             }
-            match repo.kg_enrich_from_vcs() {
+            match repo.kg_enrich_from_vcs(working_copy) {
                 Ok(kg_stats) => log::info!("KG enriched: {}", kg_stats),
                 Err(e) => log::warn!("KG enrichment failed: {}", e),
             }

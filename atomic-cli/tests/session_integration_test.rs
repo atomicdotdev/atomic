@@ -10,7 +10,6 @@
 //! Windows is excluded for the same identity-store redirection reason as the
 //! provenance integration tests.
 #![cfg(not(windows))]
-
 use std::path::Path;
 use std::process::{Command, Output};
 

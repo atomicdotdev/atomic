@@ -735,6 +735,66 @@ pub fn build_report(
         change_reports[i].blast_radius = callers.into_iter().collect();
     }
 
+    // 9. PUBLICATION_GATE (block, shared targets only): managed-session
+    //    changes in the candidate closure whose evidence fails the trusted
+    //    provenance publication gate (CB-12B, RFC §10.4). The verdict is
+    //    provenance-only: content correctness is verified independently and
+    //    is NOT implied wrong by these findings.
+    if target_is_shared {
+        let mut candidate_hashes: Vec<Hash> = set
+            .only_in_feature
+            .iter()
+            .chain(set.closure_additions.iter())
+            .filter_map(|b32| Hash::from_base32(b32.as_bytes()))
+            .collect();
+        candidate_hashes.sort();
+        candidate_hashes.dedup();
+        if !candidate_hashes.is_empty() {
+            let provider =
+                atomic_repository::repository::provenance_gate::local_session_mac_key_provider(
+                    repo,
+                );
+            match repo.evaluate_publication_gate(
+                &candidate_hashes,
+                &atomic_repository::repository::provenance_gate::PublicationGateConfig::from_repo(
+                    repo,
+                )
+                .unwrap_or(
+                    atomic_repository::repository::provenance_gate::PublicationGateConfig {
+                        trust: Default::default(),
+                        repository_identity: None,
+                    },
+                ),
+                Some(&provider),
+            ) {
+                Ok(verdict) => {
+                    for blocker in &verdict.blocks {
+                        findings.push(
+                            Finding::new(
+                                F_PUBLICATION_GATE,
+                                SEV_BLOCK,
+                                blocker.change().to_string(),
+                                format!("publication gate refused: {blocker}"),
+                            )
+                            .with_remedy(
+                                "repair or review the named managed session; do not erase \
+                                 incomplete markers or downgrade trust to pass",
+                            ),
+                        );
+                    }
+                }
+                Err(error) => {
+                    findings.push(Finding::new(
+                        F_PUBLICATION_GATE,
+                        SEV_WARN,
+                        "publication-gate".to_string(),
+                        format!("gate evaluation failed (surface this to review): {error}"),
+                    ));
+                }
+            }
+        }
+    }
+
     // Stable, severity-sorted findings (block → warn → info).
     findings.sort_by(|a, b| {
         a.severity_rank()
@@ -1137,7 +1197,8 @@ mod tests {
             .with_all(true)
             .save_to_store(true)
             .apply_after_record(true);
-        repo.record(header, options).unwrap();
+        repo.record(repo.require_working_copy_id().unwrap(), header, options)
+            .unwrap();
     }
 
     #[test]
@@ -1159,20 +1220,22 @@ mod tests {
     fn review_flags_orphan_candidate_and_blocks() {
         let temp = TempDir::new().unwrap();
         let mut repo = Repository::init(temp.path()).unwrap();
+        let working_copy = repo.require_working_copy_id().unwrap();
         let base_view = repo.current_view().to_string();
 
         // Base change on the shared/base view.
         let file = temp.path().join("a.txt");
         std::fs::write(&file, "base\n").unwrap();
-        repo.add("a.txt", Default::default()).unwrap();
+        repo.add(working_copy, "a.txt", Default::default()).unwrap();
         record_all(&repo, "base change");
 
         // Fork a feature view and record a change only there.
         repo.create_view_from("feature", &base_view).unwrap();
-        repo.switch_view("feature").unwrap();
+        repo.switch_view(working_copy, "feature").unwrap();
         std::fs::write(&file, "base\nfeature edit\n").unwrap();
         let outcome = repo
             .record(
+                working_copy,
                 ChangeHeader::new("feature change"),
                 RecordOptions::new()
                     .with_all(true)
@@ -1280,12 +1343,13 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let mut repo = Repository::init(temp.path()).unwrap();
         repo.init_vault().unwrap();
+        let working_copy = repo.require_working_copy_id().unwrap();
         let base_view = repo.current_view().to_string();
 
         // Base file on the shared view.
         let file = temp.path().join("a.txt");
         std::fs::write(&file, "base\n").unwrap();
-        repo.add("a.txt", Default::default()).unwrap();
+        repo.add(working_copy, "a.txt", Default::default()).unwrap();
         record_all(&repo, "base change");
 
         // Intent A: a task that touches a.txt (so a candidate editing a.txt
@@ -1332,9 +1396,10 @@ Fix the flaw in A.
         // the on-disk `.vault/`), so record's working-copy vault reconciliation
         // would otherwise treat them as deleted and wipe their KG projection.
         repo.create_view_from("feature", &base_view).unwrap();
-        repo.switch_view("feature").unwrap();
+        repo.switch_view(working_copy, "feature").unwrap();
         std::fs::write(&file, "base\nfeature edit\n").unwrap();
         repo.record(
+            working_copy,
             ChangeHeader::new("feature change"),
             RecordOptions::new()
                 .with_all(true)
@@ -1430,6 +1495,7 @@ Fix the flaw in A.
         let temp = TempDir::new().unwrap();
         let mut repo = Repository::init(temp.path()).unwrap();
         repo.init_vault().unwrap();
+        let working_copy = repo.require_working_copy_id().unwrap();
         let base_view = repo.current_view().to_string();
 
         for rel in files {
@@ -1438,7 +1504,7 @@ Fix the flaw in A.
                 std::fs::create_dir_all(parent).unwrap();
             }
             std::fs::write(&p, "base\n").unwrap();
-            repo.add(rel, Default::default()).unwrap();
+            repo.add(working_copy, rel, Default::default()).unwrap();
         }
         record_all(&repo, "base change");
 
@@ -1447,12 +1513,13 @@ Fix the flaw in A.
         let a_node_id = format!("intent:{}", a.uid.to_uppercase());
 
         repo.create_view_from("feature", &base_view).unwrap();
-        repo.switch_view("feature").unwrap();
+        repo.switch_view(working_copy, "feature").unwrap();
         for rel in files {
             let p = temp.path().join(rel);
             std::fs::write(&p, "base\nfeature edit\n").unwrap();
         }
         repo.record(
+            working_copy,
             ChangeHeader::new("feature change"),
             RecordOptions::new()
                 .with_all(true)
@@ -1678,18 +1745,21 @@ Edit bar.
     fn change_report_carries_message_files_and_review_command() {
         let temp = TempDir::new().unwrap();
         let mut repo = Repository::init(temp.path()).unwrap();
+        let working_copy = repo.require_working_copy_id().unwrap();
         let base_view = repo.current_view().to_string();
 
         std::fs::create_dir_all(temp.path().join("src")).unwrap();
         std::fs::write(temp.path().join("src/foo.rs"), "base\n").unwrap();
-        repo.add("src/foo.rs", Default::default()).unwrap();
+        repo.add(working_copy, "src/foo.rs", Default::default())
+            .unwrap();
         record_all(&repo, "base change");
 
         repo.create_view_from("feature", &base_view).unwrap();
-        repo.switch_view("feature").unwrap();
+        repo.switch_view(working_copy, "feature").unwrap();
         std::fs::write(temp.path().join("src/foo.rs"), "base\nfeature edit\n").unwrap();
         let outcome = repo
             .record(
+                working_copy,
                 ChangeHeader::new("Improve foo handling"),
                 RecordOptions::new()
                     .with_all(true)
@@ -1765,11 +1835,12 @@ Edit bar.
         let temp = TempDir::new().unwrap();
         let mut repo = Repository::init(temp.path()).unwrap();
         repo.init_vault().unwrap();
+        let working_copy = repo.require_working_copy_id().unwrap();
         let base_view = repo.current_view().to_string(); // "dev" (shared)
 
         let file = temp.path().join("a.txt");
         std::fs::write(&file, "base\n").unwrap();
-        repo.add("a.txt", Default::default()).unwrap();
+        repo.add(working_copy, "a.txt", Default::default()).unwrap();
         record_all(&repo, "base change");
 
         // Work intent A: a task touching a.txt (so the candidate reaches it),
@@ -1822,9 +1893,10 @@ Reviewed A independently.
         }
 
         repo.create_view_from("feature", &base_view).unwrap();
-        repo.switch_view("feature").unwrap();
+        repo.switch_view(working_copy, "feature").unwrap();
         std::fs::write(&file, "base\nfeature edit\n").unwrap();
         repo.record(
+            working_copy,
             ChangeHeader::new("feature change"),
             RecordOptions::new()
                 .with_all(true)

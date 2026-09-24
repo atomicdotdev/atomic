@@ -27,8 +27,8 @@
 # Each cell builds a FRESH repo so graphs cannot contaminate one another.
 #
 # Not yet covered (rubric §2 remaining gaps): token-level auto-merge A5/A6,
-# rename tracking A10/A11 (needs a rename command), remote-pull pathway B5,
-# unrecord-by-hash B10. (A12/A15 fixed and asserted; B7 N-way asserted below.)
+# remote-pull pathway B5, and unrecord-by-hash B10. A10/A11/A12/A15 and B7
+# are asserted below; all CB-N6 merge-rubric gates are promoted.
 
 HARNESS_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$HARNESS_DIR/helpers.sh"
@@ -351,13 +351,11 @@ assert_honest         "B7: honest exit state"                    f.txt
 
 # ── A12: independent same-path create on both sides (name conflict) ──────────
 #
-# FIXED (ATOM::30): both views independently CREATE new.txt as separate inodes.
-# TREE is single-valued so the later recorder shadowed the first; inserting one
-# side's create into the other used to report success while silently
-# materializing only one inode's content (rubric A12, the sole SILENT
-# corruption the ATOM::29 audit found). Now materialize walks REV_TREE, detects
-# that ≥ 2 inodes are visible+alive at the path, and renders a name conflict
-# with markers wrapping BOTH bodies — surfaced honestly via status/conflicts.
+# CB-N6: both views independently CREATE new.txt as separate inodes. Durable
+# PATH_CLAIMS must retain both causal claims while TREE/REV_TREE project no
+# winner. Resolution must be a real SolveNameConflict, survive reopen and
+# rematerialization, and remain view-local so an unresolved sibling can still
+# recover both claimants.
 begin_section "A12 same-path independent create (name conflict surfaced)"
 make_temp_repo rubric-a12
 init_repo
@@ -366,6 +364,7 @@ add_files seed.txt >/dev/null
 record_change "base" >/dev/null
 BASE_VIEW="$(current_view)"
 new_view feature >/dev/null
+new_view unresolved-a12 >/dev/null
 switch_view feature >/dev/null
 printf 'from-feature\n' > new.txt
 add_files new.txt >/dev/null
@@ -375,6 +374,7 @@ switch_view "$BASE_VIEW" >/dev/null
 printf 'from-base\n' > new.txt
 add_files new.txt >/dev/null
 record_change "base creates new.txt" >/dev/null
+A12_BASE_CREATE_HASH="$(tip_hash "$BASE_VIEW")"
 atomic insert "$A12_HASH" >/dev/null 2>&1
 assert_markers     "A12: name conflict surfaced with markers"   new.txt
 assert_present     "A12: feature's create preserved"           new.txt "from-feature"
@@ -382,6 +382,38 @@ assert_present     "A12: base's create preserved"              new.txt "from-bas
 assert_occurrences "A12: feature side not duplicated"          new.txt "from-feature" 1
 assert_occurrences "A12: base side not duplicated"             new.txt "from-base" 1
 assert_honest      "A12: honest exit state"                    new.txt
+
+# Choose one claimant byte-for-byte; record a real graph resolution; survive
+# restore/reopen; and leave a sibling without that resolution able to
+# reconstruct both losing and winning claims.
+pred_a12_cli_resolution_lifecycle() {
+    printf 'from-feature\n' > new.txt
+    record_change "resolve A12 name conflict" >/dev/null 2>&1 || return 1
+    local resolution_hash
+    resolution_hash="$(tip_hash "$BASE_VIEW")"
+    atomic change "$resolution_hash" --format json 2>/dev/null \
+        | grep -qF '"hunk_type": "SolveNameConflict"' || return 1
+    atomic restore --force >/dev/null 2>&1 || return 1
+    [[ "$(cat new.txt 2>/dev/null)" == "from-feature" ]] || return 1
+    [[ -z "$(atomic conflicts --short 2>/dev/null)" ]] || return 1
+
+    switch_view unresolved-a12 >/dev/null 2>&1 || return 1
+    atomic insert "$A12_HASH" >/dev/null 2>&1 || return 1
+    atomic insert "$A12_BASE_CREATE_HASH" >/dev/null 2>&1 || return 1
+    atomic restore --force >/dev/null 2>&1 || return 1
+    [[ -f new.txt ]] \
+        && grep -qE '^>>>>>>>' new.txt \
+        && grep -qxF 'from-feature' new.txt \
+        && grep -qxF 'from-base' new.txt \
+        && atomic status --short 2>/dev/null | grep -qE '^C[[:space:]]+new\.txt$' \
+        && atomic conflicts --short 2>/dev/null | grep -qE '^new\.txt:'
+}
+if pred_a12_cli_resolution_lifecycle; then
+    _pass "A12: SolveNameConflict resolution is stable and view-local"
+else
+    _fail "A12: SolveNameConflict resolution is stable and view-local" \
+        "record/change/restore or unresolved-sibling recovery failed"
+fi
 
 # ── A10: rename vs edit (inode survives the rename) ───────────────────────
 #
@@ -415,15 +447,11 @@ assert_honest          "rename-vs-edit: honest exit state"       g.txt
 
 # ── A11: rename vs rename (same file, different targets) ───────────────────
 #
-# BUG (tracked, ATOM::37): two views rename the SAME inode to DIFFERENT names.
-# Inserting one view's rename into the other silently resolves last-writer-wins
-# — one name is kept, the other is dropped, and `status` is clean with no
-# conflict surfaced. The rubric's correct outcome (A11) is a name conflict
-# (one inode cannot live at two paths). Fixing it needs graph-level detection
-# of an inode with ≥2 alive name-edges plus a name-conflict honesty signal that
-# the current marker-in-file model does not provide (docs §6.7). Correct =
-# a surfaced conflict OR both names preserved; today it is neither.
-begin_section "A11 rename vs rename (name conflict; tracked)"
+# CB-N6: two views rename the SAME inode to DIFFERENT names. PATH_CLAIMS must
+# preserve both names, project no TREE winner, and surface typed conflict rows
+# for both paths regardless of view sequence. A11 has no in-file marker channel,
+# so status + conflicts are the honesty signals.
+begin_section "A11 rename vs rename (typed name conflict)"
 make_temp_repo rubric-a11
 init_repo
 printf 'shared content\n' > orig.txt
@@ -431,19 +459,73 @@ add_files orig.txt >/dev/null
 record_change "base" >/dev/null
 BASE_VIEW="$(current_view)"
 new_view feature >/dev/null
+new_view base-side-a11 >/dev/null
+new_view merge-a11 >/dev/null
+new_view reverse-a11 >/dev/null
 switch_view feature >/dev/null
 mv orig.txt feat-name.txt
 record_change "rename orig->feat-name" >/dev/null
 A11_HASH="$(tip_hash feature)"
-switch_view "$BASE_VIEW" >/dev/null
+switch_view base-side-a11 >/dev/null
 mv orig.txt base-name.txt
 record_change "rename orig->base-name" >/dev/null
+A11_BASE_HASH="$(tip_hash base-side-a11)"
+switch_view merge-a11 >/dev/null
 atomic insert "$A11_HASH" >/dev/null 2>&1
-# Concurrent destinations are incomparable, so both names remain live and
-# materialize the same stable inode content.
-assert_file_content "A11: feature destination is preserved" feat-name.txt "shared content"
-assert_file_content "A11: base destination is preserved" base-name.txt "shared content"
-assert_file_not_exists "A11: superseded original path is absent" orig.txt
+atomic insert "$A11_BASE_HASH" >/dev/null 2>&1
+
+assert_file_exists "A11: feature destination retained" feat-name.txt
+assert_file_exists "A11: base destination retained" base-name.txt
+assert_file_equals "A11: feature destination content retained" \
+    feat-name.txt $'shared content\n'
+assert_file_equals "A11: base destination content retained" \
+    base-name.txt $'shared content\n'
+assert_no_markers "A11: feature name uses typed conflict, not content markers" feat-name.txt
+assert_no_markers "A11: base name uses typed conflict, not content markers" base-name.txt
+
+# Both typed signals, restore/reopen stability, source-view isolation, and
+# opposite insert-order parity must all pass before A11 is considered fixed.
+pred_a11_strong_name_conflict_lifecycle() {
+    local status_short conflicts_short
+    status_short="$(atomic status --short 2>/dev/null)" || return 1
+    conflicts_short="$(atomic conflicts --short 2>/dev/null)" || return 1
+    echo "$status_short" | grep -qE '^C[[:space:]]+feat-name\.txt$' || return 1
+    echo "$status_short" | grep -qE '^C[[:space:]]+base-name\.txt$' || return 1
+    echo "$conflicts_short" | grep -qE '^feat-name\.txt:' || return 1
+    echo "$conflicts_short" | grep -qE '^base-name\.txt:' || return 1
+    atomic restore --force >/dev/null 2>&1 || return 1
+    [[ "$(cat feat-name.txt 2>/dev/null)" == "shared content" ]] || return 1
+    [[ "$(cat base-name.txt 2>/dev/null)" == "shared content" ]] || return 1
+
+    switch_view feature >/dev/null 2>&1 || return 1
+    atomic restore --force >/dev/null 2>&1 || return 1
+    [[ -f feat-name.txt && ! -e base-name.txt ]] || return 1
+    switch_view base-side-a11 >/dev/null 2>&1 || return 1
+    atomic restore --force >/dev/null 2>&1 || return 1
+    [[ -f base-name.txt && ! -e feat-name.txt ]] || return 1
+    switch_view merge-a11 >/dev/null 2>&1 || return 1
+    atomic restore --force >/dev/null 2>&1 || return 1
+    [[ -f feat-name.txt && -f base-name.txt ]] || return 1
+
+    switch_view reverse-a11 >/dev/null 2>&1 || return 1
+    atomic insert "$A11_BASE_HASH" >/dev/null 2>&1 || return 1
+    atomic insert "$A11_HASH" >/dev/null 2>&1 || return 1
+    atomic restore --force >/dev/null 2>&1 || return 1
+    [[ "$(cat feat-name.txt 2>/dev/null)" == "shared content" ]] || return 1
+    [[ "$(cat base-name.txt 2>/dev/null)" == "shared content" ]] || return 1
+    status_short="$(atomic status --short 2>/dev/null)" || return 1
+    conflicts_short="$(atomic conflicts --short 2>/dev/null)" || return 1
+    echo "$status_short" | grep -qE '^C[[:space:]]+feat-name\.txt$' || return 1
+    echo "$status_short" | grep -qE '^C[[:space:]]+base-name\.txt$' || return 1
+    echo "$conflicts_short" | grep -qE '^feat-name\.txt:' \
+        && echo "$conflicts_short" | grep -qE '^base-name\.txt:'
+}
+if pred_a11_strong_name_conflict_lifecycle; then
+    _pass "A11: typed conflict is stable, isolated, and insert-order independent"
+else
+    _fail "A11: typed conflict is stable, isolated, and insert-order independent" \
+        "status/conflicts, restore, source isolation, or reverse-order merge failed"
+fi
 
 if [[ "${KNOWN_BUGS:-0}" -gt 0 ]]; then
     echo ""

@@ -6,6 +6,36 @@ use crate::event::TurnEvent;
 use crate::transcript;
 use crate::turn::session::AgentSession;
 
+use atomic_core::change::session::IncompleteSession;
+
+/// The Git-side transition observed during a turn whose content was also
+/// recorded (review ATOM::aaron::8 R2).
+///
+/// A turn that edits files AND moves Git state is mixed: the content work is
+/// attributed normally, but the transition itself is classified with the same
+/// authority as a git-only turn — verified capture binding, advisory journal
+/// explanation, or a durable refusal for an unexplained move. This evidence
+/// is carried on the recorded outcome so the orchestrator can persist the
+/// refusal; it can never be folded into the content change's provenance.
+#[derive(Debug)]
+pub struct RecordedGitTransition {
+    /// Observed-operation-only description of what moved.
+    pub operations: Vec<String>,
+    /// The verified commit-time capture hash, when one authenticated.
+    pub capture: Option<Hash>,
+    /// Durable refusal for an unexplained or unauthenticated transition.
+    pub incomplete: Option<IncompleteSession>,
+    /// CB-12A follow-up AC-8 (exact separable case): the commit OID whose
+    /// delta the recorded change covers EXACTLY — bound only when a verified
+    /// capture authenticates the commit AND the turn-end worktree carries no
+    /// remainder beyond the commit (worktree == commit tree), so the
+    /// recorded content delta IS the capture's HEAD→index delta. The
+    /// dirty-turn recorded change is then classified
+    /// `ManagedGitCommitCaptured` (exact) instead of
+    /// `ManagedCaptureAwaitingReassembly`.
+    pub exact_commit_oid: Option<String>,
+}
+
 /// Options for recording an agent turn as an Atomic change.
 ///
 /// Bundles together all the data needed to create a change from a completed
@@ -67,6 +97,12 @@ pub struct TurnRecordOutcome {
     /// AI-generated reasoning summary. `None` if the transcript was not
     /// available or could not be parsed.
     pub unhashed_data: Option<transcript::UnhashedTurnData>,
+
+    /// The Git-side transition classified for this turn window, when the
+    /// working copy was not clean (review R2). Content attribution and Git
+    /// transition classification are independent: a mixed turn records its
+    /// content AND carries its transition evidence or refusal here.
+    pub git_transition: Option<RecordedGitTransition>,
 }
 
 impl TurnRecordOutcome {

@@ -4,7 +4,9 @@ use super::builder::Trailer;
 use super::hash_index::{is_none_index, CompactPosition, HASH_INDEX_NONE, HASH_INDEX_SELF};
 use super::header::{FileHeader, FileHeaderFlags};
 use super::section::{ContentChunkHeader, SectionHeader, SectionType};
-use crate::change::format_v3::error::{FormatError, FORMAT_VERSION, MAGIC, MAX_HASH_TABLE_ENTRIES};
+use crate::change::format_v3::error::{
+    FormatError, FORMAT_VERSION, LEGACY_FORMAT_VERSION, MAGIC, MAX_HASH_TABLE_ENTRIES,
+};
 
 // ── HashIndex ──────────────────────────────────────────────────
 
@@ -464,6 +466,15 @@ fn test_file_header_from_bytes_invalid_magic() {
     } else {
         panic!("expected InvalidMagic error");
     }
+}
+
+#[test]
+fn test_file_header_accepts_legacy_version_one() {
+    let mut bytes = FileHeader::default().to_bytes();
+    bytes[4..8].copy_from_slice(&LEGACY_FORMAT_VERSION.to_le_bytes());
+
+    let decoded = FileHeader::from_bytes(&bytes).unwrap();
+    assert_eq!(decoded.version, LEGACY_FORMAT_VERSION);
 }
 
 #[test]

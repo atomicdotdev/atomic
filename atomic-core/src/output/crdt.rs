@@ -567,12 +567,22 @@ where
         let start = out.len();
         out.resize(start + len, 0);
 
-        // hash_fn re-created per call to keep the &txn borrow re-entrant.
-        let hash_fn = |id: crate::types::NodeId| -> Option<Hash> {
-            if id.is_root() {
-                None
+        // Resolve the content owner before entering ChangeStore's infallible
+        // callback boundary so pristine errors cannot masquerade as absence.
+        let content_hash = if graph_node.change.is_root() {
+            None
+        } else {
+            Some(txn.get_external(graph_node.change)?.ok_or(
+                crate::pristine::PristineError::ChangeNotFound {
+                    id: graph_node.change.get(),
+                },
+            )?)
+        };
+        let hash_fn = move |id: crate::types::NodeId| -> Option<Hash> {
+            if id == graph_node.change {
+                content_hash
             } else {
-                txn.get_external(id).ok().flatten()
+                None
             }
         };
 

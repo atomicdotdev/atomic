@@ -1,14 +1,118 @@
 //! Types for repository materialization.
 //!
-//! Contains [`MaterializeOptions`], [`MaterializeError`], and [`OutputItem`].
+//! Contains [`MaterializedEntry`], [`MaterializeOptions`], [`MaterializeError`],
+//! and [`OutputItem`].
 
 use std::collections::HashSet;
-use std::sync::Arc;
 use std::time::SystemTime;
 
+use crate::pristine::GraphVisibilityClosure;
 use crate::types::{Inode, NodeId, Position};
 
-use super::super::file::FileOutputOptions;
+use super::super::file::{FileOutputError, FileOutputOptions};
+
+// ============================================================================
+// MATERIALIZED ENTRY
+// ============================================================================
+
+/// The lifecycle presence and rendered content of a repository entry.
+///
+/// Presence is explicit: a present file with zero bytes is distinct from an
+/// absent file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MaterializedEntry {
+    /// The path is absent from the materialized view.
+    Absent {
+        /// Path in the working copy.
+        path: String,
+        /// Last known inode, when one is available.
+        inode: Option<Inode>,
+        /// Whether the absent entry is a directory.
+        directory: bool,
+    },
+    /// The path is present in the materialized view.
+    Present {
+        /// Path in the working copy.
+        path: String,
+        /// Stable inode identity for the file.
+        inode: Inode,
+        /// Rendered file content, which may be empty.
+        bytes: Vec<u8>,
+    },
+}
+
+impl MaterializedEntry {
+    /// Create an absent entry with an optional last-known inode.
+    pub fn absent(path: impl Into<String>, inode: Option<Inode>) -> Self {
+        Self::Absent {
+            path: path.into(),
+            inode,
+            directory: false,
+        }
+    }
+
+    /// Create an absent directory entry with its last-known inode.
+    pub fn absent_directory(path: impl Into<String>, inode: Inode) -> Self {
+        Self::Absent {
+            path: path.into(),
+            inode: Some(inode),
+            directory: true,
+        }
+    }
+
+    /// Create a present entry with its inode and rendered bytes.
+    pub fn present(path: impl Into<String>, inode: Inode, bytes: impl Into<Vec<u8>>) -> Self {
+        Self::Present {
+            path: path.into(),
+            inode,
+            bytes: bytes.into(),
+        }
+    }
+
+    /// Return the working-copy path for this entry.
+    pub fn path(&self) -> &str {
+        match self {
+            Self::Absent { path, .. } | Self::Present { path, .. } => path,
+        }
+    }
+
+    /// Return the inode identity when known.
+    pub fn inode(&self) -> Option<Inode> {
+        match self {
+            Self::Absent { inode, .. } => *inode,
+            Self::Present { inode, .. } => Some(*inode),
+        }
+    }
+
+    /// Return rendered bytes for a present entry.
+    pub fn bytes(&self) -> Option<&[u8]> {
+        match self {
+            Self::Absent { .. } => None,
+            Self::Present { bytes, .. } => Some(bytes),
+        }
+    }
+
+    /// Return whether this entry is present in the materialized view.
+    pub fn is_present(&self) -> bool {
+        matches!(self, Self::Present { .. })
+    }
+
+    /// Return whether this entry is absent from the materialized view.
+    pub fn is_absent(&self) -> bool {
+        matches!(self, Self::Absent { .. })
+    }
+
+    /// Return whether this lifecycle entry denotes a directory.
+    pub fn is_directory(&self) -> bool {
+        matches!(
+            self,
+            Self::Absent {
+                directory: true,
+                ..
+            }
+        )
+    }
+}
 
 // ============================================================================
 // MATERIALIZE OPTIONS
@@ -57,15 +161,12 @@ pub struct MaterializeOptions {
     /// Number of worker threads for parallel output.
     pub num_workers: usize,
 
-    /// Optional filter to only include vertices from specific changes.
+    /// Optional validated dependency closure for graph traversal.
     ///
-    /// When set, only vertices whose `change_id` is in this set (or is ROOT)
-    /// will be included in the output. This enables view-aware output where
-    /// switching views shows the content as it was when only that view's
-    /// changes were applied.
-    ///
-    /// The filter is wrapped in `Arc` for efficient sharing across files.
-    pub change_filter: Option<Arc<HashSet<NodeId>>>,
+    /// When set, only vertices whose `change_id` is in this closure (or is
+    /// ROOT) are included in output. `None` explicitly selects the unfiltered
+    /// ambient graph; an empty closure is still an active filter.
+    pub graph_visibility: Option<GraphVisibilityClosure>,
 
     /// Optional set of specific file paths to materialize.
     ///
@@ -81,15 +182,9 @@ impl MaterializeOptions {
         Self::default()
     }
 
-    /// Set a change filter for view-aware output.
-    pub fn with_change_filter(mut self, filter: HashSet<NodeId>) -> Self {
-        self.change_filter = Some(Arc::new(filter));
-        self
-    }
-
-    /// Set a change filter from an existing Arc (avoids cloning).
-    pub fn with_change_filter_arc(mut self, filter: Arc<HashSet<NodeId>>) -> Self {
-        self.change_filter = Some(filter);
+    /// Set validated graph visibility for view-aware output.
+    pub fn with_graph_visibility(mut self, visibility: GraphVisibilityClosure) -> Self {
+        self.graph_visibility = Some(visibility);
         self
     }
 
@@ -183,7 +278,7 @@ impl Default for MaterializeOptions {
             salt: 0,
             parallel: false,
             num_workers: 1,
-            change_filter: None,
+            graph_visibility: None,
             only_paths: None,
         }
     }
@@ -210,6 +305,14 @@ pub enum MaterializeError<WE> {
 
     /// Tree traversal error.
     TreeError(String),
+
+    /// A file could not be output to the working copy.
+    FileOutput {
+        /// Path whose output failed.
+        path: String,
+        /// Typed file-output failure.
+        source: FileOutputError<WE>,
+    },
 }
 
 impl<WE: std::fmt::Debug> std::fmt::Display for MaterializeError<WE> {
@@ -220,6 +323,9 @@ impl<WE: std::fmt::Debug> std::fmt::Display for MaterializeError<WE> {
             Self::Io(e) => write!(f, "I/O error: {}", e),
             Self::WorkingCopy(e) => write!(f, "Working copy error: {:?}", e),
             Self::TreeError(e) => write!(f, "Tree traversal error: {}", e),
+            Self::FileOutput { path, source } => {
+                write!(f, "Failed to materialize {}: {}", path, source)
+            }
         }
     }
 }
@@ -230,6 +336,7 @@ impl<WE: std::fmt::Debug + std::error::Error + 'static> std::error::Error for Ma
             Self::Pristine(e) => Some(e),
             Self::Io(e) => Some(e),
             Self::WorkingCopy(e) => Some(e),
+            Self::FileOutput { source, .. } => Some(source),
             _ => None,
         }
     }
@@ -287,10 +394,15 @@ impl OutputItem {
 
     /// Create a new directory output item.
     pub fn directory(path: impl Into<String>, inode: Inode) -> Self {
+        Self::directory_at(path, inode, Position::ROOT)
+    }
+
+    /// Create a directory output item backed by its graph inode position.
+    pub fn directory_at(path: impl Into<String>, inode: Inode, position: Position<NodeId>) -> Self {
         Self {
             path: path.into(),
             inode,
-            position: Position::ROOT,
+            position,
             is_directory: true,
             metadata: crate::output::traits::FileMetadata::directory(),
         }
@@ -300,5 +412,35 @@ impl OutputItem {
     pub fn with_metadata(mut self, metadata: crate::output::traits::FileMetadata) -> Self {
         self.metadata = metadata;
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn present_empty_content_is_not_absent() {
+        let present = MaterializedEntry::present("empty.txt", Inode::ROOT, Vec::new());
+        let absent = MaterializedEntry::absent("empty.txt", Some(Inode::ROOT));
+
+        assert_ne!(present, absent);
+        assert!(present.is_present());
+        assert_eq!(present.bytes(), Some(&[][..]));
+        assert!(absent.is_absent());
+        assert_eq!(absent.bytes(), None);
+    }
+
+    #[test]
+    fn materialized_entry_accessors_preserve_identity() {
+        let entry = MaterializedEntry::present("src/lib.rs", Inode::ROOT, b"content".to_vec());
+
+        assert_eq!(entry.path(), "src/lib.rs");
+        assert_eq!(entry.inode(), Some(Inode::ROOT));
+        assert_eq!(entry.bytes(), Some(b"content".as_slice()));
+
+        let absent = MaterializedEntry::absent("removed.rs", None);
+        assert_eq!(absent.path(), "removed.rs");
+        assert_eq!(absent.inode(), None);
     }
 }

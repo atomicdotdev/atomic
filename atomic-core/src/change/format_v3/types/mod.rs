@@ -46,7 +46,7 @@
 //! ```text
 //! FileHeader (64 bytes, fixed, uncompressed)
 //! ├── magic: [u8; 4]            = b"ATOM"
-//! ├── version: u32              = 1
+//! ├── version: u32              = 2 (1 accepted read-only)
 //! ├── flags: u32                = bitfield (see FileHeaderFlags)
 //! ├── hash_table_entries: u32   = count of unique hashes
 //! ├── graph_section_count: u32  = number of GRAPH sections
@@ -67,6 +67,7 @@
 //! ```
 
 pub mod builder;
+pub(crate) mod envelope;
 pub mod hash_index;
 pub mod header;
 pub mod section;

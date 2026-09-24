@@ -50,8 +50,11 @@ impl Command for Conflicts {
             }
         })?;
 
+        let working_copy = repo
+            .require_working_copy_id()
+            .map_err(|e| CliError::Internal(e.into()))?;
         let conflicts = repo
-            .list_conflicts()
+            .list_conflicts(working_copy)
             .map_err(|e| CliError::Internal(e.into()))?;
 
         if self.short {

@@ -165,12 +165,15 @@ impl Command for Split {
             },
             other => CliError::Repository(other),
         })?;
+        let working_copy = repo
+            .require_working_copy_id()
+            .map_err(CliError::Repository)?;
+        let desired_view = repo
+            .desired_view_name(working_copy)
+            .map_err(CliError::Repository)?;
 
-        // Determine source view (default to current)
-        let source = self
-            .source
-            .clone()
-            .unwrap_or_else(|| repo.current_view().to_string());
+        // Determine source view (default to the working copy's desired view)
+        let source = self.source.clone().unwrap_or(desired_view);
 
         // Verify source view exists
         if !repo.view_exists(&source).map_err(CliError::Repository)? {
@@ -214,7 +217,9 @@ impl Command for Split {
 
         // Optionally switch to the new view
         if self.switch {
-            let result = repo.switch_view(&self.name).map_err(CliError::Repository)?;
+            let result = repo
+                .switch_view(working_copy, &self.name)
+                .map_err(CliError::Repository)?;
             print_success(&format!(
                 "Switched to view: {} ({} files updated)",
                 style_view(&self.name),

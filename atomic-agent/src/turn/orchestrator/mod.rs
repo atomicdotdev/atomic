@@ -83,11 +83,15 @@ pub(crate) fn is_lock_contended(e: &std::io::Error) -> bool {
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use atomic_core::change::session::{ManagedTurnOutcome, TurnBoundary};
+
 use crate::error::AgentResult;
 use crate::event::{HookType, ProvenanceJournalEnvelope, TurnEvent};
-use crate::record::TurnRecordOutcome;
+use crate::record::{ClassifiedTurn, TurnRecordOutcome};
 use crate::turn::phase::Phase;
-use crate::turn::session::{ManagedRunStamp, SessionStore};
+use crate::turn::session::{
+    AgentSession, IncompleteSession, ManagedRunStamp, SessionStatus, SessionStore, TurnOutcomeEntry,
+};
 use crate::watcher::{self, FileWatcher, WatcherConfig};
 use atomic_core::change::session::SessionTurn;
 use atomic_core::types::Hash;
@@ -148,6 +152,10 @@ pub struct DispatchResult {
 
     /// Whether any warnings were emitted (e.g., stale session).
     pub warnings: Vec<String>,
+
+    /// Durable refusal outcome. No status, add, record, provenance, or
+    /// attestation work is performed when this is present.
+    pub incomplete: Option<IncompleteSession>,
 }
 
 impl DispatchResult {
@@ -163,6 +171,7 @@ impl DispatchResult {
             view: None,
             message: None,
             warnings: Vec::new(),
+            incomplete: None,
         }
     }
 
@@ -190,6 +199,12 @@ impl DispatchResult {
         self
     }
 
+    /// Attach an incomplete outcome after it has been durably persisted.
+    pub fn with_incomplete(mut self, incomplete: IncompleteSession) -> Self {
+        self.incomplete = Some(incomplete);
+        self
+    }
+
     /// Returns `true` if a change was recorded during this dispatch.
     pub fn was_recorded(&self) -> bool {
         self.change_recorded.is_some()
@@ -201,6 +216,9 @@ impl std::fmt::Display for DispatchResult {
         write!(f, "[{}] → {}", self.session_id, self.new_phase)?;
         if let Some(ref outcome) = self.change_recorded {
             write!(f, " ({})", outcome)?;
+        }
+        if let Some(ref incomplete) = self.incomplete {
+            write!(f, " (incomplete: {})", incomplete)?;
         }
         for warning in &self.warnings {
             write!(f, " ⚠ {}", warning)?;
@@ -398,9 +416,21 @@ pub struct TurnOrchestrator {
     /// `None` for direct agent usage (behavior unchanged).
     pub(crate) managed_run: Option<ManagedRunContext>,
 
+    /// Refusal produced by the CLI's shared working-copy guard for this exact
+    /// turn/session boundary. This is independent of managed-run ownership so
+    /// unmanaged agent endings fail closed through the same durable path.
+    pub(crate) boundary_refusal: Option<IncompleteSession>,
+
     /// Required committed journal sink for mutable provenance. Legacy JSON is
     /// accepted only as a one-time import before the next hook event.
     pub(crate) journal_sink: Option<Arc<dyn ProvenanceJournalSink>>,
+
+    /// Set when the embedding process already holds the turn publication
+    /// lock (CLI hooks acquire it before the boundary guard). The
+    /// orchestrator must not re-acquire it — fs2 locks are per file
+    /// descriptor, so a second open in the same process deadlocks on
+    /// itself.
+    pub(crate) publication_lock_held: bool,
 }
 
 impl TurnOrchestrator {
@@ -438,7 +468,9 @@ impl TurnOrchestrator {
             agent_name: "unknown".to_string(),
             agent_display_name: "Unknown Agent".to_string(),
             managed_run: None,
+            boundary_refusal: None,
             journal_sink: None,
+            publication_lock_held: false,
         })
     }
 
@@ -458,7 +490,9 @@ impl TurnOrchestrator {
             agent_name: "unknown".to_string(),
             agent_display_name: "Unknown Agent".to_string(),
             managed_run: None,
+            boundary_refusal: None,
             journal_sink: None,
+            publication_lock_held: false,
         }
     }
 
@@ -478,9 +512,23 @@ impl TurnOrchestrator {
         self.managed_run = Some(context);
     }
 
+    /// Supply a WIP-backed refusal from the CLI's shared boundary guard.
+    ///
+    /// Turn/session handlers consume this before watcher, status, alignment,
+    /// recording, provenance, or attestation work.
+    pub fn set_boundary_refusal(&mut self, refusal: IncompleteSession) {
+        self.boundary_refusal = Some(refusal);
+    }
+
     /// Route provenance mutations through a committed repository owner.
     pub fn set_journal_sink(&mut self, sink: Arc<dyn ProvenanceJournalSink>) {
         self.journal_sink = Some(sink);
+    }
+
+    /// Record that the embedding process already holds the turn
+    /// publication lock (see [`Self::set_journal_sink`] callers in the CLI).
+    pub fn set_publication_lock_held(&mut self) {
+        self.publication_lock_held = true;
     }
 
     /// The view declared by the governing managed run, if any.
@@ -493,6 +541,72 @@ impl TurnOrchestrator {
         self.managed_run.as_ref().map(|m| m.stamp.clone())
     }
 
+    /// Persist and surface a CLI boundary refusal before any working-copy
+    /// interpretation or mutation runs. Existing incomplete state is the first
+    /// writer and remains authoritative across duplicate hooks and crash retry.
+    pub(crate) fn persist_boundary_incomplete(
+        &self,
+        session_id: &str,
+    ) -> AgentResult<Option<DispatchResult>> {
+        let existing = self.session_store.load(session_id)?;
+        let stored = existing
+            .as_ref()
+            .and_then(|session| session.incomplete())
+            .cloned();
+        let Some(candidate) = stored.or_else(|| self.boundary_refusal.clone()) else {
+            return Ok(None);
+        };
+
+        let mut session = existing.unwrap_or_else(|| {
+            let mut session =
+                AgentSession::new(session_id, &self.agent_name, &self.agent_display_name);
+            if let Some(managed) = &self.managed_run {
+                session.managed_run = Some(managed.stamp.clone());
+                if let Some(view) = &managed.view {
+                    session.view_name = view.clone();
+                }
+            }
+            session
+        });
+
+        let persisted = session.mark_incomplete(candidate).clone();
+        // The mutable JSON runtime state is the crash-safe minimum. Save it
+        // before attempting the repository index so a storage-open failure can
+        // never let the boundary continue or erase the refusal.
+        self.session_store.save(&session)?;
+
+        let indexed =
+            match atomic_repository::Repository::open_existing(&self.repo_root).and_then(|repo| {
+                repo.mark_session_incomplete(
+                    session_id,
+                    Some(session.view_name.clone()),
+                    session.parent_view.clone(),
+                    &persisted,
+                )
+            }) {
+                Ok(indexed) => indexed,
+                Err(error) => {
+                    log::warn!(
+                    "Could not index incomplete agent session {}: {}; JSON refusal remains durable",
+                    session_id,
+                    error,
+                );
+                    persisted
+                }
+            };
+
+        if session.incomplete() != Some(&indexed) {
+            session.status = SessionStatus::Incomplete(indexed.clone());
+            self.session_store.save(&session)?;
+        }
+
+        Ok(Some(
+            DispatchResult::new(session_id, session.phase)
+                .with_view(&session.view_name)
+                .with_incomplete(indexed),
+        ))
+    }
+
     /// Returns the repository root path.
     pub fn repo_root(&self) -> &Path {
         &self.repo_root
@@ -501,6 +615,89 @@ impl TurnOrchestrator {
     /// Returns a reference to the session store.
     pub fn session_store(&self) -> &SessionStore {
         &self.session_store
+    }
+
+    // ── CB-12A turn-boundary persistence ──────────────────────────
+
+    /// Persist a recorded (ContentChanges) turn outcome in the session
+    /// ledger, with the durable boundary pair when both sides were captured.
+    pub(crate) fn persist_content_turn_outcome(
+        &self,
+        session: &mut AgentSession,
+        outcome: &TurnRecordOutcome,
+        boundary_end: Option<TurnBoundary>,
+    ) {
+        let entry = TurnOutcomeEntry {
+            turn: outcome.turn_number,
+            outcome: ManagedTurnOutcome::ContentChanges {
+                durable: vec![outcome.hash],
+                snapshot: None,
+            },
+            boundary_start: session.boundary_start.clone(),
+            boundary_end,
+        };
+        session.record_turn_outcome(entry);
+        session.clear_boundary_start();
+    }
+
+    /// Persist a classified (git-only or observation-only) turn outcome and
+    /// surface its durable incomplete refusal, if any.
+    ///
+    /// The first durable incomplete outcome remains authoritative: an
+    /// existing refusal is never overwritten by a later classification.
+    pub(crate) fn persist_classified_turn(
+        &self,
+        session: &mut AgentSession,
+        classified: &ClassifiedTurn,
+    ) {
+        let entry = TurnOutcomeEntry {
+            turn: classified.turn(),
+            outcome: classified.outcome.clone(),
+            boundary_start: classified.boundary_start.clone(),
+            boundary_end: classified.boundary_end.clone(),
+        };
+        session.record_turn_outcome(entry);
+        session.clear_boundary_start();
+
+        let Some(incomplete) = classified.incomplete.as_ref() else {
+            return;
+        };
+        self.persist_incomplete_refusal(session, incomplete);
+    }
+
+    /// Durably persist one incomplete refusal on the session (first writer
+    /// wins) and index it in the repository session ledger (review R3: the
+    /// JSON refusal is the crash-safe minimum; the index is best-effort).
+    /// Returns the authoritative persisted refusal.
+    pub(crate) fn persist_incomplete_refusal(
+        &self,
+        session: &mut AgentSession,
+        incomplete: &IncompleteSession,
+    ) -> IncompleteSession {
+        let persisted = session.mark_incomplete(incomplete.clone()).clone();
+        match atomic_repository::Repository::open_existing(&self.repo_root).and_then(|repo| {
+            repo.mark_session_incomplete(
+                &session.session_id,
+                Some(session.view_name.clone()),
+                session.parent_view.clone(),
+                &persisted,
+            )
+        }) {
+            Ok(indexed) => {
+                if session.incomplete() != Some(&indexed) {
+                    session.status = SessionStatus::Incomplete(indexed);
+                }
+            }
+            Err(error) => {
+                log::warn!(
+                    "Could not index incomplete agent session {}: {}; \
+                     JSON refusal remains durable",
+                    session.session_id,
+                    error
+                );
+            }
+        }
+        session.incomplete().cloned().unwrap_or(persisted)
     }
 
     // ── Main dispatch ──────────────────────────────────────────────
@@ -592,11 +789,52 @@ impl TurnOrchestrator {
             Err(_) => return true, // can't check — assume changes
         };
 
+        let working_copy = match repo.require_working_copy_id() {
+            Ok(working_copy) => working_copy,
+            Err(_) => return true, // can't validate identity — assume changes
+        };
         let opts = atomic_repository::status::StatusOptions::fast().with_untracked(true);
-        match repo.status(opts) {
+        match repo.status(working_copy, opts) {
             Ok(status) => !status.is_clean() || status.has_untracked(),
             Err(_) => true, // can't check — assume changes
         }
+    }
+
+    /// Fast gate that also admits Git-only turns (CB-12A, RFC §10.2).
+    ///
+    /// A clean worktree is NOT an empty turn: if the Git checkpoint moved
+    /// since the turn-start baseline, the turn must reach `record_turn()` so
+    /// it is classified as `RepositoryOperations` instead of being silently
+    /// skipped. Pure observation-only turns (checkpoint equal) stay skipped.
+    pub(crate) fn has_working_copy_or_git_changes(&self, session_id: &str) -> bool {
+        self.has_working_copy_changes() || self.has_git_checkpoint_moved(session_id)
+    }
+
+    /// Whether the Git checkpoint moved since the turn-start baseline
+    /// (observation only — never reconciles). Unknown states report as
+    /// moved so the record path classifies the gap explicitly.
+    pub(crate) fn has_git_checkpoint_moved(&self, session_id: &str) -> bool {
+        // A repository without Git has no checkpoint to move; clean turns
+        // there keep the plain read-only/retry semantics.
+        if !self.repo_root.join(".git").exists() {
+            return false;
+        }
+        // Working copy is clean. Compare the Git checkpoint against the
+        // turn-start baseline (observation only — never reconciles).
+        let Some(session) = self.session_store.load(session_id).ok().flatten() else {
+            return true;
+        };
+        let Some(baseline) = session.boundary_start.as_ref().and_then(|b| b.git.as_ref()) else {
+            // No baseline to compare (observation gap): let the record path
+            // classify and record the gap explicitly rather than claim
+            // observation-only without evidence.
+            return true;
+        };
+        let git = match atomic_repository::observe_git_metadata(&self.repo_root) {
+            Ok(observation) => crate::record::git_checkpoint(&observation.token()),
+            Err(_) => return true, // can't check — assume the turn needs classification
+        };
+        &git != baseline
     }
 }
 

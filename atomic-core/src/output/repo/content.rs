@@ -76,16 +76,68 @@
 //! ```
 
 use crate::change::ChangeStore;
-use crate::merge::{ConflictGroup, MergeOutcome, ResolvedConflicts, SemanticMergeEngine};
+use crate::merge::{
+    ConflictGroup, MergeOutcome, ResolvedConflicts, SemanticMergeEngine, SemanticMergeError,
+};
 use crate::output::alive::{AliveGraph, OrderResult, VertexId};
 use crate::output::traits::VertexBuffer;
-use crate::pristine::GraphTxnT;
+use crate::pristine::{GraphTxnT, PristineError};
 use crate::types::{ChangePosition, GraphNode, Hash, NodeId};
 
 use super::error::{OutputError, OutputResult};
 use super::fork::detect_fork_conflicts;
 
 // OUTPUT GRAPH CONTENT
+
+fn missing_vertex(context: &str, vertex_id: VertexId) -> PristineError {
+    PristineError::Inconsistent {
+        message: format!("{context} references missing alive graph vertex {vertex_id:?}"),
+    }
+}
+
+fn validate_order_vertices(graph: &AliveGraph, order: &OrderResult) -> Result<(), PristineError> {
+    for scc in &order.sccs {
+        for &vertex_id in scc {
+            graph
+                .try_get_vertex(vertex_id)
+                .ok_or_else(|| missing_vertex("order", vertex_id))?;
+        }
+    }
+    Ok(())
+}
+
+fn lookup_hash<F>(hash_fn: &F, node_id: NodeId) -> OutputResult<Option<Hash>>
+where
+    F: Fn(NodeId) -> Result<Option<Hash>, PristineError>,
+{
+    if node_id.is_root() {
+        return Ok(None);
+    }
+
+    hash_fn(node_id)?
+        .map(Some)
+        .ok_or_else(|| PristineError::ChangeNotFound { id: node_id.get() }.into())
+}
+
+fn output_vertex_content<C, F, V>(
+    changes: &C,
+    hash_fn: &F,
+    node: GraphNode<NodeId>,
+    buffer: &mut V,
+) -> OutputResult<()>
+where
+    C: ChangeStore,
+    F: Fn(NodeId) -> Result<Option<Hash>, PristineError>,
+    V: VertexBuffer,
+{
+    let hash = lookup_hash(hash_fn, node.change)?;
+    buffer.output_line::<OutputError, _>(node, |buf| {
+        changes
+            .get_contents(|_| hash, node, buf)
+            .map(|_| ())
+            .map_err(OutputError::change_store)
+    })
+}
 
 /// Output the content of an alive graph to a span buffer.
 ///
@@ -121,7 +173,7 @@ use super::fork::detect_fork_conflicts;
 /// use atomic_core::change::MemoryChangeStore;
 ///
 /// let changes = MemoryChangeStore::new();
-/// let hash_fn = |id: NodeId| txn.get_external(id).ok().flatten();
+/// let hash_fn = |id: NodeId| txn.get_external(id);
 ///
 /// output_graph_content(&changes, hash_fn, &graph, &order, &mut writer)?;
 /// ```
@@ -143,9 +195,11 @@ pub fn output_graph_content<C, F, V>(
 ) -> OutputResult<()>
 where
     C: ChangeStore,
-    F: Fn(NodeId) -> Option<Hash>,
+    F: Fn(NodeId) -> Result<Option<Hash>, PristineError>,
     V: VertexBuffer,
 {
+    validate_order_vertices(graph, order)?;
+
     // Track conflict IDs
     let mut conflict_id: usize = 0;
 
@@ -178,11 +232,10 @@ where
 
         // Output each span in the SCC
         for (i, &vertex_id) in scc.iter().enumerate() {
-            // Get span data
-            let vertex_data = match graph.try_get_vertex(vertex_id) {
-                Some(v) => v,
-                None => continue,
-            };
+            // Get span data.
+            let vertex_data = graph
+                .try_get_vertex(vertex_id)
+                .ok_or_else(|| missing_vertex("order", vertex_id))?;
 
             let node = vertex_data.node;
 
@@ -194,7 +247,7 @@ where
                 conflict_id += 1;
                 in_zombie = Some(conflict_id);
 
-                let hash = hash_fn(node.change);
+                let hash = lookup_hash(&hash_fn, node.change)?;
                 let hashes: Vec<Hash> = hash.into_iter().collect();
                 let hashes_ref: Option<&[Hash]> = if hashes.is_empty() {
                     None
@@ -216,7 +269,7 @@ where
 
             // For cyclic conflicts, add separator between vertices
             if is_cyclic && i > 0 {
-                let hash = hash_fn(node.change);
+                let hash = lookup_hash(&hash_fn, node.change)?;
                 let hashes: Vec<Hash> = hash.into_iter().collect();
                 let hashes_ref: Option<&[Hash]> = if hashes.is_empty() {
                     None
@@ -242,17 +295,8 @@ where
                 vertex_id
             );
 
-            // Output the node content
-            let get_contents = |buf: &mut [u8]| -> Result<(), std::io::Error> {
-                changes
-                    .get_contents(&hash_fn, node, buf)
-                    .map(|_| ())
-                    .map_err(|e| std::io::Error::other(e.to_string()))
-            };
-
-            buffer
-                .output_line(node, get_contents)
-                .map_err(OutputError::io)?;
+            // Output the node content.
+            output_vertex_content(changes, &hash_fn, node, buffer)?;
         }
 
         // End cyclic conflict if we started one
@@ -300,18 +344,19 @@ where
 /// [`output_graph_content_resolved`] so that resolved conflicts are written
 /// as plain content instead of conflict markers.
 ///
-/// Failures are swallowed gracefully — if the engine cannot merge a
-/// particular conflict the markers are left for the normal output path.
+/// Operational failures are returned to the caller. Only successful semantic
+/// absence or unsupported conflict shapes fall through to marker rendering.
 pub fn resolve_conflicts_semantically<T, C>(
     txn: &T,
     changes: &C,
     graph: &AliveGraph,
     order: &OrderResult,
-) -> ResolvedConflicts
+) -> Result<ResolvedConflicts, SemanticMergeError>
 where
     T: GraphTxnT,
     C: ChangeStore,
 {
+    validate_order_vertices(graph, order)?;
     let mut resolved = ResolvedConflicts::new();
     let engine = SemanticMergeEngine::new(txn, changes);
 
@@ -321,20 +366,18 @@ where
             continue;
         }
 
-        let vertices: Vec<GraphNode<NodeId>> = scc
-            .iter()
-            .filter_map(|&vid| graph.try_get_vertex(vid))
-            .map(|v| v.node)
-            .collect();
-
-        if vertices.len() < 2 {
-            continue;
+        let mut vertices: Vec<GraphNode<NodeId>> = Vec::with_capacity(scc.len());
+        for &vertex_id in scc {
+            let vertex = graph
+                .try_get_vertex(vertex_id)
+                .ok_or_else(|| missing_vertex("cyclic conflict", vertex_id))?;
+            vertices.push(vertex.node);
         }
 
         let group = ConflictGroup::new(vertices);
 
-        match engine.try_merge(&group) {
-            Ok(MergeOutcome::AutoMerged { content, .. }) => {
+        match engine.try_merge(&group)? {
+            MergeOutcome::AutoMerged { content, .. } => {
                 log::info!(
                     "Semantic merge resolved cyclic conflict ({} vertices, {} bytes)",
                     scc.len(),
@@ -346,28 +389,22 @@ where
                     resolved.insert_skip(vid);
                 }
             }
-            Ok(MergeOutcome::Conflict { .. }) => {
+            MergeOutcome::Conflict { .. } => {
                 log::debug!("Semantic merge: true conflict in SCC, keeping markers");
             }
-            Ok(MergeOutcome::NoCrdtData) | Ok(MergeOutcome::Clean(_)) => {}
-            Err(e) => {
-                log::warn!("Semantic merge failed for SCC: {}", e);
-            }
+            MergeOutcome::NoCrdtData | MergeOutcome::Clean(_) => {}
         }
     }
 
     // 2. Detect and resolve fork conflicts
-    let forks = detect_fork_conflicts(graph, order);
+    let forks = detect_fork_conflicts(graph, order)?;
     for fork in &forks {
-        let vertices: Vec<GraphNode<NodeId>> = fork
-            .children
-            .iter()
-            .filter_map(|&vid| graph.try_get_vertex(vid))
-            .map(|v| v.node)
-            .collect();
-
-        if vertices.len() < 2 {
-            continue;
+        let mut vertices: Vec<GraphNode<NodeId>> = Vec::with_capacity(fork.children.len());
+        for &vertex_id in &fork.children {
+            let vertex = graph
+                .try_get_vertex(vertex_id)
+                .ok_or_else(|| missing_vertex("fork conflict", vertex_id))?;
+            vertices.push(vertex.node);
         }
 
         // Before treating this as a concurrent CRDT conflict, ask the
@@ -383,7 +420,7 @@ where
         //
         // Picking the supersedor here keeps the resolution in the
         // semantic layer rather than guessing at the byte-graph level.
-        if let Some(winner_idx) = supersedor_in_fork(txn, &fork.children, graph) {
+        if let Some(winner_idx) = supersedor_in_fork(txn, &fork.children, graph)? {
             log::info!(
                 "Fork resolved by change-DAG supersession: child {} wins ({} fork children)",
                 winner_idx,
@@ -401,10 +438,13 @@ where
             continue;
         }
 
-        let group = ConflictGroup::new(vertices).with_parent(graph.get_vertex(fork.parent).node);
+        let parent = graph
+            .try_get_vertex(fork.parent)
+            .ok_or_else(|| missing_vertex("fork parent", fork.parent))?;
+        let group = ConflictGroup::new(vertices).with_parent(parent.node);
 
-        match engine.try_merge(&group) {
-            Ok(MergeOutcome::AutoMerged { content, .. }) => {
+        match engine.try_merge(&group)? {
+            MergeOutcome::AutoMerged { content, .. } => {
                 log::info!(
                     "Semantic merge resolved fork conflict ({} children, {} bytes)",
                     fork.children.len(),
@@ -415,7 +455,7 @@ where
                     resolved.insert_skip(vid);
                 }
             }
-            Ok(MergeOutcome::Conflict { .. }) => {
+            MergeOutcome::Conflict { .. } => {
                 log::debug!(
                     "Semantic merge: true conflict at fork ({} children) \
                      — emitting conflict markers",
@@ -423,19 +463,15 @@ where
                 );
                 resolved.insert_unresolved_fork(fork.children.clone());
             }
-            Ok(MergeOutcome::NoCrdtData) | Ok(MergeOutcome::Clean(_)) => {
+            MergeOutcome::NoCrdtData | MergeOutcome::Clean(_) => {
                 // NoCrdtData after dedup means >2 unique sides remain.
                 // Emit markers for all children.
-                resolved.insert_unresolved_fork(fork.children.clone());
-            }
-            Err(e) => {
-                log::warn!("Semantic merge failed for fork: {}", e);
                 resolved.insert_unresolved_fork(fork.children.clone());
             }
         }
     }
 
-    resolved
+    Ok(resolved)
 }
 
 /// If one fork child's introducing change transitively depends on every
@@ -448,18 +484,21 @@ fn supersedor_in_fork<T: GraphTxnT>(
     txn: &T,
     children: &[crate::output::alive::VertexId],
     graph: &AliveGraph,
-) -> Option<usize> {
+) -> Result<Option<usize>, PristineError> {
     use std::collections::HashSet;
 
-    // Collect each child's introducing change.  ROOT vertices have no
+    // Collect each child's introducing change. ROOT vertices have no
     // change ID; the dependency-DAG check doesn't apply to them.
-    let changes: Vec<NodeId> = children
-        .iter()
-        .map(|&vid| graph.try_get_vertex(vid).map(|v| v.node.change))
-        .collect::<Option<Vec<_>>>()?;
+    let mut changes: Vec<NodeId> = Vec::with_capacity(children.len());
+    for &vertex_id in children {
+        let vertex = graph
+            .try_get_vertex(vertex_id)
+            .ok_or_else(|| missing_vertex("supersedor candidate", vertex_id))?;
+        changes.push(vertex.node.change);
+    }
 
     if changes.iter().any(|c| c.is_root()) {
-        return None;
+        return Ok(None);
     }
 
     // For each candidate winner, walk its dependency closure and verify
@@ -467,38 +506,36 @@ fn supersedor_in_fork<T: GraphTxnT>(
     // transitively).  The walk follows the indexed normal dependency
     // edges via `get_change_deps` (hash form) + `get_internal` to
     // resolve back to NodeIds.
-    let closure_of = |start: NodeId| -> HashSet<NodeId> {
+    let closure_of = |start: NodeId| -> Result<HashSet<NodeId>, PristineError> {
         let mut seen: HashSet<NodeId> = HashSet::new();
         let mut stack: Vec<NodeId> = vec![start];
         seen.insert(start);
         while let Some(id) = stack.pop() {
-            let deps = match txn.get_change_deps(id) {
-                Ok(d) => d,
-                Err(_) => continue,
-            };
-            for dep_hash in deps {
-                if let Ok(Some(dep_id)) = txn.get_internal(&dep_hash) {
+            for dep_hash in txn.get_change_deps(id)? {
+                // A dependency absent from the local ID map is inconclusive in
+                // a partial clone, but an operational lookup failure is fatal.
+                if let Some(dep_id) = txn.get_internal(&dep_hash)? {
                     if seen.insert(dep_id) {
                         stack.push(dep_id);
                     }
                 }
             }
         }
-        seen
+        Ok(seen)
     };
 
     for (idx, &cand) in changes.iter().enumerate() {
-        let closure = closure_of(cand);
+        let closure = closure_of(cand)?;
         let dominates_all_others = changes
             .iter()
             .enumerate()
             .all(|(j, &other)| j == idx || closure.contains(&other));
         if dominates_all_others {
-            return Some(idx);
+            return Ok(Some(idx));
         }
     }
 
-    None
+    Ok(None)
 }
 
 // OUTPUT GRAPH CONTENT (RESOLVED)
@@ -522,9 +559,11 @@ pub fn output_graph_content_resolved<C, F, V>(
 ) -> OutputResult<()>
 where
     C: ChangeStore,
-    F: Fn(NodeId) -> Option<Hash>,
+    F: Fn(NodeId) -> Result<Option<Hash>, PristineError>,
     V: VertexBuffer,
 {
+    validate_order_vertices(graph, order)?;
+
     // Fast path: nothing was resolved and no unresolved forks.
     if resolved.is_empty() && resolved.unresolved_forks().is_empty() {
         return output_graph_content(changes, hash_fn, graph, order, buffer);
@@ -613,9 +652,13 @@ where
                     .map_err(OutputError::io)?;
 
                 for (idx, &child_vid) in group.iter().enumerate() {
+                    let vertex_data = graph
+                        .try_get_vertex(child_vid)
+                        .ok_or_else(|| missing_vertex("unresolved fork", child_vid))?;
+                    let node = vertex_data.node;
+
                     if idx > 0 {
-                        let change_id = graph.try_get_vertex(child_vid).map(|v| v.node.change);
-                        let hash = change_id.and_then(&hash_fn);
+                        let hash = lookup_hash(&hash_fn, node.change)?;
                         let hashes: Vec<Hash> = hash.into_iter().collect();
                         let href: Option<&[Hash]> = if hashes.is_empty() {
                             None
@@ -634,20 +677,9 @@ where
                         child_vid
                     );
 
-                    if let Some(vertex_data) = graph.try_get_vertex(child_vid) {
-                        let node = vertex_data.node;
-                        let vertex_len = node.end.get() - node.start.get();
-                        if vertex_len > 0 {
-                            let get_contents = |buf: &mut [u8]| -> Result<(), std::io::Error> {
-                                changes
-                                    .get_contents(&hash_fn, node, buf)
-                                    .map(|_| ())
-                                    .map_err(|e| std::io::Error::other(e.to_string()))
-                            };
-                            buffer
-                                .output_line(node, get_contents)
-                                .map_err(OutputError::io)?;
-                        }
+                    let vertex_len = node.end.get() - node.start.get();
+                    if vertex_len > 0 {
+                        output_vertex_content(changes, &hash_fn, node, buffer)?;
                     }
                     fork_emitted.insert(child_vid);
                 }
@@ -679,10 +711,9 @@ where
                 vertex_id
             );
 
-            let vertex_data = match graph.try_get_vertex(vertex_id) {
-                Some(v) => v,
-                None => continue,
-            };
+            let vertex_data = graph
+                .try_get_vertex(vertex_id)
+                .ok_or_else(|| missing_vertex("order", vertex_id))?;
 
             let node = vertex_data.node;
 
@@ -693,7 +724,7 @@ where
                 conflict_id += 1;
                 in_zombie = Some(conflict_id);
 
-                let hash = hash_fn(node.change);
+                let hash = lookup_hash(&hash_fn, node.change)?;
                 let hashes: Vec<Hash> = hash.into_iter().collect();
                 let hashes_ref: Option<&[Hash]> = if hashes.is_empty() {
                     None
@@ -713,7 +744,7 @@ where
             }
 
             if is_cyclic && i > 0 {
-                let hash = hash_fn(node.change);
+                let hash = lookup_hash(&hash_fn, node.change)?;
                 let hashes: Vec<Hash> = hash.into_iter().collect();
                 let hashes_ref: Option<&[Hash]> = if hashes.is_empty() {
                     None
@@ -731,16 +762,7 @@ where
                 continue;
             }
 
-            let get_contents = |buf: &mut [u8]| -> Result<(), std::io::Error> {
-                changes
-                    .get_contents(&hash_fn, node, buf)
-                    .map(|_| ())
-                    .map_err(|e| std::io::Error::other(e.to_string()))
-            };
-
-            buffer
-                .output_line(node, get_contents)
-                .map_err(OutputError::io)?;
+            output_vertex_content(changes, &hash_fn, node, buffer)?;
         }
 
         if is_cyclic {
@@ -773,7 +795,7 @@ mod tests {
     use crate::change::{Change, ChangeHeader, MemoryChangeStore};
     use crate::output::alive::{AliveGraph, AliveVertex, OrderResult, VertexId};
     use crate::output::repo::ConflictWriter;
-    use crate::types::{ChangePosition, GraphNode, Position};
+    use crate::types::{ChangePosition, EdgeFlags, GraphNode, Position, SerializedGraphEdge};
 
     /// Create a test span
     fn make_vertex(change: u64, start: u64, end: u64) -> GraphNode<NodeId> {
@@ -788,6 +810,7 @@ mod tests {
     fn make_change(content: &[u8]) -> Change {
         let mut change = Change::empty(ChangeHeader::new("test"));
         change.contents = content.to_vec();
+        change.finalize();
         change
     }
 
@@ -812,6 +835,102 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Copy)]
+    enum DependencyFault {
+        GetChangeDeps,
+        GetInternal,
+    }
+
+    struct DependencyFaultTxn {
+        fault: DependencyFault,
+    }
+
+    impl GraphTxnT for DependencyFaultTxn {
+        type Adj = std::vec::IntoIter<Result<SerializedGraphEdge, PristineError>>;
+
+        fn get_external(&self, _id: NodeId) -> Result<Option<Hash>, PristineError> {
+            Ok(None)
+        }
+
+        fn get_internal(&self, _hash: &Hash) -> Result<Option<NodeId>, PristineError> {
+            match self.fault {
+                DependencyFault::GetInternal => Err(PristineError::Inconsistent {
+                    message: "scripted get_internal failure".to_string(),
+                }),
+                DependencyFault::GetChangeDeps => Ok(None),
+            }
+        }
+
+        fn get_node_type(&self, _id: NodeId) -> Result<Option<u8>, PristineError> {
+            Ok(None)
+        }
+
+        fn iter_adjacent(
+            &self,
+            _node: GraphNode<NodeId>,
+            _min_flag: EdgeFlags,
+            _max_flag: EdgeFlags,
+        ) -> Result<Self::Adj, PristineError> {
+            Ok(Vec::new().into_iter())
+        }
+
+        fn find_block(&self, _pos: Position<NodeId>) -> Result<GraphNode<NodeId>, PristineError> {
+            Ok(GraphNode::ROOT)
+        }
+
+        fn find_block_end(
+            &self,
+            _pos: Position<NodeId>,
+        ) -> Result<GraphNode<NodeId>, PristineError> {
+            Ok(GraphNode::ROOT)
+        }
+
+        fn has_vertex(&self, _node: GraphNode<NodeId>) -> Result<bool, PristineError> {
+            Ok(false)
+        }
+
+        fn get_rev_deps(&self, _dep_id: NodeId) -> Result<Vec<NodeId>, PristineError> {
+            Ok(Vec::new())
+        }
+
+        fn get_change_deps(&self, _change_id: NodeId) -> Result<Vec<Hash>, PristineError> {
+            match self.fault {
+                DependencyFault::GetChangeDeps => Err(PristineError::Inconsistent {
+                    message: "scripted dependency lookup failure".to_string(),
+                }),
+                DependencyFault::GetInternal => Ok(vec![Hash::of(b"dependency")]),
+            }
+        }
+
+        fn has_change_in_graph(&self, _change_id: NodeId) -> Result<bool, PristineError> {
+            Ok(false)
+        }
+    }
+
+    fn make_fork_graph() -> (AliveGraph, OrderResult) {
+        let edge = SerializedGraphEdge::new(EdgeFlags::BLOCK, Position::ROOT, NodeId::ROOT);
+        let mut graph = AliveGraph::new();
+        graph.push_vertex(AliveVertex::DUMMY);
+        graph.push_vertex(AliveVertex::new(make_vertex(1, 0, 1)));
+        graph.set_last_children_start();
+        graph.push_child_to_last(Some(edge), VertexId::new(2));
+        graph.push_child_to_last(Some(edge), VertexId::new(3));
+        graph.push_vertex(AliveVertex::new(make_vertex(2, 0, 1)));
+        graph.push_vertex(AliveVertex::new(make_vertex(3, 0, 1)));
+
+        let order = OrderResult {
+            sccs: vec![
+                vec![VertexId::new(1)],
+                vec![VertexId::new(2)],
+                vec![VertexId::new(3)],
+            ],
+            conflict_tree: Default::default(),
+            cyclic_conflicts: 0,
+            forward_edges: Vec::new(),
+        };
+        (graph, order)
+    }
+
     // ------------------------------------------------------------------------
     // Basic Output Tests
     // ------------------------------------------------------------------------
@@ -827,7 +946,7 @@ mod tests {
         };
 
         let changes = MemoryChangeStore::new();
-        let hash_fn = |_: NodeId| None;
+        let hash_fn = |_: NodeId| Ok(None);
 
         let mut buffer = Vec::new();
         {
@@ -852,13 +971,7 @@ mod tests {
         let hash = change.hash().unwrap();
         changes.insert(hash, change);
 
-        let hash_fn = |id: NodeId| {
-            if id.get() == 1 {
-                Some(hash)
-            } else {
-                None
-            }
-        };
+        let hash_fn = |id: NodeId| Ok(if id.get() == 1 { Some(hash) } else { None });
 
         let mut buffer = Vec::new();
         {
@@ -872,6 +985,73 @@ mod tests {
     }
 
     #[test]
+    fn test_hash_lookup_failure_propagates() {
+        let node = make_vertex(1, 0, 4);
+        let graph = make_simple_graph(node);
+        let order = make_simple_order();
+        let changes = MemoryChangeStore::new();
+        let mut buffer = Vec::new();
+        let mut writer = ConflictWriter::new(&mut buffer, "test.rs", Position::ROOT);
+
+        let result = output_graph_content(
+            &changes,
+            |_| {
+                Err(PristineError::Inconsistent {
+                    message: "scripted get_external failure".to_string(),
+                })
+            },
+            &graph,
+            &order,
+            &mut writer,
+        );
+
+        assert!(matches!(
+            result,
+            Err(OutputError::Pristine(error))
+                if matches!(*error, PristineError::Inconsistent { .. })
+        ));
+    }
+
+    #[test]
+    fn test_missing_non_root_hash_is_error() {
+        let node = make_vertex(1, 0, 4);
+        let graph = make_simple_graph(node);
+        let order = make_simple_order();
+        let changes = MemoryChangeStore::new();
+        let mut buffer = Vec::new();
+        let mut writer = ConflictWriter::new(&mut buffer, "test.rs", Position::ROOT);
+
+        let result = output_graph_content(&changes, |_| Ok(None), &graph, &order, &mut writer);
+
+        assert!(matches!(
+            result,
+            Err(OutputError::Pristine(error))
+                if matches!(*error, PristineError::ChangeNotFound { id: 1 })
+        ));
+    }
+
+    #[test]
+    fn test_change_store_failure_preserves_category() {
+        let node = make_vertex(1, 0, 4);
+        let graph = make_simple_graph(node);
+        let order = make_simple_order();
+        let changes = MemoryChangeStore::new();
+        let missing_hash = Hash::of(b"missing change");
+        let mut buffer = Vec::new();
+        let mut writer = ConflictWriter::new(&mut buffer, "test.rs", Position::ROOT);
+
+        let result = output_graph_content(
+            &changes,
+            |_| Ok(Some(missing_hash)),
+            &graph,
+            &order,
+            &mut writer,
+        );
+
+        assert!(matches!(result, Err(OutputError::ChangeStore(_))));
+    }
+
+    #[test]
     fn test_output_empty_vertex_skipped() {
         // Empty node (start == end)
         let node = make_vertex(1, 0, 0);
@@ -879,7 +1059,7 @@ mod tests {
         let order = make_simple_order();
 
         let changes = MemoryChangeStore::new();
-        let hash_fn = |_: NodeId| None;
+        let hash_fn = |_: NodeId| Ok(None);
 
         let mut buffer = Vec::new();
         {
@@ -927,10 +1107,12 @@ mod tests {
         let hash2 = change2.hash().unwrap();
         changes.insert(hash2, change2);
 
-        let hash_fn = |id: NodeId| match id.get() {
-            1 => Some(hash1),
-            2 => Some(hash2),
-            _ => None,
+        let hash_fn = |id: NodeId| {
+            Ok(match id.get() {
+                1 => Some(hash1),
+                2 => Some(hash2),
+                _ => None,
+            })
         };
 
         let mut buffer = Vec::new();
@@ -996,10 +1178,12 @@ mod tests {
         let hash2 = change2.hash().unwrap();
         changes.insert(hash2, change2);
 
-        let hash_fn = |id: NodeId| match id.get() {
-            1 => Some(hash1),
-            2 => Some(hash2),
-            _ => None,
+        let hash_fn = |id: NodeId| {
+            Ok(match id.get() {
+                1 => Some(hash1),
+                2 => Some(hash2),
+                _ => None,
+            })
         };
 
         let mut buffer = Vec::new();
@@ -1048,13 +1232,7 @@ mod tests {
         let hash = change.hash().unwrap();
         changes.insert(hash, change);
 
-        let hash_fn = |id: NodeId| {
-            if id.get() == 1 {
-                Some(hash)
-            } else {
-                None
-            }
-        };
+        let hash_fn = |id: NodeId| Ok(if id.get() == 1 { Some(hash) } else { None });
 
         let mut buffer = Vec::new();
         let has_conflicts;
@@ -1103,13 +1281,7 @@ mod tests {
         let hash = change.hash().unwrap();
         changes.insert(hash, change);
 
-        let hash_fn = |id: NodeId| {
-            if id.get() == 1 {
-                Some(hash)
-            } else {
-                None
-            }
-        };
+        let hash_fn = |id: NodeId| Ok(if id.get() == 1 { Some(hash) } else { None });
 
         let mut buffer = Vec::new();
         {
@@ -1127,7 +1299,7 @@ mod tests {
     // ------------------------------------------------------------------------
 
     #[test]
-    fn test_output_skips_missing_vertex() {
+    fn test_output_rejects_missing_vertex() {
         let graph = AliveGraph::new(); // Empty graph
 
         // Order references a span that doesn't exist
@@ -1139,17 +1311,71 @@ mod tests {
         };
 
         let changes = MemoryChangeStore::new();
-        let hash_fn = |_: NodeId| None;
+        let hash_fn = |_: NodeId| Ok(None);
 
         let mut buffer = Vec::new();
-        {
-            let pos = Position::ROOT;
-            let mut writer = ConflictWriter::new(&mut buffer, "test.rs", pos);
+        let pos = Position::ROOT;
+        let mut writer = ConflictWriter::new(&mut buffer, "test.rs", pos);
+        let result = output_graph_content(&changes, hash_fn, &graph, &order, &mut writer);
+        assert!(matches!(
+            result,
+            Err(OutputError::Pristine(error))
+                if matches!(*error, PristineError::Inconsistent { .. })
+        ));
+    }
 
-            let result = output_graph_content(&changes, hash_fn, &graph, &order, &mut writer);
-            assert!(result.is_ok());
-        }
-        assert!(buffer.is_empty()); // Missing span produces no output
+    #[test]
+    fn semantic_resolution_rejects_missing_alive_graph_vertex() {
+        let txn = DependencyFaultTxn {
+            fault: DependencyFault::GetChangeDeps,
+        };
+        let changes = MemoryChangeStore::new();
+        let graph = AliveGraph::new();
+        let order = OrderResult {
+            sccs: vec![vec![VertexId::new(99)]],
+            conflict_tree: Default::default(),
+            cyclic_conflicts: 0,
+            forward_edges: Vec::new(),
+        };
+
+        assert!(matches!(
+            resolve_conflicts_semantically(&txn, &changes, &graph, &order),
+            Err(SemanticMergeError::Pristine(
+                PristineError::Inconsistent { .. }
+            ))
+        ));
+    }
+
+    #[test]
+    fn dependency_lookup_failure_propagates() {
+        let txn = DependencyFaultTxn {
+            fault: DependencyFault::GetChangeDeps,
+        };
+        let changes = MemoryChangeStore::new();
+        let (graph, order) = make_fork_graph();
+
+        assert!(matches!(
+            resolve_conflicts_semantically(&txn, &changes, &graph, &order),
+            Err(SemanticMergeError::Pristine(
+                PristineError::Inconsistent { .. }
+            ))
+        ));
+    }
+
+    #[test]
+    fn dependency_id_lookup_failure_propagates() {
+        let txn = DependencyFaultTxn {
+            fault: DependencyFault::GetInternal,
+        };
+        let changes = MemoryChangeStore::new();
+        let (graph, order) = make_fork_graph();
+
+        assert!(matches!(
+            resolve_conflicts_semantically(&txn, &changes, &graph, &order),
+            Err(SemanticMergeError::Pristine(
+                PristineError::Inconsistent { .. }
+            ))
+        ));
     }
 
     // ------------------------------------------------------------------------
@@ -1182,7 +1408,7 @@ mod tests {
         resolved.insert_skip(VertexId::new(2));
 
         let changes = MemoryChangeStore::new();
-        let hash_fn = |_: NodeId| None;
+        let hash_fn = |_: NodeId| Ok(None);
 
         let mut buffer = Vec::new();
         {
@@ -1218,13 +1444,7 @@ mod tests {
         let hash = change.hash().unwrap();
         changes.insert(hash, change);
 
-        let hash_fn = |id: NodeId| {
-            if id.get() == 1 {
-                Some(hash)
-            } else {
-                None
-            }
-        };
+        let hash_fn = |id: NodeId| Ok(if id.get() == 1 { Some(hash) } else { None });
 
         let mut buffer = Vec::new();
         {

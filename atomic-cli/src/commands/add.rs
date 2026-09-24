@@ -86,14 +86,16 @@
 //! ✓ Added 2 files
 //! ```
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use clap::Parser;
 
+use atomic_core::WorkingCopyId;
 use atomic_repository::status::StatusOptions;
 use atomic_repository::tracking::{TrackingOptions, TrackingStats};
-use atomic_repository::Repository;
+use atomic_repository::{Repository, WorkspaceTxnMode};
 
+use crate::commands::workspace_txn::enter_workspace;
 use crate::commands::{find_repository_root, Command};
 use crate::error::{CliError, CliResult};
 use crate::output::{
@@ -257,9 +259,13 @@ impl Add {
     }
 
     /// Collect all untracked files in the repository.
-    fn collect_untracked_files(&self, repo: &Repository) -> CliResult<Vec<PathBuf>> {
+    fn collect_untracked_files(
+        &self,
+        repo: &Repository,
+        working_copy: WorkingCopyId,
+    ) -> CliResult<Vec<PathBuf>> {
         let status = repo
-            .status(StatusOptions::default())
+            .status(working_copy, StatusOptions::default())
             .map_err(|e| CliError::Internal(e.into()))?;
 
         Ok(status.untracked().map(|e| e.path().to_path_buf()).collect())
@@ -269,6 +275,7 @@ impl Add {
     fn add_path(
         &self,
         repo: &Repository,
+        working_copy: WorkingCopyId,
         path: &str,
         options: &TrackingOptions,
     ) -> CliResult<TrackingStats> {
@@ -297,7 +304,7 @@ impl Add {
 
             // Use the dedicated directory tracking method
             return repo
-                .add_directory(&path_buf, options.clone())
+                .add_directory(working_copy, &path_buf, options.clone())
                 .map_err(|e| match e {
                     atomic_repository::RepositoryError::PathOutsideRepository { path } => {
                         CliError::PathOutsideRepository { path }
@@ -313,18 +320,19 @@ impl Add {
         }
 
         // Perform the standard add operation
-        repo.add(&path_buf, options.clone()).map_err(|e| match e {
-            atomic_repository::RepositoryError::PathOutsideRepository { path } => {
-                CliError::PathOutsideRepository { path }
-            }
-            atomic_repository::RepositoryError::FileAlreadyTracked { path } => {
-                CliError::FileAlreadyTracked { path }
-            }
-            atomic_repository::RepositoryError::PathIgnored { path } => {
-                CliError::PathIgnored { path }
-            }
-            other => CliError::Internal(other.into()),
-        })
+        repo.add(working_copy, &path_buf, options.clone())
+            .map_err(|e| match e {
+                atomic_repository::RepositoryError::PathOutsideRepository { path } => {
+                    CliError::PathOutsideRepository { path }
+                }
+                atomic_repository::RepositoryError::FileAlreadyTracked { path } => {
+                    CliError::FileAlreadyTracked { path }
+                }
+                atomic_repository::RepositoryError::PathIgnored { path } => {
+                    CliError::PathIgnored { path }
+                }
+                other => CliError::Internal(other.into()),
+            })
     }
 
     /// Print the results of adding files.
@@ -409,10 +417,22 @@ impl Command for Add {
         // Find the repository root
         let repo_root = find_repository_root()?;
 
-        // Open the repository
-        let repo = Repository::open(&repo_root).map_err(|e| CliError::InvalidRepository {
+        // Open the repository and retain its stable workspace boundary for all add work.
+        let mode = if self.dry_run {
+            WorkspaceTxnMode::Observe
+        } else {
+            WorkspaceTxnMode::Reconcile
+        };
+        let mut repo = if self.dry_run {
+            Repository::open_readonly(&repo_root)
+        } else {
+            Repository::open_for_workspace_transaction(&repo_root)
+        }
+        .map_err(|e| CliError::InvalidRepository {
             reason: e.to_string(),
         })?;
+        let workspace = enter_workspace(&mut repo, mode)?;
+        let working_copy = workspace.working_copy();
 
         // Get tracking options
         let mut options = self.get_tracking_options();
@@ -422,7 +442,7 @@ impl Command for Add {
 
         // Collect files to add
         let files_to_add: Vec<PathBuf> = if self.all {
-            self.collect_untracked_files(&repo)?
+            self.collect_untracked_files(&repo, working_copy)?
         } else {
             self.files.iter().map(PathBuf::from).collect()
         };
@@ -446,7 +466,7 @@ impl Command for Add {
         for path in &files_to_add {
             let path_str = path.to_string_lossy();
 
-            match self.add_path(&repo, &path_str, &options) {
+            match self.add_path(&repo, working_copy, &path_str, &options) {
                 Ok(stats) => {
                     // Print progress for each file
                     if self.dry_run {
@@ -484,6 +504,20 @@ impl Command for Add {
             }
         }
 
+        // CB-11A: in a colocated repository, `atomic add` records durable
+        // tracking intent AND creates an intent-to-add Git index entry
+        // (RFC §9.3). The index entry records intent only — no content is
+        // staged, and `status --git` reports the path as unstaged-new, never
+        // as staged content. Durable `TREE` is written by the tracking call
+        // above, never by this index entry.
+        if !self.dry_run && total_stats.total_added() > 0 && repo_root.join(".git").exists() {
+            if let Err(error) = create_intent_to_add_entries(&repo_root, &files_to_add) {
+                print_warning(&format!(
+                    "durable tracking succeeded but intent-to-add index entries failed: {error}"
+                ));
+            }
+        }
+
         // Print summary
         self.print_results(&total_stats);
 
@@ -505,6 +539,98 @@ impl Command for Add {
 }
 
 // Helper Types
+
+/// Create intent-to-add Git index entries for newly durably tracked files in
+/// a colocated repository.
+///
+/// The entry mirrors `git add -N`: it records intent only (empty blob OID +
+/// the intent-to-add extended flag). It never stages content, never touches
+/// the durable `TREE` (tracking was already performed), and is skipped for
+/// paths Git's index already covers.
+fn create_intent_to_add_entries(repo_root: &Path, requested: &[PathBuf]) -> CliResult<()> {
+    use git2::{IndexEntry, IndexTime, ObjectType, Oid};
+
+    const INTENT_TO_ADD: u16 = 0x2000;
+
+    let git_repo = git2::Repository::open(repo_root).map_err(|error| CliError::GitError {
+        message: format!("cannot open Git repository for intent-to-add: {error}"),
+    })?;
+    let mut index = git_repo.index().map_err(|error| CliError::GitError {
+        message: format!("cannot read Git index: {error}"),
+    })?;
+
+    let already_indexed: std::collections::BTreeSet<Vec<u8>> =
+        index.iter().map(|entry| entry.path).collect();
+
+    // Empty blob OID for the repository's object format. libgit2 requires
+    // the object to exist before `index.add` accepts the entry (mirroring
+    // `git add -N`, which materializes the same well-known empty blob).
+    let empty_oid = {
+        let mut odb = git_repo.odb().map_err(|error| CliError::GitError {
+            message: format!("cannot open Git object database: {error}"),
+        })?;
+        odb.write(ObjectType::Blob, &[])
+            .map_err(|error| CliError::GitError {
+                message: format!("cannot write the empty blob: {error}"),
+            })?
+    };
+
+    let mut created = Vec::new();
+    for requested_path in requested {
+        let Ok(metadata) = std::fs::symlink_metadata(repo_root.join(requested_path)) else {
+            continue;
+        };
+        if metadata.is_dir() {
+            // Directory adds expand into many files; only explicit files get
+            // intent-to-add entries here. `atomic stage` stages content.
+            continue;
+        }
+        let raw = requested_path
+            .to_string_lossy()
+            .replace('\\', "/")
+            .into_bytes();
+        if already_indexed.contains(&raw) {
+            continue;
+        }
+        let mode = if metadata.file_type().is_symlink() {
+            0o120000
+        } else {
+            0o100644
+        };
+        let entry = IndexEntry {
+            ctime: IndexTime::new(0, 0),
+            mtime: IndexTime::new(0, 0),
+            dev: 0,
+            ino: 0,
+            mode,
+            uid: 0,
+            gid: 0,
+            file_size: 0,
+            id: empty_oid,
+            flags: 0,
+            flags_extended: INTENT_TO_ADD,
+            path: raw.clone(),
+        };
+        index.add(&entry).map_err(|error| CliError::GitError {
+            message: format!(
+                "cannot record intent-to-add for '{}': {error}",
+                String::from_utf8_lossy(&raw)
+            ),
+        })?;
+        created.push(String::from_utf8_lossy(&raw).into_owned());
+    }
+
+    if !created.is_empty() {
+        index.write().map_err(|error| CliError::GitError {
+            message: format!("cannot write Git index: {error}"),
+        })?;
+        print_hint(&format!(
+            "intent-to-add recorded for {} file(s); content is not staged (use `atomic stage` to stage content)",
+            created.len()
+        ));
+    }
+    Ok(())
+}
 
 /// Aggregate statistics from multiple add operations.
 #[derive(Debug, Clone, Default)]
@@ -556,7 +682,7 @@ fn format_count(count: usize, singular: &str, plural: &str) -> String {
 mod tests {
     use super::*;
     use serial_test::serial;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     // Add Command Construction Tests
 
@@ -921,7 +1047,9 @@ mod tests {
 
             // Create and add a file
             std::fs::write(repo_path.join("test.txt"), "Hello").unwrap();
-            repo.add("test.txt", TrackingOptions::default()).unwrap();
+            let working_copy = repo.require_working_copy_id().unwrap();
+            repo.add(working_copy, "test.txt", TrackingOptions::default())
+                .unwrap();
         }
 
         std::env::set_current_dir(repo_path).unwrap();

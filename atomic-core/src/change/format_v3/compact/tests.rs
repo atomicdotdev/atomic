@@ -12,6 +12,7 @@ use crate::change::atom::{Atom, EdgeUpdate, Insertion, NewEdge};
 use crate::change::encoding::Encoding;
 use crate::change::graph_op::GraphOp;
 use crate::change::local::Local;
+use crate::change::{InodeAttr, InodeKind};
 use crate::types::{ChangePosition, EdgeFlags};
 use crate::Hash;
 use crate::Position;
@@ -46,6 +47,36 @@ fn make_compactor_and_table() -> HashDedupTable {
     let mut table = HashDedupTable::new(self_hash);
     table.insert(dep_hash).unwrap();
     table
+}
+
+fn make_name_conflict_table() -> HashDedupTable {
+    let mut table = HashDedupTable::new(*make_hash(0xA0).as_bytes());
+    for byte in [0xB0, 0xC0, 0xD0, 0xE0] {
+        table.insert(*make_hash(byte).as_bytes()).unwrap();
+    }
+    table
+}
+
+#[test]
+fn set_attr_compact_roundtrip_and_validation() {
+    let table = make_compactor_and_table();
+    let compactor = Compactor::new(&table);
+    let operation = GraphOp::SetAttr {
+        inode: make_position(Some(make_hash(0xBB)), 7),
+        path: "link".to_string(),
+        value: InodeAttr::Kind(InodeKind::Symlink),
+    };
+    let compact = compactor.compact_graph_op(&operation).unwrap();
+    let bytes = postcard::to_allocvec(&compact).unwrap();
+    let decoded: CompactGraphOp = postcard::from_bytes(&bytes).unwrap();
+    assert_eq!(compactor.expand_graph_op(&decoded).unwrap(), operation);
+
+    let malformed = GraphOp::SetAttr {
+        inode: make_position(Some(make_hash(0xBB)), 7),
+        path: "link".to_string(),
+        value: InodeAttr::Mode(0o1000),
+    };
+    assert!(compactor.compact_graph_op(&malformed).is_err());
 }
 
 // ── CompactGraphNode ───────────────────────────────────────────
@@ -422,7 +453,7 @@ fn test_compact_graph_op_add_root_no_path() {
 // ── Compactor: compact_position / expand_position ──────────────
 
 #[test]
-fn test_compact_position_none_hash() {
+fn test_compact_position_current_change() {
     let table = make_compactor_and_table();
     let compactor = Compactor::new(&table);
 
@@ -431,11 +462,11 @@ fn test_compact_position_none_hash() {
 
     assert_eq!(compact.change, HASH_INDEX_NONE);
     assert_eq!(compact.pos, 42);
-    assert!(compact.is_root());
+    assert_eq!(compactor.expand_position(&compact).unwrap(), pos);
 }
 
 #[test]
-fn test_compact_position_self_hash() {
+fn test_compact_position_explicit_table_hash() {
     let table = make_compactor_and_table();
     let compactor = Compactor::new(&table);
 
@@ -474,7 +505,32 @@ fn test_compact_position_unknown_hash_fails() {
 }
 
 #[test]
-fn test_expand_position_none() {
+fn test_writer_placeholder_preserves_current_root_and_nested_references() {
+    let mut table = HashDedupTable::new(*Hash::NONE.as_bytes());
+    let nested = make_hash(0xBB);
+    table.insert(*nested.as_bytes()).unwrap();
+    let compactor = Compactor::new(&table);
+
+    let current = make_position(None, 7);
+    let root = make_position(Some(Hash::NONE), 0);
+    let nested = make_position(Some(nested), 19);
+
+    let compact_current = compactor.compact_position(&current).unwrap();
+    let compact_root = compactor.compact_position(&root).unwrap();
+    let compact_nested = compactor.compact_position(&nested).unwrap();
+    assert_eq!(compact_current.change, HASH_INDEX_NONE);
+    assert_eq!(compact_root.change, HASH_INDEX_SELF);
+    assert_eq!(compact_nested.change, 1);
+    assert_eq!(
+        compactor.expand_position(&compact_current).unwrap(),
+        current
+    );
+    assert_eq!(compactor.expand_position(&compact_root).unwrap(), root);
+    assert_eq!(compactor.expand_position(&compact_nested).unwrap(), nested);
+}
+
+#[test]
+fn test_expand_position_current_change() {
     let table = make_compactor_and_table();
     let compactor = Compactor::new(&table);
 
@@ -932,20 +988,145 @@ fn test_graph_op_del_root_compact_expand_roundtrip() {
 
 #[test]
 fn test_graph_op_solve_name_conflict_roundtrip() {
-    let table = make_compactor_and_table();
+    let table = make_name_conflict_table();
     let compactor = Compactor::new(&table);
+    let winner = make_hash(0xB0);
+    let loser = make_hash(0xC0);
+    let parent = make_hash(0xD0);
 
-    let op = GraphOp::SolveNameConflict {
-        name: EdgeUpdate {
-            edges: vec![],
-            inode: make_position(None, 0),
-        },
-        path: "conflict.txt".to_string(),
-    };
+    let op = GraphOp::solve_name_conflict(
+        "src/conflict.txt",
+        make_position(Some(winner), 41),
+        [(
+            make_position(Some(parent), 9),
+            make_graph_node(Some(loser), 12, 24),
+            Some(loser),
+        )],
+    )
+    .unwrap();
 
     let compact = compactor.compact_graph_op(&op).unwrap();
     let expanded = compactor.expand_graph_op(&compact).unwrap();
     assert_eq!(op, expanded);
+    let GraphOp::SolveNameConflict { name, path } = expanded else {
+        unreachable!();
+    };
+    assert_eq!(path, "src/conflict.txt");
+    assert_eq!(name.inode.change, Some(winner));
+    assert_eq!(name.edges[0].to.change, Some(loser));
+    assert_eq!(name.edges[0].introduced_by, Some(loser));
+}
+
+#[test]
+fn test_graph_op_unsolve_name_conflict_roundtrip() {
+    let table = make_name_conflict_table();
+    let compactor = Compactor::new(&table);
+    let winner = make_hash(0xB0);
+    let loser = make_hash(0xC0);
+    let parent = make_hash(0xD0);
+    let solving_change = make_hash(0xE0);
+
+    let op = GraphOp::unsolve_name_conflict(
+        "src/conflict.txt",
+        make_position(Some(winner), 41),
+        [(
+            make_position(Some(parent), 9),
+            make_graph_node(Some(loser), 12, 24),
+            Some(solving_change),
+        )],
+    )
+    .unwrap();
+
+    let compact = compactor.compact_graph_op(&op).unwrap();
+    let expanded = compactor.expand_graph_op(&compact).unwrap();
+    assert_eq!(op, expanded);
+    let GraphOp::UnsolveNameConflict { name, .. } = expanded else {
+        unreachable!();
+    };
+    assert_eq!(name.inode.change, Some(winner));
+    assert_eq!(name.edges[0].to.change, Some(loser));
+    assert_eq!(name.edges[0].introduced_by, Some(solving_change));
+    assert_eq!(
+        name.edges[0].previous,
+        EdgeFlags::FOLDER | EdgeFlags::BLOCK | EdgeFlags::DELETED
+    );
+    assert_eq!(name.edges[0].flag, EdgeFlags::FOLDER | EdgeFlags::BLOCK);
+}
+
+#[test]
+fn test_name_conflict_compaction_rejects_empty_or_non_folder_updates() {
+    let table = make_name_conflict_table();
+    let compactor = Compactor::new(&table);
+    let winner = make_hash(0xB0);
+    let loser = make_hash(0xC0);
+    let parent = make_hash(0xD0);
+
+    let empty = GraphOp::SolveNameConflict {
+        name: EdgeUpdate {
+            edges: vec![],
+            inode: make_position(Some(winner), 41),
+        },
+        path: "src/conflict.txt".to_string(),
+    };
+    assert!(matches!(
+        compactor.compact_graph_op(&empty),
+        Err(FormatError::InvalidGraphOp { .. })
+    ));
+
+    let malformed = GraphOp::SolveNameConflict {
+        name: EdgeUpdate {
+            edges: vec![NewEdge {
+                previous: EdgeFlags::BLOCK,
+                flag: EdgeFlags::BLOCK | EdgeFlags::DELETED,
+                from: make_position(Some(parent), 9),
+                to: make_graph_node(Some(loser), 12, 24),
+                introduced_by: Some(loser),
+            }],
+            inode: make_position(Some(winner), 41),
+        },
+        path: "src/conflict.txt".to_string(),
+    };
+    assert!(matches!(
+        compactor.compact_graph_op(&malformed),
+        Err(FormatError::InvalidGraphOp { .. })
+    ));
+}
+
+#[test]
+fn test_name_conflict_expansion_rejects_current_change_refs_and_raw_flag_bits() {
+    let table = make_name_conflict_table();
+    let compactor = Compactor::new(&table);
+    let valid = GraphOp::solve_name_conflict(
+        "src/conflict.txt",
+        make_position(Some(make_hash(0xB0)), 41),
+        [(
+            make_position(Some(make_hash(0xD0)), 9),
+            make_graph_node(Some(make_hash(0xC0)), 12, 24),
+            Some(make_hash(0xC0)),
+        )],
+    )
+    .unwrap();
+    let mut compact = compactor.compact_graph_op(&valid).unwrap();
+    if let CompactGraphOp::SolveNameConflict { name, .. } = &mut compact {
+        name.inode.change = HASH_INDEX_NONE;
+    } else {
+        unreachable!();
+    }
+    assert!(matches!(
+        compactor.expand_graph_op(&compact),
+        Err(FormatError::InvalidGraphOp { .. })
+    ));
+
+    if let CompactGraphOp::SolveNameConflict { name, .. } = &mut compact {
+        name.inode.change = 1;
+        name.edges[0].previous = (EdgeFlags::FOLDER | EdgeFlags::BLOCK | EdgeFlags::PSEUDO).bits();
+    } else {
+        unreachable!();
+    }
+    assert!(matches!(
+        compactor.expand_graph_op(&compact),
+        Err(FormatError::InvalidGraphOp { .. })
+    ));
 }
 
 #[test]

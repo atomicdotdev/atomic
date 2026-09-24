@@ -24,6 +24,8 @@ struct JournalDraft {
     event: ProvenanceJournalEvent,
 }
 
+const LOCK_FILENAME: &str = "graph.lock";
+
 impl TurnOrchestrator {
     fn migrate_legacy_accumulator(
         &self,
@@ -41,10 +43,16 @@ impl TurnOrchestrator {
         let accumulator = ProvenanceAccumulator::load_or_create(&session_dir, session_id)?;
         if let Some(event) = accumulator.pending_graph_delta() {
             if self.journal_sink.is_none() {
-                return Err(AgentError::ProvenanceJournalFailed {
-                    session_id: session_id.to_string(),
-                    reason: "legacy graph.json requires an owner-backed migration sink".to_string(),
-                });
+                // Branch design (CB-12A fallback): without an owner-backed
+                // sink the accumulator graph.json itself remains the durable
+                // provenance store. Keep the pending delta in place for a
+                // later migration instead of failing the hook — the
+                // graph.json deletion below must not run either.
+                log::debug!(
+                    "Session {}: keeping legacy graph.json fallback (no owner journal sink)",
+                    session_id
+                );
+                return Ok(());
             }
             self.commit_journal_drafts(
                 session_id,
@@ -333,6 +341,277 @@ impl TurnOrchestrator {
     ///   `event.raw_json` only when the plugin didn't send them; the owner
     ///   journal then commits the enriched terminal envelopes.
     ///
+    fn with_accumulator<F>(&self, session_id: &str, f: F) -> Option<ProvenanceAccumulator>
+    where
+        F: FnOnce(&mut ProvenanceAccumulator) -> bool,
+    {
+        use fs2::FileExt;
+
+        let dir = self.session_graph_dir(session_id);
+
+        // Ensure the directory exists before creating the lock file.
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            log::warn!("Failed to create session dir for {}: {}", session_id, e,);
+            return None;
+        }
+
+        // Open (or create) the lock file and acquire an exclusive lock.
+        let lock_path = dir.join(LOCK_FILENAME);
+        let lock_file = match std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)
+        {
+            Ok(f) => f,
+            Err(e) => {
+                log::warn!("Failed to open lock file for session {}: {}", session_id, e,);
+                return None;
+            }
+        };
+
+        if let Err(e) = lock_file.try_lock_exclusive() {
+            if super::is_lock_contended(&e) {
+                log::warn!(
+                    "Provenance accumulator for session {} is already locked; skipping best-effort provenance update",
+                    session_id,
+                );
+            } else {
+                log::warn!("Failed to acquire lock for session {}: {}", session_id, e,);
+            }
+            return None;
+        }
+
+        // Load (or create) the accumulator while holding the lock.
+        let mut acc = match ProvenanceAccumulator::load_or_create(&dir, session_id) {
+            Ok(a) => a,
+            Err(e) => {
+                log::warn!(
+                    "Failed to load provenance accumulator for {}: {}",
+                    session_id,
+                    e,
+                );
+                let _ = lock_file.unlock();
+                return None;
+            }
+        };
+
+        // Run the callback.
+        let should_save = f(&mut acc);
+
+        // Save if the callback mutated the accumulator.
+        if should_save {
+            if let Err(e) = acc.save(&dir) {
+                log::warn!(
+                    "Failed to save provenance accumulator for {}: {}",
+                    session_id,
+                    e,
+                );
+            }
+        }
+
+        // Release the lock (also released on drop, but be explicit).
+        let _ = lock_file.unlock();
+
+        Some(acc)
+    }
+
+    /// Load the provenance accumulator for a session (read-only, locked).
+    ///
+    /// Best-effort: returns `None` on failure (logged, never fatal).
+    pub(crate) fn load_accumulator(&self, session_id: &str) -> Option<ProvenanceAccumulator> {
+        self.with_accumulator(session_id, |_| false)
+    }
+
+    /// Save the provenance accumulator for a session.
+    ///
+    /// Best-effort: failures are logged but never fatal.
+    pub(crate) fn save_accumulator(&self, session_id: &str, acc: &ProvenanceAccumulator) {
+        // We can't reuse with_accumulator here because we already have
+        // the accumulator in hand.  Acquire the lock, write, release.
+        use fs2::FileExt;
+
+        let dir = self.session_graph_dir(session_id);
+        let _ = std::fs::create_dir_all(&dir);
+        let lock_path = dir.join(LOCK_FILENAME);
+
+        let lock_file = match std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)
+        {
+            Ok(f) => f,
+            Err(e) => {
+                log::warn!("Failed to open lock file for session {}: {}", session_id, e);
+                return;
+            }
+        };
+
+        if let Err(e) = lock_file.try_lock_exclusive() {
+            if super::is_lock_contended(&e) {
+                log::warn!(
+                    "Provenance accumulator for session {} is already locked; skipping save",
+                    session_id,
+                );
+            } else {
+                log::warn!("Failed to acquire lock for session {}: {}", session_id, e);
+            }
+            return;
+        }
+
+        if let Err(e) = acc.save(&dir) {
+            log::warn!(
+                "Failed to save provenance accumulator for {}: {}",
+                session_id,
+                e,
+            );
+        }
+
+        let _ = lock_file.unlock();
+    }
+
+    /// Inject reasoning/thinking blocks from the stop event into the
+    /// ProvenanceAccumulator as Decision nodes.
+    ///
+    /// The OpenCode plugin sends `reasoning_text` (blocks separated by
+    /// `\n---\n`) and `reasoning_signature` (last block's Anthropic signature)
+    /// in the `stop` payload. Each block becomes a Decision node in the
+    /// provenance graph with the full thinking text and signature in its detail.
+    pub(crate) fn inject_reasoning_nodes(&mut self, session_id: &str, event: &TurnEvent) {
+        let raw = match event.raw_json.as_ref() {
+            Some(r) => r,
+            None => return,
+        };
+
+        let timestamp = event.timestamp.timestamp();
+
+        self.with_accumulator(session_id, |acc| {
+            let mut block_count = 0;
+
+            // Prefer the structured `reasoning_blocks` array when available.
+            if let Some(blocks_arr) = raw.get("reasoning_blocks").and_then(|v| v.as_array()) {
+                for block in blocks_arr {
+                    let text = match block.get("text").and_then(|v| v.as_str()) {
+                        Some(t) if !t.trim().is_empty() => t.trim(),
+                        _ => continue,
+                    };
+                    let duration_ms = block.get("duration_ms").and_then(|v| v.as_u64());
+                    let signature = block.get("signature").and_then(|v| v.as_str());
+
+                    acc.append_reasoning(text, duration_ms, signature, timestamp);
+                    block_count += 1;
+                }
+            } else {
+                // Fallback: split concatenated reasoning_text on "\n---\n"
+                let reasoning_text = match raw.get("reasoning_text").and_then(|v| v.as_str()) {
+                    Some(t) if !t.is_empty() => t,
+                    _ => return false,
+                };
+                let reasoning_signature = raw.get("reasoning_signature").and_then(|v| v.as_str());
+
+                let blocks: Vec<&str> = reasoning_text
+                    .split("\n---\n")
+                    .filter(|b| !b.trim().is_empty())
+                    .collect();
+
+                let total = blocks.len();
+                for (i, block) in blocks.iter().enumerate() {
+                    let sig = if i == total - 1 {
+                        reasoning_signature
+                    } else {
+                        None
+                    };
+                    acc.append_reasoning(block.trim(), None, sig, timestamp);
+                    block_count += 1;
+                }
+            }
+
+            if block_count > 0 {
+                log::info!(
+                    "Injected {} reasoning node{} into provenance for session {}",
+                    block_count,
+                    if block_count == 1 { "" } else { "s" },
+                    session_id,
+                );
+            }
+
+            block_count > 0
+        });
+    }
+
+    /// Inject an LLM response node into the ProvenanceAccumulator.
+    ///
+    /// The agent's closing message for the turn — what it *concluded*, as
+    /// opposed to the tool-derived nodes that capture what it *did*.
+    /// Sources, in priority order:
+    ///
+    /// 1. The stop payload, when the agent sends the response there
+    ///    (`last_assistant_message` for codex/grok, `prompt_response` for
+    ///    gemini-cli, `response` for plugins that supply it).
+    /// 2. The last assistant entry of the session transcript (claude-code:
+    ///    the Stop hook carries `transcript_path`, applied to the session
+    ///    before recording).
+    ///
+    /// Agents with neither source available get no node.
+    pub(crate) fn inject_response_node(
+        &mut self,
+        session_id: &str,
+        session: &AgentSession,
+        event: &TurnEvent,
+    ) {
+        let raw = event.raw_json.as_ref();
+        let from_payload = |key: &str| -> Option<String> {
+            raw.and_then(|r| r.get(key))
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        };
+
+        let response = from_payload("last_assistant_message")
+            .or_else(|| from_payload("prompt_response"))
+            .or_else(|| from_payload("response"))
+            .or_else(|| {
+                let path = session.transcript_path.as_ref()?;
+                let data = std::fs::read(path).ok()?;
+                transcript::last_assistant_text(
+                    &data,
+                    transcript::format_for_agent(&session.agent_name),
+                )
+            });
+
+        let Some(response) = response else {
+            return;
+        };
+
+        let timestamp = event.timestamp.timestamp();
+        self.with_accumulator(session_id, |acc| {
+            acc.append_llm_response(&response, timestamp);
+            true
+        });
+    }
+
+    /// OpenCode: recover transcript, reasoning, and response from
+    /// OpenCode's local SQLite store and fold them into the session and
+    /// the stop payload before recording.
+    ///
+    /// OpenCode writes no transcript file, so its sessions never carry a
+    /// `transcript_path`, and thin plugin versions forward only
+    /// session/model metadata. Without this step an OpenCode turn could
+    /// never carry `agent_turn` data, reasoning, or an `llm_response`
+    /// node. The recovered data lands exactly where the existing pipeline
+    /// reads it:
+    ///
+    /// - the transcript is synthesized into the session directory and set
+    ///   as `session.transcript_path` (consumed by
+    ///   `build_unhashed_turn_data` via the `opencode` condense format);
+    /// - the turn's reasoning/response/token/cost fields are injected
+    ///   into `event.raw_json` only when the plugin didn't send them
+    ///   (consumed by `build_turn_provenance`, `inject_reasoning_nodes`,
+    ///   and `inject_response_node`).
+    ///
+    /// Best-effort: any failure leaves the turn recording what the plugin
+    /// sent.
     pub(crate) fn enrich_opencode_turn(
         &self,
         session: &mut AgentSession,
@@ -623,9 +902,25 @@ impl TurnOrchestrator {
         session: &AgentSession,
         outcome: &TurnRecordOutcome,
         event: &TurnEvent,
+        _boundary_end: Option<atomic_core::change::session::TurnBoundary>,
     ) -> AgentResult<()> {
+        // Owner-backed journal (dev path): the sink state machine owns
+        // provenance and the ledger turn exclusively, and its failures are
+        // fatal — a failed record is not a finished turn (retry resumes).
+        // Without a sink, NO provenance is written at all (dev's contract:
+        // a library harness may record source changes but must not
+        // resurrect mutable provenance; production hooks install the
+        // owner sink). The session JSON remains the crash-safe evidence.
+        if self.journal_sink.is_none() {
+            log::debug!(
+                "Session {}: skipping provenance save without an owner journal sink",
+                session_id
+            );
+            return Ok(());
+        }
         self.commit_recorded_turn_events(session_id, session.turn_count.max(1), event, outcome)?;
-        self.checkpoint_turn_provenance(session_id, session, &[outcome.hash], event)
+        self.checkpoint_turn_provenance(session_id, session, &[outcome.hash], event)?;
+        Ok(())
     }
 
     pub(super) fn checkpoint_turn_provenance(
@@ -800,6 +1095,9 @@ impl TurnOrchestrator {
                         timestamp: graph.timestamp,
                         plan_id: checkpoint.source.plan_id.clone(),
                         todos,
+                        boundary_start: None,
+                        boundary_end: None,
+                        outcome: None,
                     };
                     checkpoint = sink
                         .bind_checkpoint_hash(
@@ -848,6 +1146,50 @@ impl TurnOrchestrator {
 
         Ok(())
     }
+}
+
+/// Extract the generic end-of-turn todo snapshot supplied by current agent
+/// hooks. Preserve an upstream stable `id` when present. Agents that omit IDs
+/// get a turn-local snapshot identity; this preserves the ledger faithfully
+/// without falsely claiming cross-turn lifecycle continuity.
+fn extract_turn_todos(event: &TurnEvent, session_id: &str, turn_number: u32) -> Vec<SessionTodo> {
+    event
+        .raw_json
+        .as_ref()
+        .and_then(|raw| raw.get("todos"))
+        .and_then(serde_json::Value::as_array)
+        .map(|todos| {
+            todos
+                .iter()
+                .enumerate()
+                .filter_map(|(index, value)| {
+                    let content = value.get("content")?.as_str()?.to_string();
+                    let id = value
+                        .get("id")
+                        .and_then(serde_json::Value::as_str)
+                        .filter(|id| !id.is_empty())
+                        .map(str::to_string)
+                        .unwrap_or_else(|| {
+                            format!("session:{}/turn:{}/todo:{}", session_id, turn_number, index)
+                        });
+                    Some(SessionTodo {
+                        id,
+                        content,
+                        status: value
+                            .get("status")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("pending")
+                            .to_string(),
+                        priority: value
+                            .get("priority")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("medium")
+                            .to_string(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn anonymous_tool_key(event: &TurnEvent) -> String {
@@ -938,50 +1280,6 @@ fn response_text(session: &AgentSession, event: &TurnEvent) -> Option<String> {
                 transcript::format_for_agent(&session.agent_name),
             )
         })
-}
-
-/// Extract the generic end-of-turn todo snapshot supplied by current agent
-/// hooks. Preserve an upstream stable `id` when present. Agents that omit IDs
-/// get a turn-local snapshot identity; this preserves the ledger faithfully
-/// without falsely claiming cross-turn lifecycle continuity.
-fn extract_turn_todos(event: &TurnEvent, session_id: &str, turn_number: u32) -> Vec<SessionTodo> {
-    event
-        .raw_json
-        .as_ref()
-        .and_then(|raw| raw.get("todos"))
-        .and_then(serde_json::Value::as_array)
-        .map(|todos| {
-            todos
-                .iter()
-                .enumerate()
-                .filter_map(|(index, value)| {
-                    let content = value.get("content")?.as_str()?.to_string();
-                    let id = value
-                        .get("id")
-                        .and_then(serde_json::Value::as_str)
-                        .filter(|id| !id.is_empty())
-                        .map(str::to_string)
-                        .unwrap_or_else(|| {
-                            format!("session:{}/turn:{}/todo:{}", session_id, turn_number, index)
-                        });
-                    Some(SessionTodo {
-                        id,
-                        content,
-                        status: value
-                            .get("status")
-                            .and_then(serde_json::Value::as_str)
-                            .unwrap_or("pending")
-                            .to_string(),
-                        priority: value
-                            .get("priority")
-                            .and_then(serde_json::Value::as_str)
-                            .unwrap_or("medium")
-                            .to_string(),
-                    })
-                })
-                .collect()
-        })
-        .unwrap_or_default()
 }
 
 #[cfg(test)]

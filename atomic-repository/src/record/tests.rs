@@ -14,6 +14,7 @@ fn test_options_new_returns_defaults() {
     let opts = RecordOptions::new();
     assert!(opts.get_paths().is_empty());
     assert!(!opts.all());
+    assert!(!opts.get_include_untracked());
     assert_eq!(opts.algorithm(), Algorithm::Myers);
     assert_eq!(opts.default_encoding(), Encoding::Utf8);
     assert_eq!(opts.max_file_size(), RecordOptions::DEFAULT_MAX_FILE_SIZE);
@@ -56,6 +57,13 @@ fn test_options_add_path() {
 fn test_options_all() {
     let opts = RecordOptions::new().with_all(true);
     assert!(opts.all());
+    assert!(!opts.get_include_untracked());
+}
+
+#[test]
+fn test_options_include_untracked() {
+    let opts = RecordOptions::new().include_untracked(true);
+    assert!(opts.get_include_untracked());
 }
 
 #[test]

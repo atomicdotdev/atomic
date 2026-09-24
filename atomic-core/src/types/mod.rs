@@ -20,20 +20,26 @@
 //! content addressing (identifying changes) and state tracking (channel state).
 
 mod edge_kind;
+mod effect_receipt_id;
 mod graph_edge;
 mod graph_node;
 mod hash;
 mod node_id;
+mod operation_id;
 mod position;
 mod set_id;
+mod working_copy_id;
 
 pub use edge_kind::{Edge, EdgeKind, ForwardEdge, ParentEdge, ParentEdgeKind};
+pub use effect_receipt_id::EffectReceiptId;
 pub use graph_edge::{EdgeFlags, GraphEdge, SerializedGraphEdge};
 pub use graph_node::{GraphNode, IntoGraphNode};
 pub use hash::{Hash, Hasher, Merkle};
 pub use node_id::{ChangePosition, Inode, NodeId, L64};
+pub use operation_id::OperationId;
 pub use position::Position;
 pub use set_id::SetId;
+pub use working_copy_id::WorkingCopyId;
 
 /// Base32 encoding trait for human-readable identifiers
 pub trait Base32: Sized {

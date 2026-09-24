@@ -90,6 +90,7 @@ pub mod delete;
 pub mod list;
 pub mod new;
 pub mod promote;
+pub mod show;
 pub mod split;
 pub mod switch;
 
@@ -99,6 +100,7 @@ pub use delete::Delete;
 pub use list::List;
 pub use new::New;
 pub use promote::Promote;
+pub use show::Show;
 pub use split::Split;
 pub use switch::Switch;
 
@@ -188,6 +190,9 @@ pub enum ViewCommands {
     /// ```
     Delete(Delete),
 
+    /// Show one view's Merkle and SetId identities together.
+    Show(Show),
+
     /// List all views.
     ///
     /// Shows all views in the repository. The current view is marked
@@ -222,6 +227,7 @@ impl Command for View {
             ViewCommands::Switch(cmd) => cmd.run(),
             ViewCommands::Delete(cmd) => cmd.run(),
             ViewCommands::List(cmd) => cmd.run(),
+            ViewCommands::Show(cmd) => cmd.run(),
             ViewCommands::Promote(cmd) => cmd.run(),
         }
     }
@@ -243,6 +249,7 @@ mod tests {
                 ViewCommands::Switch(_) => "switch",
                 ViewCommands::Delete(_) => "delete",
                 ViewCommands::List(_) => "list",
+                ViewCommands::Show(_) => "show",
                 ViewCommands::Promote(_) => "promote",
             }
         }
@@ -252,6 +259,7 @@ mod tests {
         let switch = Switch::default();
         let delete = Delete::default();
         let list = List::default();
+        let show = Show::default();
 
         let promote = Promote { name: None };
 
@@ -259,6 +267,7 @@ mod tests {
         assert_eq!(check_variant(&ViewCommands::Switch(switch)), "switch");
         assert_eq!(check_variant(&ViewCommands::Delete(delete)), "delete");
         assert_eq!(check_variant(&ViewCommands::List(list)), "list");
+        assert_eq!(check_variant(&ViewCommands::Show(show)), "show");
         assert_eq!(check_variant(&ViewCommands::Promote(promote)), "promote");
     }
 }

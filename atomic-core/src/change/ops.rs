@@ -78,7 +78,7 @@
 //! ```
 
 use crate::change::Encoding;
-use crate::crdt::{BranchId, BranchOp, LeafOp, TrunkId, TrunkOp};
+use crate::crdt::{BranchId, BranchOp, LeafId, LeafOp, TrunkId, TrunkOp};
 use crate::types::ChangePosition;
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -167,6 +167,37 @@ impl FileOps {
             trunk_id,
             path,
             trunk_op: Some(TrunkOp::Undelete { trunk: trunk_id }),
+            line_ops: Vec::new(),
+        }
+    }
+
+    /// Creates a semantic mode attribute operation.
+    pub fn set_mode(
+        trunk_id: TrunkId,
+        path: String,
+        mode: u16,
+    ) -> Result<Self, crate::change::AttrValueError> {
+        crate::change::InodeAttr::Mode(mode).validate()?;
+        Ok(Self {
+            trunk_id,
+            path,
+            trunk_op: Some(TrunkOp::SetMode {
+                trunk: trunk_id,
+                mode,
+            }),
+            line_ops: Vec::new(),
+        })
+    }
+
+    /// Creates a semantic inode-kind attribute operation.
+    pub fn set_kind(trunk_id: TrunkId, path: String, kind: crate::change::InodeKind) -> Self {
+        Self {
+            trunk_id,
+            path,
+            trunk_op: Some(TrunkOp::SetKind {
+                trunk: trunk_id,
+                kind,
+            }),
             line_ops: Vec::new(),
         }
     }
@@ -263,6 +294,63 @@ impl FileOps {
     pub fn into_parts(self) -> (TrunkId, String, Option<TrunkOp>, Vec<LineOps>) {
         (self.trunk_id, self.path, self.trunk_op, self.line_ops)
     }
+
+    /// Shifts this entry's ROOT-placeholder identity into a per-change
+    /// unique namespace (CB-9B review F4).
+    ///
+    /// The recorder builds each file's semantic ops independently, so every
+    /// entry starts its placeholder counters at zero (`TrunkId(ROOT, 0)`,
+    /// `BranchId(ROOT, 0..)`, `LeafId(ROOT, 0..)`). The apply pass
+    /// substitutes `TrunkId(ROOT, f)` → `TrunkId(change_id, f)` and
+    /// `BranchId(ROOT, b)` → `BranchId(change_id, b)` verbatim, so two
+    /// entries that share placeholder indices would write the same
+    /// TRUNKS/BRANCHES rows and clobber each other. Assembly renumbers each
+    /// entry into a per-change unique namespace: the trunk's file index
+    /// becomes the entry's position in the change's FileOps list, and
+    /// branch/leaf placeholders shift by the running bases of all
+    /// placeholder identities emitted so far. Real (non-placeholder) ids —
+    /// e.g. delete ops bound to existing branches — are left untouched.
+    pub fn renumber_placeholder_ids(
+        &mut self,
+        trunk_file_idx: u32,
+        branch_base: u32,
+        leaf_base: u32,
+    ) {
+        if self.trunk_id.change_id().is_root() {
+            self.trunk_id = TrunkId::new(self.trunk_id.change_id(), trunk_file_idx);
+        }
+        if let Some(trunk_op) = &mut self.trunk_op {
+            let trunk = match trunk_op {
+                TrunkOp::Delete { trunk } | TrunkOp::Undelete { trunk } => Some(trunk),
+                TrunkOp::Move { trunk, .. } => Some(trunk),
+                TrunkOp::SetMode { trunk, .. } => Some(trunk),
+                TrunkOp::SetKind { trunk, .. } => Some(trunk),
+                TrunkOp::Create { .. } => None,
+            };
+            if let Some(trunk) = trunk {
+                if trunk.change_id().is_root() {
+                    *trunk = TrunkId::new(trunk.change_id(), trunk_file_idx);
+                }
+            }
+        }
+        for line_op in &mut self.line_ops {
+            line_op.renumber_placeholder_ids(branch_base, leaf_base);
+        }
+    }
+}
+
+/// Shifts a ROOT-placeholder leaf identity.
+fn renumber_placeholder_leaf(leaf: &mut LeafOp, leaf_base: u32) {
+    match leaf {
+        LeafOp::Insert { after, .. } => {
+            if let Some(after) = after {
+                if after.change_id().is_root() {
+                    *after = LeafId::new(after.change_id(), leaf_base + after.leaf_idx());
+                }
+            }
+        }
+        LeafOp::Delete { .. } | LeafOp::Replace { .. } | LeafOp::Restore { .. } => {}
+    }
 }
 
 impl fmt::Display for FileOps {
@@ -272,6 +360,8 @@ impl fmt::Display for FileOps {
             Some(TrunkOp::Delete { .. }) => "delete",
             Some(TrunkOp::Move { .. }) => "move",
             Some(TrunkOp::Undelete { .. }) => "undelete",
+            Some(TrunkOp::SetMode { .. }) => "set-mode",
+            Some(TrunkOp::SetKind { .. }) => "set-kind",
             None => "edit",
         };
         write!(
@@ -574,6 +664,70 @@ impl LineOps {
         &self.operation
     }
 
+    /// Returns mutable access to the branch operation.
+    #[allow(dead_code)]
+    #[inline]
+    pub(crate) fn operation_mut(&mut self) -> &mut BranchOp {
+        &mut self.operation
+    }
+
+    /// Shifts every ROOT-placeholder identity in this operation by `base`.
+    pub(crate) fn renumber_placeholder_ids(&mut self, branch_base: u32, leaf_base: u32) {
+        if self.branch_id.change_id().is_root() {
+            self.branch_id = BranchId::new(
+                self.branch_id.change_id(),
+                branch_base + self.branch_id.branch_idx(),
+            );
+        }
+        match &mut self.operation {
+            BranchOp::Insert { after, content } => {
+                if let Some(after) = after {
+                    if after.change_id().is_root() {
+                        *after = BranchId::new(after.change_id(), branch_base + after.branch_idx());
+                    }
+                }
+                for leaf in content.iter_mut() {
+                    renumber_placeholder_leaf(leaf, leaf_base);
+                }
+            }
+            BranchOp::Delete { branch, content } => {
+                if branch.change_id().is_root() {
+                    *branch = BranchId::new(branch.change_id(), branch_base + branch.branch_idx());
+                }
+                for leaf in content.iter_mut() {
+                    renumber_placeholder_leaf(leaf, leaf_base);
+                }
+            }
+            BranchOp::Modify {
+                branch,
+                old_content,
+                new_content,
+            } => {
+                if branch.change_id().is_root() {
+                    *branch = BranchId::new(branch.change_id(), branch_base + branch.branch_idx());
+                }
+                for leaf in old_content.iter_mut().chain(new_content.iter_mut()) {
+                    renumber_placeholder_leaf(leaf, leaf_base);
+                }
+            }
+            BranchOp::Restore { branch } => {
+                if branch.change_id().is_root() {
+                    *branch = BranchId::new(branch.change_id(), branch_base + branch.branch_idx());
+                }
+            }
+            BranchOp::Reparent { branch, new_after } => {
+                if branch.change_id().is_root() {
+                    *branch = BranchId::new(branch.change_id(), branch_base + branch.branch_idx());
+                }
+                if let Some(after) = new_after {
+                    if after.change_id().is_root() {
+                        *after = BranchId::new(after.change_id(), branch_base + after.branch_idx());
+                    }
+                }
+            }
+        }
+    }
+
     /// Returns the leaf operations (new content for Insert/Modify, old
     /// content for Delete).
     ///
@@ -702,6 +856,9 @@ impl FileOpsStats {
                 Some(TrunkOp::Delete { .. }) => stats.files_deleted += 1,
                 Some(TrunkOp::Move { .. }) => stats.files_moved += 1,
                 Some(TrunkOp::Undelete { .. }) => stats.files_undeleted += 1,
+                Some(TrunkOp::SetMode { .. }) | Some(TrunkOp::SetKind { .. }) => {
+                    stats.files_edited += 1
+                }
                 None if !file.line_ops().is_empty() => stats.files_edited += 1,
                 None => {}
             }

@@ -31,6 +31,7 @@
 pub mod change;
 pub mod crdt;
 pub mod diff;
+pub mod operation;
 pub mod pristine;
 pub mod types;
 
@@ -50,20 +51,34 @@ pub mod merge;
 // Re-export commonly used types
 pub use types::*;
 
+// Re-export operation types
+pub use operation::{
+    ActorRef, CheckpointKind, DigestKind, EffectPlan, EffectReceipt, EffectReceiptKind,
+    EffectReceiptPayload, EffectTarget, EffectValue, FileKind, FileState, GitHashAlgorithm,
+    GitHeadState, GitIndexState, GitObjectId, GitRefObservation, GitRefTarget, GitStateRef,
+    MetadataTarget, MetadataTransition, MetadataValue, Operation, OperationCodecError,
+    OperationHeads, OperationKind, OperationLossNote, OperationPayload, OperationRelation,
+    OperationScope, RepoStateDelta, RepoStateRef, VerificationScope, ViewStateRef,
+    WorkingCopyStateRef,
+};
+
 // Re-export change types
 pub use change::{
-    AITool, AIVendor, Atom, Author, Change, ChangeError, ChangeHeader, Cost, Credit, CreditRange,
-    CreditStats, CreditType, EdgeUpdate, Encoding, FileCredits, GraphOp, HashedChange, Insertion,
+    AITool, AIVendor, Atom, Author, CausalFrontier, Change, ChangeError, ChangeHeader, ChangeKind,
+    ChangeOrigin, ChangeValidationError, Cost, Credit, CreditRange, CreditStats, CreditType,
+    Derivation, EdgeUpdate, Encoding, FileCredits, GitDerivation, GraphOp, HashedChange, Insertion,
     LineCredit, Local, LocalByte, NewEdge, PromptContent, Provenance, SuggestionType, TokenUsage,
+    VerifiedCausalFrontier,
 };
 
 // Re-export pristine types
 pub use pristine::ontology;
 pub use pristine::{EmbeddingRecord, KgEdge, KgNode, KgQueryResponse, KgSubgraph, SearchResult};
 pub use pristine::{
-    EmbeddingsMutTxnT, EmbeddingsTxnT, GraphTxnT, KgMutTxnT, KgTxnT, MutTxnT, Pristine,
-    PristineError, PristineResult, ReadTxn, TreeTxnT, VaultEntry, VaultEntryMeta, VaultEntryType,
-    VaultManifest, VaultMutTxnT, VaultTxnT, VertexExt, ViewState, ViewTxnT, WriteTxn,
+    EmbeddingsMutTxnT, EmbeddingsTxnT, GraphTxnT, KgMutTxnT, KgTxnT, MutTxnT, OperationMutTxnT,
+    OperationTxnT, Pristine, PristineError, PristineResult, ReadTxn, TreeTxnT, VaultEntry,
+    VaultEntryMeta, VaultEntryType, VaultManifest, VaultMutTxnT, VaultTxnT, VertexExt, ViewState,
+    ViewTxnT, WriteTxn,
 };
 
 // Re-export diff types
@@ -84,9 +99,10 @@ pub use record::{
 
 // Re-export apply types
 pub use apply::{
-    compute_new_state, is_change_on_view, validate_can_apply, verify_dependencies,
-    ApplyChangeResult, ApplyError, ApplyResult, ChangeToApply, LocalApplyError, LocalApplyResult,
-    MissingContext, PendingEdge, Workspace, WorkspaceStats, Zombie,
+    compute_new_state, is_change_on_view, validate_can_apply, validate_can_apply_with_frontier,
+    verify_causal_frontier, verify_dependencies, ApplyChangeResult, ApplyError, ApplyResult,
+    ChangeToApply, LocalApplyError, LocalApplyResult, MissingContext, PendingEdge, Workspace,
+    WorkspaceStats, Zombie,
 };
 
 // Re-export output types

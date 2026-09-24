@@ -127,7 +127,7 @@ pub use options::OutputOptions;
 pub use outcome::{FileWritten, OutputOutcome};
 pub use repository::{
     collect_children, materialize_prefix, materialize_view, MaterializeError, MaterializeOptions,
-    MaterializeResult, OutputItem,
+    MaterializeResult, MaterializedEntry, OutputItem,
 };
 pub use tree::{
     build_tree_hierarchy, collect_directories, collect_files, collect_tree, TreeCollectOptions,

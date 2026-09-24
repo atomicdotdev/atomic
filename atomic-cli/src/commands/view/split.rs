@@ -39,7 +39,7 @@
 use clap::Parser;
 use clap_complete::engine::ArgValueCompleter;
 
-use atomic_core::types::Base32;
+use atomic_core::types::{Base32, WorkingCopyId};
 use atomic_repository::{Repository, SplitOptions};
 
 use crate::commands::complete::complete_view_names;
@@ -93,11 +93,14 @@ impl Command for Split {
             },
             other => CliError::Repository(other),
         })?;
+        let working_copy = repo
+            .require_working_copy_id()
+            .map_err(CliError::Repository)?;
+        let desired_view = repo
+            .desired_view_name(working_copy)
+            .map_err(CliError::Repository)?;
 
-        let from_view = self
-            .from
-            .clone()
-            .unwrap_or_else(|| repo.current_view().to_string());
+        let from_view = self.from.clone().unwrap_or(desired_view);
 
         // Resolve which changes to split: either an explicit list or --last N.
         let change_hashes = self.resolve_changes(&repo, &from_view)?;
@@ -114,7 +117,9 @@ impl Command for Split {
             materialize: !self.switch,
         };
 
-        let outcome = repo.split_view(options).map_err(CliError::Repository)?;
+        let outcome = repo
+            .split_view(working_copy, options)
+            .map_err(CliError::Repository)?;
 
         // ── Dry run: report the analysis. ──
         if outcome.was_dry_run {
@@ -189,7 +194,7 @@ impl Command for Split {
             ));
         }
 
-        self.maybe_switch(&mut repo)
+        self.maybe_switch(&mut repo, working_copy)
     }
 }
 
@@ -246,9 +251,11 @@ impl Split {
     }
 
     /// Optionally switch to the new draft view.
-    fn maybe_switch(&self, repo: &mut Repository) -> CliResult<()> {
+    fn maybe_switch(&self, repo: &mut Repository, working_copy: WorkingCopyId) -> CliResult<()> {
         if self.switch {
-            let result = repo.switch_view(&self.name).map_err(CliError::Repository)?;
+            let result = repo
+                .switch_view(working_copy, &self.name)
+                .map_err(CliError::Repository)?;
             print_success(&format!(
                 "Switched to view: {} ({} files updated)",
                 style_view(&self.name),

@@ -248,8 +248,13 @@ impl<'t> Compactor<'t> {
 
     /// Convert an `Option<Hash>` to a `HashIndex`.
     ///
-    /// - `None` → `HASH_INDEX_NONE`
+    /// - `None` (the change being built) → the legacy `HASH_INDEX_NONE` sentinel
     /// - `Some(hash)` → looked up in the dedup table
+    ///
+    /// Production writers seed index 0 with their `[0; 32]` placeholder, which
+    /// is `Hash::NONE`. Consequently `Some(Hash::NONE)` (virtual ROOT) normally
+    /// encodes as index 0. Reference meaning must be recovered through the table,
+    /// not inferred from the legacy constant names alone.
     pub(super) fn hash_to_index(&self, hash: &Option<Hash>) -> FormatResult<HashIndex> {
         match hash {
             None => Ok(HASH_INDEX_NONE),
@@ -262,8 +267,9 @@ impl<'t> Compactor<'t> {
 
     /// Convert a `HashIndex` to an `Option<Hash>`.
     ///
-    /// - `HASH_INDEX_NONE` → `None`
-    /// - Valid index → `Some(Hash)`
+    /// - `HASH_INDEX_NONE` → `None` (the change being read)
+    /// - Valid index → `Some(Hash)`, including `Some(Hash::NONE)` for a writer's
+    ///   index-0 ROOT placeholder
     pub(super) fn index_to_hash(&self, index: HashIndex) -> FormatResult<Option<Hash>> {
         if index == HASH_INDEX_NONE {
             return Ok(None);

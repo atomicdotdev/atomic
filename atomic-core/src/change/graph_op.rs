@@ -42,9 +42,11 @@
 //! };
 //! ```
 
-use super::atom::{Atom, EdgeUpdate, Insertion};
+use super::atom::{Atom, EdgeUpdate, Insertion, NewEdge};
+use super::attribute::InodeAttr;
 use super::encoding::Encoding;
 use super::local::Local;
+use crate::{EdgeFlags, GraphNode, Hash, Position};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
@@ -241,26 +243,29 @@ pub enum GraphOp<H> {
         encoding: Option<Encoding>,
     },
 
-    /// Solve a name conflict.
+    /// Solve a name conflict by retaining one claimant and tombstoning the others.
     ///
-    /// When multiple changes add files with the same name, this
-    /// resolves the conflict by choosing one version.
+    /// `name.inode` is the stable inode position of the surviving claimant and
+    /// `path` is its surviving path. Every edge in `name.edges` is an exact
+    /// `FOLDER | BLOCK` → `FOLDER | BLOCK | DELETED` transition for one losing
+    /// path-claim edge. Empty, no-op, pseudo, parent, or content-edge updates do
+    /// not satisfy this operation's contract.
     SolveNameConflict {
-        /// The resolution operation
-        /// (an empty edge list selects `inode` as the surviving path identity).
+        /// Exact losing-claim edge transitions, indexed by the surviving claimant.
         name: EdgeUpdate<H>,
-        /// Path where conflict occurred
+        /// Path retained by the surviving claimant.
         path: String,
     },
 
-    /// Reopen a solved name conflict.
+    /// Reopen a solved name conflict by restoring every losing claim.
     ///
-    /// This undoes a previous `SolveNameConflict`, allowing the
-    /// conflict to be resolved differently.
+    /// This is the exact inverse transition of [`GraphOp::SolveNameConflict`]:
+    /// `name.inode` and `path` still identify the previously selected claimant,
+    /// while every edge removes `DELETED` from a `FOLDER | BLOCK` claim edge.
     UnsolveNameConflict {
-        /// The operation to undo the resolution
+        /// Exact inverse losing-claim edge transitions.
         name: EdgeUpdate<H>,
-        /// Path where conflict is
+        /// Path of the previously selected claimant.
         path: String,
     },
 
@@ -320,6 +325,208 @@ pub enum GraphOp<H> {
         /// Inode edges to delete
         inode: EdgeUpdate<H>,
     },
+
+    /// Add a causal value to an inode attribute register.
+    ///
+    /// Attribute operations contain no graph atoms. Application appends an
+    /// immutable event associated with the containing change; causally later
+    /// values supersede observed values while concurrent values remain visible.
+    /// This variant is appended to preserve all legacy enum discriminants.
+    SetAttr {
+        /// Stable graph position of the inode being changed.
+        inode: Position<H>,
+        /// Path retained for human-readable output.
+        path: String,
+        /// Canonical attribute value.
+        value: InodeAttr,
+    },
+}
+
+impl<H: PartialEq> GraphOp<H> {
+    /// Build a name-conflict resolution from exact losing path-claim edges.
+    ///
+    /// Each tuple contains the source position, exact name vertex, and change
+    /// that introduced the alive claim edge being superseded. The constructor
+    /// fixes the transition flags and rejects an empty or malformed operation.
+    pub fn solve_name_conflict(
+        path: impl Into<String>,
+        surviving_claimant: Position<H>,
+        losing_claims: impl IntoIterator<Item = (Position<H>, GraphNode<H>, H)>,
+    ) -> Result<Self, String> {
+        Self::build_name_conflict(path, surviving_claimant, losing_claims, false)
+    }
+
+    /// Build the inverse of a name-conflict resolution.
+    ///
+    /// `introduced_by` in each tuple must identify the resolution change that
+    /// introduced the deleted claim edge currently being superseded.
+    pub fn unsolve_name_conflict(
+        path: impl Into<String>,
+        surviving_claimant: Position<H>,
+        losing_claims: impl IntoIterator<Item = (Position<H>, GraphNode<H>, H)>,
+    ) -> Result<Self, String> {
+        Self::build_name_conflict(path, surviving_claimant, losing_claims, true)
+    }
+
+    fn build_name_conflict(
+        path: impl Into<String>,
+        surviving_claimant: Position<H>,
+        losing_claims: impl IntoIterator<Item = (Position<H>, GraphNode<H>, H)>,
+        inverse: bool,
+    ) -> Result<Self, String> {
+        let alive = EdgeFlags::FOLDER | EdgeFlags::BLOCK;
+        let deleted = alive | EdgeFlags::DELETED;
+        let edges = losing_claims
+            .into_iter()
+            .map(|(from, to, introduced_by)| NewEdge {
+                previous: if inverse { deleted } else { alive },
+                flag: if inverse { alive } else { deleted },
+                from,
+                to,
+                introduced_by,
+            })
+            .collect();
+        let name = EdgeUpdate {
+            edges,
+            inode: surviving_claimant,
+        };
+        let op = if inverse {
+            GraphOp::UnsolveNameConflict {
+                name,
+                path: path.into(),
+            }
+        } else {
+            GraphOp::SolveNameConflict {
+                name,
+                path: path.into(),
+            }
+        };
+        op.validate_name_conflict()?;
+        Ok(op)
+    }
+
+    /// Validate the exact edge-transition contract for a name-conflict operation.
+    ///
+    /// Other graph-operation variants are accepted unchanged. V3 serialization
+    /// invokes stricter reference validation in addition to this structural check.
+    pub fn validate_name_conflict(&self) -> Result<(), String> {
+        let (operation, name, path, expected_previous, expected_flag) = match self {
+            GraphOp::SolveNameConflict { name, path } => {
+                let alive = EdgeFlags::FOLDER | EdgeFlags::BLOCK;
+                (
+                    "SolveNameConflict",
+                    name,
+                    path,
+                    alive,
+                    alive | EdgeFlags::DELETED,
+                )
+            }
+            GraphOp::UnsolveNameConflict { name, path } => {
+                let alive = EdgeFlags::FOLDER | EdgeFlags::BLOCK;
+                (
+                    "UnsolveNameConflict",
+                    name,
+                    path,
+                    alive | EdgeFlags::DELETED,
+                    alive,
+                )
+            }
+            _ => return Ok(()),
+        };
+
+        if path.is_empty() {
+            return Err(format!("{operation} requires a non-empty surviving path"));
+        }
+        if name.edges.is_empty() {
+            return Err(format!(
+                "{operation} requires at least one losing name claim"
+            ));
+        }
+        for (index, edge) in name.edges.iter().enumerate() {
+            if edge.previous != expected_previous || edge.flag != expected_flag {
+                return Err(format!(
+                    "{operation} edge {index} must transition exactly from {expected_previous:?} to {expected_flag:?}, got {:?} to {:?}",
+                    edge.previous, edge.flag
+                ));
+            }
+            if edge.to.start >= edge.to.end {
+                return Err(format!(
+                    "{operation} edge {index} must target a non-empty name vertex"
+                ));
+            }
+            if name.edges[..index].contains(edge) {
+                return Err(format!(
+                    "{operation} edge {index} duplicates an earlier losing claim"
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+impl GraphOp<Option<Hash>> {
+    pub(crate) fn validate_serialized_name_conflict(&self) -> Result<(), String> {
+        if let GraphOp::SetAttr { inode, path, value } = self {
+            if path.is_empty() {
+                return Err("SetAttr requires a non-empty path".to_string());
+            }
+            if inode.change == Some(Hash::NONE) {
+                return Err("SetAttr cannot target ROOT".to_string());
+            }
+            value.validate().map_err(|error| error.to_string())?;
+        }
+        self.validate_name_conflict()?;
+        let (operation, name) = match self {
+            GraphOp::SolveNameConflict { name, .. } => ("SolveNameConflict", name),
+            GraphOp::UnsolveNameConflict { name, .. } => ("UnsolveNameConflict", name),
+            _ => return Ok(()),
+        };
+
+        validate_explicit_name_conflict_hash(
+            operation,
+            "surviving claimant",
+            name.inode.change,
+            false,
+        )?;
+        for (index, edge) in name.edges.iter().enumerate() {
+            validate_explicit_name_conflict_hash(
+                operation,
+                &format!("edge {index} source"),
+                edge.from.change,
+                true,
+            )?;
+            validate_explicit_name_conflict_hash(
+                operation,
+                &format!("edge {index} target"),
+                edge.to.change,
+                false,
+            )?;
+            validate_explicit_name_conflict_hash(
+                operation,
+                &format!("edge {index} introducer"),
+                edge.introduced_by,
+                false,
+            )?;
+        }
+        Ok(())
+    }
+}
+
+fn validate_explicit_name_conflict_hash(
+    operation: &str,
+    field: &str,
+    change: Option<Hash>,
+    allow_root: bool,
+) -> Result<(), String> {
+    match change {
+        None => Err(format!(
+            "{operation} {field} must reference an existing change, not the change being built"
+        )),
+        Some(hash) if !allow_root && hash == Hash::NONE => {
+            Err(format!("{operation} {field} cannot reference ROOT"))
+        }
+        Some(_) => Ok(()),
+    }
 }
 
 impl<H> GraphOp<H> {
@@ -334,7 +541,8 @@ impl<H> GraphOp<H> {
             | GraphOp::DirDel { path, .. }
             | GraphOp::DirUndel { path, .. }
             | GraphOp::SolveNameConflict { path, .. }
-            | GraphOp::UnsolveNameConflict { path, .. } => Some(path),
+            | GraphOp::UnsolveNameConflict { path, .. }
+            | GraphOp::SetAttr { path, .. } => Some(path),
 
             GraphOp::Edit { local, .. }
             | GraphOp::Replacement { local, .. }
@@ -386,6 +594,7 @@ impl<H> GraphOp<H> {
                 | GraphOp::FileDel { .. }
                 | GraphOp::FileUndel { .. }
                 | GraphOp::FileMove { .. }
+                | GraphOp::SetAttr { .. }
         )
     }
 
@@ -449,6 +658,7 @@ impl<H> GraphOp<H> {
             GraphOp::ResurrectZombies { .. } => "ResurrectZombies",
             GraphOp::AddRoot { .. } => "AddRoot",
             GraphOp::DelRoot { .. } => "DelRoot",
+            GraphOp::SetAttr { .. } => "SetAttr",
         }
     }
 }
@@ -480,6 +690,7 @@ impl<H: fmt::Debug> fmt::Display for GraphOp<H> {
             }
             GraphOp::AddRoot { .. } => write!(f, "AddRoot"),
             GraphOp::DelRoot { .. } => write!(f, "DelRoot"),
+            GraphOp::SetAttr { path, value, .. } => write!(f, "SetAttr: {path} {value:?}"),
         }
     }
 }
@@ -582,9 +793,12 @@ impl<'a, H> Iterator for HunkAtomIter<'a, H> {
             (GraphOp::DirDel { del, .. }, 0) => Some(AtomRef::EdgeUpdate(del)),
             (GraphOp::DirDel { .. }, _) => None,
 
-            // DirUndel: undel
+            // DirUndel: del
             (GraphOp::DirUndel { undel, .. }, 0) => Some(AtomRef::EdgeUpdate(undel)),
             (GraphOp::DirUndel { .. }, _) => None,
+
+            // Attribute events are applied outside the edge graph.
+            (GraphOp::SetAttr { .. }, _) => None,
         };
 
         if result.is_some() {
@@ -643,6 +857,7 @@ impl<H> GraphOp<H> {
             GraphOp::DirAdd { .. } => 2,
             GraphOp::DirDel { .. } => 1,
             GraphOp::DirUndel { .. } => 1,
+            GraphOp::SetAttr { .. } => 0,
         }
     }
 }
@@ -673,6 +888,15 @@ mod tests {
             edges: vec![],
             inode: test_hash_position(0),
         }
+    }
+
+    fn test_name_claim() -> (Position<Hash>, GraphNode<Hash>, Hash) {
+        let loser = Hash::of(b"loser-name");
+        (
+            Position::new(Hash::NONE, ChangePosition::ROOT),
+            GraphNode::new(loser, ChangePosition::new(10), ChangePosition::new(24)),
+            loser,
+        )
     }
 
     // GraphOp Type Tests
@@ -752,13 +976,72 @@ mod tests {
 
     #[test]
     fn test_solve_name_conflict() {
-        let graph_op: GraphOp<Hash> = GraphOp::SolveNameConflict {
-            name: test_edge_map(),
-            path: "conflicted.txt".to_string(),
-        };
+        let winner = Position::new(Hash::of(b"winner"), ChangePosition::new(7));
+        let graph_op =
+            GraphOp::solve_name_conflict("conflicted.txt", winner, [test_name_claim()]).unwrap();
 
         assert!(graph_op.is_conflict_resolution());
         assert_eq!(graph_op.path(), Some("conflicted.txt"));
+        let GraphOp::SolveNameConflict { name, .. } = graph_op else {
+            unreachable!();
+        };
+        assert_eq!(name.inode, winner);
+        assert_eq!(name.edges.len(), 1);
+        assert_eq!(name.edges[0].previous, EdgeFlags::FOLDER | EdgeFlags::BLOCK);
+        assert_eq!(
+            name.edges[0].flag,
+            EdgeFlags::FOLDER | EdgeFlags::BLOCK | EdgeFlags::DELETED
+        );
+    }
+
+    #[test]
+    fn test_unsolve_name_conflict_reverses_transition() {
+        let winner = Position::new(Hash::of(b"winner"), ChangePosition::new(7));
+        let graph_op =
+            GraphOp::unsolve_name_conflict("conflicted.txt", winner, [test_name_claim()]).unwrap();
+
+        let GraphOp::UnsolveNameConflict { name, .. } = graph_op else {
+            unreachable!();
+        };
+        assert_eq!(
+            name.edges[0].previous,
+            EdgeFlags::FOLDER | EdgeFlags::BLOCK | EdgeFlags::DELETED
+        );
+        assert_eq!(name.edges[0].flag, EdgeFlags::FOLDER | EdgeFlags::BLOCK);
+    }
+
+    #[test]
+    fn test_name_conflict_contract_rejects_empty_and_malformed_updates() {
+        let winner = Position::new(Hash::of(b"winner"), ChangePosition::new(7));
+        let empty = GraphOp::solve_name_conflict("conflicted.txt", winner, []);
+        assert!(empty
+            .unwrap_err()
+            .contains("at least one losing name claim"));
+
+        let mut malformed =
+            GraphOp::solve_name_conflict("conflicted.txt", winner, [test_name_claim()]).unwrap();
+        let GraphOp::SolveNameConflict { name, .. } = &mut malformed else {
+            unreachable!();
+        };
+        name.edges[0].previous = EdgeFlags::BLOCK;
+        let error = malformed.validate_name_conflict().unwrap_err();
+        assert!(error.contains("transition exactly"));
+    }
+
+    #[test]
+    fn test_name_conflict_contract_rejects_empty_name_vertices() {
+        let winner = Position::new(Hash::of(b"winner"), ChangePosition::new(7));
+        let loser = Hash::of(b"loser-name");
+        let result = GraphOp::solve_name_conflict(
+            "conflicted.txt",
+            winner,
+            [(
+                Position::new(Hash::NONE, ChangePosition::ROOT),
+                GraphNode::new(loser, ChangePosition::new(10), ChangePosition::new(10)),
+                loser,
+            )],
+        );
+        assert!(result.unwrap_err().contains("non-empty name vertex"));
     }
 
     #[test]

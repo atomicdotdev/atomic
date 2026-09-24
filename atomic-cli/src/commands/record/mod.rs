@@ -113,9 +113,8 @@ pub struct Record {
 
     /// Record all changes including untracked files.
     ///
-    /// This is equivalent to running `atomic add -A` before recording.
-    /// All untracked files will be added to tracking before the change
-    /// is created.
+    /// All untracked files are included in the change. Inclusion happens after
+    /// rename classification so a moved destination keeps its original inode.
     #[arg(short, long)]
     pub all: bool,
 
@@ -182,6 +181,18 @@ pub struct Record {
     /// baked into history. Use this flag when such lines are legitimate.
     #[arg(long)]
     pub allow_conflict_markers: bool,
+
+    /// Explicitly resolve the named name-conflict paths, preserving the
+    /// current working content (the "Preserve current files" decision).
+    ///
+    /// The named paths are resolved as name conflicts with an append-only
+    /// supersede of the losing claims; when the working bytes match
+    /// MULTIPLE alive claimants the surviving claimant is the canonical
+    /// TREE-bound incarnation among the byte-equal sides. Every competing
+    /// recorded incarnation's history is retained. A path whose working
+    /// bytes match NO claimant is refused (record its content first).
+    #[arg(long = "resolve-name-conflicts", value_name = "PATH")]
+    pub resolve_name_conflicts: Vec<String>,
 
     /// Maximum file size to record (in bytes).
     ///
