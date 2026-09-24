@@ -525,4 +525,23 @@ mod tests {
             "the canonical graph must not be cloned into the sandbox"
         );
     }
+
+    #[test]
+    fn a_sandbox_never_sees_its_pointer_as_untracked() {
+        let dir = tempdir().unwrap();
+        let repo = repo_with_recorded_file(&dir.path().join("repo"), "hello.txt", b"hi\n");
+        let sandbox = dir.path().join("agent-1");
+        repo.provision_sandbox(&sandbox, "dev").unwrap();
+        std::fs::write(sandbox.join("new.txt"), b"new\n").unwrap();
+        drop(repo);
+
+        let opened = Repository::open_existing(&sandbox).unwrap();
+        let status = opened.status(Default::default()).unwrap();
+        let untracked: Vec<_> = status.untracked().map(|e| e.path().to_path_buf()).collect();
+        assert_eq!(
+            untracked,
+            vec![PathBuf::from("new.txt")],
+            "the pointer can carry a credential; `record --all` must never pick it up"
+        );
+    }
 }
