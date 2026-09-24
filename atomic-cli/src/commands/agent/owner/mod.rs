@@ -3,6 +3,14 @@
 //! redb permits one writable process to open a database. This service elects
 //! that process with an OS-backed file lock and exposes a small, versioned local
 //! protocol so short-lived agent hooks never open `changes.redb` themselves.
+//!
+//! The same protocol reaches remote sandboxes over iroh (see [`remote`] and
+//! [`sandbox`]): a sandbox on another machine records provenance and reads its
+//! view through the owner of the repository it belongs to, with every request
+//! checked against its sandbox token.
+
+mod remote;
+mod sandbox;
 
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
@@ -33,6 +41,9 @@ use uuid::Uuid;
 
 use crate::commands::Command;
 use crate::error::CliResult;
+
+use self::remote::{RemotePointer, TokenRegistry};
+use self::sandbox::Caller;
 
 const PROTOCOL_VERSION: u16 = 1;
 // Local IPC only; a single oversized envelope (e.g. a huge recovered reasoning
@@ -106,6 +117,9 @@ struct ReserveArgs {
 struct RequestFrame {
     version: u16,
     request_id: String,
+    /// A remote sandbox's token; local callers send none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    token: Option<String>,
     request: OwnerRequest,
 }
 
@@ -175,6 +189,28 @@ enum OwnerRequest {
         turn_number: u32,
     },
     Shutdown,
+    /// Local only: mint a sandbox token for `view`, reachable over iroh.
+    OpenSandbox {
+        view: String,
+        #[serde(default)]
+        acting_as: Option<String>,
+        ttl_secs: i64,
+    },
+    /// Local only: extend `view`'s sandbox token.
+    RenewSandbox {
+        view: String,
+        ttl_secs: i64,
+    },
+    /// Local only: end `view`'s sandbox token now.
+    CloseSandbox {
+        view: String,
+    },
+    /// A view's tree: `MaterializeEntry` frames, then `Materialized`. A
+    /// remote caller gets its token's view; a local one names it.
+    Materialize {
+        #[serde(default)]
+        view: Option<String>,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -197,6 +233,8 @@ pub(crate) enum OwnerResponse {
         // Additive v1 capability: old clients ignore it, old owners omit it.
         #[serde(default)]
         frozen_envelope_paging: bool,
+        #[serde(default)]
+        remote_sandboxes: bool,
     },
     ProvenanceTurn {
         turn: StoredProvenanceTurn,
@@ -220,6 +258,25 @@ pub(crate) enum OwnerResponse {
     },
     ShuttingDown {
         pid: u32,
+    },
+    SandboxOpened {
+        remote: iroh::EndpointAddr,
+        view: String,
+        token: String,
+        expires: String,
+    },
+    SandboxRenewed {
+        expires: String,
+    },
+    SandboxClosed {
+        revoked: bool,
+    },
+    MaterializeEntry {
+        entry: atomic_repository::ViewEntry,
+    },
+    Materialized {
+        snapshot: atomic_repository::ViewSnapshot,
+        entries: u64,
     },
     Error {
         code: String,
@@ -784,6 +841,10 @@ fn runtime() -> anyhow::Result<tokio::runtime::Runtime> {
 
 /// Start the repository owner or reconnect when another process won election.
 pub(crate) fn start_or_reconnect(repository: &Path) -> anyhow::Result<OwnerResponse> {
+    // A remote sandbox's owner runs elsewhere; there is nothing to start.
+    if remote::find_remote_pointer(repository).is_some() {
+        return request(repository, OwnerRequest::Ping);
+    }
     if let Ok(response) = request(repository, OwnerRequest::Ping) {
         return Ok(response);
     }
@@ -860,16 +921,29 @@ where
         .map_err(|_| anyhow!("database owner client thread panicked"))?
 }
 
-/// Send one request to an already-running owner.
+/// Send one request to an already-running owner: the local one, or — in a
+/// remote sandbox — the one its pointer names, with its token.
 fn request(repository: &Path, request_body: OwnerRequest) -> anyhow::Result<OwnerResponse> {
-    let dot_dir = Repository::canonical_dot_dir(repository)?;
-    let endpoint = endpoint_name(&dot_dir);
+    let remote = remote::find_remote_pointer(repository).map(|(_, pointer)| pointer);
     let frame = RequestFrame {
         version: PROTOCOL_VERSION,
         request_id: Uuid::new_v4().to_string(),
+        token: remote.as_ref().map(|pointer| pointer.token.clone()),
         request: request_body,
     };
-    let response = runtime()?.block_on(exchange(&endpoint, &frame))?;
+    let response = match &remote {
+        Some(pointer) => runtime()?.block_on(async {
+            let mut stream = remote::BiStream::dial(pointer.remote.clone()).await?;
+            write_frame(&mut stream, &frame).await?;
+            let response = read_frame::<ResponseFrame, _>(&mut stream).await;
+            stream.close().await;
+            response
+        })?,
+        None => {
+            let dot_dir = Repository::canonical_dot_dir(repository)?;
+            runtime()?.block_on(exchange(&endpoint_name(&dot_dir), &frame))?
+        }
+    };
     if response.version != PROTOCOL_VERSION {
         return Err(anyhow!(
             "database owner protocol mismatch: client {}, server {}",
@@ -892,6 +966,98 @@ fn request(repository: &Path, request_body: OwnerRequest) -> anyhow::Result<Owne
     }
 }
 
+/// A remote sandbox, as `OpenSandbox` returns it: what goes in its pointer.
+pub(crate) struct OpenedSandbox {
+    pub(crate) pointer: serde_json::Value,
+    pub(crate) expires: String,
+}
+
+/// Open a remote sandbox of `view` on the repository at `repository`,
+/// starting its owner if needed.
+pub(crate) fn open_sandbox(
+    repository: &Path,
+    view: &str,
+    acting_as: Option<String>,
+    ttl_secs: i64,
+) -> anyhow::Result<OpenedSandbox> {
+    start_or_reconnect(repository)?;
+    match request(
+        repository,
+        OwnerRequest::OpenSandbox {
+            view: view.to_string(),
+            acting_as,
+            ttl_secs,
+        },
+    )? {
+        OwnerResponse::SandboxOpened {
+            remote,
+            view,
+            token,
+            expires,
+        } => Ok(OpenedSandbox {
+            pointer: serde_json::to_value(RemotePointer {
+                remote,
+                view,
+                token,
+            })?,
+            expires,
+        }),
+        other => Err(unexpected_response("open sandbox", other)),
+    }
+}
+
+/// Extend `view`'s sandbox token; returns the new expiry.
+pub(crate) fn renew_sandbox(
+    repository: &Path,
+    view: &str,
+    ttl_secs: i64,
+) -> anyhow::Result<String> {
+    match request(
+        repository,
+        OwnerRequest::RenewSandbox {
+            view: view.to_string(),
+            ttl_secs,
+        },
+    )? {
+        OwnerResponse::SandboxRenewed { expires } => Ok(expires),
+        other => Err(unexpected_response("renew sandbox", other)),
+    }
+}
+
+/// End `view`'s sandbox token; whether there was one.
+pub(crate) fn close_sandbox(repository: &Path, view: &str) -> anyhow::Result<bool> {
+    match request(
+        repository,
+        OwnerRequest::CloseSandbox {
+            view: view.to_string(),
+        },
+    )? {
+        OwnerResponse::SandboxClosed { revoked } => Ok(revoked),
+        other => Err(unexpected_response("close sandbox", other)),
+    }
+}
+
+/// In a remote sandbox: write its view's tree into the sandbox root.
+/// Returns the root and the number of entries written.
+pub(crate) fn materialize_remote_sandbox(start: &Path) -> anyhow::Result<(PathBuf, u64)> {
+    let (root, pointer) = remote::find_remote_pointer(start)
+        .ok_or_else(|| anyhow!("{} is not in a remote sandbox", start.display()))?;
+    let frame = RequestFrame {
+        version: PROTOCOL_VERSION,
+        request_id: Uuid::new_v4().to_string(),
+        token: Some(pointer.token.clone()),
+        request: OwnerRequest::Materialize { view: None },
+    };
+    let written = runtime()?.block_on(async {
+        let mut stream = remote::BiStream::dial(pointer.remote.clone()).await?;
+        write_frame(&mut stream, &frame).await?;
+        let written = sandbox::receive_materialized(&mut stream, &frame.request_id, &root).await;
+        stream.close().await;
+        written
+    })?;
+    Ok((root, written))
+}
+
 fn serve(repository: &Path) -> CliResult<()> {
     let dot_dir = Repository::canonical_dot_dir(repository)?;
     let owner_lock = acquire_owner_lock(&dot_dir)?;
@@ -901,7 +1067,8 @@ fn serve(repository: &Path) -> CliResult<()> {
             .with_context(|| format!("failed to open {}", store_path.display()))?,
     );
     let endpoint = endpoint_name(&dot_dir);
-    runtime()?.block_on(run_server(&endpoint, store))?;
+    let owner = OwnerState::new(store, dot_dir.clone());
+    runtime()?.block_on(run_server(&endpoint, owner))?;
     FileExt::unlock(&owner_lock).context("failed to release database-owner lock")?;
     Ok(())
 }
@@ -965,6 +1132,7 @@ fn handle_request(store: &RedbChangeStore, frame: RequestFrame) -> (ResponseFram
             OwnerResponse::Pong {
                 pid: std::process::id(),
                 frozen_envelope_paging: true,
+                remote_sandboxes: true,
             },
             false,
         ),
@@ -1298,6 +1466,17 @@ fn handle_request(store: &RedbChangeStore, frame: RequestFrame) -> (ResponseFram
             },
             true,
         ),
+        // Answered by `handle_connection`, which needs the whole owner.
+        OwnerRequest::OpenSandbox { .. }
+        | OwnerRequest::RenewSandbox { .. }
+        | OwnerRequest::CloseSandbox { .. }
+        | OwnerRequest::Materialize { .. } => (
+            OwnerResponse::Error {
+                code: "internal".to_string(),
+                message: "sandbox requests need the owner's connection handler".to_string(),
+            },
+            false,
+        ),
     };
 
     (
@@ -1310,22 +1489,119 @@ fn handle_request(store: &RedbChangeStore, frame: RequestFrame) -> (ResponseFram
     )
 }
 
+/// Everything a running owner holds.
+pub(crate) struct OwnerState {
+    store: Arc<RedbChangeStore>,
+    /// The repository root.
+    root: PathBuf,
+    dot_dir: PathBuf,
+    tokens: TokenRegistry,
+    /// Bound on the first `OpenSandbox`; accepts remote callers from then on.
+    remote: tokio::sync::OnceCell<iroh::Endpoint>,
+    shutdown: Arc<Notify>,
+}
+
+impl OwnerState {
+    fn new(store: Arc<RedbChangeStore>, dot_dir: PathBuf) -> Arc<Self> {
+        let root = dot_dir
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| dot_dir.clone());
+        Arc::new(Self {
+            store,
+            root,
+            dot_dir,
+            tokens: TokenRegistry::default(),
+            remote: tokio::sync::OnceCell::new(),
+            shutdown: Arc::new(Notify::new()),
+        })
+    }
+
+    /// The owner's iroh endpoint, bound (and accepting) on first use.
+    async fn remote_endpoint(self: &Arc<Self>) -> anyhow::Result<&iroh::Endpoint> {
+        self.remote
+            .get_or_try_init(|| async {
+                let endpoint = remote::bind(&self.dot_dir, remote::offline()).await?;
+                spawn_accept_remote(endpoint.clone(), Arc::clone(self));
+                Ok(endpoint)
+            })
+            .await
+    }
+}
+
+/// A plain function between binding and accepting: the accept loop answers
+/// `OpenSandbox`, which binds, so the two futures can't contain each other.
+fn spawn_accept_remote(endpoint: iroh::Endpoint, owner: Arc<OwnerState>) {
+    tokio::spawn(accept_remote(endpoint, owner));
+}
+
+/// Answer remote callers: each bi-stream is one request, as on the socket.
+async fn accept_remote(endpoint: iroh::Endpoint, owner: Arc<OwnerState>) {
+    while let Some(incoming) = endpoint.accept().await {
+        let owner = Arc::clone(&owner);
+        tokio::spawn(async move {
+            let Ok(connection) = incoming.await else {
+                return;
+            };
+            while let Some(stream) = remote::BiStream::accept(&connection).await {
+                let owner = Arc::clone(&owner);
+                tokio::spawn(async move {
+                    if let Err(error) = handle_connection(stream, owner, Caller::Remote).await {
+                        log::warn!("database-owner remote request failed: {error}");
+                    }
+                });
+            }
+        });
+    }
+}
+
 async fn handle_connection<S>(
     mut stream: S,
-    store: Arc<RedbChangeStore>,
-    shutdown: Arc<Notify>,
+    owner: Arc<OwnerState>,
+    caller: Caller,
 ) -> anyhow::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let request: RequestFrame = read_frame(&mut stream).await?;
-    let (response, should_shutdown) = handle_request(&store, request);
-    write_frame(&mut stream, &response).await?;
+    let respond = |request_id: String, response| ResponseFrame {
+        version: PROTOCOL_VERSION,
+        request_id,
+        response,
+    };
+    let grant = match sandbox::authorize(&owner, caller, &request) {
+        Ok(grant) => grant,
+        Err(refusal) => {
+            write_frame(&mut stream, &respond(request.request_id, *refusal)).await?;
+            stream.shutdown().await?;
+            return Ok(());
+        }
+    };
+    let mut should_shutdown = false;
+    match &request.request {
+        OwnerRequest::Materialize { .. } if request.version == PROTOCOL_VERSION => {
+            sandbox::materialize(&owner, grant, request, &mut stream).await?;
+        }
+        OwnerRequest::OpenSandbox { .. }
+        | OwnerRequest::RenewSandbox { .. }
+        | OwnerRequest::CloseSandbox { .. }
+            if request.version == PROTOCOL_VERSION =>
+        {
+            let response = sandbox::admin(&owner, request.request.clone()).await;
+            write_frame(&mut stream, &respond(request.request_id, response)).await?;
+        }
+        _ => {
+            let (response, shutdown) = handle_request(&owner.store, request);
+            sandbox::note_response(&owner.tokens, grant.as_ref(), &response.response);
+            write_frame(&mut stream, &response).await?;
+            should_shutdown = shutdown;
+        }
+    }
     stream.shutdown().await?;
     if should_shutdown {
         // `notify_one` retains a permit if the accept loop is between polls,
         // preventing a shutdown request from being acknowledged but lost.
-        shutdown.notify_one();
+        owner.shutdown.notify_one();
     }
     Ok(())
 }
@@ -1459,7 +1735,7 @@ async fn connect_owner_pipe(
 }
 
 #[cfg(unix)]
-async fn run_server(endpoint: &str, store: Arc<RedbChangeStore>) -> anyhow::Result<()> {
+async fn run_server(endpoint: &str, owner: Arc<OwnerState>) -> anyhow::Result<()> {
     use tokio::net::UnixListener;
 
     let path = Path::new(endpoint);
@@ -1469,16 +1745,15 @@ async fn run_server(endpoint: &str, store: Arc<RedbChangeStore>) -> anyhow::Resu
     }
     let listener = UnixListener::bind(path)
         .with_context(|| format!("failed to bind database owner at {endpoint}"))?;
-    let shutdown = Arc::new(Notify::new());
+    let shutdown = Arc::clone(&owner.shutdown);
 
     loop {
         tokio::select! {
             accepted = listener.accept() => {
                 let (stream, _) = accepted?;
-                let store = Arc::clone(&store);
-                let shutdown = Arc::clone(&shutdown);
+                let owner = Arc::clone(&owner);
                 tokio::spawn(async move {
-                    if let Err(error) = handle_connection(stream, store, shutdown).await {
+                    if let Err(error) = handle_connection(stream, owner, Caller::Local).await {
                         log::warn!("database-owner connection failed: {error}");
                     }
                 });
@@ -1488,6 +1763,9 @@ async fn run_server(endpoint: &str, store: Arc<RedbChangeStore>) -> anyhow::Resu
     }
 
     drop(listener);
+    if let Some(remote) = owner.remote.get() {
+        remote.close().await;
+    }
     if path.exists() {
         std::fs::remove_file(path)
             .with_context(|| format!("failed to remove endpoint {endpoint}"))?;
@@ -1496,10 +1774,10 @@ async fn run_server(endpoint: &str, store: Arc<RedbChangeStore>) -> anyhow::Resu
 }
 
 #[cfg(windows)]
-async fn run_server(endpoint: &str, store: Arc<RedbChangeStore>) -> anyhow::Result<()> {
+async fn run_server(endpoint: &str, owner: Arc<OwnerState>) -> anyhow::Result<()> {
     use tokio::net::windows::named_pipe::ServerOptions;
 
-    let shutdown = Arc::new(Notify::new());
+    let shutdown = Arc::clone(&owner.shutdown);
     let mut server = ServerOptions::new()
         .first_pipe_instance(true)
         .create(endpoint)
@@ -1515,16 +1793,18 @@ async fn run_server(endpoint: &str, store: Arc<RedbChangeStore>) -> anyhow::Resu
                     .create(endpoint)
                     .with_context(|| format!("failed to create database owner pipe {endpoint}"))?;
                 let connected = std::mem::replace(&mut server, next);
-                let store = Arc::clone(&store);
-                let shutdown = Arc::clone(&shutdown);
+                let owner = Arc::clone(&owner);
                 tokio::spawn(async move {
-                    if let Err(error) = handle_connection(connected, store, shutdown).await {
+                    if let Err(error) = handle_connection(connected, owner, Caller::Local).await {
                         log::warn!("database-owner connection failed: {error}");
                     }
                 });
             }
             () = shutdown.notified() => break,
         }
+    }
+    if let Some(remote) = owner.remote.get() {
+        remote.close().await;
     }
     Ok(())
 }
@@ -1698,6 +1978,7 @@ mod tests {
                 let request = RequestFrame {
                     version: PROTOCOL_VERSION,
                     request_id: request_id.clone(),
+                    token: None,
                     request: OwnerRequest::LoadFrozenEnvelopesPage {
                         provenance_id: turn.provenance_id.get(),
                         attempt_generation: attempt.attempt_generation,
@@ -1737,7 +2018,8 @@ mod tests {
             .contains("database-owner shutdown"));
         assert!(require_frozen_paging(OwnerResponse::Pong {
             pid: 42,
-            frozen_envelope_paging: true
+            frozen_envelope_paging: true,
+            remote_sandboxes: false,
         })
         .is_ok());
     }
@@ -1765,6 +2047,7 @@ mod tests {
                 RequestFrame {
                     version: PROTOCOL_VERSION,
                     request_id: "retry".into(),
+                    token: None,
                     request: OwnerRequest::PrepareCheckpoint {
                         provenance_id: turn.provenance_id.get(),
                         expected_generation: generation,
@@ -1812,6 +2095,7 @@ mod tests {
         let expected = RequestFrame {
             version: PROTOCOL_VERSION,
             request_id: "request-1".to_string(),
+            token: None,
             request: OwnerRequest::Ping,
         };
         let sent = expected.clone();
@@ -1845,6 +2129,7 @@ mod tests {
         let frame = RequestFrame {
             version: PROTOCOL_VERSION,
             request_id: "stale-request".to_string(),
+            token: None,
             request: OwnerRequest::AppendProvenanceEnvelopes {
                 provenance_id: running.provenance_id.get(),
                 expected_generation: running.generation,
