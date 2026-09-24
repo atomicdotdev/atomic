@@ -43,7 +43,7 @@ mod enable;
 mod explain;
 mod hooks;
 mod lifecycle;
-mod owner;
+pub(crate) mod owner;
 mod status;
 
 use clap::{Args, Subcommand};

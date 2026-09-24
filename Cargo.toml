@@ -55,6 +55,7 @@ bs58 = "0.5"
 blake3 = "1.5"
 ed25519-dalek = { version = "2.1", features = ["serde"] }
 rand = "0.8"
+iroh = "1"
 
 # Compression
 zstd = "0.13"
