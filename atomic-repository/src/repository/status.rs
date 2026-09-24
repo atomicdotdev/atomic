@@ -285,11 +285,18 @@ impl Repository {
                     // materialize uses) to ask: does this file have
                     // content from this view's perspective?  If not, the
                     // deletion is already recorded.
+                    //
+                    // Only a graph that holds the file can say so: a remote
+                    // sandbox's cache has its tree before any of its graph,
+                    // and there no vertex means "ask", not "deleted".
                     if has_graph {
                         if let Some(inode_val) = inode {
                             if let Ok(Some(position)) = txn.inode_position(inode_val) {
                                 if let Some(ref ids) = current_view_change_ids {
-                                    if !is_file_alive_via_retrieval(&txn, inode_val, position, ids)
+                                    if txn.has_vertex(position.inode_node()).unwrap_or(false)
+                                        && !is_file_alive_via_retrieval(
+                                            &txn, inode_val, position, ids,
+                                        )
                                     {
                                         // Deletion already recorded — skip
                                         found_on_disk.insert(path.clone());
