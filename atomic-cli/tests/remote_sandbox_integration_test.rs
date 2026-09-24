@@ -177,6 +177,64 @@ fn a_remote_sandbox_reaches_its_view_through_the_owner_and_nothing_else() {
     assert!(refused.contains("unauthorized"), "{refused}");
     std::fs::write(&pointer_path, serde_json::to_vec(&pointer).unwrap()).unwrap();
 
+    // Recording in the sandbox: its cache computes the change, the owner
+    // checks it and applies it to the view.
+    std::fs::write(vm_dir.join("README.md"), "hello\nfrom the sandbox\n").unwrap();
+    std::fs::write(vm_dir.join("src/new.rs"), "pub fn n() {}\n").unwrap();
+    ok(
+        atomic(&vm_dir, &["record", "-a", "-m", "from the sandbox"]),
+        "record in the sandbox",
+    );
+    let status = ok(atomic(&vm_dir, &["status"]), "status after record");
+    assert!(status.contains("working tree clean"), "{status}");
+    std::fs::write(vm_dir.join("src/new.rs"), "pub fn n() { 2 }\n").unwrap();
+    ok(
+        atomic(&vm_dir, &["record", "-a", "-m", "again from the sandbox"]),
+        "second record in the sandbox",
+    );
+    let log = ok(atomic(host.path(), &["log"]), "host log");
+    assert!(
+        log.contains("from the sandbox") && log.contains("again from the sandbox"),
+        "{log}"
+    );
+
+    // A second sandbox of the view sees the first one's work.
+    let other = vm.path().join("other");
+    ok(
+        atomic(
+            host.path(),
+            &[
+                "sandbox",
+                "create",
+                "exp-2",
+                "--remote",
+                "--view",
+                "dev",
+                "--dest",
+                other.to_str().unwrap(),
+            ],
+        ),
+        "second sandbox",
+    );
+    ok(
+        atomic(&other, &["sandbox", "materialize"]),
+        "materialize the second",
+    );
+    assert_eq!(
+        std::fs::read_to_string(other.join("README.md")).unwrap(),
+        "hello\nfrom the sandbox\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(other.join("src/new.rs")).unwrap(),
+        "pub fn n() { 2 }\n"
+    );
+    // (Minting for the same view replaced the first sandbox's token.)
+    std::fs::write(
+        &pointer_path,
+        std::fs::read(other.join(".atomic-sandbox")).unwrap(),
+    )
+    .unwrap();
+
     // Renewal keeps the same token; closing ends it.
     let out = ok(
         atomic(host.path(), &["sandbox", "renew", "dev", "--ttl", "600"]),

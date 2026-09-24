@@ -211,6 +211,38 @@ enum OwnerRequest {
         #[serde(default)]
         view: Option<String>,
     },
+    /// The repository's rows (and content) `record` reads for `inodes` —
+    /// what a sandbox's cache loads before recording.
+    FileStates {
+        #[serde(default)]
+        view: Option<String>,
+        inodes: Vec<u64>,
+    },
+    /// A change a sandbox recorded against `base_state`, as its V3 bytes.
+    SubmitChange {
+        #[serde(default)]
+        view: Option<String>,
+        base_state: String,
+        hash: Hash,
+        #[serde(with = "base64_bytes")]
+        bytes: Vec<u8>,
+    },
+}
+
+/// Bytes as base64 in the JSON frames.
+mod base64_bytes {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub(super) fn serialize<S: Serializer>(bytes: &[u8], s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&data_encoding::BASE64.encode(bytes))
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
+        let s = String::deserialize(d)?;
+        data_encoding::BASE64
+            .decode(s.as_bytes())
+            .map_err(serde::de::Error::custom)
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -277,6 +309,19 @@ pub(crate) enum OwnerResponse {
     Materialized {
         snapshot: atomic_repository::ViewSnapshot,
         entries: u64,
+        /// The view's rows, for the sandbox's cache.
+        skeleton: Box<atomic_repository::SandboxSkeleton>,
+    },
+    FileStates {
+        slice: Box<atomic_repository::SandboxSlice>,
+    },
+    ChangeSubmitted {
+        submitted: atomic_repository::Submitted,
+        /// The view's rows now, for the sandbox's cache.
+        skeleton: Box<atomic_repository::SandboxSkeleton>,
+    },
+    ChangeRefused {
+        rejection: atomic_repository::SubmitRejection,
     },
     Error {
         code: String,
@@ -1037,8 +1082,8 @@ pub(crate) fn close_sandbox(repository: &Path, view: &str) -> anyhow::Result<boo
     }
 }
 
-/// In a remote sandbox: write its view's tree into the sandbox root.
-/// Returns the root and the number of entries written.
+/// In a remote sandbox: write its view's tree into the sandbox root and
+/// make its cache. Returns the root and the number of entries written.
 pub(crate) fn materialize_remote_sandbox(start: &Path) -> anyhow::Result<(PathBuf, u64)> {
     let (root, pointer) = remote::find_remote_pointer(start)
         .ok_or_else(|| anyhow!("{} is not in a remote sandbox", start.display()))?;
@@ -1055,7 +1100,49 @@ pub(crate) fn materialize_remote_sandbox(start: &Path) -> anyhow::Result<(PathBu
         stream.close().await;
         written
     })?;
+    let (written, skeleton) = written;
+    Repository::create_remote_sandbox_cache(&root, &skeleton)?;
     Ok((root, written))
+}
+
+/// In a remote sandbox: load what `record` will read into its cache.
+pub(crate) fn hydrate_remote_sandbox(repo: &Repository) -> anyhow::Result<()> {
+    let inodes = repo.sandbox_slice_inodes()?;
+    match request(repo.root(), OwnerRequest::FileStates { view: None, inodes })? {
+        OwnerResponse::FileStates { slice } => Ok(repo.import_sandbox_slice(&slice)?),
+        other => Err(unexpected_response("file states", other)),
+    }
+}
+
+/// In a remote sandbox: hand a recorded change to the repository's owner.
+/// On success the cache takes the view as it now is.
+pub(crate) fn submit_from_remote_sandbox(
+    repo: &Repository,
+    hash: Hash,
+    bytes: Vec<u8>,
+) -> anyhow::Result<atomic_repository::Submitted> {
+    let base_state = repo.remote_sandbox_view_state()?;
+    match request(
+        repo.root(),
+        OwnerRequest::SubmitChange {
+            view: None,
+            base_state,
+            hash,
+            bytes,
+        },
+    )? {
+        OwnerResponse::ChangeSubmitted {
+            submitted,
+            skeleton,
+        } => {
+            repo.import_sandbox_skeleton(&skeleton)?;
+            Ok(submitted)
+        }
+        OwnerResponse::ChangeRefused { rejection } => {
+            Err(anyhow!("the repository refused the change: {rejection}"))
+        }
+        other => Err(unexpected_response("submit change", other)),
+    }
 }
 
 fn serve(repository: &Path) -> CliResult<()> {
@@ -1470,7 +1557,9 @@ fn handle_request(store: &RedbChangeStore, frame: RequestFrame) -> (ResponseFram
         OwnerRequest::OpenSandbox { .. }
         | OwnerRequest::RenewSandbox { .. }
         | OwnerRequest::CloseSandbox { .. }
-        | OwnerRequest::Materialize { .. } => (
+        | OwnerRequest::Materialize { .. }
+        | OwnerRequest::FileStates { .. }
+        | OwnerRequest::SubmitChange { .. } => (
             OwnerResponse::Error {
                 code: "internal".to_string(),
                 message: "sandbox requests need the owner's connection handler".to_string(),
@@ -1498,6 +1587,9 @@ pub(crate) struct OwnerState {
     tokens: TokenRegistry,
     /// Bound on the first `OpenSandbox`; accepts remote callers from then on.
     remote: tokio::sync::OnceCell<iroh::Endpoint>,
+    /// Submitted changes go in one at a time: each is checked against the
+    /// view's state as it is when it's applied.
+    submissions: tokio::sync::Mutex<()>,
     shutdown: Arc<Notify>,
 }
 
@@ -1513,6 +1605,7 @@ impl OwnerState {
             dot_dir,
             tokens: TokenRegistry::default(),
             remote: tokio::sync::OnceCell::new(),
+            submissions: tokio::sync::Mutex::new(()),
             shutdown: Arc::new(Notify::new()),
         })
     }
@@ -1589,6 +1682,13 @@ where
         {
             let response = sandbox::admin(&owner, request.request.clone()).await;
             write_frame(&mut stream, &respond(request.request_id, response)).await?;
+        }
+        OwnerRequest::FileStates { .. } | OwnerRequest::SubmitChange { .. }
+            if request.version == PROTOCOL_VERSION =>
+        {
+            let request_id = request.request_id.clone();
+            let response = sandbox::record_request(&owner, grant, request.request).await;
+            write_frame(&mut stream, &respond(request_id, response)).await?;
         }
         _ => {
             let (response, shutdown) = handle_request(&owner.store, request);

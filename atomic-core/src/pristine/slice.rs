@@ -429,6 +429,18 @@ impl WriteTxn<'_> {
     /// allocated itself (at or above [`LOCAL_INODE_FLOOR`]); add its ids.
     pub fn import_skeleton(&mut self, slice: &GraphSlice) -> PristineResult<()> {
         let local = |inode: u64| inode >= LOCAL_INODE_FLOOR;
+        // A path the cache added itself that the repository now has (its
+        // change landed) is the repository's inode from here on.
+        let arrived: std::collections::HashSet<&str> =
+            slice.tree.iter().map(|(path, _)| path.as_str()).collect();
+        let mut superseded = BTreeSet::new();
+        for row in self.txn.open_table(REV_TREE)?.iter()? {
+            let (inode, path) = row?;
+            if local(inode.value()) && arrived.contains(path.value()) {
+                superseded.insert(inode.value());
+            }
+        }
+        let local = |inode: u64| local(inode) && !superseded.contains(&inode);
         {
             let mut tree = self.txn.open_table(TREE)?;
             tree.retain(|_, inode| local(inode))?;
