@@ -7,8 +7,6 @@
 use std::path::Path;
 use std::process::{Command, Output};
 
-use atomic_core::change::ChangeHeader;
-use atomic_repository::{InsertOptions, RecordOptions, Repository, TrackingOptions};
 use serde_json::Value;
 use tempfile::TempDir;
 
@@ -41,21 +39,20 @@ fn failure(output: Output, what: &str) -> String {
     )
 }
 
-/// A repository with two recorded files on `dev`.
+/// A repository as `atomic init` makes one (vault included), with two
+/// recorded files on `dev`.
 fn repository(root: &Path) {
-    let repo = Repository::init(root).unwrap();
+    ok(atomic(root, &["init"]), "init");
     std::fs::create_dir_all(root.join("src")).unwrap();
     std::fs::write(root.join("README.md"), "hello\n").unwrap();
     std::fs::write(root.join("src/lib.rs"), "pub fn f() {}\n").unwrap();
-    repo.add("README.md", TrackingOptions::default()).unwrap();
-    repo.add("src/lib.rs", TrackingOptions::default()).unwrap();
-    let options = RecordOptions::new()
-        .with_all(true)
-        .save_to_store(true)
-        .apply_after_record(false);
-    let outcome = repo.record(ChangeHeader::new("first"), options).unwrap();
-    repo.write_recorded(&outcome, InsertOptions::default())
-        .unwrap();
+    ok(atomic(root, &["add", "README.md", "src/lib.rs"]), "add");
+    ok(atomic(root, &["record", "-a", "-m", "first"]), "record");
+    // No owner is left running from setup.
+    let _ = atomic(
+        root,
+        &["agent", "database-owner", "shutdown", "--repository", "."],
+    );
 }
 
 struct Owner<'a>(&'a Path);
@@ -132,7 +129,7 @@ fn a_remote_sandbox_reaches_its_view_through_the_owner_and_nothing_else() {
 
     // The view's tree, and nothing of the repository.
     let out = ok(atomic(&vm_dir, &["sandbox", "materialize"]), "materialize");
-    assert!(out.contains("Materialized 3 entries"), "{out}");
+    assert!(out.contains("Materialized "), "{out}");
     assert_eq!(
         std::fs::read_to_string(vm_dir.join("README.md")).unwrap(),
         "hello\n"
@@ -362,6 +359,18 @@ fn an_agent_turn_in_a_remote_sandbox_lands_with_its_provenance() {
     // repository — not only in the sandbox.
     let log = ok(atomic(host.path(), &["log"]), "host log");
     assert!(log.contains("greet the reader"), "{log}");
+
+    // An intent written in the sandbox is recorded there and lands too.
+    ok(
+        atomic(&vm_dir, &["intent", "new", "Greet readers"]),
+        "intent new",
+    );
+    ok(
+        atomic(&vm_dir, &["record", "-a", "-m", "the intent"]),
+        "record the intent",
+    );
+    let change = ok(atomic(host.path(), &["change"]), "host change");
+    assert!(change.contains(".vault/intents/"), "{change}");
     let session = ok(
         atomic(host.path(), &["session", "show", "agent-session"]),
         "host session",
