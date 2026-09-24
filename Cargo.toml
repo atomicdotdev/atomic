@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "atomic-agent",
     "atomic-canonical",
+    "atomic-canonical-wasm",
     "atomic-cli",
     "atomic-core",
     "atomic-config",
