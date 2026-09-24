@@ -1054,7 +1054,21 @@ impl Repository {
     /// dependencies, derived session tables, immutable `SESSION_TURNS` append,
     /// manifest, and `SESSION_HEADS` advance then commit in one pristine
     /// transaction. Repeating the exact publication is idempotent.
+    ///
+    /// In a remote sandbox the checkpoint is published in its repository,
+    /// through the owner; the result is the repository's.
     pub fn publish_provenance_checkpoint(
+        &self,
+        graph: &atomic_core::change::ProvenanceGraph,
+        turn: atomic_core::change::session::SessionTurn,
+    ) -> Result<atomic_core::change::session::SessionCheckpointPublication, RepositoryError> {
+        if self.is_remote_sandbox() {
+            return self.publish_remote_provenance_checkpoint(graph, turn);
+        }
+        self.publish_local_provenance_checkpoint(graph, turn)
+    }
+
+    pub(crate) fn publish_local_provenance_checkpoint(
         &self,
         graph: &atomic_core::change::ProvenanceGraph,
         mut turn: atomic_core::change::session::SessionTurn,

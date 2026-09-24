@@ -8,6 +8,7 @@
 //! for what the rows are and why they are copied rather than re-derived.
 
 use std::collections::BTreeSet;
+use std::path::Path;
 
 use atomic_core::change::ChangeStore as _;
 use atomic_core::pristine::slice::{GraphSlice, ViewSnapshotRows};
@@ -94,6 +95,52 @@ fn forbidden_path(path: &str) -> bool {
     path.split('/').any(|part| {
         part == crate::DOT_DIR || part == super::SANDBOX_POINTER || part == super::SANDBOX_CACHE_DIR
     })
+}
+
+/// How a remote sandbox's cache reaches its repository's owner. The
+/// transport lives with whoever runs the process (the `atomic` CLI installs
+/// one at startup); with it installed, `record`, `write_recorded` and the
+/// readers below work in a remote sandbox for every caller.
+pub trait RemoteSandboxLink: Send + Sync {
+    /// `FileStates`: the rows and content for `inodes`.
+    fn file_states(&self, root: &Path, inodes: Vec<u64>) -> Result<SandboxSlice, String>;
+    /// `SubmitChange`: the change recorded against `base_state`; the view's
+    /// skeleton after it lands.
+    fn submit(
+        &self,
+        root: &Path,
+        base_state: String,
+        hash: Hash,
+        bytes: Vec<u8>,
+    ) -> Result<Result<(Submitted, SandboxSkeleton), SubmitRejection>, String>;
+    /// `Changes`: change files the view has.
+    fn changes(&self, root: &Path, hashes: Vec<Hash>) -> Result<Vec<ChangeFile>, String>;
+    /// `PublishProvenance`: a checkpoint's provenance graph (serialized) and
+    /// session turn, published in the repository.
+    fn publish_provenance(
+        &self,
+        root: &Path,
+        graph: Vec<u8>,
+        turn: atomic_core::change::session::SessionTurn,
+    ) -> Result<
+        Result<atomic_core::change::session::SessionCheckpointPublication, SubmitRejection>,
+        String,
+    >;
+}
+
+static LINK: std::sync::OnceLock<Box<dyn RemoteSandboxLink>> = std::sync::OnceLock::new();
+
+/// Install the process's link to remote sandbox owners (once).
+pub fn set_remote_sandbox_link(link: Box<dyn RemoteSandboxLink>) {
+    let _ = LINK.set(link);
+}
+
+fn link() -> Result<&'static dyn RemoteSandboxLink, RepositoryError> {
+    LINK.get()
+        .map(|l| l.as_ref())
+        .ok_or_else(|| RepositoryError::InvalidOperation {
+            message: "this process can't reach a remote sandbox's owner".to_string(),
+        })
 }
 
 fn db(e: impl std::fmt::Display) -> RepositoryError {
@@ -362,6 +409,124 @@ impl Repository {
             self.save_change_bytes(hash, bytes, &change)?;
         }
         Ok(())
+    }
+
+    /// In a remote sandbox: load what reading or recording the working
+    /// tree needs from the owner (see [`Repository::sandbox_slice_inodes`]).
+    /// Elsewhere, nothing.
+    pub fn hydrate_remote_sandbox(&self) -> Result<(), RepositoryError> {
+        if !self.is_remote_sandbox() {
+            return Ok(());
+        }
+        let inodes = self.sandbox_slice_inodes()?;
+        let slice = link()?
+            .file_states(&self.root, inodes)
+            .map_err(|message| RepositoryError::InvalidOperation { message })?;
+        self.import_sandbox_slice(&slice)
+    }
+
+    /// In a remote sandbox: fetch the change files the view has and the
+    /// cache lacks. Returns how many. Elsewhere, nothing.
+    pub fn fetch_remote_sandbox_changes(&self) -> Result<usize, RepositoryError> {
+        if !self.is_remote_sandbox() {
+            return Ok(0);
+        }
+        let missing = self.missing_sandbox_changes()?;
+        for batch in missing.chunks(32) {
+            let changes = link()?
+                .changes(&self.root, batch.to_vec())
+                .map_err(|message| RepositoryError::InvalidOperation { message })?;
+            self.hold_sandbox_changes(&changes)?;
+        }
+        Ok(missing.len())
+    }
+
+    /// In a remote sandbox, publishing a checkpoint means publishing it in
+    /// the repository.
+    pub(crate) fn publish_remote_provenance_checkpoint(
+        &self,
+        graph: &atomic_core::change::ProvenanceGraph,
+        turn: atomic_core::change::session::SessionTurn,
+    ) -> Result<atomic_core::change::session::SessionCheckpointPublication, RepositoryError> {
+        let bytes = graph
+            .serialize()
+            .map_err(|e| RepositoryError::Serialization(e.to_string()))?;
+        link()?
+            .publish_provenance(&self.root, bytes, turn)
+            .map_err(|message| RepositoryError::InvalidOperation { message })?
+            .map_err(|rejection| {
+                RepositoryError::Apply(format!(
+                    "the repository refused the provenance: {rejection}"
+                ))
+            })
+    }
+
+    /// In a remote sandbox, what applying a recorded change means: hand it
+    /// to the owner, and take the view as it is once it lands.
+    pub(crate) fn submit_recorded(
+        &self,
+        outcome: &crate::record::RecordOutcome,
+    ) -> Result<crate::InsertOutcome, RepositoryError> {
+        let bytes = outcome
+            .v3_bytes()
+            .ok_or_else(|| RepositoryError::Apply("the change has no bytes".to_string()))?
+            .to_vec();
+        let base_state = self.remote_sandbox_view_state()?;
+        let (submitted, skeleton) = link()?
+            .submit(&self.root, base_state, *outcome.hash(), bytes)
+            .map_err(|message| RepositoryError::InvalidOperation { message })?
+            .map_err(|rejection| {
+                RepositoryError::Apply(format!("the repository refused the change: {rejection}"))
+            })?;
+        self.import_sandbox_skeleton(&skeleton)?;
+        let state =
+            <Hash as atomic_core::types::Base32>::from_base32(submitted.state.as_bytes())
+                .ok_or_else(|| RepositoryError::Apply("the owner sent a bad state".to_string()))?;
+        let mut stats = crate::InsertStats::new();
+        stats.changes_applied = 1;
+        stats.applied_hashes.push(submitted.hash);
+        Ok(crate::InsertOutcome::new(
+            state,
+            skeleton.view.change_count,
+            false,
+            stats,
+        ))
+    }
+
+    /// Serve side: publish a remote sandbox's checkpoint — if everything its
+    /// provenance explains is on `view`. The graph arrives serialized, so
+    /// what is published is exactly what the sandbox hashed.
+    pub fn publish_sandbox_provenance(
+        &self,
+        view: &str,
+        graph: &[u8],
+        turn: atomic_core::change::session::SessionTurn,
+    ) -> Result<
+        Result<atomic_core::change::session::SessionCheckpointPublication, SubmitRejection>,
+        RepositoryError,
+    > {
+        use atomic_core::types::Base32;
+        let (graph, _) = match atomic_core::change::ProvenanceGraph::deserialize(graph) {
+            Ok(parsed) => parsed,
+            Err(e) => return Ok(Err(SubmitRejection::Malformed(e.to_string()))),
+        };
+        {
+            let txn = self.pristine.read_txn().map_err(db)?;
+            let state =
+                txn.get_view(view)
+                    .map_err(db)?
+                    .ok_or_else(|| RepositoryError::ViewNotFound {
+                        name: view.to_string(),
+                    })?;
+            let visible = super::collect_visible_change_ids(&txn, &state)?;
+            for change in &graph.changes_explained {
+                match txn.get_internal(change).map_err(db)? {
+                    Some(id) if visible.contains(&id) => {}
+                    _ => return Ok(Err(SubmitRejection::ForeignChange(change.to_base32()))),
+                }
+            }
+        }
+        Ok(Ok(self.publish_local_provenance_checkpoint(&graph, turn)?))
     }
 
     /// Cache side: the view's state as the cache has it (base32) — what a

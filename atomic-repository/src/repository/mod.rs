@@ -81,7 +81,10 @@ mod filter;
 mod materialize;
 pub use materialize::{ViewEntry, ViewEntryKind, ViewSnapshot};
 mod remote_cache;
-pub use remote_cache::{SandboxSkeleton, SandboxSlice, SpanBytes, SubmitRejection, Submitted};
+pub use remote_cache::{
+    set_remote_sandbox_link, ChangeFile, RemoteSandboxLink, SandboxSkeleton, SandboxSlice,
+    SpanBytes, SubmitRejection, Submitted,
+};
 mod sandbox;
 mod semantic_materialize;
 mod split;

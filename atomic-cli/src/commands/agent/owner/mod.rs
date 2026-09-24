@@ -224,6 +224,14 @@ enum OwnerRequest {
         view: Option<String>,
         hashes: Vec<Hash>,
     },
+    /// A sandbox's checkpoint: its provenance graph (serialized) and turn.
+    PublishProvenance {
+        #[serde(default)]
+        view: Option<String>,
+        #[serde(with = "base64_bytes")]
+        graph: Vec<u8>,
+        turn: SessionTurn,
+    },
     /// A change a sandbox recorded against `base_state`, as its V3 bytes.
     SubmitChange {
         #[serde(default)]
@@ -339,6 +347,9 @@ pub(crate) enum OwnerResponse {
     },
     Changes {
         changes: Vec<WireChange>,
+    },
+    ProvenancePublished {
+        publication: atomic_core::change::session::SessionCheckpointPublication,
     },
     Error {
         code: String,
@@ -1122,68 +1133,98 @@ pub(crate) fn materialize_remote_sandbox(start: &Path) -> anyhow::Result<(PathBu
     Ok((root, written))
 }
 
-/// In a remote sandbox: load what `record` will read into its cache.
-pub(crate) fn hydrate_remote_sandbox(repo: &Repository) -> anyhow::Result<()> {
-    let inodes = repo.sandbox_slice_inodes()?;
-    match request(repo.root(), OwnerRequest::FileStates { view: None, inodes })? {
-        OwnerResponse::FileStates { slice } => Ok(repo.import_sandbox_slice(&slice)?),
-        other => Err(unexpected_response("file states", other)),
-    }
+/// The owner protocol as a remote sandbox's link to its repository's owner:
+/// what lets `Repository` record, diff, restore and read history in a
+/// remote sandbox, whoever calls it.
+pub(crate) struct OwnerLink;
+
+/// One owner request from a remote sandbox, on its own thread: callers
+/// (an agent's turn hooks, say) may already be inside a runtime.
+fn link_request(root: &Path, body: OwnerRequest) -> Result<OwnerResponse, String> {
+    let root = root.to_path_buf();
+    run_outside_async_runtime(move || request(&root, body)).map_err(|e| format!("{e:#}"))
 }
 
-/// In a remote sandbox: fetch the change files its view has and it
-/// doesn't (for `log` and anything else that reads changes).
-pub(crate) fn fetch_remote_sandbox_changes(repo: &Repository) -> anyhow::Result<usize> {
-    let missing = repo.missing_sandbox_changes()?;
-    for batch in missing.chunks(32) {
-        match request(
-            repo.root(),
-            OwnerRequest::Changes {
-                view: None,
-                hashes: batch.to_vec(),
-            },
-        )? {
-            OwnerResponse::Changes { changes } => {
-                let changes: Vec<_> = changes.into_iter().map(|c| (c.hash, c.bytes)).collect();
-                repo.hold_sandbox_changes(&changes)?;
-            }
-            OwnerResponse::ChangeRefused { rejection } => {
-                return Err(anyhow!("the repository refused: {rejection}"))
-            }
-            other => return Err(unexpected_response("changes", other)),
+impl atomic_repository::RemoteSandboxLink for OwnerLink {
+    fn file_states(
+        &self,
+        root: &Path,
+        inodes: Vec<u64>,
+    ) -> Result<atomic_repository::SandboxSlice, String> {
+        match link_request(root, OwnerRequest::FileStates { view: None, inodes })? {
+            OwnerResponse::FileStates { slice } => Ok(*slice),
+            other => Err(unexpected_response("file states", other).to_string()),
         }
     }
-    Ok(missing.len())
-}
 
-/// In a remote sandbox: hand a recorded change to the repository's owner.
-/// On success the cache takes the view as it now is.
-pub(crate) fn submit_from_remote_sandbox(
-    repo: &Repository,
-    hash: Hash,
-    bytes: Vec<u8>,
-) -> anyhow::Result<atomic_repository::Submitted> {
-    let base_state = repo.remote_sandbox_view_state()?;
-    match request(
-        repo.root(),
-        OwnerRequest::SubmitChange {
+    fn submit(
+        &self,
+        root: &Path,
+        base_state: String,
+        hash: Hash,
+        bytes: Vec<u8>,
+    ) -> Result<
+        Result<
+            (
+                atomic_repository::Submitted,
+                atomic_repository::SandboxSkeleton,
+            ),
+            atomic_repository::SubmitRejection,
+        >,
+        String,
+    > {
+        let body = OwnerRequest::SubmitChange {
             view: None,
             base_state,
             hash,
             bytes,
-        },
-    )? {
-        OwnerResponse::ChangeSubmitted {
-            submitted,
-            skeleton,
-        } => {
-            repo.import_sandbox_skeleton(&skeleton)?;
-            Ok(submitted)
+        };
+        match link_request(root, body)? {
+            OwnerResponse::ChangeSubmitted {
+                submitted,
+                skeleton,
+            } => Ok(Ok((submitted, *skeleton))),
+            OwnerResponse::ChangeRefused { rejection } => Ok(Err(rejection)),
+            other => Err(unexpected_response("submit change", other).to_string()),
         }
-        OwnerResponse::ChangeRefused { rejection } => {
-            Err(anyhow!("the repository refused the change: {rejection}"))
+    }
+
+    fn changes(
+        &self,
+        root: &Path,
+        hashes: Vec<Hash>,
+    ) -> Result<Vec<atomic_repository::ChangeFile>, String> {
+        match link_request(root, OwnerRequest::Changes { view: None, hashes })? {
+            OwnerResponse::Changes { changes } => {
+                Ok(changes.into_iter().map(|c| (c.hash, c.bytes)).collect())
+            }
+            OwnerResponse::ChangeRefused { rejection } => Err(rejection.to_string()),
+            other => Err(unexpected_response("changes", other).to_string()),
         }
-        other => Err(unexpected_response("submit change", other)),
+    }
+
+    fn publish_provenance(
+        &self,
+        root: &Path,
+        graph: Vec<u8>,
+        turn: SessionTurn,
+    ) -> Result<
+        Result<
+            atomic_core::change::session::SessionCheckpointPublication,
+            atomic_repository::SubmitRejection,
+        >,
+        String,
+    > {
+        let body = OwnerRequest::PublishProvenance {
+            view: None,
+            graph,
+            turn,
+        };
+        match link_request(root, body)? {
+            OwnerResponse::ProvenancePublished { publication } => Ok(Ok(publication)),
+            OwnerResponse::ChangeRefused { rejection } => Ok(Err(rejection)),
+            other => Err(unexpected_response("publish provenance", other).to_string()),
+        }
     }
 }
 
@@ -1602,6 +1643,7 @@ fn handle_request(store: &RedbChangeStore, frame: RequestFrame) -> (ResponseFram
         | OwnerRequest::Materialize { .. }
         | OwnerRequest::FileStates { .. }
         | OwnerRequest::Changes { .. }
+        | OwnerRequest::PublishProvenance { .. }
         | OwnerRequest::SubmitChange { .. } => (
             OwnerResponse::Error {
                 code: "internal".to_string(),
@@ -1728,6 +1770,7 @@ where
         }
         OwnerRequest::FileStates { .. }
         | OwnerRequest::Changes { .. }
+        | OwnerRequest::PublishProvenance { .. }
         | OwnerRequest::SubmitChange { .. }
             if request.version == PROTOCOL_VERSION =>
         {

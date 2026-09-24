@@ -57,6 +57,10 @@ impl Repository {
         // Build the final header (may get message from options)
         let final_header = build_header(header, &options);
 
+        // A remote sandbox's cache takes the rows it is about to read.
+        self.hydrate_remote_sandbox()
+            .map_err(RecordError::Repository)?;
+
         // Get repository status to find modified files
         let status_t0 = std::time::Instant::now();
         let mut status_options = StatusOptions::default();
@@ -1173,6 +1177,9 @@ impl Repository {
                         }
                     }
                 }
+                // A remote sandbox's change that didn't land isn't recorded
+                // anywhere: that is a failure, not a warning.
+                Err(e) if self.is_remote_sandbox() => return Err(RecordError::Repository(e)),
                 Err(e) => {
                     outcome.add_error("apply".to_string(), e.to_string());
                 }

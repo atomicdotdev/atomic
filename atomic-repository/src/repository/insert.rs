@@ -2154,6 +2154,9 @@ impl Repository {
         outcome: &RecordOutcome,
         mut options: InsertOptions,
     ) -> Result<InsertOutcome, RepositoryError> {
+        if self.is_remote_sandbox() {
+            return self.submit_recorded(outcome);
+        }
         let trace_record = std::env::var_os("ATOMIC_TRACE_RECORD").is_some();
         let change = outcome.change();
         let hash = outcome.hash();

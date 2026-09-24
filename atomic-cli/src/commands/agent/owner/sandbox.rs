@@ -77,6 +77,16 @@ pub(crate) fn authorize(
                 return Err(forbidden("that view"));
             }
         }
+        OwnerRequest::PublishProvenance {
+            view: asked, turn, ..
+        } => {
+            if asked.as_deref().is_some_and(|v| v != view) {
+                return Err(forbidden("that view"));
+            }
+            if !tokens.owns_session(view, &turn.session_id) {
+                return Err(forbidden("that session"));
+            }
+        }
         OwnerRequest::ReserveProvenanceTurn {
             session_id,
             turn_number,
@@ -106,21 +116,38 @@ pub(crate) fn authorize(
             }
             require_on_view(&owner.root, view, &source.change_hashes)?;
         }
-        OwnerRequest::BindCheckpointHash {
-            provenance_id,
-            hash,
-            ..
-        } => {
+        OwnerRequest::BindCheckpointHash { provenance_id, .. } => {
+            // Its hash names the checkpoint's provenance graph, not a change;
+            // the changes it explains were checked at PrepareCheckpoint.
             if !tokens.owns_provenance(view, *provenance_id) {
                 return Err(forbidden("that provenance turn"));
             }
-            require_on_view(&owner.root, view, std::slice::from_ref(hash))?;
         }
-        OwnerRequest::StopTurn { session_id, .. }
-        | OwnerRequest::ResumeTurn { session_id, .. }
-        | OwnerRequest::AbandonTurn { session_id, .. }
-        | OwnerRequest::TurnStatus { session_id, .. } => {
-            if !tokens.owns_session(view, session_id) {
+        OwnerRequest::StopTurn {
+            session_id,
+            turn_number,
+            ..
+        }
+        | OwnerRequest::ResumeTurn {
+            session_id,
+            turn_number,
+            ..
+        }
+        | OwnerRequest::AbandonTurn {
+            session_id,
+            turn_number,
+            ..
+        }
+        | OwnerRequest::TurnStatus {
+            session_id,
+            turn_number,
+        } => {
+            // Asking after a session nobody has written to is harmless (the
+            // store answers "no such turn"); anyone else's is not.
+            if !tokens.owns_session(view, session_id)
+                && !session_is_fresh(&owner.store, session_id, *turn_number)
+                    .map_err(|e| refuse("provenance-store", e.to_string()))?
+            {
                 return Err(forbidden("that session"));
             }
         }
@@ -310,6 +337,7 @@ pub(crate) async fn record_request(
     let named = match &request {
         OwnerRequest::FileStates { view, .. }
         | OwnerRequest::Changes { view, .. }
+        | OwnerRequest::PublishProvenance { view, .. }
         | OwnerRequest::SubmitChange { view, .. } => view.clone(),
         _ => None,
     };
@@ -345,6 +373,20 @@ pub(crate) async fn record_request(
                 },
                 Ok(Ok(Err(rejection))) => OwnerResponse::ChangeRefused { rejection },
                 Ok(Err(e)) => error("changes", format!("{e:#}")),
+                Err(e) => error("internal", e.to_string()),
+            }
+        }
+        OwnerRequest::PublishProvenance { graph, turn, .. } => {
+            let _one_at_a_time = owner.submissions.lock().await;
+            let write = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+                let repo =
+                    Repository::open_existing_wait(&root, std::time::Duration::from_secs(30))?;
+                Ok(repo.publish_sandbox_provenance(&view, &graph, turn)?)
+            });
+            match write.await {
+                Ok(Ok(Ok(publication))) => OwnerResponse::ProvenancePublished { publication },
+                Ok(Ok(Err(rejection))) => OwnerResponse::ChangeRefused { rejection },
+                Ok(Err(e)) => error("provenance", format!("{e:#}")),
                 Err(e) => error("internal", e.to_string()),
             }
         }
