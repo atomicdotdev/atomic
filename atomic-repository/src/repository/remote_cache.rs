@@ -162,12 +162,12 @@ impl Repository {
         Ok(ids)
     }
 
-    /// Serve side: `view`'s skeleton, for the inodes `live` (the ones its
-    /// materialized tree holds).
+    /// Serve side: `view`'s skeleton, with `live` its rendered tree (inode →
+    /// path, as [`Repository::materialize_view_entries`] gives them).
     pub fn export_sandbox_skeleton(
         &self,
         view: &str,
-        live: &BTreeSet<u64>,
+        live: &std::collections::BTreeMap<u64, String>,
     ) -> Result<SandboxSkeleton, RepositoryError> {
         let txn = self.pristine.read_txn().map_err(db)?;
         let state =
@@ -491,6 +491,48 @@ impl Repository {
             false,
             stats,
         ))
+    }
+
+    /// Serve side, once a sandbox's change `hash` has landed on `view`: the
+    /// view's skeleton for the sandbox's cache, and — as a pull does for the
+    /// files it writes — the vault files the change touched, indexed into
+    /// the repository's (repository-wide) vault. One render of the view
+    /// serves both.
+    pub fn after_sandbox_submit(
+        &self,
+        view: &str,
+        hash: &Hash,
+    ) -> Result<SandboxSkeleton, RepositoryError> {
+        let change = self.load_change(hash)?;
+        let vault_paths: BTreeSet<String> = change
+            .hunks()
+            .iter()
+            .filter_map(|h| h.path())
+            .chain(change.file_ops().iter().map(|ops| ops.path()))
+            .filter(|p| p.starts_with(".vault/") && p.ends_with(".md"))
+            .map(str::to_string)
+            .collect();
+        let mut live = std::collections::BTreeMap::new();
+        let mut files = std::collections::BTreeMap::new();
+        self.materialize_view_entries::<()>(view, |entry| {
+            live.insert(entry.inode, entry.path.clone());
+            if vault_paths.contains(&entry.path) {
+                files.insert(
+                    entry.path,
+                    String::from_utf8_lossy(&entry.content).into_owned(),
+                );
+            }
+            Ok(())
+        })?
+        .map_err(|()| RepositoryError::Output("unreachable".to_string()))?;
+        if !vault_paths.is_empty() && self.has_vault()? {
+            let rows: Vec<(String, Option<String>)> = vault_paths
+                .iter()
+                .map(|p| (p[".vault/".len()..].to_string(), files.remove(p)))
+                .collect();
+            self.vault_record_files(&rows)?;
+        }
+        self.export_sandbox_skeleton(view, &live)
     }
 
     /// Serve side: publish a remote sandbox's checkpoint — if everything its

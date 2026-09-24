@@ -6,7 +6,7 @@
 //! produces — which carries the repository's internal ids — must be byte for
 //! byte the change `record` produces on the repository itself.
 
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 
@@ -74,7 +74,7 @@ impl Pair {
 
     /// Ship the slice for what `record` will touch, as FileStates does:
     /// only the inodes the cache asks for.
-    fn hydrate(&self, view: &str, live: &BTreeSet<u64>) {
+    fn hydrate(&self, view: &str, live: &BTreeMap<u64, String>) {
         let inodes = self.cache.sandbox_slice_inodes().unwrap();
         assert!(
             inodes.len() < live.len(),
@@ -86,7 +86,7 @@ impl Pair {
 }
 
 /// A host repository with some history, and a cache materialized from it.
-fn pair(history: impl Fn(&Repository)) -> (Pair, String, BTreeSet<u64>) {
+fn pair(history: impl Fn(&Repository)) -> (Pair, String, BTreeMap<u64, String>) {
     let host_dir = TempDir::new().unwrap();
     let cache_dir = TempDir::new().unwrap();
     let host = Repository::init(host_dir.path()).unwrap();
@@ -96,9 +96,9 @@ fn pair(history: impl Fn(&Repository)) -> (Pair, String, BTreeSet<u64>) {
     // Materialize: the view's files into the cache's working tree, and the
     // inodes they are.
     let cache = Repository::init(cache_dir.path()).unwrap();
-    let mut live = BTreeSet::new();
+    let mut live = BTreeMap::new();
     host.materialize_view_entries::<()>(&view, |entry| {
-        live.insert(entry.inode);
+        live.insert(entry.inode, entry.path.clone());
         let path = cache_dir.path().join(&entry.path);
         match entry.kind {
             atomic_repository::ViewEntryKind::Directory => fs::create_dir_all(path).unwrap(),
@@ -126,7 +126,7 @@ fn pair(history: impl Fn(&Repository)) -> (Pair, String, BTreeSet<u64>) {
     )
 }
 
-fn assert_parity(pair: &Pair, view: &str, live: &BTreeSet<u64>, what: &str) {
+fn assert_parity(pair: &Pair, view: &str, live: &BTreeMap<u64, String>, what: &str) {
     pair.hydrate(view, live);
     let h = header(what);
     let host = change_bytes(&pair.host, h.clone());
@@ -257,7 +257,7 @@ use atomic_repository::SubmitRejection;
 
 fn view_state(repo: &Repository, view: &str) -> String {
     let skeleton = repo
-        .export_sandbox_skeleton(view, &BTreeSet::new())
+        .export_sandbox_skeleton(view, &BTreeMap::new())
         .unwrap();
     atomic_core::types::Base32::to_base32(&skeleton.view.state)
 }
@@ -266,7 +266,7 @@ fn view_state(repo: &Repository, view: &str) -> String {
 fn record_in_cache(
     pair: &Pair,
     view: &str,
-    live: &BTreeSet<u64>,
+    live: &BTreeMap<u64, String>,
     what: &str,
 ) -> (atomic_core::types::Hash, Vec<u8>) {
     pair.hydrate(view, live);
@@ -336,7 +336,7 @@ fn a_submitted_change_lands_on_the_view_and_the_next_one_builds_on_it() {
     live.clear();
     pair.host
         .materialize_view_entries::<()>(&view, |e| {
-            live.insert(e.inode);
+            live.insert(e.inode, e.path.clone());
             Ok(())
         })
         .unwrap()
@@ -437,4 +437,173 @@ fn a_change_from_another_view_is_refused() {
         "{refused:?}"
     );
     assert_eq!(view_state(&host, "dev"), base);
+}
+
+#[test]
+fn a_change_submitted_to_a_draft_view_is_on_that_view() {
+    // Expeditions work on draft views: what lands on one renders there.
+    let (pair, _, _) = pair(two_files);
+    let mut host = pair.host;
+    host.create_view_from("exp", "dev").unwrap();
+    let cache_dir = TempDir::new().unwrap();
+    drop(Repository::init(cache_dir.path()).unwrap());
+    // As a remote sandbox's cache is opened: on its pointer's view.
+    let cache = Repository::open_sandbox(cache_dir.path(), cache_dir.path(), "exp").unwrap();
+    let mut live = BTreeMap::new();
+    host.materialize_view_entries::<()>("exp", |entry| {
+        live.insert(entry.inode, entry.path.clone());
+        let path = cache_dir.path().join(&entry.path);
+        match entry.kind {
+            atomic_repository::ViewEntryKind::Directory => fs::create_dir_all(path).unwrap(),
+            _ => {
+                fs::create_dir_all(path.parent().unwrap()).unwrap();
+                fs::write(path, &entry.content).unwrap();
+            }
+        }
+        Ok(())
+    })
+    .unwrap()
+    .unwrap();
+    cache
+        .import_sandbox_skeleton(&host.export_sandbox_skeleton("exp", &live).unwrap())
+        .unwrap();
+    cache.reindex_working_copy().unwrap();
+    write(cache_dir.path(), "src/new.rs", "pub fn n() {}\n");
+    write(cache_dir.path(), "README.md", "hello\non the draft\n");
+    cache.add("src/new.rs", TrackingOptions::default()).unwrap();
+    let inodes = cache.sandbox_slice_inodes().unwrap();
+    cache
+        .import_sandbox_slice(&host.export_sandbox_slice("exp", &inodes).unwrap())
+        .unwrap();
+    let options = RecordOptions::new()
+        .with_all(true)
+        .save_to_store(false)
+        .apply_after_record(false);
+    let outcome = cache.record(header("on the draft"), options).unwrap();
+    let base = view_state(&host, "exp");
+    host.insert_submitted_change("exp", &base, outcome.hash(), outcome.v3_bytes().unwrap())
+        .unwrap()
+        .expect("accepted");
+
+    let tree = tree_of(&host, "exp");
+    assert!(
+        tree.contains(&("README.md".into(), b"hello\non the draft\n".to_vec())),
+        "{tree:?}"
+    );
+    assert!(
+        tree.contains(&("src/new.rs".into(), b"pub fn n() {}\n".to_vec())),
+        "{tree:?}"
+    );
+    assert!(
+        !tree_of(&host, "dev").iter().any(|(p, _)| p == "src/new.rs"),
+        "only on the draft"
+    );
+
+    // The next record builds on it: the refreshed skeleton knows the new file.
+    let skeleton = host.after_sandbox_submit("exp", outcome.hash()).unwrap();
+    cache.import_sandbox_skeleton(&skeleton).unwrap();
+    cache.reindex_working_copy().unwrap();
+    write(cache_dir.path(), "src/new.rs", "pub fn n() { 2 }\n");
+    let inodes = cache.sandbox_slice_inodes().unwrap();
+    cache
+        .import_sandbox_slice(&host.export_sandbox_slice("exp", &inodes).unwrap())
+        .unwrap();
+    let options = RecordOptions::new()
+        .with_all(true)
+        .save_to_store(false)
+        .apply_after_record(false);
+    let second = cache.record(header("again on the draft"), options).unwrap();
+    let (change, _) =
+        atomic_core::change::Change::deserialize(&mut &second.v3_bytes().unwrap()[..]).unwrap();
+    assert!(
+        !change
+            .hunks()
+            .iter()
+            .any(|h| matches!(h, atomic_core::change::GraphOp::FileAdd { .. })),
+        "an edit, not a second add"
+    );
+    host.insert_submitted_change(
+        "exp",
+        &view_state(&host, "exp"),
+        second.hash(),
+        second.v3_bytes().unwrap(),
+    )
+    .unwrap()
+    .expect("accepted");
+    assert!(tree_of(&host, "exp").contains(&("src/new.rs".into(), b"pub fn n() { 2 }\n".to_vec())));
+}
+
+#[test]
+fn control_a_local_sandbox_record_on_a_draft_renders_on_it() {
+    let host_dir = TempDir::new().unwrap();
+    let work = TempDir::new().unwrap();
+    {
+        let mut host = Repository::init(host_dir.path()).unwrap();
+        two_files(&host);
+        host.create_view_from("exp", "dev").unwrap();
+        host.provision_sandbox(work.path().join("w"), "exp")
+            .unwrap();
+    }
+    let sbx = Repository::open_existing(work.path().join("w")).unwrap();
+    write(sbx.root(), "README.md", "hello\non the draft\n");
+    record_and_apply(&sbx, "on the draft");
+    drop(sbx);
+    let host = Repository::open_existing(host_dir.path()).unwrap();
+    let tree = tree_of(&host, "exp");
+    assert!(
+        tree.contains(&("README.md".into(), b"hello\non the draft\n".to_vec())),
+        "{tree:?}"
+    );
+}
+
+#[test]
+fn parity_on_a_draft_view() {
+    let host_dir = TempDir::new().unwrap();
+    let work = TempDir::new().unwrap();
+    {
+        let mut host = Repository::init(host_dir.path()).unwrap();
+        two_files(&host);
+        host.create_view_from("exp", "dev").unwrap();
+        host.provision_sandbox(work.path().join("w"), "exp")
+            .unwrap();
+    }
+    // The cache, from the draft.
+    let cache_dir = TempDir::new().unwrap();
+    drop(Repository::init(cache_dir.path()).unwrap());
+    let cache = Repository::open_sandbox(cache_dir.path(), cache_dir.path(), "exp").unwrap();
+    let skeleton = {
+        let host = Repository::open_existing(host_dir.path()).unwrap();
+        let mut live = BTreeMap::new();
+        host.materialize_view_entries::<()>("exp", |entry| {
+            live.insert(entry.inode, entry.path.clone());
+            let path = cache_dir.path().join(&entry.path);
+            if entry.kind != atomic_repository::ViewEntryKind::Directory {
+                fs::create_dir_all(path.parent().unwrap()).unwrap();
+                fs::write(path, &entry.content).unwrap();
+            }
+            Ok(())
+        })
+        .unwrap()
+        .unwrap();
+        host.export_sandbox_skeleton("exp", &live).unwrap()
+    };
+    cache.import_sandbox_skeleton(&skeleton).unwrap();
+    cache.reindex_working_copy().unwrap();
+
+    let sbx = Repository::open_existing(work.path().join("w")).unwrap();
+    write(sbx.root(), "README.md", "hello\non the draft\n");
+    write(cache_dir.path(), "README.md", "hello\non the draft\n");
+    let h = header("on the draft");
+    let local = change_bytes(&sbx, h.clone());
+    drop(sbx);
+    let host = Repository::open_existing(host_dir.path()).unwrap();
+    let inodes = cache.sandbox_slice_inodes().unwrap();
+    cache
+        .import_sandbox_slice(&host.export_sandbox_slice("exp", &inodes).unwrap())
+        .unwrap();
+    let remote = change_bytes(&cache, h);
+    assert_eq!(
+        local.0, remote.0,
+        "the cache records a different change on a draft"
+    );
 }

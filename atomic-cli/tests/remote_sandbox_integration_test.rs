@@ -312,7 +312,8 @@ fn an_agent_turn_in_a_remote_sandbox_lands_with_its_provenance() {
                 "create",
                 "exp-1",
                 "--remote",
-                "--view",
+                // As basecamp runs an expedition: its own draft view, off dev.
+                "--from",
                 "dev",
                 "--dest",
                 vm_dir.to_str().unwrap(),
@@ -357,8 +358,16 @@ fn an_agent_turn_in_a_remote_sandbox_lands_with_its_provenance() {
 
     // The turn's change is on the view, and its provenance is in the
     // repository — not only in the sandbox.
-    let log = ok(atomic(host.path(), &["log"]), "host log");
+    let log = ok(
+        atomic(host.path(), &["log", "--view", "exp-1"]),
+        "host log of the draft",
+    );
     assert!(log.contains("greet the reader"), "{log}");
+    let dev = ok(atomic(host.path(), &["log"]), "host log of dev");
+    assert!(
+        !dev.contains("greet the reader"),
+        "only on the expedition's view: {dev}"
+    );
 
     // An intent written in the sandbox is recorded there and lands too.
     ok(
@@ -369,8 +378,9 @@ fn an_agent_turn_in_a_remote_sandbox_lands_with_its_provenance() {
         atomic(&vm_dir, &["record", "-a", "-m", "the intent"]),
         "record the intent",
     );
-    let change = ok(atomic(host.path(), &["change"]), "host change");
-    assert!(change.contains(".vault/intents/"), "{change}");
+    // ...and the repository's vault knows it, as it would after a pull.
+    let intents = ok(atomic(host.path(), &["intent", "list"]), "host intent list");
+    assert!(intents.contains("backlog"), "{intents}");
     let session = ok(
         atomic(host.path(), &["session", "show", "agent-session"]),
         "host session",
