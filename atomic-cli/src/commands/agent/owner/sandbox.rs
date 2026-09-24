@@ -296,12 +296,14 @@ where
     let (tx, mut rx) = tokio::sync::mpsc::channel::<OwnerResponse>(64);
     let root = owner.root.clone();
     let render = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-        let repo = Repository::open_readonly(&root)?;
+        // Writable: listing a view other than the checked-out one projects its
+        // tree in a transaction that is thrown away.
+        let repo = Repository::open_existing_wait(&root, std::time::Duration::from_secs(30))?;
         let mut entries = 0u64;
-        let mut live = std::collections::BTreeSet::new();
+        let mut live = std::collections::BTreeMap::new();
         let rendered = repo.materialize_view_entries(&view, |entry| {
             entries += 1;
-            live.insert(entry.inode);
+            live.insert(entry.inode, entry.path.clone());
             tx.blocking_send(OwnerResponse::MaterializeEntry { entry })
                 .map_err(|_| ())
         })?;
@@ -402,8 +404,7 @@ pub(crate) async fn record_request(
                     Repository::open_existing_wait(&root, std::time::Duration::from_secs(30))?;
                 match repo.insert_submitted_change(&view, &base_state, &hash, &bytes)? {
                     Ok(submitted) => {
-                        let skeleton =
-                            repo.export_sandbox_skeleton(&view, &live_inodes(&repo, &view)?)?;
+                        let skeleton = repo.after_sandbox_submit(&view, &submitted.hash)?;
                         Ok(Ok((submitted, skeleton)))
                     }
                     Err(rejection) => Ok(Err(rejection)),
@@ -421,17 +422,6 @@ pub(crate) async fn record_request(
         }
         other => error("internal", format!("not a record request: {other:?}")),
     }
-}
-
-/// The inodes `view`'s tree holds.
-fn live_inodes(repo: &Repository, view: &str) -> anyhow::Result<std::collections::BTreeSet<u64>> {
-    let mut live = std::collections::BTreeSet::new();
-    repo.materialize_view_entries::<()>(view, |entry| {
-        live.insert(entry.inode);
-        Ok(())
-    })?
-    .map_err(|()| anyhow::anyhow!("unreachable"))?;
-    Ok(live)
 }
 
 /// Client side of `Materialize`: write the view's tree into `dir` and return

@@ -7,8 +7,9 @@
 //! exactly the rows the repository has. A slice is those rows, byte for byte:
 //!
 //! - the **skeleton** ([`ReadTxn::export_skeleton`]): the view's tree —
-//!   paths, inodes and their positions, directories — and the id tables for
-//!   every change the view can see. Enough for `status` with no graph at all.
+//!   paths (as the view renders them), inodes and their positions,
+//!   directories — and the id tables for every change the view can see.
+//!   Enough for `status` with no graph at all.
 //! - a **graph slice** ([`ReadTxn::export_graph_slice`]): for a set of
 //!   inodes, the GRAPH / INODE_GRAPH rows of each file's content and of its
 //!   name chain up to the root, one hop of neighbours (so `find_block` finds
@@ -139,14 +140,15 @@ enum Reach {
 }
 
 impl ReadTxn {
-    /// The view's tree and ids: TREE for the `live` inodes (the paths the
-    /// view actually has), REV_TREE / INODES / DIRECTORIES for every inode
-    /// whose position a visible change introduced, and the id rows for every
-    /// visible change.
+    /// The view's tree and ids. `live` is the view's tree as rendered —
+    /// every path it has and the inode there, which is what TREE would hold
+    /// with the view checked out (TREE itself is the checked-out view's).
+    /// REV_TREE / INODES / DIRECTORIES come for every inode whose position a
+    /// visible change introduced, and the id rows for every visible change.
     pub fn export_skeleton(
         &self,
         visible: &BTreeSet<u64>,
-        live: &BTreeSet<u64>,
+        live: &BTreeMap<u64, String>,
     ) -> PristineResult<GraphSlice> {
         let mut out = GraphSlice::default();
         let inodes = self.txn.open_table(INODES)?;
@@ -159,20 +161,23 @@ impl ReadTxn {
                 out.inodes.push((k.value(), *v.value()));
             }
         }
-        let rev_tree = self.txn.open_table(REV_TREE)?;
-        for row in rev_tree.iter()? {
+        let mut rev_tree: BTreeMap<u64, String> = BTreeMap::new();
+        for row in self.txn.open_table(REV_TREE)?.iter()? {
             let (k, v) = row?;
             if kept.contains(&k.value()) {
-                out.rev_tree.push((k.value(), v.value().to_string()));
+                rev_tree.insert(k.value(), v.value().to_string());
             }
         }
-        let tree = self.txn.open_table(TREE)?;
-        for row in tree.iter()? {
-            let (k, v) = row?;
-            if live.contains(&v.value()) && kept.contains(&v.value()) {
-                out.tree.push((k.value().to_string(), v.value()));
-            }
+        // Implicit directories render with no inode of their own (0): only
+        // what the repository tracks goes in the tree.
+        for (inode, path) in live
+            .iter()
+            .filter(|(inode, _)| **inode != 0 && kept.contains(inode))
+        {
+            rev_tree.insert(*inode, path.clone());
+            out.tree.push((path.clone(), *inode));
         }
+        out.rev_tree = rev_tree.into_iter().collect();
         let directories = self.txn.open_table(DIRECTORIES)?;
         for row in directories.iter()? {
             let (k, v) = row?;
