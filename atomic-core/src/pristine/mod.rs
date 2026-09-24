@@ -150,6 +150,7 @@
 mod error;
 mod inode_graph;
 pub mod ontology;
+pub mod slice;
 pub(crate) mod span_index;
 pub mod tables;
 mod traits;

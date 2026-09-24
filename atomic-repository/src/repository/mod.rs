@@ -80,6 +80,8 @@ mod deferred_tree;
 mod filter;
 mod materialize;
 pub use materialize::{ViewEntry, ViewEntryKind, ViewSnapshot};
+mod remote_cache;
+pub use remote_cache::{SandboxSkeleton, SandboxSlice, SpanBytes};
 mod sandbox;
 mod semantic_materialize;
 mod split;
