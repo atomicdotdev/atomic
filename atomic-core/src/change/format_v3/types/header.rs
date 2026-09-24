@@ -56,10 +56,8 @@ impl FileHeaderFlags {
     pub const HAS_SIGNATURE: u32 = 1 << 3;
 
     /// Mask of all known flags (for validation).
-    const KNOWN_MASK: u32 = Self::HAS_PROVENANCE
-        | Self::HAS_SEMANTIC
-        | Self::HAS_UNHASHED
-        | Self::HAS_SIGNATURE;
+    const KNOWN_MASK: u32 =
+        Self::HAS_PROVENANCE | Self::HAS_SEMANTIC | Self::HAS_UNHASHED | Self::HAS_SIGNATURE;
 
     /// Create flags from a raw `u32` value.
     ///

@@ -194,7 +194,9 @@ mod tests {
         let sig = sign_change("did:atomic:attacker", &seed, &hash, 0);
 
         // Verify against a DIFFERENT (victim's) key — the forge scenario.
-        let victim_key = SigningKey::from_bytes(&other_seed).verifying_key().to_bytes();
+        let victim_key = SigningKey::from_bytes(&other_seed)
+            .verifying_key()
+            .to_bytes();
 
         let err = verify_change_signature(&sig, &victim_key, &hash).unwrap_err();
         assert!(matches!(
@@ -211,12 +213,7 @@ mod tests {
         let hash = Hash::of(b"content");
         let raw_sig = signing_key.sign(hash.as_bytes()).to_bytes();
 
-        let sig = ChangeSignature::new(
-            "did:atomic:x",
-            raw_sig,
-            *hash.as_bytes(),
-            0,
-        );
+        let sig = ChangeSignature::new("did:atomic:x", raw_sig, *hash.as_bytes(), 0);
         let public = signing_key.verifying_key().to_bytes();
         let err = verify_change_signature(&sig, &public, &hash).unwrap_err();
         assert!(matches!(

@@ -57,17 +57,16 @@ fn signing_identity(name: &str) -> (SigningIdentity, [u8; 32]) {
     )
 }
 
-fn record_signed(
-    repo: &Repository,
-    message: &str,
-    signing: &SigningIdentity,
-) -> (Hash, Change) {
+fn record_signed(repo: &Repository, message: &str, signing: &SigningIdentity) -> (Hash, Change) {
     let header = ChangeHeader::builder()
         .message(message)
         .author(Author::new("Test", Some("test@example.com")))
         .build();
     let outcome = repo
-        .record(header, RecordOptions::default().with_signing_identity(signing.clone()))
+        .record(
+            header,
+            RecordOptions::default().with_signing_identity(signing.clone()),
+        )
         .expect("record");
     let hash = *outcome.hash();
     let change = repo.load_change(&hash).expect("load change");
@@ -82,7 +81,7 @@ fn record_signed(
 fn signed_record_verifies_against_public_key() {
     let temp = TempDir::new().unwrap();
     let repo_path = temp.path().to_path_buf();
-    let mut repo = Repository::init(&repo_path).expect("init");
+    let repo = Repository::init(&repo_path).expect("init");
 
     add_file(&repo, &repo_path, "signed.txt", "signed content\n");
     let (signing, public) = signing_identity("alice");
@@ -132,7 +131,7 @@ fn signature_does_not_change_change_hash() {
     // and re-signing with a DIFFERENT key must also yield the same hash.
     let temp = TempDir::new().unwrap();
     let repo_path = temp.path().to_path_buf();
-    let mut repo = Repository::init(&repo_path).expect("init");
+    let repo = Repository::init(&repo_path).expect("init");
 
     add_file(&repo, &repo_path, "h.txt", "hash stability\n");
     let (signing_alice, _alice_public) = signing_identity("alice-signing");
@@ -171,8 +170,16 @@ fn forge_with_attacker_key_fails_against_victim_key() {
     // An attacker signs content with THEIR key and claims to be the victim
     // (their DID is embedded in the signature). Verification against the
     // victim's known public key must FAIL.
-    let attacker = ed25519_dalek::SigningKey::from_bytes(b"attacker-attacker-attacker-32byte!!"[..32].try_into().unwrap());
-    let victim = ed25519_dalek::SigningKey::from_bytes(b"victim--victim--victim--victim--32b!!"[..32].try_into().unwrap());
+    let attacker = ed25519_dalek::SigningKey::from_bytes(
+        b"attacker-attacker-attacker-32byte!!"[..32]
+            .try_into()
+            .unwrap(),
+    );
+    let victim = ed25519_dalek::SigningKey::from_bytes(
+        b"victim--victim--victim--victim--32b!!"[..32]
+            .try_into()
+            .unwrap(),
+    );
 
     let hash = Hash::of(b"malicious content claiming to be Aaron");
     let attacker_did = "did:atomic:ATTACKERCLAIMINGTOBEVICTIM00000000";
@@ -190,7 +197,10 @@ fn forge_with_attacker_key_fails_against_victim_key() {
     let victim_public = victim.verifying_key().to_bytes();
     let err = verify_change_signature(&forged, &victim_public, &hash).unwrap_err();
     assert!(
-        matches!(err, ChangeSignatureError::SignatureVerificationFailed { .. }),
+        matches!(
+            err,
+            ChangeSignatureError::SignatureVerificationFailed { .. }
+        ),
         "forged signature must fail against victim's key, got: {err:?}"
     );
 
@@ -215,13 +225,17 @@ fn unsigned_change_has_no_signature_and_still_works() {
     let hash = record_unsigned(&repo, "legacy unsigned change");
 
     let change = repo.load_change(&hash).expect("load unsigned change");
-    assert!(change.signature.is_none(), "unsigned change has no signature");
+    assert!(
+        change.signature.is_none(),
+        "unsigned change has no signature"
+    );
 
     // Round-trip through serialize/deserialize still works.
     let mut bytes = Vec::new();
     let re_hash = change.serialize(&mut bytes).expect("serialize");
     assert_eq!(re_hash, hash);
-    let (re_change, _) = Change::deserialize(&mut std::io::Cursor::new(&bytes)).expect("deserialize");
+    let (re_change, _) =
+        Change::deserialize(&mut std::io::Cursor::new(&bytes)).expect("deserialize");
     assert!(re_change.signature.is_none());
 }
 
@@ -248,7 +262,10 @@ fn signed_and_unsigned_changes_coexist() {
             .author(Author::new("Test", Some("test@example.com")))
             .build();
         let outcome = repo
-            .record(header, RecordOptions::default().with_signing_identity(signing.clone()))
+            .record(
+                header,
+                RecordOptions::default().with_signing_identity(signing.clone()),
+            )
             .expect("record");
         *outcome.hash()
     };
@@ -260,12 +277,8 @@ fn signed_and_unsigned_changes_coexist() {
     assert!(new_change.signature.is_some());
 
     // The signature verifies out-of-band.
-    verify_change_signature(
-        new_change.signature.as_ref().unwrap(),
-        &public,
-        &new,
-    )
-    .expect("verify signed change");
+    verify_change_signature(new_change.signature.as_ref().unwrap(), &public, &new)
+        .expect("verify signed change");
 
     // History shows both.
     let history = repo

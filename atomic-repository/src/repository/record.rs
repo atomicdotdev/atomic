@@ -1038,8 +1038,9 @@ impl Repository {
                 "SIGNATURE section must not affect the change hash"
             );
             // Round-trip the signed bytes for a clean deserialized form
-            let (final_signed, verified_hash) = Change::deserialize(&mut signed_bytes.as_slice())
-                .map_err(|e| RecordError::ChangeStore(e.to_string()))?;
+            let (final_signed, verified_hash) =
+                Change::deserialize(&mut signed_bytes.as_slice())
+                    .map_err(|e| RecordError::ChangeStore(e.to_string()))?;
             debug_assert_eq!(signed_hash, verified_hash);
             v3_bytes = signed_bytes;
             final_signed

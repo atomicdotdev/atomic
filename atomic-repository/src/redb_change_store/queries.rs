@@ -430,10 +430,9 @@ impl RedbChangeStore {
                 let sig_bytes = zstd::decode_all(compressed).map_err(|e| {
                     RedbStoreError::Corrupt(format!("signature decompression failed: {}", e))
                 })?;
-                let signature: ChangeSignature = postcard::from_bytes(&sig_bytes)
-                    .map_err(|e| {
-                        RedbStoreError::Corrupt(format!("signature deserialization failed: {}", e))
-                    })?;
+                let signature: ChangeSignature = postcard::from_bytes(&sig_bytes).map_err(|e| {
+                    RedbStoreError::Corrupt(format!("signature deserialization failed: {}", e))
+                })?;
                 writer.write_signature(&signature)?;
             }
         }

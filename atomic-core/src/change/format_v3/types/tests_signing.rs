@@ -1,4 +1,4 @@
-//! Quick roundtrip check for ChangeSignature postcard encoding.
+//! Roundtrip checks for the ChangeSignature section.
 #[cfg(test)]
 mod tests {
     use super::super::section::ChangeSignature;
@@ -14,7 +14,6 @@ mod tests {
 
 #[cfg(test)]
 mod full_change_roundtrip {
-    use crate::change::format_v3::*;
     use crate::change::format_v3::{ChangeReader, SectionType};
     use crate::change::{signing, Author, Change, ChangeHeader};
     use crate::types::Hash;
@@ -35,20 +34,21 @@ mod full_change_roundtrip {
         let re_hash = change.serialize(&mut bytes).expect("serialize");
         assert_eq!(re_hash, hash, "signature must not change hash");
 
-        // Manually walk sections to isolate the failure
+        // The SIGNATURE section survives a section-level round-trip.
+        let mut saw_signature = false;
         {
             let mut cursor = std::io::Cursor::new(&bytes);
             let mut reader = ChangeReader::open(&mut cursor).expect("open");
             while let Some(section) = reader.next_section().expect("section") {
-                println!("section: {:?} len {}", section.section_type, section.payload.len());
                 if section.section_type == SectionType::Signature {
-                    println!("sig payload hex head: {:02x?}", &section.payload[..24.min(section.payload.len())]);
                     let decoded_sig: crate::change::format_v3::ChangeSignature =
                         postcard::from_bytes(&section.payload).expect("standalone decode");
-                    println!("decoded ok: ts={}", decoded_sig.timestamp);
+                    assert_eq!(decoded_sig.timestamp, 12345);
+                    saw_signature = true;
                 }
             }
         }
+        assert!(saw_signature, "SIGNATURE section present in file");
         let (decoded, decoded_hash) =
             Change::deserialize(&mut std::io::Cursor::new(&bytes)).expect("deserialize");
         assert_eq!(decoded_hash, hash);

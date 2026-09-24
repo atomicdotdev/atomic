@@ -524,9 +524,6 @@ impl Change {
 
         while let Some(section) = change_reader.next_section()? {
             let section_type = section.section_type;
-            if std::env::var("ATOMIC_DEBUG_SECTIONS").is_ok() {
-                eprintln!("[sections] type={:?} len={}", section_type, section.payload.len());
-            }
             match section_type {
                 SectionType::Header => {
                     header = Some(section.deserialize().map_err(|error| {
@@ -583,16 +580,11 @@ impl Change {
                     unhashed = Some(serde_json::from_slice(&section.payload)?);
                 }
                 SectionType::Signature => {
-                    if std::env::var("ATOMIC_DEBUG_SECTIONS").is_ok() {
-                        eprintln!("[sig] payload head: {:02x?}", &section.payload[..24.min(section.payload.len())]);
-                    }
-                    signature = Some(
-                        postcard::from_bytes(&section.payload).map_err(|error| {
-                            ChangeError::Invalid(format!(
-                                "failed to deserialize {section_type} section: {error}"
-                            ))
-                        })?,
-                    );
+                    signature = Some(postcard::from_bytes(&section.payload).map_err(|error| {
+                        ChangeError::Invalid(format!(
+                            "failed to deserialize {section_type} section: {error}"
+                        ))
+                    })?);
                 }
             }
         }
@@ -648,12 +640,8 @@ impl Change {
         timestamp: i64,
     ) -> Result<Hash, ChangeError> {
         let hash = self.hash()?;
-        let signature = crate::change::signing::sign_change(
-            signer_did,
-            secret_key_bytes,
-            &hash,
-            timestamp,
-        );
+        let signature =
+            crate::change::signing::sign_change(signer_did, secret_key_bytes, &hash, timestamp);
         self.signature = Some(signature);
         Ok(hash)
     }
