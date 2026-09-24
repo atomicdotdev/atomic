@@ -159,6 +159,11 @@ impl Repository {
         let repo = Self::open_sandbox(working_root, &cache, &skeleton.view.name)?;
         repo.import_sandbox_skeleton(skeleton)?;
         repo.reindex_working_copy()?;
+        // The view's vault arrived as files, as after a pull: its tables
+        // come from them.
+        if repo.vault_dir().exists() {
+            repo.bootstrap_vault_from_working_copy()?;
+        }
         Ok(repo)
     }
 
