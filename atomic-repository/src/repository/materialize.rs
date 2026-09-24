@@ -545,7 +545,6 @@ impl Repository {
         use atomic_core::output::repo::{
             collect_children, FileOutputOptions, MaterializeOptions, OutputItem,
         };
-        use atomic_core::output::RetrieveOptions;
         use rayon::prelude::*;
         use std::collections::HashSet as StdHashSet;
 
@@ -725,82 +724,17 @@ impl Repository {
             .map(|item| {
                 let file_start = std::time::Instant::now();
 
-                // Build retrieve options with the shared change filter
-                let retrieve_opts =
-                    RetrieveOptions::default().with_change_filter_arc(change_filter_arc.clone());
-
-                // Inline the output pipeline so we can trace each phase.
-                use atomic_core::output::repo::{
-                    output_graph_content_resolved, resolve_conflicts_semantically,
-                };
-                use atomic_core::output::{compute_order, retrieve_graph, Writer};
-                use atomic_core::pristine::InodePreloadTxn;
-
-                // Pre-load ALL edges for this file's inode from INODE_GRAPH
-                // in a single range scan, then run retrieve_graph over the
-                // in-memory HashMap. O(M) scan + O(1) lookups vs O(V×log N)
-                // individual B-tree probes.
-                let preloaded = InodePreloadTxn::from_table(&txn, item.inode, &inode_graph_table)
-                    .map_err(|e| format!("{}: preload: {:?}", item.path, e))?;
-
-                let t_retrieve = std::time::Instant::now();
-                let retrieve_result = retrieve_graph(&preloaded, item.position, retrieve_opts)
-                    .map_err(|e| format!("{}: retrieve: {:?}", item.path, e))?;
-
-                if retrieve_result.graph.is_empty() {
-                    return Ok(None);
-                }
-
-                let vertices = retrieve_result.graph.len_vertices();
-                let edges = retrieve_result.edges_traversed;
-                let retrieve_ms = t_retrieve.elapsed();
-
-                let t_order = std::time::Instant::now();
-                let mut graph = retrieve_result.graph;
-                let order = compute_order(&mut graph);
-                let order_ms = t_order.elapsed();
-
-                let t_content = std::time::Instant::now();
-                let resolved = resolve_conflicts_semantically(&preloaded, store, &graph, &order);
-                let buffer = Vec::with_capacity(graph.total_bytes());
-                let mut writer = Writer::new(buffer);
-                let hash_fn = |node_id: NodeId| -> Option<Hash> {
-                    if node_id.is_root() {
-                        return None;
-                    }
-                    preloaded.get_external(node_id).ok().flatten()
-                };
-                output_graph_content_resolved(
+                let Some(content) = render_view_file(
+                    &txn,
                     store,
-                    hash_fn,
-                    &graph,
-                    &order,
-                    &mut writer,
-                    &resolved,
-                )
-                .map_err(|e| format!("{}: content: {:?}", item.path, e))?;
-                let content = writer.into_inner();
-                let content_ms = t_content.elapsed();
-
-                if content.is_empty() {
+                    &inode_graph_table,
+                    &change_filter_arc,
+                    &name_conflicts,
+                    item,
+                    trace_mat.then_some(file_start),
+                )?
+                else {
                     return Ok(None);
-                }
-
-                // Name-conflict override (rare): when ≥ 2 inodes are alive at
-                // this path on the view, replace the single-inode content with
-                // a marker-wrapped rendering of every side so the conflict is
-                // surfaced instead of silently collapsed (rubric A12).
-                let content = match name_conflicts.get(&item.path) {
-                    Some(sides) => render_name_conflict(
-                        &txn,
-                        store,
-                        &inode_graph_table,
-                        &change_filter_arc,
-                        &item.path,
-                        sides,
-                    )
-                    .unwrap_or(content),
-                    None => content,
                 };
 
                 // Detect conflict markers in the materialized bytes. This is
@@ -859,24 +793,6 @@ impl Repository {
                 }
                 std::fs::write(&abs_path, &content)
                     .map_err(|e| format!("{}: write: {}", item.path, e))?;
-
-                if trace_mat {
-                    let elapsed = file_start.elapsed();
-                    if elapsed > std::time::Duration::from_millis(50) {
-                        eprintln!(
-                            "[materialize] SLOW {} bytes={} vertices={} edges={} \
-                             retrieve={:?} order={:?} content={:?} total={:?}",
-                            item.path,
-                            bytes_written,
-                            vertices,
-                            edges,
-                            retrieve_ms,
-                            order_ms,
-                            content_ms,
-                            elapsed,
-                        );
-                    }
-                }
 
                 Ok(Some((
                     item.path.clone(),
@@ -1112,6 +1028,294 @@ impl Repository {
 
         Ok(result)
     }
+}
+
+/// One entry of a view's tree, rendered in memory by
+/// [`Repository::materialize_view_entries`] — enough for a client to write
+/// the working tree and a baseline index (`status` against it) without the
+/// repository.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ViewEntry {
+    pub path: String,
+    pub inode: u64,
+    pub kind: ViewEntryKind,
+    /// Unix permission bits as recorded.
+    pub mode: u16,
+    /// The file's bytes as a checkout of the view would write them (empty
+    /// for directories).
+    #[serde(with = "serde_bytes_vec")]
+    pub content: Vec<u8>,
+    /// `Hash::of(content)` — the baseline a client compares against.
+    pub hash: Hash,
+    /// 1-based line of the first conflict marker, if the file is conflicted.
+    pub conflict_marker_line: Option<u32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ViewEntryKind {
+    File,
+    Directory,
+    Symlink,
+}
+
+/// What a view looked like when it was rendered.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ViewSnapshot {
+    pub view: String,
+    /// The view's Merkle state, base32: a change recorded against this
+    /// snapshot applies only while the view is still here.
+    pub state: String,
+    pub change_count: u64,
+}
+
+mod serde_bytes_vec {
+    use serde::{Deserialize, Deserializer, Serializer};
+    pub fn serialize<S: Serializer>(v: &[u8], s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&data_encoding::BASE64.encode(v))
+    }
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
+        let s = String::deserialize(d)?;
+        data_encoding::BASE64
+            .decode(s.as_bytes())
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+impl Repository {
+    /// Render every entry of `view` and hand each to `sink`, in path order
+    /// (a directory before what it contains), touching nothing: no working
+    /// tree, no stat cache, no conflict state. Read-only, so it runs beside
+    /// other readers — this is what serves a remote sandbox its tree.
+    ///
+    /// Files are rendered with the same kernel as
+    /// [`Repository::materialize_parallel`], in parallel chunks, so memory
+    /// holds one chunk of contents at a time.
+    pub fn materialize_view_entries<E>(
+        &self,
+        view_name: &str,
+        mut sink: impl FnMut(ViewEntry) -> Result<(), E>,
+    ) -> Result<Result<ViewSnapshot, E>, RepositoryError> {
+        use atomic_core::output::repo::{collect_children, MaterializeOptions};
+        use atomic_core::types::Base32;
+        use rayon::prelude::*;
+
+        const CHUNK: usize = 256;
+
+        let txn = self
+            .pristine
+            .read_txn()
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        let view = txn
+            .get_view(view_name)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?
+            .ok_or_else(|| RepositoryError::ViewNotFound {
+                name: view_name.to_string(),
+            })?;
+        let change_filter_arc = Arc::new(collect_visible_change_ids(&txn, &view)?);
+        let options = MaterializeOptions::new().with_change_filter_arc(change_filter_arc.clone());
+        let mut items = collect_children(&txn, Inode::ROOT, "", &options)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        items.sort_by(|a, b| a.path.cmp(&b.path));
+
+        let visible = |item: &atomic_core::output::repo::OutputItem| {
+            item.position.change.is_root() || change_filter_arc.contains(&item.position.change)
+        };
+        let files: Vec<&atomic_core::output::repo::OutputItem> = items
+            .iter()
+            .filter(|i| !i.is_directory && visible(i))
+            .collect();
+        let name_conflicts = collect_name_conflicts(
+            &txn,
+            &self.change_store,
+            &files.iter().map(|i| i.path.as_str()).collect(),
+            &change_filter_arc,
+        )?;
+        for id in change_filter_arc.iter().filter(|id| !id.is_root()) {
+            if let Ok(Some(hash)) = txn.get_external(*id) {
+                let _ = self.change_store.load_change(&hash);
+            }
+        }
+        let inode_graph_table = txn
+            .open_inode_graph_table()
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+        // Directories that hold at least one visible file, before their files.
+        let file_paths: std::collections::HashSet<&str> =
+            files.iter().map(|i| i.path.as_str()).collect();
+        let mut dirs: Vec<&atomic_core::output::repo::OutputItem> = items
+            .iter()
+            .filter(|i| i.is_directory)
+            .filter(|d| {
+                let prefix = format!("{}/", d.path);
+                file_paths.iter().any(|p| p.starts_with(&prefix))
+            })
+            .collect();
+        dirs.sort_by(|a, b| a.path.cmp(&b.path));
+        for d in dirs {
+            let entry = ViewEntry {
+                path: d.path.clone(),
+                inode: d.inode.get(),
+                kind: ViewEntryKind::Directory,
+                mode: d.metadata.permissions,
+                content: Vec::new(),
+                hash: Hash::of(&[]),
+                conflict_marker_line: None,
+            };
+            if let Err(e) = sink(entry) {
+                return Ok(Err(e));
+            }
+        }
+
+        let store = &self.change_store;
+        for chunk in files.chunks(CHUNK) {
+            let rendered: Vec<Result<Option<ViewEntry>, String>> = chunk
+                .par_iter()
+                .map(|item| {
+                    let content = render_view_file(
+                        &txn,
+                        store,
+                        &inode_graph_table,
+                        &change_filter_arc,
+                        &name_conflicts,
+                        item,
+                        None,
+                    )?;
+                    Ok(content.map(|content| ViewEntry {
+                        path: item.path.clone(),
+                        inode: item.inode.get(),
+                        kind: if item.metadata.is_symlink {
+                            ViewEntryKind::Symlink
+                        } else {
+                            ViewEntryKind::File
+                        },
+                        mode: item.metadata.permissions,
+                        conflict_marker_line: first_conflict_marker_line(&content),
+                        hash: Hash::of(&content),
+                        content,
+                    }))
+                })
+                .collect();
+            for r in rendered {
+                match r {
+                    Ok(Some(entry)) => {
+                        if let Err(e) = sink(entry) {
+                            return Ok(Err(e));
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(e) => return Err(RepositoryError::Output(e)),
+                }
+            }
+        }
+
+        Ok(Ok(ViewSnapshot {
+            view: view.name.clone(),
+            state: view.state.to_base32(),
+            change_count: view.change_count,
+        }))
+    }
+}
+
+/// Render one file of a view in memory: retrieve its graph under the view's
+/// change filter, order it, resolve conflicts, and write the bytes a
+/// checkout would produce — with a name conflict rendered as markers. The
+/// one rendering kernel behind [`Repository::materialize_parallel`] (which
+/// writes the result to disk) and [`Repository::materialize_view_entries`]
+/// (which hands it to a caller, touching nothing). `Ok(None)`: the file has
+/// no content on this view.
+fn render_view_file<C: atomic_core::change::ChangeStore>(
+    txn: &atomic_core::pristine::ReadTxn,
+    store: &C,
+    inode_graph_table: &redb::ReadOnlyMultimapTable<&'static [u8; 32], &'static [u8; 24]>,
+    change_filter_arc: &Arc<std::collections::HashSet<NodeId>>,
+    name_conflicts: &NameConflicts,
+    item: &atomic_core::output::repo::OutputItem,
+    trace_from: Option<std::time::Instant>,
+) -> Result<Option<Vec<u8>>, String> {
+    use atomic_core::output::RetrieveOptions;
+    // Build retrieve options with the shared change filter
+    let retrieve_opts =
+        RetrieveOptions::default().with_change_filter_arc(change_filter_arc.clone());
+
+    // Inline the output pipeline so we can trace each phase.
+    use atomic_core::output::repo::{
+        output_graph_content_resolved, resolve_conflicts_semantically,
+    };
+    use atomic_core::output::{compute_order, retrieve_graph, Writer};
+    use atomic_core::pristine::InodePreloadTxn;
+
+    // Pre-load ALL edges for this file's inode from INODE_GRAPH
+    // in a single range scan, then run retrieve_graph over the
+    // in-memory HashMap. O(M) scan + O(1) lookups vs O(V×log N)
+    // individual B-tree probes.
+    let preloaded = InodePreloadTxn::from_table(&txn, item.inode, &inode_graph_table)
+        .map_err(|e| format!("{}: preload: {:?}", item.path, e))?;
+
+    let t_retrieve = std::time::Instant::now();
+    let retrieve_result = retrieve_graph(&preloaded, item.position, retrieve_opts)
+        .map_err(|e| format!("{}: retrieve: {:?}", item.path, e))?;
+
+    if retrieve_result.graph.is_empty() {
+        return Ok(None);
+    }
+
+    let vertices = retrieve_result.graph.len_vertices();
+    let edges = retrieve_result.edges_traversed;
+    let retrieve_ms = t_retrieve.elapsed();
+
+    let t_order = std::time::Instant::now();
+    let mut graph = retrieve_result.graph;
+    let order = compute_order(&mut graph);
+    let order_ms = t_order.elapsed();
+
+    let t_content = std::time::Instant::now();
+    let resolved = resolve_conflicts_semantically(&preloaded, store, &graph, &order);
+    let buffer = Vec::with_capacity(graph.total_bytes());
+    let mut writer = Writer::new(buffer);
+    let hash_fn = |node_id: NodeId| -> Option<Hash> {
+        if node_id.is_root() {
+            return None;
+        }
+        preloaded.get_external(node_id).ok().flatten()
+    };
+    output_graph_content_resolved(store, hash_fn, &graph, &order, &mut writer, &resolved)
+        .map_err(|e| format!("{}: content: {:?}", item.path, e))?;
+    let content = writer.into_inner();
+    let content_ms = t_content.elapsed();
+
+    if content.is_empty() {
+        return Ok(None);
+    }
+
+    // Name-conflict override (rare): when ≥ 2 inodes are alive at
+    // this path on the view, replace the single-inode content with
+    // a marker-wrapped rendering of every side so the conflict is
+    // surfaced instead of silently collapsed (rubric A12).
+    let content = match name_conflicts.get(&item.path) {
+        Some(sides) => render_name_conflict(
+            &txn,
+            store,
+            &inode_graph_table,
+            &change_filter_arc,
+            &item.path,
+            sides,
+        )
+        .unwrap_or(content),
+        None => content,
+    };
+
+    if let Some(file_start) = trace_from {
+        let elapsed = file_start.elapsed();
+        if elapsed > std::time::Duration::from_millis(50) {
+            eprintln!(
+                "[materialize] SLOW {} vertices={vertices} edges={edges} retrieve={retrieve_ms:?} \
+                 order={order_ms:?} content={content_ms:?} total={elapsed:?}",
+                item.path,
+            );
+        }
+    }
+    Ok(Some(content))
 }
 
 #[cfg(test)]
