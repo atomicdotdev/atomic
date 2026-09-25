@@ -9,9 +9,11 @@ use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
 
 use clap::{Parser, Subcommand};
+use clap_complete::engine::ArgValueCompleter;
 
-use atomic_repository::Repository;
+use atomic_repository::{Repository, RepositoryError};
 
+use crate::commands::complete::complete_view_names;
 use crate::commands::{find_repository_root, Command};
 use crate::error::{CliError, CliResult};
 
@@ -20,7 +22,15 @@ pub mod output;
 pub mod project;
 
 /// Triage a feature view against a target before insert.
+///
+/// Both subcommands take an optional source view and an optional `--into`
+/// target: the source defaults to the current view and the target to that
+/// view's parent, so a bare `atomic triage review` answers "is what I am
+/// working on ready to promote?".
 #[derive(Debug, Parser)]
+#[command(after_help = "\
+The <VIEW> argument and --into are both optional. Run 'atomic triage review
+--help' for the full example set.")]
 pub struct Triage {
     #[command(subcommand)]
     pub command: TriageCommands,
@@ -38,45 +48,50 @@ impl Command for Triage {
 /// Subcommands for `atomic triage`.
 #[derive(Subcommand, Debug)]
 pub enum TriageCommands {
-    /// Report the candidate change set of a feature view relative to a target.
+    /// Report the candidate change set of a view relative to a target.
     ///
-    /// # Examples
-    ///
-    /// ```text
-    /// atomic triage candidates feature --into dev
-    /// atomic triage candidates feature --into dev --json
-    /// ```
+    /// Which changes would land if this view were promoted: only-in-source,
+    /// the transitive dependency-closure additions, and which additions are
+    /// "baggage" (covered by no intent). See this subcommand's examples.
     Candidates(TriageCandidates),
 
     /// Build the canonical triage report and render it (verdict + findings).
     ///
     /// Walks the change → file → task → intent → acceptance-criterion join,
     /// gates each reached intent, and emits a bounded CLI dashboard (default)
-    /// or the full JSON worklist (`--json`).
-    ///
-    /// # Examples
-    ///
-    /// ```text
-    /// atomic triage review feature --into dev
-    /// atomic triage review feature --into dev --json
-    /// atomic triage review feature --into dev --walkthrough     # guided reading order
-    /// atomic triage review feature --into dev --html            # write + open in browser
-    /// atomic triage review feature --into dev --html --output review.html
-    /// atomic triage review feature --into dev --html --no-open
-    /// atomic triage review feature --into dev --attest > review.signed.json
-    /// ```
+    /// or the full JSON worklist (`--json`). See this subcommand's examples.
     Review(TriageReview),
 }
 
-/// Compute the triage candidate set for `<feature>` relative to `--into`.
+/// Compute the triage candidate set for a view relative to a target.
 #[derive(Debug, Parser)]
-pub struct TriageCandidates {
-    /// The feature (source) view to review.
-    pub feature: String,
+#[command(after_help = "\
+<VIEW> defaults to the current view; --into defaults to that view's parent.
 
-    /// The target view the feature would be inserted into.
-    #[arg(long)]
-    pub into: String,
+Examples:
+  # What would land if the current view were promoted? (no arguments needed)
+  atomic triage candidates
+  atomic triage candidates --json
+
+  # A specific source and target
+  atomic triage candidates my-feature --into dev
+  atomic triage candidates my-feature --into dev --json")]
+pub struct TriageCandidates {
+    /// The feature (source) view to review. Defaults to the current view.
+    #[arg(
+        value_name = "VIEW",
+        add = ArgValueCompleter::new(complete_view_names)
+    )]
+    pub feature: Option<String>,
+
+    /// The target view the feature would be inserted into. Defaults to the
+    /// feature view's parent.
+    #[arg(
+        long,
+        value_name = "VIEW",
+        add = ArgValueCompleter::new(complete_view_names)
+    )]
+    pub into: Option<String>,
 
     /// Emit the candidate set as JSON.
     #[arg(long)]
@@ -87,9 +102,10 @@ impl Command for TriageCandidates {
     fn run(&self) -> CliResult<()> {
         let root = find_repository_root()?;
         let repo = Repository::open(&root).map_err(CliError::Repository)?;
+        let (feature, into) = resolve_views(&repo, self.feature.as_deref(), self.into.as_deref())?;
 
         let set = repo
-            .triage_candidate_set(&self.feature, &self.into)
+            .triage_candidate_set(&feature, &into)
             .map_err(CliError::Repository)?;
 
         if self.json {
@@ -203,15 +219,50 @@ fn open_in_browser(target: &str) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Build the canonical triage report for `<feature>` relative to `--into`.
+/// Build the canonical triage report for a view relative to a target.
 #[derive(Debug, Parser)]
-pub struct TriageReview {
-    /// The feature (source) view to review.
-    pub feature: String,
+#[command(after_help = "\
+<VIEW> defaults to the current view; --into defaults to that view's parent. So a
+bare 'atomic triage review' asks: is the view I am working on ready to promote?
 
-    /// The target view the feature would be inserted into.
-    #[arg(long)]
-    pub into: String,
+Examples:
+  # Promote-readiness of the current view, in guided reading order
+  atomic triage review --walkthrough
+
+  # Bounded dashboard: verdict + findings, for the current view
+  atomic triage review
+
+  # The full JSON worklist — start here when driving this by hand
+  atomic triage review --json
+
+  # A specific source and target
+  atomic triage review my-feature --into dev
+  atomic triage review my-feature --into dev --json
+  atomic triage review my-feature --into dev --walkthrough
+
+  # Chapter tour in a browser
+  atomic triage review my-feature --into dev --html
+  atomic triage review my-feature --into dev --html --output review.html
+  atomic triage review my-feature --into dev --html --no-open
+
+  # Signed export for portability/compliance
+  atomic triage review my-feature --into dev --attest > review.signed.json")]
+pub struct TriageReview {
+    /// The feature (source) view to review. Defaults to the current view.
+    #[arg(
+        value_name = "VIEW",
+        add = ArgValueCompleter::new(complete_view_names)
+    )]
+    pub feature: Option<String>,
+
+    /// The target view the feature would be inserted into. Defaults to the
+    /// feature view's parent.
+    #[arg(
+        long,
+        value_name = "VIEW",
+        add = ArgValueCompleter::new(complete_view_names)
+    )]
+    pub into: Option<String>,
 
     /// Emit the full report as JSON instead of the bounded CLI dashboard.
     #[arg(long)]
@@ -251,8 +302,9 @@ impl Command for TriageReview {
     fn run(&self) -> CliResult<()> {
         let root = find_repository_root()?;
         let repo = Repository::open(&root).map_err(CliError::Repository)?;
+        let (feature, into) = resolve_views(&repo, self.feature.as_deref(), self.into.as_deref())?;
 
-        let report = project::build_report(&repo, &self.feature, &self.into)?;
+        let report = project::build_report(&repo, &feature, &into)?;
 
         // Output selection precedence:
         // attest > html > json > walkthrough > CLI dashboard.
@@ -271,5 +323,230 @@ impl Command for TriageReview {
         }
 
         Ok(())
+    }
+}
+
+/// Resolve the `(source, target)` view pair a triage run operates on.
+///
+/// Both arguments are optional so the common gesture needs no arguments at all:
+/// the source is the current view and the target is that view's direct parent
+/// — the same default `atomic insert` uses for a bare promote. `arg` names the
+/// argument a name came from so an unknown view can be reported against it.
+///
+/// # Errors
+///
+/// Returns [`CliError::InvalidArgument`] if an explicitly named view does not
+/// exist, or if the target was omitted and the source is a root view (nothing
+/// to promote into).
+fn resolve_views(
+    repo: &Repository,
+    feature: Option<&str>,
+    into: Option<&str>,
+) -> CliResult<(String, String)> {
+    let source = match feature {
+        Some(name) => {
+            require_view(repo, name, "<VIEW>")?;
+            name.to_string()
+        }
+        None => repo.current_view().to_string(),
+    };
+
+    let target = match into {
+        Some(name) => {
+            require_view(repo, name, "--into")?;
+            name.to_string()
+        }
+        None => match repo.parent_change_count(&source) {
+            Ok(Some((parent, _))) => parent,
+            Ok(None) => {
+                return Err(CliError::InvalidArgument {
+                    message: format!(
+                        "'{source}' is a root view — it has no parent to promote into.\n  \
+                         Pass --into <view> to choose a target (see 'atomic view list')."
+                    ),
+                })
+            }
+            Err(RepositoryError::ViewNotFound { name }) => {
+                return Err(unknown_view(repo, &name, "<VIEW>"))
+            }
+            Err(e) => return Err(CliError::Repository(e)),
+        },
+    };
+
+    Ok((source, target))
+}
+
+/// Fail with an actionable message when a triage view argument names a view
+/// that does not exist.
+///
+/// The usual cause is typing the placeholder from the help text
+/// (`atomic triage review feature`) instead of a real view name, so the message
+/// says the argument is optional and names the current view as the value to
+/// simply drop in — or the value to leave off entirely.
+fn require_view(repo: &Repository, name: &str, arg: &str) -> CliResult<()> {
+    if repo.view_exists(name).map_err(CliError::Repository)? {
+        Ok(())
+    } else {
+        Err(unknown_view(repo, name, arg))
+    }
+}
+
+/// The error for a view name that does not resolve.
+fn unknown_view(repo: &Repository, name: &str, arg: &str) -> CliError {
+    CliError::InvalidArgument {
+        message: format!(
+            "No view named '{name}' — {arg} takes a real view name, not a placeholder.\n  \
+             Current view is '{}'; omit {arg} to triage that instead, or run \
+             'atomic view list' to see all views.",
+            repo.current_view()
+        ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::{CommandFactory, Parser};
+    use tempfile::{tempdir, TempDir};
+
+    use super::*;
+
+    /// A repo with a root view `dev` and a draft `feature-x` parented on it,
+    /// checked out on the draft — the state the defaults are meant to serve.
+    fn draft_repo() -> (Repository, TempDir) {
+        let dir = tempdir().unwrap();
+        let mut repo = Repository::init(dir.path()).unwrap();
+        repo.create_draft_view("feature-x", "dev").unwrap();
+        repo.set_current_view_in_memory("feature-x");
+        (repo, dir)
+    }
+
+    /// The `<VIEW>` / `--into` pair parsed off a `triage review` argument list.
+    fn parse_views(args: &[&str]) -> (Option<String>, Option<String>) {
+        let cmd =
+            TriageReview::try_parse_from(std::iter::once("review").chain(args.iter().copied()))
+                .unwrap();
+        (cmd.feature, cmd.into)
+    }
+
+    #[test]
+    fn both_view_arguments_are_optional() {
+        assert_eq!(parse_views(&[]), (None, None));
+        // A lone source, and a lone target, are each valid on their own.
+        assert_eq!(
+            parse_views(&["feature-x"]),
+            (Some("feature-x".into()), None)
+        );
+        assert_eq!(parse_views(&["--into", "dev"]), (None, Some("dev".into())));
+    }
+
+    #[test]
+    fn usage_advertises_both_arguments_as_optional() {
+        for cmd in [TriageReview::command(), TriageCandidates::command()] {
+            // Neither argument may be required, or clap puts it in the usage
+            // summary instead of `[OPTIONS]` / `[VIEW]`.
+            for id in ["feature", "into"] {
+                let arg = cmd
+                    .get_arguments()
+                    .find(|a| a.get_id() == id)
+                    .unwrap_or_else(|| panic!("missing argument `{id}`"));
+                assert!(!arg.is_required_set(), "`{id}` is still required");
+            }
+        }
+
+        let usage = TriageReview::command().render_usage().to_string();
+        assert!(usage.contains("[VIEW]"), "usage: {usage}");
+        // The positional is named VIEW, not FEATURE — `feature` read as a
+        // literal view name, which is exactly the mistake that prompted this.
+        assert!(!usage.contains("[FEATURE]"), "usage: {usage}");
+    }
+
+    #[test]
+    fn omitted_arguments_resolve_to_current_view_and_its_parent() {
+        let (repo, _dir) = draft_repo();
+        let (feature, into) = resolve_views(&repo, None, None).unwrap();
+        assert_eq!(feature, "feature-x");
+        assert_eq!(into, "dev");
+    }
+
+    #[test]
+    fn explicit_arguments_pass_through_unchanged() {
+        let (repo, _dir) = draft_repo();
+        let (feature, into) = resolve_views(&repo, Some("dev"), Some("feature-x")).unwrap();
+        assert_eq!(feature, "dev");
+        assert_eq!(into, "feature-x");
+    }
+
+    #[test]
+    fn omitted_target_follows_the_named_source_not_the_current_view() {
+        let (repo, _dir) = draft_repo();
+        // Current view is feature-x, but naming `dev` as the source must make
+        // the target *its* parent — there is none, so this is a root-view error.
+        let err = resolve_views(&repo, Some("dev"), None).unwrap_err();
+        assert!(err.to_string().contains("root view"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn a_root_source_with_no_target_explains_the_missing_parent() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        let err = resolve_views(&repo, None, None).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("root view"), "unexpected: {msg}");
+        assert!(msg.contains("--into"), "unexpected: {msg}");
+    }
+
+    #[test]
+    fn a_placeholder_view_name_is_rejected_with_the_optional_argument_as_the_fix() {
+        let (repo, _dir) = draft_repo();
+        let err = resolve_views(&repo, Some("feature"), None).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("No view named 'feature'"), "unexpected: {msg}");
+        assert!(msg.contains("omit <VIEW>"), "unexpected: {msg}");
+        assert!(msg.contains("feature-x"), "unexpected: {msg}");
+    }
+
+    #[test]
+    fn a_bad_target_is_reported_against_into_not_the_positional() {
+        let (repo, _dir) = draft_repo();
+        let err = resolve_views(&repo, None, Some("nope")).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("No view named 'nope'"), "unexpected: {msg}");
+        assert!(msg.contains("omit --into"), "unexpected: {msg}");
+    }
+
+    #[test]
+    fn candidates_parses_the_same_optional_pair_as_review() {
+        let cmd = TriageCandidates::try_parse_from(["candidates"]).unwrap();
+        assert!(cmd.feature.is_none());
+        assert!(cmd.into.is_none());
+
+        let cmd =
+            TriageCandidates::try_parse_from(["candidates", "feature-x", "--into", "dev"]).unwrap();
+        assert_eq!(cmd.feature.as_deref(), Some("feature-x"));
+        assert_eq!(cmd.into.as_deref(), Some("dev"));
+    }
+
+    #[test]
+    fn help_carries_examples_for_both_subcommands() {
+        // The agent help template drops `long_about` but keeps `after_help`, so
+        // the examples have to live there to be discoverable.
+        for (name, about) in [
+            ("candidates", "atomic triage candidates"),
+            ("review", "--walkthrough"),
+        ] {
+            let help = Triage::command()
+                .find_subcommand_mut(name)
+                .unwrap()
+                .render_long_help()
+                .to_string();
+            assert!(
+                help.contains(about),
+                "{name} help missing `{about}`:\n{help}"
+            );
+            assert!(
+                help.contains("Examples:"),
+                "{name} help missing examples:\n{help}"
+            );
+        }
     }
 }
