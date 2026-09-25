@@ -117,6 +117,7 @@ impl TurnOrchestrator {
                     turn_number,
                     turn_duration_ms,
                     prompt,
+                    agent_identity: self.agent_identity.clone(),
                 };
                 record_turn(&self.repo_root, &record_options)
             };
