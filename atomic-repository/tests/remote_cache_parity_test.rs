@@ -498,6 +498,15 @@ fn a_change_submitted_to_a_draft_view_is_on_that_view() {
         !tree_of(&host, "dev").iter().any(|(p, _)| p == "src/new.rs"),
         "only on the draft"
     );
+    // What `sandbox stage` / `seal` write sees it too.
+    let out = TempDir::new().unwrap();
+    host.materialize_view_to("exp", out.path()).unwrap();
+    assert_eq!(
+        fs::read_to_string(out.path().join("src/new.rs"))
+            .ok()
+            .as_deref(),
+        Some("pub fn n() {}\n")
+    );
 
     // The next record builds on it: the refreshed skeleton knows the new file.
     let skeleton = host.after_sandbox_submit("exp", outcome.hash()).unwrap();
