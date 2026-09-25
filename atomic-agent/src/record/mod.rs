@@ -90,7 +90,8 @@ use provenance::{
 /// - Good prompt: `"Fix the authentication bug in login.rs"`
 /// - Slash command or no prompt: `"Add src/main.rs, Cargo.toml"`
 ///
-/// The author is the agent identity.
+/// The author is the agent identity — the delegated identity selected for
+/// this hook invocation when one is in force, else the plus-tag fallback.
 fn build_turn_header(
     options: &TurnRecordOptions<'_>,
     status: &RepositoryStatus,
@@ -102,6 +103,7 @@ fn build_turn_header(
         &options.session.agent_name,
         &options.session.agent_display_name,
         &options.session.session_id,
+        options.agent_identity.as_deref(),
     );
 
     ChangeHeader::builder()

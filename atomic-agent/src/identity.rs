@@ -494,6 +494,11 @@ fn extract_toml_string_value(line: &str) -> Option<String> {
 /// * `agent_name` — Agent registry key (e.g., "claude-code")
 /// * `agent_display_name` — Human-readable name (e.g., "Claude Code")
 /// * `session_id` — Session identifier for the `+tag` suffix
+/// * `agent_identity` — Name of a delegated agent identity to sign as,
+///   resolved by the CLI hook handler (env var > global setting > active
+///   server profile). `None` falls back to `ATOMIC_AGENT_IDENTITY` and then
+///   to the plus-tag path, so an environment with nothing configured
+///   behaves exactly as before agent identities existed.
 ///
 /// # Returns
 ///
@@ -502,13 +507,18 @@ fn extract_toml_string_value(line: &str) -> Option<String> {
 ///
 /// - With identity: `claude+60f5 <lee@atomic.dev>` (with public key ref)
 /// - Without: `Claude Code` (no email)
-pub fn build_agent_author(agent_name: &str, agent_display_name: &str, session_id: &str) -> Author {
+pub fn build_agent_author(
+    agent_name: &str,
+    agent_display_name: &str,
+    session_id: &str,
+    agent_identity: Option<&str>,
+) -> Author {
     let options = AgentAuthorOptions {
         agent_name,
         agent_display_name,
         session_id,
         identity_dir: None,
-        agent_identity: None,
+        agent_identity: agent_identity.map(str::to_string),
     };
     resolve_agent_author(&options)
 }
@@ -943,11 +953,42 @@ identity_type = "user"
             "claude-code",
             "Claude Code",
             "60f5cbd2-aa23-40ee-9085-4375dd186ce7",
+            None,
         );
 
         // Can't guarantee identity store exists in test env, so just verify
         // the author is valid (either tagged or fallback)
         assert!(!author.name.is_empty());
+    }
+
+    /// A name that does not resolve must degrade to a usable author, not an
+    /// error — recording a turn must never fail over identity selection.
+    #[test]
+    fn build_agent_author_never_fails_on_an_unresolvable_name() {
+        let author =
+            build_agent_author("open-code", "OpenCode", "sess1234", Some("no-such-agent"));
+        assert!(!author.name.is_empty());
+    }
+
+    /// The delegated name must reach the resolver: `build_agent_author` is a
+    /// thin wrapper over `resolve_agent_author`, so the same inputs — with
+    /// and without a delegated name — must produce identical authors.
+    #[test]
+    fn build_agent_author_threads_the_delegated_name() {
+        for name in [None, Some("fred+opencode")] {
+            let via_wrapper =
+                build_agent_author("open-code", "OpenCode", "sess1234", name);
+            let via_resolver = resolve_agent_author(&AgentAuthorOptions {
+                agent_name: "open-code",
+                agent_display_name: "OpenCode",
+                session_id: "sess1234",
+                identity_dir: None,
+                agent_identity: name.map(str::to_string),
+            });
+            assert_eq!(via_wrapper.name, via_resolver.name);
+            assert_eq!(via_wrapper.email, via_resolver.email);
+            assert_eq!(via_wrapper.identity, via_resolver.identity);
+        }
     }
 
     // extract_toml_string_value

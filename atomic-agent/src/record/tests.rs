@@ -35,6 +35,7 @@ fn make_options<'a>(session: &'a AgentSession, event: &'a TurnEvent) -> TurnReco
         turn_number: 3,
         turn_duration_ms: 12400,
         prompt: Some("Fix the authentication bug in login.rs".to_string()),
+        agent_identity: None,
     }
 }
 
@@ -869,6 +870,7 @@ fn test_record_turn_nonexistent_repo_fails() {
         turn_number: 3,
         turn_duration_ms: 5000,
         prompt: Some("Fix the bug".to_string()),
+        agent_identity: None,
     };
 
     let result = record_turn(Path::new("/nonexistent/repo/path"), &options);
@@ -1109,6 +1111,7 @@ fn test_orphaned_session_view_duplicates_content_on_merge() {
         turn_number: 1,
         turn_duration_ms: 1000,
         prompt: Some("Bump step10".to_string()),
+        agent_identity: None,
     };
     record_turn(repo_root, &options_a).unwrap();
 
@@ -1134,6 +1137,7 @@ fn test_orphaned_session_view_duplicates_content_on_merge() {
         turn_number: 1,
         turn_duration_ms: 1000,
         prompt: Some("Bump step70".to_string()),
+        agent_identity: None,
     };
     record_turn(repo_root, &options_b)
         .expect("record_turn should self-heal an orphaned session view rather than fail");

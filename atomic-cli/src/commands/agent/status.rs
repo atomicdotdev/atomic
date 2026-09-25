@@ -32,7 +32,8 @@ use crate::error::CliResult;
 /// Show agent integration status.
 ///
 /// Displays which agents have hooks installed, any active sessions,
-/// and the current state of the file watcher.
+/// the current state of the file watcher, and the delegated identity
+/// recording hooks sign as.
 #[derive(Debug, Args)]
 pub struct AgentStatus {
     /// Show detailed session information.
@@ -95,11 +96,28 @@ struct StatusJson {
     agents: Vec<AgentEntry>,
     sessions: Vec<SessionEntry>,
     totals: Totals,
+    /// The delegated identity hooks sign as, when one is selected. Absent
+    /// when hooks record as the plus-tag of the default identity — the
+    /// same resolution the hooks themselves run, so what this reports is
+    /// what the next recorded turn will use.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    agent_identity: Option<AgentIdentityJson>,
     /// Why the session list is empty, when it is empty for a reason. The human
     /// output prints this and carries on; dropping it from JSON would turn a
     /// broken session store into an indistinguishable "no sessions".
     #[serde(skip_serializing_if = "Option::is_none")]
     sessions_error: Option<String>,
+}
+
+/// The effective agent identity, as data.
+#[derive(Debug, Serialize)]
+struct AgentIdentityJson {
+    /// The identity's name in the store, e.g. `fred+opencode`.
+    name: String,
+    /// Where the selection came from — one of `env`, `global`,
+    /// `server-profile`. Stable keys; the human labels live in the
+    /// `agent identity` command.
+    source: &'static str,
 }
 
 impl AgentStatus {
@@ -167,6 +185,12 @@ impl AgentStatus {
                 })
                 .collect(),
             totals,
+            agent_identity: super::identity::resolve_effective_agent_identity().map(
+                |(name, source)| AgentIdentityJson {
+                    name,
+                    source: source.key(),
+                },
+            ),
             sessions_error,
         }
     }
@@ -191,6 +215,21 @@ impl Command for AgentStatus {
 
         println!("Agent Integration Status");
         println!("=======================");
+        println!();
+
+        // Identity — the delegated identity hooks sign as, machine-global,
+        // shown even when no hooks are installed yet because the selection
+        // is exactly what a future `atomic agent enable` will record as.
+        match super::identity::resolve_effective_agent_identity() {
+            Some((name, source)) => {
+                println!("  Identity: {name} ({source})");
+            }
+            None => {
+                println!(
+                    "  Identity: none — hooks record as the plus-tag of the default identity"
+                );
+            }
+        }
         println!();
 
         let installed = registry.installed(&repo_root);
