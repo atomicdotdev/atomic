@@ -79,6 +79,7 @@ use crate::RepositoryError;
 mod deferred_tree;
 mod filter;
 mod materialize;
+mod outcome;
 mod sandbox;
 mod semantic_materialize;
 mod split;
@@ -89,7 +90,7 @@ mod views;
 // use `use super::*;` continue to resolve them at `crate::repository::…`.
 pub use filter::{
     collect_view_change_ids, collect_visible_change_ids, collect_visible_change_ids_with_deps,
-    expand_indexed_dependency_closure, view_set_id,
+    expand_indexed_dependency_closure, view_set_id, visible_change_ids_for_views,
 };
 pub use sandbox::{SealOptions, SealResult, StageOptions, StageResult, SANDBOX_POINTER};
 pub use split::{SplitChange, SplitOptions, SplitOutcome};
@@ -125,6 +126,10 @@ mod vault_triples;
 mod verify;
 pub use insert::{
     ImportLineIndexSeed, ImportLineIndexSeedLine, ImportWriteOutcome, ImportWriteTimings,
+};
+pub use outcome::{
+    Mergeability, ModelSpend, Outcome, OutcomeConflict, OutcomeCost, OutcomeFootprint,
+    OutcomeInputs, ViewOutcome,
 };
 pub use provenance_summary::ProvenanceSummary;
 pub use semantic_materialize::{CrdtMaterializeOptions, CrdtMaterializeOutcome};

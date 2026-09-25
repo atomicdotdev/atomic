@@ -201,7 +201,10 @@ impl Repository {
     /// - `Uncovered` if the change modifies files but none are touched.
     /// - `Unknown` only when the change has no file ops at all (e.g. a load
     ///   failure) — unreachable for a normally recorded change.
-    fn change_coverage(&self, hash: &Hash) -> Result<(Vec<String>, Coverage), RepositoryError> {
+    pub(crate) fn change_coverage(
+        &self,
+        hash: &Hash,
+    ) -> Result<(Vec<String>, Coverage), RepositoryError> {
         // change → file comes from the change's own ops (authoritative), mapped
         // to the shared `file:<path>` node id the intent side also uses.
         let modifies: Vec<String> = self
