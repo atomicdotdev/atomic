@@ -7,7 +7,7 @@ The workflows I ran against #207 (Git Bridge / Git Shim) and the scenarios that 
 - **Environment:** macOS, git 2.50, debug builds, throwaway repositories under `/tmp`.
 - **How agents were tested:** Claude Code hook events were simulated with `atomic agent hooks claude-code <event> --json`: `session-start`, `user-prompt-submit`, file edits, `stop`. An isolated `HOME` was used.
 - **References:** expectations cite `docs/RFC-ATOMIC-GIT-CAUSAL-BRIDGE.md` (RFC) and `docs/bridge-operating-guide.md` (guide).
-- **Harness:** `tests/harness/46_git_bridge_scenarios.sh` has one section per workflow W1–W13, W16–W19 and W22. W10 and W11 run only when `ATOMIC_PREV_BIN` points to a previous release binary. It asserts the expected behaviour, so the section for an open scenario fails until that scenario is fixed. On 990612c, W2–W6 pass and every failure falls in the section for F1–F7, F9, F11 or F13–F15. With #212, W12 passes too. W14 and W15 aren't in the harness: F8 needs the pull save path, and F10 has unit tests in #213. `tests/harness/47_git_bridge_history_corpus.sh` covers W20 and W21 (RFC §15 item 4): it runs each history shape through onboarding and through the daily reconcile loop, and after every step restores all tracked files from Atomic and compares them with the Git tree.
+- **Harness:** `tests/harness/46_git_bridge_scenarios.sh` has one section per workflow W1–W13, W16–W19 and W22–W24. W10 and W11 run only when `ATOMIC_PREV_BIN` points to a previous release binary. It asserts the expected behaviour, so the section for an open scenario fails until that scenario is fixed. On 990612c, W2–W6 pass and every failure falls in the section for F1–F7, F9, F11 or F13–F15. With #212, W12 passes too. W14 and W15 aren't in the harness: F8 needs the pull save path, and F10 has unit tests in #213. `tests/harness/47_git_bridge_history_corpus.sh` covers W20, W21, W25 and W26 (RFC §15 item 4): it runs each history shape through onboarding and through the daily reconcile loop, replays real repositories commit by commit, and after every step restores all tracked files from Atomic and compares them with the Git tree.
 
 ---
 
@@ -37,6 +37,10 @@ The workflows I ran against #207 (Git Bridge / Git Shim) and the scenarios that 
 | W20 | History shapes through the bridge (harness 47) | merge, octopus, rename, delete and re-add, CRLF, binary, symlink, executable bit, path names with spaces or non-ASCII characters, empty commit, submodule; each onboarded and replayed with `reconcile` | merges, renames, CRLF, binary, empty commits and submodules ✅; **❌ F16, F17, F18** |
 | W21 | Import public repositories (harness 47, harness 10) | `hashicorp/go-uuid`, `holman/spark` | go-uuid ✅; **❌ F19** (spark) |
 | W22 | Edit a lockfile | `Cargo.lock` `a b` → `b` and `a b` → `x b`; hyperfine's real `Cargo.lock` v1 → v2; `git import` of `sharkdp/hyperfine` | **❌ F20** (partly also in 0.18.2) |
+| W23 | Publish a Draft view and switch with the bridge | Draft view, record, `atomic git bridge publish feature --branch feature`, `atomic git bridge switch main`, `atomic git bridge switch feature` | ✅ As guide §4 says: publish refuses a view with no projection commit, HEAD stays detached after publish, and `bridge switch` refuses a Draft view without a branch |
+| W24 | Share Atomic changes with a teammate through Git | Alice: enable, record, reconcile, `bridge binding publish --with-changes-pack`, push the branch and `refs/atomic/*`. Bob: `atomic clone <git-url>`, or `git clone` + `atomic git import` | **❌ F21, F22** |
+| W25 | Git history rewrites and pulls (harness 47) | `commit --amend`, `reset --hard HEAD~1`, `rebase`, `cherry-pick`, `git pull` fast-forward and merge; each onboarded and replayed with `reconcile` | amend, rebase, cherry-pick and both pulls ✅; **❌ F23** (reset) |
+| W26 | Real repositories replayed commit by commit (harness 47) | `hashicorp/go-uuid` (30 first-parent commits) and `holman/spark` (68): anchor at the first commit, fast-forward one commit at a time, reconcile, restore and compare after each | go-uuid ✅; **❌ F18** (spark, at its first commit) |
 
 W2–W6 start from a repository anchored with `atomic init --no-vault`, with `.atomicignore` removed, so they don't inherit F2.
 
@@ -153,10 +157,10 @@ W2–W6 start from a repository anchored with `atomic init --no-vault`, with `.a
 - **Actual:** after onboarding, `atomic status` fails with `bridge adoption snapshot capture failed: … attribute path 'link' has no semantic trunk`. After retargeting, `reconcile` fails and later commands are refused with `HeadChanged`. Restoring from Atomic writes a regular file (`git status`: `T link`). 0.18.2 also restores a regular file; the status and reconcile failures are new in #207.
 - **Verified:** run (harness 47). **Status:** open.
 
-### F18. An executable bit set in a Git commit is lost after reconcile
-- **Steps:** W20 `exec-bit`, daily loop. Anchor with a non-executable `run.sh`, `chmod +x run.sh`, commit, `atomic git bridge reconcile`, restore from Atomic.
+### F18. Executable bits are lost
+- **Steps:** W20 `exec-bit`: onboard a history whose `run.sh` is executable, or `chmod +x run.sh`, commit and `atomic git bridge reconcile`. Then restore from Atomic. W26: the first commit of `holman/spark` has an executable `spark` script.
 - **Expected:** the mode is carried as an attribute (RFC §3.5).
-- **Actual:** the restored `run.sh` isn't executable (`git status`: `M run.sh`, mode 100755 → 100644). Onboarding a history that already has the bit keeps it. 0.18.2 loses the bit on every import.
+- **Actual:** the restored file isn't executable (`git status`: `M run.sh`, mode 100755 → 100644), after onboarding and after reconcile. The spark replay fails at its first commit for this reason. 0.18.2 also loses the bit.
 - **Verified:** run (harness 47). **Status:** open.
 
 ### F19. Importing `holman/spark` fails in its merge history
@@ -179,5 +183,23 @@ W2–W6 start from a repository anchored with `atomic init --no-vault`, with `.a
   0.18.2's `status` reports clean throughout; #207's reports `M Cargo.lock`. `git import` of hyperfine fails at its second commit, which deletes a checksum line: `staged path 'Cargo.lock' renders 9273 byte(s) but the commit tree expects 16301 byte(s)`. The same content under a name without `.lock` (`x.toml`, `page.txt`) records correctly.
 - **Cause:** record treats machine-generated files (`*.lock`, `package-lock.json`, `yarn.lock`, `pnpm-lock.yaml`, minified output) as opaque and replaces them whole instead of diffing lines (`should_use_opaque_generated_vertices` in `globalize/hunk.rs`, and the fast path in `record/mod.rs`). This was added on dev in `d39dd25` "speed up records". #207 (`2b4a4f9`) routes a modification with existing line state through the normal per-line record. That fixes changing a line (the "12 of 67 bytes rendered" case in its comment) but breaks deleting a line, and the real `Cargo.lock` update is still wrong.
 - **Verified:** run. **Status:** open.
+
+### F21. A binding can't carry its changes through Git
+- **Steps:** W24. Record a change, then `atomic git bridge binding publish --key-file <key> --with-changes-pack`.
+- **Expected:** without an Atomic remote, the binding's `changes.pack` carries the change files (RFC §8.6). The command's help says private sidecars and unhashed bodies never enter the pack.
+- **Actual:** `cannot assemble the changes.pack: binding pack object … carries private material that never enters Git (the change carries an unhashed metadata section); private evidence travels only via an Atomic remote (RFC 12.13)`. Every change made with `atomic record` has that section, so a team without an Atomic remote can't publish a pack. Publishing without the pack works.
+- **Verified:** run (harness 46). **Status:** open.
+
+### F22. A teammate can't bring a bridge-pushed history into Atomic
+- **Steps:** W24. Alice pushes her branch and `refs/atomic/*`. Bob runs `atomic clone <git-url>`; or `git clone`, fetches `refs/atomic/*`, `atomic init`, `atomic git import`.
+- **Expected:** `atomic clone <git-url>` bootstraps through the binding (RFC §8.6) and restores Alice's exact change (§21 item 3). When a binding can't be resurrected, import falls back to synthesis (§5.2); trailers are hints (§12 item 8).
+- **Actual:** `atomic clone` refuses with `binding … closure is incomplete (2 missing); refusing resurrection: MissingObjects; NoFallbackAvailable`, and leaves a clone where every command is refused with `MissingCheckpoint`. `atomic git import` refuses the pushed commit: `commit … carries an unverifiable Atomic change closure: repository projection failed: view 'main' not found`. Once one person pushes through the bridge, nobody else can import that history.
+- **Verified:** run (harness 46). **Status:** open.
+
+### F23. After `git reset` to an earlier commit, reconcile refuses
+- **Steps:** W25 `reset`, daily loop. Anchor, commit twice with a reconcile after each, then `git reset --hard HEAD~1` and `atomic git bridge reconcile`.
+- **Expected:** Git moved to a commit the bridge already imported, so Atomic adopts that state and both statuses are clean (RFC §1.2, §21 item 1).
+- **Actual:** `✓ Imported 0 changes` followed by `✗ Git error: Atomic working copy is not clean`. Atomic still holds the reset commit's change and reads the missing line as unrecorded work. Later commands, `atomic restore` included, are refused with `HeadChanged`. Onboarding the same history after the reset works.
+- **Verified:** run (harness 47). **Status:** open.
 
 Some findings are security-sensitive. They were reported privately and aren't included here.

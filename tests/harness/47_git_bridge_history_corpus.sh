@@ -12,7 +12,10 @@
 # (bytes, symlinks, executable bits).
 #
 # Optional: BRIDGE_CORPUS_URLS="<git url> ..." replaces the real repositories
-# (default: go-uuid and spark, skipped without network).
+# (default: go-uuid and spark, skipped without network). Each is onboarded, then
+# replayed commit by commit through reconcile; BRIDGE_REPLAY_MAX caps the
+# replayed first-parent commits (default 100). With the real repositories the
+# suite takes about 30 minutes; BRIDGE_CORPUS_URLS=" " skips them.
 
 HARNESS_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$HARNESS_DIR/helpers.sh"
@@ -180,7 +183,77 @@ run_corpus "symlink" step_link_add step_link_retarget
 step_exec_add() { printf '#!/bin/sh\necho hi\n' > run.sh; commit_all "add script"; }
 step_exec_on() { chmod +x run.sh; commit_all "make executable"; }
 step_exec_off() { chmod -x run.sh; commit_all "drop executable"; }
-run_corpus "exec-bit" step_exec_add step_exec_on step_exec_off
+step_exec_on_again() { chmod +x run.sh; commit_all "make executable again"; }
+# End executable so the onboarding check sees the bit.
+run_corpus "exec-bit" step_exec_add step_exec_on step_exec_off step_exec_on_again
+
+# ── History rewrites and pulls (RFC §5.4) ───────────────────────────────────
+
+step_amend_base() { printf 'one\n' > f.txt; commit_all "one"; }
+step_amend_two() { printf 'two\n' >> f.txt; commit_all "two"; }
+step_amend_rewrite() { printf 'three\n' >> f.txt; git commit --quiet -a --amend --no-edit; }
+run_corpus "amend" step_amend_base step_amend_two step_amend_rewrite
+
+step_reset_base() { printf 'one\n' > f.txt; commit_all "one"; }
+step_reset_two() { printf 'two\n' >> f.txt; commit_all "two"; }
+step_reset_three() { printf 'three\n' >> f.txt; commit_all "three"; }
+step_reset_back() { git reset --quiet --hard HEAD~1; }
+run_corpus "reset" step_reset_base step_reset_two step_reset_three step_reset_back
+
+step_rebase_base() { printf 'base\n' > base.txt; commit_all "base"; }
+step_rebase_side() {
+    git switch --quiet -c side
+    printf 'side\n' > side.txt
+    commit_all "side"
+    git switch --quiet -
+}
+step_rebase_main() { printf 'main\n' > main.txt; commit_all "main"; }
+step_rebase_onto() {
+    local main
+    main="$(git_current_branch)"
+    git switch --quiet side
+    git rebase --quiet "$main"
+    git switch --quiet "$main"
+    git merge --quiet --ff-only side
+    git branch --quiet -D side
+}
+run_corpus "rebase" step_rebase_base step_rebase_side step_rebase_main step_rebase_onto
+
+step_pick_base() { printf 'base\n' > base.txt; commit_all "base"; }
+step_pick_side() {
+    git switch --quiet -c side
+    printf 'picked\n' > picked.txt
+    commit_all "to be picked"
+    git switch --quiet -
+}
+step_pick() { git cherry-pick side >/dev/null; git branch --quiet -D side; }
+run_corpus "cherry-pick" step_pick_base step_pick_side step_pick
+
+# A teammate pushes to a shared remote; this repository pulls.
+PULL_REMOTE=""
+step_pull_setup() {
+    printf 'base\n' > base.txt
+    commit_all "base"
+    PULL_REMOTE="$(mktemp -d "${TMPDIR:-/tmp}/atomic-pull-remote-XXXXXX")"
+    _HARNESS_TMPDIRS+=("$PULL_REMOTE")
+    git init --quiet --bare "$PULL_REMOTE/origin.git"
+    git -C "$PULL_REMOTE/origin.git" symbolic-ref HEAD refs/heads/main
+    git remote add origin "$PULL_REMOTE/origin.git"
+    git push --quiet origin HEAD:refs/heads/main 2>/dev/null
+    git clone --quiet "$PULL_REMOTE/origin.git" "$PULL_REMOTE/teammate" 2>/dev/null
+    git -C "$PULL_REMOTE/teammate" config user.email "teammate@atomic.dev"
+    git -C "$PULL_REMOTE/teammate" config user.name "Teammate"
+    printf 'teammate\n' > "$PULL_REMOTE/teammate/teammate.txt"
+    git -C "$PULL_REMOTE/teammate" add teammate.txt
+    git -C "$PULL_REMOTE/teammate" commit --quiet -m "teammate change"
+    git -C "$PULL_REMOTE/teammate" push --quiet origin HEAD:main 2>/dev/null
+}
+step_pull_ff() { git pull --quiet --ff-only origin main; }
+run_corpus "pull-fast-forward" step_pull_setup step_pull_ff
+
+step_pull_local() { printf 'local\n' > local.txt; commit_all "local change"; }
+step_pull_merge() { git pull --quiet --no-rebase --no-edit origin main; }
+run_corpus "pull-merge" step_pull_setup step_pull_local step_pull_merge
 
 # ── Unusual path names ──────────────────────────────────────────────────────
 
@@ -226,6 +299,58 @@ else
     _skip "Git LFS histories" "git-lfs is not installed"
 fi
 
+# First problem with the bridge state, or nothing when it is fine.
+first_error() {
+    printf '%s' "$1" | grep -E '✗|[Ee]rror' | head -1 | cut -c1-200
+}
+
+bridge_state_problem() {
+    local out
+    if ! out="$(atomic git bridge verify 2>&1)"; then printf 'bridge verify: %s' "$(first_error "$out")"; return; fi
+    out="$(git status --porcelain)"
+    if [[ -n "$out" ]]; then printf 'git status: %s' "$(printf '%s' "$out" | head -2 | tr '\n' ' ')"; return; fi
+    if ! out="$(atomic status --short 2>&1)" || [[ -n "$out" ]]; then printf 'atomic status: %s' "$(printf '%s' "$out" | head -2 | tr '\n' ' ')"; return; fi
+    git ls-files -z | xargs -0 rm -f 2>/dev/null || true
+    atomic restore --force >/dev/null 2>&1 || true
+    out="$(git status --porcelain)"
+    git reset --quiet --hard HEAD 2>/dev/null || true
+    if [[ -n "$out" ]]; then printf 'restore differs from Git: %s' "$(printf '%s' "$out" | head -3 | tr '\n' ' ')"; fi
+}
+
+# Anchor at the first commit, then fast-forward one first-parent commit at a
+# time (what `git pull` does) and reconcile, checking the state after each.
+replay_real_repository() {
+    local url="$1" name total step=0 problem="" commit out
+    local -a commits
+    name="$(basename "$url" .git)"
+    begin_section "real repository, daily loop: $name"
+    make_temp_repo "corpus-replay-$name"
+    if ! git clone --quiet "$url" source 2>/dev/null; then _skip "replay $name" "clone failed"; return; fi
+    commits=($(git -C source rev-list --first-parent --reverse HEAD | awk -v n="${BRIDGE_REPLAY_MAX:-100}" 'NR <= n'))
+    total=${#commits[@]}
+    git clone --quiet source repo 2>/dev/null || true
+    cd repo
+    git remote set-url --push origin DISABLED
+    if ! git checkout --quiet -B replay "${commits[0]}" 2>/dev/null; then _fail "replay $name" "cannot check out the first commit"; return; fi
+    anchor_bridge "$name"
+    problem="$(bridge_state_problem)"
+    if [[ -z "$problem" ]]; then
+        for commit in "${commits[@]:1}"; do
+            step=$((step + 1))
+            if ! git merge --quiet --ff-only "$commit" >/dev/null 2>&1; then problem="git fast-forward failed"; break; fi
+            if ! out="$(atomic git bridge reconcile 2>&1)"; then problem="reconcile: $(first_error "$out")"; break; fi
+            problem="$(bridge_state_problem)"
+            [[ -z "$problem" ]] || break
+        done
+    fi
+    if [[ -z "$problem" ]]; then
+        _pass "$name: $total first-parent commits reconcile and restore exactly"
+    else
+        _fail "$name: $total first-parent commits reconcile and restore exactly" \
+            "commit $((step + 1)) of $total ($(git -C ../source log -1 --format='%h %s' "${commits[$step]}" | cut -c1-60)): $problem"
+    fi
+}
+
 # ── Real repositories ───────────────────────────────────────────────────────
 
 for url in ${BRIDGE_CORPUS_URLS:-https://github.com/hashicorp/go-uuid.git https://github.com/holman/spark.git}; do
@@ -242,6 +367,7 @@ for url in ${BRIDGE_CORPUS_URLS:-https://github.com/hashicorp/go-uuid.git https:
     anchor_bridge "$(basename "$url" .git)"
     echo "    ${YELLOW}ℹ import + enable: $((SECONDS - START))s for $(git rev-list --count HEAD) commits, $(git ls-files | wc -l | tr -d ' ') files${RESET}"
     assert_bridge_state "$(basename "$url" .git)"
+    replay_real_repository "$url"
 done
 
 print_summary

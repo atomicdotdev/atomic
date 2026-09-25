@@ -2,7 +2,7 @@
 # 46_git_bridge_scenarios.sh — Git bridge workflows and failed scenarios.
 #
 # One section per workflow in docs/testing/git-bridge-test-scenarios.md
-# (W1–W13, W16–W19, W22). Assertions state the behaviour that RFC-ATOMIC-GIT-CAUSAL-BRIDGE
+# (W1–W13, W16–W19, W22–W24). Assertions state the behaviour that RFC-ATOMIC-GIT-CAUSAL-BRIDGE
 # and bridge-operating-guide expect, so a section tagged with an open failed
 # scenario (F-number) fails until that scenario is fixed.
 #
@@ -476,5 +476,93 @@ for content in $'a\nb\n' $'b\n'; do
 done
 atomic init --no-vault >/dev/null 2>&1 || true
 assert_success "git import of a lockfile that loses a line" atomic git import
+
+# ── W23. Publish a Draft view and switch with the bridge (guide §4) ─────────
+
+begin_section "W23. Publish a Draft view and switch with the bridge"
+new_bridge_repo "bridge-publish"
+MAIN="$(git_current_branch)"
+MAIN_VIEW="$(current_atomic_view)"
+atomic view create feature --parent "$MAIN_VIEW" >/dev/null 2>&1 || true
+assert_failure "publish refuses a view with no projection commit" atomic git bridge publish feature --branch feature
+assert_success "switch to Draft view 'feature'" atomic view switch feature
+create_file "feature.txt" "feature"
+assert_success "add on 'feature'" atomic add feature.txt
+assert_success "record on 'feature'" atomic record -m "feature work"
+assert_success "publish 'feature' on branch 'feature'" atomic git bridge publish feature --branch feature
+if git ls-tree --name-only feature 2>/dev/null | grep -qx "feature.txt"; then _pass "branch 'feature' holds the recorded file"; else _fail "branch 'feature' holds the recorded file"; fi
+if [[ "$(git_head_state)" == "detached" ]]; then _pass "HEAD stays detached after publish"; else _fail "HEAD stays detached after publish" "HEAD on $(git_head_state)"; fi
+assert_output_contains "the view is still a Draft" "[draft]" atomic view list -a --verbose
+assert_success "bridge switch to '$MAIN_VIEW'" atomic git bridge switch "$MAIN_VIEW"
+if [[ "$(git_head_state)" == "$MAIN" ]]; then _pass "Git HEAD on branch '$MAIN'"; else _fail "Git HEAD on branch '$MAIN'" "HEAD on $(git_head_state)"; fi
+assert_file_not_exists "feature-only file absent on $MAIN" "feature.txt"
+assert_both_clean "after bridge switch to $MAIN"
+assert_success "bridge switch to 'feature'" atomic git bridge switch feature
+if [[ "$(git_head_state)" == "feature" ]]; then _pass "Git HEAD attached to branch 'feature'"; else _fail "Git HEAD attached to branch 'feature'" "HEAD on $(git_head_state)"; fi
+assert_file_exists "feature file present on 'feature'" "feature.txt"
+assert_both_clean "after bridge switch to feature"
+atomic view create unpublished --parent "$MAIN_VIEW" >/dev/null 2>&1 || true
+assert_failure "bridge switch refuses a Draft view with no branch" atomic git bridge switch unpublished
+
+# ── W24 / F21, F22. Share Atomic changes with a teammate through Git ────────
+
+begin_section "W24 / F21, F22. Share Atomic changes with a teammate through Git"
+if ! command -v openssl >/dev/null 2>&1; then
+    _skip "sharing through Git" "openssl is needed to create a binding key"
+else
+    make_temp_repo "share"
+    SHARE_DIR="$REPO_DIR"
+    git init --quiet --bare origin.git
+    mkdir alice
+    cd alice
+    init_git_repo
+    create_file "README.md" "hello"
+    git add README.md
+    git commit --quiet -m "initial"
+    BRANCH="$(git_current_branch)"
+    git -C ../origin.git symbolic-ref HEAD "refs/heads/$BRANCH"
+    git remote add origin ../origin.git
+    git push --quiet origin "$BRANCH" 2>/dev/null
+    atomic init --no-vault >/dev/null 2>&1 || true
+    rm -f .atomicignore
+    use_binding_key
+    assert_success "alice: git import" atomic git import
+    assert_success "alice: bridge enable" atomic git bridge enable --binding-key-file "$BINDING_KEY"
+    create_file "alice.txt" "alice"
+    atomic add alice.txt >/dev/null 2>&1 || true
+    assert_success "alice: record" atomic record -m "alice change"
+    assert_success "alice: reconcile projects the change to Git" atomic git bridge reconcile
+    ALICE_HASH="$(atomic log --format short 2>/dev/null | awk '/alice change/ { print $1; exit }')"
+    if [[ -n "$ALICE_HASH" ]]; then _pass "alice: change hash $ALICE_HASH"; else _fail "alice: change hash" "no 'alice change' in atomic log"; fi
+    # RFC §8.6: without an Atomic remote, the binding's changes.pack carries the change files.
+    if atomic git bridge binding publish --key-file "$BINDING_KEY" --with-changes-pack >/dev/null 2>&1; then
+        _pass "alice: publish a binding with its changes.pack"
+    else
+        _fail "alice: publish a binding with its changes.pack" "$(atomic git bridge binding publish --key-file "$BINDING_KEY" --with-changes-pack 2>&1 | grep '✗' | head -1 | cut -c1-200)"
+        atomic git bridge binding publish --key-file "$BINDING_KEY" >/dev/null 2>&1 || true
+    fi
+    git push --quiet origin "$BRANCH" 'refs/atomic/*:refs/atomic/*' >/dev/null 2>&1 || true
+
+    # Teammate, RFC §8.6: `atomic clone <git-url>` bootstraps through the binding.
+    cd "$SHARE_DIR"
+    OUT="$(atomic clone "file://$SHARE_DIR/origin.git" bob-clone 2>&1)" && RC=0 || RC=$?
+    if [[ $RC -eq 0 ]]; then _pass "teammate: atomic clone of the Git URL"; else _fail "teammate: atomic clone of the Git URL" "$(printf '%s' "$OUT" | grep '✗' | head -1 | cut -c1-200)"; fi
+    if [[ -d bob-clone && -n "$ALICE_HASH" ]]; then
+        cd bob-clone
+        assert_output_contains "teammate: atomic clone has Alice's exact change" "$ALICE_HASH" atomic log --format short
+        assert_success "teammate: atomic status works after atomic clone" atomic status
+        cd "$SHARE_DIR"
+    fi
+
+    # Teammate, plain Git clone: trailers are hints; without a usable binding the
+    # history is synthesized, never refused (RFC §5.2, §12 item 8).
+    git clone --quiet origin.git bob-git 2>/dev/null
+    cd bob-git
+    init_git_repo
+    git fetch --quiet origin '+refs/atomic/*:refs/atomic/*' 2>/dev/null || true
+    atomic init --no-vault >/dev/null 2>&1 || true
+    rm -f .atomicignore
+    assert_success "teammate: git import of the pushed history" atomic git import
+fi
 
 print_summary
