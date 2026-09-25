@@ -143,19 +143,7 @@ pub fn active_delegation_urn(
     agent_identity: Option<&str>,
     identity_dir: Option<&Path>,
 ) -> Option<String> {
-    let name = agent_identity
-        .map(str::to_string)
-        .or_else(|| std::env::var(AGENT_IDENTITY_ENV).ok())
-        .map(|n| n.trim().to_string())
-        .filter(|n| !n.is_empty())?;
-
-    let store = match identity_dir {
-        Some(dir) => atomic_identity::IdentityStore::open(dir),
-        None => atomic_identity::IdentityStore::open_default(),
-    }
-    .ok()?;
-
-    let identity = store.load_by_name(&name).ok()?;
+    let (store, identity) = load_selected_agent_identity(agent_identity, identity_dir)?;
     atomic_canonical::delegation::active_for_delegate(&store, &identity)
         .map(|d| d.delegation.id.to_urn())
 }
@@ -166,26 +154,37 @@ pub fn active_delegation_urn(
 /// gets both authenticated pushes and correctly attributed changes.
 pub const AGENT_IDENTITY_ENV: &str = "ATOMIC_AGENT_IDENTITY";
 
-/// Build an author from a delegated agent identity, if one is configured and
-/// resolvable.
+/// Open the identity store at the given directory, or the default one.
 ///
-/// Returns `None` — rather than failing — whenever the identity is missing or
-/// unreadable. Recording a turn must not break because an agent identity was
-/// mistyped; falling back to the plus-tag author keeps the work attributed to
-/// *someone* and leaves a debug log explaining why it is not keyed.
-fn delegated_agent_author(options: &AgentAuthorOptions<'_>) -> Option<Author> {
-    let name = options
-        .agent_identity
-        .clone()
+/// Returns `None` rather than failing: every caller here is on a
+/// best-effort path where recording must continue without identity data.
+fn open_identity_store(identity_dir: Option<&Path>) -> Option<atomic_identity::IdentityStore> {
+    match identity_dir {
+        Some(dir) => atomic_identity::IdentityStore::open(dir).ok(),
+        None => atomic_identity::IdentityStore::open_default().ok(),
+    }
+}
+
+/// The currently-selected delegated agent identity, if one resolves.
+///
+/// Shared by the author path ([`delegated_agent_author`]) and the signing
+/// path ([`resolve_turn_signer`]) so attribution and proof can never name
+/// different identities: same name chain (explicit option, else
+/// [`AGENT_IDENTITY_ENV`]), same store, same refusal of human identities.
+///
+/// Returns the store alongside the identity — callers need it to load the
+/// keypair without re-opening (and possibly disagreeing about) the store.
+fn load_selected_agent_identity(
+    agent_identity: Option<&str>,
+    identity_dir: Option<&Path>,
+) -> Option<(atomic_identity::IdentityStore, atomic_identity::Identity)> {
+    let name = agent_identity
+        .map(str::to_string)
         .or_else(|| std::env::var(AGENT_IDENTITY_ENV).ok())
         .map(|n| n.trim().to_string())
         .filter(|n| !n.is_empty())?;
 
-    let store = match options.identity_dir.as_deref() {
-        Some(dir) => atomic_identity::IdentityStore::open(dir),
-        None => atomic_identity::IdentityStore::open_default(),
-    }
-    .ok()?;
+    let store = open_identity_store(identity_dir)?;
 
     let identity = match store.load_by_name(&name) {
         Ok(identity) => identity,
@@ -202,6 +201,79 @@ fn delegated_agent_author(options: &AgentAuthorOptions<'_>) -> Option<Author> {
         log::debug!("'{name}' is not an agent identity; falling back to plus-tag");
         return None;
     }
+
+    Some((store, identity))
+}
+
+/// Resolve the signer for a recorded turn: the identity whose public key
+/// the header author claims.
+///
+/// The levels mirror [`resolve_agent_author`] exactly, so the signature
+/// always proves the header's key claim:
+///
+/// 1. A **selected delegated agent identity** — keyed attribution claims
+///    its public key, so the turn signs with its secret key. If the
+///    identity resolves but its keypair is not on disk (a
+///    verification-only identity), the turn records **unsigned** rather
+///    than silently signing as someone else — a signature by a different
+///    key would contradict the header's claim.
+/// 2. The **default identity** — the plus-tag path claims the human's
+///    public key, so the turn signs with the human's secret key, exactly
+///    like `atomic record` does.
+/// 3. Neither — `None`; the change records unsigned (legacy behavior).
+///
+/// Never fails: a turn must not fail to record over identity selection.
+pub fn resolve_turn_signer(
+    agent_identity: Option<&str>,
+    identity_dir: Option<&Path>,
+) -> Option<atomic_repository::record::SigningIdentity> {
+    use atomic_canonical::did::did_for_public_key;
+    use atomic_identity::{Identity, KeyPair};
+
+    fn signing_identity(
+        identity: &Identity,
+        keypair: &KeyPair,
+    ) -> atomic_repository::record::SigningIdentity {
+        atomic_repository::record::SigningIdentity {
+            signer_did: did_for_public_key(&identity.public_key),
+            secret_key: *keypair.secret.as_bytes(),
+        }
+    }
+
+    // Level 1: the selected delegated identity — claim and proof must agree.
+    if let Some((store, identity)) = load_selected_agent_identity(agent_identity, identity_dir) {
+        return match store.load_keypair(&identity.id, None) {
+            Ok(keypair) => Some(signing_identity(&identity, &keypair)),
+            Err(e) => {
+                log::debug!(
+                    "Agent identity '{}' has no usable local keypair ({e}); \
+                     recording unsigned rather than signing as someone else",
+                    identity.name
+                );
+                None
+            }
+        };
+    }
+
+    // Level 2: plus-tag attribution claims the default identity's key.
+    let store = open_identity_store(identity_dir)?;
+    let identity = store.get_default().ok()??;
+    let keypair = store.load_keypair(&identity.id, None).ok()?;
+    Some(signing_identity(&identity, &keypair))
+}
+
+/// Build an author from a delegated agent identity, if one is configured and
+/// resolvable.
+///
+/// Returns `None` — rather than failing — whenever the identity is missing or
+/// unreadable. Recording a turn must not break because an agent identity was
+/// mistyped; falling back to the plus-tag author keeps the work attributed to
+/// *someone* and leaves a debug log explaining why it is not keyed.
+fn delegated_agent_author(options: &AgentAuthorOptions<'_>) -> Option<Author> {
+    let (_, identity) = load_selected_agent_identity(
+        options.agent_identity.as_deref(),
+        options.identity_dir.as_deref(),
+    )?;
 
     let session_short = extract_session_short(options.session_id);
     let tag = format!(
@@ -830,6 +902,140 @@ mod tests {
             active_delegation_urn(Some("alice+claude"), Some(dir.path())),
             None
         );
+    }
+
+    // resolve_turn_signer
+
+    /// Test fixture: a store holding a human default identity (with key)
+    /// and a delegated agent identity (with key).
+    fn signer_test_store(
+        dir: &Path,
+    ) -> (
+        atomic_identity::KeyPair,
+        atomic_identity::Identity,
+        atomic_identity::KeyPair,
+        atomic_identity::Identity,
+    ) {
+        use atomic_identity::{Identity, IdentityStore, IdentityType, KeyPair};
+
+        let mut store = IdentityStore::open(dir).unwrap();
+
+        let human_key = KeyPair::generate();
+        let human = Identity::builder("alice")
+            .email("alice@example.com")
+            .public_key(human_key.public.clone())
+            .build()
+            .unwrap();
+        store.save_with_keypair(&human, &human_key, None).unwrap();
+        store.set_default(&human.id).unwrap();
+
+        let agent_key = KeyPair::generate();
+        let agent = Identity::builder("alice+claude")
+            .identity_type(IdentityType::Agent)
+            .email("alice+claude@example.com")
+            .public_key(agent_key.public.clone())
+            .delegated_by(human.id)
+            .build()
+            .unwrap();
+        store.save_with_keypair(&agent, &agent_key, None).unwrap();
+
+        (human_key, human, agent_key, agent)
+    }
+
+    /// The whole point of the feature: a selected agent identity signs with
+    /// its OWN key, so the signature proves the header's key claim. The
+    /// human's key must not sign work attributed to the agent.
+    #[test]
+    fn a_selected_agent_identity_signs_with_its_own_key() {
+        use atomic_canonical::did::did_for_public_key;
+
+        let dir = TempDir::new().unwrap();
+        let (human_key, _, agent_key, agent) = signer_test_store(dir.path());
+
+        let signer = resolve_turn_signer(Some("alice+claude"), Some(dir.path())).expect("signer");
+
+        assert_eq!(
+            signer.signer_did,
+            did_for_public_key(&agent.public_key),
+            "signer DID must name the agent identity"
+        );
+        assert_eq!(signer.secret_key, *agent_key.secret.as_bytes());
+        assert_ne!(
+            signer.secret_key,
+            *human_key.secret.as_bytes(),
+            "the human's key must never sign agent-attributed work"
+        );
+    }
+
+    /// A verification-only agent identity (no keypair on disk) must not fall
+    /// through to signing as someone else: the header claims the agent's
+    /// key, so a signature by any other key would contradict the claim.
+    #[test]
+    fn a_keyless_selected_identity_records_unsigned_not_as_someone_else() {
+        use atomic_identity::{Identity, IdentityStore, IdentityType};
+
+        let dir = TempDir::new().unwrap();
+        let mut store = IdentityStore::open(dir.path()).unwrap();
+
+        let human_key = atomic_identity::KeyPair::generate();
+        let human = Identity::builder("alice")
+            .email("alice@example.com")
+            .public_key(human_key.public.clone())
+            .build()
+            .unwrap();
+        store.save_with_keypair(&human, &human_key, None).unwrap();
+        store.set_default(&human.id).unwrap();
+
+        let agent_key = atomic_identity::KeyPair::generate();
+        let agent = Identity::builder("alice+claude")
+            .identity_type(IdentityType::Agent)
+            .public_key(agent_key.public.clone())
+            .delegated_by(human.id)
+            .build()
+            .unwrap();
+        // Saved WITHOUT the keypair — the store knows the identity and its
+        // public key, but not the secret.
+        store.save(&agent).unwrap();
+
+        assert!(resolve_turn_signer(Some("alice+claude"), Some(dir.path())).is_none());
+    }
+
+    /// Plus-tag attribution claims the default identity's public key, so
+    /// that is what signs when no agent identity is selected — the same
+    /// identity `atomic record` would sign with.
+    #[test]
+    fn with_no_selection_the_default_identity_signs() {
+        use atomic_canonical::did::did_for_public_key;
+
+        let dir = TempDir::new().unwrap();
+        let (human_key, human, _, _) = signer_test_store(dir.path());
+
+        let signer = resolve_turn_signer(None, Some(dir.path())).expect("signer");
+
+        assert_eq!(signer.signer_did, did_for_public_key(&human.public_key));
+        assert_eq!(signer.secret_key, *human_key.secret.as_bytes());
+    }
+
+    /// A human identity passed as the agent identity is refused at level 1 —
+    /// attribution falls to the plus-tag path, so the signer must be the
+    /// default identity, matching the header's claim.
+    #[test]
+    fn a_human_identity_selected_falls_back_to_the_default_signer() {
+        let dir = TempDir::new().unwrap();
+        let (human_key, _, _, _) = signer_test_store(dir.path());
+
+        // "alice" is the human default, not an agent identity.
+        let signer = resolve_turn_signer(Some("alice"), Some(dir.path())).expect("signer");
+        assert_eq!(signer.secret_key, *human_key.secret.as_bytes());
+    }
+
+    /// No identities at all: no signer, and the turn records unsigned —
+    /// legacy behavior, unchanged.
+    #[test]
+    fn an_empty_store_has_no_signer() {
+        let dir = TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join("identities")).unwrap();
+        assert!(resolve_turn_signer(None, Some(dir.path().join("identities").as_path())).is_none());
     }
 
     // resolve_agent_author (integration)
