@@ -924,50 +924,17 @@ enum LinearStep {
 fn select_linear_successor<T>(
     txn: &T,
     inode: Inode,
-    adj: &mut atomic_core::pristine::InodeAdjState,
+    current: atomic_core::types::GraphNode<NodeId>,
     options: &atomic_core::output::alive::RetrieveOptions,
 ) -> atomic_core::record::RecordResult<LinearStep>
 where
     T: atomic_core::pristine::GraphTxnT + atomic_core::pristine::InodeGraphOps,
 {
-    use atomic_core::types::EdgeFlags;
-
-    let mut alive: Vec<atomic_core::types::GraphNode<NodeId>> = Vec::new();
-    let mut deleted: std::collections::HashSet<atomic_core::types::GraphNode<NodeId>> =
-        std::collections::HashSet::new();
-
-    while let Some(edge_result) = txn.next_inode_adj(adj) {
-        let edge = match edge_result {
-            Ok(edge) => edge,
-            Err(_) => return Ok(LinearStep::Bail),
-        };
-        let flags = edge.flag();
-        if flags.contains(EdgeFlags::PARENT)
-            || flags.contains(EdgeFlags::PSEUDO)
-            || flags.contains(EdgeFlags::FOLDER)
-        {
-            continue;
-        }
-        if !options.passes_filter(edge.introduced_by()) {
-            continue;
-        }
-        let dest = match txn.find_block_in_inode(inode, edge.dest()) {
-            Ok(Some(d)) => d,
-            Ok(None) | Err(_) => return Ok(LinearStep::Bail),
-        };
-        if !options.passes_filter(dest.change) {
-            continue;
-        }
-        if flags.contains(EdgeFlags::DELETED) {
-            deleted.insert(dest);
-        } else if !alive.contains(&dest) {
-            alive.push(dest);
-        }
-    }
-
     // A destination that is both alive (original edge) and deleted (superseding
     // edge) is dead from this view's perspective.
-    alive.retain(|d| !deleted.contains(d));
+    let Some((alive, deleted)) = forward_successors(txn, inode, current, options)? else {
+        return Ok(LinearStep::Bail);
+    };
 
     match alive.len() {
         0 => {
@@ -979,9 +946,142 @@ where
                 Ok(LinearStep::Bail)
             }
         }
-        1 => Ok(LinearStep::Follow(alive[0])),
+        1 if deleted.is_empty() => Ok(LinearStep::Follow(alive[0])),
+        // A deleted successor usually belongs to an in-place replacement: the
+        // dead chain rejoins the live successor's chain further down. After an
+        // insertion, though, the old `predecessor → successor` edge survives
+        // next to `predecessor → inserted → successor`, and deleting the first
+        // inserted line leaves the rest of the insertion reachable only through
+        // the dead vertex. Follow the live successor only when everything alive
+        // behind the dead successors is also reachable from it.
+        1 => {
+            if dead_successors_rejoin(txn, inode, alive[0], &deleted, options)? {
+                Ok(LinearStep::Follow(alive[0]))
+            } else {
+                Ok(LinearStep::Bail)
+            }
+        }
         _ => Ok(LinearStep::Bail),
     }
+}
+
+/// Bound on the vertices [`dead_successors_rejoin`] visits before it gives up
+/// and the walk defers to the full graph retrieval.
+const REJOIN_SEARCH_LIMIT: usize = 4096;
+
+/// Live and dead forward successors of a vertex.
+type ForwardSuccessors = (
+    Vec<atomic_core::types::GraphNode<NodeId>>,
+    std::collections::HashSet<atomic_core::types::GraphNode<NodeId>>,
+);
+
+/// Forward successors of `node`, split into live and dead destinations with the
+/// same rules as [`select_linear_successor`]. `None` when an edge can't be
+/// resolved inside the inode.
+fn forward_successors<T>(
+    txn: &T,
+    inode: Inode,
+    node: atomic_core::types::GraphNode<NodeId>,
+    options: &atomic_core::output::alive::RetrieveOptions,
+) -> atomic_core::record::RecordResult<Option<ForwardSuccessors>>
+where
+    T: atomic_core::pristine::GraphTxnT + atomic_core::pristine::InodeGraphOps,
+{
+    use atomic_core::types::EdgeFlags;
+
+    let mut adj = txn
+        .init_inode_adj(inode, node, EdgeFlags::BLOCK, EdgeFlags::all())
+        .map_err(|e| {
+            atomic_core::record::RecordError::Io(std::io::Error::other(format!(
+                "Failed to init inode traversal: {}",
+                e
+            )))
+        })?;
+    let mut alive = Vec::new();
+    let mut deleted = std::collections::HashSet::new();
+    while let Some(edge_result) = txn.next_inode_adj(&mut adj) {
+        let Ok(edge) = edge_result else {
+            return Ok(None);
+        };
+        let flags = edge.flag();
+        if flags.contains(EdgeFlags::PARENT)
+            || flags.contains(EdgeFlags::PSEUDO)
+            || flags.contains(EdgeFlags::FOLDER)
+            || !options.passes_filter(edge.introduced_by())
+        {
+            continue;
+        }
+        let Ok(Some(dest)) = txn.find_block_in_inode(inode, edge.dest()) else {
+            return Ok(None);
+        };
+        if !options.passes_filter(dest.change) {
+            continue;
+        }
+        if flags.contains(EdgeFlags::DELETED) {
+            deleted.insert(dest);
+        } else if !alive.contains(&dest) {
+            alive.push(dest);
+        }
+    }
+    alive.retain(|d| !deleted.contains(d));
+    Ok(Some((alive, deleted)))
+}
+
+/// Whether every live vertex reachable from `deleted` through dead vertices is
+/// also reachable from `live`, so following `live` skips no content.
+fn dead_successors_rejoin<T>(
+    txn: &T,
+    inode: Inode,
+    live: atomic_core::types::GraphNode<NodeId>,
+    deleted: &std::collections::HashSet<atomic_core::types::GraphNode<NodeId>>,
+    options: &atomic_core::output::alive::RetrieveOptions,
+) -> atomic_core::record::RecordResult<bool>
+where
+    T: atomic_core::pristine::GraphTxnT + atomic_core::pristine::InodeGraphOps,
+{
+    let mut behind_dead = std::collections::HashSet::new();
+    let mut dead_seen = deleted.clone();
+    let mut queue: Vec<_> = deleted.iter().copied().collect();
+    while let Some(dead) = queue.pop() {
+        if dead_seen.len() > REJOIN_SEARCH_LIMIT {
+            return Ok(false);
+        }
+        let Some((next_alive, next_deleted)) = forward_successors(txn, inode, dead, options)?
+        else {
+            return Ok(false);
+        };
+        for next in next_deleted {
+            if dead_seen.insert(next) {
+                queue.push(next);
+            }
+        }
+        behind_dead.extend(next_alive);
+    }
+    behind_dead.remove(&live);
+    if behind_dead.is_empty() {
+        return Ok(true);
+    }
+
+    let mut seen = std::collections::HashSet::from([live]);
+    let mut queue = vec![live];
+    while let Some(node) = queue.pop() {
+        if seen.len() > REJOIN_SEARCH_LIMIT {
+            return Ok(false);
+        }
+        let Some((next_alive, next_deleted)) = forward_successors(txn, inode, node, options)?
+        else {
+            return Ok(false);
+        };
+        for next in next_alive.into_iter().chain(next_deleted) {
+            if behind_dead.remove(&next) && behind_dead.is_empty() {
+                return Ok(true);
+            }
+            if seen.insert(next) {
+                queue.push(next);
+            }
+        }
+    }
+    Ok(false)
 }
 
 fn try_retrieve_linear_content_with_filter<T, C>(
@@ -1019,16 +1119,7 @@ where
             return Ok(None);
         }
 
-        let mut adj = txn
-            .init_inode_adj(inode, current, EdgeFlags::BLOCK, EdgeFlags::all())
-            .map_err(|e| {
-                atomic_core::record::RecordError::Io(std::io::Error::other(format!(
-                    "Failed to init inode traversal: {}",
-                    e
-                )))
-            })?;
-
-        let dest = match select_linear_successor(txn, inode, &mut adj, options)? {
+        let dest = match select_linear_successor(txn, inode, current, options)? {
             LinearStep::Follow(d) => d,
             LinearStep::End => break,
             // A conflict fork or delete-through that the linear walk cannot
