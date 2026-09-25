@@ -37,6 +37,17 @@ pub struct TurnRecordOptions<'a> {
     ///
     /// Used for the change message and the SessionEnvelope's prompt_summary.
     pub prompt: Option<String>,
+
+    /// Name of the delegated agent identity to sign this turn as, if one
+    /// is in force.
+    ///
+    /// Resolved once by the CLI hook handler (`ATOMIC_AGENT_IDENTITY` env var,
+    /// else the global `agent_identity` setting, else the active server
+    /// profile's binding) and passed as plain data — this crate never reads
+    /// config. `None` means no delegated identity was selected, and the
+    /// author falls back to the plus-tag of the default identity, exactly
+    /// as before agent identities existed.
+    pub agent_identity: Option<String>,
 }
 
 /// The result of recording a turn as an Atomic change.
