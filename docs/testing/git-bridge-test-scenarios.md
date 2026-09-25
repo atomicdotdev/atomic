@@ -7,6 +7,7 @@ The workflows I ran against #207 (Git Bridge / Git Shim) and the scenarios that 
 - **Environment:** macOS, git 2.50, debug builds, throwaway repositories under `/tmp`.
 - **How agents were tested:** Claude Code hook events were simulated with `atomic agent hooks claude-code <event> --json`: `session-start`, `user-prompt-submit`, file edits, `stop`. An isolated `HOME` was used.
 - **References:** expectations cite `docs/RFC-ATOMIC-GIT-CAUSAL-BRIDGE.md` (RFC) and `docs/bridge-operating-guide.md` (guide).
+- **Harness:** `tests/harness/46_git_bridge_scenarios.sh` has one section per workflow W1–W13. W10 and W11 run only when `ATOMIC_PREV_BIN` points to a previous release binary. It asserts the expected behaviour, so the section for an open scenario fails until that scenario is fixed. On 990612c, W2–W6 pass and every failure falls in the section for F1–F7 or F9. With #212, W12 passes too. W14–W16 aren't in the harness: F8 needs the pull save path, F10 has unit tests in #213, and F11 is only an error message.
 
 ---
 
@@ -89,7 +90,7 @@ W2–W6 start from a repository anchored with `atomic init --no-vault`, with `.a
 ### F9. A concurrent same-path change inserted into the current view is refused
 - **Steps:** W13. The change files were copied between repositories to stand in for a pull.
 - **Expected:** concurrent claims on one path are kept as live claims and surfaced as a name conflict (RFC §3.12 N12, §4 invariant 8).
-- **Actual:** the second insert fails with `cannot add 'same.txt': path is already bound to graph inode`. Inserting the same two changes into a *non-current* view correctly produces a name conflict, in either order.
+- **Actual:** the second insert fails with `cannot add 'same.txt': path is already bound to graph inode`. The refused insert also leaves its operation open: `atomic log` then fails with `repository operation is still completing; retry with a writable repository open` until a writable command such as `atomic status` completes it. Inserting the same two changes into a *non-current* view correctly produces a name conflict, in either order.
 - **Verified:** run. **Status:** open.
 
 ### F10. Filter drivers received paths split or interpreted by the shell
