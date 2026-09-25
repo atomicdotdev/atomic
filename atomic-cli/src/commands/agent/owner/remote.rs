@@ -205,12 +205,7 @@ pub(crate) async fn bind(dot_dir: &Path, offline: bool) -> anyhow::Result<Endpoi
         }
         Err(e) => return Err(e).with_context(|| format!("failed to read {}", key_path.display())),
     };
-    let builder = if offline {
-        Endpoint::builder(presets::Minimal)
-    } else {
-        Endpoint::builder(presets::N0)
-    };
-    Ok(builder
+    Ok(builder(offline)?
         .secret_key(key)
         .alpns(vec![ALPN.to_vec()])
         .bind()
@@ -244,12 +239,30 @@ pub(crate) async fn pointer_addr(endpoint: &Endpoint, offline: bool) -> Endpoint
 
 /// A client endpoint for dialing an owner.
 async fn dialer(offline: bool) -> anyhow::Result<Endpoint> {
+    Ok(builder(offline)?.bind().await?)
+}
+
+/// An endpoint builder: the relay-less preset when offline, and IPv4 only
+/// when `ATOMIC_IROH_IPV4_ONLY` is set — for hosts where creating an IPv6
+/// socket misbehaves (it takes down the process under some microVM network
+/// backends), so the endpoint never opens one.
+fn builder(offline: bool) -> anyhow::Result<iroh::endpoint::Builder> {
     let builder = if offline {
         Endpoint::builder(presets::Minimal)
     } else {
         Endpoint::builder(presets::N0)
     };
-    Ok(builder.bind().await?)
+    if !ipv4_only() {
+        return Ok(builder);
+    }
+    builder
+        .clear_ip_transports()
+        .bind_addr("0.0.0.0:0")
+        .map_err(|e| anyhow!("invalid bind address: {e}"))
+}
+
+fn ipv4_only() -> bool {
+    std::env::var("ATOMIC_IROH_IPV4_ONLY").is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
 }
 
 fn write_private(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
