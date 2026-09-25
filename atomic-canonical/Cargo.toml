@@ -10,10 +10,16 @@ rust-version.workspace = true
 
 [dependencies]
 serde = { workspace = true }
-serde_json = { workspace = true }
+serde_json = { workspace = true, features = ["unbounded_depth"] }
+jcs-admit = { workspace = true }
 blake3 = { workspace = true }
 bs58 = { workspace = true }
 chrono = { workspace = true }
 thiserror = { workspace = true }
 data-encoding = { workspace = true }
 atomic-identity = { workspace = true }
+
+[dev-dependencies]
+# The ingest-boundary test drives the real identity store, because the bytes
+# `load_for_delegate` admits are the bytes a store holds.
+tempfile = { workspace = true }

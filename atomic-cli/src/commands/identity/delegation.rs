@@ -26,6 +26,7 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 
 use atomic_canonical::delegation as cert;
+use atomic_canonical::jcs;
 use atomic_identity::delegation::DelegationId;
 use atomic_identity::IdentityStore;
 use atomic_remote::storage_types::{PushDelegationRequest, RevokeDelegationRequest};
@@ -95,10 +96,12 @@ pub struct Install {
 impl Command for Install {
     fn run(&self) -> CliResult<()> {
         let raw = read_input(&self.path)?;
-        let value: serde_json::Value =
-            serde_json::from_str(&raw).map_err(|e| CliError::InvalidArgument {
-                message: format!("{} is not valid JSON: {e}", self.path),
-            })?;
+        // Admission before the value exists: the raw bytes are what gets stored
+        // and later re-verified, so a fault the parse would have swallowed is a
+        // fault this machine would keep.
+        let value = jcs::admit_document(raw.as_bytes()).map_err(|e| CliError::InvalidArgument {
+            message: format!("{} was refused: {e}", self.path),
+        })?;
 
         // Verify before storing. A certificate that does not verify is not
         // something to keep "in case" — it would be silently skipped at use
@@ -187,8 +190,8 @@ impl Push {
 
         let mut pushed = 0;
         for (id, raw) in documents {
-            let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) else {
-                print_warning(&format!("Skipping {id}: not valid JSON"));
+            let Ok(value) = jcs::admit_document(raw.as_bytes()) else {
+                print_warning(&format!("Skipping {id}: refused at the ingest boundary"));
                 continue;
             };
             let Ok(delegation) = cert::verify_self_contained(&value) else {
@@ -253,7 +256,7 @@ impl Command for List {
 
         let mut any = false;
         for (id, raw) in stored {
-            let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) else {
+            let Ok(value) = jcs::admit_document(raw.as_bytes()) else {
                 continue;
             };
             // Show what parses even if it does not verify — a certificate that
@@ -337,10 +340,9 @@ impl Verify {
             load_document(&store, &self.target)?
         };
 
-        let value: serde_json::Value =
-            serde_json::from_str(&raw).map_err(|e| CliError::InvalidArgument {
-                message: format!("not valid JSON: {e}"),
-            })?;
+        let value = jcs::admit_document(raw.as_bytes()).map_err(|e| CliError::InvalidArgument {
+            message: format!("refused: {e}"),
+        })?;
 
         let delegation = match cert::verify_self_contained(&value) {
             Ok(d) => {
@@ -492,10 +494,9 @@ impl Revoke {
             .expect("clap requires one of id/--all-mine");
         let id = normalize_id(raw_id)?;
         let raw = load_document(&store, raw_id)?;
-        let value: serde_json::Value =
-            serde_json::from_str(&raw).map_err(|e| CliError::InvalidArgument {
-                message: format!("stored grant is not valid JSON: {e}"),
-            })?;
+        let value = jcs::admit_document(raw.as_bytes()).map_err(|e| CliError::InvalidArgument {
+            message: format!("stored grant was refused: {e}"),
+        })?;
         let delegation = cert::parse(&value).map_err(|e| CliError::DelegationError {
             message: format!("stored grant is malformed: {e}"),
         })?;

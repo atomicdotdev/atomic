@@ -1,0 +1,303 @@
+{
+  "_type": "https://in-toto.io/Statement/v1",
+  "predicate": {
+    "action": {
+      "durationMs": 412,
+      "method": "tools/call",
+      "protocol": "mcp",
+      "success": true,
+      "timestamp": "2026-08-18T14:33:41.882Z",
+      "toolName": "create_pull_request",
+      "type": "tool_call"
+    },
+    "agent": {
+      "principal": "svc:agent-workspace",
+      "sessionId": "sess-4f2a"
+    },
+    "chain": {
+      "previousHash": "genesis"
+    },
+    "extensions": {
+      "n": {
+        "n": {
+          "n": {
+            "n": {
+              "n": {
+                "n": {
+                  "n": {
+                    "n": {
+                      "n": {
+                        "n": {
+                          "n": {
+                            "n": {
+                              "n": {
+                                "n": {
+                                  "n": {
+                                    "n": {
+                                      "n": {
+                                        "n": {
+                                          "n": {
+                                            "n": {
+                                              "n": {
+                                                "n": {
+                                                  "n": {
+                                                    "n": {
+                                                      "n": {
+                                                        "n": {
+                                                          "n": {
+                                                            "n": {
+                                                              "n": {
+                                                                "n": {
+                                                                  "n": {
+                                                                    "n": {
+                                                                      "n": {
+                                                                        "n": {
+                                                                          "n": {
+                                                                            "n": {
+                                                                              "n": {
+                                                                                "n": {
+                                                                                  "n": {
+                                                                                    "n": {
+                                                                                      "n": {
+                                                                                        "n": {
+                                                                                          "n": {
+                                                                                            "n": {
+                                                                                              "n": {
+                                                                                                "n": {
+                                                                                                  "n": {
+                                                                                                    "n": {
+                                                                                                      "n": {
+                                                                                                        "n": {
+                                                                                                          "n": {
+                                                                                                            "n": {
+                                                                                                              "n": {
+                                                                                                                "n": {
+                                                                                                                  "n": {
+                                                                                                                    "n": {
+                                                                                                                      "n": {
+                                                                                                                        "n": {
+                                                                                                                          "n": {
+                                                                                                                            "n": {
+                                                                                                                              "n": {
+                                                                                                                                "n": {
+                                                                                                                                  "n": {
+                                                                                                                                    "n": {
+                                                                                                                                      "n": {
+                                                                                                                                        "n": {
+                                                                                                                                          "n": {
+                                                                                                                                            "n": {
+                                                                                                                                              "n": {
+                                                                                                                                                "n": {
+                                                                                                                                                  "n": {
+                                                                                                                                                    "n": {
+                                                                                                                                                      "n": {
+                                                                                                                                                        "n": {
+                                                                                                                                                          "n": {
+                                                                                                                                                            "n": {
+                                                                                                                                                              "n": {
+                                                                                                                                                                "n": {
+                                                                                                                                                                  "n": {
+                                                                                                                                                                    "n": {
+                                                                                                                                                                      "n": {
+                                                                                                                                                                        "n": {
+                                                                                                                                                                          "n": {
+                                                                                                                                                                            "n": {
+                                                                                                                                                                              "n": {
+                                                                                                                                                                                "n": {
+                                                                                                                                                                                  "n": {
+                                                                                                                                                                                    "n": {
+                                                                                                                                                                                      "n": {
+                                                                                                                                                                                        "n": {
+                                                                                                                                                                                          "n": {
+                                                                                                                                                                                            "n": {
+                                                                                                                                                                                              "n": {
+                                                                                                                                                                                                "n": {
+                                                                                                                                                                                                  "n": {
+                                                                                                                                                                                                    "n": {
+                                                                                                                                                                                                      "n": {
+                                                                                                                                                                                                        "n": {
+                                                                                                                                                                                                          "n": {
+                                                                                                                                                                                                            "n": {
+                                                                                                                                                                                                              "n": {
+                                                                                                                                                                                                                "n": {
+                                                                                                                                                                                                                  "n": {
+                                                                                                                                                                                                                    "n": {
+                                                                                                                                                                                                                      "n": {
+                                                                                                                                                                                                                        "n": {
+                                                                                                                                                                                                                          "n": {
+                                                                                                                                                                                                                            "n": {
+                                                                                                                                                                                                                              "n": {
+                                                                                                                                                                                                                                "n": {
+                                                                                                                                                                                                                                  "n": {
+                                                                                                                                                                                                                                    "n": {
+                                                                                                                                                                                                                                      "n": {
+                                                                                                                                                                                                                                        "n": {
+                                                                                                                                                                                                                                          "n": {
+                                                                                                                                                                                                                                            "n": {
+                                                                                                                                                                                                                                              "n": {
+                                                                                                                                                                                                                                                "n": {
+                                                                                                                                                                                                                                                  "n": {
+                                                                                                                                                                                                                                                    "n": {
+                                                                                                                                                                                                                                                      "n": {
+                                                                                                                                                                                                                                                        "n": {
+                                                                                                                                                                                                                                                          "n": {
+                                                                                                                                                                                                                                                            "n": {
+                                                                                                                                                                                                                                                              "n": {
+                                                                                                                                                                                                                                                                "n": {
+                                                                                                                                                                                                                                                                  "n": {
+                                                                                                                                                                                                                                                                    "n": {
+                                                                                                                                                                                                                                                                      "n": "leaf"
+                                                                                                                                                                                                                                                                    }
+                                                                                                                                                                                                                                                                  }
+                                                                                                                                                                                                                                                                }
+                                                                                                                                                                                                                                                              }
+                                                                                                                                                                                                                                                            }
+                                                                                                                                                                                                                                                          }
+                                                                                                                                                                                                                                                        }
+                                                                                                                                                                                                                                                      }
+                                                                                                                                                                                                                                                    }
+                                                                                                                                                                                                                                                  }
+                                                                                                                                                                                                                                                }
+                                                                                                                                                                                                                                              }
+                                                                                                                                                                                                                                            }
+                                                                                                                                                                                                                                          }
+                                                                                                                                                                                                                                        }
+                                                                                                                                                                                                                                      }
+                                                                                                                                                                                                                                    }
+                                                                                                                                                                                                                                  }
+                                                                                                                                                                                                                                }
+                                                                                                                                                                                                                              }
+                                                                                                                                                                                                                            }
+                                                                                                                                                                                                                          }
+                                                                                                                                                                                                                        }
+                                                                                                                                                                                                                      }
+                                                                                                                                                                                                                    }
+                                                                                                                                                                                                                  }
+                                                                                                                                                                                                                }
+                                                                                                                                                                                                              }
+                                                                                                                                                                                                            }
+                                                                                                                                                                                                          }
+                                                                                                                                                                                                        }
+                                                                                                                                                                                                      }
+                                                                                                                                                                                                    }
+                                                                                                                                                                                                  }
+                                                                                                                                                                                                }
+                                                                                                                                                                                              }
+                                                                                                                                                                                            }
+                                                                                                                                                                                          }
+                                                                                                                                                                                        }
+                                                                                                                                                                                      }
+                                                                                                                                                                                    }
+                                                                                                                                                                                  }
+                                                                                                                                                                                }
+                                                                                                                                                                              }
+                                                                                                                                                                            }
+                                                                                                                                                                          }
+                                                                                                                                                                        }
+                                                                                                                                                                      }
+                                                                                                                                                                    }
+                                                                                                                                                                  }
+                                                                                                                                                                }
+                                                                                                                                                              }
+                                                                                                                                                            }
+                                                                                                                                                          }
+                                                                                                                                                        }
+                                                                                                                                                      }
+                                                                                                                                                    }
+                                                                                                                                                  }
+                                                                                                                                                }
+                                                                                                                                              }
+                                                                                                                                            }
+                                                                                                                                          }
+                                                                                                                                        }
+                                                                                                                                      }
+                                                                                                                                    }
+                                                                                                                                  }
+                                                                                                                                }
+                                                                                                                              }
+                                                                                                                            }
+                                                                                                                          }
+                                                                                                                        }
+                                                                                                                      }
+                                                                                                                    }
+                                                                                                                  }
+                                                                                                                }
+                                                                                                              }
+                                                                                                            }
+                                                                                                          }
+                                                                                                        }
+                                                                                                      }
+                                                                                                    }
+                                                                                                  }
+                                                                                                }
+                                                                                              }
+                                                                                            }
+                                                                                          }
+                                                                                        }
+                                                                                      }
+                                                                                    }
+                                                                                  }
+                                                                                }
+                                                                              }
+                                                                            }
+                                                                          }
+                                                                        }
+                                                                      }
+                                                                    }
+                                                                  }
+                                                                }
+                                                              }
+                                                            }
+                                                          }
+                                                        }
+                                                      }
+                                                    }
+                                                  }
+                                                }
+                                              }
+                                            }
+                                          }
+                                        }
+                                      }
+                                    }
+                                  }
+                                }
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "metadata": {
+      "attestorVersion": "example-gateway/0.4.0"
+    },
+    "parties": [
+      {
+        "party": "gateway",
+        "role": "witness",
+        "scope": [
+          "toolName",
+          "timestamp",
+          "durationMs"
+        ]
+      }
+    ]
+  },
+  "predicateType": "https://in-toto.io/attestation/ai-agent-action/v0.1",
+  "subject": [
+    {
+      "digest": {
+        "sha256": "4e70d92204aee18162dc4db4d6bdc2462b73ec0c45d794ec5912bfec124cea3e"
+      },
+      "name": "session:agent-workspace-4f2a"
+    }
+  ]
+}

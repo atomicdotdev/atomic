@@ -296,10 +296,16 @@ pub fn encode_for_transport(document: &Value) -> String {
 
 /// Decode a certificate presented in a request header.
 ///
-/// Checks the size cap first, then base64, then JSON. Does **not** verify —
+/// Checks the size cap first, then base64, then admission. Does **not** verify —
 /// [`verify`] against the delegator's registered key is a separate, mandatory
 /// step, and keeping them apart means no call site can accidentally treat a
 /// well-formed certificate as a trusted one.
+///
+/// Admission runs through [`crate::jcs::admit_document`] rather than a plain
+/// parse, because this is the one place a caller-supplied document reaches the
+/// shared canonicalizer. A certificate whose `delegateKey` is repeated names one
+/// key to a reader and a different one to the signature, and the parse discarded
+/// the repeat before anything could refuse it.
 pub fn decode_from_transport(encoded: &str) -> Result<Value> {
     if encoded.len() > MAX_ENCODED_DELEGATION {
         return Err(CanonicalError::Proof(format!(
@@ -312,8 +318,7 @@ pub fn decode_from_transport(encoded: &str) -> Result<Value> {
         .decode(encoded.trim().as_bytes())
         .map_err(|e| CanonicalError::Proof(format!("delegation is not valid base64url: {e}")))?;
 
-    serde_json::from_slice(&bytes)
-        .map_err(|e| CanonicalError::Proof(format!("delegation is not valid JSON: {e}")))
+    jcs::admit_document(&bytes)
 }
 
 /// A stable fingerprint of an encoded certificate, for caching a verified
@@ -506,10 +511,11 @@ impl StoredDelegation {
 /// Every verified certificate in `store` naming `delegate` as its subject,
 /// newest first.
 ///
-/// Certificates that fail to parse or verify are **skipped**, not returned as
-/// errors. This is the one place a corrupt or foreign file in the store could
-/// otherwise take down every agent operation, and a certificate that does not
-/// verify has no authority to convey in any case. Each skip is logged at warn.
+/// Certificates that fail admission or verification are **skipped**, not
+/// returned as errors. This is the one place a corrupt or foreign file in the
+/// store could otherwise take down every agent operation, and a certificate that
+/// does not verify has no authority to convey in any case. Each skip is logged
+/// at warn.
 ///
 /// Verification is self-contained — it uses the delegator key the certificate
 /// carries — so this works on a machine that holds only the agent's key.
@@ -524,7 +530,9 @@ pub fn load_for_delegate(
 
     let mut out = Vec::new();
     for (id, raw) in stored {
-        let Ok(value) = serde_json::from_str::<Value>(&raw) else {
+        // Admission, not a plain parse: a stored certificate is a document this
+        // machine received from somewhere else, and it is about to be verified.
+        let Ok(value) = jcs::admit_document(raw.as_bytes()) else {
             continue;
         };
         // Cheap discriminator before the Ed25519 verify: most certificates in

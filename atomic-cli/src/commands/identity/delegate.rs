@@ -25,6 +25,7 @@ use std::path::PathBuf;
 use clap::Parser;
 
 use atomic_canonical::delegation as cert;
+use atomic_canonical::jcs;
 use atomic_identity::delegation::{Delegation, DelegationScope};
 use atomic_identity::{Identity, IdentityStore, IdentityType};
 
@@ -322,10 +323,12 @@ impl Delegate {
             std::fs::read_to_string(path)?
         };
 
-        let value: serde_json::Value =
-            serde_json::from_str(&raw).map_err(|e| CliError::InvalidArgument {
-                message: format!("{path} is not valid JSON: {e}"),
-            })?;
+        // Admission before the value exists: a request arrives from the far end
+        // as bytes, and its self-signature is about to be checked over the
+        // canonical form of whatever those bytes denote.
+        let value = jcs::admit_document(raw.as_bytes()).map_err(|e| CliError::InvalidArgument {
+            message: format!("{path} was refused: {e}"),
+        })?;
 
         let request = cert::verify_request(&value).map_err(|e| CliError::DelegationError {
             message: format!(

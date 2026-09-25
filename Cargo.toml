@@ -39,6 +39,12 @@ atomic-teams = { path = "atomic-teams" }
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+# Admission control for JSON that will be hashed, signed or verified. Runs on
+# the raw bytes, ahead of the parse, so the faults a parsed value can no longer
+# report -- a repeated member, nesting past the depth cap, a string that is not
+# a sequence of Unicode scalar values, a number outside the profile -- are
+# refused with a named error rather than collapsed or rounded.
+jcs-admit = "0.1"
 postcard = { version = "1.0", features = ["alloc"] }
 toml = "0.8"
 semver = "1"
