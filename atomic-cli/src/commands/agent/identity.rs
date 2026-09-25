@@ -137,7 +137,7 @@ impl std::fmt::Display for AgentIdentitySource {
 
 impl AgentIdentitySource {
     /// Stable machine key for JSON output (`env`, `global`, `server-profile`).
-    /// The human labels live in [`Display`](Self::fmt).
+    /// The human labels live in the `Display` impl.
     pub fn key(&self) -> &'static str {
         match self {
             AgentIdentitySource::EnvVar => "env",
@@ -278,7 +278,9 @@ impl Command for Unset {
         })?;
 
         if had {
-            print_success("Agent identity unset — hooks record as the plus-tag of the default identity");
+            print_success(
+                "Agent identity unset — hooks record as the plus-tag of the default identity",
+            );
         } else {
             print_hint("No agent identity was set");
         }

@@ -225,9 +225,7 @@ impl Command for AgentStatus {
                 println!("  Identity: {name} ({source})");
             }
             None => {
-                println!(
-                    "  Identity: none — hooks record as the plus-tag of the default identity"
-                );
+                println!("  Identity: none — hooks record as the plus-tag of the default identity");
             }
         }
         println!();

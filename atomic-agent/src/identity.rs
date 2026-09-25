@@ -965,8 +965,7 @@ identity_type = "user"
     /// error — recording a turn must never fail over identity selection.
     #[test]
     fn build_agent_author_never_fails_on_an_unresolvable_name() {
-        let author =
-            build_agent_author("open-code", "OpenCode", "sess1234", Some("no-such-agent"));
+        let author = build_agent_author("open-code", "OpenCode", "sess1234", Some("no-such-agent"));
         assert!(!author.name.is_empty());
     }
 
@@ -976,8 +975,7 @@ identity_type = "user"
     #[test]
     fn build_agent_author_threads_the_delegated_name() {
         for name in [None, Some("fred+opencode")] {
-            let via_wrapper =
-                build_agent_author("open-code", "OpenCode", "sess1234", name);
+            let via_wrapper = build_agent_author("open-code", "OpenCode", "sess1234", name);
             let via_resolver = resolve_agent_author(&AgentAuthorOptions {
                 agent_name: "open-code",
                 agent_display_name: "OpenCode",

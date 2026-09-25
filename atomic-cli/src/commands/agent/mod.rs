@@ -204,7 +204,7 @@ pub enum AgentCommands {
     /// nothing is suppressed; `lifecycle end --json` returns the run summary.
     Lifecycle(Lifecycle),
 
-/// Run or inspect the repository-local redb database owner.
+    /// Run or inspect the repository-local redb database owner.
     #[command(name = "database-owner", hide = true)]
     DatabaseOwner(owner::DatabaseOwner),
 
