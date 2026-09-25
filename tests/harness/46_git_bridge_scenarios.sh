@@ -2,12 +2,12 @@
 # 46_git_bridge_scenarios.sh — Git bridge workflows and failed scenarios.
 #
 # One section per workflow in docs/testing/git-bridge-test-scenarios.md
-# (W1–W13). Assertions state the behaviour that RFC-ATOMIC-GIT-CAUSAL-BRIDGE
+# (W1–W13, W16). Assertions state the behaviour that RFC-ATOMIC-GIT-CAUSAL-BRIDGE
 # and bridge-operating-guide expect, so a section tagged with an open failed
 # scenario (F-number) fails until that scenario is fixed.
 #
 # Not covered here: W14/F8 (needs the pull save path), W15/F10 (unit tests in
-# #213), W16/F11 (error message only).
+# #213).
 #
 # Optional: ATOMIC_PREV_BIN=<previous release binary> enables W10 and W11.
 
@@ -334,5 +334,19 @@ assert_success "insert A into the current view" atomic insert "$HASH_A"
 assert_success "insert B into the current view is accepted" atomic insert "$HASH_B"
 assert_success "read-only log works after the inserts" atomic log --format short
 assert_output_contains "history contains both changes" "same.txt beta" atomic log --format short
+
+# ── W16 / F11. `atomic git import` before the first Git commit ──────────────
+
+begin_section "W16 / F11. git import before the first Git commit"
+make_temp_repo "import-unborn"
+init_git_repo
+atomic init --no-vault >/dev/null 2>&1 || true
+OUT="$(atomic git import 2>&1)" && RC=0 || RC=$?
+# Importing nothing may succeed; if it fails, the error must say why.
+if [[ $RC -eq 0 ]] || printf '%s' "$OUT" | grep -Eiq 'no commits|any commits|first commit|empty repository|unborn'; then
+    _pass "import before the first commit succeeds or says the repository has no commits"
+else
+    _fail "import before the first commit succeeds or says the repository has no commits" "$(printf '%s' "$OUT" | head -1)"
+fi
 
 print_summary

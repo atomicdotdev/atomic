@@ -7,7 +7,7 @@ The workflows I ran against #207 (Git Bridge / Git Shim) and the scenarios that 
 - **Environment:** macOS, git 2.50, debug builds, throwaway repositories under `/tmp`.
 - **How agents were tested:** Claude Code hook events were simulated with `atomic agent hooks claude-code <event> --json`: `session-start`, `user-prompt-submit`, file edits, `stop`. An isolated `HOME` was used.
 - **References:** expectations cite `docs/RFC-ATOMIC-GIT-CAUSAL-BRIDGE.md` (RFC) and `docs/bridge-operating-guide.md` (guide).
-- **Harness:** `tests/harness/46_git_bridge_scenarios.sh` has one section per workflow W1–W13. W10 and W11 run only when `ATOMIC_PREV_BIN` points to a previous release binary. It asserts the expected behaviour, so the section for an open scenario fails until that scenario is fixed. On 990612c, W2–W6 pass and every failure falls in the section for F1–F7 or F9. With #212, W12 passes too. W14–W16 aren't in the harness: F8 needs the pull save path, F10 has unit tests in #213, and F11 is only an error message.
+- **Harness:** `tests/harness/46_git_bridge_scenarios.sh` has one section per workflow W1–W13 and W16. W10 and W11 run only when `ATOMIC_PREV_BIN` points to a previous release binary. It asserts the expected behaviour, so the section for an open scenario fails until that scenario is fixed. On 990612c, W2–W6 pass and every failure falls in the section for F1–F7 or F9. With #212, W12 passes too. W14 and W15 aren't in the harness: F8 needs the pull save path, and F10 has unit tests in #213.
 
 ---
 
@@ -98,6 +98,7 @@ W2–W6 start from a repository anchored with `atomic init --no-vault`, with `.a
 - **Verified:** run. **Status:** fixed by #213, which quotes the path exactly as Git does.
 
 ### F11. `atomic git import` before the first Git commit
+- **Expected:** importing an empty repository either succeeds with nothing to import or says the repository has no commits yet.
 - **Actual:** `Git error: Could not determine default branch`, with a hint about permissions. The message doesn't say that the repository needs a first commit.
 - **Verified:** run. **Status:** open (message only).
 
