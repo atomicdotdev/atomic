@@ -3,11 +3,11 @@
 The workflows I ran against #207 (Git Bridge / Git Shim) and the scenarios that failed, as input for strengthening the testing harness.
 
 - **Build under test:** `feat/atomic-sidecar-for-git` @ `990612c` (0.18.3, includes dev `e5d1d3b`).
-- **Compared with:** `dev` @ `bcbe2c5` (0.18.2). Where noted, also #212 (`d40cdcc`, bridge opt-in) and #213 (`2272daa`, filter path quoting).
+- **Compared with:** `dev` @ `bcbe2c5` (0.18.2); for F15 also 0.17.1. Where noted, also #212 (`d40cdcc`, bridge opt-in) and #213 (`2272daa`, filter path quoting).
 - **Environment:** macOS, git 2.50, debug builds, throwaway repositories under `/tmp`.
 - **How agents were tested:** Claude Code hook events were simulated with `atomic agent hooks claude-code <event> --json`: `session-start`, `user-prompt-submit`, file edits, `stop`. An isolated `HOME` was used.
 - **References:** expectations cite `docs/RFC-ATOMIC-GIT-CAUSAL-BRIDGE.md` (RFC) and `docs/bridge-operating-guide.md` (guide).
-- **Harness:** `tests/harness/46_git_bridge_scenarios.sh` has one section per workflow W1–W13 and W16. W10 and W11 run only when `ATOMIC_PREV_BIN` points to a previous release binary. It asserts the expected behaviour, so the section for an open scenario fails until that scenario is fixed. On 990612c, W2–W6 pass and every failure falls in the section for F1–F7 or F9. With #212, W12 passes too. W14 and W15 aren't in the harness: F8 needs the pull save path, and F10 has unit tests in #213.
+- **Harness:** `tests/harness/46_git_bridge_scenarios.sh` has one section per workflow W1–W13 and W16–W19. W10 and W11 run only when `ATOMIC_PREV_BIN` points to a previous release binary. It asserts the expected behaviour, so the section for an open scenario fails until that scenario is fixed. On 990612c, W2–W6 pass and every failure falls in the section for F1–F7, F9, F11 or F13–F15. With #212, W12 passes too. W14 and W15 aren't in the harness: F8 needs the pull save path, and F10 has unit tests in #213.
 
 ---
 
@@ -31,6 +31,9 @@ The workflows I ran against #207 (Git Bridge / Git Shim) and the scenarios that 
 | W14 | Pulled/cloned legacy history | a v1 change through the pull/clone save path | **❌ F8** |
 | W15 | Filter drivers with ordinary file names | `.gitattributes` filter driver using `%f`; file names with spaces | **❌ F10** (fixed by #213) |
 | W16 | `atomic git import` before the first Git commit | `git init`, `atomic init`, `atomic git import` | **❌ F11** |
+| W17 | Onboard a history that edits a file, with `reconcile` | Git history where a later commit edits an earlier file, `atomic init`, `atomic git bridge reconcile` | **❌ F13** |
+| W18 | Git branch round trip after importing that history | `atomic git import` + `bridge enable --binding-key-file`; `git switch -c feature`, commit, reconcile; switch back, reconcile | **❌ F14** |
+| W19 | Delete one of several lines added together | one file: `c` → `a b c` → `b c`, by `atomic record` and by `atomic git import` | **❌ F15** (found importing a real project; also in 0.17.1 and 0.18.2) |
 
 W2–W6 start from a repository anchored with `atomic init --no-vault`, with `.atomicignore` removed, so they don't inherit F2.
 
@@ -113,5 +116,25 @@ W2–W6 start from a repository anchored with `atomic init --no-vault`, with `.a
 | `13_import_fidelity` | 45/46 | not triaged |
 | `43_record_status_name_conflict` (#203) | 64/79 (79/79 reported in #203) | `resolved name conflict … matches 0 claimants` |
 | `43_git_bridge_operation_recovery`, `45_git_bridge_watch_daemon` | 21 passed + 2 skipped, 16/16 | ✅ |
+
+### F13. `reconcile` can't onboard a history that edits a file
+- **Steps:** W17. Two Git commits, the second edits `README` from the first. `atomic init`, `atomic git bridge reconcile`.
+- **Expected:** reconcile anchors any Git history. Foreign history imports verified against every commit tree (RFC §5.3, §21 item 4).
+- **Actual:** `partial import failed after 1 landed commit(s): … staged projection has 1 unresolved name conflict(s) at [README]; refusing to publish`. No checkpoint is written, so later commands are refused with `MissingCheckpoint`. A second commit that adds a different file works. `atomic git import` + `bridge enable` anchors the same history. Seen on `octocat/Hello-World` and on a two-commit local repository.
+- **Verified:** run. **Status:** open.
+
+### F14. After importing a history, Atomic doesn't follow a Git branch
+- **Steps:** W18. Three commits editing `README.md`; `atomic git import`, `atomic git bridge enable --binding-key-file <key>`; `git switch -c feature`, edit, commit, `atomic git bridge reconcile`; `git switch main`, reconcile.
+- **Expected:** Atomic follows to `feature` and back, and both statuses are clean (RFC §1.2, §21 item 1).
+- **Actual:** reconcile on `feature` warns `Resurrection <commit>: could not persist its interpretation closure (… already has a different persisted interpretation closure; Git ancestry is immutable, so this is corruption or a conflicting reimport)`, and Atomic stays on `main`. Back on `main`, `atomic status` lists `A README.md` while `git status` is clean. Seen on `octocat/Hello-World` and locally.
+- **Verified:** run. **Status:** open.
+
+### F15. Deleting one of several lines added together deletes the others too
+- **Steps:** W19. One file goes `c` → `a b c` (two lines added in one change) → `b c`. Recorded with `atomic record` in a plain Atomic repository (no Git), or imported with `atomic git import`.
+- **Expected:** the recorded state equals the file, `b c`.
+- **Actual:** `atomic record` succeeds, but the recorded state is `c`: `atomic status` shows `M f.txt`, `atomic diff` shows `+b`, and `atomic restore f.txt` writes `c`. `atomic git import` refuses: `staged path 'f.txt' renders 2 byte(s) but the commit tree expects 4 byte(s)`.
+- **Not new in #207:** 0.17.1 and 0.18.2 record the same wrong state (`atomic restore f.txt` writes `c`; after a further edit to `b c d`, it writes `b b c d`), but their `status` reports clean and their `git import` succeeds with the wrong content. #207 is the first build that notices: its status compares against the recorded state, and import verifies every commit against its Git tree (RFC §5.3 item 10). The fix belongs in core record, not in the bridge.
+- **Found:** importing a real project (197 linear commits, 879 files) stopped after 50 commits with `renders 5063 byte(s) but the commit tree expects 5001 byte(s)`. That file's history was reduced to the three versions above.
+- **Verified:** run. **Status:** open.
 
 Some findings are security-sensitive. They were reported privately and aren't included here.

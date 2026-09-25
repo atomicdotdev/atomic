@@ -2,7 +2,7 @@
 # 46_git_bridge_scenarios.sh — Git bridge workflows and failed scenarios.
 #
 # One section per workflow in docs/testing/git-bridge-test-scenarios.md
-# (W1–W13, W16). Assertions state the behaviour that RFC-ATOMIC-GIT-CAUSAL-BRIDGE
+# (W1–W13, W16–W19). Assertions state the behaviour that RFC-ATOMIC-GIT-CAUSAL-BRIDGE
 # and bridge-operating-guide expect, so a section tagged with an open failed
 # scenario (F-number) fails until that scenario is fixed.
 #
@@ -71,6 +71,29 @@ new_bridge_repo() {
     atomic init --no-vault >/dev/null 2>&1 || true
     rm -f .atomicignore
     assert_success "setup: bridge anchored" atomic git bridge reconcile
+}
+
+# A Git repository whose history edits README.md in three commits, the
+# shape of any real project. Single-commit repositories hide F13 and F14.
+new_git_history_repo() {
+    make_temp_repo "$1"
+    init_git_repo
+    local line
+    for line in one two three; do
+        printf '%s\n' "$line" >> README.md
+        git add README.md
+        git commit --quiet -m "README $line"
+    done
+}
+
+# Anchoring with `bridge enable` needs a hex Ed25519 secret key outside the repo.
+BINDING_KEY=""
+use_binding_key() {
+    local dir
+    dir="$(mktemp -d "${TMPDIR:-/tmp}/atomic-binding-key-XXXXXX")"
+    _HARNESS_TMPDIRS+=("$dir")
+    BINDING_KEY="$dir/binding.key.hex"
+    openssl rand -hex 32 > "$BINDING_KEY"
 }
 
 # Agent hooks write session state under $HOME; keep them out of the user's HOME.
@@ -348,5 +371,79 @@ if [[ $RC -eq 0 ]] || printf '%s' "$OUT" | grep -Eiq 'no commits|any commits|fir
 else
     _fail "import before the first commit succeeds or says the repository has no commits" "$(printf '%s' "$OUT" | head -1)"
 fi
+
+# ── W17 / F13. Onboard a project whose history edits a file ─────────────────
+
+begin_section "W17 / F13. Onboard a multi-commit history with reconcile"
+new_git_history_repo "history-reconcile"
+atomic init --no-vault >/dev/null 2>&1 || true
+rm -f .atomicignore
+assert_success "bridge reconcile anchors the history" atomic git bridge reconcile
+assert_success "bridge verify passes" atomic git bridge verify
+assert_both_clean "after onboarding the history"
+
+# ── W18 / F14. Git branch round trip after importing history ────────────────
+
+begin_section "W18 / F14. Git branch round trip after importing history"
+if ! command -v openssl >/dev/null 2>&1; then
+    _skip "Git branch round trip after importing history" "openssl is needed to create a binding key"
+else
+    new_git_history_repo "history-branch"
+    MAIN="$(git_current_branch)"
+    atomic init --no-vault >/dev/null 2>&1 || true
+    rm -f .atomicignore
+    use_binding_key
+    assert_success "git import" atomic git import
+    assert_success "bridge enable anchors with a binding key" atomic git bridge enable --binding-key-file "$BINDING_KEY"
+    assert_both_clean "after anchoring"
+    git switch --quiet -c feature
+    append_file "README.md" $'feature\n'
+    git commit --quiet -am "feature work"
+    OUT="$(atomic git bridge reconcile 2>&1)" && RC=0 || RC=$?
+    if [[ $RC -eq 0 ]] && ! printf '%s' "$OUT" | grep -q "Resurrection"; then
+        _pass "reconcile adopts the new Git branch"
+    else
+        _fail "reconcile adopts the new Git branch" "$(printf '%s' "$OUT" | grep -E '✗|⚠' | head -1 | cut -c1-200)"
+    fi
+    if [[ "$(current_atomic_view)" == "feature" ]]; then _pass "Atomic follows to view 'feature'"; else _fail "Atomic follows to view 'feature'" "current view: $(current_atomic_view)"; fi
+    git switch --quiet "$MAIN"
+    assert_success "reconcile after switching back" atomic git bridge reconcile
+    if [[ "$(current_atomic_view)" == "$MAIN" ]]; then _pass "Atomic follows back to view '$MAIN'"; else _fail "Atomic follows back to view '$MAIN'" "current view: $(current_atomic_view)"; fi
+    assert_both_clean "back on $MAIN"
+fi
+
+# ── W19 / F15. Delete one line of a block added in an earlier change ────────
+
+begin_section "W19 / F15. Delete one line of a block added earlier"
+# Found importing a real project; reduced to three versions of one file.
+# Deleting `a` must keep `b`, which was added in the same change. Older
+# releases record the same wrong state but their status doesn't notice, so
+# the check restores the file from the recorded state.
+make_temp_repo "partial-block-record"
+atomic init --no-vault >/dev/null 2>&1 || true
+create_file "f.txt" $'c\n'
+assert_success "add f.txt" atomic add f.txt
+assert_success "record v1 (c)" atomic record -m "v1"
+create_file "f.txt" $'a\nb\nc\n'
+assert_success "record v2 (a b c)" atomic record -m "v2"
+create_file "f.txt" $'b\nc\n'
+assert_success "record v3 (b c)" atomic record -m "v3"
+assert_output_not_contains "recorded f.txt matches the file on disk" "f.txt" atomic status --short
+rm -f f.txt
+atomic restore f.txt >/dev/null 2>&1 || true
+assert_file_content "restoring f.txt gives the recorded 'b c'" "f.txt" $'b\nc'
+
+make_temp_repo "partial-block-import"
+init_git_repo
+for content in $'c\n' $'a\nb\nc\n' $'b\nc\n'; do
+    create_file "f.txt" "$content"
+    git add f.txt
+    git commit --quiet -m "f.txt"
+done
+atomic init --no-vault >/dev/null 2>&1 || true
+assert_success "git import of the same three versions" atomic git import
+rm -f f.txt
+atomic restore f.txt >/dev/null 2>&1 || true
+assert_file_content "restoring f.txt after import gives Git's 'b c'" "f.txt" $'b\nc'
 
 print_summary
