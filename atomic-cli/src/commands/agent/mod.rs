@@ -41,11 +41,14 @@ mod attest;
 mod disable;
 mod enable;
 mod explain;
+pub(crate) mod health;
 mod hooks;
 mod identity;
 mod lifecycle;
 mod owner;
 mod status;
+
+use std::path::Path;
 
 use clap::{Args, Subcommand};
 
@@ -59,6 +62,27 @@ pub use explain::Explain;
 pub use identity::Identity;
 pub use lifecycle::Lifecycle;
 pub use status::AgentStatus;
+
+/// Write `bytes` to `dir/name` by way of a temporary file and a rename.
+///
+/// A hook process can be killed at any moment, and a half-written
+/// `hook-health.json` would be indistinguishable from a corrupt one — which
+/// `HookHealth::read` deliberately treats as "no data". Rename is atomic, so
+/// a reader sees either the old file or the new one, never a torn one.
+///
+/// Best-effort: failures are ignored. Every caller is a diagnostic path that
+/// must not be able to fail the operation it is describing.
+pub(crate) fn write_atomic(dir: &Path, name: &str, bytes: &[u8]) {
+    if std::fs::create_dir_all(dir).is_err() {
+        return;
+    }
+    let path = dir.join(name);
+    let tmp = dir.join(format!("{name}.tmp"));
+    if std::fs::write(&tmp, bytes).is_err() {
+        return;
+    }
+    let _ = std::fs::rename(&tmp, &path);
+}
 
 // Agent Command
 
