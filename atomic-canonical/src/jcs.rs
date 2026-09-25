@@ -9,63 +9,42 @@
 //! hash (`hash.rs`) and the Data Integrity proof (`proof.rs`) go through
 //! `canonicalize`, so the two can never drift.
 //!
-//! Object keys are sorted by UTF-16 code units as RFC 8785 §3.2.3 specifies
-//! (not by UTF-8 bytes — the two differ once keys leave the BMP, e.g. an
-//! emoji key sorts after `\u{ff61}` in UTF-8 but before it in UTF-16).
+//! # The algorithm is delegated rather than written here
 //!
-//! Scope note: numbers are emitted via `serde_json`'s formatter, which
-//! matches RFC 8785 for the integer values our vocabulary admits; the full
-//! ECMAScript number-to-string algorithm is only needed if floating-point
-//! payloads are ever admitted.
+//! The bytes come from `serde_json_canonicalizer`. Two of the three parts of
+//! RFC 8785 are straightforward to write by hand and the third is not:
+//!
+//! * Object keys sort by UTF-16 code units as §3.2.3 specifies, not by UTF-8
+//!   bytes — the two differ once a key leaves the BMP, e.g. an emoji key sorts
+//!   after `\u{ff61}` in UTF-8 but before it in UTF-16.
+//! * Strings take the short form for the seven named escapes and lowercase
+//!   `\u00xx` for the rest of C0 (§3.2.2.2).
+//! * **Numbers take the ECMAScript `Number::toString` algorithm** (§3.2.2.3),
+//!   which `serde_json`'s formatter is not. `serde_json` writes `-0.0` where the
+//!   algorithm writes `0`, keeps a `.0` on an integer-valued double where the
+//!   algorithm drops it, and crosses between decimal and exponent notation at
+//!   different magnitudes: `1e-6` for `0.000001`, `2.9514790517935283e+20` for
+//!   `295147905179352830000`. The delegate formats through `ryu_js`, which is
+//!   the ECMAScript variant the section names, and it serializes through an
+//!   explicit heap stack rather than the call stack. The cases that used to
+//!   diverge are pinned in `tests/vectors/`.
+//!
+//! Scope note: the entry point takes an already-parsed [`Value`], so faults that
+//! only exist in the wire bytes cannot be decided here — a repeated object
+//! member is gone before this function is called, and RFC 8785 admits an integer
+//! past 2^53 by rounding it to its double. Those belong to a strict decoder at
+//! the boundary where the bytes arrive; `tests/vectors/INGEST-BOUNDARY.md` names
+//! the cases and what closes them.
 
 use serde_json::Value;
 
 /// Canonicalize a JSON value into its RFC-8785 string form.
 pub fn canonicalize(value: &Value) -> String {
-    let mut out = String::new();
-    write_value(&mut out, value);
-    out
-}
-
-fn write_value(out: &mut String, value: &Value) {
-    match value {
-        Value::Null => out.push_str("null"),
-        Value::Bool(true) => out.push_str("true"),
-        Value::Bool(false) => out.push_str("false"),
-        Value::Number(n) => out.push_str(&n.to_string()),
-        Value::String(s) => write_json_string(out, s),
-        Value::Array(items) => {
-            out.push('[');
-            for (i, item) in items.iter().enumerate() {
-                if i > 0 {
-                    out.push(',');
-                }
-                write_value(out, item);
-            }
-            out.push(']');
-        }
-        Value::Object(map) => {
-            let mut keys: Vec<&String> = map.keys().collect();
-            keys.sort_by(|a, b| a.encode_utf16().cmp(b.encode_utf16()));
-            out.push('{');
-            for (i, key) in keys.iter().enumerate() {
-                if i > 0 {
-                    out.push(',');
-                }
-                write_json_string(out, key);
-                out.push(':');
-                write_value(out, &map[*key]);
-            }
-            out.push('}');
-        }
-    }
-}
-
-/// Emit a JSON string with standard escaping. `serde_json` produces a valid,
-/// minimally-escaped JSON string literal (quotes included), which matches JCS
-/// for the ASCII content in our records.
-fn write_json_string(out: &mut String, s: &str) {
-    out.push_str(&serde_json::to_string(s).expect("string serialization is infallible"));
+    // Infallible for a `Value`: there is no writer to fail against, every
+    // member name is already a Rust `String`, and the delegate's only other
+    // error path is a non-finite float, which `Value` cannot hold. This mirrors
+    // the expectation the hand-written string helper carried before it.
+    serde_json_canonicalizer::to_string(value).expect("canonicalizing a Value is infallible")
 }
 
 #[cfg(test)]

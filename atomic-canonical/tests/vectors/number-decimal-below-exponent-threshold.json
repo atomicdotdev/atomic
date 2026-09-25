@@ -1,0 +1,8 @@
+{
+  "vector": "vaf1b67f038ffff84",
+  "divergence": "decimal-to-exponent threshold: 1e-6 is written in decimal notation",
+  "input": "{\"n\":0.000001}",
+  "expect": {
+    "canonical": "{\"n\":0.000001}"
+  }
+}

@@ -1,0 +1,8 @@
+{
+  "vector": "vb177ef3b3a945a72",
+  "divergence": "decimal notation retained for the last double below 1e21",
+  "input": "{\"n\":999999999999999900000}",
+  "expect": {
+    "canonical": "{\"n\":999999999999999900000}"
+  }
+}

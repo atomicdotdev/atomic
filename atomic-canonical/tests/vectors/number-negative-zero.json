@@ -1,0 +1,8 @@
+{
+  "vector": "v9a8b364b8bc121de",
+  "divergence": "negative zero is written as 0, and -0.0 is not valid ECMAScript output at all",
+  "input": "{\"n\":-0.0}",
+  "expect": {
+    "canonical": "{\"n\":0}"
+  }
+}

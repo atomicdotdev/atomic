@@ -1,0 +1,8 @@
+{
+  "vector": "vd94ac70c9f0d84bf (accept half)",
+  "divergence": "a document nested 128 containers deep canonicalizes, which is the accept side of the depth condition",
+  "input_generated": "128 nested arrays around null",
+  "expect": {
+    "canonical_shape": "128 open brackets, null, 128 close brackets"
+  }
+}

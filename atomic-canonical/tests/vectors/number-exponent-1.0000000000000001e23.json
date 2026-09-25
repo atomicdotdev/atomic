@@ -1,0 +1,8 @@
+{
+  "vector": "vb7dd5fb8dcb6e345",
+  "divergence": "seventeen significant digits kept where sixteen would not round-trip",
+  "input": "{\"n\":1.0000000000000001e+23}",
+  "expect": {
+    "canonical": "{\"n\":1.0000000000000001e+23}"
+  }
+}
