@@ -120,6 +120,32 @@ pub fn collect_visible_change_ids_with_deps<T: ViewTxnT>(
     Ok(ids)
 }
 
+/// Collect the **union** of the effective visible change sets of several views,
+/// each with its own dependency closure expanded.
+///
+/// This is the N-view analogue of [`collect_visible_change_ids_with_deps`], and
+/// it exists because every *filter constructor* in the pristine layer is
+/// single-view while everything *below* it is already set-shaped:
+/// `ViewGraph`, `RetrieveOptions` and `MaterializeOptions.change_filter` all
+/// take a `HashSet<NodeId>` and are wholly indifferent to which views produced
+/// it. A set of views therefore needs no support anywhere downstream — only a
+/// way to build the set. This function is that way.
+///
+/// # Complexity
+///
+/// O(C) in the total number of visible changes across `views`, plus one
+/// closure expansion per view.
+pub fn visible_change_ids_for_views<T: ViewTxnT>(
+    txn: &T,
+    views: &[atomic_core::pristine::ViewState],
+) -> Result<HashSet<NodeId>, RepositoryError> {
+    let mut ids = HashSet::new();
+    for view in views {
+        ids.extend(collect_visible_change_ids_with_deps(txn, view)?);
+    }
+    Ok(ids)
+}
+
 /// Fold a view's **effective visible change set** into an order-invariant
 /// [`SetId`].
 ///

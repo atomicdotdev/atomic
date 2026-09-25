@@ -39,6 +39,7 @@ pub mod jcs;
 pub mod lift;
 pub mod memory;
 pub mod node;
+pub mod outcome_ref;
 pub mod proof;
 pub mod prov;
 pub mod render;
@@ -52,6 +53,7 @@ pub use node::{
     intent_substance_hash, AcceptanceCriterion, CanonicalNode, Constraint, Proof, Ref, ScopeItem,
     Task,
 };
+pub use outcome_ref::{outcome_reference, verify_outcome_reference, OutcomePins};
 pub use prov::{attest_prov, project, verify_prov, ProvActivityInput};
 pub use render::{render, render_memory, Target};
 pub use triage_ref::{triage_reference, verify_triage_reference, TriagePins};
