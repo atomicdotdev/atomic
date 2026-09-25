@@ -7,7 +7,7 @@ The workflows I ran against #207 (Git Bridge / Git Shim) and the scenarios that 
 - **Environment:** macOS, git 2.50, debug builds, throwaway repositories under `/tmp`.
 - **How agents were tested:** Claude Code hook events were simulated with `atomic agent hooks claude-code <event> --json`: `session-start`, `user-prompt-submit`, file edits, `stop`. An isolated `HOME` was used.
 - **References:** expectations cite `docs/RFC-ATOMIC-GIT-CAUSAL-BRIDGE.md` (RFC) and `docs/bridge-operating-guide.md` (guide).
-- **Harness:** `tests/harness/46_git_bridge_scenarios.sh` has one section per workflow W1–W13 and W16–W19. W10 and W11 run only when `ATOMIC_PREV_BIN` points to a previous release binary. It asserts the expected behaviour, so the section for an open scenario fails until that scenario is fixed. On 990612c, W2–W6 pass and every failure falls in the section for F1–F7, F9, F11 or F13–F15. With #212, W12 passes too. W14 and W15 aren't in the harness: F8 needs the pull save path, and F10 has unit tests in #213.
+- **Harness:** `tests/harness/46_git_bridge_scenarios.sh` has one section per workflow W1–W13, W16–W19 and W22. W10 and W11 run only when `ATOMIC_PREV_BIN` points to a previous release binary. It asserts the expected behaviour, so the section for an open scenario fails until that scenario is fixed. On 990612c, W2–W6 pass and every failure falls in the section for F1–F7, F9, F11 or F13–F15. With #212, W12 passes too. W14 and W15 aren't in the harness: F8 needs the pull save path, and F10 has unit tests in #213. `tests/harness/47_git_bridge_history_corpus.sh` covers W20 and W21 (RFC §15 item 4): it runs each history shape through onboarding and through the daily reconcile loop, and after every step restores all tracked files from Atomic and compares them with the Git tree.
 
 ---
 
@@ -34,6 +34,9 @@ The workflows I ran against #207 (Git Bridge / Git Shim) and the scenarios that 
 | W17 | Onboard a history that edits a file, with `reconcile` | Git history where a later commit edits an earlier file, `atomic init`, `atomic git bridge reconcile` | **❌ F13** |
 | W18 | Git branch round trip after importing that history | `atomic git import` + `bridge enable --binding-key-file`; `git switch -c feature`, commit, reconcile; switch back, reconcile | **❌ F14** |
 | W19 | Delete one of several lines added together | one file: `c` → `a b c` → `b c`, by `atomic record` and by `atomic git import` | **❌ F15** (found importing a real project; also in 0.17.1 and 0.18.2) |
+| W20 | History shapes through the bridge (harness 47) | merge, octopus, rename, delete and re-add, CRLF, binary, symlink, executable bit, path names with spaces or non-ASCII characters, empty commit, submodule; each onboarded and replayed with `reconcile` | merges, renames, CRLF, binary, empty commits and submodules ✅; **❌ F16, F17, F18** |
+| W21 | Import public repositories (harness 47, harness 10) | `hashicorp/go-uuid`, `holman/spark` | go-uuid ✅; **❌ F19** (spark) |
+| W22 | Edit a lockfile | `Cargo.lock` `a b` → `b` and `a b` → `x b`; hyperfine's real `Cargo.lock` v1 → v2; `git import` of `sharkdp/hyperfine` | **❌ F20** (partly also in 0.18.2) |
 
 W2–W6 start from a repository anchored with `atomic init --no-vault`, with `.atomicignore` removed, so they don't inherit F2.
 
@@ -114,6 +117,7 @@ W2–W6 start from a repository anchored with `atomic init --no-vault`, with `.a
 | `42_git_bridge_guard` | 47/61 | not triaged |
 | `11_diff_git_parity` | 44/48 | not triaged |
 | `13_import_fidelity` | 45/46 | not triaged |
+| `10_git_import` | stops in the hyperfine section (0.18.2: 43/43) | Three failures before that. go-uuid imports 60 changes where the suite expects its 30 first-parent commits; importing every parent is what RFC §5.3 item 4 asks for, so this expectation is outdated. The other two are F19 (spark). Then hyperfine's import fails at its second commit (F20), and because that `atomic git import` isn't guarded, the suite exits and the later sections don't run. |
 | `43_record_status_name_conflict` (#203) | 64/79 (79/79 reported in #203) | `resolved name conflict … matches 0 claimants` |
 | `43_git_bridge_operation_recovery`, `45_git_bridge_watch_daemon` | 21 passed + 2 skipped, 16/16 | ✅ |
 
@@ -133,8 +137,47 @@ W2–W6 start from a repository anchored with `atomic init --no-vault`, with `.a
 - **Steps:** W19. One file goes `c` → `a b c` (two lines added in one change) → `b c`. Recorded with `atomic record` in a plain Atomic repository (no Git), or imported with `atomic git import`.
 - **Expected:** the recorded state equals the file, `b c`.
 - **Actual:** `atomic record` succeeds, but the recorded state is `c`: `atomic status` shows `M f.txt`, `atomic diff` shows `+b`, and `atomic restore f.txt` writes `c`. `atomic git import` refuses: `staged path 'f.txt' renders 2 byte(s) but the commit tree expects 4 byte(s)`.
-- **Not new in #207:** 0.17.1 and 0.18.2 record the same wrong state (`atomic restore f.txt` writes `c`; after a further edit to `b c d`, it writes `b b c d`), but their `status` reports clean and their `git import` succeeds with the wrong content. #207 is the first build that notices: its status compares against the recorded state, and import verifies every commit against its Git tree (RFC §5.3 item 10). The fix belongs in core record, not in the bridge.
+- **Not new in #207:** 0.17.1 and 0.18.2 record wrong changes too. In the same repository `atomic restore f.txt` writes `c` (after a further edit to `b c d`, it writes `b b c d`), and replaying the recorded changes into a fresh repository with `atomic insert` gives an order conflict between `b` and `c` that the history never had. Their `status` reports clean, and their `git import` succeeds with the wrong content. #207 is the first build that notices: its status compares against the recorded state, and import verifies every commit against its Git tree (RFC §5.3 item 10). The fix belongs in core record, not in the bridge.
 - **Found:** importing a real project (197 linear commits, 879 files) stopped after 50 commits with `renders 5063 byte(s) but the commit tree expects 5001 byte(s)`. That file's history was reduced to the three versions above.
+- **Verified:** run. **Status:** open.
+
+### F16. Paths with spaces or non-ASCII characters come back percent-encoded
+- **Steps:** W20 `path-names`. Commit `dir with space/ñame é.txt`; onboard, or reconcile after the commit. Then restore the tracked files from Atomic (`atomic restore --force`).
+- **Expected:** paths are raw bytes; percent or quoted encoding is display-only and reversible (RFC §5.3 item 9). 0.18.2 restores the path correctly.
+- **Actual:** `atomic status` and `bridge verify` fail with `bridge adoption snapshot capture failed: … new attribute path 'dir with space/ñame é.txt' has no FileAdd inode`. The restore writes `dir%20with%20space/%C3%B1ame%20%C3%A9.txt` instead of the real name. The same happens with plain `atomic git import` without the bridge.
+- **Verified:** run (harness 47). **Status:** open.
+
+### F17. Symlinks break status and reconcile, and come back as regular files
+- **Steps:** W20 `symlink`. Commit a symlink `link -> target.txt`, onboard; later retarget it and reconcile.
+- **Expected:** symlinks are carried as attributes and restored as symlinks (RFC §3.5, §5.3 item 9).
+- **Actual:** after onboarding, `atomic status` fails with `bridge adoption snapshot capture failed: … attribute path 'link' has no semantic trunk`. After retargeting, `reconcile` fails and later commands are refused with `HeadChanged`. Restoring from Atomic writes a regular file (`git status`: `T link`). 0.18.2 also restores a regular file; the status and reconcile failures are new in #207.
+- **Verified:** run (harness 47). **Status:** open.
+
+### F18. An executable bit set in a Git commit is lost after reconcile
+- **Steps:** W20 `exec-bit`, daily loop. Anchor with a non-executable `run.sh`, `chmod +x run.sh`, commit, `atomic git bridge reconcile`, restore from Atomic.
+- **Expected:** the mode is carried as an attribute (RFC §3.5).
+- **Actual:** the restored `run.sh` isn't executable (`git status`: `M run.sh`, mode 100755 → 100644). Onboarding a history that already has the bit keeps it. 0.18.2 loses the bit on every import.
+- **Verified:** run (harness 47). **Status:** open.
+
+### F19. Importing `holman/spark` fails in its merge history
+- **Steps:** W21. `git clone https://github.com/holman/spark.git` (104 commits, 29 merges), `atomic init`, `atomic git import`.
+- **Expected:** every commit imports and verifies against its tree, including merge parents (RFC §5.3 item 4, §21 item 4).
+- **Actual:** `partial import failed after 41 landed commit(s): … staged semantic closure for 'spark': a branch is marked Deleted but no applied change deleted it (the global graph proves the line alive and no writer recorded the delete): an unattributed tombstone is corruption`. It fails where three branches leave the same commit. 0.18.2 imports the 68 first-parent commits, and its restored files match Git except for executable bits (F18). The cause isn't isolated yet; #207's new all-parents merge import is the likely area.
+- **Verified:** run (harness 47 and `10_git_import`). **Status:** open.
+
+### F20. Recording an edit to a lockfile loses content
+- **Steps:** W22. Record a `Cargo.lock`, edit it, record again, and read back what Atomic recorded: restore the file, or replay the recorded changes into a fresh repository with `atomic insert`. Or `atomic git import` hyperfine.
+- **Expected:** the recorded state equals the file.
+- **Actual:** (replayed into a fresh repository)
+
+  | Edit | 0.17.1 / 0.18.2 | #207 |
+  |---|---|---|
+  | `a b` → `b` (delete a line) | ✅ | ❌ empty file |
+  | `a b` → `x b` (change a line) | ❌ `x` only | ✅ |
+  | hyperfine's real `Cargo.lock` v1 → v2 (7293 → 16301 bytes) | ❌ 12 bytes (`[[package]]`) | ❌ 9273 bytes |
+
+  0.18.2's `status` reports clean throughout; #207's reports `M Cargo.lock`. `git import` of hyperfine fails at its second commit, which deletes a checksum line: `staged path 'Cargo.lock' renders 9273 byte(s) but the commit tree expects 16301 byte(s)`. The same content under a name without `.lock` (`x.toml`, `page.txt`) records correctly.
+- **Cause:** record treats machine-generated files (`*.lock`, `package-lock.json`, `yarn.lock`, `pnpm-lock.yaml`, minified output) as opaque and replaces them whole instead of diffing lines (`should_use_opaque_generated_vertices` in `globalize/hunk.rs`, and the fast path in `record/mod.rs`). This was added on dev in `d39dd25` "speed up records". #207 (`2b4a4f9`) routes a modification with existing line state through the normal per-line record. That fixes changing a line (the "12 of 67 bytes rendered" case in its comment) but breaks deleting a line, and the real `Cargo.lock` update is still wrong.
 - **Verified:** run. **Status:** open.
 
 Some findings are security-sensitive. They were reported privately and aren't included here.

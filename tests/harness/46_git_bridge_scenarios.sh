@@ -2,7 +2,7 @@
 # 46_git_bridge_scenarios.sh — Git bridge workflows and failed scenarios.
 #
 # One section per workflow in docs/testing/git-bridge-test-scenarios.md
-# (W1–W13, W16–W19). Assertions state the behaviour that RFC-ATOMIC-GIT-CAUSAL-BRIDGE
+# (W1–W13, W16–W19, W22). Assertions state the behaviour that RFC-ATOMIC-GIT-CAUSAL-BRIDGE
 # and bridge-operating-guide expect, so a section tagged with an open failed
 # scenario (F-number) fails until that scenario is fixed.
 #
@@ -445,5 +445,36 @@ assert_success "git import of the same three versions" atomic git import
 rm -f f.txt
 atomic restore f.txt >/dev/null 2>&1 || true
 assert_file_content "restoring f.txt after import gives Git's 'b c'" "f.txt" $'b\nc'
+
+# ── W22 / F20. Edit a lockfile ──────────────────────────────────────────────
+
+begin_section "W22 / F20. Edit a lockfile"
+# Lockfiles take a separate whole-file record path. Deleting a line and
+# changing a line must both record the new bytes.
+lockfile_case() {
+    local label="$1" before="$2" after="$3"
+    make_temp_repo "lockfile"
+    atomic init --no-vault >/dev/null 2>&1 || true
+    create_file "Cargo.lock" "$before"
+    atomic add Cargo.lock >/dev/null 2>&1 || true
+    atomic record -m "before" >/dev/null 2>&1 || true
+    create_file "Cargo.lock" "$after"
+    assert_success "$label: record" atomic record -m "after"
+    rm -f Cargo.lock
+    atomic restore Cargo.lock >/dev/null 2>&1 || true
+    assert_file_content "$label: restoring Cargo.lock gives the recorded bytes" "Cargo.lock" "${after%$'\n'}"
+}
+lockfile_case "delete a line" $'a\nb\n' $'b\n'
+lockfile_case "change a line" $'a\nb\n' $'x\nb\n'
+
+make_temp_repo "lockfile-import"
+init_git_repo
+for content in $'a\nb\n' $'b\n'; do
+    create_file "Cargo.lock" "$content"
+    git add Cargo.lock
+    git commit --quiet -m "Cargo.lock"
+done
+atomic init --no-vault >/dev/null 2>&1 || true
+assert_success "git import of a lockfile that loses a line" atomic git import
 
 print_summary
