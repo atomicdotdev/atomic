@@ -84,6 +84,11 @@ pub struct SealResult {
 /// instead of looking for a local `.atomic/`.
 pub const SANDBOX_POINTER: &str = ".atomic-sandbox";
 
+/// A remote sandbox's own directory, beside its pointer: the local cache of
+/// its repository's rows (`cache/`, an ordinary repository whose working
+/// tree is the sandbox). Never tracked.
+pub const SANDBOX_CACHE_DIR: &str = ".atomic-sandbox.d";
+
 /// Persisted contents of a sandbox pointer: where the canonical graph lives
 /// and which view this sandbox operates on.
 #[derive(Debug, Serialize, Deserialize)]
@@ -107,8 +112,19 @@ pub(super) fn detect_sandbox(start: &Path) -> Option<(PathBuf, PathBuf, String)>
         let pointer = dir.join(SANDBOX_POINTER);
         if pointer.is_file() {
             let bytes = std::fs::read(&pointer).ok()?;
-            let parsed: SandboxPointer = serde_json::from_slice(&bytes).ok()?;
-            return Some((dir.clone(), parsed.canonical, parsed.view));
+            if let Ok(parsed) = serde_json::from_slice::<SandboxPointer>(&bytes) {
+                return Some((dir.clone(), parsed.canonical, parsed.view));
+            }
+            // A remote pointer names an owner elsewhere; locally, the graph
+            // is the sandbox's cache (once `atomic sandbox materialize` has
+            // made it).
+            let remote: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+            let view = remote.get("remote").and(remote.get("view"))?.as_str()?;
+            let cache = remote_cache_root(&dir);
+            return cache
+                .join(DOT_DIR)
+                .is_dir()
+                .then(|| (dir.clone(), cache, view.to_string()));
         }
         // Stop if we reach a real repository root — that's not a sandbox.
         if dir.join(DOT_DIR).join("pristine.redb").is_file() {
@@ -120,7 +136,43 @@ pub(super) fn detect_sandbox(start: &Path) -> Option<(PathBuf, PathBuf, String)>
     }
 }
 
+/// Where a remote sandbox rooted at `working_root` keeps its cache.
+pub fn remote_cache_root(working_root: &Path) -> PathBuf {
+    working_root.join(SANDBOX_CACHE_DIR).join("cache")
+}
+
 impl Repository {
+    /// Make (or remake) a remote sandbox's cache from `skeleton`: an empty
+    /// repository under [`SANDBOX_CACHE_DIR`] holding the view's rows, with
+    /// the sandbox as its working tree and the tree on disk as the clean
+    /// baseline. Call it right after writing the view's files.
+    pub fn create_remote_sandbox_cache(
+        working_root: &Path,
+        skeleton: &super::SandboxSkeleton,
+    ) -> Result<Self, RepositoryError> {
+        let cache = remote_cache_root(working_root);
+        if cache.exists() {
+            std::fs::remove_dir_all(&cache)?;
+        }
+        std::fs::create_dir_all(&cache)?;
+        drop(Self::init(&cache)?);
+        let repo = Self::open_sandbox(working_root, &cache, &skeleton.view.name)?;
+        repo.import_sandbox_skeleton(skeleton)?;
+        repo.reindex_working_copy()?;
+        // The view's vault arrived as files, as after a pull: its tables
+        // come from them.
+        if repo.vault_dir().exists() {
+            repo.bootstrap_vault_from_working_copy()?;
+        }
+        Ok(repo)
+    }
+
+    /// Whether this is a remote sandbox's cache (its graph arrives from the
+    /// repository's owner, and its changes go back to it).
+    pub fn is_remote_sandbox(&self) -> bool {
+        self.is_sandbox && self.dot_dir.starts_with(self.root.join(SANDBOX_CACHE_DIR))
+    }
+
     /// Open a repository for an agent sandbox.
     ///
     /// The agent's private working tree is at `working_root`, but the graph
@@ -227,19 +279,21 @@ impl Repository {
     pub fn materialize_view_to(&self, view: &str, dir: &Path) -> Result<usize, RepositoryError> {
         std::fs::create_dir_all(dir)?;
 
+        // The view as it renders — its own added and moved files included,
+        // whichever view is checked out.
         let mut count = 0usize;
-        for path in self.visible_file_paths(view)? {
-            let bytes = match self.get_file_content_on_view(&path, view)? {
-                Some(bytes) => bytes,
-                None => continue,
-            };
-            let target = dir.join(&path);
+        self.materialize_view_entries(view, |entry| -> Result<(), std::io::Error> {
+            if entry.kind == super::ViewEntryKind::Directory {
+                return Ok(());
+            }
+            let target = dir.join(&entry.path);
             if let Some(parent) = target.parent() {
                 std::fs::create_dir_all(parent)?;
             }
-            std::fs::write(&target, &bytes)?;
+            std::fs::write(&target, &entry.content)?;
             count += 1;
-        }
+            Ok(())
+        })??;
 
         Ok(count)
     }
@@ -523,6 +577,25 @@ mod tests {
         assert!(
             !dest.join(DOT_DIR).exists(),
             "the canonical graph must not be cloned into the sandbox"
+        );
+    }
+
+    #[test]
+    fn a_sandbox_never_sees_its_pointer_as_untracked() {
+        let dir = tempdir().unwrap();
+        let repo = repo_with_recorded_file(&dir.path().join("repo"), "hello.txt", b"hi\n");
+        let sandbox = dir.path().join("agent-1");
+        repo.provision_sandbox(&sandbox, "dev").unwrap();
+        std::fs::write(sandbox.join("new.txt"), b"new\n").unwrap();
+        drop(repo);
+
+        let opened = Repository::open_existing(&sandbox).unwrap();
+        let status = opened.status(Default::default()).unwrap();
+        let untracked: Vec<_> = status.untracked().map(|e| e.path().to_path_buf()).collect();
+        assert_eq!(
+            untracked,
+            vec![PathBuf::from("new.txt")],
+            "the pointer can carry a credential; `record --all` must never pick it up"
         );
     }
 }

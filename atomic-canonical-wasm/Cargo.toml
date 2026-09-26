@@ -1,0 +1,24 @@
+[package]
+name = "atomic-canonical-wasm"
+description = "atomic-canonical for the browser: build and check atomic attestations where the signing key lives in WebCrypto"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+atomic-canonical = { workspace = true }
+atomic-identity = { workspace = true }
+serde_json = { workspace = true }
+wasm-bindgen = "0.2"
+
+# The browser supplies randomness; nothing here draws any, but the
+# dependency tree links getrandom, which refuses wasm32 without this.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.2", features = ["js"] }

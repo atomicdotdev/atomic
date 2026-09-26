@@ -110,8 +110,32 @@ pub fn substance_view(value: &Value) -> Value {
 /// path all typed nodes share. Fills `attributedTo` (from the identity's
 /// `did:atomic`) when absent, computes the content hash over `hashing_view`,
 /// signs `jcs(signing_view)`, and attaches the proof. Returns the value.
-pub fn attest_value(mut value: Value, identity: &Identity, keypair: &KeyPair) -> Value {
-    let did = did::did_for_public_key(&identity.public_key);
+///
+/// It is [`prepare_attestation`] → sign → [`attach_proof`]; a signer that
+/// holds its key outside this process uses those two halves directly.
+pub fn attest_value(value: Value, identity: &Identity, keypair: &KeyPair) -> Value {
+    let prepared = prepare_attestation(value, &identity.public_key);
+    let signature = Signer::new(keypair).sign(&prepared.signing_bytes);
+    attach_proof(prepared.value, &identity.public_key, &signature)
+}
+
+/// A value made ready to sign: `attributedTo` and `contentHash` filled in,
+/// and the exact bytes the signature must cover.
+#[derive(Debug, Clone)]
+pub struct PreparedAttestation {
+    /// The value to sign — pass it back to [`attach_proof`] unchanged.
+    pub value: Value,
+    /// `jcs(signing_view(value))`: what the Ed25519 signature covers.
+    pub signing_bytes: Vec<u8>,
+}
+
+/// First half of [`attest_value`], for signers that hold the key somewhere
+/// else — a browser's WebCrypto, a hardware token, a remote signing service.
+/// Everything that must agree with [`verify_value`] (the author, the content
+/// hash, the canonical bytes) is computed here, so the external signer only
+/// ever signs bytes, and the result is an ordinary atomic attestation.
+pub fn prepare_attestation(mut value: Value, public_key: &PublicKey) -> PreparedAttestation {
+    let did = did::did_for_public_key(public_key);
 
     if let Some(obj) = value.as_object_mut() {
         // Fill attributedTo only if there is no non-empty value already.
@@ -121,7 +145,7 @@ pub fn attest_value(mut value: Value, identity: &Identity, keypair: &KeyPair) ->
             .map(|s| !s.is_empty())
             .unwrap_or(false);
         if !has_author {
-            obj.insert(PROP_ATTRIBUTED_TO.to_string(), Value::String(did.clone()));
+            obj.insert(PROP_ATTRIBUTED_TO.to_string(), Value::String(did));
         }
     }
 
@@ -133,13 +157,24 @@ pub fn attest_value(mut value: Value, identity: &Identity, keypair: &KeyPair) ->
     }
 
     let signing_bytes = jcs::canonicalize(&signing_view(&value)).into_bytes();
-    let signature = Signer::new(keypair).sign(&signing_bytes);
+    PreparedAttestation {
+        value,
+        signing_bytes,
+    }
+}
+
+/// Second half of [`attest_value`]: attach the `eddsa-jcs-2022` proof for a
+/// signature over [`PreparedAttestation::signing_bytes`] made by
+/// `public_key`'s private key. Does not check the signature — run
+/// [`verify_value`] on the result for that.
+pub fn attach_proof(mut value: Value, public_key: &PublicKey, signature: &Signature) -> Value {
+    let did = did::did_for_public_key(public_key);
     let proof = Proof {
         type_: PROOF_TYPE.to_string(),
         cryptosuite: CRYPTOSUITE.to_string(),
         verification_method: did::verification_method(&did),
         proof_purpose: PROOF_PURPOSE.to_string(),
-        proof_value: encode_proof_value(&signature),
+        proof_value: encode_proof_value(signature),
     };
     if let Some(obj) = value.as_object_mut() {
         obj.insert(
@@ -279,6 +314,25 @@ mod tests {
             "title": "A generic value node",
             "status": "todo"
         })
+    }
+
+    /// An external signer — handed only the prepared bytes — produces
+    /// exactly the attestation `attest_value` would, and it verifies.
+    #[test]
+    fn prepare_sign_attach_matches_attest_value() {
+        let (id, kp) = dev_identity();
+        let prepared = prepare_attestation(minimal_value(), &kp.public);
+        let signature = Signer::new(&kp).sign(&prepared.signing_bytes);
+        let external = attach_proof(prepared.value, &kp.public, &signature);
+
+        assert_eq!(external, attest_value(minimal_value(), &id, &kp));
+        verify_value(&external, &kp.public).expect("externally signed value verifies");
+
+        // A signature over anything else does not.
+        let wrong = Signer::new(&kp).sign(b"not the prepared bytes");
+        let prepared = prepare_attestation(minimal_value(), &kp.public);
+        let bad = attach_proof(prepared.value, &kp.public, &wrong);
+        assert!(verify_value(&bad, &kp.public).is_err());
     }
 
     #[test]

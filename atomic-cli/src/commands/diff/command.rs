@@ -241,12 +241,20 @@ impl Command for Diff {
         // Find the repository root
         let repo_root = find_repository_root()?;
 
-        // Open the repository
-        let repo = crate::commands::open_readonly_repository(&repo_root).map_err(|e| {
-            CliError::InvalidRepository {
-                reason: e.to_string(),
-            }
-        })?;
+        // Open the repository. A remote sandbox's cache takes the content it
+        // is about to compare against, so it opens writable.
+        let repo = if atomic_repository::remote_cache_root(&repo_root).is_dir() {
+            let repo = Repository::open(&repo_root).map_err(CliError::Repository)?;
+            repo.hydrate_remote_sandbox()
+                .map_err(CliError::Repository)?;
+            repo
+        } else {
+            crate::commands::open_readonly_repository(&repo_root).map_err(|e| {
+                CliError::InvalidRepository {
+                    reason: e.to_string(),
+                }
+            })?
+        };
 
         // Parse algorithm
         let algorithm = self.parse_algorithm()?;

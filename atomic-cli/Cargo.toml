@@ -65,6 +65,8 @@ data-encoding = "2.6"
 
 # Hashing (source-content digest for canonical intent sidecars)
 blake3 = { workspace = true }
+iroh = { workspace = true }
+rand = { workspace = true }
 
 # Open URLs in default browser (for device auth flow)
 open = "5"

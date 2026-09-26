@@ -79,6 +79,12 @@ use crate::RepositoryError;
 mod deferred_tree;
 mod filter;
 mod materialize;
+pub use materialize::{ViewEntry, ViewEntryKind, ViewSnapshot};
+mod remote_cache;
+pub use remote_cache::{
+    set_remote_sandbox_link, ChangeFile, RemoteSandboxLink, SandboxSkeleton, SandboxSlice,
+    SpanBytes, SubmitRejection, Submitted,
+};
 mod sandbox;
 mod semantic_materialize;
 mod split;
@@ -91,7 +97,10 @@ pub use filter::{
     collect_view_change_ids, collect_visible_change_ids, collect_visible_change_ids_with_deps,
     expand_indexed_dependency_closure, view_set_id,
 };
-pub use sandbox::{SealOptions, SealResult, StageOptions, StageResult, SANDBOX_POINTER};
+pub use sandbox::{
+    remote_cache_root, SealOptions, SealResult, StageOptions, StageResult, SANDBOX_CACHE_DIR,
+    SANDBOX_POINTER,
+};
 pub use split::{SplitChange, SplitOptions, SplitOutcome};
 pub use views::{ManifestApplyOutcome, ViewInfo};
 

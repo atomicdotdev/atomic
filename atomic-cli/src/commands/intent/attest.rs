@@ -4,6 +4,7 @@ use clap::Parser;
 
 use serde_json::Value;
 
+use atomic_canonical::proof::prepare_attestation;
 use atomic_canonical::{lift_and_attest, validate_intent, verify};
 use atomic_core::pristine::VaultEntryType;
 use atomic_identity::IdentityStore;
@@ -28,6 +29,20 @@ pub struct IntentAttest {
     /// Output the attested node as JSON-LD.
     #[arg(long)]
     pub json: bool,
+
+    /// Don't sign: print what a signer holding the identity's key elsewhere
+    /// (a browser, a hardware token, a remote signing service) must sign —
+    /// `{"document": …, "signingBytes": "<base64>"}`. Needs only the
+    /// identity's public key. Complete with `--signed`.
+    #[arg(long, conflicts_with = "signed")]
+    pub prepare: bool,
+
+    /// Record an attestation signed elsewhere: a JSON file holding the
+    /// attested node (the `--prepare` document with its proof attached). It
+    /// must be signed by `--identity`'s key and attest the intent as it is
+    /// now.
+    #[arg(long, value_name = "PATH")]
+    pub signed: Option<std::path::PathBuf>,
 }
 
 impl Command for IntentAttest {
@@ -59,7 +74,7 @@ impl Command for IntentAttest {
             )));
         }
 
-        // Resolve identity + keypair the way `atomic identity sign` does.
+        // Resolve the identity the way `atomic identity sign` does.
         let store = IdentityStore::open_default().map_err(|e| {
             CliError::Internal(anyhow::anyhow!("Failed to open identity store: {}", e))
         })?;
@@ -79,20 +94,66 @@ impl Command for IntentAttest {
                         .to_string(),
                 })?
         };
-        let keypair = store.load_keypair(&identity.id, None).map_err(|e| {
-            CliError::Internal(anyhow::anyhow!(
-                "Failed to load keypair for '{}': {}",
-                identity.name,
-                e
-            ))
-        })?;
 
-        // Attest: lift + fill attributedTo (from the identity's did:atomic when
-        // absent) + hash + sign.
-        let node = lift_and_attest(&inputs.frontmatter, &inputs.body, &identity, &keypair)
-            .map_err(|e| CliError::InvalidArgument {
-                message: format!("could not attest intent: {e}"),
+        // Signing elsewhere, step 1: say what to sign. The same preparation
+        // `lift_and_attest` does (author, content hash, canonical bytes), with
+        // no private key involved.
+        if self.prepare {
+            let prepared = prepare_attestation(unattested.to_value(), &identity.public_key);
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "document": prepared.value,
+                    "signingBytes": data_encoding::BASE64.encode(&prepared.signing_bytes),
+                }))
+                .unwrap()
+            );
+            return Ok(());
+        }
+
+        let node = if let Some(path) = &self.signed {
+            // Signing elsewhere, step 2: the signature must be over exactly
+            // what `--prepare` produces for this intent now — so a signature
+            // over a stale or altered intent is refused, not recorded.
+            let text = std::fs::read_to_string(path).map_err(CliError::Io)?;
+            let signed: Value =
+                serde_json::from_str(&text).map_err(|e| CliError::InvalidArgument {
+                    message: format!("{} is not JSON: {e}", path.display()),
+                })?;
+            let expected = prepare_attestation(unattested.to_value(), &identity.public_key).value;
+            let mut unsigned = signed.clone();
+            if let Some(obj) = unsigned.as_object_mut() {
+                obj.remove("proof");
+            }
+            if unsigned != expected {
+                return Err(CliError::InvalidArgument {
+                    message: format!(
+                        "the signed attestation is not of intent {} as it is now (re-run --prepare)",
+                        self.id
+                    ),
+                });
+            }
+            serde_json::from_value::<atomic_canonical::CanonicalNode>(signed).map_err(|e| {
+                CliError::InvalidArgument {
+                    message: format!("not an attested intent: {e}"),
+                }
+            })?
+        } else {
+            let keypair = store.load_keypair(&identity.id, None).map_err(|e| {
+                CliError::Internal(anyhow::anyhow!(
+                    "Failed to load keypair for '{}': {}",
+                    identity.name,
+                    e
+                ))
             })?;
+            // Attest: lift + fill attributedTo (from the identity's
+            // did:atomic when absent) + hash + sign.
+            lift_and_attest(&inputs.frontmatter, &inputs.body, &identity, &keypair).map_err(
+                |e| CliError::InvalidArgument {
+                    message: format!("could not attest intent: {e}"),
+                },
+            )?
+        };
 
         // Belt-and-suspenders: re-gate the ATTESTED node — proof + attributedTo
         // must now satisfy the gate.
@@ -107,7 +168,7 @@ impl Command for IntentAttest {
 
         // Self-check: the proof verifies against the signing key before we
         // write anything to disk.
-        verify(&node, &keypair.public).map_err(|e| CliError::InvalidArgument {
+        verify(&node, &identity.public_key).map_err(|e| CliError::InvalidArgument {
             message: format!("attested intent failed self-verification: {e}"),
         })?;
 
