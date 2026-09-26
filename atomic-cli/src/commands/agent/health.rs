@@ -181,6 +181,18 @@ impl HookHealth {
 
 /// Record one hook dispatch against the repository's health file.
 ///
+/// Several agents can record into one repository at the same time, so the
+/// read-modify-write runs under an exclusive lock on `.atomic/hook-health.lock`.
+/// Without it the last writer wins and silently discards whatever the others
+/// had just recorded — which for a first-ever fire means an agent stays
+/// missing from the health record and is reported as having "never recorded",
+/// the exact false alarm this feature exists to raise.
+///
+/// The lock is best-effort in one direction only: it is never held long enough
+/// to matter, because the critical section is a few hundred bytes of JSON. If
+/// it cannot be taken the record is still written unlocked — losing a
+/// timestamp is a better outcome than not recording the fire at all.
+///
 /// Returns without doing anything if the repository is missing, so it is safe
 /// to call from a hook that may run outside a workspace.
 pub(super) fn record_fire(
@@ -191,14 +203,63 @@ pub(super) fn record_fire(
     outcome: FireOutcome,
     detail: Option<&str>,
 ) {
-    if !repo_root.join(".atomic").is_dir() {
+    let atomic_dir = repo_root.join(".atomic");
+    if !atomic_dir.is_dir() {
         return;
     }
 
     let now = chrono::Utc::now().to_rfc3339();
+    let _guard = HookHealthLock::acquire(&atomic_dir);
     let mut health = HookHealth::read(repo_root).unwrap_or_else(|| HookHealth::empty(&now));
     health.record(agent, display_name, verb, outcome, detail, &now);
     health.write(repo_root);
+}
+
+/// Exclusive lock over the health file's read-modify-write.
+///
+/// Retries for a bounded time rather than blocking indefinitely: a hook that
+/// hangs is worse than one that loses a timestamp, and a hook cannot hang the
+/// agent. If the lock cannot be taken within the budget the guard is inert and
+/// the write proceeds anyway, degraded to last-writer-wins.
+///
+/// `flock` is released by the kernel when the holder's descriptor closes, so a
+/// process that dies mid-write cannot wedge the file.
+struct HookHealthLock {
+    _file: Option<std::fs::File>,
+}
+
+impl HookHealthLock {
+    /// Total time to keep retrying before giving up and writing unlocked.
+    const BUDGET: std::time::Duration = std::time::Duration::from_millis(50);
+
+    /// Pause between attempts; short enough to stay inside the budget.
+    const BACKOFF: std::time::Duration = std::time::Duration::from_micros(200);
+
+    fn acquire(atomic_dir: &Path) -> Self {
+        use fs2::FileExt;
+
+        let path = atomic_dir.join("hook-health.lock");
+        let Ok(file) = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&path)
+        else {
+            return Self { _file: None };
+        };
+
+        let deadline = std::time::Instant::now() + Self::BUDGET;
+        loop {
+            match file.try_lock_exclusive() {
+                Ok(()) => return Self { _file: Some(file) },
+                Err(_) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(Self::BACKOFF);
+                }
+                Err(_) => return Self { _file: None },
+            }
+        }
+    }
 }
 
 /// Flatten a health record into one row per agent, for display and JSON.
@@ -836,6 +897,43 @@ mod tests {
             "",
         ] {
             let _ = error_signature(msg);
+        }
+    }
+
+    #[test]
+    fn concurrent_writers_all_land() {
+        // Several agents record into one repository at once. Without the
+        // lock the last writer wins and the rest are discarded; for a first
+        // fire that means the agent stays missing and is reported as having
+        // "never recorded" — the false alarm this feature exists to raise.
+        let dir = tmp_repo();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join(".atomic")).unwrap();
+
+        let verbs = [
+            "before-tool",
+            "after-tool",
+            "session-start",
+            "stop",
+            "user-prompt",
+        ];
+        std::thread::scope(|s| {
+            for verb in verbs {
+                s.spawn(move || {
+                    for _ in 0..5 {
+                        record_fire(root, "opencode", "OpenCode", verb, FireOutcome::Ok, None);
+                    }
+                });
+            }
+        });
+
+        let health = HookHealth::read(root).expect("health file is readable");
+        let recorded = &health.agents["opencode"].verbs;
+        for verb in verbs {
+            assert!(
+                recorded.contains_key(verb),
+                "{verb} was lost to a racing write"
+            );
         }
     }
 

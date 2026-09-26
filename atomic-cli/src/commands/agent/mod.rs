@@ -70,18 +70,36 @@ pub use status::AgentStatus;
 /// `HookHealth::read` deliberately treats as "no data". Rename is atomic, so
 /// a reader sees either the old file or the new one, never a torn one.
 ///
+/// The temporary name carries the pid and a process-local counter. A fixed
+/// `.tmp` name is *not* safe here: several agents can record into one
+/// repository at the same time, and two writers on one temp path produce a
+/// `rename` that fails for the loser and can publish interleaved bytes from
+/// the winner — which `HookHealth::read` would then read as "no health data"
+/// and silently discard the entire record.
+///
 /// Best-effort: failures are ignored. Every caller is a diagnostic path that
 /// must not be able to fail the operation it is describing.
 pub(crate) fn write_atomic(dir: &Path, name: &str, bytes: &[u8]) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
     if std::fs::create_dir_all(dir).is_err() {
         return;
     }
     let path = dir.join(name);
-    let tmp = dir.join(format!("{name}.tmp"));
+    let tmp = dir.join(format!(
+        "{name}.{}.{}.tmp",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
     if std::fs::write(&tmp, bytes).is_err() {
+        let _ = std::fs::remove_file(&tmp);
         return;
     }
-    let _ = std::fs::rename(&tmp, &path);
+    if std::fs::rename(&tmp, &path).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
 }
 
 // Agent Command
