@@ -202,8 +202,8 @@ pub use error::{FormatError, FormatResult, FORMAT_VERSION, MAGIC, MAX_HASH_TABLE
 
 // Core types
 pub use types::{
-    CompactPosition, ContentChunkHeader, FileHeader, FileHeaderBuilder, FileHeaderFlags,
-    SectionHeader, SectionType, Trailer,
+    ChangeSignature, CompactPosition, ContentChunkHeader, FileHeader, FileHeaderBuilder,
+    FileHeaderFlags, SectionHeader, SectionType, Trailer,
 };
 
 // Hash index types and helpers

@@ -69,7 +69,7 @@ mod assemble;
 mod options;
 
 pub use assemble::{build_header, filter_files, RecordOutcome, RecordStats};
-pub use options::RecordOptions;
+pub use options::{RecordOptions, SigningIdentity};
 
 use atomic_core::record::workflow::{AssemblyError, GlobalizeError};
 use thiserror::Error;
