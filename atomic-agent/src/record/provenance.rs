@@ -244,9 +244,10 @@ pub(crate) fn build_turn_envelope(
     // has no delegated identity — the plus-tag path signs with the human's key
     // and there is no certificate to point at, which is precisely the
     // difference the field is there to record.
-    if let Some(urn) =
-        crate::identity::active_delegation_urn(options.agent_identity.as_deref(), None)
-    {
+    if let Some(urn) = crate::identity::active_delegation_urn(
+        options.agent_identity.as_deref(),
+        options.identity_dir.as_deref(),
+    ) {
         builder = builder.delegation_id(urn);
     }
 

@@ -219,7 +219,7 @@ fn test_section_type_from_byte_roundtrip() {
 #[test]
 fn test_section_type_from_byte_invalid() {
     // Test some invalid bytes
-    for byte in [0x00, 0x04, 0x0F, 0x11, 0x21, 0x31, 0xFF] {
+    for byte in [0x00, 0x0F, 0x11, 0x21, 0x31, 0xFF] {
         let result = SectionType::from_byte(byte);
         assert!(result.is_err(), "byte 0x{:02X} should be invalid", byte);
     }
@@ -230,6 +230,7 @@ fn test_section_type_is_hashed() {
     assert!(SectionType::Header.is_hashed());
     assert!(SectionType::Dependencies.is_hashed());
     assert!(SectionType::Provenance.is_hashed());
+    assert!(!SectionType::Signature.is_hashed());
     assert!(SectionType::Graph.is_hashed());
     assert!(SectionType::Content.is_hashed());
     assert!(SectionType::Semantic.is_hashed());

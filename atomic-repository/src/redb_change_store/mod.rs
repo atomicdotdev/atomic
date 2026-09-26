@@ -203,6 +203,9 @@ pub struct StoredChangeMeta {
 
     /// Whether unhashed data is stored.
     pub has_unhashed: bool,
+
+    /// Whether a signature is stored.
+    pub has_signature: bool,
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -259,6 +262,7 @@ impl RedbChangeStore {
                 let _ = txn.open_table(tables::CONTENT_CHUNKS)?;
                 let _ = txn.open_table(tables::CHANGE_CHUNKS)?;
                 let _ = txn.open_table(tables::CHANGE_UNHASHED)?;
+                let _ = txn.open_table(tables::CHANGE_SIGNATURES)?;
                 Self::initialize_provenance_tables(&txn)?;
             }
             txn.commit()?;
@@ -317,6 +321,7 @@ impl RedbChangeStore {
         let mut semantic_sections: Vec<(u32, Vec<u8>)> = Vec::new();
         let mut content_chunks: Vec<(u32, [u8; 32], Vec<u8>)> = Vec::new();
         let mut unhashed_payload: Option<Vec<u8>> = None;
+        let mut signature_payload: Option<Vec<u8>> = None;
 
         let mut graph_idx = 0u32;
         let mut semantic_idx = 0u32;
@@ -356,6 +361,9 @@ impl RedbChangeStore {
                 SectionType::Unhashed => {
                     unhashed_payload = Some(section.payload.clone());
                 }
+                SectionType::Signature => {
+                    signature_payload = Some(section.payload.clone());
+                }
             }
         }
 
@@ -375,6 +383,7 @@ impl RedbChangeStore {
             content_chunk_count: content_chunks.len() as u32,
             has_provenance: provenance_payload.is_some(),
             has_unhashed: unhashed_payload.is_some(),
+            has_signature: signature_payload.is_some(),
         };
 
         // Serialize and compress metadata
@@ -431,6 +440,14 @@ impl RedbChangeStore {
                 let compressed = zstd::encode_all(unhashed.as_slice(), 3)
                     .map_err(|e| RedbStoreError::Serialization(e.to_string()))?;
                 unhashed_table.insert(&content_hash, compressed.as_slice())?;
+            }
+
+            // CHANGE_SIGNATURES
+            if let Some(signature) = &signature_payload {
+                let mut sig_table = txn.open_table(tables::CHANGE_SIGNATURES)?;
+                let compressed = zstd::encode_all(signature.as_slice(), 3)
+                    .map_err(|e| RedbStoreError::Serialization(e.to_string()))?;
+                sig_table.insert(&content_hash, compressed.as_slice())?;
             }
         }
         txn.commit()?;

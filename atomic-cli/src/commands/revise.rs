@@ -78,6 +78,7 @@ use std::path::PathBuf;
 
 use atomic_core::change::{Change, ChangeHeader};
 use atomic_core::types::{Base32, Hash};
+use atomic_identity::IdentityStore;
 use atomic_repository::{
     HistoryEntry, HistoryOptions, RecordOptions, Repository, StatusOptions, UnrecordOptions,
 };
@@ -686,6 +687,23 @@ impl Revise {
             original_change.contents.clone(),
             original_change.hashed.dependencies.clone(),
         );
+
+        // Sign the reworded change with the current identity. Reword bypasses
+        // the record pipeline (it rebuilds the change directly), so it must
+        // sign here — a revised change is signed like any new record.
+        let mut new_change = new_change;
+        if let Ok(store) = IdentityStore::open_default() {
+            let signing_identity = store.get_default().ok().flatten();
+            if let Some(identity) = signing_identity {
+                if let Ok(keypair) = store.load_keypair(&identity.id, None) {
+                    let _ = new_change.sign_with(
+                        &atomic_canonical::did::did_for_public_key(&identity.public_key),
+                        keypair.secret.as_bytes(),
+                        chrono::Utc::now().timestamp(),
+                    );
+                }
+            }
+        }
 
         // Save the new change
         let new_hash = repo.save_change(&new_change).map_err(|e| {

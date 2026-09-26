@@ -205,6 +205,7 @@ impl TurnOrchestrator {
                     turn_duration_ms: 0,
                     prompt: None,
                     agent_identity: self.agent_identity.clone(),
+                    identity_dir: None,
                 };
                 if crate::record::scope::has_pending_changes(&self.repo_root, &options)? {
                     return Err(AgentError::RecordFailed {
@@ -330,6 +331,7 @@ impl TurnOrchestrator {
                         turn_duration_ms,
                         prompt,
                         agent_identity: self.agent_identity.clone(),
+                        identity_dir: None,
                     };
 
                     match record_turn(&self.repo_root, &record_options) {
