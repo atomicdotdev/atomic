@@ -44,3 +44,5 @@ fs2 = "0.4"
 
 [dev-dependencies]
 tempfile = { workspace = true }
+ed25519-dalek = { workspace = true }
+data-encoding = { workspace = true }

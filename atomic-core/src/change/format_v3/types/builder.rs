@@ -42,6 +42,7 @@ pub struct FileHeaderBuilder {
     total_uncompressed: u64,
     has_provenance: bool,
     has_unhashed: bool,
+    has_signature: bool,
 }
 
 impl FileHeaderBuilder {
@@ -55,6 +56,7 @@ impl FileHeaderBuilder {
             total_uncompressed: 0,
             has_provenance: false,
             has_unhashed: false,
+            has_signature: false,
         }
     }
 
@@ -106,6 +108,14 @@ impl FileHeaderBuilder {
         self
     }
 
+    /// Mark that this change has a signature section.
+    ///
+    /// Automatically sets the `HAS_SIGNATURE` flag.
+    pub fn with_signature(mut self) -> Self {
+        self.has_signature = true;
+        self
+    }
+
     /// Build the [`FileHeader`], auto-computing flags.
     pub fn build(self) -> FileHeader {
         let mut flags = FileHeaderFlags::NONE;
@@ -117,6 +127,9 @@ impl FileHeaderBuilder {
         }
         if self.has_unhashed {
             flags.set(FileHeaderFlags::HAS_UNHASHED);
+        }
+        if self.has_signature {
+            flags.set(FileHeaderFlags::HAS_SIGNATURE);
         }
 
         FileHeader {

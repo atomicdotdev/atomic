@@ -505,6 +505,16 @@ pub const CHANGE_CHUNKS: TableDefinition<&[u8; 36], &[u8; 32]> =
 pub const CHANGE_UNHASHED: TableDefinition<&[u8; 32], &[u8]> =
     TableDefinition::new("change_unhashed");
 
+/// Change signatures (Ed25519 over the content hash).
+///
+/// Key: change content hash (blake3, 32 bytes)
+/// Value: compressed postcard `ChangeSignature`
+///
+/// Like CHANGE_UNHASHED, the signature does not affect the change's identity —
+/// re-signing the same change with a different key never changes its hash.
+pub const CHANGE_SIGNATURES: TableDefinition<&[u8; 32], &[u8]> =
+    TableDefinition::new("change_signatures");
+
 // Pending provenance journal tables used by the redb-native change store.
 pub const PROVENANCE_STORE_META: TableDefinition<&str, u64> =
     TableDefinition::new("provenance_store_meta");
