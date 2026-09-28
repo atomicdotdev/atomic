@@ -32,6 +32,49 @@ fn ok(output: Output, what: &str) -> String {
     String::from_utf8_lossy(&output.stdout).into_owned()
 }
 
+/// How many sandboxes a stress test runs at once.
+///
+/// The default is sized for CI, which runs `cargo test --workspace` on three
+/// platforms with default thread parallelism, and each sandbox is a process, so
+/// the cost is linear. To actually stress it:
+///
+/// ```sh
+/// SANDBOX_STRESS_SANDBOXES=200 cargo test -p atomic-cli \
+///     --test remote_sandbox_integration_test
+/// ```
+///
+/// Measured ceiling, on one 15-core laptop, `several_remote_sandboxes_work_at_once`:
+///
+/// | sandboxes | result |
+/// |---|---|
+/// | 20 | passes, ~12s |
+/// | 32 | passes, ~17s |
+/// | 64 | passes, ~31s |
+/// | 200 | **intermittent** — 1 pass in 3, ~80-95s |
+///
+/// The 200 failures are all one thing, in the owner's `Materialize` handler:
+///
+/// ```text
+/// database owner materialize failed [materialize]: Database already open. Cannot acquire lock.
+/// ```
+///
+/// That is `open_existing_wait(30s)` giving up. The owner re-opens the database
+/// per request and redb allows one holder per file, so 200 concurrent clients
+/// queue on the file lock and the last of them waits out the timeout while the
+/// owner streams whole views one client at a time. It is a capacity limit, not a
+/// correctness bug — nothing is corrupted, and 20 is nowhere near it. The fix is
+/// for the owner to hold one `Pristine` and share it with every request via
+/// `open_with_pristine`, releasing it when idle so local commands can still open
+/// the repository (which `database_lock_exclusivity_test` shows they must be
+/// able to).
+fn stress_count() -> usize {
+    std::env::var("SANDBOX_STRESS_SANDBOXES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(20)
+}
+
 fn failure(output: Output, what: &str) -> String {
     assert!(!output.status.success(), "{what} should have failed");
     format!(
@@ -550,15 +593,16 @@ fn a_sandbox_that_fell_behind_can_still_record() {
 /// because a shared owner can cross wires without erroring.
 #[test]
 fn several_remote_sandboxes_work_at_once() {
-    const SANDBOXES: usize = 20;
+    let sandboxes_count = stress_count();
 
     let host = TempDir::new().unwrap();
     repository(host.path());
     let _owner = Owner(host.path());
 
-    // Zero-padded: "recorded by sb-1" is a substring of "recorded by sb-10",
-    // and a substring test across a set like this quietly passes nothing.
-    let names: Vec<String> = (0..SANDBOXES).map(|i| format!("sb-{i:02}")).collect();
+    // Padded to a fixed width: "recorded by sb-1" is a substring of
+    // "recorded by sb-10", and a substring test across a set like this quietly
+    // passes nothing. Three digits, because 200 sandboxes reach sb-199.
+    let names: Vec<String> = (0..sandboxes_count).map(|i| format!("sb-{i:03}")).collect();
     let dirs: Vec<TempDir> = names.iter().map(|_| TempDir::new().unwrap()).collect();
     let works: Vec<PathBuf> = dirs.iter().map(|d| d.path().join("work")).collect();
 
@@ -581,14 +625,14 @@ fn several_remote_sandboxes_work_at_once() {
         );
     }
 
-    let gate = Arc::new(Barrier::new(SANDBOXES));
+    let gate = Arc::new(Barrier::new(sandboxes_count));
     let mut sandboxes = Vec::new();
     for (i, (name, work)) in names.iter().zip(&works).enumerate() {
         let gate = Arc::clone(&gate);
         let (name, work) = (name.clone(), work.clone());
         sandboxes.push(thread::spawn(move || {
             let now = "2026-01-01T00:00:00Z";
-            let session = format!("session-{i:02}");
+            let session = format!("session-{i:03}");
             let turn = |n: u32| {
                 serde_json::json!({
                     "session_id": session, "cwd": work.to_str().unwrap(), "model": "m",
@@ -736,15 +780,16 @@ fn several_remote_sandboxes_work_at_once() {
 /// why every serial test passed.
 #[test]
 fn sandboxes_can_each_record_twice() {
-    const SANDBOXES: usize = 20;
+    let sandboxes_count = stress_count();
 
     let host = TempDir::new().unwrap();
     repository(host.path());
     let _owner = Owner(host.path());
 
-    // Zero-padded: "recorded by sb-1" is a substring of "recorded by sb-10",
-    // and a substring test across a set like this quietly passes nothing.
-    let names: Vec<String> = (0..SANDBOXES).map(|i| format!("sb-{i:02}")).collect();
+    // Padded to a fixed width: "recorded by sb-1" is a substring of
+    // "recorded by sb-10", and a substring test across a set like this quietly
+    // passes nothing. Three digits, because 200 sandboxes reach sb-199.
+    let names: Vec<String> = (0..sandboxes_count).map(|i| format!("sb-{i:03}")).collect();
     let dirs: Vec<TempDir> = names.iter().map(|_| TempDir::new().unwrap()).collect();
     let works: Vec<PathBuf> = dirs.iter().map(|d| d.path().join("work")).collect();
     for (name, work) in names.iter().zip(&works) {
@@ -766,7 +811,7 @@ fn sandboxes_can_each_record_twice() {
         );
     }
 
-    let gate = Arc::new(Barrier::new(SANDBOXES));
+    let gate = Arc::new(Barrier::new(sandboxes_count));
     let mut sandboxes = Vec::new();
     for (name, work) in names.iter().zip(&works) {
         let gate = Arc::clone(&gate);
