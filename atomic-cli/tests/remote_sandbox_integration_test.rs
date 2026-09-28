@@ -4,8 +4,10 @@
 //! Runs offline: the owner and the sandbox dial each other directly on
 //! loopback (`ATOMIC_OWNER_IROH_OFFLINE`), no relays.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::sync::{Arc, Barrier};
+use std::thread;
 
 use serde_json::Value;
 use tempfile::TempDir;
@@ -534,4 +536,279 @@ fn a_sandbox_that_fell_behind_can_still_record() {
     assert!(log.contains("after the view moved"), "{log}");
     // The refused change is not on the view, under either message.
     assert!(!log.contains("against the old view"), "{log}");
+}
+
+/// Several sandboxes at once against one owner: each on its own draft view, all
+/// materializing, publishing provenance and recording at the same time.
+///
+/// This is the shape the owner's concurrency has to survive. A view has one
+/// live token, so sandboxes cannot share a view and each gets its own draft off
+/// `dev`. Everything after that contends: one owner process, one `submissions`
+/// mutex held across the insert, a redb writer only one caller may hold, and a
+/// database the owner reopens per request. The assertions are all about
+/// *separation* — every change on the draft that made it, none on any other —
+/// because a shared owner can cross wires without erroring.
+#[test]
+fn several_remote_sandboxes_work_at_once() {
+    const SANDBOXES: usize = 4;
+
+    let host = TempDir::new().unwrap();
+    repository(host.path());
+    let _owner = Owner(host.path());
+
+    let names: Vec<String> = (0..SANDBOXES).map(|i| format!("sb-{i}")).collect();
+    let dirs: Vec<TempDir> = names.iter().map(|_| TempDir::new().unwrap()).collect();
+    let works: Vec<PathBuf> = dirs.iter().map(|d| d.path().join("work")).collect();
+
+    for (name, work) in names.iter().zip(&works) {
+        ok(
+            atomic(
+                host.path(),
+                &[
+                    "sandbox",
+                    "create",
+                    name,
+                    "--remote",
+                    "--from",
+                    "dev",
+                    "--dest",
+                    work.to_str().unwrap(),
+                ],
+            ),
+            &format!("sandbox create {name}"),
+        );
+    }
+
+    let gate = Arc::new(Barrier::new(SANDBOXES));
+    let mut sandboxes = Vec::new();
+    for (i, (name, work)) in names.iter().zip(&works).enumerate() {
+        let gate = Arc::clone(&gate);
+        let (name, work) = (name.clone(), work.clone());
+        sandboxes.push(thread::spawn(move || {
+            let now = "2026-01-01T00:00:00Z";
+            let session = format!("session-{i}");
+            let turn = |n: u32| {
+                serde_json::json!({
+                    "session_id": session, "cwd": work.to_str().unwrap(), "model": "m",
+                    "provider": "p", "turn_number": n,
+                    "intent_title": format!("work on {name}"), "timestamp": now,
+                })
+            };
+
+            // From here on they contend: one owner, one database, one writer.
+            gate.wait();
+
+            ok(
+                atomic(&work, &["sandbox", "materialize"]),
+                &format!("{name} materialize"),
+            );
+            // Each sandbox's own session. A sandbox may only touch its own, so
+            // this is the owner's session check under load.
+            ok(
+                hook(
+                    &work,
+                    "session-start",
+                    serde_json::json!({
+                        "session_id": session, "cwd": work.to_str().unwrap(), "model": "m",
+                        "provider": "p", "turn_number": 0, "timestamp": now,
+                    }),
+                ),
+                &format!("{name} session-start"),
+            );
+            ok(
+                hook(&work, "turn-start", turn(1)),
+                &format!("{name} turn-start"),
+            );
+
+            // Each edits a file only it touches, so a crossed change shows up
+            // as another sandbox's content on this draft.
+            std::fs::write(work.join("README.md"), format!("hello\nfrom {name}\n")).unwrap();
+            std::fs::write(
+                work.join(format!("{name}.txt")),
+                format!("only {name} wrote this\n"),
+            )
+            .unwrap();
+            ok(
+                atomic(&work, &["add", &format!("{name}.txt")]),
+                &format!("{name} add"),
+            );
+            ok(
+                atomic(
+                    &work,
+                    &["record", "-a", "-m", &format!("recorded by {name}")],
+                ),
+                &format!("{name} record"),
+            );
+            ok(
+                hook(&work, "turn-end", turn(1)),
+                &format!("{name} turn-end"),
+            );
+            ok(
+                hook(
+                    &work,
+                    "session-end",
+                    serde_json::json!({
+                        "session_id": session, "cwd": work.to_str().unwrap(),
+                        "turn_number": 1, "timestamp": now,
+                    }),
+                ),
+                &format!("{name} session-end"),
+            );
+            session
+        }));
+    }
+
+    let sessions: Vec<String> = sandboxes
+        .into_iter()
+        .map(|s| s.join().expect("a sandbox thread finished"))
+        .collect();
+
+    // Every draft has its own sandbox's change, and its provenance.
+    for (i, name) in names.iter().enumerate() {
+        let log = ok(
+            atomic(host.path(), &["log", "--view", name]),
+            &format!("host log of {name}"),
+        );
+        assert!(
+            log.contains(&format!("recorded by {name}")),
+            "{name}: {log}"
+        );
+
+        let shown = ok(
+            atomic(host.path(), &["session", "show", &sessions[i]]),
+            &format!("host session {}", sessions[i]),
+        );
+        assert!(shown.contains("Turns: 1"), "{}: {shown}", sessions[i]);
+        assert!(
+            shown.contains(&format!("Goal marker: work on {name}")),
+            "{}: {shown}",
+            sessions[i]
+        );
+    }
+
+    // ...and nothing of any other sandbox's. This is the assertion that fails
+    // if a submit were applied to the wrong view.
+    for name in &names {
+        let log = ok(
+            atomic(host.path(), &["log", "--view", name]),
+            &format!("host log of {name}"),
+        );
+        for other in &names {
+            if other != name {
+                assert!(
+                    !log.contains(&format!("recorded by {other}")),
+                    "{name} has {other}'s change: {log}"
+                );
+            }
+        }
+    }
+
+    // The shared base is untouched: no draft's work reached `dev`.
+    let dev = ok(atomic(host.path(), &["log"]), "host log of dev");
+    for name in &names {
+        assert!(
+            !dev.contains(&format!("recorded by {name}")),
+            "a draft's work reached dev: {dev}"
+        );
+    }
+    assert_eq!(
+        std::fs::read_to_string(host.path().join("README.md")).unwrap(),
+        "hello\n",
+        "dev's working tree was rewritten by a sandbox"
+    );
+}
+
+/// A second record from each sandbox, on a repository several of them are
+/// working on. This is a known failure, kept here because the stress test above
+/// found it and it should be run the moment it is fixed.
+///
+/// A remote cache allocates node ids from a counter seeded *only* by the ids
+/// the owner chose to send it — `import_ids` takes `fetch_max` over the ids in
+/// one import, and a cache is only told the ids for the files it asks about.
+/// Instrumented on a four-sandbox run, the owner sent 5 ids with a maximum of
+/// 7, leaving each cache's counter at 8 while the repository's own counter was
+/// well past that. The cache then mints ids for its new content that are
+/// already real repository node ids, and the owner refuses the change with
+/// `node N is not on this view`: the agent's work is lost, with no way forward.
+///
+/// Parallelism is not the cause, only what makes it reliable — it races several
+/// caches through the same import so they all record from a stale counter. A
+/// single sandbox passes whenever the repository happens to have no node at the
+/// ids that cache lands on, which is why no existing test saw it.
+///
+/// The fix is the one `LOCAL_INODE_FLOOR` already applies to inodes: a cache's
+/// node ids must come from a range the repository will never hand out, and the
+/// owner must remap them into the repository's space on insert rather than
+/// applying the submitted change's ids verbatim.
+#[test]
+#[ignore = "a remote cache's node ids collide with the repository's; see above"]
+fn sandboxes_can_each_record_twice() {
+    const SANDBOXES: usize = 4;
+
+    let host = TempDir::new().unwrap();
+    repository(host.path());
+    let _owner = Owner(host.path());
+
+    let names: Vec<String> = (0..SANDBOXES).map(|i| format!("sb-{i}")).collect();
+    let dirs: Vec<TempDir> = names.iter().map(|_| TempDir::new().unwrap()).collect();
+    let works: Vec<PathBuf> = dirs.iter().map(|d| d.path().join("work")).collect();
+    for (name, work) in names.iter().zip(&works) {
+        ok(
+            atomic(
+                host.path(),
+                &[
+                    "sandbox",
+                    "create",
+                    name,
+                    "--remote",
+                    "--from",
+                    "dev",
+                    "--dest",
+                    work.to_str().unwrap(),
+                ],
+            ),
+            &format!("sandbox create {name}"),
+        );
+    }
+
+    let gate = Arc::new(Barrier::new(SANDBOXES));
+    let mut sandboxes = Vec::new();
+    for (name, work) in names.iter().zip(&works) {
+        let gate = Arc::clone(&gate);
+        let (name, work) = (name.clone(), work.clone());
+        sandboxes.push(thread::spawn(move || {
+            gate.wait();
+            ok(
+                atomic(&work, &["sandbox", "materialize"]),
+                &format!("{name} materialize"),
+            );
+            std::fs::write(work.join("README.md"), format!("hello\nfrom {name}\n")).unwrap();
+            ok(
+                atomic(&work, &["record", "-a", "-m", &format!("first by {name}")]),
+                &format!("{name} first record"),
+            );
+            // The one that fails: the cache mints ids from its stale counter.
+            std::fs::write(
+                work.join("README.md"),
+                format!("hello\nfrom {name}\nmore\n"),
+            )
+            .unwrap();
+            ok(
+                atomic(&work, &["record", "-a", "-m", &format!("second by {name}")]),
+                &format!("{name} second record: the cache must not reuse a repository node id"),
+            );
+        }));
+    }
+    for s in sandboxes {
+        s.join().expect("a sandbox thread finished");
+    }
+
+    for name in &names {
+        let log = ok(
+            atomic(host.path(), &["log", "--view", name]),
+            &format!("host log of {name}"),
+        );
+        assert!(log.contains(&format!("first by {name}")), "{name}: {log}");
+        assert!(log.contains(&format!("second by {name}")), "{name}: {log}");
+    }
 }

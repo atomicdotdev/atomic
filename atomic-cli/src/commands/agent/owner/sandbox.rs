@@ -341,7 +341,14 @@ pub(crate) async fn record_request(
     match request {
         OwnerRequest::FileStates { inodes, .. } => {
             let read = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
-                let repo = Repository::open_readonly(&root)?;
+                // Wait for the database, don't fail on it. The owner opens it
+                // per request, so two sandboxes asking at once contend for it
+                // and the loser has to wait — the same reason the writes below
+                // wait. Without this a `file-states` arriving while another
+                // request holds the file fails outright, which under load is
+                // every sandbox but one.
+                let repo =
+                    Repository::open_readonly_wait(&root, std::time::Duration::from_secs(30))?;
                 Ok(repo.export_sandbox_slice(&view, &inodes)?)
             });
             match read.await {
@@ -354,7 +361,9 @@ pub(crate) async fn record_request(
         }
         OwnerRequest::Changes { hashes, .. } => {
             let read = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
-                let repo = Repository::open_readonly(&root)?;
+                // Waits for the database for the same reason `FileStates` does.
+                let repo =
+                    Repository::open_readonly_wait(&root, std::time::Duration::from_secs(30))?;
                 Ok(repo.export_sandbox_changes(&view, &hashes)?)
             });
             match read.await {
