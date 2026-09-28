@@ -47,6 +47,26 @@ atomic push origin
 | `-h, --help` | Print help information |
 | `-V, --version` | Print version |
 
+## Logging
+
+The terminal shows warnings; `-v` or `RUST_LOG` shows more. Every command also
+writes `info` and above to a daily file, `~/.atomic/logs/atomic.YYYY-MM-DD.log`
+(UTC date; `logs/` under `ATOMIC_CONFIG_DIR` when that is set), in a directory
+only you can read. The last seven files are kept. Each line starts with the
+time and process id, then names the command and the spans it ran in:
+
+```
+2026-09-28T21:30:23.133637Z pid=4242  INFO ThreadId(01) atomic{cmd=git import}:import{branch="main" commits=50}:write{commits=50}:commit{n=3 of=50 sha=1b9c1fec}: atomic::git::import: write 1b9c1fec …
+```
+
+Each span also logs its duration when it closes (`close time.busy=…`).
+
+| Variable | Effect |
+|----------|--------|
+| `ATOMIC_LOG` | The file's filter, in `RUST_LOG` syntax (default `warn,atomic=info`); `off` turns the file off |
+| `ATOMIC_LOG_DIR` | Write the file to this directory instead; it must be an absolute path |
+| `RUST_LOG` | The terminal's filter |
+
 ---
 
 ## Command Reference
@@ -862,7 +882,9 @@ Global identity configuration is stored in `~/.config/atomic/` (or platform equi
 
 | Variable | Description |
 |----------|-------------|
-| `ATOMIC_LOG` | Set log level (`trace`, `debug`, `info`, `warn`, `error`) |
+| `ATOMIC_LOG` | The log file's filter, in `RUST_LOG` syntax; `off` turns the file off (see [Logging](#logging)) |
+| `ATOMIC_LOG_DIR` | Directory for the log file, an absolute path |
+| `RUST_LOG` | The terminal's log filter |
 | `NO_COLOR` | Disable colored output (standard convention) |
 
 ---

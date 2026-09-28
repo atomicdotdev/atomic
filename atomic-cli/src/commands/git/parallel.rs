@@ -2495,9 +2495,17 @@ pub(crate) fn trace_git_import_enabled() -> bool {
     std::env::var_os("ATOMIC_TRACE_GIT_IMPORT").is_some()
 }
 
+/// Log target of `git import`'s progress lines, so a filter can pick them
+/// out: `ATOMIC_LOG=warn,atomic::git::import=info`.
+pub(crate) const GIT_IMPORT_LOG_TARGET: &str = "atomic::git::import";
+
+/// A `git import` progress line: always in the log file, and on the terminal
+/// with `ATOMIC_TRACE_GIT_IMPORT`.
 pub(crate) fn trace_git_import(message: impl AsRef<str>) {
+    let message = message.as_ref();
+    tracing::info!(target: GIT_IMPORT_LOG_TARGET, "{message}");
     if trace_git_import_enabled() {
-        eprintln!("[git-import] {}", message.as_ref());
+        eprintln!("[git-import] {message}");
     }
 }
 
@@ -3958,6 +3966,7 @@ impl ParallelImporter {
     /// Same prospective validation with an explicit tip override (§7.5): the
     /// commits behind `tip` import into the view named `branch_name` even when
     /// no local branch carries that tip.
+    #[tracing::instrument(name = "preflight", skip_all, fields(branch = branch_name))]
     pub(crate) fn validate_branch_prospectively_for_tip(
         &self,
         branch_name: &str,
@@ -4345,6 +4354,11 @@ impl ParallelImporter {
         self.import_prevalidated(branch_name, repo, plan)
     }
 
+    #[tracing::instrument(
+        name = "import",
+        skip_all,
+        fields(branch = branch_name, commits = plan.commits.len())
+    )]
     pub(crate) fn import_prevalidated(
         &self,
         branch_name: &str,
@@ -4670,6 +4684,7 @@ impl ParallelImporter {
     // ═══════════════════════════════════════════════════════════════════════
 
     /// Phase 1: Parse all commits in parallel using rayon.
+    #[tracing::instrument(name = "parse", skip_all, fields(commits = commit_oids.len()))]
     fn phase1_parse(&self, commit_oids: &[Oid]) -> CliResult<Vec<ParsedCommit>> {
         // Build a map from OID to index for parent lookups
         let oid_to_index: std::collections::HashMap<Oid, usize> = commit_oids
@@ -4684,12 +4699,15 @@ impl ParallelImporter {
 
         // Share the repo path for thread-local repo opening
         let repo_path = self.git_repo_path.clone();
+        // Rayon's threads don't inherit the span; log their lines inside it.
+        let parse_span = tracing::Span::current();
 
         // Parse commits in parallel - each thread opens its own git repo
         let results: Vec<CliResult<ParsedCommit>> = commit_oids
             .par_iter()
             .enumerate()
             .map(|(idx, oid)| {
+                let _span = parse_span.enter();
                 // Progress reporting (every 100 commits)
                 let count = progress.fetch_add(1, Ordering::Relaxed);
                 if total > 100 && count.is_multiple_of(100) {
@@ -4712,6 +4730,7 @@ impl ParallelImporter {
             match result {
                 Ok(commit) => parsed.push(commit),
                 Err(e) => {
+                    tracing::info!(target: GIT_IMPORT_LOG_TARGET, idx, error = %e, "parse failed; commit skipped");
                     print_warning(&format!("Skipping commit {}: {}", idx, e));
                 }
             }
@@ -4734,6 +4753,7 @@ impl ParallelImporter {
     // ═══════════════════════════════════════════════════════════════════════
 
     /// Phase 2: Write changes sequentially with hash chaining.
+    #[tracing::instrument(name = "write", skip_all, fields(commits = commits.len()))]
     fn phase2_write(
         &self,
         repo: &mut Repository,
@@ -4754,9 +4774,17 @@ impl ParallelImporter {
 
         for (idx, candidate) in commits.iter().enumerate() {
             let parsed = &candidate.parsed;
+            let _commit_span = tracing::info_span!(
+                "commit",
+                n = idx + 1,
+                of = total,
+                sha = %parsed.short_sha
+            )
+            .entered();
             // Commits created by `atomic git push` whose referenced view
             // state is already present add nothing — skip them entirely.
             if should_skip_self_push(parsed, &self.options) {
+                tracing::info!(target: GIT_IMPORT_LOG_TARGET, "skip: written by atomic git push, view state already present");
                 stats.self_push_skipped += 1;
                 continue;
             }
@@ -4769,12 +4797,14 @@ impl ParallelImporter {
             if self.options.incremental {
                 match self.try_squash_insert(repo, parsed)? {
                     SquashDecision::Inserted(info) => {
+                        tracing::info!(target: GIT_IMPORT_LOG_TARGET, "squash: inserted the original changes");
                         stats.squash_inserted += 1;
                         stats.files_processed += parsed.files.len();
                         imported_commits.push(info);
                         continue;
                     }
                     SquashDecision::Skipped => {
+                        tracing::info!(target: GIT_IMPORT_LOG_TARGET, "squash: skipped");
                         stats.squash_skipped += 1;
                         continue;
                     }
@@ -4786,6 +4816,7 @@ impl ParallelImporter {
             // resurrection over synthesis. Trailers, names, and index rows
             // cannot reach this path: only crypto + Git-content verification.
             if let Some(binding) = self.verified_binding_for(repo, &git, parsed)? {
+                tracing::info!(target: GIT_IMPORT_LOG_TARGET, "resurrect from its verified binding");
                 let info = self.resurrect_commit(repo, &git, parsed, &binding)?;
                 stats.changes_written += 1;
                 stats.resurrected_exact += 1;
@@ -4830,6 +4861,7 @@ impl ParallelImporter {
             ) {
                 Ok(info) => info,
                 Err(error) => {
+                    tracing::info!(target: GIT_IMPORT_LOG_TARGET, error = %error, "write failed; the import stops at this commit");
                     stats.failure = Some(format!("{error}"));
                     break;
                 }
@@ -4879,7 +4911,9 @@ impl ParallelImporter {
         }
 
         if !index_entries.is_empty() {
-            let _ = repo.update_file_index(working_copy, &index_entries);
+            if let Err(error) = repo.update_file_index(working_copy, &index_entries) {
+                tracing::info!(target: GIT_IMPORT_LOG_TARGET, error = %error, "file index update failed");
+            }
         }
 
         Ok((stats, imported_commits))
