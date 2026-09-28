@@ -367,25 +367,35 @@ fn read_repository_pointer(path: &Path) -> Result<PathBuf, RepositoryError> {
 }
 
 fn resolve_git_admin(root: &Path) -> Result<Option<GitAdminPaths>, RepositoryError> {
-    let Some(worktree_output) = run_git_optional(root, &["rev-parse", "--show-toplevel"])? else {
+    // One `git rev-parse` answers every query, one line per argument in
+    // order. This runs on every working-copy validation, several times per
+    // command, so it is one subprocess rather than four.
+    let Some(lines) = run_git_optional_lines(
+        root,
+        &[
+            "rev-parse",
+            "--show-toplevel",
+            "--git-common-dir",
+            "--git-dir",
+            "--git-path",
+            "index",
+        ],
+    )?
+    else {
         return Ok(None);
     };
+    let [worktree_output, common_output, git_dir_output, index_output]: [Vec<u8>; 4] = lines
+        .try_into()
+        .map_err(|lines: Vec<Vec<u8>>| RepositoryError::InvalidRepository {
+            reason: format!(
+                "git rev-parse printed {} administrative paths, expected 4",
+                lines.len()
+            ),
+        })?;
     let worktree_root = resolve_git_path(root, &worktree_output, true)?;
-    let common_dir = resolve_git_path(
-        root,
-        &run_git_required(root, &["rev-parse", "--git-common-dir"])?,
-        true,
-    )?;
-    let worktree_git_dir = resolve_git_path(
-        root,
-        &run_git_required(root, &["rev-parse", "--git-dir"])?,
-        true,
-    )?;
-    let index_path = resolve_git_path(
-        root,
-        &run_git_required(root, &["rev-parse", "--git-path", "index"])?,
-        false,
-    )?;
+    let common_dir = resolve_git_path(root, &common_output, true)?;
+    let worktree_git_dir = resolve_git_path(root, &git_dir_output, true)?;
+    let index_path = resolve_git_path(root, &index_output, false)?;
 
     Ok(Some(GitAdminPaths {
         worktree_root,
@@ -395,27 +405,13 @@ fn resolve_git_admin(root: &Path) -> Result<Option<GitAdminPaths>, RepositoryErr
     }))
 }
 
-fn run_git_optional(root: &Path, args: &[&str]) -> Result<Option<Vec<u8>>, RepositoryError> {
+/// Run a Git command that prints one path per line. `None` when Git is
+/// missing or the command fails (for example outside a Git worktree).
+fn run_git_optional_lines(
+    root: &Path,
+    args: &[&str],
+) -> Result<Option<Vec<Vec<u8>>>, RepositoryError> {
     let output = match Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args(args)
-        .env_remove("GIT_INDEX_FILE")
-        .output()
-    {
-        Ok(output) => output,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(RepositoryError::Io(error)),
-    };
-    if output.status.success() {
-        Ok(Some(trim_git_output(output.stdout)?))
-    } else {
-        Ok(None)
-    }
-}
-
-fn run_git_required(root: &Path, args: &[&str]) -> Result<Vec<u8>, RepositoryError> {
-    let output = Command::new("git")
         .arg("-C")
         .arg(root)
         .args(args)
@@ -424,18 +420,22 @@ fn run_git_required(root: &Path, args: &[&str]) -> Result<Vec<u8>, RepositoryErr
         // GIT_INDEX_FILE, so strip it here: the canonical primary index path
         // is an identity input, the selected index is only evidence.
         .env_remove("GIT_INDEX_FILE")
-        .output()?;
+        .output()
+    {
+        Ok(output) => output,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(RepositoryError::Io(error)),
+    };
     if !output.status.success() {
-        return Err(RepositoryError::InvalidRepository {
-            reason: format!(
-                "git -C '{}' {} failed: {}",
-                root.display(),
-                args.join(" "),
-                String::from_utf8_lossy(&output.stderr).trim()
-            ),
-        });
+        return Ok(None);
     }
-    trim_git_output(output.stdout)
+    output
+        .stdout
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(|line| trim_git_output(line.to_vec()))
+        .collect::<Result<Vec<_>, _>>()
+        .map(Some)
 }
 
 fn trim_git_output(mut bytes: Vec<u8>) -> Result<Vec<u8>, RepositoryError> {
@@ -672,17 +672,28 @@ impl Repository {
 
     /// Return this working directory's identity or an actionable typed error.
     pub fn require_working_copy_id(&self) -> Result<WorkingCopyId, RepositoryError> {
-        let layout = layout_for_paths(
+        self.working_copy_id_in(&self.handle_layout()?)
+    }
+
+    /// This handle's canonical layout, resolved fresh on every call.
+    fn handle_layout(&self) -> Result<RepositoryLayout, RepositoryError> {
+        layout_for_paths(
             self.root.clone(),
             self.dot_dir.clone(),
             self.working_copy_dot_dir(),
             false,
-        )?;
+        )
+    }
+
+    fn working_copy_id_in(
+        &self,
+        layout: &RepositoryLayout,
+    ) -> Result<WorkingCopyId, RepositoryError> {
         match read_identity_file(&layout.working_copy_dot_dir)? {
             IdentityFile::Valid(id) => Ok(id),
-            IdentityFile::Missing => Err(migration_required(&layout, "working_copy_id is missing")),
-            IdentityFile::Empty => Err(migration_required(&layout, "working_copy_id is empty")),
-            IdentityFile::Malformed(reason) => Err(malformed_identity_error(&layout, reason)),
+            IdentityFile::Missing => Err(migration_required(layout, "working_copy_id is missing")),
+            IdentityFile::Empty => Err(migration_required(layout, "working_copy_id is empty")),
+            IdentityFile::Malformed(reason) => Err(malformed_identity_error(layout, reason)),
         }
     }
 
@@ -691,37 +702,35 @@ impl Repository {
         &self,
         id: WorkingCopyId,
     ) -> Result<WorkingCopyRecord, RepositoryError> {
-        let layout = layout_for_paths(
-            self.root.clone(),
-            self.dot_dir.clone(),
-            self.working_copy_dot_dir(),
-            false,
-        )?;
+        self.working_copy_record_in(&self.handle_layout()?, id)
+    }
+
+    fn working_copy_record_in(
+        &self,
+        layout: &RepositoryLayout,
+        id: WorkingCopyId,
+    ) -> Result<WorkingCopyRecord, RepositoryError> {
         let txn = self
             .pristine
             .read_txn()
             .map_err(|error| RepositoryError::Database(error.to_string()))?;
         txn.get_working_copy(id)
-            .map_err(|error| map_pristine_identity_error(&layout, error))?
+            .map_err(|error| map_pristine_identity_error(layout, error))?
             .ok_or(RepositoryError::WorkingCopyRecordNotFound { id })
     }
 
     /// Verify that an ID, its record, and this canonical location all agree.
     pub fn validate_working_copy(&self, id: WorkingCopyId) -> Result<(), RepositoryError> {
-        let actual = self.require_working_copy_id()?;
+        // One layout for all three checks: they describe the same moment.
+        let layout = self.handle_layout()?;
+        let actual = self.working_copy_id_in(&layout)?;
         if actual != id {
             return Err(RepositoryError::WorkingCopyIdentityMismatch {
                 requested: id,
                 actual,
             });
         }
-        let layout = layout_for_paths(
-            self.root.clone(),
-            self.dot_dir.clone(),
-            self.working_copy_dot_dir(),
-            false,
-        )?;
-        let record = self.working_copy_record(id)?;
+        let record = self.working_copy_record_in(&layout, id)?;
         if record.location_fingerprint != layout.location_fingerprint {
             return Err(RepositoryError::WorkingCopyLocationMismatch { id });
         }

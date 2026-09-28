@@ -357,10 +357,14 @@ pub(crate) fn hex_bytes(bytes: Option<&[u8]>) -> String {
 /// and semantic reconstruction, not only touched bytes. Paths outside the
 /// conversion policy's inclusion set are excluded from the expectation
 /// exactly as the prospective manifest excludes them.
+///
+/// With `touched`, the expectation covers only those paths (see
+/// [`atomic_repository::StagedTreeExpectation::verify_paths`]).
 pub(crate) fn staged_expectation_for(
     parsed: &ParsedCommit,
     prospective: &atomic_repository::ProjectTree,
     semantic_paths: &[String],
+    touched: Option<&std::collections::BTreeSet<String>>,
 ) -> atomic_repository::StagedExpectation {
     let mut entries = std::collections::BTreeMap::new();
     for entry in &prospective.manifest.entries {
@@ -370,8 +374,12 @@ pub(crate) fn staged_expectation_for(
         // The canonical String identity: fold keys already carry the
         // reversible escaped ASCII form (review CB-9C R7), so the bytes ARE
         // the key — escaped() must not re-escape a canonical identity.
+        let path = String::from_utf8_lossy(entry.path.as_bytes()).into_owned();
+        if touched.is_some_and(|paths| !paths.contains(&path)) {
+            continue;
+        }
         entries.insert(
-            String::from_utf8_lossy(entry.path.as_bytes()).into_owned(),
+            path,
             atomic_repository::StagedPathExpectation {
                 bytes: entry.repository_bytes.clone(),
                 mode: entry.mode,
@@ -406,8 +414,22 @@ pub(crate) fn staged_expectation_for(
         tree: Some(atomic_repository::StagedTreeExpectation {
             entries,
             semantic_paths,
+            verify_paths: touched.cloned(),
         }),
     }
+}
+
+/// Every path a single-parent commit touches: added, modified, deleted,
+/// renamed and copied paths, plus each rename's source.
+fn touched_paths(parsed: &ParsedCommit) -> std::collections::BTreeSet<String> {
+    let mut paths = std::collections::BTreeSet::new();
+    for file in &parsed.files {
+        paths.insert(file.path.clone());
+        if let Some(old_path) = &file.old_path {
+            paths.insert(old_path.clone());
+        }
+    }
+    paths
 }
 
 /// Lowercase hex of a tagged Git object ID (display/proof only).
@@ -674,6 +696,10 @@ pub struct ParallelImportOptions {
     /// Prove parsed Git trees against the prospective Atomic projection before
     /// source publication. This stays in-memory and never scans the worktree.
     pub validate_equivalence: bool,
+    /// Verify only the paths each single-parent commit touches, and the whole
+    /// tree at the last written commit and at merges. Set by `git import`;
+    /// bridge reconcile keeps the full-tree check on every commit.
+    pub verify_touched_paths: bool,
 }
 
 impl Default for ParallelImportOptions {
@@ -688,6 +714,7 @@ impl Default for ParallelImportOptions {
             target_view: String::new(),
             known_states: HashSet::new(),
             validate_equivalence: true,
+            verify_touched_paths: false,
         }
     }
 }
@@ -4751,6 +4778,11 @@ impl ParallelImporter {
         let mut batch_start = Instant::now();
         let git = self.open_git_repo()?;
         let mut ledger = ClosureLedger::default();
+        // The last commit this batch writes verifies the whole tree even when
+        // earlier commits verify only the paths they touch.
+        let last_written = commits
+            .iter()
+            .rposition(|candidate| !should_skip_self_push(&candidate.parsed, &self.options));
 
         for (idx, candidate) in commits.iter().enumerate() {
             let parsed = &candidate.parsed;
@@ -4818,6 +4850,7 @@ impl ParallelImporter {
             // them instead of publishing a silent hole in the Git history.
             // CB-13C F4: the failure is RECORDED on the stats (not `?`ed
             // away) so the aggregate accounts for what already landed.
+            let touched_only = self.options.verify_touched_paths && Some(idx) != last_written;
             let info = match self.write_commit(
                 repo,
                 &git,
@@ -4827,6 +4860,7 @@ impl ParallelImporter {
                 &candidate.verified,
                 &candidate.prospective,
                 boundaries,
+                touched_only,
             ) {
                 Ok(info) => info,
                 Err(error) => {
@@ -5055,6 +5089,7 @@ impl ParallelImporter {
         verified: &VerifiedProspectiveEquivalence,
         prospective: &atomic_repository::ProjectTree,
         boundaries: &[&'static str],
+        touched_only: bool,
     ) -> CliResult<ImportedCommitInfo> {
         // CB-9B F1-adjacent sibling import: a Git commit already interpreted
         // locally (same full SHA) has exactly one Atomic change. Re-synthesizing
@@ -5111,6 +5146,7 @@ impl ParallelImporter {
                 verified,
                 prospective,
                 boundaries,
+                touched_only,
             )?
         } else {
             self.write_empty_commit_synthesized(
@@ -5121,6 +5157,7 @@ impl ParallelImporter {
                 verified,
                 prospective,
                 boundaries,
+                touched_only,
             )?
         };
         ledger.record_introduced(&parsed.git_sha, info.atomic_hash, &self.options.target_view);
@@ -5248,6 +5285,7 @@ impl ParallelImporter {
     /// diff lines are never used to override the semantic layer, and Git
     /// parents never become Atomic dependencies.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     fn write_commit_synthesized(
         &self,
         repo: &mut Repository,
@@ -5257,6 +5295,7 @@ impl ParallelImporter {
         verified: &VerifiedProspectiveEquivalence,
         prospective: &atomic_repository::ProjectTree,
         boundaries: &[&'static str],
+        touched_only: bool,
     ) -> CliResult<ImportedCommitInfo> {
         use atomic_core::output::memory::Memory;
         use atomic_core::record::workflow::{
@@ -6118,7 +6157,9 @@ impl ParallelImporter {
             .filter(|recorded| recorded.crdt_ops().is_some())
             .map(|recorded| recorded.path().to_string())
             .collect();
-        let expectation = staged_expectation_for(parsed, prospective, &semantic_paths);
+        let touched = touched_only.then(|| touched_paths(parsed));
+        let expectation =
+            staged_expectation_for(parsed, prospective, &semantic_paths, touched.as_ref());
         let progress = SlowImportProgress::start(
             slow_import_commit_label(parsed),
             slow_import_record_summary(parsed, &recorded_files),
@@ -6227,6 +6268,7 @@ impl ParallelImporter {
     /// cannot collapse into one hash, and the raw foreign facts survive
     /// serialization.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     fn write_empty_commit_synthesized(
         &self,
         repo: &mut Repository,
@@ -6236,6 +6278,7 @@ impl ParallelImporter {
         verified: &VerifiedProspectiveEquivalence,
         prospective: &atomic_repository::ProjectTree,
         boundaries: &[&'static str],
+        touched_only: bool,
     ) -> CliResult<ImportedCommitInfo> {
         let commit_start = Instant::now();
 
@@ -6328,7 +6371,12 @@ impl ParallelImporter {
                 Default::default(),
                 Some(&parsed.git_sha),
                 &parent_closure,
-                &staged_expectation_for(parsed, prospective, &[]),
+                &staged_expectation_for(
+                    parsed,
+                    prospective,
+                    &[],
+                    touched_only.then(|| touched_paths(parsed)).as_ref(),
+                ),
                 &excluded,
                 // CB-9B review B4: an empty commit still advances the exact
                 // interpreted closure — superseded exclusions leave the view
@@ -6612,7 +6660,9 @@ impl ParallelImporter {
             .filter(|recorded| recorded.crdt_ops().is_some())
             .map(|recorded| recorded.path().to_string())
             .collect();
-        let expectation = staged_expectation_for(parsed, prospective, &semantic_paths);
+        // Merges always verify the whole tree: their union state is not the
+        // parent tree plus the paths Git lists as changed.
+        let expectation = staged_expectation_for(parsed, prospective, &semantic_paths, None);
         let outcome = repo
             .synthesize_git_resolution(
                 header,
@@ -8625,6 +8675,72 @@ mod tests {
             parent_tree_oid: None,
             raw_object: Vec::new(),
         }
+    }
+
+    #[test]
+    fn touched_expectation_covers_only_the_commit_paths() {
+        let policy = ConversionPolicy::new(GitHashAlgorithm::Sha1);
+        let entry = |path: &str| {
+            RepositoryEntry::new(
+                RepoPath::from_bytes(path.as_bytes()).unwrap(),
+                path.as_bytes().to_vec(),
+                0o644,
+                atomic_core::change::InodeKind::Regular,
+                None,
+                ManifestDisposition::Included,
+            )
+            .unwrap()
+        };
+        let manifest = RepositoryManifest::new(
+            SetId::ZERO,
+            policy.root().content_key,
+            vec![
+                entry("changed.txt"),
+                entry("kept.txt"),
+                entry("renamed.txt"),
+            ],
+        )
+        .unwrap();
+        let prospective = ProjectTree::from_manifest(manifest, &policy).unwrap();
+        let mut parsed = added_commit("changed.txt", b"changed.txt");
+        parsed.files[0].operation = FileOperation::Modified;
+        parsed.files.push(ParsedFile {
+            path: "renamed.txt".to_string(),
+            operation: FileOperation::Renamed,
+            new_content: Some(b"renamed.txt".to_vec()),
+            old_content: None,
+            diff_lines: None,
+            old_path: Some("old.txt".to_string()),
+            new_mode: Some(0o100644),
+        });
+
+        let touched = touched_paths(&parsed);
+        assert_eq!(
+            touched.iter().map(String::as_str).collect::<Vec<_>>(),
+            ["changed.txt", "old.txt", "renamed.txt"]
+        );
+
+        let full = staged_expectation_for(&parsed, &prospective, &[], None)
+            .tree
+            .unwrap();
+        assert_eq!(
+            full.entries.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["changed.txt", "kept.txt", "renamed.txt"]
+        );
+        assert!(full.verify_paths.is_none());
+
+        let partial = staged_expectation_for(&parsed, &prospective, &[], Some(&touched))
+            .tree
+            .unwrap();
+        assert_eq!(
+            partial
+                .entries
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            ["changed.txt", "renamed.txt"]
+        );
+        assert_eq!(partial.verify_paths.as_ref(), Some(&touched));
     }
 
     fn verified_for(parsed: &ParsedCommit) -> VerifiedProspectiveEquivalence {
