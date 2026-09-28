@@ -394,10 +394,50 @@ impl Repository {
                 return Err(e);
             }
         };
+        // Write the change's files into the working copy, when there is one on
+        // this view.
+        //
+        // `insert_change` is a library function whose working-copy contract is
+        // "clean up after deletions and moves" — it never writes new files, and
+        // every other caller remembers to materialize afterwards. This caller
+        // did not, and a view is not only moved by whoever is sitting on it: a
+        // sandbox's change lands here through the owner, and the local tree
+        // checked out on that view was left behind. `status` then saw the
+        // view's new file missing from disk and reported it as `deleted:`, and
+        // the next `record -a` committed that deletion — silently undoing the
+        // sandbox's work, in the repository the sandbox was writing to.
+        self.materialize_submitted_view(view, hash)?;
         Ok(Ok(Submitted {
             hash: *hash,
             state: outcome.new_state.to_base32(),
         }))
+    }
+
+    /// Bring the working copy on `view` up to date with the change `hash`,
+    /// touching nothing if `view` is not the checked-out one.
+    ///
+    /// Only the paths the change names, as every other insert caller does, and
+    /// a full materialize when the change names none. A view that is not
+    /// current is left alone on purpose: the user switches to it to see its
+    /// files, exactly as a pull into another view does.
+    fn materialize_submitted_view(&self, view: &str, hash: &Hash) -> Result<(), RepositoryError> {
+        if view != self.current_view {
+            return Ok(());
+        }
+        let mut affected = std::collections::HashSet::new();
+        if let Ok(change) = self.load_change(hash) {
+            for op in change.hunks() {
+                if let Some(path) = op.path() {
+                    affected.insert(path.to_string());
+                }
+            }
+        }
+        if affected.is_empty() {
+            self.materialize()?;
+        } else {
+            self.materialize_paths(affected)?;
+        }
+        Ok(())
     }
 
     /// Serve side: the V3 bytes of each of `hashes` — changes `view` can
