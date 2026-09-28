@@ -252,7 +252,9 @@ impl Repository {
                 on_view.push(inode);
             }
         }
-        let rows = txn.export_graph_slice(&on_view, state.id).map_err(db)?;
+        let rows = txn
+            .export_graph_slice(&on_view, state.id, &visible)
+            .map_err(db)?;
         let mut spans = Vec::new();
         for (key, _) in &rows.graph {
             let (change, start, end) = decode_vertex(key);

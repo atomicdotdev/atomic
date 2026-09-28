@@ -191,7 +191,14 @@ impl ReadTxn {
     }
 
     /// The rows `record` reads for `inodes`, on the view `view_id`.
-    pub fn export_graph_slice(&self, inodes: &[u64], view_id: u64) -> PristineResult<GraphSlice> {
+    /// `visible` is the view's change set, and it bounds the CRDT rows as well
+    /// as the graph: see [`ReadTxn::export_crdt`].
+    pub fn export_graph_slice(
+        &self,
+        inodes: &[u64],
+        view_id: u64,
+        visible: &BTreeSet<u64>,
+    ) -> PristineResult<GraphSlice> {
         let mut out = GraphSlice::default();
         let inode_table = self.txn.open_table(INODES)?;
         let rev_inodes = self.txn.open_table(REV_INODES)?;
@@ -268,7 +275,7 @@ impl ReadTxn {
             if let Some(c) = conflicts.get(&encode_view_seq(view_id, inode))? {
                 out.conflicts.push((inode, c.value().to_vec()));
             }
-            self.export_crdt(inode, &mut out.crdt)?;
+            self.export_crdt(inode, visible, &mut out.crdt)?;
         }
 
         let resolve = |pos: Position<NodeId>, parent: bool| -> Vec<GraphNode<NodeId>> {
@@ -348,12 +355,35 @@ impl ReadTxn {
         Ok(out)
     }
 
-    fn export_crdt(&self, inode: u64, out: &mut CrdtRows) -> PristineResult<()> {
+    /// The CRDT rows for `inode` that `visible` can see.
+    ///
+    /// Every row here is keyed by a trunk/branch/leaf id, and every such id
+    /// carries the change that created it. A view shares one ambient graph with
+    /// every other view, so a trunk inherited from a parent has branches
+    /// attached to it by changes belonging to *other* views — a sibling draft
+    /// editing the same file adds branches to the same trunk. Sending those
+    /// would put another view's nodes in this cache, and the next `record`
+    /// would name them as the ids of lines that already exist. The owner then
+    /// refuses, correctly: those nodes are not on this view.
+    ///
+    /// So filter by the view's change set, exactly as the graph rows beside
+    /// this are filtered. Without it a sandbox only works while it is the only
+    /// writer of the file.
+    fn export_crdt(
+        &self,
+        inode: u64,
+        visible: &BTreeSet<u64>,
+        out: &mut CrdtRows,
+    ) -> PristineResult<()> {
+        let on_view = |change_id: NodeId| change_id.is_root() || visible.contains(&change_id.get());
         let inode_trunk = self.txn.open_table(INODE_TRUNK)?;
         let Some(trunk) = inode_trunk.get(inode)? else {
             return Ok(());
         };
         let trunk = *trunk.value();
+        if !on_view(TrunkId::from_bytes(&trunk).change_id()) {
+            return Ok(());
+        }
         out.inode_trunk.push((inode, trunk));
         if let Some(t) = self.txn.open_table(TRUNKS)?.get(&trunk)? {
             out.trunks.push((trunk, t.value().to_vec()));
@@ -373,14 +403,23 @@ impl ReadTxn {
         let leaves = self.txn.open_table(LEAVES)?;
         let mut ids = Vec::new();
         for b in trunk_branches.get(&trunk)? {
-            ids.push(*b?.value());
+            let b = *b?.value();
+            // A branch from another view's change is not this view's line.
+            if on_view(BranchId::from_bytes(&b).change_id()) {
+                ids.push(b);
+            }
         }
         for b in &ids {
             if let Some(v) = branches.get(b)? {
                 out.branches.push((*b, *v.value()));
             }
             if let Some(v) = branch_after.get(b)? {
-                out.branch_after.push((*b, *v.value()));
+                // `after` may name a branch from another view; shipping it
+                // would dangle, so it is only kept when it is on this view.
+                let after = *v.value();
+                if on_view(BranchId::from_bytes(&after).change_id()) {
+                    out.branch_after.push((*b, after));
+                }
             }
             if let Some(v) = branch_vertex.get(b)? {
                 let vertex = *v.value();
@@ -392,6 +431,11 @@ impl ReadTxn {
             let mut ls = Vec::new();
             for l in branch_leaves.get(b)? {
                 let l = *l?.value();
+                // Same for tokens: a leaf from another view's change is not
+                // this view's token.
+                if !on_view(LeafId::from_bytes(&l).change_id()) {
+                    continue;
+                }
                 if let Some(v) = leaves.get(&l)? {
                     out.leaves.push((l, *v.value()));
                 }

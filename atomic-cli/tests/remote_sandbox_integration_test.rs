@@ -721,29 +721,20 @@ fn several_remote_sandboxes_work_at_once() {
 }
 
 /// A second record from each sandbox, on a repository several of them are
-/// working on. This is a known failure, kept here because the stress test above
-/// found it and it should be run the moment it is fixed.
+/// working on. This is what found the CRDT slice crossing views.
 ///
-/// A remote cache allocates node ids from a counter seeded *only* by the ids
-/// the owner chose to send it — `import_ids` takes `fetch_max` over the ids in
-/// one import, and a cache is only told the ids for the files it asks about.
-/// Instrumented on a four-sandbox run, the owner sent 5 ids with a maximum of
-/// 7, leaving each cache's counter at 8 while the repository's own counter was
-/// well past that. The cache then mints ids for its new content that are
-/// already real repository node ids, and the owner refuses the change with
-/// `node N is not on this view`: the agent's work is lost, with no way forward.
+/// A view shares one ambient graph with every other view, so a trunk inherited
+/// from a parent carries branches attached by *other* views' changes — a
+/// sibling draft editing the same file adds branches to the same trunk. The
+/// graph half of a slice was filtered by the view's change set; the CRDT half
+/// was not, so each cache received its siblings' branches. A later record reads
+/// those as the ids of lines that already exist, names them, and the owner
+/// refuses: `node N is not on this view` — correctly, because those nodes
+/// really do belong to another view.
 ///
-/// Parallelism is not the cause, only what makes it reliable — it races several
-/// caches through the same import so they all record from a stale counter. A
-/// single sandbox passes whenever the repository happens to have no node at the
-/// ids that cache lands on, which is why no existing test saw it.
-///
-/// The fix is the one `LOCAL_INODE_FLOOR` already applies to inodes: a cache's
-/// node ids must come from a range the repository will never hand out, and the
-/// owner must remap them into the repository's space on insert rather than
-/// applying the submitted change's ids verbatim.
+/// A single sandbox never saw it, being the only writer of the file, which is
+/// why every serial test passed.
 #[test]
-#[ignore = "a remote cache's node ids collide with the repository's; see above"]
 fn sandboxes_can_each_record_twice() {
     const SANDBOXES: usize = 20;
 
@@ -799,7 +790,7 @@ fn sandboxes_can_each_record_twice() {
             .unwrap();
             ok(
                 atomic(&work, &["record", "-a", "-m", &format!("second by {name}")]),
-                &format!("{name} second record: the cache must not reuse a repository node id"),
+                &format!("{name} second record"),
             );
         }));
     }
