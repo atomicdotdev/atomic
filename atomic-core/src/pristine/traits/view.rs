@@ -3,9 +3,10 @@
 //! Contains `ViewScope`, `ViewState` (view metadata), and `ViewTxnT`
 //! (the read-only trait for querying views and their change logs).
 
-use crate::types::{Merkle, NodeId};
+use serde::{Deserialize, Serialize};
 
 use crate::pristine::error::PristineError;
+use crate::types::{Merkle, NodeId};
 
 use super::graph::GraphTxnT;
 
@@ -44,7 +45,7 @@ use super::graph::GraphTxnT;
 /// assert_eq!(scope as u8, 1);
 /// assert!(scope.is_shared());
 /// ```
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash, Default)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash, Default, Serialize, Deserialize)]
 #[repr(u8)]
 pub enum ViewScope {
     /// Personal workspace (feature, bug, experiment).

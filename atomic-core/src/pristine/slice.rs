@@ -92,13 +92,24 @@ pub struct CrdtRows {
 }
 
 /// A view as a remote sandbox sees it: its name, the repository's Merkle
-/// state and change count for it, and the ids of every change it can see.
+/// state and change count for it, its scope and parent, and the ids of the
+/// changes **it recorded itself**, in application order.
+///
+/// The scope and parent are not decoration. A cache reconstructs the view's
+/// effective perspective from them — its own changes, its draft ancestors',
+/// and the nearest shared ancestor's — exactly as the repository does. A
+/// snapshot that flattened the view to a shared parentless one made the
+/// cache's own log the whole union instead, so anything comparing views
+/// (`triage review`, `diff_views`) counted inherited history as this view's
+/// work.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ViewSnapshotRows {
     pub id: u64,
     pub name: String,
     pub state: Merkle,
     pub change_count: u64,
+    pub kind: ViewScope,
+    pub parent: Option<u64>,
     /// In application order.
     pub visible: Vec<u64>,
 }
@@ -480,6 +491,8 @@ impl ReadTxn {
             name: view.name.clone(),
             state: view.state,
             change_count: view.change_count,
+            kind: view.kind,
+            parent: view.parent,
             visible,
         }
     }
@@ -647,17 +660,24 @@ impl WriteTxn<'_> {
         Ok(())
     }
 
-    /// Write `snapshot` as a shared, parentless view with the repository's
-    /// own id, state and change count — replacing any view with that name or
-    /// id — and its visible changes as the view's change log.
+    /// Write `snapshot` as a view — its own scope, its own parent, its own
+    /// change log, with the repository's id, state and change count —
+    /// replacing any view with that name or id.
+    ///
+    /// The parent link matters only if something will follow it: a cache that
+    /// holds `sb` with `parent: dev`, and a `dev` row with dev's real log,
+    /// reconstructs the union the repository computes. A snapshot written
+    /// parentless and shared cannot, which is why `visible` here is the
+    /// view's *own* changes and the ancestors arrive beside it in the
+    /// skeleton, not folded into this log.
     pub fn import_view_snapshot(&mut self, snapshot: &ViewSnapshotRows) -> PristineResult<()> {
         let state = ViewState {
             id: snapshot.id,
             name: snapshot.name.clone(),
             state: snapshot.state,
             change_count: snapshot.change_count,
-            kind: ViewScope::Shared,
-            parent: None,
+            kind: snapshot.kind,
+            parent: snapshot.parent,
         };
         {
             let mut views = self.txn.open_table(VIEWS)?;

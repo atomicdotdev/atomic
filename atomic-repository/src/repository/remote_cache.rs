@@ -21,9 +21,18 @@ use crate::RepositoryError;
 
 /// A view's tree for a fresh cache: the skeleton rows, the view itself, and
 /// every entry (with content) the view has.
+///
+/// `ancestors` carries the views whose changes are in the view's effective
+/// perspective — for a draft, its draft ancestors and the nearest shared
+/// ancestor — each with its *own* log, real state and real parent. Without
+/// them a cache could only hold the view parentless, count inherited history
+/// as the view's own work, and invent empty placeholders for views it was
+/// told about but never given.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SandboxSkeleton {
     pub view: ViewSnapshotRows,
+    #[serde(default)]
+    pub ancestors: Vec<ViewSnapshotRows>,
     pub rows: GraphSlice,
 }
 
@@ -188,6 +197,45 @@ fn db(e: impl std::fmt::Display) -> RepositoryError {
     RepositoryError::Database(e.to_string())
 }
 
+/// The views whose changes are in a draft's effective perspective: its draft
+/// ancestors, and the nearest shared ancestor past them. A shared view needs
+/// nobody — its perspective is its own log.
+///
+/// This mirrors the ancestor walk in [`collect_visible_change_ids`] exactly,
+/// because the cache reconstructs the union from the chain this returns: if
+/// the two ever disagree, the cache's perspective and the rows it was given
+/// disagree with it.
+fn sandbox_view_chain(
+    txn: &atomic_core::pristine::ReadTxn,
+    state: &atomic_core::pristine::ViewState,
+) -> Result<Vec<atomic_core::pristine::ViewState>, RepositoryError> {
+    if state.kind.is_shared() {
+        return Ok(Vec::new());
+    }
+    let db = |e: atomic_core::pristine::PristineError| RepositoryError::Database(e.to_string());
+    let mut chain = Vec::new();
+    for id in txn.resolve_view_chain(state).map_err(db)? {
+        if id == state.id {
+            continue; // the view itself is exported separately
+        }
+        if let Some(ancestor) = txn.get_view_by_id(id).map_err(db)? {
+            chain.push(ancestor);
+        }
+    }
+    let mut cursor = state.parent;
+    while let Some(pid) = cursor {
+        match txn.get_view_by_id(pid).map_err(db)? {
+            Some(p) if p.kind.is_shared() => {
+                chain.push(p);
+                break;
+            }
+            Some(p) => cursor = p.parent,
+            None => break,
+        }
+    }
+    Ok(chain)
+}
+
 impl Repository {
     /// The visible change ids of `view`, sorted.
     fn sandbox_visible(
@@ -205,6 +253,13 @@ impl Repository {
 
     /// Serve side: `view`'s skeleton, with `live` its rendered tree (inode →
     /// path, as [`Repository::materialize_view_entries`] gives them).
+    ///
+    /// The view goes out as itself — its scope, its parent, its *own* change
+    /// log — and its ancestors beside it, each with their own. The rows are
+    /// still filtered by the union: a cache reconstructs the union from the
+    /// chain, and this builds that union the same way
+    /// [`super::collect_visible_change_ids`] does, so what the cache
+    /// reconstructs is what the rows were filtered by.
     pub fn export_sandbox_skeleton(
         &self,
         view: &str,
@@ -217,11 +272,27 @@ impl Repository {
                 .ok_or_else(|| RepositoryError::ViewNotFound {
                     name: view.to_string(),
                 })?;
-        let visible = self.sandbox_visible(&txn, &state)?;
-        let set: BTreeSet<u64> = visible.iter().copied().collect();
-        let rows = txn.export_skeleton(&set, live).map_err(db)?;
+        let own = super::collect_view_change_ids(&txn, &state)?;
+        let chain = sandbox_view_chain(&txn, &state)?;
+        let mut union: BTreeSet<u64> = own.iter().map(|id| id.get()).collect();
+        for ancestor in &chain {
+            union.extend(
+                super::collect_view_change_ids(&txn, ancestor)?
+                    .iter()
+                    .map(|id| id.get()),
+            );
+        }
+        let own_sorted = own.iter().map(|id| id.get()).collect();
+        let rows = txn.export_skeleton(&union, live).map_err(db)?;
         Ok(SandboxSkeleton {
-            view: txn.export_view_snapshot(&state, visible),
+            view: txn.export_view_snapshot(&state, own_sorted),
+            ancestors: chain
+                .iter()
+                .map(|a| {
+                    let ids = super::collect_view_change_ids(&txn, a)?;
+                    Ok(txn.export_view_snapshot(a, ids.iter().map(|id| id.get()).collect()))
+                })
+                .collect::<Result<Vec<_>, RepositoryError>>()?,
             rows,
         })
     }
@@ -703,6 +774,13 @@ impl Repository {
         skeleton: &SandboxSkeleton,
     ) -> Result<(), RepositoryError> {
         let mut txn = self.pristine.write_txn().map_err(db)?;
+        // Ancestors first, so the view's parent link lands on a row that
+        // exists. Each import replaces any view with that name or id, which is
+        // what turns a cache's invented placeholder for the parent into the
+        // real one.
+        for ancestor in &skeleton.ancestors {
+            txn.import_view_snapshot(ancestor).map_err(db)?;
+        }
         txn.import_view_snapshot(&skeleton.view).map_err(db)?;
         txn.import_skeleton(&skeleton.rows).map_err(db)?;
         txn.commit().map_err(db)?;

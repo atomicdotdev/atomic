@@ -1058,3 +1058,124 @@ fn a_sandbox_and_the_local_repository_can_share_a_view() {
     // while a local file is pending does the same. It needs its own fix, and a
     // test that isolates it.
 }
+
+/// `triage review` in a sandbox agrees with the repository it serves.
+///
+/// A sandbox used to hold its view flattened: shared and parentless, with the
+/// whole union written as its own change log. Everything downstream of "what
+/// is this view's own work" was then wrong — `triage review` could not even
+/// default its target (the view had no parent), counted inherited history as
+/// the sandbox's candidates, and reported ORPHAN_CHANGE for changes the
+/// repository knew were fine. The verdict and every finding differed from the
+/// repository's for the same view at the same merkle.
+///
+/// The skeleton now carries the view as itself — scope, parent, own change log
+/// — plus each ancestor with its own, so the cache reconstructs the same
+/// perspective the repository computes.
+#[test]
+fn triage_in_a_sandbox_agrees_with_the_repository() {
+    let host = TempDir::new().unwrap();
+    repository(host.path());
+    let _owner = Owner(host.path());
+    let vm = TempDir::new().unwrap();
+    let work = vm.path().join("work");
+    ok(
+        atomic(
+            host.path(),
+            &[
+                "sandbox",
+                "create",
+                "sb",
+                "--remote",
+                "--from",
+                "dev",
+                "--dest",
+                work.to_str().unwrap(),
+            ],
+        ),
+        "sandbox create",
+    );
+    ok(atomic(&work, &["sandbox", "materialize"]), "materialize");
+
+    // The sandbox's own work, on its own draft.
+    std::fs::write(work.join("README.md"), "hello\nfrom the sandbox\n").unwrap();
+    ok(
+        atomic(&work, &["record", "-a", "-m", "sandbox edit"]),
+        "record in the sandbox",
+    );
+
+    /// The parts of a triage report that must not depend on which side
+    /// computed it. The ref URN is excluded: it is a hash of the whole
+    /// worklist and its stability is its own concern.
+    fn digest(output: &str) -> String {
+        let report: Value = serde_json::from_str(output).expect("triage json");
+        let findings: Vec<String> = report["findings"]
+            .as_array()
+            .map(|fs| {
+                fs.iter()
+                    .map(|f| {
+                        format!(
+                            "{} {} {}",
+                            f["code"].as_str().unwrap_or("?"),
+                            f["severity"].as_str().unwrap_or("?"),
+                            f["message"].as_str().unwrap_or("?")
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let candidates: Vec<String> = report["changes"]
+            .as_array()
+            .map(|cs| {
+                cs.iter()
+                    .map(|c| {
+                        format!(
+                            "{} {}",
+                            c["id"].as_str().unwrap_or("?"),
+                            c["message"].as_str().unwrap_or("?")
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        format!(
+            "verdict={} findings=[{}] candidates=[{}]",
+            report["verdict"].as_str().unwrap_or("?"),
+            findings.join(" | "),
+            candidates.join(" | ")
+        )
+    }
+
+    let theirs = ok(
+        atomic(&work, &["triage", "review", "--json"]),
+        "triage in the sandbox",
+    );
+    let ours = ok(
+        atomic(
+            host.path(),
+            &["triage", "review", "sb", "--into", "dev", "--json"],
+        ),
+        "triage on the repository",
+    );
+    assert_eq!(digest(&theirs), digest(&ours));
+
+    // And bare `triage review` in the sandbox needs no `--into`: the view has
+    // its parent, so the default target resolves there too.
+    let bare = ok(
+        atomic(&work, &["triage", "review", "--json"]),
+        "bare triage in the sandbox",
+    );
+    assert_eq!(digest(&bare), digest(&ours));
+
+    // The candidate is the sandbox's one own change, not the inherited base.
+    assert!(
+        digest(&ours).contains("sandbox edit"),
+        "the sandbox's edit should be the candidate: {}",
+        digest(&ours)
+    );
+    assert!(
+        !digest(&ours).contains("first"),
+        "the inherited base change is not this view's candidate: {}",
+        digest(&ours)
+    );
+}
