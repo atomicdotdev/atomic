@@ -1,4 +1,4 @@
-# atomic-canonical-wasm
+# atomic-wasm
 
 `atomic-canonical` for the browser. A page that holds an atomic identity's
 Ed25519 key in WebCrypto signs atomic documents without the key ever leaving
@@ -7,7 +7,7 @@ the browser: this module builds the canonical document and the bytes to sign
 ordinary `eddsa-jcs-2022` attestation that `atomic` verifies.
 
 ```js
-import init, { prepareAttestation, attachProof } from "./pkg/atomic_canonical_wasm.js";
+import init, { prepareAttestation, attachProof } from "./pkg/atomic_wasm.js";
 await init();
 const prepared = prepareAttestation(JSON.stringify(doc), publicKeyBytes);
 const sig = await crypto.subtle.sign("Ed25519", key, prepared.signingBytes);

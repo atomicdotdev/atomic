@@ -3,7 +3,6 @@ resolver = "2"
 members = [
     "atomic-agent",
     "atomic-canonical",
-    "atomic-canonical-wasm",
     "atomic-cli",
     "atomic-core",
     "atomic-config",
@@ -13,6 +12,7 @@ members = [
     "atomic-repository",
     "atomic-semantic",
     "atomic-teams",
+    "atomic-wasm",
 ]
 
 [workspace.package]

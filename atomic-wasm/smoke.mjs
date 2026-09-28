@@ -1,6 +1,6 @@
 import { readFileSync } from "node:fs";
-import init, { prepareAttestation, attachProof, verifyAttestation, didForPublicKey } from "./pkg/atomic_canonical_wasm.js";
-await init({ module_or_path: readFileSync(new URL("./pkg/atomic_canonical_wasm_bg.wasm", import.meta.url)) });
+import init, { prepareAttestation, attachProof, verifyAttestation, didForPublicKey } from "./pkg/atomic_wasm.js";
+await init({ module_or_path: readFileSync(new URL("./pkg/atomic_wasm_bg.wasm", import.meta.url)) });
 const kp = await crypto.subtle.generateKey("Ed25519", false, ["sign", "verify"]);
 const pub = new Uint8Array(await crypto.subtle.exportKey("raw", kp.publicKey));
 const doc = { "@type": "ExampleLogin", nonce: "abc", "é": [1, 2.5, "x"] };
