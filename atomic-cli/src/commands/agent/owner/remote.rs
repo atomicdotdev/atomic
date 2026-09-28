@@ -45,6 +45,32 @@ pub(crate) enum TokenError {
     Expired(DateTime<Utc>),
     #[error("no live token for view '{0}'")]
     NoTokenForView(String),
+    #[error("a sandbox token must last between 1 second and {MAX_TTL_SECS} seconds")]
+    InvalidTtl,
+}
+
+/// Bounds on a requested token lifetime, in seconds. Both ends matter: a
+/// non-positive TTL would mint a token that is already dead, and an enormous
+/// one is either a mistake or a way to make a token that outlives the owner.
+/// The lifetime is validated and turned into a deadline *before* the registry
+/// lock is taken, so a bad value can never be the thing that panics inside it.
+const MIN_TTL_SECS: i64 = 1;
+const MAX_TTL_SECS: i64 = 365 * 24 * 60 * 60;
+
+/// The deadline a TTL of `secs` seconds from now means, or [`TokenError::InvalidTtl`].
+///
+/// `Duration::seconds` panics outside its range and `DateTime + Duration`
+/// panics on overflow, and both are reachable from a flag and then a wire
+/// frame. Everything here is checked arithmetic instead, so a request this
+/// rejects is a request that returns an error.
+fn deadline(secs: i64) -> Result<DateTime<Utc>, TokenError> {
+    if !(MIN_TTL_SECS..=MAX_TTL_SECS).contains(&secs) {
+        return Err(TokenError::InvalidTtl);
+    }
+    let ttl = Duration::try_seconds(secs).ok_or(TokenError::InvalidTtl)?;
+    Utc::now()
+        .checked_add_signed(ttl)
+        .ok_or(TokenError::InvalidTtl)
 }
 
 #[derive(Default)]
@@ -62,49 +88,68 @@ pub(crate) struct TokenRegistry {
     inner: Arc<Mutex<Tokens>>,
 }
 
+impl TokenRegistry {
+    /// The registry's lock.
+    ///
+    /// A panic while holding it poisons the mutex, and every method would then
+    /// panic on entry — one bad request taking down every sandbox plus the
+    /// local `create`/`close` until the owner restarts. The registry's
+    /// invariants do not depend on unwinding, so a poisoned lock is recovered
+    /// rather than propagated.
+    fn lock(&self) -> std::sync::MutexGuard<'_, Tokens> {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
 fn digest(token: &str) -> String {
     blake3::hash(token.as_bytes()).to_hex().to_string()
 }
 
 impl TokenRegistry {
-    /// Mint a token for `view`, valid for `ttl`. Minting again replaces the
-    /// view's token.
+    /// Mint a token for `view`, valid for `ttl_secs` seconds. Minting again
+    /// replaces the view's token.
+    ///
+    /// The lifetime is turned into a deadline before the lock is taken, so a
+    /// bad `--ttl` is an error rather than a panic inside the registry.
     pub(crate) fn mint(
         &self,
         view: &str,
         acting_as: Option<String>,
-        ttl: Duration,
-    ) -> (String, Grant) {
+        ttl_secs: i64,
+    ) -> Result<(String, Grant), TokenError> {
+        let expires = deadline(ttl_secs)?;
         let mut bytes = [0u8; 32];
         rand::thread_rng().fill_bytes(&mut bytes);
         let token = format!("ast_{}", data_encoding::BASE64URL_NOPAD.encode(&bytes));
         let grant = Grant {
             view: view.to_string(),
             acting_as,
-            expires: Utc::now() + ttl,
+            expires,
         };
-        let mut t = self.inner.lock().unwrap();
+        let mut t = self.lock();
         t.grants.retain(|_, g| g.view != view);
         t.grants.insert(digest(&token), grant.clone());
-        (token, grant)
+        Ok((token, grant))
     }
 
-    /// Extend `view`'s live token to now + `ttl`; the same token keeps working.
-    pub(crate) fn renew(&self, view: &str, ttl: Duration) -> Result<DateTime<Utc>, TokenError> {
-        let mut t = self.inner.lock().unwrap();
+    /// Extend `view`'s live token to now + `ttl_secs` seconds; the same token
+    /// keeps working.
+    pub(crate) fn renew(&self, view: &str, ttl_secs: i64) -> Result<DateTime<Utc>, TokenError> {
+        let expires = deadline(ttl_secs)?;
+        let mut t = self.lock();
         let now = Utc::now();
         let grant = t
             .grants
             .values_mut()
             .find(|g| g.view == view && g.expires > now)
             .ok_or_else(|| TokenError::NoTokenForView(view.to_string()))?;
-        grant.expires = now + ttl;
+        grant.expires = expires;
         Ok(grant.expires)
     }
 
     /// End `view`'s token now.
     pub(crate) fn revoke(&self, view: &str) -> bool {
-        let mut t = self.inner.lock().unwrap();
+        let mut t = self.lock();
         let before = t.grants.len();
         t.grants.retain(|_, g| g.view != view);
         t.grants.len() != before
@@ -112,7 +157,7 @@ impl TokenRegistry {
 
     /// What `token` grants, if it is live.
     pub(crate) fn check(&self, token: &str) -> Result<Grant, TokenError> {
-        let t = self.inner.lock().unwrap();
+        let t = self.lock();
         let grant = t.grants.get(&digest(token)).ok_or(TokenError::Unknown)?;
         if grant.expires <= Utc::now() {
             return Err(TokenError::Expired(grant.expires));
@@ -123,7 +168,7 @@ impl TokenRegistry {
     /// Whether `view`'s sandbox may use provenance session `session_id`:
     /// one it started, or one nobody has (`fresh`), which becomes its own.
     pub(crate) fn claim_session(&self, view: &str, session_id: &str, fresh: bool) -> bool {
-        let mut t = self.inner.lock().unwrap();
+        let mut t = self.lock();
         match t.sessions.get(session_id) {
             Some(owner) => owner == view,
             None if fresh => {
@@ -135,27 +180,17 @@ impl TokenRegistry {
     }
 
     pub(crate) fn owns_session(&self, view: &str, session_id: &str) -> bool {
-        self.inner
-            .lock()
-            .unwrap()
-            .sessions
-            .get(session_id)
-            .map(String::as_str)
-            == Some(view)
+        self.lock().sessions.get(session_id).map(String::as_str) == Some(view)
     }
 
     pub(crate) fn bind_provenance(&self, view: &str, provenance_id: u64) {
-        self.inner
-            .lock()
-            .unwrap()
+        self.lock()
             .provenance
             .insert(provenance_id, view.to_string());
     }
 
     pub(crate) fn owns_provenance(&self, view: &str, provenance_id: u64) -> bool {
-        self.inner
-            .lock()
-            .unwrap()
+        self.lock()
             .provenance
             .get(&provenance_id)
             .map(String::as_str)
@@ -377,34 +412,111 @@ impl tokio::io::AsyncWrite for BiStream {
 mod tests {
     use super::*;
 
+    const HOUR: i64 = 60 * 60;
+
     #[test]
     fn a_token_reaches_its_view_until_it_ends() {
         let reg = TokenRegistry::default();
-        let (t, g) = reg.mint("exp-1", Some("did:key:zAgent".into()), Duration::hours(24));
+        let (t, g) = reg
+            .mint("exp-1", Some("did:key:zAgent".into()), 24 * HOUR)
+            .unwrap();
         assert_eq!(reg.check(&t).unwrap().view, "exp-1");
         assert_eq!(reg.check("ast_made_up"), Err(TokenError::Unknown));
 
         std::thread::sleep(std::time::Duration::from_millis(5));
-        let after = reg.renew("exp-1", Duration::hours(24)).unwrap();
+        let after = reg.renew("exp-1", 24 * HOUR).unwrap();
         assert!(after > g.expires);
         assert_eq!(reg.check(&t).unwrap().expires, after);
 
         assert!(reg.revoke("exp-1"));
         assert_eq!(reg.check(&t), Err(TokenError::Unknown));
-        assert!(reg.renew("exp-1", Duration::hours(1)).is_err());
+        assert!(reg.renew("exp-1", HOUR).is_err());
     }
 
     #[test]
     fn expired_and_replaced_tokens_are_refused() {
         let reg = TokenRegistry::default();
-        let (t, _) = reg.mint("exp-1", None, Duration::milliseconds(-1));
+        let (t, _) = reg.mint("exp-1", None, 60).unwrap();
+        // Backdate it rather than minting one that is already dead: a
+        // non-positive lifetime is refused now, which is the point below.
+        reg.lock()
+            .grants
+            .values_mut()
+            .for_each(|g| g.expires = Utc::now() - Duration::seconds(1));
         assert!(matches!(reg.check(&t), Err(TokenError::Expired(_))));
-        assert!(reg.renew("exp-1", Duration::hours(1)).is_err());
+        assert!(reg.renew("exp-1", HOUR).is_err());
 
-        let (old, _) = reg.mint("exp-2", None, Duration::hours(1));
-        let (new, _) = reg.mint("exp-2", None, Duration::hours(1));
+        let (old, _) = reg.mint("exp-2", None, HOUR).unwrap();
+        let (new, _) = reg.mint("exp-2", None, HOUR).unwrap();
         assert_eq!(reg.check(&old), Err(TokenError::Unknown));
         assert!(reg.check(&new).is_ok());
+    }
+
+    /// `--ttl` reaches the owner as an `i64` off a wire frame.
+    /// `Duration::seconds` panics outside its range and `now + Duration`
+    /// panics on overflow, and both used to happen while holding the registry
+    /// lock — so one absurd value poisoned the mutex and took every other
+    /// sandbox and the local `create`/`close` down with it.
+    #[test]
+    fn an_absurd_lifetime_is_an_error_and_not_a_panic() {
+        let reg = TokenRegistry::default();
+        // Establish a live token first: the panic used to land in renew, on
+        // the way to extending one.
+        let (t, _) = reg.mint("exp-1", None, HOUR).unwrap();
+
+        for secs in [
+            0,
+            -1,
+            i64::MIN,
+            MAX_TTL_SECS + 1,
+            i64::MAX,
+            // Below Duration::seconds' own i64-milliseconds ceiling, so this
+            // one panicked inside chrono rather than at the addition.
+            i64::MAX / 1_000,
+        ] {
+            assert_eq!(
+                reg.renew("exp-1", secs),
+                Err(TokenError::InvalidTtl),
+                "--ttl {secs} should be refused"
+            );
+            assert_eq!(
+                reg.mint("exp-2", None, secs).err(),
+                Some(TokenError::InvalidTtl),
+                "minting with --ttl {secs} should be refused"
+            );
+        }
+
+        // The ends of the accepted range, and the registry still works.
+        assert!(reg.mint("low", None, MIN_TTL_SECS).is_ok());
+        assert!(reg.mint("high", None, MAX_TTL_SECS).is_ok());
+
+        // Nothing above was applied, and the registry is intact.
+        assert_eq!(reg.check(&t).unwrap().view, "exp-1");
+        assert!(reg.revoke("exp-1"));
+        assert!(reg.claim_session("exp-1", "s1", true));
+    }
+
+    /// A panic anywhere else in an owner request used to poison the registry,
+    /// and because every method took the lock with `unwrap`, the next caller
+    /// panicked too — permanently, for every sandbox and for the local
+    /// `create`/`close`, until the owner was restarted.
+    #[test]
+    fn a_poisoned_lock_does_not_take_the_registry_down() {
+        let reg = TokenRegistry::default();
+        let (t, _) = reg.mint("exp-1", None, HOUR).unwrap();
+
+        let poisoner = reg.clone();
+        let _ = std::thread::spawn(move || {
+            let _held = poisoner.lock();
+            panic!("something unrelated blew up mid-request");
+        })
+        .join();
+
+        // Still usable, and the token it already had still resolves.
+        assert_eq!(reg.check(&t).unwrap().view, "exp-1");
+        assert!(reg.mint("exp-2", None, HOUR).is_ok());
+        assert!(reg.claim_session("exp-1", "s1", true));
+        assert!(reg.revoke("exp-1"));
     }
 
     #[test]

@@ -1089,8 +1089,14 @@ impl Repository {
     /// operations (files it added, moved or deleted) wait in the deferred
     /// tree journal until a switch applies them. For another view they are
     /// applied here in a write transaction that is thrown away, so the
-    /// listing is that view's and nothing on disk changes. A read-only handle
-    /// can't do that and lists TREE as it is.
+    /// listing is that view's and nothing on disk changes.
+    ///
+    /// A read-only handle cannot project, and `TREE` is the *current* view's —
+    /// so a read-only repository asked about another view is refused rather
+    /// than answered. Falling through would return the current view's tree
+    /// under the other view's name, and the caller writes that straight into a
+    /// remote sandbox. The current view needs no projection, so it reads `TREE`
+    /// directly and works read-only.
     fn view_tree_items(
         &self,
         txn: &atomic_core::pristine::ReadTxn,
@@ -1101,13 +1107,20 @@ impl Repository {
         let db = |e: atomic_core::pristine::PristineError| RepositoryError::Database(e.to_string());
         if view_name != self.current_view {
             let journal = self.load_deferred_tree_journal()?;
-            if let Ok(mut projected) = self.pristine.write_txn() {
-                self.apply_deferred_tree_ops_in_txn(&mut projected, &journal, view_name)?;
-                let items = collect_children(&projected, Inode::ROOT, "", options).map_err(db)?;
-                use atomic_core::pristine::MutTxnT;
-                projected.abort().map_err(db)?;
-                return Ok(items);
-            }
+            let mut projected =
+                self.pristine
+                    .write_txn()
+                    .map_err(|e| RepositoryError::InvalidOperation {
+                        message: format!(
+                            "listing view '{view_name}' projects its tree, which needs a writable \
+                         repository: {e}"
+                        ),
+                    })?;
+            self.apply_deferred_tree_ops_in_txn(&mut projected, &journal, view_name)?;
+            let items = collect_children(&projected, Inode::ROOT, "", options).map_err(db)?;
+            use atomic_core::pristine::MutTxnT;
+            projected.abort().map_err(db)?;
+            return Ok(items);
         }
         collect_children(txn, Inode::ROOT, "", options).map_err(db)
     }

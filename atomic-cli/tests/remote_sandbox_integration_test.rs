@@ -277,6 +277,62 @@ fn a_remote_sandbox_reaches_its_view_through_the_owner_and_nothing_else() {
     assert!(refused.contains("unauthorized"), "{refused}");
 }
 
+/// An absurd `--ttl` used to panic inside the owner's token registry while it
+/// held the lock, and every later call on that registry panicked too — so one
+/// typo took down every sandbox and `close` until the owner was restarted. It
+/// is a refused request, and the owner keeps serving afterwards.
+#[test]
+fn an_absurd_ttl_is_refused_and_the_owner_keeps_serving() {
+    let host = TempDir::new().unwrap();
+    repository(host.path());
+    let _owner = Owner(host.path());
+    let vm = TempDir::new().unwrap();
+    let vm_dir = vm.path().join("work");
+    ok(
+        atomic(
+            host.path(),
+            &[
+                "sandbox",
+                "create",
+                "exp-1",
+                "--remote",
+                "--view",
+                "dev",
+                "--dest",
+                vm_dir.to_str().unwrap(),
+            ],
+        ),
+        "sandbox create --remote",
+    );
+    ok(atomic(&vm_dir, &["sandbox", "materialize"]), "materialize");
+
+    for arg in [
+        "--ttl=0",
+        "--ttl=-1",
+        "--ttl=-9223372036854775808",
+        "--ttl=10000000000000000",
+    ] {
+        let refused = failure(
+            atomic(host.path(), &["sandbox", "renew", "dev", arg]),
+            &format!("renew with {arg}"),
+        );
+        assert!(refused.contains("must last between"), "{arg}: {refused}");
+        assert!(!refused.contains("panicked"), "{arg}: {refused}");
+    }
+
+    // The token is untouched and the owner still answers.
+    ok(
+        atomic(host.path(), &["sandbox", "renew", "dev", "--ttl", "600"]),
+        "renew after the bad requests",
+    );
+    ok(
+        atomic(&vm_dir, &["sandbox", "materialize"]),
+        "materialize after the bad requests",
+    );
+    let out = ok(atomic(host.path(), &["sandbox", "close", "dev"]), "close");
+    assert!(out.contains("revoked"), "{out}");
+}
+
 fn hook(cwd: &Path, verb: &str, payload: Value) -> Output {
     use std::io::Write;
     let mut child = Command::new(env!("CARGO_BIN_EXE_atomic"))
@@ -390,4 +446,92 @@ fn an_agent_turn_in_a_remote_sandbox_lands_with_its_provenance() {
         session.contains("Goal marker: greet the reader"),
         "{session}"
     );
+}
+
+/// A sandbox that falls behind must be able to record again. It used not to:
+/// the cache's view row was the stale thing, and only a *successful* submit
+/// refreshed it — so a `StaleView` refusal left the sandbox unable to land
+/// anything ever again, and the recovery the error names ("fetch and record
+/// again") did not exist anywhere. The owner now sends the view as it is with
+/// the refusal, so the cache recovers from the refusal itself.
+#[test]
+fn a_sandbox_that_fell_behind_can_still_record() {
+    let host = TempDir::new().unwrap();
+    repository(host.path());
+    let _owner = Owner(host.path());
+    let vm = TempDir::new().unwrap();
+    let vm_dir = vm.path().join("work");
+    ok(
+        atomic(
+            host.path(),
+            &[
+                "sandbox",
+                "create",
+                "exp-1",
+                "--remote",
+                "--from",
+                "dev",
+                "--dest",
+                vm_dir.to_str().unwrap(),
+            ],
+        ),
+        "sandbox create --remote",
+    );
+    ok(atomic(&vm_dir, &["sandbox", "materialize"]), "materialize");
+
+    // The sandbox records and it lands.
+    std::fs::write(vm_dir.join("README.md"), "hello\nsandbox\n").unwrap();
+    ok(
+        atomic(&vm_dir, &["record", "-a", "-m", "from the sandbox"]),
+        "record in the sandbox",
+    );
+    let log = ok(
+        atomic(host.path(), &["log", "--view", "exp-1"]),
+        "host log after the sandbox's record",
+    );
+    assert!(log.contains("from the sandbox"), "{log}");
+
+    // Move the draft view underneath the sandbox, with no sandbox involved:
+    // the owner is the user's live repository, so a local record on `dev` and
+    // an insert into the draft is exactly what a second agent would cause.
+    std::fs::write(host.path().join("OUT-OF-BAND.md"), "elsewhere\n").unwrap();
+    ok(atomic(host.path(), &["add", "OUT-OF-BAND.md"]), "host add");
+    ok(
+        atomic(host.path(), &["record", "-a", "-m", "out of band"]),
+        "host record",
+    );
+    ok(
+        atomic(
+            host.path(),
+            &["insert", "from-view", "dev", "--to-view", "exp-1"],
+        ),
+        "host insert into the draft",
+    );
+
+    // The sandbox's next record was computed against the view it no longer
+    // has, so the owner refuses it — and the refusal carries the current view,
+    // which the cache takes.
+    std::fs::write(vm_dir.join("README.md"), "hello\nsandbox\nout of date\n").unwrap();
+    let refused = failure(
+        atomic(&vm_dir, &["record", "-a", "-m", "against the old view"]),
+        "a record against a view that moved on",
+    );
+    assert!(refused.contains("moved on"), "{refused}");
+
+    // And that is where the old behaviour ended: the cache's view row was
+    // still the stale one, so the next record computed the same stale base and
+    // was refused identically. Now the retry works.
+    let retried = ok(
+        atomic(&vm_dir, &["record", "-a", "-m", "after the view moved"]),
+        "retry in the sandbox after the view moved",
+    );
+    assert!(!retried.contains("moved on"), "{retried}");
+
+    let log = ok(
+        atomic(host.path(), &["log", "--view", "exp-1"]),
+        "host log after the retry",
+    );
+    assert!(log.contains("after the view moved"), "{log}");
+    // The refused change is not on the view, under either message.
+    assert!(!log.contains("against the old view"), "{log}");
 }

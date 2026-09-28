@@ -83,7 +83,7 @@ pub use materialize::{ViewEntry, ViewEntryKind, ViewSnapshot};
 mod remote_cache;
 pub use remote_cache::{
     set_remote_sandbox_link, ChangeFile, RemoteSandboxLink, SandboxSkeleton, SandboxSlice,
-    SpanBytes, SubmitRejection, Submitted,
+    SpanBytes, SubmitRejection, Submitted, SubmittedOutcome,
 };
 mod sandbox;
 mod semantic_materialize;

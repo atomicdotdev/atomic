@@ -34,6 +34,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use redb::ReadableTable;
 use serde::{Deserialize, Serialize};
 
+use crate::crdt::ids::{BranchId, LeafId, TrunkId};
 use crate::crdt::tables::{
     BRANCHES, BRANCH_AFTER, BRANCH_LEAVES, BRANCH_VERTEX, INODE_TRUNK, LEAVES, PATH_TRUNK, TRUNKS,
     TRUNK_BRANCHES, VERTEX_BRANCH,
@@ -334,13 +335,13 @@ impl ReadTxn {
             }
         }
         for (id, _) in &out.crdt.trunks {
-            ids.insert(u64::from_be_bytes(id[0..8].try_into().unwrap()));
+            ids.insert(TrunkId::from_bytes(id).change_id().get());
         }
         for (id, _) in &out.crdt.branches {
-            ids.insert(u64::from_be_bytes(id[0..8].try_into().unwrap()));
+            ids.insert(BranchId::from_bytes(id).change_id().get());
         }
         for (id, _) in &out.crdt.leaves {
-            ids.insert(u64::from_be_bytes(id[0..8].try_into().unwrap()));
+            ids.insert(LeafId::from_bytes(id).change_id().get());
         }
         ids.remove(&0);
         out.ids = self.id_rows(ids.into_iter())?;
@@ -404,6 +405,12 @@ impl ReadTxn {
         Ok(())
     }
 
+    /// `IdRow`s for `ids`. An id with no `EXTERNAL` row is dropped: a
+    /// change can be visible on a view without being registered yet, and
+    /// callers treat a missing row as "not mine to carry". A drop is still a
+    /// silent way to lose an id, so a miss in a debug build asserts — a
+    /// mis-decoded id (see the endianness rule in `tables.rs`) looks exactly
+    /// like an absent one.
     fn id_rows(&self, ids: impl Iterator<Item = u64>) -> PristineResult<Vec<IdRow>> {
         let external = self.txn.open_table(EXTERNAL)?;
         let node_types = self.txn.open_table(NODE_TYPES)?;
@@ -412,6 +419,11 @@ impl ReadTxn {
             if let Some(h) = external.get(id)? {
                 let t = node_types.get(id)?.map(|t| t.value());
                 out.push((id, *h.value(), t));
+            } else {
+                debug_assert!(
+                    false,
+                    "id {id} has no EXTERNAL row; was it decoded correctly?"
+                );
             }
         }
         Ok(out)
@@ -638,5 +650,39 @@ impl WriteTxn<'_> {
         self.next_view_id
             .fetch_max(snapshot.id + 1, std::sync::atomic::Ordering::SeqCst);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The export decodes a CRDT id's change with the type's own `from_bytes`.
+    /// If the decode and the encoder ever disagree on endianness, the change
+    /// comes back as a different node id and `id_rows` drops it — the slice
+    /// still exports, just without the id. This pins the two together.
+    #[test]
+    fn crdt_ids_decode_little_endian_change_ids() {
+        for change in [1u64, 2, 42, 255, 256, 65_536, 1 << 32, u64::MAX >> 8] {
+            let change = NodeId::new(change);
+            let trunk = TrunkId::new(change, 7);
+            let branch = BranchId::new(change, 7);
+            let leaf = LeafId::new(change, 7);
+
+            assert_eq!(trunk.change_id(), change);
+            assert_eq!(TrunkId::from_bytes(&trunk.to_bytes()).change_id(), change);
+            assert_eq!(BranchId::from_bytes(&branch.to_bytes()).change_id(), change);
+            assert_eq!(LeafId::from_bytes(&leaf.to_bytes()).change_id(), change);
+        }
+    }
+
+    /// The first eight bytes are the change id on its own, which is what a
+    /// hand-rolled `id[0..8]` decode would read. Big-endian gets 42's
+    /// neighbours wrong; little-endian is what the encoders write.
+    #[test]
+    fn crdt_id_change_id_is_little_endian_in_its_first_eight_bytes() {
+        let bytes = TrunkId::new(NodeId::new(42), 0).to_bytes();
+        assert_eq!(&bytes[0..8], &42u64.to_le_bytes());
+        assert_ne!(&bytes[0..8], &42u64.to_be_bytes());
     }
 }

@@ -102,3 +102,67 @@ fn entries_are_the_view_s_recorded_tree() {
     );
     assert_ne!(older_snapshot.state, snapshot.state);
 }
+
+/// Another view's tree is a projection, and a read-only repository cannot
+/// project. It used to fall through to `TREE`, which is the *current* view's —
+/// handing one view's tree back under another's name, which for a remote
+/// sandbox means writing the wrong tree to disk. Refusing is the safe answer.
+#[test]
+fn a_read_only_repository_refuses_another_views_tree() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path().to_path_buf();
+    let mut repo = Repository::init(&root).expect("init");
+    let current = repo.current_view().to_string();
+
+    write(&root, "README.md", "hello\n");
+    repo.add("README.md", Default::default()).unwrap();
+    record(&repo, "first");
+    write(&root, "README.md", "hello, world\n");
+    let second = record(&repo, "second");
+
+    repo.split_view(SplitOptions::new("older", vec![second]))
+        .expect("split");
+
+    // Writable: both views render, and they differ. `split_view` moves the
+    // change out of the source view, so the new view is the one with it.
+    let (on_current, _) = entries(&repo, &current);
+    let (on_older, _) = entries(&repo, "older");
+    let body = |v: &Vec<ViewEntry>| {
+        v.iter()
+            .find(|e| e.path == "README.md")
+            .map(|e| e.content.clone())
+            .unwrap()
+    };
+    assert_eq!(body(&on_current), b"hello\n");
+    assert_eq!(body(&on_older), b"hello, world\n");
+
+    // Read-only: the current view still works (it needs no projection), but
+    // another view is refused rather than answered with the current tree.
+    drop(repo);
+    let readonly = Repository::open_readonly(&root).expect("open read-only");
+
+    let mut on_current = Vec::new();
+    readonly
+        .materialize_view_entries::<()>(&current, |e| {
+            on_current.push(e);
+            Ok(())
+        })
+        .expect("materialize the current view")
+        .expect("sink");
+    assert_eq!(body(&on_current), b"hello\n");
+
+    let mut on_older = Vec::new();
+    let refused = readonly.materialize_view_entries::<()>("older", |e| {
+        on_older.push(e);
+        Ok(())
+    });
+    let err = refused.expect_err("another view must be refused");
+    assert!(
+        format!("{err}").contains("writable"),
+        "unexpected error: {err}"
+    );
+    assert!(
+        on_older.is_empty(),
+        "nothing of the wrong view was rendered"
+    );
+}

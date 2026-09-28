@@ -7,12 +7,14 @@
 //! changes its view can see. Opening, renewing and closing sandboxes, and
 //! shutting the owner down, are local only.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use atomic_core::pristine::{GraphTxnT, ViewTxnT};
 use atomic_core::types::{Base32, Hash};
 use atomic_repository::redb_change_store::RedbChangeStore;
-use atomic_repository::{Repository, ViewEntryKind};
+use atomic_repository::{
+    Repository, SubmitRejection, ViewEntryKind, DOT_DIR, SANDBOX_CACHE_DIR, SANDBOX_POINTER,
+};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
 use super::remote::{Grant, TokenRegistry};
@@ -20,6 +22,12 @@ use super::{
     read_frame, write_frame, OwnerRequest, OwnerResponse, OwnerState, RequestFrame, ResponseFrame,
     PROTOCOL_VERSION,
 };
+
+/// Names a materialized entry may not use, because they are the sandbox's own
+/// bookkeeping: writing the pointer would re-point the sandbox (including at an
+/// attacker's own node), and writing the cache would edit the pristine the next
+/// record reads.
+const RESERVED_NAMES: &[&str] = &[DOT_DIR, SANDBOX_POINTER, SANDBOX_CACHE_DIR];
 
 /// Who is on the other end of a connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -87,14 +95,10 @@ pub(crate) fn authorize(
                 return Err(forbidden("that session"));
             }
         }
-        OwnerRequest::ReserveProvenanceTurn {
-            session_id,
-            turn_number,
-            ..
-        } => {
-            let fresh = session_is_fresh(&owner.store, session_id, *turn_number)
+        OwnerRequest::ReserveProvenanceTurn { session_id, .. } => {
+            let unused = session_is_unused(&owner.store, session_id)
                 .map_err(|e| refuse("provenance-store", e.to_string()))?;
-            if !tokens.claim_session(view, session_id, fresh) {
+            if !tokens.claim_session(view, session_id, unused) {
                 return Err(forbidden("that session"));
             }
         }
@@ -123,29 +127,14 @@ pub(crate) fn authorize(
                 return Err(forbidden("that provenance turn"));
             }
         }
-        OwnerRequest::StopTurn {
-            session_id,
-            turn_number,
-            ..
-        }
-        | OwnerRequest::ResumeTurn {
-            session_id,
-            turn_number,
-            ..
-        }
-        | OwnerRequest::AbandonTurn {
-            session_id,
-            turn_number,
-            ..
-        }
-        | OwnerRequest::TurnStatus {
-            session_id,
-            turn_number,
-        } => {
+        OwnerRequest::StopTurn { session_id, .. }
+        | OwnerRequest::ResumeTurn { session_id, .. }
+        | OwnerRequest::AbandonTurn { session_id, .. }
+        | OwnerRequest::TurnStatus { session_id, .. } => {
             // Asking after a session nobody has written to is harmless (the
             // store answers "no such turn"); anyone else's is not.
             if !tokens.owns_session(view, session_id)
-                && !session_is_fresh(&owner.store, session_id, *turn_number)
+                && !session_is_unused(&owner.store, session_id)
                     .map_err(|e| refuse("provenance-store", e.to_string()))?
             {
                 return Err(forbidden("that session"));
@@ -161,14 +150,19 @@ pub(crate) fn authorize(
     Ok(Some(grant))
 }
 
-/// Whether no one has recorded provenance for `session_id` up to this turn.
-fn session_is_fresh(store: &RedbChangeStore, session_id: &str, turn: u32) -> anyhow::Result<bool> {
-    for t in 1..=turn {
-        if store.get_provenance_turn_for(session_id, t)?.is_some() {
-            return Ok(false);
-        }
-    }
-    Ok(true)
+/// Whether nothing has ever been recorded for `session_id`.
+///
+/// One indexed lookup for the session's highest recorded turn, not a walk from
+/// turn 1: the turn number arrives on the wire, so walking to it made a single
+/// request cost up to `u32::MAX` database round trips.
+///
+/// The question is whether the session is unused, not whether one number in it
+/// is free. Every caller wants "has anyone claimed this id?" — claiming a
+/// session, and asking after a turn on it. Answering that by scanning
+/// `1..=turn` made a session with history *above* the asked turn look unused,
+/// which is the wrong way round for a check that decides who may write to it.
+fn session_is_unused(store: &RedbChangeStore, session_id: &str) -> anyhow::Result<bool> {
+    Ok(store.last_provenance_turn_for(session_id)?.is_none())
 }
 
 /// Refuse unless every change in `hashes` is visible on `view`: a sandbox's
@@ -236,10 +230,10 @@ pub(crate) async fn admin(
                 Ok(endpoint) => endpoint,
                 Err(e) => return error("remote", format!("{e:#}")),
             };
-            let (token, grant) =
-                owner
-                    .tokens
-                    .mint(&view, acting_as, chrono::Duration::seconds(ttl_secs));
+            let (token, grant) = match owner.tokens.mint(&view, acting_as, ttl_secs) {
+                Ok(minted) => minted,
+                Err(e) => return error("sandbox-token", e.to_string()),
+            };
             OwnerResponse::SandboxOpened {
                 remote: super::remote::pointer_addr(endpoint, super::remote::offline()).await,
                 view,
@@ -248,10 +242,7 @@ pub(crate) async fn admin(
             }
         }
         OwnerRequest::RenewSandbox { view, ttl_secs } => {
-            match owner
-                .tokens
-                .renew(&view, chrono::Duration::seconds(ttl_secs))
-            {
+            match owner.tokens.renew(&view, ttl_secs) {
                 Ok(expires) => OwnerResponse::SandboxRenewed {
                     expires: expires.to_rfc3339(),
                 },
@@ -373,7 +364,10 @@ pub(crate) async fn record_request(
                         .map(|(hash, bytes)| super::WireChange { hash, bytes })
                         .collect(),
                 },
-                Ok(Ok(Err(rejection))) => OwnerResponse::ChangeRefused { rejection },
+                Ok(Ok(Err(rejection))) => OwnerResponse::ChangeRefused {
+                    rejection,
+                    skeleton: None,
+                },
                 Ok(Err(e)) => error("changes", format!("{e:#}")),
                 Err(e) => error("internal", e.to_string()),
             }
@@ -387,7 +381,10 @@ pub(crate) async fn record_request(
             });
             match write.await {
                 Ok(Ok(Ok(publication))) => OwnerResponse::ProvenancePublished { publication },
-                Ok(Ok(Err(rejection))) => OwnerResponse::ChangeRefused { rejection },
+                Ok(Ok(Err(rejection))) => OwnerResponse::ChangeRefused {
+                    rejection,
+                    skeleton: None,
+                },
                 Ok(Err(e)) => error("provenance", format!("{e:#}")),
                 Err(e) => error("internal", e.to_string()),
             }
@@ -407,7 +404,15 @@ pub(crate) async fn record_request(
                         let skeleton = repo.after_sandbox_submit(&view, &submitted.hash)?;
                         Ok(Ok((submitted, skeleton)))
                     }
-                    Err(rejection) => Ok(Err(rejection)),
+                    // A stale base is recoverable and the sandbox cannot get
+                    // itself out of it alone — its view row is the stale one.
+                    // Send the view as it is now, so the next record is
+                    // computed against the graph this change was refused for.
+                    Err(rejection @ SubmitRejection::StaleView { .. }) => {
+                        let live = repo.current_sandbox_skeleton(&view)?;
+                        Ok(Err((rejection, Some(live))))
+                    }
+                    Err(rejection) => Ok(Err((rejection, None))),
                 }
             });
             match write.await {
@@ -415,7 +420,10 @@ pub(crate) async fn record_request(
                     submitted,
                     skeleton: Box::new(skeleton),
                 },
-                Ok(Ok(Err(rejection))) => OwnerResponse::ChangeRefused { rejection },
+                Ok(Ok(Err((rejection, skeleton)))) => OwnerResponse::ChangeRefused {
+                    rejection,
+                    skeleton: skeleton.map(Box::new),
+                },
                 Ok(Err(e)) => error("submit", format!("{e:#}")),
                 Err(e) => error("internal", e.to_string()),
             }
@@ -424,9 +432,55 @@ pub(crate) async fn record_request(
     }
 }
 
+/// Where a materialized entry may land: inside `dir`, and nowhere else.
+///
+/// `entry.path` arrives on the wire, and the pointer that chose `dir` is itself
+/// a file in the tree the agent was handed — so a path that climbs out, or
+/// names the pointer or the cache, lets an agent rewrite its own trust anchor
+/// or write as the user somewhere it was never given. The parts check rejects
+/// anything but plain relative components (no `..`, no root, no empty or `.`);
+/// that cannot escape lexically, and the canonicalize catches a *parent* that
+/// is a symlink out of the tree, which a parts check cannot see.
+fn entry_path(dir: &Path, path: &str) -> anyhow::Result<PathBuf> {
+    let relative = Path::new(path);
+    anyhow::ensure!(!relative.as_os_str().is_empty(), "entry has an empty path");
+    anyhow::ensure!(
+        relative.is_relative(),
+        "entry path {path:?} is not relative"
+    );
+    for part in relative.components() {
+        anyhow::ensure!(
+            matches!(part, std::path::Component::Normal(_)),
+            "entry path {path:?} is not a plain relative path",
+        );
+        anyhow::ensure!(
+            !RESERVED_NAMES
+                .iter()
+                .any(|reserved| part.as_os_str() == std::ffi::OsStr::new(reserved)),
+            "entry path {path:?} names the sandbox's own bookkeeping",
+        );
+    }
+    Ok(dir.join(relative))
+}
+
+/// The parent a write lands in, checked to still be inside `tree` after the
+/// filesystem has had its say about symlinks.
+fn entry_parent<'a>(dir: &'a Path, path: &'a Path) -> anyhow::Result<&'a Path> {
+    let parent = path.parent().unwrap_or(dir);
+    std::fs::create_dir_all(parent)?;
+    let real_tree = dir.canonicalize()?;
+    let real_parent = parent.canonicalize()?;
+    anyhow::ensure!(
+        real_parent.starts_with(&real_tree),
+        "entry parent resolves outside the sandbox",
+    );
+    Ok(parent)
+}
+
 /// Client side of `Materialize`: write the view's tree into `dir` and return
 /// how many entries it had. Files already at those paths are overwritten;
-/// nothing else in `dir` is touched.
+/// nothing else in `dir` is touched. Every path is checked by [`entry_path`]
+/// first, and every write's parent by [`entry_parent`].
 pub(crate) async fn receive_materialized<S>(
     stream: &mut S,
     request_id: &str,
@@ -443,14 +497,12 @@ where
         }
         match frame.response {
             OwnerResponse::MaterializeEntry { entry } => {
-                let path = dir.join(&entry.path);
+                let path = entry_path(dir, &entry.path)?;
                 match entry.kind {
                     ViewEntryKind::Directory => std::fs::create_dir_all(&path)?,
                     #[cfg(unix)]
                     ViewEntryKind::Symlink => {
-                        if let Some(parent) = path.parent() {
-                            std::fs::create_dir_all(parent)?;
-                        }
+                        entry_parent(dir, &path)?;
                         let target = String::from_utf8(entry.content.clone())?;
                         match std::fs::remove_file(&path) {
                             Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
@@ -462,15 +514,11 @@ where
                     }
                     #[cfg(not(unix))]
                     ViewEntryKind::Symlink => {
-                        if let Some(parent) = path.parent() {
-                            std::fs::create_dir_all(parent)?;
-                        }
+                        entry_parent(dir, &path)?;
                         std::fs::write(&path, &entry.content)?;
                     }
                     ViewEntryKind::File => {
-                        if let Some(parent) = path.parent() {
-                            std::fs::create_dir_all(parent)?;
-                        }
+                        entry_parent(dir, &path)?;
                         std::fs::write(&path, &entry.content)?;
                         #[cfg(unix)]
                         {
@@ -510,6 +558,71 @@ mod tests {
     use atomic_repository::{InsertOptions, RecordOptions, TrackingOptions};
 
     use super::*;
+
+    /// A path off the wire only ever resolves inside the tree, and never
+    /// onto the pointer or the cache — those two are how the agent picks who
+    /// it trusts and which database it records into.
+    #[test]
+    fn a_materialized_path_stays_inside_the_sandbox() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        assert_eq!(
+            entry_path(root, "src/main.rs").unwrap(),
+            root.join("src/main.rs")
+        );
+        assert_eq!(
+            entry_path(root, "README.md").unwrap(),
+            root.join("README.md")
+        );
+
+        for path in [
+            "",
+            "/etc/passwd",
+            "..",
+            "../elsewhere/x",
+            "src/../../elsewhere/x",
+            "./src/main.rs",
+            "src/../..",
+        ] {
+            assert!(
+                entry_path(root, path).is_err(),
+                "{path:?} should be refused"
+            );
+        }
+
+        for path in [
+            DOT_DIR,
+            ".atomic/config.toml",
+            "src/.atomic",
+            SANDBOX_POINTER,
+            SANDBOX_CACHE_DIR,
+            "nested/.atomic-sandbox.d",
+        ] {
+            assert!(
+                entry_path(root, path).is_err(),
+                "{path:?} should be refused"
+            );
+        }
+    }
+
+    /// A parts check cannot see a symlinked parent, so the write path checks
+    /// the parent after the filesystem has resolved it.
+    #[cfg(unix)]
+    #[test]
+    fn a_write_through_a_symlinked_parent_is_refused() {
+        let outside = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::os::unix::fs::symlink(outside.path(), root.join("escape")).unwrap();
+
+        let path = entry_path(root, "escape/stolen").unwrap();
+        assert!(entry_parent(root, &path).is_err());
+
+        // And an ordinary nested path still works.
+        let ok = entry_path(root, "src/main.rs").unwrap();
+        assert_eq!(entry_parent(root, &ok).unwrap(), root.join("src"));
+    }
 
     /// A repository with one change on `dev`, and an owner for it.
     fn owner() -> (tempfile::TempDir, Arc<OwnerState>, Hash) {
@@ -568,7 +681,7 @@ mod tests {
     #[test]
     fn a_remote_checkpoint_covers_only_its_own_turn_and_its_view_s_changes() {
         let (_dir, owner, on_view) = owner();
-        let (token, _) = owner.tokens.mint("dev", None, chrono::Duration::hours(1));
+        let (token, _) = owner.tokens.mint("dev", None, 3600).unwrap();
         owner.tokens.bind_provenance("dev", 7);
         let remote = |request| authorize(&owner, Caller::Remote, &frame(Some(&token), request));
 

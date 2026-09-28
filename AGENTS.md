@@ -340,6 +340,37 @@ Human: "I can review that!"
 | `EdgeFlags` | 1 byte | Bitflags: BLOCK, PSEUDO, FOLDER, PARENT, DELETED |
 | `SerializedGraphEdge` | 24 bytes | Compact edge: (flags+pos, change, introduced_by) |
 
+#### Endianness: keys that sort are big-endian, opaque values are little-endian
+
+The storage layer encodes integers two ways, and the rule is whether the
+bytes ever get sorted:
+
+| Encoded as | Endian | Which |
+|------------|--------|-------|
+| **Big-endian** | BE | B-tree **keys** that are range-scanned: `encode_vertex`, `encode_inode_vertex`, `encode_position`, `encode_view_seq` (`pristine/tables.rs`) |
+| **Little-endian** | LE | Values and ids only ever looked up by exact key: `SerializedGraphEdge`, and the CRDT `TrunkId`/`BranchId`/`LeafId` (`crdt/tables.rs`, `crdt/ids.rs`) |
+
+BE is load-bearing for the keys: byte order has to match numeric order or a
+range scan means nothing. `export_graph_slice` depends on it —
+
+```rust
+let lo = encode_inode_vertex(inode, 0, 0, 0);
+let hi = encode_inode_vertex(inode, u64::MAX, u64::MAX, u64::MAX);
+for row in inode_graph.range::<&[u8; 32]>(&lo..=&hi)? { ... }  // every row for one inode
+```
+
+For the LE side, sorting never happens, so byte order costs nothing and there
+is no reason to pay for BE.
+
+**The two meet in the same files**, so match the *writer*, never the
+neighbours. `export_graph_slice` decodes graph vertex keys (BE) and CRDT ids
+(LE) within a few lines of each other, which is exactly how a BE decode of a
+LE id shipped unnoticed. Decode an id with its own type's `from_bytes`
+(`TrunkId::from_bytes`, `BranchId::from_bytes`, `LeafId::from_bytes`) instead
+of slicing `id[0..8]` by hand, so the two sides cannot drift. `id_rows`
+`debug_assert`s on an id with no `EXTERNAL` row, because a mis-decoded id is
+indistinguishable from an absent one at runtime.
+
 ### Hash Type Design
 
 Following the original Atomic project, `Hash` is a **type alias** for `Merkle`:

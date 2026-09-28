@@ -344,6 +344,13 @@ pub(crate) enum OwnerResponse {
     },
     ChangeRefused {
         rejection: atomic_repository::SubmitRejection,
+        /// The view's rows now, when the refusal is about the view having moved
+        /// and a resync is what the sandbox needs to recover. Carried with the
+        /// refusal so recovering costs the round trip already being made: a
+        /// sandbox that has to ask again for a state it was just told is stale
+        /// can be left unable to record at all.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        skeleton: Option<Box<atomic_repository::SandboxSkeleton>>,
     },
     Changes {
         changes: Vec<WireChange>,
@@ -1163,16 +1170,7 @@ impl atomic_repository::RemoteSandboxLink for OwnerLink {
         base_state: String,
         hash: Hash,
         bytes: Vec<u8>,
-    ) -> Result<
-        Result<
-            (
-                atomic_repository::Submitted,
-                atomic_repository::SandboxSkeleton,
-            ),
-            atomic_repository::SubmitRejection,
-        >,
-        String,
-    > {
+    ) -> Result<atomic_repository::SubmittedOutcome, String> {
         let body = OwnerRequest::SubmitChange {
             view: None,
             base_state,
@@ -1184,7 +1182,10 @@ impl atomic_repository::RemoteSandboxLink for OwnerLink {
                 submitted,
                 skeleton,
             } => Ok(Ok((submitted, *skeleton))),
-            OwnerResponse::ChangeRefused { rejection } => Ok(Err(rejection)),
+            OwnerResponse::ChangeRefused {
+                rejection,
+                skeleton,
+            } => Ok(Err((rejection, skeleton.map(|s| *s)))),
             other => Err(unexpected_response("submit change", other).to_string()),
         }
     }
@@ -1198,7 +1199,10 @@ impl atomic_repository::RemoteSandboxLink for OwnerLink {
             OwnerResponse::Changes { changes } => {
                 Ok(changes.into_iter().map(|c| (c.hash, c.bytes)).collect())
             }
-            OwnerResponse::ChangeRefused { rejection } => Err(rejection.to_string()),
+            OwnerResponse::ChangeRefused {
+                rejection,
+                skeleton: _,
+            } => Err(rejection.to_string()),
             other => Err(unexpected_response("changes", other).to_string()),
         }
     }
@@ -1222,7 +1226,10 @@ impl atomic_repository::RemoteSandboxLink for OwnerLink {
         };
         match link_request(root, body)? {
             OwnerResponse::ProvenancePublished { publication } => Ok(Ok(publication)),
-            OwnerResponse::ChangeRefused { rejection } => Ok(Err(rejection)),
+            OwnerResponse::ChangeRefused {
+                rejection,
+                skeleton: _,
+            } => Ok(Err(rejection)),
             other => Err(unexpected_response("publish provenance", other).to_string()),
         }
     }

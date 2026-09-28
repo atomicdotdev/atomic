@@ -90,10 +90,45 @@ pub struct Submitted {
     pub state: String,
 }
 
-/// Paths only the repository's own machinery writes.
-fn forbidden_path(path: &str) -> bool {
-    path.split('/').any(|part| {
-        part == crate::DOT_DIR || part == super::SANDBOX_POINTER || part == super::SANDBOX_CACHE_DIR
+/// What `SubmitChange` came back with: the change landed, or it did not.
+pub type SubmittedOutcome =
+    Result<(Submitted, SandboxSkeleton), (SubmitRejection, Option<SandboxSkeleton>)>;
+
+/// Whether `path` may not be recorded, from a sandbox or otherwise.
+///
+/// Refused in two cases: the path is not a plain relative path, or it names the
+/// repository's own machinery. The first is not a nicety. A submitted change
+/// lands in `TREE`, and the next materialize or view switch writes
+/// `root.join(path)` — so `../../elsewhere/x` escapes the working tree, with no
+/// local user in the loop when a remote token-holder sends it. A reserved-name
+/// list cannot catch that, which is why the shape check comes first.
+///
+/// An empty path is not a path: a `FileOps` group for a token-level operation
+/// names an inode and carries no path, and there is nothing to escape with.
+pub(crate) fn forbidden_path(path: &str) -> bool {
+    if path.is_empty() {
+        return false;
+    }
+    let relative = std::path::Path::new(path);
+    if relative.is_absolute() {
+        return true;
+    }
+    // `components()` collapses repeated separators, so `src//main.rs` would
+    // read here as two plain names — and then reach `TREE` as a path no
+    // materialization can ever put a file at, because the write normalizes it
+    // back to `src/main.rs`.
+    if path.contains("//") || path.ends_with('/') {
+        return true;
+    }
+    relative.components().any(|part| match part {
+        // Not `Normal` means empty, `.`, `..`, or a root/prefix: none of which
+        // a tracked file may have.
+        std::path::Component::Normal(name) => {
+            name == crate::DOT_DIR
+                || name == super::SANDBOX_POINTER
+                || name == super::SANDBOX_CACHE_DIR
+        }
+        _ => true,
     })
 }
 
@@ -106,13 +141,19 @@ pub trait RemoteSandboxLink: Send + Sync {
     fn file_states(&self, root: &Path, inodes: Vec<u64>) -> Result<SandboxSlice, String>;
     /// `SubmitChange`: the change recorded against `base_state`; the view's
     /// skeleton after it lands.
+    ///
+    /// A `StaleView` refusal comes back with the view's current skeleton, so
+    /// the cache can resync from the refusal itself. Without it a sandbox that
+    /// fell behind could never record again: its state is the thing that is
+    /// stale, and the only way to learn the new one is a request the owner has
+    /// no reason to distinguish from a fresh sandbox.
     fn submit(
         &self,
         root: &Path,
         base_state: String,
         hash: Hash,
         bytes: Vec<u8>,
-    ) -> Result<Result<(Submitted, SandboxSkeleton), SubmitRejection>, String>;
+    ) -> Result<SubmittedOutcome, String>;
     /// `Changes`: change files the view has.
     fn changes(&self, root: &Path, hashes: Vec<Hash>) -> Result<Vec<ChangeFile>, String>;
     /// `PublishProvenance`: a checkpoint's provenance graph (serialized) and
@@ -237,6 +278,21 @@ impl Repository {
             });
         }
         Ok(SandboxSlice { rows, spans })
+    }
+
+    /// Serve side: the view's skeleton as it is right now, with nothing of it
+    /// applied. What a sandbox needs after being told its base state is stale:
+    /// its own view row is the stale one, so it cannot work out the current
+    /// state on its own, and asking again for a state it was just refused on
+    /// is a round trip the owner already has the answer for.
+    pub fn current_sandbox_skeleton(&self, view: &str) -> Result<SandboxSkeleton, RepositoryError> {
+        let mut live = std::collections::BTreeMap::new();
+        self.materialize_view_entries::<()>(view, |entry| {
+            live.insert(entry.inode, entry.path.clone());
+            Ok(())
+        })?
+        .map_err(|()| RepositoryError::Output("unreachable".to_string()))?;
+        self.export_sandbox_skeleton(view, &live)
     }
 
     /// Serve side: take a change a remote sandbox recorded on `view` and
@@ -463,6 +519,12 @@ impl Repository {
 
     /// In a remote sandbox, what applying a recorded change means: hand it
     /// to the owner, and take the view as it is once it lands.
+    ///
+    /// A refusal that says the view moved on is not a dead end: the owner
+    /// sends the view as it is now, and the cache takes it, so the next
+    /// `record` is computed against the graph this one was refused for. The
+    /// change that was refused is not applied — the caller has to record it
+    /// again — and the error says so.
     pub(crate) fn submit_recorded(
         &self,
         outcome: &crate::record::RecordOutcome,
@@ -472,12 +534,20 @@ impl Repository {
             .ok_or_else(|| RepositoryError::Apply("the change has no bytes".to_string()))?
             .to_vec();
         let base_state = self.remote_sandbox_view_state()?;
-        let (submitted, skeleton) = link()?
+        let (submitted, skeleton) = match link()?
             .submit(&self.root, base_state, *outcome.hash(), bytes)
             .map_err(|message| RepositoryError::InvalidOperation { message })?
-            .map_err(|rejection| {
-                RepositoryError::Apply(format!("the repository refused the change: {rejection}"))
-            })?;
+        {
+            Ok(landed) => landed,
+            Err((rejection, resync)) => {
+                if let Some(resync) = resync {
+                    self.import_sandbox_skeleton(&resync)?;
+                }
+                return Err(RepositoryError::Apply(format!(
+                    "the repository refused the change: {rejection}"
+                )));
+            }
+        };
         self.import_sandbox_skeleton(&skeleton)?;
         let state =
             <Hash as atomic_core::types::Base32>::from_base32(submitted.state.as_bytes())
@@ -654,5 +724,58 @@ impl Repository {
                 .hold_span(span.change, span.start, span.bytes.clone());
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::forbidden_path;
+
+    #[test]
+    fn a_recorded_path_must_be_a_plain_relative_path() {
+        for path in [
+            "/etc/passwd",
+            "/",
+            "..",
+            "../elsewhere/x",
+            "src/../../elsewhere/x",
+            "src/..",
+            "./src/main.rs",
+            "src//main.rs",
+        ] {
+            assert!(forbidden_path(path), "{path:?} should be refused");
+        }
+    }
+
+    #[test]
+    fn a_recorded_path_may_not_name_the_repositorys_own_machinery() {
+        for path in [
+            ".atomic",
+            ".atomic/config.toml",
+            "src/.atomic/config.toml",
+            ".atomic-sandbox",
+            ".atomic-sandbox.d",
+            "nested/.atomic-sandbox.d/cache",
+        ] {
+            assert!(forbidden_path(path), "{path:?} should be refused");
+        }
+    }
+
+    #[test]
+    fn an_ordinary_path_is_allowed() {
+        for path in [
+            // A token-level op names an inode, not a path: nothing to escape.
+            "",
+            "README.md",
+            "src/main.rs",
+            "a/b/c/d.txt",
+            "..hidden",
+            "...hidden",
+            "a..b",
+            "atomic",
+            "src/atomic-sandbox",
+        ] {
+            assert!(!forbidden_path(path), "{path:?} should be allowed");
+        }
     }
 }
