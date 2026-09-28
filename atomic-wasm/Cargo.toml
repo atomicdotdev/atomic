@@ -1,5 +1,5 @@
 [package]
-name = "atomic-canonical-wasm"
+name = "atomic-wasm"
 description = "atomic-canonical for the browser: build and check atomic attestations where the signing key lives in WebCrypto"
 version.workspace = true
 edition.workspace = true
