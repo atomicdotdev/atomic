@@ -1,0 +1,8 @@
+{
+  "vector": "vf2f6991c55096b1a",
+  "divergence": "shortest round-tripping digits below the 1e-6 threshold",
+  "input": "{\"n\":9.999999999999997e-7}",
+  "expect": {
+    "canonical": "{\"n\":9.999999999999997e-7}"
+  }
+}

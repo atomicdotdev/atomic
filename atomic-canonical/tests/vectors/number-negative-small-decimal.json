@@ -1,0 +1,8 @@
+{
+  "vector": "vd2659c36ece7eb47",
+  "divergence": "a negative magnitude above 1e-6 stays decimal",
+  "input": "{\"n\":-0.0000033333333333333333}",
+  "expect": {
+    "canonical": "{\"n\":-0.0000033333333333333333}"
+  }
+}
