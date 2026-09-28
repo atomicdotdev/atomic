@@ -550,13 +550,15 @@ fn a_sandbox_that_fell_behind_can_still_record() {
 /// because a shared owner can cross wires without erroring.
 #[test]
 fn several_remote_sandboxes_work_at_once() {
-    const SANDBOXES: usize = 4;
+    const SANDBOXES: usize = 20;
 
     let host = TempDir::new().unwrap();
     repository(host.path());
     let _owner = Owner(host.path());
 
-    let names: Vec<String> = (0..SANDBOXES).map(|i| format!("sb-{i}")).collect();
+    // Zero-padded: "recorded by sb-1" is a substring of "recorded by sb-10",
+    // and a substring test across a set like this quietly passes nothing.
+    let names: Vec<String> = (0..SANDBOXES).map(|i| format!("sb-{i:02}")).collect();
     let dirs: Vec<TempDir> = names.iter().map(|_| TempDir::new().unwrap()).collect();
     let works: Vec<PathBuf> = dirs.iter().map(|d| d.path().join("work")).collect();
 
@@ -586,7 +588,7 @@ fn several_remote_sandboxes_work_at_once() {
         let (name, work) = (name.clone(), work.clone());
         sandboxes.push(thread::spawn(move || {
             let now = "2026-01-01T00:00:00Z";
-            let session = format!("session-{i}");
+            let session = format!("session-{i:02}");
             let turn = |n: u32| {
                 serde_json::json!({
                     "session_id": session, "cwd": work.to_str().unwrap(), "model": "m",
@@ -743,13 +745,15 @@ fn several_remote_sandboxes_work_at_once() {
 #[test]
 #[ignore = "a remote cache's node ids collide with the repository's; see above"]
 fn sandboxes_can_each_record_twice() {
-    const SANDBOXES: usize = 4;
+    const SANDBOXES: usize = 20;
 
     let host = TempDir::new().unwrap();
     repository(host.path());
     let _owner = Owner(host.path());
 
-    let names: Vec<String> = (0..SANDBOXES).map(|i| format!("sb-{i}")).collect();
+    // Zero-padded: "recorded by sb-1" is a substring of "recorded by sb-10",
+    // and a substring test across a set like this quietly passes nothing.
+    let names: Vec<String> = (0..SANDBOXES).map(|i| format!("sb-{i:02}")).collect();
     let dirs: Vec<TempDir> = names.iter().map(|_| TempDir::new().unwrap()).collect();
     let works: Vec<PathBuf> = dirs.iter().map(|d| d.path().join("work")).collect();
     for (name, work) in names.iter().zip(&works) {
@@ -810,5 +814,204 @@ fn sandboxes_can_each_record_twice() {
         );
         assert!(log.contains(&format!("first by {name}")), "{name}: {log}");
         assert!(log.contains(&format!("second by {name}")), "{name}: {log}");
+    }
+}
+
+/// A sandbox and the local repository working the *same* view at the same
+/// time, which the `submissions` mutex does not cover: that mutex serializes
+/// requests *through the owner*, and a local `atomic record` never goes through
+/// it. Both write the view, so one is always computed against a state the other
+/// has just replaced.
+///
+/// This is a known failure, kept because the stress test found it and it should
+/// run the moment it is fixed. Two things are wrong, and the second is data
+/// loss.
+///
+/// The first is fixed and this test is what proves it. The sandbox loses every
+/// round — three of three in practice — and retries until it wins, because the
+/// owner refuses the stale change *and* sends the view as it is now. Before
+/// that, a stale refusal left the sandbox unable to record ever again.
+///
+/// The second is open. When the owner applies a sandbox's change to the view it
+/// does not update a *local* working tree on that view, so a local tree that is
+/// behind reads the view's new files as local deletions:
+///
+/// ```text
+/// $ atomic status
+/// On view dev
+/// Changes to be recorded:
+///     deleted:   from-sandbox.txt
+/// ```
+///
+/// `from-sandbox.txt` is a file the sandbox had just added, and it is present
+/// on the view — but the host's tree does not have it, so `status` offers to
+/// delete it. The host's next `record -a` takes that offer: in this test the
+/// host's `record -a` consumed the sandbox's file on every round, so by the
+/// end the view had the host's *and* the sandbox's changes in its log and
+/// neither writer's files in its content.
+///
+/// The fix is for a local working tree that is behind its view to be brought
+/// up to date before status reports on it, or for `status` to recognise that
+/// the view moved underneath and say so rather than presenting the difference
+/// as local changes. Until then, a human and an agent on one view cannot both
+/// `record -a` without eating each other's work.
+#[test]
+#[ignore = "a local tree behind its view reports the view's new files as deletions"]
+fn a_sandbox_and_the_local_repository_can_share_a_view() {
+    const ROUNDS: usize = 3;
+    const MAX_RETRIES: usize = 12;
+
+    let host = TempDir::new().unwrap();
+    repository(host.path());
+    let _owner = Owner(host.path());
+    let vm = TempDir::new().unwrap();
+    let work = vm.path().join("work");
+    // On `dev` itself, not a draft: this is the shared-view case.
+    ok(
+        atomic(
+            host.path(),
+            &[
+                "sandbox",
+                "create",
+                "shared",
+                "--remote",
+                "--view",
+                "dev",
+                "--dest",
+                work.to_str().unwrap(),
+            ],
+        ),
+        "sandbox create",
+    );
+    ok(atomic(&work, &["sandbox", "materialize"]), "materialize");
+
+    // How many rounds the sandbox lost and had to retry. Not asserted on:
+    // whether it loses depends on the scheduler and both outcomes are correct.
+    // What matters is that losing never became permanent.
+    let mut lost = 0usize;
+    for round in 0..ROUNDS {
+        let gate = Arc::new(Barrier::new(2));
+
+        let sandbox = {
+            let gate = Arc::clone(&gate);
+            let work = work.clone();
+            thread::spawn(move || {
+                gate.wait();
+                std::fs::write(work.join("from-sandbox.txt"), format!("round {round}\n")).unwrap();
+                let mut attempts = 0;
+                loop {
+                    let add = atomic(&work, &["add", "from-sandbox.txt"]);
+                    assert!(
+                        add.status.success(),
+                        "sandbox add: {}{}",
+                        String::from_utf8_lossy(&add.stdout),
+                        String::from_utf8_lossy(&add.stderr)
+                    );
+                    let out = atomic(
+                        &work,
+                        &["record", "-a", "-m", &format!("sandbox round {round}")],
+                    );
+                    let text = format!(
+                        "{}{}",
+                        String::from_utf8_lossy(&out.stdout),
+                        String::from_utf8_lossy(&out.stderr)
+                    );
+                    if out.status.success() {
+                        return attempts;
+                    }
+                    // A stale refusal is the expected outcome of losing the
+                    // race, and the cache has just resynced from it.
+                    assert!(
+                        text.contains("moved on"),
+                        "sandbox round {round} failed for a different reason: {text}"
+                    );
+                    attempts += 1;
+                    assert!(
+                        attempts < MAX_RETRIES,
+                        "sandbox never got past the moving view in {MAX_RETRIES} tries: {text}"
+                    );
+                }
+            })
+        };
+
+        let local = {
+            let gate = Arc::clone(&gate);
+            let host_root = host.path().to_path_buf();
+            thread::spawn(move || {
+                gate.wait();
+                std::fs::write(host_root.join("from-host.txt"), format!("round {round}\n"))
+                    .unwrap();
+                let add = atomic(&host_root, &["add", "from-host.txt"]);
+                assert!(add.status.success(), "host add");
+                let out = atomic(
+                    &host_root,
+                    &["record", "-a", "-m", &format!("host round {round}")],
+                );
+                assert!(
+                    out.status.success(),
+                    "host record round {round}: {}{}",
+                    String::from_utf8_lossy(&out.stdout),
+                    String::from_utf8_lossy(&out.stderr)
+                );
+            })
+        };
+
+        let attempts = sandbox.join().expect("sandbox thread finished");
+        local.join().expect("local thread finished");
+        if attempts > 0 {
+            lost += 1;
+        }
+    }
+    eprintln!("DIAG rounds the sandbox lost and retried: {lost} of {ROUNDS}");
+
+    // Both writers' changes are on the view, whatever order they arrived in.
+    let log = ok(atomic(host.path(), &["log"]), "host log of dev");
+    for round in 0..ROUNDS {
+        assert!(
+            log.contains(&format!("host round {round}")),
+            "the host's round {round} is missing: {log}"
+        );
+        assert!(
+            log.contains(&format!("sandbox round {round}")),
+            "the sandbox's round {round} is missing: {log}"
+        );
+    }
+
+    // And the view's *content* has both writers' files: the changes merged
+    // rather than one side eating the other. This is the assertion that fails
+    // today, because the host's `record -a` committed the deletion of the file
+    // the sandbox had just added.
+    let check = vm.path().join("check");
+    ok(
+        atomic(
+            host.path(),
+            &[
+                "sandbox",
+                "create",
+                "check",
+                "--remote",
+                "--view",
+                "dev",
+                "--dest",
+                check.to_str().unwrap(),
+            ],
+        ),
+        "sandbox create for the check",
+    );
+    ok(
+        atomic(&check, &["sandbox", "materialize"]),
+        "materialize the check",
+    );
+    for (file, who) in [("from-sandbox.txt", "sandbox"), ("from-host.txt", "host")] {
+        assert_eq!(
+            std::fs::read_to_string(check.join(file)).unwrap_or_else(|e| {
+                panic!(
+                    "the {who}'s {file} is not on the view: {e}\n{}",
+                    ok(atomic(&check, &["status"]), "status")
+                )
+            }),
+            format!("round {}\n", ROUNDS - 1),
+            "the {who}'s {file} has the wrong content on the view",
+        );
     }
 }
