@@ -332,6 +332,8 @@ impl Command for Restore {
         // Find repository
         let repo_root = find_repository_root()?;
         let repo = Repository::open(&repo_root).map_err(CliError::Repository)?;
+        repo.hydrate_remote_sandbox()
+            .map_err(CliError::Repository)?;
 
         // Compute status once. Restore only touches tracked files, so we skip
         // the untracked scan, and we reuse this single status for both the

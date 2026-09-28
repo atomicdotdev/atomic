@@ -499,6 +499,12 @@ impl Command for Log {
     fn run(&self) -> CliResult<()> {
         // Find and open repository
         let repo_root = find_repository_root()?;
+        // A remote sandbox's cache fetches the change files it lacks first.
+        if atomic_repository::remote_cache_root(&repo_root).is_dir() {
+            let repo = Repository::open(&repo_root).map_err(CliError::Repository)?;
+            repo.fetch_remote_sandbox_changes()
+                .map_err(CliError::Repository)?;
+        }
         let repo = crate::commands::open_readonly_repository(&repo_root).map_err(|e| match e {
             atomic_repository::RepositoryError::NotFound { path } => CliError::RepositoryNotFound {
                 searched_path: path.into(),

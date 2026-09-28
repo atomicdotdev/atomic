@@ -14,7 +14,16 @@
 //!
 //! ```text
 //! atomic sandbox create <NAME> [--dest <PATH>] [--view <VIEW>]
+//! atomic sandbox create <NAME> --remote [--dest <PATH>] [--acting-as <DID>] [--ttl <SECS>]
+//! atomic sandbox materialize
+//! atomic sandbox renew <VIEW> [--ttl <SECS>]
+//! atomic sandbox close <VIEW>
 //! ```
+//!
+//! A **remote** sandbox is for another machine (a VM, say): it holds only a
+//! pointer — the repository owner's iroh address, its view, and a token that
+//! reaches that view alone — and talks to the owner over the same protocol
+//! local hooks use. `materialize`, run inside it, writes the view's tree.
 
 use std::path::PathBuf;
 
@@ -22,6 +31,7 @@ use clap::{Parser, Subcommand};
 
 use atomic_repository::{Repository, SealOptions, StageOptions};
 
+use crate::commands::agent::owner;
 use crate::commands::{find_repository_root, Command};
 use crate::error::{CliError, CliResult};
 
@@ -50,6 +60,15 @@ pub enum SandboxCommands {
     /// Produces a single-layer deployable image of the full merged state —
     /// "run this exact version" anywhere an OCI runtime is available.
     Seal(Seal),
+
+    /// Inside a remote sandbox: write its view's tree from the owner.
+    Materialize(Materialize),
+
+    /// Extend a remote sandbox's token.
+    Renew(Renew),
+
+    /// End a remote sandbox's token now.
+    Close(Close),
 }
 
 impl Command for Sandbox {
@@ -58,6 +77,9 @@ impl Command for Sandbox {
             SandboxCommands::Create(cmd) => cmd.run(),
             SandboxCommands::Stage(cmd) => cmd.run(),
             SandboxCommands::Seal(cmd) => cmd.run(),
+            SandboxCommands::Materialize(cmd) => cmd.run(),
+            SandboxCommands::Renew(cmd) => cmd.run(),
+            SandboxCommands::Close(cmd) => cmd.run(),
         }
     }
 }
@@ -93,7 +115,25 @@ pub struct Create {
     /// view — isolating each agent's history as well as its files.
     #[arg(long, value_name = "VIEW")]
     pub from: Option<String>,
+
+    /// Make a remote sandbox: no working tree here, only a pointer (written
+    /// into `--dest`, or printed) for a machine that reaches this
+    /// repository's owner over iroh.
+    #[arg(long)]
+    pub remote: bool,
+
+    /// The identity the remote sandbox's work is attributed to.
+    #[arg(long, value_name = "DID", requires = "remote")]
+    pub acting_as: Option<String>,
+
+    /// How long the remote sandbox's token lasts, in seconds (renew it with
+    /// `atomic sandbox renew`).
+    #[arg(long, value_name = "SECS", default_value_t = DEFAULT_TTL_SECS, requires = "remote")]
+    pub ttl: i64,
 }
+
+/// Two hours: long enough to outlast a renewal missed or two.
+const DEFAULT_TTL_SECS: i64 = 2 * 60 * 60;
 
 impl Create {
     fn default_dest(repo_root: &std::path::Path, name: &str) -> PathBuf {
@@ -116,7 +156,7 @@ impl Command for Create {
             .clone()
             .unwrap_or_else(|| Self::default_dest(&root, &self.name));
 
-        if dest.exists() {
+        if !self.remote && dest.exists() {
             return Err(CliError::InvalidArgument {
                 message: format!("destination already exists: {}", dest.display()),
             });
@@ -138,6 +178,11 @@ impl Command for Create {
             (v, false)
         };
 
+        if self.remote {
+            drop(repo);
+            return self.create_remote(&root, &view);
+        }
+
         let count = repo
             .provision_sandbox(&dest, &view)
             .map_err(CliError::Repository)?;
@@ -158,6 +203,99 @@ impl Command for Create {
             root.display()
         );
 
+        Ok(())
+    }
+}
+
+impl Create {
+    fn create_remote(&self, root: &std::path::Path, view: &str) -> CliResult<()> {
+        let opened = owner::open_sandbox(root, view, self.acting_as.clone(), self.ttl)
+            .map_err(CliError::Internal)?;
+        let pointer = serde_json::to_vec_pretty(&opened.pointer).map_err(anyhow::Error::from)?;
+        match &self.dest {
+            Some(dest) => {
+                std::fs::create_dir_all(dest).map_err(anyhow::Error::from)?;
+                let path = dest.join(atomic_repository::SANDBOX_POINTER);
+                write_private(&path, &pointer)?;
+                println!("Remote sandbox '{}' created", self.name);
+                println!("  Pointer:      {}", path.display());
+                println!("  View:         {view}");
+                println!("  Expires:      {}", opened.expires);
+                println!("  Next:         run `atomic sandbox materialize` there");
+            }
+            None => println!("{}", String::from_utf8_lossy(&pointer)),
+        }
+        Ok(())
+    }
+}
+
+/// The pointer carries a token: readable by its owner only.
+fn write_private(path: &std::path::Path, bytes: &[u8]) -> CliResult<()> {
+    use std::io::Write;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path).map_err(anyhow::Error::from)?;
+    file.write_all(bytes).map_err(anyhow::Error::from)?;
+    Ok(())
+}
+
+/// Write a remote sandbox's view from its repository's owner.
+#[derive(Parser, Debug)]
+pub struct Materialize {}
+
+impl Command for Materialize {
+    fn run(&self) -> CliResult<()> {
+        let cwd = std::env::current_dir().map_err(anyhow::Error::from)?;
+        let (root, entries) =
+            owner::materialize_remote_sandbox(&cwd).map_err(CliError::Internal)?;
+        println!("Materialized {entries} entries into {}", root.display());
+        Ok(())
+    }
+}
+
+/// Extend a remote sandbox's token.
+#[derive(Parser, Debug)]
+pub struct Renew {
+    /// The sandbox's view.
+    #[arg(value_name = "VIEW")]
+    pub view: String,
+
+    /// New lifetime from now, in seconds.
+    #[arg(long, value_name = "SECS", default_value_t = DEFAULT_TTL_SECS)]
+    pub ttl: i64,
+}
+
+impl Command for Renew {
+    fn run(&self) -> CliResult<()> {
+        let root = find_repository_root()?;
+        let expires =
+            owner::renew_sandbox(&root, &self.view, self.ttl).map_err(CliError::Internal)?;
+        println!("Sandbox token for '{}' now expires {expires}", self.view);
+        Ok(())
+    }
+}
+
+/// End a remote sandbox's token now.
+#[derive(Parser, Debug)]
+pub struct Close {
+    /// The sandbox's view.
+    #[arg(value_name = "VIEW")]
+    pub view: String,
+}
+
+impl Command for Close {
+    fn run(&self) -> CliResult<()> {
+        let root = find_repository_root()?;
+        if owner::close_sandbox(&root, &self.view).map_err(CliError::Internal)? {
+            println!("Sandbox token for '{}' revoked", self.view);
+        } else {
+            println!("No live sandbox token for '{}'", self.view);
+        }
         Ok(())
     }
 }

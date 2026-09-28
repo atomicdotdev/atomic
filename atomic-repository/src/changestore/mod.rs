@@ -121,6 +121,32 @@ pub struct ChangeStore {
     /// We use `RwLock` for thread-safe interior mutability, allowing
     /// concurrent read access while ensuring exclusive write access.
     pub(crate) cache: RwLock<LruCache<Hash, Change>>,
+
+    /// Content spans held without their change files — a remote sandbox's
+    /// cache has the bytes of the vertices it was sent, never whole changes.
+    /// Consulted before the change files.
+    pub(crate) spans: RwLock<SpanOverlay>,
+}
+
+/// Content bytes by `(change, start)`, each covering `start..end`.
+#[derive(Debug, Default)]
+pub struct SpanOverlay {
+    spans: std::collections::BTreeMap<(Hash, u64), (u64, Vec<u8>)>,
+}
+
+impl SpanOverlay {
+    /// The bytes of `start..end` in `hash`'s content, if one held span covers them.
+    fn copy(&self, hash: &Hash, start: usize, end: usize, buf: &mut [u8]) -> Option<usize> {
+        let (&(h, s), (e, bytes)) = self.spans.range(..=(*hash, start as u64)).next_back()?;
+        if h != *hash || (end as u64) > *e {
+            return None;
+        }
+        let from = start - s as usize;
+        let len = end - start;
+        buf.get_mut(..len)?
+            .copy_from_slice(bytes.get(from..from + len)?);
+        Some(len)
+    }
 }
 
 impl std::fmt::Debug for ChangeStore {
@@ -189,6 +215,7 @@ impl ChangeStore {
         Ok(Self {
             changes_dir,
             cache: RwLock::new(LruCache::new(cache_capacity)),
+            spans: RwLock::new(SpanOverlay::default()),
         })
     }
 
@@ -403,6 +430,21 @@ impl ChangeStore {
         Ok(change)
     }
 
+    /// Hold `bytes` as `hash`'s content at `start..start + bytes.len()`.
+    pub fn hold_span(&self, hash: Hash, start: u64, bytes: Vec<u8>) {
+        if let Ok(mut spans) = self.spans.write() {
+            let end = start + bytes.len() as u64;
+            spans.spans.insert((hash, start), (end, bytes));
+        }
+    }
+
+    /// Drop every held span.
+    pub fn clear_spans(&self) {
+        if let Ok(mut spans) = self.spans.write() {
+            spans.spans.clear();
+        }
+    }
+
     /// Copy a content span from a change without cloning the full `Change`.
     ///
     /// Graph output calls this for every vertex it materializes. Using
@@ -416,6 +458,11 @@ impl ChangeStore {
         end: usize,
         buf: &mut [u8],
     ) -> ChangeStoreResult<usize> {
+        if let Ok(spans) = self.spans.read() {
+            if let Some(n) = spans.copy(hash, start, end, buf) {
+                return Ok(n);
+            }
+        }
         // Fast path: shared read lock — multiple threads can read concurrently.
         // peek() doesn't update LRU order, which is an acceptable trade-off
         // to avoid serializing all readers on a write lock.

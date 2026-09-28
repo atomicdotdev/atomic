@@ -926,6 +926,10 @@ fn main() {
     // Initialize logging
     init_logging();
 
+    // A remote sandbox's cache reaches its repository's owner through the
+    // owner protocol, whichever command (or agent hook) opens it.
+    atomic_repository::set_remote_sandbox_link(Box::new(commands::agent::owner::OwnerLink));
+
     // Dynamic shell completion. When invoked in completion mode (the `COMPLETE`
     // env var is set by the installed shell hook), this emits candidates —
     // including live view names and change hashes registered on the insert
