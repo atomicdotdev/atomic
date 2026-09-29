@@ -72,6 +72,10 @@ pub const MAX_BRIDGE_EVENT_RECORD_BYTES: usize = 64 * 1024;
 /// Dot-directory-relative location of the event journal.
 pub const BRIDGE_EVENT_JOURNAL_RELATIVE_PATH: &str = "bridge/events.jsonl";
 
+/// Target under which every event past the consent gate also reaches the
+/// process log (the `atomic` CLI's log file).
+const BRIDGE_EVENT_LOG_TARGET: &str = "atomic::bridge::event";
+
 /// Bounded nonblocking retry budget for the append lock. Contended writers
 /// drop the event after this budget instead of blocking bridge operations.
 const APPEND_LOCK_ATTEMPTS: u32 = 24;
@@ -751,6 +755,7 @@ impl BridgeEventJournal {
         if !self.consented.load(std::sync::atomic::Ordering::Relaxed) {
             return Ok(());
         }
+        log_event(&kind);
         // Serialize and bound the record before touching the filesystem:
         // no oversized allocation or append can happen.
         let event = BridgeEvent {
@@ -945,6 +950,16 @@ impl BridgeEventJournal {
                 bridge_opted_in(&self.dot_dir),
                 std::sync::atomic::Ordering::Relaxed,
             );
+        }
+    }
+}
+
+/// Copy an event into the process log. It runs after the consent gate, so an
+/// un-opted repository's events reach neither the journal nor the log.
+fn log_event(kind: &BridgeEventKind) {
+    if log::log_enabled!(target: BRIDGE_EVENT_LOG_TARGET, log::Level::Info) {
+        if let Ok(json) = serde_json::to_string(kind) {
+            log::info!(target: BRIDGE_EVENT_LOG_TARGET, "{json}");
         }
     }
 }

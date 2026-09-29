@@ -1072,10 +1072,8 @@ fn main() {
         Commands::Triage(triage) => triage.run(),
     };
 
-    command_log.finish(result.as_ref().err());
-
     // Handle errors with user-friendly output
-    if let Err(err) = result {
+    if let Err(err) = &result {
         print_error(&err.to_string());
 
         // Print suggestion if available — to STDERR, alongside the error itself,
@@ -1085,7 +1083,12 @@ fn main() {
             eprintln!();
             eprintln!("{}", hint(&format!("Hint: {}", suggestion)));
         }
+    }
 
+    // After the error is printed, so its log copy is inside the command span.
+    command_log.finish(result.as_ref().err());
+
+    if let Err(err) = result {
         // Exit with appropriate code
         std::process::exit(err.exit_code());
     }

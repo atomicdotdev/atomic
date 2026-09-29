@@ -921,6 +921,7 @@ pub(crate) fn record_last_bridge_operation(root: &Path) {
     }
 }
 
+#[tracing::instrument(name = "reconcile", skip_all, fields(budget = ?budget))]
 pub(crate) fn reconcile_transaction_budgeted(
     root: &Path,
     budget: ReconcileEffectBudget,
@@ -1059,6 +1060,13 @@ pub(crate) fn reconcile_transaction_budgeted(
             return Err(error);
         }
     };
+    tracing::info!(
+        view = %current.view,
+        git_head = %current.git_head,
+        checkpoint = ?direction,
+        mapping = ?mapping_outcome.as_ref().map(|(_, decision, _)| decision),
+        "reconcile observation"
+    );
     // CB-13C F3: whether this run journaled a baseline mapping (a
     // mutation). Every post-observation terminal outcome must be truthful:
     // `Refused` promises before-any-mutation, so a run that journaled the
@@ -1164,6 +1172,7 @@ pub(crate) fn reconcile_transaction_budgeted(
         (Some(_), ReconcileDirection::Diverged) => ReconcileDirection::Diverged,
         (None, direction) => direction,
     };
+    tracing::info!(direction = ?direction, "reconcile direction");
 
     match direction {
         ReconcileDirection::Neither => {
@@ -1359,6 +1368,7 @@ fn switch(target: &str) -> CliResult<()> {
     )
 }
 
+#[tracing::instrument(name = "switch", skip_all, fields(view = target))]
 fn switch_transaction(root: &Path, target: &str) -> CliResult<()> {
     let checkpoint = read_workspace_metadata(root)?
         .ok_or_else(|| git_error("bridge switch requires an existing checkpoint; run 'atomic git bridge reconcile' first"))?;
@@ -1381,6 +1391,11 @@ fn switch_transaction(root: &Path, target: &str) -> CliResult<()> {
             "current Git and Atomic state does not match the bridge checkpoint; reconcile before switching",
         ));
     }
+    tracing::info!(
+        from = %current.view,
+        git_head = %current.git_head,
+        "switch: checkpoint matches; planning the target"
+    );
 
     let target_state = repo
         .get_view_info(target)
@@ -1390,6 +1405,11 @@ fn switch_transaction(root: &Path, target: &str) -> CliResult<()> {
     let current_paths = git_head_paths(&git)?;
     let target_paths = git_branch_paths(&git, target)?;
     plan_switch_collisions(root, &current_paths, &target_paths).map_err(git_error)?;
+    tracing::info!(
+        current_paths = current_paths.len(),
+        target_paths = target_paths.len(),
+        "switch: no path collisions"
+    );
     let policy = conversion_policy(&git)?;
     let target_project = repo.project_tree(target, &policy).map_err(|error| {
         git_error(format!(
@@ -1417,6 +1437,7 @@ fn switch_transaction(root: &Path, target: &str) -> CliResult<()> {
     // target exactly once, verify Atomic considers it clean, then project that
     // result into Git. The full RFC replaces this with a view-scoped manifest
     // so Git can be prepared before filesystem mutation.
+    tracing::info!("switch: materializing the target view");
     repo.switch_view(working_copy, target)
         .map_err(CliError::from)?;
     let atomic_status = repo
@@ -1432,6 +1453,11 @@ fn switch_transaction(root: &Path, target: &str) -> CliResult<()> {
     let target_tree_oid = write_project_tree(&git, &target_project)?;
     let target_commit_oid =
         find_or_create_target_commit(&git, target, target_tree_oid, &target_state)?;
+    tracing::info!(
+        tree = %target_tree_oid,
+        commit = %target_commit_oid,
+        "switch: target view materialized clean; projecting it to Git"
+    );
     let target_ref = format!("refs/heads/{target}");
     update_target_branch(&repo, working_copy, &git, &target_ref, target_commit_oid)?;
     git.set_head(&target_ref)
@@ -1446,6 +1472,7 @@ fn switch_transaction(root: &Path, target: &str) -> CliResult<()> {
         .read_tree(&target_tree)
         .and_then(|_| index.write())
         .map_err(|error| git_error(format!("cannot reset Git index to target tree: {error}")))?;
+    tracing::info!(reference = %target_ref, "switch: Git HEAD attached and index reset");
     drop(index);
     drop(target_tree);
     drop(git);
@@ -1650,6 +1677,7 @@ fn import_git_to_atomic(root: &Path) -> CliResult<()> {
 /// admin files, and never materializes: those are command-boundary effects.
 /// Every writable open in the path carries the budget so pending recovery
 /// defers instead of replaying.
+#[tracing::instrument(name = "import_head", skip_all, fields(budget = ?budget))]
 fn import_git_to_atomic_budgeted(root: &Path, budget: ReconcileEffectBudget) -> CliResult<()> {
     let git = open_git(root)?;
     let head = observe_head(&git).map_err(observation_error)?;
@@ -2178,6 +2206,7 @@ fn operation_layer_verdict(
     }
 }
 
+#[tracing::instrument(name = "verify", skip_all)]
 fn verify() -> CliResult<BridgeSnapshot> {
     let root = find_repository_root()?;
     // CB-13A R2: diagnosis is a read-only observation boundary. Opening for
@@ -2397,6 +2426,7 @@ fn verify() -> CliResult<BridgeSnapshot> {
     })
 }
 
+#[tracing::instrument(name = "verify", skip_all)]
 fn verify_at(root: &Path) -> CliResult<BridgeSnapshot> {
     // CB-13A R2: the same read-only diagnostic boundary as `verify` — the
     // repository is observed for operation inspection without recovery.
@@ -2459,6 +2489,7 @@ pub(crate) fn verify_at_detached_ok(root: &Path) -> CliResult<BridgeSnapshot> {
 
 /// Verify against an already-open repository handle (same-process redb opens
 /// are exclusive, so callers holding a writable handle must reuse it).
+#[tracing::instrument(name = "verify", skip_all)]
 pub(crate) fn verify_with(
     repo: &Repository,
     working_copy: WorkingCopyId,
@@ -2708,6 +2739,7 @@ fn require_matching_clean_workspaces<'repo>(
     Ok((branch, oid, tree))
 }
 
+#[tracing::instrument(name = "export", skip_all)]
 pub(crate) fn project_atomic_to_git(
     root: &Path,
     repo: &Repository,

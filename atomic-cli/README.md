@@ -61,6 +61,20 @@ time and process id, then names the command and the spans it ran in:
 
 Each span also logs its duration when it closes (`close time.busy=…`).
 
+Besides each crate's own lines, the file carries these targets, which you can
+filter on (for example `ATOMIC_LOG=warn,atomic::git::hook=info`):
+
+| Target | What it records |
+|--------|-----------------|
+| `atomic::logging::command` | Each command's start (version, cwd) and finish (outcome, exit code, error) |
+| `atomic::printed` | The ✓/ℹ/⚠/✗ status messages a command printed for you, at their level (file only) |
+| `atomic::git::import` | `git import` progress: per-commit parse/write lines, phase timings, decisions |
+| `atomic::git::hook` | The evidence each Git hook journaled: checkouts, ref transactions, rewrites, deferred observations |
+| `atomic::bridge::event` | Every bridge event the repository's event journal records (reconcile outcomes, refusals, recoveries, binding transfers), as JSON; like the journal, only once the bridge is enabled or from an explicit bridge command |
+
+Git bridge operations run in spans too: `reconcile`, `import_head`, `export`,
+`verify`, `switch` (with a line per step reached) and `pre_push`.
+
 | Variable | Effect |
 |----------|--------|
 | `ATOMIC_LOG` | The file's filter, in `RUST_LOG` syntax (default `warn,atomic=info`); `off` turns the file off |

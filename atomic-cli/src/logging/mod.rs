@@ -51,7 +51,8 @@ const TERMINAL_FILTER: &str = "warn";
 /// Targets written for the log file. `--verbose` keeps them off the
 /// terminal, where a large import's lines would bury the ones it is for.
 /// (Targets match by string prefix, so neither may prefix a module path.)
-const FILE_ONLY_TARGETS: &str = "atomic::logging::command=warn,atomic::git::import=warn";
+const FILE_ONLY_TARGETS: &str = "atomic::logging::command=warn,atomic::git::import=warn,\
+atomic::git::hook=warn,atomic::bridge::event=warn";
 
 /// Crates that log through `tracing` itself. Nothing collected their events
 /// under `env_logger`, so they stay off the terminal unless `RUST_LOG` asks.
@@ -67,6 +68,11 @@ const COMMAND_TARGET: &str = "atomic::logging::command";
 /// Panics are logged under this target for the file only: the panic hook
 /// already prints them on the terminal.
 const PANIC_TARGET: &str = "atomic::panic";
+
+/// The messages the CLI printed for the user, copied into the file so it
+/// shows what each command reported. Never on the terminal, which printed
+/// them already.
+const PRINTED_TARGET: &str = "atomic::printed";
 
 const LOG_FILE_PREFIX: &str = "atomic";
 const LOG_FILE_SUFFIX: &str = "log";
@@ -143,6 +149,32 @@ impl CommandLog {
     }
 }
 
+/// How a message was printed for the user.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum Printed {
+    Success,
+    Info,
+    Warning,
+    Error,
+}
+
+/// Copy a message the CLI printed for the user into the log file, at the
+/// level it was printed at, so `ATOMIC_LOG=warn` keeps the warnings and
+/// errors. URLs lose their credentials first.
+pub(crate) fn printed(kind: Printed, message: &str) {
+    match kind {
+        Printed::Error => {
+            tracing::error!(target: PRINTED_TARGET, ?kind, "{}", redact::urls(message))
+        }
+        Printed::Warning => {
+            tracing::warn!(target: PRINTED_TARGET, ?kind, "{}", redact::urls(message))
+        }
+        Printed::Success | Printed::Info => {
+            tracing::info!(target: PRINTED_TARGET, ?kind, "{}", redact::urls(message))
+        }
+    }
+}
+
 /// Detect the global `--verbose` flag straight from `argv`.
 ///
 /// Logging has to be live before clap runs, because argument parsing itself
@@ -167,7 +199,7 @@ fn terminal_directives(rust_log: Option<String>, verbose: bool) -> String {
         }
         None => format!("{TERMINAL_FILTER},{TRACING_NATIVE_DEPENDENCIES}"),
     };
-    format!("{directives},{PANIC_TARGET}=off")
+    format!("{directives},{PANIC_TARGET}=off,{PRINTED_TARGET}=off")
 }
 
 fn parses(directives: &str) -> bool {
@@ -339,17 +371,18 @@ mod tests {
     fn rust_log_wins_over_verbose_on_the_terminal() {
         assert_eq!(
             terminal_directives(Some("atomic_remote=trace".into()), true),
-            "atomic_remote=trace,atomic::panic=off"
+            "atomic_remote=trace,atomic::panic=off,atomic::printed=off"
         );
         assert_eq!(
             terminal_directives(None, true),
             "atomic=debug,atomic_core=info,\
              atomic::logging::command=warn,atomic::git::import=warn,\
-             h2=off,hyper=off,hyper_util=off,atomic::panic=off"
+             atomic::git::hook=warn,atomic::bridge::event=warn,\
+             h2=off,hyper=off,hyper_util=off,atomic::panic=off,atomic::printed=off"
         );
         assert_eq!(
             terminal_directives(None, false),
-            "warn,h2=off,hyper=off,hyper_util=off,atomic::panic=off"
+            "warn,h2=off,hyper=off,hyper_util=off,atomic::panic=off,atomic::printed=off"
         );
         assert_eq!(
             terminal_directives(Some("  ".into()), false),
@@ -361,10 +394,14 @@ mod tests {
     fn file_only_targets_do_not_prefix_real_modules() {
         let modules = [
             "atomic::commands::git::parallel",
+            "atomic::commands::git::hooks",
             "atomic::logging",
+            "atomic::output::colors",
             "atomic_core::output",
+            "atomic_repository::repository::observability",
         ];
-        for directive in FILE_ONLY_TARGETS.split(',') {
+        let file_only = format!("{FILE_ONLY_TARGETS},{PANIC_TARGET}=off,{PRINTED_TARGET}=off");
+        for directive in file_only.split(',') {
             let target = directive.split('=').next().unwrap();
             for module in modules {
                 assert!(!module.starts_with(target), "{target} prefixes {module}");
@@ -377,7 +414,7 @@ mod tests {
         for rust_log in ["atomic=loud", ",", " , "] {
             assert_eq!(
                 terminal_directives(Some(rust_log.into()), true),
-                "error,atomic::panic=off",
+                "error,atomic::panic=off,atomic::printed=off",
                 "{rust_log:?}"
             );
         }

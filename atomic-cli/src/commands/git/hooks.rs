@@ -783,6 +783,7 @@ pub(crate) fn run_pre_push_verification(root: &Path) -> CliResult<()> {
 
 /// The exact-OID-bound pre-push verification over caller-supplied stdin
 /// lines (the hook entry point drains the real stdin; tests inject).
+#[tracing::instrument(name = "pre_push", skip_all, fields(proposed = input.lines().count()))]
 pub(crate) fn run_pre_push_verification_with_input(root: &Path, input: &str) -> CliResult<()> {
     let root = canonical_root(root)?;
 
@@ -1587,7 +1588,55 @@ fn append_journal_record<T: Serialize>(root: &Path, record: &T) -> CliResult<()>
             path.display()
         ))
     })?;
+    log_evidence(record);
     Ok(())
+}
+
+/// Log target of the evidence the hooks journal.
+const HOOK_EVIDENCE_LOG_TARGET: &str = "atomic::git::hook";
+
+/// Items of a logged evidence list; a first fetch can move thousands of refs.
+const LOGGED_EVIDENCE_ITEMS: usize = 20;
+
+/// Log one journaled record without the fields every record repeats (the
+/// fixed interpretation text, the format version, and the worktree root the
+/// command's `cwd` already names), without its capture token, which
+/// authenticates operation linkage, and with long lists cut short.
+fn log_evidence<T: Serialize>(record: &T) {
+    if !tracing::enabled!(target: HOOK_EVIDENCE_LOG_TARGET, tracing::Level::INFO) {
+        return;
+    }
+    let Ok(serde_json::Value::Object(fields)) = serde_json::to_value(record) else {
+        return;
+    };
+    tracing::info!(
+        target: HOOK_EVIDENCE_LOG_TARGET,
+        evidence = %serde_json::Value::Object(loggable_evidence(fields)),
+        "journaled Git hook evidence"
+    );
+}
+
+fn loggable_evidence(
+    mut fields: serde_json::Map<String, serde_json::Value>,
+) -> serde_json::Map<String, serde_json::Value> {
+    for repeated in ["interpretation", "version", "worktree_root"] {
+        fields.remove(repeated);
+    }
+    if fields.remove("capture_token").is_some() {
+        fields.insert("capture_token_present".into(), true.into());
+    }
+    let long_lists: Vec<(String, usize)> = fields
+        .iter()
+        .filter_map(|(name, value)| value.as_array().map(|items| (name.clone(), items.len())))
+        .filter(|(_, len)| *len > LOGGED_EVIDENCE_ITEMS)
+        .collect();
+    for (name, len) in long_lists {
+        if let Some(serde_json::Value::Array(items)) = fields.get_mut(&name) {
+            items.truncate(LOGGED_EVIDENCE_ITEMS);
+        }
+        fields.insert(format!("{name}_total"), len.into());
+    }
+    fields
 }
 
 fn write_immutable_json<T: Serialize>(path: &Path, value: &T) -> CliResult<()> {
@@ -1814,6 +1863,41 @@ mod tests {
 
     const OLD: &str = "1111111111111111111111111111111111111111";
     const NEW: &str = "2222222222222222222222222222222222222222";
+
+    #[test]
+    fn logged_evidence_drops_the_capture_token_and_caps_long_lists() {
+        let refs: Vec<serde_json::Value> = (0..25)
+            .map(|index| serde_json::json!({ "ref_name": format!("refs/heads/b{index}") }))
+            .collect();
+        let serde_json::Value::Object(fields) = serde_json::json!({
+            "version": 1,
+            "record_type": "post-rewrite",
+            "interpretation": "fixed text",
+            "worktree_root": "/repo",
+            "capture_token": "ab".repeat(32),
+            "transactions": refs,
+        }) else {
+            unreachable!()
+        };
+        let logged = loggable_evidence(fields);
+        let mut keys: Vec<&str> = logged.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "capture_token_present",
+                "record_type",
+                "transactions",
+                "transactions_total"
+            ]
+        );
+        assert_eq!(logged["capture_token_present"], true);
+        assert_eq!(logged["transactions"].as_array().unwrap().len(), 20);
+        assert_eq!(logged["transactions_total"], 25);
+        assert!(!serde_json::Value::Object(logged)
+            .to_string()
+            .contains("abab"));
+    }
 
     #[test]
     fn dispatcher_uses_absolute_binary_and_keeps_every_failure_advisory() {
