@@ -123,6 +123,38 @@ jobs:
         env:
           RUSTDOCFLAGS: -Dwarnings
 
+  conformance:
+    name: Conformance vectors
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The ai-agent-action suite from agent-evidence-vectors, pinned to a
+      # release tag. Raise the tag to take the vectors a new release adds.
+      - uses: actions/checkout@v4
+        with:
+          repository: probityai/agent-evidence-vectors
+          ref: v0.13.0
+          path: agent-evidence-vectors
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-conformance-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-conformance-
+
+      - name: Replay the suite through the JSON admission
+        run: cargo test -p atomic-canonical --test conformance_corpus -- --ignored
+        env:
+          AEV_SUITE: ${{ github.workspace }}/agent-evidence-vectors/vectors-ai-agent-action
+
   msrv:
     name: Minimum Supported Rust Version
     runs-on: ubuntu-latest
