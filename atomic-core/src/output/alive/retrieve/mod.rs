@@ -365,10 +365,25 @@ pub fn retrieve_graph<T: GraphTxnT>(
                     .find_map(|(_, v)| if !v.is_dummy() { Some(*v) } else { None });
 
             if let Some(direct) = direct_child {
-                pending_bypass
-                    .entry(direct)
-                    .or_default()
-                    .extend(bypass_children.iter().copied());
+                // After an insertion the old `vertex → successor` edge
+                // survives next to `vertex → inserted → successor`. Deleting
+                // the first inserted vertex turns the rest of the insertion
+                // into a bypass child that leads INTO the direct child
+                // (the old successor). Deferring it would put it after its
+                // own successor, a cycle that renders as a spurious order
+                // conflict. Such a child stays on this vertex, and the
+                // existing edges order it before the direct child.
+                let direct_node = result.graph.get_vertex(direct).node;
+                for succ_vid in bypass_children.iter().copied() {
+                    let succ_node = result.graph.get_vertex(succ_vid).node;
+                    if reaches(txn, succ_node, direct_node)? {
+                        if !children_to_add.iter().any(|(_, v)| *v == succ_vid) {
+                            children_to_add.push((None, succ_vid));
+                        }
+                    } else {
+                        pending_bypass.entry(direct).or_default().push(succ_vid);
+                    }
+                }
             } else {
                 for succ_vid in &bypass_children {
                     if !children_to_add.iter().any(|(_, v)| v == succ_vid) {
@@ -404,6 +419,34 @@ pub fn retrieve_graph<T: GraphTxnT>(
     }
 
     Ok(result)
+}
+
+/// Bound on the vertices [`reaches`] visits; past it the answer is `false`,
+/// which keeps the default placement of bypass children.
+const REACH_SEARCH_LIMIT: usize = 4096;
+
+/// Whether `to` is reachable from `from` through non-deleted forward edges.
+fn reaches<T: GraphTxnT>(
+    txn: &T,
+    from: GraphNode<NodeId>,
+    to: GraphNode<NodeId>,
+) -> Result<bool, PristineError> {
+    let mut queue = vec![from];
+    let mut seen = std::collections::HashSet::from([from]);
+    while let Some(current) = queue.pop() {
+        for edge in txn.iter_forward(current, false)? {
+            let Ok(next) = txn.find_block(edge.dest) else {
+                continue;
+            };
+            if next == to {
+                return Ok(true);
+            }
+            if seen.len() < REACH_SEARCH_LIMIT && seen.insert(next) {
+                queue.push(next);
+            }
+        }
+    }
+    Ok(false)
 }
 
 /// Walk through a dead vertex's forward edges to find live successors.
