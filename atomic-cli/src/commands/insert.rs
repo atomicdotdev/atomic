@@ -323,12 +323,7 @@ fn run_promote_to_parent(repo: &Repository, args: &Insert) -> CliResult<()> {
         println!();
         for (i, hash) in missing.iter().enumerate() {
             if let Ok(change) = repo.load_change(hash) {
-                let message = &change.hashed.header.message;
-                let short_msg = if message.len() > 50 {
-                    format!("{}...", &message[..47])
-                } else {
-                    message.to_string()
-                };
+                let short_msg = output::truncate_bytes(&change.hashed.header.message, 50);
                 println!("  {}. {} {}", i + 1, format_hash(hash, true), short_msg);
             } else {
                 println!("  {}. {}", i + 1, format_hash(hash, true));
@@ -608,12 +603,7 @@ fn run_preview(repo: &Repository, args: &PreviewArgs) -> CliResult<()> {
         for (i, hash) in missing.iter().enumerate() {
             // Try to load change header for more info
             if let Ok(change) = repo.load_change(hash) {
-                let message = &change.hashed.header.message;
-                let short_msg = if message.len() > 50 {
-                    format!("{}...", &message[..47])
-                } else {
-                    message.to_string()
-                };
+                let short_msg = output::truncate_bytes(&change.hashed.header.message, 50);
                 println!("  {}. {} {}", i + 1, format_hash(hash, true), short_msg);
             } else {
                 println!("  {}. {}", i + 1, format_hash(hash, true));

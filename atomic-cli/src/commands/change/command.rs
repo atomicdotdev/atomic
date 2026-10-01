@@ -690,12 +690,7 @@ fn format_node_detail(detail: &str) -> Option<String> {
 
     // Command (bash/execution nodes)
     if let Some(cmd) = obj.get("command").and_then(|v| v.as_str()) {
-        let truncated = if cmd.len() > 120 {
-            format!("{}...", &cmd[..117])
-        } else {
-            cmd.to_string()
-        };
-        return Some(format!("$ {}", truncated));
+        return Some(format!("$ {}", truncate_bytes(cmd, 120)));
     }
 
     // File path (read/write/edit nodes)
@@ -714,12 +709,7 @@ fn format_node_detail(detail: &str) -> Option<String> {
 
     // Output summary (fallback for nodes with only output)
     if let Some(summary) = obj.get("output_summary").and_then(|v| v.as_str()) {
-        let truncated = if summary.len() > 120 {
-            format!("{}...", &summary[..117])
-        } else {
-            summary.to_string()
-        };
-        return Some(truncated);
+        return Some(truncate_bytes(summary, 120));
     }
 
     None

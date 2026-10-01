@@ -66,6 +66,26 @@ pub use table::{Alignment, Column, KeyValueTable, Row, Table};
 
 pub use progress::{create_progress_bar, create_spinner, finish_error, finish_success};
 
+// Text Truncation
+
+/// Truncate `s` to at most `max` bytes, appending "..." when it was cut.
+///
+/// The cut point walks back to a UTF-8 character boundary: slicing at an
+/// arbitrary byte offset panics when the index lands inside a multi-byte
+/// character, and recorded text (change messages, provenance commands, file
+/// lines) routinely contains em-dashes or other non-ASCII content. Use
+/// [`Table::truncate`] instead when the limit is a display width, not bytes.
+pub fn truncate_bytes(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_string();
+    }
+    let mut end = max.saturating_sub(3);
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}...", &s[..end])
+}
+
 // Convenience Print Functions
 
 /// Print a success message to stdout.
@@ -265,6 +285,40 @@ mod tests {
     #[test]
     fn test_kv_table_re_exported() {
         let _table = KeyValueTable::new();
+    }
+
+    #[test]
+    fn truncate_bytes_passes_short_strings_through() {
+        assert_eq!(truncate_bytes("hello", 10), "hello");
+    }
+
+    #[test]
+    fn truncate_bytes_cuts_ascii_at_expected_offset() {
+        let s = "a".repeat(121);
+        assert_eq!(truncate_bytes(&s, 120), format!("{}...", "a".repeat(117)));
+    }
+
+    #[test]
+    fn truncate_bytes_never_splits_multibyte_characters() {
+        // Regression: byte 117 landed inside this em-dash and crashed
+        // `atomic change` with "byte index 117 is not a char boundary".
+        let prefix = "a".repeat(115);
+        let suffix = "b".repeat(10);
+        let s = format!("{prefix}—{suffix}");
+        assert!(s.len() > 120);
+        let truncated = truncate_bytes(&s, 120);
+        assert!(truncated.ends_with("..."));
+        assert_eq!(truncated, format!("{prefix}..."));
+    }
+
+    #[test]
+    fn truncate_bytes_handles_leading_multibyte_character() {
+        assert_eq!(truncate_bytes("—bcdef", 5), "...");
+    }
+
+    #[test]
+    fn truncate_bytes_returns_short_input_unchanged() {
+        assert_eq!(truncate_bytes("", 120), "");
     }
 
     #[test]
