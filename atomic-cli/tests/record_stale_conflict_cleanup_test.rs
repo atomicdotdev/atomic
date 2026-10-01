@@ -2,10 +2,13 @@
 //! verified-stale conflict metadata on an *unanchored* colocated workspace,
 //! without importing Git or fabricating a baseline.
 //!
-//! The fixture is a disposable Git+Atomic colocated repository whose bridge
-//! checkpoint has been removed, so the fresh CLI classifies it as
-//! `MissingCheckpoint` and the ordinary content-record boundary refuses before
-//! the record body runs. The narrow metadata-only route must still:
+//! The fixture is a disposable Git+Atomic colocated repository that opted in
+//! to the bridge (`[git.bridge] enabled = true`) and whose bridge checkpoint
+//! has been removed, so the fresh CLI classifies it as `MissingCheckpoint` and
+//! the ordinary content-record boundary refuses before the record body runs.
+//! (Without the opt-in a colocated repository is native and never refuses for
+//! a missing anchor — see `git_bridge_opt_in_test.rs`.) The narrow
+//! metadata-only route must still:
 //!
 //! 1. clear a persisted `Order` row whose canonical render no longer conflicts
 //!    and whose bytes equal the working tree, through the exact scoped CLI flags;
@@ -53,8 +56,8 @@ impl Fixture {
         self.repository.path()
     }
 
-    /// A clean-Git colocated repository imported into Atomic with its bridge
-    /// checkpoint deliberately removed (unanchored).
+    /// A clean-Git colocated bridge workspace imported into Atomic with its
+    /// bridge checkpoint deliberately removed (opted in, unanchored).
     fn unanchored_colocated() -> Self {
         let fixture = Self::empty();
         fixture.git_ok(&["init", "-q", "-b", "main"]);
@@ -72,6 +75,7 @@ impl Fixture {
         if bridge.exists() {
             fs::remove_dir_all(&bridge).expect("remove bridge checkpoint");
         }
+        fixture.record_bridge_opt_in();
         assert!(
             !fixture
                 .root()
@@ -80,6 +84,20 @@ impl Fixture {
             "fixture must be unanchored (MissingCheckpoint)"
         );
         fixture
+    }
+
+    /// Record `[git.bridge] enabled = true` directly (what `atomic git bridge
+    /// enable` records) without installing hook dispatchers, so the Git
+    /// operations these tests drive stay hook-free.
+    fn record_bridge_opt_in(&self) {
+        let config = self.root().join(".atomic/config.toml");
+        let mut text = fs::read_to_string(&config).expect("read repository config");
+        assert!(
+            !text.contains("[git.bridge]"),
+            "fixture expects no bridge table yet"
+        );
+        text.push_str("\n[git.bridge]\nenabled = true\n");
+        fs::write(&config, text).expect("record bridge opt-in");
     }
 
     fn atomic(&self, args: &[&str]) -> Output {

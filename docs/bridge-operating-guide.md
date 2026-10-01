@@ -58,6 +58,33 @@ local pre-push refusal.
 
 ## 2. Enable and disable
 
+**Without the opt-in, a colocated repository is a native Atomic repository.**
+A `.git` directory next to `.atomic` is not consent. Until the repository
+enrolls — `[git.bridge] enabled = true` (recorded by `enable`) or a verified
+checkpoint written by an explicit bridge command (`git bridge reconcile`,
+`git import`, anchoring, clone bootstrap / `--adopt-git`) — ordinary commands
+(`status`, `add`, `record`, `diff`, `stash`, `tag`, agent turn-end, …) behave
+exactly as in a repository without Git: they never refuse for a missing Git
+anchor, never read Git HEAD/index state, never write the Git index, and never
+create Git refs. `git init && atomic init && atomic add f && atomic record`
+works without touching Git.
+
+Once enrolled, an unanchored workspace refuses ordinary commands and names the
+exact commands that resolve it:
+
+```console
+$ atomic status
+✗ workspace reconciliation required: workspace is not anchored to a verified Git baseline: MissingCheckpoint
+
+The Git bridge is enabled for this repository, but this workspace has no verified Git baseline yet. Anchor it to the current Git HEAD (imports the Git history into the current view):
+  atomic git bridge reconcile
+To use Atomic without the Git bridge in a workspace that was never anchored:
+  atomic git bridge disable
+```
+
+A branch with no commits yet (`UnbornHead`) has no Git baseline to anchor to:
+create the first Git commit, then run `atomic git bridge reconcile`.
+
 Enable is explicit and per-repository. Exercised:
 
 ```console
@@ -98,6 +125,9 @@ advisory evidence hooks, not the guarantee (RFC §10.3) — and
 capture, pre-push, post-rewrite and reference-transaction dispatchers must
 be removed manually from `.git/hooks/`. All of them are advisory:
 correctness never depends on a hook having run (RFC §11).
+Disabling a workspace that was never anchored returns it to native Atomic
+behavior. A workspace that already holds a verified checkpoint keeps the
+stale-baseline guard for that baseline.
 
 ## 3. Working copies
 

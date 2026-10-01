@@ -428,7 +428,13 @@ pub(crate) fn apply_git_informed_overlays(
     repo_root: &Path,
     status: &mut atomic_repository::RepositoryStatus,
 ) -> CliResult<()> {
-    if !repo_root.join(".git").exists() {
+    // Git-informed overlays are colocated bridge behavior (RFC §9); native
+    // status of a working copy that never enrolled stays Git-independent.
+    if !repo_root.join(".git").exists()
+        || !repo
+            .bridge_workspace_active()
+            .map_err(CliError::Repository)?
+    {
         return Ok(());
     }
     let git_repo = open_git(repo_root)?;
