@@ -67,6 +67,9 @@ pub use table::{Alignment, Column, KeyValueTable, Row, Table};
 pub use progress::{create_progress_bar, create_spinner, finish_error, finish_success};
 
 // Convenience Print Functions
+//
+// `print_success`, `print_error`, `print_warning` and `print_info` also copy
+// their message into the log file (`crate::logging::printed`).
 
 /// Print a success message to stdout.
 ///
@@ -83,6 +86,7 @@ pub use progress::{create_progress_bar, create_spinner, finish_error, finish_suc
 /// // Output: ✓ Repository initialized successfully!
 /// ```
 pub fn print_success(message: &str) {
+    crate::logging::printed(crate::logging::Printed::Success, message);
     println!("{} {}", success("✓"), success(message));
 }
 
@@ -101,6 +105,7 @@ pub fn print_success(message: &str) {
 /// // Output: ✗ Failed to read file
 /// ```
 pub fn print_error(message: &str) {
+    crate::logging::printed(crate::logging::Printed::Error, message);
     eprintln!("{} {}", error("✗"), error(message));
 }
 
@@ -119,6 +124,7 @@ pub fn print_error(message: &str) {
 /// // Output: ⚠ File will be overwritten
 /// ```
 pub fn print_warning(message: &str) {
+    crate::logging::printed(crate::logging::Printed::Warning, message);
     eprintln!("{} {}", warning("⚠"), warning(message));
 }
 
@@ -137,6 +143,7 @@ pub fn print_warning(message: &str) {
 /// // Output: ℹ Processing 42 files...
 /// ```
 pub fn print_info(message: &str) {
+    crate::logging::printed(crate::logging::Printed::Info, message);
     println!("{} {}", info("ℹ"), info(message));
 }
 

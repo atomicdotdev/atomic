@@ -53,7 +53,10 @@ thiserror = { workspace = true }
 
 # Logging
 log = { workspace = true }
-env_logger = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tracing-appender = { workspace = true }
+tracing-log = { workspace = true }
 
 # Time
 chrono = { workspace = true }
