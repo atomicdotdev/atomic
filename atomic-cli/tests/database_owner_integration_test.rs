@@ -12,6 +12,18 @@ use fs2::FileExt;
 use serde_json::Value;
 use tempfile::TempDir;
 
+// Every test in this file spawns real `atomic` subprocesses that hold the
+// redb lock and burn CPU while they run. On 2-core Windows CI runners the
+// default test-threads parallelism lets the process-heavy tests (the
+// eight-process session-start hammer, the failpoint owners) starve whichever
+// sibling tests happen to overlap with them past their database-wait budgets
+// — the failures move between runs (concurrent_session_starts…,
+// crashing_second_checkpoint…, owner_death_after_checkpoint…, all in the
+// same file), which is the signature of scheduler starvation, not a bug in
+// any one test. Serializing the file trades a few minutes of wall time for
+// runs that fail only when something is actually broken.
+use serial_test::serial;
+
 // Bound child processes so a platform-specific IPC regression produces a
 // useful failure instead of occupying a CI runner indefinitely. Drain output
 // concurrently so a full pipe cannot prevent the child from exiting.
@@ -29,7 +41,15 @@ fn wait_for_output(mut child: Child, operation: &str) -> Output {
     }
     let stdout = drain(child.stdout.take());
     let stderr = drain(child.stderr.take());
-    let deadline = Instant::now() + Duration::from_secs(30);
+    // CI runners (2-core Windows especially) run many serialized hook
+    // processes; a single child can legitimately wait on the publication
+    // lock for a large fraction of the whole queue. Generous by default,
+    // overridable when even that is not enough.
+    let process_timeout = std::env::var("ATOMIC_TEST_PROCESS_TIMEOUT_SECS")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .map_or(120, |secs| secs.max(5));
+    let deadline = Instant::now() + Duration::from_secs(process_timeout);
     let (status, timed_out) = loop {
         if let Some(status) = child.try_wait().expect("inspect child process") {
             break (status, false);
@@ -52,7 +72,7 @@ fn wait_for_output(mut child: Child, operation: &str) -> Output {
         });
     assert!(
         !timed_out,
-        "{operation} timed out after 30s; stdout: {}; stderr: {}",
+        "{operation} timed out after {process_timeout}s; stdout: {}; stderr: {}",
         String::from_utf8_lossy(&stdout),
         String::from_utf8_lossy(&stderr)
     );
@@ -60,6 +80,26 @@ fn wait_for_output(mut child: Child, operation: &str) -> Output {
         status,
         stdout,
         stderr,
+    }
+}
+
+// Hook-failure diagnostics: assert the exit status with the child's full
+// captured output. Printing stderr alone produced empty panic messages on CI
+// (a non-zero exit with no stderr), leaving nothing to debug from.
+fn assert_hook_success(operation: &str, output: &Output) {
+    assert!(
+        output.status.success(),
+        "{operation} exited with {}: stdout: {}; stderr: {}",
+        show_status(&output.status),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn show_status(status: &std::process::ExitStatus) -> String {
+    match status.code() {
+        Some(code) => format!("exit code {code}"),
+        None => format!("{status}"),
     }
 }
 
@@ -115,7 +155,9 @@ fn run_owner(repository: &std::path::Path, operation: &str) -> Output {
 }
 
 fn wait_for_ping(repository: &std::path::Path, child: &mut Child) -> Value {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    // Each poll spawns a fresh debug-build process; on slow CI runners a
+    // single spawn can take seconds, so give the loop real headroom.
+    let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         let output = run_owner(repository, "ping");
         if output.status.success() {
@@ -198,6 +240,7 @@ fn run_agent_hook(repository: &std::path::Path, agent: &str, verb: &str, payload
 }
 
 #[test]
+#[serial]
 fn concurrent_session_starts_wait_for_writer_and_persist_views_and_lifecycle() {
     let temp = TempDir::new().unwrap();
     let repository = temp.path().join("repo");
@@ -250,6 +293,7 @@ fn concurrent_session_starts_wait_for_writer_and_persist_views_and_lifecycle() {
 }
 
 #[test]
+#[serial]
 fn read_only_turn_does_not_reuse_its_goal_for_the_next_turn_across_agents() {
     for (agent, prompt_verb) in [
         ("codex", "user-prompt-submit"),
@@ -336,7 +380,7 @@ fn wait_for_shutdown(repository: &std::path::Path) {
         .write(true)
         .open(path)
         .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         match lock.try_lock_exclusive() {
             Ok(()) => {
@@ -355,6 +399,7 @@ fn wait_for_shutdown(repository: &std::path::Path) {
 }
 
 #[test]
+#[serial]
 fn concurrent_hooks_commit_lossless_envelopes_without_output_or_drops() {
     const TOOL_EVENTS: usize = 16;
 
@@ -498,6 +543,7 @@ fn concurrent_hooks_commit_lossless_envelopes_without_output_or_drops() {
 }
 
 #[test]
+#[serial]
 fn lifecycle_stop_resume_zombie_abandon_and_lease_expiry() {
     let temp = TempDir::new().unwrap();
     let repository = temp.path().join("repo");
@@ -726,6 +772,7 @@ fn lifecycle_stop_resume_zombie_abandon_and_lease_expiry() {
 }
 
 #[test]
+#[serial]
 fn owner_death_before_and_after_event_commit_retries_exactly_once() {
     for failpoint in ["before-envelope-commit", "after-envelope-commit"] {
         let temp = TempDir::new().unwrap();
@@ -803,6 +850,7 @@ fn batch_owner_rpc(repository: &std::path::Path, request: &Value) -> std::io::Re
 
 #[cfg(unix)]
 #[test]
+#[serial]
 fn owner_batch_crash_retries_the_whole_durable_batch_exactly_once() {
     for failpoint in ["before-envelope-commit", "after-envelope-commit"] {
         let temp = TempDir::new().unwrap();
@@ -865,6 +913,7 @@ fn owner_batch_crash_retries_the_whole_durable_batch_exactly_once() {
 }
 
 #[test]
+#[serial]
 fn owner_death_after_checkpoint_prepare_and_bind_recovers_in_hook_process() {
     for failpoint in ["after-checkpoint-prepare", "after-checkpoint-bind"] {
         let temp = TempDir::new().unwrap();
@@ -929,6 +978,7 @@ fn owner_death_after_checkpoint_prepare_and_bind_recovers_in_hook_process() {
 }
 
 #[test]
+#[serial]
 fn corrupt_legacy_graph_is_retained_when_migration_cannot_verify_it() {
     let temp = TempDir::new().unwrap();
     let repository = temp.path().join("repo");
@@ -962,6 +1012,7 @@ fn corrupt_legacy_graph_is_retained_when_migration_cannot_verify_it() {
 }
 
 #[test]
+#[serial]
 fn legacy_graph_pending_delta_imports_once_then_json_authority_is_removed() {
     let temp = TempDir::new().unwrap();
     let repository = temp.path().join("repo");
@@ -1083,6 +1134,7 @@ fn legacy_graph_pending_delta_imports_once_then_json_authority_is_removed() {
 }
 
 #[test]
+#[serial]
 fn turn_end_publishes_one_checkpoint_turn_and_advances_head() {
     let temp = TempDir::new().unwrap();
     let repository = temp.path().join("repo");
@@ -1164,6 +1216,7 @@ fn turn_end_publishes_one_checkpoint_turn_and_advances_head() {
 }
 
 #[test]
+#[serial]
 fn concurrent_stops_publish_ordered_ledgers_without_external_serialization() {
     let temp = TempDir::new().unwrap();
     let repository = temp.path().join("repo");
@@ -1195,11 +1248,7 @@ fn concurrent_stops_publish_ordered_ledgers_without_external_serialization() {
             "session-start",
             &serde_json::to_vec(&serde_json::json!({"session_id":session})).unwrap(),
         );
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+        assert_hook_success(&format!("session-start {session}"), &output);
     }
     for round in 0..2 {
         for session in &sessions {
@@ -1211,11 +1260,7 @@ fn concurrent_stops_publish_ordered_ledgers_without_external_serialization() {
                 )
                 .unwrap(),
             );
-            assert!(
-                output.status.success(),
-                "{}",
-                String::from_utf8_lossy(&output.stderr)
-            );
+            assert_hook_success(&format!("round {round} prompt {session}"), &output);
         }
         // First round includes an actual change. The second is read-only.
         if round == 0 {
@@ -1247,11 +1292,7 @@ fn concurrent_stops_publish_ordered_ledgers_without_external_serialization() {
         drop(held_repository);
         for child in children {
             let output = child.join().unwrap();
-            assert!(
-                output.status.success(),
-                "{}",
-                String::from_utf8_lossy(&output.stderr)
-            );
+            assert_hook_success(&format!("round {round} concurrent stop"), &output);
             assert!(
                 output.stderr.is_empty(),
                 "{}",
@@ -1265,11 +1306,7 @@ fn concurrent_stops_publish_ordered_ledgers_without_external_serialization() {
             "stop",
             &serde_json::to_vec(&serde_json::json!({"session_id":session})).unwrap(),
         );
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+        assert_hook_success(&format!("final stop {session}"), &output);
     }
     assert!(run_owner(&repository, "shutdown").status.success());
     wait_for_shutdown(&repository);
@@ -1295,6 +1332,7 @@ fn concurrent_stops_publish_ordered_ledgers_without_external_serialization() {
 }
 
 #[test]
+#[serial]
 fn stop_publication_timeout_preserves_the_active_turn_for_retry() {
     let temp = TempDir::new().unwrap();
     let repository = temp.path().join("repo");
@@ -1337,6 +1375,7 @@ fn stop_publication_timeout_preserves_the_active_turn_for_retry() {
 }
 
 #[test]
+#[serial]
 fn killed_stop_releases_publication_lock_and_can_be_retried() {
     let temp = TempDir::new().unwrap();
     let repository = temp.path().join("repo");
@@ -1568,6 +1607,7 @@ fn large_checkpoint_fixture(
 }
 
 #[test]
+#[serial]
 fn large_frozen_checkpoint_completes_across_agents() {
     for agent in ["codex", "claude-code", "opencode"] {
         large_checkpoint_fixture(agent, 1024, 1024, false);
@@ -1575,11 +1615,13 @@ fn large_frozen_checkpoint_completes_across_agents() {
 }
 
 #[test]
+#[serial]
 fn large_envelope_checkpoint_recovers_between_pages() {
     large_checkpoint_fixture("claude-code", 1, 600 * 1024, true);
 }
 
 #[test]
+#[serial]
 fn failed_frozen_read_resumes_recorded_changes_on_next_stop() {
     let temp = TempDir::new().unwrap();
     let repository = temp.path().join("repo");
@@ -1658,6 +1700,7 @@ fn failed_frozen_read_resumes_recorded_changes_on_next_stop() {
 }
 
 #[test]
+#[serial]
 fn pre_cutover_session_count_gap_publishes_at_next_ledger_ordinal() {
     let temp = TempDir::new().unwrap();
     let repository = temp.path().join("repo");
@@ -1704,6 +1747,7 @@ fn pre_cutover_session_count_gap_publishes_at_next_ledger_ordinal() {
 }
 
 #[test]
+#[serial]
 fn crashing_second_checkpoint_keeps_first_turn_immutable() {
     let temp = TempDir::new().unwrap();
     let repository = temp.path().join("repo");
@@ -1773,6 +1817,7 @@ fn crashing_second_checkpoint_keeps_first_turn_immutable() {
 }
 
 #[test]
+#[serial]
 fn owner_election_commit_reconnect_and_crash_restart() {
     let temp = TempDir::new().unwrap();
     let repository = temp.path().join("repo");
@@ -1834,6 +1879,7 @@ fn owner_election_commit_reconnect_and_crash_restart() {
 }
 
 #[test]
+#[serial]
 fn scoped_concurrent_stops_and_session_end_do_not_record_sibling_files() {
     let temp = TempDir::new().unwrap();
     let root = temp.path().join("repo");
@@ -2025,16 +2071,19 @@ fn check_missing_turn_start(write_files: bool) {
 }
 
 #[test]
+#[serial]
 fn missing_turn_start_recovers_changes_and_provenance_without_duplicate_stops() {
     check_missing_turn_start(true);
 }
 
 #[test]
+#[serial]
 fn missing_turn_start_recovers_read_only_provenance() {
     check_missing_turn_start(false);
 }
 
 #[test]
+#[serial]
 fn scoped_stop_without_start_or_journal_fails_visibly_and_can_retry() {
     let temp = TempDir::new().unwrap();
     let root = temp.path().join("repo");

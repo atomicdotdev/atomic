@@ -74,6 +74,9 @@ pub mod section;
 #[cfg(test)]
 mod tests;
 
+#[cfg(test)]
+mod tests_signing;
+
 // ── Re-exports ─────────────────────────────────────────────────────────
 
 // Hash index types
@@ -86,4 +89,4 @@ pub use header::{FileHeader, FileHeaderFlags};
 pub use builder::{FileHeaderBuilder, Trailer};
 
 // Section types
-pub use section::{ContentChunkHeader, SectionHeader, SectionType};
+pub use section::{ChangeSignature, ContentChunkHeader, SectionHeader, SectionType};

@@ -42,6 +42,7 @@ mod disable;
 mod enable;
 mod explain;
 mod hooks;
+mod identity;
 mod lifecycle;
 mod owner;
 mod status;
@@ -55,6 +56,7 @@ pub use attest::Attest;
 pub use disable::Disable;
 pub use enable::Enable;
 pub use explain::Explain;
+pub use identity::Identity;
 pub use lifecycle::Lifecycle;
 pub use status::AgentStatus;
 
@@ -206,6 +208,29 @@ pub enum AgentCommands {
     #[command(name = "database-owner", hide = true)]
     DatabaseOwner(owner::DatabaseOwner),
 
+    /// Select or inspect the agent identity that recording hooks sign as.
+    ///
+    /// `set` makes every hooked agent on this machine record under a
+    /// delegated agent identity's own key instead of the plus-tag of the
+    /// default identity. The selection is global — one identity per
+    /// machine — with `ATOMIC_AGENT_IDENTITY` as the per-process escape
+    /// hatch and the active server profile's `agent_identity` binding as
+    /// the implicit fallback.
+    ///
+    /// # Examples
+    ///
+    /// ```text
+    /// # Select an agent identity
+    /// atomic agent identity set fred+opencode
+    ///
+    /// # See what hooks will sign as, and why
+    /// atomic agent identity show
+    ///
+    /// # Back to the plus-tag fallback
+    /// atomic agent identity unset
+    /// ```
+    Identity(Identity),
+
     /// Internal hook handlers (called by agent hooks).
     ///
     /// These commands are invoked by the hooks installed in agent
@@ -228,6 +253,7 @@ impl Command for Agent {
             AgentCommands::Attest(cmd) => cmd.run(),
             AgentCommands::Lifecycle(cmd) => cmd.run(),
             AgentCommands::DatabaseOwner(cmd) => cmd.run(),
+            AgentCommands::Identity(cmd) => cmd.run(),
             AgentCommands::Hooks(cmd) => cmd.run(),
         }
     }

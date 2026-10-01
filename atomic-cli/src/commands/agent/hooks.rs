@@ -264,6 +264,24 @@ impl Command for Hooks {
             orchestrator
                 .set_journal_sink(Arc::new(super::owner::OwnerJournalSink::new(&repo_root)));
 
+            // The delegated identity to sign recorded turns as, resolved
+            // through the selection chain (env var > global setting >
+            // active server profile). `None` keeps the plus-tag fallback,
+            // so an environment with nothing configured behaves exactly as
+            // before agent identities existed.
+            let agent_identity = super::identity::resolve_effective_agent_identity();
+            match &agent_identity {
+                Some((name, source)) => {
+                    log::debug!("hooks: recording as agent identity '{name}' ({source})");
+                }
+                None => {
+                    log::debug!(
+                        "hooks: no agent identity selected; recording as plus-tag of default"
+                    );
+                }
+            }
+            orchestrator.set_agent_identity(agent_identity.map(|(name, _)| name));
+
             // Under a managed lifecycle, sessions adopt the declared view
             // and carry the run stamp (see lifecycle module docs).
             if let Some(lc) = &managed {

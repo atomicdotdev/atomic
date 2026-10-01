@@ -1091,7 +1091,8 @@ fn build_file_outline(path: &str, content: &str, total_lines: usize) -> String {
             let trimmed = line.trim();
             if def_patterns.iter().any(|p| trimmed.starts_with(p)) {
                 let short = if trimmed.len() > 100 {
-                    format!("{}...", &trimmed[..97])
+                    let end = truncate_to_char_boundary(trimmed, 97);
+                    format!("{}...", &trimmed[..end])
                 } else {
                     trimmed.to_string()
                 };
@@ -1147,13 +1148,29 @@ fn format_tool_as_command(name: &str, args: &serde_json::Value) -> String {
     }
 }
 
+/// Find the largest byte index ≤ `max` that falls on a UTF-8 char boundary.
+///
+/// Slicing at an arbitrary byte offset panics when the index lands inside a
+/// multi-byte character, and the text passed through here (file contents,
+/// tool results) routinely contains non-ASCII characters.
+fn truncate_to_char_boundary(s: &str, max: usize) -> usize {
+    if max >= s.len() {
+        return s.len();
+    }
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    end
+}
+
 /// Truncate a tool result to [`MAX_TOOL_RESULT_BYTES`].
 fn truncate_result(s: &str) -> String {
     if s.len() <= MAX_TOOL_RESULT_BYTES {
         s.to_string()
     } else {
-        let truncated = &s[..MAX_TOOL_RESULT_BYTES];
-        format!("{truncated}\n\n... truncated ({} bytes total)", s.len())
+        let end = truncate_to_char_boundary(s, MAX_TOOL_RESULT_BYTES);
+        format!("{}\n\n... truncated ({} bytes total)", &s[..end], s.len())
     }
 }
 
@@ -1184,6 +1201,25 @@ mod tests {
         let result = truncate_result(&s);
         assert!(result.contains("truncated"));
         assert!(result.len() < s.len() + 100);
+    }
+
+    #[test]
+    fn test_truncate_result_multibyte_never_panics() {
+        let s = "é".repeat(MAX_TOOL_RESULT_BYTES / 2 + 10);
+        let result = truncate_result(&s);
+        assert!(result.contains("truncated"));
+        // The kept prefix must be whole characters, never a sliced codepoint.
+        let kept = result.split("\n\n... truncated").next().unwrap();
+        assert!(kept.chars().all(|c| c == 'é'));
+    }
+
+    #[test]
+    fn test_truncate_to_char_boundary_walks_back_inside_multibyte() {
+        let s = "aaa—bbb"; // em-dash occupies bytes 3..6
+        assert_eq!(truncate_to_char_boundary(s, 5), 3);
+        assert_eq!(truncate_to_char_boundary(s, 3), 3);
+        assert_eq!(truncate_to_char_boundary(s, 100), s.len());
+        assert_eq!(truncate_to_char_boundary(s, 0), 0);
     }
 
     #[test]

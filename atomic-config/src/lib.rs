@@ -240,6 +240,19 @@ pub struct GlobalConfig {
     /// When `None`, the legacy `[server]` block is used.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_server: Option<String>,
+
+    /// Machine-wide agent identity that recording hooks sign as.
+    ///
+    /// Set by `atomic agent identity set <name>`. When hooks record a
+    /// turn, the change is attributed to this identity's own key instead
+    /// of falling back to the plus-tag of the default identity. Deliberately
+    /// global — one agent identity per machine, not per repository — with
+    /// `ATOMIC_AGENT_IDENTITY` as the per-process escape hatch and the
+    /// active server profile's `agent_identity` as the implicit fallback.
+    ///
+    /// Example: `agent_identity = "fred+opencode"`
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_identity: Option<String>,
 }
 
 fn default_channel_name() -> String {
@@ -257,6 +270,7 @@ impl Default for GlobalConfig {
             server: ServerConfig::default(),
             servers: BTreeMap::new(),
             default_server: None,
+            agent_identity: None,
         }
     }
 }
@@ -349,6 +363,22 @@ impl GlobalConfig {
             }
             None => Ok((&mut self.server, None)),
         }
+    }
+
+    /// The active server profile's `agent_identity` binding, if any.
+    ///
+    /// Active-profile resolution mirrors [`resolve_server`](Self::resolve_server)
+    /// with no override: `default_server` → named profile, else the legacy
+    /// `[server]` block. Unlike `resolve_server`, a dangling `default_server`
+    /// degrades to the legacy block rather than erroring — this is a fallback
+    /// link in the recording hook's identity chain, and recording must never
+    /// fail over a misconfigured profile name.
+    pub fn active_server_agent_identity(&self) -> Option<&str> {
+        let profile = match self.default_server.as_deref() {
+            Some(name) => self.servers.get(name).unwrap_or(&self.server),
+            None => &self.server,
+        };
+        profile.agent_identity.as_deref()
     }
 }
 
@@ -912,6 +942,69 @@ default_org = "alice"
             config.org_base_url("alice").as_deref(),
             Some("https://alice.atomic.storage")
         );
+    }
+
+    #[test]
+    fn test_agent_identity_roundtrip() {
+        let config = GlobalConfig {
+            agent_identity: Some("fred+opencode".to_string()),
+            ..GlobalConfig::default()
+        };
+
+        let toml_str = toml::to_string_pretty(&config).unwrap();
+        assert!(toml_str.contains("agent_identity = \"fred+opencode\""));
+
+        let parsed: GlobalConfig = toml::from_str(&toml_str).unwrap();
+        assert_eq!(parsed.agent_identity.as_deref(), Some("fred+opencode"));
+    }
+
+    #[test]
+    fn test_agent_identity_absent_in_legacy_configs() {
+        // Configs written before the field existed must deserialize with
+        // no selection — hooks fall back to the plus-tag path unchanged.
+        let legacy = "default_channel = \"main\"\n";
+        let parsed: GlobalConfig = toml::from_str(legacy).unwrap();
+        assert_eq!(parsed.agent_identity, None);
+    }
+
+    #[test]
+    fn test_agent_identity_omitted_when_unset() {
+        // skip_serializing_if: an unset selection leaves no key behind,
+        // so hand-edited configs stay clean.
+        let toml_str = toml::to_string_pretty(&GlobalConfig::default()).unwrap();
+        assert!(!toml_str.contains("agent_identity"));
+    }
+
+    #[test]
+    fn test_active_server_agent_identity_prefers_default_profile() {
+        let mut config = GlobalConfig::default();
+        config.server.agent_identity = Some("legacy+agent".to_string());
+        assert_eq!(config.active_server_agent_identity(), Some("legacy+agent"));
+
+        let named = ServerConfig {
+            agent_identity: Some("named+agent".to_string()),
+            ..ServerConfig::default()
+        };
+        config.servers.insert("prod".to_string(), named);
+        config.default_server = Some("prod".to_string());
+        assert_eq!(config.active_server_agent_identity(), Some("named+agent"));
+    }
+
+    #[test]
+    fn test_active_server_agent_identity_degrades_on_dangling_default() {
+        // A default_server pointing at a removed profile must not break
+        // resolution — the legacy block is the honest active profile then.
+        let mut config = GlobalConfig::default();
+        config.server.agent_identity = Some("legacy+agent".to_string());
+        config.default_server = Some("gone".to_string());
+        assert_eq!(config.active_server_agent_identity(), Some("legacy+agent"));
+    }
+
+    #[test]
+    fn test_active_server_agent_identity_none_when_unbound() {
+        let mut config = GlobalConfig::default();
+        config.server.agent_identity = None;
+        assert_eq!(config.active_server_agent_identity(), None);
     }
 
     #[test]

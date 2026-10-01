@@ -858,21 +858,11 @@ enum Commands {
     /// ```
     Update(Update),
 
-    /// Project the code-review candidate set of a feature view against a target.
+    /// Project the code-review candidate set of a view against a target.
     ///
-    /// Reports the change hashes visible to the feature view but not the
-    /// target, their transitive dependency-closure additions, and which of
-    /// those additions are "baggage" (not covered by any intent).
-    ///
-    /// # Examples
-    ///
-    /// ```text
-    /// # Human-readable summary
-    /// atomic triage candidates feature --into dev
-    ///
-    /// # Machine-readable worklist
-    /// atomic triage candidates feature --into dev --json
-    /// ```
+    /// Both arguments are optional: the source view defaults to the current
+    /// view and the target to that view's parent, so `atomic triage review`
+    /// with no arguments asks whether the current view is ready to promote.
     Triage(Triage),
 
     /// Generate a shell completion script.

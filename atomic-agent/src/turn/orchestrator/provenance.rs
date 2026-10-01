@@ -652,7 +652,7 @@ impl TurnOrchestrator {
         let ledger = {
             let repository = atomic_repository::Repository::open_readonly_wait(
                 &self.repo_root,
-                std::time::Duration::from_secs(10),
+                super::wait_budget::database_wait(),
             )
             .map_err(|error| AgentError::ProvenanceJournalFailed {
                 session_id: session_id.to_string(),
@@ -824,7 +824,7 @@ impl TurnOrchestrator {
 
         let repository = atomic_repository::Repository::open_existing_wait(
             &self.repo_root,
-            std::time::Duration::from_secs(10),
+            super::wait_budget::database_wait(),
         )
         .map_err(|error| AgentError::ProvenanceJournalFailed {
             session_id: session_id.to_string(),

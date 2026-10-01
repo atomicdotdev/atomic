@@ -92,6 +92,17 @@ pub struct Enable {
     #[arg(long, value_name = "PATH")]
     from: Option<std::path::PathBuf>,
 
+    /// Install the skills-source package (e.g. atomic-skills) from a local
+    /// checkout instead of syncing it from Atomic storage.
+    ///
+    /// The integration package's manifest can declare a
+    /// `[skills-source]` / `[skills]` / `[agent-definition]`. Without this
+    /// flag those inputs are always re-cloned from Atomic storage on every
+    /// install, even when `--from` is given. Point this at a local
+    /// atomic-skills checkout to install fully offline.
+    #[arg(long, value_name = "PATH")]
+    from_skills: Option<std::path::PathBuf>,
+
     /// Also install AGENTS.md into the repository root so the Atomic
     /// workflow is always-on without picking a bundled agent.
     ///
@@ -113,6 +124,7 @@ impl Enable {
             global: false,
             hooks: None,
             from: None,
+            from_skills: None,
             agents_md: false,
         }
     }
@@ -422,7 +434,7 @@ impl Command for Enable {
             println!("  Turns are still recorded by the built-in hooks, but these agents");
             println!("  are missing their Atomic skills and system prompt.");
             println!("  Retry with 'atomic agent enable --force' once the package is reachable,");
-            println!("  or install from a local checkout with '--from <path>'.");
+            println!("  or install from a local checkout with '--from <path>' (and '--from-skills <path>' for the skills package).");
 
             return Err(partial_install_error(&degraded));
         }
@@ -437,7 +449,7 @@ impl Command for Enable {
 /// is **always** re-cloned on every install. This ensures new skills added
 /// to atomic-skills are picked up immediately without --force. If the
 /// re-clone fails (network), the error is returned — the caller can retry
-/// or use --from to install from a local checkout.
+/// or use --from-skills to source the skills package from a local checkout.
 fn sync_skills_cache(_force: bool) -> CliResult<std::path::PathBuf> {
     const SKILLS_AGENT: &str = "atomic-skills";
 
@@ -512,9 +524,11 @@ impl Enable {
     /// package's atomic-integration.toml.
     ///
     /// When the manifest declares `[skills-source]`, the shared atomic-skills
-    /// cache is synced (or reused) and passed as `skills_cache_dir`. When the
-    /// user opts in via `--agents-md` or the prompt, the repo root is passed
-    /// so `[[repo-file]]` entries land in the repo.
+    /// cache is synced (or reused) and passed as `skills_cache_dir`. With
+    /// `--from-skills` the skills inputs come from a local checkout and no
+    /// network access happens at all. When the user opts in via
+    /// `--agents-md` or the prompt, the repo root is passed so
+    /// `[[repo-file]]` entries land in the repo.
     fn install_integration(
         &self,
         agent_name: &str,
@@ -538,7 +552,20 @@ impl Enable {
             || manifest.agent_definition.is_some()
             || !manifest.skills.is_empty()
         {
-            Some(sync_skills_cache(self.force)?)
+            if let Some(ref from_skills) = self.from_skills {
+                if !std::fs::exists(from_skills).unwrap_or(false) {
+                    return Err(crate::error::CliError::InvalidArgument {
+                        message: format!(
+                            "--from-skills: no checkout at {}; point it at a local \
+                             atomic-skills checkout (or omit it to sync from storage)",
+                            from_skills.display()
+                        ),
+                    });
+                }
+                Some(from_skills.clone())
+            } else {
+                Some(sync_skills_cache(self.force)?)
+            }
         } else {
             None
         };
@@ -836,6 +863,7 @@ mod tests {
             global: false,
             hooks: None,
             from: None,
+            from_skills: None,
             agents_md: false,
         };
     }
@@ -849,6 +877,7 @@ mod tests {
             global: false,
             hooks: None,
             from: None,
+            from_skills: None,
             agents_md: false,
         };
         assert!(cmd.force);
@@ -864,6 +893,7 @@ mod tests {
             global: false,
             hooks: None,
             from: None,
+            from_skills: None,
             agents_md: false,
         };
         assert!(cmd.all);
@@ -879,6 +909,7 @@ mod tests {
             global: true,
             hooks: None,
             from: None,
+            from_skills: None,
             agents_md: false,
         };
         assert!(cmd.global);

@@ -20,7 +20,7 @@ use std::io::{Read, Write};
 ///
 /// | Range | Layer | Types |
 /// |-------|-------|-------|
-/// | `0x01-0x0F` | Metadata | HEADER, DEPS, PROVENANCE |
+/// | `0x01-0x0F` | Metadata | HEADER, DEPS, PROVENANCE, SIGNATURE |
 /// | `0x10-0x1F` | Graph | GRAPH (one per file) |
 /// | `0x20-0x2F` | Content | CONTENT (content-defined chunks) |
 /// | `0x30-0x3F` | Semantic | SEMANTIC (one per file) |
@@ -33,10 +33,11 @@ use std::io::{Read, Write};
 /// 1. `HEADER` (exactly one)
 /// 2. `DEPS` (exactly one, may be empty)
 /// 3. `PROVENANCE` (zero or one)
-/// 4. `GRAPH` sections (zero or more, one per file)
-/// 5. `SEMANTIC` sections (zero or more, one per file)
-/// 6. `CONTENT` chunks (zero or more)
-/// 7. `UNHASHED` (zero or one)
+/// 4. `SIGNATURE` (zero or one)
+/// 5. `GRAPH` sections (zero or more, one per file)
+/// 6. `SEMANTIC` sections (zero or more, one per file)
+/// 7. `CONTENT` chunks (zero or more)
+/// 8. `UNHASHED` (zero or one)
 ///
 /// This ordering ensures that:
 /// - The graph layer can be read without seeking past semantic/content sections
@@ -59,6 +60,18 @@ pub enum SectionType {
     ///
     /// Payload: `zstd(postcard(Vec<Provenance>))`
     Provenance = 0x03,
+
+    /// Cryptographic signature over the change's hashed sections (optional).
+    ///
+    /// Payload: `zstd(postcard(ChangeSignature))` — the signer's DID, the
+    /// Ed25519 signature over the content hash, and a timestamp.
+    ///
+    /// SIGNATURE is NOT hashed (like UNHASHED): the change hash must remain
+    /// a pure function of content+header+deps so re-signing the same change
+    /// with a different key never changes its identity. The signature covers
+    /// the file's content hash (the trailer hash), which is computed over
+    /// everything except UNHASHED and SIGNATURE sections.
+    Signature = 0x04,
 
     /// Graph operations for a single file (storage/merge layer).
     ///
@@ -127,6 +140,7 @@ impl SectionType {
             0x01 => Ok(SectionType::Header),
             0x02 => Ok(SectionType::Dependencies),
             0x03 => Ok(SectionType::Provenance),
+            0x04 => Ok(SectionType::Signature),
             0x10 => Ok(SectionType::Graph),
             0x20 => Ok(SectionType::Content),
             0x30 => Ok(SectionType::Semantic),
@@ -153,8 +167,10 @@ impl SectionType {
 
     /// Returns `true` if this section type is part of the hashed content.
     ///
-    /// All sections except `Unhashed` contribute to the change's content hash.
-    /// The hash is computed incrementally as hashed sections are written.
+    /// All sections except `Unhashed` and `Signature` contribute to the
+    /// change's content hash. The hash is computed incrementally as hashed
+    /// sections are written. SIGNATURE is excluded so the change hash stays
+    /// a pure function of content+header+deps (re-signing never re-hashes).
     ///
     /// # Examples
     ///
@@ -166,13 +182,14 @@ impl SectionType {
     /// assert!(SectionType::Semantic.is_hashed());
     /// assert!(SectionType::Content.is_hashed());
     /// assert!(!SectionType::Unhashed.is_hashed());
+    /// assert!(!SectionType::Signature.is_hashed());
     /// ```
     #[inline]
     pub const fn is_hashed(self) -> bool {
-        !matches!(self, SectionType::Unhashed)
+        !matches!(self, SectionType::Unhashed | SectionType::Signature)
     }
 
-    /// Returns `true` if this is a metadata section (HEADER, DEPS, PROVENANCE).
+    /// Returns `true` if this is a metadata section (HEADER, DEPS, PROVENANCE, SIGNATURE).
     ///
     /// Metadata sections appear first in the file and contain information
     /// about the change itself rather than file modifications.
@@ -180,7 +197,10 @@ impl SectionType {
     pub const fn is_metadata(self) -> bool {
         matches!(
             self,
-            SectionType::Header | SectionType::Dependencies | SectionType::Provenance
+            SectionType::Header
+                | SectionType::Dependencies
+                | SectionType::Provenance
+                | SectionType::Signature
         )
     }
 
@@ -210,6 +230,7 @@ impl SectionType {
             SectionType::Header => "HEADER",
             SectionType::Dependencies => "DEPS",
             SectionType::Provenance => "PROVENANCE",
+            SectionType::Signature => "SIGNATURE",
             SectionType::Graph => "GRAPH",
             SectionType::Content => "CONTENT",
             SectionType::Semantic => "SEMANTIC",
@@ -229,10 +250,11 @@ impl SectionType {
             SectionType::Header => 0,
             SectionType::Dependencies => 1,
             SectionType::Provenance => 2,
-            SectionType::Graph => 3,
-            SectionType::Semantic => 4,
-            SectionType::Content => 5,
-            SectionType::Unhashed => 6,
+            SectionType::Signature => 3,
+            SectionType::Graph => 4,
+            SectionType::Semantic => 5,
+            SectionType::Content => 6,
+            SectionType::Unhashed => 7,
         }
     }
 }
@@ -441,5 +463,117 @@ impl ContentChunkHeader {
             return f64::NAN;
         }
         self.compressed_len as f64 / self.uncompressed_len as f64
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// ChangeSignature — payload of the SIGNATURE section
+// ═══════════════════════════════════════════════════════════════════════
+
+/// Cryptographic signature over a change's content hash (V3).
+///
+/// The signature binds the signer's identity to the exact set of hashed
+/// sections that made up the change at record time. It is an Ed25519
+/// signature over the **content hash** (the trailer hash) — the blake3 hash
+/// covering the hash table and all hashed sections. The SIGNATURE section
+/// itself is excluded from that hash (like UNHASHED), so:
+///
+/// - the change hash is a pure function of content+header+deps — re-signing
+///   with a different key never changes the change's identity;
+/// - verification needs no re-serialization: the signed hash is stored in
+///   the section and can be compared against the trailer hash directly.
+///
+/// Verifying a signature means: check `signed_hash` equals the file's
+/// verified content hash, then check the Ed25519 signature over
+/// `signed_hash` against a *caller-supplied* public key. The DID embedded
+/// here is a discovery hint only — never the trust root.
+///
+/// # Fields
+///
+/// - `signer_did`: `did:atomic:<base32(blake3(pubkey))>` fingerprint of the
+///   signer's key. Non-reversible — verification needs a key resolved
+///   out-of-band (identity store, `identity lookup-key`, caller argument).
+/// - `signature`: Ed25519 signature (64 bytes) over the unsigned content hash.
+/// - `signed_hash`: the unsigned content hash that was signed (kept here so
+///   verification can detect which level was signed without re-serializing).
+/// - `timestamp`: when the signature was made (Unix epoch seconds).
+/// - `method`: signature scheme identifier, currently always `ed25519`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChangeSignature {
+    /// DID of the signer (`did:atomic:...`). A discovery hint, not a trust
+    /// root — verification must resolve the key out-of-band.
+    pub signer_did: String,
+
+    /// Ed25519 signature (64 bytes) over `signed_hash`.
+    #[serde(with = "serde_bytes_array_64")]
+    pub signature: [u8; 64],
+
+    /// The unsigned content hash that was signed.
+    #[serde(with = "serde_bytes_array_32")]
+    pub signed_hash: [u8; 32],
+
+    /// When the signature was made (Unix epoch seconds).
+    pub timestamp: i64,
+
+    /// Signature scheme identifier. Always `ed25519` for this version.
+    pub method: String,
+}
+
+impl ChangeSignature {
+    /// The signature method identifier for Ed25519.
+    pub const METHOD_ED25519: &'static str = "ed25519";
+
+    /// Size of an Ed25519 signature in bytes.
+    pub const SIGNATURE_SIZE: usize = 64;
+
+    /// Create a new change signature.
+    pub fn new(
+        signer_did: impl Into<String>,
+        signature: [u8; 64],
+        signed_hash: [u8; 32],
+        timestamp: i64,
+    ) -> Self {
+        Self {
+            signer_did: signer_did.into(),
+            signature,
+            signed_hash,
+            timestamp,
+            method: Self::METHOD_ED25519.to_string(),
+        }
+    }
+
+    /// Returns `true` if this signature uses the Ed25519 method.
+    pub fn is_ed25519(&self) -> bool {
+        self.method == Self::METHOD_ED25519
+    }
+}
+
+/// serde helper: fixed-size 64-byte array as a plain byte vector.
+mod serde_bytes_array_64 {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S: Serializer>(v: &[u8; 64], s: S) -> Result<S::Ok, S::Error> {
+        v.as_slice().serialize(s)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<[u8; 64], D::Error> {
+        let vec = Vec::<u8>::deserialize(d)?;
+        vec.try_into()
+            .map_err(|_| serde::de::Error::custom("expected 64-byte Ed25519 signature"))
+    }
+}
+
+/// serde helper: fixed-size 32-byte array as a plain byte vector.
+mod serde_bytes_array_32 {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S: Serializer>(v: &[u8; 32], s: S) -> Result<S::Ok, S::Error> {
+        v.as_slice().serialize(s)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<[u8; 32], D::Error> {
+        let vec = Vec::<u8>::deserialize(d)?;
+        vec.try_into()
+            .map_err(|_| serde::de::Error::custom("expected 32-byte hash"))
     }
 }

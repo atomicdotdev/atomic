@@ -104,6 +104,25 @@ pub struct RecordOptions {
     /// Defaults to `true`. Internal callers that already know every path they
     /// intend to record may disable this to avoid an unrelated untracked scan.
     detect_raw_renames: bool,
+
+    /// Signing credentials: who signs this change, and with what key.
+    ///
+    /// When set, the recorded change carries a SIGNATURE section — an
+    /// Ed25519 signature over the change's content hash made with the
+    /// supplied secret key. When `None`, the change is recorded unsigned
+    /// (legacy behavior).
+    signing_identity: Option<SigningIdentity>,
+}
+
+/// Credentials for signing a recorded change.
+#[derive(Debug, Clone)]
+pub struct SigningIdentity {
+    /// The signer's DID (`did:atomic:...`). A discovery hint only — the
+    /// trust root is always the caller-resolved public key.
+    pub signer_did: String,
+
+    /// The signer's Ed25519 seed (32 bytes).
+    pub secret_key: [u8; 32],
 }
 
 impl RecordOptions {
@@ -471,6 +490,23 @@ impl Default for RecordOptions {
             provenance: Vec::new(),
             allow_conflict_markers: false,
             detect_raw_renames: true,
+            signing_identity: None,
         }
+    }
+}
+
+impl RecordOptions {
+    /// Set the signing identity for this change.
+    ///
+    /// When set, the recorded change carries an Ed25519 signature over its
+    /// content hash. See [`SigningIdentity`].
+    pub fn with_signing_identity(mut self, signing: SigningIdentity) -> Self {
+        self.signing_identity = Some(signing);
+        self
+    }
+
+    /// The signing identity, if configured.
+    pub fn signing_identity(&self) -> Option<&SigningIdentity> {
+        self.signing_identity.as_ref()
     }
 }

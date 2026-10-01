@@ -25,6 +25,7 @@ use std::path::PathBuf;
 use clap::Parser;
 
 use atomic_canonical::delegation as cert;
+use atomic_canonical::jcs;
 use atomic_identity::delegation::{Delegation, DelegationScope};
 use atomic_identity::{Identity, IdentityStore, IdentityType};
 
@@ -177,9 +178,12 @@ impl Command for Delegate {
             ))
         })?;
         let certificate = cert::mint(&delegator, &keypair, &terms);
-        let document = serde_json::to_string_pretty(&certificate).map_err(|e| {
-            CliError::Internal(anyhow::anyhow!("Failed to encode certificate: {e}"))
-        })?;
+        // Admitted before it is stored, exported or printed: a grant every
+        // reader on this machine would refuse is not worth signing.
+        let document =
+            cert::encode_for_storage(&certificate).map_err(|e| CliError::InvalidArgument {
+                message: format!("this grant would be refused when it is read back: {e}"),
+            })?;
 
         // `--export` writes the wire form and nothing else, so the output is
         // safe to capture in a shell substitution.
@@ -322,10 +326,12 @@ impl Delegate {
             std::fs::read_to_string(path)?
         };
 
-        let value: serde_json::Value =
-            serde_json::from_str(&raw).map_err(|e| CliError::InvalidArgument {
-                message: format!("{path} is not valid JSON: {e}"),
-            })?;
+        // Admission before the value exists: a request arrives from the far end
+        // as bytes, and its self-signature is about to be checked over the
+        // canonical form of whatever those bytes denote.
+        let value = jcs::admit_document(raw.as_bytes()).map_err(|e| CliError::InvalidArgument {
+            message: format!("{path} was refused: {e}"),
+        })?;
 
         let request = cert::verify_request(&value).map_err(|e| CliError::DelegationError {
             message: format!(

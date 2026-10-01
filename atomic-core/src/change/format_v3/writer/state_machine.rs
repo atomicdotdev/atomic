@@ -154,6 +154,9 @@ pub struct ChangeWriter<'w, W: Write> {
     /// Tracks whether the DEPS section has been written.
     pub(super) wrote_deps_section: bool,
 
+    /// Tracks whether the SIGNATURE section has been written.
+    pub(super) wrote_signature_section: bool,
+
     /// The highest section ordering value written so far.
     /// Used to enforce monotonic section ordering.
     pub(super) last_section_ordering: Option<u8>,
@@ -187,6 +190,7 @@ impl<'w, W: Write> ChangeWriter<'w, W> {
             stats: WriterStats::default(),
             wrote_header_section: false,
             wrote_deps_section: false,
+            wrote_signature_section: false,
             last_section_ordering: None,
         }
     }
@@ -386,6 +390,57 @@ impl<'w, W: Write> ChangeWriter<'w, W> {
         // Wrap in a Vec for serialization (slices are unsized)
         let provenance_vec: Vec<&Provenance> = provenance.iter().collect();
         self.write_postcard_section(SectionType::Provenance, &provenance_vec)?;
+        Ok(())
+    }
+
+    /// Write the optional SIGNATURE section.
+    ///
+    /// Contains an Ed25519 signature over the change's *unsigned* content
+    /// hash, made with the signer's private key. The SIGNATURE section is a
+    /// hashed section, so it must be written with the writer's hasher paused
+    /// relative to the signature itself: the signature covers the unsigned
+    /// hash (computed by serializing without this section), while the file's
+    /// trailer hash covers the file including this section. See
+    /// [`ChangeSignature`](crate::change::format_v3::ChangeSignature) for the
+    /// two-level hashing model.
+    ///
+    /// # Arguments
+    ///
+    /// * `signature` - The signature payload (signer DID, Ed25519 signature,
+    ///   signed hash, timestamp, method).
+    ///
+    /// # Errors
+    ///
+    /// - [`FormatError::UnexpectedSection`] if DEPS hasn't been written yet,
+    ///   or if SIGNATURE was already written.
+    /// - Postcard serialization errors.
+    /// - Zstd compression errors.
+    /// - I/O errors.
+    pub fn write_signature(
+        &mut self,
+        signature: &crate::change::format_v3::ChangeSignature,
+    ) -> FormatResult<()> {
+        if self.state != WriterState::WritingMetadata {
+            return Err(FormatError::UnexpectedSection {
+                got: "SIGNATURE".to_string(),
+                expected: format!("state WRITING_METADATA, but was {}", self.state.name()),
+            });
+        }
+        if !self.wrote_deps_section {
+            return Err(FormatError::UnexpectedSection {
+                got: "SIGNATURE".to_string(),
+                expected: "DEPS section must be written first".to_string(),
+            });
+        }
+        if self.wrote_signature_section {
+            return Err(FormatError::UnexpectedSection {
+                got: "SIGNATURE (duplicate)".to_string(),
+                expected: "SIGNATURE section already written".to_string(),
+            });
+        }
+
+        self.write_postcard_section(SectionType::Signature, signature)?;
+        self.wrote_signature_section = true;
         Ok(())
     }
 

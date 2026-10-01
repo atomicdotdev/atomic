@@ -35,6 +35,8 @@ fn make_options<'a>(session: &'a AgentSession, event: &'a TurnEvent) -> TurnReco
         turn_number: 3,
         turn_duration_ms: 12400,
         prompt: Some("Fix the authentication bug in login.rs".to_string()),
+        agent_identity: None,
+        identity_dir: None,
     }
 }
 
@@ -869,6 +871,8 @@ fn test_record_turn_nonexistent_repo_fails() {
         turn_number: 3,
         turn_duration_ms: 5000,
         prompt: Some("Fix the bug".to_string()),
+        agent_identity: None,
+        identity_dir: None,
     };
 
     let result = record_turn(Path::new("/nonexistent/repo/path"), &options);
@@ -1109,6 +1113,8 @@ fn test_orphaned_session_view_duplicates_content_on_merge() {
         turn_number: 1,
         turn_duration_ms: 1000,
         prompt: Some("Bump step10".to_string()),
+        agent_identity: None,
+        identity_dir: None,
     };
     record_turn(repo_root, &options_a).unwrap();
 
@@ -1134,6 +1140,8 @@ fn test_orphaned_session_view_duplicates_content_on_merge() {
         turn_number: 1,
         turn_duration_ms: 1000,
         prompt: Some("Bump step70".to_string()),
+        agent_identity: None,
+        identity_dir: None,
     };
     record_turn(repo_root, &options_b)
         .expect("record_turn should self-heal an orphaned session view rather than fail");
@@ -1311,4 +1319,201 @@ fn scoped_snapshot_includes_requested_files_restored_to_clean_and_deletions() {
     let after = scope::snapshot(dir.path(), &["a.txt".into()]).unwrap();
     assert!(after["files"].as_object().unwrap().contains_key("a.txt"));
     assert!(after["files"]["a.txt"].is_null());
+}
+
+// Turn signing (end-to-end)
+//
+// A turn recorded with a selected agent identity must carry a signature by
+// the AGENT's key — the signature proves the header author's key claim, and
+// the two must name the same identity. These tests drive `record_turn` the
+// way hooks do, against a real repository and a real identity store.
+
+/// Set up a repository with one recorded file and a forked session view,
+/// ready for a turn to be recorded into.
+fn signed_turn_repo(repo_root: &Path) -> String {
+    use atomic_repository::Repository;
+
+    std::fs::write(repo_root.join("sign-me.txt"), "first\n").unwrap();
+    {
+        let mut repo = Repository::init(repo_root).unwrap();
+        repo.add(
+            "sign-me.txt",
+            atomic_repository::tracking::TrackingOptions::default(),
+        )
+        .unwrap();
+        let header = atomic_core::change::ChangeHeader::new("Add sign-me.txt");
+        let options = atomic_repository::record::RecordOptions::new()
+            .with_all(true)
+            .save_to_store(true)
+            .apply_after_record(true);
+        repo.record(header, options).unwrap();
+        repo.create_view_from("session-signed", "dev").unwrap();
+    }
+
+    "first\n".to_string()
+}
+
+fn record_signed_turn(
+    repo_root: &Path,
+    initial: &str,
+    agent_identity: Option<&str>,
+    identity_dir: Option<std::path::PathBuf>,
+) -> crate::record::TurnRecordOutcome {
+    let mut session = AgentSession::new("signed-sess", "claude-code", "Claude Code");
+    session.view_name = "session-signed".to_string();
+    session.set_parent_view("dev");
+
+    std::fs::write(repo_root.join("sign-me.txt"), "second\n").unwrap();
+    debug_assert_ne!(initial, "second\n");
+
+    let event = TurnEvent::new("signed-sess", HookType::TurnEnd);
+    let options = TurnRecordOptions {
+        session: &session,
+        event: &event,
+        turn_number: 1,
+        turn_duration_ms: 1000,
+        prompt: Some("Edit sign-me.txt".to_string()),
+        agent_identity: agent_identity.map(str::to_string),
+        identity_dir,
+    };
+    record_turn(repo_root, &options).unwrap()
+}
+
+#[test]
+fn a_turn_with_a_selected_agent_identity_is_signed_with_the_agents_key() {
+    use atomic_canonical::did::did_for_public_key;
+    use atomic_core::change::signing::verify_change_signature;
+    use atomic_identity::{Identity, IdentityStore, IdentityType, KeyPair};
+    use atomic_repository::Repository;
+    use tempfile::TempDir;
+
+    // An identity store holding a human default and a delegated agent
+    // identity, each with its own keypair on disk.
+    let id_dir = TempDir::new().unwrap();
+    let mut store = IdentityStore::open(id_dir.path()).unwrap();
+    let human_key = KeyPair::generate();
+    let human = Identity::builder("alice")
+        .email("alice@example.com")
+        .public_key(human_key.public.clone())
+        .build()
+        .unwrap();
+    store.save_with_keypair(&human, &human_key, None).unwrap();
+    store.set_default(&human.id).unwrap();
+    let agent_key = KeyPair::generate();
+    let agent = Identity::builder("alice+claude")
+        .identity_type(IdentityType::Agent)
+        .email("alice+claude@example.com")
+        .public_key(agent_key.public.clone())
+        .delegated_by(human.id)
+        .build()
+        .unwrap();
+    store.save_with_keypair(&agent, &agent_key, None).unwrap();
+    drop(store);
+
+    let repo_dir = TempDir::new().unwrap();
+    let initial = signed_turn_repo(repo_dir.path());
+    let outcome = record_signed_turn(
+        repo_dir.path(),
+        &initial,
+        Some("alice+claude"),
+        Some(id_dir.path().to_path_buf()),
+    );
+
+    // The turn's change carries a signature, made with the agent's key.
+    let repo = Repository::open_existing(repo_dir.path()).unwrap();
+    let change = repo.load_change(&outcome.hash).unwrap();
+    let signature = change.signature.as_ref().expect("turn must be signed");
+    assert_eq!(
+        signature.signer_did,
+        did_for_public_key(&agent.public_key),
+        "the signer must be the agent identity"
+    );
+    verify_change_signature(signature, agent.public_key.as_bytes(), &outcome.hash)
+        .expect("signature verifies against the agent's public key");
+
+    // Attribution and proof name the same identity: the header claims the
+    // agent's public key and the signature is made with its secret.
+    let author = change
+        .hashed
+        .header
+        .authors
+        .first()
+        .expect("turn change has an author");
+    assert_eq!(
+        author.identity.as_deref(),
+        Some(agent.public_key_base32().as_str())
+    );
+    assert_ne!(
+        author.identity.as_deref(),
+        Some(human.public_key_base32().as_str())
+    );
+
+    // And the human's key must NOT verify it — this is the forge direction.
+    assert!(
+        verify_change_signature(signature, human.public_key.as_bytes(), &outcome.hash).is_err()
+    );
+}
+
+#[test]
+fn a_turn_without_a_selected_identity_signs_with_the_default_identity() {
+    use atomic_canonical::did::did_for_public_key;
+    use atomic_core::change::signing::verify_change_signature;
+    use atomic_identity::{Identity, IdentityStore, KeyPair};
+    use atomic_repository::Repository;
+    use tempfile::TempDir;
+
+    // No agent identity selected — plus-tag attribution claims the human's
+    // key, and the turn signs with it, exactly like `atomic record`.
+    let id_dir = TempDir::new().unwrap();
+    let mut store = IdentityStore::open(id_dir.path()).unwrap();
+    let human_key = KeyPair::generate();
+    let human = Identity::builder("alice")
+        .email("alice@example.com")
+        .public_key(human_key.public.clone())
+        .build()
+        .unwrap();
+    store.save_with_keypair(&human, &human_key, None).unwrap();
+    store.set_default(&human.id).unwrap();
+    drop(store);
+
+    let repo_dir = TempDir::new().unwrap();
+    let initial = signed_turn_repo(repo_dir.path());
+    let outcome = record_signed_turn(
+        repo_dir.path(),
+        &initial,
+        None,
+        Some(id_dir.path().to_path_buf()),
+    );
+
+    let repo = Repository::open_existing(repo_dir.path()).unwrap();
+    let change = repo.load_change(&outcome.hash).unwrap();
+    let signature = change.signature.as_ref().expect("turn must be signed");
+    assert_eq!(signature.signer_did, did_for_public_key(&human.public_key));
+    verify_change_signature(signature, human.public_key.as_bytes(), &outcome.hash)
+        .expect("signature verifies against the human's public key");
+}
+
+#[test]
+fn a_turn_with_no_identity_store_records_unsigned() {
+    use atomic_repository::Repository;
+    use tempfile::TempDir;
+
+    // No identities anywhere: recording still works, and the change carries
+    // no signature — legacy behavior, unchanged.
+    let id_dir = TempDir::new().unwrap();
+    let repo_dir = TempDir::new().unwrap();
+    let initial = signed_turn_repo(repo_dir.path());
+    let outcome = record_signed_turn(
+        repo_dir.path(),
+        &initial,
+        None,
+        Some(id_dir.path().to_path_buf()),
+    );
+
+    let repo = Repository::open_existing(repo_dir.path()).unwrap();
+    let change = repo.load_change(&outcome.hash).unwrap();
+    assert!(
+        change.signature.is_none(),
+        "no identity store means no signature claim"
+    );
 }

@@ -204,6 +204,8 @@ impl TurnOrchestrator {
                     turn_number: session.turn_count.saturating_add(1),
                     turn_duration_ms: 0,
                     prompt: None,
+                    agent_identity: self.agent_identity.clone(),
+                    identity_dir: None,
                 };
                 if crate::record::scope::has_pending_changes(&self.repo_root, &options)? {
                     return Err(AgentError::RecordFailed {
@@ -328,6 +330,8 @@ impl TurnOrchestrator {
                         turn_number,
                         turn_duration_ms,
                         prompt,
+                        agent_identity: self.agent_identity.clone(),
+                        identity_dir: None,
                     };
 
                     match record_turn(&self.repo_root, &record_options) {
@@ -501,7 +505,10 @@ impl TurnOrchestrator {
             .open(canonical.join("turn-publication.lock"))
             .map_err(|error| failure(error.to_string()))?;
         let start = std::time::Instant::now();
-        let timeout = std::time::Duration::from_secs(10);
+        // N concurrent sessions serialize here, each publishing for seconds;
+        // the budget must cover the whole queue, not one publish. See
+        // `wait_budget` for the tuning rationale.
+        let timeout = super::wait_budget::publication_timeout();
         loop {
             match file.try_lock_exclusive() {
                 Ok(()) => return Ok(Some(TurnEndLockGuard { file })),

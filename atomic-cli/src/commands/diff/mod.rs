@@ -34,17 +34,74 @@
 //!   [FILES]...  Specific files to diff (default: all modified files)
 //!
 //! Options:
-//!   -c, --change <HASH>       Compare against a specific change
+//!   -c, --change <HASH>       Show a specific recorded change
 //!       --algorithm <ALG>     Diff algorithm (myers, patience) [default: myers]
 //!       --context <N>         Number of context lines [default: 3]
 //!       --stat                Show diffstat summary only
 //!       --no-color            Disable colored output
 //!       --word-diff           Enable token-level diff highlighting
-//!       --cached              Show staged changes (not yet implemented)
+//!       --json                Emit a versioned JSON document
 //!       --name-only           Show only names of changed files
 //!       --name-status         Show names and status of changed files
 //!   -h, --help                Print help information
 //! ```
+//!
+//! # Working Copy vs. Recorded Change
+//!
+//! `atomic diff` compares two different things depending on whether `-c` is
+//! given, and the distinction is the whole point of the command:
+//!
+//! | Invocation | Left side | Right side | Answers |
+//! |---|---|---|---|
+//! | `atomic diff` | the view's **recorded** state | your **working copy** on disk | "what have I changed but not recorded yet?" |
+//! | `atomic diff -c <HASH>` | the state **before** that change | the state **after** it | "what did change record `<HASH>` do?" |
+//!
+//! When the working copy is clean, `atomic diff` says so and names real,
+//! copy-pasteable `-c` commands for the most recent changes on the current
+//! view, so a clean working copy is a next step rather than a dead end.
+//!
+//! # JSON Output
+//!
+//! `--json` emits a versioned document and takes precedence over every text
+//! format selector (`--stat`, `--name-only`, `--name-status`):
+//!
+//! ```text
+//! $ atomic diff -c 5XGIB2VGQRAF --json
+//! {
+//!   "schema_version": 1,
+//!   "view": null,
+//!   "change": {
+//!     "hash": "5XGIB2VGQRAFC334ZU6LHH23X6FBST2S2I7GCC7SEFVO62KZ634A",
+//!     "short_hash": "5XGIB2VGQRAF",
+//!     "message": "Greet the world",
+//!     "authors": [{ "name": "bradley", "email": "bradley.hilton@atomic.dev" }],
+//!     "date": "2026-09-25T18:23:15Z"
+//!   },
+//!   "files": [{
+//!     "path": "main.rs",
+//!     "old_path": "main.rs",
+//!     "new_path": "main.rs",
+//!     "status": "modified",
+//!     "code": "M",
+//!     "insertions": 2,
+//!     "deletions": 1,
+//!     "hunks": [{
+//!       "old_start": 1, "old_count": 4,
+//!       "new_start": 1, "new_count": 5,
+//!       "lines": [
+//!         { "status": "removed", "content": "    println!(\"hi\");", "old_line": 2, "new_line": null },
+//!         { "status": "added",   "content": "    println!(\"hi, world\");", "old_line": null, "new_line": 2 }
+//!       ]
+//!     }]
+//!   }],
+//!   "stats": { "files": 1, "insertions": 2, "deletions": 1 }
+//! }
+//! ```
+//!
+//! `change` is `null` and `view` is set for working-copy diffs; `view` is
+//! `null` and `change` is set for `-c` diffs. `old_path`/`new_path` are
+//! `/dev/null` on the absent side of an add or delete. A diff with nothing to
+//! show still emits valid JSON with an empty `files` array.
 //!
 //! # Output Formats
 //!
@@ -102,6 +159,11 @@
 //! --- a/src/main.rs
 //! +++ b/src/main.rs
 //! ...
+//! ```
+//!
+//! Inspect a recorded change, as JSON:
+//! ```text
+//! $ atomic diff -c 5XGIB2VGQRAF --json
 //! ```
 //!
 //! Show changes for specific file:
@@ -167,14 +229,18 @@ use atomic_repository::Repository;
 use crate::commands::{find_repository_root, Command, DEFAULT_HASH_LENGTH};
 use crate::error::{CliError, CliResult};
 use crate::output::{
-    added, deleted, emphasis, hash, info, modified, path as style_path, print_info,
+    added, deleted, emphasis, hash, info, modified, path as style_path, print_hint, print_info,
 };
 
 mod command;
 mod format;
 mod helpers;
+mod json;
 mod output;
 mod types;
+
+/// How many recent changes the no-pending-changes hint offers to inspect.
+const RECENT_CHANGE_SUGGESTIONS: usize = 3;
 
 pub use command::*;
 pub(crate) use helpers::change_file_diffs;

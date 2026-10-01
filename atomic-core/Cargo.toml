@@ -24,6 +24,10 @@ fastcdc.workspace = true
 blake3.workspace = true
 xxhash-rust.workspace = true
 
+# Signing (change signatures)
+ed25519-dalek.workspace = true
+rand.workspace = true
+
 # Compression
 zstd.workspace = true
 
