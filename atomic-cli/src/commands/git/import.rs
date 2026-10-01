@@ -122,6 +122,13 @@ pub struct Import {
     #[arg(skip)]
     pub(crate) skip_checkpoint_refresh: bool,
 
+    /// Internal: verify the whole tree at every imported commit. A plain
+    /// `git import` verifies only the paths each commit touches, and the
+    /// whole tree at its last commit and at merges; bridge reconcile keeps
+    /// the full check.
+    #[arg(skip)]
+    pub(crate) full_tree_verification: bool,
+
     /// Internal §7.5 detached-HEAD import tip: the commits behind this commit
     /// import into `branch`'s view even though no local branch carries it.
     /// Never set from the command line; only the bridge reconcile path uses it
@@ -245,6 +252,7 @@ impl Import {
             target_view: branch_name.to_string(),
             known_states: known_states.clone(),
             validate_equivalence: true,
+            verify_touched_paths: !self.full_tree_verification,
         };
 
         let importer = ParallelImporter::new(git_repo, options);
@@ -768,6 +776,7 @@ impl Command for Import {
                 target_view: branch_name.clone(),
                 known_states: known_states.clone(),
                 validate_equivalence: false,
+                verify_touched_paths: false,
             };
             let plan = ParallelImporter::new(&git_repo, options)
                 .validate_branch_prospectively_for_tip(

@@ -538,6 +538,13 @@ pub struct StagedTreeExpectation {
     /// pure moves, binary content, and opaque generated files are excluded
     /// by the caller.
     pub semantic_paths: Vec<String>,
+    /// When set, the staged check covers only these paths: `entries` holds
+    /// just the ones still present, and only these may be refused as
+    /// extras. `git import` sets it for single-parent commits before its last
+    /// one, since every untouched path was verified with an earlier commit;
+    /// the last commit and merges verify the whole tree. `None` checks every
+    /// path.
+    pub verify_paths: Option<std::collections::BTreeSet<String>>,
 }
 
 impl StagedExpectation {
@@ -3424,6 +3431,10 @@ impl Repository {
             if expected_tree.entries.contains_key(path)
                 || crate::repository::project_tree::atomic_private_path(path.as_bytes())
                 || crate::repository::project_tree::bridge_private_path(path.as_bytes())
+                || expected_tree
+                    .verify_paths
+                    .as_ref()
+                    .is_some_and(|paths| !paths.contains(path))
             {
                 continue;
             }

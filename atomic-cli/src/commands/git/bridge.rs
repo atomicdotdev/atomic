@@ -1869,6 +1869,7 @@ fn import_git_to_atomic_budgeted(root: &Path, budget: ReconcileEffectBudget) -> 
         no_vault: true,
         with_crdt: false,
         skip_checkpoint_refresh: true,
+        full_tree_verification: true,
         detached_tip,
         reactive_budget: (budget.is_metadata_only()).then_some(budget),
         ..Import::default()
