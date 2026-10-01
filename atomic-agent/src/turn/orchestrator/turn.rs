@@ -505,7 +505,10 @@ impl TurnOrchestrator {
             .open(canonical.join("turn-publication.lock"))
             .map_err(|error| failure(error.to_string()))?;
         let start = std::time::Instant::now();
-        let timeout = std::time::Duration::from_secs(10);
+        // N concurrent sessions serialize here, each publishing for seconds;
+        // the budget must cover the whole queue, not one publish. See
+        // `wait_budget` for the tuning rationale.
+        let timeout = super::wait_budget::publication_timeout();
         loop {
             match file.try_lock_exclusive() {
                 Ok(()) => return Ok(Some(TurnEndLockGuard { file })),

@@ -41,7 +41,15 @@ fn wait_for_output(mut child: Child, operation: &str) -> Output {
     }
     let stdout = drain(child.stdout.take());
     let stderr = drain(child.stderr.take());
-    let deadline = Instant::now() + Duration::from_secs(30);
+    // CI runners (2-core Windows especially) run many serialized hook
+    // processes; a single child can legitimately wait on the publication
+    // lock for a large fraction of the whole queue. Generous by default,
+    // overridable when even that is not enough.
+    let process_timeout = std::env::var("ATOMIC_TEST_PROCESS_TIMEOUT_SECS")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .map_or(120, |secs| secs.max(5));
+    let deadline = Instant::now() + Duration::from_secs(process_timeout);
     let (status, timed_out) = loop {
         if let Some(status) = child.try_wait().expect("inspect child process") {
             break (status, false);
@@ -64,7 +72,7 @@ fn wait_for_output(mut child: Child, operation: &str) -> Output {
         });
     assert!(
         !timed_out,
-        "{operation} timed out after 30s; stdout: {}; stderr: {}",
+        "{operation} timed out after {process_timeout}s; stdout: {}; stderr: {}",
         String::from_utf8_lossy(&stdout),
         String::from_utf8_lossy(&stderr)
     );
@@ -72,6 +80,26 @@ fn wait_for_output(mut child: Child, operation: &str) -> Output {
         status,
         stdout,
         stderr,
+    }
+}
+
+// Hook-failure diagnostics: assert the exit status with the child's full
+// captured output. Printing stderr alone produced empty panic messages on CI
+// (a non-zero exit with no stderr), leaving nothing to debug from.
+fn assert_hook_success(operation: &str, output: &Output) {
+    assert!(
+        output.status.success(),
+        "{operation} exited with {}: stdout: {}; stderr: {}",
+        show_status(&output.status),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn show_status(status: &std::process::ExitStatus) -> String {
+    match status.code() {
+        Some(code) => format!("exit code {code}"),
+        None => format!("{status}"),
     }
 }
 
@@ -127,7 +155,9 @@ fn run_owner(repository: &std::path::Path, operation: &str) -> Output {
 }
 
 fn wait_for_ping(repository: &std::path::Path, child: &mut Child) -> Value {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    // Each poll spawns a fresh debug-build process; on slow CI runners a
+    // single spawn can take seconds, so give the loop real headroom.
+    let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         let output = run_owner(repository, "ping");
         if output.status.success() {
@@ -350,7 +380,7 @@ fn wait_for_shutdown(repository: &std::path::Path) {
         .write(true)
         .open(path)
         .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         match lock.try_lock_exclusive() {
             Ok(()) => {
@@ -1218,11 +1248,7 @@ fn concurrent_stops_publish_ordered_ledgers_without_external_serialization() {
             "session-start",
             &serde_json::to_vec(&serde_json::json!({"session_id":session})).unwrap(),
         );
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+        assert_hook_success(&format!("session-start {session}"), &output);
     }
     for round in 0..2 {
         for session in &sessions {
@@ -1234,11 +1260,7 @@ fn concurrent_stops_publish_ordered_ledgers_without_external_serialization() {
                 )
                 .unwrap(),
             );
-            assert!(
-                output.status.success(),
-                "{}",
-                String::from_utf8_lossy(&output.stderr)
-            );
+            assert_hook_success(&format!("round {round} prompt {session}"), &output);
         }
         // First round includes an actual change. The second is read-only.
         if round == 0 {
@@ -1270,11 +1292,7 @@ fn concurrent_stops_publish_ordered_ledgers_without_external_serialization() {
         drop(held_repository);
         for child in children {
             let output = child.join().unwrap();
-            assert!(
-                output.status.success(),
-                "{}",
-                String::from_utf8_lossy(&output.stderr)
-            );
+            assert_hook_success(&format!("round {round} concurrent stop"), &output);
             assert!(
                 output.stderr.is_empty(),
                 "{}",
@@ -1288,11 +1306,7 @@ fn concurrent_stops_publish_ordered_ledgers_without_external_serialization() {
             "stop",
             &serde_json::to_vec(&serde_json::json!({"session_id":session})).unwrap(),
         );
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+        assert_hook_success(&format!("final stop {session}"), &output);
     }
     assert!(run_owner(&repository, "shutdown").status.success());
     wait_for_shutdown(&repository);
