@@ -572,7 +572,7 @@ fn run_bounded_command(
     timeout: Duration,
     output_limit: usize,
 ) -> Result<Vec<u8>, String> {
-    let command = command.replace("%f", &path.to_string_lossy());
+    let command = expand_path_placeholder(command, path)?;
     #[cfg(unix)]
     let mut child = Command::new("sh")
         .args(["-c", &command])
@@ -630,6 +630,48 @@ fn run_bounded_command(
         ));
     }
     Ok(stdout)
+}
+
+/// Substitute `%f` in a driver command with the path, which must reach the
+/// driver as one literal argument whatever characters it contains.
+#[cfg(unix)]
+fn expand_path_placeholder(command: &str, path: &Path) -> Result<String, String> {
+    Ok(command.replace("%f", &git_sq_quote(&path.to_string_lossy())))
+}
+
+/// `cmd.exe` has no quoting that neutralizes every metacharacter across its
+/// expansion phases, so a path that contains one is refused rather than
+/// substituted. The driver is reported as failed and never runs with it.
+#[cfg(windows)]
+fn expand_path_placeholder(command: &str, path: &Path) -> Result<String, String> {
+    const CMD_METACHARACTERS: [char; 7] = ['&', '|', '<', '>', '^', '%', '"'];
+    let path = path.to_string_lossy();
+    if command.contains("%f") && path.contains(CMD_METACHARACTERS) {
+        return Err(format!(
+            "refusing to pass '{path}' to a cmd.exe filter command: the path contains cmd metacharacters"
+        ));
+    }
+    Ok(command.replace("%f", &path))
+}
+
+/// Git's `sq_quote_buf` (quote.c), which Git uses to substitute `%f`: wrap in
+/// single quotes, and write each `'` or `!` as a backslash escape outside them.
+#[cfg(unix)]
+fn git_sq_quote(text: &str) -> String {
+    let mut quoted = String::with_capacity(text.len() + 2);
+    quoted.push('\'');
+    for character in text.chars() {
+        if matches!(character, '\'' | '!') {
+            quoted.push('\'');
+            quoted.push('\\');
+            quoted.push(character);
+            quoted.push('\'');
+        } else {
+            quoted.push(character);
+        }
+    }
+    quoted.push('\'');
+    quoted
 }
 
 fn read_bounded(mut reader: impl Read, limit: usize) -> Result<Vec<u8>, String> {
@@ -811,6 +853,58 @@ mod tests {
         assert!(GitAttributesFilter::new(temp.path(), config)
             .clean(Path::new("x.dat"), b"")
             .is_err());
+    }
+
+    /// Git hands `%f` to a driver as one literal argument (it substitutes the
+    /// shell-quoted path, `sq_quote_buf` in `convert.c`). The driver here just
+    /// prints the argument it received, so any shell interpretation of the
+    /// path shows up as a different output.
+    #[cfg(unix)]
+    #[test]
+    fn driver_receives_the_path_verbatim_as_one_argument() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join(".gitattributes"), "* filter=echo-path\n").unwrap();
+        let mut config = ContentFilterConfig::default();
+        config.drivers.insert(
+            "echo-path".into(),
+            ExternalFilterConfig {
+                clean: Some("printf '%s' %f".into()),
+                required: true,
+                ..ExternalFilterConfig::default()
+            },
+        );
+        let filter = GitAttributesFilter::new(temp.path(), config);
+        for name in [
+            "plain.txt",
+            "with space.txt",
+            "it's.txt",
+            "semi;colon.txt",
+            "x$(echo INJECTED).txt",
+            "tick`echo INJECTED`.txt",
+            "dollar$HOME.txt",
+            "bang!.txt",
+            "quote\"d.txt",
+            "star*.txt",
+            "new\nline.txt",
+        ] {
+            let output = filter
+                .clean(Path::new(name), b"")
+                .unwrap_or_else(|error| panic!("{name:?}: {error}"));
+            assert_eq!(
+                String::from_utf8_lossy(&output.bytes),
+                name,
+                "the driver must receive {name:?} verbatim"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sq_quote_matches_git() {
+        assert_eq!(git_sq_quote("a.txt"), "'a.txt'");
+        assert_eq!(git_sq_quote("it's"), r"'it'\''s'");
+        assert_eq!(git_sq_quote("a!b"), r"'a'\!'b'");
+        assert_eq!(git_sq_quote(""), "''");
     }
 
     #[test]
