@@ -505,8 +505,7 @@ fn concurrent_hooks_commit_lossless_envelopes_without_output_or_drops() {
     wait_for_shutdown(&repository);
 
     let store =
-        RedbChangeStore::open(Repository::canonical_change_store_path(&repository).unwrap())
-            .unwrap();
+        RedbChangeStore::open(Repository::canonical_database_path(&repository).unwrap()).unwrap();
     let turn = store
         .get_provenance_turn_for("hook-concurrent", 1)
         .unwrap()
@@ -740,8 +739,7 @@ fn lifecycle_stop_resume_zombie_abandon_and_lease_expiry() {
     assert!(run_owner(&repository, "shutdown").status.success());
     wait_for_shutdown(&repository);
     let store =
-        RedbChangeStore::open(Repository::canonical_change_store_path(&repository).unwrap())
-            .unwrap();
+        RedbChangeStore::open(Repository::canonical_database_path(&repository).unwrap()).unwrap();
     let abandoned_turn = store
         .get_provenance_turn_for("lifecycle-session", 1)
         .unwrap()
@@ -806,7 +804,7 @@ fn owner_death_before_and_after_event_commit_retries_exactly_once() {
         assert!(run_owner(&repository, "shutdown").status.success());
         wait_for_shutdown(&repository);
         let store =
-            RedbChangeStore::open(Repository::canonical_change_store_path(&repository).unwrap())
+            RedbChangeStore::open(Repository::canonical_database_path(&repository).unwrap())
                 .unwrap();
         let turn = store
             .get_provenance_turn_for("event-crash", 1)
@@ -872,7 +870,7 @@ fn owner_batch_crash_retries_the_whole_durable_batch_exactly_once() {
         assert!(!wait_for_output(owner, "batch failpoint owner")
             .status
             .success());
-        let path = Repository::canonical_change_store_path(&repository).unwrap();
+        let path = Repository::canonical_database_path(&repository).unwrap();
         let store = RedbChangeStore::open(&path).unwrap();
         let events = store
             .load_provenance_envelopes(atomic_repository::redb_change_store::ProvenanceId::new(id))
@@ -957,7 +955,7 @@ fn owner_death_after_checkpoint_prepare_and_bind_recovers_in_hook_process() {
         assert!(run_owner(&repository, "shutdown").status.success());
         wait_for_shutdown(&repository);
         let store =
-            RedbChangeStore::open(Repository::canonical_change_store_path(&repository).unwrap())
+            RedbChangeStore::open(Repository::canonical_database_path(&repository).unwrap())
                 .unwrap();
         let turn = store
             .get_provenance_turn_for("checkpoint-crash", 1)
@@ -1085,8 +1083,8 @@ fn legacy_graph_pending_delta_imports_once_then_json_authority_is_removed() {
 
     assert!(run_owner(&repository, "shutdown").status.success());
     wait_for_shutdown(&repository);
-    let redb = RedbChangeStore::open(Repository::canonical_change_store_path(&repository).unwrap())
-        .unwrap();
+    let redb =
+        RedbChangeStore::open(Repository::canonical_database_path(&repository).unwrap()).unwrap();
     let turn = redb
         .get_provenance_turn_for("legacy-session", 1)
         .unwrap()
@@ -1177,8 +1175,8 @@ fn turn_end_publishes_one_checkpoint_turn_and_advances_head() {
     assert!(run_owner(&repository, "shutdown").status.success());
     wait_for_shutdown(&repository);
 
-    let redb = RedbChangeStore::open(Repository::canonical_change_store_path(&repository).unwrap())
-        .unwrap();
+    let redb =
+        RedbChangeStore::open(Repository::canonical_database_path(&repository).unwrap()).unwrap();
     let completed = redb
         .get_provenance_turn_for("checkpoint-e2e", 1)
         .unwrap()
@@ -1490,8 +1488,7 @@ fn large_checkpoint_fixture(
     // Seed valid, durably committed envelopes using the same store API as the
     // owner. Avoid 1024 CLI bootstraps; the actual Stop still runs in a process.
     let store =
-        RedbChangeStore::open(Repository::canonical_change_store_path(&repository).unwrap())
-            .unwrap();
+        RedbChangeStore::open(Repository::canonical_database_path(&repository).unwrap()).unwrap();
     let turn = store
         .get_provenance_turn_for("large-checkpoint", 1)
         .unwrap()
@@ -1579,11 +1576,12 @@ fn large_checkpoint_fixture(
     for index in 0..count {
         assert!(tools.contains(format!("large-{index}").as_str()));
     }
+    // The store below opens the same atomic.redb file.
+    drop(repo);
     assert!(run_owner(&repository, "shutdown").status.success());
     wait_for_shutdown(&repository);
     let store =
-        RedbChangeStore::open(Repository::canonical_change_store_path(&repository).unwrap())
-            .unwrap();
+        RedbChangeStore::open(Repository::canonical_database_path(&repository).unwrap()).unwrap();
     let completed = store
         .get_provenance_turn_for("large-checkpoint", 1)
         .unwrap()
@@ -1654,8 +1652,7 @@ fn failed_frozen_read_resumes_recorded_changes_on_next_stop() {
     owner.wait().unwrap();
     wait_for_shutdown(&repository);
     let store =
-        RedbChangeStore::open(Repository::canonical_change_store_path(&repository).unwrap())
-            .unwrap();
+        RedbChangeStore::open(Repository::canonical_database_path(&repository).unwrap()).unwrap();
     let prepared = store
         .get_provenance_turn_for("retry-frozen", 1)
         .unwrap()
@@ -1678,8 +1675,7 @@ fn failed_frozen_read_resumes_recorded_changes_on_next_stop() {
     assert!(run_owner(&repository, "shutdown").status.success());
     wait_for_shutdown(&repository);
     let store =
-        RedbChangeStore::open(Repository::canonical_change_store_path(&repository).unwrap())
-            .unwrap();
+        RedbChangeStore::open(Repository::canonical_database_path(&repository).unwrap()).unwrap();
     let completed = store
         .get_provenance_turn_for("retry-frozen", 1)
         .unwrap()
@@ -1693,6 +1689,7 @@ fn failed_frozen_read_resumes_recorded_changes_on_next_stop() {
     assert_eq!(completed.source, prepared.source);
     assert_eq!(completed.frozen_event_count, prepared.frozen_event_count);
     assert_eq!(completed.attempt_generation, prepared.attempt_generation);
+    drop(store);
     let repo = Repository::open(&repository).unwrap();
     let (_, ledger) = repo.get_session_ledger("retry-frozen").unwrap().unwrap();
     assert_eq!(ledger.len(), 1);
@@ -1814,6 +1811,106 @@ fn crashing_second_checkpoint_keeps_first_turn_immutable() {
     assert_eq!(turns.len(), 2);
     assert_eq!(turns[0].provenance_hash, first_hash);
     assert_ne!(turns[1].provenance_hash, first_hash);
+}
+
+#[test]
+#[serial]
+fn live_owner_releases_the_repository_database_between_requests() {
+    let temp = TempDir::new().unwrap();
+    let repository = temp.path().join("repo");
+    drop(Repository::init(&repository).unwrap());
+    let mut owner = spawn_owner(&repository);
+    wait_for_ping(&repository, &mut owner);
+    assert_eq!(reserve(&repository)["committed"], true);
+
+    // The journal shares atomic.redb with the graph, so an idle owner must not
+    // hold it or every other atomic process would be locked out.
+    let held = Repository::open_existing_wait(&repository, Duration::from_secs(10))
+        .expect("an idle owner leaves the repository database free");
+
+    // A busy database neither makes the owner look dead nor fails a request
+    // that can wait for it.
+    assert!(run_owner(&repository, "ping").status.success());
+    let waiting = thread::spawn({
+        let repository = repository.clone();
+        move || reserve(&repository)
+    });
+    thread::sleep(Duration::from_millis(300));
+    drop(held);
+    assert_eq!(waiting.join().unwrap()["committed"], true);
+
+    assert!(run_owner(&repository, "shutdown").status.success());
+    wait_for_shutdown(&repository);
+    owner.wait().expect("reap owner");
+}
+
+#[test]
+#[serial]
+fn owner_starts_while_another_process_holds_the_database() {
+    let temp = TempDir::new().unwrap();
+    let repository = temp.path().join("repo");
+    drop(Repository::init(&repository).unwrap());
+    let held = Repository::open_existing(&repository).unwrap();
+
+    // Clients give a starting owner only a short window to answer pings, so
+    // startup must not wait for the database.
+    let started = run_owner(&repository, "start");
+    assert!(
+        started.status.success(),
+        "owner start failed: {}",
+        String::from_utf8_lossy(&started.stderr)
+    );
+    let waiting = thread::spawn({
+        let repository = repository.clone();
+        move || reserve(&repository)
+    });
+    thread::sleep(Duration::from_millis(300));
+    drop(held);
+    assert_eq!(waiting.join().unwrap()["committed"], true);
+
+    assert!(run_owner(&repository, "shutdown").status.success());
+    wait_for_shutdown(&repository);
+}
+
+#[test]
+#[serial]
+fn owner_merges_a_legacy_layout_before_serving() {
+    let temp = TempDir::new().unwrap();
+    let repository = temp.path().join("repo");
+    drop(Repository::init(&repository).unwrap());
+    let dot_dir = repository.join(".atomic");
+    std::fs::rename(
+        dot_dir.join(atomic_repository::DATABASE_FILE),
+        dot_dir.join(atomic_repository::LEGACY_PRISTINE_FILE),
+    )
+    .unwrap();
+    let legacy_turn =
+        RedbChangeStore::open(dot_dir.join(atomic_repository::LEGACY_CHANGE_STORE_FILE))
+            .unwrap()
+            .reserve_provenance_turn("owner-service-test", 7, 1_700_000_000)
+            .unwrap();
+
+    let mut owner = spawn_owner(&repository);
+    wait_for_ping(&repository, &mut owner);
+    assert_eq!(reserve(&repository)["committed"], true);
+    assert!(run_owner(&repository, "shutdown").status.success());
+    wait_for_shutdown(&repository);
+    owner.wait().expect("reap owner");
+
+    assert!(dot_dir.join(atomic_repository::DATABASE_FILE).is_file());
+    assert!(!dot_dir
+        .join(atomic_repository::LEGACY_PRISTINE_FILE)
+        .exists());
+    assert!(!dot_dir
+        .join(atomic_repository::LEGACY_CHANGE_STORE_FILE)
+        .exists());
+    let store =
+        RedbChangeStore::open(Repository::canonical_database_path(&repository).unwrap()).unwrap();
+    let merged_turn = store
+        .get_provenance_turn_for("owner-service-test", 7)
+        .unwrap()
+        .expect("the reserved turn survives the merge");
+    assert_eq!(merged_turn.provenance_id, legacy_turn.provenance_id);
 }
 
 #[test]
