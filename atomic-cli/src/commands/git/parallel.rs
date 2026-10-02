@@ -9498,6 +9498,9 @@ mod tests {
                 clone_temp.path().to_str().unwrap(),
             ])
             .env("GIT_TERMINAL_PROMPT", "0")
+            // Sibling tests move the process's cwd into their own temp dirs;
+            // never let git start from one that has since been deleted.
+            .current_dir(source_temp.path())
             .output()
             .expect("run git clone --depth 1");
         assert!(

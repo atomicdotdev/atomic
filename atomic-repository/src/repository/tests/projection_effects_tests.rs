@@ -22,6 +22,37 @@ use std::fs;
 use std::process::Command;
 use std::thread;
 
+/// The failpoints and inside-window injections are armed through the
+/// process-wide environment, which every test in this binary shares. Arming
+/// takes this lock so two arming tests never overlap, and names the test's
+/// repository root so a sibling test publishing in the same window is left
+/// alone (see `injection_applies_to`).
+#[cfg(feature = "adoption-test-injection")]
+static INJECTION_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(feature = "adoption-test-injection")]
+struct ArmedInjection {
+    _serialized: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(feature = "adoption-test-injection")]
+impl Drop for ArmedInjection {
+    fn drop(&mut self) {
+        std::env::remove_var("ATOMIC_TEST_INJECT_ROOT");
+    }
+}
+
+#[cfg(feature = "adoption-test-injection")]
+fn arm_injection_for(repo: &Repository) -> ArmedInjection {
+    let serialized = INJECTION_ENV
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    std::env::set_var("ATOMIC_TEST_INJECT_ROOT", repo.root());
+    ArmedInjection {
+        _serialized: serialized,
+    }
+}
+
 /// Run one `git` command in `root` and assert success.
 fn run_git(root: &Path, args: &[&str]) -> String {
     let output = Command::new("git")
@@ -547,6 +578,7 @@ fn finalize_requires_every_effect_receipt() {
         .unwrap();
     // Crash after the first effect's receipt (the ref) — the HEAD effect
     // never landed, so its receipt is missing.
+    let _injection = arm_injection_for(&repo);
     std::env::set_var("ATOMIC_FAIL_PROJECTION_AFTER_REF", "1");
     let crashed = repo.execute_projection_publish(&prepared, &git);
     std::env::remove_var("ATOMIC_FAIL_PROJECTION_AFTER_REF");
@@ -980,6 +1012,7 @@ fn ref_third_value_inside_the_lock_window_is_receipted_and_preserved() {
             evidence,
         )
         .unwrap();
+    let _injection = arm_injection_for(&repo);
     std::env::set_var(
         "ATOMIC_TEST_INJECT_REF_BEFORE_LOCK",
         format!("refs/atomic/views/agent={external}"),
@@ -1070,6 +1103,7 @@ fn head_third_value_inside_the_lock_window_is_receipted_and_preserved() {
             evidence,
         )
         .unwrap();
+    let _injection = arm_injection_for(&repo);
     std::env::set_var("ATOMIC_TEST_INJECT_HEAD_BEFORE_LOCK", format!("{external}"));
     let executed = repo.execute_projection_publish(&prepared, &git);
     std::env::remove_var("ATOMIC_TEST_INJECT_HEAD_BEFORE_LOCK");
@@ -1137,6 +1171,7 @@ fn ref_landing_the_intended_value_inside_the_window_is_recovered_not_rejected() 
             evidence,
         )
         .unwrap();
+    let _injection = arm_injection_for(&repo);
     std::env::set_var(
         "ATOMIC_TEST_INJECT_REF_BEFORE_LOCK",
         format!("refs/atomic/views/agent={target}"),
@@ -1244,6 +1279,7 @@ fn checkpoint_replaced_inside_the_write_window_is_preserved_and_receipted() {
         prepared_bytes, external_bytes,
         "the external writer's bytes are genuinely different"
     );
+    let _injection = arm_injection_for(&repo);
     std::env::set_var("ATOMIC_TEST_INJECT_CHECKPOINT_BEFORE_WRITE", &injection);
     let executed = repo.execute_projection_publish(&prepared, &git);
     std::env::remove_var("ATOMIC_TEST_INJECT_CHECKPOINT_BEFORE_WRITE");

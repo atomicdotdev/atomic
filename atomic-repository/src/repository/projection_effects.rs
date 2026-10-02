@@ -658,6 +658,8 @@ impl Repository {
                     })
                 }
             }
+            #[cfg(feature = "adoption-test-injection")]
+            let failpoint = failpoint.filter(|_| injection_applies_to(self.root()));
             projection_failpoint(failpoint)?;
         }
         Ok(())
@@ -889,7 +891,7 @@ impl Repository {
         // Deterministic inside-window seam (opt-in instrumentation, review
         // ATOM::aaron::2): an external writer's value may land between the
         // lease's initial observation and the ref-transaction lock.
-        inject_external_ref_before_lock(git)?;
+        inject_external_ref_before_lock(self.root(), git)?;
         let mut applied = false;
         for _ in 0..MAX_REOBSERVATIONS {
             let mut transaction = git
@@ -1002,7 +1004,7 @@ impl Repository {
         // Deterministic inside-window seam (opt-in instrumentation, review
         // ATOM::aaron::2): an external writer's value may land between the
         // lease's initial observation and the HEAD ref-transaction lock.
-        inject_external_head_before_lock(git)?;
+        inject_external_head_before_lock(self.root(), git)?;
         let mut applied = false;
         for _ in 0..MAX_REOBSERVATIONS {
             let mut transaction = git
@@ -1284,6 +1286,22 @@ fn projection_failpoint(name: Option<&str>) -> Result<(), RepositoryError> {
     Ok(())
 }
 
+/// Scope of the opt-in instrumentation in this module. In-process tests share
+/// one environment with every other test in the binary, so a test that arms
+/// a failpoint or an injection names its repository root in
+/// `ATOMIC_TEST_INJECT_ROOT`; the executor of any other repository then leaves
+/// the instrumentation alone instead of inheriting a sibling test's writer.
+/// Unset, the instrumentation applies as before (a subprocess harness owns
+/// its whole environment).
+#[cfg(feature = "adoption-test-injection")]
+fn injection_applies_to(root: &Path) -> bool {
+    let Some(scope) = std::env::var_os("ATOMIC_TEST_INJECT_ROOT") else {
+        return true;
+    };
+    let canonical = |path: &Path| path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    canonical(Path::new(&scope)) == canonical(root)
+}
+
 /// Deterministic inside-window external-writer injections (opt-in
 /// instrumentation, review ATOM::aaron::2): compiled only with the
 /// `adoption-test-injection` feature. Each named environment variable makes
@@ -1300,9 +1318,15 @@ fn projection_failpoint(name: Option<&str>) -> Result<(), RepositoryError> {
 /// - `ATOMIC_TEST_INJECT_CHECKPOINT_BEFORE_WRITE` = `<path>`: the checkpoint
 ///   file is replaced with the bytes at that path before the re-observation
 ///   guard and the canonical write.
-fn inject_external_ref_before_lock(git: &GitRepository) -> Result<(), RepositoryError> {
+fn inject_external_ref_before_lock(
+    root: &Path,
+    git: &GitRepository,
+) -> Result<(), RepositoryError> {
     #[cfg(feature = "adoption-test-injection")]
     {
+        if !injection_applies_to(root) {
+            return Ok(());
+        }
         if let Some(value) = std::env::var_os("ATOMIC_TEST_INJECT_REF_BEFORE_LOCK") {
             let spec = value.to_string_lossy();
             let Some((name, oid)) = spec.split_once('=') else {
@@ -1324,14 +1348,20 @@ fn inject_external_ref_before_lock(git: &GitRepository) -> Result<(), Repository
     }
     #[cfg(not(feature = "adoption-test-injection"))]
     {
-        let _ = git;
+        let _ = (root, git);
     }
     Ok(())
 }
 
-fn inject_external_head_before_lock(git: &GitRepository) -> Result<(), RepositoryError> {
+fn inject_external_head_before_lock(
+    root: &Path,
+    git: &GitRepository,
+) -> Result<(), RepositoryError> {
     #[cfg(feature = "adoption-test-injection")]
     {
+        if !injection_applies_to(root) {
+            return Ok(());
+        }
         if let Some(value) = std::env::var_os("ATOMIC_TEST_INJECT_HEAD_BEFORE_LOCK") {
             let oid: git2::Oid = value
                 .to_string_lossy()
@@ -1343,7 +1373,7 @@ fn inject_external_head_before_lock(git: &GitRepository) -> Result<(), Repositor
     }
     #[cfg(not(feature = "adoption-test-injection"))]
     {
-        let _ = git;
+        let _ = (root, git);
     }
     Ok(())
 }
@@ -1351,6 +1381,9 @@ fn inject_external_head_before_lock(git: &GitRepository) -> Result<(), Repositor
 fn inject_external_checkpoint_before_write(root: &Path) -> Result<(), RepositoryError> {
     #[cfg(feature = "adoption-test-injection")]
     {
+        if !injection_applies_to(root) {
+            return Ok(());
+        }
         if let Some(value) = std::env::var_os("ATOMIC_TEST_INJECT_CHECKPOINT_BEFORE_WRITE") {
             let path = PathBuf::from(value);
             let bytes = fs::read(&path).map_err(|error| {
