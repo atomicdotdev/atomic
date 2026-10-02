@@ -23,10 +23,11 @@ use std::path::Path;
 use std::process::Command;
 
 use atomic_core::change::ChangeHeader;
-use atomic_core::{GitHashAlgorithm, WorkingCopyId};
+use atomic_core::WorkingCopyId;
 use atomic_repository::record::RecordOptions;
 use atomic_repository::{
-    observe_staging_state, ConversionPolicy, Repository, StageCode, StagingNotice, StagingState,
+    conversion_policy_for_git, observe_staging_state, ConversionPolicy, Repository, StageCode,
+    StagingNotice, StagingState,
 };
 use tempfile::TempDir;
 
@@ -114,12 +115,17 @@ impl Colocated {
             RecordOptions::new().add_path("f.txt"),
         )
         .unwrap();
+        // Build the policy the way the bridge does for a live repository so
+        // its platform facts match what the observer detects (macOS Git sets
+        // core.ignorecase and core.precomposeunicode).
+        let git = git2::Repository::open(&root).unwrap();
+        let policy = conversion_policy_for_git(&git).unwrap();
         Self {
             temp,
             root,
             repo,
             working_copy,
-            policy: ConversionPolicy::new(GitHashAlgorithm::Sha1),
+            policy,
         }
     }
 

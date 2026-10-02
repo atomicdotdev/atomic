@@ -29,18 +29,23 @@ fn materialized_directory_mode() -> u32 {
     0o666
 }
 
-/// The mode the lease should expect for a directory recorded with `recorded`
-/// permissions: the recorded bits where the platform applies them, else the
-/// platform's own directory mode (Windows has no permission bits to set, so
-/// the observation after materialization is always `0o666`).
+/// The mode the lease should expect for an entry recorded with `recorded`
+/// permissions: the recorded bits where the platform applies them. Windows
+/// has only a read-only flag, so an entry is observed as `0o444` when the
+/// recorded mode has no owner-write bit and `0o666` otherwise (the same
+/// mapping `set_mode` applies and `metadata_mode` reads back).
 #[cfg(unix)]
-fn planned_directory_mode(recorded: u32) -> u32 {
+fn planned_mode(recorded: u32) -> u32 {
     recorded
 }
 
 #[cfg(not(unix))]
-fn planned_directory_mode(_recorded: u32) -> u32 {
-    materialized_directory_mode()
+fn planned_mode(recorded: u32) -> u32 {
+    if recorded & 0o200 == 0 {
+        0o444
+    } else {
+        0o666
+    }
 }
 
 fn remove_existing_for_kind(path: &Path) -> Result<(), RepositoryError> {
@@ -1861,9 +1866,9 @@ impl Repository {
                 {
                     desired.insert(
                         item.path.clone(),
-                        super::operation::filesystem_directory_value(planned_directory_mode(
-                            u32::from(item.metadata.permissions),
-                        )),
+                        super::operation::filesystem_directory_value(planned_mode(u32::from(
+                            item.metadata.permissions,
+                        ))),
                     );
                 }
             }
@@ -1890,7 +1895,7 @@ impl Repository {
                             mode: if kind == FileKind::Symlink {
                                 u32::from(atomic_core::output::platform_symlink_mode())
                             } else {
-                                u32::from(materialization.mode)
+                                planned_mode(u32::from(materialization.mode))
                             },
                             content: rendered.1,
                         }),
