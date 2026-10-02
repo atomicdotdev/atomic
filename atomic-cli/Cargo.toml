@@ -1,6 +1,7 @@
 [features]
 default = ["teams"]
 remote = []
+dsse-export = ["atomic-canonical/dsse-export"]
 teams = ["atomic-teams"]
 
 [package]

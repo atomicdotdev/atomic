@@ -208,10 +208,8 @@ impl Command for Context {
         let md = render_md(&items);
         if as_json {
             println!("{}", render_json(&items, &md, self, limit));
-        } else {
-            if !md.is_empty() {
-                print!("{}", md);
-            }
+        } else if !md.is_empty() {
+            print!("{}", md);
         }
 
         Ok(())

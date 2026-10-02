@@ -410,6 +410,7 @@ Full documentation at **[docs.atomic.dev](https://docs.atomic.dev/)**.
 - [Agent Integration](https://docs.atomic.dev/agents/overview) — Setting up AI agent hooks
 - [Command Reference](https://docs.atomic.dev/commands/overview) — Complete CLI reference
 - [AGENTS.md](AGENTS.md) — Development guide for contributors and AI agents
+- [Portable provenance exports](docs/provenance-dsse-export.md) — Optional DSSE export and pinned-key reviewer workflow
 
 ## Building
 

@@ -41,6 +41,162 @@ use tempfile::TempDir;
 
 const ATOMIC_BIN: &str = env!("CARGO_BIN_EXE_atomic");
 
+#[cfg(feature = "dsse-export")]
+#[test]
+fn dsse_export_round_trip_uses_pinned_key_and_writes_nothing() {
+    use atomic_canonical::provenance_export::verify_provenance_export;
+
+    let repo_tmp = TempDir::new().unwrap();
+    let home_tmp = TempDir::new().unwrap();
+    let pubkey = create_default_identity(home_tmp.path());
+    let change_hash = repo_with_internal_change(repo_tmp.path(), home_tmp.path());
+    {
+        let repo = Repository::open(repo_tmp.path()).unwrap();
+        let graph = ProvenanceGraph::builder("session-dsse", "claude-code")
+            .agent_display_name("Claude Code")
+            .add_change_explained(change_hash)
+            .build();
+        repo.save_provenance_graph(&graph).unwrap();
+        let second = ProvenanceGraph::builder("second-session-dsse", "opencode")
+            .agent_display_name("OpenCode")
+            .add_change_explained(change_hash)
+            .build();
+        repo.save_provenance_graph(&second).unwrap();
+    }
+    let before = snapshot_files(repo_tmp.path());
+    let target = change_hash.to_base32();
+    for args in [
+        vec!["provenance", "show", &target, "--dsse"],
+        vec!["provenance", "show", &target, "--sign", "--dsse"],
+        vec!["provenance", "trace", &target, "--json", "--dsse"],
+    ] {
+        let exported = atomic(repo_tmp.path(), home_tmp.path(), &args);
+        assert!(
+            exported.status.success(),
+            "{}",
+            String::from_utf8_lossy(&exported.stderr)
+        );
+        let verified = verify_provenance_export(&exported.stdout, &pubkey).unwrap();
+        let envelope_file = home_tmp.path().join("export.dsse.json");
+        fs::write(&envelope_file, &exported.stdout).unwrap();
+        // The consumer does not need a repository or an identity store.
+        let out = atomic(
+            home_tmp.path(),
+            home_tmp.path(),
+            &[
+                "provenance",
+                "verify-dsse",
+                envelope_file.to_str().unwrap(),
+                "--public-key",
+                &pubkey.to_base32(),
+            ],
+        );
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(out.stdout, verified.payload);
+        let parsed: Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(parsed["projections"].as_array().unwrap().len(), 2);
+        if args.contains(&"--sign") {
+            verify_prov(&parsed["projections"][0], &pubkey).unwrap();
+        } else {
+            assert!(parsed["projections"][0].get("proof").is_none());
+        }
+
+        let wrong = atomic_identity::KeyPair::generate();
+        let refused = atomic(
+            home_tmp.path(),
+            home_tmp.path(),
+            &[
+                "provenance",
+                "verify-dsse",
+                envelope_file.to_str().unwrap(),
+                "--public-key",
+                &wrong.public.to_base32(),
+            ],
+        );
+        assert!(!refused.status.success());
+        assert!(refused.stdout.is_empty());
+
+        use std::io::Write;
+        use std::process::Stdio;
+        let mut stdin_consumer = Command::new(ATOMIC_BIN)
+            .args([
+                "provenance",
+                "verify-dsse",
+                "--public-key",
+                &pubkey.to_base32(),
+            ])
+            .current_dir(home_tmp.path())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        stdin_consumer
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(&exported.stdout)
+            .unwrap();
+        let stdin_out = stdin_consumer.wait_with_output().unwrap();
+        assert!(
+            stdin_out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&stdin_out.stderr)
+        );
+        assert_eq!(stdin_out.stdout, verified.payload);
+
+        // The dedicated workflow sets this; ordinary Rust-only builds need
+        // neither Python nor cryptography. CI makes the independent check required.
+        if let Ok(python) = std::env::var("ATOMIC_DSSE_PYTHON") {
+            let script = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../tools/provenance-export/verify_dsse.py");
+            let run = |bytes: &[u8], key: &str| {
+                fs::write(&envelope_file, bytes).unwrap();
+                Command::new(&python)
+                    .arg(&script)
+                    .arg(&envelope_file)
+                    .args(["--public-key", key])
+                    .output()
+                    .unwrap()
+            };
+            let independent = run(&exported.stdout, &pubkey.to_base32());
+            assert!(
+                independent.status.success(),
+                "{}",
+                String::from_utf8_lossy(&independent.stderr)
+            );
+            assert_eq!(independent.stdout, verified.payload);
+            let wrong = atomic_identity::KeyPair::generate();
+            let refused = run(&exported.stdout, &wrong.public.to_base32());
+            assert!(!refused.status.success());
+            assert!(refused.stdout.is_empty());
+            let original: Value = serde_json::from_slice(&exported.stdout).unwrap();
+            for (field, bad) in [
+                ("payloadType", "application/json"),
+                ("payload", "e30="),
+                ("payload", "eB=="),
+            ] {
+                let mut changed = original.clone();
+                changed[field] = Value::String(bad.into());
+                let refused = run(&serde_json::to_vec(&changed).unwrap(), &pubkey.to_base32());
+                assert!(!refused.status.success());
+                assert!(refused.stdout.is_empty());
+            }
+        }
+    }
+    let invalid = atomic(
+        repo_tmp.path(),
+        home_tmp.path(),
+        &["provenance", "trace", &target, "--dsse"],
+    );
+    assert!(!invalid.status.success(), "trace --dsse requires --json");
+    assert_eq!(snapshot_files(repo_tmp.path()), before);
+}
+
 /// Run `atomic <args>` inside `repo_dir` with `HOME` pointed at `home_dir` so the
 /// identity store resolves to a test-owned location.
 fn atomic(repo_dir: &Path, home_dir: &Path, args: &[&str]) -> Output {
