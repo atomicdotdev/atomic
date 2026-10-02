@@ -1,0 +1,8 @@
+{
+  "schema": "atomic-native-consumer-policy/v1",
+  "observer_source_commit": "16d31f6ae1874389a6d5dc56e54997b88a7e2397",
+  "reader_sha256": "acb9f0dbc4efe7099f65d309e77f14b0521e3affca2f2765de6d6dcea366b6ff",
+  "expected_native_schema": "atomic-native-delegation-evaluation/v1",
+  "allowed_custody": "same-operator local retained-run verification",
+  "source_selection": "actual host checkout commit and source bytes, supplied outside the packet"
+}
