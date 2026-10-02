@@ -113,7 +113,7 @@ Total: $0.12 · 3 changes covered · 20.5k tokens
 
 ### Views, Not Branches
 
-Agents work on isolated views of the same underlying graph. No branch divergence, no merge commits, no orphaned history.
+Agents work on isolated views of the same underlying graph. No branch divergence or merge commits.
 
 ```bash
 # Agent session creates an isolated view automatically
@@ -122,9 +122,13 @@ Agents work on isolated views of the same underlying graph. No branch divergence
 # When done, insert changes into the parent view
 atomic insert @~1 --to dev
 
-# Delete the agent view — cascade-deletes its edges, zero orphans
+# Delete the agent view (prompts if any changes would be orphaned)
 atomic view delete agent-ses_3781fc7a6ffet5c6r1ILy1BEbv
 ```
+
+`atomic view split <name> --last N` moves changes out of the source into a new draft and asks you to acknowledge the risks. Use `--dry-run` to preview, or `--confirm` to acknowledge them non-interactively.
+
+Deleting a draft checks for changes that would lose their last local view reference, shows their hashes, and requires confirmation. Those changes become invisible in all views; they do not automatically return to the source. Insert them elsewhere before deleting to keep them referenced. `--force` skips the deletion prompt.
 
 ### Workspace Shelving
 
@@ -330,7 +334,8 @@ Every change stores two parallel representations:
 | `atomic view create <name>` | Create a new view (`--draft` for isolated, `--parent` to set parent) |
 | `atomic view switch <name>` | Switch to a view |
 | `atomic view list` | List all views (`--verbose` for scope and parent) |
-| `atomic view delete <name>` | Delete a view |
+| `atomic view split <name>` | Move selected changes into a new draft (confirmation required; `--last N`, `--dry-run`, `--confirm`) |
+| `atomic view delete <name>` | Delete a draft; confirm if changes would be orphaned (`--force` skips the prompt) |
 | `atomic split <name>` | Create a new view from the current one |
 | `atomic stash` | Temporarily save uncommitted changes |
 

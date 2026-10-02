@@ -18,6 +18,8 @@
 //! Splitting from the middle is refused when a change staying behind depends on
 //! one being removed (which would leave `dev` incoherent). Use `--cascade` to
 //! move those dependents along too, or `--dry-run` to preview the analysis.
+//! A real split requires confirmation: deleting the draft later can orphan
+//! the extracted changes. Use `--confirm` to acknowledge this in scripts.
 //!
 //! # Usage
 //!
@@ -34,6 +36,7 @@
 //!       --cascade       Also move changes that depend on the split-out set
 //!   -n, --dry-run       Preview the split without performing it
 //!   -s, --switch        Switch to the new draft after creating it
+//!       --confirm       Acknowledge the risks and skip the confirmation prompt
 //! ```
 
 use clap::Parser;
@@ -82,6 +85,10 @@ pub struct Split {
     /// Switch to the new draft view after creating it.
     #[arg(short = 's', long = "switch")]
     pub switch: bool,
+
+    /// Acknowledge source changes are removed and deleting the draft may orphan them.
+    #[arg(long)]
+    pub confirm: bool,
 }
 
 impl Command for Split {
@@ -94,13 +101,30 @@ impl Command for Split {
             other => CliError::Repository(other),
         })?;
 
+        self.execute_with_repo(&mut repo, |prompt| {
+            dialoguer::Confirm::new()
+                .with_prompt(prompt)
+                .default(false)
+                .interact()
+                .map_err(|_| CliError::InvalidArgument {
+                    message: "Splitting changes requires confirmation. Re-run with --confirm to acknowledge the risks and proceed non-interactively.".to_string(),
+                })
+        })
+    }
+}
+
+impl Split {
+    fn execute_with_repo<F>(&self, repo: &mut Repository, confirm: F) -> CliResult<()>
+    where
+        F: FnOnce(&str) -> CliResult<bool>,
+    {
         let from_view = self
             .from
             .clone()
             .unwrap_or_else(|| repo.current_view().to_string());
 
         // Resolve which changes to split: either an explicit list or --last N.
-        let change_hashes = self.resolve_changes(&repo, &from_view)?;
+        let change_hashes = self.resolve_changes(repo, &from_view)?;
 
         let options = SplitOptions {
             target_view: self.name.clone(),
@@ -113,6 +137,40 @@ impl Command for Split {
             // refresh the source's working copy in place.
             materialize: !self.switch,
         };
+
+        if !self.dry_run && !self.confirm {
+            let mut preview_options = options.clone();
+            preview_options.dry_run = true;
+            let preview = repo
+                .split_view(preview_options)
+                .map_err(CliError::Repository)?;
+            if preview.blocked {
+                return Err(CliError::Repository(
+                    atomic_repository::RepositoryError::ViewSplitHasDependents {
+                        view: from_view.clone(),
+                        blocking: preview
+                            .dependents
+                            .iter()
+                            .map(|c| c.hash.to_base32())
+                            .collect(),
+                    },
+                ));
+            }
+            print_warning(&format!(
+                "This removes {} change(s) from '{}' into draft '{}' ({} dependent change(s) included).",
+                preview.moved.len(), from_view, self.name, preview.dependents.len(),
+            ));
+            print_warning(
+                "Deleting that draft without inserting its changes elsewhere may leave them orphaned, invisible in every view. They will not return to the source automatically.",
+            );
+            let prompt = format!(
+                "Split {} change(s) from '{}' into '{}'? I understand deleting the draft may orphan them",
+                preview.moved.len(), from_view, self.name,
+            );
+            if !confirm(&prompt)? {
+                return Err(CliError::Cancelled);
+            }
+        }
 
         let outcome = repo.split_view(options).map_err(CliError::Repository)?;
 
@@ -189,7 +247,7 @@ impl Command for Split {
             ));
         }
 
-        self.maybe_switch(&mut repo)
+        self.maybe_switch(repo)
     }
 }
 
@@ -278,6 +336,7 @@ mod tests {
         assert!(!cmd.cascade);
         assert!(!cmd.dry_run);
         assert!(!cmd.switch);
+        assert!(!cmd.confirm);
     }
 
     #[test]
@@ -292,6 +351,7 @@ mod tests {
             "--cascade",
             "--dry-run",
             "--switch",
+            "--confirm",
         ])
         .unwrap();
         assert_eq!(cmd.name, "wip");
@@ -300,6 +360,7 @@ mod tests {
         assert!(cmd.cascade);
         assert!(cmd.dry_run);
         assert!(cmd.switch);
+        assert!(cmd.confirm);
     }
 
     #[test]
@@ -311,5 +372,105 @@ mod tests {
     #[test]
     fn name_is_required() {
         assert!(Split::try_parse_from(["split"]).is_err());
+    }
+
+    fn recorded_repo() -> (tempfile::TempDir, Repository, atomic_core::types::Hash) {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = Repository::init(temp.path()).unwrap();
+        std::fs::write(temp.path().join("f.txt"), "hello\n").unwrap();
+        repo.add("f.txt", Default::default()).unwrap();
+        let hash = *repo
+            .record(
+                atomic_core::change::ChangeHeader::new("create file"),
+                atomic_repository::RecordOptions::default(),
+            )
+            .unwrap()
+            .hash();
+        (temp, repo, hash)
+    }
+
+    #[test]
+    fn declining_or_failed_confirmation_preserves_source_and_working_copy() {
+        let (temp, mut repo, hash) = recorded_repo();
+        let source = repo.current_view().to_string();
+        let cmd = Split::try_parse_from(["split", "wip", "--last", "1"]).unwrap();
+        let result = cmd.execute_with_repo(&mut repo, |prompt| {
+            assert!(prompt.contains("Split 1 change(s)"));
+            assert!(prompt.contains("orphan"));
+            Ok(false)
+        });
+        assert!(matches!(result, Err(CliError::Cancelled)));
+        let result = cmd.execute_with_repo(&mut repo, |_| {
+            Err(CliError::InvalidArgument {
+                message: "no terminal".to_string(),
+            })
+        });
+        assert!(result.is_err());
+        assert!(!repo.view_exists("wip").unwrap());
+        assert_eq!(repo.view_own_change_hashes(&source).unwrap(), vec![hash]);
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join("f.txt")).unwrap(),
+            "hello\n"
+        );
+    }
+
+    #[test]
+    fn confirmation_includes_cascaded_changes_before_moving_them() {
+        let (temp, mut repo, hash) = recorded_repo();
+        std::fs::write(temp.path().join("f.txt"), "HELLO\n").unwrap();
+        repo.record(
+            atomic_core::change::ChangeHeader::new("edit file"),
+            atomic_repository::RecordOptions::default(),
+        )
+        .unwrap();
+        let source = repo.current_view().to_string();
+        let cmd = Split::try_parse_from(["split", "wip", &hash.to_base32(), "--cascade"]).unwrap();
+        cmd.execute_with_repo(&mut repo, |prompt| {
+            assert!(prompt.contains("Split 2 change(s)"));
+            Ok(true)
+        })
+        .unwrap();
+        assert!(repo.view_own_change_hashes(&source).unwrap().is_empty());
+        assert_eq!(repo.view_own_change_hashes("wip").unwrap().len(), 2);
+    }
+
+    #[test]
+    fn blocked_split_does_not_prompt() {
+        let (temp, mut repo, hash) = recorded_repo();
+        std::fs::write(temp.path().join("f.txt"), "HELLO\n").unwrap();
+        repo.record(
+            atomic_core::change::ChangeHeader::new("edit file"),
+            atomic_repository::RecordOptions::default(),
+        )
+        .unwrap();
+        let cmd = Split::try_parse_from(["split", "wip", &hash.to_base32()]).unwrap();
+        let result = cmd.execute_with_repo(&mut repo, |_| panic!("must not prompt"));
+        assert!(matches!(
+            result,
+            Err(CliError::Repository(
+                atomic_repository::RepositoryError::ViewSplitHasDependents { .. }
+            ))
+        ));
+        assert!(!repo.view_exists("wip").unwrap());
+    }
+
+    #[test]
+    fn dry_run_and_explicit_confirmation_do_not_prompt() {
+        let (_temp, mut repo, hash) = recorded_repo();
+        let source = repo.current_view().to_string();
+        let preview = Split::try_parse_from(["split", "wip", "--last", "1", "--dry-run"]).unwrap();
+        preview
+            .execute_with_repo(&mut repo, |_| panic!("must not prompt"))
+            .unwrap();
+        assert!(!repo.view_exists("wip").unwrap());
+        assert_eq!(repo.view_own_change_hashes(&source).unwrap(), vec![hash]);
+
+        let confirmed =
+            Split::try_parse_from(["split", "wip", "--last", "1", "--confirm"]).unwrap();
+        confirmed
+            .execute_with_repo(&mut repo, |_| panic!("must not prompt"))
+            .unwrap();
+        assert_eq!(repo.view_own_change_hashes("wip").unwrap(), vec![hash]);
+        assert!(repo.view_own_change_hashes(&source).unwrap().is_empty());
     }
 }
