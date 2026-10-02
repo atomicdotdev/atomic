@@ -30,10 +30,12 @@ fn split_and_orphaning_delete_require_explicit_confirmation_without_a_terminal()
     {
         let repo = Repository::init(temp.path()).unwrap();
         source = repo.current_view().to_string();
+        let working_copy = repo.require_working_copy_id().unwrap();
         std::fs::write(temp.path().join("f.txt"), "keep this work\n").unwrap();
-        repo.add("f.txt", Default::default()).unwrap();
+        repo.add(working_copy, "f.txt", Default::default()).unwrap();
         hash = *repo
             .record(
+                working_copy,
                 ChangeHeader::new("important work"),
                 RecordOptions::default(),
             )
