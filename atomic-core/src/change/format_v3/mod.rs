@@ -205,8 +205,8 @@ pub use error::{
 
 // Core types
 pub use types::{
-    CompactPosition, ContentChunkHeader, FileHeader, FileHeaderBuilder, FileHeaderFlags,
-    SectionHeader, SectionType, Trailer,
+    ChangeSignature, CompactPosition, ContentChunkHeader, FileHeader, FileHeaderBuilder,
+    FileHeaderFlags, SectionHeader, SectionType, Trailer,
 };
 
 // Hash index types and helpers

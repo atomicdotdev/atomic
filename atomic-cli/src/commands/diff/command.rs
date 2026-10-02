@@ -10,11 +10,13 @@ use super::*;
 
 // Diff Command
 
-/// Show changes between working copy and repository.
+/// Show changes.
 ///
-/// The `diff` command compares the current state of files in the working
-/// copy against their recorded state in the repository, displaying the
-/// differences in a human-readable format.
+/// With `-c <HASH>`, displays what a specific recorded change did, by
+/// comparing the view state before it against the state after it.
+///
+/// Without `-c`, compares the current working copy against the recorded
+/// state of the current view.
 ///
 /// # Output Formats
 ///
@@ -22,6 +24,8 @@ use super::*;
 /// - **Stat**: Summary showing files and line counts
 /// - **Name-only**: Just file paths
 /// - **Name-status**: File paths with status indicators
+/// - **JSON** (`--json`): Versioned machine-readable document; takes
+///   precedence over the text formats
 ///
 /// # Algorithms
 ///
@@ -35,6 +39,8 @@ pub struct Diff {
     pub files: Vec<String>,
 
     /// Compare against a specific change hash or prefix.
+    ///
+    /// Omit this to diff the working copy against the current view instead.
     #[arg(short = 'c', long = "change", add = ArgValueCompleter::new(complete_change_hashes))]
     pub change: Option<String>,
 
@@ -99,6 +105,10 @@ pub struct Diff {
     /// that the line changed. Especially useful for code reviews.
     #[arg(long)]
     pub word_diff: bool,
+
+    /// Emit a versioned JSON document instead of a rendered diff.
+    #[arg(long)]
+    pub json: bool,
 }
 
 impl Diff {
@@ -120,6 +130,7 @@ impl Diff {
             view: None,
             snapshot: false,
             word_diff: false,
+            json: false,
         }
     }
 
@@ -190,6 +201,12 @@ impl Diff {
     /// Builder: set the word-diff flag.
     pub fn with_word_diff(mut self, word_diff: bool) -> Self {
         self.word_diff = word_diff;
+        self
+    }
+
+    /// Builder: set the JSON output flag.
+    pub fn with_json(mut self, json: bool) -> Self {
+        self.json = json;
         self
     }
 
@@ -576,6 +593,15 @@ impl Command for Diff {
             return self.show_change_diff(&repo, &hash.to_base32(), &config);
         }
 
+        let workspace_view = &workspace
+            .as_ref()
+            .expect("working-copy diff uses Reconcile")
+            .view()
+            .name;
+        // `--view` only labels the output (JSON `view`, the clean-copy hint);
+        // the comparison itself is always against the transaction's view.
+        let view = self.view.clone().unwrap_or_else(|| workspace_view.clone());
+
         // Get status to find modified files
         let status_options = StatusOptions::default();
         let status = repo
@@ -626,15 +652,9 @@ impl Command for Diff {
 
         // Check if there are any changes
         if files_to_diff.is_empty() {
-            self.print_no_changes();
+            self.print_no_pending_changes(&repo, &view);
             return Ok(());
         }
-
-        let workspace_view = &workspace
-            .as_ref()
-            .expect("working-copy diff uses Reconcile")
-            .view()
-            .name;
 
         // Compute diffs for each file
         let mut file_diffs = Vec::new();
@@ -788,12 +808,7 @@ impl Command for Diff {
         }
 
         // Print in the appropriate format
-        match config.format {
-            DiffFormat::Unified => self.print_unified(&file_diffs, &config),
-            DiffFormat::Stat => self.print_stat(&stats, &config),
-            DiffFormat::NameOnly => self.print_name_only(&file_diffs),
-            DiffFormat::NameStatus => self.print_name_status(&file_diffs, &config),
-        }
+        self.render(&file_diffs, &stats, &config, None, Some(view.as_str()))
     }
 }
 

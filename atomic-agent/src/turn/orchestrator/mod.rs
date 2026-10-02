@@ -63,6 +63,7 @@ mod provenance;
 mod session_end;
 mod session_start;
 mod turn;
+mod wait_budget;
 
 #[cfg(test)]
 mod tests;
@@ -412,6 +413,15 @@ pub struct TurnOrchestrator {
     /// Human-readable agent display name (e.g., "Claude Code").
     pub(crate) agent_display_name: String,
 
+    /// Delegated agent identity to sign recorded turns as, if one is in
+    /// force for this hook invocation.
+    ///
+    /// Resolved by the CLI hook handler from the env var / global setting /
+    /// active server profile chain, and passed as plain data — the
+    /// orchestrator never reads config itself. `None` keeps the plus-tag
+    /// fallback, which is the behavior from before agent identities existed.
+    pub(crate) agent_identity: Option<String>,
+
     /// Managed-run context when a governing lifecycle covers this hook;
     /// `None` for direct agent usage (behavior unchanged).
     pub(crate) managed_run: Option<ManagedRunContext>,
@@ -467,6 +477,7 @@ impl TurnOrchestrator {
             watcher,
             agent_name: "unknown".to_string(),
             agent_display_name: "Unknown Agent".to_string(),
+            agent_identity: None,
             managed_run: None,
             boundary_refusal: None,
             journal_sink: None,
@@ -489,6 +500,7 @@ impl TurnOrchestrator {
             watcher,
             agent_name: "unknown".to_string(),
             agent_display_name: "Unknown Agent".to_string(),
+            agent_identity: None,
             managed_run: None,
             boundary_refusal: None,
             journal_sink: None,
@@ -504,6 +516,18 @@ impl TurnOrchestrator {
     pub fn set_agent(&mut self, name: impl Into<String>, display_name: impl Into<String>) {
         self.agent_name = name.into();
         self.agent_display_name = display_name.into();
+    }
+
+    /// Set the delegated agent identity that recorded turns sign as.
+    ///
+    /// Called by the CLI hook handler after construction with the name
+    /// resolved from the selection chain (`ATOMIC_AGENT_IDENTITY` env var,
+    /// else the global `agent_identity` setting, else the active server
+    /// profile's binding). `None` — the default — keeps the plus-tag
+    /// fallback. The name crosses as plain data; resolution errors were
+    /// already handled upstream and degrade to `None`.
+    pub fn set_agent_identity(&mut self, identity: Option<String>) {
+        self.agent_identity = identity;
     }
 
     /// Attach the managed-run context for this hook invocation

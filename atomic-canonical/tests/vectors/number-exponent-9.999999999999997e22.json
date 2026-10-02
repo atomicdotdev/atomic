@@ -1,0 +1,8 @@
+{
+  "vector": "v843566cf72cd33c3",
+  "divergence": "shortest round-tripping digits in exponent notation",
+  "input": "{\"n\":9.999999999999997e+22}",
+  "expect": {
+    "canonical": "{\"n\":9.999999999999997e+22}"
+  }
+}

@@ -77,7 +77,7 @@ pub use move_evidence::{
     MoveBasis, MoveEvidence, MoveEvidenceError, ProbableMove, RenameCandidate,
     MOVE_EVIDENCE_UNHASHED_KEY, MOVE_EVIDENCE_VERSION, PROBABLE_MOVE_THRESHOLD_BPS,
 };
-pub use options::RecordOptions;
+pub use options::{RecordOptions, SigningIdentity};
 
 use atomic_core::record::workflow::{AssemblyError, GlobalizeError};
 use thiserror::Error;

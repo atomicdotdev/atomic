@@ -1,0 +1,8 @@
+{
+  "vector": "v362600d69975d14c",
+  "divergence": "decimal-to-exponent threshold: a magnitude below 1e21 stays decimal",
+  "input": "{\"n\":295147905179352830000}",
+  "expect": {
+    "canonical": "{\"n\":295147905179352830000}"
+  }
+}

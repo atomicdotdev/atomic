@@ -66,9 +66,117 @@ impl NumberedLine {
 }
 
 impl Diff {
+    /// Render a computed diff in the requested format.
+    ///
+    /// `--json` wins over every text format selector, so a consumer gets a
+    /// single parseable document rather than a rendered diff it has to
+    /// re-parse. `change` is `Some` for `atomic diff -c <hash>`; `view` is
+    /// populated only for working-copy diffs.
+    pub(super) fn render(
+        &self,
+        file_diffs: &[FileDiff],
+        stats: &DiffStats,
+        config: &DiffOutputConfig,
+        change: Option<(&Change, &Hash)>,
+        view: Option<&str>,
+    ) -> CliResult<()> {
+        if self.json {
+            return json::print_json(&json::JsonDiff::new(file_diffs, stats, change, view));
+        }
+
+        match config.format {
+            DiffFormat::Unified => self.print_unified(file_diffs, config),
+            DiffFormat::Stat => self.print_stat(stats, config),
+            DiffFormat::NameOnly => self.print_name_only(file_diffs),
+            DiffFormat::NameStatus => self.print_name_status(file_diffs, config),
+        }
+    }
+
     /// Print a message when there are no changes.
     pub(super) fn print_no_changes(&self) {
+        if self.json {
+            let _ = json::print_json(&json::JsonDiff::empty(None));
+            return;
+        }
         print_info("No changes detected");
+    }
+
+    /// Explain that the working copy matches the view, and point at the
+    /// change records that *are* inspectable.
+    ///
+    /// `atomic diff` with no `-c` compares disk against the view's recorded
+    /// state. A clean working copy is a perfectly valid answer, but it is a
+    /// dead end for someone who typed `atomic diff` expecting to see a
+    /// change. Naming a real, copy-pasteable `-c` command for the most
+    /// recent changes on this view turns the dead end into a next step.
+    pub(super) fn print_no_pending_changes(&self, repo: &Repository, view: &str) {
+        if self.json {
+            let _ = json::print_json(&json::JsonDiff::empty(Some(view)));
+            return;
+        }
+
+        print_info("No changes detected");
+        println!();
+
+        let recent = self.recent_view_changes(repo, view, RECENT_CHANGE_SUGGESTIONS);
+
+        if recent.is_empty() {
+            print_hint(&format!(
+                "Working copy matches view `{view}`, which has no recorded changes yet."
+            ));
+            print_hint("Record the working copy with `atomic record -m \"<message>\"`.");
+            return;
+        }
+
+        print_hint(&format!(
+            "Working copy matches view `{view}`. To inspect a recorded change:"
+        ));
+        for (short_hash, message) in &recent {
+            print_hint(&format!("  atomic diff -c {short_hash}  {message}"));
+        }
+        print_hint("  atomic log  — list the changes on this view");
+    }
+
+    /// Collect up to `limit` recent changes on `view`, newest first, as
+    /// `(short_hash, message)` pairs for the no-pending-changes hint.
+    ///
+    /// Best-effort: any failure to read history yields an empty list, which
+    /// degrades the hint rather than the diff.
+    fn recent_view_changes(
+        &self,
+        repo: &Repository,
+        view: &str,
+        limit: usize,
+    ) -> Vec<(String, String)> {
+        use atomic_repository::history::HistoryOptions;
+
+        let options = HistoryOptions::new()
+            .view(view.to_string())
+            .limit(limit)
+            .load_headers(true)
+            // A draft view's own log is usually empty right after it forks,
+            // but it still inherits everything from its ancestors — and those
+            // changes are diffable here. Without this the hint would claim
+            // the view has no recorded changes when it plainly does.
+            .include_inherited(true);
+
+        let Ok(entries) = repo.reverse_log(options) else {
+            return Vec::new();
+        };
+
+        entries
+            .into_iter()
+            .map(|entry| {
+                let base32 = entry.hash.to_base32();
+                let short_hash = base32[..DEFAULT_HASH_LENGTH.min(base32.len())].to_string();
+                let message = entry
+                    .header
+                    .map(|h| h.message)
+                    .filter(|m| !m.trim().is_empty())
+                    .unwrap_or_else(|| "(no message)".to_string());
+                (short_hash, message)
+            })
+            .collect()
     }
 
     /// Check whether a repository-relative path passes the positional
@@ -358,16 +466,19 @@ impl Diff {
             return Ok(());
         }
 
-        if config.format == DiffFormat::Unified {
+        // The human header duplicates what `--json` already carries under
+        // `change`, so skip it there.
+        if !self.json && config.format == DiffFormat::Unified {
             self.print_change_header(change, change_hash, config);
         }
 
-        match config.format {
-            DiffFormat::Unified => self.print_unified(&file_diffs, config),
-            DiffFormat::Stat => self.print_stat(&stats, config),
-            DiffFormat::NameOnly => self.print_name_only(&file_diffs),
-            DiffFormat::NameStatus => self.print_name_status(&file_diffs, config),
-        }
+        self.render(
+            &file_diffs,
+            &stats,
+            config,
+            Some((change, change_hash)),
+            None,
+        )
     }
 
     /// Reconstruct a line's text content from its leaf operations.
@@ -756,17 +867,12 @@ impl Diff {
         }
 
         // Print change header information
-        if config.format == DiffFormat::Unified {
+        if !self.json && config.format == DiffFormat::Unified {
             self.print_change_header(change, hash, config);
         }
 
         // Print in the appropriate format
-        match config.format {
-            DiffFormat::Unified => self.print_unified(&file_diffs, config),
-            DiffFormat::Stat => self.print_stat(&stats, config),
-            DiffFormat::NameOnly => self.print_name_only(&file_diffs),
-            DiffFormat::NameStatus => self.print_name_status(&file_diffs, config),
-        }
+        self.render(&file_diffs, &stats, config, Some((change, hash)), None)
     }
 
     /// Print header information for a change diff.

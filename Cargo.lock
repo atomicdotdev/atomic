@@ -123,7 +123,7 @@ dependencies = [
 
 [[package]]
 name = "atomic-agent"
-version = "0.18.3"
+version = "0.19.0"
 dependencies = [
  "anyhow",
  "atomic-canonical",
@@ -156,21 +156,24 @@ dependencies = [
 
 [[package]]
 name = "atomic-canonical"
-version = "0.18.3"
+version = "0.19.0"
 dependencies = [
  "atomic-identity",
  "blake3",
  "bs58",
  "chrono",
  "data-encoding",
+ "jcs-admit",
  "serde",
  "serde_json",
+ "serde_json_canonicalizer",
+ "tempfile",
  "thiserror 1.0.69",
 ]
 
 [[package]]
 name = "atomic-cli"
-version = "0.18.3"
+version = "0.19.0"
 dependencies = [
  "anyhow",
  "atomic-agent",
@@ -217,7 +220,7 @@ dependencies = [
 
 [[package]]
 name = "atomic-config"
-version = "0.18.3"
+version = "0.19.0"
 dependencies = [
  "anyhow",
  "dirs",
@@ -231,7 +234,7 @@ dependencies = [
 
 [[package]]
 name = "atomic-core"
-version = "0.18.3"
+version = "0.19.0"
 dependencies = [
  "anyhow",
  "bitflags 2.13.2",
@@ -245,6 +248,7 @@ dependencies = [
  "postcard",
  "quickcheck",
  "quickcheck_macros",
+ "rand 0.8.8",
  "rayon",
  "redb 2.6.3",
  "redb 4.2.0",
@@ -260,7 +264,7 @@ dependencies = [
 
 [[package]]
 name = "atomic-identity"
-version = "0.18.3"
+version = "0.19.0"
 dependencies = [
  "anyhow",
  "atomic-config",
@@ -282,7 +286,7 @@ dependencies = [
 
 [[package]]
 name = "atomic-objects"
-version = "0.18.3"
+version = "0.19.0"
 dependencies = [
  "blake3",
  "data-encoding",
@@ -303,7 +307,7 @@ dependencies = [
 
 [[package]]
 name = "atomic-remote"
-version = "0.18.3"
+version = "0.19.0"
 dependencies = [
  "anyhow",
  "atomic-canonical",
@@ -327,7 +331,7 @@ dependencies = [
 
 [[package]]
 name = "atomic-repository"
-version = "0.18.3"
+version = "0.19.0"
 dependencies = [
  "anyhow",
  "atomic-canonical",
@@ -338,7 +342,9 @@ dependencies = [
  "atomic-semantic",
  "blake3",
  "chrono",
+ "data-encoding",
  "dirs",
+ "ed25519-dalek",
  "flate2",
  "fs2",
  "git2",
@@ -370,7 +376,7 @@ dependencies = [
 
 [[package]]
 name = "atomic-semantic"
-version = "0.18.3"
+version = "0.19.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -387,7 +393,7 @@ dependencies = [
 
 [[package]]
 name = "atomic-teams"
-version = "0.18.3"
+version = "0.19.0"
 dependencies = [
  "atomic-remote",
  "chrono",
@@ -1685,6 +1691,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
+name = "jcs-admit"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e5e809813f7ed9d15536d3038657aee1489e5f4f4b2df5b58519007aebf8f9a9"
+dependencies = [
+ "serde",
+ "serde_json_canonicalizer",
+]
+
+[[package]]
 name = "jiff"
 version = "0.2.37"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2612,6 +2628,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 
 [[package]]
+name = "ryu-js"
+version = "1.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "04d056b875a9d2e6cb9a61d127afee9ac5999b9f87bcb32079d1318e505be714"
+
+[[package]]
 name = "same-file"
 version = "1.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2730,6 +2752,17 @@ dependencies = [
  "serde",
  "serde_core",
  "zmij",
+]
+
+[[package]]
+name = "serde_json_canonicalizer"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fe52319a927259afbfa5180c5157cd8167edfd3e8c254f9558c7fef44c5649f2"
+dependencies = [
+ "ryu-js",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

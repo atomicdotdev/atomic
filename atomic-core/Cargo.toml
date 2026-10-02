@@ -23,8 +23,10 @@ fastcdc.workspace = true
 # Hashing
 blake3.workspace = true
 
-# Signing (attestation DID signatures; Ed25519, same crate as atomic-identity)
+# Signing (attestation DID signatures and change signatures; Ed25519, same
+# crate as atomic-identity)
 ed25519-dalek.workspace = true
+rand.workspace = true
 xxhash-rust.workspace = true
 
 # Compression
