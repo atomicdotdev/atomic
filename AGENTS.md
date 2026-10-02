@@ -359,16 +359,107 @@ This simplifies the codebase while maintaining semantic clarity.
 
 ```
 .atomic/
-├── pristine/              # Graph database (redb)
-│   └── data.mdb           # Single database file
+├── pristine.redb          # Graph database
 ├── changes/               # Content-addressed change files
 │   └── AB/CDEF...         # Two-level directory structure
 ├── config.toml            # Repository configuration
-├── current_view           # Active view name
-├── working_copy_id        # Working copy state
-└── workspaces/            # Per-view shelved artifacts
-    └── <view_name>/       # Shelved build artifacts for this view
+├── bridge.lock            # Common outer operation lock
+├── working_copy_id        # Canonical 26-character WorkingCopyId (ULID)
+├── current_view           # Derived compatibility output; never authoritative
+├── operation-recovery/    # Same-filesystem staging/tombstones for this worktree
+└── working-copies/
+    └── <working-copy-id>/
+        ├── operation.lock  # Per-working-copy operation lock
+        ├── shelf.lock      # Final-rank shelf effect lock
+        ├── operation-recovery/
+        │   └── <operation-id>/ # Immutable expected-old recovery bytes
+        └── workspaces/
+            └── <view_name>/ # Per-working-copy shelved artifacts
 ```
+
+`WORKING_COPIES` is authoritative for each physical directory's desired view/state
+and last verified materialized state. Ordinary directories, linked Git worktrees,
+and agent sandboxes have distinct IDs. Linked worktrees keep local
+`.atomic/working_copy_id` and `.atomic/current_view` files plus an
+`.atomic/repository` pointer to the common Atomic directory. Working-copy-aware
+repository APIs require an explicit `WorkingCopyId`; view-scoped graph APIs remain
+usable without one.
+
+### Operation and Effect Journal
+
+`OPERATIONS` stores immutable, versioned operation payloads under typed,
+domain-separated `OperationId` hashes. The hash covers the complete canonical
+immutable payload and excludes only the derived ID, mutable head sets, receipts,
+and execution phase. `OP_HEADS` stores a sorted multi-head set per repository or
+working-copy scope and changes only through compare-and-set. `EFFECT_RECEIPTS`
+appends immutable, content-addressed outcomes keyed by operation and receipt ID.
+
+Operation payload V1 remains byte-for-byte hash-authoritative. V2 adds typed
+`OperationRelation::{Undo, Restore}` links and canonical `MetadataTransition`
+leases for view membership, tags, views, and remotes. Metadata operations advance
+the initiating working-copy head and the shared repository head in one immediate
+transaction, so linked worktrees have distinct local chains but one causal order for
+global mutations. Compatible verified heads consolidate under a deterministic
+multi-parent `Consolidate` operation; incompatible resource writes remain a sorted
+multi-head set surfaced as `Diverged`, with no invented after-state.
+
+Each `EffectPlan` has a stable ordinal, typed target, `expected_old`, and
+`expected_new`. A resource is mutated only when its observation equals one of
+those leases:
+
+- `observed == expected_old`: apply the transition.
+- `observed == expected_new`: the effect already landed; append/reuse the
+  deterministic recovery receipt without repeating the mutation.
+- Any third value: record lease rejection and fail closed rather than overwrite
+  newer external work.
+
+Prepared operations and receipts use immediate redb durability. Incomplete
+non-recovery heads produce an immutable inverse `Recover` child; incomplete
+recovery heads resume in place. Filesystem and shelf old values are retained at
+`.atomic/working-copies/<id>/operation-recovery/<operation-id>/` until later GC.
+Worktree directory staging and rollback tombstones use the working-copy-local
+`.atomic/operation-recovery/<operation-id>/` so linked worktrees remain safe even
+when the common Atomic directory is on another filesystem.
+Writable repository open performs the same idempotent recovery before accepting a
+new operation. Every writable constructor and ordinary read-only open also gates
+incomplete shared repository heads; only the dedicated operation-inspection open
+may examine incomplete or divergent state without recovery.
+
+`atomic op log|show` exposes deterministic DAG history, payloads, metadata/effect
+leases, receipts, verification, and head scopes in human or JSON form.
+`atomic op undo [<id>]` and `atomic op restore <id>` append relation-bearing inverse
+or replay operations. Switch undo restores view, shelves, and materialized bytes;
+record undo removes only the view reference and retains working bytes and the
+content-addressed change. Historical restore reconstructs shift-aware membership,
+verifies the exact view Merkle, and re-materializes selected content.
+
+Native switch, record, insert, unrecord, tag, pull-fetch, push, and materialize paths
+now emit operations. Direct materialization renders a plan before mutation, leases
+each filesystem transition, preserves existing modes, filters absent-path modes by
+the active umask, and uses the same receipted executor as switch. Push retains the
+ordered operation locks from prepared intent through remote CAS verification; pull
+records the verified fetched pack before its journaled local child operations.
+
+Operation resources are nonblocking cross-process locks acquired only in this
+order:
+
+```
+common .atomic/bridge.lock
+  → working-copies/<id>/operation.lock
+    → pristine write transaction
+      → working-copies/<id>/shelf.lock or deferred-tree-alignment.lock
+```
+
+Contention returns a typed retry error before operation or filesystem mutation.
+The shadow Git pipeline shares `bridge.lock`; it is not an independent lock
+namespace.
+
+Relevant code: `atomic-core/src/operation/`,
+`atomic-core/src/pristine/traits/operation.rs`,
+`atomic-repository/src/repository/operation.rs`,
+`atomic-repository/src/repository/materialize.rs`,
+`atomic-repository/src/repository/locks.rs`, and
+`atomic-cli/src/commands/op/`.
 
 ### Workspace Shelving
 
@@ -464,6 +555,10 @@ The pristine is the persistent storage layer using [redb](https://docs.rs/redb):
 | `GRAPH` | GraphNode ([u8; 24]) | [GraphEdge] | Canonical graph — all edges (multimap) |
 | `INODE_GRAPH` | (Inode, GraphNode) ([u8; 32]) | [GraphEdge] | File-scoped index |
 | `VIEWS` | name (str) | ViewState (var) | View metadata (scope, parent, merkle) |
+| `WORKING_COPIES` | WorkingCopyId ([u8; 16]) | WorkingCopyRecord (versioned bytes) | Desired/materialized state per physical working directory or Git worktree |
+| `OPERATIONS` | OperationId ([u8; 32]) | Operation payload (versioned bytes) | Append-only immutable operation plans |
+| `OP_HEADS` | OperationScope ([u8; 17]) | OperationHeads (versioned bytes) | CAS-updated sorted heads per repository/working copy |
+| `EFFECT_RECEIPTS` | (OperationId, EffectReceiptId) ([u8; 64]) | EffectReceipt payload (versioned bytes) | Append-only leased effect outcomes |
 | `VIEW_CHANGES` | (view_id, seq) ([u8; 16]) | change_id (u64) | Change log per view |
 | `REV_VIEW_CHANGES` | (view_id, change_id) ([u8; 16]) | seq (u64) | Reverse log |
 | `TREE` | path (str) | inode (u64) | Path → inode |

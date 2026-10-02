@@ -1,8 +1,10 @@
 //! Tag operations on Repository — backed by redb TAG_RECORDS.
 
-use atomic_core::pristine::{
-    GraphTxnT, MutTxnT, TagKind, TagMutTxnT, TagRecord, TagTxnT, ViewTxnT,
+use atomic_core::operation::{
+    ActorRef, MetadataTarget, MetadataTransition, MetadataValue, OperationKind, OperationScope,
+    RepoStateRef, ViewStateRef,
 };
+use atomic_core::pristine::{GraphTxnT, TagKind, TagRecord, TagTxnT, ViewTxnT, WorkingCopyTxnT};
 use atomic_core::types::Merkle;
 use chrono::Utc;
 
@@ -29,54 +31,18 @@ impl Repository {
         message: Option<&str>,
         kind: TagKind,
     ) -> Result<TagRecord, RepositoryError> {
-        let mut txn = self
-            .pristine
-            .write_txn()
-            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        self.create_tag_with_metadata(name, message, kind, None)
+    }
 
-        let view = txn
-            .get_view(&self.current_view)
-            .map_err(|e| RepositoryError::Database(e.to_string()))?
-            .ok_or_else(|| RepositoryError::ViewNotFound {
-                name: self.current_view.clone(),
-            })?;
-
-        // Get the hash of the change at the current sequence
-        let change_hash = if view.change_count > 0 {
-            let seq = view.change_count - 1;
-            let change_id = txn
-                .get_change_at_seq(&view, seq)
-                .map_err(|e| RepositoryError::Database(e.to_string()))?
-                .ok_or_else(|| {
-                    RepositoryError::Database(format!("No change at sequence {}", seq))
-                })?;
-            txn.get_external(change_id)
-                .map_err(|e| RepositoryError::Database(e.to_string()))?
-                .unwrap_or(Merkle::ZERO)
-        } else {
-            Merkle::ZERO
-        };
-
-        let tag = TagRecord {
-            name: name.to_string(),
-            view: self.current_view.clone(),
-            sequence: view.change_count.saturating_sub(1),
-            state: view.state,
-            change_hash,
-            timestamp: Utc::now(),
-            author: None,
-            message: message.map(|s| s.to_string()),
-            kind,
-            metadata: None,
-        };
-
-        txn.put_tag(&tag)
-            .map_err(|e| RepositoryError::Database(e.to_string()))?;
-
-        txn.commit()
-            .map_err(|e| RepositoryError::Database(e.to_string()))?;
-
-        Ok(tag)
+    /// Create a named tag on an explicit view.
+    pub fn create_tag_on_view(
+        &self,
+        view: &str,
+        name: &str,
+        message: Option<&str>,
+        kind: TagKind,
+    ) -> Result<TagRecord, RepositoryError> {
+        self.create_tag_with_metadata_on_view(view, name, message, kind, None)
     }
 
     /// Create a named tag with optional metadata on the current view.
@@ -91,40 +57,25 @@ impl Repository {
         kind: TagKind,
         metadata: Option<serde_json::Value>,
     ) -> Result<TagRecord, RepositoryError> {
-        let mut txn = self
-            .pristine
-            .write_txn()
-            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        let view = self.current_view.clone();
+        self.create_tag_with_metadata_on_view(&view, name, message, kind, metadata)
+    }
 
-        let view = txn
-            .get_view(&self.current_view)
-            .map_err(|e| RepositoryError::Database(e.to_string()))?
-            .ok_or_else(|| RepositoryError::ViewNotFound {
-                name: self.current_view.clone(),
-            })?;
-
-        // Get the hash of the change at the current sequence
-        let change_hash = if view.change_count > 0 {
-            let seq = view.change_count - 1;
-            let change_id = txn
-                .get_change_at_seq(&view, seq)
-                .map_err(|e| RepositoryError::Database(e.to_string()))?
-                .ok_or_else(|| {
-                    RepositoryError::Database(format!("No change at sequence {}", seq))
-                })?;
-            txn.get_external(change_id)
-                .map_err(|e| RepositoryError::Database(e.to_string()))?
-                .unwrap_or(Merkle::ZERO)
-        } else {
-            Merkle::ZERO
-        };
-
+    /// Create a named tag with optional metadata on an explicit view.
+    pub fn create_tag_with_metadata_on_view(
+        &self,
+        view: &str,
+        name: &str,
+        message: Option<&str>,
+        kind: TagKind,
+        metadata: Option<serde_json::Value>,
+    ) -> Result<TagRecord, RepositoryError> {
         let tag = TagRecord {
             name: name.to_string(),
-            view: self.current_view.clone(),
-            sequence: view.change_count.saturating_sub(1),
-            state: view.state,
-            change_hash,
+            view: view.to_string(),
+            sequence: 0,
+            state: Merkle::ZERO,
+            change_hash: Merkle::ZERO,
             timestamp: Utc::now(),
             author: None,
             message: message.map(|s| s.to_string()),
@@ -132,13 +83,11 @@ impl Repository {
             metadata,
         };
 
-        txn.put_tag(&tag)
-            .map_err(|e| RepositoryError::Database(e.to_string()))?;
-
-        txn.commit()
-            .map_err(|e| RepositoryError::Database(e.to_string()))?;
-
-        Ok(tag)
+        self.apply_tag_transition(&tag.view, &tag.name, Some(&tag), true)?;
+        self.get_tag_from_view(&tag.name, &tag.view)?
+            .ok_or_else(|| RepositoryError::TagNotFound {
+                name: tag.name.clone(),
+            })
     }
 
     /// Save a tag received from a remote.
@@ -147,17 +96,7 @@ impl Repository {
     /// the incoming [`TagRecord`] (including sequence, state, timestamp). Used
     /// by `pull` to replicate tags from a remote.
     pub fn save_synced_tag(&self, tag: &TagRecord) -> Result<(), RepositoryError> {
-        let mut txn = self
-            .pristine
-            .write_txn()
-            .map_err(|e| RepositoryError::Database(e.to_string()))?;
-
-        txn.put_tag(tag)
-            .map_err(|e| RepositoryError::Database(e.to_string()))?;
-
-        txn.commit()
-            .map_err(|e| RepositoryError::Database(e.to_string()))?;
-
+        self.apply_tag_transition(&tag.view, &tag.name, Some(tag), false)?;
         Ok(())
     }
 
@@ -233,16 +172,126 @@ impl Repository {
 
     /// Delete a tag by name from a specific view.
     pub fn delete_tag_from_view(&self, name: &str, view: &str) -> Result<bool, RepositoryError> {
-        let mut txn = self
-            .pristine
-            .write_txn()
-            .map_err(|e| RepositoryError::Database(e.to_string()))?;
-        let deleted = txn
-            .del_tag(view, name)
-            .map_err(|e| RepositoryError::Database(e.to_string()))?;
-        txn.commit()
-            .map_err(|e| RepositoryError::Database(e.to_string()))?;
-        Ok(deleted)
+        self.apply_tag_transition(view, name, None, false)
+    }
+
+    fn apply_tag_transition(
+        &self,
+        view: &str,
+        name: &str,
+        replacement: Option<&TagRecord>,
+        normalize_to_view_head: bool,
+    ) -> Result<bool, RepositoryError> {
+        let working_copy = self.require_working_copy_id()?;
+        let operation_lock = self.try_lock_operation(working_copy)?;
+        if let super::operation::OperationHeadState::Diverged(heads) =
+            self.consolidate_operation_heads_locked(&operation_lock)?
+        {
+            return Err(RepositoryError::OperationHeadsDiverged {
+                scope: OperationScope::WorkingCopy(working_copy).to_string(),
+                heads: heads.iter().map(ToString::to_string).collect(),
+            });
+        }
+        let mut replacement = replacement.cloned();
+        let (state, view_sequence, view_state, view_change_hash) = {
+            let txn = self
+                .pristine
+                .read_txn()
+                .map_err(|error| RepositoryError::Database(error.to_string()))?;
+            let view_state = txn
+                .get_view(view)
+                .map_err(|error| RepositoryError::Database(error.to_string()))?
+                .ok_or_else(|| RepositoryError::ViewNotFound {
+                    name: view.to_string(),
+                })?;
+            let working_copy_state = super::operation::working_copy_state_ref(
+                txn.get_working_copy(working_copy)
+                    .map_err(|error| RepositoryError::Database(error.to_string()))?
+                    .ok_or(RepositoryError::WorkingCopyRecordNotFound { id: working_copy })?,
+            );
+            let change_hash = if view_state.change_count > 0 {
+                let sequence = view_state.change_count - 1;
+                let change_id = txn
+                    .get_change_at_seq(&view_state, sequence)
+                    .map_err(|error| RepositoryError::Database(error.to_string()))?
+                    .ok_or_else(|| {
+                        RepositoryError::Database(format!("No change at sequence {sequence}"))
+                    })?;
+                txn.get_external(change_id)
+                    .map_err(|error| RepositoryError::Database(error.to_string()))?
+                    .unwrap_or(Merkle::ZERO)
+            } else {
+                Merkle::ZERO
+            };
+            (
+                RepoStateRef {
+                    view: Some(ViewStateRef {
+                        name: view.to_string(),
+                        state: view_state.state,
+                        set_id: None,
+                    }),
+                    working_copy: Some(working_copy_state),
+                    git: None,
+                },
+                view_state.change_count.saturating_sub(1),
+                view_state.state,
+                change_hash,
+            )
+        };
+        if normalize_to_view_head {
+            if let Some(tag) = &mut replacement {
+                tag.view = view.to_string();
+                tag.name = name.to_string();
+                tag.sequence = view_sequence;
+                tag.state = view_state;
+                tag.change_hash = view_change_hash;
+            }
+        }
+        let existing = self.get_tag_from_view(name, view)?;
+        if existing == replacement {
+            return Ok(existing.is_some());
+        }
+        let old_value = existing
+            .as_ref()
+            .map(serialize_tag)
+            .transpose()?
+            .map(MetadataValue::Bytes)
+            .unwrap_or(MetadataValue::Absent);
+        let new_value = replacement
+            .as_ref()
+            .map(serialize_tag)
+            .transpose()?
+            .map(MetadataValue::Bytes)
+            .unwrap_or(MetadataValue::Absent);
+        let evidence = replacement
+            .as_ref()
+            .map(TagRecord::content_hash)
+            .or_else(|| existing.as_ref().map(TagRecord::content_hash))
+            .into_iter()
+            .collect();
+        let operation = self.prepare_metadata_operation(
+            &operation_lock,
+            OperationKind::Tag,
+            None,
+            state.clone(),
+            state,
+            vec![MetadataTransition {
+                target: MetadataTarget::Tag {
+                    view: view.to_string(),
+                    name: name.to_string(),
+                },
+                expected_old: old_value,
+                expected_new: new_value,
+            }],
+            evidence,
+            ActorRef::System {
+                name: "repository-tag".to_string(),
+            },
+            super::operation::current_operation_timestamp_ms(),
+        )?;
+        self.apply_operation_metadata_locked(&operation_lock, operation.id())?;
+        self.finalize_operation_verified(&operation_lock, operation.id())?;
+        Ok(existing.is_some())
     }
 
     /// Count tags in the current view.

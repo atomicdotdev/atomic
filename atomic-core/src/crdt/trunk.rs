@@ -40,7 +40,7 @@
 //! - Concurrent operations are resolved deterministically
 
 use super::ids::TrunkId;
-use crate::change::Encoding;
+use crate::change::{Encoding, InodeKind};
 use crate::types::Inode;
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -319,6 +319,12 @@ pub enum TrunkOp {
         /// The trunk to restore.
         trunk: TrunkId,
     },
+
+    /// Add a causal Unix mode value for this trunk's inode.
+    SetMode { trunk: TrunkId, mode: u16 },
+
+    /// Add a causal materialized-kind value for this trunk's inode.
+    SetKind { trunk: TrunkId, kind: InodeKind },
 }
 
 impl TrunkOp {
@@ -331,6 +337,7 @@ impl TrunkOp {
             TrunkOp::Delete { trunk } => Some(*trunk),
             TrunkOp::Move { trunk, .. } => Some(*trunk),
             TrunkOp::Undelete { trunk } => Some(*trunk),
+            TrunkOp::SetMode { trunk, .. } | TrunkOp::SetKind { trunk, .. } => Some(*trunk),
         }
     }
 
@@ -365,6 +372,8 @@ impl TrunkOp {
             TrunkOp::Delete { .. } => "delete",
             TrunkOp::Move { .. } => "move",
             TrunkOp::Undelete { .. } => "undelete",
+            TrunkOp::SetMode { .. } => "set-mode",
+            TrunkOp::SetKind { .. } => "set-kind",
         }
     }
 }
@@ -384,6 +393,8 @@ impl fmt::Display for TrunkOp {
                 write!(f, "move {} -> {:?}", trunk, new_path)
             }
             TrunkOp::Undelete { trunk } => write!(f, "undelete {}", trunk),
+            TrunkOp::SetMode { trunk, mode } => write!(f, "set mode of {} to {mode:#o}", trunk),
+            TrunkOp::SetKind { trunk, kind } => write!(f, "set kind of {} to {kind}", trunk),
         }
     }
 }

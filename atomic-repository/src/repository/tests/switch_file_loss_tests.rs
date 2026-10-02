@@ -17,7 +17,7 @@ use crate::apply::CrossViewInsertOptions;
 use crate::record::RecordOptions;
 use atomic_core::change::ChangeHeader;
 
-fn record_all(repo: &Repository, message: &str) {
+fn record_all(repo: &TestRepository, message: &str) {
     let header = ChangeHeader::new(message);
     let options = RecordOptions::new()
         .with_all(true)

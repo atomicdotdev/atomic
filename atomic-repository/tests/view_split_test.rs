@@ -11,13 +11,19 @@ use std::path::Path;
 use atomic_core::change::{Author, ChangeHeader};
 use atomic_core::pristine::ViewScope;
 use atomic_core::types::{Base32, Hash};
+use atomic_core::WorkingCopyId;
 use atomic_repository::history::HistoryOptions;
 use atomic_repository::{RecordOptions, Repository, SplitOptions};
 use tempfile::TempDir;
 
+fn working_copy(repo: &Repository) -> WorkingCopyId {
+    repo.require_working_copy_id().expect("working copy id")
+}
+
 fn add_file(repo: &Repository, repo_path: &Path, name: &str, content: &str) {
     fs::write(repo_path.join(name), content).expect("write file");
-    repo.add(name, Default::default()).expect("add file");
+    repo.add(working_copy(repo), name, Default::default())
+        .expect("add file");
 }
 
 fn write_only(repo_path: &Path, name: &str, content: &str) {
@@ -30,7 +36,7 @@ fn record(repo: &Repository, message: &str) -> Hash {
         .author(Author::new("Test", Some("test@example.com")))
         .build();
     *repo
-        .record(header, RecordOptions::default())
+        .record(working_copy(repo), header, RecordOptions::default())
         .expect("record")
         .hash()
 }
@@ -66,7 +72,7 @@ fn split_independent_middle_changes() {
 
     // Split out the middle two.
     let outcome = repo
-        .split_view(SplitOptions::new("wip", vec![b, c]))
+        .split_view(working_copy(&repo), SplitOptions::new("wip", vec![b, c]))
         .expect("split");
 
     assert!(!outcome.blocked);
@@ -119,14 +125,17 @@ fn split_blocked_by_dependent() {
 
     // Dry run reports the block without mutating.
     let preview = repo
-        .split_view(SplitOptions {
-            target_view: "wip".to_string(),
-            from_view: None,
-            changes: vec![c1],
-            cascade: false,
-            dry_run: true,
-            materialize: false,
-        })
+        .split_view(
+            working_copy(&repo),
+            SplitOptions {
+                target_view: "wip".to_string(),
+                from_view: None,
+                changes: vec![c1],
+                cascade: false,
+                dry_run: true,
+                materialize: false,
+            },
+        )
         .expect("dry run ok");
     assert!(preview.blocked, "dry run should report blocked");
     assert_eq!(preview.dependents.len(), 1);
@@ -135,7 +144,7 @@ fn split_blocked_by_dependent() {
 
     // Real attempt errors.
     let err = repo
-        .split_view(SplitOptions::new("wip", vec![c1]))
+        .split_view(working_copy(&repo), SplitOptions::new("wip", vec![c1]))
         .expect_err("should be blocked");
     match err {
         atomic_repository::RepositoryError::ViewSplitHasDependents { blocking, .. } => {
@@ -163,14 +172,17 @@ fn split_cascade_moves_dependents() {
     let c2 = record(&repo, "edit f");
 
     let outcome = repo
-        .split_view(SplitOptions {
-            target_view: "wip".to_string(),
-            from_view: Some(source.clone()),
-            changes: vec![c1],
-            cascade: true,
-            dry_run: false,
-            materialize: false,
-        })
+        .split_view(
+            working_copy(&repo),
+            SplitOptions {
+                target_view: "wip".to_string(),
+                from_view: Some(source.clone()),
+                changes: vec![c1],
+                cascade: true,
+                dry_run: false,
+                materialize: false,
+            },
+        )
         .expect("cascade split");
 
     assert!(!outcome.blocked);
@@ -205,14 +217,17 @@ fn split_materialize_reconciles_working_copy() {
 
     // Split out `edit g` (revert g.txt) and `create h` (delete h.txt).
     let outcome = repo
-        .split_view(SplitOptions {
-            target_view: "wip".to_string(),
-            from_view: Some(source.clone()),
-            changes: vec![edit_g, create_h],
-            cascade: false,
-            dry_run: false,
-            materialize: true,
-        })
+        .split_view(
+            working_copy(&repo),
+            SplitOptions {
+                target_view: "wip".to_string(),
+                from_view: Some(source.clone()),
+                changes: vec![edit_g, create_h],
+                cascade: false,
+                dry_run: false,
+                materialize: true,
+            },
+        )
         .expect("materialize split");
 
     assert!(outcome.working_copy_updated);
@@ -241,7 +256,7 @@ fn split_rejects_change_not_in_view() {
     // A hash that was never recorded.
     let phantom = Hash::of(b"nope");
     let err = repo
-        .split_view(SplitOptions::new("wip", vec![phantom]))
+        .split_view(working_copy(&repo), SplitOptions::new("wip", vec![phantom]))
         .expect_err("should reject unknown change");
     assert!(matches!(
         err,

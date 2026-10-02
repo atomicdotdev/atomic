@@ -1,9 +1,352 @@
 use super::super::graph::AliveGraph;
 use super::super::vertex::{AliveVertex, VertexFlags, VertexId};
 use super::options::{RetrieveOptions, RetrieveResult};
-use crate::types::{ChangePosition, EdgeFlags, EdgeKind, ForwardEdge, GraphNode, NodeId, Position};
+use super::retrieve_graph;
+use crate::pristine::{GraphTxnT, GraphVisibilityClosure, PristineError};
+use crate::types::{
+    ChangePosition, EdgeFlags, EdgeKind, ForwardEdge, GraphNode, Hash, NodeId, Position,
+    SerializedGraphEdge,
+};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+
+fn visibility(changes: impl IntoIterator<Item = NodeId>) -> GraphVisibilityClosure {
+    GraphVisibilityClosure::from_ordered_unchecked(changes)
+}
+
+#[derive(Clone, Copy)]
+enum Fault {
+    Inconsistent(&'static str),
+    BlockNotFound { change: u64, pos: u64 },
+}
+
+impl Fault {
+    fn into_error(self) -> PristineError {
+        match self {
+            Self::Inconsistent(message) => PristineError::Inconsistent {
+                message: message.to_string(),
+            },
+            Self::BlockNotFound { change, pos } => PristineError::BlockNotFound { change, pos },
+        }
+    }
+}
+
+#[derive(Default)]
+struct FaultGraphTxn {
+    edges: HashMap<GraphNode<NodeId>, Vec<SerializedGraphEdge>>,
+    blocks: HashMap<Position<NodeId>, GraphNode<NodeId>>,
+    block_ends: HashMap<Position<NodeId>, GraphNode<NodeId>>,
+    find_block_faults: HashMap<Position<NodeId>, Fault>,
+    find_block_end_faults: HashMap<Position<NodeId>, Fault>,
+    forward_item_faults: HashMap<GraphNode<NodeId>, Fault>,
+    parent_item_faults: HashMap<GraphNode<NodeId>, Fault>,
+}
+
+impl FaultGraphTxn {
+    fn add_edge(&mut self, source: GraphNode<NodeId>, flags: EdgeFlags, dest: Position<NodeId>) {
+        self.edges
+            .entry(source)
+            .or_default()
+            .push(SerializedGraphEdge::new(flags, dest, NodeId::new(99)));
+    }
+
+    fn resolve_block(&mut self, pos: Position<NodeId>, node: GraphNode<NodeId>) {
+        self.blocks.insert(pos, node);
+    }
+
+    fn resolve_block_end(&mut self, pos: Position<NodeId>, node: GraphNode<NodeId>) {
+        self.block_ends.insert(pos, node);
+    }
+
+    fn fail_find_block(&mut self, pos: Position<NodeId>, fault: Fault) {
+        self.find_block_faults.insert(pos, fault);
+    }
+
+    fn fail_find_block_end(&mut self, pos: Position<NodeId>, fault: Fault) {
+        self.find_block_end_faults.insert(pos, fault);
+    }
+
+    fn fail_forward_item(&mut self, node: GraphNode<NodeId>, fault: Fault) {
+        self.forward_item_faults.insert(node, fault);
+    }
+
+    fn fail_parent_item(&mut self, node: GraphNode<NodeId>, fault: Fault) {
+        self.parent_item_faults.insert(node, fault);
+    }
+}
+
+impl GraphTxnT for FaultGraphTxn {
+    type Adj = std::vec::IntoIter<Result<SerializedGraphEdge, PristineError>>;
+
+    fn get_external(&self, _id: NodeId) -> Result<Option<Hash>, PristineError> {
+        Ok(None)
+    }
+
+    fn get_internal(&self, _hash: &Hash) -> Result<Option<NodeId>, PristineError> {
+        Ok(None)
+    }
+
+    fn iter_adjacent(
+        &self,
+        node: GraphNode<NodeId>,
+        min_flag: EdgeFlags,
+        max_flag: EdgeFlags,
+    ) -> Result<Self::Adj, PristineError> {
+        let item_fault = if min_flag.contains(EdgeFlags::PARENT) {
+            self.parent_item_faults.get(&node)
+        } else {
+            self.forward_item_faults.get(&node)
+        };
+        if let Some(fault) = item_fault {
+            return Ok(vec![Err(fault.into_error())].into_iter());
+        }
+
+        let edges = self
+            .edges
+            .get(&node)
+            .into_iter()
+            .flatten()
+            .filter(|edge| {
+                let flag = edge.flag();
+                flag >= min_flag && flag <= max_flag
+            })
+            .copied()
+            .map(Ok)
+            .collect::<Vec<_>>();
+        Ok(edges.into_iter())
+    }
+
+    fn find_block(&self, pos: Position<NodeId>) -> Result<GraphNode<NodeId>, PristineError> {
+        if let Some(fault) = self.find_block_faults.get(&pos) {
+            return Err(fault.into_error());
+        }
+        self.blocks
+            .get(&pos)
+            .copied()
+            .ok_or(PristineError::BlockNotFound {
+                change: pos.change.get(),
+                pos: pos.pos.get(),
+            })
+    }
+
+    fn find_block_end(&self, pos: Position<NodeId>) -> Result<GraphNode<NodeId>, PristineError> {
+        if let Some(fault) = self.find_block_end_faults.get(&pos) {
+            return Err(fault.into_error());
+        }
+        self.block_ends
+            .get(&pos)
+            .copied()
+            .ok_or(PristineError::BlockNotFound {
+                change: pos.change.get(),
+                pos: pos.pos.get(),
+            })
+    }
+
+    fn has_vertex(&self, node: GraphNode<NodeId>) -> Result<bool, PristineError> {
+        Ok(self.edges.contains_key(&node))
+    }
+
+    fn get_node_type(&self, _node_id: NodeId) -> Result<Option<u8>, PristineError> {
+        Ok(None)
+    }
+
+    fn get_rev_deps(&self, _dep_id: NodeId) -> Result<Vec<NodeId>, PristineError> {
+        Ok(Vec::new())
+    }
+
+    fn has_change_in_graph(&self, change_id: NodeId) -> Result<bool, PristineError> {
+        Ok(self.edges.keys().any(|node| node.change == change_id))
+    }
+}
+
+fn test_pos(change: u64, pos: u64) -> Position<NodeId> {
+    Position::new(NodeId::new(change), ChangePosition::new(pos))
+}
+
+fn test_node(change: u64, start: u64, end: u64) -> GraphNode<NodeId> {
+    GraphNode::new(
+        NodeId::new(change),
+        ChangePosition::new(start),
+        ChangePosition::new(end),
+    )
+}
+
+fn assert_inconsistent(
+    result: Result<RetrieveResult, PristineError>,
+    expected_message: &'static str,
+) {
+    match result {
+        Err(PristineError::Inconsistent { message }) => {
+            assert_eq!(message, expected_message);
+        }
+        Err(other) => panic!("expected Inconsistent({expected_message:?}), got {other:?}"),
+        Ok(_) => panic!("expected Inconsistent({expected_message:?}), got success"),
+    }
+}
+
+fn add_dead_walk_prefix(
+    txn: &mut FaultGraphTxn,
+) -> (Position<NodeId>, GraphNode<NodeId>, Position<NodeId>) {
+    let start = test_pos(1, 0);
+    let root = start.inode_node();
+    let dead_pos = test_pos(2, 0);
+    let dead = test_node(2, 0, 10);
+    let dead_end = test_pos(2, 10);
+
+    txn.add_edge(root, EdgeFlags::BLOCK, dead_pos);
+    txn.resolve_block(dead_pos, dead);
+
+    (start, dead, dead_end)
+}
+
+fn add_visible_chain_fixture(
+    txn: &mut FaultGraphTxn,
+) -> (Position<NodeId>, GraphNode<NodeId>, GraphNode<NodeId>) {
+    let (start, dead, dead_end) = add_dead_walk_prefix(txn);
+    let first_pos = test_pos(3, 0);
+    let first = test_node(3, 0, 10);
+    let second_pos = test_pos(4, 0);
+    let second = test_node(4, 0, 10);
+
+    txn.add_edge(dead, EdgeFlags::BLOCK, first_pos);
+    txn.add_edge(dead, EdgeFlags::BLOCK, second_pos);
+    txn.resolve_block(first_pos, first);
+    txn.resolve_block(second_pos, second);
+    txn.add_edge(first, EdgeFlags::PARENT | EdgeFlags::BLOCK, dead_end);
+    txn.add_edge(second, EdgeFlags::PARENT | EdgeFlags::BLOCK, dead_end);
+    txn.resolve_block_end(dead_end, dead);
+
+    (start, first, second)
+}
+
+// -------------------------------------------------------------------------
+// Fail-closed resolver propagation tests
+// -------------------------------------------------------------------------
+
+#[test]
+fn adjacency_item_error_propagates() {
+    let start = test_pos(1, 0);
+    let mut txn = FaultGraphTxn::default();
+    txn.fail_forward_item(
+        start.inode_node(),
+        Fault::Inconsistent("forward adjacency item"),
+    );
+
+    assert_inconsistent(
+        retrieve_graph(&txn, start, RetrieveOptions::new()),
+        "forward adjacency item",
+    );
+}
+
+#[test]
+fn direct_destination_resolution_error_propagates() {
+    let start = test_pos(1, 0);
+    let dest = test_pos(7, 42);
+    let mut txn = FaultGraphTxn::default();
+    txn.add_edge(start.inode_node(), EdgeFlags::BLOCK, dest);
+    txn.fail_find_block(dest, Fault::BlockNotFound { change: 7, pos: 42 });
+
+    match retrieve_graph(&txn, start, RetrieveOptions::new()) {
+        Err(PristineError::BlockNotFound { change, pos }) => {
+            assert_eq!((change, pos), (7, 42));
+        }
+        Err(other) => panic!("expected BlockNotFound(7, 42), got {other:?}"),
+        Ok(_) => panic!("expected BlockNotFound(7, 42), got success"),
+    }
+}
+
+#[test]
+fn dead_walk_destination_resolution_error_propagates() {
+    let mut txn = FaultGraphTxn::default();
+    let (start, dead, _) = add_dead_walk_prefix(&mut txn);
+    let unresolved = test_pos(8, 13);
+    txn.add_edge(dead, EdgeFlags::BLOCK, unresolved);
+    txn.fail_find_block(
+        unresolved,
+        Fault::Inconsistent("dead-walk destination resolution"),
+    );
+
+    assert_inconsistent(
+        retrieve_graph(&txn, start, RetrieveOptions::new()),
+        "dead-walk destination resolution",
+    );
+}
+
+#[test]
+fn alternate_parent_resolution_error_propagates() {
+    let mut txn = FaultGraphTxn::default();
+    let (start, dead, dead_end) = add_dead_walk_prefix(&mut txn);
+    let live_pos = test_pos(3, 0);
+    let live = test_node(3, 0, 10);
+    let alternate_end = test_pos(5, 10);
+
+    txn.add_edge(dead, EdgeFlags::BLOCK, live_pos);
+    txn.resolve_block(live_pos, live);
+    txn.add_edge(live, EdgeFlags::PARENT | EdgeFlags::BLOCK, dead_end);
+    txn.add_edge(live, EdgeFlags::PARENT | EdgeFlags::BLOCK, alternate_end);
+    txn.resolve_block_end(dead_end, dead);
+    txn.fail_find_block_end(
+        alternate_end,
+        Fault::Inconsistent("alternate-parent resolution"),
+    );
+
+    assert_inconsistent(
+        retrieve_graph(&txn, start, RetrieveOptions::new()),
+        "alternate-parent resolution",
+    );
+}
+
+#[test]
+fn alternate_parent_aliveness_error_propagates() {
+    let mut txn = FaultGraphTxn::default();
+    let (start, dead, dead_end) = add_dead_walk_prefix(&mut txn);
+    let live_pos = test_pos(3, 0);
+    let live = test_node(3, 0, 10);
+    let alternate_end = test_pos(5, 10);
+    let alternate = test_node(5, 0, 10);
+
+    txn.add_edge(dead, EdgeFlags::BLOCK, live_pos);
+    txn.resolve_block(live_pos, live);
+    txn.add_edge(live, EdgeFlags::PARENT | EdgeFlags::BLOCK, dead_end);
+    txn.add_edge(live, EdgeFlags::PARENT | EdgeFlags::BLOCK, alternate_end);
+    txn.resolve_block_end(dead_end, dead);
+    txn.resolve_block_end(alternate_end, alternate);
+    txn.fail_parent_item(alternate, Fault::Inconsistent("alternate-parent aliveness"));
+
+    assert_inconsistent(
+        retrieve_graph(&txn, start, RetrieveOptions::new()),
+        "alternate-parent aliveness",
+    );
+}
+
+#[test]
+fn visible_chain_iterator_error_propagates() {
+    let mut txn = FaultGraphTxn::default();
+    let (start, first, _) = add_visible_chain_fixture(&mut txn);
+    txn.fail_forward_item(first, Fault::Inconsistent("visible-chain iterator"));
+
+    assert_inconsistent(
+        retrieve_graph(&txn, start, RetrieveOptions::new()),
+        "visible-chain iterator",
+    );
+}
+
+#[test]
+fn visible_chain_resolution_error_propagates() {
+    let mut txn = FaultGraphTxn::default();
+    let (start, first, _) = add_visible_chain_fixture(&mut txn);
+    let unresolved = test_pos(9, 21);
+    txn.add_edge(first, EdgeFlags::BLOCK, unresolved);
+    txn.fail_find_block(
+        unresolved,
+        Fault::Inconsistent("visible-chain destination resolution"),
+    );
+
+    assert_inconsistent(
+        retrieve_graph(&txn, start, RetrieveOptions::new()),
+        "visible-chain destination resolution",
+    );
+}
 
 // -------------------------------------------------------------------------
 // RetrieveOptions Tests
@@ -14,7 +357,7 @@ fn test_retrieve_options_default() {
     let opts = RetrieveOptions::default();
     assert!(!opts.include_deleted);
     assert!(opts.max_vertices.is_none());
-    assert!(opts.change_filter.is_none());
+    assert!(opts.graph_visibility.is_none());
 }
 
 #[test]
@@ -211,13 +554,12 @@ fn test_retrieve_options_debug() {
 // Change Filter Tests
 
 #[test]
-fn test_retrieve_options_with_change_filter() {
-    let mut filter = HashSet::new();
-    filter.insert(NodeId::new(1));
-    filter.insert(NodeId::new(2));
-
-    let opts = RetrieveOptions::new().with_change_filter(filter);
+fn test_retrieve_options_with_graph_visibility() {
+    let opts =
+        RetrieveOptions::new().with_graph_visibility(visibility([NodeId::new(1), NodeId::new(2)]));
     assert!(opts.has_filter());
+    assert!(opts.passes_filter(NodeId::new(1)));
+    assert!(opts.passes_filter(NodeId::new(2)));
 }
 
 #[test]
@@ -275,13 +617,14 @@ fn test_passes_filter_not_in_set() {
 }
 
 #[test]
-fn test_passes_filter_empty_set() {
-    let filter: HashSet<NodeId> = HashSet::new();
-    let opts = RetrieveOptions::new().with_change_filter(filter);
+fn test_empty_visibility_is_filtered_but_none_is_ambient() {
+    let opts = RetrieveOptions::new().with_graph_visibility(GraphVisibilityClosure::empty());
 
-    // Empty filter means only ROOT passes
+    // An empty closure is active visibility and means only ROOT passes.
     assert!(opts.passes_filter(NodeId::ROOT));
     assert!(!opts.passes_filter(NodeId::new(1)));
+    assert!(!RetrieveOptions::new().has_filter());
+    assert!(RetrieveOptions::new().passes_filter(NodeId::new(1)));
 }
 
 #[test]
@@ -351,11 +694,7 @@ fn test_retrieve_options_shared_filter_arc() {
     let opts1 = RetrieveOptions::new().with_change_filter_arc(arc.clone());
     let opts2 = RetrieveOptions::new().with_change_filter_arc(arc.clone());
 
-    // Both should reference the same Arc
-    assert!(Arc::ptr_eq(
-        opts1.change_filter.as_ref().unwrap(),
-        opts2.change_filter.as_ref().unwrap()
-    ));
+    assert_eq!(opts1.graph_visibility, opts2.graph_visibility);
 }
 
 // -------------------------------------------------------------------------

@@ -3,28 +3,46 @@
 //! This module provides the `ReadTxn` struct which implements read-only
 //! access to the pristine database.
 
-use redb::{ReadTransaction, ReadableTable, ReadableTableMetadata};
+use redb::{ReadTransaction, ReadableMultimapTable, ReadableTable, ReadableTableMetadata};
 
-use crate::pristine::tables::{VAULT_ENTRIES, VAULT_MANIFEST};
-use crate::pristine::traits::tag::GitShaIndexTxnT;
+use crate::operation::{
+    decode_effect_receipt, decode_operation, decode_operation_heads, decode_operation_scope,
+    EffectReceipt, Operation, OperationHeads, OperationScope,
+};
+use crate::pristine::ref_mapping::RefMappingTxnT;
+use crate::pristine::tables::{
+    BRIDGE_EVENT_CAPTURES, BRIDGE_EVENT_CAPTURE_ANCHORS, BRIDGE_REF_CAPTURE_TOKENS, REF_MAPPINGS,
+    VAULT_ENTRIES, VAULT_MANIFEST,
+};
+use crate::pristine::traits::capability_txn::{capability_metadata_key, CapabilityTxnT};
 use crate::pristine::traits::tag::TagRecord;
+use crate::pristine::traits::tag::{BridgeEventCaptureTxnT, GitCommitClosureTxnT, GitShaIndexTxnT};
 use crate::pristine::traits::{EmbeddingsTxnT, KgTxnT, TagTxnT, VaultEntryMeta, VaultTxnT};
 use crate::pristine::vault::{EmbeddingRecord, KgEdge, KgNode, SearchResult};
-use crate::pristine::{VaultEntry, VaultEntryType, VaultManifest};
+use crate::pristine::{
+    decode_file_index_v2, decode_set_id_index_entry, FileIndexV2Entry, FileIndexV2Key,
+    SetIdIndexTxnT, VaultEntry, VaultEntryType, VaultManifest,
+};
 use crate::types::{
-    ChangePosition, EdgeFlags, GraphNode, Hash, Inode, Merkle, NodeId, Position,
-    SerializedGraphEdge,
+    ChangePosition, EdgeFlags, EffectReceiptId, GraphNode, Hash, Inode, Merkle, NodeId,
+    OperationId, Position, SerializedGraphEdge, WorkingCopyId,
 };
 
 use crate::pristine::error::{PristineError, PristineResult};
+use crate::pristine::path_claim::{
+    decode_path_claim_event, PathClaimEntry, PathClaimEvent, PATH_CLAIM_SCHEMA_KEY,
+};
 use crate::pristine::tables::*;
 use crate::pristine::tables::{TAG_NAME_INDEX, TAG_RECORDS};
 use crate::pristine::traits::{
-    FileIndexEntry, FileIndexMetadata, GraphTxnT, StoredConflict, TreeTxnT, ViewState, ViewTxnT,
+    decode_working_copy_record, FileIndexEntry, FileIndexMetadata, FileIndexV2TxnT, GraphTxnT,
+    GraphVisibilityClosure, OperationTxnT, PathClaimTxnT, StoredConflict, TreeTxnT, ViewState,
+    ViewTxnT, WorkingCopyRecord, WorkingCopyTxnT,
 };
 
 use super::helpers::{
-    deserialize_conflicts, deserialize_edge, deserialize_view_state, AdjIterator,
+    collect_preload_edges, collect_until_error, deserialize_conflicts, deserialize_edge,
+    deserialize_view_state, graph_presence, try_collect, try_is_present, AdjIterator,
 };
 
 /// Read-only transaction
@@ -33,6 +51,59 @@ use super::helpers::{
 /// can be active simultaneously.
 pub struct ReadTxn {
     pub(crate) txn: ReadTransaction,
+}
+
+fn operation_serialization_error(error: impl std::fmt::Display) -> PristineError {
+    PristineError::Serialization {
+        message: error.to_string(),
+    }
+}
+
+fn decode_operation_row(key: &[u8; OperationId::SIZE], bytes: &[u8]) -> PristineResult<Operation> {
+    let key_id = OperationId::from_bytes(*key);
+    let operation = decode_operation(bytes).map_err(operation_serialization_error)?;
+    if operation.id() != key_id {
+        return Err(PristineError::Inconsistent {
+            message: format!(
+                "OPERATIONS key {} contains canonical operation {}",
+                key_id,
+                operation.id()
+            ),
+        });
+    }
+    Ok(operation)
+}
+
+fn decode_effect_receipt_row(key: &[u8; 64], bytes: &[u8]) -> PristineResult<EffectReceipt> {
+    let (key_operation, key_receipt) = decode_effect_receipt_key(key);
+    let receipt = decode_effect_receipt(bytes).map_err(operation_serialization_error)?;
+    if receipt.id() != key_receipt || receipt.payload().operation != key_operation {
+        return Err(PristineError::Inconsistent {
+            message: format!(
+                "EFFECT_RECEIPTS key ({key_operation}, {key_receipt}) contains receipt ({}, {})",
+                receipt.payload().operation,
+                receipt.id()
+            ),
+        });
+    }
+    Ok(receipt)
+}
+
+fn decode_working_copy_row(
+    key: &[u8; WorkingCopyId::SIZE],
+    bytes: &[u8],
+) -> PristineResult<WorkingCopyRecord> {
+    let key_id = WorkingCopyId::from_bytes(*key);
+    let record = decode_working_copy_record(bytes)?;
+    if record.id != key_id {
+        return Err(PristineError::Inconsistent {
+            message: format!(
+                "WORKING_COPIES key {} contains record for {}",
+                key_id, record.id
+            ),
+        });
+    }
+    Ok(record)
 }
 
 impl ReadTxn {
@@ -53,12 +124,9 @@ impl ReadTxn {
 
     /// Enumerate every `(inode, path)` pair in `REV_TREE`.
     ///
-    /// Unlike [`TreeTxnT::iter_tree`], which walks the single-valued
-    /// `path -> inode` `TREE` index (so it hides every inode a later
-    /// same-path create overwrote), this walks the inode-keyed `REV_TREE`
-    /// and therefore exposes ALL inodes that ever claimed a path. Callers
-    /// use it to detect name conflicts: a path with two distinct inodes that
-    /// are both visible and alive under a view's change filter.
+    /// Healthy databases contain the exact inverse of `TREE`. Legacy
+    /// reverse-only rows may be inspected during migration, but durable name
+    /// claims belong in `PATH_CLAIMS` and must not be created here.
     pub fn iter_rev_tree(&self) -> PristineResult<Vec<(Inode, String)>> {
         let table = self.txn.open_table(REV_TREE)?;
         let mut results = Vec::new();
@@ -67,6 +135,75 @@ impl ReadTxn {
             results.push((Inode::new(k.value()), v.value().to_string()));
         }
         Ok(results)
+    }
+}
+
+impl SetIdIndexTxnT for ReadTxn {
+    fn get_set_id_index(
+        &self,
+        view_id: u64,
+    ) -> PristineResult<Option<crate::pristine::SetIdIndexEntry>> {
+        let table = match self.txn.open_table(VIEW_SET_ID_INDEX) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        let result = match table.get(view_id)? {
+            Some(value) => decode_set_id_index_entry(value.value()).map(Some),
+            None => Ok(None),
+        };
+        result
+    }
+}
+
+impl CapabilityTxnT for ReadTxn {
+    fn required_capability_version(&self, id: &str) -> PristineResult<Option<u32>> {
+        let table = self.txn.open_table(PRISTINE_META)?;
+        let version = table
+            .get(capability_metadata_key(id).as_str())?
+            .map(|version| version.value());
+        Ok(version)
+    }
+}
+
+impl PathClaimTxnT for ReadTxn {
+    fn path_claim_schema_version(&self) -> PristineResult<Option<u32>> {
+        let table = self.txn.open_table(PRISTINE_META)?;
+        let version = table
+            .get(PATH_CLAIM_SCHEMA_KEY)?
+            .map(|version| version.value());
+        Ok(version)
+    }
+
+    fn get_path_claims(&self, path: &str) -> PristineResult<Vec<PathClaimEvent>> {
+        let table = self.txn.open_multimap_table(PATH_CLAIMS)?;
+        let mut events = Vec::new();
+        for value in table.get(path)? {
+            let value = value?;
+            events.push(decode_path_claim_event(value.value())?);
+        }
+        Ok(events)
+    }
+
+    fn iter_path_claims(&self) -> PristineResult<Vec<PathClaimEntry>> {
+        let table = self.txn.open_multimap_table(PATH_CLAIMS)?;
+        let mut entries = Vec::new();
+        for row in table.iter()? {
+            let (path, values) = row?;
+            let path = path.value().to_string();
+            for value in values {
+                let value = value?;
+                entries.push(PathClaimEntry::new(
+                    path.clone(),
+                    decode_path_claim_event(value.value())?,
+                ));
+            }
+        }
+        Ok(entries)
+    }
+
+    fn iter_rev_tree_pairs(&self) -> PristineResult<Vec<(Inode, String)>> {
+        self.iter_rev_tree()
     }
 }
 
@@ -124,7 +261,7 @@ impl GraphTxnT for ReadTxn {
         let key = encode_vertex(node.change.get(), node.start.get(), node.end.get());
 
         let mut edges = Vec::new();
-        for v in table.get(&key)?.filter_map(|r| r.ok()) {
+        for v in try_collect(table.get(&key)?)? {
             let bytes: &[u8; 24] = v.value();
             let edge = deserialize_edge(bytes);
             let flag = edge.flag();
@@ -149,46 +286,42 @@ impl GraphTxnT for ReadTxn {
         let change_id = pos.change.get();
         let target_pos = pos.pos.get();
 
-        let start_key = encode_vertex(change_id, 0, 0);
-        let end_key = encode_vertex(change_id, u64::MAX, u64::MAX);
-
-        // Track empty span match as fallback
-        let mut empty_vertex_match: Option<GraphNode<NodeId>> = None;
-
-        for result in table.range::<&[u8; 24]>(&start_key..=&end_key)? {
-            let (key, _values) = result?;
-            let (v_change, v_start, v_end) = decode_vertex(key.value());
-
-            if v_change != change_id {
-                continue;
-            }
-
-            // Check for non-empty span containing this position.
-            // For edges pointing to content, we want to find the content span
-            // even if there's an empty inode span at the same start position.
-            // This is critical for graph traversal: an edge to position 9 should
-            // find content span V[9:23], not inode span V[9:9].
-            if v_start != v_end && v_start <= target_pos && target_pos < v_end {
+        // Binary-search candidates instead of scanning every vertex of the
+        // change (the historical full-range scan made each call
+        // O(change vertices); within one change the non-empty hunks are
+        // DISJOINT ranges of that change's contents buffer, so the containing
+        // vertex is the LAST vertex key ≤ (pos, u64::MAX) and the
+        // empty-vertex fallback is an exact-key lookup — review ::15,
+        // 2026-09-16). Semantics identical to the scan, including the
+        // inode/content start ambiguity (AGENTS.md "Position Ambiguity").
+        let upper = encode_vertex(change_id, target_pos, u64::MAX);
+        if let Some((v_change, v_start, v_end)) = table
+            .range::<&[u8; 24]>(&encode_vertex(change_id, 0, 0)..=&upper)?
+            .next_back()
+            .transpose()?
+            .map(|(key, _values)| decode_vertex(key.value()))
+        {
+            if v_change == change_id
+                && v_start != v_end
+                && v_start <= target_pos
+                && target_pos < v_end
+            {
                 return Ok(GraphNode {
-                    change: NodeId::new(v_change),
-                    start: ChangePosition::new(v_start),
-                    end: ChangePosition::new(v_end),
-                });
-            }
-
-            // Track empty span at exact position as fallback
-            if v_start == v_end && v_start == target_pos && empty_vertex_match.is_none() {
-                empty_vertex_match = Some(GraphNode {
-                    change: NodeId::new(v_change),
+                    change: NodeId::new(change_id),
                     start: ChangePosition::new(v_start),
                     end: ChangePosition::new(v_end),
                 });
             }
         }
 
-        // Return empty span if no non-empty span matched
-        if let Some(found) = empty_vertex_match {
-            return Ok(found);
+        // Empty-vertex fallback: the exact key (change, pos, pos).
+        let empty_key = encode_vertex(change_id, target_pos, target_pos);
+        if try_is_present(table.get(&empty_key)?)? {
+            return Ok(GraphNode {
+                change: NodeId::new(change_id),
+                start: ChangePosition::new(target_pos),
+                end: ChangePosition::new(target_pos),
+            });
         }
 
         Err(PristineError::BlockNotFound {
@@ -215,7 +348,7 @@ impl GraphTxnT for ReadTxn {
         // Without this direct lookup, iteration would return V[0:9] first since
         // it has a lower start position.
         let empty_key = encode_vertex(change_id, target_pos, target_pos);
-        if table.get(&empty_key)?.next().is_some() {
+        if try_is_present(table.get(&empty_key)?)? {
             return Ok(GraphNode {
                 change: NodeId::new(change_id),
                 start: ChangePosition::new(target_pos),
@@ -223,32 +356,42 @@ impl GraphTxnT for ReadTxn {
             });
         }
 
-        // SECOND: Fall back to iteration to find vertices that end at this position
-        let start_key = encode_vertex(change_id, 0, 0);
-        let end_key = encode_vertex(change_id, u64::MAX, u64::MAX);
-
-        // Look for a span that ends at this position or contains it
-        for result in table.range::<&[u8; 24]>(&start_key..=&end_key)? {
-            let (key, _values) = result?;
-            let (v_change, v_start, v_end) = decode_vertex(key.value());
-
-            if v_change != change_id {
-                continue;
+        // SECOND: binary-search the vertices that end at or contain this
+        // position (the historical full-range scan made each call
+        // O(change vertices) — review ::15, 2026-09-16). Under within-change
+        // hunk disjointness: an ends-at-pos span (unique when it exists) is
+        // the last vertex key ≤ (pos-1, MAX); a contains-pos span (unique
+        // when it exists) is the last vertex key ≤ (pos, MAX); an
+        // ends-at-pos span starts strictly before any contains-pos span, so
+        // this order preserves the historical first-match semantics.
+        if target_pos > 0 {
+            let before_upper = encode_vertex(change_id, target_pos - 1, u64::MAX);
+            if let Some((v_change, v_start, v_end)) = table
+                .range::<&[u8; 24]>(&encode_vertex(change_id, 0, 0)..=&before_upper)?
+                .next_back()
+                .transpose()?
+                .map(|(key, _values)| decode_vertex(key.value()))
+            {
+                if v_change == change_id && v_end == target_pos && v_start < v_end {
+                    return Ok(GraphNode {
+                        change: NodeId::new(change_id),
+                        start: ChangePosition::new(v_start),
+                        end: ChangePosition::new(v_end),
+                    });
+                }
             }
+        }
 
-            // Check for span that ends at this position
-            if v_end == target_pos && v_start < v_end {
+        let contains_upper = encode_vertex(change_id, target_pos, u64::MAX);
+        if let Some((v_change, v_start, v_end)) = table
+            .range::<&[u8; 24]>(&encode_vertex(change_id, 0, 0)..=&contains_upper)?
+            .next_back()
+            .transpose()?
+            .map(|(key, _values)| decode_vertex(key.value()))
+        {
+            if v_change == change_id && v_start <= target_pos && target_pos < v_end {
                 return Ok(GraphNode {
-                    change: NodeId::new(v_change),
-                    start: ChangePosition::new(v_start),
-                    end: ChangePosition::new(v_end),
-                });
-            }
-
-            // Also check if position falls within [start, end)
-            if v_start <= target_pos && target_pos < v_end {
-                return Ok(GraphNode {
-                    change: NodeId::new(v_change),
+                    change: NodeId::new(change_id),
                     start: ChangePosition::new(v_start),
                     end: ChangePosition::new(v_end),
                 });
@@ -264,7 +407,7 @@ impl GraphTxnT for ReadTxn {
     fn has_vertex(&self, node: GraphNode<NodeId>) -> PristineResult<bool> {
         let table = self.txn.open_multimap_table(GRAPH)?;
         let key = encode_vertex(node.change.get(), node.start.get(), node.end.get());
-        let has = table.get(&key)?.next().is_some();
+        let has = graph_presence(table.get(&key)?)?;
         Ok(has)
     }
 
@@ -296,10 +439,10 @@ impl GraphTxnT for ReadTxn {
         Ok(result)
     }
 
-    fn is_change_deps_indexed(&self, change_id: NodeId) -> PristineResult<bool> {
+    fn change_deps_indexed_count(&self, change_id: NodeId) -> PristineResult<Option<u64>> {
         let table = self.txn.open_table(CHANGE_DEPS_INDEXED)?;
-        let indexed = table.get(change_id.get())?.is_some();
-        Ok(indexed)
+        let count = table.get(change_id.get())?.map(|value| value.value());
+        Ok(count)
     }
 
     fn get_rev_change_deps(&self, dep_hash: &Hash) -> PristineResult<Vec<NodeId>> {
@@ -317,10 +460,7 @@ impl GraphTxnT for ReadTxn {
         let table = self.txn.open_multimap_table(GRAPH)?;
         let start_key = encode_vertex(change_id.get(), 0, 0);
         let end_key = encode_vertex(change_id.get(), u64::MAX, u64::MAX);
-        let has = table
-            .range::<&[u8; 24]>(&start_key..=&end_key)?
-            .next()
-            .is_some();
+        let has = graph_presence(table.range::<&[u8; 24]>(&start_key..=&end_key)?)?;
         Ok(has)
     }
 }
@@ -353,13 +493,26 @@ impl ViewTxnT for ReadTxn {
         }
     }
 
-    fn list_views(&self) -> PristineResult<Vec<String>> {
+    fn snapshot_views(&self) -> PristineResult<Vec<(String, ViewState)>> {
         let table = self.txn.open_table(VIEWS)?;
-        let mut names = Vec::new();
-        for (k, _) in table.iter()?.filter_map(|r| r.ok()) {
-            names.push(k.value().to_string());
+        let mut rows = Vec::new();
+        for entry in table.iter()? {
+            let (name, value) = entry?;
+            rows.push((
+                name.value().to_string(),
+                deserialize_view_state(value.value())?,
+            ));
         }
-        Ok(names)
+        rows.sort_by(|left, right| left.0.cmp(&right.0));
+        Ok(rows)
+    }
+
+    fn list_views(&self) -> PristineResult<Vec<String>> {
+        Ok(self
+            .snapshot_views()?
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect())
     }
 
     fn get_conflicts(&self, view_id: u64, inode: u64) -> PristineResult<Vec<StoredConflict>> {
@@ -385,6 +538,22 @@ impl ViewTxnT for ReadTxn {
             }
         }
         Ok(out)
+    }
+
+    fn snapshot_conflicts(&self) -> PristineResult<Vec<(u64, Inode, Vec<StoredConflict>)>> {
+        let table = self.txn.open_table(CONFLICTS)?;
+        let mut rows = Vec::new();
+        for entry in table.iter()? {
+            let (key, value) = entry?;
+            let (view_id, inode) = decode_view_seq(key.value());
+            rows.push((
+                view_id,
+                Inode::new(inode),
+                deserialize_conflicts(value.value())?,
+            ));
+        }
+        rows.sort_by_key(|(view_id, inode, _)| (*view_id, *inode));
+        Ok(rows)
     }
 
     fn get_change_seq(&self, view: &ViewState, change_id: NodeId) -> PristineResult<Option<u64>> {
@@ -446,6 +615,150 @@ impl ViewTxnT for ReadTxn {
     }
 }
 
+// OperationTxnT Implementation
+
+impl OperationTxnT for ReadTxn {
+    fn get_operation(&self, id: OperationId) -> PristineResult<Option<Operation>> {
+        let table = match self.txn.open_table(OPERATIONS) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => {
+                return Err(PristineError::OperationSchemaUnavailable);
+            }
+            Err(error) => return Err(error.into()),
+        };
+        match table.get(id.as_bytes())? {
+            Some(value) => decode_operation_row(id.as_bytes(), value.value()).map(Some),
+            None => Ok(None),
+        }
+    }
+
+    fn list_operations(&self) -> PristineResult<Vec<Operation>> {
+        let table = match self.txn.open_table(OPERATIONS) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => {
+                return Err(PristineError::OperationSchemaUnavailable);
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let mut operations = Vec::new();
+        for entry in table.iter()? {
+            let (key, value) = entry?;
+            operations.push(decode_operation_row(key.value(), value.value())?);
+        }
+        Ok(operations)
+    }
+
+    fn get_operation_heads(&self, scope: OperationScope) -> PristineResult<OperationHeads> {
+        let table = match self.txn.open_table(OP_HEADS) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => {
+                return Err(PristineError::OperationSchemaUnavailable);
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let key = crate::operation::encode_operation_scope(scope);
+        let heads = match table.get(&key)? {
+            Some(value) => {
+                decode_operation_heads(value.value()).map_err(operation_serialization_error)?
+            }
+            None => OperationHeads::new(Vec::new()),
+        };
+        for head in heads.as_slice() {
+            if OperationTxnT::get_operation(self, *head)?.is_none() {
+                return Err(PristineError::OperationNotFound {
+                    id: head.to_string(),
+                });
+            }
+        }
+        Ok(heads)
+    }
+
+    fn list_operation_heads(&self) -> PristineResult<Vec<(OperationScope, OperationHeads)>> {
+        let table = match self.txn.open_table(OP_HEADS) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => {
+                return Err(PristineError::OperationSchemaUnavailable);
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let mut rows = Vec::new();
+        for entry in table.iter()? {
+            let (key, value) = entry?;
+            let scope =
+                decode_operation_scope(key.value()).map_err(operation_serialization_error)?;
+            let heads =
+                decode_operation_heads(value.value()).map_err(operation_serialization_error)?;
+            for head in heads.as_slice() {
+                if OperationTxnT::get_operation(self, *head)?.is_none() {
+                    return Err(PristineError::OperationNotFound {
+                        id: head.to_string(),
+                    });
+                }
+            }
+            rows.push((scope, heads));
+        }
+        Ok(rows)
+    }
+
+    fn get_effect_receipts(&self, operation: OperationId) -> PristineResult<Vec<EffectReceipt>> {
+        if OperationTxnT::get_operation(self, operation)?.is_none() {
+            return Err(PristineError::OperationNotFound {
+                id: operation.to_string(),
+            });
+        }
+        let table = match self.txn.open_table(EFFECT_RECEIPTS) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => {
+                return Err(PristineError::OperationSchemaUnavailable);
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let start = encode_effect_receipt_key(operation, EffectReceiptId::from_bytes([0; 32]));
+        let end = encode_effect_receipt_key(operation, EffectReceiptId::from_bytes([u8::MAX; 32]));
+        let mut receipts = Vec::new();
+        for entry in table.range::<&[u8; 64]>(&start..=&end)? {
+            let (key, value) = entry?;
+            receipts.push(decode_effect_receipt_row(key.value(), value.value())?);
+        }
+        Ok(receipts)
+    }
+}
+
+// WorkingCopyTxnT Implementation
+
+impl WorkingCopyTxnT for ReadTxn {
+    fn get_working_copy(&self, id: WorkingCopyId) -> PristineResult<Option<WorkingCopyRecord>> {
+        let table = match self.txn.open_table(WORKING_COPIES) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => {
+                return Err(PristineError::WorkingCopySchemaUnavailable);
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let result = match table.get(id.as_bytes())? {
+            Some(value) => decode_working_copy_row(id.as_bytes(), value.value()).map(Some),
+            None => Ok(None),
+        };
+        result
+    }
+
+    fn list_working_copies(&self) -> PristineResult<Vec<WorkingCopyRecord>> {
+        let table = match self.txn.open_table(WORKING_COPIES) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => {
+                return Err(PristineError::WorkingCopySchemaUnavailable);
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let mut records = Vec::new();
+        for entry in table.iter()? {
+            let (key, value) = entry?;
+            records.push(decode_working_copy_row(key.value(), value.value())?);
+        }
+        Ok(records)
+    }
+}
+
 // TreeTxnT Implementation
 
 impl TreeTxnT for ReadTxn {
@@ -498,22 +811,76 @@ impl TreeTxnT for ReadTxn {
         }
     }
 
+    fn snapshot_inodes(&self) -> PristineResult<Vec<(Inode, Position<NodeId>)>> {
+        let table = self.txn.open_table(INODES)?;
+        let mut rows = Vec::new();
+        for entry in table.iter()? {
+            let (inode, position) = entry?;
+            let (change_id, pos) = decode_position(position.value());
+            rows.push((
+                Inode::new(inode.value()),
+                Position::new(NodeId::new(change_id), ChangePosition::new(pos)),
+            ));
+        }
+        rows.sort_unstable();
+        Ok(rows)
+    }
+
+    fn snapshot_rev_inodes(&self) -> PristineResult<Vec<(Position<NodeId>, Inode)>> {
+        let table = self.txn.open_table(REV_INODES)?;
+        let mut rows = Vec::new();
+        for entry in table.iter()? {
+            let (position, inode) = entry?;
+            let (change_id, pos) = decode_position(position.value());
+            rows.push((
+                Position::new(NodeId::new(change_id), ChangePosition::new(pos)),
+                Inode::new(inode.value()),
+            ));
+        }
+        rows.sort_unstable();
+        Ok(rows)
+    }
+
+    fn snapshot_directories(&self) -> PristineResult<Vec<(Inode, u8)>> {
+        let table = self.txn.open_table(DIRECTORIES)?;
+        let mut rows = Vec::new();
+        for entry in table.iter()? {
+            let (inode, flags) = entry?;
+            rows.push((Inode::new(inode.value()), flags.value()));
+        }
+        rows.sort_unstable();
+        Ok(rows)
+    }
+
+    fn snapshot_inode_graph_keys(&self) -> PristineResult<Vec<(Inode, GraphNode<NodeId>)>> {
+        let table = self.txn.open_multimap_table(INODE_GRAPH)?;
+        let mut rows = Vec::new();
+        for entry in table.iter()? {
+            let (key, _values) = entry?;
+            let (inode, change_id, start, end) = decode_inode_vertex(key.value());
+            rows.push((
+                Inode::new(inode),
+                GraphNode::new(
+                    NodeId::new(change_id),
+                    ChangePosition::new(start),
+                    ChangePosition::new(end),
+                ),
+            ));
+        }
+        rows.sort_unstable();
+        Ok(rows)
+    }
+
     fn iter_tree(
         &self,
     ) -> PristineResult<Box<dyn Iterator<Item = Result<(String, Inode), PristineError>> + '_>> {
         let table = self.txn.open_table(TREE)?;
-        // Collect to avoid lifetime issues
-        let mut results = Vec::new();
-        for result in table.iter()? {
-            match result {
-                Ok((k, v)) => {
-                    results.push(Ok((k.value().to_string(), Inode::new(v.value()))));
-                }
-                Err(e) => {
-                    results.push(Err(PristineError::Storage(Box::new(e))));
-                }
-            }
-        }
+        // Collect to avoid lifetime issues while preserving lazy iterator errors.
+        let results = collect_until_error(table.iter()?.map(|result| {
+            result
+                .map(|(key, value)| (key.value().to_string(), Inode::new(value.value())))
+                .map_err(|error| PristineError::Storage(Box::new(error)))
+        }));
         Ok(Box::new(results.into_iter()))
     }
 
@@ -532,25 +899,33 @@ impl TreeTxnT for ReadTxn {
         let start_key = encode_inode_vertex(inode_id, 0, 0, 0);
         let end_key = encode_inode_vertex(inode_id, u64::MAX, u64::MAX, u64::MAX);
 
-        // Collect to avoid lifetime issues
+        // Collect to avoid lifetime issues while preserving lazy iterator errors.
         let mut results = Vec::new();
-        for result in table.range::<&[u8; 32]>(&start_key..=&end_key)? {
-            match result {
-                Ok((key, values)) => {
-                    let (_, change_id, start, end) = decode_inode_vertex(key.value());
-                    let node = GraphNode {
-                        change: NodeId::new(change_id),
-                        start: ChangePosition::new(start),
-                        end: ChangePosition::new(end),
-                    };
+        'entries: for result in table.range::<&[u8; 32]>(&start_key..=&end_key)? {
+            let (key, values) = match result {
+                Ok(entry) => entry,
+                Err(error) => {
+                    results.push(Err(PristineError::Storage(Box::new(error))));
+                    break;
+                }
+            };
+            let (_, change_id, start, end) = decode_inode_vertex(key.value());
+            let node = GraphNode {
+                change: NodeId::new(change_id),
+                start: ChangePosition::new(start),
+                end: ChangePosition::new(end),
+            };
 
-                    for v in values.filter_map(|r| r.ok()) {
-                        let edge = deserialize_edge(v.value());
+            for value in values {
+                match value {
+                    Ok(value) => {
+                        let edge = deserialize_edge(value.value());
                         results.push(Ok((node, edge)));
                     }
-                }
-                Err(e) => {
-                    results.push(Err(PristineError::Storage(Box::new(e))));
+                    Err(error) => {
+                        results.push(Err(PristineError::Storage(Box::new(error))));
+                        break 'entries;
+                    }
                 }
             }
         }
@@ -586,9 +961,69 @@ impl TreeTxnT for ReadTxn {
     }
 }
 
+impl FileIndexV2TxnT for ReadTxn {
+    fn get_file_index_v2_batch(
+        &self,
+        keys: &[FileIndexV2Key],
+    ) -> PristineResult<Vec<Option<FileIndexV2Entry>>> {
+        let table = match self.txn.open_table(FILE_INDEX_V2) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(vec![None; keys.len()]),
+            Err(error) => return Err(error.into()),
+        };
+        let mut rows = Vec::with_capacity(keys.len());
+        for key in keys {
+            let encoded = key.encode();
+            rows.push(match table.get(encoded.as_slice())? {
+                Some(value) => Some(decode_file_index_v2(value.value())?),
+                None => None,
+            });
+        }
+        Ok(rows)
+    }
+
+    fn iter_file_index_v2(
+        &self,
+        working_copy: WorkingCopyId,
+    ) -> PristineResult<Vec<(Vec<u8>, FileIndexV2Entry)>> {
+        let table = match self.txn.open_table(FILE_INDEX_V2) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+            Err(error) => return Err(error.into()),
+        };
+        let mut rows = Vec::new();
+        for result in table.iter()? {
+            let (key, value) = result?;
+            let key = FileIndexV2Key::decode(key.value())?;
+            let entry = decode_file_index_v2(value.value())?;
+            if key.working_copy == working_copy {
+                rows.push((key.path, entry));
+            }
+        }
+        Ok(rows)
+    }
+}
+
 // Session data queries
 
 impl ReadTxn {
+    /// Sequence number recorded for a view's Merkle state, if that state is
+    /// present (CB-12B receiving-side verification uses this to locate the
+    /// ingested boundary between an old and a new view state).
+    pub fn get_state_seq(
+        &self,
+        view_id: u64,
+        merkle: &crate::types::Merkle,
+    ) -> PristineResult<Option<u64>> {
+        use crate::pristine::tables::{encode_view_merkle, STATES};
+
+        let table = self.txn.open_table(STATES)?;
+        match table.get(&encode_view_merkle(view_id, merkle.as_bytes()))? {
+            Some(value) => Ok(Some(value.value())),
+            None => Ok(None),
+        }
+    }
+
     /// Read the indexed metadata for an external session ID.
     pub fn get_session_record(
         &self,
@@ -1551,7 +1986,7 @@ impl<'txn> GraphTxnT for CachedGraphTxn<'txn> {
         let key = encode_vertex(node.change.get(), node.start.get(), node.end.get());
 
         let mut edges = Vec::new();
-        for v in table.get(&key)?.filter_map(|r| r.ok()) {
+        for v in try_collect(table.get(&key)?)? {
             let bytes: &[u8; 24] = v.value();
             let edge = deserialize_edge(bytes);
             let flag = edge.flag();
@@ -1622,7 +2057,7 @@ impl<'txn> GraphTxnT for CachedGraphTxn<'txn> {
     fn has_vertex(&self, node: GraphNode<NodeId>) -> PristineResult<bool> {
         let table = &self.graph_table;
         let key = encode_vertex(node.change.get(), node.start.get(), node.end.get());
-        let has = table.get(&key)?.next().is_some();
+        let has = graph_presence(table.get(&key)?)?;
         Ok(has)
     }
 
@@ -1638,8 +2073,8 @@ impl<'txn> GraphTxnT for CachedGraphTxn<'txn> {
         self.txn.get_change_deps(change_id)
     }
 
-    fn is_change_deps_indexed(&self, change_id: NodeId) -> PristineResult<bool> {
-        self.txn.is_change_deps_indexed(change_id)
+    fn change_deps_indexed_count(&self, change_id: NodeId) -> PristineResult<Option<u64>> {
+        self.txn.change_deps_indexed_count(change_id)
     }
 
     fn get_rev_change_deps(&self, dep_hash: &Hash) -> PristineResult<Vec<NodeId>> {
@@ -1650,10 +2085,7 @@ impl<'txn> GraphTxnT for CachedGraphTxn<'txn> {
         let table = &self.graph_table;
         let start_key = encode_vertex(change_id.get(), 0, 0);
         let end_key = encode_vertex(change_id.get(), u64::MAX, u64::MAX);
-        let has = table
-            .range::<&[u8; 24]>(&start_key..=&end_key)?
-            .next()
-            .is_some();
+        let has = graph_presence(table.range::<&[u8; 24]>(&start_key..=&end_key)?)?;
         Ok(has)
     }
 }
@@ -1677,6 +2109,22 @@ impl<'txn> TreeTxnT for CachedGraphTxn<'txn> {
 
     fn position_inode(&self, pos: Position<NodeId>) -> PristineResult<Option<Inode>> {
         self.txn.position_inode(pos)
+    }
+
+    fn snapshot_inodes(&self) -> PristineResult<Vec<(Inode, Position<NodeId>)>> {
+        self.txn.snapshot_inodes()
+    }
+
+    fn snapshot_rev_inodes(&self) -> PristineResult<Vec<(Position<NodeId>, Inode)>> {
+        self.txn.snapshot_rev_inodes()
+    }
+
+    fn snapshot_directories(&self) -> PristineResult<Vec<(Inode, u8)>> {
+        self.txn.snapshot_directories()
+    }
+
+    fn snapshot_inode_graph_keys(&self) -> PristineResult<Vec<(Inode, GraphNode<NodeId>)>> {
+        self.txn.snapshot_inode_graph_keys()
     }
 
     fn iter_tree(
@@ -1706,6 +2154,142 @@ impl<'txn> TreeTxnT for CachedGraphTxn<'txn> {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+// CrdtTxnT — delegate to the inner ReadTxn (CRDT tables are global)
+// ─────────────────────────────────────────────────────────────────────────
+
+impl<'txn> crate::pristine::CrdtTxnT for CachedGraphTxn<'txn> {
+    fn get_crdt_trunk(
+        &self,
+        key: &[u8; 12],
+    ) -> PristineResult<Option<crate::crdt::tables::SerializedTrunk>> {
+        self.txn.get_crdt_trunk(key)
+    }
+
+    fn get_crdt_inode_trunk(&self, inode: u64) -> PristineResult<Option<[u8; 12]>> {
+        self.txn.get_crdt_inode_trunk(inode)
+    }
+
+    fn get_crdt_branch(
+        &self,
+        key: &[u8; 12],
+    ) -> PristineResult<Option<crate::crdt::tables::SerializedBranch>> {
+        self.txn.get_crdt_branch(key)
+    }
+
+    fn get_crdt_branch_after(&self, branch_key: &[u8; 12]) -> PristineResult<Option<[u8; 12]>> {
+        self.txn.get_crdt_branch_after(branch_key)
+    }
+
+    fn get_crdt_leaf(
+        &self,
+        key: &[u8; 12],
+    ) -> PristineResult<Option<crate::crdt::tables::SerializedLeaf>> {
+        self.txn.get_crdt_leaf(key)
+    }
+
+    fn get_trunk_by_path(&self, path: &str) -> PristineResult<Option<crate::crdt::TrunkId>> {
+        self.txn.get_trunk_by_path(path)
+    }
+
+    fn iter_trunk_branches(
+        &self,
+        trunk_key: &[u8; 12],
+    ) -> PristineResult<Box<dyn Iterator<Item = PristineResult<[u8; 12]>> + '_>> {
+        self.txn.iter_trunk_branches(trunk_key)
+    }
+
+    fn iter_branch_leaves(
+        &self,
+        branch_key: &[u8; 12],
+    ) -> PristineResult<Box<dyn Iterator<Item = PristineResult<[u8; 12]>> + '_>> {
+        self.txn.iter_branch_leaves(branch_key)
+    }
+
+    fn get_crdt_branch_vertex(
+        &self,
+        branch_key: &[u8; 12],
+    ) -> PristineResult<Option<crate::types::GraphNode<crate::types::NodeId>>> {
+        self.txn.get_crdt_branch_vertex(branch_key)
+    }
+
+    fn get_crdt_vertex_branch(
+        &self,
+        vertex_key: &[u8; 24],
+    ) -> PristineResult<Option<crate::crdt::BranchId>> {
+        self.txn.get_crdt_vertex_branch(vertex_key)
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// InodeAttrTxnT — delegate to the inner ReadTxn (attribute registers are global)
+// ─────────────────────────────────────────────────────────────────────────
+
+impl<'txn> crate::pristine::InodeAttrTxnT for CachedGraphTxn<'txn> {
+    fn get_inode_attr_events(
+        &self,
+        position: Position<NodeId>,
+        name: crate::change::InodeAttrName,
+    ) -> PristineResult<Vec<crate::pristine::InodeAttrEvent>> {
+        self.txn.get_inode_attr_events(position, name)
+    }
+
+    fn get_inode_attr_events_by_inode(
+        &self,
+        inode: Inode,
+        name: crate::change::InodeAttrName,
+    ) -> PristineResult<Vec<crate::pristine::InodeAttrEvent>> {
+        self.txn.get_inode_attr_events_by_inode(inode, name)
+    }
+}
+
+impl<'txn> ViewTxnT for CachedGraphTxn<'txn> {
+    fn get_view_by_id(&self, id: u64) -> PristineResult<Option<ViewState>> {
+        self.txn.get_view_by_id(id)
+    }
+
+    fn get_conflicts(&self, view_id: u64, inode: u64) -> PristineResult<Vec<StoredConflict>> {
+        self.txn.get_conflicts(view_id, inode)
+    }
+
+    fn iter_conflicts(&self, view_id: u64) -> PristineResult<Vec<(u64, Vec<StoredConflict>)>> {
+        self.txn.iter_conflicts(view_id)
+    }
+
+    fn snapshot_conflicts(&self) -> PristineResult<Vec<(u64, Inode, Vec<StoredConflict>)>> {
+        self.txn.snapshot_conflicts()
+    }
+
+    fn get_view(&self, name: &str) -> PristineResult<Option<ViewState>> {
+        self.txn.get_view(name)
+    }
+
+    fn snapshot_views(&self) -> PristineResult<Vec<(String, ViewState)>> {
+        self.txn.snapshot_views()
+    }
+
+    fn list_views(&self) -> PristineResult<Vec<String>> {
+        self.txn.list_views()
+    }
+
+    fn get_change_seq(&self, view: &ViewState, change_id: NodeId) -> PristineResult<Option<u64>> {
+        self.txn.get_change_seq(view, change_id)
+    }
+
+    fn get_change_at_seq(&self, view: &ViewState, seq: u64) -> PristineResult<Option<NodeId>> {
+        self.txn.get_change_at_seq(view, seq)
+    }
+
+    fn iter_changes(
+        &self,
+        view: &ViewState,
+        from_seq: u64,
+    ) -> PristineResult<Box<dyn Iterator<Item = Result<(u64, NodeId, Merkle), PristineError>> + '_>>
+    {
+        self.txn.iter_changes(view, from_seq)
+    }
+}
+
 impl<'txn> crate::pristine::InodeGraphOps for CachedGraphTxn<'txn> {
     type InodeError = crate::pristine::PristineError;
 
@@ -1730,7 +2314,7 @@ impl<'txn> crate::pristine::InodeGraphOps for CachedGraphTxn<'txn> {
             node.end.get(),
         );
         let mut edges = Vec::new();
-        for v in self.inode_graph_table.get(&key)?.filter_map(|r| r.ok()) {
+        for v in try_collect(self.inode_graph_table.get(&key)?)? {
             let bytes: &[u8; 24] = v.value();
             let edge = deserialize_edge(bytes);
             let flag = edge.flag();
@@ -1833,7 +2417,7 @@ impl<'txn> crate::pristine::InodeGraphOps for CachedGraphTxn<'txn> {
 
         // Check for empty vertex at exact position
         let empty_key = encode_inode_vertex(inode_id, change_id, target_pos, target_pos);
-        if table.get(&empty_key)?.next().is_some() {
+        if try_is_present(table.get(&empty_key)?)? {
             return Ok(Some(GraphNode {
                 change: NodeId::new(change_id),
                 start: ChangePosition::new(target_pos),
@@ -1897,10 +2481,8 @@ impl<'txn> crate::pristine::InodeGraphOps for CachedGraphTxn<'txn> {
         let inode_id = inode.get();
         let start_key = encode_inode_vertex(inode_id, 0, 0, 0);
         let end_key = encode_inode_vertex(inode_id, u64::MAX, u64::MAX, u64::MAX);
-        Ok(table
-            .range::<&[u8; 32]>(&start_key..=&end_key)?
-            .next()
-            .is_some())
+        let populated = try_is_present(table.range::<&[u8; 32]>(&start_key..=&end_key)?)?;
+        Ok(populated)
     }
 
     fn inode_graph_needs_view_filter(&self) -> bool {
@@ -1964,12 +2546,11 @@ impl<'txn> InodePreloadTxn<'txn> {
             };
             vertex_set.insert(vertex);
 
-            let edge_list = edges.entry(vertex).or_default();
-            for v in values.filter_map(|r| r.ok()) {
-                let bytes: &[u8; 24] = v.value();
-                let edge = deserialize_edge(bytes);
-                edge_list.push(edge);
-            }
+            let edge_list = collect_preload_edges(values, |value| {
+                let bytes: &[u8; 24] = value.value();
+                deserialize_edge(bytes)
+            })?;
+            edges.entry(vertex).or_default().extend(edge_list);
         }
 
         let mut vertices: Vec<GraphNode<NodeId>> = vertex_set.into_iter().collect();
@@ -1989,17 +2570,17 @@ impl<'txn> InodePreloadTxn<'txn> {
     }
 
     /// Whether any pre-loaded edge for this inode is a DELETED edge whose
-    /// introducing change is in `visible`.
+    /// introducing change is in the validated visibility closure.
     ///
     /// Distinguishes "content was deleted on this view" from "file is
     /// empty / has no visible content": a file recorded empty carries no
     /// visible DELETED edges, while a (partially or fully) deleted file
     /// does. Used by materialize to decide when a stale on-disk file whose
     /// visible content vanished should be removed.
-    pub fn has_visible_deleted_edge(&self, visible: &std::collections::HashSet<NodeId>) -> bool {
-        self.edges.values().flatten().any(|e| {
-            e.flag().contains(crate::types::EdgeFlags::DELETED)
-                && visible.contains(&e.introduced_by())
+    pub fn has_visible_deleted_edge(&self, visibility: &GraphVisibilityClosure) -> bool {
+        self.edges.values().flatten().any(|edge| {
+            edge.flag().contains(crate::types::EdgeFlags::DELETED)
+                && visibility.contains(edge.introduced_by())
         })
     }
 }
@@ -2132,8 +2713,8 @@ impl<'txn> GraphTxnT for InodePreloadTxn<'txn> {
         self.txn.get_change_deps(change_id)
     }
 
-    fn is_change_deps_indexed(&self, change_id: NodeId) -> PristineResult<bool> {
-        self.txn.is_change_deps_indexed(change_id)
+    fn change_deps_indexed_count(&self, change_id: NodeId) -> PristineResult<Option<u64>> {
+        self.txn.change_deps_indexed_count(change_id)
     }
 
     fn get_rev_change_deps(&self, dep_hash: &Hash) -> PristineResult<Vec<NodeId>> {
@@ -2141,8 +2722,7 @@ impl<'txn> GraphTxnT for InodePreloadTxn<'txn> {
     }
 
     fn has_change_in_graph(&self, change_id: NodeId) -> PristineResult<bool> {
-        // Check the preloaded vertices
-        Ok(self.vertices.iter().any(|v| v.change == change_id))
+        self.txn.has_change_in_graph(change_id)
     }
 }
 
@@ -2165,6 +2745,22 @@ impl<'txn> TreeTxnT for InodePreloadTxn<'txn> {
 
     fn position_inode(&self, pos: Position<NodeId>) -> PristineResult<Option<Inode>> {
         self.txn.position_inode(pos)
+    }
+
+    fn snapshot_inodes(&self) -> PristineResult<Vec<(Inode, Position<NodeId>)>> {
+        self.txn.snapshot_inodes()
+    }
+
+    fn snapshot_rev_inodes(&self) -> PristineResult<Vec<(Position<NodeId>, Inode)>> {
+        self.txn.snapshot_rev_inodes()
+    }
+
+    fn snapshot_directories(&self) -> PristineResult<Vec<(Inode, u8)>> {
+        self.txn.snapshot_directories()
+    }
+
+    fn snapshot_inode_graph_keys(&self) -> PristineResult<Vec<(Inode, GraphNode<NodeId>)>> {
+        self.txn.snapshot_inode_graph_keys()
     }
 
     fn iter_tree(
@@ -2191,6 +2787,53 @@ impl<'txn> TreeTxnT for InodePreloadTxn<'txn> {
 
     fn iter_file_index(&self) -> PristineResult<Vec<FileIndexEntry>> {
         self.txn.iter_file_index()
+    }
+}
+
+impl<'txn> ViewTxnT for InodePreloadTxn<'txn> {
+    fn get_view_by_id(&self, id: u64) -> PristineResult<Option<ViewState>> {
+        self.txn.get_view_by_id(id)
+    }
+
+    fn get_conflicts(&self, view_id: u64, inode: u64) -> PristineResult<Vec<StoredConflict>> {
+        self.txn.get_conflicts(view_id, inode)
+    }
+
+    fn iter_conflicts(&self, view_id: u64) -> PristineResult<Vec<(u64, Vec<StoredConflict>)>> {
+        self.txn.iter_conflicts(view_id)
+    }
+
+    fn snapshot_conflicts(&self) -> PristineResult<Vec<(u64, Inode, Vec<StoredConflict>)>> {
+        self.txn.snapshot_conflicts()
+    }
+
+    fn get_view(&self, name: &str) -> PristineResult<Option<ViewState>> {
+        self.txn.get_view(name)
+    }
+
+    fn snapshot_views(&self) -> PristineResult<Vec<(String, ViewState)>> {
+        self.txn.snapshot_views()
+    }
+
+    fn list_views(&self) -> PristineResult<Vec<String>> {
+        self.txn.list_views()
+    }
+
+    fn get_change_seq(&self, view: &ViewState, change_id: NodeId) -> PristineResult<Option<u64>> {
+        self.txn.get_change_seq(view, change_id)
+    }
+
+    fn get_change_at_seq(&self, view: &ViewState, seq: u64) -> PristineResult<Option<NodeId>> {
+        self.txn.get_change_at_seq(view, seq)
+    }
+
+    fn iter_changes(
+        &self,
+        view: &ViewState,
+        from_seq: u64,
+    ) -> PristineResult<Box<dyn Iterator<Item = Result<(u64, NodeId, Merkle), PristineError>> + '_>>
+    {
+        self.txn.iter_changes(view, from_seq)
     }
 }
 
@@ -2330,8 +2973,144 @@ impl TagTxnT for ReadTxn {
 }
 
 // ============================================================================
+// IMMUTABLE GIT STATE BINDINGS
+// ============================================================================
+
+impl crate::pristine::BindingTxnT for ReadTxn {
+    fn get_binding_bytes(&self, id: &[u8; 32]) -> PristineResult<Option<Vec<u8>>> {
+        let table = match self.txn.open_table(BINDINGS) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+            Err(error) => return Err(PristineError::from(error)),
+        };
+        Ok(table.get(id)?.map(|value| value.value().to_vec()))
+    }
+
+    fn iter_binding_ids(&self) -> PristineResult<Vec<[u8; 32]>> {
+        let table = match self.txn.open_table(BINDINGS) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+            Err(error) => return Err(PristineError::from(error)),
+        };
+        let mut ids = Vec::new();
+        for row in table.iter()? {
+            let (key, _) = row?;
+            ids.push(*key.value());
+        }
+        Ok(ids)
+    }
+}
+
+// ============================================================================
 // GIT SHA INDEX
 // ============================================================================
+
+impl GitCommitClosureTxnT for ReadTxn {
+    fn get_git_commit_closure(&self, sha: &str) -> PristineResult<Option<Vec<Hash>>> {
+        let table = match self.txn.open_table(GIT_COMMIT_CLOSURES) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+            Err(error) => return Err(PristineError::from(error)),
+        };
+        match table.get(sha)? {
+            Some(bytes) => {
+                let value = bytes.value();
+                if value.len() < 4 {
+                    return Err(PristineError::Serialization {
+                        message: format!(
+                            "git commit closure for {sha} is truncated: {} byte(s)",
+                            value.len()
+                        ),
+                    });
+                }
+                let count = u32::from_le_bytes([value[0], value[1], value[2], value[3]]) as usize;
+                if value.len() != 4 + count * 32 {
+                    return Err(PristineError::Serialization {
+                        message: format!(
+                            "git commit closure for {sha} claims {count} hashes but holds {} bytes",
+                            value.len()
+                        ),
+                    });
+                }
+                let mut closure = Vec::with_capacity(count);
+                for index in 0..count {
+                    let start = 4 + index * 32;
+                    let mut hash = [0u8; 32];
+                    hash.copy_from_slice(&value[start..start + 32]);
+                    closure.push(Hash::from_bytes(hash));
+                }
+                Ok(Some(closure))
+            }
+            None => Ok(None),
+        }
+    }
+
+    fn has_git_commit_closure(&self, sha: &str) -> PristineResult<bool> {
+        let table = match self.txn.open_table(GIT_COMMIT_CLOSURES) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(false),
+            Err(error) => return Err(PristineError::from(error)),
+        };
+        Ok(table.get(sha)?.is_some())
+    }
+}
+
+impl BridgeEventCaptureTxnT for ReadTxn {
+    fn get_bridge_event_capture(&self, hash: &[u8; 32]) -> PristineResult<Option<Vec<u8>>> {
+        let table = match self.txn.open_table(BRIDGE_EVENT_CAPTURES) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+            Err(error) => return Err(PristineError::from(error)),
+        };
+        Ok(table.get(hash)?.map(|v| v.value().to_vec()))
+    }
+
+    fn get_bridge_event_capture_anchor(&self, hash: &[u8; 32]) -> PristineResult<Option<[u8; 32]>> {
+        let table = match self.txn.open_table(BRIDGE_EVENT_CAPTURE_ANCHORS) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+            Err(error) => return Err(PristineError::from(error)),
+        };
+        Ok(table.get(hash)?.map(|v| *v.value()))
+    }
+
+    fn get_bridge_ref_capture_token(
+        &self,
+        operation: &[u8; 32],
+    ) -> PristineResult<Option<[u8; 32]>> {
+        let table = match self.txn.open_table(BRIDGE_REF_CAPTURE_TOKENS) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+            Err(error) => return Err(PristineError::from(error)),
+        };
+        Ok(table.get(operation)?.map(|v| *v.value()))
+    }
+}
+
+impl RefMappingTxnT for ReadTxn {
+    fn get_ref_mapping_bytes(&self, view_id: u64) -> PristineResult<Option<Vec<u8>>> {
+        let table = match self.txn.open_table(REF_MAPPINGS) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+            Err(error) => return Err(PristineError::from(error)),
+        };
+        Ok(table.get(view_id)?.map(|guard| guard.value().to_vec()))
+    }
+
+    fn iter_ref_mapping_bytes(&self) -> PristineResult<Vec<(u64, Vec<u8>)>> {
+        let table = match self.txn.open_table(REF_MAPPINGS) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+            Err(error) => return Err(PristineError::from(error)),
+        };
+        let mut rows = Vec::new();
+        for row in table.iter()? {
+            let (key, value) = row?;
+            rows.push((key.value(), value.value().to_vec()));
+        }
+        Ok(rows)
+    }
+}
 
 impl GitShaIndexTxnT for ReadTxn {
     fn get_by_git_sha(&self, sha: &str) -> PristineResult<Option<NodeId>> {
@@ -2348,6 +3127,20 @@ impl GitShaIndexTxnT for ReadTxn {
 
     fn has_git_sha(&self, sha: &str) -> PristineResult<bool> {
         Ok(self.get_by_git_sha(sha)?.is_some())
+    }
+
+    fn list_git_shas(&self) -> PristineResult<Vec<String>> {
+        let table = match self.txn.open_table(GIT_SHA_INDEX) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+            Err(error) => return Err(PristineError::from(error)),
+        };
+        let mut shas = Vec::new();
+        for item in table.iter()? {
+            let (key, _) = item?;
+            shas.push(key.value().to_string());
+        }
+        Ok(shas)
     }
 
     fn find_by_git_sha_prefix(&self, prefix: &str) -> PristineResult<Option<NodeId>> {
@@ -2376,7 +3169,7 @@ impl GitShaIndexTxnT for ReadTxn {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pristine::Pristine;
+    use crate::pristine::{InodeGraphOps, MutTxnT, Pristine};
     use tempfile::tempdir;
 
     #[test]
@@ -2392,5 +3185,136 @@ mod tests {
         assert!(txn.get_view("main").unwrap().is_none());
         assert!(txn.get_inode("test.txt").unwrap().is_none());
         assert!(txn.list_views().unwrap().is_empty());
+    }
+
+    #[test]
+    fn healthy_graph_and_inode_multimap_reads_remain_ordered_and_filtered() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("pristine");
+        let pristine = Pristine::open(&db_path).unwrap();
+        let inode = Inode::new(7);
+
+        let (change_id, node, global_only_change) = {
+            let mut txn = pristine.write_txn().unwrap();
+            let change_id = txn.register_change(&Hash::of(b"inode change")).unwrap();
+            let node = GraphNode::new(change_id, ChangePosition::new(7), ChangePosition::new(7));
+            let block_10 = SerializedGraphEdge::new(
+                EdgeFlags::BLOCK,
+                Position::new(change_id, ChangePosition::new(10)),
+                change_id,
+            );
+            let folder_15 = SerializedGraphEdge::new(
+                EdgeFlags::FOLDER,
+                Position::new(change_id, ChangePosition::new(15)),
+                change_id,
+            );
+            let block_20 = SerializedGraphEdge::new(
+                EdgeFlags::BLOCK,
+                Position::new(change_id, ChangePosition::new(20)),
+                change_id,
+            );
+
+            for edge in [block_20, folder_15, block_10] {
+                txn.put_graph(node, edge).unwrap();
+                txn.put_inode_graph(inode, node, edge).unwrap();
+            }
+
+            let global_only_change = txn
+                .register_change(&Hash::of(b"global-only change"))
+                .unwrap();
+            let global_node = GraphNode::new(
+                global_only_change,
+                ChangePosition::new(0),
+                ChangePosition::new(1),
+            );
+            txn.put_graph(
+                global_node,
+                SerializedGraphEdge::new(
+                    EdgeFlags::BLOCK,
+                    Position::new(global_only_change, ChangePosition::new(0)),
+                    global_only_change,
+                ),
+            )
+            .unwrap();
+            txn.commit().unwrap();
+            (change_id, node, global_only_change)
+        };
+
+        let txn = pristine.read_txn().unwrap();
+        let cached = CachedGraphTxn::new(&txn).unwrap();
+        let expected_positions = vec![10, 20];
+
+        let edges = txn
+            .iter_adjacent(node, EdgeFlags::BLOCK, EdgeFlags::BLOCK)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            edges
+                .iter()
+                .map(|edge| edge.dest().pos.get())
+                .collect::<Vec<_>>(),
+            expected_positions
+        );
+        let cached_edges = cached
+            .iter_adjacent(node, EdgeFlags::BLOCK, EdgeFlags::BLOCK)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(cached_edges, edges);
+
+        assert!(txn.has_vertex(node).unwrap());
+        assert!(cached.has_vertex(node).unwrap());
+        assert!(txn.has_change_in_graph(change_id).unwrap());
+        assert!(cached.has_change_in_graph(change_id).unwrap());
+        assert_eq!(
+            txn.find_block_end(Position::new(change_id, ChangePosition::new(7)))
+                .unwrap(),
+            node
+        );
+        assert_eq!(
+            cached
+                .find_block_end(Position::new(change_id, ChangePosition::new(7)))
+                .unwrap(),
+            node
+        );
+
+        let inode_edges = txn
+            .iter_inode_vertices(inode)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(inode_edges.len(), 3);
+        assert!(txn.inode_graph_is_populated(inode).unwrap());
+        assert!(cached.inode_graph_is_populated(inode).unwrap());
+        assert_eq!(
+            txn.find_block_end_in_inode(inode, Position::new(change_id, ChangePosition::new(7)))
+                .unwrap(),
+            Some(node)
+        );
+        assert_eq!(
+            cached
+                .find_block_end_in_inode(inode, Position::new(change_id, ChangePosition::new(7)))
+                .unwrap(),
+            Some(node)
+        );
+
+        let mut cached_adj = cached
+            .init_inode_adj(inode, node, EdgeFlags::BLOCK, EdgeFlags::BLOCK)
+            .unwrap();
+        let mut cached_inode_edges = Vec::new();
+        while let Some(edge) = cached.next_inode_adj(&mut cached_adj) {
+            cached_inode_edges.push(edge.unwrap());
+        }
+        assert_eq!(cached_inode_edges, edges);
+
+        let preload = InodePreloadTxn::new(&txn, inode).unwrap();
+        let preload_edges = preload
+            .iter_adjacent(node, EdgeFlags::BLOCK, EdgeFlags::BLOCK)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(preload_edges, edges);
+        assert!(preload.has_change_in_graph(global_only_change).unwrap());
     }
 }

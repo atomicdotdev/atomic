@@ -407,6 +407,19 @@ pub struct RepositoryStatus {
     /// hashing.  A non-zero value means `atomic status --reindex`
     /// would likely resolve the false positives.
     stale_index_count: usize,
+
+    /// Canonical root of the FILE_INDEX_V2 re-verification performed by status.
+    verified_candidate_root: Option<crate::change_source::VerifiedCandidateRoot>,
+
+    /// Transaction-local reason the selected adapter degraded to a full scan.
+    change_source_fallback: Option<crate::change_source::ChangeSourceFallbackReason>,
+
+    /// Advisory notices attached to this status report (e.g. the RFC §8.3
+    /// conflict-snapshot caveat). Notices never change cleanliness.
+    notices: Vec<String>,
+
+    /// Deterministic counters for the canonical candidate transaction.
+    change_source_metrics: Option<crate::change_source::ChangeSourceMetrics>,
 }
 
 impl RepositoryStatus {
@@ -423,7 +436,21 @@ impl RepositoryStatus {
             entries: Vec::new(),
             path_index: HashMap::new(),
             stale_index_count: 0,
+            verified_candidate_root: None,
+            change_source_fallback: None,
+            change_source_metrics: None,
+            notices: Vec::new(),
         }
+    }
+
+    /// Attach an advisory notice to this status report.
+    pub fn add_notice(&mut self, notice: String) {
+        self.notices.push(notice);
+    }
+
+    /// The advisory notices attached to this status report.
+    pub fn notices(&self) -> &[String] {
+        &self.notices
     }
 
     /// Create a repository status with pre-allocated capacity.
@@ -440,6 +467,10 @@ impl RepositoryStatus {
             entries: Vec::with_capacity(capacity),
             path_index: HashMap::with_capacity(capacity),
             stale_index_count: 0,
+            verified_candidate_root: None,
+            change_source_fallback: None,
+            change_source_metrics: None,
+            notices: Vec::new(),
         }
     }
 
@@ -456,6 +487,33 @@ impl RepositoryStatus {
     /// Get the Merkle state of the current view.
     pub fn state(&self) -> Option<&Merkle> {
         self.state.as_ref()
+    }
+
+    /// Canonical FILE_INDEX_V2 verification root for this status transaction.
+    pub fn verified_candidate_root(&self) -> Option<crate::change_source::VerifiedCandidateRoot> {
+        self.verified_candidate_root
+    }
+
+    /// Deterministic candidate verification counters for this transaction.
+    pub fn change_source_metrics(&self) -> Option<&crate::change_source::ChangeSourceMetrics> {
+        self.change_source_metrics.as_ref()
+    }
+
+    /// Why candidate discovery degraded to a complete scan, when applicable.
+    pub fn change_source_fallback(
+        &self,
+    ) -> Option<&crate::change_source::ChangeSourceFallbackReason> {
+        self.change_source_fallback.as_ref()
+    }
+
+    pub(crate) fn set_change_source_verification(
+        &mut self,
+        root: crate::change_source::VerifiedCandidateRoot,
+        metrics: crate::change_source::ChangeSourceMetrics,
+    ) {
+        self.verified_candidate_root = Some(root);
+        self.change_source_fallback = metrics.fallback_reason.clone();
+        self.change_source_metrics = Some(metrics);
     }
 
     /// Number of tracked files that were reported as Modified only because
@@ -586,6 +644,30 @@ impl RepositoryStatus {
         self.conflicted().count()
     }
 
+    /// Iterate over files whose type changed (regular ↔ symlink ↔ directory).
+    pub fn type_changed(&self) -> impl Iterator<Item = &FileStatusEntry> {
+        self.entries
+            .iter()
+            .filter(|e| e.status == FileStatus::TypeChanged)
+    }
+
+    /// Count of type-changed files.
+    pub fn type_changed_count(&self) -> usize {
+        self.type_changed().count()
+    }
+
+    /// Iterate over files whose permissions changed.
+    pub fn permissions_changed(&self) -> impl Iterator<Item = &FileStatusEntry> {
+        self.entries
+            .iter()
+            .filter(|e| e.status == FileStatus::PermissionsChanged)
+    }
+
+    /// Count of permission-changed files.
+    pub fn permissions_changed_count(&self) -> usize {
+        self.permissions_changed().count()
+    }
+
     /// Iterate over clean files.
     pub fn clean(&self) -> impl Iterator<Item = &FileStatusEntry> {
         self.entries
@@ -670,6 +752,16 @@ pub struct StatusOptions {
     /// When `false`, only uses filesystem metadata (faster but less accurate).
     /// Default: `true`
     pub hash_contents: bool,
+
+    /// Authoritative nested-repository boundaries (review CB-9C R5).
+    ///
+    /// Relative working-copy paths whose contents are foreign nested
+    /// working-copy state (e.g. tracked gitlink submodules). The directory
+    /// walk prunes these outright; every other directory is pruned only when
+    /// its `.git` marker establishes an actual repository boundary. An
+    /// incidental `.git` file or empty `.git` directory never hides ordinary
+    /// parent content.
+    pub nested_repo_boundaries: std::collections::HashSet<PathBuf>,
 }
 
 impl Default for StatusOptions {
@@ -680,6 +772,7 @@ impl Default for StatusOptions {
             path_filters: Vec::new(),
             respect_ignore_files: true,
             hash_contents: true,
+            nested_repo_boundaries: std::collections::HashSet::new(),
         }
     }
 }
@@ -727,6 +820,19 @@ impl StatusOptions {
         self.include_ignored = include;
         self
     }
+
+    /// Set the authoritative nested-repository boundaries to prune.
+    ///
+    /// Paths are relative to the status root. Tracked gitlink submodules are
+    /// the primary source (review CB-9C R5).
+    pub fn with_nested_repo_boundaries<I, P>(mut self, boundaries: I) -> Self
+    where
+        I: IntoIterator<Item = P>,
+        P: Into<PathBuf>,
+    {
+        self.nested_repo_boundaries = boundaries.into_iter().map(Into::into).collect();
+        self
+    }
 }
 
 // Helper Functions
@@ -747,6 +853,87 @@ pub fn is_always_ignored(path: &Path) -> bool {
     false
 }
 
+/// Whether a nested `.git` marker establishes an authoritative repository
+/// boundary (review CB-9C R5, re-review EYL).
+///
+/// Only an actual Git directory counts — validated without upward discovery:
+///
+/// - a `.git` **directory** must hold a `HEAD` ref plus the `objects` and
+///   `refs` stores (a directory containing only `HEAD` is a fake marker and
+///   Git itself refuses it, so it must not hide ordinary parent content);
+/// - a `.git` **file** must be a `gitdir:` link whose target exists and is
+///   itself an actual Git directory (linked worktree gitdirs carry a
+///   `commondir` file pointing at the shared store, which is validated in
+///   the target's place). A dangling or malformed link is incidental state.
+///
+/// An empty `.git` directory, an unrelated `.git` file, or a `gitdir:` link
+/// to a missing target must never hide ordinary parent content from the
+/// walk. Tracked gitlink boundaries passed by the caller prune regardless of
+/// marker validity (see `StatusOptions::nested_repo_boundaries`).
+fn establishes_repository_boundary(git_marker: &Path) -> bool {
+    if git_marker.is_file() {
+        let Ok(bytes) = std::fs::read(git_marker) else {
+            return false;
+        };
+        let Some(target) = bytes.strip_prefix(b"gitdir:") else {
+            return false;
+        };
+        let text = String::from_utf8_lossy(target);
+        let target = text.trim();
+        if target.is_empty() {
+            return false;
+        }
+        let target_path = std::path::Path::new(target);
+        // Relative gitdir targets resolve against the directory containing
+        // the marker file (how Git writes submodule and worktree links).
+        let resolved = if target_path.is_absolute() {
+            target_path.to_path_buf()
+        } else {
+            git_marker
+                .parent()
+                .unwrap_or(Path::new("."))
+                .join(target_path)
+        };
+        return is_actual_git_directory(&resolved);
+    }
+    if git_marker.is_dir() {
+        return is_actual_git_directory(git_marker);
+    }
+    false
+}
+
+/// Whether `dir` is an actual Git directory: a readable `HEAD` plus the
+/// `objects` and `refs` stores (the same minimal shape Git's own
+/// `is_git_directory` check requires). A directory holding only `HEAD` — the
+/// forged-marker shape the review pinned — is rejected. A linked-worktree
+/// gitdir (which delegates `objects`/`refs` to its `commondir`) passes when
+/// the common store validates and the worktree gitdir holds its own `HEAD`.
+fn is_actual_git_directory(dir: &Path) -> bool {
+    if !dir.join("HEAD").is_file() {
+        return false;
+    }
+    if dir.join("objects").is_dir() && dir.join("refs").is_dir() {
+        return true;
+    }
+    // Linked worktree gitdir: `common dir` names the shared Git directory,
+    // resolved relative to the worktree gitdir itself.
+    if let Ok(common) = std::fs::read_to_string(dir.join("commondir")) {
+        let common = common.trim();
+        if !common.is_empty() {
+            let common_path = std::path::Path::new(common);
+            let resolved = if common_path.is_absolute() {
+                common_path.to_path_buf()
+            } else {
+                dir.join(common_path)
+            };
+            if resolved.join("objects").is_dir() && resolved.join("refs").is_dir() {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Hash the contents of a file using Blake3.
 ///
 /// This is used to compute content hashes for modification detection.
@@ -759,7 +946,24 @@ pub fn is_always_ignored(path: &Path) -> bool {
 ///
 /// The Blake3 hash of the file contents.
 pub fn hash_file_contents(path: &Path) -> StatusResult<Hash> {
-    let contents = std::fs::read(path)?;
+    let metadata = std::fs::symlink_metadata(path)?;
+    let contents = if metadata.file_type().is_symlink() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            std::fs::read_link(path)?.as_os_str().as_bytes().to_vec()
+        }
+        #[cfg(not(unix))]
+        {
+            std::fs::read_link(path)?
+                .as_os_str()
+                .to_string_lossy()
+                .as_bytes()
+                .to_vec()
+        }
+    } else {
+        std::fs::read(path)?
+    };
     Ok(Hash::of(&contents))
 }
 
@@ -808,6 +1012,33 @@ pub fn collect_working_copy_files_with_rules(
             // Always skip the internal directories
             if let Some(name) = e.file_name().to_str() {
                 if ALWAYS_IGNORED.contains(&name) {
+                    return false;
+                }
+            }
+
+            // Skip nested repository worktrees (submodules, linked Git
+            // worktrees): their content is foreign state with its own
+            // `.git`, not untracked content of this working copy (CB-9C).
+            // Without this, a checked-out submodule's files surface as
+            // untracked entries and later snapshots try to record them
+            // under a gitlink path that is not an Atomic directory.
+            //
+            // Review CB-9C R5: pruning authority is exact. A directory is
+            // pruned only when it is an explicitly established boundary
+            // (a tracked gitlink/nested-working-copy path passed by the
+            // caller) or its `.git` marker is an actual repository (a
+            // `gitdir:` link file, or a directory holding a HEAD ref). A
+            // mere `.git` existence — an empty marker directory, an
+            // unrelated file — is incidental and must never hide ordinary
+            // parent content. The root itself is never pruned: a colocated
+            // repository's own `.git` lives there.
+            if e.file_type().is_dir() && e.depth() > 0 {
+                let relative = e.path().strip_prefix(root).unwrap_or(e.path());
+                if options.nested_repo_boundaries.contains(relative) {
+                    return false;
+                }
+                let marker = e.path().join(".git");
+                if marker.exists() && establishes_repository_boundary(&marker) {
                     return false;
                 }
             }
@@ -1347,6 +1578,193 @@ mod tests {
             Path::new("src/nested/main.rs"),
             &filters
         ));
+    }
+
+    /// Review CB-9C R5: an incidental nested `.git` marker must never hide
+    /// ordinary parent content; only actual repository boundaries prune.
+    #[test]
+    fn incidental_git_markers_do_not_hide_ordinary_files() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+
+        // An ordinary directory holding an EMPTY .git marker directory.
+        std::fs::create_dir_all(root.join("ordinary/.git")).unwrap();
+        std::fs::write(root.join("ordinary/new.txt"), b"visible\n").unwrap();
+        // A `.git` marker FILE that is not a gitdir link.
+        std::fs::create_dir_all(root.join("marker-file")).unwrap();
+        std::fs::write(root.join("marker-file/.git"), b"not a gitdir link").unwrap();
+        std::fs::write(root.join("marker-file/keep.txt"), b"visible\n").unwrap();
+        // A real nested repository (gitdir + HEAD + objects + refs) prunes.
+        std::fs::create_dir_all(root.join("nested-repo/.git/objects")).unwrap();
+        std::fs::create_dir_all(root.join("nested-repo/.git/refs")).unwrap();
+        std::fs::write(
+            root.join("nested-repo/.git/HEAD"),
+            b"ref: refs/heads/main\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("nested-repo/hidden.txt"), b"foreign\n").unwrap();
+        // A linked-worktree style gitdir FILE whose target is an actual Git
+        // directory (with a commondir delegating objects/refs) prunes.
+        std::fs::create_dir_all(root.join("shared-store/.git/objects")).unwrap();
+        std::fs::create_dir_all(root.join("shared-store/.git/refs")).unwrap();
+        std::fs::write(
+            root.join("shared-store/.git/HEAD"),
+            b"ref: refs/heads/main\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join("shared-store/.git/worktrees/wt")).unwrap();
+        std::fs::write(
+            root.join("shared-store/.git/worktrees/wt/commondir"),
+            "../../\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("shared-store/.git/worktrees/wt/HEAD"),
+            b"ref: refs/heads/wt\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join("linked-real")).unwrap();
+        std::fs::write(
+            root.join("linked-real/.git"),
+            b"gitdir: ../shared-store/.git/worktrees/wt\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("linked-real/hidden.txt"), b"foreign\n").unwrap();
+
+        let options = StatusOptions::default();
+        let files = collect_working_copy_files(root, &options).unwrap();
+        assert!(
+            files.contains(&PathBuf::from("ordinary/new.txt")),
+            "an empty .git marker must not hide ordinary parent files: {files:?}"
+        );
+        assert!(
+            files.contains(&PathBuf::from("marker-file/keep.txt")),
+            "a plain .git file is not a repository boundary: {files:?}"
+        );
+        assert!(!files.contains(&PathBuf::from("nested-repo/hidden.txt")));
+        assert!(!files.contains(&PathBuf::from("linked-real/hidden.txt")));
+    }
+
+    /// Review CB-9C R5 (re-review EYL): forged repository markers — a
+    /// `gitdir:` link whose target does not exist, and a `.git` directory
+    /// containing ONLY a `HEAD` file — are not repository boundaries. Both
+    /// shapes hide ordinary parent content under marker-syntax validation
+    /// while Git itself refuses them, so validation must resolve an actual
+    /// Git directory (HEAD + objects + refs, commondir-aware).
+    #[test]
+    fn forged_repository_markers_do_not_hide_ordinary_files() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+
+        // A `gitdir:` link file pointing at a nonexistent target.
+        std::fs::create_dir_all(root.join("dangling")).unwrap();
+        std::fs::write(root.join("dangling/.git"), b"gitdir: /nonexistent/repo\n").unwrap();
+        std::fs::write(root.join("dangling/keep.txt"), b"visible\n").unwrap();
+        // A `.git` directory containing ONLY a HEAD file.
+        std::fs::create_dir_all(root.join("head-only/.git")).unwrap();
+        std::fs::write(root.join("head-only/.git/HEAD"), b"ref: refs/heads/main\n").unwrap();
+        std::fs::write(root.join("head-only/keep.txt"), b"visible\n").unwrap();
+        // A real repository next door still prunes (control).
+        std::fs::create_dir_all(root.join("real/.git/objects")).unwrap();
+        std::fs::create_dir_all(root.join("real/.git/refs")).unwrap();
+        std::fs::write(root.join("real/.git/HEAD"), b"ref: refs/heads/main\n").unwrap();
+        std::fs::write(root.join("real/hidden.txt"), b"foreign\n").unwrap();
+
+        let options = StatusOptions::default();
+        let files = collect_working_copy_files(root, &options).unwrap();
+        assert!(
+            files.contains(&PathBuf::from("dangling/keep.txt")),
+            "a dangling gitdir target is not a repository boundary: {files:?}"
+        );
+        assert!(
+            files.contains(&PathBuf::from("head-only/keep.txt")),
+            "a HEAD-only .git directory is not a repository boundary: {files:?}"
+        );
+        assert!(!files.contains(&PathBuf::from("real/hidden.txt")));
+    }
+
+    /// Review CB-9C R5: an explicitly established boundary (e.g. a tracked
+    /// gitlink path) prunes even without a valid `.git` marker, and path
+    /// filters keep working alongside it.
+    #[test]
+    fn explicit_boundaries_prune_and_path_filters_still_apply() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+
+        // A gitlink-shaped directory whose .git marker is missing/invalid.
+        std::fs::create_dir_all(root.join("mod")).unwrap();
+        std::fs::write(root.join("mod/inner.txt"), b"submodule state\n").unwrap();
+        std::fs::create_dir_all(root.join("ordinary")).unwrap();
+        std::fs::write(root.join("ordinary/new.txt"), b"visible\n").unwrap();
+
+        let options = StatusOptions::default().with_nested_repo_boundaries([PathBuf::from("mod")]);
+        let files = collect_working_copy_files(root, &options).unwrap();
+        assert!(!files.contains(&PathBuf::from("mod/inner.txt")));
+        assert!(files.contains(&PathBuf::from("ordinary/new.txt")));
+
+        // Path-scoped collection intersects boundaries the same way.
+        let scoped = options.filter_path(PathBuf::from("mod"));
+        let files = collect_working_copy_files(root, &scoped).unwrap();
+        assert!(
+            !files.contains(&PathBuf::from("mod/inner.txt")),
+            "a path-scoped walk must not resurrect pruned boundary content: {files:?}"
+        );
+    }
+
+    #[test]
+    fn establishes_repository_boundary_requires_an_actual_repository() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+
+        // Empty marker directory: not a boundary.
+        std::fs::create_dir_all(root.join("empty/.git")).unwrap();
+        assert!(!establishes_repository_boundary(&root.join("empty/.git")));
+        // Plain file: not a boundary.
+        std::fs::remove_dir(root.join("empty/.git")).unwrap();
+        std::fs::write(root.join("empty/.git"), b"junk").unwrap();
+        assert!(!establishes_repository_boundary(&root.join("empty/.git")));
+        // gitdir link file with a NONEXISTENT target: not a boundary (review
+        // CB-9C re-review EYL — marker syntax alone never establishes one).
+        std::fs::write(root.join("empty/.git"), b"gitdir: /some/where\n").unwrap();
+        assert!(!establishes_repository_boundary(&root.join("empty/.git")));
+        // Directory with ONLY a HEAD file: not a boundary (Git refuses it).
+        std::fs::remove_file(root.join("empty/.git")).unwrap();
+        std::fs::create_dir(root.join("empty/.git")).unwrap();
+        std::fs::write(root.join("empty/.git/HEAD"), b"ref: refs/heads/main\n").unwrap();
+        assert!(!establishes_repository_boundary(&root.join("empty/.git")));
+        // HEAD + objects + refs: an actual Git directory.
+        std::fs::create_dir(root.join("empty/.git/objects")).unwrap();
+        std::fs::create_dir(root.join("empty/.git/refs")).unwrap();
+        assert!(establishes_repository_boundary(&root.join("empty/.git")));
+        // A gitdir link to an actual Git directory: boundary.
+        std::fs::remove_dir_all(root.join("empty/.git")).unwrap();
+        std::fs::create_dir_all(root.join("store/objects")).unwrap();
+        std::fs::create_dir_all(root.join("store/refs")).unwrap();
+        std::fs::write(root.join("store/HEAD"), b"ref: refs/heads/main\n").unwrap();
+        std::fs::write(root.join("empty/.git"), b"gitdir: ../store\n").unwrap();
+        assert!(establishes_repository_boundary(&root.join("empty/.git")));
+        // Linked-worktree gitdir delegating objects/refs via commondir:
+        // boundary.
+        std::fs::create_dir_all(root.join("store/worktrees/wt")).unwrap();
+        std::fs::write(root.join("store/worktrees/wt/commondir"), "../../\n").unwrap();
+        std::fs::write(
+            root.join("store/worktrees/wt/HEAD"),
+            b"ref: refs/heads/wt\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("empty/.git"), b"gitdir: ../store/worktrees/wt\n").unwrap();
+        assert!(establishes_repository_boundary(&root.join("empty/.git")));
+        // Malformed gitdir body: not a boundary.
+        std::fs::write(root.join("empty/.git"), b"gitdir:   \n").unwrap();
+        assert!(!establishes_repository_boundary(&root.join("empty/.git")));
     }
 
     // StatusError Tests

@@ -28,8 +28,19 @@ impl Repository {
     /// | 1,000 files | ~1s | <50ms |
     /// | 43,000 files | ~150s | <3s |
     /// | 80,000 files | ~150s | <5s |
-    pub fn status(&self, options: StatusOptions) -> Result<RepositoryStatus, RepositoryError> {
-        self.status_inner(options, UntrackedScanPolicy::Always, true)
+    pub fn status(
+        &self,
+        working_copy: WorkingCopyId,
+        options: StatusOptions,
+    ) -> Result<RepositoryStatus, RepositoryError> {
+        self.status_inner(
+            working_copy,
+            options,
+            UntrackedScanPolicy::Always,
+            true,
+            false,
+            None,
+        )
     }
 
     /// Compute status for recording without scanning unrelated untracked files.
@@ -40,25 +51,31 @@ impl Repository {
     /// also unnecessary because rename matching reads candidates on demand.
     pub(crate) fn status_for_record(
         &self,
+        working_copy: WorkingCopyId,
         options: StatusOptions,
         detect_raw_renames: bool,
+        include_all_untracked: bool,
     ) -> Result<RepositoryStatus, RepositoryError> {
-        let policy = if detect_raw_renames {
+        let policy = if include_all_untracked {
+            UntrackedScanPolicy::Always
+        } else if detect_raw_renames {
             UntrackedScanPolicy::WhenRegularFileDeleted
         } else {
             UntrackedScanPolicy::Never
         };
-        self.status_inner(options, policy, false)
+        self.status_inner(working_copy, options, policy, false, true, None)
     }
 
     fn status_inner(
         &self,
+        working_copy: WorkingCopyId,
         options: StatusOptions,
         untracked_policy: UntrackedScanPolicy,
         hash_untracked: bool,
+        for_record: bool,
+        change_source_override: Option<&dyn crate::change_source::ChangeSource>,
     ) -> Result<RepositoryStatus, RepositoryError> {
-        use std::time::SystemTime;
-
+        let view_name = self.desired_view_name(working_copy)?;
         let overall_start = std::time::Instant::now();
 
         let txn = self
@@ -66,41 +83,37 @@ impl Repository {
             .read_txn()
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
-        let view_state = txn
-            .get_view(&self.current_view)
+        let view = txn
+            .get_view(&view_name)
             .map_err(|e| RepositoryError::Database(e.to_string()))?
-            .map(|s| s.state);
+            .ok_or_else(|| RepositoryError::ViewNotFound {
+                name: view_name.clone(),
+            })?;
+        let visibility = graph_visibility_closure(&txn, &view)?;
+        let content_filter = crate::content_filter::GitAttributesFilter::for_repository(&self.root);
 
-        let mut status = RepositoryStatus::new(self.current_view.clone(), view_state);
+        let claim_visibility = super::name_resolution::path_claim_visibility_for_view(
+            &txn,
+            &self.change_store,
+            &view,
+            &visibility,
+        )?;
+        let projection = self.project_tree_for_visibility(&txn, &claim_visibility)?;
+        let projected_present = projection.present;
+        let projected_present_paths: HashSet<PathBuf> =
+            projected_present.keys().map(PathBuf::from).collect();
+        let projected_absent: Vec<_> = projection.absent_metadata.into_values().collect();
+        let projected_name_conflicts = projection.name_conflicts;
+        let persisted_name_paths: HashSet<String> = txn
+            .iter_conflicts(view.id)
+            .map_err(|error| RepositoryError::Database(error.to_string()))?
+            .into_iter()
+            .flat_map(|(_, records)| records)
+            .filter(|record| record.kind == atomic_core::pristine::StoredConflictKind::Name)
+            .map(|record| record.path)
+            .collect();
 
-        // ── View-aware filtering ───────────────────────────────────────
-        //
-        // Always build the explicit change filter.  The TREE table is
-        // global — it contains entries from ALL views, including child
-        // views.  Without filtering, files recorded on child views leak
-        // into the parent's status as false "Deleted" entries.
-        //
-        // The previous "universal" fast-path (skip filter for
-        // is_shared() && parent.is_none()) was unsound: the dev view is
-        // shared with no parent, but child/sibling views may have unique
-        // changes.  Skipping the filter caused TREE entries created by
-        // those changes to surface as phantom `Deleted` files in dev's
-        // status.
-        //
-        // The filter computation is O(C) where C is changes on the view —
-        // a single B-tree scan, fast even on large repos.
-        //
-        // None means "no current view" (a misconfigured repo); preserve
-        // the legacy "show everything" behavior in that case rather than
-        // producing an empty status.
-        let current_view_change_ids: Option<HashSet<NodeId>> = if let Some(ref view) = txn
-            .get_view(&self.current_view)
-            .map_err(|e| RepositoryError::Database(e.to_string()))?
-        {
-            Some(collect_visible_change_ids_with_deps(&txn, view)?)
-        } else {
-            None
-        };
+        let mut status = RepositoryStatus::new(view_name, Some(view.state));
 
         let phase1_ms = overall_start.elapsed().as_millis();
         log::debug!("status: view filter setup took {}ms", phase1_ms);
@@ -144,23 +157,19 @@ impl Repository {
             // filesystem walk doesn't mark them Untracked) but flag them
             // so that if they're absent from disk we skip them silently
             // instead of reporting Deleted.
-            let has_graph = if let Ok(Some(position)) = txn.inode_position(inode) {
-                if let Some(ref ids) = current_view_change_ids {
-                    if !position.change.is_root() && !ids.contains(&position.change) {
-                        // Foreign file — tracked globally, not on this view.
-                        // Include in tracked_paths with has_graph=false so
-                        // it shows as Added if on disk, and track it as
-                        // foreign so we skip it when not on disk.
-                        foreign_paths.insert(normalized.clone());
-                        false
-                    } else {
-                        true
-                    }
-                } else {
-                    true
+            let has_graph = match txn
+                .inode_position(inode)
+                .map_err(|e| RepositoryError::Database(e.to_string()))?
+            {
+                Some(position)
+                    if !position.change.is_root() && !visibility.contains(position.change) =>
+                {
+                    // Foreign file — tracked globally, not on this view.
+                    foreign_paths.insert(normalized.clone());
+                    false
                 }
-            } else {
-                false
+                Some(_) => true,
+                None => false,
             };
 
             // Apply path filter if specified
@@ -184,6 +193,36 @@ impl Repository {
             tracked_paths.insert(normalized);
         }
 
+        // TREE is aligned to the current visible lifecycle and therefore omits
+        // recorded deletions. Reintroduce those paths for status classification
+        // using the operation-aware projection so a filesystem reappearance is
+        // an undelete of the original inode rather than an untracked new file.
+        for absent in &projected_absent {
+            let normalized = PathBuf::from(&absent.path);
+            // A projected deletion is already the recorded state. Reintroduce
+            // it only when an entry actually reappears on disk, where it must
+            // be classified as an undelete of the stable inode rather than as
+            // an untracked add.
+            if std::fs::symlink_metadata(self.root.join(&normalized)).is_err() {
+                continue;
+            }
+            if !options.path_filters.is_empty() {
+                let matches = options
+                    .path_filters
+                    .iter()
+                    .any(|f| normalized.starts_with(f) || f.starts_with(&normalized));
+                if !matches {
+                    continue;
+                }
+            }
+            tracked_paths.insert(normalized.clone());
+            inode_map.insert(normalized.clone(), absent.inode);
+            has_graph_content_cache.insert(normalized.clone(), true);
+            if absent.directory {
+                directory_inodes.insert(absent.inode);
+            }
+        }
+
         let tree_ms = tree_start.elapsed().as_millis();
         log::debug!(
             "status: TREE scan took {}ms ({} tracked files, {} dirs)",
@@ -192,24 +231,206 @@ impl Repository {
             directory_inodes.len()
         );
 
-        // ── Batch-load FILE_INDEX ───────────────────────────────────────
-        //
-        // One sequential B-tree scan loads the entire FILE_INDEX into memory.
-        // This replaces 43k individual B-tree lookups with 43k HashMap lookups
-        // (nanoseconds each).
+        for path in projected_name_conflicts.keys() {
+            let normalized = PathBuf::from(path);
+            if options.path_filters.is_empty()
+                || options
+                    .path_filters
+                    .iter()
+                    .any(|filter| normalized.starts_with(filter) || filter.starts_with(&normalized))
+            {
+                tracked_paths.insert(normalized);
+            }
+        }
+
+        // ── Canonical FILE_INDEX_V2 scan and re-verification ────────────
+        use crate::change_source::{
+            conversion_policy_fingerprint, now_timestamp, verify_candidates, CanonicalTrackedPath,
+            ChangeSource, ChangeSourceError, ChangeSourceFallbackReason, ChangeSourceKind,
+            ChangeSourceRequest, ChangeSourceTokenStore, ScanChangeSource, SelectedChangeSource,
+            VerifiedChange,
+        };
+        use atomic_core::pristine::FileIndexV2TxnT;
+
         let index_start = std::time::Instant::now();
-        let file_index_entries = txn
-            .iter_file_index()
-            .map_err(|e| RepositoryError::Database(e.to_string()))?;
-        let file_index: HashMap<String, (i64, u32, u64, Hash)> = file_index_entries
-            .into_iter()
-            .map(|(path, secs, nanos, size, hash)| (path, (secs, nanos, size, hash)))
+        let mut canonical_tracked = Vec::new();
+        let mut gitlink_paths: std::collections::HashSet<PathBuf> =
+            std::collections::HashSet::new();
+        for path in &tracked_paths {
+            if inode_map
+                .get(path)
+                .is_some_and(|inode| directory_inodes.contains(inode))
+                || !has_graph_content_cache.get(path).copied().unwrap_or(false)
+                || !projected_present_paths.contains(path)
+                || foreign_paths.contains(path)
+            {
+                continue;
+            }
+            let Some(inode) = inode_map.get(path).copied() else {
+                continue;
+            };
+            let Some(position) = txn
+                .inode_position(inode)
+                .map_err(|error| RepositoryError::Database(error.to_string()))?
+            else {
+                continue;
+            };
+            let projected = atomic_core::output::project_inode_attributes(
+                &txn,
+                position,
+                visibility.attribute_visibility(),
+            )
+            .map_err(|error| RepositoryError::Database(error.to_string()))?;
+            if projected.is_conflicted() {
+                continue;
+            }
+            // CB-9C: gitlink paths have no materialized bytes to verify —
+            // their content identity is the Git index's object ID, not the
+            // submodule directory's disk state — so they are excluded from
+            // the canonical content-verification set and recorded for the
+            // tracked-file classification loop instead.
+            if projected.materialization.kind == atomic_core::change::InodeKind::Gitlink {
+                gitlink_paths.insert(path.clone());
+                continue;
+            }
+            let repo_path = crate::repository::RepoPath::from_native(path)
+                .map_err(|error| RepositoryError::Output(error.to_string()))?;
+            canonical_tracked.push(CanonicalTrackedPath {
+                path: repo_path,
+                canonical_mode: projected.materialization.mode,
+                canonical_kind: projected.materialization.kind,
+            });
+        }
+        canonical_tracked.sort_by(|left, right| left.path.cmp(&right.path));
+        let tracked_repo_paths: Vec<_> = canonical_tracked
+            .iter()
+            .map(|entry| entry.path.clone())
             .collect();
+        let conversion_policy = conversion_policy_fingerprint(&self.root, &tracked_repo_paths)
+            .map_err(map_change_source_error)?;
+        let source_request = ChangeSourceRequest {
+            root: &self.root,
+            tracked_paths: &tracked_repo_paths,
+            previous_token: None,
+        };
+        let token_store = ChangeSourceTokenStore::new(&self.dot_dir, working_copy);
+        let mut source_result = if let Some(source) = change_source_override {
+            source.changes(source_request)
+        } else {
+            let git_watch = atomic_config::RepoConfig::load(&self.config_path())
+                .map_err(|error| RepositoryError::Config(error.to_string()))?
+                .git
+                .watch;
+            let fsmonitor_token = token_store
+                .load(ChangeSourceKind::Fsmonitor)
+                .map_err(|error| RepositoryError::Output(error.to_string()))?;
+            let watchman_token = token_store
+                .load(ChangeSourceKind::Watchman)
+                .map_err(|error| RepositoryError::Output(error.to_string()))?;
+            if fsmonitor_token.invalidation.is_some() || watchman_token.invalidation.is_some() {
+                let mut result = ScanChangeSource
+                    .changes(source_request)
+                    .map_err(map_change_source_error)?;
+                result.fallback_source = Some(if fsmonitor_token.invalidation.is_some() {
+                    ChangeSourceKind::Fsmonitor
+                } else {
+                    ChangeSourceKind::Watchman
+                });
+                result.fallback = Some(ChangeSourceFallbackReason::UnknownToken);
+                Ok(result)
+            } else {
+                SelectedChangeSource::new(git_watch).changes_with_tokens(
+                    source_request,
+                    fsmonitor_token.token.as_ref(),
+                    watchman_token.token.as_ref(),
+                )
+            }
+        }
+        .map_err(map_change_source_error)?;
+        let file_index = match txn.iter_file_index_v2(working_copy) {
+            Ok(entries) => entries
+                .into_iter()
+                .map(|(path, entry)| {
+                    crate::repository::RepoPath::new(path)
+                        .map(|path| (path, entry))
+                        .map_err(|error| RepositoryError::Output(error.to_string()))
+                })
+                .collect::<Result<std::collections::BTreeMap<_, _>, _>>()?,
+            Err(error) => {
+                source_result.fallback = Some(ChangeSourceFallbackReason::MalformedIndex(
+                    error.to_string(),
+                ));
+                std::collections::BTreeMap::new()
+            }
+        };
+        let index_write_time = now_timestamp();
+        let verified_scan = verify_candidates(
+            source_result,
+            &canonical_tracked,
+            &file_index,
+            conversion_policy,
+            index_write_time,
+            &content_filter,
+            |path| {
+                let path_text = std::str::from_utf8(path.as_bytes()).map_err(|error| {
+                    ChangeSourceError::CanonicalContent {
+                        path: path.escaped(),
+                        message: error.to_string(),
+                    }
+                })?;
+                let item = projected_present.get(path_text).ok_or_else(|| {
+                    ChangeSourceError::CanonicalContent {
+                        path: path.escaped(),
+                        message: "path is absent from the canonical graph projection".into(),
+                    }
+                })?;
+                super::content::retrieve_content_with_filter_fast(
+                    &txn,
+                    &self.change_store,
+                    item.inode,
+                    item.position,
+                    atomic_core::output::alive::RetrieveOptions::new()
+                        .with_graph_visibility(visibility.clone()),
+                )
+                .map(|bytes| Hash::of(&bytes))
+                .map_err(|error| ChangeSourceError::CanonicalContent {
+                    path: path.escaped(),
+                    message: error.to_string(),
+                })
+            },
+        )
+        .map_err(map_change_source_error)?;
+        status.set_change_source_verification(verified_scan.root, verified_scan.metrics.clone());
+        // CB-13C observability (review R1): status is an observational
+        // boundary and never writes telemetry — including from read-only
+        // opens, non-Git repositories or un-opted configurations. The
+        // degradation metrics are returned to the caller here (see
+        // `change_source_metrics`); only explicit bridge command boundaries
+        // decide whether an authorized journal records them.
+        let verified_by_path: HashMap<PathBuf, _> = verified_scan
+            .candidates
+            .iter()
+            .filter_map(|candidate| {
+                candidate
+                    .path
+                    .to_native()
+                    .ok()
+                    .map(|path| (path, candidate.clone()))
+            })
+            .collect();
+        let source_token = verified_scan.token.clone();
+        let source_metrics = verified_scan.metrics.clone();
+        let v2_updates = verified_scan.index_updates;
+        let v2_deletions = verified_scan.index_deletions;
         let index_ms = index_start.elapsed().as_millis();
         log::debug!(
-            "status: FILE_INDEX loaded {}ms ({} entries)",
+            "status: FILE_INDEX_V2 verified {}ms (tracked={}, leases={}, hashed={}, fallback={:?}, root={:?})",
             index_ms,
-            file_index.len()
+            verified_scan.stats.tracked_paths,
+            verified_scan.stats.cache_leases,
+            verified_scan.stats.content_reads,
+            verified_scan.fallback,
+            verified_scan.root
         );
 
         // ── Classify tracked files ──────────────────────────────────────
@@ -228,6 +449,24 @@ impl Repository {
             let inode = inode_map.get(path).copied();
             let has_graph = has_graph_content_cache.get(path).copied().unwrap_or(false);
 
+            // CB-9C: a tracked gitlink materializes as a submodule
+            // directory. Its content identity lives in the Git index, its
+            // disk permissions are foreign state, and its submodule
+            // contents are not Atomic untracked content — so the gitlink
+            // path itself is present and clean unless the projected state
+            // says otherwise.
+            if gitlink_paths.contains(path) {
+                found_on_disk.insert(path.clone());
+                if !abs_path.is_dir() {
+                    let mut entry = FileStatusEntry::new(path.clone(), FileStatus::TypeChanged);
+                    if let Some(inode) = inode {
+                        entry.set_inode(inode);
+                    }
+                    status.add_entry(entry);
+                }
+                continue;
+            }
+
             let is_dir = inode
                 .map(|i| directory_inodes.contains(&i))
                 .unwrap_or(false);
@@ -235,9 +474,11 @@ impl Repository {
             // Skip tracked directories — handle separately
             if is_dir {
                 found_on_disk.insert(path.clone());
+                let projected_present = projected_present_paths.contains(path);
                 if abs_path.is_dir() {
-                    if !has_graph {
-                        // Directory tracked but not yet recorded
+                    if !has_graph || !projected_present {
+                        // A projected-absent directory that reappears is an
+                        // undelete candidate carrying its original inode.
                         let mut entry = FileStatusEntry::new(path.clone(), FileStatus::Added);
                         if let Some(inode) = inode {
                             entry.set_inode(inode);
@@ -245,9 +486,9 @@ impl Repository {
                         entry.set_details("directory".to_string());
                         status.add_entry(entry);
                     }
-                    // else: Clean directory — skip
+                } else if has_graph && !projected_present {
+                    // The deletion is already recorded on this view.
                 } else {
-                    // Directory deleted from disk
                     let mut entry = FileStatusEntry::new(path.clone(), FileStatus::Deleted);
                     if let Some(inode) = inode {
                         entry.set_inode(inode);
@@ -258,10 +499,11 @@ impl Repository {
                 continue;
             }
 
-            // Check if file exists on disk
+            // Check if file exists on disk without following symlinks. Dangling
+            // links remain present and their target bytes are versioned content.
             stat_count += 1;
-            let metadata = match std::fs::metadata(&abs_path) {
-                Ok(m) if m.is_file() => m,
+            let _metadata = match std::fs::symlink_metadata(&abs_path) {
+                Ok(m) if m.is_file() || m.file_type().is_symlink() || (m.is_dir() && !is_dir) => m,
                 _ => {
                     // Foreign file not on disk — skip silently.
                     // This file is tracked globally (in TREE) but its
@@ -274,30 +516,13 @@ impl Repository {
                         continue;
                     }
 
-                    // File missing from disk.  Check whether the deletion
-                    // has already been recorded in the graph.
-                    //
-                    // The graph uses an additive-only edge model: the
-                    // original alive BLOCK edge and the new BLOCK|DELETED
-                    // edge coexist.  A simple "any alive edge?" check
-                    // gives wrong answers.  Instead, use the
-                    // change-filter-aware retrieval path (the same one
-                    // materialize uses) to ask: does this file have
-                    // content from this view's perspective?  If not, the
-                    // deletion is already recorded.
-                    if has_graph {
-                        if let Some(inode_val) = inode {
-                            if let Ok(Some(position)) = txn.inode_position(inode_val) {
-                                if let Some(ref ids) = current_view_change_ids {
-                                    if !is_file_alive_via_retrieval(&txn, inode_val, position, ids)
-                                    {
-                                        // Deletion already recorded — skip
-                                        found_on_disk.insert(path.clone());
-                                        continue;
-                                    }
-                                }
-                            }
-                        }
+                    // Lifecycle projection, not content length, decides whether
+                    // the missing path is an already-recorded deletion. A
+                    // present zero-byte file remains in this set and is reported
+                    // Deleted when missing from disk.
+                    if has_graph && !projected_present_paths.contains(path) {
+                        found_on_disk.insert(path.clone());
+                        continue;
                     }
                     // File is genuinely missing and deletion not yet recorded
                     let mut entry = FileStatusEntry::new(path.clone(), FileStatus::Deleted);
@@ -311,6 +536,69 @@ impl Repository {
             };
 
             found_on_disk.insert(path.clone());
+
+            if has_graph {
+                if let (Some(inode), Some(position)) = (
+                    inode,
+                    inode.and_then(|inode| txn.inode_position(inode).ok().flatten()),
+                ) {
+                    let projected = atomic_core::output::project_inode_attributes(
+                        &txn,
+                        position,
+                        visibility.attribute_visibility(),
+                    )
+                    .map_err(|error| RepositoryError::Database(error.to_string()))?;
+                    if projected.is_conflicted() {
+                        let mut entry = FileStatusEntry::new(path.clone(), FileStatus::Conflicted);
+                        entry.set_inode(inode);
+                        entry.set_details("inode attribute conflict".to_string());
+                        status.add_or_replace_entry(entry);
+                        continue;
+                    }
+                    let actual = super::attributes::working_inode_attrs(&abs_path)?;
+                    let facts = atomic_core::output::InodeStatusFacts::between(
+                        projected.materialization,
+                        actual.mode,
+                        actual.kind,
+                    );
+                    // CB-9C: a gitlink's registered mode is not a
+                    // materialized fact — the submodule directory's own
+                    // permission bits are foreign state, so a mode
+                    // difference on a Gitlink kind is never a reportable
+                    // permission change. The materialized directory mode is
+                    // whatever the filesystem created.
+                    let permissions_changed = facts.permissions_changed
+                        && projected.materialization.kind
+                            != atomic_core::change::InodeKind::Gitlink;
+                    if facts.type_changed {
+                        let mut entry = FileStatusEntry::new(path.clone(), FileStatus::TypeChanged);
+                        entry.set_inode(inode);
+                        status.add_entry(entry);
+                        continue;
+                    }
+                    if permissions_changed {
+                        let mut entry =
+                            FileStatusEntry::new(path.clone(), FileStatus::PermissionsChanged);
+                        entry.set_inode(inode);
+                        status.add_entry(entry);
+                        continue;
+                    }
+                }
+            }
+
+            if has_graph && !projected_present_paths.contains(path) {
+                let mut entry = FileStatusEntry::new(path.clone(), FileStatus::Added);
+                if let Some(inode) = inode {
+                    entry.set_inode(inode);
+                }
+                if options.hash_contents {
+                    if let Ok(hash) = hash_file_contents(&abs_path) {
+                        entry.set_current_hash(hash);
+                    }
+                }
+                status.add_entry(entry);
+                continue;
+            }
 
             // Not yet recorded → Added
             if !has_graph {
@@ -327,119 +615,51 @@ impl Repository {
                 continue;
             }
 
-            // ── FILE_INDEX fast path (ALWAYS runs, not gated on hash_contents) ──
-            //
-            // Check mtime+size against the in-memory FILE_INDEX HashMap.
-            // This is the critical performance path: 99%+ of files in a
-            // large repo are clean, and this catches them with just a stat
-            // + HashMap lookup (nanoseconds, not B-tree milliseconds).
-            let path_str = path.to_string_lossy();
-            if let Some(&(cached_secs, cached_nanos, cached_size, cached_hash)) =
-                file_index.get(path_str.as_ref())
-            {
-                let mtime = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
-                let duration = mtime
-                    .duration_since(SystemTime::UNIX_EPOCH)
-                    .unwrap_or_default();
-                let current_secs = duration.as_secs() as i64;
-                let current_nanos = duration.subsec_nanos();
-                let current_size = metadata.len();
-
-                if current_secs == cached_secs
-                    && current_nanos == cached_nanos
-                    && current_size == cached_size
-                {
-                    // mtime + size match → Clean — skip entirely
-                    index_hit_count += 1;
-                    continue;
-                }
-
-                // mtime or size differ — hash to confirm
-                if options.hash_contents {
-                    hash_count += 1;
-                    match hash_file_contents(&abs_path) {
-                        Ok(current_hash) => {
-                            if current_hash == cached_hash {
-                                // Content unchanged (just mtime drift) → Clean
-                                continue;
-                            }
-                            // Content changed → Modified
-                            let mut entry =
-                                FileStatusEntry::new(path.clone(), FileStatus::Modified);
-                            if let Some(inode) = inode {
-                                entry.set_inode(inode);
-                            }
+            // The source result is only a candidate set. Canonical V2
+            // re-verification has already checked metadata, racy-stat, policy,
+            // graph mode/kind, and repository bytes before a clean omission.
+            if let Some(verified) = verified_by_path.get(path) {
+                match verified.change {
+                    VerifiedChange::Unchanged => {
+                        if verified.rehashed {
+                            hash_count += 1;
+                        } else {
+                            index_hit_count += 1;
+                        }
+                        continue;
+                    }
+                    VerifiedChange::Modified => {
+                        if verified.rehashed {
+                            hash_count += 1;
+                        }
+                        let mut entry = FileStatusEntry::new(path.clone(), FileStatus::Modified);
+                        if let Some(inode) = inode {
+                            entry.set_inode(inode);
+                        }
+                        if let Some(current_hash) = verified.content_id {
                             entry.set_current_hash(current_hash);
-                            status.add_entry(entry);
-                            continue;
                         }
-                        Err(_) => {
-                            let mut entry =
-                                FileStatusEntry::new(path.clone(), FileStatus::Modified);
-                            if let Some(inode) = inode {
-                                entry.set_inode(inode);
-                            }
-                            entry.set_details("Unable to read file contents".to_string());
-                            status.add_entry(entry);
-                            continue;
-                        }
+                        status.add_entry(entry);
+                        continue;
                     }
-                } else {
-                    // No hash requested but mtime changed → assume Modified
-                    let mut entry = FileStatusEntry::new(path.clone(), FileStatus::Modified);
-                    if let Some(inode) = inode {
-                        entry.set_inode(inode);
+                    VerifiedChange::Deleted
+                    | VerifiedChange::TypeChanged
+                    | VerifiedChange::PermissionsChanged => {
+                        // Deletion and canonical attribute changes were already
+                        // classified above with the existing status semantics.
                     }
-                    status.add_entry(entry);
-                    continue;
                 }
             }
 
-            // No FILE_INDEX entry — file is tracked with graph content
-            // but was never indexed. This happens after `atomic insert`,
-            // `atomic clone`, or `atomic view switch` materializes a file
-            // into the working copy without going through `record()` (only
-            // record/materialize_view populate FILE_INDEX today).
-            //
-            // We CANNOT silently treat this as Clean: that would let real
-            // edits to such files become invisible to status/diff/record,
-            // and `record(all=true)` would silently drop them.
-            //
-            // Conservative correctness: mark Modified so the caller can
-            // run a full diff against pristine. If the file is actually
-            // unchanged, the recording workflow produces an empty hunk
-            // and skips it (record_modified_file returns is_empty()).
-            // Subsequent records re-populate FILE_INDEX, returning the
-            // file to the fast path.
+            // Paths excluded from the canonical scanner (for example an
+            // unresolved attribute conflict) retain the conservative behavior.
             status.add_stale_index_hit();
-            if options.hash_contents {
-                hash_count += 1;
-                let mut entry = FileStatusEntry::new(path.clone(), FileStatus::Modified);
-                if let Some(inode) = inode {
-                    entry.set_inode(inode);
-                }
-                match hash_file_contents(&abs_path) {
-                    Ok(current_hash) => {
-                        entry.set_current_hash(current_hash);
-                    }
-                    Err(_) => {
-                        entry.set_details("Unable to read file contents".to_string());
-                    }
-                }
-                entry.set_details("FILE_INDEX entry missing".to_string());
-                status.add_entry(entry);
-            } else {
-                // Fast mode: skip the hash but still surface the entry so
-                // it isn't silently dropped. Callers using fast mode (e.g.
-                // the agent record path) re-query with hash_contents=true
-                // before recording.
-                let mut entry = FileStatusEntry::new(path.clone(), FileStatus::Modified);
-                if let Some(inode) = inode {
-                    entry.set_inode(inode);
-                }
-                entry.set_details("FILE_INDEX entry missing".to_string());
-                status.add_entry(entry);
+            let mut entry = FileStatusEntry::new(path.clone(), FileStatus::Modified);
+            if let Some(inode) = inode {
+                entry.set_inode(inode);
             }
+            entry.set_details("FILE_INDEX_V2 verification unavailable".to_string());
+            status.add_entry(entry);
         }
 
         let classify_ms = classify_start.elapsed().as_millis();
@@ -477,13 +697,21 @@ impl Repository {
         );
         if scan_untracked {
             let rules = if options.respect_ignore_files {
-                Some(self.ignore_rules())
+                Some(self.load_ignore_rules())
             } else {
                 None
             };
 
+            // Review CB-9C R5: prune only authoritative nested-repository
+            // boundaries. Tracked visible gitlink paths are passed
+            // explicitly; every other directory is pruned only when its
+            // `.git` marker is an actual repository, so incidental `.git`
+            // markers never hide ordinary parent content.
+            let walker_options = options
+                .clone()
+                .with_nested_repo_boundaries(gitlink_paths.iter().cloned());
             let working_files =
-                collect_working_copy_files_with_rules(&self.root, &options, rules.as_ref())
+                collect_working_copy_files_with_rules(&self.root, &walker_options, rules.as_ref())
                     .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
             for path in working_files {
@@ -500,46 +728,122 @@ impl Repository {
             }
         }
 
+        // PATH_CLAIMS conflicts are authoritative and visible even before a
+        // materialize has persisted compatibility conflict rows. A12 file
+        // conflicts become recordable Modified entries once markers are removed;
+        // A11 and directory conflicts have no in-file marker channel.
+        for (path, conflict) in &projected_name_conflicts {
+            let normalized = PathBuf::from(path);
+            if !options.path_filters.is_empty()
+                && !options
+                    .path_filters
+                    .iter()
+                    .any(|filter| normalized.starts_with(filter) || filter.starts_with(&normalized))
+            {
+                continue;
+            }
+            let abs_path = self.root.join(&normalized);
+            let has_markers = std::fs::read(&abs_path)
+                .ok()
+                .and_then(|bytes| super::materialize::first_conflict_marker_line(&bytes))
+                .is_some();
+            let path_sides = conflict.sides_at_path(path);
+            let marker_resolved_a12 = for_record
+                && persisted_name_paths.contains(path)
+                && !conflict.is_rename_conflict()
+                && !has_markers
+                && path_sides.iter().all(|side| !side.is_directory())
+                && abs_path.is_file();
+            let mut entry = FileStatusEntry::new(
+                normalized,
+                if marker_resolved_a12 {
+                    FileStatus::Modified
+                } else {
+                    FileStatus::Conflicted
+                },
+            );
+            if path_sides.len() == 1 {
+                entry.set_inode(path_sides[0].inode);
+            }
+            entry.set_details(format!(
+                "name conflict ({} path(s), {} claimant(s))",
+                conflict.paths.len(),
+                conflict.sides.len()
+            ));
+            status.add_or_replace_entry(entry);
+        }
+
         // ── Conflicted files ────────────────────────────────────────────
         //
         // Surface persisted conflict state (written by the last materialize
         // on this view) so a conflicted working tree is never reported clean.
         // A Conflicted entry supersedes any Modified entry for the same path.
-        if let Some(view) = txn
-            .get_view(&self.current_view)
-            .map_err(|e| RepositoryError::Database(e.to_string()))?
+        let conflicts = txn
+            .iter_conflicts(view.id)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        for (inode, records) in conflicts {
+            let Some(first) = records.first() else {
+                continue;
+            };
+            let path = PathBuf::from(&first.path);
+            // Honesty invariant: only report Conflicted while the file on
+            // disk still carries markers. Once the user resolves them the
+            // file falls back to normal Modified detection and becomes
+            // recordable again (which then clears the stale entry).
+            let abs_path = self.root.join(&path);
+            let still_conflicted = std::fs::read(&abs_path)
+                .ok()
+                .and_then(|c| super::materialize::first_conflict_marker_line(&c))
+                .is_some();
+            if !still_conflicted {
+                continue;
+            }
+            let detail = if records.len() > 1 {
+                format!("{} ({} conflicts)", first.summary(), records.len())
+            } else {
+                first.summary()
+            };
+            let mut entry = FileStatusEntry::new(path, FileStatus::Conflicted);
+            entry.set_inode(atomic_core::types::Inode::new(inode));
+            entry.set_details(detail);
+            // Conflicted supersedes any prior (e.g. Modified) entry so the
+            // file is reported exactly once.
+            status.add_or_replace_entry(entry);
+        }
+
+        // RFC §8.3 (CB-8B) — the essential conflict caveat: when this view's
+        // conflict state has been projected as an ordinary Git conflict
+        // snapshot commit (clean Git index, committed markers), the notice
+        // must make the distinction explicit. Committed markers are a lossy
+        // Git representation, NOT Git unmerged stages 1-3: Git status is
+        // clean for them and merge tools do not apply, while the Atomic
+        // conflict remains unresolved until it is resolved in Atomic.
+        if status
+            .entries()
+            .iter()
+            .any(|entry| entry.status() == FileStatus::Conflicted)
         {
-            let conflicts = txn
-                .iter_conflicts(view.id)
-                .map_err(|e| RepositoryError::Database(e.to_string()))?;
-            for (inode, records) in conflicts {
-                let Some(first) = records.first() else {
-                    continue;
-                };
-                let path = PathBuf::from(&first.path);
-                // Honesty invariant: only report Conflicted while the file on
-                // disk still carries markers. Once the user resolves them the
-                // file falls back to normal Modified detection and becomes
-                // recordable again (which then clears the stale entry).
-                let abs_path = self.root.join(&path);
-                let still_conflicted = std::fs::read(&abs_path)
-                    .ok()
-                    .and_then(|c| super::materialize::first_conflict_marker_line(&c))
-                    .is_some();
-                if !still_conflicted {
-                    continue;
-                }
-                let detail = if records.len() > 1 {
-                    format!("{} ({} conflicts)", first.summary(), records.len())
-                } else {
-                    first.summary()
-                };
-                let mut entry = FileStatusEntry::new(path, FileStatus::Conflicted);
-                entry.set_inode(atomic_core::types::Inode::new(inode));
-                entry.set_details(detail);
-                // Conflicted supersedes any prior (e.g. Modified) entry so the
-                // file is reported exactly once.
-                status.add_or_replace_entry(entry);
+            let git_snapshot = git2::Repository::open(&self.root)
+                .ok()
+                .and_then(|git| {
+                    let head = git.head().ok()?.target()?;
+                    let commit = git.find_commit(head).ok()?;
+                    let message = commit.message().unwrap_or("");
+                    Some(
+                        message
+                            .lines()
+                            .any(|line| line.trim().starts_with("atomic-conflict ")),
+                    )
+                })
+                .unwrap_or(false);
+            if git_snapshot {
+                status.add_notice(
+                    "Git HEAD is an Atomic conflict snapshot commit: marker files are \
+                     committed on a CLEAN Git index (not Git unmerged stages 1-3). The \
+                     Atomic conflict remains unresolved; resolve it in Atomic and record \
+                     before treating the state as clean."
+                        .to_string(),
+                );
             }
         }
 
@@ -555,7 +859,48 @@ impl Repository {
             untracked_ms
         );
 
+        drop(txn);
+        if let Err(error) =
+            self.update_file_index_v2_transaction(working_copy, &v2_updates, &v2_deletions)
+        {
+            log::warn!("status: unable to persist FILE_INDEX_V2 transaction: {error}");
+        }
+        if source_metrics.fallback_reason == Some(ChangeSourceFallbackReason::UnknownToken) {
+            if let Some(source) = source_metrics.fallback_source {
+                if let Err(error) = token_store.invalidate(source) {
+                    log::warn!("status: unable to invalidate change-source token: {error}");
+                }
+            }
+        } else if source_metrics.fallback_count == 0
+            && matches!(
+                source_metrics.source,
+                ChangeSourceKind::Fsmonitor | ChangeSourceKind::Watchman
+            )
+        {
+            if let Err(error) = token_store.store(source_metrics.source, &source_token) {
+                log::warn!("status: unable to persist change-source token: {error}");
+            }
+        }
+
         Ok(status)
+    }
+
+    #[cfg(test)]
+    #[cfg(unix)] // consumed by unix-gated change-source tests
+    fn status_with_change_source(
+        &self,
+        working_copy: WorkingCopyId,
+        options: StatusOptions,
+        source: &dyn crate::change_source::ChangeSource,
+    ) -> Result<RepositoryStatus, RepositoryError> {
+        self.status_inner(
+            working_copy,
+            options,
+            UntrackedScanPolicy::Never,
+            false,
+            false,
+            Some(source),
+        )
     }
 
     /// List the current view's persisted conflicts.
@@ -568,36 +913,82 @@ impl Repository {
     #[allow(clippy::type_complexity)]
     pub fn list_conflicts(
         &self,
+        working_copy: WorkingCopyId,
     ) -> Result<Vec<(String, Vec<atomic_core::pristine::StoredConflict>)>, RepositoryError> {
+        let view_name = self.desired_view_name(working_copy)?;
         let txn = self
             .pristine
             .read_txn()
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
         let view = match txn
-            .get_view(&self.current_view)
+            .get_view(&view_name)
             .map_err(|e| RepositoryError::Database(e.to_string()))?
         {
             Some(v) => v,
             None => return Ok(Vec::new()),
         };
-        let mut out = Vec::new();
+        let full_visibility = graph_visibility_closure(&txn, &view)?;
+        let visibility = super::name_resolution::path_claim_visibility_for_view(
+            &txn,
+            &self.change_store,
+            &view,
+            &full_visibility,
+        )?;
+        let projection = self.project_tree_for_visibility(&txn, &visibility)?;
+        let active_name_paths: HashSet<String> = projection
+            .name_conflicts
+            .iter()
+            .filter_map(|(path, conflict)| {
+                let sides = conflict.sides_at_path(path);
+                let requires_marker =
+                    !conflict.is_rename_conflict() && sides.iter().all(|side| !side.is_directory());
+                let has_marker = std::fs::read(self.root.join(path))
+                    .ok()
+                    .and_then(|bytes| super::materialize::first_conflict_marker_line(&bytes))
+                    .is_some();
+                (!requires_marker || has_marker).then(|| path.clone())
+            })
+            .collect();
+        let mut by_path = HashMap::<String, Vec<atomic_core::pristine::StoredConflict>>::new();
         for (_inode, records) in txn
             .iter_conflicts(view.id)
             .map_err(|e| RepositoryError::Database(e.to_string()))?
         {
-            let Some(first) = records.first() else {
-                continue;
-            };
-            let abs_path = self.root.join(&first.path);
-            let still_conflicted = std::fs::read(&abs_path)
-                .ok()
-                .and_then(|c| super::materialize::first_conflict_marker_line(&c))
-                .is_some();
-            if !still_conflicted {
+            for record in records {
+                let still_conflicted = if record.kind
+                    == atomic_core::pristine::StoredConflictKind::Name
+                {
+                    active_name_paths.contains(&record.path)
+                } else {
+                    std::fs::read(self.root.join(&record.path))
+                        .ok()
+                        .and_then(|bytes| super::materialize::first_conflict_marker_line(&bytes))
+                        .is_some()
+                };
+                if still_conflicted {
+                    by_path.entry(record.path.clone()).or_default().push(record);
+                }
+            }
+        }
+        for (path, conflict) in projection.name_conflicts {
+            if !active_name_paths.contains(&path) {
                 continue;
             }
-            out.push((first.path.clone(), records));
+            by_path.entry(path.clone()).or_insert_with(|| {
+                vec![atomic_core::pristine::StoredConflict {
+                    kind: atomic_core::pristine::StoredConflictKind::Name,
+                    path,
+                    line: None,
+                    sides: conflict
+                        .sides
+                        .iter()
+                        .flat_map(|side| side.event_changes.iter())
+                        .map(|change| change.get().to_string())
+                        .collect(),
+                }]
+            });
         }
+        let mut out: Vec<_> = by_path.into_iter().collect();
         out.sort_by(|a, b| a.0.cmp(&b.0));
         Ok(out)
     }
@@ -607,11 +998,14 @@ impl Repository {
     /// # Example
     ///
     /// ```rust,ignore
-    /// let status = repo.status_quick()?;
+    /// let status = repo.status_quick(working_copy)?;
     /// println!("Modified: {}", status.modified_count());
     /// ```
-    pub fn status_quick(&self) -> Result<RepositoryStatus, RepositoryError> {
-        self.status(StatusOptions::fast())
+    pub fn status_quick(
+        &self,
+        working_copy: WorkingCopyId,
+    ) -> Result<RepositoryStatus, RepositoryError> {
+        self.status(working_copy, StatusOptions::fast())
     }
 
     /// Status showing only tracked files (no untracked).
@@ -619,58 +1013,83 @@ impl Repository {
     /// # Example
     ///
     /// ```rust,ignore
-    /// let status = repo.status_tracked()?;
+    /// let status = repo.status_tracked(working_copy)?;
     /// // Only shows modified, deleted, added - no untracked
     /// ```
-    pub fn status_tracked(&self) -> Result<RepositoryStatus, RepositoryError> {
-        self.status(StatusOptions::tracked_only())
+    pub fn status_tracked(
+        &self,
+        working_copy: WorkingCopyId,
+    ) -> Result<RepositoryStatus, RepositoryError> {
+        self.status(working_copy, StatusOptions::tracked_only())
     }
 
     /// Check if the working copy is clean (no modifications).
-    pub fn is_working_copy_clean(&self) -> Result<bool, RepositoryError> {
-        let status = self.status(StatusOptions::fast())?;
+    pub fn is_working_copy_clean(
+        &self,
+        working_copy: WorkingCopyId,
+    ) -> Result<bool, RepositoryError> {
+        let status = self.status(working_copy, StatusOptions::fast())?;
         Ok(status.is_clean())
     }
 
     /// Get only modified files.
-    pub fn modified_files(&self) -> Result<Vec<PathBuf>, RepositoryError> {
-        let status = self.status(StatusOptions::default())?;
+    pub fn modified_files(
+        &self,
+        working_copy: WorkingCopyId,
+    ) -> Result<Vec<PathBuf>, RepositoryError> {
+        let status = self.status(working_copy, StatusOptions::default())?;
         Ok(status.modified().map(|e| e.path().to_path_buf()).collect())
     }
 
     /// Get only untracked files.
-    pub fn untracked_files(&self) -> Result<Vec<PathBuf>, RepositoryError> {
-        let status = self.status(StatusOptions::default())?;
+    pub fn untracked_files(
+        &self,
+        working_copy: WorkingCopyId,
+    ) -> Result<Vec<PathBuf>, RepositoryError> {
+        let status = self.status(working_copy, StatusOptions::default())?;
         Ok(status.untracked().map(|e| e.path().to_path_buf()).collect())
     }
 
     /// Get only deleted files.
-    pub fn deleted_files(&self) -> Result<Vec<PathBuf>, RepositoryError> {
-        let status = self.status(StatusOptions::default())?;
+    pub fn deleted_files(
+        &self,
+        working_copy: WorkingCopyId,
+    ) -> Result<Vec<PathBuf>, RepositoryError> {
+        let status = self.status(working_copy, StatusOptions::default())?;
         Ok(status.deleted().map(|e| e.path().to_path_buf()).collect())
     }
 }
 
-/// Check whether a file has live content from a view's perspective.
+/// Check whether an explicit delete still has surviving content spans.
 ///
-/// Uses the change-filter-aware `is_vertex_alive` logic from the retrieval
-/// pipeline.  In Atomic's additive-only graph model, both the original alive
-/// edge and the DELETED edge coexist.  The retrieval path correctly handles
-/// supersession: a vertex is dead when a DELETED parent edge was introduced
-/// by a change *in* the filter, even if an older alive parent edge also
-/// exists.
-///
-/// Returns `false` when the deletion has been recorded (no alive content
-/// from this view's perspective).
+/// This is only a tie-breaker for lifecycle projection: an ordinary tracked
+/// empty file is present because its path lifecycle says so. For a visible
+/// `FileDel`, surviving spans from concurrent modifications keep the file
+/// present; a graph with no live byte spans leaves the deletion absent.
 pub(crate) fn is_file_alive_via_retrieval<T: GraphTxnT>(
     txn: &T,
     _inode: Inode,
     position: Position<NodeId>,
-    visible_changes: &HashSet<NodeId>,
-) -> bool {
-    try_is_file_alive_via_retrieval(txn, position, visible_changes).unwrap_or(false)
+    visibility: &GraphVisibilityClosure,
+) -> Result<bool, RepositoryError> {
+    use atomic_core::output::alive::{retrieve_graph, RetrieveOptions};
+
+    // Liveness fast path (review E4): this check runs for EVERY absent
+    // path-claim entry on every projection, and a full alive-graph walk per
+    // entry is quadratic on long-history repositories (a single file with a
+    // deep history took minutes). The question is exactly "does this position
+    // render any alive bytes?", so the traversal can stop at the first alive
+    // content vertex; the partial graph's byte total is the whole verdict.
+    let options = RetrieveOptions::new()
+        .with_graph_visibility(visibility.clone())
+        .stop_at_first_content(true);
+    let retrieved = retrieve_graph(txn, position, options)
+        .map_err(|e| RepositoryError::Database(e.to_string()))?;
+    Ok(retrieved.graph.total_bytes() > 0)
 }
 
+/// Dev #203: supersession-aware aliveness probe against an explicit NodeId
+/// change filter (no GraphVisibilityClosure construction).
 pub(crate) fn try_is_file_alive_via_retrieval<T: GraphTxnT>(
     txn: &T,
     position: Position<NodeId>,
@@ -702,6 +1121,10 @@ pub(crate) fn try_is_file_alive_via_retrieval<T: GraphTxnT>(
     Ok(false)
 }
 
+fn map_change_source_error(error: crate::change_source::ChangeSourceError) -> RepositoryError {
+    RepositoryError::Output(error.to_string())
+}
+
 /// Normalize a tracked path from the TREE table to a relative PathBuf
 /// with forward slashes, handling absolute paths and platform differences.
 fn normalize_tracked_path(path: &str, repo_root: &Path) -> PathBuf {
@@ -728,5 +1151,251 @@ fn normalize_tracked_path(path: &str, repo_root: &Path) -> PathBuf {
         PathBuf::from(stripped.to_string_lossy().replace('\\', "/"))
     } else {
         stripped
+    }
+}
+
+#[cfg(all(test, unix))]
+mod change_source_convergence_tests {
+    use std::sync::Arc;
+
+    use atomic_config::GitWatch;
+    use atomic_core::change::ChangeHeader;
+    use tempfile::tempdir;
+
+    use super::*;
+    use crate::change_source::{
+        ChangeSource, ChangeSourceEnvironment, ChangeSourceError, ChangeSourceRequest,
+        ChangeSourceResult, ScanChangeSource, SelectedChangeSource,
+    };
+    use crate::record::RecordOptions;
+
+    #[derive(Clone, Copy)]
+    enum CandidateMutation {
+        Exact,
+        Dropped,
+        DuplicateReordered,
+    }
+
+    struct CandidateSource(CandidateMutation);
+
+    impl ChangeSource for CandidateSource {
+        fn changes(
+            &self,
+            request: ChangeSourceRequest<'_>,
+        ) -> Result<ChangeSourceResult, ChangeSourceError> {
+            let mut result = ScanChangeSource.changes(request)?;
+            result.complete = false;
+            match self.0 {
+                CandidateMutation::Exact => {}
+                CandidateMutation::Dropped => {
+                    result.candidates.pop();
+                }
+                CandidateMutation::DuplicateReordered => {
+                    if let Some(candidate) = result.candidates.first().cloned() {
+                        result.candidates.push(candidate);
+                    }
+                    result.candidates.reverse();
+                }
+            }
+            result.stats.candidates = result.candidates.len();
+            Ok(result)
+        }
+    }
+
+    struct FailingSource(ChangeSourceError);
+
+    impl ChangeSource for FailingSource {
+        fn changes(
+            &self,
+            _: ChangeSourceRequest<'_>,
+        ) -> Result<ChangeSourceResult, ChangeSourceError> {
+            Err(self.0.clone())
+        }
+    }
+
+    fn status_shape(status: &RepositoryStatus) -> Vec<(PathBuf, FileStatus)> {
+        let mut entries: Vec<_> = status
+            .entries()
+            .iter()
+            .map(|entry| (entry.path().to_path_buf(), entry.status()))
+            .collect();
+        entries.sort_by(|left, right| left.0.cmp(&right.0));
+        entries
+    }
+
+    fn selected(
+        mode: GitWatch,
+        fsmonitor: Arc<dyn ChangeSource>,
+        watchman: Arc<dyn ChangeSource>,
+    ) -> SelectedChangeSource {
+        SelectedChangeSource::with_sources(
+            mode,
+            ChangeSourceEnvironment::default(),
+            fsmonitor,
+            watchman,
+        )
+    }
+
+    #[test]
+    fn scan_adapters_candidate_disorder_and_failures_converge_in_status() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        let working_copy = repo.require_working_copy_id().unwrap();
+        std::fs::write(dir.path().join("a.txt"), b"one").unwrap();
+        std::fs::write(dir.path().join("b.txt"), b"two").unwrap();
+        repo.add(working_copy, "a.txt", TrackingOptions::default())
+            .unwrap();
+        repo.add(working_copy, "b.txt", TrackingOptions::default())
+            .unwrap();
+        repo.record(
+            working_copy,
+            ChangeHeader::new("seed"),
+            RecordOptions::new()
+                .with_all(true)
+                .save_to_store(true)
+                .apply_after_record(true),
+        )
+        .unwrap();
+
+        repo.status_with_change_source(
+            working_copy,
+            StatusOptions::tracked_only(),
+            &ScanChangeSource,
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("b.txt"), b"changed").unwrap();
+
+        let scan = repo
+            .status_with_change_source(
+                working_copy,
+                StatusOptions::tracked_only(),
+                &ScanChangeSource,
+            )
+            .unwrap();
+        let expected_root = scan.verified_candidate_root().unwrap();
+        let expected_status = status_shape(&scan);
+        let scan_metrics = scan.change_source_metrics().unwrap();
+        assert_eq!(
+            scan_metrics.source,
+            crate::change_source::ChangeSourceKind::Scan
+        );
+        assert_eq!(scan_metrics.candidate_count, 2);
+        assert_eq!(scan_metrics.metadata_reads, 2);
+        assert_eq!(scan_metrics.content_reads, 1);
+        assert_eq!(scan_metrics.content_hashes, 1);
+        assert_eq!(scan_metrics.valid_lease_hits, 1);
+        assert_eq!(scan_metrics.fallback_count, 0);
+
+        for source in [
+            selected(
+                GitWatch::Fsmonitor,
+                Arc::new(CandidateSource(CandidateMutation::Exact)),
+                Arc::new(CandidateSource(CandidateMutation::Exact)),
+            ),
+            selected(
+                GitWatch::Watchman,
+                Arc::new(CandidateSource(CandidateMutation::Exact)),
+                Arc::new(CandidateSource(CandidateMutation::Exact)),
+            ),
+            selected(
+                GitWatch::Fsmonitor,
+                Arc::new(CandidateSource(CandidateMutation::Dropped)),
+                Arc::new(CandidateSource(CandidateMutation::Exact)),
+            ),
+            selected(
+                GitWatch::Watchman,
+                Arc::new(CandidateSource(CandidateMutation::Exact)),
+                Arc::new(CandidateSource(CandidateMutation::DuplicateReordered)),
+            ),
+        ] {
+            let status = repo
+                .status_with_change_source(working_copy, StatusOptions::tracked_only(), &source)
+                .unwrap();
+            assert_eq!(status.verified_candidate_root(), Some(expected_root));
+            assert_eq!(status_shape(&status), expected_status);
+        }
+
+        let failures = [
+            ChangeSourceError::Unavailable("missing".into()),
+            ChangeSourceError::UnsupportedVersion {
+                found: "2.1.0".into(),
+                minimum: "2.37.0".into(),
+            },
+            ChangeSourceError::UnknownToken,
+            ChangeSourceError::Overflow { limit: 1 },
+            ChangeSourceError::MalformedResponse("bad json".into()),
+            ChangeSourceError::Timeout { milliseconds: 1 },
+        ];
+        for failure in failures {
+            let source = selected(
+                GitWatch::Fsmonitor,
+                Arc::new(FailingSource(failure)),
+                Arc::new(CandidateSource(CandidateMutation::Exact)),
+            );
+            let status = repo
+                .status_with_change_source(working_copy, StatusOptions::tracked_only(), &source)
+                .unwrap();
+            assert_eq!(status.verified_candidate_root(), Some(expected_root));
+            assert_eq!(status_shape(&status), expected_status);
+            assert!(status.change_source_fallback().is_some());
+            let metrics = status.change_source_metrics().unwrap();
+            assert_eq!(metrics.fallback_count, 1);
+            assert_eq!(
+                metrics.fallback_source,
+                Some(crate::change_source::ChangeSourceKind::Fsmonitor)
+            );
+            assert!(metrics.fallback_reason.is_some());
+        }
+    }
+
+    /// Review R1: status is observational and must not write bridge
+    /// telemetry — not from a read-only open, a non-Git repository, or a
+    /// configuration with the bridge un-opted. A degrading change source
+    /// still surfaces its metrics to the caller, but no event file may be
+    /// created (this failed before: the fallback emitted into
+    /// `.atomic/bridge/events.jsonl` unconditionally).
+    #[test]
+    fn status_fallback_writes_no_event_journal() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        let working_copy = repo.require_working_copy_id().unwrap();
+        std::fs::write(dir.path().join("a.txt"), b"one").unwrap();
+        repo.add(working_copy, "a.txt", TrackingOptions::default())
+            .unwrap();
+        repo.record(
+            working_copy,
+            ChangeHeader::new("seed"),
+            RecordOptions::new()
+                .with_all(true)
+                .save_to_store(true)
+                .apply_after_record(true),
+        )
+        .unwrap();
+
+        let source = selected(
+            GitWatch::Fsmonitor,
+            Arc::new(FailingSource(ChangeSourceError::Unavailable(
+                "missing".into(),
+            ))),
+            Arc::new(CandidateSource(CandidateMutation::Exact)),
+        );
+        let status = repo
+            .status_with_change_source(working_copy, StatusOptions::tracked_only(), &source)
+            .unwrap();
+
+        // The degradation metrics are returned to the caller (the
+        // explicitly authorized sink boundary decides what to record).
+        let metrics = status.change_source_metrics().unwrap();
+        assert_eq!(metrics.fallback_count, 1);
+        assert!(status.change_source_fallback().is_some());
+
+        let journal_path = dir
+            .path()
+            .join(crate::repository::DOT_DIR)
+            .join("bridge/events.jsonl");
+        assert!(
+            !journal_path.exists(),
+            "observational status must never write bridge telemetry"
+        );
     }
 }

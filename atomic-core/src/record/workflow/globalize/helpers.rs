@@ -201,3 +201,19 @@ pub fn extract_parent(path: &str) -> &str {
         .and_then(|p| p.to_str())
         .unwrap_or("")
 }
+
+/// Return all non-root ancestor directories in parent-first order.
+///
+/// Repository paths are expected to be normalized and relative. For example,
+/// `src/domain/model.rs` yields `src` followed by `src/domain`.
+#[must_use]
+pub fn ancestor_directories(path: &str) -> Vec<String> {
+    let mut ancestors = Vec::new();
+    let mut current = extract_parent(path);
+    while !current.is_empty() && current != "." {
+        ancestors.push(current.to_string());
+        current = extract_parent(current);
+    }
+    ancestors.reverse();
+    ancestors
+}

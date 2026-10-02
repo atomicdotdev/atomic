@@ -45,7 +45,7 @@
 //!
 //! // Create archives
 //! use atomic_repository::ArchiveOptions;
-//! repo.archive("release.tar.gz", ArchiveOptions::default())?;
+//! repo.archive(working_copy, "release.tar.gz", ArchiveOptions::default())?;
 //! ```
 //!
 //! # Architecture
@@ -88,14 +88,18 @@
 
 // Core modules
 pub mod apply;
+pub mod change_source;
 pub mod changestore;
+pub mod content_filter;
 pub mod error;
+pub mod git_binding;
 pub mod ignore;
 pub mod manifest;
 pub mod record;
 pub mod repository;
 pub mod status;
 pub mod tracking;
+pub mod wip;
 
 // Phase 7 additions
 pub mod archive;
@@ -128,15 +132,21 @@ pub mod query_plan;
 
 // Content search re-exports
 pub use content_search::{
-    build_content_index, content_index_stats, has_content_index, search_content,
-    update_content_index, update_content_index_paths, ContentIndexStats, ContentMatch,
-    ContentSearchError, ContentSearchOptions, ContentSearchResult,
+    build_content_index, content_index_stats, has_content_index, refresh_content_index,
+    search_content, update_content_index, update_content_index_paths, ContentIndexStats,
+    ContentMatch, ContentSearchError, ContentSearchOptions, ContentSearchResult,
 };
 
 // Re-export main types at crate root for convenience
 
 // Change store exports
 pub use changestore::{ChangeStore, ChangeStoreError, ChangeStoreResult, DEFAULT_CACHE_CAPACITY};
+
+// Content-filter exports
+pub use content_filter::{
+    is_git_lfs_pointer, looks_binary, ContentFilter, ContentFilterError, FilterDirection,
+    FilteredContent, GitAttributesFilter,
+};
 
 // Error exports
 pub use error::*;
@@ -224,8 +234,10 @@ pub use remote::{RemoteConfig, RemoteEntry, RemoteError, RemoteResult};
 
 // Record exports
 pub use record::{
-    build_header, filter_files, RecordError, RecordOptions, RecordOutcome, RecordResult,
-    RecordStats,
+    build_header, extract_move_evidence, filter_files, merge_move_evidence, AuthoritativeMove,
+    LossNote, MoveAuthority, MoveBasis, MoveEvidence, MoveEvidenceError, ProbableMove, RecordError,
+    RecordOptions, RecordOutcome, RecordResult, RecordStats, RenameCandidate,
+    MOVE_EVIDENCE_UNHASHED_KEY, MOVE_EVIDENCE_VERSION, PROBABLE_MOVE_THRESHOLD_BPS,
 };
 
 // Archive exports

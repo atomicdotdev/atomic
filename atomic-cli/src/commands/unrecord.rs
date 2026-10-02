@@ -42,8 +42,9 @@ use clap::Parser;
 
 use atomic_core::types::{Base32, Hash};
 use atomic_repository::unrecord::UnrecordOptions;
-use atomic_repository::{Repository, RepositoryError};
+use atomic_repository::{Repository, RepositoryError, WorkspaceTxnMode};
 
+use crate::commands::workspace_txn::enter_workspace;
 use crate::commands::{find_repository_root, Command};
 use crate::error::{CliError, CliResult};
 use crate::output::{print_success, print_warning};
@@ -84,18 +85,30 @@ pub struct Unrecord {
 impl Command for Unrecord {
     fn run(&self) -> CliResult<()> {
         let repo_root = find_repository_root()?;
-        let repo = Repository::open(&repo_root).map_err(|e| match e {
+        let mode = if self.dry_run {
+            WorkspaceTxnMode::Observe
+        } else {
+            WorkspaceTxnMode::Reconcile
+        };
+        let mut repo = match mode {
+            WorkspaceTxnMode::Observe => Repository::open_readonly(&repo_root),
+            WorkspaceTxnMode::Reconcile => Repository::open_for_workspace_transaction(&repo_root),
+            WorkspaceTxnMode::Force => unreachable!("unrecord never forces workspace entry"),
+        }
+        .map_err(|e| match e {
             atomic_repository::RepositoryError::NotFound { path } => CliError::RepositoryNotFound {
                 searched_path: path.into(),
             },
             other => CliError::Repository(other),
         })?;
 
+        let workspace = enter_workspace(&mut repo, mode)?;
         let options = if self.dry_run {
             UnrecordOptions::dry_run()
         } else {
             UnrecordOptions::new()
-        };
+        }
+        .view(workspace.view().name.clone());
 
         let outcome = if let Some(ref prefix) = self.change {
             let hash = resolve_change(&repo, prefix)?;

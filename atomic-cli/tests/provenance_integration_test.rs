@@ -22,7 +22,6 @@
 //! (FOLDERID_Profile) and ignores the env var, so the store cannot be redirected
 //! from a test. An explicit identity-store override (env/flag) would lift this.
 #![cfg(not(windows))]
-
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::Path;

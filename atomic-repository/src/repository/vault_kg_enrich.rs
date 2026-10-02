@@ -43,18 +43,22 @@ impl Repository {
     /// repository's version control data. Call this after `init_kg()`.
     ///
     /// Returns statistics about the number of nodes and edges created.
-    pub fn kg_enrich_from_vcs(&self) -> Result<KgEnrichStats, RepositoryError> {
+    pub fn kg_enrich_from_vcs(
+        &self,
+        working_copy: WorkingCopyId,
+    ) -> Result<KgEnrichStats, RepositoryError> {
+        self.validate_working_copy(working_copy)?;
         // Phase 1: Views → nodes + parent edges
         let views = self.kg_enrich_views()?;
 
         // Phase 2: Tracked files → nodes
-        let files = self.kg_enrich_files()?;
+        let files = self.kg_enrich_files(working_copy)?;
 
         // Phase 2b: Module nodes + PART_OF edges
-        let modules = self.kg_enrich_modules()?;
+        let modules = self.kg_enrich_modules(working_copy)?;
 
         // Phase 3: Changes → nodes + edges (modifies, authored_by, on_view, depends_on)
-        let changes = self.kg_enrich_changes()?;
+        let changes = self.kg_enrich_changes(working_copy)?;
 
         let mut stats = KgEnrichStats {
             views,
@@ -65,13 +69,13 @@ impl Repository {
         };
 
         // Phase 4: AST entities → nodes + DEFINES edges
-        stats.entities = self.kg_enrich_entities()?;
+        stats.entities = self.kg_enrich_entities(working_copy)?;
 
         // Phase 4b: INCLUDES edges (from import entities)
-        stats.includes = self.kg_enrich_includes()?;
+        stats.includes = self.kg_enrich_includes(working_copy)?;
 
         // Phase 4c: CALLS edges (caller entity → callee entity)
-        stats.calls = self.kg_enrich_calls()?;
+        stats.calls = self.kg_enrich_calls(working_copy)?;
 
         Ok(stats)
     }
@@ -86,7 +90,11 @@ impl Repository {
     /// This keeps build artifacts and dependencies (e.g. `node_modules/`,
     /// `dist/`, `target/`) out of the KG so `atomic query enrich` indexes
     /// only meaningful source files.
-    fn list_enrichable_files(&self) -> Result<Vec<TrackedFile>, RepositoryError> {
+    fn list_enrichable_files(
+        &self,
+        working_copy: WorkingCopyId,
+    ) -> Result<Vec<TrackedFile>, RepositoryError> {
+        self.validate_working_copy(working_copy)?;
         let files = self.list_tracked_files()?;
         let rules = IgnoreRules::load_for_enrichment(&self.root);
 
@@ -198,8 +206,8 @@ impl Repository {
     /// creates a `module:{dir}` node. Then creates `PART_OF` edges from
     /// file → module and module → parent module (only between modules that
     /// were created, not every intermediate directory).
-    pub fn kg_enrich_modules(&self) -> Result<usize, RepositoryError> {
-        let files = self.list_enrichable_files()?;
+    pub fn kg_enrich_modules(&self, working_copy: WorkingCopyId) -> Result<usize, RepositoryError> {
+        let files = self.list_enrichable_files(working_copy)?;
 
         // Collect directories that directly contain at least one file.
         let mut dirs_with_files: HashSet<String> = HashSet::new();
@@ -274,8 +282,8 @@ impl Repository {
     /// Enrich the KG with tracked file nodes.
     ///
     /// Creates a `file:{path}` node for each file tracked in the repository.
-    pub fn kg_enrich_files(&self) -> Result<usize, RepositoryError> {
-        let files = self.list_enrichable_files()?;
+    pub fn kg_enrich_files(&self, working_copy: WorkingCopyId) -> Result<usize, RepositoryError> {
+        let files = self.list_enrichable_files(working_copy)?;
 
         let mut txn = self
             .pristine
@@ -307,18 +315,19 @@ impl Repository {
     /// - Creates `ON_VIEW` edge to the current view
     /// - Creates `DEPENDS_ON` edges to dependency changes
     /// - Creates `MODIFIES` edges to files (via `FileOps` in the change)
-    pub fn kg_enrich_changes(&self) -> Result<usize, RepositoryError> {
+    pub fn kg_enrich_changes(&self, working_copy: WorkingCopyId) -> Result<usize, RepositoryError> {
         use crate::history::HistoryOptions;
 
+        self.validate_working_copy(working_copy)?;
+        let view_name = self.desired_view_name(working_copy)?;
         let history = self
-            .log(HistoryOptions::with_headers())
+            .log(HistoryOptions::with_headers().view(&view_name))
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
         if history.is_empty() {
             return Ok(0);
         }
 
-        let view_name = self.current_view().to_string();
         let ignore_rules = IgnoreRules::load_for_enrichment(&self.root);
 
         let mut txn = self
@@ -452,7 +461,13 @@ impl Repository {
     ///
     /// Call this after `record()` to immediately add the new change
     /// to the knowledge graph. Lighter than `kg_enrich_from_vcs()`.
-    pub fn kg_enrich_change(&self, hash: &Hash) -> Result<(), RepositoryError> {
+    pub fn kg_enrich_change(
+        &self,
+        working_copy: WorkingCopyId,
+        hash: &Hash,
+    ) -> Result<(), RepositoryError> {
+        self.validate_working_copy(working_copy)?;
+        let view_name = self.desired_view_name(working_copy)?;
         let hash_str = hash.to_base32();
         let short_hash = truncate_hash(&hash_str);
 
@@ -495,8 +510,7 @@ impl Repository {
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
         }
 
-        // ON_VIEW edge to current view
-        let view_name = self.current_view().to_string();
+        // ON_VIEW edge to the validated working copy's desired view
         txn.upsert_kg_edge(&KgEdge::new(
             format!("change:{}", short_hash),
             format!("view:{}", view_name),
@@ -637,8 +651,12 @@ impl Repository {
     /// The content-index step is best-effort and a no-op when no content index
     /// exists yet — building it is the job of `atomic query enrich`/`index`;
     /// this only maintains an index that already exists.
-    pub fn enrich_change(&self, hash: &Hash) -> Result<(), RepositoryError> {
-        self.kg_enrich_change(hash)?;
+    pub fn enrich_change(
+        &self,
+        working_copy: WorkingCopyId,
+        hash: &Hash,
+    ) -> Result<(), RepositoryError> {
+        self.kg_enrich_change(working_copy, hash)?;
 
         // Collect the paths this change touched for an incremental content
         // index refresh. Best-effort: a load failure just skips the content
@@ -676,8 +694,11 @@ impl Repository {
     /// resolve each import path to an existing `file:{path}` node in the KG.
     /// If a match is found, creates an `INCLUDES` edge from the source file
     /// to the included file. Best-effort — unresolvable imports are skipped.
-    pub fn kg_enrich_includes(&self) -> Result<usize, RepositoryError> {
-        let files = self.list_enrichable_files()?;
+    pub fn kg_enrich_includes(
+        &self,
+        working_copy: WorkingCopyId,
+    ) -> Result<usize, RepositoryError> {
+        let files = self.list_enrichable_files(working_copy)?;
 
         // Build a lookup set of tracked file paths for resolution.
         let tracked_paths: HashSet<String> = files
@@ -803,8 +824,8 @@ impl Repository {
     ///
     /// Callee resolution is name-based: a call to `foo()` matches any entity named `foo`
     /// across all tracked files. Calls to external crates / stdlib are silently skipped.
-    pub fn kg_enrich_calls(&self) -> Result<usize, RepositoryError> {
-        let files = self.list_enrichable_files()?;
+    pub fn kg_enrich_calls(&self, working_copy: WorkingCopyId) -> Result<usize, RepositoryError> {
+        let files = self.list_enrichable_files(working_copy)?;
 
         let mut parser_registry = atomic_semantic::ParserRegistry::new();
 
@@ -937,8 +958,11 @@ impl Repository {
     /// `entity:{file}:{name}:{line}` nodes with `DEFINES` edges from
     /// the corresponding file nodes. Runs during bulk enrichment
     /// (`atomic vault query enrich`, `atomic git import`).
-    pub fn kg_enrich_entities(&self) -> Result<usize, RepositoryError> {
-        let files = self.list_enrichable_files()?;
+    pub fn kg_enrich_entities(
+        &self,
+        working_copy: WorkingCopyId,
+    ) -> Result<usize, RepositoryError> {
+        let files = self.list_enrichable_files(working_copy)?;
 
         let mut parser_registry = atomic_semantic::ParserRegistry::new();
         let mut count = 0;
@@ -1136,7 +1160,9 @@ mod tests {
         let repo = Repository::init(dir.path()).unwrap();
         repo.init_kg().unwrap();
 
-        let stats = repo.kg_enrich_from_vcs().unwrap();
+        let stats = repo
+            .kg_enrich_from_vcs(repo.require_working_copy_id().unwrap())
+            .unwrap();
         // Should have at least the default view (e.g. "dev")
         assert!(
             stats.views >= 1,
@@ -1238,9 +1264,15 @@ mod tests {
         // Track everything on disk. `add` itself only consults `.atomicignore`,
         // so node_modules still lands in the tree — enrichment must be the
         // layer that filters it out.
-        repo.add(".", TrackingOptions::default()).unwrap();
+        repo.add(
+            repo.require_working_copy_id().unwrap(),
+            ".",
+            TrackingOptions::default(),
+        )
+        .unwrap();
 
-        repo.kg_enrich_files().unwrap();
+        repo.kg_enrich_files(repo.require_working_copy_id().unwrap())
+            .unwrap();
 
         assert!(
             repo.vault_kg_node("file:src/index.ts").unwrap().is_some(),
@@ -1281,8 +1313,11 @@ mod tests {
 
         let repo = Repository::init(root).unwrap();
         repo.init_kg().unwrap();
-        repo.add(".", TrackingOptions::default()).unwrap();
+        let working_copy = repo.require_working_copy_id().unwrap();
+        repo.add(working_copy, ".", TrackingOptions::default())
+            .unwrap();
         repo.record(
+            working_copy,
             ChangeHeader::builder().message("init").build(),
             RecordOptions::new().enrich_kg(false),
         )
@@ -1290,7 +1325,7 @@ mod tests {
 
         // Change enrichment builds `file:` nodes from the change's file_ops.
         // Ignored paths recorded in the change must still be filtered out.
-        repo.kg_enrich_changes().unwrap();
+        repo.kg_enrich_changes(working_copy).unwrap();
 
         assert!(
             repo.vault_kg_node("file:src/index.ts").unwrap().is_some(),
@@ -1317,8 +1352,11 @@ mod tests {
 
         let repo = Repository::init(root).unwrap();
         repo.init_kg().unwrap();
-        repo.add(".", TrackingOptions::default()).unwrap();
+        let working_copy = repo.require_working_copy_id().unwrap();
+        repo.add(working_copy, ".", TrackingOptions::default())
+            .unwrap();
         repo.record(
+            working_copy,
             ChangeHeader::builder().message("init").build(),
             RecordOptions::new().with_all(true),
         )
@@ -1331,8 +1369,10 @@ mod tests {
         // rebuild: record() (enrich_kg defaults on) refreshes the index for the
         // change's paths.
         std::fs::write(root.join("src/b.ts"), b"const betamarker = 2;\n").unwrap();
-        repo.add(".", TrackingOptions::default()).unwrap();
+        repo.add(working_copy, ".", TrackingOptions::default())
+            .unwrap();
         repo.record(
+            working_copy,
             ChangeHeader::builder().message("add b").build(),
             RecordOptions::new().with_all(true),
         )

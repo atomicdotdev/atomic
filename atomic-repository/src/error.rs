@@ -1,6 +1,10 @@
 //! Error types for repository operations
 
+use std::fmt;
 use std::path::PathBuf;
+
+use atomic_core::pristine::PristineError;
+use atomic_core::WorkingCopyId;
 use thiserror::Error;
 
 use crate::remote::RemoteError;
@@ -8,14 +12,26 @@ use crate::remote::RemoteError;
 /// Result type for repository operations
 pub type Result<T> = std::result::Result<T, RepositoryError>;
 
-impl From<atomic_core::pristine::PristineError> for RepositoryError {
-    fn from(error: atomic_core::pristine::PristineError) -> Self {
-        if matches!(&error, atomic_core::pristine::PristineError::Database(inner)
-            if matches!(inner.as_ref(), redb::DatabaseError::DatabaseAlreadyOpen))
-        {
-            Self::DatabaseBusy
-        } else {
-            Self::Database(error.to_string())
+/// A cross-process lock participating in the repository operation hierarchy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RepositoryLockKind {
+    /// Repository-common refs, bindings, and operation state.
+    Common,
+    /// Index and materialization state for one persistent working copy.
+    WorkingCopy { id: WorkingCopyId },
+    /// Shelved filesystem state for one persistent working copy.
+    Shelf { id: WorkingCopyId },
+    /// Repository-common deferred TREE journal and alignment state.
+    DeferredTree,
+}
+
+impl fmt::Display for RepositoryLockKind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Common => formatter.write_str("common repository operation lock"),
+            Self::WorkingCopy { id } => write!(formatter, "working-copy operation lock for {id}"),
+            Self::Shelf { id } => write!(formatter, "working-copy shelf lock for {id}"),
+            Self::DeferredTree => formatter.write_str("deferred-tree operation lock"),
         }
     }
 }
@@ -38,6 +54,13 @@ pub enum RepositoryError {
     /// Invalid repository structure
     #[error("Invalid repository structure: {reason}")]
     InvalidRepository { reason: String },
+
+    /// The repository requires capabilities unsupported by this Atomic build.
+    #[error("{source}")]
+    UnsupportedRequiredCapabilities {
+        #[source]
+        source: PristineError,
+    },
 
     /// View not found
     #[error("View not found: {name}")]
@@ -71,6 +94,36 @@ pub enum RepositoryError {
     #[error("Working copy has uncommitted changes")]
     UncommittedChanges,
 
+    /// Persistent working-copy identity must be initialized by a writable open.
+    #[error(
+        "working-copy identity at '{}' requires writable migration: {reason}; rerun with a command that opens the repository for writing",
+        path.display()
+    )]
+    WorkingCopyMigrationRequired { path: PathBuf, reason: String },
+
+    /// A nonempty working-copy identity is corrupt and must not be replaced implicitly.
+    #[error("malformed working-copy identity at '{}': {reason}", path.display())]
+    MalformedWorkingCopyIdentity { path: PathBuf, reason: String },
+
+    /// The requested operation requires a registered physical working copy.
+    #[error("this repository handle has no registered physical working copy")]
+    WorkingCopyRequired,
+
+    /// No persistent record exists for the requested working-copy identity.
+    #[error("working-copy record not found: {id}")]
+    WorkingCopyRecordNotFound { id: WorkingCopyId },
+
+    /// The supplied identity does not identify this repository handle's working directory.
+    #[error("working-copy identity mismatch: requested {requested}, this directory uses {actual}")]
+    WorkingCopyIdentityMismatch {
+        requested: WorkingCopyId,
+        actual: WorkingCopyId,
+    },
+
+    /// The persistent identity is bound to a different canonical location.
+    #[error("working-copy identity {id} is bound to a different canonical location")]
+    WorkingCopyLocationMismatch { id: WorkingCopyId },
+
     /// File not found
     #[error("File not found: {path}")]
     FileNotFound { path: PathBuf },
@@ -95,9 +148,87 @@ pub enum RepositoryError {
     #[error("Invalid operation: {message}")]
     InvalidOperation { message: String },
 
+    /// The legacy Git shadow pipeline refused to write (CB-13B).
+    ///
+    /// The repository durably requires the `git-bridge-cutover` capability,
+    /// so the colocated bridge owns writes. Nothing was written: the legacy
+    /// writer refuses before taking its lock or mutating any state.
+    #[error(
+        "repository has cut over to the colocated Git bridge: legacy shadow writes are \
+         fenced by required capability '{capability}'"
+    )]
+    LegacyShadowWriterFenced { capability: String },
+
+    /// The trusted provenance publication gate refused (CB-12B, RFC §10.4).
+    ///
+    /// No metadata, ref, or pack was moved: the refusal happens before any
+    /// mutation or publication. Content correctness is NOT implied to be
+    /// wrong — the report names the exact evidence blockers and limitations.
+    #[error(
+        "publication refused at {boundary}: trusted provenance gate found {managed_changes} \
+         managed-session change(s) with incomplete evidence (of {checked} checked):\n{report}"
+    )]
+    PublicationGateRefused {
+        boundary: String,
+        report: String,
+        managed_changes: usize,
+        checked: usize,
+    },
+
     /// Change not found
     #[error("Change not found: {hash}")]
     ChangeNotFound { hash: String },
+
+    /// Operation not found by full identity or prefix.
+    #[error("Operation not found: {selector}")]
+    OperationNotFound { selector: String },
+
+    /// Ambiguous operation identity prefix.
+    #[error("Ambiguous operation prefix '{prefix}': matches {}", matches.join(", "))]
+    AmbiguousOperation {
+        prefix: String,
+        matches: Vec<String>,
+    },
+
+    /// An operation selector is malformed or too short to resolve safely.
+    #[error("Invalid operation selector '{selector}': {reason}")]
+    InvalidOperationSelector { selector: String, reason: String },
+
+    /// Concurrent operation heads cannot be consolidated without inventing state.
+    #[error("Operation scope '{scope}' is Diverged: {}", heads.join(", "))]
+    OperationHeadsDiverged { scope: String, heads: Vec<String> },
+
+    /// A leased Git effect observed a third value: newer external work owns
+    /// the resource and was preserved; the effect mutated nothing (RFC §12.6).
+    #[error("SyncConflict: leased effect on {target} diverged — expected {expected}, observed {observed}")]
+    LeaseDiverged {
+        target: String,
+        expected: String,
+        observed: String,
+    },
+
+    /// The selected operation has not completed verification.
+    #[error("Operation {operation} is not verified")]
+    OperationNotVerified { operation: String },
+
+    /// A metadata-only (reactive watch) boundary deferred instead of acting:
+    /// the repository/entry holds unsafe recovery or Git-owned work that only
+    /// an explicit command boundary may execute. Nothing was mutated (CB-13D,
+    /// RFC §11.2 rule 4).
+    #[error("reactive metadata-only boundary deferred: {detail}; the pending work requires an explicit command boundary")]
+    ReactiveDeferred { detail: String },
+
+    /// The selected operation is outside the current scope's reachable history.
+    #[error("Operation {operation} is not reachable from scope '{scope}'")]
+    OperationNotReachable { operation: String, scope: String },
+
+    /// The selected operation cannot be inverted by the current implementation.
+    #[error("Operation {operation} ({kind}) is not reversible: {reason}")]
+    OperationNotReversible {
+        operation: String,
+        kind: String,
+        reason: String,
+    },
 
     /// Ambiguous hash prefix (multiple matches)
     #[error("Ambiguous hash prefix '{prefix}': matches {}", matches.join(", "))]
@@ -153,7 +284,23 @@ pub enum RepositoryError {
     #[error("Unrecord error: {0}")]
     Unrecord(String),
 
-    /// Lock error (another process holds the lock)
+    /// An ordered operation lock is held by another process.
+    #[error("{lock} at '{}' is held by another process; retry the operation", path.display())]
+    LockContended {
+        lock: RepositoryLockKind,
+        path: PathBuf,
+    },
+
+    /// A mapping replacement was built from an observation that is no longer
+    /// the stored row (CB-10A review R6): the caller must re-observe and
+    /// rebuild instead of clobbering a newer row under an invented lease.
+    #[error(
+        "ref mapping for view '{view}' moved since the caller observed it; \
+         re-observe and rebuild the replacement (nothing was written)"
+    )]
+    RefMappingObservationMoved { view: String },
+
+    /// Legacy unscoped lock error.
     #[error("Repository is locked by another process")]
     Locked,
 
@@ -240,9 +387,67 @@ pub enum RepositoryError {
         declared: String,
         actual: String,
     },
+
+    /// A stored Git-state binding names this commit but failed verification.
+    /// Resurrection refuses closed instead of re-synthesizing over a known
+    /// binding claim (RFC §12.4); the rejection is recoverable by retry.
+    #[error(
+        "binding {id} for commit {commit} failed verification and cannot be resurrected: {reason}"
+    )]
+    BindingRejected {
+        id: String,
+        commit: String,
+        reason: String,
+    },
+
+    /// The binding's change closure could not be completed from any source.
+    #[error(
+        "binding {id} closure is incomplete ({count} missing); refusing resurrection: {reasons}"
+    )]
+    BindingClosureIncomplete {
+        id: String,
+        count: usize,
+        reasons: String,
+    },
+
+    /// The isolated projection recomputed from the restored closure does not
+    /// match the binding's bound Git tree or SetId (RFC §5.2 projection
+    /// compare). Nothing was published; the rejection is recoverable.
+    #[error("resurrection of binding {id} rejected: {reason}")]
+    ResurrectionRejected { id: String, reason: String },
+
+    /// The observed Git lease changed during resurrection (TOCTOU guard);
+    /// the attempt was aborted and the retry budget exhausted.
+    #[error(
+        "resurrection of binding {id} contended with concurrent Git mutation for {attempts} attempts; refusing"
+    )]
+    ResurrectionContended { id: String, attempts: u8 },
+
+    /// Internal marker: the Git lease observed before the projection proof
+    /// changed before publication. Never surfaced directly; the guard loop
+    /// converts it into a fresh attempt or a [`RepositoryError::ResurrectionContended`].
+    #[error("Git lease changed during resurrection; retrying")]
+    ResurrectionLeaseChanged,
+
+    /// CB-7A: no verified binding covers the observed Git HEAD, so the bound
+    /// HEAD adoption refuses. Unbound Git adoption ships with Phase 9 foreign
+    /// synthesis (RFC §7.3, §12.4); the prototype importer is never invoked.
+    #[error("cannot adopt unbound Git HEAD {head}: {reason}")]
+    HeadAdoptionUnbound { head: String, reason: String },
+
+    /// CB-7A: the bound HEAD adoption refused for a typed reason — unexplained
+    /// post-checkout differences, unborn/missing HEAD, verification failure,
+    /// or contention. Nothing was adopted and no tracked file was rewritten.
+    #[error("cannot adopt Git HEAD {head}: {reason}")]
+    HeadAdoptionRefused { head: String, reason: String },
 }
 
 impl RepositoryError {
+    /// Whether retrying after the competing operation completes can succeed.
+    pub fn is_lock_contended(&self) -> bool {
+        matches!(self, RepositoryError::LockContended { .. })
+    }
+
     /// Check if this error indicates the repository doesn't exist
     pub fn is_not_found(&self) -> bool {
         matches!(
@@ -256,6 +461,9 @@ impl RepositoryError {
         matches!(
             self,
             RepositoryError::UncommittedChanges
+                | RepositoryError::UnsupportedRequiredCapabilities { .. }
+                | RepositoryError::WorkingCopyMigrationRequired { .. }
+                | RepositoryError::MalformedWorkingCopyIdentity { .. }
                 | RepositoryError::MergeConflict { .. }
                 | RepositoryError::FileNotTracked { .. }
                 | RepositoryError::MissingDependency { .. }
@@ -301,6 +509,23 @@ impl RepositoryError {
                 | RepositoryError::ChangeAlreadyApplied { .. }
                 | RepositoryError::MissingDependency { .. }
         )
+    }
+}
+
+impl From<PristineError> for RepositoryError {
+    fn from(error: PristineError) -> Self {
+        if matches!(&error, PristineError::Database(inner)
+            if matches!(inner.as_ref(), redb::DatabaseError::DatabaseAlreadyOpen))
+        {
+            Self::DatabaseBusy
+        } else {
+            match error {
+                source @ PristineError::UnsupportedRequiredCapabilities { .. } => {
+                    Self::UnsupportedRequiredCapabilities { source }
+                }
+                other => Self::Database(other.to_string()),
+            }
+        }
     }
 }
 

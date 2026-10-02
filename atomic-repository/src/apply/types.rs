@@ -143,6 +143,15 @@ pub struct InsertOptions {
     /// that is already in the view log (same NodeId, new hunks).
     /// Default: `false`
     pub skip_validation: bool,
+
+    /// Skip the trusted provenance publication gate (CB-12B).
+    ///
+    /// Internal escape hatch for callers that have ALREADY gated the complete
+    /// reachable closure once (e.g. `insert_change_rec` gates the closure
+    /// before looping). This never bypasses the gate for external callers:
+    /// the default is `false`, and every closure entry point re-gates.
+    /// Default: `false`
+    pub(crate) skip_publication_gate: bool,
 }
 
 impl Default for InsertOptions {
@@ -154,6 +163,7 @@ impl Default for InsertOptions {
             max_depth: 100,
             track_conflicts: true,
             skip_validation: false,
+            skip_publication_gate: false,
         }
     }
 }

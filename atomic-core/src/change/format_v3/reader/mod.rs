@@ -87,6 +87,8 @@
 use super::error::FormatResult;
 use super::hash_table::HashDedupTable;
 use super::types::{ContentChunkHeader, FileHeader, SectionType};
+use serde::de::DeserializeOwned;
+use std::any::Any;
 use std::io::Read;
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -138,11 +140,13 @@ impl ReadSection {
     /// Deserialize the payload from postcard format.
     ///
     /// Convenience wrapper around [`postcard::from_bytes`] that handles
-    /// the error conversion.
+    /// the error conversion. Historical July 2026 PROVENANCE payloads are
+    /// decoded through their original positional layout and converted to the
+    /// current owned provenance type.
     ///
     /// # Type Parameters
     ///
-    /// * `T` - The target type, must implement `serde::Deserialize`.
+    /// * `T` - The target type, which must own its deserialized data.
     ///
     /// # Errors
     ///
@@ -155,8 +159,33 @@ impl ReadSection {
     ///
     /// let header: ChangeHeader = section.deserialize()?;
     /// ```
-    pub fn deserialize<'de, T: serde::Deserialize<'de>>(&'de self) -> FormatResult<T> {
-        Ok(postcard::from_bytes(&self.payload)?)
+    pub fn deserialize<T: DeserializeOwned + 'static>(&self) -> FormatResult<T> {
+        match postcard::from_bytes(&self.payload) {
+            Ok(value) => Ok(value),
+            Err(current_error) if self.section_type == SectionType::Header => {
+                if let Ok(header) =
+                    super::types::envelope::decode_change_header_only_v2(&self.payload)
+                {
+                    let value: Box<dyn Any> = Box::new(header);
+                    if let Ok(value) = value.downcast::<T>() {
+                        return Ok(*value);
+                    }
+                }
+                Err(current_error.into())
+            }
+            Err(current_error) if self.section_type == SectionType::Provenance => {
+                if let Ok(provenance) =
+                    super::compatibility::deserialize_july_2026_provenance(&self.payload)
+                {
+                    let value: Box<dyn Any> = Box::new(provenance);
+                    if let Ok(value) = value.downcast::<T>() {
+                        return Ok(*value);
+                    }
+                }
+                Err(current_error.into())
+            }
+            Err(error) => Err(error.into()),
+        }
     }
 
     /// Returns `true` if this is a hashed section (contributes to content hash).

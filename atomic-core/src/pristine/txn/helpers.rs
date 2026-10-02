@@ -170,6 +170,49 @@ pub fn deserialize_view_state(bytes: &[u8]) -> PristineResult<ViewState> {
     })
 }
 
+// Fallible iterator helpers
+
+pub(crate) fn try_collect<T, E>(
+    results: impl IntoIterator<Item = Result<T, E>>,
+) -> Result<Vec<T>, E> {
+    results.into_iter().collect()
+}
+
+pub(crate) fn collect_until_error<T, E>(
+    results: impl IntoIterator<Item = Result<T, E>>,
+) -> Vec<Result<T, E>> {
+    let mut collected = Vec::new();
+    for result in results {
+        let failed = result.is_err();
+        collected.push(result);
+        if failed {
+            break;
+        }
+    }
+    collected
+}
+
+pub(crate) fn try_is_present<T, E>(
+    mut results: impl Iterator<Item = Result<T, E>>,
+) -> Result<bool, E> {
+    Ok(results.next().transpose()?.is_some())
+}
+
+pub(super) fn collect_preload_edges<T, E>(
+    results: impl IntoIterator<Item = Result<T, E>>,
+    mut into_edge: impl FnMut(T) -> SerializedGraphEdge,
+) -> Result<Vec<SerializedGraphEdge>, E> {
+    let mut edges = Vec::new();
+    for result in results {
+        edges.push(into_edge(result?));
+    }
+    Ok(edges)
+}
+
+pub(super) fn graph_presence<T, E>(results: impl Iterator<Item = Result<T, E>>) -> Result<bool, E> {
+    try_is_present(results)
+}
+
 // Adjacency Iterator
 
 /// Iterator over adjacent edges
@@ -406,6 +449,52 @@ mod tests {
 
         let result = deserialize_view_state(&bytes);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn try_collect_rejects_partial_success() {
+        let result = try_collect([Ok(1), Err("storage failure"), Ok(2)]);
+
+        assert_eq!(result, Err("storage failure"));
+    }
+
+    #[test]
+    fn preload_edge_adapter_rejects_valid_then_error_without_partial_vector() {
+        let edge = SerializedGraphEdge::new(
+            EdgeFlags::BLOCK,
+            Position::new(NodeId::new(1), ChangePosition::new(2)),
+            NodeId::new(3),
+        );
+        let result =
+            collect_preload_edges([Ok(edge), Err("storage failure"), Ok(edge)], |edge| edge);
+
+        assert_eq!(result, Err("storage failure"));
+    }
+
+    #[test]
+    fn graph_presence_adapter_propagates_first_error_instead_of_true() {
+        let result = graph_presence([Err("storage failure"), Ok(())].into_iter());
+
+        assert_eq!(result, Err("storage failure"));
+    }
+
+    #[test]
+    fn collect_until_error_never_yields_success_after_failure() {
+        let results = collect_until_error([Ok(1), Err("storage failure"), Ok(2)]);
+
+        assert_eq!(results, vec![Ok(1), Err("storage failure")]);
+    }
+
+    #[test]
+    fn try_is_present_propagates_presence_errors() {
+        let result = try_is_present([Err::<u8, _>("storage failure")].into_iter());
+
+        assert_eq!(result, Err("storage failure"));
+        assert_eq!(try_is_present([Ok::<_, &str>(1)].into_iter()), Ok(true));
+        assert_eq!(
+            try_is_present(std::iter::empty::<Result<u8, &str>>()),
+            Ok(false)
+        );
     }
 
     #[test]

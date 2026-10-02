@@ -50,10 +50,11 @@ use std::collections::HashSet;
 use std::time::Instant;
 
 use crate::change::{Change, ChangeHeader, FileOps, GraphOp, Provenance};
-use crate::pristine::{GraphTxnT, TreeTxnT};
-use crate::types::Hash;
+use crate::crdt::{BranchId, BranchOp, LeafOp};
+use crate::pristine::{CrdtTxnT, GraphTxnT, TreeTxnT};
+use crate::types::{ChangePosition, Hash, Position};
 
-use super::globalize::{globalize_recorded_file, GlobalizeContext};
+use super::globalize::{globalize_recorded_file, globalize_set_attr, GlobalizeContext};
 use super::record::RecordedFile;
 
 /// Shift the content offsets of a pre-globalized op's inserted span(s) by
@@ -125,6 +126,14 @@ pub struct AssemblyContext {
 
     /// Statistics about the assembly.
     stats: AssemblyStats,
+
+    /// Running base for the next FileOps entry's placeholder branch ids
+    /// (CB-9B review F4): placeholder branch indices must stay unique
+    /// across the change so the apply-time substitution cannot collide.
+    placeholder_branch_base: u32,
+
+    /// Running base for the next FileOps entry's placeholder leaf ids.
+    placeholder_leaf_base: u32,
 }
 
 impl AssemblyContext {
@@ -148,6 +157,8 @@ impl AssemblyContext {
             dependencies: HashSet::new(),
             extra_known: HashSet::new(),
             stats: AssemblyStats::new(),
+            placeholder_branch_base: 0,
+            placeholder_leaf_base: 0,
         }
     }
 
@@ -165,6 +176,8 @@ impl AssemblyContext {
             dependencies: HashSet::new(),
             extra_known: HashSet::new(),
             stats: AssemblyStats::new(),
+            placeholder_branch_base: 0,
+            placeholder_leaf_base: 0,
         }
     }
 
@@ -180,11 +193,58 @@ impl AssemblyContext {
 
     /// Add a file operation to the context (semantic layer).
     ///
-    /// # Arguments
+    /// The entry's ROOT-placeholder identities are renumbered into a
+    /// per-change unique namespace (CB-9B review F4): the trunk's file index
+    /// becomes this entry's position, and branch/leaf placeholders shift by
+    /// the running bases so two recorded files can never collide in the
+    /// CRDT tables at apply time.
     ///
-    /// * `ops` - The file operation to add
-    pub fn add_file_ops(&mut self, ops: FileOps) {
+    /// # Errors
+    ///
+    /// Returns [`AssemblyError::PlaceholderNamespaceExhausted`] when the
+    /// running placeholder namespace cannot advance: either the FileOps
+    /// entry count or the accumulated placeholder span would exceed `u32`.
+    pub fn add_file_ops(&mut self, ops: FileOps) -> AssemblyResult<()> {
+        let mut ops = ops;
+        // CB-9B review B1: the entry's local placeholder span must be
+        // measured BEFORE renumbering. After `renumber_placeholder_ids` the
+        // ops carry the shifted indices, so measuring them afterwards
+        // double-counts the running base and grows it geometrically
+        // (2·base + span) instead of linearly — a 34-entry one-line import
+        // overflowed u32 and panicked.
+        let branch_span = checked_placeholder_span(max_placeholder_branch_index(&ops))?;
+        let leaf_span = checked_placeholder_span(max_placeholder_leaf_index(&ops))?;
+        let trunk_file_idx = u32::try_from(self.file_ops.len()).map_err(|_| {
+            AssemblyError::PlaceholderNamespaceExhausted {
+                namespace: "trunk-file",
+                next_index: self.file_ops.len() as u64,
+                limit: u32::MAX as u64,
+            }
+        })?;
+        let branch_base = self.placeholder_branch_base;
+        let leaf_base = self.placeholder_leaf_base;
+        // Checked before the shifts so every individual `base + local`
+        // substitution inside renumber_placeholder_ids stays in range: each
+        // local index is < span, so base + span is the upper bound.
+        let next_branch_base = branch_base.checked_add(branch_span).ok_or(
+            AssemblyError::PlaceholderNamespaceExhausted {
+                namespace: "branch",
+                next_index: branch_base as u64 + branch_span as u64,
+                limit: u32::MAX as u64,
+            },
+        )?;
+        let next_leaf_base = leaf_base.checked_add(leaf_span).ok_or(
+            AssemblyError::PlaceholderNamespaceExhausted {
+                namespace: "leaf",
+                next_index: leaf_base as u64 + leaf_span as u64,
+                limit: u32::MAX as u64,
+            },
+        )?;
+        ops.renumber_placeholder_ids(trunk_file_idx, branch_base, leaf_base);
+        self.placeholder_branch_base = next_branch_base;
+        self.placeholder_leaf_base = next_leaf_base;
         self.file_ops.push(ops);
+        Ok(())
     }
 
     /// Add a dependency.
@@ -313,6 +373,159 @@ impl AssemblyContext {
 // MAIN ASSEMBLY FUNCTIONS
 // ============================================================================
 
+/// Emit the graph-backed inode attribute writes one recorded file carries.
+///
+/// Two target shapes are supported:
+/// - **Existing inode**: the record carries the inode's graph position, so
+///   each attribute write globalizes against that position and adds the
+///   owning change as a dependency.
+/// - **Created in this change**: the file's own `FileAdd` hunk names the new
+///   inode placeholder, so the attribute op self-references the applying
+///   change (`change: None`) at the created inode's start offset.
+///
+/// Each write also produces the semantic counterpart (`FileOps::set_mode` /
+/// `set_kind`) bound to the file's trunk: the change's own generated trunk
+/// when the record carries CRDT ops, otherwise the trunk already stored for
+/// the inode.
+fn emit_recorded_attributes<T>(
+    ctx: &mut AssemblyContext,
+    glob_ctx: &mut GlobalizeContext<'_, T>,
+    file: &RecordedFile,
+) -> AssemblyResult<()>
+where
+    T: GraphTxnT + TreeTxnT + CrdtTxnT + crate::pristine::InodeAttrTxnT,
+{
+    if file.attrs().is_empty() {
+        return Ok(());
+    }
+    let path = file.path().to_string();
+
+    let invalid = |reason: String| AssemblyError::Globalize {
+        path: path.clone(),
+        source: super::globalize::GlobalizeError::InvalidAttribute {
+            path: path.clone(),
+            reason,
+        },
+    };
+
+    // Resolve the semantic trunk once: the file's generated ops carry it for
+    // new files; existing files resolve through the CRDT inode index.
+    let trunk = match file.crdt_ops() {
+        Some(ops) => ops.trunk_id(),
+        None => {
+            let inode = file
+                .inode()
+                .ok_or_else(|| invalid("attribute write has no trunk or inode binding".into()))?;
+            let key = glob_ctx
+                .txn()
+                .get_crdt_inode_trunk(inode.get())
+                .map_err(|error| AssemblyError::Globalize {
+                    path: path.clone(),
+                    source: super::globalize::GlobalizeError::Pristine(Box::new(error)),
+                })?
+                .ok_or_else(|| invalid(format!("inode {inode:?} has no CRDT trunk")))?;
+            crate::crdt::tables::decode_trunk_id(&key)
+        }
+    };
+
+    // Resolve the attribute target: the record's bound position wins; a
+    // `FileAdd` hunk for this path means the inode is created by this change.
+    enum AttrTarget {
+        /// Existing inode: globalize against the bound position.
+        Existing(crate::types::Position<crate::types::NodeId>),
+        /// Created by this change: self-referencing placeholder position.
+        Created(u64),
+    }
+    let target = if let Some(position) = file.position() {
+        AttrTarget::Existing(position)
+    } else {
+        let created = ctx
+            .hunks()
+            .iter()
+            .rev()
+            .find_map(|operation| match operation {
+                GraphOp::FileAdd {
+                    add_inode,
+                    path: added,
+                    ..
+                } if added == file.path() => Some(add_inode.start.get()),
+                _ => None,
+            });
+        created.map(AttrTarget::Created).ok_or_else(|| {
+            invalid("attribute target has no inode binding and no FileAdd in this change".into())
+        })?
+    };
+
+    for value in file.attrs() {
+        let hunk = match &target {
+            AttrTarget::Existing(position) => {
+                // Wire causal dependencies on the register's current event
+                // writers (the same rule the native record path applies):
+                // without them a later attribute write would appear
+                // concurrent to the previous writer instead of dominating
+                // it, projecting a spurious register conflict.
+                //
+                // Review CB-9C R1: the events come from the exact assembly
+                // view (a ViewGraph filters register events to its own
+                // closure), and only the causally maximal writers become
+                // dependencies — a dominated writer is already a transitive
+                // dependency of its dominator, and invisible sibling writers
+                // must never be imported as causality.
+                let existing = glob_ctx
+                    .txn()
+                    .get_inode_attr_events(*position, value.name())
+                    .map_err(|error| AssemblyError::Globalize {
+                        path: path.clone(),
+                        source: super::globalize::GlobalizeError::Pristine(Box::new(error)),
+                    })?;
+                let frontier =
+                    crate::pristine::attr_event_dependency_frontier(glob_ctx.txn(), existing)
+                        .map_err(|error| AssemblyError::Globalize {
+                            path: path.clone(),
+                            source: super::globalize::GlobalizeError::Pristine(Box::new(error)),
+                        })?;
+                for event in frontier {
+                    glob_ctx
+                        .add_dependency_by_id(event.introduced_by)
+                        .map_err(|error| AssemblyError::Globalize {
+                            path: path.clone(),
+                            source: error,
+                        })?;
+                }
+                globalize_set_attr(glob_ctx, *position, path.clone(), *value).map_err(|error| {
+                    AssemblyError::Globalize {
+                        path: path.clone(),
+                        source: error,
+                    }
+                })?
+            }
+            AttrTarget::Created(offset) => GraphOp::SetAttr {
+                inode: Position {
+                    change: None,
+                    pos: ChangePosition::new(*offset),
+                },
+                path: path.clone(),
+                value: *value,
+            },
+        };
+        ctx.add_hunk(hunk);
+
+        let semantic = match value {
+            crate::change::InodeAttr::Mode(mode) => FileOps::set_mode(trunk, path.clone(), *mode)
+                .map_err(|error| AssemblyError::Globalize {
+                path: path.clone(),
+                source: super::globalize::GlobalizeError::InvalidAttribute {
+                    path: path.clone(),
+                    reason: error.to_string(),
+                },
+            })?,
+            crate::change::InodeAttr::Kind(kind) => FileOps::set_kind(trunk, path.clone(), *kind),
+        };
+        ctx.add_file_ops(semantic)?;
+    }
+    Ok(())
+}
+
 /// Assemble a change from recorded files.
 ///
 /// This is the main entry point for creating a Change from recording results.
@@ -347,7 +560,11 @@ pub fn assemble_change<T>(
     options: &AssemblyOptions,
 ) -> types::AssemblyResult<AssemblyResult_>
 where
-    T: GraphTxnT + TreeTxnT + crate::pristine::InodeGraphOps,
+    T: GraphTxnT
+        + TreeTxnT
+        + CrdtTxnT
+        + crate::pristine::InodeAttrTxnT
+        + crate::pristine::InodeGraphOps,
 {
     // Validate input
     if files.is_empty() {
@@ -361,7 +578,7 @@ where
     let mut ctx = AssemblyContext::new(header);
     let mut stats = AssemblyStats::new();
     let mut globalized_files = Vec::new();
-    let mut globalize_errors = Vec::new();
+    let globalize_errors = Vec::new();
 
     // Process each file
     let total_files = files.len();
@@ -391,8 +608,11 @@ where
         // .nojekyll, .gitkeep).  These have hunks from the recording phase but
         // no actual content bytes, so globalization will produce nothing —
         // avoid the expensive globalize_recorded_file call entirely.
+        // Attribute-carrying records never skip: their FileAdd target and the
+        // attribute ops must both be emitted for the staged state to hold.
         if file.inode().is_none()
             && file.content().is_empty()
+            && file.attrs().is_empty()
             && !file.is_directory()
             && !file.is_deleted_directory()
             && !options.get_include_empty_files()
@@ -433,12 +653,17 @@ where
                 shift_graph_op_content(&mut op, shift);
                 ctx.add_hunk(op);
             }
-            // Collect CRDT ops if present
-            if !file.opaque_generated() {
-                if let Some(crdt_ops) = file.crdt_ops() {
-                    ctx.add_file_ops(crdt_ops.clone());
+            // Opaque files retain their trunk lifecycle but deliberately omit
+            // line/token semantics. Attribute operations still need that stable
+            // trunk identity.
+            if let Some(crdt_ops) = file.crdt_ops() {
+                let mut crdt_ops = crdt_ops.clone();
+                if file.opaque_generated() {
+                    crdt_ops.line_ops_mut().clear();
                 }
+                ctx.add_file_ops(crdt_ops)?;
             }
+            emit_recorded_attributes(&mut ctx, &mut glob_ctx, file)?;
             let glob_ms = glob_start.elapsed().as_millis();
             log::debug!(
                 "assemble_change: pre-globalized file {}/{} '{}' in {}ms ({} hunks)",
@@ -469,6 +694,10 @@ where
                         !file.is_empty(),
                         file.position(),
                     );
+                    // Attribute writes stand alone: a chmod-only or kind-only
+                    // record globalizes empty but must still emit its SetAttr
+                    // hunks and semantic counterparts.
+                    emit_recorded_attributes(&mut ctx, &mut glob_ctx, file)?;
                     stats.record_skip();
                     continue;
                 }
@@ -481,19 +710,26 @@ where
                 // OrphanBranch on every line.  Falling back to
                 // `file.crdt_ops()` (pre-enrichment) preserves the legacy
                 // shape for files globalize couldn't enrich.
-                if !file.opaque_generated() {
-                    if let Some(enriched_ops) = globalized.file_ops() {
-                        ctx.add_file_ops(enriched_ops.clone());
-                    } else if let Some(crdt_ops) = file.crdt_ops() {
-                        ctx.add_file_ops(crdt_ops.clone());
+                if file.opaque_generated() {
+                    if let Some(crdt_ops) = file.crdt_ops() {
+                        let mut trunk_only = crdt_ops.clone();
+                        trunk_only.line_ops_mut().clear();
+                        ctx.add_file_ops(trunk_only)?;
                     }
+                } else if let Some(enriched_ops) = globalized.file_ops() {
+                    ctx.add_file_ops(enriched_ops.clone())?;
+                } else if let Some(crdt_ops) = file.crdt_ops() {
+                    ctx.add_file_ops(crdt_ops.clone())?;
                 }
 
                 let hunk_count = globalized.hunks().len();
-                // Add hunks from the globalized file
+                // Add hunks from the globalized file BEFORE the attribute
+                // writes (CB-9C): a created FileAdd target must already be
+                // in the context when its attribute op resolves.
                 for graph_op in globalized.hunks() {
                     ctx.add_hunk(graph_op.clone());
                 }
+                emit_recorded_attributes(&mut ctx, &mut glob_ctx, file)?;
 
                 log::debug!(
                     "assemble_change: file {}/{} '{}' globalized in {}ms ({} hunks, {} bytes added)",
@@ -508,18 +744,19 @@ where
                 stats.add_content_bytes(globalized.bytes_added());
                 globalized_files.push(globalized);
             }
-            Err(e) => {
-                let glob_ms = glob_start.elapsed().as_millis();
+            Err(source) => {
                 log::debug!(
-                    "assemble_change: file {}/{} '{}' globalize error in {}ms: {}",
+                    "assemble_change: file {}/{} '{}' globalization failed after {}ms: {}",
                     file_idx + 1,
                     total_files,
                     file.path(),
-                    glob_ms,
-                    e,
+                    glob_start.elapsed().as_millis(),
+                    source,
                 );
-                stats.record_error();
-                globalize_errors.push((file.path().to_string(), e));
+                return Err(types::AssemblyError::Globalize {
+                    path: file.path().to_string(),
+                    source,
+                });
             }
         }
     }
@@ -584,11 +821,90 @@ where
 /// use atomic_core::change::ChangeHeader;
 ///
 /// let header = ChangeHeader::builder().message("Empty change").build();
-/// let change = create_empty_change(header);
-///
-/// assert!(change.hunks().is_empty());
-/// ```
 #[must_use]
 pub fn create_empty_change(header: ChangeHeader) -> Change {
     Change::empty(header)
+}
+
+/// The namespace span an entry occupies for one placeholder family: its
+/// local maximum index plus one slot (CB-9B review B1).
+///
+/// `u32::MAX` as a local maximum leaves no free slot, so the span itself
+/// saturates and the entry cannot fit — reported as exhaustion rather than
+/// wrapping into a reused namespace.
+fn checked_placeholder_span(max_index: u32) -> AssemblyResult<u32> {
+    max_index
+        .checked_add(1)
+        .ok_or(AssemblyError::PlaceholderNamespaceExhausted {
+            namespace: "branch",
+            next_index: u32::MAX as u64 + 1,
+            limit: u32::MAX as u64,
+        })
+}
+
+/// The highest ROOT-placeholder branch index used in `ops` (CB-9B review F4).
+///
+/// Real (non-placeholder) ids — e.g. delete ops bound to existing branches —
+/// do not participate: only placeholders need a per-change unique namespace.
+/// A ROOT-placeholder trunk's file index participates as a branch-slot
+/// value because the apply substitutes both from the same placeholder
+/// shape.
+fn max_placeholder_branch_index(ops: &FileOps) -> u32 {
+    let trunk = ops.trunk_id();
+    let mut max = if trunk.change_id().is_root() {
+        trunk.file_idx()
+    } else {
+        0
+    };
+    let mut consider = |id: &BranchId| {
+        if id.change_id().is_root() && id.branch_idx() > max {
+            max = id.branch_idx();
+        }
+    };
+    for line_op in ops.line_ops() {
+        consider(&copy_branch(line_op.branch_id()));
+        match line_op.operation() {
+            BranchOp::Insert { after, .. } => {
+                if let Some(after) = after {
+                    consider(after);
+                }
+            }
+            BranchOp::Delete { branch, .. } | BranchOp::Modify { branch, .. } => {
+                consider(&copy_branch(*branch))
+            }
+            BranchOp::Restore { branch } => consider(&copy_branch(*branch)),
+            BranchOp::Reparent { branch, new_after } => {
+                consider(&copy_branch(*branch));
+                if let Some(after) = new_after {
+                    consider(after);
+                }
+            }
+        }
+    }
+    max
+}
+
+fn copy_branch(id: BranchId) -> BranchId {
+    id
+}
+
+/// The highest ROOT-placeholder leaf index used in `ops`.
+fn max_placeholder_leaf_index(ops: &FileOps) -> u32 {
+    let mut max = 0u32;
+    let mut consider = |leaf: &LeafOp| {
+        if let LeafOp::Insert {
+            after: Some(id), ..
+        } = leaf
+        {
+            if id.change_id().is_root() && id.leaf_idx() > max {
+                max = id.leaf_idx();
+            }
+        }
+    };
+    for line_op in ops.line_ops() {
+        for leaf in line_op.leaf_ops() {
+            consider(leaf);
+        }
+    }
+    max
 }

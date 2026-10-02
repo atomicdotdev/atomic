@@ -21,7 +21,16 @@ fn record_all(repo: &Repository, message: &str) {
         .with_all(true)
         .save_to_store(true)
         .apply_after_record(true);
-    repo.record(header, options).unwrap();
+    repo.record(repo.require_working_copy_id().unwrap(), header, options)
+        .unwrap();
+}
+
+fn create_parentless_shared_view(repo: &Repository, name: &str) {
+    use atomic_core::pristine::{MutTxnT, ViewScope};
+
+    let mut txn = repo.pristine.write_txn().unwrap();
+    txn.create_view(name, ViewScope::Shared, None).unwrap();
+    txn.commit().unwrap();
 }
 
 fn count_occurrences(content: &str, pattern: &str) -> usize {
@@ -386,117 +395,62 @@ fn test_sorting_lines_does_not_duplicate_them() {
 /// on top and checks whether
 /// `status` and `record` agree about it.
 #[test]
-fn test_further_edit_after_orphan_view_merge_is_still_detected() {
-    use crate::apply::CrossViewInsertOptions;
+fn test_record_rejects_orphan_view_against_dev_working_copy() {
     use crate::record::RecordError;
     use crate::status::StatusOptions;
 
     let (temp_dir, repo) = create_temp_repo();
     let file = temp_dir.path().join("main.go");
 
-    // Step 1: base content, recorded normally on dev.
     let initial = build_go_like_source(80);
     std::fs::write(&file, &initial).unwrap();
     repo.add("main.go", TrackingOptions::default()).unwrap();
     record_all(&repo, "Add main.go");
 
-    // Step 2: simulate an orphaned session view directly — the exact
-    // low-level mechanism of the orphan-view duplication bug.
-    // `RecordOptions::view("orphan-xyz")` with a view name that doesn't
-    // exist yet reaches `open_or_create_view`'s
-    // parentless-Shared fallback, since nothing here calls
-    // `create_view_from` first (unlike a properly-forked session).
+    create_parentless_shared_view(&repo, "orphan-xyz");
     let edited = initial.replacen("return 40\n", "return 4000\n", 1);
     std::fs::write(&file, &edited).unwrap();
-    repo.record(
+
+    let rejected = repo.record(
         ChangeHeader::new("orphan edit"),
         RecordOptions::new()
             .with_all(true)
             .view("orphan-xyz")
             .apply_after_record(true)
             .save_to_store(true),
-    )
-    .expect("orphan record should succeed (it's the duplication bug, not a crash)");
-
-    // Step 3: merge the orphan view into dev — this is what reproduces the
-    // duplication (confirmed already by the orphan-view duplication tests);
-    // not re-asserted here.
-    repo.insert_from_view(CrossViewInsertOptions::new("orphan-xyz", "dev"))
-        .unwrap();
-    repo.materialize().unwrap();
-
-    // Step 4: a further, ordinary, targeted edit on top of the now-merged
-    // (duplicated) file — exactly the scenario that failed in the real
-    // project. Does `status` and `record` agree about it?
-    let current = std::fs::read_to_string(&file).unwrap();
-    let further_edited = current.replacen("return 4000\n", "return 5000\n", 1);
-    assert_ne!(
-        current, further_edited,
-        "the further edit must actually change the file"
     );
-    std::fs::write(&file, &further_edited).unwrap();
+    assert!(matches!(
+        rejected,
+        Err(RecordError::Repository(
+            RepositoryError::InvalidOperation { .. }
+        ))
+    ));
+    assert_eq!(repo.current_view(), "dev");
+    assert!(repo
+        .get_view_changes(Some("orphan-xyz"))
+        .unwrap()
+        .is_empty());
 
-    let status = repo
-        .status(StatusOptions::default())
-        .expect("status failed");
-    let modified_paths: Vec<String> = status
+    let status = repo.status(StatusOptions::default()).unwrap();
+    assert!(status
         .modified()
-        .map(|e| e.path().to_string_lossy().to_string())
-        .collect();
-    println!(
-        "test_further_edit_after_orphan_view_merge_is_still_detected: status.modified = {:?}",
-        modified_paths
-    );
+        .any(|entry| entry.path() == Path::new("main.go")));
 
-    let record_result = repo.record(
-        ChangeHeader::new("further edit"),
-        RecordOptions::new()
-            .with_all(true)
-            .apply_after_record(true)
-            .save_to_store(true),
-    );
-
-    match record_result {
-        Err(RecordError::NothingToRecord) => {
-            panic!(
-                "BUG REPRODUCED: record() found nothing to record, but status.modified = {:?} \
-                 and the file content genuinely differs from pristine",
-                modified_paths
-            );
-        }
-        Err(e) => panic!("unexpected record error: {}", e),
-        Ok(outcome) => {
-            let recorded = outcome.recorded_files();
-            println!(
-                "test_further_edit_after_orphan_view_merge_is_still_detected: recorded_files = {:?}, hunk_count={}",
-                recorded,
-                outcome.change().hunks().len(),
-            );
-            assert!(
-                recorded.iter().any(|p| p == "main.go"),
-                "BUG REPRODUCED: record() succeeded but did not include main.go, even though \
-                 status flagged it as modified (recorded_files = {:?})",
-                recorded
-            );
-        }
-    }
-
-    // Independently of whether record() claimed success, verify the actual
-    // materialized content matches the further edit — this is the
-    // ground-truth check that would have caught the real bug (record()
-    // silently no-op'ing while claiming nothing was wrong).
+    let outcome = repo
+        .record(
+            ChangeHeader::new("ordinary edit"),
+            RecordOptions::new()
+                .with_all(true)
+                .apply_after_record(true)
+                .save_to_store(true),
+        )
+        .unwrap();
+    assert!(outcome
+        .recorded_files()
+        .iter()
+        .any(|path| path == "main.go"));
     repo.materialize().unwrap();
-    let final_content = std::fs::read_to_string(&file).unwrap();
-    let copies = count_occurrences(&final_content, "func step0() int {");
-    println!(
-        "test_further_edit_after_orphan_view_merge_is_still_detected: final copies of step0 = {}",
-        copies
-    );
-    assert_eq!(
-        final_content, further_edited,
-        "BUG REPRODUCED: materialized content after record() does not match the further edit \
-         that was actually made on disk"
-    );
+    assert_eq!(std::fs::read(&file).unwrap(), edited.as_bytes());
 }
 
 /// Companion to `test_further_edit_after_orphan_view_merge_is_still_detected`,
@@ -530,7 +484,7 @@ fn test_further_edit_after_orphan_view_merge_is_still_detected() {
 fn test_emptying_file_after_orphan_view_merge_removes_every_copy() {
     use crate::apply::CrossViewInsertOptions;
 
-    let (temp_dir, repo) = create_temp_repo();
+    let (temp_dir, mut repo) = create_temp_repo();
     let file = temp_dir.path().join("main.go");
 
     // Step 1: base content, recorded normally on dev.
@@ -539,9 +493,10 @@ fn test_emptying_file_after_orphan_view_merge_removes_every_copy() {
     repo.add("main.go", TrackingOptions::default()).unwrap();
     record_all(&repo, "Add main.go");
 
-    // Step 2: simulate an orphaned session view directly (the orphan-view
-    // duplication mechanism), producing a second, duplicate copy of the
-    // file's content once merged.
+    // Step 2: simulate the old orphan-session topology explicitly, producing
+    // a second, duplicate copy of the file's content once merged.
+    create_parentless_shared_view(&repo, "orphan-xyz");
+    repo.set_current_view("orphan-xyz").unwrap();
     let edited = initial.replacen("return 40\n", "return 4000\n", 1);
     std::fs::write(&file, &edited).unwrap();
     repo.record(
@@ -553,6 +508,7 @@ fn test_emptying_file_after_orphan_view_merge_removes_every_copy() {
             .save_to_store(true),
     )
     .expect("orphan record should succeed (it's the duplication bug, not a crash)");
+    repo.set_current_view("dev").unwrap();
 
     // Step 3: merge the orphan view into dev — reproduces the duplication.
     repo.insert_from_view(CrossViewInsertOptions::new("orphan-xyz", "dev"))

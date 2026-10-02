@@ -13,6 +13,7 @@ use std::time::Duration;
 
 use clap::Parser;
 
+use atomic_core::operation::OperationKind;
 use atomic_core::types::{Base32, Hash, SetId};
 use atomic_objects::{
     ObjectFamily, ObjectRecord, RefRecord, SyncPack, SyncWants, ViewScopeLabel, ViewSnapshot,
@@ -20,6 +21,7 @@ use atomic_objects::{
 use atomic_remote::{HttpRemote, HttpRemoteConfig};
 use atomic_repository::{Repository, ViewManifest};
 
+use crate::commands::workspace_txn::{boundary_mode, enter_workspace};
 use crate::commands::{find_repository_root, format_hash, Command};
 use crate::error::{CliError, CliResult};
 use crate::output::{
@@ -357,11 +359,30 @@ impl Push {
 
     /// Get the local view name to push from.
     ///
-    /// Returns the explicitly specified view or the repository's current view.
-    fn get_local_view(&self, repo: &Repository) -> String {
-        self.from_view
-            .clone()
-            .unwrap_or_else(|| repo.current_view().to_string())
+    /// Returns the explicitly specified view or the working copy's desired view.
+    /// Used by the CB-4B read-only preflight, which resolves authority from the
+    /// working-copy record before writable open.
+    fn get_local_view(&self, repo: &Repository) -> CliResult<String> {
+        if let Some(view) = &self.from_view {
+            return Ok(view.clone());
+        }
+
+        let working_copy = repo
+            .require_working_copy_id()
+            .map_err(CliError::Repository)?;
+        repo.desired_view_name(working_copy)
+            .map_err(CliError::Repository)
+    }
+
+    /// Get the local view name from retained WorkspaceTxn authority.
+    fn get_local_view_from_txn(
+        &self,
+        workspace: &atomic_repository::WorkspaceTxn,
+    ) -> CliResult<String> {
+        if let Some(view) = &self.from_view {
+            return Ok(view.clone());
+        }
+        Ok(workspace.view().name.clone())
     }
 
     /// Get the remote view name to declare the leaf view under.
@@ -486,15 +507,53 @@ impl Push {
 
     /// Async implementation of the push command.
     async fn run_async(&self) -> CliResult<()> {
-        // Find and open repository
+        // For an active Git bridge, run CB-4B through a read-only Atomic handle
+        // before writable open can recover/create an operation and before the
+        // first HTTP `/code` negotiation POST. Plain Atomic repositories retain
+        // their original writable-open/recovery behavior.
         let repo_root = find_repository_root()?;
-        let repo = Repository::open(&repo_root).map_err(CliError::Repository)?;
+        let preflight = if crate::commands::git::shadow::bridge_publication_required(&repo_root) {
+            let readonly_repo =
+                Repository::open_readonly(&repo_root).map_err(CliError::Repository)?;
+            let local_view = self.get_local_view(&readonly_repo)?;
+            let publication = crate::commands::git::shadow::verify_bridge_publication(
+                &readonly_repo,
+                &repo_root,
+                &local_view,
+            )?
+            .ok_or_else(|| CliError::GitError {
+                message: "Git bridge publication marker disappeared during preflight".to_string(),
+            })?;
+            Some((local_view, publication))
+        } else {
+            None
+        };
+
+        // Enter the shared workspace transaction before any network or graph
+        // work. Dry runs observe without mutation — the boundary opens
+        // read-only so Observe is mutation-free by construction; ordinary
+        // pushes reconcile safe drift and refuse unsafe baselines.
+        // WorkspaceTxn authority (working copy + view) is retained for the
+        // entire command body.
+        let mut repo = if self.dry_run {
+            Repository::open_readonly(&repo_root)
+        } else {
+            Repository::open_for_workspace_transaction(&repo_root)
+        }
+        .map_err(CliError::Repository)?;
+        let workspace = enter_workspace(&mut repo, boundary_mode(self.dry_run))?;
+        let (local_view, publication) = match preflight {
+            Some((local_view, publication)) => {
+                publication.reobserve(&repo, &repo_root)?;
+                (local_view, Some(publication))
+            }
+            None => (self.get_local_view_from_txn(&workspace)?, None),
+        };
 
         // Resolve remote name, URL, and identity hint
         let (remote_name, remote_url, identity_hint) = self.resolve_remote_url(&repo)?;
 
         // Determine views: the leaf we push, and its name on the remote.
-        let local_view = self.get_local_view(&repo);
         let remote_view = self.get_remote_view(&local_view);
 
         // Print header
@@ -645,6 +704,29 @@ impl Push {
         if syncs.iter().all(|s| s.plan.is_noop()) {
             print_success("Already up to date");
             return Ok(());
+        }
+
+        // CB-12B: trusted provenance publication gate. Atomic push is a
+        // protected publication boundary (RFC §10.4): the complete reachable
+        // closure of every change about to be stored on the remote must
+        // carry trusted managed-session evidence before any pack is built
+        // or sent. This refuses before publication with exact diagnostics;
+        // content correctness is verified independently of this verdict.
+        {
+            let mut push_closure: Vec<Hash> = Vec::new();
+            for sync in &syncs {
+                push_closure.extend(sync.to_store.iter().copied());
+            }
+            push_closure.sort();
+            push_closure.dedup();
+            if !push_closure.is_empty() {
+                let provider =
+                    atomic_repository::repository::provenance_gate::local_session_mac_key_provider(
+                        &repo,
+                    );
+                repo.enforce_publication_gate("Atomic push", &push_closure, Some(&provider))
+                    .map_err(CliError::Repository)?;
+            }
         }
 
         // Sync phase: store change files, then declare each manifest,
@@ -905,8 +987,30 @@ impl Push {
             }
         }
 
+        let working_copy = workspace.working_copy();
+        let evidence = pack
+            .encode()
+            .map(|bytes| Hash::of(&bytes))
+            .map_err(|error| {
+                CliError::Internal(anyhow::anyhow!(
+                    "failed to encode prepared push evidence: {}",
+                    error
+                ))
+            })?;
+        if let Some(publication) = &publication {
+            publication.reobserve(&repo, &repo_root)?;
+        }
+        let push_operation = repo
+            .prepare_remote_operation(working_copy, OperationKind::Push, &remote_name, evidence)
+            .map_err(CliError::Repository)?;
+
         // Send everything in one `/code` push: objects stored + refs CAS-moved.
         if !pack.is_empty() {
+            // Close the local observation-to-remote-CAS window after operation
+            // preparation but immediately before the publication POST.
+            if let Some(publication) = &publication {
+                publication.reobserve(&repo, &repo_root)?;
+            }
             let spinner = create_spinner("Pushing to remote...");
             remote.sync_push(&pack).await.map_err(|e| {
                 finish_error(&spinner, "Push failed");
@@ -959,6 +1063,9 @@ impl Push {
             );
         }
 
+        repo.finalize_remote_operation(push_operation)
+            .map_err(CliError::Repository)?;
+
         // Summary
         print_blank();
         let mut summary = format!(
@@ -1010,10 +1117,15 @@ impl Command for Push {
     /// - `CliError::RemoteError` - Network/server error (including servers
     ///   that predate view-manifest support)
     fn run(&self) -> CliResult<()> {
-        // Create async runtime for HTTP operations
-        let runtime = tokio::runtime::Runtime::new().map_err(|e| {
-            CliError::Internal(anyhow::anyhow!("Failed to create async runtime: {}", e))
-        })?;
+        // A current-thread runtime keeps the workspace transaction's ordered
+        // operation locks bound to one thread for the whole async body; nested
+        // repository operations re-enter them instead of contending.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| {
+                CliError::Internal(anyhow::anyhow!("Failed to create async runtime: {}", e))
+            })?;
 
         runtime.block_on(self.run_async())
     }

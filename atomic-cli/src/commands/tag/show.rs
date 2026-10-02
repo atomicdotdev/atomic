@@ -34,8 +34,9 @@
 use clap::Parser;
 
 use atomic_core::types::{Base32, Hash};
-use atomic_repository::{Repository, TagKind};
+use atomic_repository::{Repository, TagKind, WorkspaceTxnMode};
 
+use crate::commands::workspace_txn::enter_workspace;
 use crate::commands::{find_repository_root, Command};
 use crate::error::{CliError, CliResult};
 use crate::output::{emphasis, hint};
@@ -78,15 +79,19 @@ impl Command for Show {
 
         // Find the repository
         let repo_root = find_repository_root()?;
-        let repo = Repository::open(&repo_root).map_err(|e| match e {
+        let mut repo = Repository::open_readonly(&repo_root).map_err(|e| match e {
             atomic_repository::RepositoryError::NotFound { path } => CliError::RepositoryNotFound {
                 searched_path: path.into(),
             },
             other => CliError::Repository(other),
         })?;
 
+        let workspace = enter_workspace(&mut repo, WorkspaceTxnMode::Observe)?;
+
         // Get the tag
-        let tag = repo.get_tag(name).map_err(CliError::Repository)?;
+        let tag = repo
+            .get_tag_from_view(name, &workspace.view().name)
+            .map_err(CliError::Repository)?;
 
         match tag {
             Some(tag) => {
