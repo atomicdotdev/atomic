@@ -677,6 +677,24 @@ pub const EMBEDDINGS: TableDefinition<&str, &[u8]> = TableDefinition::new("embed
 /// (`LEGACY_DIR_KEY`, UTF-8).
 pub const ATOMIC_META: TableDefinition<&str, &[u8]> = TableDefinition::new("atomic_meta");
 
+/// Exact verified V3 bytes, authoritative for transactionally published changes.
+/// Section tables are derived query projections; this preserves signed bytes
+/// and original chunk/hash-table layout for export without reserialization.
+pub const CHANGE_BYTES: TableDefinition<&[u8; 32], &[u8]> = TableDefinition::new("change_bytes");
+/// Serialized finalized provenance objects, committed with their session ledger.
+pub const PROVENANCE_OBJECTS: TableDefinition<&[u8; 32], &[u8]> =
+    TableDefinition::new("provenance_objects");
+/// Ordered repository events awaiting delivery. Payloads are versioned JSON.
+pub const REPOSITORY_OUTBOX: TableDefinition<u64, &[u8]> =
+    TableDefinition::new("repository_outbox");
+/// Stable operation key to outbox sequence, making publication retries idempotent.
+pub const REPOSITORY_OUTBOX_KEYS: TableDefinition<&str, u64> =
+    TableDefinition::new("repository_outbox_keys");
+/// Immutable publication receipts keyed by session ID and provenance hash.
+/// Retried older checkpoints return their original manifest without moving head.
+pub const SESSION_CHECKPOINT_RECEIPTS: TableDefinition<&str, &[u8]> =
+    TableDefinition::new("session_checkpoint_receipts");
+
 // KG Edge Key / FTS Helpers
 
 /// Encode a KG edge key as "from_id\0to_id\0kind".

@@ -222,113 +222,23 @@ pub struct StoredChangeMeta {
 // RedbChangeStore — the main store
 // ═══════════════════════════════════════════════════════════════════════
 
-/// redb-native change storage.
-///
-/// Stores change data in redb tables with per-section granularity,
-/// enabling layer-selective reads and content deduplication.
-///
-/// # Table Layout
-///
-/// | Table | Key | Value | Purpose |
-/// |-------|-----|-------|---------|
-/// | `CHANGE_META` | `[u8; 32]` (hash) | compressed meta blob | Header + deps + hash table |
-/// | `CHANGE_GRAPH` | `[u8; 36]` (hash + idx) | compressed graph ops | Per-file graph sections |
-/// | `CHANGE_SEMANTIC` | `[u8; 36]` (hash + idx) | compressed semantic ops | Per-file semantic sections |
-/// | `CONTENT_CHUNKS` | `[u8; 32]` (chunk hash) | compressed content | Deduped content chunks |
-/// | `CHANGE_CHUNKS` | `[u8; 36]` (hash + idx) | `[u8; 32]` (chunk hash) | Change → chunk manifest |
-/// | `CHANGE_UNHASHED` | `[u8; 32]` (hash) | compressed JSON | AI transcripts, etc. |
-/// | `PROVENANCE_TURNS` | `u64` | pending turn metadata | Resumable fenced turn frontier |
-/// | `PROVENANCE_JOURNAL_EVENTS` | `[u8; 16]` | immutable event | Ordered pending provenance |
-/// | `PROVENANCE_FINAL_HASHES` | `[u8; 32]` | `u64` | Final hash → reserved turn |
-pub struct RedbChangeStore {
-    db: Arc<Database>,
+/// Verified and compressed change data prepared outside the writer lock.
+/// [`write`](Self::write) stages the verified original bytes and query projections
+/// in the caller's transaction; it never opens another writer or commits.
+pub struct PreparedChange {
+    content_hash: [u8; 32],
+    bytes: Vec<u8>,
+    meta_compressed: Vec<u8>,
+    graph_sections: Vec<(u32, Vec<u8>)>,
+    semantic_sections: Vec<(u32, Vec<u8>)>,
+    content_chunks: Vec<(u32, [u8; 32], Vec<u8>)>,
+    unhashed_payload: Option<Vec<u8>>,
+    signature_payload: Option<Vec<u8>>,
 }
 
-impl RedbChangeStore {
-    /// Open or create a redb change store at the given path.
-    ///
-    /// Creates all required tables on first use. Subsequent opens
-    /// use the existing tables.
-    ///
-    /// # Arguments
-    ///
-    /// * `path` - Path to the redb database file, created if missing. Use
-    ///   [`open_existing`](Self::open_existing) for a repository database so a
-    ///   missing or not-yet-merged repository is never replaced by an empty one.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the database cannot be opened or tables cannot be created.
-    pub fn open<P: AsRef<Path>>(path: P) -> RedbStoreResult<Self> {
-        Self::from_database(Arc::new(Database::create(path)?))
-    }
-
-    /// Open the store in an existing database file without creating it.
-    ///
-    /// Repository callers pass [`crate::ensure_database`]'s result here.
-    pub fn open_existing<P: AsRef<Path>>(path: P) -> RedbStoreResult<Self> {
-        Self::from_database(Arc::new(Builder::new().open(path)?))
-    }
-
-    /// Use the store's tables in an already-open database, creating any that
-    /// are missing.
-    pub fn from_database(db: Arc<Database>) -> RedbStoreResult<Self> {
-        atomic_core::pristine::schema::check_schema_version(&db.begin_read()?)
-            .map_err(|error| RedbStoreError::Corrupt(error.to_string()))?;
-        {
-            let txn = db.begin_write()?;
-            {
-                let _ = txn.open_table(tables::CHANGE_META)?;
-                let _ = txn.open_table(tables::CHANGE_GRAPH)?;
-                let _ = txn.open_table(tables::CHANGE_SEMANTIC)?;
-                let _ = txn.open_table(tables::CONTENT_CHUNKS)?;
-                let _ = txn.open_table(tables::CHANGE_CHUNKS)?;
-                let _ = txn.open_table(tables::CHANGE_UNHASHED)?;
-                let _ = txn.open_table(tables::CHANGE_SIGNATURES)?;
-                Self::initialize_provenance_tables(&txn)?;
-            }
-            txn.commit()?;
-        }
-
-        Ok(Self { db })
-    }
-
-    /// Get a reference to the underlying database.
-    pub(crate) fn db(&self) -> &Database {
-        &self.db
-    }
-
-    // ── Write Operations ───────────────────────────────────────────
-
-    /// Import a V3 `.change` file into the redb store.
-    ///
-    /// Reads the V3 file section by section using [`ChangeReader`], then
-    /// stores each section in the appropriate redb table. Content chunks
-    /// are deduplicated by their blake3 hash — if a chunk already exists
-    /// in CONTENT_CHUNKS, it's not written again.
-    ///
-    /// # Arguments
-    ///
-    /// * `file_path` - Path to the `.change` file to import.
-    ///
-    /// # Returns
-    ///
-    /// The blake3 content hash of the imported change (its identity).
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the file can't be read, is not valid V3 format,
-    /// or if redb writes fail.
-    pub fn import_v3_file<P: AsRef<Path>>(&self, file_path: P) -> RedbStoreResult<[u8; 32]> {
-        let file_data = std::fs::read(file_path.as_ref())?;
-        self.import_v3_bytes(&file_data)
-    }
-
-    /// Import V3 change data from a byte slice.
-    ///
-    /// This is the core import method — used by both `import_v3_file` and
-    /// by the network layer when receiving change data during pull.
-    pub fn import_v3_bytes(&self, data: &[u8]) -> RedbStoreResult<[u8; 32]> {
+impl PreparedChange {
+    /// Validate a complete V3 object and prepare its query projections.
+    pub fn from_v3_bytes(data: &[u8]) -> RedbStoreResult<Self> {
         let mut cursor = Cursor::new(data);
         let mut reader = ChangeReader::open(&mut cursor)?;
 
@@ -414,67 +324,241 @@ impl RedbChangeStore {
         let meta_compressed = zstd::encode_all(&meta_bytes[..], 3)
             .map_err(|e| RedbStoreError::Serialization(e.to_string()))?;
 
-        // Write everything in a single transaction
-        let txn = self.db.begin_write()?;
+        let compress = |bytes: &[u8]| {
+            zstd::encode_all(bytes, 3).map_err(|e| RedbStoreError::Serialization(e.to_string()))
+        };
+        let graph_sections = graph_sections
+            .into_iter()
+            .map(|(i, b)| Ok((i, compress(&b)?)))
+            .collect::<RedbStoreResult<Vec<_>>>()?;
+        let semantic_sections = semantic_sections
+            .into_iter()
+            .map(|(i, b)| Ok((i, compress(&b)?)))
+            .collect::<RedbStoreResult<Vec<_>>>()?;
+        let content_chunks = content_chunks
+            .into_iter()
+            .map(|(i, h, b)| Ok((i, h, compress(&b)?)))
+            .collect::<RedbStoreResult<Vec<_>>>()?;
+        Ok(Self {
+            content_hash,
+            bytes: data.to_vec(),
+            meta_compressed,
+            graph_sections,
+            semantic_sections,
+            content_chunks,
+            unhashed_payload: unhashed_payload.as_deref().map(compress).transpose()?,
+            signature_payload: signature_payload.as_deref().map(compress).transpose()?,
+        })
+    }
+
+    /// The verified content hash of the prepared object.
+    pub fn hash(&self) -> [u8; 32] {
+        self.content_hash
+    }
+
+    /// Store the object and its sections without committing the transaction.
+    pub fn write(&self, txn: &redb::WriteTransaction) -> RedbStoreResult<()> {
+        // Borrowed transactions may bypass the repository/store constructors.
+        // Enforce the version fence before staging any canonical object rows.
+        let repository_schema = txn.list_tables()?.any(|table| {
+            redb::TableHandle::name(&table) == redb::TableHandle::name(&tables::ATOMIC_META)
+        });
+        if repository_schema {
+            atomic_core::pristine::schema::stamp_schema_version(txn)
+                .map_err(|error| RedbStoreError::Corrupt(error.to_string()))?;
+        }
+        let Self {
+            content_hash,
+            bytes,
+            meta_compressed,
+            graph_sections,
+            semantic_sections,
+            content_chunks,
+            unhashed_payload,
+            signature_payload,
+        } = self;
         {
+            txn.open_table(tables::CHANGE_BYTES)?
+                .insert(content_hash, bytes.as_slice())?;
             // CHANGE_META
             let mut meta_table = txn.open_table(tables::CHANGE_META)?;
-            meta_table.insert(&content_hash, meta_compressed.as_slice())?;
+            meta_table.insert(content_hash, meta_compressed.as_slice())?;
 
             // CHANGE_GRAPH
             let mut graph_table = txn.open_table(tables::CHANGE_GRAPH)?;
-            for (idx, payload) in &graph_sections {
-                let key = tables::encode_change_file_key(&content_hash, *idx);
-                let compressed = zstd::encode_all(payload.as_slice(), 3)
-                    .map_err(|e| RedbStoreError::Serialization(e.to_string()))?;
+            for (idx, payload) in graph_sections {
+                let key = tables::encode_change_file_key(content_hash, *idx);
+                let compressed = payload;
                 graph_table.insert(&key, compressed.as_slice())?;
             }
 
             // CHANGE_SEMANTIC
             let mut semantic_table = txn.open_table(tables::CHANGE_SEMANTIC)?;
-            for (idx, payload) in &semantic_sections {
-                let key = tables::encode_change_file_key(&content_hash, *idx);
-                let compressed = zstd::encode_all(payload.as_slice(), 3)
-                    .map_err(|e| RedbStoreError::Serialization(e.to_string()))?;
+            for (idx, payload) in semantic_sections {
+                let key = tables::encode_change_file_key(content_hash, *idx);
+                let compressed = payload;
                 semantic_table.insert(&key, compressed.as_slice())?;
             }
 
             // CONTENT_CHUNKS (content-addressed — skip if already present)
             let mut chunk_table = txn.open_table(tables::CONTENT_CHUNKS)?;
-            for (_idx, chunk_hash, chunk_data) in &content_chunks {
+            for (_idx, chunk_hash, chunk_data) in content_chunks {
                 if chunk_table.get(chunk_hash)?.is_none() {
-                    let compressed = zstd::encode_all(chunk_data.as_slice(), 3)
-                        .map_err(|e| RedbStoreError::Serialization(e.to_string()))?;
+                    let compressed = chunk_data;
                     chunk_table.insert(chunk_hash, compressed.as_slice())?;
                 }
             }
 
             // CHANGE_CHUNKS (change → ordered chunk manifest)
             let mut change_chunks_table = txn.open_table(tables::CHANGE_CHUNKS)?;
-            for (idx, chunk_hash, _) in &content_chunks {
-                let key = tables::encode_change_file_key(&content_hash, *idx);
+            for (idx, chunk_hash, _) in content_chunks {
+                let key = tables::encode_change_file_key(content_hash, *idx);
                 change_chunks_table.insert(&key, chunk_hash)?;
             }
 
             // CHANGE_UNHASHED
-            if let Some(unhashed) = &unhashed_payload {
-                let mut unhashed_table = txn.open_table(tables::CHANGE_UNHASHED)?;
-                let compressed = zstd::encode_all(unhashed.as_slice(), 3)
-                    .map_err(|e| RedbStoreError::Serialization(e.to_string()))?;
-                unhashed_table.insert(&content_hash, compressed.as_slice())?;
+            let mut unhashed_table = txn.open_table(tables::CHANGE_UNHASHED)?;
+            if let Some(unhashed) = unhashed_payload {
+                unhashed_table.insert(content_hash, unhashed.as_slice())?;
+            } else {
+                unhashed_table.remove(content_hash)?;
             }
 
-            // CHANGE_SIGNATURES
-            if let Some(signature) = &signature_payload {
-                let mut sig_table = txn.open_table(tables::CHANGE_SIGNATURES)?;
-                let compressed = zstd::encode_all(signature.as_slice(), 3)
-                    .map_err(|e| RedbStoreError::Serialization(e.to_string()))?;
-                sig_table.insert(&content_hash, compressed.as_slice())?;
+            // Optional sections can be replaced without changing the hash.
+            // Remove absent projections so they agree with CHANGE_BYTES.
+            let mut sig_table = txn.open_table(tables::CHANGE_SIGNATURES)?;
+            if let Some(signature) = signature_payload {
+                sig_table.insert(content_hash, signature.as_slice())?;
+            } else {
+                sig_table.remove(content_hash)?;
             }
         }
-        txn.commit()?;
 
-        Ok(content_hash)
+        Ok(())
+    }
+}
+
+/// redb-native change storage.
+///
+/// Stores change data in redb tables with per-section granularity,
+/// enabling layer-selective reads and content deduplication.
+///
+/// # Table Layout
+///
+/// | Table | Key | Value | Purpose |
+/// |-------|-----|-------|---------|
+/// | `CHANGE_META` | `[u8; 32]` (hash) | compressed meta blob | Header + deps + hash table |
+/// | `CHANGE_GRAPH` | `[u8; 36]` (hash + idx) | compressed graph ops | Per-file graph sections |
+/// | `CHANGE_SEMANTIC` | `[u8; 36]` (hash + idx) | compressed semantic ops | Per-file semantic sections |
+/// | `CONTENT_CHUNKS` | `[u8; 32]` (chunk hash) | compressed content | Deduped content chunks |
+/// | `CHANGE_CHUNKS` | `[u8; 36]` (hash + idx) | `[u8; 32]` (chunk hash) | Change → chunk manifest |
+/// | `CHANGE_UNHASHED` | `[u8; 32]` (hash) | compressed JSON | AI transcripts, etc. |
+/// | `PROVENANCE_TURNS` | `u64` | pending turn metadata | Resumable fenced turn frontier |
+/// | `PROVENANCE_JOURNAL_EVENTS` | `[u8; 16]` | immutable event | Ordered pending provenance |
+/// | `PROVENANCE_FINAL_HASHES` | `[u8; 32]` | `u64` | Final hash → reserved turn |
+pub struct RedbChangeStore {
+    db: Arc<Database>,
+}
+
+impl RedbChangeStore {
+    /// Open or create a redb change store at the given path.
+    ///
+    /// Creates all required tables on first use. Subsequent opens
+    /// use the existing tables.
+    ///
+    /// # Arguments
+    ///
+    /// * `path` - Path to the redb database file, created if missing. Use
+    ///   [`open_existing`](Self::open_existing) for a repository database so a
+    ///   missing or not-yet-merged repository is never replaced by an empty one.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database cannot be opened or tables cannot be created.
+    pub fn open<P: AsRef<Path>>(path: P) -> RedbStoreResult<Self> {
+        Self::from_database(Arc::new(Database::create(path)?))
+    }
+
+    /// Open the store in an existing database file without creating it.
+    ///
+    /// Repository callers pass [`crate::ensure_database`]'s result here.
+    pub fn open_existing<P: AsRef<Path>>(path: P) -> RedbStoreResult<Self> {
+        Self::from_database(Arc::new(Builder::new().open(path)?))
+    }
+
+    /// Use the store's tables in an already-open database, creating any that
+    /// are missing.
+    pub fn from_database(db: Arc<Database>) -> RedbStoreResult<Self> {
+        atomic_core::pristine::schema::check_schema_version(&db.begin_read()?)
+            .map_err(|error| RedbStoreError::Corrupt(error.to_string()))?;
+        let repository_schema = match db.begin_read()?.open_table(tables::ATOMIC_META) {
+            Ok(_) => true,
+            Err(redb::TableError::TableDoesNotExist(_)) => false,
+            Err(error) => return Err(error.into()),
+        };
+        {
+            let txn = db.begin_write()?;
+            {
+                if repository_schema {
+                    atomic_core::pristine::schema::stamp_schema_version(&txn)
+                        .map_err(|error| RedbStoreError::Corrupt(error.to_string()))?;
+                }
+                let _ = txn.open_table(tables::CHANGE_META)?;
+                let _ = txn.open_table(tables::CHANGE_GRAPH)?;
+                let _ = txn.open_table(tables::CHANGE_SEMANTIC)?;
+                let _ = txn.open_table(tables::CONTENT_CHUNKS)?;
+                let _ = txn.open_table(tables::CHANGE_CHUNKS)?;
+                let _ = txn.open_table(tables::CHANGE_UNHASHED)?;
+                let _ = txn.open_table(tables::CHANGE_SIGNATURES)?;
+                Self::initialize_provenance_tables(&txn)?;
+            }
+            txn.commit()?;
+        }
+
+        Ok(Self { db })
+    }
+
+    /// Get a reference to the underlying database.
+    pub(crate) fn db(&self) -> &Database {
+        &self.db
+    }
+
+    // ── Write Operations ───────────────────────────────────────────
+
+    /// Import a V3 `.change` file into the redb store.
+    ///
+    /// Reads the V3 file section by section using [`ChangeReader`], then
+    /// stores each section in the appropriate redb table. Content chunks
+    /// are deduplicated by their blake3 hash — if a chunk already exists
+    /// in CONTENT_CHUNKS, it's not written again.
+    ///
+    /// # Arguments
+    ///
+    /// * `file_path` - Path to the `.change` file to import.
+    ///
+    /// # Returns
+    ///
+    /// The blake3 content hash of the imported change (its identity).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file can't be read, is not valid V3 format,
+    /// or if redb writes fail.
+    pub fn import_v3_file<P: AsRef<Path>>(&self, file_path: P) -> RedbStoreResult<[u8; 32]> {
+        let file_data = std::fs::read(file_path.as_ref())?;
+        self.import_v3_bytes(&file_data)
+    }
+
+    /// Import V3 change data from a byte slice.
+    ///
+    /// This is the core import method — used by both `import_v3_file` and
+    /// by the network layer when receiving change data during pull.
+    pub fn import_v3_bytes(&self, data: &[u8]) -> RedbStoreResult<[u8; 32]> {
+        let prepared = PreparedChange::from_v3_bytes(data)?;
+        let txn = self.db.begin_write()?;
+        prepared.write(&txn)?;
+        txn.commit()?;
+        Ok(prepared.hash())
     }
 
     /// Store a `Change` object into the redb store.

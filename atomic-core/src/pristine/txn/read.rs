@@ -36,6 +36,11 @@ pub struct ReadTxn {
 }
 
 impl ReadTxn {
+    /// Borrow the same read snapshot for co-located object tables.
+    pub fn redb_transaction(&self) -> &ReadTransaction {
+        &self.txn
+    }
+
     /// Create a new read transaction
     pub(crate) fn new(txn: ReadTransaction) -> Self {
         Self { txn }

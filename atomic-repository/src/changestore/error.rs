@@ -11,6 +11,9 @@ pub type ChangeStoreResult<T> = Result<T, ChangeStoreError>;
 /// including I/O errors, serialization failures, and integrity violations.
 #[derive(Debug, Error)]
 pub enum ChangeStoreError {
+    /// Accessing the canonical repository object failed.
+    #[error("Repository object database: {0}")]
+    Database(String),
     /// The requested change was not found on disk.
     ///
     /// This can occur when:

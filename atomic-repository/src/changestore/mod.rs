@@ -1,9 +1,9 @@
 //! Change storage for Atomic VCS
 //!
 //! This module provides the [`ChangeStore`] abstraction for persisting and retrieving
-//! changes from the filesystem. Changes are stored in a two-level directory structure
-//! based on their content hash, enabling efficient lookup and avoiding filesystem
-//! limitations with too many files in a single directory.
+//! changes. Repository-owned stores read canonical objects from `atomic.redb`,
+//! with filesystem fallback for legacy objects. Standalone stores use the
+//! filesystem. Export files use a two-level content-addressed directory structure.
 //!
 //! # Directory Structure
 //!
@@ -29,12 +29,10 @@
 //!
 //! # Atomic Writes
 //!
-//! All write operations use the atomic write pattern:
-//! 1. Write to a temporary file in the same directory
-//! 2. Rename to the final path
-//!
-//! This ensures that readers never see partial writes, even in case of
-//! crashes or power failures.
+//! Repository writes commit canonical objects in REDB before refreshing export
+//! files. Recording stages object and graph writes in the same transaction.
+//! Filesystem exports and standalone writes use a temporary file and rename,
+//! so readers never observe a partially written export.
 //!
 //! # Example
 //!
@@ -69,10 +67,13 @@ mod trait_impl;
 #[cfg(test)]
 mod tests;
 
+use atomic_core::pristine::tables::{CHANGE_BYTES, PROVENANCE_OBJECTS};
+use atomic_core::pristine::{MutTxnT, Pristine};
+use redb::ReadableTable;
 use std::fs::{self, File};
 use std::io::{BufReader, BufWriter};
 use std::path::{Path, PathBuf};
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 
 use atomic_core::change::Change;
 use atomic_core::types::{Base32, Hash};
@@ -113,6 +114,7 @@ mod cache;
 pub(crate) use cache::LruCache;
 
 pub struct ChangeStore {
+    pub(crate) database: Option<Arc<Pristine>>,
     /// Path to the changes directory (`.atomic/changes/`)
     pub(crate) changes_dir: PathBuf,
 
@@ -120,7 +122,14 @@ pub struct ChangeStore {
     ///
     /// We use `RwLock` for thread-safe interior mutability, allowing
     /// concurrent read access while ensuring exclusive write access.
-    pub(crate) cache: RwLock<LruCache<Hash, Change>>,
+    pub(crate) cache: RwLock<LruCache<Hash, CachedChange>>,
+}
+
+pub(crate) struct CachedChange {
+    change: Change,
+    // The complete V3 object includes mutable unhashed data and signatures.
+    // Its fingerprint detects updates through other handles sharing this DB.
+    canonical_fingerprint: Option<Hash>,
 }
 
 impl std::fmt::Debug for ChangeStore {
@@ -188,8 +197,156 @@ impl ChangeStore {
 
         Ok(Self {
             changes_dir,
+            database: None,
             cache: RwLock::new(LruCache::new(cache_capacity)),
         })
+    }
+
+    pub(crate) fn with_database(mut self, database: Arc<Pristine>) -> Self {
+        self.database = Some(database);
+        self
+    }
+
+    pub(crate) fn object_bytes(
+        &self,
+        table: redb::TableDefinition<&[u8; 32], &[u8]>,
+        hash: &Hash,
+    ) -> ChangeStoreResult<Option<Vec<u8>>> {
+        let Some(db) = &self.database else {
+            return Ok(None);
+        };
+        let read = db
+            .read_txn()
+            .map_err(|e| ChangeStoreError::Database(e.to_string()))?;
+        let table = match read.redb_transaction().open_table(table) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+            Err(e) => return Err(ChangeStoreError::Database(e.to_string())),
+        };
+        let bytes = table
+            .get(hash.as_bytes())
+            .map_err(|e| ChangeStoreError::Database(e.to_string()))?
+            .map(|bytes| bytes.value().to_vec());
+        Ok(bytes)
+    }
+
+    fn has_canonical_change(&self, hash: &Hash) -> ChangeStoreResult<bool> {
+        let Some(db) = &self.database else {
+            return Ok(false);
+        };
+        let read = db
+            .read_txn()
+            .map_err(|e| ChangeStoreError::Database(e.to_string()))?;
+        let table = match read.redb_transaction().open_table(CHANGE_BYTES) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(false),
+            Err(error) => return Err(ChangeStoreError::Database(error.to_string())),
+        };
+        let exists = table
+            .get(hash.as_bytes())
+            .map_err(|e| ChangeStoreError::Database(e.to_string()))?
+            .is_some();
+        Ok(exists)
+    }
+
+    pub(crate) fn object_hashes(
+        &self,
+        table: redb::TableDefinition<&[u8; 32], &[u8]>,
+    ) -> ChangeStoreResult<Vec<Hash>> {
+        let Some(db) = &self.database else {
+            return Ok(Vec::new());
+        };
+        let read = db
+            .read_txn()
+            .map_err(|e| ChangeStoreError::Database(e.to_string()))?;
+        let table = match read.redb_transaction().open_table(table) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+            Err(e) => return Err(ChangeStoreError::Database(e.to_string())),
+        };
+        let mut hashes = Vec::new();
+        for row in table
+            .iter()
+            .map_err(|e| ChangeStoreError::Database(e.to_string()))?
+        {
+            let (key, _) = row.map_err(|e| ChangeStoreError::Database(e.to_string()))?;
+            hashes.push(Hash::from_bytes(*key.value()));
+        }
+        Ok(hashes)
+    }
+
+    /// Persist a verified object independently of graph publication.
+    /// Record uses the same prepared object inside its graph transaction instead.
+    pub(crate) fn save_change_bytes(&self, hash: &Hash, bytes: &[u8]) -> ChangeStoreResult<Hash> {
+        let prepared = crate::redb_change_store::PreparedChange::from_v3_bytes(bytes)
+            .map_err(|e| ChangeStoreError::Database(e.to_string()))?;
+        if prepared.hash() != *hash.as_bytes() {
+            return Err(ChangeStoreError::HashMismatch {
+                expected: hash.to_base32(),
+                computed: Hash::from_bytes(prepared.hash()).to_base32(),
+            });
+        }
+        if let Some(db) = &self.database {
+            let txn = db
+                .write_txn()
+                .map_err(|e| ChangeStoreError::Database(e.to_string()))?;
+            prepared
+                .write(txn.redb_transaction())
+                .map_err(|e| ChangeStoreError::Database(e.to_string()))?;
+            txn.commit()
+                .map_err(|e| ChangeStoreError::Database(e.to_string()))?;
+            if let Err(error) = self.cache_change_bytes(hash, bytes) {
+                log::warn!(
+                    "committed change {}; export cache deferred: {error}",
+                    hash.to_base32()
+                );
+            }
+        } else {
+            self.cache_change_bytes(hash, bytes)?;
+        }
+        if let Ok(mut cache) = self.cache.write() {
+            cache.remove(hash);
+        }
+        Ok(*hash)
+    }
+
+    pub(crate) fn cache_change_bytes(&self, hash: &Hash, bytes: &[u8]) -> ChangeStoreResult<()> {
+        let path = self.change_path(hash);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let temp = tempfile::NamedTempFile::new_in(&self.changes_dir)?;
+        std::io::Write::write_all(&mut temp.as_file(), bytes)?;
+        temp.persist(path)?;
+        Ok(())
+    }
+
+    /// Read the exact verified V3 bytes, preserving their original encoding.
+    ///
+    /// Repository objects take precedence over filesystem export copies. A
+    /// legacy object with no database row is read from its content-addressed
+    /// file. Corrupt database bytes never fall back to an older export.
+    pub fn load_change_bytes(&self, hash: &Hash) -> ChangeStoreResult<Vec<u8>> {
+        let bytes = match self.object_bytes(CHANGE_BYTES, hash)? {
+            Some(bytes) => bytes,
+            None => match fs::read(self.change_path(hash)) {
+                Ok(bytes) => bytes,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    return Err(ChangeStoreError::NotFound {
+                        hash: hash.to_base32(),
+                    });
+                }
+                Err(error) => return Err(error.into()),
+            },
+        };
+        let (_, actual) = Change::deserialize(&mut bytes.as_slice())?;
+        if actual != *hash {
+            return Err(ChangeStoreError::HashMismatch {
+                expected: hash.to_base32(),
+                computed: actual.to_base32(),
+            });
+        }
+        Ok(bytes)
     }
 
     /// Create a change store from a repository root directory.
@@ -259,11 +416,17 @@ impl ChangeStore {
     /// }
     /// ```
     pub fn has_change(&self, hash: &Hash) -> bool {
+        if matches!(self.has_canonical_change(hash), Ok(true)) {
+            return true;
+        }
         // Check cache first
         if self
             .cache
             .read()
-            .map(|c| c.contains_key(hash))
+            .map(|c| {
+                c.peek(hash)
+                    .is_some_and(|entry| entry.canonical_fingerprint.is_none())
+            })
             .unwrap_or(false)
         {
             return true;
@@ -302,6 +465,11 @@ impl ChangeStore {
     /// println!("Saved change: {}", hash.to_base32());
     /// ```
     pub fn save_change(&self, change: &Change) -> ChangeStoreResult<Hash> {
+        if self.database.is_some() {
+            let mut bytes = Vec::new();
+            let hash = change.serialize(&mut bytes)?;
+            return self.save_change_bytes(&hash, &bytes);
+        }
         // Create a temporary file in the changes directory
         let temp_file = tempfile::NamedTempFile::new_in(&self.changes_dir)?;
 
@@ -322,7 +490,13 @@ impl ChangeStore {
 
         // Add to cache
         if let Ok(mut cache) = self.cache.write() {
-            cache.insert(hash, change.clone());
+            cache.insert(
+                hash,
+                CachedChange {
+                    change: change.clone(),
+                    canonical_fingerprint: None,
+                },
+            );
         }
 
         log::debug!(
@@ -334,10 +508,11 @@ impl ChangeStore {
         Ok(hash)
     }
 
-    /// Load a change from disk.
+    /// Load a canonical or legacy change.
     ///
-    /// If the change is in the cache, it's returned directly. Otherwise,
-    /// it's loaded from disk, verified, and added to the cache.
+    /// Canonical bytes are fingerprinted before reusing a decoded cache entry,
+    /// so optional data changed through another handle is observed. Legacy
+    /// files use the filesystem cache until the object is saved canonically.
     ///
     /// # Arguments
     ///
@@ -358,12 +533,42 @@ impl ChangeStore {
     /// println!("Message: {}", change.hashed.header.message);
     /// ```
     pub fn load_change(&self, hash: &Hash) -> ChangeStoreResult<Change> {
+        if let Some(bytes) = self.object_bytes(CHANGE_BYTES, hash)? {
+            let fingerprint = Hash::of(&bytes);
+            if let Ok(mut cache) = self.cache.write() {
+                if let Some(entry) = cache.get(hash) {
+                    if entry.canonical_fingerprint == Some(fingerprint) {
+                        return Ok(entry.change.clone());
+                    }
+                }
+            }
+            let (change, actual) = Change::deserialize(&mut bytes.as_slice())?;
+            if actual != *hash {
+                return Err(ChangeStoreError::HashMismatch {
+                    expected: hash.to_base32(),
+                    computed: actual.to_base32(),
+                });
+            }
+            if let Ok(mut cache) = self.cache.write() {
+                cache.insert(
+                    *hash,
+                    CachedChange {
+                        change: change.clone(),
+                        canonical_fingerprint: Some(fingerprint),
+                    },
+                );
+            }
+            return Ok(change);
+        }
         // Check cache first
         {
             if let Ok(mut cache) = self.cache.write() {
-                if let Some(change) = cache.get(hash) {
+                if let Some(entry) = cache
+                    .get(hash)
+                    .filter(|entry| entry.canonical_fingerprint.is_none())
+                {
                     log::trace!("Cache hit for change {}", hash.to_base32());
-                    return Ok(change.clone());
+                    return Ok(entry.change.clone());
                 }
             }
         }
@@ -397,7 +602,13 @@ impl ChangeStore {
 
         // Add to cache
         if let Ok(mut cache) = self.cache.write() {
-            cache.insert(*hash, change.clone());
+            cache.insert(
+                *hash,
+                CachedChange {
+                    change: change.clone(),
+                    canonical_fingerprint: None,
+                },
+            );
         }
 
         Ok(change)
@@ -420,42 +631,14 @@ impl ChangeStore {
         // peek() doesn't update LRU order, which is an acceptable trade-off
         // to avoid serializing all readers on a write lock.
         if let Ok(cache) = self.cache.read() {
-            if let Some(change) = cache.peek(hash) {
-                return copy_content_from_change(hash, change, start, end, buf);
+            if let Some(entry) = cache.peek(hash) {
+                return copy_content_from_change(hash, &entry.change, start, end, buf);
             }
         }
 
-        let path = self.change_path(hash);
-        log::debug!(
-            "Loading change content {} from {}",
-            hash.to_base32(),
-            path.display()
-        );
+        let change = self.load_change(hash)?;
 
-        if !path.exists() {
-            return Err(ChangeStoreError::NotFound {
-                hash: hash.to_base32(),
-            });
-        }
-
-        let file = File::open(&path)?;
-        let mut reader = BufReader::new(file);
-        let (change, computed_hash) = Change::deserialize(&mut reader)?;
-
-        if computed_hash != *hash {
-            return Err(ChangeStoreError::HashMismatch {
-                expected: hash.to_base32(),
-                computed: computed_hash.to_base32(),
-            });
-        }
-
-        let copied = copy_content_from_change(hash, &change, start, end, buf)?;
-
-        if let Ok(mut cache) = self.cache.write() {
-            cache.insert(*hash, change);
-        }
-
-        Ok(copied)
+        copy_content_from_change(hash, &change, start, end, buf)
     }
 
     /// Delete a change from disk and the cache.
@@ -482,19 +665,37 @@ impl ChangeStore {
     /// }
     /// ```
     pub fn delete_change(&self, hash: &Hash) -> ChangeStoreResult<bool> {
-        // Remove from cache
+        let mut canonical_store = None;
+        if let Some(db) = &self.database {
+            if self.object_bytes(CHANGE_BYTES, hash)?.is_some() {
+                let handle = db
+                    .shared_database()
+                    .ok_or_else(|| ChangeStoreError::Database("read-only repository".into()))?;
+                let store = crate::redb_change_store::RedbChangeStore::from_database(handle)
+                    .map_err(|e| ChangeStoreError::Database(e.to_string()))?;
+                canonical_store = Some(store);
+            }
+        }
+
+        // Remove the legacy fallback before deleting the canonical object.
+        // A failed export removal must not leave a deleted object visible;
+        // a later database failure still leaves the canonical copy readable.
+        let path = self.change_path(hash);
+        let removed_export = match fs::remove_file(&path) {
+            Ok(()) => true,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(error) => return Err(error.into()),
+        };
+        let removed_canonical = match canonical_store {
+            Some(store) => store
+                .delete_change(hash.as_bytes())
+                .map_err(|e| ChangeStoreError::Database(e.to_string()))?,
+            None => false,
+        };
+
         if let Ok(mut cache) = self.cache.write() {
             cache.remove(hash);
         }
-
-        // Remove from disk
-        let path = self.change_path(hash);
-
-        if !path.exists() {
-            return Ok(false);
-        }
-
-        fs::remove_file(&path)?;
 
         // Try to remove the parent directory if it's empty
         // This is best-effort; we don't care if it fails
@@ -508,7 +709,7 @@ impl ChangeStore {
             path.display()
         );
 
-        Ok(true)
+        Ok(removed_canonical || removed_export)
     }
 
     /// Iterate over all change hashes stored on disk.
@@ -532,7 +733,15 @@ impl ChangeStore {
     /// }
     /// ```
     pub fn iter_changes(&self) -> impl Iterator<Item = ChangeStoreResult<Hash>> + '_ {
-        ChangeIterator::new(&self.changes_dir)
+        let mut seen = std::collections::HashSet::new();
+        let stored = match self.object_hashes(CHANGE_BYTES) {
+            Ok(hashes) => hashes.into_iter().map(Ok).collect::<Vec<_>>(),
+            Err(error) => vec![Err(error)],
+        };
+        stored
+            .into_iter()
+            .chain(ChangeIterator::new(&self.changes_dir))
+            .filter(move |entry| entry.as_ref().map_or(true, |hash| seen.insert(*hash)))
     }
 
     /// Count the number of changes stored on disk.

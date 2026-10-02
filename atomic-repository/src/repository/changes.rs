@@ -109,15 +109,9 @@ impl Repository {
         v3_bytes: &[u8],
         _change: &Change,
     ) -> Result<Hash, RepositoryError> {
-        // Write the exact V3 bytes to the file store (no re-serialization).
-        // This ensures the hash in the filename matches the hash in the pristine.
-        let change_path = self.change_store.change_path(hash);
-        if let Some(parent) = change_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::write(&change_path, v3_bytes)?;
-
-        Ok(*hash)
+        self.change_store
+            .save_change_bytes(hash, v3_bytes)
+            .map_err(|e| RepositoryError::Database(e.to_string()))
     }
 
     /// Load a change from the repository.
@@ -1048,47 +1042,68 @@ impl Repository {
     // Provenance Graph Operations
     // =========================================================================
 
-    /// Publish a prepared turn checkpoint without rewriting prior session turns.
-    ///
-    /// The content-addressed provenance file is written first. Its registration,
-    /// dependencies, derived session tables, immutable `SESSION_TURNS` append,
-    /// manifest, and `SESSION_HEADS` advance then commit in one pristine
-    /// transaction. Repeating the exact publication is idempotent.
+    /// Publish object bytes, identities, dependencies, session ledger and outbox
+    /// in one repository transaction. Filesystem copies are recoverable exports.
     pub fn publish_provenance_checkpoint(
         &self,
         graph: &atomic_core::change::ProvenanceGraph,
-        mut turn: atomic_core::change::session::SessionTurn,
+        turn: atomic_core::change::session::SessionTurn,
+    ) -> Result<atomic_core::change::session::SessionCheckpointPublication, RepositoryError> {
+        self.publish_checkpoint_transaction(graph, turn, None)
+    }
+
+    /// Publish an owner-prepared checkpoint and complete its fenced journal
+    /// attempt atomically with the object, session ledger and outbox event.
+    pub fn publish_bound_provenance_checkpoint(
+        &self,
+        graph: &atomic_core::change::ProvenanceGraph,
+        turn: atomic_core::change::session::SessionTurn,
+        id: crate::redb_change_store::ProvenanceId,
+        generation: u64,
+        completed_at: i64,
+    ) -> Result<atomic_core::change::session::SessionCheckpointPublication, RepositoryError> {
+        self.publish_checkpoint_transaction(graph, turn, Some((id, generation, completed_at)))
+    }
+
+    fn publish_checkpoint_transaction(
+        &self,
+        graph: &atomic_core::change::ProvenanceGraph,
+        turn: atomic_core::change::session::SessionTurn,
+        bound: Option<(crate::redb_change_store::ProvenanceId, u64, i64)>,
     ) -> Result<atomic_core::change::session::SessionCheckpointPublication, RepositoryError> {
         use atomic_core::pristine::MutTxnT;
-
-        let existing_turns = self
-            .get_session_ledger(&turn.session_id)?
-            .map(|(_, turns)| turns)
-            .unwrap_or_default();
-        turn.turn_number = existing_turns
-            .iter()
-            .find(|existing| existing.provenance_hash == turn.provenance_hash)
-            .map(|existing| existing.turn_number)
-            .unwrap_or(existing_turns.len() as u32);
-
-        let hash = self
-            .change_store
-            .save_provenance_graph(graph)
-            .map_err(|error| RepositoryError::Database(error.to_string()))?;
+        let bytes = graph
+            .serialize()
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        let hash = Hash::of(&bytes);
         if turn.provenance_hash != hash
             || turn.session_id != graph.session_id
             || turn.change_hashes != graph.changes_explained
             || turn.previous_provenance != graph.previous
         {
             return Err(RepositoryError::Database(
-                "prepared session turn does not match provenance graph".to_string(),
+                "prepared session turn does not match provenance graph".into(),
             ));
         }
-
         let mut txn = self
             .pristine
             .write_txn()
             .map_err(|error| RepositoryError::Database(error.to_string()))?;
+        if let Some((id, generation, _)) = bound {
+            RedbChangeStore::validate_checkpoint_binding(
+                txn.redb_transaction(),
+                id,
+                generation,
+                &turn,
+            )
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        }
+        txn.redb_transaction()
+            .open_table(atomic_core::pristine::tables::PROVENANCE_OBJECTS)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?
+            .insert(hash.as_bytes(), bytes.as_slice())
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        super::publication::failpoint("checkpoint-after-object")?;
         let provenance_id = txn
             .register_provenance(&hash)
             .map_err(|error| RepositoryError::Database(error.to_string()))?;
@@ -1119,8 +1134,33 @@ impl Repository {
         let publication = txn
             .publish_session_checkpoint(&json_path, turn)
             .map_err(|error| RepositoryError::Database(error.to_string()))?;
+        super::publication::failpoint("checkpoint-after-ledger")?;
+        if let Some((id, generation, completed_at)) = bound {
+            RedbChangeStore::acknowledge_provenance_checkpoint_in_txn(
+                txn.redb_transaction(),
+                id,
+                generation,
+                publication.manifest_hash,
+                completed_at,
+            )
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        }
+        let event = serde_json::to_vec(&serde_json::json!({
+            "version": 1, "kind": "provenance.published", "session_id": graph.session_id,
+            "provenance": hash.to_base32(), "manifest": publication.manifest_hash.to_base32(),
+        }))
+        .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        txn.append_repository_event(
+            &format!("checkpoint:{}:{}", graph.session_id, hash.to_base32()),
+            &event,
+        )?;
+        super::publication::failpoint("checkpoint-before-commit")?;
         txn.commit()
             .map_err(|error| RepositoryError::Database(error.to_string()))?;
+        super::publication::failpoint("checkpoint-after-commit")?;
+        if let Err(error) = self.change_store.save_provenance_graph(graph) {
+            log::warn!("checkpoint committed; provenance export cache deferred: {error}");
+        }
         Ok(publication)
     }
 
