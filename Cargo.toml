@@ -44,7 +44,7 @@ serde_json = "1.0"
 # report -- a repeated member, nesting past the depth cap, a string that is not
 # a sequence of Unicode scalar values, a number outside the profile -- are
 # refused with a named error rather than collapsed or rounded.
-jcs-admit = "0.1"
+jcs-admit = "0.1.1"
 postcard = { version = "1.0", features = ["alloc"] }
 toml = "0.8"
 semver = "1"
