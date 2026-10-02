@@ -231,7 +231,7 @@ mod tests {
         let reopened = PublicKeyCache::open_at(dir.as_path());
         assert_eq!(
             reopened.get(SERVER, "lee").map(|c| c.public_key).as_deref(),
-            Some(KEY.into())
+            Some(KEY)
         );
     }
 
@@ -271,7 +271,7 @@ mod tests {
     #[test]
     fn corrupt_cache_degrades_to_empty() {
         let dir = scratch_dir("corrupt");
-        std::fs::write(&dir.join(CACHE_FILE), b"not json at all").unwrap();
+        std::fs::write(dir.join(CACHE_FILE), b"not json at all").unwrap();
 
         let cache = PublicKeyCache::open_at(dir.as_path());
         assert!(cache.get(SERVER, "lee").is_none());

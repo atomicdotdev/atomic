@@ -1336,7 +1336,9 @@ mod tests {
         {
             let repo = Repository::init(repo_path).unwrap();
             std::fs::write(repo_path.join("new_file.txt"), "New content").unwrap();
-            repo.add("new_file.txt", Default::default()).unwrap();
+            let working_copy = repo.require_working_copy_id().unwrap();
+            repo.add(working_copy, "new_file.txt", Default::default())
+                .unwrap();
         }
 
         std::env::set_current_dir(repo_path).unwrap();
@@ -1360,7 +1362,9 @@ mod tests {
         {
             let repo = Repository::init(repo_path).unwrap();
             std::fs::write(repo_path.join("test.txt"), "Content").unwrap();
-            repo.add("test.txt", Default::default()).unwrap();
+            let working_copy = repo.require_working_copy_id().unwrap();
+            repo.add(working_copy, "test.txt", Default::default())
+                .unwrap();
         }
 
         std::env::set_current_dir(repo_path).unwrap();
@@ -1383,7 +1387,9 @@ mod tests {
         {
             let repo = Repository::init(repo_path).unwrap();
             std::fs::write(repo_path.join("test.txt"), "Line 1\nLine 2\nLine 3\n").unwrap();
-            repo.add("test.txt", Default::default()).unwrap();
+            let working_copy = repo.require_working_copy_id().unwrap();
+            repo.add(working_copy, "test.txt", Default::default())
+                .unwrap();
         }
 
         std::env::set_current_dir(repo_path).unwrap();
@@ -1407,7 +1413,9 @@ mod tests {
         {
             let repo = Repository::init(repo_path).unwrap();
             std::fs::write(&file_path, "Hello, World!\n").unwrap();
-            repo.add("hello.txt", Default::default()).unwrap();
+            let working_copy = repo.require_working_copy_id().unwrap();
+            repo.add(working_copy, "hello.txt", Default::default())
+                .unwrap();
             // repo is dropped here, releasing the database lock
         }
 
@@ -1442,7 +1450,8 @@ mod tests {
 
             // Step 5: Verify the file is detected as modified by checking status
             let repo = Repository::open(repo_path).unwrap();
-            let status = repo.status(Default::default()).unwrap();
+            let working_copy = repo.require_working_copy_id().unwrap();
+            let status = repo.status(working_copy, Default::default()).unwrap();
 
             // The file should be detected as modified
             let modified_count = status.modified_count();
@@ -1503,10 +1512,15 @@ mod tests {
             .unwrap();
 
             // Add all files
-            repo.add("README.md", Default::default()).unwrap();
-            repo.add("src/main.rs", Default::default()).unwrap();
-            repo.add("src/lib.rs", Default::default()).unwrap();
-            repo.add("config.toml", Default::default()).unwrap();
+            let working_copy = repo.require_working_copy_id().unwrap();
+            repo.add(working_copy, "README.md", Default::default())
+                .unwrap();
+            repo.add(working_copy, "src/main.rs", Default::default())
+                .unwrap();
+            repo.add(working_copy, "src/lib.rs", Default::default())
+                .unwrap();
+            repo.add(working_copy, "config.toml", Default::default())
+                .unwrap();
         }
 
         std::env::set_current_dir(repo_path).unwrap();
@@ -1551,7 +1565,8 @@ mod tests {
 
         // Step 5: Verify status detects all changes correctly
         let repo = Repository::open(repo_path).unwrap();
-        let status = repo.status(Default::default()).unwrap();
+        let working_copy = repo.require_working_copy_id().unwrap();
+        let status = repo.status(working_copy, Default::default()).unwrap();
 
         // Check modified files
         let modified_count = status.modified_count();
@@ -1669,8 +1684,11 @@ mod tests {
             let repo = Repository::init(repo_path).unwrap();
             std::fs::write(repo_path.join("file1.txt"), "Content 1").unwrap();
             std::fs::write(repo_path.join("file2.txt"), "Content 2").unwrap();
-            repo.add("file1.txt", Default::default()).unwrap();
-            repo.add("file2.txt", Default::default()).unwrap();
+            let working_copy = repo.require_working_copy_id().unwrap();
+            repo.add(working_copy, "file1.txt", Default::default())
+                .unwrap();
+            repo.add(working_copy, "file2.txt", Default::default())
+                .unwrap();
         }
 
         std::env::set_current_dir(repo_path).unwrap();
@@ -1694,7 +1712,9 @@ mod tests {
         {
             let repo = Repository::init(repo_path).unwrap();
             std::fs::write(repo_path.join("test.txt"), "Original content\n").unwrap();
-            repo.add("test.txt", Default::default()).unwrap();
+            let working_copy = repo.require_working_copy_id().unwrap();
+            repo.add(working_copy, "test.txt", Default::default())
+                .unwrap();
         }
 
         std::env::set_current_dir(repo_path).unwrap();
@@ -1718,7 +1738,9 @@ mod tests {
         {
             let repo = Repository::init(repo_path).unwrap();
             std::fs::write(repo_path.join("test.txt"), "Content").unwrap();
-            repo.add("test.txt", Default::default()).unwrap();
+            let working_copy = repo.require_working_copy_id().unwrap();
+            repo.add(working_copy, "test.txt", Default::default())
+                .unwrap();
         }
 
         std::env::set_current_dir(repo_path).unwrap();
@@ -1741,13 +1763,16 @@ mod tests {
         {
             let repo = Repository::init(repo_path).unwrap();
             std::fs::write(repo_path.join("code.rs"), "let x = 42;\n").unwrap();
-            repo.add("code.rs", Default::default()).unwrap();
+            let working_copy = repo.require_working_copy_id().unwrap();
+            repo.add(working_copy, "code.rs", Default::default())
+                .unwrap();
 
             // Record the initial state
             let header = atomic_core::change::ChangeHeader::builder()
                 .message("Initial commit")
                 .build();
-            repo.record(header, Default::default()).unwrap();
+            repo.record(working_copy, header, Default::default())
+                .unwrap();
         }
 
         // Modify the file (change value)
@@ -1784,7 +1809,9 @@ mod tests {
                 "Line 1\nLine 2\nLine 3\nLine 4\nLine 5\n",
             )
             .unwrap();
-            repo.add("test.txt", Default::default()).unwrap();
+            let working_copy = repo.require_working_copy_id().unwrap();
+            repo.add(working_copy, "test.txt", Default::default())
+                .unwrap();
         }
 
         std::env::set_current_dir(repo_path).unwrap();

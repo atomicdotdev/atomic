@@ -132,7 +132,7 @@ use atomic_core::change::{Author, Change, GraphOp, Provenance};
 use atomic_core::pristine::ViewTxnT;
 use atomic_core::types::{Base32, Hash};
 use atomic_repository::history::{find_change_sequence, get_change_at_sequence};
-use atomic_repository::Repository;
+use atomic_repository::{extract_move_evidence, LossNote, MoveAuthority, MoveBasis, Repository};
 
 use crate::commands::{
     find_repository_root, format_hash_with_length, format_timestamp, Command, DEFAULT_HASH_LENGTH,

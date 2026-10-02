@@ -45,6 +45,8 @@
 
 use std::fmt;
 
+use super::UnsupportedRepositoryCapability;
+
 /// Errors that can occur in pristine operations
 ///
 /// This enum covers all error conditions that can arise when interacting
@@ -165,12 +167,106 @@ pub enum PristineError {
         parent_name: String,
     },
 
+    /// A persisted view references a parent that is not present.
+    BrokenViewParent {
+        /// Internal ID of the child view.
+        view_id: u64,
+        /// Human-readable child view name.
+        view_name: String,
+        /// Missing parent view ID.
+        parent_id: u64,
+    },
+
+    /// Persistent working-copy storage has not been initialized.
+    WorkingCopySchemaUnavailable,
+
+    /// Persistent operation-journal storage has not been initialized.
+    OperationSchemaUnavailable,
+
+    /// A referenced immutable operation is absent.
+    OperationNotFound {
+        /// Canonical operation ID.
+        id: String,
+    },
+
+    /// An immutable operation references a parent that is absent.
+    OperationParentNotFound {
+        /// Operation being inserted.
+        operation: String,
+        /// Missing parent operation.
+        parent: String,
+    },
+
+    /// Compare-and-set observed a different current operation-head set.
+    OperationHeadConflict {
+        /// Human-readable operation scope.
+        scope: String,
+        /// Canonical expected head IDs.
+        expected: Vec<String>,
+        /// Canonical actual head IDs.
+        actual: Vec<String>,
+    },
+
+    /// A receipt references an effect ordinal not present in its operation.
+    EffectPlanNotFound {
+        /// Operation owning the effect plan.
+        operation: String,
+        /// Missing effect ordinal.
+        ordinal: u32,
+    },
+
+    /// A working-copy ID or canonical location is already bound elsewhere.
+    WorkingCopyIdentityConflict {
+        /// ID requested by the caller.
+        requested_id: String,
+        /// Existing ID that owns the conflicting identity or location.
+        existing_id: String,
+    },
+
+    /// A view cannot be deleted while working copies select it.
+    ViewHasWorkingCopies {
+        /// Human-readable view name.
+        name: String,
+        /// Working-copy IDs whose desired view points here.
+        working_copy_ids: Vec<String>,
+    },
+
     /// Change not found by its internal ID
     ///
     /// The NodeId doesn't correspond to any registered change.
     ChangeNotFound {
         /// The internal ID that wasn't found
         id: u64,
+    },
+
+    /// A change has no dependency-index marker.
+    UnindexedChangeDependencies {
+        /// Internal ID of the change that needs dependency-index repair.
+        change_id: u64,
+    },
+
+    /// The dependency-index marker disagrees with the stored unique rows.
+    ChangeDependencyCountMismatch {
+        /// Internal ID of the inconsistent change.
+        change_id: u64,
+        /// Unique dependency count recorded in the marker table.
+        expected: u64,
+        /// Unique dependency rows actually found.
+        actual: u64,
+    },
+
+    /// A dependency hash is not registered in the local repository.
+    MissingRegisteredDependency {
+        /// Internal ID of the depending change.
+        change_id: u64,
+        /// External hash of the missing dependency.
+        dependency: String,
+    },
+
+    /// The indexed change dependency graph contains a cycle.
+    DependencyCycle {
+        /// Internal change IDs forming the cycle, with the first repeated last.
+        cycle: Vec<u64>,
     },
 
     /// Hash not found in the external→internal mapping
@@ -187,6 +283,12 @@ pub enum PristineError {
     /// without wrapping to 0 and reusing an existing slot. In practice
     /// this is unreachable (requires 2^64 allocations).
     IdSpaceExhausted,
+
+    /// The repository requires capabilities unsupported by this build.
+    UnsupportedRequiredCapabilities {
+        /// Unsupported capability requirements in stable identifier order.
+        capabilities: Vec<UnsupportedRepositoryCapability>,
+    },
 
     // Data Errors
     /// Invalid span structure
@@ -285,8 +387,114 @@ impl fmt::Display for PristineError {
                     name, parent_name
                 )
             }
+            Self::BrokenViewParent {
+                view_id,
+                view_name,
+                parent_id,
+            } => write!(
+                f,
+                "view '{}' ({}) references missing parent view {}; repair the view hierarchy before resolving visibility",
+                view_name, view_id, parent_id
+            ),
+            Self::WorkingCopySchemaUnavailable => write!(
+                f,
+                "working-copy storage is unavailable; reopen the repository normally with write access to initialize the WORKING_COPIES table"
+            ),
+            Self::OperationSchemaUnavailable => write!(
+                f,
+                "operation-journal storage is unavailable; reopen the repository normally with write access to initialize OPERATIONS, OP_HEADS, and EFFECT_RECEIPTS"
+            ),
+            Self::OperationNotFound { id } => {
+                write!(f, "operation not found: {id}")
+            }
+            Self::OperationParentNotFound { operation, parent } => write!(
+                f,
+                "operation {operation} references missing parent operation {parent}"
+            ),
+            Self::OperationHeadConflict {
+                scope,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "operation-head compare-and-set conflict for {scope}: expected [{}], found [{}]",
+                expected.join(", "),
+                actual.join(", ")
+            ),
+            Self::EffectPlanNotFound { operation, ordinal } => write!(
+                f,
+                "operation {operation} has no effect plan with ordinal {ordinal}"
+            ),
+            Self::WorkingCopyIdentityConflict {
+                requested_id,
+                existing_id,
+            } if requested_id == existing_id => write!(
+                f,
+                "working-copy identity conflict: ID '{}' is already bound to a different canonical location",
+                requested_id
+            ),
+            Self::WorkingCopyIdentityConflict {
+                requested_id,
+                existing_id,
+            } => write!(
+                f,
+                "working-copy identity conflict: canonical location is already bound to ID '{}', not requested ID '{}'",
+                existing_id, requested_id
+            ),
+            Self::ViewHasWorkingCopies {
+                name,
+                working_copy_ids,
+            } => write!(
+                f,
+                "cannot delete view '{}': selected by working copies: {}",
+                name,
+                working_copy_ids.join(", ")
+            ),
             Self::IdSpaceExhausted => write!(f, "internal ID space exhausted (u64::MAX reached)"),
+            Self::UnsupportedRequiredCapabilities { capabilities } => write!(
+                f,
+                "repository requires unsupported capabilities: {}; upgrade Atomic to a version that supports every required repository capability before reopening",
+                capabilities
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
             Self::ChangeNotFound { id } => write!(f, "change not found: {}", id),
+            Self::UnindexedChangeDependencies { change_id } => write!(
+                f,
+                "change {} has no indexed dependency metadata; backfill the dependency index before graph traversal",
+                change_id
+            ),
+            Self::ChangeDependencyCountMismatch {
+                change_id,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "change {} dependency index count mismatch: marker says {}, but {} unique rows were found; rebuild the dependency index",
+                change_id, expected, actual
+            ),
+            Self::MissingRegisteredDependency {
+                change_id,
+                dependency,
+            } => write!(
+                f,
+                "change {} depends on {}, which is not registered locally; fetch or register the dependency before graph traversal",
+                change_id, dependency
+            ),
+            Self::DependencyCycle { cycle } => {
+                let path = cycle
+                    .iter()
+                    .map(u64::to_string)
+                    .collect::<Vec<_>>()
+                    .join(" -> ");
+                write!(
+                    f,
+                    "change dependency cycle detected ({}); repair the dependency index before graph traversal",
+                    path
+                )
+            }
             Self::HashNotFound { hash } => write!(f, "hash not found: {}", hash),
 
             // Data errors
@@ -428,8 +636,102 @@ mod tests {
                 &["cannot set parent", "a", "b", "cycle"],
             ),
             (
+                PristineError::BrokenViewParent {
+                    view_id: 3,
+                    view_name: "feature".into(),
+                    parent_id: 99,
+                },
+                &["feature", "3", "missing parent", "99", "repair"],
+            ),
+            (
+                PristineError::WorkingCopySchemaUnavailable,
+                &["working-copy storage", "WORKING_COPIES", "write access"],
+            ),
+            (
+                PristineError::OperationSchemaUnavailable,
+                &[
+                    "operation-journal storage",
+                    "OPERATIONS",
+                    "OP_HEADS",
+                    "EFFECT_RECEIPTS",
+                ],
+            ),
+            (
+                PristineError::OperationNotFound { id: "OP1".into() },
+                &["operation not found", "OP1"],
+            ),
+            (
+                PristineError::OperationParentNotFound {
+                    operation: "OP2".into(),
+                    parent: "OP1".into(),
+                },
+                &["OP2", "missing parent", "OP1"],
+            ),
+            (
+                PristineError::OperationHeadConflict {
+                    scope: "repository".into(),
+                    expected: vec!["OP1".into()],
+                    actual: vec!["OP2".into()],
+                },
+                &["compare-and-set conflict", "repository", "OP1", "OP2"],
+            ),
+            (
+                PristineError::EffectPlanNotFound {
+                    operation: "OP1".into(),
+                    ordinal: 7,
+                },
+                &["OP1", "effect plan", "7"],
+            ),
+            (
+                PristineError::WorkingCopyIdentityConflict {
+                    requested_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".into(),
+                    existing_id: "01BX5ZZKBKACTAV9WEVGEMMVRZ".into(),
+                },
+                &[
+                    "working-copy identity conflict",
+                    "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+                    "01BX5ZZKBKACTAV9WEVGEMMVRZ",
+                ],
+            ),
+            (
+                PristineError::ViewHasWorkingCopies {
+                    name: "feature".into(),
+                    working_copy_ids: vec!["01ARZ3NDEKTSV4RRFFQ69G5FAV".into()],
+                },
+                &[
+                    "cannot delete view",
+                    "feature",
+                    "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+                ],
+            ),
+            (
                 PristineError::ChangeNotFound { id: 42 },
                 &["change not found", "42"],
+            ),
+            (
+                PristineError::UnindexedChangeDependencies { change_id: 7 },
+                &["7", "no indexed dependency", "backfill"],
+            ),
+            (
+                PristineError::ChangeDependencyCountMismatch {
+                    change_id: 7,
+                    expected: 2,
+                    actual: 1,
+                },
+                &["7", "count mismatch", "2", "1", "rebuild"],
+            ),
+            (
+                PristineError::MissingRegisteredDependency {
+                    change_id: 7,
+                    dependency: "ABCD1234".into(),
+                },
+                &["7", "ABCD1234", "not registered locally", "fetch"],
+            ),
+            (
+                PristineError::DependencyCycle {
+                    cycle: vec![1, 2, 1],
+                },
+                &["dependency cycle", "1 -> 2 -> 1", "repair"],
             ),
             (
                 PristineError::HashNotFound {
@@ -497,7 +799,47 @@ mod tests {
                 name: "a".into(),
                 parent_name: "b".into(),
             },
+            PristineError::BrokenViewParent {
+                view_id: 1,
+                view_name: "x".into(),
+                parent_id: 2,
+            },
+            PristineError::WorkingCopySchemaUnavailable,
+            PristineError::OperationSchemaUnavailable,
+            PristineError::OperationNotFound { id: "x".into() },
+            PristineError::OperationParentNotFound {
+                operation: "x".into(),
+                parent: "y".into(),
+            },
+            PristineError::OperationHeadConflict {
+                scope: "repository".into(),
+                expected: vec!["x".into()],
+                actual: vec!["y".into()],
+            },
+            PristineError::EffectPlanNotFound {
+                operation: "x".into(),
+                ordinal: 0,
+            },
+            PristineError::WorkingCopyIdentityConflict {
+                requested_id: "x".into(),
+                existing_id: "y".into(),
+            },
+            PristineError::ViewHasWorkingCopies {
+                name: "x".into(),
+                working_copy_ids: vec!["y".into()],
+            },
             PristineError::ChangeNotFound { id: 1 },
+            PristineError::UnindexedChangeDependencies { change_id: 1 },
+            PristineError::ChangeDependencyCountMismatch {
+                change_id: 1,
+                expected: 2,
+                actual: 1,
+            },
+            PristineError::MissingRegisteredDependency {
+                change_id: 1,
+                dependency: "x".into(),
+            },
+            PristineError::DependencyCycle { cycle: vec![1, 1] },
             PristineError::HashNotFound { hash: "x".into() },
             PristineError::InvalidVertex {
                 message: "x".into(),

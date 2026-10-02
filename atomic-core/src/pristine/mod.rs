@@ -125,8 +125,10 @@
 //! | `VIEWS` | name | ViewState | View metadata |
 //! | `VIEW_CHANGES` | (view_id, seq) | change_id | Change log |
 //! | `REV_VIEW_CHANGES` | (view_id, change_id) | seq | Reverse change log |
-//! | `TREE` | path | inode | Path → inode mapping |
-//! | `REV_TREE` | inode | path | Inode → path mapping |
+//! | `PRISTINE_META` | metadata key | version | Derived-index completion and required capabilities |
+//! | `PATH_CLAIMS` | path | fixed claim event | Additive, unfiltered path transitions |
+//! | `TREE` | path | inode | Unambiguous path → inode projection |
+//! | `REV_TREE` | inode | path | Exact inverse of TREE |
 //! | `INODES` | inode | Position | Inode → graph position |
 //! | `REV_INODES` | Position | inode | Graph position → inode |
 //! | `DEPS` | change_id | `dep_id` | Dependencies (multimap) |
@@ -147,9 +149,15 @@
 //! The `INODE_GRAPH` secondary index enables O(n) file traversal where n is
 //! proportional to file size, rather than O(N) where N is total graph size.
 
+mod attribute;
+mod bindings;
+mod capability;
 mod error;
 mod inode_graph;
 pub mod ontology;
+mod path_claim;
+mod ref_mapping;
+mod set_id_index;
 pub(crate) mod span_index;
 pub mod tables;
 mod traits;
@@ -157,17 +165,56 @@ mod txn;
 pub mod vault;
 pub mod view_graph;
 
+pub use attribute::{
+    attr_event_dependency_frontier, decode_inode_attr_event, encode_inode_attr_event,
+    InodeAttrEvent, InodeAttrMutTxnT, InodeAttrState, InodeAttrTxnT, INODE_ATTR_EVENT_SIZE,
+    INODE_ATTR_EVENT_VERSION,
+};
+pub use bindings::{BindingMutTxnT, BindingStoreOutcome, BindingTxnT};
+pub use capability::{
+    RepositoryCapability, RequiredRepositoryCapability, UnsupportedRepositoryCapability,
+    BRIDGE_CUTOVER_CAPABILITY, CHANGE_FORMAT_VNEXT_CAPABILITY, REQUIRED_CAPABILITY_PREFIX,
+    SUPPORTED_REPOSITORY_CAPABILITIES,
+};
 pub use error::{PristineError, PristineResult};
+mod file_index_v2;
+
+pub use file_index_v2::{
+    decode_file_index_v2, encode_file_index_v2, FileIndexTimestamp, FileIndexV2Entry,
+    FileIndexV2Fields, FileIndexV2Key, FILE_INDEX_V2_KEY_VERSION, FILE_INDEX_V2_VALUE_SIZE,
+    FILE_INDEX_V2_VERSION,
+};
+
 pub use inode_graph::{
-    InodeAdjState, InodeEdgeIter, InodeGraphOps, InodeGraphStats, InodeVertex, IntoInodeVertex,
+    InodeAdjState, InodeEdgeIter, InodeGraphOps, InodeGraphStats, InodeScopedGraph, InodeVertex,
+    IntoInodeVertex,
+};
+pub use path_claim::{
+    decode_path_claim_event, encode_path_claim_event, PathClaimEntry, PathClaimEvent, PathClaimId,
+    PathClaimKind, PathClaimState, PATH_CLAIM_EVENT_SIZE, PATH_CLAIM_EVENT_VERSION,
+    PATH_CLAIM_SCHEMA_KEY, PATH_CLAIM_SCHEMA_VERSION,
+};
+pub use ref_mapping::{
+    RefMapping, RefMappingMutTxnT, RefMappingTxnT, RefSyncStatus, REF_MAPPING_VERSION,
+};
+pub use set_id_index::{
+    decode_set_id_index_entry, encode_set_id_index_entry, SetIdIndexEntry, SetIdIndexMutTxnT,
+    SetIdIndexTxnT, SET_ID_INDEX_V1_SIZE, SET_ID_INDEX_VERSION,
 };
 pub use tables::directory_flags;
 pub use tables::*;
 pub use traits::{
-    CrdtTxnT, EmbeddingsMutTxnT, EmbeddingsTxnT, FileIndexEntry, FileIndexMetadata,
-    GitShaIndexMutTxnT, GitShaIndexTxnT, GraphTxnT, KgMutTxnT, KgTxnT, MutTxnT, StoredConflict,
+    decode_working_copy_record, encode_working_copy_record, BridgeEventCaptureMutTxnT,
+    BridgeEventCaptureTxnT, CapabilityMutTxnT, CapabilityTxnT, CrdtTxnT,
+    EffectiveProjectionClosure, EmbeddingsMutTxnT, EmbeddingsTxnT, FileIndexEntry,
+    FileIndexMetadata, FileIndexV2MutTxnT, FileIndexV2TxnT, GitCommitClosureMutTxnT,
+    GitCommitClosureTxnT, GitShaIndexMutTxnT, GitShaIndexTxnT, GraphTxnT, GraphVisibilityClosure,
+    KgMutTxnT, KgTxnT, MutTxnT, NativeDerivedIndexes, NativeDerivedIndexesMutTxnT,
+    OperationMutTxnT, OperationTxnT, PathClaimMutTxnT, PathClaimTxnT, StoredConflict,
     StoredConflictKind, TagKind, TagMutTxnT, TagRecord, TagTxnT, TreeTxnT, VaultEntryMeta,
-    VaultMutTxnT, VaultTxnT, VertexExt, ViewScope, ViewState, ViewTxnT,
+    VaultMutTxnT, VaultTxnT, VertexExt, ViewMembershipSet, ViewScope, ViewState, ViewTxnT,
+    WorkingCopyMutTxnT, WorkingCopyRecord, WorkingCopyTxnT, WORKING_COPY_RECORD_V1_SIZE,
+    WORKING_COPY_RECORD_VERSION,
 };
 pub use txn::{AdjIterator, CachedGraphTxn, InodePreloadTxn, Pristine, ReadTxn, WriteTxn};
 pub use vault::{

@@ -77,6 +77,27 @@ pub enum AssemblyError {
     /// This should not normally happen, but indicates a bug if it does.
     #[error("Dependency cycle detected")]
     DependencyCycle,
+
+    /// The per-change ROOT-placeholder identity namespace is exhausted
+    /// (CB-9B review B1).
+    ///
+    /// Placeholder branch/leaf/trunk-file indices must stay unique within a
+    /// change and are capped at `u32::MAX`. Recording a further semantic
+    /// entry that cannot fit fails closed with this typed error instead of
+    /// wrapping the namespace (release mode) or panicking on overflow
+    /// (debug mode).
+    #[error(
+        "placeholder {namespace} namespace exhausted: next index {next_index} exceeds limit {limit}"
+    )]
+    PlaceholderNamespaceExhausted {
+        /// Which placeholder family ran out of namespace (`branch`,
+        /// `leaf`, or `trunk-file`).
+        namespace: &'static str,
+        /// The first index the next entry would need.
+        next_index: u64,
+        /// The inclusive namespace limit (`u32::MAX`).
+        limit: u64,
+    },
 }
 
 /// Result type for assembly operations.

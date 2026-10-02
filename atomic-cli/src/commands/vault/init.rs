@@ -2,6 +2,7 @@
 
 use clap::Parser;
 
+use atomic_core::WorkingCopyId;
 use atomic_repository::Repository;
 
 use crate::commands::{find_repository_root, Command};
@@ -30,6 +31,10 @@ impl Command for Init {
             reason: e.to_string(),
         })?;
 
+        let working_copy = repo
+            .require_working_copy_id()
+            .map_err(CliError::Repository)?;
+
         if repo.has_vault().unwrap_or(false) {
             print_info("Vault is already initialized");
             return Ok(());
@@ -44,7 +49,7 @@ impl Command for Init {
         // Add all vault files to tracking
         let vault_dir = repo.vault_dir();
         if vault_dir.exists() {
-            add_vault_files_recursive(&repo, &vault_dir)?;
+            add_vault_files_recursive(&repo, working_copy, &vault_dir)?;
         }
 
         // Record vault files as their own change
@@ -52,7 +57,7 @@ impl Command for Init {
         let options = atomic_repository::RecordOptions::new()
             .add_path(".vault")
             .detect_raw_renames(false);
-        match repo.record(header, options) {
+        match repo.record(working_copy, header, options) {
             Ok(_) => print_success("Recorded vault defaults"),
             Err(atomic_repository::RecordError::NothingToRecord) => {}
             Err(e) => log::warn!("Failed to record vault files: {}", e),
@@ -62,15 +67,23 @@ impl Command for Init {
     }
 }
 
-fn add_vault_files_recursive(repo: &Repository, dir: &std::path::Path) -> CliResult<()> {
+fn add_vault_files_recursive(
+    repo: &Repository,
+    working_copy: WorkingCopyId,
+    dir: &std::path::Path,
+) -> CliResult<()> {
     if let Ok(entries) = std::fs::read_dir(dir) {
         for entry in entries.flatten() {
             let path = entry.path();
             if path.is_dir() {
-                add_vault_files_recursive(repo, &path)?;
+                add_vault_files_recursive(repo, working_copy, &path)?;
             } else if path.is_file() {
                 if let Ok(rel) = path.strip_prefix(repo.root()) {
-                    let _ = repo.add(rel, atomic_repository::TrackingOptions::default());
+                    let _ = repo.add(
+                        working_copy,
+                        rel,
+                        atomic_repository::TrackingOptions::default(),
+                    );
                 }
             }
         }

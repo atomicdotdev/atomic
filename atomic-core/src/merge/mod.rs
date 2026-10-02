@@ -23,7 +23,7 @@ mod resolved;
 pub mod three_way;
 mod types;
 
-pub use engine::{SemanticMergeEngine, TxnOnlyMergeEngine};
+pub use engine::{SemanticMergeEngine, SemanticMergeError, TxnOnlyMergeEngine};
 pub use resolved::ResolvedConflicts;
 pub use three_way::{three_way_merge, three_way_merge_bytes, tokenize, MergeToken, ThreeWayResult};
 pub use types::{ConflictGroup, LeafEdit, MergeSource};

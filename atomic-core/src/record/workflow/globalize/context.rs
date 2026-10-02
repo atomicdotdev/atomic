@@ -59,6 +59,12 @@ pub struct GlobalizeContext<'txn, T> {
     /// Globalization frequently asks for the same file's line vertices across
     /// many hunks in a single recorded file. Cache that traversal once.
     pub(super) content_vertices_cache: std::collections::HashMap<Inode, Vec<GraphNode<NodeId>>>,
+
+    /// Directory inode anchors available to additions in the change being built.
+    ///
+    /// Persisted anchors carry an external hash; directories introduced by this
+    /// change use `None` and their `add_inode.start` position.
+    pub(super) directory_anchors: std::collections::HashMap<String, Position<Option<Hash>>>,
 }
 
 impl<'txn, T> GlobalizeContext<'txn, T>
@@ -86,6 +92,7 @@ where
             inode_cache: std::collections::HashMap::new(),
             position_cache: std::collections::HashMap::new(),
             content_vertices_cache: std::collections::HashMap::new(),
+            directory_anchors: std::collections::HashMap::new(),
         }
     }
 
@@ -110,6 +117,7 @@ where
             inode_cache: std::collections::HashMap::new(),
             position_cache: std::collections::HashMap::new(),
             content_vertices_cache: std::collections::HashMap::new(),
+            directory_anchors: std::collections::HashMap::new(),
         }
     }
 
@@ -163,10 +171,24 @@ where
             // Root node has no hash dependency
             return Ok(());
         }
-        if let Some(hash) = self.txn.get_external(node_id)? {
-            self.dependencies.insert(hash);
-        }
+        let hash = self
+            .txn
+            .get_external(node_id)?
+            .ok_or(GlobalizeError::MissingExternalHash { node_id })?;
+        self.dependencies.insert(hash);
         Ok(())
+    }
+
+    pub(super) fn directory_anchor(&self, path: &str) -> Option<Position<Option<Hash>>> {
+        self.directory_anchors.get(path).copied()
+    }
+
+    pub(super) fn register_directory_anchor(
+        &mut self,
+        path: impl Into<String>,
+        anchor: Position<Option<Hash>>,
+    ) {
+        self.directory_anchors.insert(path.into(), anchor);
     }
 
     /// Get the collected dependencies.

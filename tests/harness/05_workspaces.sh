@@ -8,12 +8,11 @@
 # Key principle: "views, not forks."  The repository (pristine, changes)
 # is shared.  The working copy is a projection of the active view.
 # switch_view swaps the ENTIRE projection — tracked files from the graph,
-# artifacts from .atomic/workspaces/<view>/.
+# artifacts from .atomic/working-copies/<id>/workspaces/<view>/.
 #
 # Under the hood, switch_view uses rename() (O(1) on same filesystem)
 # to swap ignored entries between the working copy and workspace storage.
-# A future enhancement will use reflinks (copy-on-write clones) for
-# additional efficiency on supported filesystems.
+# Operation leases and receipts make each rename interruption-safe.
 #
 # There is NO separate "workspace" CLI.  Views ARE workspaces.
 # view create → creates the view + its workspace storage
@@ -31,7 +30,14 @@
 #   7. Tracked files continue to be managed by the graph (existing behavior)
 #   8. Multiple views can each have different versions of the same artifact
 #   9. Workspaces survive across many round-trip switches
-#  10. Workspace storage lives in .atomic/ (durable, not /tmp)
+#  10. Workspace storage lives in .atomic/working-copies/<id>/ (durable, not /tmp)
+
+working_copy_workspace_path() {
+    local view="$1"
+    local id
+    id="$(tr -d '[:space:]' < .atomic/working_copy_id)"
+    printf '.atomic/working-copies/%s/workspaces/%s' "$id" "$view"
+}
 
 HARNESS_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$HARNESS_DIR/helpers.sh"
@@ -112,15 +118,15 @@ assert_dir_not_exists \
 # They should be shelved in dev's workspace
 assert_dir_exists \
     "node_modules shelved in dev workspace" \
-    ".atomic/workspaces/dev/node_modules"
+    "$(working_copy_workspace_path dev)/node_modules"
 
 assert_file_exists \
     "lodash shelved in dev workspace" \
-    ".atomic/workspaces/dev/node_modules/lodash/index.js"
+    "$(working_copy_workspace_path dev)/node_modules/lodash/index.js"
 
 assert_dir_exists \
     "dist shelved in dev workspace" \
-    ".atomic/workspaces/dev/dist"
+    "$(working_copy_workspace_path dev)/dist"
 
 # ═══════════════════════════════════════════════════════════════════════════
 begin_section "Workspace: Ignored files restored on switch back"
@@ -693,8 +699,8 @@ fi
 begin_section "Workspace: Workspace storage is durable"
 # ═══════════════════════════════════════════════════════════════════════════
 #
-# Workspace state lives in .atomic/workspaces/ — inside the project
-# directory.  It is NOT in /tmp.  Verify the paths.
+# Workspace state is working-copy scoped under .atomic/working-copies/ —
+# inside the project directory, never /tmp.
 
 make_temp_repo "ws-durable"
 init_repo
@@ -715,14 +721,14 @@ switch_view "feature" >/dev/null 2>&1 || true
 # Verify workspace is inside .atomic/ (durable path)
 assert_dir_exists \
     "workspace storage is inside .atomic/" \
-    ".atomic/workspaces"
+    ".atomic/working-copies"
 
 assert_dir_exists \
-    "dev workspace is inside .atomic/workspaces/" \
-    ".atomic/workspaces/dev"
+    "dev workspace is working-copy scoped" \
+    "$(working_copy_workspace_path dev)"
 
 # Verify it's the actual content (not a symlink to /tmp)
-actual_path="$(cd .atomic/workspaces/dev 2>/dev/null && pwd -P)"
+actual_path="$(cd "$(working_copy_workspace_path dev)" 2>/dev/null && pwd -P)"
 if echo "$actual_path" | grep -q "/tmp"; then
     _fail "workspace is NOT in /tmp" "path resolved to $actual_path"
 else
@@ -732,10 +738,10 @@ fi
 # Verify the shelved content is really there
 assert_file_exists \
     "shelved dep exists on disk" \
-    ".atomic/workspaces/dev/node_modules/dep.js"
+    "$(working_copy_workspace_path dev)/node_modules/dep.js"
 assert_file_content \
     "shelved dep has correct content" \
-    ".atomic/workspaces/dev/node_modules/dep.js" \
+    "$(working_copy_workspace_path dev)/node_modules/dep.js" \
     "dep_content"
 
 # ═══════════════════════════════════════════════════════════════════════════

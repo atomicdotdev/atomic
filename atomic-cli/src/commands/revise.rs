@@ -81,9 +81,11 @@ use atomic_core::types::{Base32, Hash};
 use atomic_identity::IdentityStore;
 use atomic_repository::{
     HistoryEntry, HistoryOptions, RecordOptions, Repository, StatusOptions, UnrecordOptions,
+    WorkspaceTxnMode,
 };
 use clap::Parser;
 
+use crate::commands::workspace_txn::enter_workspace;
 use crate::commands::{find_repository_root, format_hash, Command};
 use crate::error::{CliError, CliResult};
 use crate::output::{print_hint, print_success, print_warning};
@@ -285,13 +287,16 @@ impl Revise {
     }
 
     /// Resolve the reference to a sequence number and entry.
-    fn resolve_reference(&self, repo: &Repository) -> CliResult<(u64, HistoryEntry)> {
+    fn resolve_reference(
+        &self,
+        repo: &Repository,
+        workspace_view: &str,
+    ) -> CliResult<(u64, HistoryEntry)> {
         let change_ref = self.parse_reference();
 
         // Get current view info
-        let stack_name = repo.current_view();
         let stack_info = repo
-            .get_view_info(stack_name)
+            .get_view_info(workspace_view)
             .map_err(CliError::Repository)?;
 
         if stack_info.change_count == 0 {
@@ -308,13 +313,13 @@ impl Revise {
                 .map_err(|e| CliError::Internal(anyhow::anyhow!("{}", e)))?,
             ChangeRef::Hash(hash_str) => {
                 // Find the change by hash prefix
-                self.find_by_hash(repo, hash_str)?
+                self.find_by_hash(repo, workspace_view, hash_str)?
             }
         };
 
         // Get the history entry at that sequence using log
         let history = repo
-            .log(HistoryOptions::default())
+            .log(HistoryOptions::default().view(workspace_view))
             .map_err(CliError::Repository)?;
 
         let entry = history
@@ -328,10 +333,15 @@ impl Revise {
     }
 
     /// Find a change by hash prefix.
-    fn find_by_hash(&self, repo: &Repository, hash_str: &str) -> CliResult<u64> {
+    fn find_by_hash(
+        &self,
+        repo: &Repository,
+        workspace_view: &str,
+        hash_str: &str,
+    ) -> CliResult<u64> {
         // Get history and search for matching hash
         let history = repo
-            .log(HistoryOptions::default())
+            .log(HistoryOptions::default().view(workspace_view))
             .map_err(CliError::Repository)?;
 
         let hash_lower = hash_str.to_lowercase();
@@ -449,12 +459,12 @@ impl Revise {
     fn display_dry_run(
         &self,
         repo: &Repository,
+        workspace_view: &str,
         sequence: u64,
         entry: &HistoryEntry,
     ) -> CliResult<()> {
-        let stack_name = repo.current_view();
         let stack_info = repo
-            .get_view_info(stack_name)
+            .get_view_info(workspace_view)
             .map_err(CliError::Repository)?;
         let changes_to_unrecord = stack_info.change_count - sequence;
 
@@ -473,7 +483,7 @@ impl Revise {
 
             // Get history entries for display
             let history = repo
-                .log(HistoryOptions::default())
+                .log(HistoryOptions::default().view(workspace_view))
                 .map_err(CliError::Repository)?;
 
             // Filter and display entries from sequence to end (in reverse order)
@@ -517,12 +527,13 @@ impl Revise {
     fn execute_revise(
         &self,
         repo: &Repository,
+        working_copy: atomic_core::types::WorkingCopyId,
+        workspace_view: &str,
         sequence: u64,
         entry: &HistoryEntry,
     ) -> CliResult<Hash> {
-        let stack_name = repo.current_view();
         let stack_info = repo
-            .get_view_info(stack_name)
+            .get_view_info(workspace_view)
             .map_err(CliError::Repository)?;
 
         // Load the original change to get its message
@@ -541,7 +552,7 @@ impl Revise {
         if changes_to_unrecord > 1 {
             // Get history and collect changes after the target
             let history = repo
-                .log(HistoryOptions::default())
+                .log(HistoryOptions::default().view(workspace_view))
                 .map_err(CliError::Repository)?;
 
             // Collect entries after the target sequence, sorted by sequence
@@ -565,7 +576,7 @@ impl Revise {
 
         // Unrecord in reverse order (from newest to target)
         for _ in 0..changes_to_unrecord {
-            repo.unrecord_last(UnrecordOptions::default())
+            repo.unrecord_last(UnrecordOptions::default().view(workspace_view))
                 .map_err(|e| CliError::Internal(anyhow::anyhow!("Failed to unrecord: {}", e)))?;
         }
 
@@ -587,7 +598,14 @@ impl Revise {
         // Handle --reword mode differently: create a new change with same content
         // but different header, rather than going through working copy
         if self.reword {
-            return self.execute_reword(repo, &original_change, &message, author, &pending_changes);
+            return self.execute_reword(
+                repo,
+                workspace_view,
+                &original_change,
+                &message,
+                author,
+                &pending_changes,
+            );
         }
 
         // Build header for content modification mode
@@ -598,7 +616,7 @@ impl Revise {
         let header = header_builder.build();
 
         // Build record options for content modification mode
-        let mut options = RecordOptions::default();
+        let mut options = RecordOptions::default().view(workspace_view);
 
         if !self.files.is_empty() {
             options = options.paths(
@@ -610,7 +628,7 @@ impl Revise {
         }
 
         // Record the revised change
-        let outcome = repo.record(header, options).map_err(|e| {
+        let outcome = repo.record(working_copy, header, options).map_err(|e| {
             // If recording fails, we should try to restore the state
             print_warning(&format!(
                 "Recording failed: {}. Attempting to restore...",
@@ -619,7 +637,7 @@ impl Revise {
 
             // Try to re-apply all the unrecorded changes
             for hash in pending_changes.iter().rev() {
-                if let Err(restore_err) = repo.reinsert_change(hash, None) {
+                if let Err(restore_err) = repo.reinsert_change_on_view(workspace_view, hash, None) {
                     print_warning(&format!(
                         "Failed to restore change {}: {}",
                         format_hash(hash, false),
@@ -638,18 +656,19 @@ impl Revise {
             print_hint(&format!("Re-applying {} changes...", pending_changes.len()));
 
             for hash in &pending_changes {
-                repo.reinsert_change(hash, None).map_err(|e| {
-                    print_warning(&format!(
-                        "Failed to re-apply change {}: {}",
-                        format_hash(hash, false),
-                        e
-                    ));
-                    CliError::Internal(anyhow::anyhow!(
-                        "Failed to re-apply change {}: {}",
-                        format_hash(hash, false),
-                        e
-                    ))
-                })?;
+                repo.reinsert_change_on_view(workspace_view, hash, None)
+                    .map_err(|e| {
+                        print_warning(&format!(
+                            "Failed to re-apply change {}: {}",
+                            format_hash(hash, false),
+                            e
+                        ));
+                        CliError::Internal(anyhow::anyhow!(
+                            "Failed to re-apply change {}: {}",
+                            format_hash(hash, false),
+                            e
+                        ))
+                    })?;
             }
         }
 
@@ -665,6 +684,7 @@ impl Revise {
     fn execute_reword(
         &self,
         repo: &Repository,
+        workspace_view: &str,
         original_change: &Change,
         message: &str,
         author: Option<atomic_core::change::Author>,
@@ -711,28 +731,32 @@ impl Revise {
         })?;
 
         // Insert the new change into the view (it replaces the unrecorded one)
-        repo.insert_change(&new_hash, Default::default())
-            .map_err(|e| {
-                CliError::Internal(anyhow::anyhow!("Failed to apply reworded change: {}", e))
-            })?;
+        repo.insert_change(
+            &new_hash,
+            atomic_repository::InsertOptions::default().view(workspace_view),
+        )
+        .map_err(|e| {
+            CliError::Internal(anyhow::anyhow!("Failed to apply reworded change: {}", e))
+        })?;
 
         // Re-apply pending changes
         if !pending_changes.is_empty() {
             print_hint(&format!("Re-applying {} changes...", pending_changes.len()));
 
             for hash in pending_changes {
-                repo.reinsert_change(hash, None).map_err(|e| {
-                    print_warning(&format!(
-                        "Failed to re-apply change {}: {}",
-                        format_hash(hash, false),
-                        e
-                    ));
-                    CliError::Internal(anyhow::anyhow!(
-                        "Failed to re-apply change {}: {}",
-                        format_hash(hash, false),
-                        e
-                    ))
-                })?;
+                repo.reinsert_change_on_view(workspace_view, hash, None)
+                    .map_err(|e| {
+                        print_warning(&format!(
+                            "Failed to re-apply change {}: {}",
+                            format_hash(hash, false),
+                            e
+                        ));
+                        CliError::Internal(anyhow::anyhow!(
+                            "Failed to re-apply change {}: {}",
+                            format_hash(hash, false),
+                            e
+                        ))
+                    })?;
             }
         }
 
@@ -760,20 +784,33 @@ impl Command for Revise {
     fn run(&self) -> CliResult<()> {
         // Find and open repository
         let repo_root = find_repository_root()?;
-        let repo = Repository::open(&repo_root).map_err(CliError::Repository)?;
+        let mode = if self.dry_run {
+            WorkspaceTxnMode::Observe
+        } else {
+            WorkspaceTxnMode::Reconcile
+        };
+        let mut repo = match mode {
+            WorkspaceTxnMode::Observe => Repository::open_readonly(&repo_root),
+            WorkspaceTxnMode::Reconcile => Repository::open_for_workspace_transaction(&repo_root),
+            WorkspaceTxnMode::Force => unreachable!("revise never forces workspace entry"),
+        }
+        .map_err(CliError::Repository)?;
+        let workspace = enter_workspace(&mut repo, mode)?;
+        let working_copy = workspace.working_copy();
+        let workspace_view = &workspace.view().name;
 
         // Resolve the reference
-        let (sequence, entry) = self.resolve_reference(&repo)?;
+        let (sequence, entry) = self.resolve_reference(&repo, workspace_view)?;
 
         // Dry run mode
         if self.dry_run {
-            return self.display_dry_run(&repo, sequence, &entry);
+            return self.display_dry_run(&repo, workspace_view, sequence, &entry);
         }
 
         // Check for uncommitted changes if not in reword mode
         if !self.reword {
             let status = repo
-                .status(StatusOptions::default())
+                .status(working_copy, StatusOptions::default())
                 .map_err(CliError::Repository)?;
 
             if status.is_clean() && self.message.is_none() {
@@ -790,7 +827,8 @@ impl Command for Revise {
             sequence
         );
 
-        let new_hash = self.execute_revise(&repo, sequence, &entry)?;
+        let new_hash =
+            self.execute_revise(&repo, working_copy, workspace_view, sequence, &entry)?;
 
         // Success message
         println!();

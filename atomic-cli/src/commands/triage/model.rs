@@ -41,8 +41,12 @@ pub(crate) const F_OPEN_REMEDIATION: &str = FINDING_CODE[9];
 /// A reached work intent whose changes are not covered by an independent,
 /// completed review intent (the review-coverage promotion gate).
 pub(crate) const F_UNREVIEWED_CHANGE: &str = FINDING_CODE[10];
+/// A candidate change for promotion into a shared target whose managed
+/// provenance evidence fails the trusted publication gate (CB-12B). Blocking
+/// for shared targets only; content correctness is separate.
+pub(crate) const F_PUBLICATION_GATE: &str = FINDING_CODE[11];
 
-// All eleven closed-vocabulary finding codes are now populated by `build_report`.
+// All twelve closed-vocabulary finding codes are now populated by `build_report`.
 
 // ── Severities ──────────────────────────────────────────────────────────────
 

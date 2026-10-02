@@ -121,8 +121,14 @@ impl Command for Delete {
             other => CliError::Repository(other),
         })?;
 
-        // Check if trying to delete the current view
-        if repo.current_view() == name {
+        // Check if trying to delete the working copy's desired view
+        let working_copy = repo
+            .require_working_copy_id()
+            .map_err(CliError::Repository)?;
+        let desired_view = repo
+            .desired_view_name(working_copy)
+            .map_err(CliError::Repository)?;
+        if desired_view == name.as_str() {
             return Err(CliError::CannotDeleteCurrentView {
                 name: name.to_string(),
             });
@@ -152,7 +158,15 @@ impl Command for Delete {
             }
         }
 
-        // Delete the view
+        // Capture scope before deletion: the mapping reconciliation depends
+        // on the view's scope (CB-10A).
+        let scope = repo.get_view_info(name).ok().map(|info| info.scope);
+
+        // CB-10A review R5: deletion eligibility is decided FIRST and only a
+        // successful deletion may touch mappings. `delete_view` refuses
+        // Shared views (permanent) and views with children; calling it before
+        // any mapping effect means a refused delete leaves the mapping bytes,
+        // Git refs, view rows and operation state untouched.
         repo.delete_view(name).map_err(|e| match e {
             atomic_repository::RepositoryError::ViewNotFound { name } => {
                 CliError::ViewNotFound { name }
@@ -162,6 +176,18 @@ impl Command for Delete {
             }
             other => CliError::Repository(other),
         })?;
+
+        // CB-10A: a Draft's mapping row is removed together with the (now
+        // deleted) view. A Shared view can never reach this point: deletion
+        // is refused above and its mapping stays intact.
+        if let Some(atomic_core::pristine::ViewScope::Draft) = scope {
+            repo.reconcile_mapping_after_view_delete(
+                working_copy,
+                name,
+                atomic_core::pristine::ViewScope::Draft,
+            )
+            .map_err(CliError::Repository)?;
+        }
 
         print_success(&format!("Deleted view: {}", style_view(name)));
 

@@ -17,13 +17,19 @@ use atomic_core::change::format_v3::{ChangeReader, ChangeSignature, SectionType}
 use atomic_core::change::signing::{sign_change, verify_change_signature, ChangeSignatureError};
 use atomic_core::change::{Author, Change, ChangeHeader};
 use atomic_core::types::{Base32, Hash};
+use atomic_core::WorkingCopyId;
 use atomic_repository::record::{RecordOptions, SigningIdentity};
 use atomic_repository::Repository;
 use tempfile::TempDir;
 
+fn working_copy(repo: &Repository) -> WorkingCopyId {
+    repo.require_working_copy_id().expect("working copy id")
+}
+
 fn add_file(repo: &Repository, repo_path: &Path, name: &str, content: &str) {
     fs::write(repo_path.join(name), content).expect("write file");
-    repo.add(name, Default::default()).expect("add file");
+    repo.add(working_copy(repo), name, Default::default())
+        .expect("add file");
 }
 
 fn record_unsigned(repo: &Repository, message: &str) -> Hash {
@@ -32,7 +38,7 @@ fn record_unsigned(repo: &Repository, message: &str) -> Hash {
         .author(Author::new("Test", Some("test@example.com")))
         .build();
     *repo
-        .record(header, RecordOptions::default())
+        .record(working_copy(repo), header, RecordOptions::default())
         .expect("record")
         .hash()
 }
@@ -64,6 +70,7 @@ fn record_signed(repo: &Repository, message: &str, signing: &SigningIdentity) ->
         .build();
     let outcome = repo
         .record(
+            working_copy(repo),
             header,
             RecordOptions::default().with_signing_identity(signing.clone()),
         )
@@ -263,6 +270,7 @@ fn signed_and_unsigned_changes_coexist() {
             .build();
         let outcome = repo
             .record(
+                working_copy(&repo),
                 header,
                 RecordOptions::default().with_signing_identity(signing.clone()),
             )

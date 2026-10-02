@@ -110,6 +110,7 @@ struct RequestFrame {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[allow(clippy::large_enum_variant)] // the wire protocol carries full payloads inline
 enum OwnerRequest {
     Ping,
     ReserveProvenanceTurn {

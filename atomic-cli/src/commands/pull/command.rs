@@ -27,17 +27,20 @@
 //! - Diverged history warnings
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use bytes::Bytes;
 use clap::Parser;
 
+use atomic_core::operation::OperationKind;
 use atomic_core::types::{Base32, Hash, Merkle, SetId};
 use atomic_objects::{ObjectFamily, SyncPack, SyncWants, ViewSnapshot};
 use atomic_remote::{ChangelistEntry, HttpRemote, HttpRemoteConfig, StateResponse};
 use atomic_repository::history::HistoryOptions;
 use atomic_repository::{InsertOptions, Repository, ViewManifest};
 
+use crate::commands::workspace_txn::{boundary_mode, enter_workspace};
 use crate::commands::{find_repository_root, format_hash, Command};
 use crate::error::{CliError, CliResult};
 use crate::output::{
@@ -342,6 +345,10 @@ impl Pull {
         self
     }
 
+    fn may_materialize_working_copy(&self) -> bool {
+        !self.dry_run && !self.download_only
+    }
+
     // Internal Helper Methods
 
     /// Use the explicit remote first, then the repository default.
@@ -477,18 +484,30 @@ impl Pull {
     ///
     /// This is the main entry point for the pull operation. It coordinates
     /// all the steps required to download and apply remote changes.
-    async fn run_async(&self) -> CliResult<()> {
-        // Find and open repository
-        let repo_root = find_repository_root()?;
-        let mut repo = Repository::open(&repo_root).map_err(CliError::Repository)?;
+    async fn run_async(&self, repo_root: PathBuf) -> CliResult<()> {
+        // Open the repository and enter the shared workspace transaction for the
+        // whole boundary. Dry runs observe without mutation — the boundary opens
+        // read-only so Observe is mutation-free by construction; ordinary pulls
+        // reconcile safe drift and refuse unsafe baselines before any network
+        // or graph work. WorkspaceTxn authority (working copy + view) is
+        // retained for the entire command body.
+        let mut repo = if self.dry_run {
+            Repository::open_readonly(&repo_root)
+        } else {
+            Repository::open_for_workspace_transaction(&repo_root)
+        }
+        .map_err(CliError::Repository)?;
+        let workspace = enter_workspace(&mut repo, boundary_mode(self.dry_run))?;
+        let working_copy = workspace.working_copy();
+        let desired_view = workspace.view().name.clone();
 
         // Resolve remote name, URL, and identity hint
         let (remote_name, remote_url, identity_hint) = self.resolve_remote_url(&repo)?;
 
-        // Determine views. The remote view defaults to the current view; the
-        // local view defaults to the remote view being pulled, so
+        // Determine views. The remote view defaults to the working copy's desired
+        // view; the local view defaults to the remote view being pulled, so
         // `atomic pull --from-view X` pulls into a local view named `X`.
-        let remote_view = self.get_remote_view(repo.current_view());
+        let remote_view = self.get_remote_view(&desired_view);
         let local_view = self.get_local_view(&remote_view);
 
         // Whether the local target view already exists. Creation is deferred
@@ -644,6 +663,23 @@ impl Pull {
         if self.dry_run {
             return self.display_dry_run(&remote_name, &remote_url, &remote_view, &to_download);
         }
+
+        let evidence = pull_pack
+            .encode()
+            .map(|bytes| Hash::of(&bytes))
+            .map_err(|error| {
+                CliError::Internal(anyhow::anyhow!(
+                    "failed to encode verified pull evidence: {}",
+                    error
+                ))
+            })?;
+        repo.append_verified_remote_operation(
+            working_copy,
+            OperationKind::Pull,
+            &remote_name,
+            evidence,
+        )
+        .map_err(CliError::Repository)?;
 
         // Save missing graph nodes first. Even when none are missing, continue:
         // remote view metadata may still add closures around nodes already in
@@ -832,9 +868,9 @@ impl Pull {
         // files.
         let mut materialize_failed = false;
         if stats.has_applied() {
-            if local_view == repo.current_view() {
+            if local_view == desired_view {
                 let mat_spinner = create_spinner("Updating working copy...");
-                match repo.materialize() {
+                match repo.materialize(working_copy) {
                     Ok(result) => {
                         finish_success(
                             &mat_spinner,
@@ -931,7 +967,7 @@ impl Pull {
             if let Err(e) = repo.init_kg() {
                 log::warn!("KG table init failed: {}", e);
             }
-            match repo.kg_enrich_from_vcs() {
+            match repo.kg_enrich_from_vcs(working_copy) {
                 Ok(kg_stats) => log::info!("KG enriched after pull: {}", kg_stats),
                 Err(e) => log::warn!("KG enrichment after pull failed: {}", e),
             }
@@ -989,12 +1025,19 @@ impl Command for Pull {
     /// - Network operations fail
     /// - Changes fail to download or save
     fn run(&self) -> CliResult<()> {
-        // Create a runtime for async operations
-        let rt = tokio::runtime::Runtime::new().map_err(|e| {
-            CliError::Internal(anyhow::anyhow!("Failed to create async runtime: {}", e))
-        })?;
+        let repo_root = find_repository_root()?;
 
-        rt.block_on(self.run_async())
+        // A current-thread runtime keeps the workspace transaction's ordered
+        // operation locks bound to one thread for the whole async body; nested
+        // repository operations re-enter them instead of contending.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| {
+                CliError::Internal(anyhow::anyhow!("Failed to create async runtime: {}", e))
+            })?;
+
+        rt.block_on(self.run_async(repo_root))
     }
 }
 
@@ -1019,6 +1062,17 @@ mod tests {
         assert!(!pull.insecure);
         assert_eq!(pull.timeout, DEFAULT_TIMEOUT_SECS);
         assert!(!pull.download_only);
+    }
+
+    #[test]
+    fn test_materialization_guard_selector() {
+        assert!(Pull::new().may_materialize_working_copy());
+        assert!(!Pull::new()
+            .with_dry_run(true)
+            .may_materialize_working_copy());
+        assert!(!Pull::new()
+            .with_download_only(true)
+            .may_materialize_working_copy());
     }
 
     /// Test Default trait implementation.

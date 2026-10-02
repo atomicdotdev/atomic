@@ -80,6 +80,9 @@ pub fn apply_trunk_op<T: MutCrdtTxnT>(
         TrunkOp::Delete { trunk } => apply_delete(txn, context, *trunk),
         TrunkOp::Move { trunk, new_path } => apply_move(txn, context, *trunk, new_path),
         TrunkOp::Undelete { trunk } => apply_undelete(txn, context, *trunk),
+        // Attribute state is applied by GraphOp::SetAttr; semantic operations
+        // remain in FileOps for review and replay without duplicating storage.
+        TrunkOp::SetMode { .. } | TrunkOp::SetKind { .. } => Ok(()),
     }
 }
 

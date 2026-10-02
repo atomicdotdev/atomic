@@ -188,7 +188,7 @@ impl InodeGraphOps for ReadTxn {
         let target_pos = pos.pos.get();
 
         let empty_key = encode_inode_vertex(inode_id, change_id, target_pos, target_pos);
-        if table.get(&empty_key)?.next().is_some() {
+        if table.get(&empty_key)?.next().transpose()?.is_some() {
             return Ok(Some(GraphNode {
                 change: NodeId::new(change_id),
                 start: ChangePosition::new(target_pos),
@@ -409,7 +409,7 @@ impl<'a> InodeGraphOps for WriteTxn<'a> {
         let target_pos = pos.pos.get();
 
         let empty_key = encode_inode_vertex(inode_id, change_id, target_pos, target_pos);
-        if table.get(&empty_key)?.next().is_some() {
+        if table.get(&empty_key)?.next().transpose()?.is_some() {
             return Ok(Some(GraphNode {
                 change: NodeId::new(change_id),
                 start: ChangePosition::new(target_pos),
@@ -470,5 +470,60 @@ impl<'a> InodeGraphOps for WriteTxn<'a> {
         }
 
         Ok(count)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pristine::{MutTxnT, Pristine};
+    use crate::types::Hash;
+    use tempfile::tempdir;
+
+    #[test]
+    fn healthy_read_and_write_inode_probes_and_adjacency_work() {
+        let dir = tempdir().unwrap();
+        let pristine = Pristine::open(dir.path().join("pristine")).unwrap();
+        let inode = Inode::new(13);
+
+        let (change_id, node, edge) = {
+            let mut txn = pristine.write_txn().unwrap();
+            let change_id = txn.register_change(&Hash::of(b"inode probe")).unwrap();
+            let node = GraphNode::new(change_id, ChangePosition::new(5), ChangePosition::new(5));
+            let edge = SerializedGraphEdge::new(
+                EdgeFlags::BLOCK,
+                Position::new(change_id, ChangePosition::new(8)),
+                change_id,
+            );
+            txn.put_inode_graph(inode, node, edge).unwrap();
+
+            assert_eq!(
+                txn.find_block_end_in_inode(
+                    inode,
+                    Position::new(change_id, ChangePosition::new(5))
+                )
+                .unwrap(),
+                Some(node)
+            );
+            let mut adj = txn
+                .init_inode_adj(inode, node, EdgeFlags::BLOCK, EdgeFlags::BLOCK)
+                .unwrap();
+            assert_eq!(txn.next_inode_adj(&mut adj).unwrap().unwrap(), edge);
+            assert!(txn.next_inode_adj(&mut adj).is_none());
+            txn.commit().unwrap();
+            (change_id, node, edge)
+        };
+
+        let txn = pristine.read_txn().unwrap();
+        assert_eq!(
+            txn.find_block_end_in_inode(inode, Position::new(change_id, ChangePosition::new(5)))
+                .unwrap(),
+            Some(node)
+        );
+        let mut adj = txn
+            .init_inode_adj(inode, node, EdgeFlags::BLOCK, EdgeFlags::BLOCK)
+            .unwrap();
+        assert_eq!(txn.next_inode_adj(&mut adj).unwrap().unwrap(), edge);
+        assert!(txn.next_inode_adj(&mut adj).is_none());
     }
 }

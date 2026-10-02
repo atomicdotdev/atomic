@@ -58,8 +58,9 @@ use std::path::PathBuf;
 use clap::Parser;
 
 use atomic_repository::tracking::TrackingOptions;
-use atomic_repository::Repository;
+use atomic_repository::{Repository, WorkspaceTxnMode};
 
+use crate::commands::workspace_txn::enter_workspace;
 use crate::commands::{find_repository_root, Command};
 use crate::error::{CliError, CliResult};
 use crate::output::{print_hint, print_success, print_warning};
@@ -234,7 +235,19 @@ impl Command for Remove {
     fn run(&self) -> CliResult<()> {
         // Find repository
         let repo_root = find_repository_root()?;
-        let repo = Repository::open(&repo_root).map_err(CliError::Repository)?;
+        let mode = if self.dry_run {
+            WorkspaceTxnMode::Observe
+        } else {
+            WorkspaceTxnMode::Reconcile
+        };
+        let mut repo = if self.dry_run {
+            Repository::open_readonly(&repo_root)
+        } else {
+            Repository::open_for_workspace_transaction(&repo_root)
+        }
+        .map_err(CliError::Repository)?;
+        let workspace = enter_workspace(&mut repo, mode)?;
+        let working_copy = workspace.working_copy();
 
         let options = self.to_tracking_options();
         let action = self.format_action();
@@ -265,8 +278,24 @@ impl Command for Remove {
                 println!("{}: {}", action, normalized);
             }
 
+            if self.dry_run {
+                match repo.is_tracked(&normalized) {
+                    Ok(true) => total_removed += 1,
+                    Ok(false) if !self.force => {
+                        print_warning(&format!("Not tracked: {}", normalized));
+                        total_errors += 1;
+                    }
+                    Ok(false) => {}
+                    Err(error) => {
+                        print_warning(&format!("Failed to inspect '{}': {}", normalized, error));
+                        total_errors += 1;
+                    }
+                }
+                continue;
+            }
+
             // Remove from tracking
-            match repo.remove(&normalized, options.clone()) {
+            match repo.remove(working_copy, &normalized, options.clone()) {
                 Ok(stats) => {
                     total_removed += stats.files_removed;
 

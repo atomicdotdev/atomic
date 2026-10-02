@@ -1,5 +1,113 @@
 use super::*;
-use crate::pristine::InodeGraphOps;
+use crate::pristine::{InodeGraphOps, PathClaimId};
+
+impl<'txn, T> GlobalizeContext<'txn, T>
+where
+    T: GraphTxnT + TreeTxnT,
+{
+    /// Build a FileMove from the exact currently alive structural source claim.
+    ///
+    /// The claimant and source edge are validated before globalization. This is
+    /// required after a rename because the stable inode position still points to
+    /// the original add and cannot reconstruct the current name vertex.
+    pub fn file_move_from_claim(
+        &mut self,
+        path: &str,
+        claimant: Position<NodeId>,
+        source: PathClaimId,
+        destination_parent: Position<Option<Hash>>,
+    ) -> GlobalizeResult<GraphOp<Option<Hash>>> {
+        if source.claimant != claimant || source.name.is_empty() || !source.parent.is_empty() {
+            return Err(GlobalizeError::InvalidParentMetadata {
+                path: path.to_string(),
+                parent: extract_parent(path).to_string(),
+                reason: "FileMove source claim does not identify one exact directory name edge",
+            });
+        }
+
+        let alive = EdgeFlags::FOLDER | EdgeFlags::BLOCK;
+        let mut source_edge_exists = false;
+        for edge in self
+            .txn()
+            .iter_adjacent(source.parent, EdgeFlags::empty(), EdgeFlags::all())?
+        {
+            let edge = edge?;
+            source_edge_exists |= edge.flag() == alive
+                && edge.dest() == source.name.start_pos()
+                && edge.introduced_by() == source.introduced_by;
+        }
+        let mut claimant_edge_exists = false;
+        for edge in self
+            .txn()
+            .iter_adjacent(source.name, EdgeFlags::empty(), EdgeFlags::all())?
+        {
+            let edge = edge?;
+            claimant_edge_exists |= edge.flag() == alive && edge.dest() == claimant;
+        }
+        if !source_edge_exists || !claimant_edge_exists {
+            return Err(GlobalizeError::InvalidParentMetadata {
+                path: path.to_string(),
+                parent: extract_parent(path).to_string(),
+                reason: "FileMove source claim is not the exact currently alive claimant",
+            });
+        }
+
+        let source_from = self.external_existing_position(source.parent.end_pos())?;
+        let source_name = GraphNode {
+            change: self.external_existing_change(source.name.change)?,
+            start: source.name.start,
+            end: source.name.end,
+        };
+        let introduced_by = self.external_existing_change(source.introduced_by)?;
+        let claimant = self.external_existing_position(claimant)?;
+        let del = EdgeUpdate {
+            edges: vec![NewEdge {
+                previous: alive,
+                flag: alive | EdgeFlags::DELETED,
+                from: source_from,
+                to: source_name,
+                introduced_by,
+            }],
+            inode: claimant,
+        };
+
+        let filename = extract_filename(path).as_bytes();
+        let (start, end) = self.append_content(filename);
+        let add = Insertion {
+            predecessors: vec![destination_parent],
+            successors: vec![claimant],
+            flag: alive,
+            start,
+            end,
+            inode: claimant,
+        };
+        Ok(GraphOp::FileMove {
+            del,
+            add,
+            path: path.to_string(),
+        })
+    }
+
+    fn external_existing_position(
+        &mut self,
+        position: Position<NodeId>,
+    ) -> GlobalizeResult<Position<Option<Hash>>> {
+        Ok(Position {
+            change: self.external_existing_change(position.change)?,
+            pos: position.pos,
+        })
+    }
+
+    fn external_existing_change(&mut self, change: NodeId) -> GlobalizeResult<Option<Hash>> {
+        if change.is_root() {
+            return Ok(Some(Hash::NONE));
+        }
+        self.add_dependency_by_id(change)?;
+        self.get_external(change)
+            .map(Some)
+            .ok_or(GlobalizeError::MissingExternalHash { node_id: change })
+    }
+}
 
 /// Globalize all hunks in a recorded file.
 ///
@@ -38,128 +146,71 @@ where
     let path = recorded.path();
     let mut result = GlobalizedFile::new(path);
 
-    // Handle directory additions (DirAdd)
-    if recorded.is_directory() {
-        // Create a DirAdd graph_op for an explicitly tracked directory
-        // The directory has no content, just name and inode vertices
-
-        let parent_context_pos: Position<Option<Hash>> = {
-            let parent_path = extract_parent(path);
-            if parent_path.is_empty() {
-                // Top-level directory - parent is ROOT
-                Position {
-                    change: Some(Hash::NONE),
-                    pos: ChangePosition::ROOT,
-                }
-            } else {
-                // Nested directory - for now use ROOT
-                Position {
-                    change: Some(Hash::NONE),
-                    pos: ChangePosition::ROOT,
-                }
+    // Undelete must run before the ordinary Added-directory branch. A restored
+    // empty directory deliberately has the same surface shape as a new one, but
+    // it must reverse the visible deletion and retain the original inode.
+    if recorded.is_undelete() {
+        let initial_deps = ctx.dependencies().len();
+        let undel = build_undelete_edge_update(ctx, recorded)?;
+        if recorded.is_undeleted_directory() {
+            if undel.edges.len() != 2 {
+                return Err(GlobalizeError::InvalidParentMetadata {
+                    path: path.to_string(),
+                    parent: extract_parent(path).to_string(),
+                    reason: "directory undelete did not resolve both structural claims",
+                });
             }
-        };
-
-        // Add the directory name to the content buffer
-        let dirname = extract_filename(path);
-        let dirname_bytes = dirname.as_bytes();
-        let (name_start, name_end) = ctx.append_content(dirname_bytes);
-
-        // The inode span is empty (marks the directory's root)
-        let inode_start = name_end;
-        let inode_end = inode_start;
-
-        // Create name span with FOLDER flag
-        let add_name = Insertion {
-            predecessors: vec![parent_context_pos],
-            successors: vec![],
-            flag: EdgeFlags::FOLDER, // FOLDER flag for directory entry
-            start: name_start,
-            end: name_end,
-            inode: Position {
-                change: None, // Self-reference (current change)
-                pos: inode_start,
-            },
-        };
-
-        // Create inode span (empty)
-        let add_inode = Insertion {
-            predecessors: vec![Position {
-                change: None,
-                pos: name_end,
-            }],
-            successors: vec![],
-            flag: EdgeFlags::FOLDER,
-            start: inode_start,
-            end: inode_end,
-            inode: Position {
-                change: None,
-                pos: inode_start,
-            },
-        };
-
-        let graph_op: GraphOp<Option<Hash>> = GraphOp::DirAdd {
-            add_name,
-            add_inode,
-            path: path.to_string(),
-        };
-
-        result.add_hunk(graph_op);
-        result.set_bytes_added(dirname_bytes.len() as u64);
-        return Ok(result);
-    }
-
-    // Handle directory deletions (DirDel)
-    if recorded.is_deleted_directory() {
-        // For directory deletion, we need to create an EdgeUpdate to mark the
-        // directory's edges as deleted. This requires the directory's inode
-        // and position in the graph.
-        //
-        // If we have position info, create a proper DirDel graph_op.
-        // Otherwise, the directory is already untracked from the TREE table
-        // during the record process, so we can skip the graph_op.
-
-        if let (Some(_inode), Some(position)) = (recorded.inode(), recorded.position()) {
-            // Convert NodeId to Option<Hash> for the graph_op
-            // We need to look up the external hash for this change
-            let change_hash: Option<Hash> = ctx.get_external(position.change);
-
-            // Create EdgeUpdate to mark directory edges as deleted
-            let del = EdgeUpdate {
-                edges: vec![NewEdge {
-                    previous: EdgeFlags::FOLDER,
-                    flag: EdgeFlags::FOLDER | EdgeFlags::DELETED,
-                    from: Position {
-                        change: change_hash,
-                        pos: position.pos,
-                    },
-                    to: GraphNode {
-                        change: change_hash,
-                        start: position.pos,
-                        end: position.pos, // Empty span for directory inode
-                    },
-                    introduced_by: change_hash,
-                }],
-                inode: Position {
-                    change: change_hash,
-                    pos: position.pos,
-                },
-            };
-
-            let graph_op: GraphOp<Option<Hash>> = GraphOp::DirDel {
-                del,
+            result.add_hunk(GraphOp::DirUndel {
+                undel,
                 path: path.to_string(),
-            };
-
-            result.add_hunk(graph_op);
-            // Note: edges_added tracking not implemented in GlobalizedFile
-            // The graph_op count serves as a proxy for tracking edge modifications
+            });
+            result.set_dependency_count(ctx.dependencies().len() - initial_deps);
+            return Ok(result);
         }
-        // If no position info, the directory was never recorded to the graph,
-        // so there's nothing to delete. The tracking removal is sufficient.
 
+        result.add_hunk(GraphOp::FileUndel {
+            undel,
+            contents: None,
+            path: path.to_string(),
+            encoding: recorded.encoding(),
+        });
+        if recorded.hunks().is_empty() {
+            result.set_dependency_count(ctx.dependencies().len() - initial_deps);
+            return Ok(result);
+        }
+    }
+
+    // Handle directory additions (DirAdd). Missing ancestors are emitted as
+    // implicit directory anchors before the requested directory, so input order
+    // cannot flatten nested names under ROOT.
+    if recorded.is_directory() {
+        let initial_content_len = ctx.content_len();
+        let initial_deps = ctx.dependencies().len();
+        ensure_directory_anchor(ctx, path, path, &mut result)?;
+        result.set_bytes_added(ctx.content_len() - initial_content_len);
+        result.set_dependency_count(ctx.dependencies().len() - initial_deps);
         return Ok(result);
     }
+
+    // A directory deletion removes the two precise claims emitted by DirAdd:
+    // parent -> name and name -> inode. Positions alone are ambiguous here
+    // because the name and empty inode marker share an end position.
+    if recorded.is_deleted_directory() {
+        let initial_deps = ctx.dependencies().len();
+        let del = build_directory_delete(ctx, recorded)?;
+        result.add_hunk(GraphOp::DirDel {
+            del,
+            path: path.to_string(),
+        });
+        result.set_dependency_count(ctx.dependencies().len() - initial_deps);
+        return Ok(result);
+    }
+
+    // Exact moves emit their FileMove before entering the ordinary existing-file
+    // content path below. Track their contribution separately because the
+    // content-path baselines are captured after this structural operation.
+    let mut leading_bytes_added = 0;
+    let mut leading_dependency_count = 0;
 
     // Handle file moves/renames (FileMove)
     if matches!(
@@ -175,138 +226,158 @@ where
                 field: "old_path",
             })?;
 
-        // Look up the inode for the old path
-        let old_inode =
-            ctx.txn()
-                .get_inode(old_path)?
-                .ok_or_else(|| GlobalizeError::PathNotFound {
-                    path: old_path.to_string(),
+        if let Some(source) = recorded.exact_source_claim() {
+            let claimant = recorded
+                .position()
+                .ok_or_else(|| GlobalizeError::MissingField {
+                    path: path.to_string(),
+                    field: "position",
                 })?;
+            let initial_content_len = ctx.content_len();
+            let initial_deps = ctx.dependencies().len();
+            let destination_parent = ensure_parent_directory_anchor(ctx, path, path, &mut result)?;
+            let operation = ctx.file_move_from_claim(path, claimant, source, destination_parent)?;
+            result.add_hunk(operation);
+            leading_bytes_added = ctx.content_len() - initial_content_len;
+            leading_dependency_count = ctx.dependencies().len() - initial_deps;
+        } else {
+            // Compatibility path for callers that have not supplied the exact
+            // causally maximal source claim. This legacy reconstruction cannot
+            // safely globalize content edits against an authoritative current
+            // name claim, so retain its structural-only early return.
+            // Look up the inode for the old path
+            let old_inode =
+                ctx.txn()
+                    .get_inode(old_path)?
+                    .ok_or_else(|| GlobalizeError::PathNotFound {
+                        path: old_path.to_string(),
+                    })?;
 
-        // Look up the inode's graph position
-        let old_inode_pos_node = ctx
-            .txn()
-            .inode_position(old_inode)?
-            .ok_or_else(|| GlobalizeError::InodeNotFound { inode: old_inode })?;
+            // Look up the inode's graph position
+            let old_inode_pos_node = ctx
+                .txn()
+                .inode_position(old_inode)?
+                .ok_or_else(|| GlobalizeError::InodeNotFound { inode: old_inode })?;
 
-        // Convert the inode position to Option<Hash> using external hash resolution
-        let change_hash: Option<Hash> = ctx.get_external(old_inode_pos_node.change);
+            // Convert the inode position to Option<Hash> using external hash resolution
+            let change_hash: Option<Hash> = ctx.get_external(old_inode_pos_node.change);
 
-        // Add a dependency on the change that introduced this file
-        ctx.add_dependency_by_id(old_inode_pos_node.change)?;
+            // Add a dependency on the change that introduced this file
+            ctx.add_dependency_by_id(old_inode_pos_node.change)?;
 
-        let old_parent_context_pos: Position<Option<Hash>> = {
-            let old_parent_path = extract_parent(old_path);
-            if old_parent_path.is_empty() {
-                Position {
-                    change: Some(Hash::NONE),
-                    pos: ChangePosition::ROOT,
-                }
-            } else {
-                match resolve_parent_inode(ctx, old_path)
-                    .and_then(|parent_inode| resolve_inode_to_position(ctx, parent_inode))
-                {
-                    Ok(parent_pos) => {
-                        ctx.add_dependency_by_id(parent_pos.change)?;
-                        position_to_option_hash_resolved(ctx.txn(), parent_pos, None)
-                    }
-                    Err(_) => Position {
+            let old_parent_context_pos: Position<Option<Hash>> = {
+                let old_parent_path = extract_parent(old_path);
+                if old_parent_path.is_empty() {
+                    Position {
                         change: Some(Hash::NONE),
                         pos: ChangePosition::ROOT,
-                    },
+                    }
+                } else {
+                    match resolve_parent_inode(ctx, old_path)
+                        .and_then(|parent_inode| resolve_inode_to_position(ctx, parent_inode))
+                    {
+                        Ok(parent_pos) => {
+                            ctx.add_dependency_by_id(parent_pos.change)?;
+                            position_to_option_hash_resolved(ctx.txn(), parent_pos, None)
+                        }
+                        Err(_) => Position {
+                            change: Some(Hash::NONE),
+                            pos: ChangePosition::ROOT,
+                        },
+                    }
                 }
-            }
-        };
+            };
 
-        let old_filename = extract_filename(old_path);
-        let old_name_end = old_inode_pos_node.pos;
-        let old_name_start =
-            ChangePosition::new(old_name_end.get().saturating_sub(old_filename.len() as u64));
+            let old_filename = extract_filename(old_path);
+            let old_name_end = old_inode_pos_node.pos;
+            let old_name_start =
+                ChangePosition::new(old_name_end.get().saturating_sub(old_filename.len() as u64));
 
-        // Build the del EdgeUpdate: delete the old parent -> old-name edge.
-        //
-        // For file adds, the path name is inserted as a normal BLOCK|FOLDER
-        // vertex with predecessor = parent context. Renames must delete that
-        // edge, not an edge at the inode marker position.
-        let del = EdgeUpdate {
-            edges: vec![NewEdge {
-                previous: EdgeFlags::FOLDER | EdgeFlags::BLOCK,
-                flag: EdgeFlags::FOLDER | EdgeFlags::BLOCK | EdgeFlags::DELETED,
-                from: old_parent_context_pos,
-                to: GraphNode {
+            // Build the del EdgeUpdate: delete the old parent -> old-name edge.
+            //
+            // For file adds, the path name is inserted as a normal BLOCK|FOLDER
+            // vertex with predecessor = parent context. Renames must delete that
+            // edge, not an edge at the inode marker position.
+            let del = EdgeUpdate {
+                edges: vec![NewEdge {
+                    previous: EdgeFlags::FOLDER | EdgeFlags::BLOCK,
+                    flag: EdgeFlags::FOLDER | EdgeFlags::BLOCK | EdgeFlags::DELETED,
+                    from: old_parent_context_pos,
+                    to: GraphNode {
+                        change: change_hash,
+                        start: old_name_start,
+                        end: old_name_end,
+                    },
+                    introduced_by: change_hash,
+                }],
+                inode: Position {
                     change: change_hash,
-                    start: old_name_start,
-                    end: old_name_end,
+                    pos: old_inode_pos_node.pos,
                 },
-                introduced_by: change_hash,
-            }],
-            inode: Position {
+            };
+
+            // Build the add Insertion: a new name vertex in the correct parent
+            // directory, wired to the existing inode position.
+            let parent_context_pos: Position<Option<Hash>> = {
+                let parent_path = extract_parent(path);
+                if parent_path.is_empty() {
+                    Position {
+                        change: Some(Hash::NONE),
+                        pos: ChangePosition::ROOT,
+                    }
+                } else {
+                    match resolve_parent_inode(ctx, path)
+                        .and_then(|parent_inode| resolve_inode_to_position(ctx, parent_inode))
+                    {
+                        Ok(parent_pos) => {
+                            ctx.add_dependency_by_id(parent_pos.change)?;
+                            position_to_option_hash_resolved(ctx.txn(), parent_pos, None)
+                        }
+                        Err(_) => Position {
+                            change: Some(Hash::NONE),
+                            pos: ChangePosition::ROOT,
+                        },
+                    }
+                }
+            };
+
+            // The inode position for the add — references the EXISTING inode (old change).
+            let inode_opt_hash_pos: Position<Option<Hash>> = Position {
                 change: change_hash,
                 pos: old_inode_pos_node.pos,
-            },
-        };
+            };
 
-        // Build the add Insertion: a new name vertex in the correct parent
-        // directory, wired to the existing inode position.
-        let parent_context_pos: Position<Option<Hash>> = {
-            let parent_path = extract_parent(path);
-            if parent_path.is_empty() {
-                Position {
-                    change: Some(Hash::NONE),
-                    pos: ChangePosition::ROOT,
-                }
-            } else {
-                match resolve_parent_inode(ctx, path)
-                    .and_then(|parent_inode| resolve_inode_to_position(ctx, parent_inode))
-                {
-                    Ok(parent_pos) => {
-                        ctx.add_dependency_by_id(parent_pos.change)?;
-                        position_to_option_hash_resolved(ctx.txn(), parent_pos, None)
-                    }
-                    Err(_) => Position {
-                        change: Some(Hash::NONE),
-                        pos: ChangePosition::ROOT,
-                    },
-                }
+            // Write the new filename bytes into the content buffer.
+            let new_filename = extract_filename(path);
+            let new_filename_bytes = new_filename.as_bytes();
+            let initial_content_len = ctx.content_len();
+            let (name_start, name_end) = ctx.append_content(new_filename_bytes);
+
+            let add = Insertion {
+                predecessors: vec![parent_context_pos],
+                successors: vec![inode_opt_hash_pos],
+                flag: EdgeFlags::FOLDER | EdgeFlags::BLOCK,
+                start: name_start,
+                end: name_end,
+                inode: inode_opt_hash_pos,
+            };
+
+            let graph_op: GraphOp<Option<Hash>> = GraphOp::FileMove {
+                del,
+                add,
+                path: path.to_string(),
+            };
+
+            result.add_hunk(graph_op);
+            result.set_bytes_added(ctx.content_len() - initial_content_len);
+
+            // Carry any CRDT ops that were set on the recorded file
+            if let Some(file_ops) = recorded.crdt_ops().cloned() {
+                result.set_file_ops(file_ops);
             }
-        };
 
-        // The inode position for the add — references the EXISTING inode (old change).
-        let inode_opt_hash_pos: Position<Option<Hash>> = Position {
-            change: change_hash,
-            pos: old_inode_pos_node.pos,
-        };
-
-        // Write the new filename bytes into the content buffer.
-        let new_filename = extract_filename(path);
-        let new_filename_bytes = new_filename.as_bytes();
-        let initial_content_len = ctx.content_len();
-        let (name_start, name_end) = ctx.append_content(new_filename_bytes);
-
-        let add = Insertion {
-            predecessors: vec![parent_context_pos],
-            successors: vec![inode_opt_hash_pos],
-            flag: EdgeFlags::FOLDER | EdgeFlags::BLOCK,
-            start: name_start,
-            end: name_end,
-            inode: inode_opt_hash_pos,
-        };
-
-        let graph_op: GraphOp<Option<Hash>> = GraphOp::FileMove {
-            del,
-            add,
-            path: path.to_string(),
-        };
-
-        result.add_hunk(graph_op);
-        result.set_bytes_added(ctx.content_len() - initial_content_len);
-
-        // Carry any CRDT ops that were set on the recorded file
-        if let Some(file_ops) = recorded.crdt_ops().cloned() {
-            result.set_file_ops(file_ops);
+            return Ok(result);
         }
-
-        return Ok(result);
     }
 
     // Check for empty file
@@ -488,33 +559,7 @@ where
         // - add_inode: Span for the file's inode (root of file content graph)
         // - contents: Span containing the actual file content
 
-        // Determine the parent context position.
-        // For top-level files (no directory prefix), we use ROOT.
-        // For nested files, we would resolve the parent directory's position.
-        //
-        // The ROOT position is represented as:
-        // Position { change: Some(Hash::NONE), pos: ChangePosition::ROOT }
-        //
-        // This is the virtual root span that all top-level files reference.
-        let parent_context_pos: Position<Option<Hash>> = {
-            let parent_path = extract_parent(path);
-            if parent_path.is_empty() {
-                // Top-level file - parent is ROOT
-                Position {
-                    change: Some(Hash::NONE), // Hash::NONE indicates ROOT
-                    pos: ChangePosition::ROOT,
-                }
-            } else {
-                // Nested file - try to resolve parent directory position
-                // For now, use ROOT as we don't have nested directory support yet
-                // In a full implementation, we would resolve the parent directory's
-                // inode and get its graph position
-                Position {
-                    change: Some(Hash::NONE),
-                    pos: ChangePosition::ROOT,
-                }
-            }
-        };
+        let parent_context_pos = ensure_parent_directory_anchor(ctx, path, path, &mut result)?;
 
         // Add the filename to the content buffer
         let filename = extract_filename(path);
@@ -660,10 +705,366 @@ where
     // in the inode branch after processing all hunks
 
     // Update statistics
-    result.set_bytes_added(ctx.content_len() - initial_content_len);
-    result.set_dependency_count(ctx.dependencies().len() - initial_deps);
+    result.set_bytes_added(leading_bytes_added + (ctx.content_len() - initial_content_len));
+    result
+        .set_dependency_count(leading_dependency_count + (ctx.dependencies().len() - initial_deps));
 
     Ok(result)
+}
+
+fn build_directory_delete<T>(
+    ctx: &mut GlobalizeContext<'_, T>,
+    recorded: &RecordedFile,
+) -> GlobalizeResult<EdgeUpdate<Option<Hash>>>
+where
+    T: GraphTxnT + TreeTxnT + InodeGraphOps,
+{
+    let path = recorded.path();
+    let position = recorded
+        .position()
+        .ok_or_else(|| GlobalizeError::MissingField {
+            path: path.to_string(),
+            field: "position",
+        })?;
+    recorded
+        .inode()
+        .ok_or_else(|| GlobalizeError::MissingField {
+            path: path.to_string(),
+            field: "inode",
+        })?;
+
+    ctx.add_dependency_by_id(position.change)?;
+    let change_hash =
+        ctx.txn()
+            .get_external(position.change)?
+            .ok_or(GlobalizeError::MissingExternalHash {
+                node_id: position.change,
+            })?;
+    let dirname = extract_filename(path);
+    let name_len = dirname.len() as u64;
+    if name_len == 0 || name_len > position.pos.get() {
+        return Err(GlobalizeError::InvalidParentMetadata {
+            path: path.to_string(),
+            parent: extract_parent(path).to_string(),
+            reason: "directory name does not match its inode position",
+        });
+    }
+    let name_start = ChangePosition::new(position.pos.get() - name_len);
+    let name_node = GraphNode::new(position.change, name_start, position.pos);
+    let inode_node = GraphNode::new(position.change, position.pos, position.pos);
+
+    let parent_position = if extract_parent(path).is_empty() {
+        Position::ROOT
+    } else {
+        let parent_inode = resolve_parent_inode(ctx, path)?;
+        let parent_position = resolve_inode_to_position(ctx, parent_inode)?;
+        ctx.add_dependency_by_id(parent_position.change)?;
+        parent_position
+    };
+    let parent_node = if parent_position.change.is_root() {
+        GraphNode::root()
+    } else {
+        ctx.txn().find_block_end(parent_position)?
+    };
+
+    let claim_flags = EdgeFlags::FOLDER | EdgeFlags::BLOCK;
+    ensure_exact_forward_claim(
+        ctx.txn(),
+        parent_node,
+        name_node,
+        claim_flags,
+        position.change,
+    )?;
+    ensure_exact_forward_claim(
+        ctx.txn(),
+        name_node,
+        inode_node,
+        claim_flags,
+        position.change,
+    )?;
+
+    let external_name = GraphNode {
+        change: Some(change_hash),
+        start: name_start,
+        end: position.pos,
+    };
+    let external_inode = GraphNode {
+        change: Some(change_hash),
+        start: position.pos,
+        end: position.pos,
+    };
+    let deleted_flags = claim_flags | EdgeFlags::DELETED;
+    Ok(EdgeUpdate {
+        edges: vec![
+            NewEdge {
+                previous: claim_flags,
+                flag: deleted_flags,
+                from: position_to_option_hash_resolved(ctx.txn(), parent_position, None),
+                to: external_name,
+                introduced_by: Some(change_hash),
+            },
+            NewEdge {
+                previous: claim_flags,
+                flag: deleted_flags,
+                // Use the name's start so apply can distinguish it from the
+                // empty inode marker at name.end.
+                from: Position {
+                    change: Some(change_hash),
+                    pos: name_start,
+                },
+                to: external_inode,
+                introduced_by: Some(change_hash),
+            },
+        ],
+        inode: Position {
+            change: Some(change_hash),
+            pos: position.pos,
+        },
+    })
+}
+
+fn ensure_exact_forward_claim<T: GraphTxnT>(
+    txn: &T,
+    source: GraphNode<NodeId>,
+    target: GraphNode<NodeId>,
+    flags: EdgeFlags,
+    introduced_by: NodeId,
+) -> GlobalizeResult<()> {
+    let mut adjacent = txn.iter_adjacent(source, EdgeFlags::empty(), EdgeFlags::all())?;
+    for edge in &mut adjacent {
+        let edge = edge?;
+        if edge.flag() == flags
+            && edge.dest() == target.start_pos()
+            && edge.introduced_by() == introduced_by
+        {
+            return Ok(());
+        }
+    }
+    Err(GlobalizeError::NodeNotFound {
+        position: target.start_pos(),
+    })
+}
+
+fn build_undelete_edge_update<T>(
+    ctx: &mut GlobalizeContext<'_, T>,
+    recorded: &RecordedFile,
+) -> GlobalizeResult<EdgeUpdate<Option<Hash>>>
+where
+    T: GraphTxnT + TreeTxnT + InodeGraphOps,
+{
+    let inode = recorded
+        .inode()
+        .ok_or_else(|| GlobalizeError::MissingField {
+            path: recorded.path().to_string(),
+            field: "inode",
+        })?;
+    let inode_position = recorded
+        .position()
+        .ok_or_else(|| GlobalizeError::MissingField {
+            path: recorded.path().to_string(),
+            field: "position",
+        })?;
+    let deleting: HashSet<Hash> = recorded.undelete_changes().iter().copied().collect();
+    let dirname = extract_filename(recorded.path());
+    let directory_name_start = ChangePosition::new(
+        inode_position
+            .pos
+            .get()
+            .checked_sub(dirname.len() as u64)
+            .unwrap_or(inode_position.pos.get()),
+    );
+    let inode_node = GraphNode::new(
+        inode_position.change,
+        inode_position.pos,
+        inode_position.pos,
+    );
+
+    let mut edges = Vec::new();
+    for entry in ctx.txn().iter_inode_vertices(inode)? {
+        let (target, reverse) = entry?;
+        let flags = reverse.flag();
+        if !flags.contains(EdgeFlags::PARENT) || !flags.contains(EdgeFlags::DELETED) {
+            continue;
+        }
+        let deleting_hash = ctx.txn().get_external(reverse.introduced_by())?.ok_or(
+            GlobalizeError::MissingExternalHash {
+                node_id: reverse.introduced_by(),
+            },
+        )?;
+        if !deleting.contains(&deleting_hash) {
+            continue;
+        }
+
+        ctx.add_dependency(deleting_hash);
+        let mut previous = flags;
+        previous.remove(EdgeFlags::PARENT);
+        let mut restored = previous;
+        restored.remove(EdgeFlags::DELETED);
+        let mut source = reverse.dest();
+        if recorded.is_undeleted_directory()
+            && target == inode_node
+            && restored.contains(EdgeFlags::FOLDER)
+        {
+            source = Position::new(inode_position.change, directory_name_start);
+        }
+        let edge = NewEdge {
+            previous,
+            flag: restored,
+            from: position_to_option_hash_resolved(ctx.txn(), source, None),
+            to: GraphNode {
+                change: ctx.txn().get_external(target.change)?,
+                start: target.start,
+                end: target.end,
+            },
+            introduced_by: Some(deleting_hash),
+        };
+        if !edges.contains(&edge) {
+            edges.push(edge);
+        }
+    }
+
+    edges.sort_by_key(|edge| {
+        (
+            edge.to.change,
+            edge.to.start,
+            edge.to.end,
+            edge.from.change,
+            edge.from.pos,
+        )
+    });
+    Ok(EdgeUpdate {
+        edges,
+        inode: position_to_option_hash_resolved(ctx.txn(), inode_position, None),
+    })
+}
+
+fn root_directory_anchor() -> Position<Option<Hash>> {
+    Position {
+        change: Some(Hash::NONE),
+        pos: ChangePosition::ROOT,
+    }
+}
+
+fn ensure_parent_directory_anchor<T>(
+    ctx: &mut GlobalizeContext<'_, T>,
+    path: &str,
+    child_path: &str,
+    result: &mut GlobalizedFile,
+) -> GlobalizeResult<Position<Option<Hash>>>
+where
+    T: GraphTxnT + TreeTxnT + InodeGraphOps,
+{
+    let parent = extract_parent(path);
+    if parent.is_empty() {
+        Ok(root_directory_anchor())
+    } else {
+        ensure_directory_anchor(ctx, parent, child_path, result)
+    }
+}
+
+fn ensure_directory_anchor<T>(
+    ctx: &mut GlobalizeContext<'_, T>,
+    directory_path: &str,
+    child_path: &str,
+    result: &mut GlobalizedFile,
+) -> GlobalizeResult<Position<Option<Hash>>>
+where
+    T: GraphTxnT + TreeTxnT + InodeGraphOps,
+{
+    if let Some(anchor) = ctx.directory_anchor(directory_path) {
+        return Ok(anchor);
+    }
+
+    if let Some(inode) = ctx.txn().get_inode(directory_path)? {
+        if let Some(position) = ctx.txn().inode_position(inode)? {
+            let hash = ctx.txn().get_external(position.change)?.ok_or(
+                GlobalizeError::MissingExternalHash {
+                    node_id: position.change,
+                },
+            )?;
+
+            // TREE is a global projection. An entry introduced only on a sibling
+            // view is absent from this filtered graph and must not become a causal
+            // dependency of the current view.
+            if ctx.txn().is_change_visible(position.change) {
+                if !ctx.txn().is_directory(inode)? {
+                    return Err(GlobalizeError::ParentNotDirectory {
+                        path: child_path.to_string(),
+                        parent: directory_path.to_string(),
+                    });
+                }
+
+                let inode_node = GraphNode::new(position.change, position.pos, position.pos);
+                if !ctx.txn().has_vertex(inode_node)? {
+                    return Err(GlobalizeError::InvalidParentMetadata {
+                        path: child_path.to_string(),
+                        parent: directory_path.to_string(),
+                        reason: "directory inode anchor is missing from the graph",
+                    });
+                }
+
+                let anchor = Position {
+                    change: Some(hash),
+                    pos: position.pos,
+                };
+                ctx.add_dependency(hash);
+                ctx.register_directory_anchor(directory_path, anchor);
+                return Ok(anchor);
+            }
+        } else if directory_path != child_path {
+            // A staged explicit directory legitimately has no graph position
+            // while its own DirAdd is being assembled. A parent without one is
+            // incomplete metadata and must still fail before emitting a child.
+            return Err(GlobalizeError::InvalidParentMetadata {
+                path: child_path.to_string(),
+                parent: directory_path.to_string(),
+                reason: "directory inode has no graph position",
+            });
+        }
+    }
+
+    let parent_anchor = ensure_parent_directory_anchor(ctx, directory_path, child_path, result)?;
+    let dirname = extract_filename(directory_path);
+    if dirname.is_empty() {
+        return Err(GlobalizeError::InvalidParentMetadata {
+            path: child_path.to_string(),
+            parent: directory_path.to_string(),
+            reason: "directory path has no name component",
+        });
+    }
+
+    let (name_start, name_end) = ctx.append_content(dirname.as_bytes());
+    let inode_anchor = Position {
+        change: None,
+        pos: name_end,
+    };
+    let name_anchor = Position {
+        change: None,
+        pos: name_end,
+    };
+
+    result.add_hunk(GraphOp::DirAdd {
+        add_name: Insertion {
+            predecessors: vec![parent_anchor],
+            successors: vec![],
+            flag: EdgeFlags::FOLDER | EdgeFlags::BLOCK,
+            start: name_start,
+            end: name_end,
+            inode: parent_anchor,
+        },
+        add_inode: Insertion {
+            predecessors: vec![name_anchor],
+            successors: vec![],
+            flag: EdgeFlags::FOLDER | EdgeFlags::BLOCK,
+            start: name_end,
+            end: name_end,
+            inode: inode_anchor,
+        },
+        path: directory_path.to_string(),
+    });
+    ctx.register_directory_anchor(directory_path, inode_anchor);
+
+    Ok(inode_anchor)
 }
 
 /// Return the byte slice of `content` covering `len` lines starting at line
@@ -959,5 +1360,41 @@ fn enrich_lines_from_hunk_content(
             let abs_end = content_end;
             line_ops.set_content_range(abs_start, abs_end);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::change::{FileOps, LineOps};
+    use crate::crdt::{BranchId, TrunkId};
+
+    #[test]
+    fn move_file_ops_retain_trunk_op_during_content_range_enrichment() {
+        let change = NodeId::new(9);
+        let trunk = TrunkId::new(change, 0);
+        let mut file_ops = FileOps::move_file(trunk, "old.rs".into(), "new.rs".into());
+        file_ops.add_line_op(LineOps::insert_at(
+            BranchId::new(change, 1),
+            None,
+            Vec::new(),
+            2,
+        ));
+        let range = HunkContentRange {
+            kind: BuiltHunkKind::Insert,
+            new_start: 1,
+            new_len: 1,
+            content_start: ChangePosition::new(50),
+            content_end: ChangePosition::new(54),
+            uses_full_content: false,
+        };
+
+        enrich_file_ops_for_edit(&mut file_ops, b"alpha\nnew\nomega\n", &[range]);
+
+        assert!(file_ops.is_move());
+        assert_eq!(
+            file_ops.line_ops()[0].content_range(),
+            Some((ChangePosition::new(50), ChangePosition::new(54)))
+        );
     }
 }

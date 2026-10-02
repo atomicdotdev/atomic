@@ -58,8 +58,9 @@ fn ordinary_queries_wait_for_a_writer_including_sandbox_intent_reads() {
         })
         .unwrap();
     let sandbox = tempfile::tempdir().unwrap();
+    let working_copy = writer.require_working_copy_id().unwrap();
     writer
-        .provision_sandbox(sandbox.path(), writer.current_view())
+        .provision_sandbox(working_copy, sandbox.path(), writer.current_view())
         .unwrap();
     let commands: &[&[&str]] = &[
         &["intent", "list", "--json"],

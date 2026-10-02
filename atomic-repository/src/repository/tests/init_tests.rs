@@ -33,7 +33,12 @@ fn test_open_existing() {
     drop(repo);
 
     let opened = Repository::open(temp_dir.path()).unwrap();
-    assert_eq!(opened.root(), root);
+    // The repository canonicalizes its root (macOS tempdirs live behind
+    // /var → /private/var); compare canonicalized on both sides.
+    assert_eq!(
+        std::fs::canonicalize(opened.root()).unwrap(),
+        std::fs::canonicalize(&root).unwrap()
+    );
     assert_eq!(opened.current_view(), DEFAULT_STACK);
 }
 
@@ -62,12 +67,22 @@ fn test_canonical_change_store_path_follows_sandbox_pointer() {
     let repo_root = temp_dir.path().join("repo");
     let sandbox = temp_dir.path().join("agent-sandbox");
     let repo = Repository::init(&repo_root).unwrap();
-    repo.provision_sandbox(&sandbox, repo.current_view())
+    let working_copy = repo.require_working_copy_id().unwrap();
+    repo.provision_sandbox(working_copy, &sandbox, repo.current_view())
         .unwrap();
 
+    // Compare canonical dot_dirs (macOS tempdirs live behind
+    // /var → /private/var); the change-store file itself is created lazily,
+    // so canonicalize the directory rather than the file.
+    assert_eq!(
+        std::fs::canonicalize(Repository::canonical_dot_dir(&sandbox).unwrap()).unwrap(),
+        std::fs::canonicalize(repo.dot_dir()).unwrap()
+    );
     assert_eq!(
         Repository::canonical_change_store_path(&sandbox).unwrap(),
-        repo.redb_change_store_path()
+        Repository::canonical_dot_dir(&sandbox)
+            .unwrap()
+            .join("changes.redb")
     );
 }
 
@@ -120,7 +135,10 @@ fn test_change_path() {
 fn test_to_relative() {
     let (temp_dir, repo) = create_temp_repo();
 
-    let abs_path = temp_dir.path().join("src").join("main.rs");
+    // repo.root() is canonical (e.g. macOS /var -> /private/var); derive
+    // the input from the canonical root so the comparison is platform-fair.
+    let root = std::fs::canonicalize(temp_dir.path()).unwrap();
+    let abs_path = root.join("src").join("main.rs");
     let rel_path = repo.to_relative(&abs_path).unwrap();
 
     assert_eq!(rel_path, PathBuf::from("src/main.rs"));
@@ -133,7 +151,9 @@ fn test_to_absolute() {
     let rel_path = PathBuf::from("src/main.rs");
     let abs_path = repo.to_absolute(&rel_path);
 
-    assert_eq!(abs_path, temp_dir.path().join("src/main.rs"));
+    // repo.root() is canonical (e.g. macOS /var -> /private/var).
+    let root = std::fs::canonicalize(temp_dir.path()).unwrap();
+    assert_eq!(abs_path, root.join("src/main.rs"));
 }
 
 #[test]
@@ -144,4 +164,64 @@ fn test_is_internal_path() {
     assert!(repo.is_internal_path(repo.pristine_path()));
     assert!(repo.is_internal_path(repo.changes_dir()));
     assert!(!repo.is_internal_path(repo.root().join("src")));
+}
+
+/// Dropping a repository that performed a record must release the redb lock
+/// so the bridge checkpoint verifier can reopen (CB-8A record projection).
+#[test]
+fn test_drop_after_record_releases_the_database_lock() {
+    let (_temp_dir, repo) = create_temp_repo();
+    let root = repo.root().to_path_buf();
+    std::fs::write(root.join("file.txt"), b"content\n").unwrap();
+    repo.add(root.join("file.txt"), Default::default()).unwrap();
+    let outcome = repo
+        .record_with_message("record then reopen", Default::default())
+        .unwrap();
+    assert!(outcome.was_applied());
+    drop(repo);
+    assert!(
+        Repository::open(&root).is_ok(),
+        "sequential reopen after record must succeed"
+    );
+}
+
+/// The CB-8A record projection sequence: workspace transaction + record +
+/// drop, then a fresh writable open (the checkpoint verifier's) must succeed.
+#[test]
+fn test_workspace_record_then_reopen_releases_the_database_lock() {
+    let (_temp_dir, repo) = create_temp_repo();
+    let root = repo.root().to_path_buf();
+    std::fs::write(root.join("file.txt"), b"content\n").unwrap();
+    repo.add(root.join("file.txt"), Default::default()).unwrap();
+
+    // Mirror the record command: open_for_workspace_transaction, enter the
+    // workspace, record, then drop everything.
+    drop(repo);
+    let mut repo = Repository::open_for_workspace_transaction(&root).unwrap();
+    let start = repo
+        .begin_workspace_txn(WorkspaceTxnMode::Reconcile)
+        .unwrap();
+    let workspace = match start {
+        crate::WorkspaceTxnStart::Ready(workspace) => workspace,
+        crate::WorkspaceTxnStart::Remediation(_) => panic!("expected ready workspace"),
+    };
+    let working_copy = workspace.working_copy();
+    let outcome = repo
+        .record_with_lifecycle(
+            working_copy,
+            atomic_core::change::ChangeHeader::builder()
+                .message("workspace record")
+                .author(atomic_core::change::Author::new("T", Some("t@t")))
+                .build(),
+            Default::default(),
+            crate::repository::snapshot::RecordLifecycle::Durable,
+        )
+        .unwrap();
+    assert!(outcome.was_applied());
+    drop(workspace);
+    drop(repo);
+    assert!(
+        Repository::open(&root).is_ok(),
+        "reopen after workspace record must succeed"
+    );
 }

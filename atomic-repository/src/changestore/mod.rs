@@ -192,6 +192,20 @@ impl ChangeStore {
         })
     }
 
+    /// Open an existing change store without creating or modifying directories.
+    pub fn open_existing(changes_dir: PathBuf, cache_capacity: usize) -> ChangeStoreResult<Self> {
+        if !changes_dir.is_dir() {
+            return Err(ChangeStoreError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("change store does not exist: {}", changes_dir.display()),
+            )));
+        }
+        Ok(Self {
+            changes_dir,
+            cache: RwLock::new(LruCache::new(cache_capacity)),
+        })
+    }
+
     /// Create a change store from a repository root directory.
     ///
     /// This is a convenience method that constructs the changes directory
@@ -552,6 +566,13 @@ impl ChangeStore {
             count += 1;
         }
         Ok(count)
+    }
+
+    /// Evict one cached object after an externally journaled deletion.
+    pub fn evict(&self, hash: &Hash) {
+        if let Ok(mut cache) = self.cache.write() {
+            cache.remove(hash);
+        }
     }
 
     /// Clear the in-memory cache.

@@ -109,25 +109,31 @@ use crate::types::{ChangePosition, EdgeFlags, GraphNode, Hash, Inode, NodeId, Po
 use super::graph_op::{BuiltHunk, BuiltHunkKind};
 use super::record::RecordedFile;
 
+mod attribute;
 mod context;
 mod error;
 mod file;
 mod helpers;
 mod hunk;
+mod name_conflict;
 mod options;
 mod pipeline;
 mod resolve;
 mod vertex;
 
+pub use attribute::globalize_set_attr;
 pub use context::*;
 pub use error::*;
 pub use file::*;
-pub use helpers::{extract_filename, extract_parent, split_into_lines};
+pub use helpers::{ancestor_directories, extract_filename, extract_parent, split_into_lines};
 pub(crate) use helpers::{
     node_id_to_option_hash, position_to_option_hash, position_to_option_hash_resolved,
     vertex_to_option_hash,
 };
 pub use hunk::{globalize_hunk, should_use_opaque_generated_vertices, CRDT_DIFF_LINE_THRESHOLD};
+pub use name_conflict::{
+    globalize_solve_name_conflict, globalize_unsolve_name_conflict, NameConflictClaim,
+};
 pub use options::*;
 pub use pipeline::globalize_recorded_file;
 pub use resolve::*;

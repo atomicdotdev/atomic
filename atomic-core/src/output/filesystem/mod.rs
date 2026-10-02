@@ -90,7 +90,29 @@ impl FileSystem {
 
     /// Check if a path exists.
     pub fn exists(&self, path: &str) -> bool {
-        self.resolve_path(path).map(|p| p.exists()).unwrap_or(false)
+        self.resolve_path(path)
+            .map(|path| fs::symlink_metadata(path).is_ok())
+            .unwrap_or(false)
+    }
+
+    /// Replace a path with a symbolic link, preserving dangling targets.
+    #[cfg(unix)]
+    pub fn write_symlink(&self, path: &str, target: &Path) -> io::Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let absolute = self.resolve_path(path)?;
+        if let Some(parent) = absolute.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        if fs::symlink_metadata(&absolute).is_ok() {
+            let metadata = fs::symlink_metadata(&absolute)?;
+            if metadata.is_dir() && !metadata.file_type().is_symlink() {
+                fs::remove_dir_all(&absolute)?;
+            } else {
+                fs::remove_file(&absolute)?;
+            }
+        }
+        symlink(target, absolute)
     }
 }
 
@@ -247,14 +269,15 @@ impl WorkingCopy for FileSystem {
     fn remove_path(&self, path: &str, recursive: bool) -> Result<(), Self::Error> {
         let abs_path = self.resolve_path(path)?;
 
-        if !abs_path.exists() {
+        if fs::symlink_metadata(&abs_path).is_err() {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
                 format!("Path not found: {}", path),
             ));
         }
 
-        if abs_path.is_dir() {
+        let metadata = fs::symlink_metadata(&abs_path)?;
+        if metadata.is_dir() && !metadata.file_type().is_symlink() {
             if recursive {
                 fs::remove_dir_all(&abs_path)
             } else {
@@ -295,6 +318,15 @@ impl WorkingCopy for FileSystem {
             if !parent.exists() {
                 fs::create_dir_all(parent)?;
             }
+        }
+
+        // A kind transition from symlink to regular must unlink first;
+        // opening with truncate would otherwise overwrite the link target.
+        if fs::symlink_metadata(&abs_path)
+            .map(|metadata| metadata.file_type().is_symlink())
+            .unwrap_or(false)
+        {
+            fs::remove_file(&abs_path)?;
         }
 
         let file = OpenOptions::new()

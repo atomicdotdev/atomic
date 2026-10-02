@@ -87,15 +87,13 @@
 //! subgraph and E is the number of edges. The SCC computation adds O(V + E)
 //! for Tarjan's algorithm, giving overall O(V + E) complexity.
 
-use std::collections::HashSet;
 use std::io::Write;
-use std::sync::Arc;
 
 use crate::change::ChangeStore;
 use crate::output::alive::{compute_order, retrieve_graph, RetrieveOptions};
 use crate::output::traits::{WorkingCopy, Writer};
-use crate::pristine::GraphTxnT;
-use crate::types::{Hash, Inode, NodeId, Position};
+use crate::pristine::{GraphTxnT, GraphVisibilityClosure};
+use crate::types::{Inode, NodeId, Position};
 
 use super::conflict::{FileConflict, FileConflictType};
 use super::content::{output_graph_content_resolved, resolve_conflicts_semantically};
@@ -292,9 +290,9 @@ pub struct FileOutputResult {
     /// Conflicts detected during output.
     pub conflicts: Vec<FileConflict>,
 
-    /// Blake3 content hash of the written file content.
+    /// Blake3 content hash of the rendered file content.
     ///
-    /// Computed during the write pass via `HashingWriter`, eliminating
+    /// Computed during the render pass via `HashingWriter`, eliminating
     /// the need to re-read the file from disk for FILE_INDEX population.
     pub content_hash: Option<crate::types::Hash>,
 }
@@ -458,6 +456,9 @@ pub enum FileOutputError<WE> {
     /// Working copy error.
     WorkingCopy(WE),
 
+    /// Output pipeline error without a more specific file-level variant.
+    Output(OutputError),
+
     /// File position not found.
     PositionNotFound(Position<NodeId>),
 
@@ -472,6 +473,7 @@ impl<WE: std::fmt::Debug> std::fmt::Display for FileOutputError<WE> {
             Self::ChangeStore(e) => write!(f, "Change store error: {}", e),
             Self::Io(e) => write!(f, "I/O error: {}", e),
             Self::WorkingCopy(e) => write!(f, "Working copy error: {:?}", e),
+            Self::Output(e) => write!(f, "Output error: {e}"),
             Self::PositionNotFound(pos) => write!(f, "Position not found: {:?}", pos),
             Self::InodeNotFound(inode) => write!(f, "Inode not found: {:?}", inode),
         }
@@ -484,6 +486,7 @@ impl<WE: std::fmt::Debug + std::error::Error + 'static> std::error::Error for Fi
             Self::Graph(e) => Some(e),
             Self::Io(e) => Some(e),
             Self::WorkingCopy(e) => Some(e),
+            Self::Output(e) => Some(e),
             _ => None,
         }
     }
@@ -506,12 +509,19 @@ impl<WE> From<OutputError> for FileOutputError<WE> {
         match e {
             OutputError::Io(e) => Self::Io(e),
             OutputError::ChangeStore(e) => Self::ChangeStore(e.to_string()),
-            _ => Self::ChangeStore(e.to_string()),
+            OutputError::Pristine(e) => Self::Graph(*e),
+            other => Self::Output(other),
         }
     }
 }
 
 // OUTPUT FILE FUNCTION
+
+/// Fully rendered file content awaiting a working-copy write.
+pub(crate) struct RenderedFile {
+    pub(crate) bytes: Vec<u8>,
+    pub(crate) result: FileOutputResult,
+}
 
 /// Output a single file from the repository graph to the working copy.
 ///
@@ -586,11 +596,12 @@ where
     )
 }
 
-/// Output a single file from the graph with an optional change filter.
+/// Output a single file from the graph with optional validated visibility.
 ///
 /// This is the core file output function that supports view-aware output.
-/// When a `change_filter` is provided, only vertices from changes in the filter
-/// (or ROOT) will be included in the output.
+/// When `graph_visibility` is provided, only vertices from changes in the
+/// dependency closure (or ROOT) are included. `None` explicitly reads the
+/// unfiltered ambient graph.
 ///
 /// # Arguments
 ///
@@ -601,7 +612,7 @@ where
 /// * `position` - Starting position in the graph
 /// * `path` - Path where the file should be written
 /// * `options` - Output options
-/// * `change_filter` - Optional set of change NodeIds to include
+/// * `graph_visibility` - Optional validated dependency closure to include
 ///
 /// # Returns
 ///
@@ -615,7 +626,7 @@ pub fn output_file_with_filter<T, C, W>(
     position: Position<NodeId>,
     path: &str,
     options: FileOutputOptions,
-    change_filter: Option<Arc<HashSet<NodeId>>>,
+    graph_visibility: Option<GraphVisibilityClosure>,
 ) -> Result<FileOutputResult, FileOutputError<W::Error>>
 where
     T: GraphTxnT,
@@ -623,13 +634,38 @@ where
     W: WorkingCopy,
     W::Writer: Write,
 {
-    // Initialize result
+    let rendered = render_file_with_filter::<T, C, W::Error>(
+        txn,
+        changes,
+        inode,
+        position,
+        path,
+        options,
+        graph_visibility,
+    )?;
+    apply_rendered_file(working_copy, rendered, options.flush_after_write)
+}
+
+/// Render a file completely without opening a working-copy writer.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn render_file_with_filter<T, C, WE>(
+    txn: &T,
+    changes: &C,
+    inode: Inode,
+    position: Position<NodeId>,
+    path: &str,
+    options: FileOutputOptions,
+    graph_visibility: Option<GraphVisibilityClosure>,
+) -> Result<RenderedFile, FileOutputError<WE>>
+where
+    T: GraphTxnT,
+    C: ChangeStore,
+{
     let mut result = FileOutputResult::new(path, inode);
 
-    // Retrieve the alive graph with optional change filter
     let mut retrieve_opts = options.to_retrieve_options();
-    if let Some(filter) = change_filter {
-        retrieve_opts = retrieve_opts.with_change_filter_arc(filter);
+    if let Some(visibility) = graph_visibility {
+        retrieve_opts = retrieve_opts.with_graph_visibility(visibility);
     }
     let retrieve_result = retrieve_graph(txn, position, retrieve_opts)?;
 
@@ -637,69 +673,34 @@ where
     result.edges_traversed = retrieve_result.edges_traversed;
     result.was_truncated = retrieve_result.truncated;
 
-    // Handle empty graph.
-    //
-    // When a change_filter is active (view-aware output), an empty graph
-    // means the file has no content on the target view.  In that case we
-    // must NOT create the file — it belongs to a different view and should
-    // not appear in the working copy.
-    //
-    // Without a change_filter the empty graph represents a genuinely empty
-    // file, so we create it as before.
+    // An empty graph represents present, zero-byte content at this layer.
+    // Presence and lifecycle filtering are the caller's responsibility.
     if retrieve_result.graph.is_empty() {
-        if retrieve_result.was_filtered {
-            // File has no vertices after filtering — skip it entirely.
-            return Ok(result);
-        }
-        // No filter active: create an empty file on disk.
-        let writer = working_copy
-            .write_file(path, inode)
-            .map_err(FileOutputError::WorkingCopy)?;
-        let hashing_writer = crate::output::filesystem::HashingWriter::new(writer);
-        let mut writer = Writer::new(hashing_writer);
-        if options.flush_after_write {
-            writer.inner_mut().flush()?;
-        }
-        result.content_hash = Some(writer.inner_mut().finalize());
-        return Ok(result);
+        let hashing_writer = crate::output::filesystem::HashingWriter::new(Vec::new());
+        result.content_hash = Some(hashing_writer.finalize());
+        return Ok(RenderedFile {
+            bytes: hashing_writer.into_inner(),
+            result,
+        });
     }
 
-    // Compute SCC ordering
     let mut graph = retrieve_result.graph;
     let order = compute_order(&mut graph);
+    let resolved =
+        resolve_conflicts_semantically(txn, changes, &graph, &order).map_err(OutputError::from)?;
 
-    // Attempt semantic merge for any conflicting SCCs
-    let resolved = resolve_conflicts_semantically(txn, changes, &graph, &order);
-
-    // Create writer with hashing layer
-    let file_writer = working_copy
-        .write_file(path, inode)
-        .map_err(FileOutputError::WorkingCopy)?;
-    let hashing_writer = crate::output::filesystem::HashingWriter::new(file_writer);
+    let hashing_writer = crate::output::filesystem::HashingWriter::new(Vec::new());
     let mut writer = Writer::new(hashing_writer);
 
-    // Hash function for conflict markers
-    let hash_fn = |node_id: NodeId| -> Option<Hash> {
-        if node_id.is_root() {
-            return None;
-        }
-        txn.get_external(node_id).ok().flatten()
-    };
+    let hash_fn = |node_id: NodeId| txn.get_external(node_id);
 
-    // Output the graph content (with semantic merge resolution)
     output_graph_content_resolved(changes, hash_fn, &graph, &order, &mut writer, &resolved)?;
 
-    // Flush if requested
-    if options.flush_after_write {
-        writer.inner_mut().flush()?;
-    }
+    let hashing_writer = writer.into_inner();
+    result.content_hash = Some(hashing_writer.finalize());
+    let bytes = hashing_writer.into_inner();
 
-    // Extract the content hash from the hashing writer
-    let content_hash = writer.inner_mut().finalize();
-    result.content_hash = Some(content_hash);
-
-    // Extract conflicts from order result.
-    // Only count SCCs that were NOT resolved by the semantic merge engine.
+    // Only count SCCs that were not resolved by the semantic merge engine.
     let effectively_resolved = resolved.resolved_count();
     let remaining_cyclic = order.cyclic_conflicts.saturating_sub(effectively_resolved);
 
@@ -715,6 +716,27 @@ where
         }
     }
 
+    Ok(RenderedFile { bytes, result })
+}
+
+/// Apply previously rendered bytes to one working-copy file.
+pub(crate) fn apply_rendered_file<W>(
+    working_copy: &W,
+    rendered: RenderedFile,
+    flush_after_write: bool,
+) -> Result<FileOutputResult, FileOutputError<W::Error>>
+where
+    W: WorkingCopy,
+    W::Writer: Write,
+{
+    let RenderedFile { bytes, result } = rendered;
+    let mut writer = working_copy
+        .write_file(&result.path, result.inode)
+        .map_err(FileOutputError::WorkingCopy)?;
+    writer.write_all(&bytes)?;
+    if flush_after_write {
+        writer.flush()?;
+    }
     Ok(result)
 }
 
@@ -784,17 +806,10 @@ where
     // Hash function to convert NodeId to Hash using the transaction.
     // This is required for the ChangeStore to load the correct change file
     // and retrieve the content bytes for each span.
-    let hash_fn = |node_id: NodeId| -> Option<Hash> {
-        // Handle ROOT node - it has no hash
-        if node_id.is_root() {
-            return None;
-        }
-        // Use transaction's get_external to convert NodeId to Hash
-        txn.get_external(node_id).ok().flatten()
-    };
+    let hash_fn = |node_id: NodeId| txn.get_external(node_id);
 
     // Attempt semantic merge for any conflicting SCCs
-    let resolved = resolve_conflicts_semantically(txn, changes, &graph, &order);
+    let resolved = resolve_conflicts_semantically(txn, changes, &graph, &order)?;
 
     // Output the graph content (with semantic merge resolution)
     output_graph_content_resolved(changes, hash_fn, &graph, &order, &mut writer, &resolved)?;
@@ -820,13 +835,13 @@ where
 /// Output a file's content to a buffer with explicit retrieve options.
 ///
 /// This is a lower-level function that allows passing custom [`RetrieveOptions`]
-/// directly, enabling features like change filtering for state-based content
+/// directly, enabling validated graph visibility for state-based content
 /// retrieval.
 ///
 /// # State-Based Content Retrieval
 ///
 /// The primary use case for this function is retrieving file content at a
-/// specific historical state. By setting a change filter in the options,
+/// specific historical state. By setting graph visibility in the options,
 /// you can retrieve content as it existed before or after a specific change:
 ///
 /// ```text
@@ -849,7 +864,7 @@ where
 /// * `changes` - Change store for span content
 /// * `position` - Starting position in the graph (file's inode position)
 /// * `file_options` - Basic file output options (max_vertices, include_deleted)
-/// * `retrieve_options` - Advanced retrieve options including change filter
+/// * `retrieve_options` - Advanced retrieve options including graph visibility
 ///
 /// # Returns
 ///
@@ -873,13 +888,11 @@ where
 /// ```rust,ignore
 /// use atomic_core::output::alive::RetrieveOptions;
 /// use atomic_core::output::repo::{output_file_to_buffer_with_options, FileOutputOptions};
-/// use std::collections::HashSet;
+/// use atomic_core::pristine::GraphVisibilityClosure;
 ///
-/// // Get changes applied before a specific change
-/// let change_set: HashSet<NodeId> = get_changes_up_to_sequence(&txn, &view, 5)?;
-///
-/// // Create retrieve options with the filter
-/// let retrieve_opts = RetrieveOptions::new().with_change_filter(change_set);
+/// let membership = get_membership_up_to_sequence(&txn, &view, 5)?;
+/// let visibility = GraphVisibilityClosure::try_from_membership(&txn, &membership)?;
+/// let retrieve_opts = RetrieveOptions::new().with_graph_visibility(visibility);
 /// let file_opts = FileOutputOptions::new();
 ///
 /// // Get content at that historical state
@@ -910,7 +923,7 @@ where
     T: GraphTxnT,
     C: ChangeStore,
 {
-    // Retrieve the alive graph with the provided options (including change filter)
+    // Retrieve the alive graph with the provided options (including visibility).
     let retrieve_result = retrieve_graph(txn, position, retrieve_options)
         .map_err(|e| OutputError::Pristine(Box::new(e)))?;
 
@@ -930,21 +943,19 @@ where
     // Hash function to convert NodeId to Hash using the transaction.
     // This is required for the ChangeStore to load the correct change file
     // and retrieve the content bytes for each span.
-    let hash_fn = |node_id: NodeId| -> Option<Hash> {
-        // Handle ROOT node - it has no hash
-        if node_id.is_root() {
-            return None;
-        }
-        // Use transaction's get_external to convert NodeId to Hash
-        txn.get_external(node_id).ok().flatten()
-    };
+    let hash_fn = |node_id: NodeId| txn.get_external(node_id);
 
     // Attempt semantic merge for any conflicting SCCs
-    let resolved = resolve_conflicts_semantically(txn, changes, &graph, &order);
+    let resolved = resolve_conflicts_semantically(txn, changes, &graph, &order)?;
     let had_fork_structure = !resolved.is_empty();
 
     // Output the graph content (with semantic merge resolution)
     output_graph_content_resolved(changes, hash_fn, &graph, &order, &mut writer, &resolved)?;
+
+    // Whether the renderer itself emitted conflict markers. Source content
+    // that merely contains marker-shaped bytes (documentation examples, test
+    // fixtures) is written through `output_line` and never sets this.
+    let rendered_conflict = writer.has_conflict_markers();
 
     // Extract buffer
     let content = writer.into_inner();
@@ -959,6 +970,14 @@ where
                 FileConflict::new(String::new(), FileConflictType::Cyclic).with_id(conflict_id),
             );
         }
+    }
+    // An unresolved fork that is not a cyclic SCC still emits markers through
+    // the renderer; record it so callers see `conflicts` as "markers were
+    // rendered", never as "source content happens to look like markers".
+    if rendered_conflict && conflicts.is_empty() {
+        conflict_id += 1;
+        conflicts
+            .push(FileConflict::new(String::new(), FileConflictType::Order).with_id(conflict_id));
     }
 
     Ok((content, conflicts, had_fork_structure))
@@ -1345,6 +1364,20 @@ mod tests {
             FileOutputError::Io(_) => (),
             _ => panic!("Expected Io variant"),
         }
+    }
+
+    #[test]
+    fn test_error_from_output_error_pristine() {
+        let output_err =
+            OutputError::Pristine(Box::new(crate::pristine::PristineError::Inconsistent {
+                message: "broken graph".to_string(),
+            }));
+        let err: FileOutputError<std::io::Error> = output_err.into();
+
+        assert!(matches!(
+            err,
+            FileOutputError::Graph(crate::pristine::PristineError::Inconsistent { .. })
+        ));
     }
 
     #[test]

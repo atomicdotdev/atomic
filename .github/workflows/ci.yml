@@ -55,7 +55,7 @@ jobs:
             ${{ runner.os }}-cargo-test-
 
       - name: Run tests
-        run: cargo test --workspace
+        run: cargo test --workspace --features atomic-cli/adoption-test-injection
 
       - name: Run CLI semantic diff harness
         if: matrix.os == 'ubuntu-latest'

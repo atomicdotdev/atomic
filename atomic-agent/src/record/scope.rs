@@ -84,8 +84,9 @@ pub fn fingerprint(root: &Path, path: &str) -> Result<Option<String>, String> {
 pub fn snapshot(root: &Path, extra: &[String]) -> Result<serde_json::Value, String> {
     let repo = Repository::open_readonly_wait(root, std::time::Duration::from_secs(10))
         .map_err(|e| e.to_string())?;
+    let working_copy = repo.require_working_copy_id().map_err(|e| e.to_string())?;
     let status = repo
-        .status(StatusOptions::default().with_untracked(true))
+        .status(working_copy, StatusOptions::default().with_untracked(true))
         .map_err(|e| e.to_string())?;
     let dirty: Vec<String> = status
         .entries()
@@ -171,8 +172,9 @@ pub(crate) fn has_pending_changes(
     };
     let repo =
         Repository::open_readonly_wait(root, std::time::Duration::from_secs(10)).map_err(fail)?;
+    let working_copy = repo.require_working_copy_id().map_err(fail)?;
     let status = repo
-        .status(StatusOptions::default().with_untracked(true))
+        .status(working_copy, StatusOptions::default().with_untracked(true))
         .map_err(fail)?;
     let scoped = filter(status, Some(&files));
     Ok(!scoped.is_clean() || scoped.has_untracked() || scoped.has_conflicts())

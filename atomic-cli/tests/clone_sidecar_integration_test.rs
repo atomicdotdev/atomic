@@ -18,7 +18,6 @@
 //! Windows is excluded: the test isolates the identity store by pointing
 //! `HOME` at a temp dir, which `dirs::home_dir()` ignores on Windows.
 #![cfg(not(windows))]
-
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::path::Path;
