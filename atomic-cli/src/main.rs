@@ -73,6 +73,7 @@ use commands::{
     Log,
     Memory,
     Move,
+    Outcome,
     ProjectCmd,
     Provenance,
     Pull,
@@ -865,6 +866,14 @@ enum Commands {
     /// with no arguments asks whether the current view is ready to promote.
     Triage(Triage),
 
+    /// Collapse N views into one rollup: cost, footprint, and mergeability.
+    ///
+    /// Where `triage review` asks "is *this* view ready to promote?", an
+    /// outcome asks what promoting several at once would cost, touch, and
+    /// collide on. Both view arguments are optional: the sources default to
+    /// the current view and the target to its parent.
+    Outcome(Outcome),
+
     /// Generate a shell completion script.
     ///
     /// Emits a static completion script for the given shell. For live
@@ -1045,6 +1054,7 @@ fn main() {
         Commands::Provenance(provenance) => provenance.run(),
 
         Commands::Triage(triage) => triage.run(),
+        Commands::Outcome(outcome) => outcome.run(),
     };
 
     // Handle errors with user-friendly output
