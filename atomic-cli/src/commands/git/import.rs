@@ -579,12 +579,12 @@ impl Command for Import {
             // read-only so we can subtract what each branch's view already
             // contains. A fresh (not-yet-initialized) repo has nothing
             // imported, so the forecast is the full history — which is correct.
-            let repo = if self.incremental && workdir.join(".atomic").join("pristine.redb").exists()
-            {
-                Repository::open_readonly(workdir).ok()
-            } else {
-                None
-            };
+            let repo =
+                if self.incremental && atomic_repository::has_database(&workdir.join(".atomic")) {
+                    Repository::open_readonly(workdir).ok()
+                } else {
+                    None
+                };
 
             for branch_name in &branches {
                 if let Ok(reference) = git_repo.find_branch(branch_name, git2::BranchType::Local) {
@@ -644,7 +644,7 @@ impl Command for Import {
         // Check if Atomic repository exists in THIS directory (not parent dirs).
         // Don't use find_repository_root() — it walks up and might find
         // ~/.atomic/ (global config dir) which isn't a repo.
-        let repo_exists = workdir.join(".atomic").join("pristine.redb").exists();
+        let repo_exists = atomic_repository::has_database(&workdir.join(".atomic"));
         let mut repo = if repo_exists {
             Repository::open(workdir).map_err(|e| CliError::Internal(e.into()))?
         } else {

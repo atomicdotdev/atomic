@@ -22,10 +22,12 @@
 
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use redb::{Builder, Database, ReadOnlyDatabase, ReadableDatabase, ReadableTable};
 
 use crate::pristine::error::{PristineError, PristineResult};
+use crate::pristine::schema::{check_schema_version, stamp_schema_version};
 use crate::pristine::tables::*;
 
 use super::helpers::deserialize_view_state;
@@ -49,7 +51,11 @@ fn upgrade_legacy_database(path: &Path) -> PristineResult<()> {
     Ok(())
 }
 
-fn open_database(path: &Path, create: bool, cache_bytes: usize) -> PristineResult<Database> {
+pub(crate) fn open_database(
+    path: &Path,
+    create: bool,
+    cache_bytes: usize,
+) -> PristineResult<Database> {
     let open = || {
         let mut builder = Builder::new();
         builder.set_cache_size(cache_bytes);
@@ -100,7 +106,7 @@ pub struct Pristine {
 }
 
 enum PristineDatabase {
-    Writable(Database),
+    Writable(Arc<Database>),
     ReadOnly(ReadOnlyDatabase),
 }
 
@@ -180,6 +186,8 @@ impl Pristine {
             write_txn.open_table(SESSION_PROVENANCE)?;
             write_txn.open_table(SESSION_MANIFESTS)?;
             write_txn.open_table(SESSION_HEADS)?;
+
+            stamp_schema_version(&write_txn)?;
         }
         write_txn.commit()?;
 
@@ -187,45 +195,7 @@ impl Pristine {
         // Errors are propagated (not silently skipped) so that open()
         // fails fast on corrupted data rather than underestimating the
         // max ID and reusing an already-allocated slot.
-        let read_txn = db.begin_read()?;
-
-        let next_node_id = {
-            let table = read_txn.open_table(EXTERNAL)?;
-            let mut max_id = 0u64;
-            for result in table.iter()? {
-                let (k, _) = result?;
-                max_id = max_id.max(k.value());
-            }
-            AtomicU64::new(next_id(max_id)?)
-        };
-
-        let next_view_id = {
-            let table = read_txn.open_table(VIEWS)?;
-            let mut max_id = 0u64;
-            for result in table.iter()? {
-                let (_, value) = result?;
-                let state = deserialize_view_state(value.value())?;
-                max_id = max_id.max(state.id);
-            }
-            AtomicU64::new(next_id(max_id)?)
-        };
-
-        let next_inode = {
-            let table = read_txn.open_table(INODES)?;
-            let mut max_id = 0u64;
-            for result in table.iter()? {
-                let (k, _) = result?;
-                max_id = max_id.max(k.value());
-            }
-            AtomicU64::new(next_id(max_id)?)
-        };
-
-        Ok(Self {
-            db: PristineDatabase::Writable(db),
-            next_node_id,
-            next_view_id,
-            next_inode,
-        })
+        Self::scan_ids(PristineDatabase::Writable(Arc::new(db)))
     }
 
     /// Open an existing pristine database without the table-init write lock.
@@ -246,7 +216,7 @@ impl Pristine {
     pub fn open_existing<P: AsRef<Path>>(path: P) -> PristineResult<Self> {
         let cache_bytes = 8 * 1024 * 1024 * 1024; // 8 GiB
         let db = open_database(path.as_ref(), false, cache_bytes)?;
-        Self::scan_ids(PristineDatabase::Writable(db))
+        Self::scan_ids(PristineDatabase::Writable(Arc::new(db)))
     }
 
     /// Open an existing pristine database in read-only mode
@@ -287,13 +257,11 @@ impl Pristine {
         Self::scan_ids(PristineDatabase::ReadOnly(db))
     }
 
-    /// Scan existing tables for the next available IDs.
-    ///
-    /// Shared implementation for `open_existing` and `open_readonly` — both
-    /// skip the table-init write transaction and only need a read pass to
-    /// discover the max allocated node, view, and inode IDs.
+    /// Check the schema version and scan existing tables for the next
+    /// available node, view, and inode IDs. Shared by every constructor.
     fn scan_ids(db: PristineDatabase) -> PristineResult<Self> {
         let read_txn = db.begin_read()?;
+        check_schema_version(&read_txn)?;
 
         let next_node_id = {
             let table = read_txn.open_table(EXTERNAL)?;
@@ -332,6 +300,18 @@ impl Pristine {
             next_view_id,
             next_inode,
         })
+    }
+
+    /// The writable redb handle, for stores that keep their tables in the same
+    /// repository database. `None` for a read-only pristine.
+    ///
+    /// A second `Database` for the same file cannot be opened while this one
+    /// is alive, even in the same process, so co-located stores must share it.
+    pub fn shared_database(&self) -> Option<Arc<Database>> {
+        match &self.db {
+            PristineDatabase::Writable(db) => Some(Arc::clone(db)),
+            PristineDatabase::ReadOnly(_) => None,
+        }
     }
 
     /// Begin a read-only transaction

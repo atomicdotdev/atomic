@@ -667,6 +667,16 @@ pub const KG_INDEX_META: TableDefinition<&str, u32> = TableDefinition::new("kg_i
 /// Stores embeddings for semantic similarity search over vault content.
 pub const EMBEDDINGS: TableDefinition<&str, &[u8]> = TableDefinition::new("embeddings");
 
+// Database Metadata
+
+/// Repository database metadata: key → value bytes
+///
+/// Holds the schema version (`SCHEMA_VERSION_KEY`, little-endian u64) and, for
+/// databases merged from the legacy `pristine.redb` + `changes.redb` layout,
+/// the `.atomic/legacy/` directory the old files were moved to
+/// (`LEGACY_DIR_KEY`, UTF-8).
+pub const ATOMIC_META: TableDefinition<&str, &[u8]> = TableDefinition::new("atomic_meta");
+
 // KG Edge Key / FTS Helpers
 
 /// Encode a KG edge key as "from_id\0to_id\0kind".

@@ -1,11 +1,12 @@
 //! redb-native change storage for Atomic VCS.
 //!
 //! This module implements [`RedbChangeStore`], which stores change data directly
-//! in redb tables instead of `.change` files. Production repositories keep the
-//! store at `.atomic/changes.redb`; the repository owner service is the sole
-//! long-lived opener and ordinary [`crate::Repository`] handles expose only its
-//! canonical path. Direct [`RedbChangeStore::open`] calls are intended for the
-//! owner service, standalone stores, and tests.
+//! in redb tables instead of `.change` files. Production repositories keep these
+//! tables in the repository database, `.atomic/atomic.redb`, next to the graph.
+//! The agent database owner opens it with [`RedbChangeStore::open_existing`]
+//! while serving a request; a process that already holds a [`crate::Repository`]
+//! uses [`crate::Repository::redb_change_store`] to share that handle.
+//! [`RedbChangeStore::open`] creates standalone stores, mainly for tests.
 //!
 //! # Sub-modules
 //!
@@ -28,10 +29,11 @@ pub use queries::{StoreStats, StoredContentChunk};
 use atomic_core::change::format_v3::{self, ChangeReader, FormatError, SectionType};
 use atomic_core::change::{Change, ChangeHeader};
 use atomic_core::pristine::tables;
-use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
+use redb::{Builder, Database, ReadableDatabase, ReadableTable, TableDefinition};
 use std::fmt;
 use std::io::Cursor;
 use std::path::Path;
+use std::sync::Arc;
 use thiserror::Error;
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -137,6 +139,14 @@ pub enum RedbStoreError {
 /// Convenience result type for redb store operations.
 pub type RedbStoreResult<T> = Result<T, RedbStoreError>;
 
+impl RedbStoreError {
+    /// Whether opening failed because another handle holds the database file.
+    pub fn is_database_busy(&self) -> bool {
+        matches!(self, Self::Database(inner)
+            if matches!(inner.as_ref(), redb::DatabaseError::DatabaseAlreadyOpen))
+    }
+}
+
 impl From<redb::DatabaseError> for RedbStoreError {
     fn from(e: redb::DatabaseError) -> Self {
         RedbStoreError::Database(Box::new(e))
@@ -231,7 +241,7 @@ pub struct StoredChangeMeta {
 /// | `PROVENANCE_JOURNAL_EVENTS` | `[u8; 16]` | immutable event | Ordered pending provenance |
 /// | `PROVENANCE_FINAL_HASHES` | `[u8; 32]` | `u64` | Final hash → reserved turn |
 pub struct RedbChangeStore {
-    db: Database,
+    db: Arc<Database>,
 }
 
 impl RedbChangeStore {
@@ -242,17 +252,27 @@ impl RedbChangeStore {
     ///
     /// # Arguments
     ///
-    /// * `path` - Path to the redb database file. Repository-integrated callers
-    ///   use [`crate::Repository::canonical_change_store_path`], which resolves
-    ///   to `.atomic/changes.redb` (including from agent sandboxes).
+    /// * `path` - Path to the redb database file, created if missing. Use
+    ///   [`open_existing`](Self::open_existing) for a repository database so a
+    ///   missing or not-yet-merged repository is never replaced by an empty one.
     ///
     /// # Errors
     ///
     /// Returns an error if the database cannot be opened or tables cannot be created.
     pub fn open<P: AsRef<Path>>(path: P) -> RedbStoreResult<Self> {
-        let db = Database::create(path)?;
+        Self::from_database(Arc::new(Database::create(path)?))
+    }
 
-        // Create all tables on first use
+    /// Open the store in an existing database file without creating it.
+    ///
+    /// Repository callers pass [`crate::ensure_database`]'s result here.
+    pub fn open_existing<P: AsRef<Path>>(path: P) -> RedbStoreResult<Self> {
+        Self::from_database(Arc::new(Builder::new().open(path)?))
+    }
+
+    /// Use the store's tables in an already-open database, creating any that
+    /// are missing.
+    pub fn from_database(db: Arc<Database>) -> RedbStoreResult<Self> {
         {
             let txn = db.begin_write()?;
             {
