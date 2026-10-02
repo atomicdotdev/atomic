@@ -81,6 +81,7 @@ mod database;
 mod deferred_tree;
 mod filter;
 mod materialize;
+mod publication;
 mod sandbox;
 mod semantic_materialize;
 mod split;
@@ -332,7 +333,8 @@ default = "{}"
         // tables live in the same database; the owner service creates them on
         // first use.
         let change_store = ChangeStore::new(dot_dir.join("changes"), DEFAULT_CACHE_CAPACITY)
-            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+            .map_err(|e| RepositoryError::Database(e.to_string()))?
+            .with_database(Arc::clone(&pristine));
 
         let repository = Self {
             root,
@@ -385,7 +387,8 @@ default = "{}"
             Self::read_current_view(&dot_dir).unwrap_or_else(|_| DEFAULT_STACK.to_string());
 
         let change_store = ChangeStore::new(dot_dir.join("changes"), DEFAULT_CACHE_CAPACITY)
-            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+            .map_err(|e| RepositoryError::Database(e.to_string()))?
+            .with_database(Arc::clone(&pristine));
 
         let mut repository = Self {
             root,
@@ -429,7 +432,8 @@ default = "{}"
             Self::read_current_view(&dot_dir).unwrap_or_else(|_| DEFAULT_STACK.to_string());
 
         let change_store = ChangeStore::new(dot_dir.join("changes"), DEFAULT_CACHE_CAPACITY)
-            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+            .map_err(|e| RepositoryError::Database(e.to_string()))?
+            .with_database(Arc::clone(&pristine));
 
         let mut repository = Self {
             root,
@@ -496,7 +500,8 @@ default = "{}"
             Self::read_current_view(&dot_dir).unwrap_or_else(|_| DEFAULT_STACK.to_string());
 
         let change_store = ChangeStore::new(dot_dir.join("changes"), DEFAULT_CACHE_CAPACITY)
-            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+            .map_err(|e| RepositoryError::Database(e.to_string()))?
+            .with_database(Arc::clone(&pristine));
 
         let repository = Self {
             root,
@@ -577,7 +582,8 @@ default = "{}"
             Self::read_current_view(&dot_dir).unwrap_or_else(|_| DEFAULT_STACK.to_string());
 
         let change_store = ChangeStore::new(dot_dir.join("changes"), DEFAULT_CACHE_CAPACITY)
-            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+            .map_err(|e| RepositoryError::Database(e.to_string()))?
+            .with_database(Arc::clone(&pristine));
 
         let mut repository = Self {
             root,

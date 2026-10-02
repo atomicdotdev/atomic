@@ -213,6 +213,15 @@ impl TurnOrchestrator {
         event: &TurnEvent,
         turn_number: u32,
     ) -> AgentResult<()> {
+        // A previous Stop may have committed before saving the JSON session
+        // cache. Its immutable terminal events are already complete; do not
+        // append new retry observations or require the owner to be reachable.
+        if self
+            .completed_turn_checkpoint(&event.session_id, turn_number)?
+            .is_some()
+        {
+            return Ok(());
+        }
         self.migrate_legacy_accumulator(
             &event.session_id,
             turn_number,
@@ -628,6 +637,47 @@ impl TurnOrchestrator {
         self.checkpoint_turn_provenance(session_id, session, &[outcome.hash], event)
     }
 
+    pub(super) fn completed_turn_checkpoint(
+        &self,
+        session_id: &str,
+        turn_number: u32,
+    ) -> AgentResult<Option<atomic_core::change::session::SessionTurn>> {
+        if self.journal_sink.is_none() {
+            return Ok(None);
+        }
+        let failure = |reason: String| AgentError::ProvenanceJournalFailed {
+            session_id: session_id.to_string(),
+            reason,
+        };
+        let repository = atomic_repository::Repository::open_readonly_wait(
+            &self.repo_root,
+            super::wait_budget::database_wait(),
+        )
+        .map_err(|error| failure(error.to_string()))?;
+        let read = repository
+            .pristine()
+            .read_txn()
+            .map_err(|error| failure(error.to_string()))?;
+        let completed = atomic_repository::redb_change_store::RedbChangeStore::
+            completed_provenance_checkpoint_for_in_txn(
+                read.redb_transaction(), session_id, turn_number,
+            ).map_err(|error| failure(error.to_string()))?;
+        if let Some(turn) = &completed {
+            let graph = repository
+                .load_provenance_graph(&turn.provenance_hash)
+                .map_err(|error| failure(error.to_string()))?;
+            if graph.session_id != session_id
+                || graph.changes_explained != turn.change_hashes
+                || graph.previous != turn.previous_provenance
+            {
+                return Err(failure(
+                    "completed checkpoint object does not match its ledger".into(),
+                ));
+            }
+        }
+        Ok(completed)
+    }
+
     pub(super) fn checkpoint_turn_provenance(
         &self,
         session_id: &str,
@@ -645,6 +695,21 @@ impl TurnOrchestrator {
             );
             return Ok(());
         };
+
+        // Completion, its object, ledger and manifest already committed in one
+        // transaction. Recover that receipt before deriving a new predecessor
+        // from the advanced session head or contacting the journal owner.
+        if let Some(completed) =
+            self.completed_turn_checkpoint(session_id, session.turn_count.max(1))?
+        {
+            if !change_hashes.is_empty() && change_hashes != completed.change_hashes {
+                return Err(AgentError::ProvenanceJournalFailed {
+                    session_id: session_id.to_string(),
+                    reason: "completed checkpoint conflicts with newly recorded changes".into(),
+                });
+            }
+            return Ok(());
+        }
 
         // A failed read must not masquerade as a new session, which would
         // bind a checkpoint with a missing predecessor. Release this handle
@@ -720,11 +785,16 @@ impl TurnOrchestrator {
         let (graph, _provenance_hash, session_turn) =
             match (checkpoint.provenance_hash, checkpoint.session_turn.clone()) {
                 (Some(hash), Some(turn)) => {
-                    let graph = change_store.load_provenance_graph(&hash).map_err(|error| {
-                        AgentError::ProvenanceJournalFailed {
-                            session_id: session_id.to_string(),
-                            reason: format!("bound provenance graph is unavailable: {error}"),
-                        }
+                    // Canonical objects may have no filesystem export (for
+                    // example after a crash or restoring atomic.redb).
+                    let graph = atomic_repository::Repository::open_readonly_wait(
+                        &self.repo_root,
+                        super::wait_budget::database_wait(),
+                    )
+                    .and_then(|repository| repository.load_provenance_graph(&hash))
+                    .map_err(|error| AgentError::ProvenanceJournalFailed {
+                        session_id: session_id.to_string(),
+                        reason: format!("bound provenance graph is unavailable: {error}"),
                     })?;
                     (graph, hash, turn)
                 }
@@ -822,9 +892,7 @@ impl TurnOrchestrator {
                 }
             };
 
-        // The owner opens the same database file to record the acknowledgement,
-        // so this handle must be closed before calling it.
-        let publication = {
+        {
             let repository = atomic_repository::Repository::open_existing_wait(
                 &self.repo_root,
                 super::wait_budget::database_wait(),
@@ -834,21 +902,20 @@ impl TurnOrchestrator {
                 reason: error.to_string(),
             })?;
             repository
-                .publish_provenance_checkpoint(&graph, session_turn)
+                .publish_bound_provenance_checkpoint(
+                    &graph,
+                    session_turn,
+                    atomic_repository::redb_change_store::ProvenanceId::new(
+                        checkpoint.provenance_id,
+                    ),
+                    checkpoint.attempt_generation,
+                    event.timestamp.timestamp(),
+                )
                 .map_err(|error| AgentError::ProvenanceJournalFailed {
                     session_id: session_id.to_string(),
                     reason: error.to_string(),
-                })?
-        };
-        sink.acknowledge_checkpoint(
-            &checkpoint,
-            publication.manifest_hash,
-            event.timestamp.timestamp(),
-        )
-        .map_err(|reason| AgentError::ProvenanceJournalFailed {
-            session_id: session_id.to_string(),
-            reason,
-        })?;
+                })?;
+        }
 
         Ok(())
     }

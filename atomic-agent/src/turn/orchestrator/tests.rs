@@ -111,10 +111,10 @@ impl ProvenanceJournalSink for RejectingJournalSink {
     fn resume_turn(
         &self,
         _session_id: &str,
-        _turn_number: u32,
+        turn_number: u32,
         _now: i64,
     ) -> Result<Option<JournalTurnStatus>, String> {
-        Err("owner unavailable".to_string())
+        Err(format!("owner unavailable for turn {turn_number}"))
     }
 
     fn abandon_turn(
@@ -152,6 +152,171 @@ async fn journal_failure_prevents_unacknowledged_graph_fallback() {
         &dir.path().join(".atomic/sessions/journal-failure")
     )
     .exists());
+}
+
+#[tokio::test]
+async fn stop_recovers_committed_checkpoint_without_owner_or_export_cache() {
+    use atomic_core::change::{session::SessionTurn, ProvenanceGraph};
+    use atomic_core::types::Hash;
+    use atomic_repository::redb_change_store::ProvenanceCheckpointSource;
+
+    let dir = TempDir::new().unwrap();
+    let repository = Repository::init(dir.path()).unwrap();
+    fs::write(dir.path().join("original.txt"), "committed before crash\n").unwrap();
+    repository
+        .add(
+            "original.txt",
+            atomic_repository::tracking::TrackingOptions::default(),
+        )
+        .unwrap();
+    let recorded = repository
+        .record(
+            atomic_core::change::ChangeHeader::new("original turn"),
+            atomic_repository::record::RecordOptions::new().with_all(true),
+        )
+        .unwrap();
+    let original_hash = *recorded.hash();
+    let store = repository.redb_change_store().unwrap();
+    let running = store
+        .reserve_provenance_turn("committed-stop", 1, 10)
+        .unwrap();
+    let graph = ProvenanceGraph::builder("committed-stop", "codex")
+        .agent_display_name("Codex")
+        .agent_vendor("openai")
+        .changes_explained(vec![original_hash])
+        .timestamp(11)
+        .build();
+    let hash = Hash::of(&graph.serialize().unwrap());
+    let turn = SessionTurn {
+        session_id: "committed-stop".into(),
+        turn_number: 0,
+        goal: None,
+        provenance_hash: hash,
+        change_hashes: vec![original_hash],
+        previous_provenance: None,
+        timestamp: graph.timestamp,
+        plan_id: None,
+        todos: vec![],
+    };
+    let prepared = store
+        .prepare_provenance_checkpoint(
+            running.provenance_id,
+            running.generation,
+            ProvenanceCheckpointSource {
+                agent_name: "codex".into(),
+                agent_display_name: "Codex".into(),
+                agent_vendor: "openai".into(),
+                change_hashes: vec![original_hash],
+                previous_provenance: None,
+                plan_id: None,
+                ledger_turn_number: 0,
+            },
+            11,
+        )
+        .unwrap();
+    store
+        .bind_provenance_checkpoint_hash(
+            running.provenance_id,
+            prepared.attempt_generation,
+            hash,
+            turn.clone(),
+            12,
+        )
+        .unwrap();
+    let publication = repository
+        .publish_bound_provenance_checkpoint(
+            &graph,
+            turn.clone(),
+            running.provenance_id,
+            prepared.attempt_generation,
+            13,
+        )
+        .unwrap();
+    // This cache may be absent after a crash or a database-only restore.
+    fs::remove_file(repository.change_store().provenance_path(&hash)).unwrap();
+    drop(store);
+    drop(repository);
+
+    // Simulate death after database commit but before the Stop saved session JSON.
+    let mut orchestrator = make_orchestrator(&dir);
+    orchestrator.set_journal_sink(std::sync::Arc::new(RejectingJournalSink));
+    let mut session = AgentSession::new("committed-stop", "codex", "Codex");
+    session.agent_vendor = "openai".into();
+    session.phase = Phase::Active;
+    session.begin_turn();
+    orchestrator.session_store.save(&session).unwrap();
+
+    // Edits arriving after the crash belong to a later interaction, not to the
+    // already-completed turn whose JSON cache is being repaired.
+    fs::write(dir.path().join("original.txt"), "new edit after crash\n").unwrap();
+
+    orchestrator
+        .dispatch(turn_end_event("committed-stop"))
+        .await
+        .unwrap();
+    let recovered = orchestrator
+        .session_store
+        .load("committed-stop")
+        .unwrap()
+        .unwrap();
+    assert_eq!(recovered.phase, Phase::Idle);
+    assert_eq!(recovered.turn_count, 1);
+    assert_eq!(recovered.recorded_change_hashes, vec![original_hash]);
+    assert_eq!(
+        fs::read_to_string(dir.path().join("original.txt")).unwrap(),
+        "new edit after crash\n"
+    );
+    let repository = Repository::open_readonly(dir.path()).unwrap();
+    assert!(!repository
+        .status(atomic_repository::status::StatusOptions::default())
+        .unwrap()
+        .is_clean());
+    assert_eq!(
+        repository.get_session_head("committed-stop").unwrap(),
+        Some(publication.manifest_hash)
+    );
+    assert_eq!(
+        repository
+            .get_session_ledger("committed-stop")
+            .unwrap()
+            .unwrap()
+            .1,
+        vec![turn]
+    );
+    assert_eq!(repository.load_provenance_graph(&hash).unwrap(), graph);
+    drop(repository);
+
+    // A fresh prompt can arrive before the failed Stop is retried. Repair the
+    // old cached Active turn first, then address the next journal identity.
+    orchestrator.session_store.save(&session).unwrap();
+    let error = orchestrator
+        .dispatch(turn_start_event("committed-stop", "a new request"))
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("turn 2"), "{error}");
+    let recovered = orchestrator
+        .session_store
+        .load("committed-stop")
+        .unwrap()
+        .unwrap();
+    assert_eq!(recovered.turn_count, 1);
+    assert_eq!(recovered.recorded_change_hashes, vec![original_hash]);
+
+    // Programmatic agent turns can have no TurnStart at all; the pre-Stop JSON
+    // then remains Idle until publication completes. Recover that case too.
+    session.phase = Phase::Idle;
+    orchestrator.session_store.save(&session).unwrap();
+    orchestrator
+        .dispatch(turn_end_event("committed-stop"))
+        .await
+        .unwrap();
+    let recovered = orchestrator
+        .session_store
+        .load("committed-stop")
+        .unwrap()
+        .unwrap();
+    assert_eq!(recovered.turn_count, 1);
+    assert_eq!(recovered.recorded_change_hashes, vec![original_hash]);
 }
 
 // DispatchResult tests

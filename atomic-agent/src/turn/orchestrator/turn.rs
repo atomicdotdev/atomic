@@ -31,6 +31,52 @@ enum TurnEndLock {
 }
 
 impl TurnOrchestrator {
+    fn pending_recorded_turn(
+        &self,
+        session: &crate::turn::session::AgentSession,
+    ) -> AgentResult<Option<crate::record::TurnRecordOutcome>> {
+        if self.journal_sink.is_none() || !session.is_turn_active() {
+            return Ok(None);
+        }
+        crate::record::recover_recorded_turn(
+            &self.repo_root,
+            session,
+            session.turn_count.saturating_add(1),
+        )
+    }
+
+    /// Repair the next cached turn whose database publication already completed.
+    /// This runs before a retry can record later working-copy edits, and before
+    /// a fresh prompt chooses its next journal turn number.
+    fn reconcile_completed_turn(
+        &self,
+        session: &mut crate::turn::session::AgentSession,
+    ) -> AgentResult<bool> {
+        // A programmatic agent can stop without a TurnStart; its old JSON may
+        // still be Idle. The journal's exact next turn identity proves whether
+        // this is an unsaved completion in either phase.
+        if session.is_ended() {
+            return Ok(false);
+        }
+        let Some(completed) = self
+            .completed_turn_checkpoint(&session.session_id, session.turn_count.saturating_add(1))?
+        else {
+            return Ok(false);
+        };
+        for hash in completed.change_hashes {
+            if !session.recorded_change_hashes.contains(&hash) {
+                session.recorded_change_hashes.push(hash);
+            }
+        }
+        session.end_turn();
+        session.clear_current_prompt();
+        let transition =
+            phase::transition(session.phase, Event::TurnEnd, TransitionContext::default());
+        phase::apply_common_actions(session, &transition);
+        self.session_store.save(session)?;
+        Ok(true)
+    }
+
     /// Handle a TurnStart event (UserPromptSubmit).
     ///
     /// Begins file watching and transitions the session to Active.
@@ -41,6 +87,14 @@ impl TurnOrchestrator {
         let session_id = &event.session_id;
 
         let mut session = self.load_or_create_session(session_id, &event)?;
+        self.reconcile_completed_turn(&mut session)?;
+        if self.pending_recorded_turn(&session)?.is_some() {
+            // Finish the already-committed interaction before assigning a new
+            // prompt to its journal identity. Do not capture newer file edits.
+            self.handle_turn_end(TurnEvent::new(session_id, crate::event::HookType::TurnEnd))
+                .await?;
+            session = self.load_or_create_session(session_id, &event)?;
+        }
         let turn_number = session.turn_count.saturating_add(1);
         if session.managed_run.is_none() || self.managed_run.is_some() {
             self.resume_journal_turn(session_id, turn_number, event.timestamp.timestamp())?;
@@ -154,6 +208,13 @@ impl TurnOrchestrator {
 
         let mut session = self.load_or_create_session(session_id, &event)?;
 
+        if self.reconcile_completed_turn(&mut session)? {
+            if self.watcher.is_active() {
+                let _ = self.watcher.cancel_turn().await;
+            }
+            return Ok(DispatchResult::new(session_id, session.phase));
+        }
+
         // Tool hooks can reserve and populate the next journal turn without
         // a TurnStart (e.g. programmatic OpenCode/subagent turns). Consult that
         // durable state before classifying an idle session's Stop as a retry.
@@ -192,10 +253,13 @@ impl TurnOrchestrator {
             }
         }
 
-        let has_changes = session.explicit_record_files || self.has_working_copy_changes();
+        let mut recovered_record = self.pending_recorded_turn(&session)?;
+        let has_changes = recovered_record.is_some()
+            || session.explicit_record_files
+            || self.has_working_copy_changes();
         if !session.is_turn_active()
             && session.turn_count > 0
-            && (session.explicit_record_files || !has_changes)
+            && (self.journal_sink.is_some() || session.explicit_record_files || !has_changes)
         {
             if session.explicit_record_files {
                 let options = TurnRecordOptions {
@@ -216,7 +280,9 @@ impl TurnOrchestrator {
                 }
             }
             // A retried Stop after successful publication must not create a
-            // second empty checkpoint for the same completed interaction.
+            // second checkpoint for the same completed interaction. With a
+            // durable journal, only a prompt/tool event can start the next
+            // turn; stale stat caches or later edits cannot establish one.
             return Ok(DispatchResult::new(session_id, session.phase));
         }
 
@@ -334,7 +400,11 @@ impl TurnOrchestrator {
                         identity_dir: None,
                     };
 
-                    match record_turn(&self.repo_root, &record_options) {
+                    let recorded = recovered_record
+                        .take()
+                        .map(Ok)
+                        .unwrap_or_else(|| record_turn(&self.repo_root, &record_options));
+                    match recorded {
                         Ok(outcome) => {
                             // Track the recorded files in the session
                             let recorded_files: Vec<String> = outcome.recorded_file_list().to_vec();
