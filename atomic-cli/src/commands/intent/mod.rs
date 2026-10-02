@@ -39,6 +39,7 @@ pub mod key_cache;
 pub mod link;
 pub mod list;
 pub mod new;
+pub(crate) mod replay;
 pub mod show;
 pub mod update;
 pub mod validate;

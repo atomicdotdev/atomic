@@ -339,7 +339,7 @@ impl Repository {
             // was created by materialize for tracked content),
             // merge by recursing into it rather than replacing it.
             if dst.is_dir() && src.is_dir() {
-                self.merge_dir_into(&src, &dst);
+                Self::merge_dir_into(&src, &dst);
                 let _ = std::fs::remove_dir_all(&src);
             } else {
                 // Ensure parent exists
@@ -358,7 +358,7 @@ impl Repository {
     /// workspace artifacts into a directory that already contains tracked
     /// files (e.g. `src/` might have tracked `.ts` files from the graph
     /// AND ignored `.cache/` from the workspace).
-    fn merge_dir_into(&self, src_dir: &Path, dst_dir: &Path) {
+    fn merge_dir_into(src_dir: &Path, dst_dir: &Path) {
         let entries = match std::fs::read_dir(src_dir) {
             Ok(e) => e,
             Err(_) => return,
@@ -369,7 +369,7 @@ impl Repository {
             let dst = dst_dir.join(&name);
 
             if dst.is_dir() && src.is_dir() {
-                self.merge_dir_into(&src, &dst);
+                Self::merge_dir_into(&src, &dst);
                 let _ = std::fs::remove_dir_all(&src);
             } else {
                 if let Some(parent) = dst.parent() {

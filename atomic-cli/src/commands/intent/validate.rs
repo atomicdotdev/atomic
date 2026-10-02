@@ -1,7 +1,7 @@
 //! `atomic intent validate <ID|path>` — gate an intent against the canonical
 //! shapes.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use clap::Parser;
 
@@ -25,6 +25,18 @@ pub struct IntentValidate {
     /// Output the validation report as JSON.
     #[arg(long)]
     pub json: bool,
+
+    /// Replay bounded evidence claims from a locally supplied manifest.
+    #[arg(long, requires = "evidence_checker")]
+    pub replay_evidence: Option<PathBuf>,
+
+    /// Trusted local checker executable (no shell; never loaded from the manifest).
+    #[arg(long, requires = "replay_evidence")]
+    pub evidence_checker: Option<PathBuf>,
+
+    /// Include native intent substance and view-chain pins in the JSON report.
+    #[arg(long, requires = "json")]
+    pub evidence_context: bool,
 }
 
 impl Command for IntentValidate {
@@ -36,6 +48,7 @@ impl Command for IntentValidate {
         // if a FRESH attestation sidecar exists we gate the attested node (so a
         // previously-attested intent reports conforms), a STALE one warns and
         // falls back to the raw node.
+        let mut source_hash = None;
         let node = if is_path_shaped(&self.id_or_path) {
             let path = Path::new(&self.id_or_path);
             if !path.is_file() {
@@ -54,6 +67,7 @@ impl Command for IntentValidate {
             let root = find_repository_root()?;
             let repo = Repository::open(&root).map_err(CliError::Repository)?;
             let inputs = bridge::read_intent(&repo, &self.id_or_path)?;
+            source_hash = Some(bridge::source_content_hash(&inputs));
             match bridge::load_attestation(&repo, &self.id_or_path, &inputs)? {
                 bridge::Attestation::Fresh(node) => *node,
                 bridge::Attestation::Stale(_) => {
@@ -69,6 +83,24 @@ impl Command for IntentValidate {
         };
 
         let mut report = validate_intent(&node);
+        let wants_context = self.evidence_context || self.replay_evidence.is_some();
+        if wants_context && is_path_shaped(&self.id_or_path) {
+            return Err(validation_failed(
+                "evidence replay/context requires a stored intent ID",
+            ));
+        }
+        let context = if wants_context {
+            let root = find_repository_root()?;
+            let context = super::replay::read_context(&root, &self.id_or_path)?;
+            if source_hash.as_deref() != Some(context.source_hash()) {
+                return Err(validation_failed(
+                    "intent changed before evidence context was captured",
+                ));
+            }
+            Some(context)
+        } else {
+            None
+        };
 
         // Evidence URNs must RESOLVE to real changes when a repository is
         // reachable — the gate only checks presence. (Recording the Why: a met
@@ -84,11 +116,42 @@ impl Command for IntentValidate {
             report.results.extend(extra);
         }
 
+        let replay = match (&self.replay_evidence, &self.evidence_checker, &context) {
+            (Some(manifest), Some(checker), Some(context)) => {
+                let root = find_repository_root()?;
+                let replay = super::replay::replay(manifest, checker, context, &node)?;
+                // Release the repository before invoking a checker, then re-read.
+                // A checker result from another intent definition or view state
+                // must not be reused as a fresh validation result.
+                let after = super::replay::read_context(&root, &self.id_or_path)?;
+                let mut violations = replay.violations();
+                if &after != context {
+                    violations.push(Violation {
+                        focus_node: node.id.clone(),
+                        shape: "EvidenceReplayFreshness".into(),
+                        path: None,
+                        message: "intent substance or view chain changed during evidence replay"
+                            .into(),
+                    });
+                }
+                if !violations.is_empty() {
+                    report.conforms = false;
+                    report.results.extend(violations);
+                }
+                Some(replay)
+            }
+            _ => None,
+        };
+
         if self.json {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&report_json(&report)).unwrap()
-            );
+            let mut output = report_json(&report);
+            if let Some(context) = &context {
+                output["evidence_context"] = serde_json::to_value(context).unwrap();
+            }
+            if let Some(replay) = &replay {
+                output["evidence_replay"] = serde_json::to_value(replay).unwrap();
+            }
+            println!("{}", serde_json::to_string_pretty(&output).unwrap());
         } else {
             print!("{report}");
         }
