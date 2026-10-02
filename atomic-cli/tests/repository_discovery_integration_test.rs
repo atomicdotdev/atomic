@@ -27,7 +27,19 @@ fn assert_not_repository(output: &Output, dir: &Path) {
     assert_eq!(output.status.code(), Some(3), "{output:?}");
     assert!(output.stdout.is_empty(), "{output:?}");
     assert!(stderr.contains("Not in an Atomic repository"), "{stderr}");
-    assert!(stderr.contains(&dir.display().to_string()), "{stderr}");
+    let reported_path = stderr
+        .split_once("Not in an Atomic repository: '")
+        .and_then(|(_, rest)| rest.split_once("' (no repository found"))
+        .map(|(path, _)| Path::new(path))
+        .expect("repository error must include the searched directory");
+    // Windows canonical paths use the \\?\ prefix, while current_dir() may
+    // return the same directory without it. Compare filesystem paths instead
+    // of requiring their displayed strings to be identical.
+    assert_eq!(
+        reported_path.canonicalize().unwrap(),
+        dir.canonicalize().unwrap(),
+        "{stderr}"
+    );
     assert!(stderr.contains("Vault searches"), "{stderr}");
     assert!(stderr.contains("atomic init"), "{stderr}");
     assert!(!stderr.contains("Internal error"), "{stderr}");
