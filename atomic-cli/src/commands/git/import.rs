@@ -1582,6 +1582,10 @@ mod tests {
 
     #[test]
     #[serial]
+    #[cfg_attr(
+        not(unix),
+        ignore = "the Git bridge projection requires lossless unix paths (ProjectTreeError::UnsupportedPlatformPath)"
+    )]
     fn import_records_a_per_import_synthesis_aggregation() {
         // Review R5: the per-import synthesis aggregation is wired from
         // the real import statistics and is consent-gated. Failing before
@@ -1656,6 +1660,10 @@ mod tests {
 
     #[test]
     #[serial]
+    #[cfg_attr(
+        not(unix),
+        ignore = "the Git bridge projection requires lossless unix paths (ProjectTreeError::UnsupportedPlatformPath)"
+    )]
     fn standalone_import_refreshes_v2_checkpoint_before_status() {
         let _dir_guard = DirGuard::new();
         let root = tempfile::tempdir().unwrap();
@@ -1691,6 +1699,10 @@ mod tests {
 
     #[test]
     #[serial]
+    #[cfg_attr(
+        not(unix),
+        ignore = "the Git bridge projection requires lossless unix paths (ProjectTreeError::UnsupportedPlatformPath)"
+    )]
     fn one_line_incremental_import_finishes_within_debug_budget() {
         let _dir_guard = DirGuard::new();
         let root = tempfile::tempdir().unwrap();
@@ -1732,6 +1744,10 @@ mod tests {
 
     #[test]
     #[serial]
+    #[cfg_attr(
+        not(unix),
+        ignore = "the Git bridge projection requires lossless unix paths (ProjectTreeError::UnsupportedPlatformPath)"
+    )]
     fn mismatched_incremental_import_does_not_publish_checkpoint_before_alignment() {
         let _dir_guard = DirGuard::new();
         let root = tempfile::tempdir().unwrap();

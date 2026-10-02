@@ -1643,6 +1643,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        not(unix),
+        ignore = "Windows cannot create the trailing-dot fixture name `foo.`"
+    )]
     fn read_only_index_tree_oid_matches_git_write_tree() {
         let (directory, repository) = initialized_repository();
         fs::create_dir_all(directory.path().join("foo")).expect("foo directory");

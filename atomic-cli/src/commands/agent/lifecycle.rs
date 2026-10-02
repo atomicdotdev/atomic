@@ -933,8 +933,14 @@ fn persist_first_refusal(
             error,
         ))
     })?;
-    fs::write(&temp, data)?;
-    fs::File::open(&temp)?.sync_all()?;
+    {
+        // Write and fsync through one writable handle: on Windows,
+        // `sync_all` on a read-only handle is refused (access denied).
+        use std::io::Write as _;
+        let mut file = fs::File::create(&temp)?;
+        file.write_all(&data)?;
+        file.sync_all()?;
+    }
 
     let won = match fs::hard_link(&temp, &path) {
         Ok(()) => true,

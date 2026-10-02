@@ -29,6 +29,20 @@ fn materialized_directory_mode() -> u32 {
     0o666
 }
 
+/// The mode the lease should expect for a directory recorded with `recorded`
+/// permissions: the recorded bits where the platform applies them, else the
+/// platform's own directory mode (Windows has no permission bits to set, so
+/// the observation after materialization is always `0o666`).
+#[cfg(unix)]
+fn planned_directory_mode(recorded: u32) -> u32 {
+    recorded
+}
+
+#[cfg(not(unix))]
+fn planned_directory_mode(_recorded: u32) -> u32 {
+    materialized_directory_mode()
+}
+
 fn remove_existing_for_kind(path: &Path) -> Result<(), RepositoryError> {
     let Ok(metadata) = std::fs::symlink_metadata(path) else {
         return Ok(());
@@ -1847,8 +1861,8 @@ impl Repository {
                 {
                     desired.insert(
                         item.path.clone(),
-                        super::operation::filesystem_directory_value(u32::from(
-                            item.metadata.permissions,
+                        super::operation::filesystem_directory_value(planned_directory_mode(
+                            u32::from(item.metadata.permissions),
                         )),
                     );
                 }

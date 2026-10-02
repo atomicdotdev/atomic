@@ -44,5 +44,9 @@ fn sandbox_database_wait_uses_the_canonical_database() {
     drop(held);
     let opened = opener.join().unwrap();
     assert!(opened.is_sandbox());
-    assert_eq!(opened.dot_dir(), root.join(".atomic"));
+    // The repository stores its canonical root (macOS: /var -> /private/var).
+    assert_eq!(
+        opened.dot_dir(),
+        root.canonicalize().unwrap().join(".atomic")
+    );
 }

@@ -414,6 +414,10 @@ mod tests {
 
     #[test]
     #[serial]
+    #[cfg_attr(
+        not(unix),
+        ignore = "the Git bridge projection requires lossless unix paths (ProjectTreeError::UnsupportedPlatformPath)"
+    )]
     fn native_colocated_switch_projects_parent_advance_into_child_shadow() {
         let _guard = DirGuard::new();
         let temp = tempfile::tempdir().unwrap();
@@ -530,6 +534,10 @@ mod tests {
 
     #[test]
     #[serial]
+    #[cfg_attr(
+        not(unix),
+        ignore = "the Git bridge projection requires lossless unix paths (ProjectTreeError::UnsupportedPlatformPath)"
+    )]
     fn conflicted_shadow_projection_fails_and_restores_git_evidence() {
         let _guard = DirGuard::new();
         let temp = tempfile::tempdir().unwrap();

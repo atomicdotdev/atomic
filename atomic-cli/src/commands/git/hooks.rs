@@ -2253,6 +2253,10 @@ mod pre_push_tests {
     /// verify-receive tests: a refused local push is advisory; a refused
     /// receive is the guarantee.
     #[test]
+    #[cfg_attr(
+        not(unix),
+        ignore = "the Git bridge projection requires lossless unix paths (ProjectTreeError::UnsupportedPlatformPath)"
+    )]
     fn pre_push_refuses_managed_work_without_evidence() {
         let dir = TempDir::new().unwrap();
         let root = dir.path().canonicalize().unwrap();
@@ -2356,6 +2360,10 @@ mod pre_push_tests {
     /// projection of the current view must refuse BEFORE anything leaves
     /// the machine (never a mutable HEAD reread after the fact).
     #[test]
+    #[cfg_attr(
+        not(unix),
+        ignore = "the Git bridge projection requires lossless unix paths (ProjectTreeError::UnsupportedPlatformPath)"
+    )]
     fn pre_push_binds_to_the_exact_proposed_oid() {
         let dir = TempDir::new().unwrap();
         let root = dir.path().canonicalize().unwrap();
