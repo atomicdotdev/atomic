@@ -4,6 +4,8 @@
 //! a view from the repository. The view's metadata is deleted, but the
 //! changes themselves remain in the graph (they may be referenced by other
 //! views).
+//! If deletion would orphan changes, their hashes are shown and confirmation
+//! is required. `--force` explicitly skips that confirmation.
 //!
 //! # Important: Cannot Delete Current View
 //!
@@ -46,7 +48,10 @@ use atomic_repository::Repository;
 
 use crate::commands::{find_repository_root, Command};
 use crate::error::{CliError, CliResult};
-use crate::output::{print_success, view as style_view, warning};
+use crate::output::{
+    hash as style_hash, print_hint, print_success, print_warning, view as style_view,
+};
+use atomic_core::types::Base32;
 
 #[cfg(test)]
 use std::path::PathBuf;
@@ -72,8 +77,7 @@ pub struct Delete {
 
     /// Force deletion without confirmation.
     ///
-    /// By default, the command may prompt for confirmation if the view
-    /// has changes. Use this flag to skip confirmation.
+    /// By default, confirmation is required if deletion would orphan changes.
     #[arg(long, short = 'f')]
     pub force: bool,
 }
@@ -121,6 +125,23 @@ impl Command for Delete {
             other => CliError::Repository(other),
         })?;
 
+        self.execute_with_repo(&mut repo, name, |prompt| {
+            dialoguer::Confirm::new()
+                .with_prompt(prompt)
+                .default(false)
+                .interact()
+                .map_err(|_| CliError::InvalidArgument {
+                    message: "Deleting this view would orphan changes and requires confirmation. Re-run with --force to acknowledge the risks and proceed non-interactively.".to_string(),
+                })
+        })
+    }
+}
+
+impl Delete {
+    fn execute_with_repo<F>(&self, repo: &mut Repository, name: &str, confirm: F) -> CliResult<()>
+    where
+        F: FnOnce(&str) -> CliResult<bool>,
+    {
         // Check if trying to delete the current view
         if repo.current_view() == name {
             return Err(CliError::CannotDeleteCurrentView {
@@ -135,20 +156,26 @@ impl Command for Delete {
             });
         }
 
-        // Get view info for warning message
-        if !self.force {
-            if let Ok(info) = repo.get_view_info(name) {
-                if info.change_count > 0 {
-                    println!(
-                        "{}",
-                        warning(&format!(
-                            "View '{}' has {} change(s). Use --force to confirm deletion.",
-                            name, info.change_count
-                        ))
-                    );
-                    // In a real implementation, we might prompt for confirmation here
-                    // For now, we'll just warn but proceed
-                }
+        let orphans = repo
+            .view_deletion_orphans(name)
+            .map_err(CliError::Repository)?;
+        if !orphans.is_empty() {
+            print_warning(&format!(
+                "Deleting '{}' would orphan {} change(s): no remaining view references them.",
+                name,
+                orphans.len(),
+            ));
+            for hash in &orphans {
+                println!("  {}", style_hash(hash.to_base32()));
+            }
+            print_warning(
+                "Their data is not erased by view deletion, but they will disappear from all views and will not return to the source automatically.",
+            );
+            print_hint("Insert these changes into another view before deleting this one to keep them referenced.");
+            if !self.force
+                && !confirm("I understand these changes will be orphaned; delete the view")?
+            {
+                return Err(CliError::Cancelled);
             }
         }
 
@@ -175,6 +202,94 @@ impl Command for Delete {
 mod tests {
     use super::*;
     use serial_test::serial;
+
+    fn orphan_repo() -> (tempfile::TempDir, Repository, atomic_core::types::Hash) {
+        use atomic_core::pristine::{MutTxnT, ViewScope, ViewTxnT};
+        let temp = tempfile::tempdir().unwrap();
+        let repo = Repository::init(temp.path()).unwrap();
+        let hash = atomic_core::types::Hash::of(b"unique change");
+        let mut txn = repo.pristine().write_txn().unwrap();
+        let parent = txn.get_view(repo.current_view()).unwrap().unwrap();
+        let mut draft = txn
+            .create_view("wip", ViewScope::Draft, Some(parent.id))
+            .unwrap();
+        let id = txn.register_change(&hash).unwrap();
+        txn.put_change(&mut draft, id, &hash).unwrap();
+        txn.put_change_deps(id, &[]).unwrap();
+        txn.update_view(&draft).unwrap();
+        txn.commit().unwrap();
+        (temp, repo, hash)
+    }
+
+    #[test]
+    fn declining_or_failed_confirmation_keeps_orphan_candidate_referenced() {
+        let (_temp, mut repo, hash) = orphan_repo();
+        let cmd = Delete::with_name("wip");
+        let result = cmd.execute_with_repo(&mut repo, "wip", |prompt| {
+            assert!(prompt.contains("orphaned"));
+            Ok(false)
+        });
+        assert!(matches!(result, Err(CliError::Cancelled)));
+        let result = cmd.execute_with_repo(&mut repo, "wip", |_| {
+            Err(CliError::InvalidArgument {
+                message: "no terminal".to_string(),
+            })
+        });
+        assert!(result.is_err());
+        assert!(repo.view_exists("wip").unwrap());
+        assert_eq!(repo.views_containing_change(&hash).unwrap(), vec!["wip"]);
+    }
+
+    #[test]
+    fn confirming_or_forcing_allows_orphaning() {
+        for force in [false, true] {
+            let (_temp, mut repo, hash) = orphan_repo();
+            Delete::with_name("wip")
+                .with_force(force)
+                .execute_with_repo(&mut repo, "wip", |_| {
+                    assert!(!force, "--force must skip the prompt");
+                    Ok(true)
+                })
+                .unwrap();
+            assert!(!repo.view_exists("wip").unwrap());
+            assert!(repo.views_containing_change(&hash).unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn changes_retained_elsewhere_allow_deletion_without_prompt() {
+        use atomic_core::pristine::{GraphTxnT, MutTxnT, ViewTxnT};
+        let (_temp, mut repo, hash) = orphan_repo();
+        let mut txn = repo.pristine().write_txn().unwrap();
+        let mut parent = txn.get_view(repo.current_view()).unwrap().unwrap();
+        let id = txn.get_internal(&hash).unwrap().unwrap();
+        txn.put_change(&mut parent, id, &hash).unwrap();
+        txn.update_view(&parent).unwrap();
+        txn.commit().unwrap();
+        Delete::with_name("wip")
+            .execute_with_repo(&mut repo, "wip", |_| panic!("no changes would be orphaned"))
+            .unwrap();
+        assert_eq!(
+            repo.views_containing_change(&hash).unwrap(),
+            vec![repo.current_view()]
+        );
+    }
+
+    #[test]
+    fn parent_view_deletion_is_rejected_before_prompting() {
+        let (_temp, mut repo, _hash) = orphan_repo();
+        repo.create_overlay_view("child", Some("wip"), None)
+            .unwrap();
+        let result = Delete::with_name("wip")
+            .execute_with_repo(&mut repo, "wip", |_| panic!("cannot delete a parent view"));
+        assert!(matches!(
+            result,
+            Err(CliError::Repository(
+                atomic_repository::RepositoryError::InvalidOperation { .. }
+            ))
+        ));
+        assert!(repo.view_exists("wip").unwrap());
+    }
 
     // -------------------------------------------------------------------------
     // Directory Guard for Safe Current Dir Changes
