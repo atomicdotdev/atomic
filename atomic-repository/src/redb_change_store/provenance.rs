@@ -261,36 +261,6 @@ fn checkpoint_source_matches_except_ordinal(
         && left.plan_id == right.plan_id
 }
 
-fn checkpoint_manifest_turn(
-    turn: &StoredProvenanceTurn,
-    attempt: &ProvenanceCheckpointAttempt,
-    manifest_hash: Hash,
-    bytes: &[u8],
-) -> RedbStoreResult<SessionTurn> {
-    let conflict = || RedbStoreError::ProvenanceCheckpointPublicationConflict {
-        id: turn.provenance_id.get(),
-    };
-    if Hash::of(bytes) != manifest_hash {
-        return Err(conflict());
-    }
-    let manifest = atomic_core::change::session::SessionManifest::from_bytes(bytes)
-        .map_err(|error| RedbStoreError::Serialization(error.to_string()))?;
-    let published = manifest.turns.last().ok_or_else(conflict)?;
-    let mut bound = attempt.session_turn.clone().ok_or_else(conflict)?;
-    // Old agent counters are normalized to the immutable ledger ordinal by
-    // publication. Every other part of the bound turn must remain identical.
-    bound.turn_number = published.turn_number;
-    if manifest.session_id != turn.session_id
-        || published.session_id != turn.session_id
-        || attempt.provenance_hash != Some(published.provenance_hash)
-        || turn.final_hash != Some(published.provenance_hash)
-        || bound != *published
-    {
-        return Err(conflict());
-    }
-    Ok(published.clone())
-}
-
 fn ensure_generation(turn: &StoredProvenanceTurn, expected: u64) -> RedbStoreResult<()> {
     if turn.generation != expected {
         return Err(RedbStoreError::ProvenanceFenced {
@@ -406,20 +376,7 @@ impl RedbChangeStore {
         turn_number: u32,
     ) -> RedbStoreResult<Option<StoredProvenanceTurn>> {
         let txn = self.db.begin_read()?;
-        Self::get_provenance_turn_for_in_txn(&txn, session_id, turn_number)
-    }
-
-    /// Read the journal identity in the caller's repository snapshot.
-    pub fn get_provenance_turn_for_in_txn(
-        txn: &redb::ReadTransaction,
-        session_id: &str,
-        turn_number: u32,
-    ) -> RedbStoreResult<Option<StoredProvenanceTurn>> {
-        let index = match txn.open_table(tables::PROVENANCE_TURN_INDEX) {
-            Ok(index) => index,
-            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
-            Err(error) => return Err(error.into()),
-        };
+        let index = txn.open_table(tables::PROVENANCE_TURN_INDEX)?;
         let turns = txn.open_table(tables::PROVENANCE_TURNS)?;
         let key = turn_key(session_id, turn_number);
         let Some(id) = index.get(&key)?.map(|value| value.value()) else {
@@ -435,56 +392,6 @@ impl RedbChangeStore {
             ));
         }
         Ok(Some(turn))
-    }
-
-    /// Recover a completed Stop from canonical data, even when its JSON session
-    /// cache still says Active. The manifest and ledger must prove publication.
-    pub fn completed_provenance_checkpoint_for_in_txn(
-        txn: &redb::ReadTransaction,
-        session_id: &str,
-        turn_number: u32,
-    ) -> RedbStoreResult<Option<SessionTurn>> {
-        let Some(turn) = Self::get_provenance_turn_for_in_txn(txn, session_id, turn_number)? else {
-            return Ok(None);
-        };
-        if turn.state != ProvenanceTurnState::Completed {
-            return Ok(None);
-        }
-        let attempt = turn.checkpoint_attempt.as_ref().ok_or(
-            RedbStoreError::ProvenanceCheckpointNotBound {
-                id: turn.provenance_id.get(),
-            },
-        )?;
-        let manifest_hash = attempt
-            .manifest_hash
-            .filter(|_| attempt.phase == ProvenanceCheckpointPhase::Published)
-            .ok_or(RedbStoreError::ProvenanceCheckpointNotBound {
-                id: turn.provenance_id.get(),
-            })?;
-        let manifests = txn.open_table(tables::SESSION_MANIFESTS)?;
-        let bytes = manifests.get(manifest_hash.as_bytes())?.ok_or(
-            RedbStoreError::ProvenanceCheckpointPublicationConflict {
-                id: turn.provenance_id.get(),
-            },
-        )?;
-        let published = checkpoint_manifest_turn(&turn, attempt, manifest_hash, bytes.value())?;
-        let ledger = txn.open_table(tables::SESSION_TURNS)?;
-        let key =
-            encode_session_turn_key(session_turn_namespace(session_id), published.turn_number);
-        let stored =
-            ledger
-                .get(&key)?
-                .ok_or(RedbStoreError::ProvenanceCheckpointPublicationConflict {
-                    id: turn.provenance_id.get(),
-                })?;
-        let stored = SessionTurn::from_bytes(stored.value())
-            .map_err(|error| RedbStoreError::Serialization(error.to_string()))?;
-        if stored != published {
-            return Err(RedbStoreError::ProvenanceCheckpointPublicationConflict {
-                id: turn.provenance_id.get(),
-            });
-        }
-        Ok(Some(published))
     }
 
     /// Return the completed turn bound to a final provenance hash.
@@ -1018,55 +925,6 @@ impl RedbChangeStore {
         completed_at: i64,
     ) -> RedbStoreResult<StoredProvenanceTurn> {
         let txn = self.db.begin_write()?;
-        let turn = Self::acknowledge_provenance_checkpoint_in_txn(
-            &txn,
-            id,
-            expected_generation,
-            manifest_hash,
-            completed_at,
-        )?;
-        txn.commit()?;
-        Ok(turn)
-    }
-
-    /// Check that publication is for the exact fenced checkpoint prepared by the owner.
-    pub fn validate_checkpoint_binding(
-        txn: &redb::WriteTransaction,
-        id: ProvenanceId,
-        expected_generation: u64,
-        session_turn: &SessionTurn,
-    ) -> RedbStoreResult<()> {
-        let turns = txn.open_table(tables::PROVENANCE_TURNS)?;
-        let turn = load_turn(&turns, id)?;
-        let attempt = turn
-            .checkpoint_attempt
-            .as_ref()
-            .ok_or(RedbStoreError::ProvenanceCheckpointNotBound { id: id.get() })?;
-        if attempt.attempt_generation != expected_generation
-            || attempt.provenance_hash != Some(session_turn.provenance_hash)
-            || attempt.session_turn.as_ref() != Some(session_turn)
-            || !matches!(
-                turn.state,
-                ProvenanceTurnState::Checkpointing | ProvenanceTurnState::Completed
-            )
-        {
-            return Err(RedbStoreError::ProvenanceCheckpointConflict { id: id.get() });
-        }
-        if !matches!(turn.state, ProvenanceTurnState::Completed) {
-            ensure_generation(&turn, expected_generation)?;
-        }
-        Ok(())
-    }
-
-    /// Complete a bound checkpoint in its repository publication transaction.
-    /// The caller owns commit/rollback; no nested write transaction is opened.
-    pub fn acknowledge_provenance_checkpoint_in_txn(
-        txn: &redb::WriteTransaction,
-        id: ProvenanceId,
-        expected_generation: u64,
-        manifest_hash: Hash,
-        completed_at: i64,
-    ) -> RedbStoreResult<StoredProvenanceTurn> {
         let mut turns = txn.open_table(tables::PROVENANCE_TURNS)?;
         let mut turn = load_turn(&turns, id)?;
         let mut attempt =
@@ -1077,37 +935,6 @@ impl RedbChangeStore {
                     expected: "checkpoint hash bound",
                 })?;
 
-        // The same attempt generation remains the retry token after completion;
-        // do not acknowledge a different generation merely because its hash matches.
-        if attempt.attempt_generation != expected_generation {
-            return Err(RedbStoreError::ProvenanceCheckpointConflict { id: id.get() });
-        }
-        // An RPC acknowledgement is not proof that repository publication took
-        // place. Check the immutable manifest and ledger in this same transaction
-        // before allowing either a transition or an idempotent acknowledgement.
-        {
-            let manifests = txn.open_table(tables::SESSION_MANIFESTS)?;
-            let bytes = manifests
-                .get(manifest_hash.as_bytes())?
-                .ok_or(RedbStoreError::ProvenanceCheckpointPublicationConflict { id: id.get() })?;
-            let published =
-                checkpoint_manifest_turn(&turn, &attempt, manifest_hash, bytes.value())?;
-            let ledger = txn.open_table(tables::SESSION_TURNS)?;
-            let key = encode_session_turn_key(
-                session_turn_namespace(&turn.session_id),
-                published.turn_number,
-            );
-            let stored = ledger
-                .get(&key)?
-                .ok_or(RedbStoreError::ProvenanceCheckpointPublicationConflict { id: id.get() })?;
-            let stored = SessionTurn::from_bytes(stored.value())
-                .map_err(|error| RedbStoreError::Serialization(error.to_string()))?;
-            if stored != published {
-                return Err(RedbStoreError::ProvenanceCheckpointPublicationConflict {
-                    id: id.get(),
-                });
-            }
-        }
         if matches!(turn.state, ProvenanceTurnState::Completed)
             && attempt.manifest_hash == Some(manifest_hash)
         {
@@ -1139,6 +966,7 @@ impl RedbChangeStore {
         let bytes = turn.to_bytes()?;
         turns.insert(id.get(), bytes.as_slice())?;
         drop(turns);
+        txn.commit()?;
         Ok(turn)
     }
 

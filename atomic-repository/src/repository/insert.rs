@@ -11,40 +11,6 @@ use atomic_core::pristine::InodeGraphOps;
 use atomic_core::types::{ChangePosition, EdgeFlags, GraphNode, SerializedGraphEdge};
 use std::collections::{HashMap, HashSet};
 
-/// Durable result of a recorded publication, also used as its outbox event.
-/// Recording disables conflict detection, so these are all returned statistics.
-#[derive(serde::Serialize, serde::Deserialize)]
-struct RecordPublicationReceipt {
-    version: u32,
-    kind: String,
-    change: Hash,
-    view: String,
-    view_id: u64,
-    state: atomic_core::types::Merkle,
-    sequence: u64,
-    changes_applied: usize,
-    atoms_processed: usize,
-    dependencies_applied: usize,
-    applied_hashes: Vec<Hash>,
-}
-
-impl RecordPublicationReceipt {
-    fn into_outcome(self) -> InsertOutcome {
-        InsertOutcome::new(
-            self.state,
-            self.sequence,
-            false,
-            InsertStats {
-                changes_applied: self.changes_applied,
-                atoms_processed: self.atoms_processed,
-                dependencies_applied: self.dependencies_applied,
-                applied_hashes: self.applied_hashes,
-                ..InsertStats::default()
-            },
-        )
-    }
-}
-
 /// Check whether a file's creating change exists ONLY on the given view
 /// (and no other view).  Returns `true` when it is safe to remove the
 /// file's TREE / INODES entries because no other view needs them.
@@ -811,9 +777,7 @@ impl Repository {
         debug_assert_eq!(hash, verified_hash);
 
         let save_start = std::time::Instant::now();
-        crate::redb_change_store::PreparedChange::from_v3_bytes(&v3_bytes)
-            .and_then(|prepared| prepared.write(txn.redb_transaction()))
-            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        self.save_change_bytes(&hash, &v3_bytes, &final_change)?;
         timings.save_ms = save_start.elapsed().as_millis();
 
         let change_id = txn
@@ -947,9 +911,6 @@ impl Repository {
         txn.commit()
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
         timings.commit_ms = commit_start.elapsed().as_millis();
-        if let Err(error) = self.change_store.cache_change_bytes(&hash, &v3_bytes) {
-            log::warn!("import committed; change export cache deferred: {error}");
-        }
 
         Ok(ImportWriteOutcome {
             hash,
@@ -1045,9 +1006,7 @@ impl Repository {
         }
 
         let save_start = std::time::Instant::now();
-        crate::redb_change_store::PreparedChange::from_v3_bytes(&v3_bytes)
-            .and_then(|prepared| prepared.write(txn.redb_transaction()))
-            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        self.save_change_bytes(&hash, &v3_bytes, &final_change)?;
         timings.save_ms = save_start.elapsed().as_millis();
 
         let change_id = txn
@@ -1101,9 +1060,6 @@ impl Repository {
         txn.commit()
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
         timings.commit_ms = commit_start.elapsed().as_millis();
-        if let Err(error) = self.change_store.cache_change_bytes(&hash, &v3_bytes) {
-            log::warn!("import committed; change export cache deferred: {error}");
-        }
 
         Ok(ImportWriteOutcome {
             hash,
@@ -2210,90 +2166,11 @@ impl Repository {
         // identical, only the (empty) conflict report is skipped.
         options.track_conflicts = false;
 
-        let serialized;
-        let bytes = match outcome.v3_bytes() {
-            Some(bytes) => bytes,
-            None => {
-                serialized = {
-                    let mut bytes = Vec::new();
-                    change
-                        .serialize(&mut bytes)
-                        .map_err(|e| RepositoryError::Database(e.to_string()))?;
-                    bytes
-                };
-                &serialized
-            }
-        };
-        let prepared = crate::redb_change_store::PreparedChange::from_v3_bytes(bytes)
-            .map_err(|e| RepositoryError::Database(e.to_string()))?;
-        if prepared.hash() != *hash.as_bytes() {
-            return Err(RepositoryError::Database(
-                "record bytes do not match prepared hash".into(),
-            ));
-        }
-
         // Get write transaction
         let mut txn = self
             .pristine
             .write_txn()
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
-
-        let target = options.view.as_deref().unwrap_or(&self.current_view);
-        let event_key = format!("record:{}:{target}", hash.to_base32());
-        if let Some(event) = txn.repository_event(&event_key)? {
-            let receipt: RecordPublicationReceipt = serde_json::from_slice(&event)
-                .map_err(|e| RepositoryError::Database(format!("invalid record receipt: {e}")))?;
-            let view = txn.get_view(target)?.ok_or_else(|| {
-                RepositoryError::Database("record target view disappeared".into())
-            })?;
-            if receipt.version != 1
-                || receipt.kind != "change.recorded"
-                || receipt.change != *hash
-                || receipt.view != target
-                || receipt.view_id != view.id
-                || outcome
-                    .expected_view
-                    .as_ref()
-                    .is_some_and(|(name, id, _)| name == target && *id != receipt.view_id)
-            {
-                return Err(RepositoryError::Database(
-                    "record receipt does not match the target view".into(),
-                ));
-            }
-            // A lost response is a retry of the earlier publication even if
-            // later records have advanced this view. Never replay its graph.
-            return Ok(receipt.into_outcome());
-        }
-        if let Some((prepared_on, expected_id, expected_ids)) = &outcome.expected_view {
-            let source = txn.get_view(prepared_on)?.ok_or_else(|| {
-                RepositoryError::Database(
-                    "record preparation view disappeared; retry record".into(),
-                )
-            })?;
-            if source.id != *expected_id
-                || collect_visible_change_ids_with_deps(&txn, &source)? != *expected_ids
-            {
-                return Err(RepositoryError::Database(
-                    "record preparation closure changed; retry record".into(),
-                ));
-            }
-            // The explicit write_recorded API permits a different target view
-            // when it has the same effective closure used for preparation.
-            if prepared_on != target {
-                let view = txn.get_view(target)?.ok_or_else(|| {
-                    RepositoryError::Database("record target view disappeared; retry record".into())
-                })?;
-                if collect_visible_change_ids_with_deps(&txn, &view)? != *expected_ids {
-                    return Err(RepositoryError::Database(
-                        "record target closure differs from preparation; retry record".into(),
-                    ));
-                }
-            }
-        }
-        prepared
-            .write(txn.redb_transaction())
-            .map_err(|e| RepositoryError::Database(e.to_string()))?;
-        super::publication::failpoint("record-after-object")?;
 
         // Register the change to get an internal ID
         let change_id = txn
@@ -2447,41 +2324,11 @@ impl Repository {
         )
         .map_err(|e| RepositoryError::Apply(e.to_string()))?;
 
-        super::publication::failpoint("record-after-graph")?;
-        let view = txn
-            .get_view(view_name)?
-            .ok_or_else(|| RepositoryError::Database("record target view disappeared".into()))?;
-        // Resolving a file's recorded conflict must commit with the new graph.
-        // FILE_INDEX remains an independently rebuildable working-copy cache.
-        for path in outcome.recorded_files() {
-            let clean_path = path.strip_suffix("/ (directory)").unwrap_or(path);
-            if let Some(inode) = txn.get_inode(clean_path)? {
-                txn.del_conflicts(view.id, inode.get())?;
-            }
-        }
-        let event = serde_json::to_vec(&RecordPublicationReceipt {
-            version: 1,
-            kind: "change.recorded".into(),
-            change: *hash,
-            view: view_name.into(),
-            view_id: view.id,
-            state: apply_outcome.new_state,
-            sequence: apply_outcome.sequence,
-            changes_applied: apply_outcome.stats.changes_applied,
-            atoms_processed: apply_outcome.stats.atoms_processed,
-            dependencies_applied: apply_outcome.stats.dependencies_applied,
-            applied_hashes: apply_outcome.stats.applied_hashes.clone(),
-        })
-        .map_err(|e| RepositoryError::Database(e.to_string()))?;
-        txn.append_repository_event(&event_key, &event)?;
-
         // Commit the transaction
         let commit_start = std::time::Instant::now();
         self.append_deferred_tree_ops(&txn, &tree_ops, view_name)?;
-        super::publication::failpoint("record-before-commit")?;
         txn.commit()
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
-        super::publication::failpoint("record-after-commit")?;
         if trace_record {
             eprintln!(
                 "[write_recorded] txn.commit complete elapsed={:?}",
@@ -2489,11 +2336,6 @@ impl Repository {
             );
         }
 
-        // Export is a recoverable cache write. It cannot turn a committed
-        // graph operation into a reported failure; repository reads use redb.
-        if let Err(error) = self.change_store.cache_change_bytes(hash, bytes) {
-            log::warn!("record committed; change export cache deferred: {error}");
-        }
         Ok(apply_outcome)
     }
 

@@ -54,24 +54,6 @@ impl Repository {
             DetectedFile, RecordedFile,
         };
 
-        // Preparation is outside the writer lock. Validate the effective
-        // closure again when publishing, including inherited dependencies.
-        let expected_view = {
-            let read = self
-                .pristine
-                .read_txn()
-                .map_err(|e| RecordError::Repository(RepositoryError::Database(e.to_string())))?;
-            let name = options.get_view().unwrap_or(&self.current_view);
-            read.get_view(name)
-                .map_err(|e| RecordError::Repository(RepositoryError::Database(e.to_string())))?
-                .map(|view| {
-                    collect_visible_change_ids_with_deps(&read, &view)
-                        .map(|ids| (name.to_string(), view.id, ids))
-                })
-                .transpose()
-                .map_err(RecordError::Repository)?
-        };
-
         // Build the final header (may get message from options)
         let final_header = build_header(header, &options);
 
@@ -1078,7 +1060,6 @@ impl Repository {
         }
 
         let mut outcome = RecordOutcome::new(change, computed_hash, stats);
-        outcome.expected_view = expected_view;
         // Stash the original V3 bytes so save_change can write them directly
         // instead of re-serializing (which may produce a different hash).
         outcome.set_v3_bytes(v3_bytes);
@@ -1100,7 +1081,7 @@ impl Repository {
         // Save to store if requested.
         // Use the original V3 bytes (not re-serialized) to ensure the hash
         // on disk matches the hash registered in the pristine graph.
-        if options.get_save_to_store() && !options.get_apply_after_record() {
+        if options.get_save_to_store() {
             let save_start = std::time::Instant::now();
             if let Some(v3_bytes) = outcome.v3_bytes() {
                 // Fast path: write the exact V3 bytes that produced computed_hash
@@ -1124,7 +1105,7 @@ impl Repository {
         // We use write_recorded() instead of insert_change() because it creates
         // the TREE and INODES entries for FileAdd hunks, which is necessary
         // for the file to be recognized as tracked with graph content.
-        if options.get_apply_after_record() && options.get_save_to_store() {
+        if options.get_apply_after_record() && outcome.was_saved() {
             let apply_opts = match options.get_view() {
                 Some(view) => InsertOptions::default().view(view),
                 None => InsertOptions::default(),
@@ -1132,7 +1113,6 @@ impl Repository {
             let apply_t0 = std::time::Instant::now();
             match self.write_recorded(&outcome, apply_opts) {
                 Ok(apply_outcome) => {
-                    outcome.set_saved(true);
                     outcome.set_applied(apply_outcome.new_state);
 
                     // Update file index for all recorded/added files.
@@ -1203,6 +1183,20 @@ impl Repository {
                             let _ = idx_txn.del_file_index(path_str);
                         }
 
+                        // Clear persisted conflict state for recorded files:
+                        // recording without markers IS the resolution.
+                        let record_view =
+                            options.get_view().unwrap_or(&self.current_view).to_string();
+                        if let Ok(Some(view)) = idx_txn.get_view(&record_view) {
+                            for path_str in outcome.recorded_files() {
+                                let clean_path =
+                                    path_str.strip_suffix("/ (directory)").unwrap_or(path_str);
+                                if let Ok(Some(inode)) = idx_txn.get_inode(clean_path) {
+                                    let _ = idx_txn.del_conflicts(view.id, inode.get());
+                                }
+                            }
+                        }
+
                         let _ = idx_txn.commit();
                         if trace_record {
                             eprintln!(
@@ -1212,7 +1206,9 @@ impl Repository {
                         }
                     }
                 }
-                Err(error) => return Err(RecordError::Repository(error)),
+                Err(e) => {
+                    outcome.add_error("apply".to_string(), e.to_string());
+                }
             }
             if trace_record {
                 eprintln!(

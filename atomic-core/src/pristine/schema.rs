@@ -16,7 +16,7 @@ use crate::pristine::tables::*;
 
 /// Schema version written by this build. Opening a database stamped with a
 /// newer version fails instead of misreading tables this build does not know.
-pub const SCHEMA_VERSION: u64 = 2;
+pub const SCHEMA_VERSION: u64 = 1;
 
 /// [`ATOMIC_META`] key for the schema version (little-endian u64).
 pub const SCHEMA_VERSION_KEY: &str = "schema_version";
@@ -120,7 +120,6 @@ pub(crate) fn visit_tables(visitor: &mut impl TableVisitor) -> PristineResult<()
     visitor.table(SESSION_PROVENANCE)?;
     visitor.table(SESSION_MANIFESTS)?;
     visitor.table(SESSION_HEADS)?;
-    visitor.table(SESSION_CHECKPOINT_RECEIPTS)?;
 
     // Vault and knowledge graph
     visitor.table(VAULT_ENTRIES)?;
@@ -148,10 +147,6 @@ pub(crate) fn visit_tables(visitor: &mut impl TableVisitor) -> PristineResult<()
 
     // Database metadata
     visitor.table(ATOMIC_META)?;
-    visitor.table(CHANGE_BYTES)?;
-    visitor.table(PROVENANCE_OBJECTS)?;
-    visitor.table(REPOSITORY_OUTBOX)?;
-    visitor.table(REPOSITORY_OUTBOX_KEYS)?;
     Ok(())
 }
 
@@ -182,14 +177,12 @@ pub(crate) fn table_names() -> Vec<String> {
     names.0
 }
 
-/// Upgrade a supported database's version in the caller's transaction.
-/// Never overwrite malformed metadata or a version newer than this build.
-pub fn stamp_schema_version(txn: &WriteTransaction) -> PristineResult<()> {
+/// Record [`SCHEMA_VERSION`] unless the database already carries a version.
+pub(crate) fn stamp_schema_version(txn: &WriteTransaction) -> PristineResult<()> {
     let mut meta = txn.open_table(ATOMIC_META)?;
-    if let Some(stored) = meta.get(SCHEMA_VERSION_KEY)? {
-        validate_schema_version(stored.value())?;
+    if meta.get(SCHEMA_VERSION_KEY)?.is_none() {
+        meta.insert(SCHEMA_VERSION_KEY, SCHEMA_VERSION.to_le_bytes().as_slice())?;
     }
-    meta.insert(SCHEMA_VERSION_KEY, SCHEMA_VERSION.to_le_bytes().as_slice())?;
     Ok(())
 }
 
@@ -203,11 +196,7 @@ pub fn check_schema_version(txn: &ReadTransaction) -> PristineResult<()> {
     let Some(stored) = meta.get(SCHEMA_VERSION_KEY)? else {
         return Ok(());
     };
-    validate_schema_version(stored.value())
-}
-
-fn validate_schema_version(stored: &[u8]) -> PristineResult<()> {
-    let found = <[u8; 8]>::try_from(stored)
+    let found = <[u8; 8]>::try_from(stored.value())
         .map(u64::from_le_bytes)
         .map_err(|_| PristineError::Inconsistent {
             message: "schema version in atomic_meta is not 8 bytes".to_string(),
@@ -287,14 +276,10 @@ mod tests {
     }
 
     #[test]
-    fn stamping_is_idempotent_and_upgrades_supported_versions() {
+    fn stamping_keeps_an_existing_version() {
         let dir = tempfile::tempdir().unwrap();
         let db = redb::Database::create(dir.path().join("db")).unwrap();
         let txn = db.begin_write().unwrap();
-        txn.open_table(ATOMIC_META)
-            .unwrap()
-            .insert(SCHEMA_VERSION_KEY, 1_u64.to_le_bytes().as_slice())
-            .unwrap();
         stamp_schema_version(&txn).unwrap();
         stamp_schema_version(&txn).unwrap();
         txn.commit().unwrap();
@@ -304,30 +289,5 @@ mod tests {
         let meta = txn.open_table(ATOMIC_META).unwrap();
         let stored = meta.get(SCHEMA_VERSION_KEY).unwrap().unwrap();
         assert_eq!(stored.value(), SCHEMA_VERSION.to_le_bytes().as_slice());
-    }
-
-    #[test]
-    fn stamping_refuses_unsupported_or_malformed_versions_without_overwriting() {
-        for bytes in [
-            (SCHEMA_VERSION + 1).to_le_bytes().to_vec(),
-            vec![1_u8, 2, 3],
-        ] {
-            let dir = tempfile::tempdir().unwrap();
-            let db = redb::Database::create(dir.path().join("db")).unwrap();
-            let txn = db.begin_write().unwrap();
-            txn.open_table(ATOMIC_META)
-                .unwrap()
-                .insert(SCHEMA_VERSION_KEY, bytes.as_slice())
-                .unwrap();
-            assert!(stamp_schema_version(&txn).is_err());
-            txn.commit().unwrap();
-
-            let read = db.begin_read().unwrap();
-            let meta = read.open_table(ATOMIC_META).unwrap();
-            assert_eq!(
-                meta.get(SCHEMA_VERSION_KEY).unwrap().unwrap().value(),
-                bytes.as_slice()
-            );
-        }
     }
 }

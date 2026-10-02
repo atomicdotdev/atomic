@@ -160,11 +160,6 @@ impl fmt::Display for RecordStats {
 /// Result of recording changes.
 #[derive(Debug)]
 pub struct RecordOutcome {
-    pub(crate) expected_view: Option<(
-        String,
-        u64,
-        std::collections::HashSet<atomic_core::types::NodeId>,
-    )>,
     /// The recorded change.
     change: Change,
 
@@ -213,7 +208,6 @@ impl RecordOutcome {
     /// Create a new record outcome.
     pub fn new(change: Change, hash: Hash, stats: RecordStats) -> Self {
         Self {
-            expected_view: None,
             change,
             hash,
             stats,

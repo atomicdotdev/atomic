@@ -328,7 +328,6 @@ impl RedbChangeStore {
         };
 
         let txn = self.db().begin_write()?;
-        txn.open_table(tables::CHANGE_BYTES)?.remove(hash)?;
         {
             let mut meta_table = txn.open_table(tables::CHANGE_META)?;
             meta_table.remove(hash)?;
@@ -353,7 +352,6 @@ impl RedbChangeStore {
 
             let mut unhashed_table = txn.open_table(tables::CHANGE_UNHASHED)?;
             unhashed_table.remove(hash)?;
-            txn.open_table(tables::CHANGE_SIGNATURES)?.remove(hash)?;
         }
         txn.commit()?;
 
@@ -378,17 +376,6 @@ impl RedbChangeStore {
     /// This is the core export method used by both file export and
     /// network transfer.
     pub fn export_v3_bytes(&self, hash: &[u8; 32]) -> RedbStoreResult<Vec<u8>> {
-        let read = self.db().begin_read()?;
-        match read.open_table(tables::CHANGE_BYTES) {
-            Ok(table) => {
-                if let Some(bytes) = table.get(hash)? {
-                    return Ok(bytes.value().to_vec());
-                }
-            }
-            Err(redb::TableError::TableDoesNotExist(_)) => {}
-            Err(error) => return Err(error.into()),
-        }
-        drop(read);
         let meta = self.load_meta(hash)?;
 
         // Reconstruct the hash dedup table

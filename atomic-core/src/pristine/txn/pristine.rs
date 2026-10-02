@@ -337,31 +337,6 @@ impl Pristine {
             )));
         };
         let txn = db.begin_write()?;
-        stamp_schema_version(&txn)?;
-        // Seed every allocator before a mutation can remove its highest row.
-        // Older schemas have no durable counters; waiting until the next
-        // allocation would lose their high-water marks across a reopen.
-        {
-            let mut meta = txn.open_table(ATOMIC_META)?;
-            for (key, counter) in [
-                ("next_node_id", &self.next_node_id),
-                ("next_view_id", &self.next_view_id),
-                ("next_inode", &self.next_inode),
-            ] {
-                let stored = meta
-                    .get(key)?
-                    .map(|value| <[u8; 8]>::try_from(value.value()).map(u64::from_le_bytes))
-                    .transpose()
-                    .map_err(|_| PristineError::Inconsistent {
-                        message: format!("invalid allocator {key}"),
-                    })?;
-                let next = stored.unwrap_or(1).max(counter.load(Ordering::SeqCst));
-                if stored != Some(next) {
-                    meta.insert(key, next.to_le_bytes().as_slice())?;
-                }
-                counter.fetch_max(next, Ordering::SeqCst);
-            }
-        }
         Ok(WriteTxn::new(
             txn,
             &self.next_node_id,
@@ -370,10 +345,10 @@ impl Pristine {
         ))
     }
 
-    // Test-only counter probe. Production IDs are allocated by WriteTxn and
-    // committed with the entity, never handed out by a public process counter.
-    #[cfg(test)]
-    fn alloc_node_id(&self) -> u64 {
+    /// Allocate a new node ID
+    ///
+    /// This is thread-safe and guaranteed to return unique IDs.
+    pub fn alloc_node_id(&self) -> u64 {
         self.next_node_id.fetch_add(1, Ordering::SeqCst)
     }
 
@@ -386,144 +361,7 @@ impl Pristine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pristine::schema::{SCHEMA_VERSION, SCHEMA_VERSION_KEY};
-    use crate::pristine::{MutTxnT, ViewScope, ViewState};
-    use crate::types::{Hash, Inode, NodeId, Position};
     use tempfile::tempdir;
-
-    fn legacy_allocator_fixture(path: &Path) -> (Hash, NodeId, ViewState, Inode) {
-        let pristine = Pristine::open(path).unwrap();
-        let mut txn = pristine.write_txn().unwrap();
-        let hash = Hash::of(b"legacy highest entity");
-        let node = txn.register_change(&hash).unwrap();
-        let view = txn.create_view("legacy", ViewScope::Draft, None).unwrap();
-        let inode = txn.alloc_inode().unwrap();
-        txn.put_inode(inode, Position::new(node, 0_u64.into()))
-            .unwrap();
-        txn.commit().unwrap();
-        drop(pristine);
-
-        // Version 1 derived counters from live rows on each open.
-        let db = Database::open(path).unwrap();
-        let txn = db.begin_write().unwrap();
-        {
-            let mut meta = txn.open_table(ATOMIC_META).unwrap();
-            for key in ["next_node_id", "next_view_id", "next_inode"] {
-                meta.remove(key).unwrap();
-            }
-            meta.insert(SCHEMA_VERSION_KEY, 1_u64.to_le_bytes().as_slice())
-                .unwrap();
-        }
-        txn.commit().unwrap();
-        (hash, node, view, inode)
-    }
-
-    fn remove_legacy_highest_rows(
-        txn: &mut WriteTxn<'_>,
-        hash: Hash,
-        node: NodeId,
-        view: &ViewState,
-        inode: Inode,
-    ) {
-        txn.del_view(view).unwrap();
-        txn.del_inode(inode).unwrap();
-        txn.redb_transaction()
-            .open_table(EXTERNAL)
-            .unwrap()
-            .remove(node.get())
-            .unwrap();
-        txn.redb_transaction()
-            .open_table(INTERNAL)
-            .unwrap()
-            .remove(hash.as_bytes())
-            .unwrap();
-        txn.redb_transaction()
-            .open_table(NODE_TYPES)
-            .unwrap()
-            .remove(node.get())
-            .unwrap();
-    }
-
-    #[test]
-    fn legacy_allocator_watermarks_survive_deletion_and_reopen() {
-        for initialize_tables in [false, true] {
-            let dir = tempdir().unwrap();
-            let path = dir.path().join("pristine");
-            let (hash, node, view, inode) = legacy_allocator_fixture(&path);
-            {
-                let pristine = if initialize_tables {
-                    Pristine::open(&path)
-                } else {
-                    Pristine::open_existing(&path)
-                }
-                .unwrap();
-                let mut txn = pristine.write_txn().unwrap();
-                remove_legacy_highest_rows(&mut txn, hash, node, &view, inode);
-                txn.commit().unwrap();
-            }
-
-            let pristine = Pristine::open_existing(&path).unwrap();
-            let mut txn = pristine.write_txn().unwrap();
-            let new_node = txn.register_change(&Hash::of(b"new entity")).unwrap();
-            let new_view = txn.create_view("new", ViewScope::Draft, None).unwrap();
-            let new_inode = txn.alloc_inode().unwrap();
-            assert!(new_node.get() > node.get(), "entity ID was reused");
-            assert!(new_view.id > view.id, "view ID was reused");
-            assert!(new_inode.get() > inode.get(), "inode ID was reused");
-            txn.commit().unwrap();
-            let read = pristine.read_txn().unwrap();
-            let meta = read.redb_transaction().open_table(ATOMIC_META).unwrap();
-            assert_eq!(
-                meta.get(SCHEMA_VERSION_KEY).unwrap().unwrap().value(),
-                SCHEMA_VERSION.to_le_bytes().as_slice()
-            );
-        }
-    }
-
-    #[test]
-    fn legacy_allocator_upgrade_rolls_back_with_mutation() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("pristine");
-        let (hash, node, view, inode) = legacy_allocator_fixture(&path);
-        {
-            let pristine = Pristine::open_existing(&path).unwrap();
-            let mut txn = pristine.write_txn().unwrap();
-            remove_legacy_highest_rows(&mut txn, hash, node, &view, inode);
-            drop(txn);
-        }
-
-        let db = Database::open(&path).unwrap();
-        let read = db.begin_read().unwrap();
-        let meta = read.open_table(ATOMIC_META).unwrap();
-        for key in ["next_node_id", "next_view_id", "next_inode"] {
-            assert!(
-                meta.get(key).unwrap().is_none(),
-                "aborted allocator seed survived"
-            );
-        }
-        assert_eq!(
-            meta.get(SCHEMA_VERSION_KEY).unwrap().unwrap().value(),
-            1_u64.to_le_bytes().as_slice()
-        );
-        assert!(read
-            .open_table(EXTERNAL)
-            .unwrap()
-            .get(node.get())
-            .unwrap()
-            .is_some());
-        assert!(read
-            .open_table(VIEWS)
-            .unwrap()
-            .get(view.name.as_str())
-            .unwrap()
-            .is_some());
-        assert!(read
-            .open_table(INODES)
-            .unwrap()
-            .get(inode.get())
-            .unwrap()
-            .is_some());
-    }
 
     #[test]
     fn test_pristine_open() {
