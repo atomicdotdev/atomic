@@ -295,47 +295,30 @@ pub fn parse_remote_manifest(view: &str, text: &str, url: &str) -> CliResult<Vie
 
 // Change Data Loading
 
-/// Load and serialize change data from the repository.
+/// Load the exact verified change bytes from the repository.
 ///
-/// Loads the change from the repository and serializes it to bytes
-/// suitable for uploading to a remote.
+/// Reads canonical database objects or legacy files without re-serialization.
 ///
 /// # Errors
 ///
 /// Returns `CliError::ChangeNotFound` if the change doesn't exist,
-/// or `CliError::Internal` if serialization fails.
+/// or `CliError::Internal` if reading or verification fails.
 pub fn load_change_data(repo: &Repository, hash: &Hash) -> CliResult<Bytes> {
-    // Read the raw V3 change file from disk instead of deserializing and
-    // re-serializing.  This is faster, uses less memory, and — critically —
-    // preserves the exact bytes that produced the content hash.  Re-serializing
-    // can produce different bytes (field ordering, padding) which would break
-    // hash verification on the server.
-    let change_path = repo.change_store().change_path(hash);
-    if change_path.exists() {
-        let data = std::fs::read(&change_path).map_err(|e| {
-            CliError::Internal(anyhow::anyhow!(
-                "Failed to read change file {:?}: {}",
-                change_path,
-                e
-            ))
-        })?;
-        return Ok(Bytes::from(data));
-    }
-
-    // Fallback: deserialize + re-serialize (legacy path for changes
-    // whose on-disk file was cleaned up or doesn't exist).
-    let change = repo
-        .load_change(hash)
-        .map_err(|_| CliError::ChangeNotFound {
-            hash: hash.to_base32(),
-        })?;
-
-    let mut buffer = Vec::new();
-    change
-        .serialize(&mut buffer)
-        .map_err(|e| CliError::Internal(anyhow::anyhow!("Failed to serialize change: {}", e)))?;
-
-    Ok(Bytes::from(buffer))
+    repo.change_store()
+        .load_change_bytes(hash)
+        .map(Bytes::from)
+        .map_err(|error| {
+            if error.is_not_found() {
+                CliError::ChangeNotFound {
+                    hash: hash.to_base32(),
+                }
+            } else {
+                CliError::Internal(anyhow::anyhow!(
+                    "Failed to read change {}: {error}",
+                    hash.to_base32()
+                ))
+            }
+        })
 }
 
 /// Load the message from a change, returning None if it fails.
@@ -499,6 +482,28 @@ mod tests {
     use super::*;
     use atomic_core::pristine::ViewScope;
     use std::collections::HashMap;
+
+    #[test]
+    fn push_uses_canonical_bytes_with_a_stale_or_missing_export() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        let mut change = atomic_core::change::Change::empty(
+            atomic_core::change::ChangeHeader::new("push bytes"),
+        );
+        let hash = repo.save_change(&change).unwrap();
+        let path = repo.change_store().change_path(&hash);
+        change.unhashed = Some(serde_json::json!({"transcript": "canonical update"}));
+        let mut bytes = Vec::new();
+        assert_eq!(change.serialize(&mut bytes).unwrap(), hash);
+        repo.redb_change_store()
+            .unwrap()
+            .import_v3_bytes(&bytes)
+            .unwrap();
+        assert_ne!(std::fs::read(&path).unwrap(), bytes);
+        assert_eq!(load_change_data(&repo, &hash).unwrap().as_ref(), bytes);
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(load_change_data(&repo, &hash).unwrap().as_ref(), bytes);
+    }
 
     /// Deterministic test hash.
     fn h(n: u8) -> Hash {

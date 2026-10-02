@@ -18,8 +18,8 @@ use redb::{
 
 use super::error::{PristineError, PristineResult};
 use super::schema::{
-    table_names, visit_tables, TableVisitor, LEGACY_DIR_KEY, RETIRED_TABLES, SCHEMA_VERSION,
-    SCHEMA_VERSION_KEY,
+    check_schema_version, table_names, visit_tables, TableVisitor, LEGACY_DIR_KEY, RETIRED_TABLES,
+    SCHEMA_VERSION, SCHEMA_VERSION_KEY,
 };
 use super::tables::ATOMIC_META;
 use super::txn::open_database;
@@ -79,6 +79,7 @@ impl LegacyDatabases {
     /// and with an I/O `NotFound` when the file no longer exists.
     pub fn add(&mut self, path: &Path) -> PristineResult<()> {
         let database = open_database(path, false, MERGE_CACHE_BYTES)?;
+        check_schema_version(&database.begin_read()?)?;
         self.sources.push((path.to_path_buf(), database));
         Ok(())
     }
@@ -113,7 +114,8 @@ impl LegacyDatabases {
             left_behind,
             ..MergeReport::default()
         };
-        for (_, source) in &self.sources {
+        let mut source_digests = Vec::new();
+        for (path, source) in &self.sources {
             let read = source.begin_read()?;
             let mut write = merged.begin_write()?;
             // Only the final metadata commit needs to be durable: until it
@@ -121,27 +123,67 @@ impl LegacyDatabases {
             write
                 .set_durability(Durability::None)
                 .map_err(|error| merge_error(error.to_string()))?;
+            let before: BTreeSet<_> = report.tables.keys().cloned().collect();
             visit_tables(&mut Copier {
                 source: &read,
                 target: &write,
                 report: &mut report,
             })?;
             write.commit()?;
+            let copied = report
+                .tables
+                .iter()
+                .filter(|(name, _)| !before.contains(*name));
+            source_digests.push((source_key(path)?, fingerprint(copied)));
         }
 
-        visit_tables(&mut Verifier {
-            merged: &merged.begin_read()?,
-            expected: &report,
-        })?;
+        if collect_digests(&merged.begin_read()?)? != report.tables {
+            return Err(merge_error(
+                "merged tables do not match their sources".into(),
+            ));
+        }
 
         let write = merged.begin_write()?;
         {
             let mut meta = write.open_table(ATOMIC_META)?;
             meta.insert(SCHEMA_VERSION_KEY, SCHEMA_VERSION.to_le_bytes().as_slice())?;
             meta.insert(LEGACY_DIR_KEY, legacy_dir.as_bytes())?;
+            for (key, digest) in source_digests {
+                meta.insert(key.as_str(), digest.as_slice())?;
+            }
         }
         write.commit()?;
         Ok(report)
+    }
+
+    /// Verify surviving legacy sources against the snapshot used for the merge.
+    ///
+    /// A crash releases source locks before retirement. An older executable
+    /// can then acknowledge new writes to those files; never silently archive
+    /// them as if they were still the snapshot we copied.
+    pub fn verify_unchanged(&self, merged: &Path) -> PristineResult<()> {
+        let db = Builder::new().open_read_only(merged)?;
+        let read = db.begin_read()?;
+        check_schema_version(&read)?;
+        let meta = read.open_table(ATOMIC_META)?;
+        for (path, source) in &self.sources {
+            let key = source_key(path)?;
+            let expected = meta.get(key.as_str())?.ok_or_else(|| {
+                merge_error(format!(
+                    "no source digest for {}; cannot safely resume retirement",
+                    path.display()
+                ))
+            })?;
+            let snapshot = source.begin_read()?;
+            refuse_unknown_tables(&snapshot, &table_names().into_iter().collect(), path)?;
+            let actual = fingerprint(collect_digests(&snapshot)?.iter());
+            if expected.value() != actual.as_slice() {
+                return Err(merge_error(format!(
+                    "{} changed after migration; retained both databases for recovery; do not discard either file", path.display()
+                )));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -297,32 +339,56 @@ impl TableVisitor for Copier<'_> {
     }
 }
 
-struct Verifier<'a> {
-    merged: &'a ReadTransaction,
-    expected: &'a MergeReport,
+fn source_key(path: &Path) -> PristineResult<String> {
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| merge_error("legacy source must have a UTF-8 filename".into()))?;
+    Ok(format!("legacy_source/{name}"))
 }
 
-impl Verifier<'_> {
-    fn compare(&mut self, name: &str, digest: Option<DigestBuilder>) -> PristineResult<()> {
-        let actual = digest.map(DigestBuilder::finish);
-        let expected = self.expected.tables.get(name).copied();
-        if actual != expected {
-            return Err(merge_error(format!(
-                "table {name} does not match its source after copying"
-            )));
+fn fingerprint<'a>(tables: impl Iterator<Item = (&'a String, &'a TableDigest)>) -> [u8; 32] {
+    let mut digest = blake3::Hasher::new();
+    for (name, table) in tables {
+        digest.update(&(name.len() as u64).to_le_bytes());
+        digest.update(name.as_bytes());
+        digest.update(&table.rows.to_le_bytes());
+        digest.update(&table.hash);
+    }
+    *digest.finalize().as_bytes()
+}
+
+fn collect_digests(txn: &ReadTransaction) -> PristineResult<BTreeMap<String, TableDigest>> {
+    let mut collector = DigestCollector {
+        merged: txn,
+        tables: BTreeMap::new(),
+    };
+    visit_tables(&mut collector)?;
+    Ok(collector.tables)
+}
+
+struct DigestCollector<'a> {
+    merged: &'a ReadTransaction,
+    tables: BTreeMap<String, TableDigest>,
+}
+
+impl DigestCollector<'_> {
+    fn collect(&mut self, name: &str, digest: Option<DigestBuilder>) -> PristineResult<()> {
+        if let Some(digest) = digest {
+            self.tables.insert(name.to_string(), digest.finish());
         }
         Ok(())
     }
 }
 
-impl TableVisitor for Verifier<'_> {
+impl TableVisitor for DigestCollector<'_> {
     fn table<K: Key + 'static, V: Value + 'static>(
         &mut self,
         definition: TableDefinition<'static, K, V>,
     ) -> PristineResult<()> {
         let table = match self.merged.open_table(definition) {
             Ok(table) => table,
-            Err(TableError::TableDoesNotExist(_)) => return self.compare(definition.name(), None),
+            Err(TableError::TableDoesNotExist(_)) => return self.collect(definition.name(), None),
             Err(error) => return Err(error.into()),
         };
         let mut digest = DigestBuilder::default();
@@ -333,7 +399,7 @@ impl TableVisitor for Verifier<'_> {
                 V::as_bytes(&value.value()).as_ref(),
             );
         }
-        self.compare(definition.name(), Some(digest))
+        self.collect(definition.name(), Some(digest))
     }
 
     fn multimap<K: Key + 'static, V: Key + 'static>(
@@ -342,7 +408,7 @@ impl TableVisitor for Verifier<'_> {
     ) -> PristineResult<()> {
         let table = match self.merged.open_multimap_table(definition) {
             Ok(table) => table,
-            Err(TableError::TableDoesNotExist(_)) => return self.compare(definition.name(), None),
+            Err(TableError::TableDoesNotExist(_)) => return self.collect(definition.name(), None),
             Err(error) => return Err(error.into()),
         };
         let mut digest = DigestBuilder::default();
@@ -356,6 +422,6 @@ impl TableVisitor for Verifier<'_> {
                 );
             }
         }
-        self.compare(definition.name(), Some(digest))
+        self.collect(definition.name(), Some(digest))
     }
 }

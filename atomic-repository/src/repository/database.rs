@@ -129,6 +129,7 @@ fn finish_retiring_legacy(dot_dir: &Path, legacy: &LegacyDatabases) -> Result<()
             ),
         });
     };
+    legacy.verify_unchanged(&dot_dir.join(DATABASE_FILE))?;
     retire_legacy_files(dot_dir, &legacy_name, legacy)?;
     log::warn!(
         "finished an interrupted database merge in {}",
@@ -172,6 +173,7 @@ fn retire_legacy_files(
         }
     }
     sync_dir(&target)?;
+    sync_dir(&dot_dir.join(LEGACY_DIR))?;
     sync_dir(dot_dir)?;
     Ok(())
 }

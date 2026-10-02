@@ -174,7 +174,8 @@ impl Repository {
         };
         let pristine = Arc::new(pristine.map_err(RepositoryError::from)?);
         let change_store = ChangeStore::new(dot_dir.join("changes"), DEFAULT_CACHE_CAPACITY)
-            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+            .map_err(|e| RepositoryError::Database(e.to_string()))?
+            .with_database(Arc::clone(&pristine));
 
         Ok(Self {
             root: working_root,

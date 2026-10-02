@@ -114,6 +114,83 @@ fn build_turn_header(
 
 // record_turn (the main entry point)
 
+/// Recover a committed record before retrying a turn's unfinished checkpoint.
+/// The hashed provenance survives a crash before exports or session JSON are
+/// written. Only records in this session's view with its exact turn identity
+/// qualify; newer working-copy edits must remain unrecorded during recovery.
+pub(crate) fn recover_recorded_turn(
+    repo_root: &Path,
+    session: &crate::turn::session::AgentSession,
+    turn_number: u32,
+) -> AgentResult<Option<TurnRecordOutcome>> {
+    let failure = |reason: String| AgentError::RecordFailed {
+        session_id: session.session_id.clone(),
+        turn_number,
+        reason,
+    };
+    let repo = atomic_repository::Repository::open_readonly_wait(
+        repo_root,
+        crate::turn::orchestrator::wait_budget::database_wait(),
+    )
+    .map_err(|error| failure(error.to_string()))?;
+    let history = repo
+        .log(
+            atomic_repository::history::HistoryOptions::new()
+                .view(&session.view_name)
+                .load_headers(false),
+        )
+        .map_err(|error| failure(error.to_string()))?;
+    for entry in history {
+        let change = repo
+            .load_change(&entry.hash)
+            .map_err(|error| failure(error.to_string()))?;
+        let matches_turn = change.provenance().iter().any(|provenance| {
+            provenance.session_id.as_deref() == Some(session.session_id.as_str())
+                && provenance.metadata.iter().any(|(key, value)| {
+                    key == "turn_number" && value.parse::<u32>() == Ok(turn_number)
+                })
+                && provenance
+                    .metadata
+                    .iter()
+                    .any(|(key, value)| key == "agent_name" && value == &session.agent_name)
+        });
+        if matches_turn {
+            let recorded_files: Vec<String> = change
+                .hunks()
+                .iter()
+                .filter_map(|hunk| hunk.path().map(str::to_owned))
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect();
+            let outcome = TurnRecordOutcome {
+                hash: entry.hash,
+                turn_number,
+                file_count: recorded_files.len(),
+                message: change.hashed.header.message.clone(),
+                recorded_files,
+                unhashed_data: transcript::extract_unhashed(&change),
+            };
+            let repair_cache = repo.current_view() == session.view_name;
+            drop(repo);
+            if repair_cache {
+                let repo = atomic_repository::Repository::open_existing_wait(
+                    repo_root,
+                    crate::turn::orchestrator::wait_budget::database_wait(),
+                )
+                .map_err(|error| failure(error.to_string()))?;
+                // Recheck after reacquiring ownership; another view may have
+                // been selected while the read handle was released.
+                if repo.current_view() == session.view_name {
+                    repo.refresh_file_index_for_paths(&outcome.recorded_files)
+                        .map_err(|error| failure(error.to_string()))?;
+                }
+            }
+            return Ok(Some(outcome));
+        }
+    }
+    Ok(None)
+}
+
 /// Record an agent turn as an Atomic change.
 ///
 /// This is the function that bridges the agent world into the VCS world.
@@ -490,42 +567,23 @@ pub fn record_turn(
                     options.turn_number,
                 );
 
-                // The store wrote the change file during record(), before
-                // this unhashed data existed. Re-save so the file on disk
-                // carries the transcript. The unhashed section is outside
-                // the hash, so the content hash is unchanged and the file
-                match atomic_repository::Repository::canonical_dot_dir(repo_root)
-                    .map(|dot| dot.join("changes"))
-                    .map_err(|e| e.to_string())
-                    .and_then(|dir| {
-                        atomic_repository::ChangeStore::new(
-                            dir,
-                            atomic_repository::DEFAULT_CACHE_CAPACITY,
-                        )
-                        .map_err(|e| e.to_string())
-                    }) {
-                    Ok(store) => match store.save_change(outcome.change()) {
-                        Ok(saved) if saved == *outcome.hash() => {}
-                        Ok(saved) => {
-                            log::warn!(
-                                "Re-saved change hash {} differs from recorded {} — \
+                // Update the canonical object through the repository handle.
+                // Unhashed data does not change the content hash; an export
+                // copy alone would be hidden by the existing database object.
+                match repo.save_change(outcome.change()) {
+                    Ok(saved) if saved == *outcome.hash() => {}
+                    Ok(saved) => {
+                        log::warn!(
+                            "Re-saved change hash {} differs from recorded {} — \
                                  unhashed data may be orphaned",
-                                saved.to_base32(),
-                                outcome.hash().to_base32(),
-                            );
-                        }
-                        Err(e) => {
-                            log::warn!(
-                                "Failed to persist transcript on change {} (non-fatal): {}",
-                                outcome.hash().to_base32(),
-                                e
-                            );
-                        }
-                    },
+                            saved.to_base32(),
+                            outcome.hash().to_base32(),
+                        );
+                    }
                     Err(e) => {
                         log::warn!(
-                            "Could not open change store to persist transcript \
-                             (non-fatal): {}",
+                            "Failed to persist transcript on change {} (non-fatal): {}",
+                            outcome.hash().to_base32(),
                             e
                         );
                     }
@@ -550,4 +608,54 @@ pub fn record_turn(
         recorded_files,
         unhashed_data,
     })
+}
+
+#[cfg(test)]
+mod canonical_transcript_tests {
+    use super::*;
+    use crate::event::{HookType, TurnEvent};
+    use crate::turn::session::AgentSession;
+
+    #[test]
+    fn recorded_transcript_survives_reopen_without_export_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("repo");
+        let mut repo = atomic_repository::Repository::init(&root).unwrap();
+        let mut session = AgentSession::new("canonical-transcript", "claude-code", "Claude Code");
+        let parent = repo.current_view().to_string();
+        session.set_parent_view(&parent);
+        repo.create_view_from(&session.view_name, &parent).unwrap();
+        drop(repo);
+
+        let transcript = dir.path().join("transcript.jsonl");
+        std::fs::write(&transcript,
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Saved the new source file."}]}}"#,
+        ).unwrap();
+        session.transcript_path = Some(transcript);
+        std::fs::write(root.join("source.txt"), "source content\n").unwrap();
+        let event = TurnEvent::new(&session.session_id, HookType::TurnEnd);
+        let outcome = record_turn(
+            &root,
+            &TurnRecordOptions {
+                session: &session,
+                event: &event,
+                turn_number: 1,
+                turn_duration_ms: 100,
+                prompt: Some("Create the source file".into()),
+                agent_identity: None,
+                identity_dir: Some(dir.path().join("identities")),
+            },
+        )
+        .unwrap();
+        assert!(
+            outcome.unhashed_data.is_some(),
+            "fixture must produce a transcript"
+        );
+        let repo = atomic_repository::Repository::open(&root).unwrap();
+        std::fs::remove_file(repo.change_store().change_path(&outcome.hash)).unwrap();
+        let loaded = repo.load_change(&outcome.hash).unwrap();
+        let stored = transcript::extract_unhashed(&loaded).expect("canonical transcript");
+        assert_eq!(stored.session_id, session.session_id);
+        assert!(stored.entry_count() > 0);
+    }
 }

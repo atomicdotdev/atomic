@@ -12,7 +12,7 @@ use std::fs::{File, OpenOptions};
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex, TryLockError, Weak};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context};
@@ -930,22 +930,35 @@ impl StoreLease {
         }
     }
 
-    fn acquire(&self) -> anyhow::Result<Arc<RedbChangeStore>> {
-        let mut current = self
-            .current
-            .lock()
-            .map_err(|_| anyhow!("database-owner store lease is poisoned"))?;
+    fn acquire(&self, started: Instant) -> anyhow::Result<Arc<RedbChangeStore>> {
+        let timeout = atomic_agent::turn::orchestrator::wait_budget::database_wait();
+        let mut current = loop {
+            match self.current.try_lock() {
+                Ok(guard) => break guard,
+                Err(TryLockError::Poisoned(_)) => {
+                    return Err(anyhow!("database-owner store lease is poisoned"));
+                }
+                Err(TryLockError::WouldBlock) if started.elapsed() < timeout => {
+                    std::thread::sleep(
+                        DATABASE_RETRY_DELAY.min(timeout.saturating_sub(started.elapsed())),
+                    );
+                }
+                Err(TryLockError::WouldBlock) => {
+                    return Err(anyhow!(
+                        "database-owner store lease stayed busy for {timeout:?}"
+                    ));
+                }
+            }
+        };
         if let Some(store) = current.upgrade() {
             return Ok(store);
         }
-        let store = Arc::new(self.open_waiting()?);
+        let store = Arc::new(self.open_waiting(started, timeout)?);
         *current = Arc::downgrade(&store);
         Ok(store)
     }
 
-    fn open_waiting(&self) -> anyhow::Result<RedbChangeStore> {
-        let timeout = atomic_agent::turn::orchestrator::wait_budget::database_wait();
-        let started = Instant::now();
+    fn open_waiting(&self, started: Instant, timeout: Duration) -> anyhow::Result<RedbChangeStore> {
         loop {
             match self.open_once() {
                 Err(OpenFailure::Busy) if started.elapsed() < timeout => {
@@ -1431,12 +1444,14 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let request: RequestFrame = read_frame(&mut stream).await?;
+    let started = Instant::now();
     // Opening the database may wait for another process; keep that off the
     // runtime threads that accept connections and answer pings.
-    let (response, should_shutdown) =
-        tokio::task::spawn_blocking(move || handle_request_with(request, || lease.acquire()))
-            .await
-            .context("database-owner request handler panicked")?;
+    let (response, should_shutdown) = tokio::task::spawn_blocking(move || {
+        handle_request_with(request, || lease.acquire(started))
+    })
+    .await
+    .context("database-owner request handler panicked")?;
     write_frame(&mut stream, &response).await?;
     stream.shutdown().await?;
     if should_shutdown {

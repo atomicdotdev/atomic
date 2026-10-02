@@ -29,6 +29,12 @@ impl ChangeStore {
 
     /// Check if a provenance graph with the given hash exists on disk.
     pub fn has_provenance_graph(&self, hash: &Hash) -> bool {
+        if matches!(
+            self.object_bytes(super::PROVENANCE_OBJECTS, hash),
+            Ok(Some(_))
+        ) {
+            return true;
+        }
         self.provenance_path(hash).exists()
     }
 
@@ -94,15 +100,18 @@ impl ChangeStore {
         &self,
         hash: &Hash,
     ) -> ChangeStoreResult<atomic_core::change::ProvenanceGraph> {
-        let path = self.provenance_path(hash);
-
-        if !path.exists() {
-            return Err(ChangeStoreError::NotFound {
-                hash: hash.to_base32(),
-            });
-        }
-
-        let data = fs::read(&path)?;
+        let data = match self.object_bytes(super::PROVENANCE_OBJECTS, hash)? {
+            Some(bytes) => bytes,
+            None => {
+                let path = self.provenance_path(hash);
+                if !path.exists() {
+                    return Err(ChangeStoreError::NotFound {
+                        hash: hash.to_base32(),
+                    });
+                }
+                fs::read(&path)?
+            }
+        };
         let (graph, computed_hash) = atomic_core::change::ProvenanceGraph::deserialize(&data)
             .map_err(|e| {
                 ChangeStoreError::Io(std::io::Error::new(
@@ -124,7 +133,15 @@ impl ChangeStore {
 
     /// Iterate over all provenance graph hashes on disk.
     pub fn iter_provenance_graphs(&self) -> impl Iterator<Item = ChangeStoreResult<Hash>> + '_ {
-        super::iterators::ProvenanceIterator::new(&self.changes_dir)
+        let mut seen = std::collections::HashSet::new();
+        let stored = match self.object_hashes(super::PROVENANCE_OBJECTS) {
+            Ok(hashes) => hashes.into_iter().map(Ok).collect::<Vec<_>>(),
+            Err(error) => vec![Err(error)],
+        };
+        stored
+            .into_iter()
+            .chain(super::iterators::ProvenanceIterator::new(&self.changes_dir))
+            .filter(move |entry| entry.as_ref().map_or(true, |hash| seen.insert(*hash)))
     }
 
     /// Count provenance graphs on disk.

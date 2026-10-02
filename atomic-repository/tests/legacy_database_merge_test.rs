@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use atomic_core::change::{Author, ChangeHeader};
-use atomic_core::pristine::tables::ATOMIC_META;
+use atomic_core::pristine::tables::*;
 use atomic_core::pristine::Pristine;
 use atomic_core::types::Hash;
 use atomic_repository::history::HistoryOptions;
@@ -80,6 +80,19 @@ fn legacy_repository(with_change_store: bool) -> Legacy {
         let db = redb::Database::open(&pristine).unwrap();
         let txn = db.begin_write().unwrap();
         txn.delete_table(ATOMIC_META).unwrap();
+        // This fixture represents the pre-consolidation layout. New record
+        // writes populate native change projections in atomic.redb; an old
+        // pristine had none of those tables (its .change files remain here).
+        txn.delete_table(CHANGE_BYTES).unwrap();
+        txn.delete_table(CHANGE_META).unwrap();
+        txn.delete_table(CHANGE_GRAPH).unwrap();
+        txn.delete_table(CHANGE_SEMANTIC).unwrap();
+        txn.delete_table(CONTENT_CHUNKS).unwrap();
+        txn.delete_table(CHANGE_CHUNKS).unwrap();
+        txn.delete_table(CHANGE_UNHASHED).unwrap();
+        txn.delete_table(CHANGE_SIGNATURES).unwrap();
+        txn.delete_table(REPOSITORY_OUTBOX).unwrap();
+        txn.delete_table(REPOSITORY_OUTBOX_KEYS).unwrap();
         txn.commit().unwrap();
     }
     if with_change_store {

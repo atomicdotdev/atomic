@@ -12,6 +12,55 @@ enum UntrackedScanPolicy {
 impl Repository {
     // Status Methods
 
+    /// Repair derived file-index entries after interrupted publication.
+    /// Only bytes equal to the selected view's canonical graph become clean
+    /// cache entries. Later working-copy edits invalidate the old entry.
+    pub fn refresh_file_index_for_paths(&self, paths: &[String]) -> Result<(), RepositoryError> {
+        use std::time::SystemTime;
+        let mut entries = Vec::new();
+        for path in paths {
+            let absolute = self.root.join(path);
+            // Capture stat before bytes, so a concurrent edit cannot pair old
+            // bytes with a newer modification timestamp and appear clean.
+            let metadata = std::fs::metadata(&absolute).ok();
+            let content = std::fs::read(&absolute).ok();
+            let recorded = self.get_file_content(path)?;
+            let entry = match (metadata, content, recorded) {
+                (Some(metadata), Some(content), Some(recorded)) if content == recorded => {
+                    let duration = metadata
+                        .modified()
+                        .unwrap_or(SystemTime::UNIX_EPOCH)
+                        .duration_since(SystemTime::UNIX_EPOCH)
+                        .unwrap_or_default();
+                    Some((duration, metadata.len(), Hash::of(&content)))
+                }
+                _ => None,
+            };
+            entries.push((path, entry));
+        }
+        let mut txn = self
+            .pristine
+            .write_txn()
+            .map_err(|error| RepositoryError::Database(error.to_string()))?;
+        for (path, entry) in entries {
+            if let Some((duration, size, hash)) = entry {
+                txn.put_file_index(
+                    path,
+                    duration.as_secs() as i64,
+                    duration.subsec_nanos(),
+                    size,
+                    &hash,
+                )
+                .map_err(|error| RepositoryError::Database(error.to_string()))?;
+            } else {
+                txn.del_file_index(path)
+                    .map_err(|error| RepositoryError::Database(error.to_string()))?;
+            }
+        }
+        txn.commit()
+            .map_err(|error| RepositoryError::Database(error.to_string()))
+    }
+
     /// Compute the status of the working copy.
     ///
     /// Optimized for repositories with tens of thousands of files:

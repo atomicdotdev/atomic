@@ -98,6 +98,7 @@ impl<K: Eq + std::hash::Hash + Clone, V> LruCache<K, V> {
     }
 
     /// Check if a key is in the cache without updating access time.
+    #[cfg(test)]
     pub(crate) fn contains_key(&self, key: &K) -> bool {
         self.entries.contains_key(key)
     }

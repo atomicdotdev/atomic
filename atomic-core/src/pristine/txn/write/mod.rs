@@ -15,7 +15,7 @@ use crate::crdt::tables::{
 };
 
 use crate::types::{
-    ChangePosition, EdgeFlags, GraphNode, Hash, Inode, Merkle, NodeId, Position,
+    Base32, ChangePosition, EdgeFlags, GraphNode, Hash, Inode, Merkle, NodeId, Position,
     SerializedGraphEdge,
 };
 
@@ -58,6 +58,72 @@ impl<'a> WriteTxn<'a> {
             next_view_id,
             next_inode,
         }
+    }
+
+    /// Borrow the storage transaction for co-located object and journal writes.
+    /// The repository operation retains ownership and commits it exactly once.
+    pub fn redb_transaction(&self) -> &WriteTransaction {
+        &self.txn
+    }
+
+    fn allocate_id(&self, key: &str, counter: &AtomicU64) -> PristineResult<u64> {
+        let mut meta = self.txn.open_table(ATOMIC_META)?;
+        let stored = meta
+            .get(key)?
+            .map(|value| <[u8; 8]>::try_from(value.value()).map(u64::from_le_bytes))
+            .transpose()
+            .map_err(|_| PristineError::Inconsistent {
+                message: format!("invalid allocator {key}"),
+            })?;
+        // The scanned value seeds old repositories; durable high-water marks
+        // prevent reuse after removing the highest entity or reopening.
+        let id = stored.unwrap_or(1).max(counter.load(Ordering::SeqCst));
+        let next = id
+            .checked_add(1)
+            .ok_or_else(|| PristineError::Inconsistent {
+                message: format!("allocator {key} exhausted"),
+            })?;
+        meta.insert(key, next.to_le_bytes().as_slice())?;
+        counter.fetch_max(next, Ordering::SeqCst);
+        Ok(id)
+    }
+
+    /// Read an operation's immutable outbox receipt in this write snapshot.
+    pub fn repository_event(&self, key: &str) -> PristineResult<Option<Vec<u8>>> {
+        let keys = self.txn.open_table(REPOSITORY_OUTBOX_KEYS)?;
+        let events = self.txn.open_table(REPOSITORY_OUTBOX)?;
+        let Some(sequence) = keys.get(key)? else {
+            return Ok(None);
+        };
+        let payload = events
+            .get(sequence.value())?
+            .ok_or_else(|| PristineError::Inconsistent {
+                message: format!("missing outbox event for {key}"),
+            })?;
+        Ok(Some(payload.value().to_vec()))
+    }
+
+    /// Append an event once in the same transaction as the repository mutation.
+    /// Reusing a key with different bytes is rejected instead of losing an event.
+    pub fn append_repository_event(&self, key: &str, payload: &[u8]) -> PristineResult<u64> {
+        let mut keys = self.txn.open_table(REPOSITORY_OUTBOX_KEYS)?;
+        let mut events = self.txn.open_table(REPOSITORY_OUTBOX)?;
+        if let Some(sequence) = keys.get(key)? {
+            let sequence = sequence.value();
+            if events
+                .get(sequence)?
+                .is_some_and(|stored| stored.value() == payload)
+            {
+                return Ok(sequence);
+            }
+            return Err(PristineError::Inconsistent {
+                message: format!("outbox key {key} already has a different payload"),
+            });
+        }
+        let sequence = self.allocate_id("next_outbox_id", &AtomicU64::new(1))?;
+        events.insert(sequence, payload)?;
+        keys.insert(key, sequence)?;
+        Ok(sequence)
     }
 
     /// Populate the session tables from a provenance graph.
@@ -546,13 +612,39 @@ impl<'a> WriteTxn<'a> {
     pub fn publish_session_checkpoint(
         &mut self,
         json_path: &str,
-        turn: crate::change::session::SessionTurn,
+        mut turn: crate::change::session::SessionTurn,
     ) -> PristineResult<crate::change::session::SessionCheckpointPublication> {
         use crate::change::session::{
             SessionCheckpointPublication, SessionManifest, SessionRecord,
         };
 
+        let receipt_key = format!("{}:{}", turn.session_id, turn.provenance_hash.to_base32());
+        let receipt = {
+            let receipts = self.txn.open_table(SESSION_CHECKPOINT_RECEIPTS)?;
+            let receipt = receipts
+                .get(receipt_key.as_str())?
+                .map(|bytes| bytes.value().to_vec());
+            receipt
+        };
+        if let Some(bytes) = receipt {
+            let publication: SessionCheckpointPublication = serde_json::from_slice(&bytes)
+                .map_err(|error| PristineError::Serialization {
+                    message: error.to_string(),
+                })?;
+            turn.turn_number = publication.turn.turn_number;
+            if turn != publication.turn {
+                return Err(PristineError::Inconsistent {
+                    message: format!("checkpoint receipt conflicts for {receipt_key}"),
+                });
+            }
+            return Ok(publication);
+        }
         let mut turns = self.load_session_turns_for_write(&turn.session_id)?;
+        turn.turn_number = turns
+            .iter()
+            .find(|existing| existing.provenance_hash == turn.provenance_hash)
+            .map(|existing| existing.turn_number)
+            .unwrap_or(turns.len() as u32);
         if let Some(existing) = turns
             .iter()
             .find(|existing| existing.turn_number == turn.turn_number)
@@ -565,6 +657,42 @@ impl<'a> WriteTxn<'a> {
                     ),
                 });
             }
+            // Repositories predating receipts still retain immutable manifests.
+            // Recover the manifest ending at this checkpoint, never today's head.
+            let manifests = self.txn.open_table(SESSION_MANIFESTS)?;
+            let mut candidates = Vec::new();
+            for entry in manifests.iter()? {
+                let (hash, bytes) = entry?;
+                let manifest = SessionManifest::from_bytes(bytes.value()).map_err(|error| {
+                    PristineError::Serialization {
+                        message: error.to_string(),
+                    }
+                })?;
+                if manifest.session_id == turn.session_id
+                    && manifest.turns == turns[..=turn.turn_number as usize]
+                {
+                    candidates.push(Hash::from_bytes(*hash.value()));
+                }
+            }
+            if candidates.len() != 1 {
+                return Err(PristineError::Inconsistent {
+                    message: format!(
+                        "missing or ambiguous original checkpoint manifest for {receipt_key}"
+                    ),
+                });
+            }
+            let publication = SessionCheckpointPublication {
+                turn,
+                manifest_hash: candidates[0],
+            };
+            let bytes =
+                serde_json::to_vec(&publication).map_err(|error| PristineError::Serialization {
+                    message: error.to_string(),
+                })?;
+            self.txn
+                .open_table(SESSION_CHECKPOINT_RECEIPTS)?
+                .insert(receipt_key.as_str(), bytes.as_slice())?;
+            return Ok(publication);
         } else {
             if turn.turn_number as usize != turns.len()
                 || turn.previous_provenance != turns.last().map(|prior| prior.provenance_hash)
@@ -626,10 +754,18 @@ impl<'a> WriteTxn<'a> {
             fork_turn,
         };
         let manifest_hash = self.save_session_manifest(&manifest)?;
-        Ok(SessionCheckpointPublication {
+        let publication = SessionCheckpointPublication {
             turn,
             manifest_hash,
-        })
+        };
+        let bytes =
+            serde_json::to_vec(&publication).map_err(|error| PristineError::Serialization {
+                message: error.to_string(),
+            })?;
+        self.txn
+            .open_table(SESSION_CHECKPOINT_RECEIPTS)?
+            .insert(receipt_key.as_str(), bytes.as_slice())?;
+        Ok(publication)
     }
 
     /// Index an immutable provenance graph as the next turn of its session.
@@ -885,7 +1021,7 @@ impl<'a> WriteTxn<'a> {
         }
 
         // Allocate a new ID
-        let id = self.next_node_id.fetch_add(1, Ordering::SeqCst);
+        let id = self.allocate_id("next_node_id", self.next_node_id)?;
         let node_id = NodeId::new(id);
 
         // Insert into both tables
@@ -996,7 +1132,7 @@ impl<'a> MutTxnT for WriteTxn<'a> {
         }
 
         // Create new view (defaults to Shared, no parent for backward compat)
-        let id = self.next_view_id.fetch_add(1, Ordering::SeqCst);
+        let id = self.allocate_id("next_view_id", self.next_view_id)?;
         let state = ViewState::new(id, name.to_string());
 
         // Save it
@@ -1064,7 +1200,7 @@ impl<'a> MutTxnT for WriteTxn<'a> {
         }
 
         // Allocate ID and create state
-        let id = self.next_view_id.fetch_add(1, Ordering::SeqCst);
+        let id = self.allocate_id("next_view_id", self.next_view_id)?;
         let state = ViewState::with_scope(id, name.to_string(), kind, parent);
 
         // Save it
@@ -1666,7 +1802,7 @@ impl<'a> MutTxnT for WriteTxn<'a> {
     }
 
     fn alloc_inode(&mut self) -> PristineResult<Inode> {
-        let id = self.next_inode.fetch_add(1, Ordering::SeqCst);
+        let id = self.allocate_id("next_inode", self.next_inode)?;
         Ok(Inode::new(id))
     }
 
