@@ -20,15 +20,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let proto_root = manifest.join("proto");
     let mut files = Vec::new();
     collect_protos(&proto_root, &mut files);
-    assert!(!files.is_empty(), "no protos found under {}", proto_root.display());
+    assert!(
+        !files.is_empty(),
+        "no protos found under {}",
+        proto_root.display()
+    );
 
     // protox is a pure-Rust protoc replacement: no system protoc dependency.
     // The include root carries `atomic/...`, matching the imports
     // (`atomic/common/common.proto`).
-    let fds = protox::compile(
-        &files,
-        [proto_root.clone()],
-    )?;
+    let fds = protox::compile(&files, [proto_root.clone()])?;
 
     tonic_build::configure()
         .build_client(true)

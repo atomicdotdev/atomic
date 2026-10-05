@@ -18,6 +18,8 @@
 //! the contract and the codegen only — implementations live elsewhere.
 
 pub mod atomic {
+    // The generated module is machine-written; lints do not apply to it.
+    #![allow(clippy::all)]
     tonic::include_proto!("atomic");
 }
 
