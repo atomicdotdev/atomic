@@ -1,3 +1,7 @@
+// Temporary Unix-only Git bridge support to unblock Windows native CI.
+// Revisit after Windows support is defined; see the RFC temporary platform policy.
+#![cfg(unix)]
+
 //! CB-6B end-to-end: verified binding closure transport through the real CLI.
 //!
 //! Proves through the real binary and real Git plumbing (RFC §8.6, §12):

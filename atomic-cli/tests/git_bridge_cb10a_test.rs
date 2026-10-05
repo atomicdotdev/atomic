@@ -1,3 +1,7 @@
+// Temporary Unix-only Git bridge support to unblock Windows native CI.
+// Revisit after Windows support is defined; see the RFC temporary platform policy.
+#![cfg(unix)]
+
 //! CB-10A integration coverage: persistent ref mappings and three-way
 //! reconciliation (RFC §8.1/§8.5).
 //!

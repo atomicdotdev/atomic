@@ -1,3 +1,7 @@
+// Temporary Unix-only Git bridge support to unblock Windows native CI.
+// Revisit after Windows support is defined; see the RFC temporary platform policy.
+#![cfg(unix)]
+
 //! CB-9A end-to-end: `atomic git import` synthesizes foreign Git history
 //! through normal recorded-file assembly with hashed Git origin, tagged
 //! commit/tree OIDs, graph-context dependencies, bridge sequencing, and an

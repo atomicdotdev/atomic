@@ -130,6 +130,10 @@ fn sibling_replay_insert_unrecord_and_reinsert_share_projection() {
 }
 
 #[test]
+#[cfg_attr(
+    not(unix),
+    ignore = "temporary Unix-only Git bridge (PR #207); see RFC temporary platform policy"
+)]
 fn graph_first_direct_import_matches_native_record_projection() {
     let (source_temp, source) = create_temp_repo();
     let path = source_temp.path().join("src/domain/model.rs");

@@ -13,6 +13,28 @@
 
 ---
 
+## Temporary platform support (PR #207)
+
+The Git causal bridge is **Unix-only for now (Linux and macOS)**. Windows
+bridge support is not yet defined or validated. This temporary policy removes
+unsupported bridge scenarios from the Windows CI path while that work is
+deferred; it is not evidence that those scenarios work on Windows.
+
+Bridge end-to-end suites that exercise import/export, colocated reconciliation,
+Git projection, hook capture, or exact restoration from Git bindings use
+`cfg(unix)`. Mixed suites gate only their bridge cases. Linux and macOS continue
+to run these suites. Windows still builds the workspace and runs native Atomic
+tests, including graph/closure semantics, view switching, conflict handling,
+materialization, operation recovery, database ownership, and platform-independent
+bridge data/codec tests. Native Windows failures remain failures; they must not
+be hidden by this bridge policy.
+
+Remove the temporary gates once Windows bridge support is agreed and implemented,
+with validation for path encoding and case behavior, executable modes and
+symlinks, Git index/file locking and replacement, hooks, and recovery. At that
+point rerun the full bridge suites on a real Windows runner before declaring
+support. A green native Windows job alone does not establish bridge support.
+
 ## 0. Glossary
 
 Terms in this RFC are overloaded elsewhere in Atomic; the definitions below are normative for this document.

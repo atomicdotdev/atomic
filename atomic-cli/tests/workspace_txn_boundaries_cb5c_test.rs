@@ -2,7 +2,9 @@
 //! bootstrap, dry-run Observe mutation-freedom, no-Git behavior, and managed
 //! turn boundaries under Git-owned partial operations.
 
-#![cfg(not(windows))]
+// Temporary Unix-only Git bridge support to unblock Windows native CI.
+// Revisit after Windows support is defined; see the RFC temporary platform policy.
+#![cfg(unix)]
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write as _;

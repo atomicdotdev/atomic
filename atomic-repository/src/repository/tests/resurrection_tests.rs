@@ -1,3 +1,7 @@
+// Temporary Unix-only Git bridge support to unblock Windows native CI.
+// Revisit after Windows support is defined; see the RFC temporary platform policy.
+#![cfg(unix)]
+
 //! CB-6C: exact bound resurrection and the checked Git SHA cache.
 //!
 //! Fixtures verify original causal and semantic identities — hashes, bytes,

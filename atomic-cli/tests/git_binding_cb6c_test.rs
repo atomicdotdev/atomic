@@ -1,3 +1,7 @@
+// Temporary Unix-only Git bridge support to unblock Windows native CI.
+// Revisit after Windows support is defined; see the RFC temporary platform policy.
+#![cfg(unix)]
+
 //! CB-6C end-to-end: exact resurrection through the real CLI and real Git.
 //!
 //! Proves through the real binary and real Git plumbing (RFC §5.1–5.2, §8.6):

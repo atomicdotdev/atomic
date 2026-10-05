@@ -1,3 +1,7 @@
+// Temporary Unix-only Git bridge support to unblock Windows native CI.
+// Revisit after Windows support is defined; see the RFC temporary platform policy.
+#![cfg(unix)]
+
 //! CB-13B integration coverage: the reachable CLI cutover entry point.
 //!
 //! The cutover executor's repository-level gates have their own suite

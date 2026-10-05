@@ -1,3 +1,7 @@
+// Temporary Unix-only Git bridge support to unblock Windows native CI.
+// Revisit after Windows support is defined; see the RFC temporary platform policy.
+#![cfg(unix)]
+
 //! CB-8A end-to-end: canonical Atomic→Git projection and view-scope HEAD policy.
 //!
 //! Normative source: RFC-ATOMIC-GIT-CAUSAL-BRIDGE §8.1–8.2, §5.5, §12,

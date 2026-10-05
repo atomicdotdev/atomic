@@ -10,7 +10,9 @@
 //! The native codes (`M`/`A`/`D`/`P`/`T`/`C`) deliberately differ from the
 //! `--git` XY subset; each row asserts its native column too.
 
-#![cfg(not(windows))]
+// Temporary Unix-only Git bridge support to unblock Windows native CI.
+// Revisit after Windows support is defined; see the RFC temporary platform policy.
+#![cfg(unix)]
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write as _;

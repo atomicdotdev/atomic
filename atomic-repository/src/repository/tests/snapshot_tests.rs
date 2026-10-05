@@ -854,6 +854,10 @@ fn snapshot_retention_preserves_an_object_rooted_by_an_incomplete_session_record
 /// stay distinct: a keep-ref-pinned object survives; the unpinned object
 /// with the same age still collects.
 #[test]
+#[cfg_attr(
+    not(unix),
+    ignore = "temporary Unix-only Git bridge (PR #207); see RFC temporary platform policy"
+)]
 fn snapshot_retention_respects_git_keep_refs_and_audit_wall() {
     let (directory, repo) = create_temp_repo();
     // The keep-ref root scans Git refs: the fixture needs a Git repository.

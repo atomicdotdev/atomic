@@ -1,3 +1,7 @@
+// Temporary Unix-only Git bridge support to unblock Windows native CI.
+// Revisit after Windows support is defined; see the RFC temporary platform policy.
+#![cfg(unix)]
+
 //! CB-9B end-to-end: causal merge resolution, distinct empty commits, and
 //! squash/rewrite synthesis through the real importer.
 //!

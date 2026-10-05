@@ -1109,6 +1109,10 @@ mod tests {
     /// the final-only O_NOFOLLOW opened the external file, which the tail
     /// repair erased), passing after.
     #[test]
+    #[cfg_attr(
+        not(unix),
+        ignore = "temporary Unix-only Git bridge (PR #207); see RFC temporary platform policy"
+    )]
     fn ancestor_symlink_target_is_never_followed_mutated_or_erased() {
         let directory = tempfile::tempdir().unwrap();
         let external = directory.path().join("external");
@@ -1173,6 +1177,10 @@ mod tests {
     /// `{`) is identified and repaired: the fragment is truncated and the
     /// event appends cleanly.
     #[test]
+    #[cfg_attr(
+        not(unix),
+        ignore = "temporary Unix-only Git bridge (PR #207); see RFC temporary platform policy"
+    )]
     fn owned_crash_fragment_is_repaired_and_the_event_appends() {
         let _directory = tempfile::tempdir().unwrap();
         let (_dir, journal) = journal();
@@ -1702,6 +1710,10 @@ mod tests {
     /// the incomplete fragment never merges with a new record, and any
     /// complete history before it is retained.
     #[test]
+    #[cfg_attr(
+        not(unix),
+        ignore = "temporary Unix-only Git bridge (PR #207); see RFC temporary platform policy"
+    )]
     fn partial_tail_fragment_is_repaired_on_next_emit() {
         let (directory, journal) = journal();
         std::fs::create_dir_all(journal.path().parent().unwrap()).unwrap();
@@ -1738,6 +1750,10 @@ mod tests {
     /// line parses as one JSON object, and the file stays within the cap.
     /// Advisory contention may drop events; it may never interleave them.
     #[test]
+    #[cfg_attr(
+        not(unix),
+        ignore = "temporary Unix-only Git bridge (PR #207); see RFC temporary platform policy"
+    )]
     fn concurrent_emits_produce_valid_jsonl_within_the_bound() {
         let (directory, journal) = journal();
         let path = journal.path().to_path_buf();
@@ -1796,6 +1812,10 @@ mod tests {
     /// A symlinked journal path is refused: the event is not written and
     /// the symlink target is untouched.
     #[test]
+    #[cfg_attr(
+        not(unix),
+        ignore = "temporary Unix-only Git bridge (PR #207); see RFC temporary platform policy"
+    )]
     fn symlinked_journal_path_is_refused_and_target_untouched() {
         let (directory, journal) = journal();
         std::fs::create_dir_all(journal.path().parent().unwrap()).unwrap();

@@ -1,3 +1,6 @@
+// Temporary Unix-only Git bridge support to unblock Windows native CI.
+// Revisit after Windows support is defined; see the RFC temporary platform policy.
+#![cfg(unix)]
 #![cfg(feature = "remote")]
 //! CB-4B publication gates fail before any local or remote mutation.
 

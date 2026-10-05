@@ -1,3 +1,7 @@
+// Temporary Unix-only Git bridge support to unblock Windows native CI.
+// Revisit after Windows support is defined; see the RFC temporary platform policy.
+#![cfg(unix)]
+
 //! CB-8B: exact fresh-store conflict restoration from the complete pack
 //! (RFC §8.3, intent ac-1).
 //!

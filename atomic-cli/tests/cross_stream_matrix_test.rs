@@ -1,3 +1,7 @@
+// Temporary Unix-only Git bridge support to unblock Windows native CI.
+// Revisit after Windows support is defined; see the RFC temporary platform policy.
+#![cfg(unix)]
+
 //! §22.5 / ::25 AC-1 cross-stream matrix: the named dimension suites.
 //!
 //! Each test is one matrix dimension executed end-to-end through the real

@@ -1,3 +1,7 @@
+// Temporary Unix-only Git bridge support to unblock Windows native CI.
+// Revisit after Windows support is defined; see the RFC temporary platform policy.
+#![cfg(unix)]
+
 //! CB-6A end-to-end: signed bindings, trust policy, and packed-tree privacy.
 //!
 //! Proves through the real CLI binary and real Git plumbing:

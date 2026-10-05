@@ -6,7 +6,9 @@
 //! Git index, and never create Git refs. Once the user opts in, an unanchored
 //! workspace refuses with the exact commands that resolve it.
 
-#![cfg(not(windows))]
+// Temporary Unix-only Git bridge support to unblock Windows native CI.
+// Revisit after Windows support is defined; see the RFC temporary platform policy.
+#![cfg(unix)]
 use std::fs;
 use std::path::Path;
 use std::process::{Command, Output, Stdio};

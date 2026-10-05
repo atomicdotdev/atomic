@@ -1,3 +1,7 @@
+// Temporary Unix-only Git bridge support to unblock Windows native CI.
+// Revisit after Windows support is defined; see the RFC temporary platform policy.
+#![cfg(unix)]
+
 //! CB-7A end-to-end: bridge anchoring and bound Git HEAD adoption.
 //!
 //! Normative source: RFC-ATOMIC-GIT-CAUSAL-BRIDGE §5.1–5.2, §7.1–7.5, §8.1,

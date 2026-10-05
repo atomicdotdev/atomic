@@ -1,3 +1,7 @@
+// Temporary Unix-only Git bridge support to unblock Windows native CI.
+// Revisit after Windows support is defined; see the RFC temporary platform policy.
+#![cfg(unix)]
+
 //! CB-13A R2: the deterministic diagnostic census. `git bridge verify`
 //! enumerates the durable classes a recovery would need to face — missing
 //! changes, invalid bindings, stale/broken working-copy records, orphaned

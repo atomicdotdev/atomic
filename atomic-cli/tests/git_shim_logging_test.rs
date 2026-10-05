@@ -1,3 +1,7 @@
+// Temporary Unix-only Git bridge support to unblock Windows native CI.
+// Revisit after Windows support is defined; see the RFC temporary platform policy.
+#![cfg(unix)]
+
 //! Process-level coverage for what the git shim writes to the log file:
 //! bridge events, the evidence Git's hooks journal, the reconcile and switch
 //! spans with their decisions, and the messages each command printed, all

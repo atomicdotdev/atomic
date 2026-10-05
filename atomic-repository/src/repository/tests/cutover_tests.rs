@@ -690,6 +690,10 @@ fn cutover_preserves_legacy_object_bytes_and_hashes() {
 }
 
 #[test]
+#[cfg_attr(
+    not(unix),
+    ignore = "temporary Unix-only Git bridge (PR #207); see RFC temporary platform policy"
+)]
 fn hook_manager_symlinks_and_hookspath_are_active_surfaces() {
     // Matrix cell: hook managers that symlink dispatchers into hooks/ and
     // a configured core.hooksPath are both active surfaces.
@@ -993,6 +997,10 @@ fn observe_marker() -> &'static str {
 }
 
 #[test]
+#[cfg_attr(
+    not(unix),
+    ignore = "temporary Unix-only Git bridge (PR #207); see RFC temporary platform policy"
+)]
 fn cutover_decommissions_owned_dispatchers_with_journaled_leases() {
     // CB-13B R2: the hook writer routes through the journaled cutover —
     // the Atomic-owned advisory dispatcher is removed through a
@@ -1025,6 +1033,10 @@ fn cutover_decommissions_owned_dispatchers_with_journaled_leases() {
 }
 
 #[test]
+#[cfg_attr(
+    not(unix),
+    ignore = "temporary Unix-only Git bridge (PR #207); see RFC temporary platform policy"
+)]
 fn cutover_rollback_restores_decommissioned_hooks_byte_for_byte() {
     // CB-13B R2: the leased hook rollback — the typed undo replays the
     // swapped effect plans from the cutover's retained backups, restoring
@@ -1051,6 +1063,10 @@ fn cutover_rollback_restores_decommissioned_hooks_byte_for_byte() {
 }
 
 #[test]
+#[cfg_attr(
+    not(unix),
+    ignore = "temporary Unix-only Git bridge (PR #207); see RFC temporary platform policy"
+)]
 fn restore_refuses_an_effect_bearing_operation() {
     // Pins the re-review's noted gap: restore of an effect-bearing
     // operation (the cutover's hook decommission) explicitly refuses
@@ -1075,6 +1091,10 @@ fn restore_refuses_an_effect_bearing_operation() {
 }
 
 #[test]
+#[cfg_attr(
+    not(unix),
+    ignore = "temporary Unix-only Git bridge (PR #207); see RFC temporary platform policy"
+)]
 fn cutover_recovery_restores_decommissioned_hooks_after_interruption() {
     // Interruption between the fence and the receipt: the dispatcher is
     // already gone and the row is durable. The writable open's idempotent

@@ -1,3 +1,7 @@
+// Temporary Unix-only Git bridge support to unblock Windows native CI.
+// Revisit after Windows support is defined; see the RFC temporary platform policy.
+#![cfg(unix)]
+
 //! CB-13D integration coverage: the optional metadata-only bridge watch
 //! daemon (RFC §11.2).
 //!

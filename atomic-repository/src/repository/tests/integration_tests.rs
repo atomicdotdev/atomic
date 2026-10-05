@@ -1121,6 +1121,10 @@ fn shared_content_does_not_absorb_draft_edit_after_parent_update_roundtrip() {
 }
 
 #[test]
+#[cfg_attr(
+    not(unix),
+    ignore = "temporary Unix-only Git bridge (PR #207); see RFC temporary platform policy"
+)]
 fn graph_first_incremental_import_remains_isolated_after_draft_roundtrip() {
     let source_temp = TempDir::new().unwrap();
     let source = TestRepository::new(Repository::init(source_temp.path()).unwrap());

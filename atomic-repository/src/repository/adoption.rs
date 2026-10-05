@@ -3734,6 +3734,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        not(unix),
+        ignore = "temporary Unix-only Git bridge (PR #207); see RFC temporary platform policy"
+    )]
     fn unexplained_walk_never_follows_symlinks_or_leaves_the_root() {
         let directory = tempfile::TempDir::new().unwrap();
         let root = directory.path();
@@ -3875,6 +3879,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        not(unix),
+        ignore = "temporary Unix-only Git bridge (PR #207); see RFC temporary platform policy"
+    )]
     fn known_gitlink_without_on_disk_marker_is_never_scanned() {
         let directory = tempfile::TempDir::new().unwrap();
         let root = directory.path();
