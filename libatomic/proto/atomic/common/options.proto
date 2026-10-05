@@ -1,8 +1,7 @@
 // atomic-protocol — method options (RFC D7).
 //
-// DRAFT — numbers are correctable until review and the first tagged
-// release; add-only thereafter. Field and extension numbers are NEVER reused
-// or renumbered. 51001/51002 are the permanent allocations for Atomic's
+// Numbers are add-only after the first tagged release. Field and
+// extension numbers are NEVER reused or renumbered. 51001/51002 are the permanent allocations for Atomic's
 // method options (chosen once, per RFC).
 //
 // THE ONE PROTOCOL: this package is the sole public protobuf contract for

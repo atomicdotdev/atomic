@@ -1,5 +1,5 @@
 // atomic-protocol — ReactorService definition (the RPC contract).
-// DRAFT — add-only. Messages for this service live in
+// Add-only. Messages for this service live in
 // atomic/services/reactor/reactor_messages.proto · shared primitives in atomic/common/.
 
 syntax = "proto3";

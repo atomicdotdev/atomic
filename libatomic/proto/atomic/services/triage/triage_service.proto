@@ -1,5 +1,5 @@
 // atomic-protocol — TriageService definition (the RPC contract).
-// DRAFT — add-only. Messages for this service live in
+// Add-only. Messages for this service live in
 // atomic/services/triage/triage_messages.proto · shared primitives in atomic/common/.
 
 syntax = "proto3";

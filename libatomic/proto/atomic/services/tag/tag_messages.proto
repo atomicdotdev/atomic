@@ -1,6 +1,6 @@
 // atomic-protocol — TagService: named Merkle-state snapshots.
 //
-// DRAFT — add-only. Tags are repository metadata: reads are BOTH (hosted
+// Add-only. Tags are repository metadata: reads are BOTH (hosted
 // servers serve them), writes BOTH with repository.write (a hosted
 // repository can be tagged remotely). The RFC names tags in its BOTH scope
 // list.

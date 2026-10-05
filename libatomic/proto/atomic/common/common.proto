@@ -1,6 +1,6 @@
 // atomic-protocol — shared primitives.
 //
-// DRAFT — add-only. Field numbers are never reused or renumbered.
+// Add-only. Field numbers are never reused or renumbered.
 // Conventions carried from the earlier parked draft:
 // package `atomic`, RepositoryRef numbering per the RFC.
 //

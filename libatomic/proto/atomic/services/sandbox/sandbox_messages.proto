@@ -2,7 +2,7 @@
 // trees, and the remote-sandbox data ops (the remote-sandboxes extension
 // — the handoff is the spec here).
 //
-// DRAFT — add-only.
+// Add-only.
 //
 // "A remote sandbox is a machine holding only a pointer file .atomic-sandbox
 // = {iroh EndpointAddr of the serving daemon, repository, view, token}.
@@ -289,7 +289,7 @@ message ChangeRefused {
 
 // atomic-protocol — grants and sandbox tokens.
 //
-// DRAFT — add-only.
+// Add-only.
 //
 // Model carried from the remote-sandbox extension: a grant is
 // view-scoped, optionally identity-bound, and time-boxed. A remote caller is

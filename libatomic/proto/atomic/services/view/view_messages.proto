@@ -1,6 +1,6 @@
 // atomic-protocol — ViewService: view lifecycle and scope.
 //
-// DRAFT — add-only. Views are the workflow spine (draft → shared). View
+// Add-only. Views are the workflow spine (draft → shared). View
 // reads and repository-only lifecycle writes are BOTH. Only switch follows a
 // host working copy and stays LOCAL. Sandboxes have no lifecycle authority.
 //

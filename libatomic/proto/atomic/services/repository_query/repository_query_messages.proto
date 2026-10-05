@@ -1,6 +1,6 @@
 // atomic-protocol — RepositoryQueryService: read-only repository operations.
 //
-// DRAFT — add-only. Reads execute as independent concurrent read
+// Add-only. Reads execute as independent concurrent read
 // transactions (RFC concurrency model); no global write lock is ever assumed.
 // LOCAL-scoped reads are working-copy-aware (status/DiffWorkingCopy against the
 // tree); BOTH reads (log/change/Diff/PreviewMutation) are semantically identical on

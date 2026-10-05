@@ -1,6 +1,6 @@
 // atomic-protocol — GitInteropService: the git import/push pipelines.
 //
-// DRAFT — add-only. Git interop is LOCAL-only (working copies and git
+// Add-only. Git interop is LOCAL-only (working copies and git
 // mirrors are local). `git hooks install/uninstall` only writes .git/hooks
 // shim files — no RPC (exempt, file-only). Import may create the repository
 // (init_with_view) on first run — bootstrap-adjacent, flagged in COVERAGE.

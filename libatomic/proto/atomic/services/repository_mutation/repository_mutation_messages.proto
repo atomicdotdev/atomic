@@ -1,7 +1,7 @@
 // atomic-protocol — RepositoryMutationService: working-copy and change-graph
 // mutations.
 //
-// DRAFT — add-only. Every mutation carries RequestMeta (idempotency key) and
+// Add-only. Every mutation carries RequestMeta (idempotency key) and
 // an ExpectedState precondition where the caller knows prior state (RFC
 // 2.2/2.3: expected-Merkle/sequence preconditions on mutating operations —
 // the fencing pattern generalized from provenance to ALL mutations).

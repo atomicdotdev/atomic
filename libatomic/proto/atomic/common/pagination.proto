@@ -1,6 +1,6 @@
 // atomic-protocol — pagination.
 //
-// DRAFT — add-only.
+// Add-only.
 //
 // The frozen-provenance cursor {seq, offset} (verified against the
 // provenance store source)

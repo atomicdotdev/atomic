@@ -2,7 +2,7 @@
 // session/turn journal, generation fencing, checkpoint phases, frozen-
 // envelope storage, session ledger, provenance projection.
 //
-// DRAFT — add-only. Context: the legacy agent journal protocol and the
+// Add-only. Context: the legacy agent journal protocol and the
 // `atomic agent database-owner` command that served it are being FULLY
 // DISMANTLED; atomicd becomes the only storage owner. What carries forward
 // is the provenance tracking semantics below — verified against the

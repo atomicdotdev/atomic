@@ -1,5 +1,5 @@
 // atomic-protocol — RepositoryMutationService definition (the RPC contract).
-// DRAFT — add-only. Messages for this service live in
+// Add-only. Messages for this service live in
 // atomic/services/repository_mutation/repository_mutation_messages.proto · shared primitives in atomic/common/.
 
 syntax = "proto3";

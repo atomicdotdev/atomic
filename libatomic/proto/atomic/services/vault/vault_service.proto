@@ -1,5 +1,5 @@
 // atomic-protocol — VaultService definition (the RPC contract).
-// DRAFT — add-only. Messages for this service live in
+// Add-only. Messages for this service live in
 // atomic/services/vault/vault_messages.proto · shared primitives in atomic/common/.
 
 syntax = "proto3";

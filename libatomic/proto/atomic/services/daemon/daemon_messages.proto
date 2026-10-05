@@ -1,7 +1,7 @@
 // atomic-protocol — DaemonService: daemon health, capability negotiation,
 // repository registry, lifecycle.
 //
-// DRAFT — add-only. Extends the earlier parked draft.
+// Add-only. Extends the earlier parked draft.
 //
 // The legacy agent journal protocol is being fully dismantled (with the
 // `atomic agent database-owner` command that served it); liveness,

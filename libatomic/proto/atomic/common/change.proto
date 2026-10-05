@@ -1,6 +1,6 @@
 // atomic-protocol — shared change-domain types.
 //
-// DRAFT — add-only. Shared across RepositoryQueryService,
+// Add-only. Shared across RepositoryQueryService,
 // RepositoryMutationService, and friends. Shapes are verified against the
 // atomic source (2026-10-02) — this is ATOMIC's model (patch theory, a
 // semantic change graph), NOT git's:

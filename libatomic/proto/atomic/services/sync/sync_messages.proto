@@ -1,7 +1,7 @@
 // atomic-protocol — SyncService: remote synchronization and the remote
 // registry.
 //
-// DRAFT — add-only. The existing HTTP `/code` + SyncPack behavior must be
+// Add-only. The existing HTTP `/code` + SyncPack behavior must be
 // preserved behind — or deliberately migrated into — ONE SyncService domain
 // implementation (RFC "one synchronization protocol"): local repo sync,
 // atomicd-to-server sync, and future server replication use the same

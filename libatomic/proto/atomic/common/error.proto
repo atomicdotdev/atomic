@@ -1,6 +1,6 @@
 // atomic-protocol — the stable error model.
 //
-// DRAFT — add-only. Enum values 28+ reserved: enum numbers are never reused.
+// Add-only. Enum values 28+ reserved: enum numbers are never reused.
 //
 // Vocabulary provenance:
 //  * legacy agent journal protocol (verified in source, 2026-10-01):

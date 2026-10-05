@@ -45,12 +45,12 @@ libatomic/
         <svc>_messages.proto     that service's messages
 ```
 
-## Status: DRAFT for alignment
+## Add-only discipline
 
-Numbers are correctable until review and the first tagged release —
-**add-only thereafter**. Field and extension numbers are never reused or
-renumbered; removed field numbers are reserved. Older draft clients must
-fail version negotiation rather than send an ignored field to a writer.
+Field and extension numbers are never reused or renumbered; removed field
+numbers are reserved. A client that does not match the negotiated contract
+version must fail version negotiation rather than send an ignored field to
+a writer.
 
 ## The contract gate
 

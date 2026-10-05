@@ -1,6 +1,6 @@
 // atomic-protocol — MaintenanceService: repository repair and consistency.
 //
-// DRAFT — add-only. `atomic doctor` folds into Repair (the
+// Add-only. `atomic doctor` folds into Repair (the
 // mutating actions) and CheckRepository (the read-only consistency check,
 // split out per the read/write principle — a check never gates on a
 // mutation or enters the write queue; see COVERAGE §9). ReindexWorkspace is
