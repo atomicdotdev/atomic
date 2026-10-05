@@ -43,6 +43,9 @@ console = { workspace = true }
 # Async runtime
 tokio = { workspace = true }
 
+# Exclusive maintenance inside the database owner
+redb = { workspace = true }
+
 # Error handling
 anyhow = { workspace = true }
 thiserror = { workspace = true }

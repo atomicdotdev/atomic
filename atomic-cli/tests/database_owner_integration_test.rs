@@ -135,6 +135,161 @@ fn spawn_owner(repository: &std::path::Path) -> Child {
         .expect("spawn foreground database owner")
 }
 
+// Reap the foreground owner even when a maintenance assertion panics.
+struct MaintenanceOwner(Child);
+
+impl Drop for MaintenanceOwner {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+fn run_compact(repository: &std::path::Path) -> Output {
+    command_output(
+        Command::new(env!("CARGO_BIN_EXE_atomic"))
+            .arg("compact")
+            .arg("--repository")
+            .arg(repository)
+            .arg("--json"),
+    )
+}
+
+#[test]
+#[serial]
+fn compact_from_sandbox_preserves_history_pending_journal_and_dirty_files() {
+    let temp = TempDir::new().unwrap();
+    let repository = temp.path().join("repo");
+    let sandbox = temp.path().join("sandbox");
+    let mut repo = Repository::init(&repository).unwrap();
+    let contents = b"recorded contents\n";
+    std::fs::write(repository.join("file.txt"), contents).unwrap();
+    repo.add("file.txt", Default::default()).unwrap();
+    let hash = *repo.record_all("compaction fixture").unwrap().hash();
+    let change_path = ChangeStore::new(repo.changes_dir(), DEFAULT_CACHE_CAPACITY)
+        .unwrap()
+        .change_path(&hash);
+    let change_bytes = std::fs::read(&change_path).unwrap();
+    let view = repo.current_view().to_owned();
+    repo.create_view("compact-child").unwrap();
+    let views = repo.list_views().unwrap();
+    repo.provision_sandbox(&sandbox, &view).unwrap();
+    let database =
+        std::fs::canonicalize(Repository::canonical_database_path(&sandbox).unwrap()).unwrap();
+    let store = repo.redb_change_store().unwrap();
+    let turn = store.reserve_provenance_turn("compact", 1, 1).unwrap();
+    let envelope = serde_json::to_vec(&serde_json::json!({
+        "schema_version":1,"event_id":"pending","session_id":"compact",
+        "turn_number":1,"generation":turn.generation,"timestamp_ms":1700000000000_i64,
+        "event":{"type":"tool","phase":"after","tool_name":"Read",
+            "tool_call_id":"pending","input":{"path":"file.txt"},
+            "output":"recorded contents","status":"completed"}
+    }))
+    .unwrap();
+    ProvenanceJournalEnvelope::from_json_bytes(&envelope).unwrap();
+    store
+        .append_provenance_envelope(turn.provenance_id, turn.generation, "pending", &envelope, 2)
+        .unwrap();
+    let pending = store.load_provenance_envelopes(turn.provenance_id).unwrap();
+    let turn_before = store
+        .get_provenance_turn(turn.provenance_id)
+        .unwrap()
+        .unwrap();
+    drop(store);
+    drop(repo);
+    std::fs::write(repository.join("file.txt"), b"unrecorded main edit\n").unwrap();
+    std::fs::write(sandbox.join("file.txt"), b"unrecorded sandbox edit\n").unwrap();
+
+    // Start with a relative path, then ask from another working tree. Reports
+    // must identify the canonical database independently of the owner's cwd.
+    let mut owner = MaintenanceOwner(
+        owner_command(std::path::Path::new("."), "serve")
+            .current_dir(&repository)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let ping_before = wait_for_ping(&repository, &mut owner.0);
+    let before_bytes = std::fs::metadata(&database).unwrap().len();
+    let output = run_compact(&sandbox);
+    assert_hook_success("compact sandbox", &output);
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["database"], database.to_str().unwrap());
+    assert_eq!(report["before_bytes"], before_bytes);
+    let after_bytes = std::fs::metadata(&database).unwrap().len();
+    assert_eq!(report["after_bytes"], after_bytes);
+    assert_eq!(
+        report["reclaimed_bytes"],
+        before_bytes.saturating_sub(after_bytes)
+    );
+    assert_eq!(wait_for_ping(&repository, &mut owner.0), ping_before);
+    assert_hook_success("repeat compact", &run_compact(&repository));
+    // A subsequent store request proves maintenance released the owner gate.
+    assert_eq!(reserve(&repository)["committed"], true);
+
+    let repo = Repository::open(&repository).unwrap();
+    assert_eq!(repo.list_views().unwrap(), views);
+    assert_eq!(repo.current_view(), view);
+    assert_eq!(repo.log(Default::default()).unwrap()[0].hash, hash);
+    for visible_view in [&view, "compact-child"] {
+        assert_eq!(
+            repo.get_file_content_on_view("file.txt", visible_view)
+                .unwrap()
+                .unwrap(),
+            contents
+        );
+    }
+    assert_eq!(std::fs::read(&change_path).unwrap(), change_bytes);
+    assert_eq!(
+        std::fs::read(repository.join("file.txt")).unwrap(),
+        b"unrecorded main edit\n"
+    );
+    assert_eq!(
+        std::fs::read(sandbox.join("file.txt")).unwrap(),
+        b"unrecorded sandbox edit\n"
+    );
+    let store = repo.redb_change_store().unwrap();
+    assert_eq!(
+        store.load_provenance_envelopes(turn.provenance_id).unwrap(),
+        pending
+    );
+    assert_eq!(
+        store
+            .get_provenance_turn(turn.provenance_id)
+            .unwrap()
+            .unwrap(),
+        turn_before
+    );
+}
+
+#[test]
+#[serial]
+fn compact_busy_database_times_out_and_owner_can_retry() {
+    let temp = TempDir::new().unwrap();
+    let repository = temp.path().join("repo");
+    let held = Repository::init(&repository).unwrap();
+    let mut owner = MaintenanceOwner(
+        owner_command(&repository, "serve")
+            .env("ATOMIC_DB_LOCK_WAIT_MS", "100")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    wait_for_ping(&repository, &mut owner.0);
+    let output = run_compact(&repository);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("database compaction waited"), "{stderr}");
+    wait_for_ping(&repository, &mut owner.0);
+    drop(held);
+    assert_hook_success("compact after lock release", &run_compact(&repository));
+    assert_eq!(reserve(&repository)["committed"], true);
+}
+
 fn spawn_owner_with_failpoint(
     repository: &std::path::Path,
     failpoint: &str,

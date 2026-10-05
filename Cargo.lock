@@ -206,6 +206,7 @@ dependencies = [
  "log",
  "open",
  "rayon",
+ "redb 4.2.0",
  "reqwest",
  "serde",
  "serde_json",

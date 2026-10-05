@@ -47,6 +47,8 @@ mod lifecycle;
 mod owner;
 mod status;
 
+pub(crate) use owner::compact_repository;
+
 use clap::{Args, Subcommand};
 
 use crate::commands::Command;

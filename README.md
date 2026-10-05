@@ -76,6 +76,31 @@ The **lock is the authority; the socket or named pipe is only transport**. The l
 
 Repositories created before `atomic.redb` kept graph state in `.atomic/pristine.redb` and the journal in `.atomic/changes.redb`. The first open by a newer `atomic` merges both into `atomic.redb`, verifies every table against its source, and moves the old files to `.atomic/legacy/<timestamp>/`. If an owner started by an older `atomic` still holds `changes.redb`, run `atomic agent database-owner shutdown` in that repository first.
 
+### Reclaiming database space
+
+Run `atomic compact` to reclaim unused space in an existing `atomic.redb`:
+
+```sh
+atomic compact
+atomic compact --repository /path/to/repo --json
+```
+
+The command starts or reconnects to the repository's database owner, waits for
+in-flight database requests to finish, and compacts with exclusive access.
+It reports `database`, `before_bytes`, `after_bytes`, and `reclaimed_bytes`.
+Running it inside a sandbox compacts that sandbox's canonical repository.
+Changes, provenance, views, and working-copy files are preserved; this does not
+delete history or `.change` files. The amount reclaimed depends on unused space,
+and may be zero. Compaction runs only when explicitly requested.
+
+Use a quiet period for large repositories: database operations wait while
+compaction runs and can exhaust their normal lock-wait budgets. The owner's
+`ATOMIC_DB_LOCK_WAIT_MS` setting bounds acquisition waits, not the duration of
+an already-started compaction. Owners started by an older executable must be
+shut down once before retrying. For a legacy repository, first open it with the
+current Atomic to complete its database migration; `compact` does not migrate
+or create a database.
+
 Within one repository, redb write transactions are serialized by design, while reads and independent repositories can proceed concurrently. Startup, reconnect, and retry loops are bounded so a broken owner fails instead of hanging hooks indefinitely. Checkpoint attempts, event cutoffs, and fencing generations let interrupted turns resume without rewriting completed session turns.
 
 Current operational considerations:
