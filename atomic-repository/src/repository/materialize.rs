@@ -608,13 +608,7 @@ impl Repository {
                 name: view_name.to_string(),
             })?;
         let visibility = graph_visibility_closure(&txn, &view)?;
-        let claim_visibility = super::name_resolution::path_claim_visibility_for_view(
-            &txn,
-            &self.change_store,
-            &view,
-            &visibility,
-        )?;
-        let projection = self.project_tree_for_visibility(&txn, &claim_visibility)?;
+        let projection = self.project_tree_for_visibility(&txn, &visibility)?;
         if projection.name_conflicts.contains_key(&normalized) {
             let mut external_hashes = std::collections::HashMap::new();
             for node_id in visibility.iter_dependency_first().copied() {
@@ -930,13 +924,7 @@ impl Repository {
             .ok_or_else(|| RepositoryError::ViewNotFound {
                 name: view_name.to_string(),
             })?;
-        let full_visibility = graph_visibility_closure(&txn, &view)?;
-        let visibility = super::name_resolution::path_claim_visibility_for_view(
-            &txn,
-            &self.change_store,
-            &view,
-            &full_visibility,
-        )?;
+        let visibility = graph_visibility_closure(&txn, &view)?;
         let projection = self.project_tree_for_visibility(&txn, &visibility)?;
 
         // Base set: the path-claim-aware projection (CB-13D machinery).
@@ -950,7 +938,7 @@ impl Repository {
         // parent chain) decides whether a REV_TREE-claimed path is still
         // rendered by the view's filter.
         let view_change_ids: std::collections::HashSet<atomic_core::types::NodeId> =
-            full_visibility.iter_dependency_first().copied().collect();
+            visibility.iter_dependency_first().copied().collect();
 
         // REV_TREE recovery: a view is a FILTER over the global graph — every
         // node it exposes already lives in the graph, and TREE is just a
@@ -989,7 +977,7 @@ impl Repository {
                             &txn,
                             inode,
                             position,
-                            &full_visibility.clone(),
+                            &visibility.clone(),
                         )? {
                             paths.insert(path);
                             break;
@@ -1399,21 +1387,14 @@ impl Repository {
             .pristine
             .read_txn()
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
-        let view = txn
-            .get_view_by_id(view_id)
+        txn.get_view_by_id(view_id)
             .map_err(|error| RepositoryError::Database(error.to_string()))?
             .ok_or_else(|| {
                 RepositoryError::Database(format!(
                     "materialization references missing view id {view_id}"
                 ))
             })?;
-        let claim_visibility = super::name_resolution::path_claim_visibility_for_view(
-            &txn,
-            &self.change_store,
-            &view,
-            &visibility,
-        )?;
-        let projection = self.project_tree_for_visibility(&txn, &claim_visibility)?;
+        let projection = self.project_tree_for_visibility(&txn, &visibility)?;
         let mut absent_entries = projection.absent;
         let name_conflicts = projection.name_conflicts;
         let mut items: Vec<OutputItem> = projection.present.into_values().collect();
@@ -2211,13 +2192,7 @@ impl Repository {
             .ok_or_else(|| RepositoryError::ViewNotFound {
                 name: view_name.clone(),
             })?;
-        let full_visibility = graph_visibility_closure(&txn, &view)?;
-        let visibility = super::name_resolution::path_claim_visibility_for_view(
-            &txn,
-            &self.change_store,
-            &view,
-            &full_visibility,
-        )?;
+        let visibility = graph_visibility_closure(&txn, &view)?;
         let projection = self.project_tree_for_visibility(&txn, &visibility)?;
         let mut paths: HashSet<String> = projection
             .present

@@ -354,15 +354,19 @@ assert_honest         "B7: honest exit state"                    f.txt
 # CB-N6: both views independently CREATE new.txt as separate inodes. Durable
 # PATH_CLAIMS must retain both causal claims while TREE/REV_TREE project no
 # winner. Resolution must be a real SolveNameConflict, survive reopen and
-# rematerialization, and remain view-local so an unresolved sibling can still
-# recover both claimants.
+# rematerialization, follow the effective closure in descendants, and leave an
+# independent unresolved sibling able to recover both claimants.
 begin_section "A12 same-path independent create (name conflict surfaced)"
 make_temp_repo rubric-a12
 init_repo
 printf 'seed\n' > seed.txt
 add_files seed.txt >/dev/null
 record_change "base" >/dev/null
-BASE_VIEW="$(current_view)"
+# Resolve on a draft so the unresolved sibling does not inherit the resolution
+# through their shared parent.
+BASE_VIEW=merge-a12
+new_view "$BASE_VIEW" >/dev/null
+switch_view "$BASE_VIEW" >/dev/null
 new_view feature >/dev/null
 new_view unresolved-a12 >/dev/null
 switch_view feature >/dev/null
@@ -391,10 +395,19 @@ pred_a12_cli_resolution_lifecycle() {
     record_change "resolve A12 name conflict" >/dev/null 2>&1 || return 1
     local resolution_hash
     resolution_hash="$(tip_hash "$BASE_VIEW")"
+    # Consume all output so pipefail cannot mistake grep's early exit for a
+    # failed Atomic command (SIGPIPE).
     atomic change "$resolution_hash" --format json 2>/dev/null \
-        | grep -qF '"hunk_type": "SolveNameConflict"' || return 1
+        | grep -F '"hunk_type": "SolveNameConflict"' >/dev/null || return 1
     atomic restore --force >/dev/null 2>&1 || return 1
     [[ "$(cat new.txt 2>/dev/null)" == "from-feature" ]] || return 1
+    [[ -z "$(atomic conflicts --short 2>/dev/null)" ]] || return 1
+
+    new_view inherited-a12 --draft --parent "$BASE_VIEW" >/dev/null 2>&1 || return 1
+    switch_view inherited-a12 >/dev/null 2>&1 || return 1
+    atomic restore --force >/dev/null 2>&1 || return 1
+    [[ "$(cat new.txt 2>/dev/null)" == "from-feature" ]] || return 1
+    [[ -z "$(atomic status --short 2>/dev/null)" ]] || return 1
     [[ -z "$(atomic conflicts --short 2>/dev/null)" ]] || return 1
 
     switch_view unresolved-a12 >/dev/null 2>&1 || return 1
@@ -405,14 +418,14 @@ pred_a12_cli_resolution_lifecycle() {
         && grep -qE '^>>>>>>>' new.txt \
         && grep -qxF 'from-feature' new.txt \
         && grep -qxF 'from-base' new.txt \
-        && atomic status --short 2>/dev/null | grep -qE '^C[[:space:]]+new\.txt$' \
-        && atomic conflicts --short 2>/dev/null | grep -qE '^new\.txt:'
+        && atomic status --short 2>/dev/null | grep -E '^C[[:space:]]+new\.txt$' >/dev/null \
+        && atomic conflicts --short 2>/dev/null | grep -E '^new\.txt:' >/dev/null
 }
 if pred_a12_cli_resolution_lifecycle; then
-    _pass "A12: SolveNameConflict resolution is stable and view-local"
+    _pass "A12: SolveNameConflict follows inheritance and preserves sibling conflicts"
 else
-    _fail "A12: SolveNameConflict resolution is stable and view-local" \
-        "record/change/restore or unresolved-sibling recovery failed"
+    _fail "A12: SolveNameConflict follows inheritance and preserves sibling conflicts" \
+        "record/change/restore, inherited resolution, or unresolved-sibling recovery failed"
 fi
 
 # ── A10: rename vs edit (inode survives the rename) ───────────────────────

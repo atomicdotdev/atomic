@@ -1002,17 +1002,11 @@ impl Repository {
             })?;
         let visibility = graph_visibility_closure(&*txn, &view)?;
         self.validate_deferred_tree_metadata(&*txn, &journal, &visibility)?;
-        let claim_visibility = super::name_resolution::path_claim_visibility_for_view(
-            &*txn,
-            &self.change_store,
-            &view,
-            &visibility,
-        )?;
 
         let affected = if preserve_existing_tree_paths {
             HashSet::new()
         } else {
-            self.apply_deferred_tree_ops_in_txn(txn, &journal, &claim_visibility)?
+            self.apply_deferred_tree_ops_in_txn(txn, &journal, &visibility)?
         };
         if changed {
             self.persist_deferred_tree_journal(&journal)?;
@@ -1041,6 +1035,9 @@ impl Repository {
 
     /// Project path/lifecycle state from durable structural claims. TREE is a
     /// strict one-to-one cache and never participates in claimant selection.
+    /// Path claims and their resolutions use the complete graph visibility
+    /// closure, including inherited changes and transitive dependencies. Direct
+    /// view membership must not change the projection of an identical closure.
     pub(super) fn project_tree_for_visibility<T>(
         &self,
         txn: &T,
@@ -1576,13 +1573,7 @@ impl Repository {
             &*txn,
             &super::filter::view_membership(txn, &view)?,
         )?;
-        let claim_visibility = super::name_resolution::path_claim_visibility_for_view(
-            &*txn,
-            &self.change_store,
-            &view,
-            &visibility,
-        )?;
-        self.apply_deferred_tree_ops_in_txn(txn, &journal, &claim_visibility)
+        self.apply_deferred_tree_ops_in_txn(txn, &journal, &visibility)
     }
 
     fn apply_deferred_tree_ops_in_txn(
@@ -1878,13 +1869,7 @@ impl Repository {
             .ok_or_else(|| RepositoryError::ViewNotFound {
                 name: pending.source_view.clone(),
             })?;
-        let full_visibility = graph_visibility_closure(&*txn, &source_view)?;
-        let visibility = super::name_resolution::path_claim_visibility_for_view(
-            &*txn,
-            &self.change_store,
-            &source_view,
-            &full_visibility,
-        )?;
+        let visibility = graph_visibility_closure(&*txn, &source_view)?;
         self.apply_deferred_tree_ops_in_txn(&mut txn, &journal, &visibility)?;
         self.write_current_view(&pending.source_view)?;
         txn.commit()?;
@@ -1980,23 +1965,15 @@ impl Repository {
         // Legacy tolerance: members can predate the dependency index; degrade
         // them to leaves instead of refusing the switch (dev #196/#206 parity
         // — unrecord-safety legacy fixtures).
-        let full_visibility = GraphVisibilityClosure::try_from_membership_lenient(
+        let visibility = GraphVisibilityClosure::try_from_membership_lenient(
             &*txn,
             &super::filter::view_membership(&*txn, &target_view)?,
         )
         .map_err(|error| RepositoryError::Database(error.to_string()))?;
-        let claim_visibility = super::name_resolution::path_claim_visibility_for_view(
-            &*txn,
-            &self.change_store,
-            &target_view,
-            &full_visibility,
-        )?;
         let journal = self.load_deferred_tree_journal()?;
         let old_view = persisted_view;
         self.write_deferred_tree_alignment_pending(&old_view, &target_name)?;
-        if let Err(error) =
-            self.apply_deferred_tree_ops_in_txn(&mut txn, &journal, &claim_visibility)
-        {
+        if let Err(error) = self.apply_deferred_tree_ops_in_txn(&mut txn, &journal, &visibility) {
             let _ = self.clear_deferred_tree_alignment_pending();
             return Err(error);
         }

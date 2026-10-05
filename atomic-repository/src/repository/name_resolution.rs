@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use atomic_core::change::{EdgeUpdate, GraphOp, Insertion};
 use atomic_core::pristine::{
     GraphTxnT, GraphVisibilityClosure, PathClaimEntry, PathClaimEvent, PathClaimId, PathClaimKind,
-    PathClaimState, PathClaimTxnT, TreeTxnT, ViewMembershipSet, ViewState, ViewTxnT,
+    PathClaimState, PathClaimTxnT, TreeTxnT,
 };
 use atomic_core::types::{EdgeFlags, GraphNode};
 
@@ -49,88 +49,6 @@ pub(super) struct ReducedPathClaims {
     pub(super) present: Vec<ProjectedPathClaim>,
     pub(super) absent: Vec<super::deferred_tree::ProjectedAbsent>,
     pub(super) conflicts: HashMap<String, ProjectedNameConflict>,
-}
-
-pub(super) fn path_claim_visibility_for_view<T>(
-    txn: &T,
-    store: &ChangeStore,
-    view: &ViewState,
-    full_visibility: &GraphVisibilityClosure,
-) -> Result<GraphVisibilityClosure, RepositoryError>
-where
-    T: ViewTxnT + PathClaimTxnT,
-{
-    let entries = txn
-        .iter_path_claims()
-        .map_err(|error| RepositoryError::Database(error.to_string()))?;
-    path_claim_visibility_for_view_with_entries(txn, store, view, full_visibility, &entries)
-}
-
-pub(super) fn path_claim_visibility_for_view_with_entries<T>(
-    txn: &T,
-    store: &ChangeStore,
-    view: &ViewState,
-    full_visibility: &GraphVisibilityClosure,
-    entries: &[PathClaimEntry],
-) -> Result<GraphVisibilityClosure, RepositoryError>
-where
-    T: ViewTxnT,
-{
-    let mut direct = HashSet::new();
-    for entry in txn
-        .iter_changes(view, 0)
-        .map_err(|error| RepositoryError::Database(error.to_string()))?
-    {
-        let (_, change_id, _) =
-            entry.map_err(|error| RepositoryError::Database(error.to_string()))?;
-        direct.insert(change_id);
-    }
-    let path_event_changes: HashSet<NodeId> = entries
-        .iter()
-        .map(|entry| entry.event.event_change)
-        .collect();
-    let mut membership = Vec::new();
-    for change_id in full_visibility.iter_dependency_first().copied() {
-        let inherited_name_resolution = !direct.contains(&change_id)
-            && path_event_changes.contains(&change_id)
-            && is_name_resolution_change(txn, store, change_id)?;
-        if !inherited_name_resolution {
-            membership.push(change_id);
-        }
-    }
-    let membership = ViewMembershipSet::from_ordered(membership);
-    // Legacy tolerance: members can predate the dependency index; degrade
-    // them to leaves instead of refusing the projection (dev #196/#206).
-    GraphVisibilityClosure::try_from_membership_lenient(txn, &membership)
-        .map_err(|error| RepositoryError::Database(error.to_string()))
-}
-
-fn is_name_resolution_change<T: GraphTxnT>(
-    txn: &T,
-    store: &ChangeStore,
-    change_id: NodeId,
-) -> Result<bool, RepositoryError> {
-    let hash = txn
-        .get_external(change_id)
-        .map_err(|error| RepositoryError::Database(error.to_string()))?
-        .ok_or_else(|| {
-            RepositoryError::Database(format!(
-                "path-claim change {} has no external hash",
-                change_id.get()
-            ))
-        })?;
-    let change = store.load_change(&hash).map_err(|error| {
-        RepositoryError::Database(format!(
-            "cannot inspect path-claim change {}: {}",
-            hash, error
-        ))
-    })?;
-    Ok(change.hunks().iter().any(|operation| {
-        matches!(
-            operation,
-            GraphOp::SolveNameConflict { .. } | GraphOp::UnsolveNameConflict { .. }
-        )
-    }))
 }
 
 pub(super) fn path_claim_events_for_change<T>(

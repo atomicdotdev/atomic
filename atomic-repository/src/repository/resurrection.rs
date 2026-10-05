@@ -959,14 +959,13 @@ impl Repository {
             let project = match conflicts {
                 Some(restore) => {
                     let txn = self.pristine.read_txn().map_err(database_map)?;
-                    let view = txn.get_view(view_name).map_err(database_map)?.ok_or(
+                    txn.get_view(view_name).map_err(database_map)?.ok_or(
                         RepositoryError::ViewNotFound {
                             name: view_name.to_string(),
                         },
                     )?;
                     self.project_change_closure_with_conflict_markers(
                         &txn,
-                        &view,
                         ordered,
                         policy,
                         &restore.marker_bytes,
@@ -1287,16 +1286,15 @@ impl Repository {
         // ── The mandatory projection proof (RFC §5.2, §12.5): recompute the
         //    full projected tree under the current conversion policy from
         //    the restored closure and compare tree OID and SetId.
-        let view = txn.get_view(view_name).map_err(pristine_map)?.ok_or(
-            RepositoryError::ViewNotFound {
+        txn.get_view(view_name)
+            .map_err(pristine_map)?
+            .ok_or(RepositoryError::ViewNotFound {
                 name: view_name.to_string(),
-            },
-        )?;
+            })?;
         let project = match conflicts {
             Some(restore) => self
                 .project_change_closure_with_conflict_markers(
                     &*txn,
-                    &view,
                     &ordered,
                     policy,
                     &restore.marker_bytes,
@@ -1306,7 +1304,7 @@ impl Repository {
                     reason: format!("conflict projection failed: {error}"),
                 })?,
             None => self
-                .project_change_closure_with_txn(&*txn, &view, &ordered, policy)
+                .project_change_closure_with_txn(&*txn, &ordered, policy)
                 .map_err(|error| RepositoryError::ResurrectionRejected {
                     id: binding.id().to_hex(),
                     reason: format!("projection failed: {error}"),

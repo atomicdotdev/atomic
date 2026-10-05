@@ -299,15 +299,8 @@ impl Repository {
             .ok_or_else(|| format!("view '{view_name}' does not exist"))?;
         let graph_visibility = super::filter::graph_visibility_closure(&txn, &view)
             .map_err(|e| format!("cannot build view visibility: {e}"))?;
-        let claim_visibility = super::name_resolution::path_claim_visibility_for_view(
-            &txn,
-            &self.change_store,
-            &view,
-            &graph_visibility,
-        )
-        .map_err(|e| format!("cannot build claim visibility: {e}"))?;
         let projection = self
-            .project_tree_for_visibility(&txn, &claim_visibility)
+            .project_tree_for_visibility(&txn, &graph_visibility)
             .map_err(|e| format!("cannot project path claims: {e}"))?;
         let Some(claim) = projection.present_metadata.get(path) else {
             return Ok(None);
@@ -823,15 +816,8 @@ impl Repository {
             })?;
         let shared_graph_visibility =
             graph_visibility_closure(&shared_txn, &view).map_err(RecordError::Repository)?;
-        let shared_claim_visibility = super::name_resolution::path_claim_visibility_for_view(
-            &shared_txn,
-            &self.change_store,
-            &view,
-            &shared_graph_visibility,
-        )
-        .map_err(RecordError::Repository)?;
         let tree_projection = self
-            .project_tree_for_visibility(&shared_txn, &shared_claim_visibility)
+            .project_tree_for_visibility(&shared_txn, &shared_graph_visibility)
             .map_err(RecordError::Repository)?;
         let projected_present = tree_projection.present_metadata;
         let projected_absent: std::collections::HashMap<

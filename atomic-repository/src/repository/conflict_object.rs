@@ -902,13 +902,7 @@ impl Repository {
             return Ok(None);
         }
         let visibility = super::filter::graph_visibility_closure(&txn, &view)?;
-        let claim_visibility = super::name_resolution::path_claim_visibility_for_view(
-            &txn,
-            &self.change_store,
-            &view,
-            &visibility,
-        )?;
-        let projection = self.project_tree_for_visibility(&txn, &claim_visibility)?;
+        let projection = self.project_tree_for_visibility(&txn, &visibility)?;
 
         let mut external_hashes = std::collections::HashMap::new();
         for node_id in visibility.iter_dependency_first().copied() {
@@ -1194,13 +1188,7 @@ impl Repository {
             ordered
         };
         let project = self
-            .project_change_closure_with_conflict_markers(
-                &txn,
-                &view,
-                &roots,
-                policy,
-                &marker_bytes,
-            )
+            .project_change_closure_with_conflict_markers(&txn, &roots, policy, &marker_bytes)
             .map_err(|error| {
                 ConflictProjectionError::Repository(RepositoryError::InvalidOperation {
                     message: error.to_string(),

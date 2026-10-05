@@ -1099,21 +1099,8 @@ impl Repository {
         if debug_tree {
             eprintln!("PTREE identity ms={}", tree_start.elapsed().as_millis());
         }
-        let claim_visibility = super::name_resolution::path_claim_visibility_for_view(
-            &txn,
-            &self.change_store,
-            &view,
-            closure.graph_visibility(),
-        )
-        .map_err(ProjectTreeError::from)?;
-        if debug_tree {
-            eprintln!(
-                "PTREE claim_visibility ms={}",
-                tree_start.elapsed().as_millis()
-            );
-        }
         let projection = self
-            .project_tree_for_visibility(&txn, &claim_visibility)
+            .project_tree_for_visibility(&txn, closure.graph_visibility())
             .map_err(ProjectTreeError::from)?;
         if debug_tree {
             eprintln!(
@@ -1244,11 +1231,10 @@ impl Repository {
             return Err(ProjectTreeError::UnsupportedPlatformPath);
         }
         let txn = self.pristine.read_txn().map_err(repo_error)?;
-        let view = txn
-            .get_view(view_name)
+        txn.get_view(view_name)
             .map_err(repo_error)?
             .ok_or_else(|| ProjectTreeError::Repository(format!("view '{view_name}' not found")))?;
-        self.project_change_closure_with_txn(&txn, &view, roots, policy)
+        self.project_change_closure_with_txn(&txn, roots, policy)
     }
 
     /// The closure projection computed over an explicit transaction.
@@ -1262,7 +1248,6 @@ impl Repository {
     pub(super) fn project_change_closure_with_txn<T>(
         &self,
         txn: &T,
-        view: &atomic_core::pristine::ViewState,
         roots: &[Hash],
         policy: &ConversionPolicy,
     ) -> Result<ProjectTree, ProjectTreeError>
@@ -1274,13 +1259,7 @@ impl Repository {
             + atomic_core::pristine::InodeGraphOps<InodeError = atomic_core::pristine::PristineError>
             + atomic_core::pristine::InodeAttrTxnT,
     {
-        self.project_change_closure_with_conflict_markers(
-            txn,
-            view,
-            roots,
-            policy,
-            &Default::default(),
-        )
+        self.project_change_closure_with_conflict_markers(txn, roots, policy, &Default::default())
     }
 
     /// Project a change closure, substituting conflict-marker bytes for the
@@ -1293,7 +1272,6 @@ impl Repository {
     pub(super) fn project_change_closure_with_conflict_markers<T>(
         &self,
         txn: &T,
-        view: &atomic_core::pristine::ViewState,
         roots: &[Hash],
         policy: &ConversionPolicy,
         marker_bytes: &std::collections::BTreeMap<String, Vec<u8>>,
@@ -1317,15 +1295,8 @@ impl Repository {
         let membership = ViewMembershipSet::from_ordered(root_ids);
         let closure = EffectiveProjectionClosure::try_from_membership(txn, &membership)
             .map_err(repo_error)?;
-        let claim_visibility = super::name_resolution::path_claim_visibility_for_view(
-            txn,
-            &self.change_store,
-            view,
-            closure.graph_visibility(),
-        )
-        .map_err(ProjectTreeError::from)?;
         let projection = self
-            .project_tree_for_visibility(txn, &claim_visibility)
+            .project_tree_for_visibility(txn, closure.graph_visibility())
             .map_err(ProjectTreeError::from)?;
         // Unprojected name claims refuse exactly like the clean path: a path
         // claimed by several inodes is carried only when its complete marker

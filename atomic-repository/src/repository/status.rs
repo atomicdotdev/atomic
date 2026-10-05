@@ -92,13 +92,7 @@ impl Repository {
         let visibility = graph_visibility_closure(&txn, &view)?;
         let content_filter = crate::content_filter::GitAttributesFilter::for_repository(&self.root);
 
-        let claim_visibility = super::name_resolution::path_claim_visibility_for_view(
-            &txn,
-            &self.change_store,
-            &view,
-            &visibility,
-        )?;
-        let projection = self.project_tree_for_visibility(&txn, &claim_visibility)?;
+        let projection = self.project_tree_for_visibility(&txn, &visibility)?;
         let projected_present = projection.present;
         let projected_present_paths: HashSet<PathBuf> =
             projected_present.keys().map(PathBuf::from).collect();
@@ -927,13 +921,7 @@ impl Repository {
             Some(v) => v,
             None => return Ok(Vec::new()),
         };
-        let full_visibility = graph_visibility_closure(&txn, &view)?;
-        let visibility = super::name_resolution::path_claim_visibility_for_view(
-            &txn,
-            &self.change_store,
-            &view,
-            &full_visibility,
-        )?;
+        let visibility = graph_visibility_closure(&txn, &view)?;
         let projection = self.project_tree_for_visibility(&txn, &visibility)?;
         let active_name_paths: HashSet<String> = projection
             .name_conflicts

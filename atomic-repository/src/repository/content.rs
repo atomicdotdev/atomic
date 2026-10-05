@@ -324,17 +324,8 @@ impl Repository {
                 name: view_name.to_string(),
             })?;
         let visibility = graph_visibility_closure(&txn, &view)?;
-        let claim_visibility = super::name_resolution::path_claim_visibility_for_view(
-            &txn,
-            &self.change_store,
-            &view,
-            &visibility,
-        )?;
-        let projection = self.project_tree_for_visibility_scoped(
-            &txn,
-            &claim_visibility,
-            Some(normalized.as_str()),
-        )?;
+        let projection =
+            self.project_tree_for_visibility_scoped(&txn, &visibility, Some(normalized.as_str()))?;
         if let Some(conflict) = projection.name_conflicts.get(&normalized) {
             return Err(RepositoryError::InvalidOperation {
                 message: format!(
@@ -519,13 +510,7 @@ impl Repository {
                 name: self.current_view.clone(),
             })?;
         let visibility = graph_visibility_closure(&txn, &view)?;
-        let claim_visibility = super::name_resolution::path_claim_visibility_for_view(
-            &txn,
-            &self.change_store,
-            &view,
-            &visibility,
-        )?;
-        let projection = self.project_tree_for_visibility(&txn, &claim_visibility)?;
+        let projection = self.project_tree_for_visibility(&txn, &visibility)?;
         if projection.name_conflicts.contains_key(&normalized) {
             return Err(RepositoryError::InvalidOperation {
                 message: format!(
@@ -581,13 +566,7 @@ impl Repository {
                 name: self.current_view.clone(),
             })?;
         let visibility = graph_visibility_closure(&txn, &view)?;
-        let claim_visibility = super::name_resolution::path_claim_visibility_for_view(
-            &txn,
-            &self.change_store,
-            &view,
-            &visibility,
-        )?;
-        let projection = self.project_tree_for_visibility(&txn, &claim_visibility)?;
+        let projection = self.project_tree_for_visibility(&txn, &visibility)?;
         if projection.name_conflicts.contains_key(&normalized) {
             return Err(RepositoryError::InvalidOperation {
                 message: format!(

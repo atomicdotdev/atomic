@@ -1238,18 +1238,10 @@ impl Repository {
                 .ok_or_else(|| RepositoryError::ViewNotFound {
                     name: view_name.clone(),
                 })?;
-            let full_visibility = graph_visibility_closure(txn, &view)?;
-            let claim_visibility =
-                super::name_resolution::path_claim_visibility_for_view_with_entries(
-                    txn,
-                    &self.change_store,
-                    &view,
-                    &full_visibility,
-                    &claims,
-                )?;
+            let visibility = graph_visibility_closure(txn, &view)?;
             let reduced = super::name_resolution::reduce_path_claim_entries_with_inodes(
                 txn,
-                &claim_visibility,
+                &visibility,
                 &claims,
                 &recovered,
             )?;
@@ -1258,7 +1250,7 @@ impl Repository {
                 txn,
                 &self.change_store,
                 view.id,
-                &claim_visibility,
+                &visibility,
                 &reduced,
                 &mut conflicts,
             )?;
