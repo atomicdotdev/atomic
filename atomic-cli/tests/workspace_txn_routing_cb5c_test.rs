@@ -110,10 +110,12 @@ fn read(relative: &str) -> String {
 }
 
 fn strip_tests(contents: &str) -> String {
+    // Windows checkouts may use CRLF; strip the test module on either platform.
+    let contents = contents.replace("\r\n", "\n");
     contents
         .split("\n#[cfg(test)]\nmod tests")
         .next()
-        .unwrap_or(contents)
+        .unwrap_or(&contents)
         .to_string()
 }
 

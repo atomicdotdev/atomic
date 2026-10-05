@@ -89,6 +89,8 @@ fn cb5b_commands_do_not_use_legacy_guards_or_ambient_view_authority() {
 fn read(relative: &str) -> String {
     let contents = fs::read_to_string(manifest_dir().join(relative))
         .unwrap_or_else(|error| panic!("cannot read {relative}: {error}"));
+    // Windows checkouts may use CRLF; strip the test module on either platform.
+    let contents = contents.replace("\r\n", "\n");
     contents
         .split("\n#[cfg(test)]\nmod tests")
         .next()
