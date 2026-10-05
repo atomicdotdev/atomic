@@ -1857,11 +1857,26 @@ checksum = "20870f649af7073d53e38067b2a84312175d56ea15217e1b15bc83506ec50afb"
 name = "libatomic"
 version = "0.19.1"
 dependencies = [
+ "atomic-agent",
+ "atomic-canonical",
+ "atomic-core",
+ "atomic-identity",
+ "atomic-repository",
+ "atomic-semantic",
+ "blake3",
+ "chrono",
+ "data-encoding",
+ "futures-core",
  "prost",
  "prost-types",
  "protox",
+ "serde_json",
+ "similar",
+ "tokio",
+ "tokio-stream",
  "tonic",
  "tonic-build",
+ "ulid",
 ]
 
 [[package]]

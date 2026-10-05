@@ -81,9 +81,11 @@ mod database;
 mod deferred_tree;
 mod filter;
 mod materialize;
+mod revise;
 mod sandbox;
 mod semantic_materialize;
 mod split;
+mod stash;
 mod switch;
 mod views;
 
@@ -97,8 +99,10 @@ pub use filter::{
     collect_view_change_ids, collect_visible_change_ids, collect_visible_change_ids_with_deps,
     expand_indexed_dependency_closure, view_set_id,
 };
+pub use revise::RewordOutcome;
 pub use sandbox::{SealOptions, SealResult, StageOptions, StageResult, SANDBOX_POINTER};
 pub use split::{SplitChange, SplitOptions, SplitOutcome};
+pub use stash::{StashEntry, StashPushOptions, DEFAULT_STASH_MESSAGE, STASH_PREFIX};
 pub use views::{ManifestApplyOutcome, ViewInfo};
 
 // Re-import workspace helpers from `switch` so they are available to
@@ -144,6 +148,7 @@ pub use vault_identity::VaultIdentity;
 pub use vault_intent::{
     IntentCreateOptions, IntentCreateResult, IntentDeleteResult, IntentInfo, IntentUpdateOptions,
 };
+pub use vault_intent::{FEATURE_SCAFFOLD, REVIEW_SCAFFOLD};
 pub use vault_kg_enrich::KgEnrichStats;
 pub use vault_names::{derive_intent_prefix, generate_goal_name};
 pub use verify::{VerifyProblem, VerifyReport};

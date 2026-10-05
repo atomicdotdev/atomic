@@ -1,21 +1,25 @@
-//! libatomic — the canonical Atomic contract.
+//! libatomic — the canonical Atomic contract and its reference
+//! implementation.
 //!
-//! This crate owns the one Atomic protobuf contract: the canonical
-//! sources live under `proto/` (package `atomic`), `build.rs` compiles
-//! them with protox (a pure-Rust protoc replacement — no system protoc)
-//! and tonic-build, and `proto/check_contract.py` gates the declared
-//! descriptor invariants (add-only; scopes, callers, effects and
-//! capabilities on every method; read/write discipline; retired fields;
-//! fencing).
+//! This crate owns both halves of the Atomic service layer:
 //!
-//! The generated module is [`atomic`] — every file in the contract
-//! declares `package atomic`, so all messages and the generated service
-//! clients/servers land in that single module — with a transport-neutral
-//! [`proto`] alias for callers that prefer it.
+//!  * the **contract** — the canonical protobuf sources under `proto/`
+//!    (package `atomic`), compiled by `build.rs` with protox (a pure-Rust
+//!    protoc replacement — no system protoc) and tonic-build into the
+//!    [`atomic`] module (aliased as [`proto`]), plus the descriptor
+//!    contract gate (`proto/check_contract.py` — add-only; scope, caller,
+//!    effect and capability declarations on every method; read/write
+//!    discipline; retired fields; generation/snapshot fencing).
+//!  * the **handlers** — the reference implementation of that contract
+//!    under [`daemon`]: the repository registry and per-repository
+//!    serialization gates, the tonic service impls and their plain inner
+//!    functions, the provenance journal core and sink, and the
+//!    domain/protobuf converters.
 //!
-//! The contract is transport-neutral by design: any process or tooling
-//! that speaks Atomic imports this crate for the types. This crate ships
-//! the contract and the codegen only — implementations live elsewhere.
+//! The handlers are transport-neutral: a server process wires them onto
+//! any transport (the generated servers exist for exactly that), and any
+//! tool that speaks Atomic can call the same handlers in-process instead
+//! of over a wire — one implementation everywhere.
 
 pub mod atomic {
     // The generated module is machine-written; lints do not apply to it.
@@ -25,3 +29,5 @@ pub mod atomic {
 
 /// The generated contract module under its transport-neutral name.
 pub use crate::atomic as proto;
+
+pub mod daemon;
