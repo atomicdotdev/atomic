@@ -1,0 +1,70 @@
+// atomic-protocol — method options (RFC D7).
+//
+// DRAFT — numbers are correctable until review and the first tagged
+// release; add-only thereafter. Field and extension numbers are NEVER reused
+// or renumbered. 51001/51002 are the permanent allocations for Atomic's
+// method options (chosen once, per RFC).
+//
+// THE ONE PROTOCOL: this package is the sole public protobuf contract for
+// local daemon and hosted server. There is no second protocol.
+//
+// Capability tokens use dot style ("repository.read") — the RFC is
+// internally inconsistent (dot style in its method-option examples, colon
+// style in its authorization section); dot style is carried from the parked
+// earlier draft and flagged for ratification.
+
+syntax = "proto3";
+
+package atomic;
+
+import "google/protobuf/descriptor.proto";
+
+// Declared execution scope for an RPC. Scope documents where a method is
+// expected to run; negotiated capabilities determine whether a specific
+// endpoint can execute it; authorization determines whether the principal
+// may invoke it (RFC D7 — three distinct checks).
+enum ExecutionScope {
+  EXECUTION_SCOPE_UNSPECIFIED = 0;
+  EXECUTION_SCOPE_LOCAL = 1;   // local daemon only (working-copy, admin ops)
+  EXECUTION_SCOPE_REMOTE = 2;  // hosted server only (org policy, hosted grants)
+  EXECUTION_SCOPE_BOTH = 3;   // same semantics on local daemon and hosted server
+}
+
+// Caller trust is independent of endpoint placement. Middleware establishes
+// this class; no request body may assert it. Socket access is not authorization.
+enum CallerClass {
+  CALLER_CLASS_UNSPECIFIED = 0;
+  CALLER_CLASS_LOCAL = 1;
+  CALLER_CLASS_REMOTE_IDENTITY = 2;
+  CALLER_CLASS_SANDBOX = 3;
+}
+
+// Allowed effects, not permissions. REPOSITORY_READ never acquires a writer,
+// even for lazy repair or an aborted projection. WORKSPACE_WRITE requires the
+// workspace lease; REPOSITORY_WRITE queues per repository. DAEMON_WRITE uses
+// daemon storage, never a global queue serializing all repository writes.
+enum RpcEffect {
+  RPC_EFFECT_UNSPECIFIED = 0;
+  RPC_EFFECT_REPOSITORY_READ = 1;
+  RPC_EFFECT_REPOSITORY_WRITE = 2;
+  RPC_EFFECT_WORKSPACE_READ = 3;
+  RPC_EFFECT_WORKSPACE_WRITE = 4;
+  RPC_EFFECT_DAEMON_READ = 5;
+  RPC_EFFECT_DAEMON_WRITE = 6;
+  RPC_EFFECT_EXTERNAL_IO = 7;
+}
+
+extend google.protobuf.MethodOptions {
+  // Intended execution scope. Every method declares one.
+  ExecutionScope execution_scope = 51001;
+  // Required endpoint capabilities (RFC D7: "one or more" — with ONE flagged
+  // carve-out: the negotiation pair DaemonService.Health/GetCapabilities
+  // declares zero, because a client must discover what an endpoint supports
+  // before it can know which capabilities it holds; gating the handshake on a
+  // capability would be circular. Carried from the parked Slice 0 draft.)
+  repeated string required_capability = 51002;
+  // Explicit allowlist. Missing/unspecified means deny. A sandbox credential
+  // cannot become an unrestricted remote identity on another service.
+  repeated CallerClass allowed_caller = 51003;
+  repeated RpcEffect effect = 51004;
+}

@@ -1,0 +1,18 @@
+[package]
+name = "libatomic"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "The canonical Atomic protobuf contract: service definitions, tonic/prost codegen, and the descriptor contract gate"
+
+[dependencies]
+tonic = { workspace = true }
+prost = { workspace = true }
+prost-types = { workspace = true }
+
+[build-dependencies]
+tonic-build = { workspace = true }
+protox = { workspace = true }

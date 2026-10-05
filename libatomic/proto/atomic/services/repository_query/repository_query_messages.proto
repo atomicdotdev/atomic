@@ -1,0 +1,169 @@
+// atomic-protocol — RepositoryQueryService: read-only repository operations.
+//
+// DRAFT — add-only. Reads execute as independent concurrent read
+// transactions (RFC concurrency model); no global write lock is ever assumed.
+// LOCAL-scoped reads are working-copy-aware (status/DiffWorkingCopy against the
+// tree); BOTH reads (log/change/Diff/PreviewMutation) are semantically identical on
+// the local daemon and the hosted server (D6/D7 — the CLI-vs-RPC parity
+// targets).
+
+syntax = "proto3";
+
+package atomic;
+
+import "atomic/common/common.proto";
+import "atomic/common/change.proto";
+import "atomic/common/pagination.proto";
+
+
+
+message StatusRequest {
+  RepositoryRef repository = 1;
+  reserved 2; // allow_reindex violated read-only execution
+}
+// Mirrors RepositoryStatus (atomic-repository/src/status.rs:390): view,
+// merkle state, per-file entries, and the stale-index count that drives the
+// --reindex hint (unindexed tracked files are conservatively reported
+// Modified; explicit ReindexWorkspace resolves them).
+message StatusResponse {
+  string view = 1;
+  optional Hash view_merkle = 2;
+  repeated FileStatusEntry files = 3;
+  uint32 modified_count = 4;
+  uint32 deleted_count = 5;
+  uint32 untracked_count = 6;
+  uint32 added_count = 7;
+  uint32 conflicted_count = 8;
+  uint32 stale_index_count = 9;   // non-zero → `status --reindex` would
+                                    // resolve false positives
+  ViewSnapshot snapshot = 10;
+}
+// atomic's file-status vocabulary, source-verified (status.rs:136):
+// Modified, Deleted, Untracked, Added, Conflicted — no git-shaped states.
+enum FileStatus {
+  FILE_STATUS_UNSPECIFIED = 0;
+  FILE_STATUS_MODIFIED = 1;
+  FILE_STATUS_DELETED = 2;
+  FILE_STATUS_UNTRACKED = 3;
+  FILE_STATUS_ADDED = 4;
+  FILE_STATUS_CONFLICTED = 5;
+}
+// Mirrors FileStatusEntry (status.rs:263).
+message FileStatusEntry {
+  string path = 1;
+  FileStatus status = 2;
+  optional uint64 inode = 3;         // opaque handle; present for tracked files
+  optional Hash recorded_hash = 4;   // recorded graph content
+  optional Hash current_hash = 5;    // on-disk content when hashed
+  optional string details = 6;       // conflict type, permissions, etc.
+}
+
+message LogRequest {
+  RepositoryRef repository = 1;
+  bool all_views = 2;                  // `--all`
+  optional string view = 3; // required unless all_views; no daemon current-view default
+  optional PageCursor cursor = 4;
+  optional PageBudget budget = 5;
+}
+message LogResponse {
+  repeated ChangeLogEntry entries = 1;
+  optional PageCursor next_cursor = 2;
+}
+// ChangeLogEntry lives in atomic/common/change.proto (shared change-domain).
+
+message GetChangeRequest {
+  RepositoryRef repository = 1;
+  ChangeRef ref = 2;
+  ChangeIncludes includes = 3;
+  optional ViewRef view = 4; // required when ref is a view-log sequence
+}
+// Sections fetched by flag instead of by verb — the combine that keeps
+// GetChange one RPC.
+message ChangeIncludes {
+  bool metadata = 1;
+  bool graph_section = 2;
+  bool semantic_section = 3;
+  bool signatures = 4;
+  bool content_chunks = 5;
+}
+message GetChangeResponse {
+  ChangeInfo change = 1;
+  optional VersionedBytes graph_section = 2;
+  optional VersionedBytes semantic_section = 3;
+  repeated ChangeSignature signatures = 4;
+  optional bytes content_chunks = 5;
+}
+// ChangeInfo lives in atomic/common/change.proto (shared change-domain).
+
+message DiffRequest {
+  RepositoryRef repository = 1;
+  reserved 2; // working_copy moved to a LOCAL, workspace-aware method
+  oneof scope {
+    RefPairScope refs = 3;             // view/tag/change-pair diff
+  }
+  bool stat_only = 4;
+}
+message DiffWorkingCopyRequest {
+  RepositoryRef repository = 1; // workspace_id required
+  WorkingCopyScope working_copy = 2;
+  bool stat_only = 3;
+}
+message WorkingCopyScope {
+  bool include_untracked = 1;
+  repeated string paths = 2;           // working-copy paths (LOCAL semantics)
+}
+message RefPairScope {
+  string from_view = 1;
+  string to_view = 2;
+}
+message DiffChunk {
+  string path = 1;
+  optional bytes patch = 2;            // unified diff hunks (absent when stat-only)
+  uint64 additions = 3;
+  uint64 deletions = 4;
+  bool binary = 5;
+}
+
+message ListConflictsRequest {
+  RepositoryRef repository = 1;
+}
+message ListConflictsResponse {
+  repeated ConflictInfo conflicts = 1;
+}
+
+message PreviewMutationRequest {
+  RepositoryRef repository = 1;
+  reserved 2; // filesystem restore has its own LOCAL preview
+  oneof operation {
+    InsertPreview insert = 3;
+    UnrecordPreview unrecord = 4;
+  }
+}
+message PreviewRestoreRequest {
+  RepositoryRef repository = 1; // workspace_id required
+  repeated string paths = 2; // workspace-root-relative
+  bool force = 3;
+}
+message InsertPreview {
+  oneof source {
+    Hash single_change = 1;
+    string from_view = 2;
+    string up_to_tag = 3;
+  }
+  string target_view = 4; // required; dependency closure is always enforced
+  bool allow_conflicts = 5;
+}
+message UnrecordPreview {
+  ViewRef view = 1;
+  optional ChangeRef target = 2; // absent means last change in this view
+}
+message PreviewMutationResponse {
+  repeated string affected_paths = 1;
+  repeated ChangeInfo changes = 2;
+  repeated ConflictInfo conflicts = 3;
+  ViewSnapshot snapshot = 4;
+  // The restore preview's would-untrack list (add-only): Added files
+  // that a restore would untrack but keep on disk.
+  repeated string untracked = 5;
+}
+// ConflictInfo lives in atomic/common/change.proto (shared change-domain).

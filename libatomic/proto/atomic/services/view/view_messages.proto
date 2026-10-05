@@ -1,0 +1,118 @@
+// atomic-protocol — ViewService: view lifecycle and scope.
+//
+// DRAFT — add-only. Views are the workflow spine (draft → shared). View
+// reads and repository-only lifecycle writes are BOTH. Only switch follows a
+// host working copy and stays LOCAL. Sandboxes have no lifecycle authority.
+//
+// Mappings (see COVERAGE.md): `atomic split` = CreateView with
+// explicit from_view, then optional SwitchView; `view promote` = SetViewScope
+// (a scope change to Shared root — DISTINCT from bare `atomic insert`,
+// which lands the current view's changes into its parent; verified
+// against insert.rs and view/promote.rs before mapping them apart).
+
+syntax = "proto3";
+
+package atomic;
+
+import "atomic/common/common.proto";
+
+enum ViewScope {
+  VIEW_SCOPE_UNSPECIFIED = 0;
+  VIEW_SCOPE_DRAFT = 1;
+  VIEW_SCOPE_SHARED = 2;
+}
+
+
+
+message ListViewsRequest {
+  RepositoryRef repository = 1;
+  bool include_details = 2;   // `-v`
+}
+message ListViewsResponse {
+  repeated ViewInfo views = 1;
+}
+message ViewInfo {
+  string name = 1;
+  ViewScope scope = 2;
+  optional string parent = 3;
+  optional Hash head = 4;         // head merkle state
+  uint64 change_count = 5;
+  bool current = 6;
+  ViewRef ref = 7;
+  ViewSnapshot snapshot = 8;
+}
+
+message CreateViewRequest {
+  RepositoryRef repository = 1;
+  RequestMeta meta = 2;
+  string name = 3;
+  reserved 5, 7; // from_current/switch_after: client resolves/composes explicitly
+  oneof base {
+    string from_view = 4;   // `view create --from` / `split` from another view
+    bool empty = 6;         // `--empty`
+  }
+  ViewScope scope = 8;
+  optional ViewSnapshot base_snapshot = 9; // required for from_view
+}
+message CreateViewResponse {
+  ViewInfo view = 1;
+  ResponseMeta meta = 100;
+}
+
+message SwitchViewRequest {
+  RepositoryRef repository = 1;
+  RequestMeta meta = 2;
+  string view = 3;
+}
+message SwitchViewResponse {
+  uint64 files_written = 1;        // materialized files (add-only render)
+  ResponseMeta meta = 100;
+}
+
+message DeleteViewRequest {
+  RepositoryRef repository = 1;
+  RequestMeta meta = 2;
+  string view = 3;
+  optional ExpectedState expected = 4; // required matching view_snapshot;
+  // refuse views checked out by an active workspace; do not switch it implicitly
+}
+message DeleteViewResponse { ResponseMeta meta = 100; }
+
+message SetViewScopeRequest {
+  RepositoryRef repository = 1;
+  RequestMeta meta = 2;
+  string view = 3;
+  ViewScope scope = 4;      // `view promote` sets SHARED (parent cleared)
+  ViewSnapshot expected_snapshot = 5;
+}
+message SetViewScopeResponse { ResponseMeta meta = 100; }
+
+// `atomic view split` (add-only): fork a draft and remove the chosen
+// changes from the source, atomically, under the reverse-dependency
+// guard. Mirrors the domain SplitOptions/SplitOutcome exactly.
+message SplitViewRequest {
+  RepositoryRef repository = 1;
+  RequestMeta meta = 2;
+  string name = 3;                  // the new draft view
+  string from_view = 4;             // source (empty = current view)
+  repeated Hash changes = 5;        // the changes to split out
+  bool cascade = 6;                 // move dependents instead of refusing
+  bool materialize = 7;             // reconcile the source's working copy
+}
+// One change involved in a split, with its pre-split source sequence.
+message SplitChangeInfo {
+  optional Hash hash = 1;
+  uint64 sequence = 2;
+}
+message SplitViewResponse {
+  repeated SplitChangeInfo requested = 1;   // in source-sequence order
+  repeated SplitChangeInfo dependents = 2;  // the blocking/moved closure
+  repeated SplitChangeInfo moved = 3;       // requested + dependents
+  uint64 source_change_count = 4;           // source's own count after
+  uint64 target_change_count = 5;           // draft's own count after
+  bool working_copy_updated = 6;
+  uint64 files_written = 7;
+  uint64 files_removed = 8;
+  ViewInfo view = 9;
+  ResponseMeta meta = 100;
+}

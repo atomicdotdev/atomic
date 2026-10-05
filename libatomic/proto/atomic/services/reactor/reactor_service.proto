@@ -1,0 +1,54 @@
+// atomic-protocol — ReactorService definition (the RPC contract).
+// DRAFT — add-only. Messages for this service live in
+// atomic/services/reactor/reactor_messages.proto · shared primitives in atomic/common/.
+
+syntax = "proto3";
+
+package atomic;
+
+import "atomic/common/options.proto";
+import "atomic/services/reactor/reactor_messages.proto";
+import "atomic/common/event.proto";
+
+service ReactorService {
+  // Single-event publish; ack means durably appended + sequenced.
+  rpc Publish(PublishEventRequest) returns (PublishEventResponse) {
+    option (atomic.execution_scope) = EXECUTION_SCOPE_BOTH;
+    option (atomic.required_capability) = "reactor.publish";
+    option (atomic.allowed_caller) = CALLER_CLASS_LOCAL;
+    option (atomic.allowed_caller) = CALLER_CLASS_REMOTE_IDENTITY;
+    option (atomic.effect) = RPC_EFFECT_DAEMON_WRITE;
+  }
+  // Streaming publish — one EventEnvelope per frame, one ack summary.
+  rpc PublishStream(stream EventEnvelope) returns (PublishStreamResponse) {
+    option (atomic.execution_scope) = EXECUTION_SCOPE_BOTH;
+    option (atomic.required_capability) = "reactor.publish";
+    option (atomic.allowed_caller) = CALLER_CLASS_LOCAL;
+    option (atomic.allowed_caller) = CALLER_CLASS_REMOTE_IDENTITY;
+    option (atomic.effect) = RPC_EFFECT_DAEMON_WRITE;
+  }
+  // Live subscription (at-least-once; per-consumer checkpoints).
+  rpc Subscribe(SubscribeRequest) returns (stream EventEnvelope) {
+    option (atomic.execution_scope) = EXECUTION_SCOPE_BOTH;
+    option (atomic.required_capability) = "reactor.subscribe";
+    option (atomic.allowed_caller) = CALLER_CLASS_LOCAL;
+    option (atomic.allowed_caller) = CALLER_CLASS_REMOTE_IDENTITY;
+    option (atomic.effect) = RPC_EFFECT_DAEMON_READ;
+  }
+  // Replay from a checkpoint or sequence with the same envelope shape.
+  rpc Replay(ReplayRequest) returns (stream EventEnvelope) {
+    option (atomic.execution_scope) = EXECUTION_SCOPE_BOTH;
+    option (atomic.required_capability) = "reactor.subscribe";
+    option (atomic.allowed_caller) = CALLER_CLASS_LOCAL;
+    option (atomic.allowed_caller) = CALLER_CLASS_REMOTE_IDENTITY;
+    option (atomic.effect) = RPC_EFFECT_DAEMON_READ;
+  }
+  // Persist a consumer's delivery checkpoint.
+  rpc CheckpointConsumer(CheckpointConsumerRequest) returns (CheckpointConsumerResponse) {
+    option (atomic.execution_scope) = EXECUTION_SCOPE_BOTH;
+    option (atomic.required_capability) = "reactor.checkpoint";
+    option (atomic.allowed_caller) = CALLER_CLASS_LOCAL;
+    option (atomic.allowed_caller) = CALLER_CLASS_REMOTE_IDENTITY;
+    option (atomic.effect) = RPC_EFFECT_DAEMON_WRITE;
+  }
+}

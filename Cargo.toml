@@ -12,6 +12,7 @@ members = [
     "atomic-repository",
     "atomic-semantic",
     "atomic-teams",
+    "libatomic",
 ]
 
 [workspace.package]
@@ -35,6 +36,14 @@ atomic-remote = { path = "atomic-remote" }
 atomic-repository = { path = "atomic-repository" }
 atomic-semantic = { path = "atomic-semantic" }
 atomic-teams = { path = "atomic-teams" }
+libatomic = { path = "libatomic" }
+
+# gRPC (one contract, many transports)
+tonic = "0.12"
+prost = "0.13"
+prost-types = "0.13"
+tonic-build = "0.12"
+protox = "0.7"
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }

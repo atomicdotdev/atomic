@@ -1,0 +1,224 @@
+// atomic-protocol — VaultService: the `.vault/` knowledge store — intents,
+// memories, goals, vault sync, context.
+//
+// DRAFT — add-only. This is the agent-facing product surface (the
+// intent→change workflow with triage + knowledge graph), so the combine
+// discipline matters most here: intents/memories/goals are one entity model
+// with a kind enum, not three parallel RPC families. `vault intent`/
+// `vault memory` shims in the CLI print redirects — they map onto the same
+// methods below.
+//
+// Combine decisions (see COVERAGE.md):
+//  * goal start/stop/resume → UpdateVaultEntity(kind=GOAL, action);
+//  * goal list/show → GetVaultEntry/ListVaultEntries(kind filter);
+//  * intent new / memory new → CreateVaultEntity;
+//  * intent update / memory write → UpdateVaultEntity;
+//  * vault list/summaries → ListVaultEntries modes;
+//  * attest verbs → AttestationService (intent/memory are just targets).
+
+syntax = "proto3";
+
+package atomic;
+
+// VIEW ISOLATION: every request names its view (field 20), including reads.
+// A sandbox target must equal its grant's stable view ID. Reads see that view's
+// effective vault. Edits to inherited entities create target-local versions;
+// deletion creates a target-local tombstone; links refer only to visible
+// entities. No repository mutation overwrites sibling/ancestor state or writes
+// host files. ExportVault is the separate local filesystem operation.
+// Changes to the view's vault revision participate in ViewSnapshot fencing.
+// Remote sandboxes may write through these RPCs or submit recorded .vault edits;
+// both paths have identical view-local indexing/authorization semantics.
+
+import "google/protobuf/timestamp.proto";
+import "atomic/common/common.proto";
+import "atomic/common/pagination.proto";
+
+enum VaultEntityKind {
+  VAULT_ENTITY_KIND_UNSPECIFIED = 0;
+  VAULT_ENTITY_KIND_INTENT = 1;
+  VAULT_ENTITY_KIND_MEMORY = 2;
+  VAULT_ENTITY_KIND_GOAL = 3;
+}
+
+enum VaultEntityStatus {
+  VAULT_ENTITY_STATUS_UNSPECIFIED = 0;
+  VAULT_ENTITY_STATUS_BACKLOG = 1;
+  VAULT_ENTITY_STATUS_IN_PROGRESS = 2;
+  VAULT_ENTITY_STATUS_NEEDS_REVIEW = 3;
+  VAULT_ENTITY_STATUS_PLANNED = 4;
+  VAULT_ENTITY_STATUS_DONE = 5;
+  VAULT_ENTITY_STATUS_ACTIVE = 6;
+  VAULT_ENTITY_STATUS_SUSPENDED = 7;
+  VAULT_ENTITY_STATUS_COMPLETED = 8;
+  VAULT_ENTITY_STATUS_SUPERSEDED = 9;
+  VAULT_ENTITY_STATUS_RETRACTED = 10;
+  // Validate per-kind transitions: intent lifecycle vs goal/memory lifecycle.
+}
+
+
+
+message InitVaultRequest {
+  RepositoryRef repository = 1;
+  RequestMeta meta = 2;
+  ViewRef view = 20;
+  ViewSnapshot expected_snapshot = 21;
+}
+message InitVaultResponse { ResponseMeta meta = 100; }
+
+message SyncVaultRequest {
+  RepositoryRef repository = 1;
+  RequestMeta meta = 2;
+  ViewRef view = 20;
+  ViewSnapshot expected_snapshot = 21;
+}
+message SyncVaultResponse {
+  uint32 entities_synced = 1;
+  ResponseMeta meta = 100;
+}
+
+message GetVaultEntryRequest {
+  RepositoryRef repository = 1;
+  VaultEntityKind kind = 2;
+  string id = 3;
+  ViewRef view = 20;
+}
+message GetVaultEntryResponse {
+  VaultEntry entry = 1;
+  ViewSnapshot snapshot = 20;
+}
+
+message ListVaultEntriesRequest {
+  RepositoryRef repository = 1;
+  optional VaultEntityKind kind = 2;
+  optional VaultEntityStatus status = 3;
+  bool summaries_only = 4;      // `vault summaries`
+  optional PageCursor cursor = 5;
+  optional PageBudget budget = 6;
+  ViewRef view = 20;
+}
+message ListVaultEntriesResponse {
+  repeated VaultEntry entries = 1;   // summaries_only → title lines only
+  optional PageCursor next_cursor = 2;
+  ViewSnapshot snapshot = 20; // continuation cursors bind to this perspective
+}
+
+message GetVaultContextRequest {
+  RepositoryRef repository = 1;
+  optional uint32 max_entries = 2;
+  repeated VaultEntityKind kinds = 3;
+  ViewRef view = 20;
+}
+message GetVaultContextResponse {
+  repeated VaultEntry entries = 1;
+  ViewSnapshot snapshot = 20;
+  // SHAPE-CONFIRM: context-pack composition from vault/context.rs.
+}
+
+message ExportVaultRequest {
+  RepositoryRef repository = 1;
+  RequestMeta meta = 2;
+  repeated VaultEntityKind kinds = 3;
+  optional string destination = 4;   // local path (LOCAL scope)
+  ViewRef view = 20;
+}
+message ExportVaultResponse {
+  uint32 exported = 1;
+  ResponseMeta meta = 100;
+}
+
+message CreateVaultEntityRequest {
+  RepositoryRef repository = 1;
+  RequestMeta meta = 2;
+  VaultEntityKind kind = 3;
+  string title = 4;
+  optional string body = 5;         // initial directive/content text
+  // Memory-specific metadata (kind INTENT ignores these):
+  // constraint|preference|lesson|context|decision (add-only).
+  optional string memory_kind = 6;
+  // urn:atomic:... the memory derives from (add-only).
+  repeated string derived_from = 7;
+  // One-line summaries for goals (add-only).
+  repeated string about = 8;
+  ViewRef view = 20;
+  ViewSnapshot expected_snapshot = 21;
+}
+message CreateVaultEntityResponse {
+  VaultEntry entry = 1;
+  ResponseMeta meta = 100;
+}
+
+message UpdateVaultEntityRequest {
+  RepositoryRef repository = 1;
+  RequestMeta meta = 2;
+  VaultEntityKind kind = 3;
+  string id = 4;
+  oneof update {
+    string body = 5;                 // rewrite content (memory write)
+    VaultEntityStatus status = 6;   // status transition (intent lifecycle,
+                                     // goal start/stop/resume)
+  }
+  optional ExpectedState expected = 7;
+  ViewRef view = 20; // expected.kind must be view_snapshot matching this view
+}
+message UpdateVaultEntityResponse {
+  VaultEntry entry = 1;
+  ResponseMeta meta = 100;
+}
+
+message DeleteVaultEntityRequest {
+  RepositoryRef repository = 1;
+  RequestMeta meta = 2;
+  VaultEntityKind kind = 3;
+  string id = 4;
+  ViewRef view = 20;
+  ViewSnapshot expected_snapshot = 21;
+}
+message DeleteVaultEntityResponse { ResponseMeta meta = 100; }
+
+message ValidateVaultEntityRequest {
+  RepositoryRef repository = 1;
+  VaultEntityKind kind = 2;
+  oneof subject {
+    string id = 3;            // validate stored entity
+    bytes document = 4;      // validate candidate bytes (path-arg form)
+  }
+  optional Hash content_hash = 5;
+  ViewRef view = 20;
+}
+message ValidateVaultEntityResponse {
+  bool valid = 1;
+  repeated string issues = 2;
+}
+
+message LinkVaultEntitiesRequest {
+  RepositoryRef repository = 1;
+  RequestMeta meta = 2;
+  VaultEntityRef source = 3;
+  VaultEntityRef target = 4;
+  ViewRef view = 20;
+  ViewSnapshot expected_snapshot = 21;
+}
+message LinkVaultEntitiesResponse { ResponseMeta meta = 100; }
+
+message VaultEntityRef {
+  VaultEntityKind kind = 1;
+  string id = 2;
+}
+
+message VaultEntry {
+  VaultEntityKind kind = 1;
+  string id = 2;
+  string title = 3;
+  optional VaultEntityStatus status = 4;
+  optional string body = 5;   // present unless summaries_only
+  optional google.protobuf.Timestamp created_at = 6;
+  optional google.protobuf.Timestamp updated_at = 7;
+  repeated string linked = 8; // linked entity ids
+  // Local-surface render helpers (add-only): the vault file path and the
+  // intent/memory priority label.
+  optional string vault_path = 9;
+  optional string priority = 10;
+  // SHAPE-CONFIRM: attestation/verification state surfacing (attestations
+  // live in AttestationService; entries reference their latest attestation).
+}

@@ -1,0 +1,112 @@
+// atomic-protocol — KnowledgeService: knowledge-graph queries and
+// maintenance.
+//
+// DRAFT — add-only. The CLI's eleven `query` verbs collapse into TWO RPCs
+// (the headline combine of this draft):
+//  * QueryGraph — every read: content/code search, kg search, entity,
+//    neighbors, callers, graph slice, plan execution, RAG ask;
+//  * MaintainKnowledgeGraph — embed/enrich/reindex (the write/rebuild side).
+// Local file-index construction (`query index`) remains client-side. QueryGraph
+// reads a view-scoped indexed snapshot; it must never build/refresh an index.
+
+syntax = "proto3";
+
+package atomic;
+
+import "atomic/common/common.proto";
+
+
+
+message QueryGraphRequest {
+  RepositoryRef repository = 1;
+  uint32 limit = 2;             // default 10-20 per kind today
+  oneof query {
+    ContentSearchQuery content_search = 3;   // `query code` (syntext index)
+    KgSearchQuery kg_search = 4;             // `query search`
+    EntityQuery entity = 5;                  // `query entities`
+    NeighborsQuery neighbors = 6;            // `query neighbors`
+    CallersQuery callers = 7;               // `query callers`
+    GraphSliceQuery graph_slice = 8;         // `query graph`
+    PlanExecutionQuery plan = 9;            // `query plan` (JSON plan steps)
+    RagAskQuery rag_ask = 10;               // `query ask` (KG + LLM answer)
+  }
+  ViewRef view = 11; // required; sandbox must match grant
+  // All nodes, edges, snippets, opaque payloads and every plan step are filtered
+  // BEFORE evaluation/provider calls by this effective perspective. Plans are
+  // read-only; no embed/enrich/reindex or arbitrary filesystem/provider action.
+}
+
+message ContentSearchQuery {
+  string query = 1;
+  repeated string paths = 2;
+  // SHAPE-CONFIRM: filters from query/mod.rs content search.
+}
+message KgSearchQuery {
+  string query = 1;
+}
+message EntityQuery {
+  string node_id = 1;
+}
+message NeighborsQuery {
+  string node_id = 1;
+  optional bool incoming = 2;
+}
+message CallersQuery {
+  string node_id = 1;
+}
+message GraphSliceQuery {
+  repeated string node_ids = 1;
+  optional int32 max_depth = 2;
+}
+message PlanExecutionQuery {
+  bytes plan_json = 1;         // structured multi-step plan (parse_plan shape)
+}
+message RagAskQuery {
+  string question = 1;
+  uint32 top_k = 2;
+}
+
+message QueryGraphResponse {
+  repeated KGNode nodes = 1;
+  repeated KGEdge edges = 2;
+  repeated ContentHit hits = 3;      // content/code search results
+  optional string answer = 4;        // rag_ask
+  optional bytes plan_result = 5;    // plan step outputs (JSON)
+  ViewSnapshot snapshot = 6;
+}
+
+message KGNode {
+  string id = 1;
+  string node_type = 2;
+  optional string name = 3;
+  optional bytes data = 4;          // node payload (SHAPE-CONFIRM)
+  optional double score = 5;        // search ranking when applicable
+}
+message KGEdge {
+  string source = 1;
+  string target = 2;
+  string relation = 3;
+}
+message ContentHit {
+  string path = 1;
+  string snippet = 2;
+  optional uint64 line = 3;
+  optional double score = 4;
+}
+
+enum KnowledgeMaintainAction {
+  KNOWLEDGE_MAINTAIN_ACTION_UNSPECIFIED = 0;
+  KNOWLEDGE_MAINTAIN_ACTION_EMBED = 1;    // `query embed`
+  KNOWLEDGE_MAINTAIN_ACTION_ENRICH = 2;   // `query enrich` (index build)
+  KNOWLEDGE_MAINTAIN_ACTION_REINDEX = 3;  // `query reindex`
+}
+message MaintainKnowledgeGraphRequest {
+  RepositoryRef repository = 1;
+  RequestMeta meta = 2;
+  KnowledgeMaintainAction action = 3;
+  optional string scope = 4;      // e.g. entity-type filter
+}
+message MaintainKnowledgeGraphResponse {
+  uint64 processed = 1;
+  ResponseMeta meta = 100;
+}

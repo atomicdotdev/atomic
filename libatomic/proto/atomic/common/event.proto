@@ -1,0 +1,53 @@
+// atomic-protocol — the Reactor event envelope (RFC "Event envelope" section).
+//
+// DRAFT — add-only. CONTRACT DRAFT: the ReactorService server lands in
+// Phase 3; this envelope is drafted now so repository mutation events
+// (transactional outbox, RFC D8) and agent ingestion rhyme with it
+// (align with the Reactor event envelope so the two contracts
+// rhyme").
+//
+// Durability semantics (RFC D9) belong to the server, but the envelope
+// carries the identity fields they depend on:
+//  * append-before-acknowledgement; globally unique event_id (dedup on it);
+//  * daemon ingestion_sequence assigned at ingest (replay order);
+//  * repo-local and session-local sequences;
+//  * causation_id (what caused this event) + correlation_id (what work this
+//    event belongs to) — preserved across daemon proxying (RFC D7).
+
+syntax = "proto3";
+
+package atomic;
+
+import "google/protobuf/timestamp.proto";
+import "atomic/common/common.proto";
+
+message EventEnvelope {
+  string event_id = 1;                 // globally unique (UUID v4)
+  Identity source = 2;                 // producing agent/principal
+  Identity authenticated_principal = 3; // OUTPUT ONLY, derived by middleware;
+  // inbound assertions are refused. source requires explicit delegation rights.
+  optional bytes repository_id = 4;
+  // PublishEventRequest.repository and this ID must agree when both present;
+  // every frame of PublishStream independently authorizes its repository.
+  optional string workspace_id = 5;
+  optional string session_id = 6;
+  optional uint32 session_turn = 7;
+
+  // Assigned by the daemon at ingest; absent on publish requests.
+  optional uint64 ingestion_sequence = 8;
+  optional uint64 repository_sequence = 9;
+  optional uint64 session_sequence = 10;
+
+  google.protobuf.Timestamp occurred_at = 11;   // caller-supplied observation time
+  optional google.protobuf.Timestamp ingested_at = 12; // daemon clock at ingest
+
+  optional string causation_id = 13;
+  optional string correlation_id = 14;
+
+  // Schema/type URL identifying the payload family (RFC: opaque extension
+  // payloads must identify a schema and obey size limits).
+  string type_url = 15;
+  oneof payload {
+    bytes opaque = 16;   // stable named families land additively in Phase 3
+  }
+}

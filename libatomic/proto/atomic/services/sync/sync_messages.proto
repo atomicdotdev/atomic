@@ -1,0 +1,94 @@
+// atomic-protocol — SyncService: remote synchronization and the remote
+// registry.
+//
+// DRAFT — add-only. The existing HTTP `/code` + SyncPack behavior must be
+// preserved behind — or deliberately migrated into — ONE SyncService domain
+// implementation (RFC "one synchronization protocol"): local repo sync,
+// atomicd-to-server sync, and future server replication use the same
+// object, dependency, and compare-and-swap semantics. The hosted server
+// implements the receiving side of the SAME contract (view manifests,
+// CAS-on-prev), so `view list --remote` is just ViewService.ListViews with
+// a hosted RepositoryRef — routing, not a second protocol.
+//
+// Remotes are persisted IN the repository database — so remote registry
+// CRUD is service-layer work, combined into one ManageRemotes RPC.
+// `clone`/`init` are bootstrap (exempt from service coverage per RFC) —
+// clone's fetch/apply/sidecar-import phases are covered by PullChanges.
+
+syntax = "proto3";
+
+package atomic;
+
+import "atomic/common/common.proto";
+
+
+
+message PushChangesRequest {
+  RepositoryRef repository = 1;
+  RequestMeta meta = 2;
+  string remote = 3;
+  repeated string views = 4;          // empty = current view manifest chain
+  optional ExpectedState expected = 5; // CAS-on-prev precondition
+}
+message PushChangesResponse {
+  uint64 pushed_changes = 1;
+  repeated string manifests = 2;
+  ResponseMeta meta = 100;
+}
+
+message PullChangesRequest {
+  RepositoryRef repository = 1;
+  RequestMeta meta = 2;
+  string remote = 3;
+  bool import_sidecars = 4;           // provenance/attestation ingestion on
+                                       // apply (default true)
+  // Imports update repository/view state only. Host materialization is a
+  // separately authorized working-copy operation, not a hidden pull effect.
+}
+message PullChangesResponse {
+  uint64 applied_changes = 1;
+  repeated string updated_views = 2;
+  ResponseMeta meta = 100;
+}
+
+enum RemoteAction {
+  REMOTE_ACTION_UNSPECIFIED = 0;
+  REMOTE_ACTION_ADD = 1;
+  REMOTE_ACTION_REMOVE = 2;
+  REMOTE_ACTION_RENAME = 3;
+  REMOTE_ACTION_SET_URL = 4;
+  REMOTE_ACTION_SET_DEFAULT = 5;
+  reserved 6;   // was LIST — split to ListRemotes so a read never gates on
+                // repository.write (COVERAGE §9)
+}
+message ListRemotesRequest {
+  RepositoryRef repository = 1;
+}
+message ListRemotesResponse {
+  repeated RemoteInfo remotes = 1;
+}
+message ManageRemotesRequest {
+  RepositoryRef repository = 1;
+  RequestMeta meta = 2;
+  RemoteAction action = 3;
+  optional string name = 4;
+  optional string url = 5;
+  optional string new_name = 6;
+}
+message ManageRemotesResponse {
+  repeated RemoteInfo remotes = 1;
+  ResponseMeta meta = 100;
+}
+message RemoteInfo {
+  string name = 1;
+  string url = 2;
+  bool default = 3;
+}
+
+message BindRemoteProjectRequest {
+  RepositoryRef repository = 1;
+  RequestMeta meta = 2;
+  string server = 3;                  // server profile name (config.toml)
+  string project_id = 4;
+}
+message BindRemoteProjectResponse { ResponseMeta meta = 100; }

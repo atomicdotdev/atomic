@@ -1,0 +1,170 @@
+// atomic-protocol — ProvenanceService definition (the RPC contract).
+// DRAFT — add-only. Messages for this service live in
+// atomic/services/provenance/provenance_messages.proto · shared primitives in atomic/common/.
+
+syntax = "proto3";
+
+package atomic;
+
+import "atomic/common/options.proto";
+import "atomic/services/provenance/provenance_messages.proto";
+
+service ProvenanceService {
+  // Grants the generation for this session/turn. The first reserve claims
+  // the session for the caller's view (authorization matrix).
+  rpc ReserveTurn(ReserveTurnRequest) returns (ReserveTurnResponse) {
+    option (atomic.execution_scope) = EXECUTION_SCOPE_BOTH;
+    option (atomic.required_capability) = "agent.checkpoint";
+    option (atomic.allowed_caller) = CALLER_CLASS_LOCAL;
+    option (atomic.allowed_caller) = CALLER_CLASS_REMOTE_IDENTITY;
+    option (atomic.allowed_caller) = CALLER_CLASS_SANDBOX;
+    option (atomic.effect) = RPC_EFFECT_REPOSITORY_WRITE;
+  }
+
+  // Appends journal envelopes — chunked client-side under
+  // limits.append_chunk_budget_bytes (4 MiB budget preserved); acks carry
+  // per-event sequences.
+  rpc AppendEnvelopes(AppendEnvelopesRequest) returns (AppendEnvelopesResponse) {
+    option (atomic.execution_scope) = EXECUTION_SCOPE_BOTH;
+    option (atomic.required_capability) = "provenance.write";
+    option (atomic.allowed_caller) = CALLER_CLASS_LOCAL;
+    option (atomic.allowed_caller) = CALLER_CLASS_REMOTE_IDENTITY;
+    option (atomic.allowed_caller) = CALLER_CLASS_SANDBOX;
+    option (atomic.effect) = RPC_EFFECT_REPOSITORY_WRITE;
+  }
+
+  // Freezes envelopes for checkpointing. CRASH-INJECTION SEAM:
+  // before-envelope-commit / after-envelope-commit /
+  // after-checkpoint-prepare.
+  rpc PrepareCheckpoint(PrepareCheckpointRequest) returns (PrepareCheckpointResponse) {
+    option (atomic.execution_scope) = EXECUTION_SCOPE_BOTH;
+    option (atomic.required_capability) = "agent.checkpoint";
+    option (atomic.allowed_caller) = CALLER_CLASS_LOCAL;
+    option (atomic.allowed_caller) = CALLER_CLASS_REMOTE_IDENTITY;
+    option (atomic.allowed_caller) = CALLER_CLASS_SANDBOX;
+    option (atomic.effect) = RPC_EFFECT_REPOSITORY_WRITE;
+  }
+
+  // Loads frozen envelopes as pages: cursor absent = first page; a complete
+  // journal may arrive as a single page. (A legacy unpaged form existed as
+  // compat with the dismantled protocol — not carried.) CRASH-INJECTION
+  // SEAM: before-frozen-page-continuation / frozen-page-unavailable.
+  rpc LoadFrozenEnvelopes(LoadFrozenEnvelopesRequest) returns (LoadFrozenEnvelopesResponse) {
+    option (atomic.execution_scope) = EXECUTION_SCOPE_BOTH;
+    option (atomic.required_capability) = "provenance.read";
+    option (atomic.allowed_caller) = CALLER_CLASS_LOCAL;
+    option (atomic.allowed_caller) = CALLER_CLASS_REMOTE_IDENTITY;
+    option (atomic.allowed_caller) = CALLER_CLASS_SANDBOX;
+    option (atomic.effect) = RPC_EFFECT_REPOSITORY_READ;
+  }
+
+  // Binds the manifest hash to the checkpoint attempt (advances the
+  // generation to attempt_generation). CRASH-INJECTION SEAM:
+  // after-checkpoint-bind.
+  rpc BindCheckpointHash(BindCheckpointHashRequest) returns (BindCheckpointHashResponse) {
+    option (atomic.execution_scope) = EXECUTION_SCOPE_BOTH;
+    option (atomic.required_capability) = "agent.checkpoint";
+    option (atomic.allowed_caller) = CALLER_CLASS_LOCAL;
+    option (atomic.allowed_caller) = CALLER_CLASS_REMOTE_IDENTITY;
+    option (atomic.allowed_caller) = CALLER_CLASS_SANDBOX;
+    option (atomic.effect) = RPC_EFFECT_REPOSITORY_WRITE;
+  }
+
+  // Completes the turn: the checkpoint is acknowledged (caller-supplied
+  // completion time).
+  rpc AcknowledgeCheckpoint(AcknowledgeCheckpointRequest) returns (AcknowledgeCheckpointResponse) {
+    option (atomic.execution_scope) = EXECUTION_SCOPE_BOTH;
+    option (atomic.required_capability) = "agent.checkpoint";
+    option (atomic.allowed_caller) = CALLER_CLASS_LOCAL;
+    option (atomic.allowed_caller) = CALLER_CLASS_REMOTE_IDENTITY;
+    option (atomic.allowed_caller) = CALLER_CLASS_SANDBOX;
+    option (atomic.effect) = RPC_EFFECT_REPOSITORY_WRITE;
+  }
+
+  // Stop/resume/abandon in one RPC (action enum); no crash-injection seams
+  // live on these transitions.
+  rpc UpdateTurn(UpdateTurnRequest) returns (UpdateTurnResponse) {
+    option (atomic.execution_scope) = EXECUTION_SCOPE_BOTH;
+    option (atomic.required_capability) = "provenance.write";
+    option (atomic.allowed_caller) = CALLER_CLASS_LOCAL;
+    option (atomic.allowed_caller) = CALLER_CLASS_REMOTE_IDENTITY;
+    option (atomic.allowed_caller) = CALLER_CLASS_SANDBOX;
+    option (atomic.effect) = RPC_EFFECT_REPOSITORY_WRITE;
+  }
+
+  // Turn status (read).
+  rpc GetTurn(GetTurnRequest) returns (GetTurnResponse) {
+    option (atomic.execution_scope) = EXECUTION_SCOPE_BOTH;
+    option (atomic.required_capability) = "provenance.read";
+    option (atomic.allowed_caller) = CALLER_CLASS_LOCAL;
+    option (atomic.allowed_caller) = CALLER_CLASS_REMOTE_IDENTITY;
+    option (atomic.allowed_caller) = CALLER_CLASS_SANDBOX;
+    option (atomic.effect) = RPC_EFFECT_REPOSITORY_READ;
+  }
+
+  // — session ledger (`atomic session show/fork/rebuild`) —
+  rpc GetSession(GetSessionRequest) returns (GetSessionResponse) {
+    option (atomic.execution_scope) = EXECUTION_SCOPE_BOTH;
+    option (atomic.required_capability) = "provenance.read";
+    option (atomic.allowed_caller) = CALLER_CLASS_LOCAL;
+    option (atomic.allowed_caller) = CALLER_CLASS_REMOTE_IDENTITY;
+    option (atomic.allowed_caller) = CALLER_CLASS_SANDBOX;
+    option (atomic.effect) = RPC_EFFECT_REPOSITORY_READ;
+  }
+  rpc ForkSession(ForkSessionRequest) returns (ForkSessionResponse) {
+    option (atomic.execution_scope) = EXECUTION_SCOPE_BOTH;
+    option (atomic.required_capability) = "provenance.write";
+    option (atomic.allowed_caller) = CALLER_CLASS_LOCAL;
+    option (atomic.allowed_caller) = CALLER_CLASS_REMOTE_IDENTITY;
+    option (atomic.effect) = RPC_EFFECT_REPOSITORY_WRITE;
+  }
+  rpc RebuildSessionIndex(RebuildSessionIndexRequest) returns (RebuildSessionIndexResponse) {
+    option (atomic.execution_scope) = EXECUTION_SCOPE_LOCAL;
+    option (atomic.required_capability) = "provenance.write";
+    option (atomic.allowed_caller) = CALLER_CLASS_LOCAL;
+    option (atomic.effect) = RPC_EFFECT_REPOSITORY_WRITE;
+  }
+
+  // — provenance projection (`atomic provenance show/trace`) —
+  rpc GetProvenance(GetProvenanceRequest) returns (GetProvenanceResponse) {
+    option (atomic.execution_scope) = EXECUTION_SCOPE_BOTH;
+    option (atomic.required_capability) = "provenance.read";
+    option (atomic.allowed_caller) = CALLER_CLASS_LOCAL;
+    option (atomic.allowed_caller) = CALLER_CLASS_REMOTE_IDENTITY;
+    option (atomic.allowed_caller) = CALLER_CLASS_SANDBOX;
+    option (atomic.effect) = RPC_EFFECT_REPOSITORY_READ;
+  }
+  // Unsigned projection/signable bytes. Private-key signing stays with caller.
+  rpc ExportProvenance(ExportProvenanceRequest) returns (ExportProvenanceResponse) {
+    option (atomic.execution_scope) = EXECUTION_SCOPE_BOTH;
+    option (atomic.required_capability) = "provenance.read";
+    option (atomic.allowed_caller) = CALLER_CLASS_LOCAL;
+    option (atomic.allowed_caller) = CALLER_CLASS_REMOTE_IDENTITY;
+    option (atomic.allowed_caller) = CALLER_CLASS_SANDBOX;
+    option (atomic.effect) = RPC_EFFECT_REPOSITORY_READ;
+  }
+
+// TRANSITION (full-turn slice, 2026-10-02): typed turn dispatch. The Reactor
+// bridge delivers verified TurnEvents here; the daemon hosts the turn
+// orchestrator (session view, recording, journal checkpoint) in-process while
+// the aggregate-client decomposition lands. Target state (COVERAGE §4): the
+// hook surface decomposes into ProvenanceService + RepositoryMutationService
+// + AttestationService + KnowledgeService composed by the client; this RPC
+// is the transitional seam and stays add-only after this draft pass.
+rpc DispatchTurnEvent(DispatchTurnEventRequest) returns (DispatchTurnEventResponse) {
+  option (atomic.execution_scope) = EXECUTION_SCOPE_LOCAL;
+  option (atomic.required_capability) = "provenance.write";
+  option (atomic.allowed_caller) = CALLER_CLASS_LOCAL;
+  option (atomic.effect) = RPC_EFFECT_REPOSITORY_WRITE;
+}
+
+  // Recent session ledgers, newest activity first (`atomic session show` with
+  // no id / the bare `session` listing). Add-only sibling of GetSession.
+  rpc ListSessions(ListSessionsRequest) returns (ListSessionsResponse) {
+    option (atomic.execution_scope) = EXECUTION_SCOPE_BOTH;
+    option (atomic.required_capability) = "provenance.read";
+    option (atomic.allowed_caller) = CALLER_CLASS_LOCAL;
+    option (atomic.allowed_caller) = CALLER_CLASS_REMOTE_IDENTITY;
+    option (atomic.effect) = RPC_EFFECT_REPOSITORY_READ;
+  }
+}

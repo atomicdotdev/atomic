@@ -1,0 +1,42 @@
+// atomic-protocol — MaintenanceService definition (the RPC contract).
+// DRAFT — add-only. Messages for this service live in
+// atomic/services/maintenance/maintenance_messages.proto · shared primitives in atomic/common/.
+
+syntax = "proto3";
+
+package atomic;
+
+import "atomic/common/options.proto";
+import "atomic/services/maintenance/maintenance_messages.proto";
+
+service MaintenanceService {
+  // `atomic doctor repair-dependency-index | materialize-crdt` — mutating
+  // repairs only; the read-only consistency check lives in CheckRepository.
+  rpc Repair(RepairRequest) returns (RepairResponse) {
+    option (atomic.execution_scope) = EXECUTION_SCOPE_LOCAL;
+    option (atomic.required_capability) = "maintenance.admin";
+    option (atomic.allowed_caller) = CALLER_CLASS_LOCAL;
+    option (atomic.effect) = RPC_EFFECT_REPOSITORY_WRITE;
+  }
+  // `atomic doctor check` — the consistency check is doc'd read-only in
+  // source ("Read-only… Mutates nothing", doctor.rs:36-46): read authorization
+  // and execution, never repair authority. EXECUTES AS A READ TRANSACTION
+  // — concurrent, never queued behind writers.
+  rpc CheckRepository(CheckRepositoryRequest) returns (CheckRepositoryResponse) {
+    option (atomic.execution_scope) = EXECUTION_SCOPE_BOTH;
+    option (atomic.required_capability) = "maintenance.read";
+    option (atomic.allowed_caller) = CALLER_CLASS_LOCAL;
+    option (atomic.allowed_caller) = CALLER_CLASS_REMOTE_IDENTITY;
+    option (atomic.effect) = RPC_EFFECT_REPOSITORY_READ;
+  }
+  // Lease the workspace while deriving/validating its file-index baseline.
+  // Writes derived repository metadata, never workspace file contents.
+  rpc ReindexWorkspace(ReindexWorkspaceRequest) returns (ReindexWorkspaceResponse) {
+    option (atomic.execution_scope) = EXECUTION_SCOPE_LOCAL;
+    option (atomic.required_capability) = "maintenance.admin";
+    option (atomic.required_capability) = "working-copy.read";
+    option (atomic.allowed_caller) = CALLER_CLASS_LOCAL;
+    option (atomic.effect) = RPC_EFFECT_REPOSITORY_WRITE;
+    option (atomic.effect) = RPC_EFFECT_WORKSPACE_READ;
+  }
+}

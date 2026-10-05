@@ -1,0 +1,57 @@
+// atomic-protocol — TagService: named Merkle-state snapshots.
+//
+// DRAFT — add-only. Tags are repository metadata: reads are BOTH (hosted
+// servers serve them), writes BOTH with repository.write (a hosted
+// repository can be tagged remotely). The RFC names tags in its BOTH scope
+// list.
+
+syntax = "proto3";
+
+package atomic;
+
+import "google/protobuf/timestamp.proto";
+import "atomic/common/common.proto";
+
+
+
+message CreateTagRequest {
+  RepositoryRef repository = 1;
+  RequestMeta meta = 2;
+  string name = 3;
+  optional Hash state = 4;         // merkle state to snapshot (default:
+                                     // explicitly named view's own Merkle)
+  optional string message = 5;
+  ViewRef view = 6;
+  ViewSnapshot expected_snapshot = 7;
+}
+message CreateTagResponse { ResponseMeta meta = 100; }
+
+message DeleteTagRequest {
+  RepositoryRef repository = 1;
+  RequestMeta meta = 2;
+  string name = 3;
+  Hash expected_state = 4; // required; refuse replacing/deleting a raced tag
+}
+message DeleteTagResponse { ResponseMeta meta = 100; }
+
+message ListTagsRequest {
+  RepositoryRef repository = 1;
+}
+message ListTagsResponse {
+  repeated TagInfo tags = 1;
+}
+
+message GetTagRequest {
+  RepositoryRef repository = 1;
+  string name = 2;
+}
+message GetTagResponse {
+  TagInfo tag = 1;
+}
+
+message TagInfo {
+  string name = 1;
+  Hash state = 2;
+  optional string message = 3;
+  optional google.protobuf.Timestamp created_at = 4;
+}

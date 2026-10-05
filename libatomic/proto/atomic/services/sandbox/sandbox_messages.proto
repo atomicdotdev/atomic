@@ -1,0 +1,342 @@
+// atomic-protocol — SandboxService: sandbox grants, local sandbox working
+// trees, and the remote-sandbox data ops (the remote-sandboxes extension
+// — the handoff is the spec here).
+//
+// DRAFT — add-only.
+//
+// "A remote sandbox is a machine holding only a pointer file .atomic-sandbox
+// = {iroh EndpointAddr of the serving daemon, repository, view, token}.
+// Materialize writes the view's tree into the sandbox root; record/status/
+// log/diff then work locally and land changes through the serving
+// repository."
+//
+// Authorization matrix for remote callers (preserved semantics):
+//  * sandbox credentials travel in authenticated transport metadata (README);
+//    data ops must target the token's view — naming another view → FORBIDDEN;
+//  * session ownership: first ReserveTurn claims the session for its view;
+//  * provenance ownership: post-reserve, envelope/checkpoint ops on that
+//    turn from another view → FORBIDDEN;
+//  * PrepareCheckpoint additionally requires the checkpoint's change_hashes
+//    to be visible on the caller's view;
+//  * grant admin (Open/Renew/Close) is LOCAL-only.
+//
+// Inode keying (recorded recommendation): FileStates inodes
+// are OPAQUE SERVER-ISSUED HANDLES — they originate from the server's own
+// skeleton export (like cursors). They are not permissions: every use checks
+// repository, snapshot and effective-view visibility; guesses are refused.
+//
+// Materialize path safety (client-side checks that MUST survive): paths off
+// the wire must be plain relative components (no "..", no root, no empty or
+// "."), reserved bookkeeping names refused (.atomic, the pointer file, the
+// cache dir — writing the pointer would re-point the sandbox at an
+// attacker's node), parents canonicalized and checked inside the tree
+// (symlinked-parent escape refused).
+
+syntax = "proto3";
+
+package atomic;
+
+import "google/protobuf/timestamp.proto";
+import "atomic/common/common.proto";
+import "atomic/common/error.proto";
+import "atomic/common/change.proto";
+
+// ————— sandbox cache exports (client-side; only transport changes with the
+//       daemon — "SandboxSkeleton"/"SandboxSlice") —————
+
+message SandboxViewRow {
+  string path = 1;
+  uint64 inode = 2;              // opaque server-issued handle
+  optional Hash content = 3;
+  // SHAPE-CONFIRM (Slice 3): full row fields.
+}
+
+message SandboxAncestorView {
+  string view = 1;
+  optional Hash head = 2;        // its own log
+  optional Hash real_state = 3; // real state
+  optional string parent = 4;   // real parent
+  ViewSnapshot snapshot = 5;
+  repeated ChangeLogEntry log = 6; // this ancestor's OWN log, not the union
+  // draft ancestors + nearest shared ancestor, each with its own log,
+  // real state, real parent.
+}
+
+message SandboxSkeleton {
+  repeated SandboxViewRow rows = 1;
+  repeated SandboxAncestorView ancestors = 2;
+  VersionedBytes graph_slice = 3;   // serialized graph slice
+  ViewSnapshot snapshot = 4;
+  repeated ChangeLogEntry own_log = 5;
+  VersionedBytes vault = 6; // target's effective vault, including its overlay
+  // SHAPE-CONFIRM (Slice 3): skeleton takes its view's vault; draft views
+  // render as themselves.
+}
+
+message SandboxContentSpan {
+  uint64 inode = 1;
+  uint64 offset = 2;
+  uint64 length = 3;
+  Hash change = 4;
+  bytes content = 5; // length must equal content size; never arbitrary CAS access
+}
+
+message SandboxSlice {
+  repeated SandboxViewRow rows = 1;         // the rows record reads
+  repeated SandboxContentSpan content_spans = 2; // the content spans
+  ViewSnapshot snapshot = 3;
+}
+
+// ————— grant admin (LOCAL-only, mint/renew/revoke) —————
+
+
+
+// ————— grant admin messages —————
+
+message OpenSandboxRequest {
+  RepositoryRef repository = 1;
+  RequestMeta meta = 2;
+  string view = 3;
+  optional string acting_as_did = 4;
+  optional uint64 ttl_secs = 5;   // bounds 1..31536000; default 7200
+  repeated string capabilities = 6; // explicit nonempty subset of sandbox,
+  // provenance, vault and attestation permissions; never repository.write,
+  // working-copy.*, daemon.*, sandbox.admin or view lifecycle permissions.
+  ViewRef target = 7; // required; view string is a compatibility/display hint
+}
+message OpenSandboxResponse {
+  SandboxOpened opened = 1;      // {endpoint_addr, view, token, expires_at}
+  ResponseMeta meta = 100;
+}
+
+message RenewSandboxRequest {
+  RepositoryRef repository = 1;
+  RequestMeta meta = 2;
+  string view = 3;
+  uint64 ttl_secs = 4;
+  ViewRef target = 5;
+}
+message RenewSandboxResponse {
+  google.protobuf.Timestamp expires_at = 1;
+  ResponseMeta meta = 100;
+}
+
+message CloseSandboxRequest {
+  RepositoryRef repository = 1;
+  RequestMeta meta = 2;
+  string view = 3;
+  ViewRef target = 4;
+}
+message CloseSandboxResponse {
+  bool revoked = 1;
+  ResponseMeta meta = 100;
+}
+
+// ————— local working trees —————
+
+message CreateSandboxTreeRequest {
+  RepositoryRef repository = 1;
+  RequestMeta meta = 2;
+  string name = 3;
+  optional string from_view = 4;
+}
+message CreateSandboxTreeResponse {
+  string sandbox_path = 1;   // local working-tree path (LOCAL scope)
+  ResponseMeta meta = 100;
+}
+
+message StageSandboxImageRequest {
+  RepositoryRef repository = 1;
+  RequestMeta meta = 2;
+  string name = 3;
+  // SHAPE-CONFIRM (Slice 3): OCI staging options from commands/sandbox.rs.
+}
+message StageSandboxImageResponse {
+  string staged_ref = 1;
+  ResponseMeta meta = 100;
+}
+
+message SealSandboxImageRequest {
+  RepositoryRef repository = 1;
+  RequestMeta meta = 2;
+  string name = 3;
+}
+message SealSandboxImageResponse {
+  string sealed_ref = 1;
+  ResponseMeta meta = 100;
+}
+
+// ————— data ops —————
+
+message MaterializeRequest {
+  RepositoryRef repository = 1;
+  reserved 2, 3; // credentials moved to middleware; mutable view names removed
+  optional ViewRef target = 4; // sandbox: inferred from grant; others: required
+}
+message MaterializeFrame {
+  oneof frame {
+    TreeEntry entry = 1;         // streamed first
+    MaterializeSummary done = 2;  // terminal frame
+  }
+}
+message TreeEntry {
+  string path = 1;               // plain relative components — receivers
+                                   // validate (path-safety rules above)
+  TreeEntryKind kind = 2;
+  optional Hash content = 3;
+  optional bytes inline = 4;       // small blobs may ride the entry
+}
+enum TreeEntryKind {
+  TREE_ENTRY_KIND_UNSPECIFIED = 0;
+  TREE_ENTRY_KIND_FILE = 1;
+  TREE_ENTRY_KIND_DIRECTORY = 2;
+  TREE_ENTRY_KIND_SYMLINK = 3;
+}
+message MaterializeSummary {
+  Hash snapshot = 1;
+  uint64 entries = 2;
+  SandboxSkeleton skeleton = 3;
+  // Entries, snapshot and skeleton MUST be from one coherent effective state.
+}
+
+message GetFileStatesRequest {
+  RepositoryRef repository = 1;
+  reserved 2, 3;
+  repeated uint64 inodes = 4;   // opaque server-issued handles (skeleton-
+                                 // issued, like cursors — §10.1)
+  optional ViewRef target = 5;
+  ViewSnapshot expected_snapshot = 6; // required; bind handles to this state
+}
+message GetFileStatesResponse {
+  SandboxSlice slice = 1;
+}
+
+message GetChangesRequest {
+  RepositoryRef repository = 1;
+  reserved 2, 3;
+  repeated Hash hashes = 4;
+  optional ViewRef target = 5;
+  ViewSnapshot expected_snapshot = 6;
+  // Every hash must belong to the authorized effective filter. Fail the whole
+  // request if any hash is foreign; knowledge of a hash grants no access.
+}
+message GetChangesResponse {
+  oneof outcome {
+    ChangesPayload changes = 1;
+    ErrorInfo refused = 2;       // ChangeRefused
+  }
+}
+message ChangesPayload {
+  repeated ChangeBundle changes = 1;   // versioned-opaque V3 bytes
+}
+
+message PublishProvenanceRequest {
+  RepositoryRef repository = 1;
+  RequestMeta meta = 2;
+  reserved 3, 4, 6; // token/name and caller-supplied StoredProvenanceTurn removed
+  VersionedBytes graph = 5;    // serialized provenance graph
+  SessionTurn turn = 7;
+  uint64 expected_generation = 8; // required; derive stored turn server-side
+  optional ViewRef target = 9;
+  // Turn ownership, graph identity and explained-change visibility are checked
+  // again at publication. A payload cannot replace another session's state.
+}
+message PublishProvenanceResponse {
+  oneof outcome {
+    ProvenancePublished publication = 1;
+    ErrorInfo refused = 2;
+  }
+  ResponseMeta meta = 100;
+}
+message ProvenancePublished {
+  Hash provenance_hash = 1;
+  google.protobuf.Timestamp published_at = 2;
+  // SHAPE-CONFIRM (Slice 3): publication record shape.
+}
+
+message SubmitChangeRequest {
+  RepositoryRef repository = 1;
+  RequestMeta meta = 2;
+  reserved 3, 4, 5; // credentials/name/own-log-only base_state removed
+  ChangeBundle change = 6;      // versioned-opaque V3 change bytes
+  ViewSnapshot expected_snapshot = 7; // required; effective view incl. ancestors
+  optional ViewRef target = 8;
+  // Parse/hash/schema-check before queueing; in publication validate all
+  // dependencies, referenced nodes, paths and metadata against the granted
+  // effective filter. Refusal writes nothing. Reserved/traversal paths are
+  // refused on SUBMISSION as well as client-side materialization.
+  // .vault edits are allowed, but require vault.write in addition to
+  // sandbox.submit and update only this view's vault overlay atomically.
+}
+message SubmitChangeResponse {
+  oneof outcome {
+    ChangeSubmitted submitted = 1;
+    ChangeRefused refused = 2;   // stale-view carries a live skeleton
+  }
+  ResponseMeta meta = 100;
+}
+message ChangeSubmitted {
+  bool submitted = 1;
+  SandboxSkeleton skeleton = 2;
+}
+message ChangeRefused {
+  ErrorInfo rejection = 1;      // e.g. {code: VIEW_STALE, context:{...}}
+  optional SandboxSkeleton skeleton = 2;   // present on stale-view refusals
+}
+
+
+// ————— grants and sandbox tokens (sandbox-domain; formerly grant.proto) —————
+
+// atomic-protocol — grants and sandbox tokens.
+//
+// DRAFT — add-only.
+//
+// Model carried from the remote-sandbox extension: a grant is
+// view-scoped, optionally identity-bound, and time-boxed. A remote caller is
+// trusted ONLY as far as its token: exactly one view, optionally one acting
+// identity, until expiry.
+//
+// CONTRACT BEHAVIOR (recorded recommendation):
+// the grant registry is EPHEMERAL — only blake3 hashes of tokens are stored,
+// grant-admin issuance replay is memory-only and invalidated with its grant;
+// no durable response/outbox/event payload may contain the token,
+// the registry dies with the daemon process, and a restart invalidates all
+// sandbox tokens (fail-closed). Local admin reissues via OpenSandbox to recover;
+// this is documented contract behavior, not an outage.
+//
+// TTL bounds: 1s..31536000s (365d) with checked arithmetic — one absurd
+// --ttl (or an unrelated poisoned lock) must never take the registry down.
+// One live token per (repository, stable view ID): minting replaces. Default
+// TTL 7200s. Deleting a view revokes its grants; name reuse cannot revive them.
+
+
+
+
+// A live grant as tracked by the registry (informational; tokens themselves
+// are opaque bytes on the wire — the server stores only blake3(token)).
+message GrantInfo {
+  string view = 1;
+  optional string acting_as_did = 2;
+  google.protobuf.Timestamp expires_at = 3;
+  RepositoryRef repository = 4;
+  ViewRef target = 5;
+  repeated string capabilities = 6;
+}
+
+// Result of minting a sandbox token (OpenSandbox). `endpoint_addr` is the
+// iroh EndpointAddr of the serving daemon under the iroh transport kind;
+// under UDS/named-pipe/TLS it is the local endpoint identifier.
+message SandboxOpened {
+  string endpoint_addr = 1;
+  string view = 2;
+  bytes token = 3;
+  google.protobuf.Timestamp expires_at = 4;
+  RepositoryRef repository = 5;   // the grant's repository identity — the
+                                  // sandbox echoes it in every data request
+                                  // and the pointer file carries it (a
+                                   // sandbox has no local .atomic to read)
+  // workspace_id is absent: this ref grants no access to a host working tree.
+  ViewRef target = 6;
+  repeated string capabilities = 7;
+  ViewSnapshot snapshot = 8; // allows vault/API work before tree materialization
+}
