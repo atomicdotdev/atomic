@@ -8,8 +8,6 @@
 //! handlers: generation fencing, request-ID echo and caller-supplied `now`
 //! live in the store layer itself.
 
-use std::sync::Arc;
-
 use atomic_agent::{
     JournalAppendAck, JournalCheckpointAttempt, JournalCheckpointSource, JournalStopCause,
     JournalTurnLifecycle, JournalTurnReservation, JournalTurnStatus, ProvenanceJournalEnvelope,
@@ -21,21 +19,29 @@ use atomic_repository::redb_change_store::{
     FrozenProvenanceCursor, FrozenProvenancePage, ProvenanceCheckpointAttempt as StoreAttempt,
     ProvenanceCheckpointSource, ProvenanceId, StopCause, StopState, StoredProvenanceTurn,
 };
-use atomic_repository::Repository;
 
+/// The sink holds NO database handle: post-#230 the change store lives in
+/// the merged atomic.redb — the same file the orchestrator's repository
+/// opens — and redb refuses a second concurrent handle. Each journal
+/// operation opens the store, runs, and drops it (the sequential
+/// open/close discipline #230's orchestrator applies).
 pub struct DirectJournalSink {
-    store: Arc<atomic_repository::redb_change_store::RedbChangeStore>,
+    root: std::path::PathBuf,
 }
 
 impl DirectJournalSink {
     pub fn open(root: &std::path::Path) -> Result<Self, String> {
+        // Resolve (and merge, when a legacy layout is present) the merged
+        // database path — WITHOUT holding a handle.
+        let dot_dir = root.join(".atomic");
         let path =
-            Repository::canonical_change_store_path(root).map_err(|error| error.to_string())?;
-        let store = atomic_repository::redb_change_store::RedbChangeStore::open(&path)
-            .map_err(|error| format!("failed to open {}: {error}", path.display()))?;
-        Ok(Self {
-            store: Arc::new(store),
-        })
+            atomic_repository::ensure_database(&dot_dir).map_err(|error| error.to_string())?;
+        Ok(Self { root: path })
+    }
+
+    fn store(&self) -> Result<atomic_repository::redb_change_store::RedbChangeStore, String> {
+        atomic_repository::redb_change_store::RedbChangeStore::open_existing(&self.root)
+            .map_err(|error| format!("failed to open {}: {error}", self.root.display()))
     }
 }
 
@@ -137,7 +143,7 @@ impl ProvenanceJournalSink for DirectJournalSink {
         now: i64,
     ) -> Result<JournalTurnReservation, String> {
         let turn = self
-            .store
+            .store()?
             .reserve_provenance_turn(session_id, turn_number, now)
             .map_err(|error| error.to_string())?;
         Ok(JournalTurnReservation {
@@ -166,7 +172,7 @@ impl ProvenanceJournalSink for DirectJournalSink {
             .map(|(id, bytes)| (id.as_str(), bytes.as_slice()))
             .collect();
         let stored = self
-            .store
+            .store()?
             .append_provenance_envelopes(
                 ProvenanceId::new(reservation.provenance_id),
                 reservation.generation,
@@ -190,7 +196,7 @@ impl ProvenanceJournalSink for DirectJournalSink {
         now: i64,
     ) -> Result<JournalCheckpointAttempt, String> {
         let attempt = self
-            .store
+            .store()?
             .prepare_provenance_checkpoint(
                 ProvenanceId::new(reservation.provenance_id),
                 reservation.generation,
@@ -211,7 +217,7 @@ impl ProvenanceJournalSink for DirectJournalSink {
         // The daemon is in-process with the store: no frame budgets, no
         // paging — one direct read.
         let stored = self
-            .store
+            .store()?
             .load_frozen_provenance_envelopes(ProvenanceId::new(checkpoint.provenance_id))
             .map_err(|error| error.to_string())?;
         Ok(stored.into_iter().map(|entry| entry.envelope).collect())
@@ -225,7 +231,7 @@ impl ProvenanceJournalSink for DirectJournalSink {
         now: i64,
     ) -> Result<JournalCheckpointAttempt, String> {
         let attempt = self
-            .store
+            .store()?
             .bind_provenance_checkpoint_hash(
                 ProvenanceId::new(checkpoint.provenance_id),
                 checkpoint.attempt_generation,
@@ -246,7 +252,7 @@ impl ProvenanceJournalSink for DirectJournalSink {
         manifest_hash: Hash,
         completed_at: i64,
     ) -> Result<(), String> {
-        self.store
+        self.store()?
             .acknowledge_provenance_checkpoint(
                 ProvenanceId::new(checkpoint.provenance_id),
                 checkpoint.attempt_generation,
@@ -266,12 +272,12 @@ impl ProvenanceJournalSink for DirectJournalSink {
         observed_at: i64,
     ) -> Result<Option<JournalTurnStatus>, String> {
         let turn = self
-            .store
+            .store()?
             .get_provenance_turn_for(session_id, turn_number)
             .map_err(|error| error.to_string())?;
         let Some(turn) = turn else { return Ok(None) };
         let stopped = self
-            .store
+            .store()?
             .stop_provenance_turn(
                 turn.provenance_id,
                 turn.generation,
@@ -293,12 +299,12 @@ impl ProvenanceJournalSink for DirectJournalSink {
         now: i64,
     ) -> Result<Option<JournalTurnStatus>, String> {
         let turn = self
-            .store
+            .store()?
             .get_provenance_turn_for(session_id, turn_number)
             .map_err(|error| error.to_string())?;
         let Some(turn) = turn else { return Ok(None) };
         let resumed = self
-            .store
+            .store()?
             .resume_provenance_turn(turn.provenance_id, turn.generation, now)
             .map_err(|error| error.to_string())?;
         Ok(Some(to_journal_turn_status(resumed)))
@@ -311,12 +317,12 @@ impl ProvenanceJournalSink for DirectJournalSink {
         observed_at: i64,
     ) -> Result<Option<JournalTurnStatus>, String> {
         let turn = self
-            .store
+            .store()?
             .get_provenance_turn_for(session_id, turn_number)
             .map_err(|error| error.to_string())?;
         let Some(turn) = turn else { return Ok(None) };
         let abandoned = self
-            .store
+            .store()?
             .abandon_provenance_turn(
                 turn.provenance_id,
                 turn.generation,
@@ -337,7 +343,7 @@ impl ProvenanceJournalSink for DirectJournalSink {
         turn_number: u32,
     ) -> Result<Option<JournalTurnStatus>, String> {
         let turn = self
-            .store
+            .store()?
             .get_provenance_turn_for(session_id, turn_number)
             .map_err(|error| error.to_string())?;
         Ok(turn.map(to_journal_turn_status))

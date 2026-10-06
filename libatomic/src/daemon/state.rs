@@ -117,14 +117,17 @@ impl RepoHandle {
         })
     }
 
-    /// The redb-native change/provenance store (changes.redb) for this
-    /// request — opened by path WITHOUT opening the repository database.
-    /// The hosted turn orchestrator opens pristine itself; changes.redb is a
-    /// separate database file, so both can be open in-process together.
+    /// The redb-native change/provenance store (atomic.redb — the merged
+    /// database) for this request — opened by path WITHOUT opening the
+    /// repository handle. redb refuses a second concurrent handle on the
+    /// same file, so the journal-port handlers open, use, and drop this
+    /// sequentially under the gate (the same open/close-per-op discipline
+    /// #230's orchestrator applies).
     pub fn change_store(&self) -> Result<RedbChangeStore, Status> {
-        let path = Repository::canonical_change_store_path(&self.root)
+        let dot_dir = self.root.join(".atomic");
+        let path = atomic_repository::ensure_database(&dot_dir)
             .map_err(|error| domain_status(ErrorCode::Repository, error.to_string()))?;
-        RedbChangeStore::open(&path).map_err(|error| {
+        RedbChangeStore::open_existing(&path).map_err(|error| {
             domain_status(
                 ErrorCode::ProvenanceStore,
                 format!("failed to open {}: {error}", path.display()),

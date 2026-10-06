@@ -77,7 +77,7 @@ use crate::RepositoryError;
 
 // ── Sub-modules (new) ───────────────────────────────────────────────────
 
-mod database;
+pub mod database;
 mod deferred_tree;
 mod filter;
 mod materialize;
