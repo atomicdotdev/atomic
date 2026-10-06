@@ -108,12 +108,46 @@ message GetVaultContextRequest {
   RepositoryRef repository = 1;
   optional uint32 max_entries = 2;
   repeated VaultEntityKind kinds = 3;
+  // The retrieval seeds from `atomic vault context` (add-only): free-text
+  // query terms, an intent to seed from, and file paths whose neighbors are
+  // candidates. Absent seeds fall back to the most recently updated
+  // memories — the command's documented bare form.
+  repeated string query = 4;         // free-text seed terms
+  optional string intent = 5;       // --intent seed (id)
+  repeated string files = 6;        // --files seeds (working-copy paths)
+  optional uint32 budget_chars = 7; // total body budget across items
+  optional bool include_body = 8;  // false → candidate metadata only
   ViewRef view = 20;
 }
 message GetVaultContextResponse {
   repeated VaultEntry entries = 1;
+  // The ranked, budgeted memory context (add-only) — the gather+rank
+  // domain computation `atomic vault context` performs, served as one
+  // ranked list (schema: atomic.context.item.v1, mirroring the CLI's
+  // ranked MemoryItem).
+  repeated ContextItem context = 2;
   ViewSnapshot snapshot = 20;
   // SHAPE-CONFIRM: context-pack composition from vault/context.rs.
+}
+// One ranked memory returned by GetVaultContext — the fields of the CLI's
+// MemoryItem (atomic-cli/src/commands/vault/context.rs), add-only.
+message ContextItem {
+  string memory_id = 1;      // canonical urn:atomic:memory:… identity
+  string kg_node_id = 2;     // the KG's node identity
+  string revision_hash = 3;  // entry type + frontmatter + body revision
+  string content_hash = 4;   // body-only hash
+  string path = 5;           // vault-relative path (memory/<name>.md)
+  string name = 6;
+  string kind = 7;           // memoryKind (constraint/lesson/…)
+  string status = 8;
+  double score = 9;          // final ranking score
+  string why_matched = 10;   // the ranking signals that matched
+  optional string body = 11;     // present when include_body
+  optional string preview = 12;  // first line of the body (with body)
+  string updated_at = 13;
+  uint64 introduced_by = 14; // introducing change sequence (0 = unrecorded)
+  bool recorded = 15;       // introduced_by != 0
+  bool truncated = 16;      // body clipped to the budget
 }
 
 message ExportVaultRequest {
