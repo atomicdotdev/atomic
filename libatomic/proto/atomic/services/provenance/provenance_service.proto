@@ -160,6 +160,27 @@ rpc DispatchTurnEvent(DispatchTurnEventRequest) returns (DispatchTurnEventRespon
 
   // Recent session ledgers, newest activity first (`atomic session show` with
   // no id / the bare `session` listing). Add-only sibling of GetSession.
+  // `atomic agent explain` — the typed-turn reasoning surface: the handler
+  // loads the session's recorded turns, extracts the condensed transcripts
+  // (the change's unhashed section, with the session transcript file as
+  // fallback), generates the reasoning via the Claude CLI (external IO),
+  // anchors code learnings to the CRDT graph, and — with `save` — writes
+  // the reasoning back into the change's unhashed section and appends
+  // learnings to the agent context file. The session record resolves
+  // CLIENT-SIDE (the session store is a working-copy file read, not redb);
+  // its fields ride the request.
+  rpc ExplainTurns(ExplainTurnsRequest) returns (ExplainTurnsResponse) {
+    option (atomic.execution_scope) = EXECUTION_SCOPE_LOCAL;
+    option (atomic.required_capability) = "repository.read";
+    option (atomic.required_capability) = "repository.write";
+    option (atomic.required_capability) = "working-copy.write";
+    option (atomic.allowed_caller) = CALLER_CLASS_LOCAL;
+    option (atomic.effect) = RPC_EFFECT_REPOSITORY_READ;
+    option (atomic.effect) = RPC_EFFECT_REPOSITORY_WRITE;
+    option (atomic.effect) = RPC_EFFECT_WORKSPACE_WRITE;
+    option (atomic.effect) = RPC_EFFECT_EXTERNAL_IO; // the Claude CLI subprocess
+  }
+
   rpc ListSessions(ListSessionsRequest) returns (ListSessionsResponse) {
     option (atomic.execution_scope) = EXECUTION_SCOPE_BOTH;
     option (atomic.required_capability) = "provenance.read";

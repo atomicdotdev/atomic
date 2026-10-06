@@ -139,10 +139,24 @@ message CreateSandboxTreeRequest {
   RequestMeta meta = 2;
   string name = 3;
   optional string from_view = 4;
+  // `atomic sandbox create`'s remaining surface (add-only): the destination
+  // (defaulting server-side to `<repo-parent>/<repo-name>-sandboxes/<name>`)
+  // and the explicit --view (mutually exclusive with from_view, validated
+  // client-side by clap).
+  optional string dest = 5;
+  optional string view = 6;
 }
 message CreateSandboxTreeResponse {
   string sandbox_path = 1;   // local working-tree path (LOCAL scope)
   ResponseMeta meta = 100;
+  // The create report the local body prints (add-only): the resolved
+  // destination, the recorded view, whether a new draft was created, the
+  // cloned file count, and the canonical repo root (the Graph line).
+  string resolved_dest = 2;
+  string view = 3;
+  bool created_draft = 4;
+  uint32 files_cloned = 5;
+  string repo_root = 6;
 }
 
 message StageSandboxImageRequest {
@@ -150,20 +164,37 @@ message StageSandboxImageRequest {
   RequestMeta meta = 2;
   string name = 3;
   // SHAPE-CONFIRM (Slice 3): OCI staging options from commands/sandbox.rs.
+  // The CLI's full flag surface (add-only).
+  string base_view = 4;
+  string out_dir = 5;
 }
 message StageSandboxImageResponse {
   string staged_ref = 1;
   ResponseMeta meta = 100;
+  // The staged-image report the local body prints (add-only).
+  string image_dir = 2;
+  string manifest_digest = 3;
+  string base_diff_id = 4;
+  uint64 delta_files = 5;
 }
 
 message SealSandboxImageRequest {
   RepositoryRef repository = 1;
   RequestMeta meta = 2;
   string name = 3;
+  // The CLI's full flag surface (add-only): the output directory, the
+  // entrypoint argv, and the image env assignments.
+  string out_dir = 4;
+  repeated string entrypoint = 5;
+  repeated string env = 6;
 }
 message SealSandboxImageResponse {
   string sealed_ref = 1;
   ResponseMeta meta = 100;
+  // The sealed-image report the local body prints (add-only).
+  string image_dir = 2;
+  string manifest_digest = 3;
+  uint64 files = 4;
 }
 
 // ————— data ops —————

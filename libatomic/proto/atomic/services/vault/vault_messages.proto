@@ -64,7 +64,14 @@ message InitVaultRequest {
   ViewRef view = 20;
   ViewSnapshot expected_snapshot = 21;
 }
-message InitVaultResponse { ResponseMeta meta = 100; }
+message InitVaultResponse {
+  ResponseMeta meta = 100;
+  // The init report (add-only): whether the vault already existed, the
+  // initialized vault directory, and whether the defaults recorded.
+  bool already_initialized = 1;
+  optional string vault_dir = 2;
+  bool recorded = 3;
+}
 
 message SyncVaultRequest {
   RepositoryRef repository = 1;
@@ -121,6 +128,10 @@ message ListVaultEntriesRequest {
   // Raw status filter (add-only): the goal listing's free-form status
   // string ("active"/"completed"/"suspended"/"all"), applied verbatim.
   optional string status_filter = 10;
+  // `atomic vault summaries` (add-only): ToolResult entries under
+  // path_prefix, with each entry's id set to the filename stem and its
+  // body set to the first-200-char content preview.
+  bool tool_result_previews = 11;
   ViewRef view = 20;
 }
 message ListVaultEntriesResponse {
@@ -180,11 +191,17 @@ message ExportVaultRequest {
   RequestMeta meta = 2;
   repeated VaultEntityKind kinds = 3;
   optional string destination = 4;   // local path (LOCAL scope)
+  // `atomic vault materialize` (add-only): with a path, materialize only
+  // that entry; without, materialize every vault entry.
+  optional string path = 5;
   ViewRef view = 20;
 }
 message ExportVaultResponse {
   uint32 exported = 1;
   ResponseMeta meta = 100;
+  // The materialized path (add-only): the entry's vault-relative path in
+  // the single-entry form, so the client prints the local report.
+  optional string materialized_path = 2;
 }
 
 message CreateVaultEntityRequest {
@@ -200,6 +217,11 @@ message CreateVaultEntityRequest {
   repeated string derived_from = 7;
   // One-line summaries for goals (add-only).
   repeated string about = 8;
+  // `vault goal start` metadata (add-only, kind GOAL): the developer, the
+  // linked intent, and the AI model — GoalStartOptions' fields.
+  optional string developer = 9;
+  optional string intent = 10;
+  optional string model = 11;
   ViewRef view = 20;
   ViewSnapshot expected_snapshot = 21;
 }
@@ -221,9 +243,37 @@ message UpdateVaultEntityRequest {
     // ONE request — the handler applies them atomically through the same
     // domain update the CLI's multi-flag form performs.
     IntentUpdateFields fields = 8;
+    // The freeform memory write (add-only): `atomic memory write` — raw
+    // stdin content stored (create-or-replace) at the given vault path
+    // with simple frontmatter, then materialized to the working copy.
+    MemoryWriteAction memory_write = 9;
+    // The goal lifecycle (add-only): `vault goal stop` (promote/discard)
+    // and `vault goal resume` — the domain calls the local bodies make.
+    GoalStopAction goal_stop = 10;
+    GoalResumeAction goal_resume = 11;
   }
   optional ExpectedState expected = 7;
   ViewRef view = 20; // expected.kind must be view_snapshot matching this view
+}
+
+// The freeform memory write (add-only).
+message MemoryWriteAction {
+  string path = 1;                // the vault-relative path (`memory/<name>.md`)
+  bytes content = 2;              // the raw stdin content
+  string frontmatter_json = 3;    // the simple {name, type} frontmatter
+}
+
+// `vault goal stop` (add-only): the goal to stop (empty = the most recent
+// active goal) + the promote/discard options.
+message GoalStopAction {
+  optional string goal = 1;
+  bool promote = 2;
+  bool discard = 3;
+}
+
+// `vault goal resume` (add-only).
+message GoalResumeAction {
+  string goal = 1;
 }
 // One composed intent update (`intent update`'s multi-flag form, add-only).
 // Status stays the raw lifecycle string the domain update consumes
@@ -240,6 +290,14 @@ message IntentUpdateFields {
 }
 message UpdateVaultEntityResponse {
   VaultEntry entry = 1;
+  // The memory-write report (add-only): the stored path + content hash, so
+  // the client prints the local write report.
+  optional string write_path = 2;
+  optional Hash write_hash = 3;
+  // The goal-stop report (add-only): the stopped goal's outcome status and
+  // the removed file count.
+  optional string stop_status = 4;
+  optional uint32 paths_removed = 5;
   ResponseMeta meta = 100;
 }
 
@@ -251,7 +309,13 @@ message DeleteVaultEntityRequest {
   ViewRef view = 20;
   ViewSnapshot expected_snapshot = 21;
 }
-message DeleteVaultEntityResponse { ResponseMeta meta = 100; }
+message DeleteVaultEntityResponse {
+  // The delete report (add-only): the normalized id + the removed file's
+  // vault path, so the client prints the local delete report.
+  string id = 1;
+  string vault_path = 2;
+  ResponseMeta meta = 100;
+}
 
 message ValidateVaultEntityRequest {
   RepositoryRef repository = 1;
@@ -318,6 +382,11 @@ message VaultEntry {
   // the raw status label as stored (the frontmatter's own string).
   optional string assignee = 22;
   optional string status_label = 23;
+  // Goal report columns (add-only): `vault goal start`'s created goal
+  // directory + file, and the goal's developer.
+  optional string developer = 24;
+  optional string goal_dir = 25;
+  optional string goal_file = 26;
   // SHAPE-CONFIRM: attestation/verification state surfacing (attestations
   // live in AttestationService; entries reference their latest attestation).
 }

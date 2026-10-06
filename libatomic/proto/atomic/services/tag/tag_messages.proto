@@ -11,6 +11,7 @@ package atomic;
 
 import "google/protobuf/timestamp.proto";
 import "atomic/common/common.proto";
+import "atomic/common/change.proto";
 
 
 
@@ -19,12 +20,20 @@ message CreateTagRequest {
   RequestMeta meta = 2;
   string name = 3;
   optional Hash state = 4;         // merkle state to snapshot (default:
-                                     // explicitly named view's own Merkle)
+                                      // explicitly named view's own Merkle)
   optional string message = 5;
   ViewRef view = 6;
   ViewSnapshot expected_snapshot = 7;
+  // Overwrite an existing tag of this name after deleting it first —
+  // `atomic tag create --force` (add-only; the local body's exact flow).
+  bool force = 8;
 }
-message CreateTagResponse { ResponseMeta meta = 100; }
+message CreateTagResponse {
+  // The created tag (add-only) — the client renders the local create
+  // report ("Created [annotated] tag: …") from the wire-carried record.
+  TagInfo tag = 1;
+  ResponseMeta meta = 100;
+}
 
 message DeleteTagRequest {
   RepositoryRef repository = 1;
@@ -32,10 +41,22 @@ message DeleteTagRequest {
   string name = 3;
   Hash expected_state = 4; // required; refuse replacing/deleting a raced tag
 }
-message DeleteTagResponse { ResponseMeta meta = 100; }
+message DeleteTagResponse {
+  // Whether the named tag existed and was deleted (add-only) — the client
+  // renders the local delete report ("Deleted tag" / the not-exist hint).
+  bool deleted = 1;
+  ResponseMeta meta = 100;
+}
 
 message ListTagsRequest {
   RepositoryRef repository = 1;
+  // The local listing's filters (add-only), applied with the same
+  // semantics the local body applies over the domain listing: a view
+  // filter switches to the view's tag list, the pattern filter is the
+  // star-stripped substring match, and annotated-only keeps annotated tags.
+  optional string view = 2;
+  optional string pattern = 3;
+  bool annotated_only = 4;
 }
 message ListTagsResponse {
   repeated TagInfo tags = 1;
@@ -47,6 +68,10 @@ message GetTagRequest {
 }
 message GetTagResponse {
   TagInfo tag = 1;
+  // Per-record presence + view membership for ReviewGate metadata
+  // (add-only): the handler computes each record hash's presence and the
+  // views carrying it with the same domain reads the local render performs.
+  repeated TagRecordPresence records = 2;
 }
 
 message TagInfo {
@@ -54,4 +79,21 @@ message TagInfo {
   Hash state = 2;
   optional string message = 3;
   optional google.protobuf.Timestamp created_at = 4;
+  // The full domain tag record (add-only) — the fields the local list/show
+  // renders: the owning view, the log sequence, the tag kind label, the
+  // annotation author, and the extensible metadata JSON text.
+  string view = 5;
+  uint64 sequence = 6;
+  string kind = 7;
+  optional Author author = 8;
+  optional string metadata = 9;
+}
+
+// One ReviewGate metadata record's resolved presence (add-only).
+message TagRecordPresence {
+  string hash = 1;             // the record's base32 change hash
+  bool present = 2;            // the change exists in the store
+  repeated string views = 3;   // the views carrying the change
+  bool parseable = 4;          // the raw text parsed as a base32 hash (the
+                                // local render prints unparseable text raw)
 }

@@ -22,6 +22,13 @@ message ListTriageCandidatesRequest {
 }
 message ListTriageCandidatesResponse {
   repeated TriageCandidate candidates = 1;
+  // The CLI's candidate-set domain serialization (add-only; schema
+  // "atomic.triage.candidates.v1" = the repository's CandidateSet JSON)
+  // so the client renders the exact `--json` document the local body
+  // emits, and the resolved (feature, target) pair for the header lines.
+  optional VersionedBytes candidate_set = 2;
+  string feature = 3;
+  string target = 4;
 }
 message TriageCandidate {
   Hash change = 1;
@@ -34,6 +41,10 @@ message GenerateTriageReviewRequest {
   RepositoryRef repository = 1;
   string from_view = 2;
   string to_view = 3;
+  // The full canonical report (add-only; schema "atomic.triage.report.v1")
+  // — the walkthrough/dashboard/JSON renders run client-side over the
+  // wire-carried domain report.
+  optional VersionedBytes report = 4;
 }
 message GenerateTriageReviewResponse {
   repeated TriageLayer layers = 1;    // ordered semantic walkthrough layers

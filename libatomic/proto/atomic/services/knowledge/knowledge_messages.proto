@@ -65,6 +65,16 @@ message CallersQuery {
 message GraphSliceQuery {
   repeated string node_ids = 1;
   optional int32 max_depth = 2;
+  // The search-seeded graph build (add-only): `query graph`'s full knob
+  // surface — the seed query, the seed limit, the neighbor depth, the
+  // comma-separated kinds filter, the per-seed change cap, and the node
+  // ceiling (0 = the format default: 200 DOT / 5000 HTML).
+  optional string query = 3;
+  optional uint32 seed_limit = 4;
+  optional uint32 depth = 5;
+  optional string kinds = 6;
+  optional uint32 changes_per_seed = 7;
+  optional uint32 max_nodes = 8;
 }
 message PlanExecutionQuery {
   bytes plan_json = 1;         // structured multi-step plan (parse_plan shape)
@@ -72,6 +82,11 @@ message PlanExecutionQuery {
 message RagAskQuery {
   string question = 1;
   uint32 top_k = 2;
+  // The agentic loop knobs (add-only): the turn budget and the verbose
+  // tool-call trace (rendered client-side after the fact over the wire —
+  // the unary RPC cannot stream them live).
+  optional uint32 max_turns = 3;
+  optional bool verbose = 4;
 }
 
 message QueryGraphResponse {
@@ -81,6 +96,16 @@ message QueryGraphResponse {
   optional string answer = 4;        // rag_ask
   optional bytes plan_result = 5;    // plan step outputs (JSON)
   ViewSnapshot snapshot = 6;
+  // The pre-cap node count (add-only): the `query graph` cap note's "N
+  // nodes collected" figure.
+  optional uint32 graph_collected = 7;
+  // Whether the neighbors subgraph holds ANY calls edge (add-only): the
+  // `query callers` hint's entry-point distinction.
+  bool calls_present = 8;
+  // The full agentic ask result (add-only; schema "atomic.query.ask.v1" =
+  // the domain AgentResult JSON) plus its elapsed time.
+  optional VersionedBytes ask_result = 9;
+  optional uint64 ask_elapsed_ms = 10;
 }
 
 message KGNode {
@@ -125,4 +150,9 @@ message MaintainKnowledgeGraphRequest {
 message MaintainKnowledgeGraphResponse {
   uint64 processed = 1;
   ResponseMeta meta = 100;
+  // The embed report (add-only): the resolved provider + dimensions and,
+  // in the targeted form, the path (processed == 0 = content unchanged).
+  optional string provider = 2;
+  optional uint32 dimensions = 3;
+  optional string path = 4;
 }

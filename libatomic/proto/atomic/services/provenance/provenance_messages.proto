@@ -307,17 +307,32 @@ message ForkSessionRequest {
   RequestMeta meta = 2;
   string session_id = 3;
   string forked_session_id = 4;
+  // The turn boundary (add-only): inherits turns 0..=N — the local
+  // `session fork --at-turn` semantics.
+  optional uint32 at_turn = 5;
 }
 message ForkSessionResponse {
   string session_id = 1;
   ResponseMeta meta = 100;
+  // The fork report (add-only): both manifest hashes, so the client
+  // prints the local fork report.
+  optional Hash parent_manifest = 2;
+  optional Hash child_manifest = 3;
+  optional uint32 fork_turn = 4;
 }
 
 message RebuildSessionIndexRequest {
   RepositoryRef repository = 1;
   RequestMeta meta = 2;
 }
-message RebuildSessionIndexResponse { ResponseMeta meta = 100; }
+message RebuildSessionIndexResponse {
+  ResponseMeta meta = 100;
+  // The rebuild report (add-only): the indexed/present/corrupt counts the
+  // local body prints.
+  uint64 indexed = 1;
+  uint64 already_present = 2;
+  uint64 corrupt = 3;
+}
 
 // ————— provenance projection —————
 
@@ -335,10 +350,40 @@ message ExportProvenanceRequest {
   reserved 2, 4; // mutation header and daemon-held signer selection removed
   Hash change = 3;
   ViewRef view = 5;
+  // The person DID that signs/anchors the projection (add-only): resolved
+  // CLIENT-SIDE from the identity store (a config file read, not redb) and
+  // carried on the wire — the handler never reads the caller's identities.
+  optional string person_did = 6;
+  // The raw `provenance trace/show` target (add-only): a bare base32 hash,
+  // a hash prefix, or `urn:atomic:change:<base32>`. When set, the handler
+  // resolves it with the local resolver's exact semantics (prefix match
+  // against the whole change store, URN strip, ambiguity refusal) and
+  // ignores `change`.
+  optional string target = 7;
 }
 message ExportProvenanceResponse {
   bytes prov_jsonld = 1;           // W3C PROV projection
   reserved 2; // caller signs; no daemon private-key operation under a read cap
+  // The trace inputs (add-only): the resolved change hash plus one bundle per
+  // explaining graph (most-recent first) — the domain ProvenanceGraph JSON,
+  // the mapped ProvActivityInput JSON (schema "atomic.prov.input.v1"), the
+  // graph's own hash, and the pre-walked prior-turn activity URNs the
+  // human chain renders.
+  optional Hash resolved_change = 3;
+  repeated ProvenanceTraceBundle graphs = 4;
+}
+
+// One explaining provenance graph, wire-carried for the client renders
+// (add-only; schema "atomic.prov.graph.v1" = the domain ProvenanceGraph
+// JSON, schema "atomic.prov.input.v1" = the ProvActivityInput JSON).
+message ProvenanceTraceBundle {
+  optional Hash graph_hash = 1;         // the stored graph's content hash
+  VersionedBytes graph = 2;             // atomic.prov.graph.v1
+  VersionedBytes input = 3;            // atomic.prov.input.v1
+  repeated string prior_activities = 4; // activity URNs of the `previous`
+                                         // chain, oldest first; empty entry
+                                         // = "(graph unavailable)"
+  bool chain_truncated = 5;            // the 64-hop walk cap was hit
 }
 
 // — typed turn dispatch (transition seam; see provenance_service.proto) —
@@ -368,6 +413,47 @@ message DispatchTurnEventResponse {
   repeated string files = 5;
   repeated string warnings = 6;
   ResponseMeta meta = 100;
+}
+
+// — typed agent-turn reasoning (`atomic agent explain`; add-only) —
+
+message ExplainTurnsRequest {
+  RepositoryRef repository = 1;
+  RequestMeta meta = 2;
+  string session_id = 3;
+  optional uint32 turn = 4;      // 1-indexed; absent = most recent
+  bool all = 5;                  // every turn in the session
+  bool save = 6;                 // write the reasoning into the change
+  string model = 7;              // the Claude CLI model
+  // The session record's client-resolved fields (the session store is a
+  // working-copy file read, not redb — resolved client-side, add-only).
+  string view_name = 8;
+  optional string transcript_path = 9;
+  repeated string files_touched = 10;
+  string agent_name = 11;
+}
+message ExplainTurnsResponse {
+  repeated ExplainTurnResult turns = 1;
+  // The session has no recorded turns on its view (the early-out line).
+  bool session_has_no_turns = 2;
+  ResponseMeta meta = 100;
+}
+message ExplainTurnResult {
+  uint32 turn_number = 1;        // 1-indexed
+  string message = 2;            // the change's header message
+  bool no_transcript = 3;        // the skip branch
+  // The generated reasoning (schema "atomic.agent.reasoning.v1" — the
+  // domain TurnReasoning JSON).
+  optional VersionedBytes reasoning = 4;
+  optional string generation_error = 5;
+  uint32 anchored = 6;           // graph-anchored code learnings count
+  bool saved = 7;                // the reasoning landed in the change
+  optional string save_error = 8;
+  // The learnings context-file save outcome (its Display text).
+  optional string context_saved = 9;
+  optional string context_save_error = 10;
+  // The explained change's hash (the save line's 12-char reference).
+  optional Hash change = 11;
 }
 
 // — recent session ledgers (the `session show` no-arg listing) —

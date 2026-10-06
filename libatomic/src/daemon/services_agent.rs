@@ -206,7 +206,7 @@ mod context_ranking {
     }
 
     /// Read a vault path from KG node metadata; the legacy fallback maps the
-    /// node identity onto `memory/<name>.md`.
+    /// node identity onto ``memory/<name>.md``.
     fn memory_path_from_node(node: &KgNode) -> Option<String> {
         node.metadata
             .as_ref()
@@ -1062,6 +1062,27 @@ fn memory_list_attestation(
     LoadedAttestation::None
 }
 
+/// The local vault-init body's recursive tracker: add every file under
+/// the vault directory (relative to the repository root).
+fn add_vault_files_recursive(
+    repo: &atomic_repository::Repository,
+    dir: &std::path::Path,
+) -> Result<(), Status> {
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                add_vault_files_recursive(repo, &path)?;
+            } else if path.is_file() {
+                if let Ok(relative) = path.strip_prefix(repo.root()) {
+                    let _ = repo.add(relative, atomic_repository::TrackingOptions::default());
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn response_meta(meta: &Option<RequestMeta>) -> Option<ResponseMeta> {
     meta.as_ref().map(|meta| ResponseMeta {
         request_id: meta.request_id.clone(),
@@ -1138,6 +1159,51 @@ impl vault_service_server::VaultService for VaultImpl {
                         ..Default::default()
                     }),
                     meta: response_meta(&meta),
+                }
+            }
+            Kind::Goal => {
+                // `vault goal start` — GoalStartOptions' fields ride the
+                // request (add-only); the created goal's dir/file and the
+                // listing columns ride the response entry.
+                let handle_for_task = handle.clone();
+                let title = request.title.clone();
+                let developer = request.developer.clone();
+                let intent = request.intent.clone();
+                let model = request.model.clone();
+                let meta_for_task = meta.clone();
+                let result = tokio::task::spawn_blocking({
+                    let handle = handle_for_task;
+                    move || {
+                        let repo = handle.repository()?;
+                        repo.vault_goal_start(atomic_repository::GoalStartOptions {
+                            name: (!title.is_empty()).then_some(title.clone()),
+                            developer,
+                            intent,
+                            model,
+                        })
+                        .map_err(repository_error)
+                    }
+                })
+                .await
+                .map_err(|e| Status::internal(e.to_string()))??;
+                CreateVaultEntityResponse {
+                    entry: Some(VaultEntry {
+                        kind: Kind::Goal as i32,
+                        id: result.name.clone(),
+                        title: String::new(),
+                        status: None,
+                        body: None,
+                        created_at: None,
+                        updated_at: None,
+                        linked: request.intent.clone().into_iter().collect(),
+                        vault_path: None,
+                        priority: None,
+                        developer: request.developer.clone(),
+                        goal_dir: Some(result.goal_dir.clone()),
+                        goal_file: Some(result.goal_file.clone()),
+                        ..Default::default()
+                    }),
+                    meta: response_meta(&meta_for_task),
                 }
             }
             Kind::Memory => {
@@ -1284,6 +1350,12 @@ impl vault_service_server::VaultService for VaultImpl {
                         options.content = fields.body;
                         options.force = fields.force;
                     }
+                    _ => {
+                        return Err(domain_status(
+                            ErrorCode::InvalidArgument,
+                            "update kind is not part of the intent lifecycle",
+                        ));
+                    }
                 }
                 let info = repo
                     .vault_intent_update(&id, options)
@@ -1304,6 +1376,10 @@ impl vault_service_server::VaultService for VaultImpl {
                         status_label: Some(info.status.clone()),
                         ..Default::default()
                     }),
+                    write_path: None,
+                    write_hash: None,
+                    stop_status: None,
+                    paths_removed: None,
                     meta: response_meta(&meta),
                 })
             }
@@ -1342,12 +1418,129 @@ impl vault_service_server::VaultService for VaultImpl {
                             priority: None,
                             ..Default::default()
                         }),
+                        write_path: None,
+                        write_hash: None,
+                        stop_status: None,
+                        paths_removed: None,
                         meta: response_meta(&meta),
                     })
                 }
-                UpdateKind::Status(_) | UpdateKind::Fields(_) => Err(domain_status(
+                UpdateKind::MemoryWrite(memory_write) => {
+                    // `atomic memory write` — the raw store + materialize
+                    // (create-or-replace at the named vault path), with the
+                    // content hash riding the response.
+                    let repo = handle.repository()?;
+                    let hash = repo
+                        .vault_store(
+                            &memory_write.path,
+                            VaultEntryType::Memory,
+                            memory_write.content.clone(),
+                            memory_write.frontmatter_json.clone(),
+                        )
+                        .map_err(repository_error)?;
+                    repo.vault_materialize(&memory_write.path)
+                        .map_err(repository_error)?;
+                    Ok(UpdateVaultEntityResponse {
+                        entry: None,
+                        write_path: Some(memory_write.path.clone()),
+                        write_hash: Some(super::convert::hash_proto(&hash)),
+                        stop_status: None,
+                        paths_removed: None,
+                        meta: response_meta(&meta),
+                    })
+                }
+                UpdateKind::Status(_)
+                | UpdateKind::Fields(_)
+                | UpdateKind::GoalStop(_)
+                | UpdateKind::GoalResume(_) => Err(domain_status(
                     ErrorCode::InvalidArgument,
                     "memory status transitions are new revisions, not updates",
+                )),
+            },
+            Kind::Goal => match update {
+                // `vault goal stop` — the goal to stop (empty = the most
+                // recent active goal) + the promote/discard options.
+                UpdateKind::GoalStop(goal_stop) => {
+                    let repo = handle.repository()?;
+                    let goal_name = match &goal_stop.goal {
+                        Some(name) => name.clone(),
+                        None => repo
+                            .vault_goal_list(Some("active"))
+                            .map_err(repository_error)?
+                            .first()
+                            .map(|summary| summary.name.clone())
+                            .ok_or_else(|| {
+                                domain_status(
+                                    ErrorCode::InvalidArgument,
+                                    "No active goal found. Specify a goal name.",
+                                )
+                            })?,
+                    };
+                    let result = repo
+                        .vault_goal_stop(
+                            &goal_name,
+                            atomic_repository::GoalStopOptions {
+                                promote: goal_stop.promote,
+                                discard: goal_stop.discard,
+                            },
+                        )
+                        .map_err(repository_error)?;
+                    Ok(UpdateVaultEntityResponse {
+                        entry: Some(VaultEntry {
+                            kind: Kind::Goal as i32,
+                            id: result.name.clone(),
+                            title: String::new(),
+                            status: None,
+                            body: None,
+                            created_at: None,
+                            updated_at: None,
+                            linked: Vec::new(),
+                            vault_path: None,
+                            priority: None,
+                            status_label: Some(result.status.clone()),
+                            ..Default::default()
+                        }),
+                        write_path: None,
+                        write_hash: None,
+                        stop_status: Some(result.status.clone()),
+                        paths_removed: Some(result.paths_removed as u32),
+                        meta: response_meta(&meta),
+                    })
+                }
+                // `vault goal resume`.
+                UpdateKind::GoalResume(goal_resume) => {
+                    let repo = handle.repository()?;
+                    let info = repo
+                        .vault_goal_resume(&goal_resume.goal)
+                        .map_err(repository_error)?;
+                    Ok(UpdateVaultEntityResponse {
+                        entry: Some(VaultEntry {
+                            kind: Kind::Goal as i32,
+                            id: info.name.clone(),
+                            title: info.developer.clone(),
+                            status: None,
+                            body: None,
+                            created_at: None,
+                            updated_at: None,
+                            linked: info.intent.clone().into_iter().collect(),
+                            vault_path: None,
+                            priority: None,
+                            developer: Some(info.developer.clone()),
+                            status_label: Some(info.status.clone()),
+                            started_at: Some(info.started_at.clone()),
+                            turns: Some(info.turns),
+                            ..Default::default()
+                        }),
+                        write_path: None,
+                        write_hash: None,
+                        stop_status: None,
+                        paths_removed: None,
+                        meta: response_meta(&meta),
+                    })
+                }
+                _ => Err(domain_status(
+                    ErrorCode::InvalidArgument,
+                    "update kind is not part of the goal lifecycle",
                 )),
             },
             other => Err(domain_status(
@@ -1486,6 +1679,34 @@ impl vault_service_server::VaultService for VaultImpl {
                         entry_bundle: bundle,
                     })
                 }
+                Kind::Goal => {
+                    // `atomic vault goal show <goal>` — the stored goal.md
+                    // entry (content + frontmatter ride the bundle).
+                    let repo = handle.repository_readonly()?;
+                    let entry = repo.vault_goal_show(&id).map_err(repository_error)?;
+                    let bundle = include_bundle
+                        .then(|| vault_entry_bundle(&repo, Some(Kind::Goal), &id, &entry))
+                        .transpose()?;
+                    Ok(GetVaultEntryResponse {
+                        entry: Some(VaultEntry {
+                            kind: Kind::Goal as i32,
+                            id: id.clone(),
+                            title: String::new(),
+                            status: None,
+                            body: Some(body_of(&entry)),
+                            created_at: None,
+                            updated_at: None,
+                            linked: Vec::new(),
+                            vault_path: None,
+                            priority: None,
+                            entry_type: Some(entry.entry_type.to_string()),
+                            updated_at_label: Some(entry.updated_at.clone()),
+                            ..Default::default()
+                        }),
+                        snapshot: None,
+                        entry_bundle: bundle,
+                    })
+                }
                 other => Err(domain_status(
                     ErrorCode::InvalidArgument,
                     format!("vault entity kind {other:?} lands with its slice (unimplemented)"),
@@ -1513,281 +1734,330 @@ impl vault_service_server::VaultService for VaultImpl {
         let path_prefix = request.path_prefix.clone().unwrap_or_default();
         let entry_type = request.entry_type.clone();
         let status_filter = request.status_filter.clone();
+        let tool_result_previews = request.tool_result_previews;
         let limit = request
             .budget
             .and_then(|budget| budget.max_items)
             .map(|max| max as usize);
-        let response = tokio::task::spawn_blocking(move || match kind {
-            Some(Kind::Intent) => {
-                // A query: read-only open with the read-concurrency wait.
+        let response = tokio::task::spawn_blocking(move || {
+            if tool_result_previews {
+                // `atomic vault summaries` — the ToolResult entries under the
+                // prefix, each with its filename-stem id and a 200-char content
+                // preview (the local body's exact enumeration + preview).
                 let repo = handle.repository_readonly()?;
-                // The verifying identity resolved ONCE (soft-fail to "no
-                // identity"; a named-but-missing identity is a hard error).
-                let verifier = resolve_listing_verifier(&identity)?;
-                let manifest = repo.vault_manifest().map_err(repository_error)?;
-                let infos = repo.vault_intent_list(None).map_err(repository_error)?;
-                let entries = infos
-                    .into_iter()
-                    .map(|info| {
-                        // The manifest kind tag (a manifest read, never a
-                        // lift); a row missing from the manifest degrades
-                        // to the default "feature".
-                        let manifest_kind = manifest
-                            .intents
-                            .get(&info.id)
-                            .map(|summary| summary.kind.clone())
-                            .unwrap_or_else(|| "feature".to_string());
-                        // The attestation columns: a read/attestation
-                        // failure for a SINGLE intent degrades that row's
-                        // cells ("none"/"na"), never the whole list.
-                        let (attested, verifies) = (|| {
-                            let entry = repo.vault_intent_show(&info.id).ok()?;
-                            let frontmatter = parse_frontmatter(&entry).ok()?;
-                            let body = body_of(&entry);
-                            match intent_list_attestation(&repo, &info.id, &frontmatter, &body) {
-                                LoadedAttestation::Fresh(node) => Some((
-                                    "fresh",
-                                    verifies_token(
-                                        Some(&node),
-                                        node.attributed_to.as_deref(),
-                                        verifier.as_ref(),
-                                        |node, public_key| verify(node, public_key).is_ok(),
-                                    ),
-                                )),
-                                LoadedAttestation::Stale(_) => Some(("stale", "na")),
-                                LoadedAttestation::None => Some(("none", "na")),
-                            }
-                        })()
-                        .unwrap_or(("none", "na"));
-                        VaultEntry {
-                            kind: Kind::Intent as i32,
-                            id: info.id.clone(),
-                            title: info.title.clone(),
-                            status: intent_status_to_proto(&info.status).map(|s| s as i32),
-                            body: None, // listings are summaries; bodies stay unloaded
+                let entries = repo
+                    .vault_list(&path_prefix, Some(VaultEntryType::ToolResult))
+                    .map_err(repository_error)?;
+                let mut rows = Vec::with_capacity(entries.len());
+                for meta in &entries {
+                    let filename = meta.path.rsplit('/').next().unwrap_or(&meta.path);
+                    let id = filename.strip_suffix(".md").unwrap_or(filename);
+                    if let Ok(Some(entry)) = repo.vault_retrieve(&meta.path) {
+                        let content = String::from_utf8_lossy(&entry.content_bytes);
+                        let preview: String = content.chars().take(200).collect();
+                        rows.push(VaultEntry {
+                            kind: Kind::Unspecified as i32,
+                            id: id.to_string(),
+                            title: String::new(),
+                            status: None,
+                            body: Some(preview),
                             created_at: None,
                             updated_at: None,
                             linked: Vec::new(),
-                            vault_path: None,
-                            priority: Some(info.priority.clone()),
-                            status_label: Some(info.status.clone()),
-                            manifest_kind: Some(manifest_kind),
-                            attested: Some(attested.to_string()),
-                            verifies: Some(verifies.to_string()),
+                            vault_path: Some(meta.path.clone()),
+                            priority: None,
+                            entry_type: Some("tool_result".to_string()),
                             ..Default::default()
-                        }
-                    })
-                    .collect();
-                Ok::<_, Status>(ListVaultEntriesResponse {
-                    entries,
+                        });
+                    }
+                }
+                return Ok::<_, Status>(ListVaultEntriesResponse {
+                    entries: rows,
                     next_cursor: None,
                     snapshot: None,
-                })
+                });
             }
-            Some(Kind::Memory) => {
-                // A query: read-only open with the read-concurrency wait.
-                let repo = handle.repository_readonly()?;
-                // The verifying identity resolved ONCE — the `verifies`
-                // column's resolver (the same soft/hard-fail rule).
-                let verifier = resolve_listing_verifier(&identity)?;
-                // The SAME enumeration the local body performs: the
-                // `memory/` prefix, never attestation entries, never the
-                // `MEMORY.md` index scaffold, most-recent first with the
-                // id as the stable tiebreaker, truncated to the budget.
-                let metas = repo.vault_list("memory/", None).map_err(repository_error)?;
-                let mut items: Vec<(String, String)> = metas
-                    .iter()
-                    .filter(|meta| !meta.path.starts_with("attestations/"))
-                    .filter(|meta| !memory_is_index_scaffold(&repo, &meta.path))
-                    .map(|meta| {
-                        let id = meta
-                            .path
-                            .trim_end_matches(".md")
-                            .trim_start_matches("memory/")
-                            .to_string();
-                        (id, meta.updated_at.clone())
-                    })
-                    .collect();
-                items.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-                if let Some(limit) = limit {
-                    items.truncate(limit);
-                }
-                let entries = items
-                    .iter()
-                    .map(|(id, _)| {
-                        // kind/status/about degrade to "–"/0 when a single
-                        // memory cannot be read or lifted — never the list.
-                        let degraded = (
-                            "\u{2013}".to_string(),
-                            "\u{2013}".to_string(),
-                            0u32,
-                            "none",
-                            "na",
-                        );
-                        let (memory_kind, memory_status, about, attested, verifies) = (|| {
-                            let path = format!("memory/{id}.md");
-                            let entry = repo.vault_retrieve(&path).ok()??;
-                            let frontmatter = parse_frontmatter(&entry).ok()?;
-                            let body = body_of(&entry);
-                            match memory_list_attestation(&repo, id, &frontmatter, &body) {
-                                LoadedAttestation::Fresh(node) => {
-                                    // The fresh node drives the display
-                                    // columns; the DID-match-then-verify
-                                    // rule drives `verifies`.
-                                    let verifies = verifies_token(
-                                        Some(&node),
-                                        node.attributed_to.as_deref(),
-                                        verifier.as_ref(),
-                                        |node, public_key| verify_memory(node, public_key).is_ok(),
-                                    );
-                                    Some((
-                                        node.memory_kind.clone(),
-                                        node.status.clone(),
-                                        node.about.len() as u32,
+            match kind {
+                Some(Kind::Intent) => {
+                    // A query: read-only open with the read-concurrency wait.
+                    let repo = handle.repository_readonly()?;
+                    // The verifying identity resolved ONCE (soft-fail to "no
+                    // identity"; a named-but-missing identity is a hard error).
+                    let verifier = resolve_listing_verifier(&identity)?;
+                    let manifest = repo.vault_manifest().map_err(repository_error)?;
+                    let infos = repo.vault_intent_list(None).map_err(repository_error)?;
+                    let entries = infos
+                        .into_iter()
+                        .map(|info| {
+                            // The manifest kind tag (a manifest read, never a
+                            // lift); a row missing from the manifest degrades
+                            // to the default "feature".
+                            let manifest_kind = manifest
+                                .intents
+                                .get(&info.id)
+                                .map(|summary| summary.kind.clone())
+                                .unwrap_or_else(|| "feature".to_string());
+                            // The attestation columns: a read/attestation
+                            // failure for a SINGLE intent degrades that row's
+                            // cells ("none"/"na"), never the whole list.
+                            let (attested, verifies) = (|| {
+                                let entry = repo.vault_intent_show(&info.id).ok()?;
+                                let frontmatter = parse_frontmatter(&entry).ok()?;
+                                let body = body_of(&entry);
+                                match intent_list_attestation(&repo, &info.id, &frontmatter, &body)
+                                {
+                                    LoadedAttestation::Fresh(node) => Some((
                                         "fresh",
-                                        verifies,
-                                    ))
+                                        verifies_token(
+                                            Some(&node),
+                                            node.attributed_to.as_deref(),
+                                            verifier.as_ref(),
+                                            |node, public_key| verify(node, public_key).is_ok(),
+                                        ),
+                                    )),
+                                    LoadedAttestation::Stale(_) => Some(("stale", "na")),
+                                    LoadedAttestation::None => Some(("none", "na")),
                                 }
-                                other => {
-                                    // Stale/None: the columns come from the
-                                    // CURRENT source (the lift); the drift
-                                    // is still surfaced by the attested
-                                    // column.
-                                    let token = match other {
-                                        LoadedAttestation::Stale(_) => "stale",
-                                        _ => "none",
-                                    };
-                                    match lift_memory(&frontmatter, &body) {
-                                        Ok(node) => Some((
-                                            node.memory_kind,
-                                            node.status,
+                            })()
+                            .unwrap_or(("none", "na"));
+                            VaultEntry {
+                                kind: Kind::Intent as i32,
+                                id: info.id.clone(),
+                                title: info.title.clone(),
+                                status: intent_status_to_proto(&info.status).map(|s| s as i32),
+                                body: None, // listings are summaries; bodies stay unloaded
+                                created_at: None,
+                                updated_at: None,
+                                linked: Vec::new(),
+                                vault_path: None,
+                                priority: Some(info.priority.clone()),
+                                status_label: Some(info.status.clone()),
+                                manifest_kind: Some(manifest_kind),
+                                attested: Some(attested.to_string()),
+                                verifies: Some(verifies.to_string()),
+                                ..Default::default()
+                            }
+                        })
+                        .collect();
+                    Ok::<_, Status>(ListVaultEntriesResponse {
+                        entries,
+                        next_cursor: None,
+                        snapshot: None,
+                    })
+                }
+                Some(Kind::Memory) => {
+                    // A query: read-only open with the read-concurrency wait.
+                    let repo = handle.repository_readonly()?;
+                    // The verifying identity resolved ONCE — the `verifies`
+                    // column's resolver (the same soft/hard-fail rule).
+                    let verifier = resolve_listing_verifier(&identity)?;
+                    // The SAME enumeration the local body performs: the
+                    // `memory/` prefix, never attestation entries, never the
+                    // `MEMORY.md` index scaffold, most-recent first with the
+                    // id as the stable tiebreaker, truncated to the budget.
+                    let metas = repo.vault_list("memory/", None).map_err(repository_error)?;
+                    let mut items: Vec<(String, String)> = metas
+                        .iter()
+                        .filter(|meta| !meta.path.starts_with("attestations/"))
+                        .filter(|meta| !memory_is_index_scaffold(&repo, &meta.path))
+                        .map(|meta| {
+                            let id = meta
+                                .path
+                                .trim_end_matches(".md")
+                                .trim_start_matches("memory/")
+                                .to_string();
+                            (id, meta.updated_at.clone())
+                        })
+                        .collect();
+                    items.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+                    if let Some(limit) = limit {
+                        items.truncate(limit);
+                    }
+                    let entries = items
+                        .iter()
+                        .map(|(id, _)| {
+                            // kind/status/about degrade to "–"/0 when a single
+                            // memory cannot be read or lifted — never the list.
+                            let degraded = (
+                                "\u{2013}".to_string(),
+                                "\u{2013}".to_string(),
+                                0u32,
+                                "none",
+                                "na",
+                            );
+                            let (memory_kind, memory_status, about, attested, verifies) = (|| {
+                                let path = format!("memory/{id}.md");
+                                let entry = repo.vault_retrieve(&path).ok()??;
+                                let frontmatter = parse_frontmatter(&entry).ok()?;
+                                let body = body_of(&entry);
+                                match memory_list_attestation(&repo, id, &frontmatter, &body) {
+                                    LoadedAttestation::Fresh(node) => {
+                                        // The fresh node drives the display
+                                        // columns; the DID-match-then-verify
+                                        // rule drives `verifies`.
+                                        let verifies = verifies_token(
+                                            Some(&node),
+                                            node.attributed_to.as_deref(),
+                                            verifier.as_ref(),
+                                            |node, public_key| {
+                                                verify_memory(node, public_key).is_ok()
+                                            },
+                                        );
+                                        Some((
+                                            node.memory_kind.clone(),
+                                            node.status.clone(),
                                             node.about.len() as u32,
-                                            token,
-                                            "na",
-                                        )),
-                                        Err(_) => {
-                                            let fm = |key: &str| {
-                                                frontmatter
-                                                    .get(key)
-                                                    .and_then(Value::as_str)
-                                                    .map(str::to_owned)
-                                                    .unwrap_or_else(|| "\u{2013}".to_string())
-                                            };
-                                            Some((fm("memoryKind"), fm("status"), 0, token, "na"))
+                                            "fresh",
+                                            verifies,
+                                        ))
+                                    }
+                                    other => {
+                                        // Stale/None: the columns come from the
+                                        // CURRENT source (the lift); the drift
+                                        // is still surfaced by the attested
+                                        // column.
+                                        let token = match other {
+                                            LoadedAttestation::Stale(_) => "stale",
+                                            _ => "none",
+                                        };
+                                        match lift_memory(&frontmatter, &body) {
+                                            Ok(node) => Some((
+                                                node.memory_kind,
+                                                node.status,
+                                                node.about.len() as u32,
+                                                token,
+                                                "na",
+                                            )),
+                                            Err(_) => {
+                                                let fm = |key: &str| {
+                                                    frontmatter
+                                                        .get(key)
+                                                        .and_then(Value::as_str)
+                                                        .map(str::to_owned)
+                                                        .unwrap_or_else(|| "\u{2013}".to_string())
+                                                };
+                                                Some((
+                                                    fm("memoryKind"),
+                                                    fm("status"),
+                                                    0,
+                                                    token,
+                                                    "na",
+                                                ))
+                                            }
                                         }
                                     }
                                 }
+                            })(
+                            )
+                            .unwrap_or(degraded);
+                            VaultEntry {
+                                kind: Kind::Memory as i32,
+                                id: id.clone(),
+                                title: id.clone(),
+                                status: None,
+                                body: None,
+                                created_at: None,
+                                updated_at: None,
+                                linked: Vec::new(),
+                                vault_path: Some(format!(".vault/memory/{id}.md")),
+                                priority: None,
+                                memory_kind: Some(memory_kind),
+                                memory_status: Some(memory_status),
+                                about_count: Some(about),
+                                attested: Some(attested.to_string()),
+                                verifies: Some(verifies.to_string()),
+                                ..Default::default()
                             }
-                        })(
-                        )
-                        .unwrap_or(degraded);
-                        VaultEntry {
-                            kind: Kind::Memory as i32,
-                            id: id.clone(),
-                            title: id.clone(),
+                        })
+                        .collect();
+                    Ok(ListVaultEntriesResponse {
+                        entries,
+                        next_cursor: None,
+                        snapshot: None,
+                    })
+                }
+                Some(Kind::Goal) => {
+                    // A query: read-only open with the read-concurrency wait.
+                    let repo = handle.repository_readonly()?;
+                    let goals = repo
+                        .vault_goal_list(status_filter.as_deref())
+                        .map_err(repository_error)?;
+                    let entries = goals
+                        .into_iter()
+                        .map(|goal| {
+                            let status = match goal.status.as_str() {
+                                "active" => VaultEntityStatus::Active,
+                                "suspended" => VaultEntityStatus::Suspended,
+                                "completed" => VaultEntityStatus::Completed,
+                                _ => VaultEntityStatus::Unspecified,
+                            };
+                            VaultEntry {
+                                kind: Kind::Goal as i32,
+                                id: goal.name.clone(),
+                                title: goal.developer.clone(),
+                                status: Some(status as i32),
+                                body: None,
+                                created_at: None,
+                                updated_at: None,
+                                linked: goal.intent.clone().into_iter().collect(),
+                                vault_path: Some(format!(".vault/goals/{}/_goal.md", goal.name)),
+                                priority: None,
+                                status_label: Some(goal.status.clone()),
+                                started_at: Some(goal.started_at.clone()),
+                                turns: Some(goal.turns),
+                                ..Default::default()
+                            }
+                        })
+                        .collect();
+                    Ok::<_, Status>(ListVaultEntriesResponse {
+                        entries,
+                        next_cursor: None,
+                        snapshot: None,
+                    })
+                }
+                None => {
+                    // A query: read-only open with the read-concurrency wait.
+                    let repo = handle.repository_readonly()?;
+                    // `vault list`: EVERY vault entry with its type, content
+                    // size, and updated-at date, filtered by the path prefix
+                    // and the parsed entry type — the same enumeration the
+                    // local body performs.
+                    let type_filter = entry_type
+                        .as_deref()
+                        .and_then(|raw| raw.parse::<VaultEntryType>().ok());
+                    let metas = repo
+                        .vault_list(&path_prefix, type_filter)
+                        .map_err(repository_error)?;
+                    let entries = metas
+                        .into_iter()
+                        .map(|meta| VaultEntry {
+                            kind: Kind::Unspecified as i32,
+                            id: meta.path.clone(),
+                            title: String::new(),
                             status: None,
                             body: None,
                             created_at: None,
                             updated_at: None,
                             linked: Vec::new(),
-                            vault_path: Some(format!(".vault/memory/{id}.md")),
+                            vault_path: Some(meta.path.clone()),
                             priority: None,
-                            memory_kind: Some(memory_kind),
-                            memory_status: Some(memory_status),
-                            about_count: Some(about),
-                            attested: Some(attested.to_string()),
-                            verifies: Some(verifies.to_string()),
+                            content_size: Some(meta.content_size as u64),
+                            updated_at_label: Some(meta.updated_at.clone()),
+                            entry_type: Some(meta.entry_type.to_string()),
                             ..Default::default()
-                        }
+                        })
+                        .collect();
+                    Ok(ListVaultEntriesResponse {
+                        entries,
+                        next_cursor: None,
+                        snapshot: None,
                     })
-                    .collect();
-                Ok(ListVaultEntriesResponse {
-                    entries,
-                    next_cursor: None,
-                    snapshot: None,
-                })
+                }
+                other => Err(domain_status(
+                    ErrorCode::InvalidArgument,
+                    format!("vault entity kind {other:?} lands with its slice (unimplemented)"),
+                )),
             }
-            Some(Kind::Goal) => {
-                // A query: read-only open with the read-concurrency wait.
-                let repo = handle.repository_readonly()?;
-                let goals = repo
-                    .vault_goal_list(status_filter.as_deref())
-                    .map_err(repository_error)?;
-                let entries = goals
-                    .into_iter()
-                    .map(|goal| {
-                        let status = match goal.status.as_str() {
-                            "active" => VaultEntityStatus::Active,
-                            "suspended" => VaultEntityStatus::Suspended,
-                            "completed" => VaultEntityStatus::Completed,
-                            _ => VaultEntityStatus::Unspecified,
-                        };
-                        VaultEntry {
-                            kind: Kind::Goal as i32,
-                            id: goal.name.clone(),
-                            title: goal.developer.clone(),
-                            status: Some(status as i32),
-                            body: None,
-                            created_at: None,
-                            updated_at: None,
-                            linked: goal.intent.clone().into_iter().collect(),
-                            vault_path: Some(format!(".vault/goals/{}/_goal.md", goal.name)),
-                            priority: None,
-                            status_label: Some(goal.status.clone()),
-                            started_at: Some(goal.started_at.clone()),
-                            turns: Some(goal.turns),
-                            ..Default::default()
-                        }
-                    })
-                    .collect();
-                Ok::<_, Status>(ListVaultEntriesResponse {
-                    entries,
-                    next_cursor: None,
-                    snapshot: None,
-                })
-            }
-            None => {
-                // A query: read-only open with the read-concurrency wait.
-                let repo = handle.repository_readonly()?;
-                // `vault list`: EVERY vault entry with its type, content
-                // size, and updated-at date, filtered by the path prefix
-                // and the parsed entry type — the same enumeration the
-                // local body performs.
-                let type_filter = entry_type
-                    .as_deref()
-                    .and_then(|raw| raw.parse::<VaultEntryType>().ok());
-                let metas = repo
-                    .vault_list(&path_prefix, type_filter)
-                    .map_err(repository_error)?;
-                let entries = metas
-                    .into_iter()
-                    .map(|meta| VaultEntry {
-                        kind: Kind::Unspecified as i32,
-                        id: meta.path.clone(),
-                        title: String::new(),
-                        status: None,
-                        body: None,
-                        created_at: None,
-                        updated_at: None,
-                        linked: Vec::new(),
-                        vault_path: Some(meta.path.clone()),
-                        priority: None,
-                        content_size: Some(meta.content_size as u64),
-                        updated_at_label: Some(meta.updated_at.clone()),
-                        entry_type: Some(meta.entry_type.to_string()),
-                        ..Default::default()
-                    })
-                    .collect();
-                Ok(ListVaultEntriesResponse {
-                    entries,
-                    next_cursor: None,
-                    snapshot: None,
-                })
-            }
-            other => Err(domain_status(
-                ErrorCode::InvalidArgument,
-                format!("vault entity kind {other:?} lands with its slice (unimplemented)"),
-            )),
         })
         .await
         .map_err(|e| Status::internal(e.to_string()))??;
@@ -1934,9 +2204,49 @@ impl vault_service_server::VaultService for VaultImpl {
 
     async fn init_vault(
         &self,
-        _request: Request<InitVaultRequest>,
+        request: Request<InitVaultRequest>,
     ) -> Result<Response<InitVaultResponse>, Status> {
-        Err(Status::unimplemented("InitVault lands with its slice"))
+        // `atomic vault init` — inside an EXISTING repository (it requires
+        // one), so it routes normally: has_vault → init_vault → track the
+        // .vault tree → record the defaults (the local body's exact flow).
+        let request = request.into_inner();
+        let handle = self.state.resolve(request.repository.as_ref().unwrap())?;
+        self.state.log_rpc("InitVault", Some(&handle));
+        let gate_handle = handle.clone();
+        let _gate = gate_handle.exclusive().await;
+        let meta = request.meta.clone();
+        let (already, vault_dir, recorded) = tokio::task::spawn_blocking(move || {
+            let repo = handle.repository()?;
+            if repo.has_vault().unwrap_or(false) {
+                return Ok::<_, Status>((true, None, false));
+            }
+            repo.init_vault().map_err(repository_error)?;
+            let vault_dir = repo.vault_dir().display().to_string();
+            // Track every vault file (the local body's recursive add).
+            if repo.vault_dir().exists() {
+                add_vault_files_recursive(&repo, &repo.vault_dir())?;
+            }
+            // Record the defaults as their own change; NothingToRecord is
+            // the local body's silent no-op, other failures only log.
+            let header = atomic_core::change::ChangeHeader::new("Initialize vault");
+            let options = atomic_repository::RecordOptions::new()
+                .add_path(".vault")
+                .detect_raw_renames(false);
+            let recorded = match repo.record(header, options) {
+                Ok(_) => true,
+                Err(atomic_repository::RecordError::NothingToRecord) => false,
+                Err(_) => false,
+            };
+            Ok((false, Some(vault_dir), recorded))
+        })
+        .await
+        .map_err(|e| Status::internal(e.to_string()))??;
+        Ok(Response::new(InitVaultResponse {
+            already_initialized: already,
+            vault_dir,
+            recorded,
+            meta: response_meta(&meta),
+        }))
     }
 
     async fn get_vault_context(
@@ -2030,27 +2340,116 @@ impl vault_service_server::VaultService for VaultImpl {
 
     async fn export_vault(
         &self,
-        _request: Request<ExportVaultRequest>,
+        request: Request<ExportVaultRequest>,
     ) -> Result<Response<ExportVaultResponse>, Status> {
-        Err(Status::unimplemented("ExportVault lands with its slice"))
+        // `atomic vault materialize` — inflate vault entries to markdown
+        // in the working copy. The domain calls (vault_materialize /
+        // vault_materialize_all) run handler-side; the CLI prints the
+        // local report from the wire-carried counts.
+        let request = request.into_inner();
+        let handle = self.state.resolve(request.repository.as_ref().unwrap())?;
+        self.state.log_rpc("ExportVault", Some(&handle));
+        let gate_handle = handle.clone();
+        let _gate = gate_handle.exclusive().await;
+        let meta = request.meta.clone();
+        let path = request.path.clone().filter(|path| !path.is_empty());
+        let (count, materialized_path) = tokio::task::spawn_blocking(move || {
+            let repo = handle.repository()?;
+            match path {
+                Some(path) => {
+                    repo.vault_materialize(&path).map_err(repository_error)?;
+                    Ok::<_, Status>((1, Some(path)))
+                }
+                None => {
+                    let count = repo.vault_materialize_all().map_err(repository_error)?;
+                    Ok((count as u32, None))
+                }
+            }
+        })
+        .await
+        .map_err(|e| Status::internal(e.to_string()))??;
+        Ok(Response::new(ExportVaultResponse {
+            exported: count,
+            materialized_path,
+            meta: response_meta(&meta),
+        }))
     }
 
     async fn delete_vault_entity(
         &self,
-        _request: Request<DeleteVaultEntityRequest>,
+        request: Request<DeleteVaultEntityRequest>,
     ) -> Result<Response<DeleteVaultEntityResponse>, Status> {
-        Err(Status::unimplemented(
-            "DeleteVaultEntity lands with its slice",
-        ))
+        let request = request.into_inner();
+        let kind = Kind::try_from(request.kind)
+            .map_err(|_| domain_status(ErrorCode::InvalidArgument, "unknown vault entity kind"))?;
+        let handle = self.state.resolve(request.repository.as_ref().unwrap())?;
+        self.state.log_rpc("DeleteVaultEntity", Some(&handle));
+        let gate_handle = handle.clone();
+        let _gate = gate_handle.exclusive().await;
+        let meta = request.meta.clone();
+        let id = request.id.clone();
+        let result = tokio::task::spawn_blocking(move || match kind {
+            // `atomic intent delete` — the unstarted-backlog guard is the
+            // domain's (vault_intent_delete); the normalized id + removed
+            // file ride the response so the client prints the local report.
+            Kind::Intent => {
+                let repo = handle.repository()?;
+                let result = repo.vault_intent_delete(&id).map_err(repository_error)?;
+                Ok::<_, Status>((result.id, result.intent_file))
+            }
+            other => Err(domain_status(
+                ErrorCode::InvalidArgument,
+                format!("vault entity kind {other:?} lands with its slice"),
+            )),
+        })
+        .await
+        .map_err(|e| Status::internal(e.to_string()))??;
+        Ok(Response::new(DeleteVaultEntityResponse {
+            id: result.0,
+            vault_path: format!(".vault/{}", result.1),
+            meta: response_meta(&meta),
+        }))
     }
 
     async fn link_vault_entities(
         &self,
-        _request: Request<LinkVaultEntitiesRequest>,
+        request: Request<LinkVaultEntitiesRequest>,
     ) -> Result<Response<LinkVaultEntitiesResponse>, Status> {
-        Err(Status::unimplemented(
-            "LinkVaultEntities lands with its slice",
-        ))
+        let request = request.into_inner();
+        let handle = self.state.resolve(request.repository.as_ref().unwrap())?;
+        self.state.log_rpc("LinkVaultEntities", Some(&handle));
+        let gate_handle = handle.clone();
+        let _gate = gate_handle.exclusive().await;
+        let meta = request.meta.clone();
+        let source = request
+            .source
+            .ok_or_else(|| domain_status(ErrorCode::InvalidArgument, "source entity required"))?;
+        let target = request
+            .target
+            .ok_or_else(|| domain_status(ErrorCode::InvalidArgument, "target entity required"))?;
+        let source_kind = Kind::try_from(source.kind)
+            .map_err(|_| domain_status(ErrorCode::InvalidArgument, "unknown source kind"))?;
+        let target_kind = Kind::try_from(target.kind)
+            .map_err(|_| domain_status(ErrorCode::InvalidArgument, "unknown target kind"))?;
+        if !matches!((source_kind, target_kind), (Kind::Intent, Kind::Goal)) {
+            return Err(domain_status(
+                ErrorCode::InvalidArgument,
+                "linking is implemented for intent → goal",
+            ));
+        }
+        let intent_id = source.id.clone();
+        let goal_name = target.id.clone();
+        tokio::task::spawn_blocking(move || {
+            let repo = handle.repository()?;
+            repo.vault_intent_link(&intent_id, &goal_name)
+                .map_err(repository_error)?;
+            Ok::<_, Status>(())
+        })
+        .await
+        .map_err(|e| Status::internal(e.to_string()))??;
+        Ok(Response::new(LinkVaultEntitiesResponse {
+            meta: response_meta(&meta),
+        }))
     }
 }
 
@@ -2734,13 +3133,13 @@ impl knowledge_service_server::KnowledgeService for KnowledgeImpl {
                         .into_iter()
                         .filter(|node| node.kind.to_lowercase() == kind)
                         .take(limit)
-                        .map(crate::daemon::services_query::kg_node_proto)
+                        .map(|node| crate::daemon::services_query::kg_node_proto(node.clone()))
                         .collect::<Vec<_>>()
                 } else {
                     repo.vault_kg_search(&search.query, limit, Some(pool))
                         .map_err(repository_error)?
                         .into_iter()
-                        .map(crate::daemon::services_query::kg_node_proto)
+                        .map(|node| crate::daemon::services_query::kg_node_proto(node.clone()))
                         .collect()
                 };
                 Ok::<_, Status>(QueryGraphResponse {
@@ -2750,6 +3149,10 @@ impl knowledge_service_server::KnowledgeService for KnowledgeImpl {
                     answer: None,
                     plan_result: None,
                     snapshot: None,
+                    graph_collected: None,
+                    calls_present: false,
+                    ask_result: None,
+                    ask_elapsed_ms: None,
                 })
             }
             QueryOneof::Neighbors(neighbors) => {
@@ -2766,6 +3169,10 @@ impl knowledge_service_server::KnowledgeService for KnowledgeImpl {
                     answer: None,
                     plan_result: None,
                     snapshot: None,
+                    graph_collected: None,
+                    calls_present: false,
+                    ask_result: None,
+                    ask_elapsed_ms: None,
                 })
             }
             QueryOneof::Entity(entity) => {
@@ -2799,6 +3206,296 @@ impl knowledge_service_server::KnowledgeService for KnowledgeImpl {
                     answer: None,
                     plan_result: None,
                     snapshot: None,
+                    graph_collected: None,
+                    calls_present: false,
+                    ask_result: None,
+                    ask_elapsed_ms: None,
+                })
+            }
+            QueryOneof::Callers(callers) => {
+                let repo = handle.repository_readonly()?;
+                // The local body's domain: the 1-hop neighbors subgraph,
+                // filtered to CALLS edges pointing at the entity.
+                let (nodes, edges) =
+                    crate::daemon::services_query::neighbors_impl(&repo, &callers.node_id, 1)?;
+                let subgraph = repo
+                    .vault_kg_neighbors(&callers.node_id, 1)
+                    .map_err(repository_error)?;
+                let calls_present = subgraph
+                    .edges
+                    .iter()
+                    .any(|edge| edge.kind.to_uppercase() == "CALLS");
+                // The caller edges + the caller nodes (their summaries ride
+                // the nodes so the CLI renders the caller lines).
+                let caller_edges: Vec<crate::atomic::KgEdge> = subgraph
+                    .edges
+                    .iter()
+                    .filter(|edge| {
+                        edge.kind.to_uppercase() == "CALLS" && edge.to_id == callers.node_id
+                    })
+                    .map(|edge| crate::daemon::services_query::kg_edge_proto(edge.clone()))
+                    .collect();
+                let caller_ids: std::collections::HashSet<&str> = subgraph
+                    .edges
+                    .iter()
+                    .filter(|edge| {
+                        edge.kind.to_uppercase() == "CALLS" && edge.to_id == callers.node_id
+                    })
+                    .map(|edge| edge.from_id.as_str())
+                    .collect();
+                let caller_nodes: Vec<crate::atomic::KgNode> = subgraph
+                    .nodes
+                    .iter()
+                    .filter(|node| caller_ids.contains(node.id.as_str()))
+                    .map(|node| crate::daemon::services_query::kg_node_proto(node.clone()))
+                    .collect();
+                let _ = (nodes, edges);
+                Ok(QueryGraphResponse {
+                    nodes: caller_nodes,
+                    edges: caller_edges,
+                    hits: Vec::new(),
+                    answer: None,
+                    plan_result: None,
+                    snapshot: None,
+                    graph_collected: None,
+                    calls_present,
+                    ask_result: None,
+                    ask_elapsed_ms: None,
+                })
+            }
+            QueryOneof::GraphSlice(graph) => {
+                // `atomic query graph` — the full seed/expand/filter/cap
+                // build (the local command's algorithm, ported verbatim).
+                let repo = handle.repository_readonly()?;
+                let query = graph.query.clone().unwrap_or_default();
+                if query.is_empty() {
+                    return Err(domain_status(
+                        ErrorCode::InvalidArgument,
+                        "graph seed query required",
+                    ));
+                }
+                let limit = if graph.seed_limit.unwrap_or(0) == 0 {
+                    10
+                } else {
+                    graph.seed_limit.unwrap() as usize
+                };
+                let depth = graph.depth.unwrap_or(1).min(2) as u8;
+                let kinds = graph.kinds.clone().unwrap_or_else(|| "all".to_string());
+                let allow_all = kinds.trim().eq_ignore_ascii_case("all");
+                let allowed_kinds: std::collections::HashSet<String> = if allow_all {
+                    std::collections::HashSet::new()
+                } else {
+                    kinds
+                        .split(',')
+                        .map(|kind| kind.trim().to_lowercase())
+                        .filter(|kind| !kind.is_empty())
+                        .collect()
+                };
+                let kind_allowed = |kind: &str| -> bool {
+                    allow_all || allowed_kinds.contains(&kind.to_lowercase())
+                };
+                let changes_per_seed = graph.changes_per_seed.unwrap_or(5) as usize;
+                let cap_changes = changes_per_seed > 0;
+                // 1. Seed: search, filtered to allowed kinds, take limit.
+                let seed_nodes: Vec<atomic_core::pristine::vault::KgNode> = repo
+                    .vault_kg_search(&query, limit * 3, None)
+                    .map_err(repository_error)?
+                    .into_iter()
+                    .filter(|node| kind_allowed(&node.kind))
+                    .take(limit)
+                    .collect();
+                if seed_nodes.is_empty() {
+                    return Ok(QueryGraphResponse {
+                        nodes: Vec::new(),
+                        edges: Vec::new(),
+                        hits: Vec::new(),
+                        answer: None,
+                        plan_result: None,
+                        snapshot: None,
+                        graph_collected: Some(0),
+                        calls_present: false,
+                        ask_result: None,
+                        ask_elapsed_ms: None,
+                    });
+                }
+                // 2. Expand: per-seed neighbor subgraphs, kind-filtered,
+                //    change-capped per seed.
+                let mut node_map: std::collections::HashMap<
+                    String,
+                    atomic_core::pristine::vault::KgNode,
+                > = std::collections::HashMap::new();
+                let mut edge_set: std::collections::HashSet<(String, String, String)> =
+                    std::collections::HashSet::new();
+                let mut all_edges: Vec<atomic_core::pristine::vault::KgEdge> = Vec::new();
+                for seed in &seed_nodes {
+                    node_map
+                        .entry(seed.id.clone())
+                        .or_insert_with(|| seed.clone());
+                    let subgraph = repo
+                        .vault_kg_neighbors(&seed.id, depth)
+                        .map_err(repository_error)?;
+                    let mut changes_for_seed: usize = 0;
+                    for node in subgraph.nodes {
+                        if !kind_allowed(&node.kind) {
+                            continue;
+                        }
+                        if node.kind == "change" && cap_changes {
+                            if node_map.contains_key(&node.id) {
+                                continue;
+                            }
+                            if changes_for_seed >= changes_per_seed {
+                                continue;
+                            }
+                            changes_for_seed += 1;
+                        }
+                        node_map.entry(node.id.clone()).or_insert(node);
+                    }
+                    for edge in subgraph.edges {
+                        let from_kind_ok = allow_all || {
+                            let prefix = edge.from_id.split(':').next().unwrap_or("");
+                            kind_allowed(prefix)
+                        };
+                        let to_kind_ok = allow_all || {
+                            let prefix = edge.to_id.split(':').next().unwrap_or("");
+                            kind_allowed(prefix)
+                        };
+                        if from_kind_ok
+                            && to_kind_ok
+                            && (node_map.contains_key(&edge.from_id)
+                                || node_map.contains_key(&edge.to_id))
+                        {
+                            let key = (edge.from_id.clone(), edge.to_id.clone(), edge.kind.clone());
+                            if edge_set.insert(key) {
+                                all_edges.push(edge);
+                            }
+                        }
+                    }
+                }
+                // 3. Isolated-node removal (seeds always kept).
+                let connected_ids: std::collections::HashSet<String> = all_edges
+                    .iter()
+                    .flat_map(|edge| [edge.from_id.clone(), edge.to_id.clone()])
+                    .collect();
+                let seed_ids: std::collections::HashSet<&str> =
+                    seed_nodes.iter().map(|node| node.id.as_str()).collect();
+                let mut nodes: Vec<atomic_core::pristine::vault::KgNode> = node_map
+                    .into_values()
+                    .filter(|node| {
+                        connected_ids.contains(&node.id) || seed_ids.contains(node.id.as_str())
+                    })
+                    .collect();
+                nodes.sort_by(|left, right| left.id.cmp(&right.id));
+                let final_ids: std::collections::HashSet<&str> =
+                    nodes.iter().map(|node| node.id.as_str()).collect();
+                all_edges.retain(|edge| {
+                    final_ids.contains(edge.from_id.as_str())
+                        && final_ids.contains(edge.to_id.as_str())
+                });
+                // 4. Cap at max_nodes (0 = the format default: 200 DOT /
+                //    5000 HTML — the caller's own default applies).
+                let max_nodes = graph.max_nodes.unwrap_or(0) as usize;
+                let mut collected = nodes.len() as u32;
+                if max_nodes > 0 && nodes.len() > max_nodes {
+                    let kept_ids: std::collections::HashSet<&str> = nodes[..max_nodes]
+                        .iter()
+                        .map(|node| node.id.as_str())
+                        .collect();
+                    all_edges.retain(|edge| {
+                        kept_ids.contains(edge.from_id.as_str())
+                            && kept_ids.contains(edge.to_id.as_str())
+                    });
+                    nodes.truncate(max_nodes);
+                }
+                let _ = &collected;
+                collected = nodes.len() as u32;
+                let _ = &collected;
+                Ok(QueryGraphResponse {
+                    nodes: nodes
+                        .iter()
+                        .map(|node| crate::daemon::services_query::kg_node_proto(node.clone()))
+                        .collect(),
+                    edges: all_edges
+                        .iter()
+                        .map(|edge| crate::daemon::services_query::kg_edge_proto(edge.clone()))
+                        .collect(),
+                    hits: Vec::new(),
+                    answer: None,
+                    plan_result: None,
+                    snapshot: None,
+                    graph_collected: None,
+                    calls_present: false,
+                    ask_result: None,
+                    ask_elapsed_ms: None,
+                })
+            }
+            QueryOneof::Plan(plan) => {
+                // `atomic query plan` — the structured plan executes against
+                // the repository; the domain PlanResult JSON rides the
+                // response for both the --json render (byte parity) and the
+                // human summary.
+                let repo = handle.repository()?;
+                let plan_json = String::from_utf8_lossy(&plan.plan_json).into_owned();
+                let parsed = atomic_repository::parse_plan(&plan_json).map_err(repository_error)?;
+                let result =
+                    atomic_repository::execute_plan(&repo, &parsed).map_err(repository_error)?;
+                let payload = serde_json::to_vec(&result)
+                    .map_err(|error| Status::internal(format!("plan encode: {error}")))?;
+                Ok(QueryGraphResponse {
+                    nodes: Vec::new(),
+                    edges: Vec::new(),
+                    hits: Vec::new(),
+                    answer: None,
+                    plan_result: Some(payload),
+                    snapshot: None,
+                    graph_collected: None,
+                    calls_present: false,
+                    ask_result: None,
+                    ask_elapsed_ms: None,
+                })
+            }
+            QueryOneof::RagAsk(ask) => {
+                // `atomic query ask` — the agentic tool loop runs over the
+                // repository (the LLM provider resolves from the same
+                // environment/config); the full AgentResult rides the wire.
+                let repo = handle.repository_readonly()?;
+                let llm = atomic_repository::resolve_llm_provider().ok_or_else(|| {
+                    domain_status(
+                        ErrorCode::InvalidArgument,
+                        "No API key configured. Set ANTHROPIC_API_KEY or OPENAI_API_KEY.",
+                    )
+                })?;
+                let executor = atomic_repository::RepoToolExecutor::new(&repo);
+                let max_turns = ask.max_turns.unwrap_or(5);
+                let verbose = ask.verbose.unwrap_or(false);
+                let config = atomic_repository::AgentConfig {
+                    system_prompt: crate::daemon::services_query::ASK_SYSTEM_PROMPT.to_string(),
+                    max_turns: max_turns as u8,
+                    max_tokens: 4096,
+                    verbose,
+                };
+                let start = std::time::Instant::now();
+                let result =
+                    atomic_repository::run_tool_loop_sync(&llm, &executor, &ask.question, &config)
+                        .map_err(|error| {
+                            domain_status(ErrorCode::Repository, format!("LLM error: {error}"))
+                        })?;
+                let elapsed = start.elapsed();
+                let payload = serde_json::to_vec(&result)
+                    .map_err(|error| Status::internal(format!("ask encode: {error}")))?;
+                Ok(QueryGraphResponse {
+                    nodes: Vec::new(),
+                    edges: Vec::new(),
+                    hits: Vec::new(),
+                    answer: Some(result.answer),
+                    plan_result: None,
+                    snapshot: None,
+                    graph_collected: None,
+                    calls_present: false,
+                    ask_result: Some(VersionedBytes {
+                        schema: "atomic.query.ask.v1".to_string(),
+                        payload,
+                    }),
+                    ask_elapsed_ms: Some(elapsed.as_millis() as u64),
                 })
             }
             other => Err(domain_status(
@@ -2846,6 +3543,9 @@ impl knowledge_service_server::KnowledgeService for KnowledgeImpl {
                         }
                         return Ok::<_, Status>(MaintainKnowledgeGraphResponse {
                             processed: total,
+                            provider: None,
+                            dimensions: None,
+                            path: None,
                             meta: response_meta(&meta),
                         });
                     }
@@ -2866,6 +3566,53 @@ impl knowledge_service_server::KnowledgeService for KnowledgeImpl {
                 KnowledgeMaintainAction::Reindex => {
                     repo.vault_reindex_kg().map_err(repository_error)? as u64
                 }
+                // `atomic query embed` — the provider resolves from the
+                // same environment/config the CLI reads; the sync embed
+                // function + the hash fallback are the domain's.
+                KnowledgeMaintainAction::Embed => {
+                    // The embed target rides the scope field (the per-path
+                    // form; absent = embed everything).
+                    let scope = request.scope.clone();
+                    let provider = atomic_repository::resolve_embedding_provider();
+                    let dims = provider.dimensions;
+                    let config = atomic_repository::EmbedConfig {
+                        max_chunk_tokens: 512,
+                        dimensions: dims,
+                    };
+                    let embed_fn = |text: &str| -> Vec<f32> {
+                        provider
+                            .embed_sync(&[text.to_string()])
+                            .ok()
+                            .and_then(|v| v.into_iter().next())
+                            .unwrap_or_else(|| atomic_repository::hash_embed(text, dims))
+                    };
+                    match scope {
+                        Some(path) if !path.is_empty() => {
+                            let count = repo
+                                .vault_embed(&path, &embed_fn, &config)
+                                .map_err(repository_error)?;
+                            return Ok::<_, Status>(MaintainKnowledgeGraphResponse {
+                                processed: count as u64,
+                                provider: Some(provider.model.clone()),
+                                dimensions: Some(dims as u32),
+                                path: Some(path),
+                                meta: response_meta(&meta),
+                            });
+                        }
+                        _ => {
+                            let count = repo
+                                .vault_embed_all(&embed_fn, &config)
+                                .map_err(repository_error)?;
+                            return Ok(MaintainKnowledgeGraphResponse {
+                                processed: count as u64,
+                                provider: Some(provider.model.clone()),
+                                dimensions: Some(dims as u32),
+                                path: None,
+                                meta: response_meta(&meta),
+                            });
+                        }
+                    }
+                }
                 other => {
                     return Err(domain_status(
                         ErrorCode::InvalidArgument,
@@ -2875,6 +3622,9 @@ impl knowledge_service_server::KnowledgeService for KnowledgeImpl {
             };
             Ok::<_, Status>(MaintainKnowledgeGraphResponse {
                 processed,
+                provider: None,
+                dimensions: None,
+                path: None,
                 meta: response_meta(&meta),
             })
         })
@@ -3126,18 +3876,61 @@ impl provenance_service_server::ProvenanceService for ProvenanceImpl {
 
     async fn fork_session(
         &self,
-        _request: Request<ForkSessionRequest>,
+        request: Request<ForkSessionRequest>,
     ) -> Result<Response<ForkSessionResponse>, Status> {
-        Err(Status::unimplemented("ForkSession lands with its slice"))
+        // `atomic session fork` — the domain fork (parent manifest, child
+        // session, the inherited turns) runs handler-side; the wire carries
+        // both manifest hashes for the local fork report.
+        let request = request.into_inner();
+        let handle = self.state.resolve(request.repository.as_ref().unwrap())?;
+        self.state.log_rpc("ForkSession", Some(&handle));
+        let gate_handle = handle.clone();
+        let _gate = gate_handle.exclusive().await;
+        let meta = request.meta.clone();
+        let session_id = request.session_id.clone();
+        let child = request.forked_session_id.clone();
+        let child_for_report = child.clone();
+        let at_turn = request.at_turn.unwrap_or(0);
+        let (parent_hash, child_hash) = tokio::task::spawn_blocking(move || {
+            let repo = handle.repository()?;
+            repo.fork_session(&session_id, at_turn, &child)
+                .map_err(repository_error)
+        })
+        .await
+        .map_err(|e| Status::internal(e.to_string()))??;
+        Ok(Response::new(ForkSessionResponse {
+            session_id: child_for_report,
+            parent_manifest: Some(super::convert::hash_proto(&parent_hash)),
+            child_manifest: Some(super::convert::hash_proto(&child_hash)),
+            fork_turn: Some(at_turn),
+            meta: response_meta(&meta),
+        }))
     }
 
     async fn rebuild_session_index(
         &self,
-        _request: Request<RebuildSessionIndexRequest>,
+        request: Request<RebuildSessionIndexRequest>,
     ) -> Result<Response<RebuildSessionIndexResponse>, Status> {
-        Err(Status::unimplemented(
-            "RebuildSessionIndex lands with its slice",
-        ))
+        // `atomic session rebuild` — the domain rebuild runs handler-side;
+        // the counts ride the response for the local report.
+        let request = request.into_inner();
+        let handle = self.state.resolve(request.repository.as_ref().unwrap())?;
+        self.state.log_rpc("RebuildSessionIndex", Some(&handle));
+        let gate_handle = handle.clone();
+        let _gate = gate_handle.exclusive().await;
+        let meta = request.meta.clone();
+        let (indexed, skipped, corrupt) = tokio::task::spawn_blocking(move || {
+            let repo = handle.repository()?;
+            repo.rebuild_session_index().map_err(repository_error)
+        })
+        .await
+        .map_err(|e| Status::internal(e.to_string()))??;
+        Ok(Response::new(RebuildSessionIndexResponse {
+            indexed: indexed as u64,
+            already_present: skipped as u64,
+            corrupt: corrupt as u64,
+            meta: response_meta(&meta),
+        }))
     }
 
     async fn get_provenance(
@@ -3149,10 +3942,551 @@ impl provenance_service_server::ProvenanceService for ProvenanceImpl {
 
     async fn export_provenance(
         &self,
-        _request: Request<ExportProvenanceRequest>,
+        request: Request<ExportProvenanceRequest>,
     ) -> Result<Response<ExportProvenanceResponse>, Status> {
-        Err(Status::unimplemented(
-            "ExportProvenance lands with its slice",
-        ))
+        export_provenance_impl(self.state.clone(), request).await
+    }
+
+    async fn explain_turns(
+        &self,
+        request: Request<ExplainTurnsRequest>,
+    ) -> Result<Response<ExplainTurnsResponse>, Status> {
+        explain_turns_impl(self.state.clone(), request).await
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ExplainTurns — the `agent explain` domain (the transcript extraction,
+// the Claude CLI generation, the graph anchoring, and the save-backs)
+// ---------------------------------------------------------------------------
+
+/// The local `get_condensed_text`: the change's unhashed section first,
+/// then the session transcript file condensed on the fly.
+#[allow(clippy::too_many_arguments)]
+fn explain_condensed_text(
+    change: &atomic_core::change::Change,
+    transcript_path: Option<&std::path::Path>,
+    agent_name: &str,
+    files_touched: &[String],
+) -> String {
+    use atomic_agent::transcript;
+    if let Some(unhashed) = transcript::extract_unhashed(change) {
+        if !unhashed.condensed_text.is_empty() {
+            return unhashed.condensed_text;
+        }
+        if !unhashed.condensed_transcript.is_empty() {
+            let files: Vec<String> = unhashed
+                .tools_used
+                .iter()
+                .flat_map(|tool| tool.files_affected.clone())
+                .collect();
+            return transcript::format_condensed(&unhashed.condensed_transcript, &files);
+        }
+    }
+    if let Some(path) = transcript_path {
+        if let Ok(raw) = std::fs::read(path) {
+            let format = if agent_name.contains("gemini") {
+                "json"
+            } else {
+                "jsonl"
+            };
+            let entries = transcript::condense_transcript(&raw, format);
+            if entries.is_empty() {
+                return String::new();
+            }
+            let files: Vec<String> = if !change.file_ops().is_empty() {
+                change
+                    .file_ops()
+                    .iter()
+                    .map(|file_op| file_op.path().to_string())
+                    .collect()
+            } else {
+                files_touched.to_vec()
+            };
+            return transcript::format_condensed(&entries, &files);
+        }
+    }
+    String::new()
+}
+
+/// The local explain body's domain, in ONE blocking pass: the turn list
+/// on the session's view, then per turn the transcript extraction, the
+/// Claude CLI generation, the graph anchoring, and the save-backs.
+async fn explain_turns_impl(
+    state: std::sync::Arc<DaemonState>,
+    request: Request<ExplainTurnsRequest>,
+) -> Result<Response<ExplainTurnsResponse>, Status> {
+    let request = request.into_inner();
+    let handle = state.resolve(request.repository.as_ref().unwrap())?;
+    state.log_rpc("ExplainTurns", Some(&handle));
+    let gate_handle = handle.clone();
+    let _gate = gate_handle.exclusive().await;
+    let meta = request.meta.clone();
+    let session_id = request.session_id.clone();
+    let view_name = request.view_name.clone();
+    let transcript_path = request
+        .transcript_path
+        .clone()
+        .map(std::path::PathBuf::from);
+    let files_touched = request.files_touched.clone();
+    let agent_name = request.agent_name.clone();
+    let root = handle.root.clone();
+    let model = request.model.clone();
+    let turn = request.turn;
+    let all = request.all;
+    let save = request.save;
+
+    let (session_has_no_turns, results) = tokio::task::spawn_blocking(move || {
+        let repo = handle.repository()?;
+        let entries = repo
+            .log(atomic_repository::HistoryOptions::with_headers().view(&view_name))
+            .map_err(|error| match error {
+                atomic_repository::RepositoryError::ViewNotFound { name } => {
+                    domain_status(ErrorCode::View, format!("view '{name}' does not exist"))
+                }
+                other => repository_error(other),
+            })?;
+        if entries.is_empty() {
+            return Ok::<_, Status>((true, Vec::new()));
+        }
+        let len = entries.len();
+        let turns: Vec<usize> = if all {
+            (0..len).collect()
+        } else if let Some(turn_number) = turn {
+            let index = (turn_number as usize).checked_sub(1).ok_or_else(|| {
+                domain_status(ErrorCode::InvalidArgument, "Turn number must be >= 1")
+            })?;
+            if index >= len {
+                return Err(domain_status(
+                    ErrorCode::InvalidArgument,
+                    format!(
+                        "Turn {} not found. Session has {} turn{}.",
+                        turn_number,
+                        len,
+                        if len == 1 { "" } else { "s" }
+                    ),
+                ));
+            }
+            vec![index]
+        } else {
+            vec![len - 1]
+        };
+
+        let mut results = Vec::with_capacity(turns.len());
+        for index in turns {
+            let entry = entries
+                .get(index)
+                .ok_or_else(|| domain_status(ErrorCode::Changes, "turn index out of range"))?;
+            let change = repo.load_change(&entry.hash).map_err(|error| {
+                domain_status(
+                    ErrorCode::Changes,
+                    format!("Failed to load change {}: {error}", entry.hash.to_base32()),
+                )
+            })?;
+            let message = change.hashed.header.message.clone();
+            let turn_number = (index + 1) as u32;
+            let condensed = explain_condensed_text(
+                &change,
+                transcript_path.as_deref(),
+                &agent_name,
+                &files_touched,
+            );
+            if condensed.is_empty() {
+                results.push(ExplainTurnResult {
+                    turn_number,
+                    message,
+                    change: Some(super::convert::hash_proto(&entry.hash)),
+                    no_transcript: true,
+                    reasoning: None,
+                    generation_error: None,
+                    anchored: 0,
+                    saved: false,
+                    save_error: None,
+                    context_saved: None,
+                    context_save_error: None,
+                });
+                continue;
+            }
+
+            // The files for this turn — FileOps paths first, then the
+            // unhashed tool summaries, then the session's touched files.
+            let files: Vec<String> = if !change.file_ops().is_empty() {
+                change
+                    .file_ops()
+                    .iter()
+                    .map(|file_op| file_op.path().to_string())
+                    .collect()
+            } else if let Some(unhashed) = atomic_agent::transcript::extract_unhashed(&change) {
+                unhashed
+                    .tools_used
+                    .iter()
+                    .flat_map(|tool| tool.files_affected.clone())
+                    .collect()
+            } else {
+                files_touched.clone()
+            };
+
+            let generator = atomic_agent::transcript::ClaudeCliGenerator::new().with_model(&model);
+            use atomic_agent::transcript::ReasoningGenerator as _;
+            let reasoning = match generator.generate(&condensed, &files) {
+                Ok(reasoning) => reasoning,
+                Err(error) => {
+                    results.push(ExplainTurnResult {
+                        turn_number,
+                        message,
+                        change: Some(super::convert::hash_proto(&entry.hash)),
+                        no_transcript: false,
+                        reasoning: None,
+                        generation_error: Some(error.to_string()),
+                        anchored: 0,
+                        saved: false,
+                        save_error: None,
+                        context_saved: None,
+                        context_save_error: None,
+                    });
+                    continue;
+                }
+            };
+            if reasoning.is_empty() {
+                results.push(ExplainTurnResult {
+                    turn_number,
+                    message,
+                    change: Some(super::convert::hash_proto(&entry.hash)),
+                    no_transcript: false,
+                    reasoning: None,
+                    generation_error: Some(String::new()),
+                    anchored: 0,
+                    saved: false,
+                    save_error: None,
+                    context_saved: None,
+                    context_save_error: None,
+                });
+                continue;
+            }
+
+            // Anchor code learnings to the CRDT graph.
+            let mut reasoning = reasoning;
+            let mut anchored = 0u32;
+            if reasoning.has_code_learnings() {
+                let file_ops = change.file_ops();
+                if !file_ops.is_empty() {
+                    atomic_agent::transcript::anchor_to_graph(
+                        &mut reasoning.learnings.code,
+                        file_ops,
+                    );
+                    anchored = reasoning
+                        .learnings
+                        .code
+                        .iter()
+                        .filter(|learning| learning.is_anchored())
+                        .count() as u32;
+                }
+            }
+
+            let reasoning_payload = serde_json::to_vec(&reasoning)
+                .map_err(|error| Status::internal(format!("reasoning encode: {error}")))?;
+
+            // Save back into the change's unhashed section (pushable) and
+            // the learnings to the agent context file.
+            let (saved, save_error, context_saved, context_save_error) = if save {
+                let mut updated = change.clone();
+                let mut unhashed_data = atomic_agent::transcript::extract_unhashed(&updated)
+                    .unwrap_or_else(|| {
+                        atomic_agent::transcript::UnhashedTurnData::new(
+                            "",
+                            0,
+                            "unknown",
+                            Vec::new(),
+                            &[],
+                        )
+                    });
+                unhashed_data = unhashed_data.with_reasoning(reasoning.clone());
+                let mut saved = false;
+                let mut save_error = None;
+                match atomic_agent::transcript::attach_unhashed(&mut updated, &unhashed_data) {
+                    Ok(()) => match repo.save_change(&updated) {
+                        Ok(_) => saved = true,
+                        Err(error) => save_error = Some(error.to_string()),
+                    },
+                    Err(error) => {
+                        save_error = Some(format!("Failed to attach reasoning: {error}"));
+                    }
+                }
+                let (context_saved, context_save_error) = if !reasoning.learnings.is_empty() {
+                    match atomic_agent::learnings::save_learnings_to_context_file(
+                        &root,
+                        &agent_name,
+                        &reasoning.learnings,
+                    ) {
+                        Ok(result) => (Some(result.to_string()), None),
+                        Err(error) => (None, Some(error.to_string())),
+                    }
+                } else {
+                    (None, None)
+                };
+                (saved, save_error, context_saved, context_save_error)
+            } else {
+                (false, None, None, None)
+            };
+
+            results.push(ExplainTurnResult {
+                turn_number,
+                message,
+                change: Some(super::convert::hash_proto(&entry.hash)),
+                no_transcript: false,
+                reasoning: Some(VersionedBytes {
+                    schema: "atomic.agent.reasoning.v1".to_string(),
+                    payload: reasoning_payload,
+                }),
+                generation_error: None,
+                anchored,
+                saved,
+                save_error,
+                context_saved,
+                context_save_error,
+            });
+        }
+        Ok::<_, Status>((false, results))
+    })
+    .await
+    .map_err(|error| Status::internal(error.to_string()))??;
+    let _ = session_id;
+
+    Ok(Response::new(ExplainTurnsResponse {
+        turns: results,
+        session_has_no_turns,
+        meta: response_meta(&meta),
+    }))
+}
+
+// ---------------------------------------------------------------------------
+// ExportProvenance — the `provenance trace/show` domain (add-only fields:
+// the resolved change hash + per-graph trace bundles)
+// ---------------------------------------------------------------------------
+
+/// Build a unique activity id for a turn's graph — the CLI's
+/// `activity_id_for` semantics: `<session_id>#<first-explained-change>`
+/// (or just the session id when none are explained), so turnParent joins.
+fn provenance_activity_id(graph: &atomic_core::change::ProvenanceGraph) -> String {
+    use atomic_core::types::Base32;
+    match graph.changes_explained.first() {
+        Some(hash) => format!("{}#{}", graph.session_id, hash.to_base32()),
+        None => graph.session_id.clone(),
+    }
+}
+
+/// Map a loaded graph into the plain projector input — the CLI's
+/// `map_graph_to_input` semantics (the turn parent loads the previous
+/// graph and uses ITS activity id; best-effort when it cannot load).
+fn provenance_map_input(
+    repo: &atomic_repository::Repository,
+    graph: &atomic_core::change::ProvenanceGraph,
+    change_hash: &atomic_core::types::Hash,
+    person_did: &str,
+) -> (
+    atomic_canonical::prov::ProvActivityInput,
+    Option<atomic_core::types::Hash>,
+) {
+    use atomic_canonical::prov::{change_urn, ProvActivityInput};
+    use atomic_core::types::Base32;
+    let previous = graph.previous;
+    let turn_parent = previous.and_then(|prev_hash| {
+        repo.load_provenance_graph(&prev_hash)
+            .ok()
+            .map(|prev| atomic_canonical::prov::activity_urn(&provenance_activity_id(&prev)))
+    });
+    let agent_vendor = (!graph.agent_vendor.is_empty()).then(|| graph.agent_vendor.clone());
+    let input = ProvActivityInput {
+        change_id_base32: change_hash.to_base32(),
+        activity_id: provenance_activity_id(graph),
+        started_at: None,
+        ended_at: None,
+        agent_slug: atomic_canonical::prov::normalize_agent_slug(&graph.agent_name),
+        agent_display_name: graph.agent_display_name.clone(),
+        agent_vendor,
+        person_did: person_did.to_string(),
+        generated: graph
+            .changes_explained
+            .iter()
+            .map(|hash| change_urn(&hash.to_base32()))
+            .collect(),
+        used: Vec::new(),
+        turn_parent,
+    };
+    (input, previous)
+}
+
+/// The ProvActivityInput as the versioned bundle JSON (schema
+/// "atomic.prov.input.v1") — the CLI deserializes the same shape.
+fn prov_input_bundle(input: &atomic_canonical::prov::ProvActivityInput) -> Vec<u8> {
+    serde_json::json!({
+        "change_id_base32": input.change_id_base32,
+        "activity_id": input.activity_id,
+        "started_at": input.started_at,
+        "ended_at": input.ended_at,
+        "agent_slug": input.agent_slug,
+        "agent_display_name": input.agent_display_name,
+        "agent_vendor": input.agent_vendor,
+        "person_did": input.person_did,
+        "generated": input.generated,
+        "used": input.used,
+        "turn_parent": input.turn_parent,
+    })
+    .to_string()
+    .into_bytes()
+}
+
+/// The ExportProvenance domain: resolve the target (URN/prefix/hash with
+/// the CLI resolver's exact semantics), load the explaining graphs (the
+/// REV_DEPS lookup with the disk-scan fallback, newest first), map each
+/// to the projection input, and pre-walk the prior-turn chain the human
+/// trace renders. The CLI projects/signs client-side over the bundles.
+async fn export_provenance_impl(
+    state: std::sync::Arc<DaemonState>,
+    request: Request<ExportProvenanceRequest>,
+) -> Result<Response<ExportProvenanceResponse>, Status> {
+    use atomic_core::types::Base32;
+    let request = request.into_inner();
+    let handle = state.resolve(request.repository.as_ref().unwrap())?;
+    state.log_rpc("ExportProvenance", Some(&handle));
+    let gate_handle = handle.clone();
+    let _gate = gate_handle.exclusive().await;
+    let target = request.target.clone();
+    let exact = request.change.as_ref().and_then(|hash| {
+        hash.value
+            .clone()
+            .try_into()
+            .ok()
+            .map(atomic_core::types::Merkle)
+    });
+    let person_did = request.person_did.clone().unwrap_or_default();
+    let (resolved, bundles) = tokio::task::spawn_blocking(move || {
+        let repo = handle.repository_readonly()?;
+        // Resolve the target: the raw CLI string (URN / prefix / full
+        // base32), else the request's exact hash.
+        let change_hash = match &target {
+            Some(target) => resolve_provenance_target(&repo, target)?,
+            None => exact.ok_or_else(|| {
+                domain_status(ErrorCode::InvalidArgument, "change target required")
+            })?,
+        };
+        // The graphs that explain the change, newest first (the CLI's
+        // load_graphs: REV_DEPS first, disk-scan fallback, error when
+        // nothing explains it).
+        let mut graphs = repo
+            .find_provenance_for_change(&change_hash)
+            .map_err(repository_error)?;
+        if graphs.is_empty() {
+            graphs = repo
+                .find_provenance_for_change_scan(&change_hash)
+                .map_err(repository_error)?;
+        }
+        if graphs.is_empty() {
+            return Err(domain_status(
+                ErrorCode::InvalidArgument,
+                format!(
+                    "no provenance graph explains change {}",
+                    change_hash.to_base32()
+                ),
+            ));
+        }
+        graphs.sort_by_key(|(_, graph)| std::cmp::Reverse(graph.timestamp));
+        let mut bundles = Vec::with_capacity(graphs.len());
+        for (graph_hash, graph) in &graphs {
+            let (input, previous) = provenance_map_input(&repo, graph, &change_hash, &person_did);
+            // The prior-turn walk the trace render performs (≤64 hops; an
+            // unloadable graph ends the chain with the empty marker, the
+            // cap sets the truncated flag — the local render's two
+            // distinct chain-end lines).
+            let mut prior_activities = Vec::new();
+            let mut chain_truncated = false;
+            let mut cursor = previous;
+            let mut depth = 0usize;
+            while let Some(prev_hash) = cursor {
+                depth += 1;
+                if depth > 64 {
+                    chain_truncated = true;
+                    break;
+                }
+                match repo.load_provenance_graph(&prev_hash) {
+                    Ok(prev) => {
+                        prior_activities.push(atomic_canonical::prov::activity_urn(
+                            &provenance_activity_id(&prev),
+                        ));
+                        cursor = prev.previous;
+                    }
+                    Err(_) => {
+                        prior_activities.push(String::new());
+                        break;
+                    }
+                }
+            }
+            let graph_payload = serde_json::to_vec(&graph)
+                .map_err(|error| Status::internal(format!("graph encode: {error}")))?;
+            bundles.push(ProvenanceTraceBundle {
+                graph_hash: Some(super::convert::hash_proto(graph_hash)),
+                graph: Some(VersionedBytes {
+                    schema: "atomic.prov.graph.v1".to_string(),
+                    payload: graph_payload,
+                }),
+                input: Some(VersionedBytes {
+                    schema: "atomic.prov.input.v1".to_string(),
+                    payload: prov_input_bundle(&input),
+                }),
+                prior_activities,
+                chain_truncated,
+            });
+        }
+        Ok::<_, Status>((change_hash, bundles))
+    })
+    .await
+    .map_err(|error| Status::internal(error.to_string()))??;
+    Ok(Response::new(ExportProvenanceResponse {
+        prov_jsonld: Vec::new(),
+        resolved_change: Some(super::convert::hash_proto(&resolved)),
+        graphs: bundles,
+    }))
+}
+
+/// The raw CLI target (bare hash, hash prefix, or URN) → the change hash —
+/// the provenance command's resolver semantics verbatim.
+fn resolve_provenance_target(
+    repo: &atomic_repository::Repository,
+    target: &str,
+) -> Result<atomic_core::types::Merkle, Status> {
+    use atomic_core::types::Base32;
+    const URN_PREFIX: &str = "urn:atomic:change:";
+    if let Some(base32) = target.strip_prefix(URN_PREFIX) {
+        return atomic_core::types::Hash::from_base32(base32.as_bytes()).ok_or_else(|| {
+            domain_status(
+                ErrorCode::InvalidArgument,
+                format!("invalid change base32 in URN: {target}"),
+            )
+        });
+    }
+    let mut matches = Vec::new();
+    for result in repo.iter_changes() {
+        let hash =
+            result.map_err(|error| domain_status(ErrorCode::Repository, error.to_string()))?;
+        if hash.to_base32().starts_with(target) {
+            matches.push(hash);
+        }
+    }
+    match matches.len() {
+        0 => atomic_core::types::Hash::from_base32(target.as_bytes()).ok_or_else(|| {
+            domain_status(ErrorCode::NotFound, format!("change not found: {target}"))
+        }),
+        1 => Ok(matches[0]),
+        _ => {
+            let list: Vec<String> = matches.iter().map(|hash| hash.to_base32()).collect();
+            Err(domain_status(
+                ErrorCode::InvalidArgument,
+                format!(
+                    "ambiguous change prefix {} (matches: {})",
+                    target,
+                    list.join(", ")
+                ),
+            ))
+        }
     }
 }

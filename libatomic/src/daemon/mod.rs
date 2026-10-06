@@ -21,6 +21,9 @@
 //! - [`services_provenance`] — the ProvenanceService journal-port wire handlers.
 //! - [`services_query`] — the heavy query handlers + ViewService.
 //! - [`services_maintenance`] — MaintenanceService (doctor).
+//! - [`services_sandbox`] — SandboxService (the local sandbox trees).
+//! - [`services_tag`] — TagService (tag create/delete/list/show).
+//! - [`services_sync`] — SyncService (remote registry, push/pull).
 //! - [`provenance_core`] — the shared provenance journal core.
 //! - [`journal_sink`] — the in-process provenance sink (DirectJournalSink).
 //! - [`convert`] — domain ↔ protobuf converters.
@@ -39,4 +42,9 @@ pub mod services_agent;
 pub mod services_maintenance;
 pub mod services_provenance;
 pub mod services_query;
+pub mod services_sandbox;
+pub mod services_sync;
+pub mod services_sync_remote;
+pub mod services_tag;
+pub mod services_triage;
 pub mod state;

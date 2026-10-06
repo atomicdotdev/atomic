@@ -14,8 +14,11 @@ atomic-agent = { workspace = true }
 atomic-canonical = { workspace = true }
 atomic-core = { workspace = true }
 atomic-identity = { workspace = true }
+atomic-objects = { workspace = true }
+atomic-remote = { workspace = true }
 atomic-repository = { workspace = true }
 atomic-semantic = { workspace = true }
+bytes = { workspace = true }
 
 # gRPC: the generated contract (this crate owns the codegen).
 tonic = { workspace = true }
@@ -25,7 +28,7 @@ prost-types = { workspace = true }
 # Async: the handlers are async and offload redb work to the blocking pool.
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
-futures-core = { workspace = true }
+futures-core = "0.3"
 
 # Domain support.
 serde_json = { workspace = true }

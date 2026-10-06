@@ -29,11 +29,103 @@ message PushChangesRequest {
   string remote = 3;
   repeated string views = 4;          // empty = current view manifest chain
   optional ExpectedState expected = 5; // CAS-on-prev precondition
+  // `atomic push`'s flag surface (add-only). The network sync IS domain —
+  // the handler performs it end to end; the client resolves auth
+  // CLIENT-SIDE (identity store + config are file reads, not redb) and
+  // ships the headers, so the handler never touches the caller's
+  // identities. `remote_url` carries the client-resolved remote URL (the
+  // ListRemotes read); `remote` stays the configured name for the report.
+  optional string to_view = 6;
+  optional string from_view = 7;
+  bool dry_run = 8;
+  bool force = 9;
+  bool all = 10;
+  bool insecure = 11;
+  uint64 timeout_secs = 12;
+  map<string, string> auth_headers = 13;
+  optional string remote_url = 14;
 }
 message PushChangesResponse {
   uint64 pushed_changes = 1;
   repeated string manifests = 2;
   ResponseMeta meta = 100;
+  // The push report (add-only): the structured per-view sync outcome the
+  // CLI renders with the local push body's exact print functions — one
+  // entry per view in the root→leaf chain.
+  optional PushReport report = 3;
+  // The plan-phase conflict (add-only): the handler performed NO mutation
+  // (the conflict aborts before any store/declare), so it rides the
+  // response instead of an error, letting the client render the local
+  // divergence block and exit with the local error.
+  optional PushConflict conflict = 4;
+}
+
+// The push report (add-only): every line the local push body prints,
+// structured so the CLI renders.
+message PushReport {
+  string remote_name = 1;
+  string remote_url = 2;
+  repeated PushViewReport views = 3;      // the chain, root → leaf
+  uint64 total_stored = 4;
+  uint64 views_declared = 5;
+  repeated PushSidecar attestations = 6;
+  repeated PushSidecar provenance = 7;
+  repeated PushTag tags = 8;
+}
+
+// One view's sync outcome (add-only).
+message PushViewReport {
+  string remote_name = 1;         // the view's name on the remote
+  string scope = 2;              // manifest scope label
+  optional string parent = 3;
+  bool exists_on_remote = 4;
+  uint64 remote_change_count = 5;
+  bool noop = 6;
+  bool shrink = 7;                // the skip-and-warn branch
+  bool forced = 8;                // the diverged-anyway warning
+  repeated PushChange to_store = 9;
+  uint64 log_count = 10;
+  bool declared = 11;
+}
+
+// One change the handler stored (add-only): hash + message for the
+// per-change report lines.
+message PushChange {
+  Hash hash = 1;
+  optional string message = 2;
+}
+
+// One uploaded sidecar (add-only): an attestation or a provenance graph.
+message PushSidecar {
+  Hash hash = 1;
+  optional string cost = 2;       // attestation cost_display
+  uint64 covered = 3;            // attestation change_count
+  uint64 nodes = 4;              // provenance node_count
+  uint64 explained = 5;          // provenance change_count
+}
+
+// One uploaded tag (add-only).
+message PushTag {
+  Hash hash = 1;                  // the tag content hash
+  string name = 2;
+  string kind = 3;                // the TagKind label
+}
+
+// The plan-phase push conflict (add-only): which view, which flavor, the
+// conflict's own description, and the two manifests' render states.
+message PushConflict {
+  string view = 1;
+  bool identity_mismatch = 2;     // false = diverged
+  string description = 3;         // the conflict's Display text
+  optional ManifestState local = 4;
+  optional ManifestState remote = 5;
+}
+
+// One manifest's render state for the divergence block (add-only).
+message ManifestState {
+  string view = 1;                // the view name to render
+  string state = 2;               // the merkle state's base32
+  uint64 change_count = 3;
 }
 
 message PullChangesRequest {
@@ -41,14 +133,89 @@ message PullChangesRequest {
   RequestMeta meta = 2;
   string remote = 3;
   bool import_sidecars = 4;           // provenance/attestation ingestion on
-                                       // apply (default true)
+                                        // apply (default true)
   // Imports update repository/view state only. Host materialization is a
   // separately authorized working-copy operation, not a hidden pull effect.
+  // `atomic pull`'s flag surface (add-only) — same client-side auth model
+  // as PushChanges (headers resolved from the identity store, never redb).
+  optional string to_view = 5;
+  optional string from_view = 6;
+  bool dry_run = 7;
+  bool all = 8;
+  bool insecure = 9;
+  uint64 timeout_secs = 10;
+  optional string identity = 11;      // informational; auth rides headers
+  bool download_only = 12;
+  map<string, string> auth_headers = 13;
+  optional string remote_url = 14;
 }
 message PullChangesResponse {
   uint64 applied_changes = 1;
   repeated string updated_views = 2;
   ResponseMeta meta = 100;
+  // The pull report (add-only): the structured sync outcome the CLI
+  // renders with the local pull body's exact print functions.
+  optional PullReport report = 3;
+}
+
+// The pull report (add-only): every line the local pull body prints.
+message PullReport {
+  string remote_name = 1;
+  string remote_url = 2;
+  string remote_view = 3;
+  string local_view = 4;
+  uint64 local_view_changes = 5;     // the local view's log length
+  uint64 graph_objects = 6;          // registered change hashes (the haves)
+  uint64 remote_changes = 7;         // the remote view's log length
+  optional string remote_state = 8;  // the remote tip merkle base32 (""=empty)
+  repeated string local_only = 9; // diverged-history warning hashes (short)
+  repeated PullDownload downloads = 10; // per-change save results
+  uint64 changes_downloaded = 11;
+  uint64 bytes_transferred = 12;
+  bool applied = 13;                  // any view closure advanced
+  uint64 applied_changes = 14;        // replayed + applied count
+  repeated string apply_errors = 15;
+  repeated PullSidecar sidecars = 16;  // imported provenance/attestation stats
+  bool set_id_verified = 17;
+  optional string set_id_warning = 18; // the mismatch/local-error warning text
+  bool materialized = 19;             // the working copy was updated
+  uint64 files_written = 20;
+  optional string materialize_error = 21;
+  repeated PullTag tags = 22;         // downloaded tags
+  repeated PullWarning warnings = 23;  // the local body's print_warning lines
+  optional string local_tip = 24;     // the local view's tip hash base32
+  bool vault_bootstrapped = 25;       // "Vault initialized from pulled content"
+  uint64 reconciled_views = 26;       // the reconciled closure count
+  bool download_only = 27;
+  uint64 changes_failed = 28;
+}
+
+// One downloaded change (add-only): hash, message, and save outcome.
+message PullDownload {
+  Hash hash = 1;
+  optional string message = 2;
+  bool ok = 3;
+  optional string error = 4;
+  uint64 index = 5;                   // the (i/total) position
+  uint64 total = 6;
+}
+
+// One imported sidecar's report line (add-only).
+message PullSidecar {
+  string kind = 1;    // "provenance" | "attestation"
+  uint64 count = 2;
+  optional string detail = 3;
+}
+
+// One downloaded tag (add-only).
+message PullTag {
+  string name = 1;
+  string kind = 2;
+}
+
+// A warning line the local body prints via print_warning (add-only).
+message PullWarning {
+  string text = 1;
 }
 
 enum RemoteAction {
@@ -74,6 +241,9 @@ message ManageRemotesRequest {
   optional string name = 4;
   optional string url = 5;
   optional string new_name = 6;
+  // ADD + set default in ONE transaction — `remote add --default`
+  // (add-only; the local body's add_remote_default domain call).
+  bool set_default = 7;
 }
 message ManageRemotesResponse {
   repeated RemoteInfo remotes = 1;
