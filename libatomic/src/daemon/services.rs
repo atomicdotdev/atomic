@@ -748,10 +748,7 @@ fn compute_ref_pair_diff(
             .get_file_content_on_view(&path, to_view)
             .map_err(repository_error)?;
         let old_binary = old.contains(&0);
-        let new_binary = new
-            .as_ref()
-            .map(|c| c.contains(&0))
-            .unwrap_or(false);
+        let new_binary = new.as_ref().map(|c| c.contains(&0)).unwrap_or(false);
         if old_binary || new_binary {
             chunks.push(DiffChunk {
                 path: path.clone(),

@@ -105,15 +105,8 @@ fn checkpoint_source_proto(source: &ProvenanceCheckpointSource) -> CheckpointSou
         agent_name: source.agent_name.clone(),
         agent_display_name: source.agent_display_name.clone(),
         agent_vendor: source.agent_vendor.clone(),
-        change_hashes: source
-            .change_hashes
-            .iter()
-            .map(hash_proto)
-            .collect(),
-        previous_provenance: source
-            .previous_provenance
-            .as_ref()
-            .map(hash_proto),
+        change_hashes: source.change_hashes.iter().map(hash_proto).collect(),
+        previous_provenance: source.previous_provenance.as_ref().map(hash_proto),
         plan_id: source.plan_id.clone(),
         ledger_turn_number: source.ledger_turn_number,
     }
@@ -131,10 +124,7 @@ fn attempt_proto(attempt: &StoreAttempt) -> ProvenanceCheckpointAttempt {
         frozen_event_count: attempt.frozen_event_count,
         source: Some(checkpoint_source_proto(&attempt.source)),
         phase: phase as i32,
-        provenance_hash: attempt
-            .provenance_hash
-            .as_ref()
-            .map(hash_proto),
+        provenance_hash: attempt.provenance_hash.as_ref().map(hash_proto),
         session_turn: attempt
             .session_turn
             .as_ref()

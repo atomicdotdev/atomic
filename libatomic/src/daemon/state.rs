@@ -215,7 +215,6 @@ impl DaemonState {
     }
 }
 
-
 impl Default for DaemonState {
     fn default() -> Self {
         Self::new()
