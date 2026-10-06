@@ -626,8 +626,20 @@ impl Command for Import {
             // contains. A fresh (not-yet-initialized) repo has nothing
             // imported, so the forecast is the full history — which is correct.
             // The dry run selects the explicit Observe mode: it never mutates.
+            // Ordinary read-only opens now migrate the legacy database layout.
+            // Require that migration separately rather than move files in a preview.
+            if self.incremental
+                && workdir
+                    .join(".atomic")
+                    .join(atomic_repository::LEGACY_PRISTINE_FILE)
+                    .is_file()
+            {
+                return Err(CliError::GitError {
+                    message: "Incremental dry run requires database migration first; run `atomic view list` to migrate the repository, then retry".to_string(),
+                });
+            }
             let mut repo =
-                if self.incremental && workdir.join(".atomic").join("pristine.redb").exists() {
+                if self.incremental && atomic_repository::has_database(&workdir.join(".atomic")) {
                     Repository::open_readonly(workdir).ok()
                 } else {
                     None
@@ -710,7 +722,7 @@ impl Command for Import {
                 message: "a detached import tip requires an explicit target view name".to_string(),
             });
         }
-        let repo_exists = workdir.join(".atomic").join("pristine.redb").exists();
+        let repo_exists = atomic_repository::has_database(&workdir.join(".atomic"));
         // CB-13D review R1: the metadata-only watch path never bootstraps a
         // repository — init, ignore templates, and vault setup are
         // command-boundary effects.

@@ -1,6 +1,6 @@
 use std::time::{Duration, Instant};
 
-use atomic_repository::{Repository, RepositoryError};
+use atomic_repository::{Repository, RepositoryError, DATABASE_FILE};
 
 #[test]
 fn database_wait_is_bounded_and_does_not_retry_non_contention_errors() {
@@ -13,7 +13,11 @@ fn database_wait_is_bounded_and_does_not_retry_non_contention_errors() {
     assert!(start.elapsed() >= Duration::from_millis(100));
     assert!(start.elapsed() < Duration::from_secs(2));
     drop(held);
-    std::fs::write(root.join(".atomic/pristine.redb"), b"corrupt database").unwrap();
+    std::fs::write(
+        root.join(".atomic").join(DATABASE_FILE),
+        b"corrupt database",
+    )
+    .unwrap();
     let start = Instant::now();
     let result = Repository::open_existing_wait(&root, Duration::from_secs(10));
     assert!(matches!(result, Err(RepositoryError::Database(_))));

@@ -60,7 +60,7 @@ pub enum CliError {
     ///
     /// This error occurs when a command that requires a repository is run
     /// outside of any Atomic repository.
-    #[error("Not in an Atomic repository (or any parent up to mount point)")]
+    #[error("Not in an Atomic repository: '{searched_path}' (no repository found in this directory or its parents)")]
     RepositoryNotFound {
         /// The path where the search started
         searched_path: PathBuf,
@@ -573,7 +573,7 @@ impl CliError {
     pub fn suggestion(&self) -> Option<&'static str> {
         match self {
             Self::RepositoryNotFound { .. } => {
-                Some("Run 'atomic init' to create a new repository, or change to a directory inside an existing repository.")
+                Some("Vault searches and other repository commands require an Atomic repository. Run 'atomic init' to create one, or change to a directory inside an existing Atomic repository.")
             }
             Self::RepositoryExists { .. } => {
                 Some("The directory is already an Atomic repository. Use 'atomic status' to see its state.")
@@ -735,6 +735,7 @@ mod tests {
         let err = CliError::repository_not_found("/home/user/project");
         let msg = err.to_string();
         assert!(msg.contains("Not in an Atomic repository"));
+        assert!(msg.contains("/home/user/project"));
     }
 
     #[test]

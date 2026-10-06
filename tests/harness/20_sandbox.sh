@@ -107,7 +107,7 @@ assert_file_exists "agent-1 has its own dep" "$SB/node_modules/only-in-1/x.js"
 assert_file_not_exists "agent-2 does NOT see agent-1's dep" "$SB2/node_modules/only-in-1/x.js"
 
 # Both sandboxes still share the same canonical graph (one pristine).
-assert_file_exists "canonical pristine is single source" "$CANON/.atomic/pristine.redb"
+assert_file_exists "canonical database is single source" "$CANON/.atomic/atomic.redb"
 
 # ═══════════════════════════════════════════════════════════════════════════
 begin_section "Sandbox: --from creates a per-agent draft view"

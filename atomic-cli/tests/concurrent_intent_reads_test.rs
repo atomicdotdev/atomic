@@ -136,11 +136,7 @@ fn ordinary_read_timeout_returns_failure_without_waiting_forever() {
 fn ordinary_read_corruption_fails_without_contention_wait() {
     let temp = tempfile::tempdir().unwrap();
     drop(Repository::init(temp.path()).unwrap());
-    std::fs::write(
-        temp.path().join(".atomic/pristine.redb"),
-        b"corrupt database",
-    )
-    .unwrap();
+    std::fs::write(temp.path().join(".atomic/atomic.redb"), b"corrupt database").unwrap();
     let outputs = finish_queries(
         Queries(vec![spawn_query(
             temp.path(),

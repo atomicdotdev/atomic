@@ -259,13 +259,13 @@ fn collect_snapshot(base: &Path, path: &Path, snapshot: &mut BTreeMap<String, Ve
                 .to_vec(),
         );
     } else if metadata.is_file() {
-        // redb 4.2 writes a graceful-shutdown marker into pristine.redb on
+        // redb 4.2 writes a graceful-shutdown marker into atomic.redb on
         // every clean close, so the file's bytes differ between opens even
         // when no state changed. That internal marker is not a mutation of
         // repository state; record its size so growth is still caught and
         // rely on the change store, bridge journal, and op-log snapshots
         // for semantic tamper evidence.
-        if relative.ends_with("pristine.redb") {
+        if relative.ends_with("atomic.redb") {
             snapshot.insert(
                 format!("file-size:{relative}"),
                 metadata.len().to_le_bytes().to_vec(),

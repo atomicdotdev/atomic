@@ -134,6 +134,35 @@ fn change_by_sha(
     found.unwrap_or_else(|| panic!("no imported change for git commit {git_sha}"))
 }
 
+#[test]
+fn incremental_dry_run_leaves_legacy_database_untouched_until_explicit_open() {
+    use atomic_repository::{DATABASE_FILE, LEGACY_PRISTINE_FILE};
+
+    let fixture = fixture();
+    atomic_ok(
+        &fixture.root,
+        &fixture.home,
+        &["git", "import", "--no-vault"],
+    );
+    let dot_dir = fixture.root.join(".atomic");
+    let legacy = dot_dir.join(LEGACY_PRISTINE_FILE);
+    fs::rename(dot_dir.join(DATABASE_FILE), &legacy).unwrap();
+    let before = fs::read(&legacy).unwrap();
+
+    let args = ["git", "import", "--incremental", "--dry-run", "--no-vault"];
+    let preview = atomic(&fixture.root, &fixture.home, &args);
+    assert!(!preview.status.success());
+    assert!(String::from_utf8_lossy(&preview.stderr).contains("atomic view list"));
+    assert_eq!(fs::read(&legacy).unwrap(), before);
+    assert!(!dot_dir.join(DATABASE_FILE).exists());
+    assert!(!dot_dir.join("legacy").exists());
+
+    atomic_ok(&fixture.root, &fixture.home, &["view", "list"]);
+    assert!(!legacy.exists());
+    assert!(dot_dir.join(DATABASE_FILE).is_file());
+    atomic_ok(&fixture.root, &fixture.home, &args);
+}
+
 /// Lowercase-hex decode (test helper; the hex crate is not a dependency).
 fn decode_hex(hex: &str) -> Vec<u8> {
     (0..hex.len())

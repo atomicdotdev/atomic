@@ -22,6 +22,7 @@
 
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use redb::{
     Builder, Database, ReadOnlyDatabase, ReadTransaction, ReadableDatabase, ReadableMultimapTable,
@@ -35,6 +36,7 @@ use crate::pristine::error::{PristineError, PristineResult};
 use crate::pristine::path_claim::{
     path_claim_schema_error, PATH_CLAIM_SCHEMA_KEY, PATH_CLAIM_SCHEMA_VERSION,
 };
+use crate::pristine::schema::{check_schema_version, stamp_schema_version};
 use crate::pristine::tables::*;
 use crate::pristine::traits::PathClaimTxnT;
 
@@ -82,7 +84,9 @@ fn ensure_supported_repository_capabilities(
     }
 }
 
-fn require_supported_repository_capabilities(read_txn: &ReadTransaction) -> PristineResult<()> {
+pub(crate) fn require_supported_repository_capabilities(
+    read_txn: &ReadTransaction,
+) -> PristineResult<()> {
     ensure_supported_repository_capabilities(&collect_required_repository_capabilities(read_txn)?)
 }
 
@@ -118,7 +122,15 @@ fn upgrade_legacy_database(path: &Path) -> PristineResult<()> {
     Ok(())
 }
 
-fn open_database(
+pub(crate) fn open_database(
+    path: &Path,
+    create: bool,
+    cache_bytes: usize,
+) -> PristineResult<Database> {
+    open_database_with_backend(path, create, cache_bytes).map(|(database, _)| database)
+}
+
+fn open_database_with_backend(
     path: &Path,
     create: bool,
     cache_bytes: usize,
@@ -208,7 +220,7 @@ pub struct Pristine {
 }
 
 enum PristineDatabase {
-    Writable(Database, SnapshotBackend),
+    Writable(Arc<Database>, SnapshotBackend),
     ReadOnly(ReadOnlyDatabase),
 }
 
@@ -250,7 +262,8 @@ impl Pristine {
         // redb cache is 1 GB which causes excessive page eviction when
         // the GRAPH table grows beyond that during large imports.
         let cache_bytes = 8 * 1024 * 1024 * 1024; // 8 GiB
-        let (db, backend) = open_database(path, true, cache_bytes)?;
+        let (db, backend) = open_database_with_backend(path, true, cache_bytes)?;
+        check_schema_version(&db.begin_read()?)?;
 
         // Existing repositories must be checked before the additive table-init
         // transaction starts. Binaries predating this generic fence cannot honor
@@ -362,6 +375,8 @@ impl Pristine {
             write_txn.open_table(SESSION_PROVENANCE)?;
             write_txn.open_table(SESSION_MANIFESTS)?;
             write_txn.open_table(SESSION_HEADS)?;
+
+            stamp_schema_version(&write_txn)?;
         }
         write_txn.commit()?;
 
@@ -369,7 +384,7 @@ impl Pristine {
         // repository-level change files have been replayed into PATH_CLAIMS.
         // `open` returns a writable handle so that backfill can happen in one
         // transaction; read-only/open-existing modes reject the incomplete schema.
-        Self::scan_ids(PristineDatabase::Writable(db, backend), false)
+        Self::scan_ids(PristineDatabase::Writable(Arc::new(db), backend), false)
     }
 
     /// Open an existing pristine database without the table-init write lock.
@@ -405,9 +420,9 @@ impl Pristine {
         require_complete_path_claims: bool,
     ) -> PristineResult<Self> {
         let cache_bytes = 8 * 1024 * 1024 * 1024; // 8 GiB
-        let (db, backend) = open_database(path.as_ref(), false, cache_bytes)?;
+        let (db, backend) = open_database_with_backend(path.as_ref(), false, cache_bytes)?;
         Self::scan_ids(
-            PristineDatabase::Writable(db, backend),
+            PristineDatabase::Writable(Arc::new(db), backend),
             require_complete_path_claims,
         )
     }
@@ -471,14 +486,12 @@ impl Pristine {
     /// skip the table-init write transaction and only need a read pass to
     /// discover the max allocated node, view, and inode IDs.
     fn scan_ids(db: PristineDatabase, require_complete_path_claims: bool) -> PristineResult<Self> {
-        {
-            let capabilities_txn = db.begin_read()?;
-            require_supported_repository_capabilities(&capabilities_txn)?;
-            if require_complete_path_claims {
-                require_path_claim_schema(&capabilities_txn)?;
-            }
-        }
         let read_txn = db.begin_read()?;
+        check_schema_version(&read_txn)?;
+        require_supported_repository_capabilities(&read_txn)?;
+        if require_complete_path_claims {
+            require_path_claim_schema(&read_txn)?;
+        }
 
         let next_node_id = {
             let table = read_txn.open_table(EXTERNAL)?;
@@ -591,6 +604,18 @@ impl Pristine {
                 Err(path_claim_schema_error(Some(version)))
             }
             _ => Ok(true),
+        }
+    }
+
+    /// The writable redb handle, for stores that keep their tables in the same
+    /// repository database. `None` for a read-only pristine.
+    ///
+    /// A second `Database` for the same file cannot be opened while this one
+    /// is alive, even in the same process, so co-located stores must share it.
+    pub fn shared_database(&self) -> Option<Arc<Database>> {
+        match &self.db {
+            PristineDatabase::Writable(db, _) => Some(Arc::clone(db)),
+            PristineDatabase::ReadOnly(_) => None,
         }
     }
 

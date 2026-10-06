@@ -87,7 +87,7 @@ fn combined_native_index_corruption_is_detected_repaired_and_idempotent() {
     );
     drop(repo);
 
-    let database_path = temp.path().join(".atomic/pristine.redb");
+    let database_path = temp.path().join(".atomic/atomic.redb");
     let database = redb::Database::open(&database_path).unwrap();
     let write = database.begin_write().unwrap();
     {
@@ -212,7 +212,7 @@ fn injected_failure_rolls_back_complete_replacement() {
     let inode = repo.get_file_inode("f.txt").unwrap().unwrap();
     drop(repo);
 
-    let database_path = temp.path().join(".atomic/pristine.redb");
+    let database_path = temp.path().join(".atomic/atomic.redb");
     let database = redb::Database::open(&database_path).unwrap();
     let write = database.begin_write().unwrap();
     {
@@ -248,7 +248,7 @@ fn malformed_claim_and_conflict_rows_are_detected_and_replaced() {
     drop(txn);
     drop(repo);
 
-    let database_path = temp.path().join(".atomic/pristine.redb");
+    let database_path = temp.path().join(".atomic/atomic.redb");
     let database = redb::Database::open(&database_path).unwrap();
     let write = database.begin_write().unwrap();
     {
@@ -299,7 +299,7 @@ fn repair_preserves_bijective_graphless_staged_file_and_directory() {
     let recorded_inode = txn.get_inode("recorded.txt").unwrap().unwrap();
     drop(txn);
     drop(repo);
-    let database_path = temp.path().join(".atomic/pristine.redb");
+    let database_path = temp.path().join(".atomic/atomic.redb");
     let database = redb::Database::open(&database_path).unwrap();
     let write = database.begin_write().unwrap();
     {
@@ -379,7 +379,7 @@ fn suspicious_inode_binding_on_staged_path_refuses_repair() {
     drop(txn);
     drop(repo);
 
-    let database_path = temp.path().join(".atomic/pristine.redb");
+    let database_path = temp.path().join(".atomic/atomic.redb");
     let database = redb::Database::open(&database_path).unwrap();
     let write = database.begin_write().unwrap();
     {
@@ -430,7 +430,7 @@ fn contradictory_path_claim_transition_is_reported_as_stale() {
     drop(txn);
     drop(repo);
 
-    let database_path = temp.path().join(".atomic/pristine.redb");
+    let database_path = temp.path().join(".atomic/atomic.redb");
     let database = redb::Database::open(&database_path).unwrap();
     let write = database.begin_write().unwrap();
     {
@@ -467,7 +467,7 @@ fn poisoned_inode_graph_owner_refuses_legacy_repair_without_prewrite_migration()
     drop(repo);
 
     let poisoned_inode = Inode::new(inode.get() + 10_000);
-    let database_path = temp.path().join(".atomic/pristine.redb");
+    let database_path = temp.path().join(".atomic/atomic.redb");
     let database = redb::Database::open(&database_path).unwrap();
     let write = database.begin_write().unwrap();
     {
@@ -527,7 +527,7 @@ fn missing_path_claim_schema_is_repaired_without_implicit_open_migration() {
     record_all(&repo, "base");
     drop(repo);
 
-    let database_path = temp.path().join(".atomic/pristine.redb");
+    let database_path = temp.path().join(".atomic/atomic.redb");
     let database = redb::Database::open(&database_path).unwrap();
     let write = database.begin_write().unwrap();
     {
@@ -572,7 +572,7 @@ fn directory_empty_flags_use_exact_direct_children_during_repair() {
     drop(txn);
     drop(repo);
 
-    let database_path = temp.path().join(".atomic/pristine.redb");
+    let database_path = temp.path().join(".atomic/atomic.redb");
     let database = redb::Database::open(&database_path).unwrap();
     let write = database.begin_write().unwrap();
     {
@@ -637,7 +637,7 @@ fn content_conflict_projection_is_rebuilt_from_graph_markers() {
     drop(txn);
     drop(repo);
 
-    let database_path = temp.path().join(".atomic/pristine.redb");
+    let database_path = temp.path().join(".atomic/atomic.redb");
     let database = redb::Database::open(&database_path).unwrap();
     let write = database.begin_write().unwrap();
     {
@@ -706,7 +706,7 @@ fn one_sided_graphless_staging_is_unrepairable_and_preserved() {
     let staged_inode = repo.get_file_inode("staged.txt").unwrap().unwrap();
     drop(repo);
 
-    let database_path = temp.path().join(".atomic/pristine.redb");
+    let database_path = temp.path().join(".atomic/atomic.redb");
     let database = redb::Database::open(&database_path).unwrap();
     let write = database.begin_write().unwrap();
     {
@@ -760,7 +760,7 @@ fn targeted_path_claim_repair_refuses_stale_event_on_derived_path() {
     let mut stale = alive.event;
     stale.state = PathClaimState::Dead;
     let stale_encoded = encode_path_claim_event(&stale);
-    let database_path = temp.path().join(".atomic/pristine.redb");
+    let database_path = temp.path().join(".atomic/atomic.redb");
     let database = redb::Database::open(&database_path).unwrap();
     let write = database.begin_write().unwrap();
     {
@@ -840,7 +840,7 @@ fn targeted_path_claim_repair_inserts_missing_rows_idempotently() {
     drop(txn);
     drop(repo);
 
-    let database_path = temp.path().join(".atomic/pristine.redb");
+    let database_path = temp.path().join(".atomic/atomic.redb");
     let database = redb::Database::open(&database_path).unwrap();
     let write = database.begin_write().unwrap();
     {
@@ -900,7 +900,7 @@ fn targeted_path_claim_repair_journals_an_immutable_remediation_operation() {
         .collect();
     drop(txn);
     drop(repo);
-    let database_path = temp.path().join(".atomic/pristine.redb");
+    let database_path = temp.path().join(".atomic/atomic.redb");
     let database = redb::Database::open(&database_path).unwrap();
     let write = database.begin_write().unwrap();
     {
@@ -969,7 +969,7 @@ fn path_claims_repair_journals_reconstructible_inverse_and_undo_restores_it() {
     drop(repo);
 
     // Corrupt the claims table the same way the combined fixture does.
-    let database_path = temp.path().join(".atomic/pristine.redb");
+    let database_path = temp.path().join(".atomic/atomic.redb");
     let database = redb::Database::open(&database_path).unwrap();
     let write = database.begin_write().unwrap();
     {

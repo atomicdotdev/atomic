@@ -105,6 +105,63 @@ fn stored_bindings_are_idempotent_and_survive_reopen() {
 }
 
 #[test]
+fn published_binding_and_operation_survive_database_consolidation() {
+    let keypair = test_keypair(1);
+    let binding = sample_binding(&keypair, 0x10);
+    let (directory, repository, git) = create_temp_repo_with_git();
+    let working_copy = repository.working_copy();
+    let publication = repository
+        .publish_binding(working_copy, &git, &binding, None)
+        .unwrap();
+    let operation = publication.operation().unwrap();
+    drop(repository);
+
+    let dot_dir = directory.path().join(".atomic");
+    std::fs::rename(
+        dot_dir.join(crate::DATABASE_FILE),
+        dot_dir.join(crate::LEGACY_PRISTINE_FILE),
+    )
+    .unwrap();
+    {
+        let store = crate::redb_change_store::RedbChangeStore::open(
+            dot_dir.join(crate::LEGACY_CHANGE_STORE_FILE),
+        )
+        .unwrap();
+        store
+            .reserve_provenance_turn("before-migration", 1, 1)
+            .unwrap();
+    }
+
+    let reopened = Repository::open(directory.path()).unwrap();
+    assert_eq!(reopened.require_working_copy_id().unwrap(), working_copy);
+    assert_eq!(
+        reopened.load_binding(&binding.id()).unwrap(),
+        Some(binding.clone())
+    );
+    let replay = reopened
+        .publish_binding(working_copy, &git, &binding, None)
+        .unwrap();
+    assert!(matches!(replay, BindingPublication::Idempotent { .. }));
+    assert_eq!(
+        reopened
+            .operation_details(operation)
+            .unwrap()
+            .operation
+            .id(),
+        operation
+    );
+    assert!(reopened
+        .redb_change_store()
+        .unwrap()
+        .get_provenance_turn_for("before-migration", 1)
+        .unwrap()
+        .is_some());
+    assert!(dot_dir.join(crate::DATABASE_FILE).exists());
+    assert!(!dot_dir.join(crate::LEGACY_PRISTINE_FILE).exists());
+    assert!(!dot_dir.join(crate::LEGACY_CHANGE_STORE_FILE).exists());
+}
+
+#[test]
 fn publication_creates_create_only_ref_and_is_idempotent() {
     let keypair = test_keypair(4);
     let binding = sample_binding(&keypair, 0x40);
@@ -519,7 +576,7 @@ fn corrupt_stored_bytes_fail_closed_instead_of_reading_none() {
     // Simulate storage corruption by rewriting the row at the database layer
     // (bypassing the insert-only API), then prove load_binding fails closed
     // with an explicit error rather than silently returning None.
-    let db_path = directory.path().join(".atomic/pristine.redb");
+    let db_path = directory.path().join(".atomic/atomic.redb");
     drop(repository);
     let db = redb::Database::create(&db_path).expect("open db directly");
     let write_txn = db.begin_write().expect("write txn");

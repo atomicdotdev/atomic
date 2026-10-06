@@ -15,6 +15,7 @@ mod write;
 
 pub use helpers::AdjIterator;
 pub use pristine::Pristine;
+pub(crate) use pristine::{open_database, require_supported_repository_capabilities};
 pub use read::CachedGraphTxn;
 pub use read::InodePreloadTxn;
 pub use read::ReadTxn;

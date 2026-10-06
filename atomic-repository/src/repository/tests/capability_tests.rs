@@ -7,7 +7,7 @@ use atomic_core::pristine::{
 };
 
 fn set_raw_requirement(root: &Path, capability: &str, version: u32) {
-    let database = redb::Database::open(root.join(".atomic/pristine.redb")).unwrap();
+    let database = redb::Database::open(root.join(".atomic/atomic.redb")).unwrap();
     let write = database.begin_write().unwrap();
     {
         let mut metadata = write.open_table(PRISTINE_META).unwrap();
@@ -18,7 +18,7 @@ fn set_raw_requirement(root: &Path, capability: &str, version: u32) {
 }
 
 fn clear_path_claim_marker(root: &Path) {
-    let database = redb::Database::open(root.join(".atomic/pristine.redb")).unwrap();
+    let database = redb::Database::open(root.join(".atomic/atomic.redb")).unwrap();
     let write = database.begin_write().unwrap();
     {
         let mut metadata = write.open_table(PRISTINE_META).unwrap();
@@ -109,7 +109,7 @@ fn unsupported_open_starts_neither_migration_nor_change_store_creation() {
     expect_unsupported(Repository::open(temp.path()), "future-format");
     assert!(!temp.path().join(".atomic/changes").exists());
 
-    let database = redb::Database::open(temp.path().join(".atomic/pristine.redb")).unwrap();
+    let database = redb::Database::open(temp.path().join(".atomic/atomic.redb")).unwrap();
     let read = database.begin_read().unwrap();
     let metadata = read.open_table(PRISTINE_META).unwrap();
     assert!(metadata.get(PATH_CLAIM_SCHEMA_KEY).unwrap().is_none());

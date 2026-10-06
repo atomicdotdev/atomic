@@ -23,7 +23,7 @@ fn doctor_check_is_read_only_and_native_repair_is_idempotent() {
     .unwrap();
     drop(repo);
 
-    let pristine_path = temp.path().join(".atomic/pristine.redb");
+    let pristine_path = temp.path().join(".atomic/atomic.redb");
     let pristine_len = std::fs::metadata(&pristine_path).unwrap().len();
     let before = Repository::open_readonly_for_native_repair(temp.path())
         .unwrap()
@@ -99,7 +99,7 @@ fn doctor_check_does_not_recreate_a_missing_change_store() {
     let changes = temp.path().join(".atomic/changes");
     let preserved = temp.path().join(".atomic/changes-preserved");
     std::fs::rename(&changes, &preserved).unwrap();
-    let pristine = temp.path().join(".atomic/pristine.redb");
+    let pristine = temp.path().join(".atomic/atomic.redb");
     let pristine_before = std::fs::read(&pristine).unwrap();
 
     for args in [
@@ -123,7 +123,7 @@ fn doctor_check_does_not_recreate_a_missing_change_store() {
         assert_eq!(
             std::fs::read(&pristine).unwrap().len(),
             pristine_before.len(),
-            "doctor wrote to pristine.redb (length changed); byte-for-byte equality is
+            "doctor wrote to atomic.redb (length changed); byte-for-byte equality is
              intentionally not required because redb 4.2 rewrites its
              graceful-shutdown marker on every clean close"
         );
@@ -166,7 +166,7 @@ fn doctor_rejects_corrupt_current_view_without_repairing_dev() {
     let current_view = temp.path().join(".atomic/current_view");
     let invalid = [0xff, 0xfe, 0xfd];
     std::fs::write(&current_view, invalid).unwrap();
-    let pristine = temp.path().join(".atomic/pristine.redb");
+    let pristine = temp.path().join(".atomic/atomic.redb");
     let pristine_before = std::fs::read(&pristine).unwrap();
     let feature_before = std::fs::read(temp.path().join("feature.txt")).unwrap();
 
@@ -189,7 +189,7 @@ fn doctor_rejects_corrupt_current_view_without_repairing_dev() {
         assert_eq!(
             std::fs::read(&pristine).unwrap().len(),
             pristine_before.len(),
-            "doctor wrote to pristine.redb (length changed); byte-for-byte equality is
+            "doctor wrote to atomic.redb (length changed); byte-for-byte equality is
              intentionally not required because redb 4.2 rewrites its
              graceful-shutdown marker on every clean close"
         );
@@ -226,7 +226,7 @@ fn doctor_reports_missing_change_authority_as_unrepairable_without_writes() {
 
     let preserved_change = change_path.with_extension("change-missing");
     std::fs::rename(&change_path, &preserved_change).unwrap();
-    let pristine_path = temp.path().join(".atomic/pristine.redb");
+    let pristine_path = temp.path().join(".atomic/atomic.redb");
     let pristine_before = std::fs::read(&pristine_path).unwrap();
     let worktree_before = std::fs::read(temp.path().join("f.txt")).unwrap();
 
@@ -252,7 +252,7 @@ fn doctor_reports_missing_change_authority_as_unrepairable_without_writes() {
         assert_eq!(
             std::fs::read(&pristine_path).unwrap().len(),
             pristine_before.len(),
-            "doctor wrote to pristine.redb (length changed); byte-for-byte equality is
+            "doctor wrote to atomic.redb (length changed); byte-for-byte equality is
              intentionally not required because redb 4.2 rewrites its
              graceful-shutdown marker on every clean close"
         );

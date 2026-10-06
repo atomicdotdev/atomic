@@ -49,13 +49,13 @@ atomic agent enable
 
 ### Repository owner locks and connection recovery
 
-Agent hooks are short-lived processes, while redb permits only one writable process to open a database. Atomic therefore starts one long-lived **database owner per canonical repository**. Hooks send committed provenance requests to that owner instead of opening the repository's redb change store directly.
+Agent hooks are short-lived processes, while redb permits only one process at a time to open a database file. Atomic therefore starts one long-lived **database owner per canonical repository**. Hooks send committed provenance requests to that owner instead of opening the repository's provenance journal directly. The journal lives in the repository database, `.atomic/atomic.redb`, alongside the graph, so the owner opens that file only while it serves a request and leaves it free for other `atomic` commands in between.
 
 Each repository has an independent ownership namespace:
 
 | Resource | Location | Purpose |
 |---|---|---|
-| redb change store | `.atomic/changes.redb` | Mutable provenance journal and checkpoint state |
+| repository database | `.atomic/atomic.redb` | Graph, views, sessions, vault, and the provenance journal with its checkpoint state |
 | owner election lock | `.atomic/changes-owner.lock` | OS-backed authority deciding which process may own that database |
 | Unix endpoint | `/tmp/atomic-owner-<repository-digest>.sock` | Local IPC transport on macOS and Linux |
 | Windows endpoint | `\\.\pipe\atomic-owner-<repository-digest>` | Local IPC transport on Windows |
@@ -69,16 +69,18 @@ Agent A ─┐                         Agent C ─┐
 Agent B ─┴─> Project 1 owner       Agent D ─┴─> Project 2 owner
                  │                                  │
                  v                                  v
-       Project 1 changes.redb             Project 2 changes.redb
+       Project 1 atomic.redb              Project 2 atomic.redb
 ```
 
 The **lock is the authority; the socket or named pipe is only transport**. The lock file may remain on disk after normal operation, but an unlocked file does not block a new owner. If an owner crashes, the OS releases its lock automatically. Recovery then proceeds as follows:
 
 1. A hook cannot reach the old endpoint and starts or reconnects to an owner.
 2. Owner candidates race for that repository's `changes-owner.lock`.
-3. Only the lock winner may open `changes.redb`.
+3. Only the lock winner serves provenance requests against `atomic.redb`.
 4. On Unix, the winner removes any stale socket left by the dead owner and binds a fresh endpoint.
 5. The hook retries with the same request/event ID, so a request committed before the crash is acknowledged once rather than applied twice.
+
+Repositories created before `atomic.redb` kept graph state in `.atomic/pristine.redb` and the journal in `.atomic/changes.redb`. The first open by a newer `atomic` merges both into `atomic.redb`, verifies every table against its source, and moves the old files to `.atomic/legacy/<timestamp>/`. If an owner started by an older `atomic` still holds `changes.redb`, run `atomic agent database-owner shutdown` in that repository first.
 
 Within one repository, redb write transactions are serialized by design, while reads and independent repositories can proceed concurrently. Startup, reconnect, and retry loops are bounded so a broken owner fails instead of hanging hooks indefinitely. Checkpoint attempts, event cutoffs, and fencing generations let interrupted turns resume without rewriting completed session turns.
 

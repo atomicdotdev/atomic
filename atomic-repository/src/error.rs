@@ -340,6 +340,15 @@ pub enum RepositoryError {
     #[error("Database already open. Cannot acquire lock.")]
     DatabaseBusy,
 
+    /// The legacy `changes.redb` could not be merged into `atomic.redb`
+    /// because another process holds it, normally an agent database owner
+    /// started by an older atomic.
+    #[error(
+        "{path} is held by another process (usually an agent database owner from an older \
+         atomic); run `atomic agent database-owner shutdown` in this repository and retry"
+    )]
+    LegacyChangeStoreBusy { path: String },
+
     /// Walkdir error (during file traversal)
     #[error("Directory traversal error: {0}")]
     WalkDir(#[from] walkdir::Error),

@@ -170,7 +170,7 @@ fn inject_order_conflict(root: &Path, path: &str, line: u32) {
     use atomic_core::pristine::{MutTxnT, StoredConflict, StoredConflictKind, TreeTxnT, ViewTxnT};
 
     let view_name = desired_view(root);
-    let pristine = atomic_core::pristine::Pristine::open(root.join(".atomic/pristine.redb"))
+    let pristine = atomic_core::pristine::Pristine::open(root.join(".atomic/atomic.redb"))
         .expect("open pristine");
     let (view_id, inode) = {
         let txn = pristine.read_txn().expect("read txn");
@@ -203,7 +203,7 @@ fn persisted_conflict_count(root: &Path, path: &str) -> usize {
     use atomic_core::pristine::{TreeTxnT, ViewTxnT};
 
     let view_name = desired_view(root);
-    let pristine = atomic_core::pristine::Pristine::open(root.join(".atomic/pristine.redb"))
+    let pristine = atomic_core::pristine::Pristine::open(root.join(".atomic/atomic.redb"))
         .expect("open pristine");
     let txn = pristine.read_txn().expect("read txn");
     let view = txn

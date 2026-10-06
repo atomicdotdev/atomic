@@ -359,7 +359,9 @@ This simplifies the codebase while maintaining semantic clarity.
 
 ```
 .atomic/
-├── pristine.redb          # Graph database
+├── atomic.redb            # Repository database (redb): graph, views,
+│                          # sessions, vault, provenance journal
+├── legacy/<timestamp>/    # pristine.redb + changes.redb replaced by a merge
 ├── changes/               # Content-addressed change files
 │   └── AB/CDEF...         # Two-level directory structure
 ├── config.toml            # Repository configuration

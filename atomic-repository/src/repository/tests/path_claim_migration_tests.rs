@@ -46,7 +46,7 @@ fn writable_open_atomically_backfills_claims_and_removes_reverse_only_rows() {
     .unwrap();
     drop(repo);
 
-    let database_path = temp.path().join(".atomic/pristine.redb");
+    let database_path = temp.path().join(".atomic/atomic.redb");
     clear_path_claim_schema(&database_path);
     let database = redb::Database::open(&database_path).unwrap();
     let write = database.begin_write().unwrap();
@@ -94,7 +94,7 @@ fn migration_recovers_missing_inode_binding_from_inode_graph() {
     drop(txn);
     drop(repo);
 
-    let database_path = temp.path().join(".atomic/pristine.redb");
+    let database_path = temp.path().join(".atomic/atomic.redb");
     clear_path_claim_schema(&database_path);
     let database = redb::Database::open(&database_path).unwrap();
     let write = database.begin_write().unwrap();
@@ -146,7 +146,7 @@ fn migration_replays_causal_rename_chain_without_using_cached_tree_path() {
     .unwrap();
     drop(repo);
 
-    let database_path = temp.path().join(".atomic/pristine.redb");
+    let database_path = temp.path().join(".atomic/atomic.redb");
     clear_path_claim_schema(&database_path);
     let repo = Repository::open(temp.path()).unwrap();
     let txn = repo.pristine.read_txn().unwrap();

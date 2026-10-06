@@ -239,11 +239,11 @@ fn collect_snapshot(base: &Path, path: &Path, snapshot: &mut BTreeMap<String, Ve
                 .to_vec(),
         );
     } else if metadata.is_file() {
-        // redb 4.2 rewrites its graceful-shutdown marker into pristine.redb
+        // redb 4.2 rewrites its graceful-shutdown marker into atomic.redb
         // on every clean close, so byte equality is not a mutation signal.
         // Record the size instead; the git and worktree snapshots carry the
         // semantic tamper evidence for these boundary refusals.
-        if relative.ends_with("pristine.redb") {
+        if relative.ends_with("atomic.redb") {
             snapshot.insert(
                 format!("file-size:{relative}"),
                 metadata.len().to_le_bytes().to_vec(),

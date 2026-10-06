@@ -345,6 +345,21 @@ pub enum PristineError {
         /// Description of the serialization failure
         message: String,
     },
+
+    // Schema Errors
+    /// The database was written by a newer schema than this build reads
+    UnsupportedSchema {
+        /// Schema version stored in the database
+        found: u64,
+        /// Newest schema version this build understands
+        supported: u64,
+    },
+
+    /// Merging legacy databases into the repository database failed
+    Merge {
+        /// Why the merge was refused or did not verify
+        message: String,
+    },
 }
 
 impl fmt::Display for PristineError {
@@ -516,6 +531,14 @@ impl fmt::Display for PristineError {
 
             // Serialization errors
             Self::Serialization { message } => write!(f, "serialization error: {}", message),
+
+            // Schema errors
+            Self::UnsupportedSchema { found, supported } => write!(
+                f,
+                "repository database schema {} is newer than this atomic supports ({}); upgrade atomic",
+                found, supported
+            ),
+            Self::Merge { message } => write!(f, "database merge failed: {}", message),
         }
     }
 }

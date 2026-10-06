@@ -82,7 +82,7 @@ pub(super) fn discover_layout(start: &Path) -> Result<RepositoryLayout, Reposito
             return layout_for_paths(dir, common_dot_dir, local_dot_dir, false);
         }
 
-        if local_dot_dir.join("pristine.redb").is_file() {
+        if super::has_database(&local_dot_dir) {
             return layout_for_paths(dir, local_dot_dir.clone(), local_dot_dir, false);
         }
 
@@ -351,14 +351,14 @@ fn read_repository_pointer(path: &Path) -> Result<PathBuf, RepositoryError> {
             .unwrap_or_else(|| Path::new("."))
             .join(pointed)
     };
-    let common_dot_dir = if pointed.join("pristine.redb").is_file() {
+    let common_dot_dir = if super::has_database(&pointed) {
         pointed
-    } else if pointed.join(DOT_DIR).join("pristine.redb").is_file() {
+    } else if super::has_database(&pointed.join(DOT_DIR)) {
         pointed.join(DOT_DIR)
     } else {
         return Err(RepositoryError::InvalidRepository {
             reason: format!(
-                "Atomic repository pointer '{}' does not reference a pristine database",
+                "Atomic repository pointer '{}' does not reference a repository database",
                 path.display()
             ),
         });
