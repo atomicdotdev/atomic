@@ -689,17 +689,7 @@ fn snapshot_retention_refuses_and_preserves_objects_rooted_by_an_interrupted_ope
         .unwrap()
         .to_string_lossy()
         .replace('\\', "/");
-    #[cfg(unix)]
-    let mode = {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::metadata(&change_path)
-            .unwrap()
-            .permissions()
-            .mode()
-            & 0o7777
-    };
-    #[cfg(not(unix))]
-    let mode = 0o644;
+    let mode = super::super::operation::metadata_mode(&std::fs::metadata(&change_path).unwrap());
     let prepared = repo
         .prepare_working_copy_transition(
             &operation_lock,
