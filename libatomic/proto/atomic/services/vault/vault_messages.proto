@@ -136,7 +136,7 @@ message ContextItem {
   string kg_node_id = 2;     // the KG's node identity
   string revision_hash = 3;  // entry type + frontmatter + body revision
   string content_hash = 4;   // body-only hash
-  string path = 5;           // vault-relative path (memory/<name>.md)
+  string path = 5;           // vault-relative path, e.g. memory/`<name>`.md
   string name = 6;
   string kind = 7;           // memoryKind (constraint/lesson/…)
   string status = 8;
