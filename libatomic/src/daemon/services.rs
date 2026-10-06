@@ -560,6 +560,7 @@ impl repository_query_service_server::RepositoryQueryService for QueryImpl {
                             conflicts: Vec::new(),
                             snapshot: None,
                             untracked: Vec::new(),
+                            pristine_content: None,
                         })
                     }
                     Some(preview_mutation_request::Operation::Unrecord(preview)) => {
@@ -670,6 +671,7 @@ impl repository_query_service_server::RepositoryQueryService for QueryImpl {
                             conflicts: Vec::new(),
                             snapshot: None,
                             untracked: Vec::new(),
+                            pristine_content: None,
                         })
                     }
                     None => Err(domain_status(
@@ -727,12 +729,23 @@ impl repository_query_service_server::RepositoryQueryService for QueryImpl {
                         _ => {}
                     }
                 }
+                // The single-file dry-run arm (add-only): the pristine
+                // bytes `restore --dry-run <file>` dumps to stdout — the
+                // SAME domain read the local body makes. Absent content is
+                // the CLI's not-found error, not a failure here.
+                let pristine_content = match request.content_path {
+                    Some(ref path) if !path.is_empty() => repo
+                        .get_file_content(std::path::Path::new(path))
+                        .map_err(repository_error)?,
+                    _ => None,
+                };
                 Ok(PreviewMutationResponse {
                     affected_paths: affected,
                     changes: Vec::new(),
                     conflicts: Vec::new(),
                     snapshot: None,
                     untracked,
+                    pristine_content,
                 })
             })
             .await
@@ -872,6 +885,90 @@ fn change_info(
         has_provenance: change.has_provenance(),
         has_unhashed: change.unhashed.is_some(),
         has_signature: change.signature.is_some(),
+    }
+}
+
+/// The hash-only report entry for a change the listing could not load —
+/// the local previews print the hash alone in that case, never an error.
+fn bare_change_info(hash: &atomic_core::types::Merkle) -> ChangeInfo {
+    ChangeInfo {
+        hash: Some(hash_proto(hash)),
+        message: None,
+        description: None,
+        authors: Vec::new(),
+        recorded_at: None,
+        dependencies: Vec::new(),
+        graph_section_count: 0,
+        semantic_section_count: 0,
+        content_chunk_count: 0,
+        has_provenance: false,
+        has_unhashed: false,
+        has_signature: false,
+    }
+}
+
+/// A wire Hash → the domain Merkle, refusing a malformed value.
+fn wire_hash(hash: &crate::atomic::Hash) -> Result<atomic_core::types::Merkle, Status> {
+    let mut bytes = [0u8; 32];
+    if hash.value.len() != 32 {
+        return Err(domain_status(
+            ErrorCode::InvalidArgument,
+            "hash must be 32 bytes",
+        ));
+    }
+    bytes.copy_from_slice(&hash.value);
+    Ok(atomic_core::types::Merkle(bytes))
+}
+
+/// Resolve one raw change reference with the local insert bodies'
+/// semantics: a full base32 hash parses directly; otherwise a
+/// case-insensitive unique prefix over the change store, refusing with
+/// the local messages on no match / ambiguity.
+fn resolve_change_reference(
+    repo: &Repository,
+    reference: &str,
+) -> Result<atomic_core::types::Merkle, Status> {
+    use atomic_core::types::Base32;
+    if let Some(hash) = atomic_core::types::Merkle::from_base32(reference.as_bytes()) {
+        return Ok(hash);
+    }
+    if reference.len() >= 2 {
+        match repo.find_change_by_prefix(reference) {
+            Ok(Some(hash)) => return Ok(hash),
+            Ok(None) => {}
+            Err(atomic_repository::RepositoryError::AmbiguousHash { .. }) => {
+                return Err(domain_status(
+                    ErrorCode::NotFound,
+                    format!("Ambiguous change hash '{reference}' - matches multiple changes"),
+                ));
+            }
+            Err(error) => return Err(repository_error(error)),
+        }
+    }
+    Err(domain_status(
+        ErrorCode::NotFound,
+        format!("Change not found: {reference}"),
+    ))
+}
+
+/// The single-insert domain calls the local single-insert body makes:
+/// the dependency closure by default, `--deps=false` skips it (the
+/// plain insert path).
+fn single_insert(
+    repo: &Repository,
+    hash: &atomic_core::types::Merkle,
+    target: &str,
+    apply_dependencies: bool,
+    allow_conflicts: bool,
+) -> Result<atomic_repository::InsertOutcome, atomic_repository::RepositoryError> {
+    let options = InsertOptions::default()
+        .apply_deps(apply_dependencies)
+        .allow_conflict(allow_conflicts)
+        .view(target.to_string());
+    if apply_dependencies {
+        repo.insert_change_rec(hash, options)
+    } else {
+        repo.insert_change(hash, options)
     }
 }
 
@@ -1468,51 +1565,243 @@ impl repository_mutation_service_server::RepositoryMutationService for MutationI
                     .target_view
                     .clone()
                     .unwrap_or_else(|| handle.current_view());
-                // Dependency closure is mandatory on the wire: the CLI's
-                // --deps=false escape hatch stays client-side.
-                let (applied, has_conflicts) = match request.source {
+                let dry_run = request.dry_run.unwrap_or(false);
+                let apply_dependencies = request.apply_dependencies.unwrap_or(true);
+                // How the working copy refreshes after the insert — the
+                // per-arm policy the local bodies apply (the bare
+                // promotion never rematerializes: its target view is not
+                // checked out).
+                #[derive(PartialEq, Clone, Copy)]
+                enum Refresh {
+                    Skip,
+                    Surgical,
+                    Full,
+                }
+                // One report per arm: everything the CLI renders with the
+                // local bodies' print functions.
+                struct ArmReport {
+                    applied: Vec<atomic_core::types::Merkle>,
+                    new_state: atomic_core::types::Merkle,
+                    skipped: usize,
+                    has_conflicts: bool,
+                    resolved_source_view: Option<String>,
+                    resolved_target_view: String,
+                    both_views_shared: Option<bool>,
+                    resolved_change: Option<atomic_core::types::Merkle>,
+                    refresh: Refresh,
+                }
+                let cross_view_error = |error: atomic_repository::RepositoryError| -> Status {
+                    domain_status(ErrorCode::ChangeRejected, error.to_string())
+                };
+                let report = match request.source {
+                    // A resolved single change: the direct domain calls the
+                    // local single-insert body makes (the --deps=false
+                    // escape hatch skips the closure).
                     Some(insert_changes_request::Source::SingleChange(hash)) => {
-                        let mut bytes = [0u8; 32];
-                        if hash.value.len() != 32 {
-                            return Err(domain_status(
-                                ErrorCode::InvalidArgument,
-                                "hash must be 32 bytes",
-                            ));
+                        let hash = wire_hash(&hash)?;
+                        let outcome = single_insert(
+                            &repo,
+                            &hash,
+                            &target,
+                            apply_dependencies,
+                            request.allow_conflicts,
+                        )
+                        .map_err(cross_view_error)?;
+                        ArmReport {
+                            applied: outcome.stats.applied_hashes.clone(),
+                            new_state: outcome.new_state,
+                            skipped: 0,
+                            has_conflicts: outcome.has_conflicts,
+                            resolved_source_view: None,
+                            resolved_target_view: target.clone(),
+                            both_views_shared: None,
+                            resolved_change: Some(hash),
+                            refresh: Refresh::Full,
                         }
-                        bytes.copy_from_slice(&hash.value);
-                        let options = InsertOptions::default()
-                            .apply_deps(request.apply_dependencies.unwrap_or(true))
-                            .allow_conflict(request.allow_conflicts)
-                            .view(target.clone());
-                        let outcome = repo
-                            .insert_change_rec(&atomic_core::types::Merkle(bytes), options)
-                            .map_err(|error| {
-                                domain_status(ErrorCode::ChangeRejected, error.to_string())
-                            })?;
-                        (outcome.stats.applied_hashes.clone(), outcome.has_conflicts)
+                    }
+                    // A raw single reference (`insert <ref>`): resolved
+                    // with the local resolver's semantics, then the same
+                    // single-insert path.
+                    Some(insert_changes_request::Source::SingleRef(reference)) => {
+                        let hash = resolve_change_reference(&repo, &reference)?;
+                        let outcome = single_insert(
+                            &repo,
+                            &hash,
+                            &target,
+                            apply_dependencies,
+                            request.allow_conflicts,
+                        )
+                        .map_err(cross_view_error)?;
+                        ArmReport {
+                            applied: outcome.stats.applied_hashes.clone(),
+                            new_state: outcome.new_state,
+                            skipped: 0,
+                            has_conflicts: outcome.has_conflicts,
+                            resolved_source_view: None,
+                            resolved_target_view: target.clone(),
+                            both_views_shared: None,
+                            resolved_change: Some(hash),
+                            refresh: Refresh::Full,
+                        }
                     }
                     Some(insert_changes_request::Source::FromView(source)) => {
                         let options = CrossViewInsertOptions::new(&source, &target)
-                            .with_dependencies(request.apply_dependencies.unwrap_or(true))
-                            .allow_conflicts(request.allow_conflicts);
-                        let outcome = repo.insert_from_view(options).map_err(|error| {
-                            domain_status(ErrorCode::ChangeRejected, error.to_string())
-                        })?;
-                        (outcome.applied_hashes.clone(), outcome.has_conflicts)
+                            .with_dependencies(apply_dependencies)
+                            .allow_conflicts(request.allow_conflicts)
+                            .dry_run(dry_run);
+                        let outcome = repo.insert_from_view(options).map_err(cross_view_error)?;
+                        ArmReport {
+                            applied: outcome.applied_hashes.clone(),
+                            new_state: outcome.new_state,
+                            skipped: outcome.skipped_hashes.len(),
+                            has_conflicts: outcome.has_conflicts,
+                            resolved_source_view: Some(source),
+                            resolved_target_view: target.clone(),
+                            both_views_shared: None,
+                            resolved_change: None,
+                            refresh: Refresh::Surgical,
+                        }
                     }
                     Some(insert_changes_request::Source::UpToTag(tag)) => {
-                        // The wire carries only the tag; the source view is
-                        // the repository's current view — exactly the CLI
-                        // default (`insert tag` without --from-view).
-                        let from_view = handle.current_view();
+                        // The source view: the --from-view override when
+                        // the wire carries one, else the repository's
+                        // current view — exactly the CLI default.
+                        let from_view = request
+                            .tag_from_view
+                            .clone()
+                            .unwrap_or_else(|| handle.current_view());
                         let options = CrossViewInsertOptions::new(&from_view, &target)
                             .up_to_tag(&tag)
-                            .with_dependencies(request.apply_dependencies.unwrap_or(true))
-                            .allow_conflicts(request.allow_conflicts);
-                        let outcome = repo.insert_from_view(options).map_err(|error| {
-                            domain_status(ErrorCode::ChangeRejected, error.to_string())
-                        })?;
-                        (outcome.applied_hashes.clone(), outcome.has_conflicts)
+                            .with_dependencies(apply_dependencies)
+                            .allow_conflicts(request.allow_conflicts)
+                            .dry_run(dry_run);
+                        let outcome = repo.insert_from_view(options).map_err(cross_view_error)?;
+                        ArmReport {
+                            applied: outcome.applied_hashes.clone(),
+                            new_state: outcome.new_state,
+                            skipped: outcome.skipped_hashes.len(),
+                            has_conflicts: outcome.has_conflicts,
+                            resolved_source_view: Some(from_view),
+                            resolved_target_view: target.clone(),
+                            both_views_shared: None,
+                            resolved_change: None,
+                            refresh: Refresh::Surgical,
+                        }
+                    }
+                    // The bare CLI promotion: the current view into its
+                    // parent (or the explicit target override). Everything
+                    // resolves HERE — the CLI holds no repository handle.
+                    Some(insert_changes_request::Source::PromoteCurrentView(_)) => {
+                        let source = handle.current_view();
+                        let source_info = repo
+                            .get_view_info(&source)
+                            .map_err(|error| domain_status(ErrorCode::View, error.to_string()))?;
+                        let target = match request.target_view.clone() {
+                            Some(override_target) => override_target,
+                            None => source_info.parent_name.clone().ok_or_else(|| {
+                                domain_status(
+                                    ErrorCode::View,
+                                    format!(
+                                        "'{source}' is a root view — there is no parent to \
+                                         insert into.\n  Use 'atomic insert from-view <source>' \
+                                         or pass --to <view> to choose a target."
+                                    ),
+                                )
+                            })?,
+                        };
+                        if target == source {
+                            return Err(domain_status(
+                                ErrorCode::InvalidArgument,
+                                format!(
+                                    "Source and target are the same view ('{source}'). Pass \
+                                     --to <view> to insert somewhere else."
+                                ),
+                            ));
+                        }
+                        // The pre-flight listing: the same domain read the
+                        // local pre-flight makes (the dry-run form's report
+                        // AND the real form's count/confirm inputs).
+                        let missing = repo
+                            .get_missing_changes_between(&source, Some(&target))
+                            .map_err(cross_view_error)?;
+                        let mut both_views_shared = None;
+                        if !dry_run && !missing.is_empty() {
+                            // The shared→shared confirmation gate the CLI
+                            // prompts for client-side.
+                            let target_info = repo.get_view_info(&target).map_err(|error| {
+                                domain_status(ErrorCode::View, error.to_string())
+                            })?;
+                            both_views_shared = Some(
+                                source_info.scope.is_shared() && target_info.scope.is_shared(),
+                            );
+                        }
+                        if dry_run {
+                            // The preview: list what would move; insert
+                            // nothing. (The local dry-run branch lists the
+                            // missing set from this same read.)
+                            ArmReport {
+                                applied: missing,
+                                new_state: atomic_core::types::Merkle::ZERO,
+                                skipped: 0,
+                                has_conflicts: false,
+                                resolved_source_view: Some(source),
+                                resolved_target_view: target,
+                                both_views_shared: None,
+                                resolved_change: None,
+                                refresh: Refresh::Skip,
+                            }
+                        } else {
+                            // The insert itself: the same domain call the
+                            // local body makes after its confirmation.
+                            let options = CrossViewInsertOptions::new(&source, &target)
+                                .with_dependencies(apply_dependencies)
+                                .allow_conflicts(request.allow_conflicts);
+                            let outcome =
+                                repo.insert_from_view(options).map_err(cross_view_error)?;
+                            ArmReport {
+                                applied: outcome.applied_hashes.clone(),
+                                new_state: outcome.new_state,
+                                skipped: outcome.skipped_hashes.len(),
+                                has_conflicts: outcome.has_conflicts,
+                                resolved_source_view: Some(source),
+                                resolved_target_view: target,
+                                both_views_shared,
+                                resolved_change: None,
+                                // The promotion's target is never the
+                                // checked-out view: no rematerialization.
+                                refresh: Refresh::Skip,
+                            }
+                        }
+                    }
+                    // Multi-pick: resolve each reference with the local
+                    // resolver's semantics, then the cherry-pick call the
+                    // local multi-insert body makes.
+                    Some(insert_changes_request::Source::ChangeSet(set)) => {
+                        let mut hashes = Vec::with_capacity(set.changes.len());
+                        for reference in &set.changes {
+                            hashes.push(resolve_change_reference(&repo, reference)?);
+                        }
+                        let outcome = if dry_run {
+                            let options = CrossViewInsertOptions::new("", &target)
+                                .only_changes(hashes.clone())
+                                .with_dependencies(true)
+                                .dry_run(true);
+                            repo.insert_from_view(options).map_err(cross_view_error)?
+                        } else {
+                            repo.cherry_pick(&hashes, "", Some(&target))
+                                .map_err(cross_view_error)?
+                        };
+                        ArmReport {
+                            applied: outcome.applied_hashes.clone(),
+                            new_state: outcome.new_state,
+                            skipped: outcome.skipped_hashes.len(),
+                            has_conflicts: outcome.has_conflicts,
+                            resolved_source_view: None,
+                            resolved_target_view: target.clone(),
+                            both_views_shared: None,
+                            resolved_change: None,
+                            refresh: Refresh::Full,
+                        }
                     }
                     None => {
                         return Err(domain_status(
@@ -1521,62 +1810,86 @@ impl repository_mutation_service_server::RepositoryMutationService for MutationI
                         ))
                     }
                 };
-                // Render the inserted changes; surface conflicts when
-                // they occurred (never swallowed).
-                let mut inserted = Vec::with_capacity(applied.len());
+                // Render the inserted changes (tolerant of an unloadable
+                // change — the local listings print the hash alone) and
+                // collect the touched paths for the surgical refresh.
+                let mut inserted = Vec::with_capacity(report.applied.len());
                 let mut affected_paths: std::collections::HashSet<String> =
                     std::collections::HashSet::new();
-                for hash in &applied {
-                    let change = repo
-                        .load_change(hash)
-                        .map_err(|error| domain_status(ErrorCode::Repository, error.to_string()))?;
-                    // Collect the paths the inserted changes touch so the
-                    // working copy can be refreshed surgically (below).
-                    for op in change.hunks() {
-                        if let Some(path) = op.path() {
-                            affected_paths.insert(path.to_string());
+                for hash in &report.applied {
+                    match repo.load_change(hash) {
+                        Ok(change) => {
+                            for op in change.hunks() {
+                                if let Some(path) = op.path() {
+                                    affected_paths.insert(path.to_string());
+                                }
+                            }
+                            inserted.push(change_info(&change, hash));
                         }
+                        Err(_) => inserted.push(bare_change_info(hash)),
                     }
-                    inserted.push(change_info(&change, hash));
                 }
                 // Refresh the working copy when the insert landed on the
                 // repository's CURRENT view: the graph insert alone never
                 // touches the working tree, and a CLI standing on the
                 // target view expects the inserted files on disk (the
-                // local insert's materialization, now owned here so both
-                // transports behave identically). Affected paths only;
-                // a full materialize is the fallback when the inserted
-                // changes carry no path info.
-                if target == handle.current_view() && !applied.is_empty() {
-                    if affected_paths.is_empty() {
-                        repo.materialize().map_err(|error| {
-                            domain_status(ErrorCode::Materialize, error.to_string())
-                        })?;
-                    } else {
-                        repo.materialize_paths(affected_paths).map_err(|error| {
-                            domain_status(ErrorCode::Materialize, error.to_string())
-                        })?;
-                    }
+                // local bodies' materialization, owned here so both
+                // transports behave identically). Per arm: view/tag inserts
+                // refresh the touched paths (full as the fallback when the
+                // changes carry no path info); single- and multi-pick
+                // inserts rematerialize the whole view; the bare promotion
+                // never does (its target is not checked out).
+                let mut files_updated = None;
+                let mut directories_created = None;
+                if !dry_run
+                    && !report.applied.is_empty()
+                    && report.refresh != Refresh::Skip
+                    && target == handle.current_view()
+                {
+                    let materialized =
+                        if report.refresh == Refresh::Full || affected_paths.is_empty() {
+                            repo.materialize().map_err(|error| {
+                                domain_status(ErrorCode::Materialize, error.to_string())
+                            })?
+                        } else {
+                            repo.materialize_paths(affected_paths).map_err(|error| {
+                                domain_status(ErrorCode::Materialize, error.to_string())
+                            })?
+                        };
+                    files_updated = Some(materialized.files_written as u64);
+                    directories_created = Some(materialized.directories_created as u64);
                 }
-                let conflicts = if has_conflicts {
-                    repo.list_conflicts()
-                        .map_err(repository_error)?
-                        .into_iter()
-                        .map(|(path, _)| ConflictInfo {
-                            path,
+                // The still-on-disk conflict listing (per record, file
+                // order preserved): what the CLI's conflict summary prints.
+                // A read failure silences the listing — the local summary
+                // returns silently too.
+                let conflicts = repo
+                    .list_conflicts()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .flat_map(|(path, records)| {
+                        records.into_iter().map(move |record| ConflictInfo {
+                            path: path.clone(),
                             view: None,
                             base: None,
-                            kind: None,
-                            line: None,
-                            sides: Vec::new(),
+                            kind: Some(format!("{:?}", record.kind).to_lowercase()),
+                            line: record.line.map(|line| line as u64),
+                            sides: record.sides,
                         })
-                        .collect()
-                } else {
-                    Vec::new()
-                };
+                    })
+                    .collect();
                 Ok(InsertChangesResponse {
                     inserted,
                     conflicts,
+                    resolved_source_view: report.resolved_source_view,
+                    resolved_target_view: Some(report.resolved_target_view),
+                    both_views_shared: report.both_views_shared,
+                    resolved_change: report.resolved_change.as_ref().map(hash_proto),
+                    new_state: Some(hash_proto(&report.new_state)),
+                    skipped_count: report.skipped as u32,
+                    files_updated,
+                    directories_created,
+                    has_conflicts: report.has_conflicts,
                     meta: None,
                 })
             })

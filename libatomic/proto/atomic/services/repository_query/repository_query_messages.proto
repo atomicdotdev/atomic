@@ -175,6 +175,11 @@ message PreviewRestoreRequest {
   RepositoryRef repository = 1; // workspace_id required
   repeated string paths = 2; // workspace-root-relative
   bool force = 3;
+  // The single-file pristine-content arm (add-only): `restore --dry-run
+  // <file>` dumps that one file's pristine bytes to stdout. When set, the
+  // response additionally carries the path's pristine content (absent =
+  // the graph holds no content for it — the CLI's not-found error).
+  optional string content_path = 4;
 }
 message InsertPreview {
   oneof source {
@@ -197,5 +202,8 @@ message PreviewMutationResponse {
   // The restore preview's would-untrack list (add-only): Added files
   // that a restore would untrack but keep on disk.
   repeated string untracked = 5;
+  // The single-file restore preview's pristine bytes (add-only): present
+  // iff the request named a content_path the graph holds content for.
+  optional bytes pristine_content = 6;
 }
 // ConflictInfo lives in atomic/common/change.proto (shared change-domain).

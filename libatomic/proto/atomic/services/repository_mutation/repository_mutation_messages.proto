@@ -133,6 +133,19 @@ message InsertChangesRequest {
     Hash single_change = 4;
     string from_view = 5;
     string up_to_tag = 6;
+    // The bare CLI promotion (`atomic insert`), add-only: the handler
+    // resolves the current view and its parent server-side — the CLI
+    // holds no repository handle, so source/target/missing and the
+    // shared-to-shared gate data come back in the response.
+    PromoteCurrentView promote_current_view = 18;
+    // Multi-pick (`insert change <ref>...`), add-only: raw change
+    // references (full base32 or unique prefix), each resolved with the
+    // insert resolver's semantics and applied with cherry-pick.
+    ChangeSet change_set = 19;
+    // A single raw change reference (`insert <ref>`), add-only: resolved
+    // like change_set's entries, applied with the single-insert
+    // semantics (the dependency closure rides apply_dependencies).
+    string single_ref = 20;
   }
   optional string target_view = 7; // display hint; must agree with target.view
   bool allow_conflicts = 9;
@@ -142,11 +155,43 @@ message InsertChangesRequest {
   // Dependency closure is the default; false is the `--deps=false` escape
   // hatch (single-change inserts without closure).
   optional bool apply_dependencies = 15;
+  // Preview the plan without inserting (add-only): the handler runs the
+  // same domain call with its dry-run flag and returns what the local
+  // preview prints; nothing is applied and the working copy is untouched.
+  optional bool dry_run = 16;
+  // The `insert tag --from-view` override (add-only): the source view for
+  // the up_to_tag arm; absent = the repository's current view (the CLI
+  // default the arm already carried).
+  optional string tag_from_view = 17;
+}
+// The bare promotion's source arm (add-only): everything resolves from
+// the repository — source = the current view, target = its parent unless
+// the request's target_view overrides it.
+message PromoteCurrentView {}
+// The multi-pick source (add-only): the raw change references, in the
+// order the caller named them.
+message ChangeSet {
+  repeated string changes = 1;
 }
 message InsertChangesResponse {
   repeated ChangeInfo inserted = 1;
   reserved 2;
-  repeated ConflictInfo conflicts = 3;  // when allowed & occurred
+  // The post-insert conflict listing (still on disk, per file), rendered
+  // by the CLI's conflict summary. Present regardless of the outcome
+  // flag: pre-existing conflicts surface here too.
+  repeated ConflictInfo conflicts = 3;
+  // The report fields the local bodies' renders need (add-only):
+  optional string resolved_source_view = 4;  // the arm's resolved source
+  optional string resolved_target_view = 5;  // explicit or default target
+  optional bool both_views_shared = 6;  // the promotion confirm gate
+  optional Hash resolved_change = 7;  // single-ref arms' resolved change
+  optional Hash new_state = 8;  // the target's post-insert state
+  uint32 skipped_count = 9;  // source changes already in the target
+  // Set when the handler refreshed the working copy (the insert landed
+  // on the current view): the materialize counts the CLI reports.
+  optional uint64 files_updated = 10;
+  optional uint64 directories_created = 11;
+  bool has_conflicts = 12;  // the insert outcome's own flag
   ResponseMeta meta = 100;
 }
 
