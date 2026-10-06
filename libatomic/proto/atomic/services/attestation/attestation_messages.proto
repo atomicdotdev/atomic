@@ -1,7 +1,7 @@
 // atomic-protocol — AttestationService: the external-signing flow and
 // attestation records.
 //
-// Add-only.
+// DRAFT — add-only.
 //
 // Covers `atomic intent attest --prepare/--signed` (REMOTE-capable — that is
 // the point of the feature: a signer holding the key elsewhere — browser,

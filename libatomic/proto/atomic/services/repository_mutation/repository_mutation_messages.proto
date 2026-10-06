@@ -1,7 +1,7 @@
 // atomic-protocol — RepositoryMutationService: working-copy and change-graph
 // mutations.
 //
-// Add-only. Every mutation carries RequestMeta (idempotency key) and
+// DRAFT — add-only. Every mutation carries RequestMeta (idempotency key) and
 // an ExpectedState precondition where the caller knows prior state (RFC
 // 2.2/2.3: expected-Merkle/sequence preconditions on mutating operations —
 // the fencing pattern generalized from provenance to ALL mutations).
@@ -25,9 +25,20 @@ message AddFilesRequest {
   RequestMeta meta = 2;
   repeated string paths = 3;         // working-copy paths
   optional ExpectedState expected = 4;
+  bool dry_run = 5;                  // report what would be tracked; no mutation
+  bool force = 6;                    // add even ignored paths
+  bool directory = 7;                // explicit directory tracking
+  bool no_recursive = 8;             // directories without their contents
 }
 message AddFilesResponse {
   uint32 tracked = 1;
+  // Dry-run / tolerant report: what would be tracked, what was skipped
+  // (already tracked / ignored) and what could not be added, per path.
+  repeated string would_add = 2;
+  repeated string skipped_tracked = 3;
+  repeated string skipped_ignored = 4;
+  repeated string failed_paths = 5;
+  bool dry_run = 6;
   ResponseMeta meta = 100;
 }
 
@@ -36,6 +47,8 @@ message RemoveFilesRequest {
   RequestMeta meta = 2;
   repeated string paths = 3;
   bool keep_working_copy = 4;        // `--keep`
+  bool dry_run = 5;                  // report what would be untracked; no mutation
+  bool force = 6;                    // remove even with uncommitted edits
 }
 message RemoveFilesResponse {
   uint32 removed = 1;
@@ -47,6 +60,8 @@ message MoveFileRequest {
   RequestMeta meta = 2;
   string source = 3;
   string destination = 4;
+  bool dry_run = 5;                  // validate only; no disk move
+  bool force = 6;                    // overwrite an existing destination
 }
 message MoveFileResponse { ResponseMeta meta = 100; }
 
@@ -69,6 +84,10 @@ message RecordRequest {
   repeated string paths = 4;        // empty = tracked-files snapshot
   optional ExpectedState expected = 5; // required matching view_snapshot;
   // snapshot.view must equal this workspace's current view when publishing.
+  // Authorship override: an explicit author, or a named identity from the
+  // serving host's identity store. Absent → the host's default identity.
+  optional Author author = 6;
+  optional string identity_name = 7;
 }
 message RecordResponse {
   ChangeInfo change = 1;
@@ -105,7 +124,9 @@ message InsertChangesRequest {
   ViewRef target = 12;
   ViewSnapshot expected_snapshot = 13;
   optional ViewSnapshot source_snapshot = 14; // required for from_view/tag
-  // Dependency closure is mandatory; a confirmation flag cannot bypass policy.
+  // Dependency closure is the default; false is the `--deps=false` escape
+  // hatch (single-change inserts without closure).
+  optional bool apply_dependencies = 15;
 }
 message InsertChangesResponse {
   repeated ChangeInfo inserted = 1;

@@ -1,10 +1,10 @@
 //! The service-layer handlers: the domain half of the daemon.
 //!
-//! ONE implementation, any number of callers: a transport process
-//! (e.g. `atomicd`) serves these handlers over a socket through the
-//! generated tonic servers, and any consumer may call the very same
-//! handlers in-process — there is no second copy of service-layer
-//! logic anywhere.
+//! ONE implementation, two callers: the reactor's transport shell
+//! (`atomicd`) serves these handlers over a private Unix-domain socket,
+//! and the Atomic CLI's local service mode calls the very same handlers
+//! in-process (`ATOMIC_SERVICE=local`) — there is no second copy of
+//! service-layer logic anywhere.
 //!
 //! One state ([`state::DaemonState`]) multiplexes many repositories
 //! (RFC D3): each resolved root is registered under its persistent ID

@@ -277,6 +277,7 @@ impl repository_query_service_server::RepositoryQueryService for QueryImpl {
             Ok::<_, Status>(StatusResponse {
                 view: status.view().to_string(),
                 view_merkle: status.state().map(hash_proto),
+                needs_reindex: status.needs_reindex(),
                 files,
                 modified_count: status.modified_count() as u32,
                 deleted_count: status.deleted_count() as u32,
@@ -310,6 +311,9 @@ impl repository_query_service_server::RepositoryQueryService for QueryImpl {
                     .unwrap_or_else(|| handle.current_view()),
             )
         };
+        let include_inherited = request.all_views;
+        let tags_only = request.tags_only;
+        let path_filter = request.path_filter.clone();
         let from_sequence = request.cursor.as_ref().map_or(0, |c| c.seq);
         let limit = request
             .budget
@@ -323,10 +327,41 @@ impl repository_query_service_server::RepositoryQueryService for QueryImpl {
             if let Some(view) = &view {
                 options = options.view(view.clone());
             }
+            if include_inherited {
+                options = options.include_inherited(true);
+            }
+            if tags_only {
+                options = options.tagged_only(true);
+            }
             if let Some(limit) = limit {
                 options = options.limit(limit);
             }
             let entries = repo.reverse_log(options).map_err(repository_error)?;
+            // `--path`: keep the entries whose changes touch the path —
+            // change content is loaded here (server-side), not per client.
+            let entries = if path_filter.is_empty() {
+                entries
+            } else {
+                entries
+                    .into_iter()
+                    .filter(|entry| {
+                        if entry.is_tagged {
+                            return false; // tag rows carry no hunks
+                        }
+                        repo.load_change(&entry.hash)
+                            .map(|change| {
+                                change.hashed.hunks.iter().any(|op| {
+                                    op.path().is_some_and(|p| {
+                                        path_filter.iter().any(|filter| {
+                                            p == filter || p.starts_with(&format!("{filter}/"))
+                                        })
+                                    })
+                                })
+                            })
+                            .unwrap_or(false)
+                    })
+                    .collect()
+            };
             let entries = entries
                 .into_iter()
                 .map(|entry| ChangeLogEntry {
@@ -468,21 +503,26 @@ impl repository_query_service_server::RepositoryQueryService for QueryImpl {
             .resolve(request.repository.as_ref().unwrap_or(&default_ref()))?;
         self.state.log_rpc("PreviewMutation", Some(&handle));
         // Read transaction: read-only open, never queued behind writers.
+        // The unrecord preview opens its own WRITABLE handle below (the
+        // domain's dry-run rides a write transaction, and the gate is
+        // held for this request).
         let root = handle.root.clone();
         let current_view = handle.current_view();
+        let unrecord_handle = handle.clone();
         let result =
             tokio::task::spawn_blocking(move || -> Result<PreviewMutationResponse, Status> {
-                let repo = Repository::open_readonly(&root).map_err(|error| {
-                    domain_status(
-                        ErrorCode::Repository,
-                        format!("failed to open repository read-only: {error}"),
-                    )
-                })?;
                 match request.operation {
                     Some(preview_mutation_request::Operation::Insert(preview)) => {
                         // The would-insert listing: missing changes between
                         // the source and the target (tag cutoff through the
-                        // domain dry-run).
+                        // domain dry-run). Read-only open, never queued
+                        // behind writers.
+                        let repo = Repository::open_readonly(&root).map_err(|error| {
+                            domain_status(
+                                ErrorCode::Repository,
+                                format!("failed to open repository read-only: {error}"),
+                            )
+                        })?;
                         let target = if preview.target_view.is_empty() {
                             current_view
                         } else {
@@ -531,6 +571,7 @@ impl repository_query_service_server::RepositoryQueryService for QueryImpl {
                             .and_then(|v| v.name)
                             .filter(|name| !name.is_empty())
                             .unwrap_or_else(|| current_view.clone());
+                        let repo = unrecord_handle.repository()?;
                         let target_hash = match preview.target.and_then(|target| target.kind) {
                             Some(change_ref::Kind::Hash(hash)) => {
                                 let mut bytes = [0u8; 32];
@@ -542,6 +583,33 @@ impl repository_query_service_server::RepositoryQueryService for QueryImpl {
                                 }
                                 bytes.copy_from_slice(&hash.value);
                                 Some(atomic_core::types::Merkle(bytes))
+                            }
+                            // Case-insensitive unique-prefix resolution —
+                            // same resolver as the mutating twin.
+                            Some(change_ref::Kind::Prefix(prefix)) => {
+                                let prefix = prefix.trim().to_ascii_uppercase();
+                                match repo.find_change_by_prefix(&prefix) {
+                                    Ok(Some(hash)) => Some(hash),
+                                    Ok(None) => {
+                                        return Err(domain_status(
+                                            ErrorCode::NotFound,
+                                            format!("no change found matching '{prefix}'"),
+                                        ))
+                                    }
+                                    Err(atomic_repository::RepositoryError::AmbiguousHash {
+                                        prefix,
+                                        matches,
+                                    }) => {
+                                        return Err(domain_status(
+                                            ErrorCode::NotFound,
+                                            format!(
+                                                "ambiguous change prefix '{prefix}' (matches: {})",
+                                                matches.join(", ")
+                                            ),
+                                        ))
+                                    }
+                                    Err(error) => return Err(repository_error(error)),
+                                }
                             }
                             Some(change_ref::Kind::Sequence(sequence)) => {
                                 let txn = repo.pristine().read_txn().map_err(|error| {
@@ -572,40 +640,23 @@ impl repository_query_service_server::RepositoryQueryService for QueryImpl {
                             }
                             None => None,
                         };
-                        // The would-unrecord listing: preview_unrecord is
-                        // the READ path (the mutating unrecord's dry_run
-                        // still opens a write transaction).
-                        let txn = repo.pristine().read_txn().map_err(|error| {
-                            domain_status(ErrorCode::Repository, error.to_string())
-                        })?;
-                        let view_state = txn
-                            .get_view(&view)
-                            .map_err(|error| domain_status(ErrorCode::View, error.to_string()))?
-                            .ok_or_else(|| {
-                                domain_status(ErrorCode::View, format!("view '{view}' not found"))
-                            })?;
-                        let target_hash = match target_hash {
-                            Some(hash) => hash,
-                            None => atomic_repository::unrecord::get_last_change(&txn, &view_state)
-                                .map_err(|error| {
-                                    domain_status(ErrorCode::PreconditionFailed, error.to_string())
-                                })?
-                                .ok_or_else(|| {
-                                    domain_status(
-                                        ErrorCode::PreconditionFailed,
-                                        format!("view '{view}' is empty — nothing to unrecord"),
-                                    )
-                                })?,
+                        // The would-unrecord preview is the SAME domain call
+                        // as the mutating unrecord's dry_run — one guard
+                        // surface (membership, dependents, emptiness), not
+                        // a second read-path approximation of it. The
+                        // domain's dry-run opens a write transaction, so
+                        // this arm uses the request's writable handle (the
+                        // gate is held) for BOTH the target resolution and
+                        // the preview.
+                        let options = atomic_repository::UnrecordOptions::dry_run().view(view);
+                        let outcome = match target_hash {
+                            Some(hash) => repo.unrecord(&hash, options).map_err(|error| {
+                                domain_status(ErrorCode::PreconditionFailed, error.to_string())
+                            })?,
+                            None => repo.unrecord_last(options).map_err(|error| {
+                                domain_status(ErrorCode::PreconditionFailed, error.to_string())
+                            })?,
                         };
-                        let outcome = atomic_repository::unrecord::preview_unrecord(
-                            &txn,
-                            &view_state,
-                            &[target_hash],
-                            &atomic_repository::UnrecordOptions::dry_run().view(view),
-                        )
-                        .map_err(|error| {
-                            domain_status(ErrorCode::PreconditionFailed, error.to_string())
-                        })?;
                         let mut changes = Vec::with_capacity(outcome.unrecorded.len());
                         for hash in &outcome.unrecorded {
                             let change = repo.load_change(hash).map_err(|error| {
@@ -852,6 +903,31 @@ fn resolve_author() -> Result<Option<Author>, String> {
     )))
 }
 
+/// Authorship for a record: an explicit wire author wins; else a named
+/// identity from the serving host's store; else the default identity.
+fn resolve_author_for(
+    author: Option<&crate::atomic::Author>,
+    identity_name: Option<&str>,
+) -> Result<Option<Author>, String> {
+    if let Some(author) = author {
+        return Ok(Some(Author {
+            name: author.name.clone(),
+            email: author.email.clone(),
+            identity: None,
+        }));
+    }
+    if let Some(name) = identity_name {
+        let store = IdentityStore::open_default().map_err(|e| e.to_string())?;
+        let identity = store.load_by_name(name).map_err(|e| e.to_string())?;
+        return Ok(Some(Author::with_identity(
+            identity.name.clone(),
+            identity.email.clone(),
+            identity.public_key_base32(),
+        )));
+    }
+    resolve_author()
+}
+
 #[tonic::async_trait]
 impl repository_mutation_service_server::RepositoryMutationService for MutationImpl {
     async fn add_files(
@@ -867,17 +943,69 @@ impl repository_mutation_service_server::RepositoryMutationService for MutationI
         let _gate = gate_handle.exclusive().await;
         let paths: Vec<String> = request.paths;
         let meta = request.meta.unwrap_or_default();
+        let options = TrackingOptions {
+            recursive: !request.no_recursive,
+            force: request.force,
+            dry_run: request.dry_run,
+            ..TrackingOptions::default()
+        };
+        let directory = request.directory;
+        let dry_run = request.dry_run;
         let result = tokio::task::spawn_blocking(move || {
             let repo = handle.repository()?;
             let mut tracked = 0usize;
+            // The tolerant per-path report (dry-run or not): skips never
+            // fail the batch; failures are collected per path.
+            let mut would_add: Vec<String> = Vec::new();
+            let mut skipped_tracked: Vec<String> = Vec::new();
+            let mut skipped_ignored: Vec<String> = Vec::new();
+            let mut failed_paths: Vec<String> = Vec::new();
             for path in &paths {
-                let stats = repo
-                    .add(path, TrackingOptions::default())
-                    .map_err(repository_error)?;
-                tracked += stats.files_added;
+                let result = if directory {
+                    repo.add_directory(path, options.clone())
+                } else {
+                    repo.add(path, options.clone())
+                };
+                match result {
+                    Ok(stats) => {
+                        if dry_run {
+                            if stats.total_added() > 0 {
+                                would_add.push(path.clone());
+                            }
+                            for (skipped, reason) in &stats.skipped_paths {
+                                if reason.contains("tracked") {
+                                    skipped_tracked.push(skipped.to_string_lossy().into_owned());
+                                } else if reason.contains("ignored") {
+                                    skipped_ignored.push(skipped.to_string_lossy().into_owned());
+                                }
+                            }
+                        } else {
+                            tracked += stats.files_added;
+                        }
+                    }
+                    Err(atomic_repository::RepositoryError::FileAlreadyTracked { path }) => {
+                        skipped_tracked.push(path.to_string_lossy().into_owned());
+                    }
+                    Err(atomic_repository::RepositoryError::PathIgnored { path }) => {
+                        if !options.force {
+                            skipped_ignored.push(path.to_string_lossy().into_owned());
+                        }
+                    }
+                    Err(_) if dry_run => {
+                        failed_paths.push(path.clone());
+                    }
+                    Err(error) => {
+                        return Err(repository_error(error));
+                    }
+                }
             }
             Ok::<_, Status>(AddFilesResponse {
                 tracked: tracked as u32,
+                would_add,
+                skipped_tracked,
+                skipped_ignored,
+                failed_paths,
+                dry_run,
                 meta: Some(ResponseMeta {
                     request_id: meta.request_id,
                     replayed: false,
@@ -904,6 +1032,8 @@ impl repository_mutation_service_server::RepositoryMutationService for MutationI
         let message = request.message;
         let paths = request.paths;
         let meta = request.meta.unwrap_or_default();
+        let author = request.author;
+        let identity_name = request.identity_name;
         let view = handle.current_view();
         let result = tokio::task::spawn_blocking(move || {
             if message.trim().is_empty() {
@@ -912,12 +1042,13 @@ impl repository_mutation_service_server::RepositoryMutationService for MutationI
                     "record message is empty",
                 ));
             }
-            let author = resolve_author().map_err(|error| {
-                domain_status(
-                    ErrorCode::Internal,
-                    format!("identity resolution failed: {error}"),
-                )
-            })?;
+            let author =
+                resolve_author_for(author.as_ref(), identity_name.as_deref()).map_err(|error| {
+                    domain_status(
+                        ErrorCode::Internal,
+                        format!("identity resolution failed: {error}"),
+                    )
+                })?;
             let mut header = ChangeHeader::builder().message(message.clone());
             if let Some(author) = author {
                 header = header.author(author);
@@ -981,7 +1112,11 @@ impl repository_mutation_service_server::RepositoryMutationService for MutationI
         let _gate = gate_handle.exclusive().await;
         let result = tokio::task::spawn_blocking(move || -> Result<RemoveFilesResponse, Status> {
             let repo = handle.repository()?;
-            let options = TrackingOptions::default();
+            let options = TrackingOptions {
+                force: request.force,
+                dry_run: request.dry_run,
+                ..TrackingOptions::default()
+            };
             let mut removed: u32 = 0;
             let mut to_delete: Vec<std::path::PathBuf> = Vec::new();
             for path in &request.paths {
@@ -1009,10 +1144,13 @@ impl repository_mutation_service_server::RepositoryMutationService for MutationI
                 }
             }
             // The CLI deletes from disk only after every tracking removal
-            // succeeded; the daemon mirrors that ordering.
-            for path in to_delete {
-                if path.is_file() {
-                    let _ = std::fs::remove_file(&path);
+            // succeeded; the daemon mirrors that ordering. A dry run
+            // reports the untrack counts without touching disk.
+            if !request.dry_run {
+                for path in to_delete {
+                    if path.is_file() {
+                        let _ = std::fs::remove_file(&path);
+                    }
                 }
             }
             Ok(RemoveFilesResponse {
@@ -1053,9 +1191,10 @@ impl repository_mutation_service_server::RepositoryMutationService for MutationI
                     format!("file not found: {}", source_path.display()),
                 ));
             }
-            if repo
-                .is_tracked(&request.destination)
-                .map_err(repository_error)?
+            if !request.force
+                && repo
+                    .is_tracked(&request.destination)
+                    .map_err(repository_error)?
             {
                 return Err(domain_status(
                     ErrorCode::InvalidArgument,
@@ -1070,6 +1209,10 @@ impl repository_mutation_service_server::RepositoryMutationService for MutationI
                         format!("failed to create destination directory: {error}"),
                     )
                 })?;
+            }
+            if request.dry_run {
+                // Validated only: the move would happen; nothing touches disk.
+                return Ok(MoveFileResponse { meta: None });
             }
             // Disk move ONLY — the raw-rename working-copy shape the CLI
             // leaves behind on purpose: record's move detection pairs the
@@ -1220,6 +1363,33 @@ impl repository_mutation_service_server::RepositoryMutationService for MutationI
                         "revise target must be a change hash (the client resolves @/@~N)",
                     ))
                 }
+                // Case-insensitive unique-prefix resolution over the whole
+                // change store; the revise stack surgery speaks.
+                Some(change_ref::Kind::Prefix(prefix)) => {
+                    let prefix = prefix.trim().to_ascii_uppercase();
+                    match repo.find_change_by_prefix(&prefix) {
+                        Ok(Some(hash)) => hash,
+                        Ok(None) => {
+                            return Err(domain_status(
+                                ErrorCode::NotFound,
+                                format!("no change found matching '{prefix}'"),
+                            ))
+                        }
+                        Err(atomic_repository::RepositoryError::AmbiguousHash {
+                            prefix,
+                            matches,
+                        }) => {
+                            return Err(domain_status(
+                                ErrorCode::NotFound,
+                                format!(
+                                    "ambiguous change prefix '{prefix}' (matches: {})",
+                                    matches.join(", ")
+                                ),
+                            ))
+                        }
+                        Err(error) => return Err(repository_error(error)),
+                    }
+                }
             };
             let message = request.reword_message.clone().ok_or_else(|| {
                 domain_status(
@@ -1284,7 +1454,7 @@ impl repository_mutation_service_server::RepositoryMutationService for MutationI
                         }
                         bytes.copy_from_slice(&hash.value);
                         let options = InsertOptions::default()
-                            .apply_deps(true)
+                            .apply_deps(request.apply_dependencies.unwrap_or(true))
                             .allow_conflict(request.allow_conflicts)
                             .view(target.clone());
                         let outcome = repo
@@ -1424,6 +1594,35 @@ impl repository_mutation_service_server::RepositoryMutationService for MutationI
                         ErrorCode::InvalidArgument,
                         "unrecord takes a hash target (or none for the last change)",
                     ))
+                }
+                // Case-insensitive unique-prefix resolution over the whole
+                // change store; the unrecord membership guard speaks.
+                Some(change_ref::Kind::Prefix(prefix)) => {
+                    let prefix = prefix.trim().to_ascii_uppercase();
+                    match repo.find_change_by_prefix(&prefix) {
+                        Ok(Some(hash)) => {
+                            repo.unrecord(&hash, options).map_err(repository_error)?
+                        }
+                        Ok(None) => {
+                            return Err(domain_status(
+                                ErrorCode::NotFound,
+                                format!("no change found matching '{prefix}'"),
+                            ))
+                        }
+                        Err(atomic_repository::RepositoryError::AmbiguousHash {
+                            prefix,
+                            matches,
+                        }) => {
+                            return Err(domain_status(
+                                ErrorCode::NotFound,
+                                format!(
+                                    "ambiguous change prefix '{prefix}' (matches: {})",
+                                    matches.join(", ")
+                                ),
+                            ))
+                        }
+                        Err(error) => return Err(repository_error(error)),
+                    }
                 }
                 // No target: the most recent change on the view. An empty
                 // view refuses with the domain's own message.

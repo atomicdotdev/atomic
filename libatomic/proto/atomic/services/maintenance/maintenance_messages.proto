@@ -1,6 +1,6 @@
 // atomic-protocol — MaintenanceService: repository repair and consistency.
 //
-// Add-only. `atomic doctor` folds into Repair (the
+// DRAFT — add-only. `atomic doctor` folds into Repair (the
 // mutating actions) and CheckRepository (the read-only consistency check,
 // split out per the read/write principle — a check never gates on a
 // mutation or enters the write queue; see COVERAGE §9). ReindexWorkspace is
@@ -20,6 +20,7 @@ enum RepairAction {
   REPAIR_ACTION_MATERIALIZE_CRDT = 2;           // CRDT tables from FileOps
   reserved 3;                                   // was CONSISTENCY_CHECK —
                                                  // split to CheckRepository
+  REPAIR_ACTION_REINDEX_WORKING_COPY = 4;       // `status --reindex`
 }
 message RepairRequest {
   RepositoryRef repository = 1;
@@ -60,6 +61,8 @@ message RepairResponse {
   uint64 leaves_created = 14;
   CrdtSkipStats skip_stats = 15;
   repeated string skip_samples = 16;
+  // REINDEX_WORKING_COPY render data.
+  uint64 reindexed = 17;
   ResponseMeta meta = 100;
 }
 message CheckRepositoryRequest {

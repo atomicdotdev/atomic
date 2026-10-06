@@ -1,5 +1,5 @@
 // atomic-protocol — DaemonService definition (the RPC contract).
-// Add-only. Messages for this service live in
+// DRAFT — add-only. Messages for this service live in
 // atomic/services/daemon/daemon_messages.proto · shared primitives in atomic/common/.
 
 syntax = "proto3";

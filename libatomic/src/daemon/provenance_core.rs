@@ -1,8 +1,8 @@
 //! The provenance journal core — one code path for the in-process dispatch
 //! and the wire.
 //!
-//! Every store operation the legacy owner protocol served lives here
-//! exactly once: the RPC handlers in
+//! Every store operation the legacy owner protocol served (`atomic agent
+//! database-owner`, owner.rs) lives here exactly once: the RPC handlers in
 //! `services_provenance.rs` and the in-process `DirectJournalSink` are thin
 //! wrappers over these functions, so the two surfaces cannot drift.
 //!
@@ -83,7 +83,7 @@ impl JournalError {
 }
 
 /// The crash-injection seam, ported VERBATIM from the legacy owner
-/// (`owner_failpoint`). The env names are load-bearing: the
+/// (owner.rs `owner_failpoint`). The env names are load-bearing: the
 /// legacy test suite spawns owners (now daemons) with them and asserts
 /// the process aborts and the retry converges.
 pub fn owner_failpoint(name: &str) {
@@ -230,8 +230,8 @@ pub fn load_frozen_page(
 
 /// Reassemble only complete envelopes, advancing the cursor after a
 /// successful page. Retrying an RPC cannot append its bytes twice.
-/// Ported verbatim from the legacy owner client
-/// (`append_frozen_page`).
+/// Ported verbatim from the legacy owner client (owner.rs
+/// `append_frozen_page`).
 pub fn append_frozen_page(
     envelopes: &mut Vec<Vec<u8>>,
     partial: &mut Vec<u8>,

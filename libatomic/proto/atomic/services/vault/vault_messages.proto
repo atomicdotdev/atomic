@@ -1,7 +1,7 @@
 // atomic-protocol — VaultService: the `.vault/` knowledge store — intents,
 // memories, goals, vault sync, context.
 //
-// Add-only. This is the agent-facing product surface (the
+// DRAFT — add-only. This is the agent-facing product surface (the
 // intent→change workflow with triage + knowledge graph), so the combine
 // discipline matters most here: intents/memories/goals are one entity model
 // with a kind enum, not three parallel RPC families. `vault intent`/
@@ -95,6 +95,7 @@ message ListVaultEntriesRequest {
   bool summaries_only = 4;      // `vault summaries`
   optional PageCursor cursor = 5;
   optional PageBudget budget = 6;
+  optional string identity = 7;   // filter by the entry's author identity
   ViewRef view = 20;
 }
 message ListVaultEntriesResponse {

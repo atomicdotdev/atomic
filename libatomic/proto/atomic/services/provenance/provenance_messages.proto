@@ -2,7 +2,7 @@
 // session/turn journal, generation fencing, checkpoint phases, frozen-
 // envelope storage, session ledger, provenance projection.
 //
-// Add-only. Context: the legacy agent journal protocol and the
+// DRAFT — add-only. Context: the legacy agent journal protocol and the
 // `atomic agent database-owner` command that served it are being FULLY
 // DISMANTLED; atomicd becomes the only storage owner. What carries forward
 // is the provenance tracking semantics below — verified against the
@@ -35,7 +35,7 @@
 //  * Turn lifecycle: stop/resume/abandon combined into one UpdateTurn with
 //    an action enum (no crash-injection seams live there); status is the
 //    read-side GetTurn.
-//  * Authorization (sandbox matrix): the first ReserveTurn
+//  * Authorization (sandbox matrix, HANDOFF §5): the first ReserveTurn
 //    claims the session for its view; later ops from another view →
 //    FORBIDDEN. After a successful remote reserve, envelope/checkpoint ops
 //    on that turn from another view → FORBIDDEN. Remote callers present the
@@ -132,7 +132,7 @@ message ProvenanceCheckpointAttempt {
 // ————— wire envelopes —————
 
 // Legacy {event_id, bytes} journal envelope + the schema/type URL the unified
-// contract requires (align with the Reactor event envelope so
+// contract requires (HANDOFF §6: align with the Reactor event envelope so
 // the two contracts rhyme).
 message WireEnvelope {
   string event_id = 1;
@@ -285,6 +285,21 @@ message GetSessionResponse {
   repeated StoredProvenanceTurn turns = 1;
   // SHAPE-CONFIRM (Slice 2): session-stamp fields beyond turns live in the
   // session ledger; finalize against commands/session.rs.
+  // The complete session ledger as versioned-opaque bytes (schema
+  // "atomic.session.ledger.v1": JSON of the {record, turns} pair).
+  optional VersionedBytes ledger_bundle = 2;
+  // Turn → intent resolution (vault paths and explicit plan ids), the
+  // client-side inheritance chain starts from this.
+  repeated SessionTurnIntent turn_intents = 3;
+  optional Hash manifest_head = 4;
+  optional Hash parent_manifest = 5;
+  optional uint32 fork_turn = 6;
+}
+
+// One turn's resolved intent (from plan_id or the vault's session links).
+message SessionTurnIntent {
+  uint32 turn = 1;
+  string intent = 2;
 }
 
 message ForkSessionRequest {
@@ -363,6 +378,12 @@ message ListSessionsRequest {
 }
 message ListSessionsResponse {
   repeated SessionSummary sessions = 1;
+  // The complete recent-session ledgers as versioned-opaque bytes (schema
+  // "atomic.session.ledgers.v1": JSON array of {record, turns} pairs) —
+  // the client renders listings/JSON from the domain shape it knows.
+  optional VersionedBytes ledgers_bundle = 2;
+  // Vault-derived intent count per session, parallel to `sessions` order.
+  repeated uint32 intent_counts = 3;
 }
 message SessionSummary {
   string session_id = 1;

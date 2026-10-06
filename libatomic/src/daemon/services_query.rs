@@ -185,10 +185,11 @@ pub async fn get_change_impl(
     let gate_handle = handle.clone();
     let _gate = gate_handle.exclusive().await;
     let handle_for_task = handle.clone();
+    let wants_bundle = request.includes.as_ref().is_some_and(|i| i.metadata);
     let change = tokio::task::spawn_blocking(move || {
         // A query: read-only open with the read-concurrency wait.
         let repo = handle_for_task.repository_readonly()?;
-        let hash = match reference {
+        let (hash, sequence) = match reference {
             change_ref::Kind::Hash(hash) => {
                 let mut bytes = [0u8; 32];
                 if hash.value.len() != 32 {
@@ -198,10 +199,12 @@ pub async fn get_change_impl(
                     ));
                 }
                 bytes.copy_from_slice(&hash.value);
-                atomic_core::types::Merkle(bytes)
+                (atomic_core::types::Merkle(bytes), None)
             }
             change_ref::Kind::Sequence(sequence) => {
-                let view_name = view.unwrap_or_else(|| repo.current_view().to_string());
+                let view_name = view
+                    .clone()
+                    .unwrap_or_else(|| repo.current_view().to_string());
                 let txn = repo
                     .pristine()
                     .read_txn()
@@ -215,18 +218,79 @@ pub async fn get_change_impl(
                 let entry =
                     atomic_repository::history::get_change_at_sequence(&txn, &view_state, sequence)
                         .map_err(|error| domain_status(ErrorCode::NotFound, error.to_string()))?;
-                entry.hash
+                (entry.hash, Some(sequence))
+            }
+            change_ref::Kind::Prefix(prefix) => {
+                // Case-insensitive unique-prefix resolution over the whole
+                // change store — the same resolver `insert` uses; the
+                // caller's membership/guard errors come from the target op.
+                let prefix = prefix.trim().to_ascii_uppercase();
+                if prefix.is_empty() {
+                    return Err(domain_status(
+                        ErrorCode::InvalidArgument,
+                        "change prefix required",
+                    ));
+                }
+                match repo.find_change_by_prefix(&prefix) {
+                    Ok(Some(hash)) => (hash, None),
+                    Ok(None) => {
+                        return Err(domain_status(
+                            ErrorCode::NotFound,
+                            format!("no change found matching '{prefix}'"),
+                        ))
+                    }
+                    Err(atomic_repository::RepositoryError::AmbiguousHash { prefix, matches }) => {
+                        return Err(domain_status(
+                            ErrorCode::NotFound,
+                            format!(
+                                "ambiguous change prefix '{prefix}' (matches: {})",
+                                matches.join(", ")
+                            ),
+                        ))
+                    }
+                    Err(error) => {
+                        return Err(domain_status(ErrorCode::Repository, error.to_string()))
+                    }
+                }
             }
         };
         let change = repo
             .load_change(&hash)
             .map_err(|error| domain_status(ErrorCode::NotFound, error.to_string()))?;
-        Ok::<_, Status>((change, hash))
+        // The complete change, V3-serialized, plus the causal decision
+        // graph(s) explaining it — the client's full-detail renders
+        // (change ledger, hunks, JSON) deserialize these with atomic-core.
+        let bundle = if wants_bundle {
+            let mut buffer = Vec::new();
+            change
+                .serialize(&mut buffer)
+                .map_err(|error| domain_status(ErrorCode::Repository, error.to_string()))?;
+            Some(VersionedBytes {
+                schema: "atomic.change.v3".to_string(),
+                payload: buffer,
+            })
+        } else {
+            None
+        };
+        let ledger = repo
+            .find_provenance_for_change(&hash)
+            .map_err(|error| domain_status(ErrorCode::Repository, error.to_string()))?
+            .into_iter()
+            .map(|(_graph_hash, graph)| {
+                let payload = serde_json::to_vec(&graph)
+                    .map_err(|error| domain_status(ErrorCode::Internal, error.to_string()))?;
+                Ok::<VersionedBytes, Status>(VersionedBytes {
+                    schema: "atomic.prov.graph.v1".to_string(),
+                    payload,
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok::<_, Status>((change, hash, sequence, bundle, ledger))
     })
     .await
     .map_err(|error| Status::internal(error.to_string()))??;
 
-    let (change, hash) = change;
+    let (change, hash, sequence, change_bundle, provenance_ledger) = change;
     let header = &change.hashed.header;
     Ok(Response::new(GetChangeResponse {
         change: Some(ChangeInfo {
@@ -257,6 +321,9 @@ pub async fn get_change_impl(
         semantic_section: None,
         signatures: Vec::new(),
         content_chunks: None,
+        change_bundle,
+        provenance_ledger,
+        sequence,
     }))
 }
 
@@ -278,15 +345,64 @@ pub async fn get_session_impl(
     let handle_for_task = handle.clone();
     let ledger = tokio::task::spawn_blocking(move || {
         let repo = handle_for_task.repository()?;
-        repo.get_session_ledger(&session_id)
-            .map_err(repository_error)
+        let ledger = repo
+            .get_session_ledger(&session_id)
+            .map_err(repository_error)?;
+        // Turn → intent resolution: explicit plan ids ride the turns; vault
+        // session links come from the manifest (the same map the client
+        // built locally — one implementation, served here).
+        let turn_intents = match &ledger {
+            Some((_record, turns)) => turns
+                .iter()
+                .filter_map(|turn| {
+                    let intent = turn
+                        .plan_id
+                        .clone()
+                        .or_else(|| vault_turn_intent(&repo, &session_id, turn.turn_number))?;
+                    Some(SessionTurnIntent {
+                        turn: turn.turn_number,
+                        intent,
+                    })
+                })
+                .collect::<Vec<_>>(),
+            None => Vec::new(),
+        };
+        let head_hash = repo.get_session_head(&session_id).ok().flatten();
+        let manifest_head = head_hash.as_ref().map(hash_proto);
+        let (parent_manifest, fork_turn) = head_hash
+            .as_ref()
+            .and_then(|head| repo.get_session_manifest(head).ok().flatten())
+            .map(|manifest| {
+                (
+                    manifest.parent_session.as_ref().map(hash_proto),
+                    manifest.fork_turn,
+                )
+            })
+            .unwrap_or((None, None));
+        Ok::<_, Status>((
+            ledger,
+            turn_intents,
+            manifest_head,
+            parent_manifest,
+            fork_turn,
+        ))
     })
     .await
     .map_err(|error| Status::internal(error.to_string()))??;
 
-    let Some((_record, turns)) = ledger else {
+    let (ledger, turn_intents, manifest_head, parent_manifest, fork_turn) = ledger;
+    let Some((record, turns)) = ledger else {
         return Err(domain_status(ErrorCode::NotFound, "session not found"));
     };
+    // The complete ledger as versioned-opaque bytes: JSON of the
+    // {record, turns} pair — the client's listings/renders deserialize the
+    // domain shape it knows (atomic.session.ledger.v1).
+    let ledger_bundle = serde_json::to_vec(&(record, &turns))
+        .ok()
+        .map(|payload| VersionedBytes {
+            schema: "atomic.session.ledger.v1".to_string(),
+            payload,
+        });
     let turns = turns
         .into_iter()
         .filter(|turn| {
@@ -296,7 +412,34 @@ pub async fn get_session_impl(
         })
         .map(stored_turn_proto)
         .collect();
-    Ok(Response::new(GetSessionResponse { turns }))
+    Ok(Response::new(GetSessionResponse {
+        turns,
+        ledger_bundle,
+        turn_intents,
+        manifest_head,
+        parent_manifest,
+        fork_turn,
+    }))
+}
+
+/// The vault-manifest turn→intent map for one session (the stored `turn` is
+/// `turn_count + 1` at creation, so subtract one for the ledger's 0-indexed
+/// turn number — mirrors the vault's own resolution).
+fn vault_turn_intent(repo: &Repository, session_id: &str, turn_number: u32) -> Option<String> {
+    let manifest = repo.vault_manifest().ok()?;
+    for (key, summary) in &manifest.intents {
+        if summary.session.as_deref() != Some(session_id) {
+            continue;
+        }
+        if summary.turn.and_then(|t| t.checked_sub(1)) == Some(turn_number) {
+            return Some(if summary.human_key.is_empty() {
+                key.clone()
+            } else {
+                summary.human_key.clone()
+            });
+        }
+    }
+    None
 }
 
 /// Map a stored session turn to the wire shape (the fields the ledger owns:
@@ -416,6 +559,17 @@ impl view_service_server::ViewService for ViewImpl {
                         }
                         (Some(source.clone()), Some(source))
                     }
+                    // `--parent`: anchor on the parent WITHOUT seeding —
+                    // the draft workspace form.
+                    Some(create_view_request::Base::Parent(parent)) => {
+                        if !repo.view_exists(&parent).map_err(repository_error)? {
+                            return Err(domain_status(
+                                ErrorCode::View,
+                                format!("view '{parent}' not found"),
+                            ));
+                        }
+                        (Some(parent), None)
+                    }
                     Some(create_view_request::Base::Empty(_)) | None => (None, None),
                 };
                 repo.create_overlay_view(&name, anchor.as_deref(), seed.as_deref())
@@ -473,9 +627,11 @@ impl view_service_server::ViewService for ViewImpl {
                 ));
             }
             // The CLI's safety gate, verbatim: refuse to switch away
-            // from a dirty working copy (the wire carries no bypass —
-            // --force/--stash stay client-side).
-            if handle_for_task.current_view() != name {
+            // from a dirty working copy — unless the caller explicitly
+            // bypassed it (--force/--stash, an informed client decision).
+            if !request.bypass_dirty_check.unwrap_or(false)
+                && handle_for_task.current_view() != name
+            {
                 let status = repo
                     .status(StatusOptions::default())
                     .map_err(repository_error)?;
@@ -605,7 +761,7 @@ impl view_service_server::ViewService for ViewImpl {
                         },
                         changes,
                         cascade: request.cascade,
-                        dry_run: false,
+                        dry_run: request.dry_run,
                         materialize: request.materialize,
                     })
                     .map_err(repository_error)?;
@@ -636,10 +792,18 @@ impl view_service_server::ViewService for ViewImpl {
                         })
                         .collect::<Vec<_>>()
                 };
-                let view_info = repo
-                    .get_view_info(&outcome.target_view)
-                    .map_err(repository_error)?;
+                // A dry run creates nothing: the report below is a
+                // preview, so there is no target view to describe.
+                let view_info = if request.dry_run {
+                    None
+                } else {
+                    Some(
+                        repo.get_view_info(&outcome.target_view)
+                            .map_err(repository_error)?,
+                    )
+                };
                 Ok(SplitViewResponse {
+                    dry_run: request.dry_run,
                     requested: map(&outcome.requested),
                     dependents: map(&outcome.dependents),
                     moved: map(&outcome.moved),
@@ -648,10 +812,10 @@ impl view_service_server::ViewService for ViewImpl {
                     working_copy_updated: outcome.working_copy_updated,
                     files_written: outcome.files_written as u64,
                     files_removed: outcome.files_removed as u64,
-                    view: Some(ViewInfo {
+                    view: view_info.map(|info| ViewInfo {
                         name: outcome.target_view.clone(),
                         scope: ViewScope::Unspecified as i32,
-                        parent: view_info.parent_name.clone(),
+                        parent: info.parent_name.clone(),
                         head: None,
                         change_count: outcome.target_change_count,
                         current: handle_for_task.current_view() == outcome.target_view,

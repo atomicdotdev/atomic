@@ -6,8 +6,8 @@
 //! in-process dispatch uses), behind the per-repository gate — changes.redb
 //! is one writable handle per process, exactly like pristine.
 //!
-//! Semantics parity with the legacy owner protocol
-//! (`handle_request`): generation fencing with the store's verbatim error
+//! Semantics parity with the legacy owner protocol (owner.rs
+//! `handle_request`): generation fencing with the store's verbatim error
 //! text, caller-supplied `now` (never a server clock), the five named
 //! crash-injection failpoints, prepare's reuse_frozen_changes recovery, and
 //! strict-continuity frozen-envelope paging. Error classification follows

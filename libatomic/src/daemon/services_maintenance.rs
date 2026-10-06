@@ -28,10 +28,12 @@ fn repair_action(action: i32) -> Result<RepairAction, Status> {
     Ok(match action {
         x if x == Action::RebuildDependencyIndex as i32 => Action::RebuildDependencyIndex,
         x if x == Action::MaterializeCrdt as i32 => Action::MaterializeCrdt,
+        x if x == Action::ReindexWorkingCopy as i32 => Action::ReindexWorkingCopy,
         _ => {
             return Err(domain_status(
                 ErrorCode::InvalidArgument,
-                "repair action is required (REBUILD_DEPENDENCY_INDEX or MATERIALIZE_CRDT)",
+                "repair action is required (REBUILD_DEPENDENCY_INDEX, MATERIALIZE_CRDT, \
+                 or REINDEX_WORKING_COPY)",
             ))
         }
     })
@@ -66,6 +68,17 @@ impl MaintenanceService for MaintenanceImpl {
                         indexed: indexed as u64,
                         skipped: skipped as u64,
                         failed: failed as u64,
+                        reindexed: 0,
+                        ..Default::default()
+                    })
+                }
+                RepairAction::ReindexWorkingCopy => {
+                    // `status --reindex`: rebuild the working-copy index so
+                    // stale rows stop producing false positives.
+                    let reindexed = repo.reindex_working_copy().map_err(repository_error)?;
+                    Ok(RepairResponse {
+                        findings: Vec::new(),
+                        reindexed: reindexed as u64,
                         ..Default::default()
                     })
                 }
@@ -82,6 +95,7 @@ impl MaintenanceService for MaintenanceImpl {
                         indexed: 0,
                         skipped: 0,
                         failed: 0,
+                        reindexed: 0,
                         changes_scanned: outcome.changes_scanned as u64,
                         changes_applied: outcome.changes_applied as u64,
                         file_ops_applied: outcome.file_ops_applied as u64,

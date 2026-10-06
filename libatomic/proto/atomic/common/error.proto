@@ -1,19 +1,19 @@
 // atomic-protocol — the stable error model.
 //
-// Add-only. Enum values 28+ reserved: enum numbers are never reused.
+// DRAFT — add-only. Enum values 28+ reserved: enum numbers are never reused.
 //
 // Vocabulary provenance:
 //  * legacy agent journal protocol (verified in source, 2026-10-01):
 //    "unsupported-version", "provenance-store", "provenance-checkpoint",
 //    "provenance-lifecycle".
-//  * sandbox branch per the remote-sandboxes extension:
+//  * sandbox branch per HANDOFF §4/§5 (Aaron's unmerged feat/remote-sandboxes):
 //    unauthorized, forbidden, view, repository, provenance, changes, submit,
 //    file-states, materialize, sandbox-token, remote, internal.
 //  * RFC D7/capability section: CAPABILITY_UNAVAILABLE, WORKSPACE_REQUIRED.
 //  * standard transport/domain classes, stable and machine-readable.
 //
 // Errors carry stable machine-readable codes plus actionable context
-// Transport-level failures use gRPC status with ErrorInfo as
+// (HANDOFF §12). Transport-level failures use gRPC status with ErrorInfo as
 // the detail payload; domain refusals that must carry recovery payloads
 // (e.g. a stale-view skeleton) travel inside the response message as oneof
 // outcomes, not as transport errors.

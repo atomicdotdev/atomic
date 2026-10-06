@@ -1414,6 +1414,28 @@ impl knowledge_service_server::KnowledgeService for KnowledgeImpl {
             let repo = handle.repository()?;
             let processed = match action {
                 KnowledgeMaintainAction::Enrich => {
+                    // Per-change scope (`enrich --changes`): enrich only
+                    // the named changes' nodes.
+                    if !request.changes.is_empty() {
+                        let mut total: u64 = 0;
+                        for hash in &request.changes {
+                            if hash.value.len() != 32 {
+                                return Err(domain_status(
+                                    ErrorCode::InvalidArgument,
+                                    "hash must be 32 bytes",
+                                ));
+                            }
+                            let mut bytes = [0u8; 32];
+                            bytes.copy_from_slice(&hash.value);
+                            repo.kg_enrich_change(&atomic_core::types::Merkle(bytes))
+                                .map_err(repository_error)?;
+                            total += 1;
+                        }
+                        return Ok::<_, Status>(MaintainKnowledgeGraphResponse {
+                            processed: total,
+                            meta: response_meta(&meta),
+                        });
+                    }
                     // The CLI --rebuild flag rides the scope field ("rebuild").
                     if request.scope.as_deref() == Some("rebuild") {
                         repo.kg_clear_derived().map_err(repository_error)?;
@@ -1617,10 +1639,52 @@ impl provenance_service_server::ProvenanceService for ProvenanceImpl {
         let sessions = tokio::task::spawn_blocking(move || {
             let repo = handle_for_task.repository()?;
             let ledgers = repo.list_session_ledgers(limit).map_err(repository_error)?;
-            Ok::<_, Status>(
-                ledgers
-                    .into_iter()
-                    .map(|(record, turns)| SessionSummary {
+            // Vault-derived session→intents map (the same map the client
+            // built locally — one implementation, served here).
+            let mut intent_map: std::collections::HashMap<String, Vec<String>> =
+                std::collections::HashMap::new();
+            if let Ok(manifest) = repo.vault_manifest() {
+                for (key, summary) in &manifest.intents {
+                    if let Some(session_id) = &summary.session {
+                        let label = if summary.human_key.is_empty() {
+                            key.clone()
+                        } else {
+                            summary.human_key.clone()
+                        };
+                        let ids = intent_map.entry(session_id.clone()).or_default();
+                        if !ids.contains(&label) {
+                            ids.push(label);
+                        }
+                    }
+                }
+            }
+            // The complete ledgers as versioned-opaque bytes (JSON of the
+            // {record, turns} pairs — atomic.session.ledgers.v1); the
+            // client renders listings/JSON from the domain shape.
+            let ledgers_bundle = serde_json::to_vec(&ledgers)
+                .ok()
+                .map(|payload| VersionedBytes {
+                    schema: "atomic.session.ledgers.v1".to_string(),
+                    payload,
+                });
+            let mut intent_counts = Vec::with_capacity(ledgers.len());
+            let summaries = ledgers
+                .into_iter()
+                .map(|(record, turns)| {
+                    // Prefer explicit plan ids from the turns; the vault
+                    // map covers the rest.
+                    let from_turns: std::collections::HashSet<&str> =
+                        turns.iter().filter_map(|t| t.plan_id.as_deref()).collect();
+                    let intent_count = if !from_turns.is_empty() {
+                        from_turns.len()
+                    } else {
+                        intent_map
+                            .get(&record.session_id)
+                            .map(|ids| ids.len())
+                            .unwrap_or(0)
+                    };
+                    intent_counts.push(intent_count as u32);
+                    SessionSummary {
                         session_id: record.session_id,
                         view: record.view_name,
                         turn_count: record.turn_count.max(turns.len() as u32),
@@ -1632,13 +1696,19 @@ impl provenance_service_server::ProvenanceService for ProvenanceImpl {
                             seconds: ended,
                             nanos: 0,
                         }),
-                    })
-                    .collect::<Vec<_>>(),
-            )
+                    }
+                })
+                .collect::<Vec<_>>();
+            Ok::<_, Status>((summaries, ledgers_bundle, intent_counts))
         })
         .await
         .map_err(|error| Status::internal(error.to_string()))??;
-        Ok(Response::new(ListSessionsResponse { sessions }))
+        let (sessions, ledgers_bundle, intent_counts) = sessions;
+        Ok(Response::new(ListSessionsResponse {
+            sessions,
+            ledgers_bundle,
+            intent_counts,
+        }))
     }
 
     async fn fork_session(

@@ -1,5 +1,5 @@
 // atomic-protocol — AttestationService definition (the RPC contract).
-// Add-only. Messages for this service live in
+// DRAFT — add-only. Messages for this service live in
 // atomic/services/attestation/attestation_messages.proto · shared primitives in atomic/common/.
 
 syntax = "proto3";

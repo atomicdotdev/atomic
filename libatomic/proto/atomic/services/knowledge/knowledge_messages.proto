@@ -1,7 +1,7 @@
 // atomic-protocol — KnowledgeService: knowledge-graph queries and
 // maintenance.
 //
-// Add-only. The CLI's eleven `query` verbs collapse into TWO RPCs
+// DRAFT — add-only. The CLI's eleven `query` verbs collapse into TWO RPCs
 // (the headline combine of this draft):
 //  * QueryGraph — every read: content/code search, kg search, entity,
 //    neighbors, callers, graph slice, plan execution, RAG ask;
@@ -105,6 +105,7 @@ message MaintainKnowledgeGraphRequest {
   RequestMeta meta = 2;
   KnowledgeMaintainAction action = 3;
   optional string scope = 4;      // e.g. entity-type filter
+  repeated Hash changes = 5;     // ENRICH: limit to these changes' nodes
 }
 message MaintainKnowledgeGraphResponse {
   uint64 processed = 1;

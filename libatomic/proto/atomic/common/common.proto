@@ -1,7 +1,7 @@
 // atomic-protocol — shared primitives.
 //
-// Add-only. Field numbers are never reused or renumbered.
-// Conventions carried from the earlier parked draft:
+// DRAFT — add-only. Field numbers are never reused or renumbered.
+// Conventions carried from the parked Slice 0 draft (REAC::aaron::2):
 // package `atomic`, RepositoryRef numbering per the RFC.
 //
 // CONTRACT RULES (descriptor gate now; runtime conformance tests at implementation):
@@ -126,13 +126,13 @@ message SessionTurn {
 // internal encoding is owned elsewhere (V3 change files, provenance graph
 // exports, knowledge-graph slices). SubmitChange/Changes carry V3 change
 // bytes as versioned-opaque with this schema field, like the event envelope's
-// type URL (recorded recommendation).
+// type URL (HANDOFF §10.3 recommendation).
 message VersionedBytes {
   string schema = 1;   // e.g. "atomic.change.v3", "atomic.prov.graph.v1"
   bytes payload = 2;
 }
 
-// Expected-state precondition on a mutation (RFC D5/D7: fencing
+// Expected-state precondition on a mutation (RFC D5/D7 + HANDOFF §6: fencing
 // on EVERY mutation, not just provenance). A mismatch fails with
 // PRECONDITION_FAILED (or GENERATION_CONFLICT for the provenance fencing
 // flavor) instead of silently racing.
@@ -151,6 +151,9 @@ message ChangeRef {
   oneof kind {
     Hash hash = 1;
     uint64 sequence = 2;
+    // Case-insensitive unique-prefix resolution against the whole change
+    // store; the target operation's own membership/guard errors speak.
+    string prefix = 3;
   }
 }
 

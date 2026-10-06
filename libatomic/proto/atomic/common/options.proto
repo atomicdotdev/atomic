@@ -1,8 +1,9 @@
 // atomic-protocol — method options (RFC D7).
 //
-// Numbers are add-only after the first tagged release. Field and
-// extension numbers are NEVER reused or renumbered. 51001/51002 are the permanent allocations for Atomic's
-// method options (chosen once, per RFC).
+// DRAFT — numbers are correctable until Lee's review and the first tagged
+// release; add-only thereafter. Field and extension numbers are NEVER reused
+// or renumbered. 51001/51002 are the permanent allocations for Atomic's
+// method options (chosen once, per RFC + HANDOFF §7.7/§12).
 //
 // THE ONE PROTOCOL: this package is the sole public protobuf contract for
 // local daemon and hosted server. There is no second protocol.
@@ -10,7 +11,7 @@
 // Capability tokens use dot style ("repository.read") — the RFC is
 // internally inconsistent (dot style in its method-option examples, colon
 // style in its authorization section); dot style is carried from the parked
-// earlier draft and flagged for ratification.
+// Slice 0 draft (REAC::aaron::2) and flagged for Lee's ratification.
 
 syntax = "proto3";
 

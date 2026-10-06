@@ -1,6 +1,6 @@
 // atomic-protocol — ViewService: view lifecycle and scope.
 //
-// Add-only. Views are the workflow spine (draft → shared). View
+// DRAFT — add-only. Views are the workflow spine (draft → shared). View
 // reads and repository-only lifecycle writes are BOTH. Only switch follows a
 // host working copy and stays LOCAL. Sandboxes have no lifecycle authority.
 //
@@ -50,6 +50,9 @@ message CreateViewRequest {
   oneof base {
     string from_view = 4;   // `view create --from` / `split` from another view
     bool empty = 6;         // `--empty`
+    // `--parent`: anchor on this parent WITHOUT seeding from it (the
+    // draft workspace form).
+    string parent = 10;
   }
   ViewScope scope = 8;
   optional ViewSnapshot base_snapshot = 9; // required for from_view
@@ -63,6 +66,9 @@ message SwitchViewRequest {
   RepositoryRef repository = 1;
   RequestMeta meta = 2;
   string view = 3;
+  // The client's explicit dirty-working-copy bypass (`--force`/`--stash`);
+  // the server-side refusal remains the default.
+  optional bool bypass_dirty_check = 4;
 }
 message SwitchViewResponse {
   uint64 files_written = 1;        // materialized files (add-only render)
@@ -98,6 +104,7 @@ message SplitViewRequest {
   repeated Hash changes = 5;        // the changes to split out
   bool cascade = 6;                 // move dependents instead of refusing
   bool materialize = 7;             // reconcile the source's working copy
+  bool dry_run = 8;                  // report the split without mutating
 }
 // One change involved in a split, with its pre-split source sequence.
 message SplitChangeInfo {
@@ -114,5 +121,6 @@ message SplitViewResponse {
   uint64 files_written = 7;
   uint64 files_removed = 8;
   ViewInfo view = 9;
+  bool dry_run = 10;                // the report above is a preview
   ResponseMeta meta = 100;
 }

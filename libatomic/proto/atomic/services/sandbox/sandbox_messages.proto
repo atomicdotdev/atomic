@@ -1,8 +1,8 @@
 // atomic-protocol — SandboxService: sandbox grants, local sandbox working
-// trees, and the remote-sandbox data ops (the remote-sandboxes extension
+// trees, and the remote-sandbox data ops (HANDOFF §5, Aaron's unmerged branch
 // — the handoff is the spec here).
 //
-// Add-only.
+// DRAFT — add-only.
 //
 // "A remote sandbox is a machine holding only a pointer file .atomic-sandbox
 // = {iroh EndpointAddr of the serving daemon, repository, view, token}.
@@ -20,7 +20,7 @@
 //    to be visible on the caller's view;
 //  * grant admin (Open/Renew/Close) is LOCAL-only.
 //
-// Inode keying (recorded recommendation): FileStates inodes
+// Inode keying (HANDOFF §10.1 recommendation on record): FileStates inodes
 // are OPAQUE SERVER-ISSUED HANDLES — they originate from the server's own
 // skeleton export (like cursors). They are not permissions: every use checks
 // repository, snapshot and effective-view visibility; guesses are refused.
@@ -42,13 +42,13 @@ import "atomic/common/error.proto";
 import "atomic/common/change.proto";
 
 // ————— sandbox cache exports (client-side; only transport changes with the
-//       daemon — "SandboxSkeleton"/"SandboxSlice") —————
+//       daemon — HANDOFF §5 "SandboxSkeleton"/"SandboxSlice") —————
 
 message SandboxViewRow {
   string path = 1;
   uint64 inode = 2;              // opaque server-issued handle
   optional Hash content = 3;
-  // SHAPE-CONFIRM (Slice 3): full row fields.
+  // SHAPE-CONFIRM (Slice 3, from Aaron's branch): full row fields.
 }
 
 message SandboxAncestorView {
@@ -251,7 +251,7 @@ message PublishProvenanceResponse {
 message ProvenancePublished {
   Hash provenance_hash = 1;
   google.protobuf.Timestamp published_at = 2;
-  // SHAPE-CONFIRM (Slice 3): publication record shape.
+  // SHAPE-CONFIRM (Slice 3): publication record shape from Aaron's branch.
 }
 
 message SubmitChangeRequest {
@@ -289,14 +289,14 @@ message ChangeRefused {
 
 // atomic-protocol — grants and sandbox tokens.
 //
-// Add-only.
+// DRAFT — add-only.
 //
-// Model carried from the remote-sandbox extension: a grant is
+// Model carried from the remote-sandbox extension (HANDOFF §5): a grant is
 // view-scoped, optionally identity-bound, and time-boxed. A remote caller is
 // trusted ONLY as far as its token: exactly one view, optionally one acting
 // identity, until expiry.
 //
-// CONTRACT BEHAVIOR (recorded recommendation):
+// CONTRACT BEHAVIOR (HANDOFF §10.2 recommendation, on record for Lee):
 // the grant registry is EPHEMERAL — only blake3 hashes of tokens are stored,
 // grant-admin issuance replay is memory-only and invalidated with its grant;
 // no durable response/outbox/event payload may contain the token,

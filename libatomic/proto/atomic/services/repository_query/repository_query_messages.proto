@@ -1,6 +1,6 @@
 // atomic-protocol — RepositoryQueryService: read-only repository operations.
 //
-// Add-only. Reads execute as independent concurrent read
+// DRAFT — add-only. Reads execute as independent concurrent read
 // transactions (RFC concurrency model); no global write lock is ever assumed.
 // LOCAL-scoped reads are working-copy-aware (status/DiffWorkingCopy against the
 // tree); BOTH reads (log/change/Diff/PreviewMutation) are semantically identical on
@@ -37,6 +37,7 @@ message StatusResponse {
   uint32 stale_index_count = 9;   // non-zero → `status --reindex` would
                                     // resolve false positives
   ViewSnapshot snapshot = 10;
+  bool needs_reindex = 11;         // stale_index_count > 0
 }
 // atomic's file-status vocabulary, source-verified (status.rs:136):
 // Modified, Deleted, Untracked, Added, Conflicted — no git-shaped states.
@@ -64,6 +65,8 @@ message LogRequest {
   optional string view = 3; // required unless all_views; no daemon current-view default
   optional PageCursor cursor = 4;
   optional PageBudget budget = 5;
+  repeated string path_filter = 6;      // `--path`: entries whose changes touch it
+  bool tags_only = 7;                  // tagged entries only
 }
 message LogResponse {
   repeated ChangeLogEntry entries = 1;
@@ -92,6 +95,16 @@ message GetChangeResponse {
   optional VersionedBytes semantic_section = 3;
   repeated ChangeSignature signatures = 4;
   optional bytes content_chunks = 5;
+  // The complete change as versioned-opaque bytes (schema
+  // "atomic.change.v3") — deserialize with atomic-core for full-detail
+  // rendering (hunks, content, unhashed sections) without a second
+  // server-side render per client need.
+  optional VersionedBytes change_bundle = 6;
+  // The causal decision graph(s) explaining this change (schema
+  // "atomic.prov.graph.v1", one per covering graph, in order).
+  repeated VersionedBytes provenance_ledger = 7;
+  // The change's sequence on the resolved view, when known.
+  optional uint64 sequence = 8;
 }
 // ChangeInfo lives in atomic/common/change.proto (shared change-domain).
 
@@ -102,11 +115,13 @@ message DiffRequest {
     RefPairScope refs = 3;             // view/tag/change-pair diff
   }
   bool stat_only = 4;
+  bool word_diff = 5;                  // word-level highlight inside hunks
 }
 message DiffWorkingCopyRequest {
   RepositoryRef repository = 1; // workspace_id required
   WorkingCopyScope working_copy = 2;
   bool stat_only = 3;
+  bool word_diff = 4;           // word-level highlight inside hunks
 }
 message WorkingCopyScope {
   bool include_untracked = 1;

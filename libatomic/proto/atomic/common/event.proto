@@ -1,8 +1,9 @@
 // atomic-protocol — the Reactor event envelope (RFC "Event envelope" section).
 //
-// Add-only. The envelope is defined now so repository mutation events
+// DRAFT — add-only. CONTRACT DRAFT: the ReactorService server lands in
+// Phase 3; this envelope is drafted now so repository mutation events
 // (transactional outbox, RFC D8) and agent ingestion rhyme with it
-// (align with the Reactor event envelope so the two contracts
+// (HANDOFF §6: "align with the Reactor event envelope so the two contracts
 // rhyme").
 //
 // Durability semantics (RFC D9) belong to the server, but the envelope

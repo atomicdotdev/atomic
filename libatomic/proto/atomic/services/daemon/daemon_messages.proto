@@ -1,7 +1,7 @@
 // atomic-protocol — DaemonService: daemon health, capability negotiation,
 // repository registry, lifecycle.
 //
-// Add-only. Extends the earlier parked draft.
+// DRAFT — add-only. Extends the parked Slice 0 draft (REAC::aaron::2).
 //
 // The legacy agent journal protocol is being fully dismantled (with the
 // `atomic agent database-owner` command that served it); liveness,
@@ -89,7 +89,7 @@ message GetCapabilitiesResponse {
   string implementation_version = 2;
   EndpointKind endpoint_kind = 3;
   repeated MethodDescriptorInfo methods = 4;  // the generated method matrix
-  repeated string features = 5;    // e.g. "harness_reflection" (see the
+  repeated string features = 5;    // e.g. "harness_reflection" (HANDOFF §10.6:
                                    // grpcurl + server reflection is the
                                    // recommended harness flavor)
   Limits limits = 6;

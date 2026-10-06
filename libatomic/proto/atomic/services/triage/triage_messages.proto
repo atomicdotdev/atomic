@@ -1,6 +1,6 @@
 // atomic-protocol — TriageService: promotion review.
 //
-// Add-only. Triage review is a paid-surface workflow (the
+// DRAFT — add-only. Triage review is a paid-surface workflow (the
 // intent→change pipeline's review gate): candidates are the change-sets
 // pending promotion between views; the review is the canonical report
 // (ordered semantic layers, provenance-backed) that `atomic triage review

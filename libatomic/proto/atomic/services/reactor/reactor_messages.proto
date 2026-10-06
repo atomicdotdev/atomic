@@ -1,7 +1,9 @@
 // atomic-protocol — ReactorService: durable cross-project event ingestion.
 //
-// Add-only. The ReactorService server lands with atomicd; the
-// repository-outbox events (RFC D8) rhyme with this envelope (event.proto).
+// DRAFT — add-only. CONTRACT DRAFT ONLY: the server lands in Phase 3 with
+// atomicd; the contract is drafted now because the Reactor is its own first
+// consumer and the repository-outbox events (RFC D8) must rhyme with this
+// envelope (event.proto).
 //
 // Durability semantics (RFC D9) that the contract names explicitly:
 //  * append-before-acknowledgement (an acked event is durable);

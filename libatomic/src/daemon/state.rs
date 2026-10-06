@@ -17,8 +17,8 @@ use tonic::{Code, Status};
 
 use prost::Message;
 
-/// Env-configured JSONL log of handled RPCs (one line per request, so
-/// external auditing can pair client invocations with served requests).
+/// Env-configured JSONL log of handled RPCs (the e2e harness audit pairs
+/// client invocations with served requests through it).
 pub const ENV_LOG_REQUESTS: &str = "ATOMIC_DAEMON_LOG_REQUESTS";
 
 /// How long a read-only open retries when another process holds a
