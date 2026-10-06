@@ -190,7 +190,7 @@ fn checkpoint_recovers_idempotently_across_every_publication_boundary() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("repo");
     let repository = Repository::init(&root).unwrap();
-    let redb_path = repository.redb_change_store_path();
+    let redb_path = repository.database_path();
     let changes_dir = repository.changes_dir();
     drop(repository);
 
@@ -313,6 +313,9 @@ fn checkpoint_recovers_idempotently_across_every_publication_boundary() {
         )
         .unwrap();
     assert_eq!(rebound, bound);
+    // The journal shares atomic.redb with the graph; like the owner between
+    // requests, release it before the repository opens the same file.
+    drop(store);
 
     let repository = Repository::open(&root).unwrap();
     let publication = repository
@@ -358,6 +361,7 @@ fn checkpoint_recovers_idempotently_across_every_publication_boundary() {
 
     // Crash after pristine publication: retrying publication above is harmless,
     // and acknowledgement is itself idempotent after completion.
+    let store = RedbChangeStore::open(&redb_path).unwrap();
     let completed = store
         .acknowledge_provenance_checkpoint(
             running.provenance_id,

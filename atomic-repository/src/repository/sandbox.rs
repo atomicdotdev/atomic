@@ -111,7 +111,7 @@ pub(super) fn detect_sandbox(start: &Path) -> Option<(PathBuf, PathBuf, String)>
             return Some((dir.clone(), parsed.canonical, parsed.view));
         }
         // Stop if we reach a real repository root — that's not a sandbox.
-        if dir.join(DOT_DIR).join("pristine.redb").is_file() {
+        if super::database::has_database(&dir.join(DOT_DIR)) {
             return None;
         }
         if !dir.pop() {
@@ -125,8 +125,8 @@ impl Repository {
     ///
     /// The agent's private working tree is at `working_root`, but the graph
     /// lives in the **canonical** repository found from `canonical`. All
-    /// sandboxes opened this way read and write the same `pristine` and
-    /// `changes` store, so there is exactly one graph. `view` selects which
+    /// sandboxes opened this way read and write the same repository database
+    /// and `changes` store, so there is exactly one graph. `view` selects which
     /// view this sandbox operates on (typically the agent's own draft view).
     ///
     /// The canonical `current_view` file on disk is left untouched — the view
@@ -166,7 +166,7 @@ impl Repository {
         let canonical_root = Self::find_root(canonical)?;
         let dot_dir = canonical_root.join(DOT_DIR);
 
-        let path = dot_dir.join("pristine.redb");
+        let path = super::ensure_database(&dot_dir)?;
         let pristine = if read_only {
             Pristine::open_readonly(path)
         } else {
