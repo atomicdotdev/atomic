@@ -802,7 +802,7 @@ impl Repository {
             let mode = if kind == FileKind::Symlink {
                 u32::from(atomic_core::output::platform_symlink_mode())
             } else {
-                u32::from(materialization.mode)
+                super::operation::planned_filesystem_mode(u32::from(materialization.mode))
             };
             let expected_new = EffectValue::File(FileState {
                 kind,

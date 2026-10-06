@@ -42,6 +42,9 @@ use super::helpers::deserialize_view_state;
 use super::read::ReadTxn;
 use super::write::WriteTxn;
 
+mod snapshot;
+use snapshot::SnapshotBackend;
+
 /// Return `max_id + 1`, or error if the ID space is exhausted.
 fn next_id(max_id: u64) -> PristineResult<u64> {
     max_id.checked_add(1).ok_or(PristineError::IdSpaceExhausted)
@@ -115,15 +118,17 @@ fn upgrade_legacy_database(path: &Path) -> PristineResult<()> {
     Ok(())
 }
 
-fn open_database(path: &Path, create: bool, cache_bytes: usize) -> PristineResult<Database> {
+fn open_database(
+    path: &Path,
+    create: bool,
+    cache_bytes: usize,
+) -> PristineResult<(Database, SnapshotBackend)> {
     let open = || {
         let mut builder = Builder::new();
         builder.set_cache_size(cache_bytes);
-        if create {
-            builder.create(path)
-        } else {
-            builder.open(path)
-        }
+        let backend = SnapshotBackend::open(path, create)?;
+        let database = builder.create_with_backend(backend.clone())?;
+        Ok::<_, redb::DatabaseError>((database, backend))
     };
 
     match open() {
@@ -203,7 +208,7 @@ pub struct Pristine {
 }
 
 enum PristineDatabase {
-    Writable(Database),
+    Writable(Database, SnapshotBackend),
     ReadOnly(ReadOnlyDatabase),
 }
 
@@ -217,7 +222,7 @@ impl Pristine {
 impl PristineDatabase {
     fn begin_read(&self) -> Result<redb::ReadTransaction, redb::TransactionError> {
         match self {
-            Self::Writable(db) => db.begin_read(),
+            Self::Writable(db, _) => db.begin_read(),
             Self::ReadOnly(db) => db.begin_read(),
         }
     }
@@ -225,7 +230,7 @@ impl PristineDatabase {
     /// The writable database handle, or an error for read-only pristines.
     fn writable_db(&self) -> PristineResult<&Database> {
         match self {
-            Self::Writable(db) => Ok(db),
+            Self::Writable(db, _) => Ok(db),
             Self::ReadOnly(_) => Err(PristineError::Io(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
                 "cannot write through a read-only pristine handle",
@@ -245,7 +250,7 @@ impl Pristine {
         // redb cache is 1 GB which causes excessive page eviction when
         // the GRAPH table grows beyond that during large imports.
         let cache_bytes = 8 * 1024 * 1024 * 1024; // 8 GiB
-        let db = open_database(path, true, cache_bytes)?;
+        let (db, backend) = open_database(path, true, cache_bytes)?;
 
         // Existing repositories must be checked before the additive table-init
         // transaction starts. Binaries predating this generic fence cannot honor
@@ -364,7 +369,7 @@ impl Pristine {
         // repository-level change files have been replayed into PATH_CLAIMS.
         // `open` returns a writable handle so that backfill can happen in one
         // transaction; read-only/open-existing modes reject the incomplete schema.
-        Self::scan_ids(PristineDatabase::Writable(db), false)
+        Self::scan_ids(PristineDatabase::Writable(db, backend), false)
     }
 
     /// Open an existing pristine database without the table-init write lock.
@@ -400,8 +405,11 @@ impl Pristine {
         require_complete_path_claims: bool,
     ) -> PristineResult<Self> {
         let cache_bytes = 8 * 1024 * 1024 * 1024; // 8 GiB
-        let db = open_database(path.as_ref(), false, cache_bytes)?;
-        Self::scan_ids(PristineDatabase::Writable(db), require_complete_path_claims)
+        let (db, backend) = open_database(path.as_ref(), false, cache_bytes)?;
+        Self::scan_ids(
+            PristineDatabase::Writable(db, backend),
+            require_complete_path_claims,
+        )
     }
 
     /// Open an existing pristine database in read-only mode

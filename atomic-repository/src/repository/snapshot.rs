@@ -535,13 +535,7 @@ impl Repository {
                 })?
                 .to_string_lossy()
                 .replace('\\', "/");
-            #[cfg(unix)]
-            let mode = {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::metadata(&path)?.permissions().mode() & 0o7777
-            };
-            #[cfg(not(unix))]
-            let mode = 0o644;
+            let mode = super::operation::metadata_mode(&std::fs::metadata(&path)?);
             effects.push(EffectPlan {
                 ordinal: ordinal as u32,
                 target: EffectTarget::FilesystemPath { path: relative },

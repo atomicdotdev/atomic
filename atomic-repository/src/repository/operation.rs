@@ -5292,14 +5292,26 @@ fn create_symlink(
     })
 }
 
+/// Predict the physical mode after `set_mode`, using the same representation
+/// as `metadata_mode`. Non-Unix filesystems expose only the read-only flag.
+pub(super) fn planned_filesystem_mode(recorded: u32) -> u32 {
+    if cfg!(unix) {
+        recorded
+    } else if recorded & 0o200 == 0 {
+        0o444
+    } else {
+        0o666
+    }
+}
+
 #[cfg(unix)]
-fn metadata_mode(metadata: &fs::Metadata) -> u32 {
+pub(super) fn metadata_mode(metadata: &fs::Metadata) -> u32 {
     use std::os::unix::fs::PermissionsExt;
     metadata.permissions().mode() & 0o7777
 }
 
 #[cfg(not(unix))]
-fn metadata_mode(metadata: &fs::Metadata) -> u32 {
+pub(super) fn metadata_mode(metadata: &fs::Metadata) -> u32 {
     if metadata.permissions().readonly() {
         0o444
     } else {

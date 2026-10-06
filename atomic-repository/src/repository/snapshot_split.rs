@@ -357,11 +357,9 @@ impl Repository {
         let scratch_dot = root.join(DOT_DIR);
         std::fs::create_dir_all(scratch_dot.join("changes")).map_err(RepositoryError::Io)?;
         std::fs::create_dir_all(scratch_dot.join(WORKSPACES_DIR)).map_err(RepositoryError::Io)?;
-        std::fs::copy(
-            self.dot_dir.join("pristine.redb"),
-            scratch_dot.join("pristine.redb"),
-        )
-        .map_err(RepositoryError::Io)?;
+        self.pristine
+            .copy_snapshot(&scratch_dot.join("pristine.redb"))
+            .map_err(|error| RepositoryError::Database(error.to_string()))?;
         copy_optional_file(
             &self.dot_dir.join("config.toml"),
             &scratch_dot.join("config.toml"),

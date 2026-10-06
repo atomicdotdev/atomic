@@ -411,9 +411,11 @@ fn suspicious_inode_binding_on_staged_path_refuses_repair() {
 #[test]
 fn contradictory_path_claim_transition_is_reported_as_stale() {
     let (temp, repo) = create_temp_repo();
-    let path = temp.path().join("a|1.txt");
+    // Keep delimiter-in-path coverage where `|` is a legal filename.
+    let name = if cfg!(unix) { "a|1.txt" } else { "a-1.txt" };
+    let path = temp.path().join(name);
     std::fs::write(&path, b"content\n").unwrap();
-    repo.add("a|1.txt", TrackingOptions::default()).unwrap();
+    repo.add(name, TrackingOptions::default()).unwrap();
     record_all(&repo, "base");
     std::fs::remove_file(&path).unwrap();
     record_all(&repo, "delete");
@@ -422,7 +424,7 @@ fn contradictory_path_claim_transition_is_reported_as_stale() {
         .iter_path_claims()
         .unwrap()
         .into_iter()
-        .find(|entry| entry.path == "a|1.txt" && entry.event.state == PathClaimState::Dead)
+        .find(|entry| entry.path == name && entry.event.state == PathClaimState::Dead)
         .unwrap();
     contradictory.event.state = PathClaimState::Alive;
     drop(txn);
@@ -446,7 +448,7 @@ fn contradictory_path_claim_transition_is_reported_as_stale() {
     assert!(report.problems.iter().any(|problem| {
         problem.index == NativeIndex::PathClaims
             && problem.kind == NativeIndexProblemKind::Stale
-            && problem.key.contains("a|1.txt")
+            && problem.key.contains(name)
     }));
     repo.repair_native_derived_indexes().unwrap();
     assert!(repo.verify_native_derived_indexes().unwrap().is_healthy());

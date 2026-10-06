@@ -1,6 +1,6 @@
 use super::super::operation::{
     classify_effect_lease, deterministic_effect_receipt, has_operation_verified_receipt,
-    LeaseClassification, RecoveryOutcome,
+    planned_filesystem_mode, LeaseClassification, RecoveryOutcome,
 };
 use super::*;
 use atomic_core::operation::{
@@ -291,7 +291,9 @@ fn directory_effect_gap_recovers_to_absence() {
         ordinal: 0,
         target,
         expected_old: EffectValue::Absent,
-        expected_new: super::super::operation::filesystem_directory_value(0o755),
+        expected_new: super::super::operation::filesystem_directory_value(planned_filesystem_mode(
+            0o755,
+        )),
     };
     let lock = repo.try_lock_operation(repo.working_copy()).unwrap();
     let prepared = repo
@@ -331,7 +333,9 @@ fn file_to_directory_transition_uses_two_receipted_stages() {
             ordinal: 1,
             target,
             expected_old: EffectValue::Absent,
-            expected_new: super::super::operation::filesystem_directory_value(0o755),
+            expected_new: super::super::operation::filesystem_directory_value(
+                planned_filesystem_mode(0o755),
+            ),
         },
     ];
     let state = operation_state(&repo);
@@ -376,7 +380,7 @@ fn directory_to_file_transition_uses_two_receipted_stages() {
             expected_old: EffectValue::Absent,
             expected_new: EffectValue::File(FileState {
                 kind: FileKind::Regular,
-                mode: 0o644,
+                mode: planned_filesystem_mode(0o644),
                 content: Hash::of(bytes),
             }),
         },
