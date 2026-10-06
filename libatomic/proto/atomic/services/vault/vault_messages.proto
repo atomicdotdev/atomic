@@ -81,11 +81,28 @@ message GetVaultEntryRequest {
   RepositoryRef repository = 1;
   VaultEntityKind kind = 2;
   string id = 3;
+  // Resolve by vault-relative path first (add-only): `vault show PATH`
+  // names entries by path (any entry type), not by kind+id.
+  optional string path = 4;
+  // Request the versioned-opaque entry bundle (add-only): the stored
+  // entry's full domain serialization plus the RAW attestation sources
+  // (the tracked attestation entry and the legacy sidecar text), so the
+  // client runs its existing lift/classification code over wire-carried
+  // inputs (the canonical --json projections).
+  bool include_bundle = 5;
   ViewRef view = 20;
 }
 message GetVaultEntryResponse {
   VaultEntry entry = 1;
   ViewSnapshot snapshot = 20;
+  // The stored entry + raw attestation sources (add-only; schema
+  // "atomic.vault.entry.bundle.v1"): JSON {"entry": `<atomic_core
+  // VaultEntry>`, "attestation": null | {"tracked": null | {"path": string,
+  // "frontmatter_json": string, "content": [bytes]}, "sidecar": null |
+  // {"path": string, "text": string}}}. The client deserializes the
+  // domain entry and classifies the attestation with the same bridge code
+  // the local body uses.
+  optional VersionedBytes entry_bundle = 21;
 }
 
 message ListVaultEntriesRequest {
@@ -96,6 +113,14 @@ message ListVaultEntriesRequest {
   optional PageCursor cursor = 5;
   optional PageBudget budget = 6;
   optional string identity = 7;   // filter by the entry's author identity
+  // `vault list --prefix` (add-only): filter to paths under this prefix.
+  optional string path_prefix = 8;
+  // `vault list --type` (add-only): the vault entry-type string
+  // (session|tool_result|memory|intent|skill|scratch|attestation).
+  optional string entry_type = 9;
+  // Raw status filter (add-only): the goal listing's free-form status
+  // string ("active"/"completed"/"suspended"/"all"), applied verbatim.
+  optional string status_filter = 10;
   ViewRef view = 20;
 }
 message ListVaultEntriesResponse {
@@ -192,9 +217,26 @@ message UpdateVaultEntityRequest {
     string body = 5;                 // rewrite content (memory write)
     VaultEntityStatus status = 6;   // status transition (intent lifecycle,
                                      // goal start/stop/resume)
+    // The fully composed update (add-only): every intent-update field in
+    // ONE request — the handler applies them atomically through the same
+    // domain update the CLI's multi-flag form performs.
+    IntentUpdateFields fields = 8;
   }
   optional ExpectedState expected = 7;
   ViewRef view = 20; // expected.kind must be view_snapshot matching this view
+}
+// One composed intent update (`intent update`'s multi-flag form, add-only).
+// Status stays the raw lifecycle string the domain update consumes
+// ("backlog"/"in_progress"/"needs-review"/"done"/"planned"/"icebox").
+message IntentUpdateFields {
+  optional string status = 1;
+  optional string assignee = 2;
+  optional string priority = 3;
+  optional string title = 4;
+  optional string reason = 5;
+  repeated string informed_by = 6;
+  optional string body = 7;
+  bool force = 8;
 }
 message UpdateVaultEntityResponse {
   VaultEntry entry = 1;
@@ -254,6 +296,28 @@ message VaultEntry {
   // intent/memory priority label.
   optional string vault_path = 9;
   optional string priority = 10;
+  // Listing-surface columns (add-only): the per-entry classification the
+  // attestation-aware listings render. The handler computes these with the
+  // same domain logic the local bodies use (manifest kind, the tracked
+  // attestation's fresh/stale state, the DID-match-then-verify rule).
+  optional string manifest_kind = 11;  // intent classification ("feature"/"review"/…)
+  optional string attested = 12;       // "fresh" | "stale" | "none"
+  optional string verifies = 13;       // "yes" | "no" | "na"
+  optional string memory_kind = 14;    // memory listing's kind column
+  optional string memory_status = 15;  // memory listing's status column
+  optional uint32 about_count = 16;    // memory listing's about-input count
+  // Whole-vault listing columns (add-only): `vault list`'s per-entry
+  // type/size/date table.
+  optional uint64 content_size = 17;   // stored content size in bytes
+  optional string updated_at_label = 18; // RFC 3339, as stored
+  optional string entry_type = 19;      // "memory"/"intent"/"session"/…
+  // Goal listing columns (add-only): `vault goal list --json`.
+  optional string started_at = 20;
+  optional uint32 turns = 21;
+  // Intent update report columns (add-only): the post-update assignee and
+  // the raw status label as stored (the frontmatter's own string).
+  optional string assignee = 22;
+  optional string status_label = 23;
   // SHAPE-CONFIRM: attestation/verification state surfacing (attestations
   // live in AttestationService; entries reference their latest attestation).
 }

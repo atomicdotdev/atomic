@@ -97,10 +97,32 @@ message ListAttestationsRequest {
   optional PageCursor cursor = 3;
   optional PageBudget budget = 4;
   ViewRef view = 5;
+  // Resolve ONE attestation by hash or prefix (add-only): `agent attest
+  // --hash` — the hash names an attestation, which the change-oriented Log
+  // cannot resolve. The response carries the detail bundle.
+  optional string hash_prefix = 6;
+  // The provenance-summary mode (add-only): `agent attest --summary
+  // [--view V]` — the response carries the summary bundle instead of the
+  // attestation list.
+  optional string summary_view = 7;
+  // With summary_view (add-only): summarize only the delta of the view
+  // relative to this parent — `agent attest --pending PARENT --view V`.
+  optional string pending_parent = 8;
 }
 message ListAttestationsResponse {
   repeated AttestationInfo attestations = 1;
   optional PageCursor next_cursor = 2;
+  // One resolved attestation's full detail (add-only; schema
+  // "atomic.attestation.detail.v1"): JSON {"hash": `<base32>`,
+  // "attestation": `<domain Attestation>`, "coverage": [{"view": string,
+  // "covered": uint, "total": uint}]} — the client renders the detail with
+  // the same code the local body runs.
+  optional VersionedBytes detail_bundle = 3;
+  // The AI provenance summary (add-only; schema
+  // "atomic.provenance.summary.v1"): JSON {"summary":
+  // `<domain ProvenanceSummary>`, "parent": string | null} — `parent` is
+  // the summarized view's recorded parent (the draft-view hint).
+  optional VersionedBytes summary_bundle = 4;
 }
 
 message AttestationInfo {

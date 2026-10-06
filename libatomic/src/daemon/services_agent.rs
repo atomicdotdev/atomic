@@ -19,7 +19,9 @@ use atomic_canonical::memory::lift_memory;
 use atomic_canonical::{
     lift_and_attest, lift_and_attest_memory, verify, verify_memory, CanonicalNode, MemoryNode,
 };
+use atomic_core::change::attestation::Attestation;
 use atomic_core::pristine::VaultEntryType;
+use atomic_core::types::Base32;
 use atomic_identity::{Identity, IdentityStore};
 use atomic_repository::IntentCreateOptions;
 use atomic_repository::IntentUpdateOptions;
@@ -732,45 +734,332 @@ fn fresh_attested_memory(
     }
 }
 
-/// Does the memory stored at `memory/<id>.md` carry a fresh attestation
-/// signed by `did` that verifies under `public_key`? The
-/// identity-filtered listing's domain check — the same
-/// DID-match-then-verify rule the CLI's attestation-aware memory listing
-/// applies: only a current, same-signer, cryptographically valid
-/// attestation passes (a stale or other-signed attestation does not).
-fn memory_attests_identity(
+/// The versioned-opaque entry bundle (schema "atomic.vault.entry.bundle.v1"):
+/// the stored entry's full domain serialization plus the RAW attestation
+/// sources, so the client runs its existing lift/classification code over
+/// wire-carried inputs. `kind` selects the attestation scheme (the intent
+/// and memory bridges' dual-read paths); `None` bundles the entry with no
+/// attestation (the path-resolved `vault show` projection).
+fn vault_entry_bundle(
     repo: &Repository,
-    vault_path: &str,
-    public_key: &atomic_identity::keypair::PublicKey,
-    did: &str,
-) -> bool {
-    let Ok(Some(entry)) = repo.vault_retrieve(vault_path) else {
+    kind: Option<Kind>,
+    id_or_path: &str,
+    entry: &atomic_core::pristine::VaultEntry,
+) -> Result<VersionedBytes, Status> {
+    let attestation = match kind {
+        Some(Kind::Intent) => intent_attestation_sources(repo, id_or_path),
+        Some(Kind::Memory) => memory_attestation_sources(repo, id_or_path),
+        _ => Value::Null,
+    };
+    let payload = serde_json::json!({
+        "entry": entry,
+        "attestation": attestation,
+    });
+    serde_json::to_vec(&payload)
+        .map(|payload| VersionedBytes {
+            schema: "atomic.vault.entry.bundle.v1".to_string(),
+            payload,
+        })
+        .map_err(|error| Status::internal(error.to_string()))
+}
+
+/// The RAW intent attestation sources (the bridge's dual-read inputs):
+/// the tracked vault entry (frontmatter + body bytes) and the legacy
+/// sidecar candidate's text — the first EXISTING candidate (the
+/// normalized-id path, then the raw-arg path a pre-upgrade build wrote).
+/// Both ride the wire when both exist; the client's classification keeps
+/// the bridge's precedence (tracked first, sidecar fallback).
+fn intent_attestation_sources(repo: &Repository, id: &str) -> Value {
+    let vpath = format!(
+        "attestations/{}/attested.md",
+        sanitize_id(&normalized_id(repo, id))
+    );
+    let tracked = repo.vault_retrieve(&vpath).ok().flatten().map(|entry| {
+        serde_json::json!({
+            "path": vpath,
+            "frontmatter_json": entry.frontmatter_json,
+            "content": entry.content_bytes,
+        })
+    });
+    let normalized = repo
+        .dot_dir()
+        .join("canonical")
+        .join("intents")
+        .join(sanitize_id(&normalized_id(repo, id)))
+        .join("attested.jsonld");
+    let raw = repo
+        .dot_dir()
+        .join("canonical")
+        .join("intents")
+        .join(sanitize_id(id))
+        .join("attested.jsonld");
+    let sidecar = [normalized, raw]
+        .into_iter()
+        .find(|candidate| candidate.exists())
+        .and_then(|candidate| {
+            std::fs::read_to_string(&candidate).ok().map(|text| {
+                serde_json::json!({
+                    "path": candidate.display().to_string(),
+                    "text": text,
+                })
+            })
+        });
+    serde_json::json!({ "tracked": tracked, "sidecar": sidecar })
+}
+
+/// The RAW memory attestation sources: the tracked
+/// `attestations/memory/<id>/attested.md` entry and the single legacy
+/// sidecar path's text.
+fn memory_attestation_sources(repo: &Repository, id: &str) -> Value {
+    let vpath = format!("attestations/memory/{}/attested.md", sanitize_id(id));
+    let tracked = repo.vault_retrieve(&vpath).ok().flatten().map(|entry| {
+        serde_json::json!({
+            "path": vpath,
+            "frontmatter_json": entry.frontmatter_json,
+            "content": entry.content_bytes,
+        })
+    });
+    let sidecar_path = repo
+        .dot_dir()
+        .join("canonical")
+        .join("memory")
+        .join(sanitize_id(id))
+        .join("attested.jsonld");
+    let sidecar = if sidecar_path.exists() {
+        std::fs::read_to_string(&sidecar_path).ok().map(|text| {
+            serde_json::json!({
+                "path": sidecar_path.display().to_string(),
+                "text": text,
+            })
+        })
+    } else {
+        None
+    };
+    serde_json::json!({ "tracked": tracked, "sidecar": sidecar })
+}
+
+fn memory_is_index_scaffold(repo: &Repository, path: &str) -> bool {
+    let Ok(Some(entry)) = repo.vault_retrieve(path) else {
         return false;
     };
-    let Ok(frontmatter) = parse_frontmatter(&entry) else {
-        return false;
-    };
-    let body = body_of(&entry);
-    let Some(id) = vault_path
-        .strip_prefix("memory/")
-        .and_then(|stem| stem.strip_suffix(".md"))
-    else {
-        return false;
-    };
-    let Some(node) = fresh_attested_memory(repo, id, &frontmatter, &body) else {
-        return false;
-    };
-    // DID pre-check: a different (or absent) signer is not a match.
-    if node.attributed_to.as_deref() != Some(did) {
-        return false;
-    }
-    // Same signer ⇒ the only failure that can follow is a real
-    // hash/signature failure.
-    verify_memory(&node, public_key).is_ok()
+    serde_json::from_str::<Value>(&entry.frontmatter_json)
+        .ok()
+        .and_then(|v| v.get("type").and_then(Value::as_str).map(str::to_owned))
+        .as_deref()
+        == Some("index")
 }
 
 fn now_rfc3339() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+}
+
+// ---------------------------------------------------------------------------
+// Listing-surface domain logic — the attestation-aware listings
+//
+// The per-entry classification the `intent list`/`memory list` columns and
+// JSON carry: the manifest kind tag, the tracked attestation's fresh/stale
+// state (with the legacy-sidecar dual-read), and the
+// DID-match-then-verify rule. Ported from the CLI bodies so the ranking
+// recipe lives in exactly one place (the handler); the CLI renders.
+// ---------------------------------------------------------------------------
+
+/// The verifying identity resolved ONCE for a whole listing: its public
+/// key and DID. `None` soft-fails (no identity resolvable — every
+/// `verifies` cell reads "na"); a NAMED-but-missing identity is a hard
+/// error, matching the verify verbs.
+struct ListingVerifier {
+    public_key: atomic_identity::keypair::PublicKey,
+    did: String,
+}
+
+fn resolve_listing_verifier(name: &Option<String>) -> Result<Option<ListingVerifier>, Status> {
+    let Ok(store) = IdentityStore::open_default() else {
+        return Ok(None);
+    };
+    let identity = match name {
+        Some(name) => Some(store.load_by_name(name).map_err(|_| {
+            domain_status(ErrorCode::NotFound, format!("identity '{name}' not found"))
+        })?),
+        None => store.get_default().ok().flatten(),
+    };
+    Ok(identity.map(|identity| ListingVerifier {
+        did: did_for_public_key(&identity.public_key),
+        public_key: identity.public_key.clone(),
+    }))
+}
+
+/// The DID-match-then-verify rule (the lists' `verifies` column):
+/// "na" when there is no fresh attestation, no resolvable identity, or a
+/// different signer; "yes"/"no" only for a same-signer fresh node. The
+/// same rule the CLI bodies apply, ported so the handler owns it.
+fn verifies_token<N>(
+    node: Option<&N>,
+    attributed_to: Option<&str>,
+    verifier: Option<&ListingVerifier>,
+    verify: impl FnOnce(&N, &atomic_identity::keypair::PublicKey) -> bool,
+) -> &'static str {
+    let (Some(node), Some(verifier)) = (node, verifier) else {
+        return "na";
+    };
+    // DID pre-check FIRST: a different (or absent) signer is "na", not
+    // "no" (a merely-unresolvable signer is NOT a failure).
+    if attributed_to != Some(verifier.did.as_str()) {
+        return "na";
+    }
+    // Same signer ⇒ the only path to "no" is a real hash/signature failure.
+    if verify(node, &verifier.public_key) {
+        "yes"
+    } else {
+        "no"
+    }
+}
+
+/// One loaded attestation artifact, classified against the current source
+/// (the fresh/stale/none trichotomy the listings render).
+enum LoadedAttestation<N> {
+    Fresh(N),
+    Stale(N),
+    None,
+}
+
+/// The fresh/stale classification: the recorded source-content anchor
+/// versus the current source hash (the same rule the CLI bridge applies).
+fn classify_artifact<N>(
+    node: N,
+    recorded: Option<String>,
+    current: String,
+) -> LoadedAttestation<N> {
+    if recorded.as_deref() == Some(current.as_str()) {
+        LoadedAttestation::Fresh(node)
+    } else {
+        LoadedAttestation::Stale(node)
+    }
+}
+
+/// The `sourceContentHash` anchor off a tracked attestation entry's
+/// frontmatter.
+fn tracked_source_anchor(entry: &atomic_core::pristine::VaultEntry) -> Option<String> {
+    serde_json::from_str::<Value>(&entry.frontmatter_json)
+        .ok()
+        .and_then(|v| {
+            v.get("sourceContentHash")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+}
+
+/// An intent's attestation, loaded through the same dual-read the CLI
+/// bridge performs: the tracked vault entry first (its body parses to a
+/// `CanonicalNode`), then the legacy sidecar candidates (the normalized
+/// id path, then the raw-arg path a pre-upgrade build wrote).
+fn intent_list_attestation(
+    repo: &Repository,
+    id: &str,
+    frontmatter: &Map<String, Value>,
+    body: &str,
+) -> LoadedAttestation<CanonicalNode> {
+    let vpath = format!(
+        "attestations/{}/attested.md",
+        sanitize_id(&normalized_id(repo, id))
+    );
+    if let Ok(Some(entry)) = repo.vault_retrieve(&vpath) {
+        if let Ok(node) = serde_json::from_str::<CanonicalNode>(body_of(&entry).trim_end()) {
+            return classify_artifact(
+                node,
+                tracked_source_anchor(&entry),
+                source_content_hash(frontmatter, body),
+            );
+        }
+        // A malformed tracked entry falls through to the sidecar.
+    }
+    let normalized = repo
+        .dot_dir()
+        .join("canonical")
+        .join("intents")
+        .join(sanitize_id(&normalized_id(repo, id)))
+        .join("attested.jsonld");
+    let raw = repo
+        .dot_dir()
+        .join("canonical")
+        .join("intents")
+        .join(sanitize_id(id))
+        .join("attested.jsonld");
+    for path in [normalized, raw] {
+        if !path.exists() {
+            continue;
+        }
+        if let Ok(text) = std::fs::read_to_string(&path) {
+            if let Ok(artifact) = serde_json::from_str::<Value>(&text) {
+                if let Ok(node) = serde_json::from_value::<CanonicalNode>(
+                    artifact.get("node").cloned().unwrap_or(Value::Null),
+                ) {
+                    let recorded = artifact
+                        .get("source")
+                        .and_then(|s| s.get("sourceContentHash"))
+                        .and_then(Value::as_str)
+                        .map(str::to_string);
+                    return classify_artifact(
+                        node,
+                        recorded,
+                        source_content_hash(frontmatter, body),
+                    );
+                }
+            }
+            // The CLI bridge warns and treats an unreadable sidecar as
+            // none; the listing degrades the row the same way.
+            return LoadedAttestation::None;
+        }
+    }
+    LoadedAttestation::None
+}
+
+/// A memory's attestation, loaded through the memory bridge's dual-read:
+/// the tracked `attestations/memory/<id>/attested.md` entry first, then
+/// the single legacy sidecar path.
+fn memory_list_attestation(
+    repo: &Repository,
+    id: &str,
+    frontmatter: &Map<String, Value>,
+    body: &str,
+) -> LoadedAttestation<MemoryNode> {
+    let vpath = format!("attestations/memory/{}/attested.md", sanitize_id(id));
+    if let Ok(Some(entry)) = repo.vault_retrieve(&vpath) {
+        if let Ok(node) = serde_json::from_str::<MemoryNode>(body_of(&entry).trim_end()) {
+            return classify_artifact(
+                node,
+                tracked_source_anchor(&entry),
+                source_content_hash(frontmatter, body),
+            );
+        }
+    }
+    let path = repo
+        .dot_dir()
+        .join("canonical")
+        .join("memory")
+        .join(sanitize_id(id))
+        .join("attested.jsonld");
+    if path.exists() {
+        if let Ok(text) = std::fs::read_to_string(&path) {
+            if let Ok(artifact) = serde_json::from_str::<Value>(&text) {
+                if let Ok(node) = serde_json::from_value::<MemoryNode>(
+                    artifact.get("node").cloned().unwrap_or(Value::Null),
+                ) {
+                    let recorded = artifact
+                        .get("source")
+                        .and_then(|s| s.get("sourceContentHash"))
+                        .and_then(Value::as_str)
+                        .map(str::to_string);
+                    return classify_artifact(
+                        node,
+                        recorded,
+                        source_content_hash(frontmatter, body),
+                    );
+                }
+            }
+            return LoadedAttestation::None;
+        }
+    }
+    LoadedAttestation::None
 }
 
 pub(crate) fn response_meta(meta: &Option<RequestMeta>) -> Option<ResponseMeta> {
@@ -846,6 +1135,7 @@ impl vault_service_server::VaultService for VaultImpl {
                         linked: Vec::new(),
                         vault_path: Some(format!(".vault/{}", result.intent_file)),
                         priority: Some("medium".to_string()),
+                        ..Default::default()
                     }),
                     meta: response_meta(&meta),
                 }
@@ -929,6 +1219,7 @@ impl vault_service_server::VaultService for VaultImpl {
                         linked: Vec::new(),
                         vault_path: Some(format!(".vault/{vault_path}")),
                         priority: None,
+                        ..Default::default()
                     }),
                     meta: response_meta(&meta),
                 }
@@ -979,6 +1270,20 @@ impl vault_service_server::VaultService for VaultImpl {
                     UpdateKind::Body(body) => {
                         options.content = Some(body);
                     }
+                    // The fully composed update: every field in ONE
+                    // request, applied atomically by the same domain
+                    // update the CLI's multi-flag form performs.
+                    UpdateKind::Fields(fields) => {
+                        options.status = fields.status;
+                        options.assignee = fields.assignee;
+                        options.priority = fields.priority;
+                        options.title = fields.title;
+                        options.reason = fields.reason;
+                        options.informed_by =
+                            (!fields.informed_by.is_empty()).then_some(fields.informed_by);
+                        options.content = fields.body;
+                        options.force = fields.force;
+                    }
                 }
                 let info = repo
                     .vault_intent_update(&id, options)
@@ -995,6 +1300,9 @@ impl vault_service_server::VaultService for VaultImpl {
                         linked: Vec::new(),
                         vault_path: None,
                         priority: Some(info.priority.clone()),
+                        assignee: info.assignee.clone(),
+                        status_label: Some(info.status.clone()),
+                        ..Default::default()
                     }),
                     meta: response_meta(&meta),
                 })
@@ -1032,11 +1340,12 @@ impl vault_service_server::VaultService for VaultImpl {
                             linked: Vec::new(),
                             vault_path: Some(format!(".vault/{vault_path}")),
                             priority: None,
+                            ..Default::default()
                         }),
                         meta: response_meta(&meta),
                     })
                 }
-                UpdateKind::Status(_) => Err(domain_status(
+                UpdateKind::Status(_) | UpdateKind::Fields(_) => Err(domain_status(
                     ErrorCode::InvalidArgument,
                     "memory status transitions are new revisions, not updates",
                 )),
@@ -1063,66 +1372,125 @@ impl vault_service_server::VaultService for VaultImpl {
         let gate_handle = handle.clone();
         let _gate = gate_handle.exclusive().await;
         let id = request.id.clone();
-        let response = tokio::task::spawn_blocking(move || match kind {
-            Kind::Intent => {
+        let path = request.path.clone();
+        let include_bundle = request.include_bundle;
+        let response = tokio::task::spawn_blocking(move || {
+            // Path-first resolution (add-only): `vault show <path>` names
+            // ANY vault entry by its vault-relative path — no kind
+            // inference. The bundle carries the stored entry (plus no
+            // attestation: the vault-show projection never consults one).
+            if let Some(path) = path.as_deref().filter(|path| !path.is_empty()) {
                 // A query: read-only open with the read-concurrency wait.
                 let repo = handle.repository_readonly()?;
-                let entry = repo.vault_intent_show(&id).map_err(repository_error)?;
-                let frontmatter = parse_frontmatter(&entry)?;
-                let title = frontmatter
-                    .get("title")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_string();
-                let status = frontmatter
-                    .get("status")
-                    .and_then(Value::as_str)
-                    .and_then(intent_status_to_proto)
-                    .map(|s| s as i32);
-                Ok::<_, Status>(GetVaultEntryResponse {
-                    entry: Some(VaultEntry {
-                        kind: Kind::Intent as i32,
-                        id: normalized_id(&repo, &id),
-                        title,
-                        status,
-                        body: Some(body_of(&entry)),
-                        created_at: None,
-                        updated_at: None,
-                        linked: Vec::new(),
-                        vault_path: None,
-                        priority: None,
-                    }),
-                    snapshot: None,
-                })
-            }
-            Kind::Memory => {
-                // A query: read-only open with the read-concurrency wait.
-                let repo = handle.repository_readonly()?;
-                let vault_path = format!("memory/{id}.md");
                 let entry = repo
-                    .vault_retrieve(&vault_path)
+                    .vault_retrieve(path)
                     .map_err(repository_error)?
-                    .ok_or_else(|| domain_status(ErrorCode::NotFound, "memory not found"))?;
-                Ok(GetVaultEntryResponse {
+                    .ok_or_else(|| {
+                        domain_status(
+                            ErrorCode::NotFound,
+                            format!("vault entry '{path}' not found"),
+                        )
+                    })?;
+                let bundle = include_bundle
+                    .then(|| vault_entry_bundle(&repo, None, path, &entry))
+                    .transpose()?;
+                return Ok::<_, Status>(GetVaultEntryResponse {
                     entry: Some(VaultEntry {
-                        kind: Kind::Memory as i32,
-                        id: id.clone(),
-                        title: id.clone(),
+                        kind: Kind::Unspecified as i32,
+                        id: path.to_string(),
+                        title: String::new(),
                         status: None,
                         body: Some(body_of(&entry)),
                         created_at: None,
                         updated_at: None,
                         linked: Vec::new(),
-                        vault_path: Some(format!(".vault/{vault_path}")),
+                        vault_path: Some(path.to_string()),
                         priority: None,
+                        entry_type: Some(entry.entry_type.to_string()),
+                        updated_at_label: Some(entry.updated_at.clone()),
+                        ..Default::default()
                     }),
                     snapshot: None,
-                })
+                    entry_bundle: bundle,
+                });
             }
-            other => Err(domain_status(
-                ErrorCode::InvalidArgument,
-                format!("vault entity kind {other:?} lands with its slice (unimplemented)"),
-            )),
+            match kind {
+                Kind::Intent => {
+                    // A query: read-only open with the read-concurrency wait.
+                    let repo = handle.repository_readonly()?;
+                    let entry = repo.vault_intent_show(&id).map_err(repository_error)?;
+                    let frontmatter = parse_frontmatter(&entry)?;
+                    let title = frontmatter
+                        .get("title")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string();
+                    let status = frontmatter
+                        .get("status")
+                        .and_then(Value::as_str)
+                        .and_then(intent_status_to_proto)
+                        .map(|s| s as i32);
+                    let bundle = include_bundle
+                        .then(|| vault_entry_bundle(&repo, Some(Kind::Intent), &id, &entry))
+                        .transpose()?;
+                    Ok(GetVaultEntryResponse {
+                        entry: Some(VaultEntry {
+                            kind: Kind::Intent as i32,
+                            id: normalized_id(&repo, &id),
+                            title,
+                            status,
+                            body: Some(body_of(&entry)),
+                            created_at: None,
+                            updated_at: None,
+                            linked: Vec::new(),
+                            vault_path: None,
+                            priority: None,
+                            ..Default::default()
+                        }),
+                        snapshot: None,
+                        entry_bundle: bundle,
+                    })
+                }
+                Kind::Memory => {
+                    // A query: read-only open with the read-concurrency wait.
+                    let repo = handle.repository_readonly()?;
+                    // The memory id/path resolver (no manifest lookup, no
+                    // case-folding): a bare id, a `memory/<id>` path, an
+                    // `<id>.md` name, or a full `memory/<id>.md` path all
+                    // resolve to `memory/<id>.md`.
+                    let without_prefix = id.strip_prefix("memory/").unwrap_or(&id);
+                    let stem = without_prefix.strip_suffix(".md").unwrap_or(without_prefix);
+                    let vault_path = format!("memory/{stem}.md");
+                    let entry = repo
+                        .vault_retrieve(&vault_path)
+                        .map_err(repository_error)?
+                        .ok_or_else(|| domain_status(ErrorCode::NotFound, "memory not found"))?;
+                    let bundle = include_bundle
+                        .then(|| vault_entry_bundle(&repo, Some(Kind::Memory), stem, &entry))
+                        .transpose()?;
+                    Ok(GetVaultEntryResponse {
+                        entry: Some(VaultEntry {
+                            kind: Kind::Memory as i32,
+                            id: stem.to_string(),
+                            title: stem.to_string(),
+                            status: None,
+                            body: Some(body_of(&entry)),
+                            created_at: None,
+                            updated_at: None,
+                            linked: Vec::new(),
+                            vault_path: Some(format!(".vault/{vault_path}")),
+                            priority: None,
+                            ..Default::default()
+                        }),
+                        snapshot: None,
+                        entry_bundle: bundle,
+                    })
+                }
+                other => Err(domain_status(
+                    ErrorCode::InvalidArgument,
+                    format!("vault entity kind {other:?} lands with its slice (unimplemented)"),
+                )),
+            }
         })
         .await
         .map_err(|e| Status::internal(e.to_string()))??;
@@ -1134,33 +1502,80 @@ impl vault_service_server::VaultService for VaultImpl {
         request: Request<ListVaultEntriesRequest>,
     ) -> Result<Response<ListVaultEntriesResponse>, Status> {
         let request = request.into_inner();
-        let kind = request
-            .kind
-            .and_then(|k| Kind::try_from(k).ok())
-            .unwrap_or(Kind::Intent);
+        // kind absent → the whole-vault listing (`vault list`: every entry
+        // with its type/size/date columns, prefix- and type-filtered).
+        let kind = request.kind.and_then(|k| Kind::try_from(k).ok());
         let handle = self.state.resolve(request.repository.as_ref().unwrap())?;
         self.state.log_rpc("ListVaultEntries", Some(&handle));
         let gate_handle = handle.clone();
         let _gate = gate_handle.exclusive().await;
         let identity = request.identity;
+        let path_prefix = request.path_prefix.clone().unwrap_or_default();
+        let entry_type = request.entry_type.clone();
+        let status_filter = request.status_filter.clone();
+        let limit = request
+            .budget
+            .and_then(|budget| budget.max_items)
+            .map(|max| max as usize);
         let response = tokio::task::spawn_blocking(move || match kind {
-            Kind::Intent => {
+            Some(Kind::Intent) => {
                 // A query: read-only open with the read-concurrency wait.
                 let repo = handle.repository_readonly()?;
+                // The verifying identity resolved ONCE (soft-fail to "no
+                // identity"; a named-but-missing identity is a hard error).
+                let verifier = resolve_listing_verifier(&identity)?;
+                let manifest = repo.vault_manifest().map_err(repository_error)?;
                 let infos = repo.vault_intent_list(None).map_err(repository_error)?;
                 let entries = infos
                     .into_iter()
-                    .map(|info| VaultEntry {
-                        kind: Kind::Intent as i32,
-                        id: info.id.clone(),
-                        title: info.title.clone(),
-                        status: intent_status_to_proto(&info.status).map(|s| s as i32),
-                        body: None, // listings are summaries; bodies stay unloaded
-                        created_at: None,
-                        updated_at: None,
-                        linked: Vec::new(),
-                        vault_path: None,
-                        priority: Some(info.priority.clone()),
+                    .map(|info| {
+                        // The manifest kind tag (a manifest read, never a
+                        // lift); a row missing from the manifest degrades
+                        // to the default "feature".
+                        let manifest_kind = manifest
+                            .intents
+                            .get(&info.id)
+                            .map(|summary| summary.kind.clone())
+                            .unwrap_or_else(|| "feature".to_string());
+                        // The attestation columns: a read/attestation
+                        // failure for a SINGLE intent degrades that row's
+                        // cells ("none"/"na"), never the whole list.
+                        let (attested, verifies) = (|| {
+                            let entry = repo.vault_intent_show(&info.id).ok()?;
+                            let frontmatter = parse_frontmatter(&entry).ok()?;
+                            let body = body_of(&entry);
+                            match intent_list_attestation(&repo, &info.id, &frontmatter, &body) {
+                                LoadedAttestation::Fresh(node) => Some((
+                                    "fresh",
+                                    verifies_token(
+                                        Some(&node),
+                                        node.attributed_to.as_deref(),
+                                        verifier.as_ref(),
+                                        |node, public_key| verify(node, public_key).is_ok(),
+                                    ),
+                                )),
+                                LoadedAttestation::Stale(_) => Some(("stale", "na")),
+                                LoadedAttestation::None => Some(("none", "na")),
+                            }
+                        })()
+                        .unwrap_or(("none", "na"));
+                        VaultEntry {
+                            kind: Kind::Intent as i32,
+                            id: info.id.clone(),
+                            title: info.title.clone(),
+                            status: intent_status_to_proto(&info.status).map(|s| s as i32),
+                            body: None, // listings are summaries; bodies stay unloaded
+                            created_at: None,
+                            updated_at: None,
+                            linked: Vec::new(),
+                            vault_path: None,
+                            priority: Some(info.priority.clone()),
+                            status_label: Some(info.status.clone()),
+                            manifest_kind: Some(manifest_kind),
+                            attested: Some(attested.to_string()),
+                            verifies: Some(verifies.to_string()),
+                            ..Default::default()
+                        }
                     })
                     .collect();
                 Ok::<_, Status>(ListVaultEntriesResponse {
@@ -1169,64 +1584,198 @@ impl vault_service_server::VaultService for VaultImpl {
                     snapshot: None,
                 })
             }
-            Kind::Memory => {
+            Some(Kind::Memory) => {
                 // A query: read-only open with the read-concurrency wait.
                 let repo = handle.repository_readonly()?;
-                let metas = repo
-                    .vault_list("memory/", Some(VaultEntryType::Memory))
-                    .map_err(repository_error)?;
-                // `--identity`: keep only the memories whose attestation
-                // verifies under that identity — the domain check the CLI's
-                // attestation-aware listing performs (resolve the identity,
-                // load each memory's fresh attested node, DID-match the
-                // signer, verify the signature). A named-but-missing
-                // identity is a hard error, matching the verify verbs.
-                let verifier = identity
-                    .map(|name| {
-                        let store = IdentityStore::open_default().map_err(|error| {
-                            domain_status(
-                                ErrorCode::NotFound,
-                                format!("identity store unavailable: {error}"),
-                            )
-                        })?;
-                        let identity = store.load_by_name(&name).map_err(|_| {
-                            domain_status(
-                                ErrorCode::NotFound,
-                                format!("identity '{name}' not found"),
-                            )
-                        })?;
-                        Ok::<_, Status>((
-                            identity.public_key.clone(),
-                            did_for_public_key(&identity.public_key),
-                        ))
-                    })
-                    .transpose()?;
-                let entries = metas
-                    .into_iter()
-                    .filter(|meta| match &verifier {
-                        None => true,
-                        Some((public_key, did)) => {
-                            memory_attests_identity(&repo, &meta.path, public_key, did)
-                        }
-                    })
+                // The verifying identity resolved ONCE — the `verifies`
+                // column's resolver (the same soft/hard-fail rule).
+                let verifier = resolve_listing_verifier(&identity)?;
+                // The SAME enumeration the local body performs: the
+                // `memory/` prefix, never attestation entries, never the
+                // `MEMORY.md` index scaffold, most-recent first with the
+                // id as the stable tiebreaker, truncated to the budget.
+                let metas = repo.vault_list("memory/", None).map_err(repository_error)?;
+                let mut items: Vec<(String, String)> = metas
+                    .iter()
+                    .filter(|meta| !meta.path.starts_with("attestations/"))
+                    .filter(|meta| !memory_is_index_scaffold(&repo, &meta.path))
                     .map(|meta| {
                         let id = meta
                             .path
                             .trim_end_matches(".md")
                             .trim_start_matches("memory/")
                             .to_string();
+                        (id, meta.updated_at.clone())
+                    })
+                    .collect();
+                items.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+                if let Some(limit) = limit {
+                    items.truncate(limit);
+                }
+                let entries = items
+                    .iter()
+                    .map(|(id, _)| {
+                        // kind/status/about degrade to "–"/0 when a single
+                        // memory cannot be read or lifted — never the list.
+                        let degraded = (
+                            "\u{2013}".to_string(),
+                            "\u{2013}".to_string(),
+                            0u32,
+                            "none",
+                            "na",
+                        );
+                        let (memory_kind, memory_status, about, attested, verifies) = (|| {
+                            let path = format!("memory/{id}.md");
+                            let entry = repo.vault_retrieve(&path).ok()??;
+                            let frontmatter = parse_frontmatter(&entry).ok()?;
+                            let body = body_of(&entry);
+                            match memory_list_attestation(&repo, id, &frontmatter, &body) {
+                                LoadedAttestation::Fresh(node) => {
+                                    // The fresh node drives the display
+                                    // columns; the DID-match-then-verify
+                                    // rule drives `verifies`.
+                                    let verifies = verifies_token(
+                                        Some(&node),
+                                        node.attributed_to.as_deref(),
+                                        verifier.as_ref(),
+                                        |node, public_key| verify_memory(node, public_key).is_ok(),
+                                    );
+                                    Some((
+                                        node.memory_kind.clone(),
+                                        node.status.clone(),
+                                        node.about.len() as u32,
+                                        "fresh",
+                                        verifies,
+                                    ))
+                                }
+                                other => {
+                                    // Stale/None: the columns come from the
+                                    // CURRENT source (the lift); the drift
+                                    // is still surfaced by the attested
+                                    // column.
+                                    let token = match other {
+                                        LoadedAttestation::Stale(_) => "stale",
+                                        _ => "none",
+                                    };
+                                    match lift_memory(&frontmatter, &body) {
+                                        Ok(node) => Some((
+                                            node.memory_kind,
+                                            node.status,
+                                            node.about.len() as u32,
+                                            token,
+                                            "na",
+                                        )),
+                                        Err(_) => {
+                                            let fm = |key: &str| {
+                                                frontmatter
+                                                    .get(key)
+                                                    .and_then(Value::as_str)
+                                                    .map(str::to_owned)
+                                                    .unwrap_or_else(|| "\u{2013}".to_string())
+                                            };
+                                            Some((fm("memoryKind"), fm("status"), 0, token, "na"))
+                                        }
+                                    }
+                                }
+                            }
+                        })(
+                        )
+                        .unwrap_or(degraded);
                         VaultEntry {
                             kind: Kind::Memory as i32,
                             id: id.clone(),
-                            title: id,
+                            title: id.clone(),
                             status: None,
                             body: None,
                             created_at: None,
                             updated_at: None,
                             linked: Vec::new(),
-                            vault_path: Some(format!(".vault/{}", meta.path)),
+                            vault_path: Some(format!(".vault/memory/{id}.md")),
                             priority: None,
+                            memory_kind: Some(memory_kind),
+                            memory_status: Some(memory_status),
+                            about_count: Some(about),
+                            attested: Some(attested.to_string()),
+                            verifies: Some(verifies.to_string()),
+                            ..Default::default()
                         }
+                    })
+                    .collect();
+                Ok(ListVaultEntriesResponse {
+                    entries,
+                    next_cursor: None,
+                    snapshot: None,
+                })
+            }
+            Some(Kind::Goal) => {
+                // A query: read-only open with the read-concurrency wait.
+                let repo = handle.repository_readonly()?;
+                let goals = repo
+                    .vault_goal_list(status_filter.as_deref())
+                    .map_err(repository_error)?;
+                let entries = goals
+                    .into_iter()
+                    .map(|goal| {
+                        let status = match goal.status.as_str() {
+                            "active" => VaultEntityStatus::Active,
+                            "suspended" => VaultEntityStatus::Suspended,
+                            "completed" => VaultEntityStatus::Completed,
+                            _ => VaultEntityStatus::Unspecified,
+                        };
+                        VaultEntry {
+                            kind: Kind::Goal as i32,
+                            id: goal.name.clone(),
+                            title: goal.developer.clone(),
+                            status: Some(status as i32),
+                            body: None,
+                            created_at: None,
+                            updated_at: None,
+                            linked: goal.intent.clone().into_iter().collect(),
+                            vault_path: Some(format!(".vault/goals/{}/_goal.md", goal.name)),
+                            priority: None,
+                            status_label: Some(goal.status.clone()),
+                            started_at: Some(goal.started_at.clone()),
+                            turns: Some(goal.turns),
+                            ..Default::default()
+                        }
+                    })
+                    .collect();
+                Ok::<_, Status>(ListVaultEntriesResponse {
+                    entries,
+                    next_cursor: None,
+                    snapshot: None,
+                })
+            }
+            None => {
+                // A query: read-only open with the read-concurrency wait.
+                let repo = handle.repository_readonly()?;
+                // `vault list`: EVERY vault entry with its type, content
+                // size, and updated-at date, filtered by the path prefix
+                // and the parsed entry type — the same enumeration the
+                // local body performs.
+                let type_filter = entry_type
+                    .as_deref()
+                    .and_then(|raw| raw.parse::<VaultEntryType>().ok());
+                let metas = repo
+                    .vault_list(&path_prefix, type_filter)
+                    .map_err(repository_error)?;
+                let entries = metas
+                    .into_iter()
+                    .map(|meta| VaultEntry {
+                        kind: Kind::Unspecified as i32,
+                        id: meta.path.clone(),
+                        title: String::new(),
+                        status: None,
+                        body: None,
+                        created_at: None,
+                        updated_at: None,
+                        linked: Vec::new(),
+                        vault_path: Some(meta.path.clone()),
+                        priority: None,
+                        content_size: Some(meta.content_size as u64),
+                        updated_at_label: Some(meta.updated_at.clone()),
+                        entry_type: Some(meta.entry_type.to_string()),
+                        ..Default::default()
                     })
                     .collect();
                 Ok(ListVaultEntriesResponse {
@@ -1427,6 +1976,7 @@ impl vault_service_server::VaultService for VaultImpl {
                         linked: Vec::new(),
                         vault_path: None,
                         priority: Some(info.priority.clone()),
+                        ..Default::default()
                     });
                 }
             }
@@ -1451,6 +2001,7 @@ impl vault_service_server::VaultService for VaultImpl {
                         linked: Vec::new(),
                         vault_path: Some(format!(".vault/{}", meta.path)),
                         priority: None,
+                        ..Default::default()
                     });
                 }
             }
@@ -1506,6 +2057,51 @@ impl vault_service_server::VaultService for VaultImpl {
 // ---------------------------------------------------------------------------
 // AttestationService
 // ---------------------------------------------------------------------------
+
+/// One resolved attestation's detail (schema "atomic.attestation.detail.v1"):
+/// the domain payload plus the per-view coverage rows (in the view
+/// listing's order, zero-total views skipped), so the client renders the
+/// detail with the same code the local body runs.
+fn attestation_detail_bundle(
+    repo: &Repository,
+    hash: &atomic_core::types::Hash,
+    attest: &Attestation,
+) -> Result<VersionedBytes, Status> {
+    let mut coverage: Vec<Value> = Vec::new();
+    if let Ok(views) = repo.list_views() {
+        for view_name in &views {
+            let Ok(history) =
+                repo.log(atomic_repository::history::HistoryOptions::default().view(view_name))
+            else {
+                continue;
+            };
+            let total = history.len();
+            if total == 0 {
+                continue;
+            }
+            let covered = history
+                .iter()
+                .filter(|entry| attest.covers_change(&entry.hash))
+                .count();
+            coverage.push(serde_json::json!({
+                "view": view_name,
+                "covered": covered,
+                "total": total,
+            }));
+        }
+    }
+    let payload = serde_json::json!({
+        "hash": hash.to_base32(),
+        "attestation": attest,
+        "coverage": coverage,
+    });
+    serde_json::to_vec(&payload)
+        .map(|payload| VersionedBytes {
+            schema: "atomic.attestation.detail.v1".to_string(),
+            payload,
+        })
+        .map_err(|error| Status::internal(error.to_string()))
+}
 
 pub struct AttestationImpl {
     pub state: Arc<DaemonState>,
@@ -1928,6 +2524,114 @@ impl attestation_service_server::AttestationService for AttestationImpl {
         let request = request.into_inner();
         let handle = self.state.resolve(request.repository.as_ref().unwrap())?;
         self.state.log_rpc("ListAttestations", Some(&handle));
+        let gate_handle = handle.clone();
+        let _gate = gate_handle.exclusive().await;
+
+        // `agent attest --hash <prefix>`: resolve ONE attestation by hash
+        // or prefix (the hash names an attestation; the change-oriented Log
+        // cannot resolve it) and serve its full detail — the domain
+        // payload plus the per-view coverage — as versioned-opaque bytes
+        // the client renders with its existing detail code.
+        if let Some(prefix) = request.hash_prefix.clone().filter(|p| !p.is_empty()) {
+            let handle_for_task = handle.clone();
+            let detail = tokio::task::spawn_blocking(move || -> Result<VersionedBytes, Status> {
+                let repo = handle_for_task.repository()?;
+                // Exact match first, then the prefix scan — the same
+                // resolution the CLI's find_by_prefix performs.
+                let mut matches: Vec<(atomic_core::types::Hash, Attestation)> = Vec::new();
+                if let Some(hash) =
+                    atomic_core::types::Hash::from_base32(prefix.as_bytes())
+                {
+                    if let Ok(attest) = repo.load_attestation(&hash) {
+                        return attestation_detail_bundle(&repo, &hash, &attest);
+                    }
+                }
+                let prefix_upper = prefix.to_uppercase();
+                for result in repo.change_store().iter_attestations() {
+                    let hash = match result {
+                        Ok(hash) => hash,
+                        Err(_) => continue,
+                    };
+                    if hash.to_base32().starts_with(&prefix_upper) {
+                        if let Ok(attest) = repo.load_attestation(&hash) {
+                            matches.push((hash, attest));
+                        }
+                    }
+                }
+                match matches.len() {
+                    0 => Err(domain_status(
+                        ErrorCode::NotFound,
+                        format!("No attestation found matching '{prefix}'"),
+                    )),
+                    1 => Ok(attestation_detail_bundle(
+                        &repo,
+                        &matches[0].0,
+                        &matches[0].1,
+                    )?),
+                    n => Err(domain_status(
+                        ErrorCode::NotFound,
+                        format!(
+                            "Ambiguous hash prefix '{prefix}' matches {n} attestations. Be more specific."
+                        ),
+                    )),
+                }
+            })
+            .await
+            .map_err(|error| Status::internal(error.to_string()))??;
+            return Ok(Response::new(ListAttestationsResponse {
+                attestations: Vec::new(),
+                next_cursor: None,
+                detail_bundle: Some(detail),
+                summary_bundle: None,
+            }));
+        }
+
+        // `agent attest --summary [--view V] [--pending P]`: the AI
+        // provenance summary (AI/Human/Needs-attention/System
+        // classification over the view's changes), served as
+        // versioned-opaque bytes the client renders with its existing
+        // summary code. `--pending` classifies only the view's delta
+        // relative to the parent.
+        if let Some(summary_view) = request.summary_view.clone().filter(|v| !v.is_empty()) {
+            let pending_parent = request.pending_parent.clone();
+            let handle_for_task = handle.clone();
+            let summary = tokio::task::spawn_blocking(move || -> Result<VersionedBytes, Status> {
+                let repo = handle_for_task.repository()?;
+                let summary = if let Some(parent) = pending_parent.clone().filter(|p| !p.is_empty())
+                {
+                    repo.provenance_summary_pending(&summary_view, &parent)
+                        .map_err(repository_error)?
+                } else {
+                    repo.provenance_summary(&summary_view)
+                        .map_err(repository_error)?
+                };
+                // The draft-view hint source: the summarized view's
+                // recorded parent, exactly what the local body reads.
+                let parent = repo
+                    .get_view_info(&summary_view)
+                    .ok()
+                    .and_then(|info| info.parent_name);
+                let payload = serde_json::json!({
+                    "summary": summary,
+                    "parent": parent,
+                });
+                serde_json::to_vec(&payload)
+                    .map(|payload| VersionedBytes {
+                        schema: "atomic.provenance.summary.v1".to_string(),
+                        payload,
+                    })
+                    .map_err(|error| Status::internal(error.to_string()))
+            })
+            .await
+            .map_err(|error| Status::internal(error.to_string()))??;
+            return Ok(Response::new(ListAttestationsResponse {
+                attestations: Vec::new(),
+                next_cursor: None,
+                detail_bundle: None,
+                summary_bundle: Some(summary),
+            }));
+        }
+
         // The agent-attest read path filters by view; the unfiltered listing
         // walks the whole audit graph and lands with its slice.
         let view = request
@@ -1940,8 +2644,6 @@ impl attestation_service_server::AttestationService for AttestationImpl {
         };
         let view_name = view.unwrap_or_else(|| handle.current_view());
         let handle_for_task = handle.clone();
-        let gate_handle = handle.clone();
-        let _gate = gate_handle.exclusive().await;
         let attestations = tokio::task::spawn_blocking(move || {
             let repo = handle_for_task.repository()?;
             let results = repo
@@ -1979,6 +2681,8 @@ impl attestation_service_server::AttestationService for AttestationImpl {
         Ok(Response::new(ListAttestationsResponse {
             attestations,
             next_cursor: None,
+            detail_bundle: None,
+            summary_bundle: None,
         }))
     }
 }
@@ -2014,21 +2718,31 @@ impl knowledge_service_server::KnowledgeService for KnowledgeImpl {
         let response = tokio::task::spawn_blocking(move || match query {
             QueryOneof::KgSearch(search) => {
                 let repo = handle.repository()?;
-                let pool = 5000usize;
-                let nodes = repo
-                    .vault_kg_search(&search.query, pool, Some(pool))
-                    .map_err(repository_error)?;
-                let nodes: Vec<_> = nodes
-                    .into_iter()
-                    .take(limit)
-                    .map(|node| KgNode {
-                        id: node.id.clone(),
-                        node_type: node.kind.clone(),
-                        name: Some(node.label.clone()),
-                        data: node.summary.clone().map(String::into_bytes),
-                        score: None,
-                    })
-                    .collect();
+                // The candidate pool the CLI's --pool names (default 5000)
+                // — the pool is what lets lower-scored kinds survive the
+                // diversity selection, so it rides the request.
+                let pool = search.pool.map(|pool| pool as usize).unwrap_or(5000);
+                let nodes = if let Some(kind_filter) =
+                    search.kind.clone().filter(|kind| !kind.is_empty())
+                {
+                    // The --kind form: search the full pool, keep the
+                    // kind's nodes, take the limit AFTER filtering — the
+                    // local post-filter order.
+                    let kind = kind_filter.to_lowercase();
+                    repo.vault_kg_search(&search.query, pool, Some(pool))
+                        .map_err(repository_error)?
+                        .into_iter()
+                        .filter(|node| node.kind.to_lowercase() == kind)
+                        .take(limit)
+                        .map(crate::daemon::services_query::kg_node_proto)
+                        .collect::<Vec<_>>()
+                } else {
+                    repo.vault_kg_search(&search.query, limit, Some(pool))
+                        .map_err(repository_error)?
+                        .into_iter()
+                        .map(crate::daemon::services_query::kg_node_proto)
+                        .collect()
+                };
                 Ok::<_, Status>(QueryGraphResponse {
                     nodes,
                     edges: Vec::new(),
@@ -2040,8 +2754,11 @@ impl knowledge_service_server::KnowledgeService for KnowledgeImpl {
             }
             QueryOneof::Neighbors(neighbors) => {
                 let repo = handle.repository()?;
-                let (nodes, edges) =
-                    crate::daemon::services_query::neighbors_impl(&repo, &neighbors.node_id, 1)?;
+                let (nodes, edges) = crate::daemon::services_query::neighbors_impl(
+                    &repo,
+                    &neighbors.node_id,
+                    neighbors.depth.unwrap_or(1) as u8,
+                )?;
                 Ok(QueryGraphResponse {
                     nodes,
                     edges,
@@ -2072,6 +2789,7 @@ impl knowledge_service_server::KnowledgeService for KnowledgeImpl {
                         name: Some(entity.name.clone()),
                         data: entity.signature.clone().map(String::into_bytes),
                         score: None,
+                        ..Default::default()
                     })
                     .collect();
                 Ok(QueryGraphResponse {

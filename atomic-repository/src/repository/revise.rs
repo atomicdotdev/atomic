@@ -8,13 +8,17 @@
 //! signature is the revised change's provenance), insert it, and re-apply
 //! the pending changes above the target in source order.
 //!
-//! This module is the ONE code path for the reword flow: the CLI command
-//! and the daemon's Revise RPC both call it (the shared-core pattern from
-//! `provenance_core`). The content-modification form of revise —
-//! re-capturing the working copy through an interactive editor — is
-//! client-side orchestration and stays out of the domain.
+//! The content-modification form (`atomic revise` without `--reword`)
+//! re-captures the working copy: the same unrecord/re-apply surgery, but
+//! the replacement change is RECORDED from the working copy (the
+//! client-side editor flow composes the message; the record itself is
+//! the domain's).
+//!
+//! This module is the ONE code path for both flows: the CLI command and
+//! the daemon's Revise RPC both call it (the shared-core pattern from
+//! `provenance_core`).
 
-use atomic_core::change::{Author, Change};
+use atomic_core::change::{Author, Change, ChangeHeader};
 use atomic_core::types::{Base32, Hash};
 
 use crate::Repository;
@@ -23,6 +27,15 @@ use crate::Repository;
 #[derive(Debug, Clone)]
 pub struct RewordOutcome {
     /// The new change hash (new header ⇒ new hash).
+    pub new_hash: Hash,
+    /// The changes re-applied above the target, in source order.
+    pub reinserted: Vec<Hash>,
+}
+
+/// The outcome of a content-mode revise.
+#[derive(Debug, Clone)]
+pub struct ReviseOutcome {
+    /// The newly recorded change's hash.
     pub new_hash: Hash,
     /// The changes re-applied above the target, in source order.
     pub reinserted: Vec<Hash>,
@@ -128,6 +141,96 @@ impl Repository {
         }
 
         Ok(RewordOutcome {
+            new_hash,
+            reinserted,
+        })
+    }
+
+    /// Revise one recorded change by re-capturing the working copy into
+    /// it: unrecord from the top of the current view down to (and
+    /// including) the target, RECORD a replacement change from the
+    /// working copy (the message and optional author the client composed
+    /// — the editor flow is client-side by design), and re-apply the
+    /// pending changes above the target in source order. A record failure
+    /// rolls the stack back (everything unrecorded is re-applied, newest
+    /// first) and surfaces the error.
+    pub fn revise_content(
+        &mut self,
+        target: &Hash,
+        message: &str,
+        author: Option<Author>,
+        paths: Vec<String>,
+    ) -> Result<ReviseOutcome, crate::RepositoryError> {
+        // Resolve the target's sequence and the pending changes above it.
+        let history = self.log(crate::HistoryOptions::default())?;
+        let Some(entry) = history.iter().find(|e| &e.hash == target) else {
+            return Err(crate::RepositoryError::ChangeNotFound {
+                hash: target.to_base32(),
+            });
+        };
+        let sequence = entry.sequence;
+
+        let stack_info = self.get_view_info(&self.current_view)?;
+        let changes_to_unrecord = stack_info.change_count as usize - sequence as usize;
+
+        // Pending changes (above the target), oldest first for re-apply.
+        let mut pending: Vec<(u64, Hash)> = history
+            .into_iter()
+            .filter(|e| e.sequence > sequence)
+            .map(|e| (e.sequence, e.hash))
+            .collect();
+        pending.sort_by_key(|(sequence, _)| *sequence);
+        let pending = pending
+            .into_iter()
+            .map(|(_, hash)| hash)
+            .collect::<Vec<_>>();
+
+        // Step 1: unrecord from the top down to (and including) the target.
+        for _ in 0..changes_to_unrecord {
+            self.unrecord_last(crate::UnrecordOptions::default())?;
+        }
+
+        // Step 2: the new header — the composed message, the author
+        // override or the original's first author (the same preservation
+        // the CLI's content mode applies).
+        let original = self.load_change(target)?;
+        let author = author.or_else(|| original.hashed.header.authors.first().cloned());
+        let mut header_builder = ChangeHeader::builder().message(message);
+        if let Some(author) = author {
+            header_builder = header_builder.author(author);
+        }
+        let header = header_builder.build();
+
+        // Step 3: record the revised change from the working copy (the
+        // record pipeline reads it — the daemon holds the repository
+        // root's working tree).
+        let mut options = crate::RecordOptions::default();
+        if !paths.is_empty() {
+            options = options.paths(paths);
+        }
+        let outcome = self.record(header, options).map_err(|error| {
+            // Rollback: re-apply everything unrecorded, newest first, and
+            // surface the error (never a silent partial stack).
+            for hash in pending.iter().rev() {
+                let _ = self.reinsert_change(hash, None);
+            }
+            match error {
+                crate::record::RecordError::Repository(error) => error,
+                other => crate::RepositoryError::InvalidOperation {
+                    message: other.to_string(),
+                },
+            }
+        })?;
+        let new_hash = *outcome.hash();
+
+        // Step 4: re-apply the pending changes in source order.
+        let mut reinserted = Vec::with_capacity(pending.len());
+        for hash in &pending {
+            self.reinsert_change(hash, None)?;
+            reinserted.push(*hash);
+        }
+
+        Ok(ReviseOutcome {
             new_hash,
             reinserted,
         })

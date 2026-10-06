@@ -79,6 +79,11 @@ message GetChangeRequest {
   ChangeRef ref = 2;
   ChangeIncludes includes = 3;
   optional ViewRef view = 4; // required when ref is a view-log sequence
+  // Reconstruct the per-file content around the change (add-only):
+  // `diff -c` needs each touched file's pre/post-change bytes — the
+  // legacy no-file_ops fallback and the FileOps context padding. The
+  // handler reads them from the graph; the response carries them.
+  bool include_file_contents = 5;
 }
 // Sections fetched by flag instead of by verb — the combine that keeps
 // GetChange one RPC.
@@ -105,6 +110,18 @@ message GetChangeResponse {
   repeated VersionedBytes provenance_ledger = 7;
   // The change's sequence on the resolved view, when known.
   optional uint64 sequence = 8;
+  // Per-file reconstructed content (add-only), present when the request
+  // set include_file_contents: each touched file's bytes before and after
+  // the change, as the graph holds them.
+  repeated ChangeFileContent file_contents = 9;
+}
+// One file's content around a change (add-only): what the graph
+// reconstruction reads server-side for `diff -c` (the legacy
+// no-file_ops fallback) and the FileOps hunks' context padding.
+message ChangeFileContent {
+  string path = 1;
+  optional bytes before = 2;  // pre-change content (absent = none/unreadable)
+  optional bytes after = 3;   // post-change content (absent = none/unreadable)
 }
 // ChangeInfo lives in atomic/common/change.proto (shared change-domain).
 

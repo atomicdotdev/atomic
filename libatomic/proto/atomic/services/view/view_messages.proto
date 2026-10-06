@@ -40,6 +40,11 @@ message ViewInfo {
   bool current = 6;
   ViewRef ref = 7;
   ViewSnapshot snapshot = 8;
+  // Own/inherited classification (add-only): the split `view list --json`
+  // carries — the view's own-log count and the inherited half. With both
+  // present, `change_count` reads as their sum (the effective total).
+  optional uint64 own_change_count = 9;
+  optional uint64 inherited_change_count = 10;
 }
 
 message CreateViewRequest {

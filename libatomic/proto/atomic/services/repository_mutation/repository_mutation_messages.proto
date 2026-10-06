@@ -103,6 +103,21 @@ message ReviseRequest {
   ChangeRef target = 3;
   optional string reword_message = 4;  // `--reword`
   optional ExpectedState expected = 5; // required matching view_snapshot
+  // The content-modification mode (add-only): `atomic revise` without
+  // --reword — re-capture the working copy into the target change. The
+  // stack surgery (unrecord → record → re-apply) is the domain's; the
+  // message/author compose client-side (editors are interactive).
+  optional ContentRevise content = 6;
+  // The `--author` override for the reword form (add-only).
+  optional Author author = 7;
+}
+// One content-mode revise (add-only): the new header message (composed
+// client-side from -m or the editor), an optional author override, and the
+// positional file filter.
+message ContentRevise {
+  string message = 1;
+  optional Author author = 2;    // `--author "Name <email>"`
+  repeated string paths = 3;     // the positional file filter
 }
 message ReviseResponse {
   ChangeInfo change = 1;

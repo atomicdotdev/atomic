@@ -43,6 +43,12 @@ message ContentSearchQuery {
 }
 message KgSearchQuery {
   string query = 1;
+  // `query search --kind` (add-only): keep only nodes of this kind
+  // (case-insensitive), applied over the candidate pool before the limit.
+  optional string kind = 2;
+  // The candidate pool size (add-only): how many candidates to score
+  // before selecting the top results (the CLI's --pool, default 5000).
+  optional uint32 pool = 3;
 }
 message EntityQuery {
   string node_id = 1;
@@ -50,6 +56,8 @@ message EntityQuery {
 message NeighborsQuery {
   string node_id = 1;
   optional bool incoming = 2;
+  // Traversal depth (add-only): `query neighbors -d` (1 or 2; default 1).
+  optional uint32 depth = 3;
 }
 message CallersQuery {
   string node_id = 1;
@@ -81,11 +89,18 @@ message KGNode {
   optional string name = 3;
   optional bytes data = 4;          // node payload (SHAPE-CONFIRM)
   optional double score = 5;        // search ranking when applicable
+  // Full KG-node fields (add-only) for the `--json` projections: the
+  // domain node's source and metadata ride the wire so the client
+  // serializes the same shape the local body emits.
+  optional string source = 6;
+  optional bytes metadata = 7;      // JSON-encoded metadata value
 }
 message KGEdge {
   string source = 1;
   string target = 2;
   string relation = 3;
+  // Full KG-edge field (add-only): the domain edge's metadata (JSON).
+  optional bytes metadata = 4;
 }
 message ContentHit {
   string path = 1;

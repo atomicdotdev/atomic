@@ -186,6 +186,7 @@ pub async fn get_change_impl(
     let _gate = gate_handle.exclusive().await;
     let handle_for_task = handle.clone();
     let wants_bundle = request.includes.as_ref().is_some_and(|i| i.metadata);
+    let wants_file_contents = request.include_file_contents;
     let change = tokio::task::spawn_blocking(move || {
         // A query: read-only open with the read-concurrency wait.
         let repo = handle_for_task.repository_readonly()?;
@@ -285,12 +286,44 @@ pub async fn get_change_impl(
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
-        Ok::<_, Status>((change, hash, sequence, bundle, ledger))
+        // Per-file content reconstruction (`diff -c`): each touched
+        // file's pre/post-change bytes as the graph holds them — the
+        // legacy no-file_ops fallback AND the FileOps hunks' context
+        // padding read server-side; the client renders.
+        let file_contents = if wants_file_contents {
+            let mut paths: Vec<String> = atomic_repository::get_files_in_change(&change);
+            for ops in change.file_ops() {
+                paths.push(ops.path().to_string());
+            }
+            paths.sort();
+            paths.dedup();
+            paths
+                .into_iter()
+                .map(|path| {
+                    let before = repo
+                        .get_file_content_before_change(&path, &hash)
+                        .ok()
+                        .flatten();
+                    let after = repo
+                        .get_file_content_after_change(&path, &hash)
+                        .ok()
+                        .flatten();
+                    ChangeFileContent {
+                        path,
+                        before,
+                        after,
+                    }
+                })
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        Ok::<_, Status>((change, hash, sequence, bundle, ledger, file_contents))
     })
     .await
     .map_err(|error| Status::internal(error.to_string()))??;
 
-    let (change, hash, sequence, change_bundle, provenance_ledger) = change;
+    let (change, hash, sequence, change_bundle, provenance_ledger, file_contents) = change;
     let header = &change.hashed.header;
     Ok(Response::new(GetChangeResponse {
         change: Some(ChangeInfo {
@@ -324,6 +357,7 @@ pub async fn get_change_impl(
         change_bundle,
         provenance_ledger,
         sequence,
+        file_contents,
     }))
 }
 
@@ -518,6 +552,12 @@ impl view_service_server::ViewService for ViewImpl {
                         name: Some(name),
                     }),
                     snapshot: None,
+                    // The own/inherited split `view list --json` carries:
+                    // change_count reads as their sum (the effective
+                    // total) — the same classification the local body
+                    // computes per view.
+                    own_change_count: Some(info.own_change_count),
+                    inherited_change_count: Some(info.inherited_change_count),
                 }
             })
             .collect();
@@ -597,6 +637,8 @@ impl view_service_server::ViewService for ViewImpl {
                 head: None,
                 change_count: change_count as u64,
                 current: name == current,
+                own_change_count: Some(change_count as u64),
+                inherited_change_count: Some(0),
                 r#ref: Some(ViewRef {
                     view_id: blake3::hash(name.as_bytes()).as_bytes().to_vec(),
                     name: Some(name),
@@ -819,6 +861,12 @@ impl view_service_server::ViewService for ViewImpl {
                         head: None,
                         change_count: outcome.target_change_count,
                         current: handle_for_task.current_view() == outcome.target_view,
+                        own_change_count: Some(outcome.target_change_count),
+                        inherited_change_count: Some(
+                            info.inherited_change_count.saturating_add(
+                                (info.change_count).saturating_sub(info.own_change_count),
+                            ),
+                        ),
                         r#ref: Some(ViewRef {
                             view_id: blake3::hash(outcome.target_view.as_bytes()).as_bytes().to_vec(),
                             name: Some(outcome.target_view.clone()),
@@ -863,33 +911,6 @@ fn validate_view_name(name: &str) -> Result<(), Status> {
 // Goals — `atomic vault goal list` (ListVaultEntries kind=GOAL)
 // ---------------------------------------------------------------------------
 
-pub fn list_goal_entries(repo: &Repository) -> Result<Vec<VaultEntry>, Status> {
-    let goals = repo.vault_goal_list(None).map_err(repository_error)?;
-    Ok(goals
-        .into_iter()
-        .map(|goal| {
-            let status = match goal.status.as_str() {
-                "active" => VaultEntityStatus::Active,
-                "suspended" => VaultEntityStatus::Suspended,
-                "completed" => VaultEntityStatus::Completed,
-                _ => VaultEntityStatus::Unspecified,
-            };
-            VaultEntry {
-                kind: VaultEntityKind::Goal as i32,
-                id: goal.name.clone(),
-                title: goal.developer.clone(),
-                status: Some(status as i32),
-                body: None,
-                created_at: None,
-                updated_at: None,
-                linked: goal.intent.clone().into_iter().collect(),
-                vault_path: Some(format!(".vault/goals/{}/_goal.md", goal.name)),
-                priority: None,
-            }
-        })
-        .collect())
-}
-
 // ---------------------------------------------------------------------------
 // Neighbors — `atomic vault query neighbors`
 // ---------------------------------------------------------------------------
@@ -902,25 +923,36 @@ pub fn neighbors_impl(
     let subgraph = repo
         .vault_kg_neighbors(node_id, depth)
         .map_err(repository_error)?;
-    let nodes = subgraph
-        .nodes
-        .into_iter()
-        .map(|node| KgNode {
-            id: node.id.clone(),
-            node_type: node.kind.clone(),
-            name: Some(node.label.clone()),
-            data: node.summary.clone().map(String::into_bytes),
-            score: None,
-        })
-        .collect();
-    let edges = subgraph
-        .edges
-        .into_iter()
-        .map(|edge| KgEdge {
-            source: edge.from_id,
-            target: edge.to_id,
-            relation: edge.kind,
-        })
-        .collect();
+    let nodes = subgraph.nodes.into_iter().map(kg_node_proto).collect();
+    let edges = subgraph.edges.into_iter().map(kg_edge_proto).collect();
     Ok((nodes, edges))
+}
+
+/// Domain KG node → wire, with the FULL field set (add-only source and
+/// metadata) so the client serializes the same JSON shape the local body
+/// emits.
+pub(crate) fn kg_node_proto(node: atomic_core::pristine::vault::KgNode) -> KgNode {
+    KgNode {
+        id: node.id,
+        node_type: node.kind,
+        name: Some(node.label),
+        data: node.summary.clone().map(String::into_bytes),
+        score: None,
+        source: Some(node.source),
+        metadata: node
+            .metadata
+            .and_then(|metadata| serde_json::to_vec(&metadata).ok()),
+    }
+}
+
+/// Domain KG edge → wire, with the edge metadata (add-only).
+pub(crate) fn kg_edge_proto(edge: atomic_core::pristine::vault::KgEdge) -> KgEdge {
+    KgEdge {
+        source: edge.from_id,
+        target: edge.to_id,
+        relation: edge.kind,
+        metadata: edge
+            .metadata
+            .and_then(|metadata| serde_json::to_vec(&metadata).ok()),
+    }
 }

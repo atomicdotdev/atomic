@@ -1391,28 +1391,55 @@ impl repository_mutation_service_server::RepositoryMutationService for MutationI
                     }
                 }
             };
-            let message = request.reword_message.clone().ok_or_else(|| {
-                domain_status(
+            // The content-modification mode: the message (and optional
+            // author override, and the positional file filter) compose
+            // CLIENT-side — the editor flow is interactive by design —
+            // and the stack surgery (unrecord → record from the working
+            // copy → re-apply) is the domain's, applied atomically.
+            let wire_author = request.author.map(|author| Author {
+                name: author.name,
+                email: author.email,
+                identity: None,
+            });
+            let (message, author, paths, content_mode) = match (
+                request.reword_message,
+                request.content,
+            ) {
+                (Some(message), _) => (message, wire_author, Vec::new(), false),
+                (None, Some(content)) => (
+                    content.message,
+                    content.author.map(|author| Author {
+                        name: author.name,
+                        email: author.email,
+                        identity: None,
+                    }),
+                    content.paths,
+                    true,
+                ),
+                (None, None) => return Err(domain_status(
                     ErrorCode::InvalidArgument,
-                    "reword_message is required (the interactive editor is client-side)",
-                )
+                    "reword_message or content is required (the interactive editor is client-side)",
+                )),
+            };
+            let new_hash = if content_mode {
+                repo.revise_content(&target, &message, author, paths)
+                    .map(|outcome| outcome.new_hash)
+            } else {
+                repo.reword_change(&target, &message, author)
+                    .map(|outcome| outcome.new_hash)
+            }
+            .map_err(|error| match error {
+                atomic_repository::RepositoryError::ChangeNotFound { hash } => domain_status(
+                    ErrorCode::NotFound,
+                    format!("change {hash} not found on the current view"),
+                ),
+                other => domain_status(ErrorCode::ChangeRejected, other.to_string()),
             })?;
-            let outcome =
-                repo.reword_change(&target, &message, None)
-                    .map_err(|error| match error {
-                        atomic_repository::RepositoryError::ChangeNotFound { hash } => {
-                            domain_status(
-                                ErrorCode::NotFound,
-                                format!("change {hash} not found on the current view"),
-                            )
-                        }
-                        other => domain_status(ErrorCode::ChangeRejected, other.to_string()),
-                    })?;
             let change = repo
-                .load_change(&outcome.new_hash)
+                .load_change(&new_hash)
                 .map_err(|error| domain_status(ErrorCode::Repository, error.to_string()))?;
             Ok(ReviseResponse {
-                change: Some(change_info(&change, &outcome.new_hash)),
+                change: Some(change_info(&change, &new_hash)),
                 meta: None,
             })
         })
@@ -1466,7 +1493,7 @@ impl repository_mutation_service_server::RepositoryMutationService for MutationI
                     }
                     Some(insert_changes_request::Source::FromView(source)) => {
                         let options = CrossViewInsertOptions::new(&source, &target)
-                            .with_dependencies(true)
+                            .with_dependencies(request.apply_dependencies.unwrap_or(true))
                             .allow_conflicts(request.allow_conflicts);
                         let outcome = repo.insert_from_view(options).map_err(|error| {
                             domain_status(ErrorCode::ChangeRejected, error.to_string())
@@ -1480,7 +1507,7 @@ impl repository_mutation_service_server::RepositoryMutationService for MutationI
                         let from_view = handle.current_view();
                         let options = CrossViewInsertOptions::new(&from_view, &target)
                             .up_to_tag(&tag)
-                            .with_dependencies(true)
+                            .with_dependencies(request.apply_dependencies.unwrap_or(true))
                             .allow_conflicts(request.allow_conflicts);
                         let outcome = repo.insert_from_view(options).map_err(|error| {
                             domain_status(ErrorCode::ChangeRejected, error.to_string())

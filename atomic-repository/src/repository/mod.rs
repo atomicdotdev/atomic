@@ -99,7 +99,7 @@ pub use filter::{
     collect_view_change_ids, collect_visible_change_ids, collect_visible_change_ids_with_deps,
     expand_indexed_dependency_closure, view_set_id,
 };
-pub use revise::RewordOutcome;
+pub use revise::{ReviseOutcome, RewordOutcome};
 pub use sandbox::{SealOptions, SealResult, StageOptions, StageResult, SANDBOX_POINTER};
 pub use split::{SplitChange, SplitOptions, SplitOutcome};
 pub use stash::{StashEntry, StashPushOptions, DEFAULT_STASH_MESSAGE, STASH_PREFIX};
@@ -627,6 +627,15 @@ default = "{}"
             let dot_dir = dir.join(DOT_DIR);
             // A database distinguishes a repository from a config directory
             if dot_dir.is_dir() && database::has_database(&dot_dir) {
+                return Ok(dir);
+            }
+            // A sandbox working tree has no `.atomic/` of its own — it
+            // carries a pointer to the canonical graph. Treat the
+            // sandbox root as a valid repository root;
+            // `Repository::open*` resolves the pointer (the same rule
+            // the CLI's root finder applies, so service-layer
+            // resolution accepts sandboxed working trees).
+            if dir.join(SANDBOX_POINTER).is_file() {
                 return Ok(dir);
             }
             current = dir.parent().map(Path::to_path_buf);
