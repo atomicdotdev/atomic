@@ -65,6 +65,8 @@ mod session_start;
 mod turn;
 mod wait_budget;
 
+pub use wait_budget::publication_timeout;
+
 #[cfg(test)]
 mod tests;
 

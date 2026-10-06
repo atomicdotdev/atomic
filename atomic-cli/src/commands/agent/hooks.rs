@@ -428,7 +428,9 @@ pub(crate) fn hold_turn_publication_lock(
         .open(canonical.join("turn-publication.lock"))
         .map_err(|error| CliError::Internal(anyhow!("failed to open publication lock: {error}")))?;
     let start = std::time::Instant::now();
-    let timeout = std::time::Duration::from_secs(10);
+    // This outer guard bypasses the orchestrator's lock acquisition. Use the
+    // same budget so both entry points honor the publication timeout setting.
+    let timeout = atomic_agent::turn::orchestrator::publication_timeout();
     loop {
         match file.try_lock_exclusive() {
             Ok(()) => return Ok(Some(TurnPublicationLock(file))),
