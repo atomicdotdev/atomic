@@ -217,6 +217,17 @@ fn run_hook(repository: &std::path::Path, verb: &str, payload: &[u8]) -> Output 
 }
 
 fn run_agent_hook(repository: &std::path::Path, agent: &str, verb: &str, payload: &[u8]) -> Output {
+    let child = spawn_agent_hook(repository, agent, verb, payload, &[]);
+    wait_for_output(child, &format!("{agent} {verb}"))
+}
+
+fn spawn_agent_hook(
+    repository: &std::path::Path,
+    agent: &str,
+    verb: &str,
+    payload: &[u8],
+    env: &[(&str, &str)],
+) -> Child {
     let mut child = Command::new(env!("CARGO_BIN_EXE_atomic"))
         .arg("agent")
         .arg("hooks")
@@ -225,6 +236,7 @@ fn run_agent_hook(repository: &std::path::Path, agent: &str, verb: &str, payload
         .arg("--foreground")
         .arg("--no-color")
         .current_dir(repository)
+        .envs(env.iter().copied())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -236,7 +248,7 @@ fn run_agent_hook(repository: &std::path::Path, agent: &str, verb: &str, payload
         .expect("hook stdin")
         .write_all(payload)
         .expect("write hook payload");
-    wait_for_output(child, &format!("{agent} {verb}"))
+    child
 }
 
 #[test]
@@ -940,7 +952,9 @@ fn owner_death_after_checkpoint_prepare_and_bind_recovers_in_hook_process() {
         let marker = temp.path().join(format!("{failpoint}.marker"));
         let mut owner = spawn_owner_with_failpoint(&repository, failpoint, &marker);
         wait_for_ping(&repository, &mut owner);
-        let started = Instant::now();
+        // run_hook bounds the child through wait_for_output. Recovery includes
+        // owner restart and durable writes, so a separate 15-second wall-clock
+        // assertion measures runner speed rather than recovery correctness.
         let stop = run_hook(
             &repository,
             "stop",
@@ -951,8 +965,15 @@ fn owner_death_after_checkpoint_prepare_and_bind_recovers_in_hook_process() {
             "{failpoint} retry failed: {}",
             String::from_utf8_lossy(&stop.stderr)
         );
-        assert!(started.elapsed() < Duration::from_secs(15));
-        assert!(!owner.wait().unwrap().success());
+        assert!(marker.exists(), "{failpoint} was not exercised");
+        assert!(!wait_for_output(owner, failpoint).status.success());
+
+        let retry = run_hook(
+            &repository,
+            "stop",
+            br#"{"session_id":"checkpoint-crash","response":"recovered"}"#,
+        );
+        assert_hook_success(&format!("{failpoint} duplicate Stop"), &retry);
 
         assert!(run_owner(&repository, "shutdown").status.success());
         wait_for_shutdown(&repository);
@@ -974,6 +995,7 @@ fn owner_death_after_checkpoint_prepare_and_bind_recovers_in_hook_process() {
             .unwrap()
             .unwrap();
         assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].change_hashes.len(), 1);
     }
 }
 
@@ -1351,10 +1373,33 @@ fn stop_publication_timeout_preserves_the_active_turn_for_retry() {
         .open(repository.join(".atomic/turn-publication.lock"))
         .unwrap();
     file.lock_exclusive().unwrap();
-    let output = run_hook(&repository, "stop", payload);
+    let output = wait_for_output(
+        spawn_agent_hook(
+            &repository,
+            "claude-code",
+            "stop",
+            payload,
+            &[("ATOMIC_TURN_PUBLICATION_TIMEOUT_MS", "0")],
+        ),
+        "zero-budget Stop",
+    );
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("timed out waiting"));
+
+    // A retry with a longer budget must survive contention beyond the old
+    // CLI's fixed 10-second limit. Configure only the child process so other
+    // tests and the test runner's own timeout are unaffected.
+    let retry = spawn_agent_hook(
+        &repository,
+        "claude-code",
+        "stop",
+        payload,
+        &[("ATOMIC_TURN_PUBLICATION_TIMEOUT_MS", "60000")],
+    );
+    thread::sleep(Duration::from_secs(11));
     drop(file);
+    let output = wait_for_output(retry, "Stop waiting past the former 10-second limit");
+    assert_hook_success("Stop after publication lock release", &output);
     for _ in 0..2 {
         let output = run_hook(&repository, "stop", payload);
         assert!(
