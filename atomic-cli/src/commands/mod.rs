@@ -295,8 +295,10 @@ pub fn find_repository_root_from(start_path: &Path) -> CliResult<PathBuf> {
     loop {
         let dot_dir = current.join(DOT_DIR);
         // A bare `.atomic/` may hold global configuration (e.g. ~/.atomic),
-        // not a repository. Require the repository's graph database too.
-        if dot_dir.is_dir() && dot_dir.join("pristine.redb").is_file() {
+        // not a repository. Require the repository's graph database too —
+        // the SAME predicate Repository::find_root applies (atomic.redb,
+        // or the legacy pristine.redb before the #230 database merge).
+        if dot_dir.is_dir() && atomic_repository::repository::database::has_database(&dot_dir) {
             return Ok(current);
         }
 
@@ -639,7 +641,7 @@ mod tests {
             let mut check = temp.path().to_path_buf();
             let mut found = false;
             loop {
-                if check.join(DOT_DIR).join("pristine.redb").is_file()
+                if atomic_repository::repository::database::has_database(&check.join(DOT_DIR))
                     || check.join(SANDBOX_POINTER).is_file()
                 {
                     found = true;

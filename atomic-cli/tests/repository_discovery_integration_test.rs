@@ -110,7 +110,9 @@ fn init_and_queries_from_repository_subdirectories_still_work() {
 
     let output = atomic(&project, &home, &["init"]);
     assert!(output.status.success(), "{output:?}");
-    assert!(project.join(".atomic/pristine.redb").is_file());
+    // #230 merged the databases: a fresh init writes the merged
+    // atomic.redb (the legacy pristine.redb no longer exists).
+    assert!(project.join(".atomic/atomic.redb").is_file());
 
     let nested = project.join("src/deep");
     std::fs::create_dir_all(nested.join(".atomic")).unwrap();
@@ -122,7 +124,7 @@ fn init_and_queries_from_repository_subdirectories_still_work() {
         let output = atomic(&nested, &home, args);
         assert!(output.status.success(), "{args:?}: {output:?}");
     }
-    assert!(!nested.join(".atomic/pristine.redb").exists());
+    assert!(!nested.join(".atomic/atomic.redb").exists());
 }
 
 #[test]
