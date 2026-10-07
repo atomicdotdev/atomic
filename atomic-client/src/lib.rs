@@ -6,6 +6,12 @@
 //! cannot reach the daemon may start/restart it — it may NEVER open the
 //! repository databases itself).
 
+// The tonic client surface returns `tonic::Status` (176 bytes) from
+// nearly every method; boxing it everywhere would churn the whole
+// call surface for no win. The transport crate opts out, as the
+// libatomic daemon surface does.
+#![allow(clippy::result_large_err)]
+
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::Duration;
