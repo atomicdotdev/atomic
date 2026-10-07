@@ -445,7 +445,10 @@ impl Service {
 }
 
 /// Collect a local handler's item stream (each item is already a
-/// `Result`).
+/// `Result`). The `Err` is `tonic::Status` — 176 bytes, but the same
+/// wire type every reactor call returns; boxing just this collector
+/// would fork the error surface.
+#[allow(clippy::result_large_err)]
 async fn collect_chunks(
     mut stream: std::pin::Pin<
         Box<dyn futures_core::Stream<Item = Result<pb::DiffChunk, Status>> + Send>,
@@ -458,7 +461,9 @@ async fn collect_chunks(
     Ok(chunks)
 }
 
-/// Collect a reactor client's tonic streaming response.
+/// Collect a reactor client's tonic streaming response (same `Status`
+/// error surface as every reactor call).
+#[allow(clippy::result_large_err)]
 async fn collect_streaming(
     mut stream: tonic::Streaming<pb::DiffChunk>,
 ) -> Result<Vec<pb::DiffChunk>, Status> {
