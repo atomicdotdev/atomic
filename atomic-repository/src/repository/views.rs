@@ -468,6 +468,84 @@ impl Repository {
             .is_some())
     }
 
+    /// Preview which changes would lose their last view reference on deletion.
+    ///
+    /// Returns hashes in the view's own log order. Inherited changes are not
+    /// removed, and changes referenced by another view (including through
+    /// indexed transitive dependencies) are retained. The analysis is local
+    /// to this repository; it does not check remote copies.
+    ///
+    /// Rejects current, Shared, and parent views just like deletion does.
+    pub fn view_deletion_orphans(&self, name: &str) -> Result<Vec<Hash>, RepositoryError> {
+        if name == self.current_view {
+            return Err(RepositoryError::CannotDeleteCurrentView {
+                name: name.to_string(),
+            });
+        }
+
+        let db = |e: atomic_core::pristine::PristineError| RepositoryError::Database(e.to_string());
+        let txn = self.pristine.read_txn().map_err(db)?;
+        let view =
+            txn.get_view(name)
+                .map_err(db)?
+                .ok_or_else(|| RepositoryError::ViewNotFound {
+                    name: name.to_string(),
+                })?;
+        if view.kind.is_shared() {
+            return Err(RepositoryError::InvalidOperation {
+                message: format!(
+                    "cannot delete shared view '{}': shared views are permanent",
+                    name
+                ),
+            });
+        }
+        let children = txn.get_children_views(view.id).map_err(db)?;
+        if !children.is_empty() {
+            return Err(RepositoryError::InvalidOperation {
+                message: format!(
+                    "cannot delete view '{}': has child views ({}). Delete or reparent children first.",
+                    name,
+                    children.iter().map(|v| v.name.as_str()).collect::<Vec<_>>().join(", ")
+                ),
+            });
+        }
+
+        let candidates: Vec<NodeId> = txn
+            .iter_changes(&view, 0)
+            .map_err(db)?
+            .map(|entry| entry.map(|(_, id, _)| id).map_err(db))
+            .collect::<Result<_, _>>()?;
+        if candidates.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // The union of the remaining own logs also covers all parent chains:
+        // ancestors remain, and views with children cannot be deleted.
+        let mut retained = HashSet::new();
+        for other_name in txn.list_views().map_err(db)? {
+            if other_name == name {
+                continue;
+            }
+            if let Some(other) = txn.get_view(&other_name).map_err(db)? {
+                for entry in txn.iter_changes(&other, 0).map_err(db)? {
+                    let (_, id, _) = entry.map_err(db)?;
+                    retained.insert(id);
+                }
+            }
+        }
+        expand_indexed_dependency_closure(&txn, &mut retained)?;
+
+        candidates
+            .into_iter()
+            .filter(|id| !retained.contains(id))
+            .map(|id| {
+                txn.get_external(id).map_err(db)?.ok_or_else(|| {
+                    RepositoryError::Database(format!("Change {} has no external hash", id.0))
+                })
+            })
+            .collect()
+    }
+
     /// Delete a view from the repository.
     ///
     /// This removes the view and all its associated metadata, but does not
