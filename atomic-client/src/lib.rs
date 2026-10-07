@@ -18,8 +18,13 @@ use std::time::Duration;
 
 use libatomic::atomic::daemon_service_client::DaemonServiceClient;
 use libatomic::atomic::{HealthRequest, HealthResponse};
-use tonic::transport::{Channel, Endpoint, Uri};
+// The socket transport is unix-only; `Channel` itself is portable and
+// callers keep their shape everywhere.
+#[cfg(unix)]
+use tonic::transport::{Endpoint, Uri};
+#[cfg(unix)]
 use tower::service_fn;
+use tonic::transport::Channel;
 
 /// Env override for the daemon socket (tests, harnesses, exotic layouts).
 pub const ENV_DAEMON_SOCKET: &str = "ATOMIC_DAEMON_SOCKET";
