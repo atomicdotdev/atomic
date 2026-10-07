@@ -43,6 +43,11 @@ pub struct Promote {
 
 impl Command for Promote {
     fn run(&self) -> CliResult<()> {
+        // Route through the daemon (SetViewScope SHARED).
+        if crate::commands::rpc::view_promote(self)? {
+            return Ok(());
+        }
+
         let root = find_repository_root()?;
         let repo = Repository::open(&root).map_err(|e| CliError::InvalidRepository {
             reason: e.to_string(),

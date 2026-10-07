@@ -215,6 +215,7 @@ dependencies = [
  "anyhow",
  "atomic-agent",
  "atomic-canonical",
+ "atomic-client",
  "atomic-config",
  "atomic-core",
  "atomic-identity",
@@ -234,10 +235,13 @@ dependencies = [
  "dirs",
  "env_logger",
  "fs2",
+ "futures-core",
  "git2",
  "indicatif",
+ "libatomic",
  "log",
  "open",
+ "prost-types",
  "rayon",
  "reqwest",
  "serde",
@@ -246,9 +250,24 @@ dependencies = [
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
+ "tokio-stream",
+ "tonic",
  "url",
  "uuid",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "atomic-client"
+version = "0.19.1"
+dependencies = [
+ "atomic-repository",
+ "hyper-util",
+ "libatomic",
+ "libc",
+ "tokio",
+ "tonic",
+ "tower 0.4.13",
 ]
 
 [[package]]
@@ -3642,6 +3661,7 @@ version = "0.1.44"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "63e71662fa4b2a2c3a26f570f037eb95bb1f85397f3cd8076caed2f026a6d100"
 dependencies = [
+ "log",
  "pin-project-lite",
  "tracing-attributes",
  "tracing-core",

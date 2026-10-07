@@ -497,6 +497,10 @@ impl Command for Log {
     /// - The specified view doesn't exist
     /// - Database errors occur
     fn run(&self) -> CliResult<()> {
+        if crate::commands::rpc::log(self)? {
+            return Ok(());
+        }
+
         // Find and open repository
         let repo_root = find_repository_root()?;
         let repo = crate::commands::open_readonly_repository(&repo_root).map_err(|e| match e {

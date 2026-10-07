@@ -34,6 +34,13 @@ pub struct IntentDelete {
 
 impl Command for IntentDelete {
     fn run(&self) -> CliResult<()> {
+        // Route every form through the service layer: the existence
+        // pre-check rides a read, the prompt stays client-side, and the
+        // handler enforces the same unstarted-backlog guard.
+        if crate::commands::rpc::intent_delete(self)? {
+            return Ok(());
+        }
+
         let root = find_repository_root()?;
         let repo = Repository::open(&root).map_err(CliError::Repository)?;
 

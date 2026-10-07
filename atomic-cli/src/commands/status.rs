@@ -514,6 +514,10 @@ impl Command for Status {
     /// - The repository cannot be opened
     /// - Status computation fails
     fn run(&self) -> CliResult<()> {
+        if crate::commands::rpc::status(self)? {
+            return Ok(());
+        }
+
         // Find the repository root
         let repo_root = find_repository_root()?;
 

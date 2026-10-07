@@ -232,19 +232,21 @@ use crate::output::{
     added, deleted, emphasis, hash, info, modified, path as style_path, print_hint, print_info,
 };
 
-mod command;
+pub(crate) mod command;
 mod format;
 mod helpers;
 mod json;
 mod output;
-mod types;
+pub(crate) mod types;
 
 /// How many recent changes the no-pending-changes hint offers to inspect.
 const RECENT_CHANGE_SUGGESTIONS: usize = 3;
 
 pub use command::*;
-pub(crate) use helpers::change_file_diffs;
-pub(crate) use output::{build_hunks_from_diff, format_stat_graph};
+pub(crate) use helpers::{change_file_diffs, change_file_diffs_with, legacy_content_file_diffs};
+pub(crate) use output::{
+    build_hunks_from_diff, format_stat_graph, print_semantic_word_diff_line, print_word_diff_line,
+};
 pub use types::*;
 
 #[cfg(test)]

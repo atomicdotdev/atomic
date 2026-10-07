@@ -15,6 +15,10 @@ impl Command for Record {
     /// 8. Apply the change to the current view
     /// 9. Display the result
     fn run(&self) -> CliResult<()> {
+        if crate::commands::rpc::record(self)? {
+            return Ok(());
+        }
+
         // Find repository
         let repo_root = find_repository_root()?;
         let repo = Repository::open(&repo_root).map_err(CliError::Repository)?;

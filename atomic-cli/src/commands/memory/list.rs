@@ -65,7 +65,7 @@ pub struct MemoryList {
 
 /// The classification of one memory's attestation, for a table/JSON row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Attested {
+pub(crate) enum Attested {
     Fresh,
     Stale,
     None,
@@ -91,7 +91,7 @@ impl Attested {
 
 /// The result of the DID-match-then-verify rule for one row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Verifies {
+pub(crate) enum Verifies {
     Yes,
     No,
     Na,
@@ -116,13 +116,13 @@ impl Verifies {
 }
 
 /// A fully-computed memory row.
-struct Row {
-    id: String,
-    kind: String,
-    status: String,
-    about: usize,
-    attested: Attested,
-    verifies: Verifies,
+pub(crate) struct Row {
+    pub(crate) id: String,
+    pub(crate) kind: String,
+    pub(crate) status: String,
+    pub(crate) about: usize,
+    pub(crate) attested: Attested,
+    pub(crate) verifies: Verifies,
 }
 
 /// The verifying identity resolved ONCE for the whole list.
@@ -265,8 +265,89 @@ fn compute_row(repo: &Repository, id: &str, verifier: Option<&Verifier>) -> Row 
     }
 }
 
+impl MemoryList {
+    /// The shared render — the exact local body's table and JSON shapes,
+    /// driven by the rows (computed in-process by the local body or
+    /// reconstructed from the wire's per-entry classification).
+    pub(crate) fn render(rows: &[Row], json: bool) {
+        if json {
+            let json: Vec<serde_json::Value> = rows
+                .iter()
+                .map(|r| {
+                    serde_json::json!({
+                        "id": r.id,
+                        "kind": r.kind,
+                        "status": r.status,
+                        "about": r.about,
+                        "attested": r.attested.json(),
+                        "verifies": r.verifies.json(),
+                    })
+                })
+                .collect();
+            println!("{}", serde_json::to_string_pretty(&json).unwrap());
+            return;
+        }
+        if rows.is_empty() {
+            println!("No memories found.");
+            return;
+        }
+        // Fixed-width, left-aligned columns with a header row.
+        let id_w = col_width(rows.iter().map(|r| r.id.chars().count()), "id");
+        let kind_w = col_width(rows.iter().map(|r| r.kind.chars().count()), "kind");
+        let status_w = col_width(rows.iter().map(|r| r.status.chars().count()), "status");
+
+        println!(
+            "  {:<id_w$}  {:<kind_w$}  {:<status_w$}  {:>5}  {:<8}  verifies",
+            "id", "kind", "status", "about", "attested",
+        );
+        for r in rows {
+            println!(
+                "  {:<id_w$}  {:<kind_w$}  {:<status_w$}  {:>5}  {:<8}  {}",
+                r.id,
+                r.kind,
+                r.status,
+                r.about,
+                r.attested.table(),
+                r.verifies.table(),
+            );
+        }
+    }
+}
+
+/// One row reconstructed from the wire's per-entry classification — the
+/// routed twin of [`compute_row`]: the handler computed the
+/// kind/status/about columns and the attestation/verifies state with the
+/// same domain logic, so the row maps straight off the wire columns.
+pub(crate) fn wire_row(entry: &atomic_client::proto::VaultEntry) -> Row {
+    let attested = match entry.attested.as_deref() {
+        Some("fresh") => Attested::Fresh,
+        Some("stale") => Attested::Stale,
+        _ => Attested::None,
+    };
+    let verifies = match entry.verifies.as_deref() {
+        Some("yes") => Verifies::Yes,
+        Some("no") => Verifies::No,
+        _ => Verifies::Na,
+    };
+    Row {
+        id: entry.id.clone(),
+        kind: entry.memory_kind.clone().unwrap_or_else(|| NA.to_string()),
+        status: entry
+            .memory_status
+            .clone()
+            .unwrap_or_else(|| NA.to_string()),
+        about: entry.about_count.unwrap_or(0) as usize,
+        attested,
+        verifies,
+    }
+}
+
 impl Command for MemoryList {
     fn run(&self) -> CliResult<()> {
+        if crate::commands::rpc::memory_list(self)? {
+            return Ok(());
+        }
+
         let root = find_repository_root()?;
         let repo = Repository::open(&root).map_err(CliError::Repository)?;
 

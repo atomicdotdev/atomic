@@ -4,7 +4,8 @@ use std::collections::HashMap;
 
 use clap::{Args, Subcommand};
 
-use atomic_core::types::Base32;
+use atomic_core::change::session::{SessionRecord, SessionTurn};
+use atomic_core::types::{Base32, Hash};
 use atomic_repository::Repository;
 
 use crate::commands::{find_repository_root, Command};
@@ -20,6 +21,9 @@ pub struct Session {
 #[derive(Debug, Subcommand)]
 enum SessionCommands {
     /// Show the ordered Atomic ledger for a session.
+    ///
+    /// `list` is an alias: `session list` (no id) shows recent sessions.
+    #[command(name = "show", alias = "list")]
     Show(SessionShow),
     /// Fork a session at a turn boundary into a new child session.
     Fork(SessionFork),
@@ -74,6 +78,11 @@ impl Command for Session {
 
 impl Command for SessionFork {
     fn run(&self) -> CliResult<()> {
+        // Route every form through the service layer (the handler runs the
+        // same fork_session domain call).
+        if crate::commands::rpc::session_fork(self)? {
+            return Ok(());
+        }
         let root = find_repository_root()?;
         let repo = Repository::open(&root).map_err(CliError::Repository)?;
         let (parent_hash, child_hash) = repo
@@ -90,6 +99,11 @@ impl Command for SessionFork {
 
 impl Command for SessionRebuild {
     fn run(&self) -> CliResult<()> {
+        // Route every form through the service layer (the handler runs the
+        // same rebuild_session_index domain call).
+        if crate::commands::rpc::session_rebuild()? {
+            return Ok(());
+        }
         let root = find_repository_root()?;
         let repo = Repository::open(&root).map_err(CliError::Repository)?;
         let (indexed, skipped, corrupt) =
@@ -104,6 +118,10 @@ impl Command for SessionRebuild {
 
 impl Command for SessionShow {
     fn run(&self) -> CliResult<()> {
+        if crate::commands::rpc::session_show(self)? {
+            return Ok(());
+        }
+
         let root = find_repository_root()?;
         let repo = Repository::open(&root).map_err(CliError::Repository)?;
         match &self.session_id {
@@ -117,6 +135,34 @@ fn show_recent_sessions(repo: &Repository, limit: usize, json: bool) -> CliResul
     let ledgers = repo
         .list_session_ledgers(limit)
         .map_err(CliError::Repository)?;
+    // The per-session intent counts: prefer turn plan ids, else the vault
+    // manifest's session links.
+    let intent_map = build_session_intent_map(repo);
+    let intent_counts: Vec<usize> = ledgers
+        .iter()
+        .map(|(record, turns)| {
+            let from_turns: std::collections::HashSet<&str> =
+                turns.iter().filter_map(|t| t.plan_id.as_deref()).collect();
+            if !from_turns.is_empty() {
+                from_turns.len()
+            } else {
+                intent_map
+                    .get(&record.session_id)
+                    .map(|ids| ids.len())
+                    .unwrap_or(0)
+            }
+        })
+        .collect();
+    render_recent_sessions(ledgers, intent_counts, json)
+}
+
+/// The listing render, over the gathered data — the repository path and the
+/// routed path (ListSessions' ledger bundle + intent counts) share it.
+pub(crate) fn render_recent_sessions(
+    ledgers: Vec<(SessionRecord, Vec<SessionTurn>)>,
+    intent_counts: Vec<usize>,
+    json: bool,
+) -> CliResult<()> {
     if json {
         println!(
             "{}",
@@ -131,8 +177,6 @@ fn show_recent_sessions(repo: &Repository, limit: usize, json: bool) -> CliResul
         return Ok(());
     }
 
-    let intent_map = build_session_intent_map(repo);
-
     // Compute column width for SESSION: at least the header width, but wide enough
     // to show full session IDs so they can be copied for `atomic session show <id>`.
     let ses_width = ledgers
@@ -141,23 +185,6 @@ fn show_recent_sessions(repo: &Repository, limit: usize, json: bool) -> CliResul
         .max()
         .unwrap_or(0)
         .max("SESSION".len());
-
-    // Count intents per session.
-    let intent_counts: Vec<usize> = ledgers
-        .iter()
-        .map(|(record, turns)| {
-            // Prefer plan_id from turns (managed-run).
-            let from_turns: std::collections::HashSet<&str> =
-                turns.iter().filter_map(|t| t.plan_id.as_deref()).collect();
-            if !from_turns.is_empty() {
-                return from_turns.len();
-            }
-            intent_map
-                .get(&record.session_id)
-                .map(|ids| ids.len())
-                .unwrap_or(0)
-        })
-        .collect();
 
     println!("Recent sessions ({}):", ledgers.len());
     println!(
@@ -218,6 +245,39 @@ fn show_session_detail(repo: &Repository, session_id: &str, json: bool) -> CliRe
             hint: None,
         })?;
 
+    // The routed pieces the render needs: turn→intent resolution and the
+    // session manifest data.
+    let turn_intents = build_turn_intent_map(repo, session_id);
+    let head = repo.get_session_head(session_id).ok().flatten();
+    let (parent_manifest, fork_turn) = head
+        .as_ref()
+        .and_then(|h| repo.get_session_manifest(h).ok().flatten())
+        .map(|manifest| (manifest.parent_session, manifest.fork_turn))
+        .unwrap_or((None, None));
+    render_session_detail(
+        record,
+        turns,
+        turn_intents,
+        head,
+        parent_manifest,
+        fork_turn,
+        json,
+    )
+}
+
+/// The detail render, over the gathered data — the repository path and the
+/// routed path (GetSession's ledger bundle + turn intents + manifest data)
+/// share it.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn render_session_detail(
+    record: SessionRecord,
+    turns: Vec<SessionTurn>,
+    turn_intents: HashMap<u32, String>,
+    manifest_head: Option<atomic_core::types::Hash>,
+    parent_manifest: Option<atomic_core::types::Hash>,
+    fork_turn: Option<u32>,
+    json: bool,
+) -> CliResult<()> {
     if json {
         println!(
             "{}",
@@ -227,9 +287,6 @@ fn show_session_detail(repo: &Repository, session_id: &str, json: bool) -> CliRe
         );
         return Ok(());
     }
-
-    // Build turn→intent map for this session from vault paths.
-    let turn_intents = build_turn_intent_map(repo, session_id);
 
     println!("Session {}", record.session_id);
     println!(
@@ -260,15 +317,13 @@ fn show_session_detail(repo: &Repository, session_id: &str, json: bool) -> CliRe
         println!("  Intents: {}", all_intents.join(", "));
     }
 
-    if let Ok(Some(head)) = repo.get_session_head(session_id) {
+    if let Some(head) = manifest_head {
         println!("  Manifest head: {}", head.to_base32());
-        if let Ok(Some(manifest)) = repo.get_session_manifest(&head) {
-            if let Some(parent) = manifest.parent_session {
-                println!("  Parent manifest: {}", parent.to_base32());
-            }
-            if let Some(fork_turn) = manifest.fork_turn {
-                println!("  Forked at turn: {}", fork_turn);
-            }
+        if let Some(parent) = parent_manifest {
+            println!("  Parent manifest: {}", parent.to_base32());
+        }
+        if let Some(fork_turn) = fork_turn {
+            println!("  Forked at turn: {}", fork_turn);
         }
     }
     if let Some(first) = record.first_provenance {

@@ -121,6 +121,13 @@ impl List {
 
 impl Command for List {
     fn run(&self) -> CliResult<()> {
+        // Route every form through the service layer: the view/pattern/
+        // annotated-only filters ride the request and the handler applies
+        // the same semantics over the domain listing.
+        if crate::commands::rpc::tag_list(self)? {
+            return Ok(());
+        }
+
         // Find the repository
         let repo_root = find_repository_root()?;
         let repo = Repository::open(&repo_root).map_err(|e| match e {

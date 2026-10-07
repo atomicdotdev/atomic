@@ -136,6 +136,8 @@ pub struct Goal {
 
 impl Command for Goal {
     fn run(&self) -> CliResult<()> {
+        // Route every form through the service layer (start/stop/resume
+        // ride the Vault entity wire; list already routes).
         match &self.command {
             GoalCommands::Start(cmd) => cmd.run(),
             GoalCommands::Stop(cmd) => cmd.run(),
@@ -174,6 +176,9 @@ pub struct GoalStart {
 
 impl Command for GoalStart {
     fn run(&self) -> CliResult<()> {
+        if crate::commands::rpc::vault_goal_start(self)? {
+            return Ok(());
+        }
         let root = find_repository_root()?;
         let repo = Repository::open(&root).map_err(CliError::Repository)?;
 
@@ -221,6 +226,9 @@ pub struct GoalStop {
 
 impl Command for GoalStop {
     fn run(&self) -> CliResult<()> {
+        if crate::commands::rpc::vault_goal_stop(self)? {
+            return Ok(());
+        }
         let root = find_repository_root()?;
         let repo = Repository::open(&root).map_err(CliError::Repository)?;
 
@@ -279,6 +287,9 @@ pub struct GoalResume {
 
 impl Command for GoalResume {
     fn run(&self) -> CliResult<()> {
+        if crate::commands::rpc::vault_goal_resume(self)? {
+            return Ok(());
+        }
         let root = find_repository_root()?;
         let repo = Repository::open(&root).map_err(CliError::Repository)?;
 
@@ -324,8 +335,57 @@ pub struct GoalList {
     pub json: bool,
 }
 
+/// One goal listing row — the shape both the local body (repo-read) and
+/// the routed hook (wire-carried) render.
+pub(crate) struct GoalRow {
+    pub name: String,
+    pub developer: String,
+    pub status: String,
+    pub intent: Option<String>,
+    pub started_at: String,
+    pub turns: u32,
+}
+
+/// The shared render — the exact local body's table and JSON shapes.
+pub(crate) fn render_goal_rows(rows: &[GoalRow], json: bool) {
+    if json {
+        let json: Vec<serde_json::Value> = rows
+            .iter()
+            .map(|s| {
+                serde_json::json!({
+                    "name": s.name,
+                    "developer": s.developer,
+                    "status": s.status,
+                    "intent": s.intent,
+                    "started_at": s.started_at,
+                    "turns": s.turns,
+                })
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&json).unwrap());
+        return;
+    }
+    if rows.is_empty() {
+        println!("No goals found.");
+        return;
+    }
+    for s in rows {
+        let intent_str = s.intent.as_deref().unwrap_or("");
+        println!(
+            "  {:12} {:24} {:10} {}",
+            s.status, s.name, s.developer, intent_str
+        );
+    }
+}
+
 impl Command for GoalList {
     fn run(&self) -> CliResult<()> {
+        // Every form routes (the raw status filter and the
+        // started_at/turns columns ride the wire).
+        if crate::commands::rpc::vault_goal_list(self)? {
+            return Ok(());
+        }
+
         let root = find_repository_root()?;
         let repo = Repository::open(&root).map_err(CliError::Repository)?;
 
@@ -336,34 +396,20 @@ impl Command for GoalList {
         };
         let goals = repo.vault_goal_list(filter).map_err(CliError::Repository)?;
 
-        if self.json {
-            let json: Vec<serde_json::Value> = goals
+        render_goal_rows(
+            &goals
                 .iter()
-                .map(|s| {
-                    serde_json::json!({
-                        "name": s.name,
-                        "developer": s.developer,
-                        "status": s.status,
-                        "intent": s.intent,
-                        "started_at": s.started_at,
-                        "turns": s.turns,
-                    })
+                .map(|s| GoalRow {
+                    name: s.name.clone(),
+                    developer: s.developer.clone(),
+                    status: s.status.clone(),
+                    intent: s.intent.clone(),
+                    started_at: s.started_at.clone(),
+                    turns: s.turns,
                 })
-                .collect();
-            println!("{}", serde_json::to_string_pretty(&json).unwrap());
-        } else {
-            if goals.is_empty() {
-                println!("No goals found.");
-                return Ok(());
-            }
-            for s in &goals {
-                let intent_str = s.intent.as_deref().unwrap_or("");
-                println!(
-                    "  {:12} {:24} {:10} {}",
-                    s.status, s.name, s.developer, intent_str
-                );
-            }
-        }
+                .collect::<Vec<_>>(),
+            self.json,
+        );
 
         Ok(())
     }
@@ -384,6 +430,9 @@ pub struct GoalShow {
 
 impl Command for GoalShow {
     fn run(&self) -> CliResult<()> {
+        if crate::commands::rpc::vault_goal_show(self)? {
+            return Ok(());
+        }
         let root = find_repository_root()?;
         let repo = Repository::open(&root).map_err(CliError::Repository)?;
 

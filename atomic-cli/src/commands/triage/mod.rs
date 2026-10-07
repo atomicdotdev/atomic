@@ -100,6 +100,19 @@ pub struct TriageCandidates {
 
 impl Command for TriageCandidates {
     fn run(&self) -> CliResult<()> {
+        // Route every form through the service layer: the handler resolves
+        // the view pair (the same defaults and errors) and runs the
+        // candidate-set domain call; this render prints the local lines
+        // over the wire-carried domain payload.
+        if let Some(wire) = crate::commands::rpc::triage_candidates(self)? {
+            let set: atomic_repository::CandidateSet = serde_json::from_slice(&wire.payload)
+                .map_err(|error| {
+                    CliError::Internal(anyhow::anyhow!("candidate set bundle: {error}"))
+                })?;
+            render_candidate_set(&wire.feature, &wire.target, &set, self.json)?;
+            return Ok(());
+        }
+
         let root = find_repository_root()?;
         let repo = Repository::open(&root).map_err(CliError::Repository)?;
         let (feature, into) = resolve_views(&repo, self.feature.as_deref(), self.into.as_deref())?;
@@ -107,38 +120,49 @@ impl Command for TriageCandidates {
         let set = repo
             .triage_candidate_set(&feature, &into)
             .map_err(CliError::Repository)?;
-
-        if self.json {
-            println!("{}", serde_json::to_string_pretty(&set).unwrap());
-            return Ok(());
-        }
-
-        println!("Triage candidates: {} \u{2192} {}", set.feature, set.target);
-        println!("  only in {}: {}", set.feature, set.only_in_feature.len());
-        for hash in &set.only_in_feature {
-            println!("    {}", hash);
-        }
-        println!("  closure additions: {}", set.closure_additions.len());
-        for hash in &set.closure_additions {
-            println!("    {}", hash);
-        }
-        println!("  baggage: {}", set.baggage.len());
-        for entry in &set.baggage {
-            let coverage = match entry.coverage {
-                atomic_repository::Coverage::Covered => "covered",
-                atomic_repository::Coverage::Uncovered => "uncovered",
-                atomic_repository::Coverage::Unknown => "unknown",
-            };
-            let files = if entry.modifies.is_empty() {
-                String::new()
-            } else {
-                format!("  [{}]", entry.modifies.join(", "))
-            };
-            println!("    {} ({}){}", entry.change, coverage, files);
-        }
-
+        render_candidate_set(&feature, &into, &set, self.json)?;
         Ok(())
     }
+}
+
+/// The candidates render, over the gathered data — the repository path and
+/// the routed path (ListTriageCandidates' bundle) share it.
+fn render_candidate_set(
+    feature: &str,
+    into: &str,
+    set: &atomic_repository::CandidateSet,
+    json: bool,
+) -> CliResult<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(&set).unwrap());
+        return Ok(());
+    }
+
+    println!("Triage candidates: {} \u{2192} {}", set.feature, set.target);
+    println!("  only in {}: {}", set.feature, set.only_in_feature.len());
+    for hash in &set.only_in_feature {
+        println!("    {}", hash);
+    }
+    println!("  closure additions: {}", set.closure_additions.len());
+    for hash in &set.closure_additions {
+        println!("    {}", hash);
+    }
+    println!("  baggage: {}", set.baggage.len());
+    for entry in &set.baggage {
+        let coverage = match entry.coverage {
+            atomic_repository::Coverage::Covered => "covered",
+            atomic_repository::Coverage::Uncovered => "uncovered",
+            atomic_repository::Coverage::Unknown => "unknown",
+        };
+        let files = if entry.modifies.is_empty() {
+            String::new()
+        } else {
+            format!("  [{}]", entry.modifies.join(", "))
+        };
+        println!("    {} ({}){}", entry.change, coverage, files);
+    }
+
+    Ok(())
 }
 
 /// Write the rendered HTML to a file and (unless suppressed) open it in the
@@ -300,6 +324,14 @@ pub struct TriageReview {
 
 impl Command for TriageReview {
     fn run(&self) -> CliResult<()> {
+        // STRUCTURAL LIMIT (recorded in REAC::aaron::27): the canonical
+        // report builder (`project::build_report` — the change → file →
+        // task → intent → acceptance-criterion join) is a ~2000-line
+        // module entangled with CLI-only presentation helpers (hunk
+        // display summaries, the `diff -c` builder, the intent bridge);
+        // porting it into the handler layer is a separate migration and
+        // GenerateTriageReview refuses until it lands. This command keeps
+        // its local body — the one remaining redb-open on a routed surface.
         let root = find_repository_root()?;
         let repo = Repository::open(&root).map_err(CliError::Repository)?;
         let (feature, into) = resolve_views(&repo, self.feature.as_deref(), self.into.as_deref())?;

@@ -128,7 +128,7 @@
 use clap::{Parser, ValueEnum};
 use serde::Serialize;
 
-use atomic_core::change::{Author, Change, GraphOp, Provenance};
+use atomic_core::change::{Author, Change, GraphOp, Provenance, ProvenanceGraph};
 use atomic_core::pristine::ViewTxnT;
 use atomic_core::types::{Base32, Hash};
 use atomic_repository::history::{find_change_sequence, get_change_at_sequence};
@@ -146,8 +146,8 @@ use console::style;
 
 // Output Format
 
-mod command;
-mod types;
+pub(crate) mod command;
+pub(crate) mod types;
 
 pub use command::*;
 pub use types::*;

@@ -276,6 +276,12 @@ const MAX_GRAPH_NODES_HTML: usize = 5000;
 
 impl Command for QueryGraph {
     fn run(&self) -> CliResult<()> {
+        // Route every form through the service layer: the seed/expand/
+        // filter/cap build runs handler-side; the DOT/HTML/JSON renders
+        // stay client-side over the wire-carried subgraph.
+        if crate::commands::rpc::query_graph(self)? {
+            return Ok(());
+        }
         let root = find_repository_root()?;
         let repo = Repository::open(&root).map_err(CliError::Repository)?;
 
@@ -493,7 +499,7 @@ impl Command for QueryGraph {
 }
 
 /// Generate a DOT (Graphviz) representation of a subgraph.
-fn emit_dot(nodes: &[KgNode], edges: &[KgEdge]) -> String {
+pub(crate) fn emit_dot(nodes: &[KgNode], edges: &[KgEdge]) -> String {
     let mut out = String::new();
     out.push_str("digraph query {\n");
     out.push_str("  rankdir=LR;\n");
@@ -619,7 +625,7 @@ fn dot_escape_label(s: &str) -> String {
 }
 
 /// Generate a self-contained HTML page with a D3.js force-directed graph.
-fn emit_html(query: &str, nodes: &[KgNode], edges: &[KgEdge]) -> String {
+pub(crate) fn emit_html(query: &str, nodes: &[KgNode], edges: &[KgEdge]) -> String {
     // Build JSON data for embedding
     let graph_nodes: Vec<serde_json::Value> = nodes
         .iter()
@@ -1028,7 +1034,7 @@ fn emit_html(query: &str, nodes: &[KgNode], edges: &[KgEdge]) -> String {
 }
 
 /// Truncate display text on character boundaries and append `...`.
-fn truncate_display(s: &str, max_chars: usize) -> String {
+pub(crate) fn truncate_display(s: &str, max_chars: usize) -> String {
     if s.chars().count() <= max_chars {
         s.to_string()
     } else {
@@ -1070,6 +1076,10 @@ pub struct QueryNodes {
 
 impl Command for QueryNodes {
     fn run(&self) -> CliResult<()> {
+        if crate::commands::rpc::query_search(self)? {
+            return Ok(());
+        }
+
         let root = find_repository_root()?;
         let repo = Repository::open(&root).map_err(CliError::Repository)?;
 
@@ -1143,6 +1153,10 @@ pub struct QueryNeighbors {
 
 impl Command for QueryNeighbors {
     fn run(&self) -> CliResult<()> {
+        if crate::commands::rpc::query_neighbors(self)? {
+            return Ok(());
+        }
+
         let root = find_repository_root()?;
         let repo = Repository::open(&root).map_err(CliError::Repository)?;
 
@@ -1198,6 +1212,11 @@ pub struct QueryCallers {
 
 impl Command for QueryCallers {
     fn run(&self) -> CliResult<()> {
+        // Route every form through the service layer (the handler filters
+        // the subgraph to CALLS edges at the entity).
+        if crate::commands::rpc::query_callers(self)? {
+            return Ok(());
+        }
         let root = find_repository_root()?;
         let repo = Repository::open(&root).map_err(CliError::Repository)?;
 
@@ -1285,7 +1304,6 @@ pub struct QueryEntities {
 impl Command for QueryEntities {
     fn run(&self) -> CliResult<()> {
         let root = find_repository_root()?;
-        let _repo = Repository::open(&root).map_err(CliError::Repository)?;
 
         if !atomic_semantic::is_supported(&self.path) {
             println!("Unsupported file type: {}", self.path);
@@ -1587,6 +1605,10 @@ mod enrich_tests {
 
 impl Command for QueryEnrich {
     fn run(&self) -> CliResult<()> {
+        if crate::commands::rpc::query_enrich(self)? {
+            return Ok(());
+        }
+
         let root = find_repository_root()?;
         let repo = Repository::open(&root).map_err(CliError::Repository)?;
 
@@ -1723,6 +1745,11 @@ pub struct Reindex;
 
 impl Command for Reindex {
     fn run(&self) -> CliResult<()> {
+        // Route every form through the service layer (the handler runs
+        // the same vault_reindex_kg domain call).
+        if crate::commands::rpc::query_reindex()? {
+            return Ok(());
+        }
         let root = find_repository_root()?;
         let repo = Repository::open(&root).map_err(CliError::Repository)?;
 
@@ -1743,6 +1770,12 @@ pub struct QueryEmbed {
 
 impl Command for QueryEmbed {
     fn run(&self) -> CliResult<()> {
+        // Route every form through the service layer: the provider
+        // resolves handler-side from the same environment/config; the CLI
+        // prints the local report from the wire-carried outcome.
+        if crate::commands::rpc::query_embed(self)? {
+            return Ok(());
+        }
         let root = find_repository_root()?;
         let repo = Repository::open(&root).map_err(CliError::Repository)?;
 
@@ -1800,6 +1833,11 @@ pub struct PlanExec {
 
 impl Command for PlanExec {
     fn run(&self) -> CliResult<()> {
+        // Route every form through the service layer (stdin stays
+        // client-side; the plan executes handler-side against the repo).
+        if crate::commands::rpc::query_plan(self)? {
+            return Ok(());
+        }
         let root = find_repository_root()?;
         let repo = Repository::open(&root).map_err(CliError::Repository)?;
 
@@ -1931,6 +1969,13 @@ The knowledge graph contains:
 
 impl Command for QueryAsk {
     fn run(&self) -> CliResult<()> {
+        // Route every form through the service layer: the agentic tool
+        // loop runs handler-side over the repository. --verbose's live
+        // tool-call trace is the unary-RPC limit: the trace rides the
+        // result (rendered in --json), not streamed live.
+        if crate::commands::rpc::query_ask(self)? {
+            return Ok(());
+        }
         let root = find_repository_root()?;
         let repo = Repository::open(&root).map_err(CliError::Repository)?;
 

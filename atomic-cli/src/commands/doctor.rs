@@ -82,6 +82,10 @@ impl Command for Doctor {
 
 impl Command for Check {
     fn run(&self) -> CliResult<()> {
+        if crate::commands::rpc::doctor_check(self)? {
+            return Ok(());
+        }
+
         let repo = require_repository(None)?;
 
         print_info("Verifying working-copy consistency against the graph...");
@@ -117,6 +121,10 @@ impl Command for Check {
 
 impl Command for RepairDependencyIndex {
     fn run(&self) -> CliResult<()> {
+        if crate::commands::rpc::doctor_repair_dependency_index(self)? {
+            return Ok(());
+        }
+
         let repo = require_repository(None)?;
 
         print_info("Repairing change dependency index...");
@@ -145,6 +153,10 @@ impl Command for RepairDependencyIndex {
 
 impl Command for MaterializeCrdt {
     fn run(&self) -> CliResult<()> {
+        if crate::commands::rpc::doctor_materialize_crdt(self)? {
+            return Ok(());
+        }
+
         let repo = require_repository(None)?;
         let view = self
             .view

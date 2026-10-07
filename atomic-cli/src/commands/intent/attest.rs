@@ -32,6 +32,10 @@ pub struct IntentAttest {
 
 impl Command for IntentAttest {
     fn run(&self) -> CliResult<()> {
+        if crate::commands::rpc::intent_attest(self)? {
+            return Ok(());
+        }
+
         let root = find_repository_root()?;
         let repo = Repository::open(&root).map_err(CliError::Repository)?;
 

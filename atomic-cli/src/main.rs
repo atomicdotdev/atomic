@@ -52,6 +52,7 @@ mod agent_error;
 mod commands;
 mod error;
 mod output;
+mod service;
 
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 

@@ -68,6 +68,13 @@ impl Show {
 
 impl Command for Show {
     fn run(&self) -> CliResult<()> {
+        // Route every form through the service layer: the wire carries the
+        // full tag record plus the ReviewGate per-record presence the local
+        // render reads from the repository.
+        if crate::commands::rpc::tag_show(self)? {
+            return Ok(());
+        }
+
         // Get the tag name
         let name = self
             .name
@@ -151,6 +158,50 @@ impl Command for Show {
 /// Only lines whose underlying data is present are printed. All lookups are
 /// defensive against absent fields, matching the extensible metadata shape.
 fn render_review_gate_metadata(repo: &Repository, metadata: &serde_json::Value) {
+    // The per-record presence/membership is the repository read the routed
+    // path cannot make — computed here for the local body, computed by the
+    // GetTag handler for the wire.
+    let mut records = Vec::new();
+    if let Some(original) = metadata
+        .get("changes")
+        .and_then(|c| c.get("original_hashes"))
+        .and_then(|v| v.as_array())
+    {
+        for entry in original {
+            let Some(text) = entry.as_str() else { continue };
+            match Hash::from_base32(text.as_bytes()) {
+                Some(hash) => {
+                    let present = repo.has_change(&hash);
+                    let views = repo.views_containing_change(&hash).unwrap_or_default();
+                    records.push(crate::commands::rpc::TagRecordWire {
+                        hash: text.to_string(),
+                        parseable: true,
+                        present,
+                        views,
+                    });
+                }
+                None => records.push(crate::commands::rpc::TagRecordWire {
+                    hash: text.to_string(),
+                    parseable: false,
+                    present: false,
+                    views: Vec::new(),
+                }),
+            }
+        }
+    }
+    render_review_gate_records(&metadata.to_string(), &records);
+}
+
+/// The ReviewGate render over wire-carried records — the SAME lines the
+/// local body prints (Git/Aggregate/Records blocks), driven by the
+/// presence/membership the handler computed.
+pub(crate) fn render_review_gate_records(
+    metadata_json: &str,
+    records: &[crate::commands::rpc::TagRecordWire],
+) {
+    let Ok(metadata) = serde_json::from_str::<serde_json::Value>(metadata_json) else {
+        return;
+    };
     // Git provenance line: "Git: <merge_strategy> <sha> (PR #<n>)"
     if let Some(git) = metadata.get("git") {
         let sha = git.get("sha").and_then(|v| v.as_str());
@@ -174,9 +225,7 @@ fn render_review_gate_metadata(repo: &Repository, metadata: &serde_json::Value) 
     }
 
     let changes = metadata.get("changes");
-    let original = changes
-        .and_then(|c| c.get("original_hashes"))
-        .and_then(|v| v.as_array());
+    let record_count = records.len();
 
     // Aggregate line.
     if let Some(changes) = changes {
@@ -189,10 +238,7 @@ fn render_review_gate_metadata(repo: &Repository, metadata: &serde_json::Value) 
             .unwrap_or(false);
 
         if let (Some(from), Some(to)) = (from, to) {
-            let count_val = count
-                .map(|c| c as usize)
-                .or_else(|| original.map(|a| a.len()))
-                .unwrap_or(0);
+            let count_val = count.map(|c| c as usize).unwrap_or(record_count);
             let inserted_suffix = if inserted { ", inserted" } else { "" };
             println!(
                 "{}: {} \u{2026} {}  ({} records{})",
@@ -202,36 +248,32 @@ fn render_review_gate_metadata(repo: &Repository, metadata: &serde_json::Value) 
                 count_val,
                 inserted_suffix
             );
-        } else if let Some(original) = original {
-            let count_val = count.map(|c| c as usize).unwrap_or(original.len());
+        } else if record_count > 0 {
+            let count_val = count.map(|c| c as usize).unwrap_or(record_count);
             println!("{}: {} records", emphasis("Aggregate"), count_val);
         }
     }
 
     // Per-record presence and view membership.
-    if let Some(original) = original {
-        if !original.is_empty() {
-            println!("{}:", emphasis("Records"));
-            for entry in original {
-                let Some(s) = entry.as_str() else { continue };
-                match Hash::from_base32(s.as_bytes()) {
-                    Some(hash) => {
-                        let present = repo.has_change(&hash);
-                        let mark = if present { "\u{2713}" } else { "\u{2717}" };
-                        let status = if present { "present" } else { "missing" };
-                        let views = repo.views_containing_change(&hash).unwrap_or_default();
-                        let views_suffix = if views.is_empty() {
-                            String::new()
-                        } else {
-                            format!("  ({})", views.join(", "))
-                        };
-                        println!("  {} {}  {}{}", mark, s, status, views_suffix);
-                    }
-                    None => {
-                        println!("  {}", s);
-                    }
-                }
+    if !records.is_empty() {
+        println!("{}:", emphasis("Records"));
+        for record in records {
+            if !record.parseable {
+                println!("  {}", record.hash);
+                continue;
             }
+            let mark = if record.present {
+                "\u{2713}"
+            } else {
+                "\u{2717}"
+            };
+            let status = if record.present { "present" } else { "missing" };
+            let views_suffix = if record.views.is_empty() {
+                String::new()
+            } else {
+                format!("  ({})", record.views.join(", "))
+            };
+            println!("  {} {}  {}{}", mark, record.hash, status, views_suffix);
         }
     }
 }

@@ -70,17 +70,17 @@ pub struct Explain {
     ///
     /// The session must have at least one recorded turn on its agent view.
     /// Use `atomic agent status` to see available sessions.
-    session_id: String,
+    pub(crate) session_id: String,
 
     /// Explain a specific turn number (1-indexed).
     ///
     /// If not specified, explains the most recent turn.
     #[arg(long, value_name = "N")]
-    turn: Option<u32>,
+    pub(crate) turn: Option<u32>,
 
     /// Explain all turns in the session.
     #[arg(long)]
-    all: bool,
+    pub(crate) all: bool,
 
     /// Save the reasoning back into the change's unhashed section.
     ///
@@ -88,14 +88,14 @@ pub struct Explain {
     /// included when you `atomic push`. Without this flag, reasoning
     /// is only displayed, not stored.
     #[arg(long)]
-    save: bool,
+    pub(crate) save: bool,
 
     /// Claude CLI model to use for reasoning generation.
     ///
     /// Defaults to "sonnet". Use "opus" for higher quality at higher cost,
     /// or "haiku" for faster/cheaper results.
     #[arg(long, default_value = "sonnet")]
-    model: String,
+    pub(crate) model: String,
 }
 
 impl Explain {
@@ -114,6 +114,15 @@ impl Explain {
 
 impl Command for Explain {
     fn run(&self) -> CliResult<()> {
+        // Route every form through the service layer: the handler loads the
+        // session's turns, extracts the transcripts, generates the reasoning
+        // (Claude CLI), anchors the learnings, and performs the save-backs.
+        // The session record stays CLIENT-SIDE (the session store is a
+        // working-copy file read, not redb).
+        if crate::commands::rpc::agent_explain(self)? {
+            return Ok(());
+        }
+
         let repo_root = find_repository_root()?;
 
         // Load the session to get the view name
@@ -421,7 +430,7 @@ fn get_condensed_text(
 // Display Reasoning
 
 /// Print a reasoning summary in a readable format.
-fn print_reasoning(reasoning: &TurnReasoning) {
+pub(crate) fn print_reasoning(reasoning: &TurnReasoning) {
     println!("  ├── {}: {}", emphasis("Intent"), info(&reasoning.intent));
     println!(
         "  ├── {}: {}",

@@ -104,6 +104,11 @@ impl Delete {
 
 impl Command for Delete {
     fn run(&self) -> CliResult<()> {
+        // Route through the daemon (--force only affects the local warning).
+        if crate::commands::rpc::view_delete(self)? {
+            return Ok(());
+        }
+
         // Get the view name
         let name = self
             .name
@@ -299,15 +304,19 @@ mod tests {
         // Change to the repo directory
         std::env::set_current_dir(repo_path).unwrap();
 
-        // Try to delete a non-existent view
+        // Try to delete a non-existent view. The plain form routes
+        // through the service area; the refusal is the domain's.
         let cmd = Delete::with_name("nonexistent");
         let result = cmd.run();
         assert!(result.is_err());
         match result.unwrap_err() {
-            CliError::ViewNotFound { name } => {
-                assert_eq!(name, "nonexistent");
+            CliError::ServiceRefusal { message } => {
+                assert!(
+                    message.contains("view 'nonexistent' not found"),
+                    "unexpected refusal: {message}"
+                );
             }
-            other => panic!("Expected ViewNotFound, got: {:?}", other),
+            other => panic!("Expected the view-not-found refusal, got: {:?}", other),
         }
     }
 
@@ -328,15 +337,20 @@ mod tests {
         // Change to the repo directory
         std::env::set_current_dir(repo_path).unwrap();
 
-        // Try to delete the current view
+        // Try to delete the current view. The plain form routes through
+        // the service area (local backend by default): the domain's
+        // refusal rides the contract's error vocabulary.
         let cmd = Delete::with_name("dev");
         let result = cmd.run();
         assert!(result.is_err());
         match result.unwrap_err() {
-            CliError::CannotDeleteCurrentView { name } => {
-                assert_eq!(name, "dev");
+            CliError::ServiceRefusal { message } => {
+                assert!(
+                    message.contains("cannot delete the current view 'dev'"),
+                    "unexpected refusal: {message}"
+                );
             }
-            other => panic!("Expected CannotDeleteCurrentView, got: {:?}", other),
+            other => panic!("Expected the current-view refusal, got: {:?}", other),
         }
     }
 

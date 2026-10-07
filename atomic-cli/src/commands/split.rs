@@ -58,7 +58,7 @@ const INVALID_CHARS: &[char] = &['/', '\\', '\0', ':', '*', '?', '"', '<', '>', 
 // View Name Validation
 
 /// Validate a view name.
-fn validate_view_name(name: &str) -> Result<(), String> {
+pub(crate) fn validate_view_name(name: &str) -> Result<(), String> {
     if name.is_empty() {
         return Err("View name cannot be empty".to_string());
     }
@@ -154,6 +154,14 @@ impl Split {
 
 impl Command for Split {
     fn run(&self) -> CliResult<()> {
+        // Route every form through the service layer: the wrapper composes
+        // the same CreateView(FromView) wire `view create --from` uses (plus
+        // SwitchView when --switch), and this render prints the split
+        // body's report from the wire-carried counts.
+        if crate::commands::rpc::split(self)? {
+            return Ok(());
+        }
+
         // Validate the new view name
         validate_view_name(&self.name).map_err(|msg| CliError::InvalidArgument { message: msg })?;
 

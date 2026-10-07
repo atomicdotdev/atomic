@@ -85,6 +85,7 @@ pub mod record;
 pub mod remove;
 pub mod restore;
 pub mod revise;
+pub(crate) mod rpc;
 pub mod sandbox;
 pub mod session;
 pub mod split;
