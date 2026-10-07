@@ -36,14 +36,14 @@ pub const READ_OPEN_WAIT: std::time::Duration = std::time::Duration::from_secs(1
 /// serialization for this slice — the read/write split is future work.)
 pub struct RepoHandle {
     pub root: PathBuf,
-    gate: tokio::sync::Mutex<()>,
+    gate: std::sync::Arc<tokio::sync::Mutex<()>>,
 }
 
 impl RepoHandle {
     pub fn new(root: PathBuf) -> Self {
         Self {
             root,
-            gate: tokio::sync::Mutex::new(()),
+            gate: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -51,6 +51,12 @@ impl RepoHandle {
     /// time for this repository. Acquire before any domain call.
     pub async fn exclusive(&self) -> tokio::sync::MutexGuard<'_, ()> {
         self.gate.lock().await
+    }
+
+    /// Move maintenance exclusion into blocking work so cancelling its caller
+    /// cannot release the gate while that work is still using the database.
+    pub(super) async fn exclusive_owned(&self) -> tokio::sync::OwnedMutexGuard<()> {
+        self.gate.clone().lock_owned().await
     }
 
     /// The persistent repository ID for this daemon: a blake3 digest of the

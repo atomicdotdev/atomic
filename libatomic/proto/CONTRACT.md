@@ -70,6 +70,32 @@ that would incorrectly exclude the serving local atomicd.
   stream/message/queue limits apply per principal; slow streaming cannot keep a
   writer open. Negotiate limits before allocating opaque payloads.
 
+## Repeatable physical maintenance
+
+`MaintenanceService.CompactDatabase` is an explicit exception to logical-mutation
+replay/publication semantics. It changes the physical page layout of an existing
+database without changing its logical records. redb performs its own internal
+transactions; there is no Atomic replay receipt written into the database.
+`RequestMeta.request_id` correlates an attempt and is echoed, with `replayed=false`.
+A repeated request may run again and report different byte counts, including zero
+reclaimed bytes. The CLI does not automatically retry a lost response.
+
+Only local administrators with `maintenance.admin` may invoke it. The serving
+transport must enforce caller identity and the descriptor allowlist before
+dispatch; a sandbox working-directory path does not confer sandbox-token
+authority. Compaction resolves that path to the canonical database without
+opening a Repository or migrating it.
+
+Acquiring the repository gate and exclusive redb file lock is bounded by
+`ATOMIC_DB_LOCK_WAIT_MS`; a busy database returns UNAVAILABLE. Read paths which
+do not use the repository gate remain protected by redb's file lock and may
+fail/wait during maintenance. Cancellation while queued for the gate starts no
+blocking work. Once blocking maintenance starts, that task retains the gate and
+finishes independently of the RPC caller, including its bounded file-lock wait.
+Persistent savepoints are preserved and reported as a precondition failure.
+Successful byte counts are sampled before compaction and after closing redb;
+other processes should remain idle until the command returns.
+
 ## Repository and workspace routing
 
 RepositoryRef.authority selects an explicit configured authority; it is not an

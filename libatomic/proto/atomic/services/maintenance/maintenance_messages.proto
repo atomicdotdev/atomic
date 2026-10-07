@@ -12,6 +12,21 @@ package atomic;
 
 import "atomic/common/common.proto";
 
+message CompactDatabaseRequest {
+  RepositoryRef repository = 1;
+  // Correlates this physical maintenance attempt. Unlike logical mutations,
+  // compaction is repeatable, without a durable replay receipt (CONTRACT.md).
+  RequestMeta meta = 2;
+}
+message CompactDatabaseResponse {
+  // Canonical physical path, available only to local administrative callers.
+  string database = 1;
+  uint64 before_bytes = 2;
+  uint64 after_bytes = 3;
+  uint64 reclaimed_bytes = 4;
+  ResponseMeta meta = 100;
+}
+
 
 
 enum RepairAction {

@@ -95,5 +95,6 @@ git2 = { workspace = true }
 windows-sys = { version = "0.61", features = ["Win32_Foundation"] }
 
 [dev-dependencies]
+tokio-stream = { workspace = true, features = ["net"] }
 tempfile = { workspace = true }
 serial_test = { workspace = true }

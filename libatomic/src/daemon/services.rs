@@ -78,6 +78,7 @@ const METHOD_MATRIX: &[(&str, &str)] = &[
     ("ProvenanceService", "GetSession"),
     ("ProvenanceService", "ListSessions"),
     ("MaintenanceService", "Repair"),
+    ("MaintenanceService", "CompactDatabase"),
     ("MaintenanceService", "CheckRepository"),
     ("ViewService", "ListViews"),
     ("ViewService", "CreateView"),
@@ -109,13 +110,26 @@ impl daemon_service_server::DaemonService for DaemonImpl {
     ) -> Result<Response<GetCapabilitiesResponse>, Status> {
         let methods = METHOD_MATRIX
             .iter()
-            .map(|(service, method)| MethodDescriptorInfo {
-                service: service.to_string(),
-                method: method.to_string(),
-                scope: ExecutionScope::Both as i32,
-                required_capabilities: Vec::new(),
-                allowed_callers: Vec::new(),
-                effects: Vec::new(),
+            .map(|(service, method)| {
+                if *service == "MaintenanceService" && *method == "CompactDatabase" {
+                    MethodDescriptorInfo {
+                        service: service.to_string(),
+                        method: method.to_string(),
+                        scope: ExecutionScope::Local as i32,
+                        required_capabilities: vec!["maintenance.admin".to_string()],
+                        allowed_callers: vec![CallerClass::Local as i32],
+                        effects: vec![RpcEffect::RepositoryWrite as i32],
+                    }
+                } else {
+                    MethodDescriptorInfo {
+                        service: service.to_string(),
+                        method: method.to_string(),
+                        scope: ExecutionScope::Both as i32,
+                        required_capabilities: Vec::new(),
+                        allowed_callers: Vec::new(),
+                        effects: Vec::new(),
+                    }
+                }
             })
             .collect();
         Ok(Response::new(GetCapabilitiesResponse {
