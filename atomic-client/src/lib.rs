@@ -59,18 +59,32 @@ pub struct AtomicClient {
     pub channel: Channel,
 }
 
-async fn connect_channel(socket: &std::path::Path) -> Result<Channel, tonic::transport::Error> {
-    let socket = socket.to_path_buf();
-    let connect = move |_: Uri| {
-        let socket = socket.clone();
-        async move {
-            let stream = tokio::net::UnixStream::connect(socket).await?;
-            Ok::<_, std::io::Error>(hyper_util::rt::TokioIo::new(stream))
-        }
-    };
-    Endpoint::from_static("http://localhost") // authority is the socket, not a URI
-        .connect_with_connector(service_fn(connect))
-        .await
+async fn connect_channel(socket: &std::path::Path) -> Result<Channel, std::io::Error> {
+    // The transport is a Unix-domain socket: unix-only. Other platforms
+    // compile (the CLI surface keeps its shape) but cannot connect.
+    #[cfg(unix)]
+    {
+        let socket = socket.to_path_buf();
+        let connect = move |_: Uri| {
+            let socket = socket.clone();
+            async move {
+                let stream = tokio::net::UnixStream::connect(socket).await?;
+                Ok::<_, std::io::Error>(hyper_util::rt::TokioIo::new(stream))
+            }
+        };
+        Endpoint::from_static("http://localhost") // authority is the socket, not a URI
+            .connect_with_connector(service_fn(connect))
+            .await
+            .map_err(std::io::Error::other)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = socket;
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "the atomic daemon transport is unix-only (unix-domain socket)",
+        ))
+    }
 }
 
 impl AtomicClient {
