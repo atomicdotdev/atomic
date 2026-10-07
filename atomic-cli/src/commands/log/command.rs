@@ -93,12 +93,14 @@ pub struct Log {
     #[arg(long = "full-hash")]
     pub full_hash: bool,
 
-    /// Show full history including inherited changes.
+    /// Show the full history including changes inherited from ancestor
+    /// views.
     ///
-    /// Currently a no-op — all views show their complete history.
-    /// Reserved for future use when fork-point filtering is
-    /// re-implemented with a stable fork-point snapshot.
-    #[arg(long = "all", hide = true)]
+    /// Draft views list only their own changes by default — the work
+    /// this view added, not what it inherited from its parent chain —
+    /// so `--all` is how you see the complete change log a draft
+    /// view can reach (shared views always show their full chain).
+    #[arg(long = "all")]
     pub all: bool,
 
     /// Show compact output (shorthand for --format short).
