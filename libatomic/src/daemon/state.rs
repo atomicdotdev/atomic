@@ -21,12 +21,14 @@ use prost::Message;
 /// client invocations with served requests through it).
 pub const ENV_LOG_REQUESTS: &str = "ATOMIC_DAEMON_LOG_REQUESTS";
 
-/// How long a read-only open retries when another process holds a
-/// writable handle: short-lived writers (a recording agent turn, a stop
-/// checkpoint publication) finish first; readers then share the database
-/// across processes. The query handlers' policy — the same one the CLI's
-/// query commands apply.
-pub const READ_OPEN_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+/// The cross-process open grace: redb refuses any open while another
+/// process holds the database, so every daemon open — read or write,
+/// repository or change store — waits up to this budget for a short-lived
+/// writer (a recording agent turn in another process) to finish. The same
+/// budget the hook-side waits use; override with `ATOMIC_DB_LOCK_WAIT_MS`.
+pub fn database_open_wait() -> std::time::Duration {
+    atomic_repository::database_lock_wait()
+}
 
 /// One registered repository: canonical root + the per-repository
 /// serialization gate. redb permits ONE handle per database file even
@@ -89,11 +91,12 @@ impl RepoHandle {
     }
 
     /// Open the repository database for this request. The caller drops the
-    /// handle when done; the gate guarantees exclusivity. `open_existing`
-    /// skips the table-init write transaction (the repository exists — the
-    /// daemon never bootstraps).
+    /// handle when done; the gate guarantees exclusivity within this
+    /// process. `open_existing_wait` skips the table-init write transaction
+    /// (the repository exists — the daemon never bootstraps) and gives an
+    /// external short-lived writer the open grace before failing.
     pub fn repository(&self) -> Result<Repository, Status> {
-        Repository::open_existing(&self.root).map_err(|error| {
+        Repository::open_existing_wait(&self.root, database_open_wait()).map_err(|error| {
             domain_status(
                 ErrorCode::Repository,
                 format!(
@@ -108,11 +111,11 @@ impl RepoHandle {
     /// read-concurrency wait: redb refuses any open while a writable
     /// handle exists (this or another process), so a short-lived writer —
     /// a recording agent turn in another process, a gated mutation in this
-    /// one — is given [`READ_OPEN_WAIT`] to finish before the read fails.
+    /// one — is given [`database_open_wait`] to finish before the read fails.
     /// Readers share the database across processes the same way the CLI's
     /// query commands always have. The caller must hold no other handle.
     pub fn repository_readonly(&self) -> Result<Repository, Status> {
-        Repository::open_readonly_wait(&self.root, READ_OPEN_WAIT).map_err(|error| {
+        Repository::open_readonly_wait(&self.root, database_open_wait()).map_err(|error| {
             domain_status(
                 ErrorCode::Repository,
                 format!(
@@ -133,7 +136,7 @@ impl RepoHandle {
         let dot_dir = self.root.join(".atomic");
         let path = atomic_repository::ensure_database(&dot_dir)
             .map_err(|error| domain_status(ErrorCode::Repository, error.to_string()))?;
-        RedbChangeStore::open_existing(&path).map_err(|error| {
+        RedbChangeStore::open_existing_wait(&path, database_open_wait()).map_err(|error| {
             domain_status(
                 ErrorCode::ProvenanceStore,
                 format!("failed to open {}: {error}", path.display()),

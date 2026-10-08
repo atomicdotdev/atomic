@@ -778,7 +778,7 @@ fn compute_ref_pair_diff(
     stat_only: bool,
 ) -> Result<Vec<DiffChunk>, Status> {
     let repo =
-        Repository::open_readonly_wait(root, super::state::READ_OPEN_WAIT).map_err(|error| {
+        Repository::open_readonly_wait(root, super::state::database_open_wait()).map_err(|error| {
             domain_status(
                 ErrorCode::Repository,
                 format!("failed to open repository read-only: {error}"),
