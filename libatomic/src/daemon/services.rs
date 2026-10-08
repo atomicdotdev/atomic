@@ -777,13 +777,14 @@ fn compute_ref_pair_diff(
     to_view: &str,
     stat_only: bool,
 ) -> Result<Vec<DiffChunk>, Status> {
-    let repo =
-        Repository::open_readonly_wait(root, super::state::database_open_wait()).map_err(|error| {
+    let repo = Repository::open_readonly_wait(root, super::state::database_open_wait()).map_err(
+        |error| {
             domain_status(
                 ErrorCode::Repository,
                 format!("failed to open repository read-only: {error}"),
             )
-        })?;
+        },
+    )?;
     for view in [from_view, to_view] {
         if !repo.view_exists(view).map_err(repository_error)? {
             return Err(domain_status(

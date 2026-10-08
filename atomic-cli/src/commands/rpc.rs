@@ -402,27 +402,29 @@ pub fn log(args: &crate::commands::log::command::Log) -> CliResult<bool> {
     // marker, blank line between entries) otherwise.
     use crate::commands::log::types::{JsonAuthor, JsonLogEntry, LogFormat};
     if matches!(args.format, LogFormat::Json) {
-        let json_entries: Vec<JsonLogEntry> = entries.iter().map(|entry| JsonLogEntry {
-            sequence: entry.sequence,
-            hash: wire_hash_base32(&entry.hash),
-            state: wire_hash_base32(&entry.state),
-            message: entry.message.clone(),
-            description: entry.description.clone(),
-            authors: entry
-                .authors
-                .iter()
-                .map(|author| JsonAuthor {
-                    name: author.name.clone(),
-                    email: author.email.clone(),
-                })
-                .collect(),
-            timestamp: entry.recorded_at.as_ref().and_then(|ts| {
-                chrono::DateTime::from_timestamp(ts.seconds, ts.nanos.max(0) as u32)
-                    .map(|time| time.to_rfc3339())
-            }),
-            is_tagged: entry.is_tagged,
-        })
-        .collect();
+        let json_entries: Vec<JsonLogEntry> = entries
+            .iter()
+            .map(|entry| JsonLogEntry {
+                sequence: entry.sequence,
+                hash: wire_hash_base32(&entry.hash),
+                state: wire_hash_base32(&entry.state),
+                message: entry.message.clone(),
+                description: entry.description.clone(),
+                authors: entry
+                    .authors
+                    .iter()
+                    .map(|author| JsonAuthor {
+                        name: author.name.clone(),
+                        email: author.email.clone(),
+                    })
+                    .collect(),
+                timestamp: entry.recorded_at.as_ref().and_then(|ts| {
+                    chrono::DateTime::from_timestamp(ts.seconds, ts.nanos.max(0) as u32)
+                        .map(|time| time.to_rfc3339())
+                }),
+                is_tagged: entry.is_tagged,
+            })
+            .collect();
         let doc = serde_json::to_string_pretty(&json_entries)
             .map_err(|e| CliError::Internal(e.into()))?;
         println!("{doc}");
@@ -430,7 +432,9 @@ pub fn log(args: &crate::commands::log::command::Log) -> CliResult<bool> {
     }
 
     use crate::commands::{format_hash_with_length, format_timestamp, DEFAULT_HASH_LENGTH};
-    use crate::output::{author as style_author, hash as style_hash, hint, timestamp as style_timestamp};
+    use crate::output::{
+        author as style_author, hash as style_hash, hint, timestamp as style_timestamp,
+    };
     for (i, entry) in entries.iter().enumerate() {
         // Separator between entries (the old formatter's `i > 0` rule).
         if i > 0 {
@@ -461,10 +465,14 @@ pub fn log(args: &crate::commands::log::command::Log) -> CliResult<bool> {
             println!("Author: {}", style_author(&author_line));
         }
         if let Some(recorded_at) = &entry.recorded_at {
-            if let Some(time) =
-                chrono::DateTime::from_timestamp(recorded_at.seconds, recorded_at.nanos.max(0) as u32)
-            {
-                println!("Date:   {}", style_timestamp(&format_timestamp(&time.with_timezone(&chrono::Utc))));
+            if let Some(time) = chrono::DateTime::from_timestamp(
+                recorded_at.seconds,
+                recorded_at.nanos.max(0) as u32,
+            ) {
+                println!(
+                    "Date:   {}",
+                    style_timestamp(&format_timestamp(&time.with_timezone(&chrono::Utc)))
+                );
             }
         }
 
@@ -1722,8 +1730,7 @@ pub fn diff(args: &super::diff::command::Diff) -> CliResult<bool> {
     // rendering dialect of its own.
     if response.is_empty() {
         let repo_root = crate::commands::find_repository_root()?;
-        let repo = atomic_repository::Repository::open(&repo_root)
-            .map_err(CliError::Repository)?;
+        let repo = atomic_repository::Repository::open(&repo_root).map_err(CliError::Repository)?;
         let view = current_view_name()?;
         args.print_no_pending_changes(&repo, &view);
         return Ok(true);
@@ -1797,12 +1804,9 @@ fn file_diff_from_chunk(
     }
     let old_lines: Vec<_> = old_content.split(|&b| b == b'\n').collect();
     let new_lines: Vec<_> = new_content.split(|&b| b == b'\n').collect();
-    for hunk in super::diff::build_hunks_from_diff(
-        &diff_result,
-        &old_lines,
-        &new_lines,
-        context_lines,
-    ) {
+    for hunk in
+        super::diff::build_hunks_from_diff(&diff_result, &old_lines, &new_lines, context_lines)
+    {
         file_diff.add_hunk(hunk);
     }
     file_diff.compute_stats();
@@ -2525,13 +2529,15 @@ pub fn view_list(args: &super::view::List) -> CliResult<bool> {
         super::view::list::print_local_json(&json_views, current)?;
         return Ok(true);
     }
-    let entries: Vec<super::view::list::ViewEntry> =
-        response.views.iter().map(super::view::list::ViewEntry::from_wire).collect();
+    let entries: Vec<super::view::list::ViewEntry> = response
+        .views
+        .iter()
+        .map(super::view::list::ViewEntry::from_wire)
+        .collect();
 
     // Same filter + hierarchy rendering as the local listing, so both
     // paths look identical (see #194).
-    let (visible, hidden) =
-        super::view::list::compute_visibility(&entries, args.all);
+    let (visible, hidden) = super::view::list::compute_visibility(&entries, args.all);
     let ordered = super::view::list::tree_order(&entries, &visible);
 
     let max_name_len = ordered

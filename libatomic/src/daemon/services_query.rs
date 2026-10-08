@@ -157,10 +157,7 @@ fn compute_working_copy_diff(
         let (old_payload, new_payload) = if stat_only {
             (None, None)
         } else {
-            (
-                Some(old_content.clone()),
-                new_content.clone(),
-            )
+            (Some(old_content.clone()), new_content.clone())
         };
         chunks.push(DiffChunk {
             path: path_str,

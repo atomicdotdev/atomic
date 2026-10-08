@@ -240,7 +240,10 @@ impl ViewEntry {
 /// it has changes of its own, or it is the current view, or it is an
 /// ancestor of such a view (so the hierarchy stays connected). Returns the
 /// visible name set and the hidden count.
-pub(crate) fn compute_visibility(entries: &[ViewEntry], show_all: bool) -> (HashSet<String>, usize) {
+pub(crate) fn compute_visibility(
+    entries: &[ViewEntry],
+    show_all: bool,
+) -> (HashSet<String>, usize) {
     if show_all {
         let all = entries.iter().map(|e| e.name.clone()).collect();
         return (all, 0);

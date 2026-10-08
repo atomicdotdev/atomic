@@ -46,7 +46,10 @@ pub fn database_lock_wait() -> std::time::Duration {
     std::env::var("ATOMIC_DB_LOCK_WAIT_MS")
         .ok()
         .and_then(|raw| raw.parse::<u64>().ok())
-        .map_or(std::time::Duration::from_secs(30), std::time::Duration::from_millis)
+        .map_or(
+            std::time::Duration::from_secs(30),
+            std::time::Duration::from_millis,
+        )
 }
 
 /// Whether `dot_dir` holds a repository database in either layout.
