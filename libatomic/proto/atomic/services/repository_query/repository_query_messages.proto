@@ -154,6 +154,13 @@ message DiffChunk {
   uint64 additions = 3;
   uint64 deletions = 4;
   bool binary = 5;
+  // Add-only: the client renders with the same formatters the local path
+  // uses ("one render, two data sources"). `status` is the DomainFileStatus
+  // downcased ("added" | "deleted" | "modified" | "untracked"); the contents
+  // are absent when binary or stat-only, `new_content` also when deleted.
+  optional string status = 6;
+  optional bytes old_content = 7;      // recorded view content
+  optional bytes new_content = 8;      // working-copy content
 }
 
 message ListConflictsRequest {

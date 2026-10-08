@@ -72,7 +72,7 @@ impl Diff {
     /// single parseable document rather than a rendered diff it has to
     /// re-parse. `change` is `Some` for `atomic diff -c <hash>`; `view` is
     /// populated only for working-copy diffs.
-    pub(super) fn render(
+    pub(crate) fn render(
         &self,
         file_diffs: &[FileDiff],
         stats: &DiffStats,
@@ -109,7 +109,7 @@ impl Diff {
     /// dead end for someone who typed `atomic diff` expecting to see a
     /// change. Naming a real, copy-pasteable `-c` command for the most
     /// recent changes on this view turns the dead end into a next step.
-    pub(super) fn print_no_pending_changes(&self, repo: &Repository, view: &str) {
+    pub(crate) fn print_no_pending_changes(&self, repo: &Repository, view: &str) {
         if self.json {
             let _ = json::print_json(&json::JsonDiff::empty(Some(view)));
             return;
