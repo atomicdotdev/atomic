@@ -459,6 +459,13 @@ cargo install --path atomic-cli
 atomic --version
 ```
 
+Local builds include their source commit in the version output, for example
+`atomic 0.19.1 (dev 4b143dfbcad2)`, with `-dirty` appended for tracked changes.
+The release workflow sets `ATOMIC_BUILD_CHANNEL=release` to report only the
+package version. Development builds distributed later retain their embedded
+commit; Git is not required to run them. When building from a source archive,
+set `ATOMIC_BUILD_COMMIT` to the source commit, or the output shows `dev unknown`.
+
 To install a locally built binary system-wide, the destination directory may require administrator privileges. On macOS, replacing the file rather than overwriting its existing inode also avoids retaining stale Gatekeeper provenance metadata:
 
 ```bash
