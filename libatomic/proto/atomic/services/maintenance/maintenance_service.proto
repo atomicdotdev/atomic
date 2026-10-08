@@ -10,6 +10,14 @@ import "atomic/common/options.proto";
 import "atomic/services/maintenance/maintenance_messages.proto";
 
 service MaintenanceService {
+  // Explicit physical maintenance of an existing atomic.redb. Busy handles
+  // cause bounded waiting, then UNAVAILABLE. Not logical garbage collection.
+  rpc CompactDatabase(CompactDatabaseRequest) returns (CompactDatabaseResponse) {
+    option (atomic.execution_scope) = EXECUTION_SCOPE_LOCAL;
+    option (atomic.required_capability) = "maintenance.admin";
+    option (atomic.allowed_caller) = CALLER_CLASS_LOCAL;
+    option (atomic.effect) = RPC_EFFECT_REPOSITORY_WRITE;
+  }
   // `atomic doctor repair-dependency-index | materialize-crdt` — mutating
   // repairs only; the read-only consistency check lives in CheckRepository.
   rpc Repair(RepairRequest) returns (RepairResponse) {

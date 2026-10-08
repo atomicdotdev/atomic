@@ -3,11 +3,11 @@
 //! `atomic doctor` folds into Repair (the mutating actions) and
 //! CheckRepository (the read-only consistency check). The read/write split
 //! the state gate defers lands here for the read side: CheckRepository
-//! opens the repository READ-ONLY (redb read-only handles coexist with
-//! the writer's exclusive lock) and never acquires the per-repo gate —
-//! a consistency check never queues behind writers, exactly as the
-//! contract's "EXECUTES AS A READ TRANSACTION" demands. Repair is a
-//! repository write: gated like every other mutating handler.
+//! opens the repository READ-ONLY without acquiring the per-repo gate.
+//! Separate read-only handles share redb's file lock with other readers;
+//! an exclusive writable handle still prevents these opens. Repair uses the
+//! mutation gate. Compaction additionally requires exclusive access to the
+//! physical database, including exclusion of independent reader handles.
 
 use std::sync::Arc;
 
@@ -18,6 +18,8 @@ use tonic::{Request, Response, Status};
 
 use super::services::default_ref;
 use super::state::{domain_status, repository_error, DaemonState};
+
+mod compact;
 
 pub struct MaintenanceImpl {
     pub state: Arc<DaemonState>,
@@ -41,6 +43,19 @@ fn repair_action(action: i32) -> Result<RepairAction, Status> {
 
 #[tonic::async_trait]
 impl MaintenanceService for MaintenanceImpl {
+    async fn compact_database(
+        &self,
+        request: Request<CompactDatabaseRequest>,
+    ) -> Result<Response<CompactDatabaseResponse>, Status> {
+        compact::compact(
+            &self.state,
+            request,
+            atomic_agent::turn::orchestrator::wait_budget::database_wait(),
+        )
+        .await
+        .map(Response::new)
+    }
+
     async fn repair(
         &self,
         request: Request<RepairRequest>,
@@ -139,9 +154,8 @@ impl MaintenanceService for MaintenanceImpl {
             .state
             .resolve(request.repository.as_ref().unwrap_or(&default_ref()))?;
         self.state.log_rpc("CheckRepository", Some(&handle));
-        // No gate, no writer queue: read-only opens coexist with the
-        // writer's exclusive handle, so the check runs concurrent with
-        // in-flight writes ("EXECUTES AS A READ TRANSACTION").
+        // No mutation gate. redb's shared file lock still refuses this
+        // open while a writable handle (including compaction) is live.
         let root = handle.root.clone();
         let result = tokio::task::spawn_blocking(move || {
             let repo = atomic_repository::Repository::open_readonly(&root).map_err(|error| {

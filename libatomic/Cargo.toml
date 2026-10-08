@@ -37,6 +37,12 @@ blake3 = { workspace = true }
 data-encoding = { workspace = true }
 similar = { workspace = true }
 ulid = { workspace = true }
+redb = { workspace = true }
+anyhow = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
 
 [build-dependencies]
 tonic-build = { workspace = true }

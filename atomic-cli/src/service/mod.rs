@@ -56,6 +56,8 @@ use tonic::{Request, Status};
 
 use crate::error::{CliError, CliResult};
 
+mod compact;
+
 /// The service-area selector. `ATOMIC_SERVICE` wins; `ATOMIC_RPC` is the
 /// legacy alias (1 → reactor, anything else → local); unset routes local.
 pub const ENV_SERVICE: &str = "ATOMIC_SERVICE";

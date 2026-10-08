@@ -40,7 +40,7 @@ completion engine are load-bearing surfaces.
 | SyncService | PushChanges, PullChanges, ListRemotes, ManageRemotes, BindRemoteProject | all LOCAL |
 | GitInteropService | ImportFromGit, PreviewGitImport, PushToGit | LOCAL |
 | TriageService | ListTriageCandidates, GenerateTriageReview | BOTH |
-| MaintenanceService | Repair, CheckRepository, ReindexWorkspace | LOCAL, BOTH, LOCAL |
+| MaintenanceService | Repair, CheckRepository, ReindexWorkspace, CompactDatabase | LOCAL, BOTH, LOCAL, LOCAL |
 | ReactorService | Publish, PublishStream, Subscribe, Replay, CheckpointConsumer | all BOTH (contract draft) |
 
 ## 2. Legacy agent journal protocol (13 ops, BEING DISMANTLED) → ProvenanceService
@@ -151,6 +151,7 @@ daemon, never the write queue.
 | `split [--switch]` | direct-RW | CreateView (explicit base); --switch composes SwitchView |
 | `stash push/pop/apply/list/show/drop/clear` | direct-RW | CreateStash / ApplyStash / ListStashes / DropStash; pop composes apply then drop |
 | `doctor repair-dependency-index/materialize-crdt/check` | direct-RW (check: read semantics) | Repair + CheckRepository (maintenance.read, BOTH) |
+| `compact [--repository PATH] [--json]` | shared service (local or Reactor) | CompactDatabase (maintenance.admin, LOCAL); repeatable physical maintenance |
 | `session show/fork/rebuild` | direct-RW | ProvenanceService.GetSession / ForkSession / RebuildSessionIndex |
 | `sandbox create/stage/seal` | direct-RW | SandboxService.CreateSandboxTree / StageSandboxImage / SealSandboxImage (SHAPE-CONFIRM) |
 | `tag create/delete/list/show` | direct-RW | TagService (create/delete/list/get) |

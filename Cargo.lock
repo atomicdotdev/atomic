@@ -1876,6 +1876,7 @@ checksum = "20870f649af7073d53e38067b2a84312175d56ea15217e1b15bc83506ec50afb"
 name = "libatomic"
 version = "0.19.1"
 dependencies = [
+ "anyhow",
  "atomic-agent",
  "atomic-canonical",
  "atomic-core",
@@ -1892,13 +1893,16 @@ dependencies = [
  "prost",
  "prost-types",
  "protox",
+ "redb 4.2.0",
  "serde_json",
  "similar",
+ "tempfile",
  "tokio",
  "tokio-stream",
  "tonic",
  "tonic-build",
  "ulid",
+ "uuid",
 ]
 
 [[package]]

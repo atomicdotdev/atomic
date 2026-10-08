@@ -84,6 +84,36 @@ Current operational considerations:
 - Unix endpoints use `/tmp` to stay below macOS Unix-socket path limits. A future hardening step should move them into a user-private runtime directory where available, enforce restrictive socket permissions, and validate peer credentials.
 - A 96-bit endpoint digest makes accidental cross-project collisions extraordinarily unlikely, but the repository-local lock remains the final ownership check.
 
+### Reclaiming unused database space
+
+Run explicit maintenance when the repository is quiet:
+
+```bash
+atomic compact
+atomic compact --repository /path/to/repo --json
+```
+
+The command compacts the existing `.atomic/atomic.redb` and reports its
+before/after sizes and reclaimed bytes. It preserves history, views,
+provenance, change files and unrecorded working files. It does not delete
+live data or deduplicate change objects; zero bytes reclaimed is a valid result.
+
+Compaction runs through libatomic, in-process by default. With
+`ATOMIC_SERVICE=reactor`, it uses the same handler through the configured
+Reactor service; that service must advertise `CompactDatabase`. An older or
+unavailable service produces an error, with no local fallback.
+
+Other database readers and writers must release their handles. Lock waiting
+uses `ATOMIC_DB_LOCK_WAIT_MS` (30 seconds by default); a busy database produces
+an error that can be retried. Once blocking maintenance starts, it finishes
+independently of the caller, including the bounded lock wait. Use a quiet period:
+other commands may time out while the database is being compacted. Persistent
+savepoints block compaction and are never deleted automatically.
+
+This is manual maintenance of an existing combined database, with no implicit
+initialization or migration. Hosted Storage's open-handle cache requires separate
+maintenance coordination before online compaction can be supported.
+
 ### Provenance Graphs
 
 Every agent session builds a causal decision DAG. Not just *what* changed, but *why*:

@@ -62,6 +62,7 @@ use commands::{
     ChangeCmd,
     Clone,
     Command,
+    Compact,
     Completions,
     Conflicts,
     Diff,
@@ -446,6 +447,9 @@ enum Commands {
     /// Use this for explicit maintenance tasks that may scan stored changes,
     /// such as backfilling the dependency index for legacy repositories.
     Doctor(Doctor),
+
+    /// Reclaim unused space in the repository database.
+    Compact(Compact),
 
     /// Git interoperability commands.
     ///
@@ -996,6 +1000,7 @@ fn main() {
         Commands::Diff(diff) => diff.run(),
 
         Commands::Doctor(doctor) => doctor.run(),
+        Commands::Compact(compact) => compact.run(),
 
         Commands::Git(git) => git.run(),
 
