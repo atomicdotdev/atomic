@@ -162,7 +162,7 @@ fn apply_agent_help(cmd: clap::Command) -> clap::Command {
 /// are truly independent.
 #[derive(Parser, Debug)]
 #[command(name = "atomic")]
-#[command(author, version, about, long_about = None)]
+#[command(author, version = env!("ATOMIC_CLI_VERSION"), about, long_about = None)]
 #[command(propagate_version = true)]
 #[command(arg_required_else_help = true)]
 struct Cli {
