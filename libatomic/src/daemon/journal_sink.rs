@@ -40,8 +40,11 @@ impl DirectJournalSink {
     }
 
     fn store(&self) -> Result<atomic_repository::redb_change_store::RedbChangeStore, String> {
-        atomic_repository::redb_change_store::RedbChangeStore::open_existing(&self.root)
-            .map_err(|error| format!("failed to open {}: {error}", self.root.display()))
+        atomic_repository::redb_change_store::RedbChangeStore::open_existing_wait(
+            &self.root,
+            super::state::database_open_wait(),
+        )
+        .map_err(|error| format!("failed to open {}: {error}", self.root.display()))
     }
 }
 

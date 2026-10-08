@@ -270,6 +270,36 @@ impl RedbChangeStore {
         Self::from_database(Arc::new(Builder::new().open(path)?))
     }
 
+    /// Open the store in an existing database file, waiting at most
+    /// `timeout` for an incompatible process handle to close. Other errors
+    /// return immediately.
+    ///
+    /// redb refuses any open while another process holds the database —
+    /// short-lived writers (a recording agent turn, a gated daemon
+    /// mutation) are given this grace instead of failing the open. The
+    /// same policy [`crate::Repository::open_existing_wait`] applies to
+    /// repository opens.
+    pub fn open_existing_wait<P: AsRef<Path>>(
+        path: P,
+        timeout: std::time::Duration,
+    ) -> RedbStoreResult<Self> {
+        let start = std::time::Instant::now();
+        loop {
+            match Self::open_existing(path.as_ref()) {
+                Err(RedbStoreError::Database(db))
+                    if matches!(db.as_ref(), redb::DatabaseError::DatabaseAlreadyOpen)
+                        && start.elapsed() < timeout =>
+                {
+                    std::thread::sleep(
+                        std::time::Duration::from_millis(10)
+                            .min(timeout.saturating_sub(start.elapsed())),
+                    );
+                }
+                result => return result,
+            }
+        }
+    }
+
     /// Use the store's tables in an already-open database, creating any that
     /// are missing.
     pub fn from_database(db: Arc<Database>) -> RedbStoreResult<Self> {

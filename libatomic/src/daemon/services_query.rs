@@ -126,6 +126,9 @@ fn compute_working_copy_diff(
                 additions: 0,
                 deletions: 0,
                 binary: true,
+                status: Some(diff_status_string(file_status)),
+                old_content: None,
+                new_content: None,
             });
             continue;
         }
@@ -151,15 +154,36 @@ fn compute_working_copy_diff(
                     .into_bytes(),
             )
         };
+        let (old_payload, new_payload) = if stat_only {
+            (None, None)
+        } else {
+            (Some(old_content.clone()), new_content.clone())
+        };
         chunks.push(DiffChunk {
             path: path_str,
             patch,
             additions,
             deletions,
             binary: false,
+            status: Some(diff_status_string(file_status)),
+            old_content: old_payload,
+            new_content: new_payload,
         });
     }
     Ok(chunks)
+}
+
+/// The wire's downcased file status for a diff chunk — the CLI renders
+/// name-status and /dev/null headers from this.
+fn diff_status_string(status: DomainFileStatus) -> String {
+    match status {
+        DomainFileStatus::Added => "added",
+        DomainFileStatus::Deleted => "deleted",
+        DomainFileStatus::Modified => "modified",
+        DomainFileStatus::Untracked => "untracked",
+        other => return format!("{other:?}").to_lowercase(),
+    }
+    .to_string()
 }
 
 // ---------------------------------------------------------------------------

@@ -777,13 +777,14 @@ fn compute_ref_pair_diff(
     to_view: &str,
     stat_only: bool,
 ) -> Result<Vec<DiffChunk>, Status> {
-    let repo =
-        Repository::open_readonly_wait(root, super::state::READ_OPEN_WAIT).map_err(|error| {
+    let repo = Repository::open_readonly_wait(root, super::state::database_open_wait()).map_err(
+        |error| {
             domain_status(
                 ErrorCode::Repository,
                 format!("failed to open repository read-only: {error}"),
             )
-        })?;
+        },
+    )?;
     for view in [from_view, to_view] {
         if !repo.view_exists(view).map_err(repository_error)? {
             return Err(domain_status(
@@ -818,6 +819,14 @@ fn compute_ref_pair_diff(
 
     let mut chunks = Vec::new();
     for path in all_paths {
+        let in_from = from_files.contains(&path);
+        let in_to = to_files.contains(&path);
+        let status = match (in_from, in_to) {
+            (true, true) => "modified",
+            (false, true) => "added",
+            (true, false) => "deleted",
+            (false, false) => continue,
+        };
         let old = repo
             .get_file_content_on_view(&path, from_view)
             .map_err(repository_error)?
@@ -834,6 +843,9 @@ fn compute_ref_pair_diff(
                 additions: 0,
                 deletions: 0,
                 binary: true,
+                status: Some(status.to_string()),
+                old_content: None,
+                new_content: None,
             });
             continue;
         }
@@ -863,12 +875,20 @@ fn compute_ref_pair_diff(
                     .into_bytes(),
             )
         };
+        let (old_payload, new_payload) = if stat_only {
+            (None, None)
+        } else {
+            (Some(old.clone()), new.clone())
+        };
         chunks.push(DiffChunk {
             path,
             patch,
             additions,
             deletions,
             binary: false,
+            status: Some(status.to_string()),
+            old_content: old_payload,
+            new_content: new_payload,
         });
     }
     Ok(chunks)

@@ -30,6 +30,28 @@ pub const LEGACY_DIR: &str = "legacy";
 /// Scratch file a merge writes before publishing it as [`DATABASE_FILE`].
 const MERGING_FILE: &str = "atomic.redb.merging";
 
+/// Budget for opening a repository database (or the change store inside
+/// it) when another process may hold the writer lock.
+///
+/// Every hook invocation is a separate process, so cross-process
+/// coordination waits on a bounded budget rather than failing the open:
+/// short-lived writers (a recording agent turn, a gated daemon mutation)
+/// finish first, and the contested open then succeeds. Waiting longer is
+/// always safe — the work being waited on is finite and ordered — and the
+/// budget is overridable so constrained environments (CI runners,
+/// sandboxes) can tighten or loosen it without recompiling.
+///
+/// Override with `ATOMIC_DB_LOCK_WAIT_MS`.
+pub fn database_lock_wait() -> std::time::Duration {
+    std::env::var("ATOMIC_DB_LOCK_WAIT_MS")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .map_or(
+            std::time::Duration::from_secs(30),
+            std::time::Duration::from_millis,
+        )
+}
+
 /// Whether `dot_dir` holds a repository database in either layout.
 pub fn has_database(dot_dir: &Path) -> bool {
     dot_dir.join(DATABASE_FILE).is_file() || dot_dir.join(LEGACY_PRISTINE_FILE).is_file()

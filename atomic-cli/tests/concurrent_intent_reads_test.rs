@@ -119,13 +119,18 @@ fn ordinary_read_timeout_returns_failure_without_waiting_forever() {
     let temp = tempfile::tempdir().unwrap();
     let _writer = Repository::init(temp.path()).unwrap();
     let start = Instant::now();
-    let outputs = finish_queries(
-        Queries(vec![spawn_query(
-            temp.path(),
-            &["intent", "list", "--json"],
-        )]),
-        Duration::from_secs(20),
-    );
+    // The budget is pinned so the test measures the bound, not the default
+    // (ATOMIC_DB_LOCK_WAIT_MS raises the daemon's read-open grace to 30s;
+    // waiting that out would make this test a 30s affair on every run).
+    let output = Command::new(env!("CARGO_BIN_EXE_atomic"))
+        .args(["intent", "list", "--json"])
+        .env("ATOMIC_DB_LOCK_WAIT_MS", "10000")
+        .current_dir(temp.path())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let outputs = finish_queries(Queries(vec![output]), Duration::from_secs(20));
     assert!(start.elapsed() >= Duration::from_secs(10));
     assert!(!outputs[0].status.success());
     assert!(String::from_utf8_lossy(&outputs[0].stderr).contains("Database already open"));
@@ -136,12 +141,15 @@ fn ordinary_read_corruption_fails_without_contention_wait() {
     let temp = tempfile::tempdir().unwrap();
     drop(Repository::init(temp.path()).unwrap());
     std::fs::write(temp.path().join(".atomic/atomic.redb"), b"corrupt database").unwrap();
+    // A generous deadline for process startup (a loaded machine can sit in
+    // dyld for a while); a contention wait would be the 30s default budget,
+    // so completing inside this bound still proves no wait happened.
     let outputs = finish_queries(
         Queries(vec![spawn_query(
             temp.path(),
             &["intent", "list", "--json"],
         )]),
-        Duration::from_secs(3),
+        Duration::from_secs(20),
     );
     assert!(!outputs[0].status.success());
     assert!(!String::from_utf8_lossy(&outputs[0].stderr).contains("Database already open"));

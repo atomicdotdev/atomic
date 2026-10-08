@@ -93,8 +93,8 @@ mod views;
 // Re-export public items so external callers and sibling sub-modules that
 // use `use super::*;` continue to resolve them at `crate::repository::…`.
 pub use database::{
-    ensure_database, has_database, DATABASE_FILE, LEGACY_CHANGE_STORE_FILE, LEGACY_DIR,
-    LEGACY_PRISTINE_FILE,
+    database_lock_wait, ensure_database, has_database, DATABASE_FILE, LEGACY_CHANGE_STORE_FILE,
+    LEGACY_DIR, LEGACY_PRISTINE_FILE,
 };
 pub use filter::{
     collect_view_change_ids, collect_visible_change_ids, collect_visible_change_ids_with_deps,

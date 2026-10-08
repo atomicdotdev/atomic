@@ -396,56 +396,108 @@ pub fn log(args: &crate::commands::log::command::Log) -> CliResult<bool> {
     if args.reverse {
         entries.reverse(); // --reverse: oldest first
     }
-    for entry in &entries {
-        let hash = short_hash(&entry.hash);
-        match args.format {
-            crate::commands::log::types::LogFormat::Json => {
+
+    // Same renders as the local path: the versioned pretty JSON array for
+    // -f json, and the styled default format (hash === markers, (tag)
+    // marker, blank line between entries) otherwise.
+    use crate::commands::log::types::{JsonAuthor, JsonLogEntry, LogFormat};
+    if matches!(args.format, LogFormat::Json) {
+        let json_entries: Vec<JsonLogEntry> = entries
+            .iter()
+            .map(|entry| JsonLogEntry {
+                sequence: entry.sequence,
+                hash: wire_hash_base32(&entry.hash),
+                state: wire_hash_base32(&entry.state),
+                message: entry.message.clone(),
+                description: entry.description.clone(),
+                authors: entry
+                    .authors
+                    .iter()
+                    .map(|author| JsonAuthor {
+                        name: author.name.clone(),
+                        email: author.email.clone(),
+                    })
+                    .collect(),
+                timestamp: entry.recorded_at.as_ref().and_then(|ts| {
+                    chrono::DateTime::from_timestamp(ts.seconds, ts.nanos.max(0) as u32)
+                        .map(|time| time.to_rfc3339())
+                }),
+                is_tagged: entry.is_tagged,
+            })
+            .collect();
+        let doc = serde_json::to_string_pretty(&json_entries)
+            .map_err(|e| CliError::Internal(e.into()))?;
+        println!("{doc}");
+        return Ok(true);
+    }
+
+    use crate::commands::{format_hash_with_length, format_timestamp, DEFAULT_HASH_LENGTH};
+    use crate::output::{
+        author as style_author, hash as style_hash, hint, timestamp as style_timestamp,
+    };
+    for (i, entry) in entries.iter().enumerate() {
+        // Separator between entries (the old formatter's `i > 0` rule).
+        if i > 0 {
+            println!();
+        }
+
+        let hash = Merkle(
+            entry
+                .hash
+                .as_ref()
+                .and_then(|h| h.value.clone().try_into().ok())
+                .unwrap_or([0u8; 32]),
+        );
+        let hash_str = format_hash_with_length(&hash, DEFAULT_HASH_LENGTH);
+        let tagged_marker = if entry.is_tagged { " (tag)" } else { "" };
+        println!(
+            "{} === {} ==={}",
+            hint(&format!("#{}", entry.sequence)),
+            style_hash(&hash_str),
+            hint(tagged_marker)
+        );
+
+        for author in &entry.authors {
+            let author_line = match &author.email {
+                Some(email) => format!("{} <{email}>", author.name),
+                None => author.name.clone(),
+            };
+            println!("Author: {}", style_author(&author_line));
+        }
+        if let Some(recorded_at) = &entry.recorded_at {
+            if let Some(time) = chrono::DateTime::from_timestamp(
+                recorded_at.seconds,
+                recorded_at.nanos.max(0) as u32,
+            ) {
                 println!(
-                    "{}",
-                    serde_json::to_string(&serde_json::json!({
-                        "hash": hash,
-                        "sequence": entry.sequence,
-                        "message": entry.message,
-                        "view": entry.view,
-                    }))
-                    .map_err(|e| CliError::Internal(e.into()))?
+                    "Date:   {}",
+                    style_timestamp(&format_timestamp(&time.with_timezone(&chrono::Utc)))
                 );
             }
-            _ => {
-                println!("#{} === {} ===", entry.sequence, hash);
-                for author in &entry.authors {
-                    let email = author
-                        .email
-                        .as_ref()
-                        .map(|e| format!(" <{e}>"))
-                        .unwrap_or_default();
-                    println!("Author: {}{}", author.name, email);
-                }
-                if let Some(recorded_at) = &entry.recorded_at {
-                    let time = chrono::DateTime::from_timestamp(
-                        recorded_at.seconds,
-                        recorded_at.nanos.max(0) as u32,
-                    );
-                    if let Some(time) = time {
-                        println!("Date:   {}", time.format("%Y-%m-%d %H:%M:%S"));
-                    }
-                }
-                println!();
-                if let Some(message) = &entry.message {
-                    for line in message.lines() {
-                        println!("    {line}");
-                    }
-                }
-                if let Some(description) = &entry.description {
-                    for line in description.lines() {
-                        println!("    {line}");
-                    }
-                }
-                println!();
+        }
+
+        println!();
+        if let Some(message) = &entry.message {
+            for line in message.lines() {
+                println!("    {line}");
+            }
+        }
+        if let Some(description) = &entry.description {
+            println!();
+            for line in description.lines() {
+                println!("    {line}");
             }
         }
     }
     Ok(true)
+}
+
+/// The Base32 form of a wire `Hash` (the local path's `Hash::to_base32`).
+fn wire_hash_base32(hash: &Option<pb::Hash>) -> String {
+    hash.as_ref()
+        .and_then(|h| h.value.clone().try_into().ok())
+        .map(|bytes| Merkle(bytes).to_base32())
+        .unwrap_or_default()
 }
 
 // ---------------------------------------------------------------------------
@@ -1671,41 +1723,94 @@ pub fn diff(args: &super::diff::command::Diff) -> CliResult<bool> {
         stat_only,
     })?;
 
-    if args.json {
-        print_diff_json(&response, Some(&current_view_name()?))?;
-        return Ok(true);
-    }
+    // One render, two data sources: rebuild the FileDiffs the local path
+    // would have built from the wire's status + contents, then hand them to
+    // the SAME formatters (print_unified/print_stat/... — including the
+    // versioned JSON document and word-diff pairing). The bridge grows no
+    // rendering dialect of its own.
     if response.is_empty() {
-        println!("No pending changes.");
+        let repo_root = crate::commands::find_repository_root()?;
+        let repo = atomic_repository::Repository::open(&repo_root).map_err(CliError::Repository)?;
+        let view = current_view_name()?;
+        args.print_no_pending_changes(&repo, &view);
         return Ok(true);
     }
+
+    let algorithm = args.parse_algorithm()?;
+    let config = args.get_output_config();
+    let view = current_view_name()?;
+
+    let mut file_diffs = Vec::new();
+    let mut stats = super::diff::types::DiffStats::new();
     for chunk in &response {
-        if name_only {
-            println!("{}", chunk.path);
-            continue;
-        }
-        if stat_only {
-            println!(
-                " {} | +{} -{}",
-                chunk.path, chunk.additions, chunk.deletions
-            );
-            continue;
-        }
-        if chunk.binary {
-            println!("Binary file {} differs", chunk.path);
-            continue;
-        }
-        if let Some(patch) = &chunk.patch {
-            println!("--- {}", chunk.path);
-            println!("+++ {}", chunk.path);
-            if args.word_diff {
-                print_word_diff_patch(&String::from_utf8_lossy(patch));
-            } else {
-                print!("{}", String::from_utf8_lossy(patch));
-            }
+        if let Some(file_diff) = file_diff_from_chunk(chunk, &algorithm, config.context_lines) {
+            stats.add_file(file_diff.stats.clone());
+            file_diffs.push(file_diff);
         }
     }
+
+    args.render(&file_diffs, &stats, &config, None, Some(view.as_str()))?;
     Ok(true)
+}
+
+/// Rebuild one local-path `FileDiff` from a wire `DiffChunk`.
+///
+/// The chunk carries the file's status plus its recorded and working-copy
+/// contents (see DiffChunk.status/old_content/new_content), so the exact
+/// comparison the local path performs — `diff_text` + hunks with context —
+/// runs here and feeds the shared formatters.
+fn file_diff_from_chunk(
+    chunk: &pb::DiffChunk,
+    algorithm: &atomic_core::diff::Algorithm,
+    context_lines: usize,
+) -> Option<super::diff::types::FileDiff> {
+    use super::diff::types::{FileChangeStatus, FileDiff};
+    use atomic_core::diff::diff_text;
+
+    let status = match chunk.status.as_deref() {
+        Some("added") => FileChangeStatus::Added,
+        Some("deleted") => FileChangeStatus::Deleted,
+        Some("untracked") => FileChangeStatus::Untracked,
+        _ => FileChangeStatus::Modified,
+    };
+
+    let mut file_diff = match status {
+        FileChangeStatus::Added => FileDiff::added(&chunk.path),
+        FileChangeStatus::Deleted => FileDiff::deleted(&chunk.path),
+        FileChangeStatus::Untracked => FileDiff::new(&chunk.path, FileChangeStatus::Untracked),
+        _ => FileDiff::modified(&chunk.path),
+    };
+
+    if chunk.binary {
+        file_diff.is_binary = true;
+        file_diff.stats.status = status.status_char();
+        return Some(file_diff);
+    }
+
+    let old_content = chunk.old_content.clone().unwrap_or_default();
+    let new_content = chunk.new_content.clone().unwrap_or_default();
+
+    // stat-only: the wire carries the counts but not the contents (the
+    // server omits them) — a stats-only entry renders `--stat` fine.
+    if chunk.patch.is_none() {
+        file_diff.stats.insertions = chunk.additions as usize;
+        file_diff.stats.deletions = chunk.deletions as usize;
+        return Some(file_diff);
+    }
+
+    let diff_result = diff_text(&old_content, &new_content, *algorithm);
+    if diff_result.is_unchanged() {
+        return None;
+    }
+    let old_lines: Vec<_> = old_content.split(|&b| b == b'\n').collect();
+    let new_lines: Vec<_> = new_content.split(|&b| b == b'\n').collect();
+    for hunk in
+        super::diff::build_hunks_from_diff(&diff_result, &old_lines, &new_lines, context_lines)
+    {
+        file_diff.add_hunk(hunk);
+    }
+    file_diff.compute_stats();
+    Some(file_diff)
 }
 
 /// `atomic change` over GetChange (includes.metadata: the versioned
@@ -1866,7 +1971,6 @@ fn diff_view_pair(args: &super::diff::command::Diff, from: &str, to: &str) -> Cl
         return Ok(false);
     };
     let stat_only = args.stat;
-    let name_only = args.name_only || args.name_status || args.short;
     let from = from.to_string();
     let to = to.to_string();
     let chunks = session.diff(pb::DiffRequest {
@@ -1889,32 +1993,20 @@ fn diff_view_pair(args: &super::diff::command::Diff, from: &str, to: &str) -> Cl
         println!("No differences between the views.");
         return Ok(true);
     }
+
+    // Same shared-formatter render as the working-copy form: the wire's
+    // status + contents rebuild the FileDiffs the local path would build.
+    let algorithm = args.parse_algorithm()?;
+    let config = args.get_output_config();
+    let mut file_diffs = Vec::new();
+    let mut stats = super::diff::types::DiffStats::new();
     for chunk in &chunks {
-        if name_only {
-            println!("{}", chunk.path);
-            continue;
-        }
-        if stat_only {
-            println!(
-                " {} | +{} -{}",
-                chunk.path, chunk.additions, chunk.deletions
-            );
-            continue;
-        }
-        if chunk.binary {
-            println!("Binary file {} differs", chunk.path);
-            continue;
-        }
-        if let Some(patch) = &chunk.patch {
-            println!("--- a/{}", chunk.path);
-            println!("+++ b/{}", chunk.path);
-            if args.word_diff {
-                print_word_diff_patch(&String::from_utf8_lossy(patch));
-            } else {
-                print!("{}", String::from_utf8_lossy(patch));
-            }
+        if let Some(file_diff) = file_diff_from_chunk(chunk, &algorithm, config.context_lines) {
+            stats.add_file(file_diff.stats.clone());
+            file_diffs.push(file_diff);
         }
     }
+    args.render(&file_diffs, &stats, &config, None, None)?;
     Ok(true)
 }
 
@@ -2437,20 +2529,34 @@ pub fn view_list(args: &super::view::List) -> CliResult<bool> {
         super::view::list::print_local_json(&json_views, current)?;
         return Ok(true);
     }
-    for view in &response.views {
-        // Scope + parent annotations mirror the local listing's metadata.
-        let kind = match pb::ViewScope::try_from(view.scope) {
-            Ok(pb::ViewScope::Draft) => " [draft]",
-            Ok(pb::ViewScope::Shared) => " [shared]",
-            _ => "",
+    let entries: Vec<super::view::list::ViewEntry> = response
+        .views
+        .iter()
+        .map(super::view::list::ViewEntry::from_wire)
+        .collect();
+
+    // Same filter + hierarchy rendering as the local listing, so both
+    // paths look identical (see #194).
+    let (visible, hidden) = super::view::list::compute_visibility(&entries, args.all);
+    let ordered = super::view::list::tree_order(&entries, &visible);
+
+    let max_name_len = ordered
+        .iter()
+        .map(|(_, entry)| entry.name.len())
+        .max()
+        .unwrap_or(0);
+
+    for (depth, entry) in &ordered {
+        let line = if args.short {
+            super::view::list::render_short_line(entry, *depth)
+        } else {
+            super::view::list::render_line(entry, *depth, max_name_len)
         };
-        let parent = view
-            .parent
-            .as_ref()
-            .map(|parent| format!(" (parent: {parent})"))
-            .unwrap_or_default();
-        let marker = if view.current { " (current)" } else { "" };
-        println!("{}{}{}{}", view.name, kind, parent, marker);
+        println!("{}", line);
+    }
+
+    if hidden > 0 {
+        print_hint(&super::view::list::summary_line(hidden));
     }
     Ok(true)
 }
