@@ -1,0 +1,67 @@
+// atomic-protocol — TriageService: promotion review.
+//
+// DRAFT — add-only. Triage review is a paid-surface workflow (the
+// intent→change pipeline's review gate): candidates are the change-sets
+// pending promotion between views; the review is the canonical report
+// (ordered semantic layers, provenance-backed) that `atomic triage review
+// --json` emits today. Structured here (not JSON strings) so the hosted
+// Outpost UI can render it without a parser divergence.
+
+syntax = "proto3";
+
+package atomic;
+
+import "atomic/common/common.proto";
+
+
+
+message ListTriageCandidatesRequest {
+  RepositoryRef repository = 1;
+  optional string from_view = 2;
+  optional string to_view = 3;
+}
+message ListTriageCandidatesResponse {
+  repeated TriageCandidate candidates = 1;
+  // The CLI's candidate-set domain serialization (add-only; schema
+  // "atomic.triage.candidates.v1" = the repository's CandidateSet JSON)
+  // so the client renders the exact `--json` document the local body
+  // emits, and the resolved (feature, target) pair for the header lines.
+  optional VersionedBytes candidate_set = 2;
+  string feature = 3;
+  string target = 4;
+}
+message TriageCandidate {
+  Hash change = 1;
+  optional string intent_id = 2;      // linked vault provenance
+  repeated string views = 3;          // views carrying the change
+  optional string summary = 4;
+}
+
+message GenerateTriageReviewRequest {
+  RepositoryRef repository = 1;
+  string from_view = 2;
+  string to_view = 3;
+  // The full canonical report (add-only; schema "atomic.triage.report.v1")
+  // — the walkthrough/dashboard/JSON renders run client-side over the
+  // wire-carried domain report.
+  optional VersionedBytes report = 4;
+}
+message GenerateTriageReviewResponse {
+  repeated TriageLayer layers = 1;    // ordered semantic walkthrough layers
+  repeated TriageRisk risks = 2;
+  // SHAPE-CONFIRM: layer/risk vocabulary from triage/model+output.rs.
+}
+message TriageLayer {
+  string name = 1;                    // e.g. storage, service, protocol, docs
+  repeated TriageChangeRef changes = 2;
+  string narration = 3;
+}
+message TriageChangeRef {
+  Hash change = 1;
+  repeated string files = 2;
+}
+message TriageRisk {
+  string severity = 1;               // blocker | warning | note
+  string finding = 2;
+  optional Hash change = 3;
+}

@@ -1,0 +1,29 @@
+// atomic-protocol — KnowledgeService definition (the RPC contract).
+// DRAFT — add-only. Messages for this service live in
+// atomic/services/knowledge/knowledge_messages.proto · shared primitives in atomic/common/.
+
+syntax = "proto3";
+
+package atomic;
+
+import "atomic/common/options.proto";
+import "atomic/services/knowledge/knowledge_messages.proto";
+
+service KnowledgeService {
+  rpc QueryGraph(QueryGraphRequest) returns (QueryGraphResponse) {
+    option (atomic.execution_scope) = EXECUTION_SCOPE_BOTH;
+    option (atomic.required_capability) = "knowledge.read";
+    option (atomic.allowed_caller) = CALLER_CLASS_LOCAL;
+    option (atomic.allowed_caller) = CALLER_CLASS_REMOTE_IDENTITY;
+    option (atomic.allowed_caller) = CALLER_CLASS_SANDBOX;
+    option (atomic.effect) = RPC_EFFECT_REPOSITORY_READ;
+    option (atomic.effect) = RPC_EFFECT_EXTERNAL_IO; // only ask/vector plan steps
+  }
+  rpc MaintainKnowledgeGraph(MaintainKnowledgeGraphRequest) returns (MaintainKnowledgeGraphResponse) {
+    option (atomic.execution_scope) = EXECUTION_SCOPE_LOCAL;
+    option (atomic.required_capability) = "knowledge.write";
+    option (atomic.allowed_caller) = CALLER_CLASS_LOCAL;
+    option (atomic.effect) = RPC_EFFECT_REPOSITORY_WRITE;
+    option (atomic.effect) = RPC_EFFECT_EXTERNAL_IO;
+  }
+}

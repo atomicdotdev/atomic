@@ -60,6 +60,12 @@ impl Delete {
 
 impl Command for Delete {
     fn run(&self) -> CliResult<()> {
+        // Route every form through the service layer (the handler runs the
+        // same domain delete and the wire carries the existed flag).
+        if crate::commands::rpc::tag_delete(self)? {
+            return Ok(());
+        }
+
         // Get the tag name
         let name = self
             .name

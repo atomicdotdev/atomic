@@ -1,0 +1,134 @@
+// atomic-protocol — SandboxService definition (the RPC contract).
+// DRAFT — add-only. Messages for this service live in
+// atomic/services/sandbox/sandbox_messages.proto · shared primitives in atomic/common/.
+
+syntax = "proto3";
+
+package atomic;
+
+import "atomic/common/options.proto";
+import "atomic/services/sandbox/sandbox_messages.proto";
+
+service SandboxService {
+  // Mint a sandbox grant: one live token per repository + stable view ID
+  // (minting replaces the
+  // prior). TTL bounds 1s..365d, checked arithmetic; default 2h. Tokens are
+  // ephemeral — restart invalidates them; local administration reissues them
+  // (contract behavior, sandbox_messages.proto).
+  rpc OpenSandbox(OpenSandboxRequest) returns (OpenSandboxResponse) {
+    option (atomic.execution_scope) = EXECUTION_SCOPE_LOCAL;
+    option (atomic.required_capability) = "sandbox.admin";
+    option (atomic.allowed_caller) = CALLER_CLASS_LOCAL;
+    option (atomic.effect) = RPC_EFFECT_REPOSITORY_READ;
+    option (atomic.effect) = RPC_EFFECT_DAEMON_WRITE;
+  }
+  rpc RenewSandbox(RenewSandboxRequest) returns (RenewSandboxResponse) {
+    option (atomic.execution_scope) = EXECUTION_SCOPE_LOCAL;
+    option (atomic.required_capability) = "sandbox.admin";
+    option (atomic.allowed_caller) = CALLER_CLASS_LOCAL;
+    option (atomic.effect) = RPC_EFFECT_DAEMON_WRITE;
+  }
+  rpc CloseSandbox(CloseSandboxRequest) returns (CloseSandboxResponse) {
+    option (atomic.execution_scope) = EXECUTION_SCOPE_LOCAL;
+    option (atomic.required_capability) = "sandbox.admin";
+    option (atomic.allowed_caller) = CALLER_CLASS_LOCAL;
+    option (atomic.effect) = RPC_EFFECT_DAEMON_WRITE;
+  }
+
+  // Local copy-on-write sandbox working trees (`atomic sandbox
+  // create/stage/seal` — OCI image stage/seal). Local-only paths are fine
+  // here (LOCAL scope): these are working-copy-adjacent operations.
+  // SHAPE-CONFIRM (Slice 3): refine against commands/sandbox.rs.
+  rpc CreateSandboxTree(CreateSandboxTreeRequest) returns (CreateSandboxTreeResponse) {
+    option (atomic.execution_scope) = EXECUTION_SCOPE_LOCAL;
+    option (atomic.required_capability) = "sandbox.create";
+    option (atomic.required_capability) = "working-copy.write";
+    option (atomic.allowed_caller) = CALLER_CLASS_LOCAL;
+    option (atomic.effect) = RPC_EFFECT_REPOSITORY_READ;
+    option (atomic.effect) = RPC_EFFECT_WORKSPACE_WRITE;
+    option (atomic.effect) = RPC_EFFECT_DAEMON_WRITE;
+  }
+  rpc StageSandboxImage(StageSandboxImageRequest) returns (StageSandboxImageResponse) {
+    option (atomic.execution_scope) = EXECUTION_SCOPE_LOCAL;
+    option (atomic.required_capability) = "sandbox.create";
+    option (atomic.required_capability) = "working-copy.read";
+    option (atomic.required_capability) = "working-copy.write";
+    option (atomic.allowed_caller) = CALLER_CLASS_LOCAL;
+    option (atomic.effect) = RPC_EFFECT_REPOSITORY_READ;
+    option (atomic.effect) = RPC_EFFECT_WORKSPACE_READ;
+    option (atomic.effect) = RPC_EFFECT_WORKSPACE_WRITE;
+    option (atomic.effect) = RPC_EFFECT_EXTERNAL_IO;
+    option (atomic.effect) = RPC_EFFECT_DAEMON_WRITE;
+  }
+  rpc SealSandboxImage(SealSandboxImageRequest) returns (SealSandboxImageResponse) {
+    option (atomic.execution_scope) = EXECUTION_SCOPE_LOCAL;
+    option (atomic.required_capability) = "sandbox.create";
+    option (atomic.required_capability) = "working-copy.read";
+    option (atomic.required_capability) = "working-copy.write";
+    option (atomic.allowed_caller) = CALLER_CLASS_LOCAL;
+    option (atomic.effect) = RPC_EFFECT_REPOSITORY_READ;
+    option (atomic.effect) = RPC_EFFECT_WORKSPACE_READ;
+    option (atomic.effect) = RPC_EFFECT_WORKSPACE_WRITE;
+    option (atomic.effect) = RPC_EFFECT_EXTERNAL_IO;
+    option (atomic.effect) = RPC_EFFECT_DAEMON_WRITE;
+  }
+
+  // ————— data ops (BOTH deployments; sandbox = token's view only) —————
+  // Sandbox callers take repository + stable view from their pointer file (which
+  // carries the RepositoryRef returned by OpenSandbox — a sandbox has no
+  // local .atomic to read it from). The server cross-checks the sandbox
+  // token's grant binding: a token bound to a different repository or view
+  // → FORBIDDEN. The repository named by the request and the repository the
+  // token was minted for must be the same.
+
+  // The legacy surface's only multi-frame response → server streaming.
+  // Entries stream first; the summary frame carries snapshot hash, entry
+  // count, and the skeleton so the sandbox can cache without a second
+  // round trip.
+  rpc Materialize(MaterializeRequest) returns (stream MaterializeFrame) {
+    option (atomic.execution_scope) = EXECUTION_SCOPE_BOTH;
+    option (atomic.required_capability) = "sandbox.read";
+    option (atomic.allowed_caller) = CALLER_CLASS_LOCAL;
+    option (atomic.allowed_caller) = CALLER_CLASS_REMOTE_IDENTITY;
+    option (atomic.allowed_caller) = CALLER_CLASS_SANDBOX;
+    option (atomic.effect) = RPC_EFFECT_REPOSITORY_READ;
+  }
+  rpc GetFileStates(GetFileStatesRequest) returns (GetFileStatesResponse) {
+    option (atomic.execution_scope) = EXECUTION_SCOPE_BOTH;
+    option (atomic.required_capability) = "sandbox.read";
+    option (atomic.allowed_caller) = CALLER_CLASS_LOCAL;
+    option (atomic.allowed_caller) = CALLER_CLASS_REMOTE_IDENTITY;
+    option (atomic.allowed_caller) = CALLER_CLASS_SANDBOX;
+    option (atomic.effect) = RPC_EFFECT_REPOSITORY_READ;
+  }
+  rpc GetChanges(GetChangesRequest) returns (GetChangesResponse) {
+    option (atomic.execution_scope) = EXECUTION_SCOPE_BOTH;
+    option (atomic.required_capability) = "sandbox.read";
+    option (atomic.allowed_caller) = CALLER_CLASS_LOCAL;
+    option (atomic.allowed_caller) = CALLER_CLASS_REMOTE_IDENTITY;
+    option (atomic.allowed_caller) = CALLER_CLASS_SANDBOX;
+    option (atomic.effect) = RPC_EFFECT_REPOSITORY_READ;
+  }
+  rpc PublishProvenance(PublishProvenanceRequest) returns (PublishProvenanceResponse) {
+    option (atomic.execution_scope) = EXECUTION_SCOPE_BOTH;
+    option (atomic.required_capability) = "provenance.write";
+    option (atomic.allowed_caller) = CALLER_CLASS_LOCAL;
+    option (atomic.allowed_caller) = CALLER_CLASS_REMOTE_IDENTITY;
+    option (atomic.allowed_caller) = CALLER_CLASS_SANDBOX;
+    option (atomic.effect) = RPC_EFFECT_REPOSITORY_WRITE;
+  }
+  // Publishes only into the authorized view and its vault overlay. No host
+  // materialization, current-view switch, sibling/ancestor vault replacement,
+  // or implicit promotion. expected_snapshot fences the effective perspective. A
+  // VIEW_STALE refusal CARRIES A LIVE SKELETON — recovery costs the round
+  // trip already being made; never make the sandbox ask again for a state it
+  // was just told is stale.
+  rpc SubmitChange(SubmitChangeRequest) returns (SubmitChangeResponse) {
+    option (atomic.execution_scope) = EXECUTION_SCOPE_BOTH;
+    option (atomic.required_capability) = "sandbox.submit";
+    option (atomic.allowed_caller) = CALLER_CLASS_LOCAL;
+    option (atomic.allowed_caller) = CALLER_CLASS_REMOTE_IDENTITY;
+    option (atomic.allowed_caller) = CALLER_CLASS_SANDBOX;
+    option (atomic.effect) = RPC_EFFECT_REPOSITORY_WRITE;
+  }
+}

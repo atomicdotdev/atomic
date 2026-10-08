@@ -1,0 +1,32 @@
+// atomic-protocol — pagination.
+//
+// DRAFT — add-only.
+//
+// The frozen-provenance cursor {seq, offset} (verified against the
+// provenance store source)
+// is the first concrete instance of this primitive: `seq` indexes the journal
+// envelope, `offset` the byte position within it — so one envelope larger
+// than a page budget is reassembled client-side from fragments, with strict
+// continuity validation (append_frozen_page). Every future paginated read
+// (Log, ListAttestations, vault listings, Replay...) uses the same cursor
+// message rather than growing per-op cursor types.
+
+syntax = "proto3";
+
+package atomic;
+
+// Opaque-ish cursor: `seq` selects an item (envelope/log entry/...), `offset`
+// a position inside it when items span pages. Servers issue cursors; clients
+// treat them as opaque and echo them back for the next page.
+message PageCursor {
+  uint64 seq = 1;
+  uint64 offset = 2;
+}
+
+// Client-side page budget request. Servers clamp to the negotiated limits
+// (GetCapabilities.limits) and always return the next cursor, if more data
+// remains.
+message PageBudget {
+  optional uint32 max_items = 1;
+  optional uint32 max_bytes = 2;
+}

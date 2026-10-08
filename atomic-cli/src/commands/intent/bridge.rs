@@ -195,6 +195,33 @@ pub enum Attestation {
     Stale(Box<CanonicalNode>),
 }
 
+/// The RAW attestation sources the dual-read consults — the tracked vault
+/// entry's bytes plus the legacy sidecar candidate's text. The wire
+/// carries exactly these (the GetVaultEntry bundle), so the classification
+/// below runs in ONE place over identical inputs whether they were read
+/// in-process or fetched over the service layer.
+pub struct AttestationSources {
+    /// The tracked `attestations/<sanitized-id>/attested.md` entry, with
+    /// its vault path (the malformed-entry warning names it).
+    pub tracked: Option<TrackedAttestation>,
+    /// The first EXISTING legacy sidecar candidate's path and text.
+    pub sidecar: Option<SidecarArtifact>,
+}
+
+/// The tracked attestation entry's raw bytes.
+pub struct TrackedAttestation {
+    pub vault_path: String,
+    pub frontmatter_json: String,
+    pub content: Vec<u8>,
+}
+
+/// The legacy sidecar candidate's raw text, with its path (the
+/// unreadable-sidecar warnings name it).
+pub struct SidecarArtifact {
+    pub path: String,
+    pub text: String,
+}
+
 /// Load an intent's attestation sidecar and classify it against the current
 /// source (`inputs`). A missing sidecar is `None`; a corrupt/malformed one is
 /// treated as `None` with a warning (so a read still works on the raw node).
@@ -205,16 +232,55 @@ pub fn load_attestation(
     id: &str,
     inputs: &LiftInputs,
 ) -> CliResult<Attestation> {
-    // 1) Tracked vault entry (new authoritative source). The body is the pretty
-    //    JSON-LD node (+ a trailing '\n'); parse it straight to a CanonicalNode.
+    // 1) Tracked vault entry (new authoritative source). The body is the
+    //    pretty JSON-LD node (+ a trailing '\n'); the classification parses
+    //    it straight to a CanonicalNode.
     let vpath = attestation_vault_path(repo, id)?;
-    if let Some(entry) = repo.vault_retrieve(&vpath).map_err(CliError::Repository)? {
-        let raw = String::from_utf8_lossy(&entry.content_bytes);
+    let tracked = repo
+        .vault_retrieve(&vpath)
+        .map_err(CliError::Repository)?
+        .map(|entry| TrackedAttestation {
+            vault_path: vpath.clone(),
+            frontmatter_json: entry.frontmatter_json,
+            content: entry.content_bytes,
+        });
+    // 2) Legacy sidecar fallback (pre-upgrade attestations). Probe the
+    //    normalized-id path first (what the current `attest` writes), then
+    //    the raw-arg path an M1a-era build used (it sanitized the RAW CLI
+    //    arg without normalizing), so a sidecar written via `attest 1` /
+    //    `attest pimo-1` is still found after upgrade regardless of the id
+    //    form (critic #4).
+    let sidecar = attested_sidecar_candidates(repo, id)?
+        .into_iter()
+        .find(|candidate| candidate.exists())
+        .and_then(|path| {
+            std::fs::read_to_string(&path)
+                .ok()
+                .map(|text| SidecarArtifact {
+                    path: path.display().to_string(),
+                    text,
+                })
+        });
+    Ok(classify_attestation(
+        AttestationSources { tracked, sidecar },
+        inputs,
+    ))
+}
+
+/// The dual-read classification, pure over its inputs: the tracked entry
+/// parses to a `CanonicalNode` and its `sourceContentHash` anchor decides
+/// fresh vs stale; a malformed tracked entry warns and falls through to
+/// the sidecar; a missing or unreadable sidecar degrades to `None` with a
+/// warning. Both the local body (repo-read sources) and the routed path
+/// (wire-carried sources) run this SAME code.
+pub fn classify_attestation(sources: AttestationSources, inputs: &LiftInputs) -> Attestation {
+    if let Some(tracked) = sources.tracked {
+        let raw = String::from_utf8_lossy(&tracked.content);
         match serde_json::from_str::<CanonicalNode>(raw.trim_end()) {
             Ok(node) => {
                 // Staleness: prefer the frontmatter anchor `sourceContentHash`;
                 // frontmatter_json round-trips as a flat-scalar JSON object.
-                let recorded = serde_json::from_str::<Value>(&entry.frontmatter_json)
+                let recorded = serde_json::from_str::<Value>(&tracked.frontmatter_json)
                     .ok()
                     .and_then(|v| {
                         v.get("sourceContentHash")
@@ -222,39 +288,31 @@ pub fn load_attestation(
                             .map(str::to_owned)
                     });
                 let current = source_content_hash(inputs);
-                return Ok(match recorded {
+                return match recorded {
                     Some(h) if h == current => Attestation::Fresh(Box::new(node)),
                     _ => Attestation::Stale(Box::new(node)),
-                });
+                };
             }
             Err(e) => {
-                eprintln!("warning: ignoring malformed tracked attestation {vpath}: {e}");
+                eprintln!(
+                    "warning: ignoring malformed tracked attestation {}: {e}",
+                    tracked.vault_path
+                );
                 // fall through to the legacy sidecar
             }
         }
     }
-
-    // 2) Legacy sidecar fallback (pre-upgrade attestations). Probe the
-    //    normalized-id path first (what the current `attest` writes), then the
-    //    raw-arg path an M1a-era build used (it sanitized the RAW CLI arg without
-    //    normalizing), so a sidecar written via `attest 1` / `attest pimo-1` is
-    //    still found after upgrade regardless of the id form (critic #4).
-    let path = match attested_sidecar_candidates(repo, id)?
-        .into_iter()
-        .find(|p| p.exists())
-    {
-        Some(p) => p,
-        None => return Ok(Attestation::None),
+    let Some(sidecar) = sources.sidecar else {
+        return Attestation::None;
     };
-    let raw = std::fs::read_to_string(&path).map_err(CliError::Io)?;
-    let artifact: Value = match serde_json::from_str(&raw) {
+    let artifact: Value = match serde_json::from_str(&sidecar.text) {
         Ok(v) => v,
         Err(e) => {
             eprintln!(
                 "warning: ignoring unreadable attestation sidecar {}: {e}",
-                path.display()
+                sidecar.path
             );
-            return Ok(Attestation::None);
+            return Attestation::None;
         }
     };
     let node_val = match artifact.get("node") {
@@ -262,9 +320,9 @@ pub fn load_attestation(
         None => {
             eprintln!(
                 "warning: attestation sidecar {} has no 'node' — ignoring",
-                path.display()
+                sidecar.path
             );
-            return Ok(Attestation::None);
+            return Attestation::None;
         }
     };
     let node: CanonicalNode = match serde_json::from_value(node_val) {
@@ -272,9 +330,9 @@ pub fn load_attestation(
         Err(e) => {
             eprintln!(
                 "warning: ignoring malformed attestation node in {}: {e}",
-                path.display()
+                sidecar.path
             );
-            return Ok(Attestation::None);
+            return Attestation::None;
         }
     };
     let recorded = artifact
@@ -283,8 +341,8 @@ pub fn load_attestation(
         .and_then(Value::as_str);
     let current = source_content_hash(inputs);
     match recorded {
-        Some(h) if h == current => Ok(Attestation::Fresh(Box::new(node))),
-        _ => Ok(Attestation::Stale(Box::new(node))),
+        Some(h) if h == current => Attestation::Fresh(Box::new(node)),
+        _ => Attestation::Stale(Box::new(node)),
     }
 }
 

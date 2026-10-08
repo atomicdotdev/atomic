@@ -850,6 +850,21 @@ pub fn decode_change_file_key(key: &[u8; 36]) -> ([u8; 32], u32) {
 }
 
 // Key Encoding Helpers
+//
+// Endianness. A key that gets range-scanned is big-endian, so its bytes sort
+// in the same order as the numbers they encode — that is what makes a
+// `range(lo..=hi)` over these tables mean what it says (e.g. every row for
+// one inode: `encode_inode_vertex(inode, 0, 0, 0)` through
+// `encode_inode_vertex(inode, u64::MAX, u64::MAX, u64::MAX)`). A value that is
+// only ever looked up by its exact key can be little-endian; sorting never
+// happens, so byte order costs nothing. That covers the serialized graph edge
+// and the CRDT trunk/branch/leaf ids, which are opaque and point-looked-up
+// (`crdt::tables`).
+//
+// The two rules meet in files that handle both, so match the writer rather
+// than the neighbours: decode an id with that type's own `from_bytes`
+// (`TrunkId`, `BranchId`, `LeafId`) rather than slicing bytes by hand, and the
+// two sides cannot drift.
 
 /// Encode a span as 24 bytes for use as a graph key
 #[inline]

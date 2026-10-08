@@ -48,6 +48,12 @@ pub struct Materialize {
 
 impl Command for Materialize {
     fn run(&self) -> CliResult<()> {
+        // Route every form through the service layer (the handler runs the
+        // same vault_materialize/_all domain calls).
+        if crate::commands::rpc::vault_materialize(self)? {
+            return Ok(());
+        }
+
         let root = find_repository_root()?;
         let repo = Repository::open(&root).map_err(CliError::Repository)?;
 

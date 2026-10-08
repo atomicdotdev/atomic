@@ -16,6 +16,7 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::anyhow;
 use clap::{Args, Subcommand, ValueEnum};
@@ -794,13 +795,15 @@ fn pending_turn_number(session: &AgentSession) -> u32 {
     }
 }
 
-fn owner_sink(dot_dir: &Path) -> CliResult<super::owner::OwnerJournalSink> {
+/// The journal sink for lifecycle transitions: the daemon's RPC sink
+/// (D4 start-or-retry — the daemon is the only repository journal writer).
+fn journal_sink(dot_dir: &Path) -> CliResult<Arc<dyn ProvenanceJournalSink>> {
     let root = dot_dir.parent().ok_or_else(|| {
         CliError::Internal(anyhow!(
             "canonical .atomic directory has no repository parent"
         ))
     })?;
-    Ok(super::owner::OwnerJournalSink::new(root))
+    Ok(super::provenance_rpc::sink_for(root))
 }
 
 fn map_stop_cause(cause: JournalStopCauseWire) -> JournalStopCause {
@@ -821,7 +824,7 @@ fn stop_lifecycle_turns(
     resumable: bool,
     observed_at: i64,
 ) -> CliResult<()> {
-    let sink = owner_sink(dot_dir)?;
+    let sink = journal_sink(dot_dir)?;
     for session in sessions_for_run(dot_dir, &lifecycle.run_id) {
         sink.stop_turn(
             &session.session_id,
@@ -836,7 +839,7 @@ fn stop_lifecycle_turns(
 }
 
 fn resume_lifecycle_turns(dot_dir: &Path, lifecycle: &ManagedLifecycle, now: i64) -> CliResult<()> {
-    let sink = owner_sink(dot_dir)?;
+    let sink = journal_sink(dot_dir)?;
     for session in sessions_for_run(dot_dir, &lifecycle.run_id) {
         sink.resume_turn(&session.session_id, pending_turn_number(&session), now)
             .map_err(|reason| CliError::Internal(anyhow!(reason)))?;
@@ -849,7 +852,7 @@ fn abandon_lifecycle_turns(
     lifecycle: &ManagedLifecycle,
     now: i64,
 ) -> CliResult<()> {
-    let sink = owner_sink(dot_dir)?;
+    let sink = journal_sink(dot_dir)?;
     for session in sessions_for_run(dot_dir, &lifecycle.run_id) {
         sink.abandon_turn(&session.session_id, pending_turn_number(&session), now)
             .map_err(|reason| CliError::Internal(anyhow!(reason)))?;
@@ -861,7 +864,7 @@ fn collect_lifecycle_turn_statuses(
     dot_dir: &Path,
     lifecycles: &[ManagedLifecycle],
 ) -> CliResult<Vec<LifecycleTurnStatus>> {
-    let sink = owner_sink(dot_dir)?;
+    let sink = journal_sink(dot_dir)?;
     let mut result = Vec::new();
     for lifecycle in lifecycles {
         for session in sessions_for_run(dot_dir, &lifecycle.run_id) {

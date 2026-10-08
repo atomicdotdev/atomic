@@ -30,6 +30,10 @@ atomic-identity = { workspace = true }
 atomic-objects = { workspace = true }
 atomic-remote = { workspace = true }
 atomic-repository = { workspace = true }
+libatomic = { workspace = true }
+atomic-client = { workspace = true }
+tonic = { workspace = true }
+prost-types = { workspace = true }
 atomic-semantic = { workspace = true }
 atomic-teams = { workspace = true, optional = true }
 
@@ -42,6 +46,8 @@ console = { workspace = true }
 
 # Async runtime
 tokio = { workspace = true }
+tokio-stream = { workspace = true }
+futures-core = "0.3"
 
 # Error handling
 anyhow = { workspace = true }
@@ -89,5 +95,6 @@ git2 = { workspace = true }
 windows-sys = { version = "0.61", features = ["Win32_Foundation"] }
 
 [dev-dependencies]
+tokio-stream = { workspace = true, features = ["net"] }
 tempfile = { workspace = true }
 serial_test = { workspace = true }

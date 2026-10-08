@@ -406,6 +406,10 @@ impl Command for Add {
     /// - A file is inside .atomic/
     /// - A database error occurs
     fn run(&self) -> CliResult<()> {
+        if crate::commands::rpc::add(self)? {
+            return Ok(());
+        }
+
         // Find the repository root
         let repo_root = find_repository_root()?;
 

@@ -989,6 +989,13 @@ impl Command for Pull {
     /// - Network operations fail
     /// - Changes fail to download or save
     fn run(&self) -> CliResult<()> {
+        // Route every form through the service layer: the handler performs
+        // the network sync, the applies, and the verification; the CLI
+        // renders the local pull body's lines from the report.
+        if crate::commands::rpc::pull(self)? {
+            return Ok(());
+        }
+
         // Create a runtime for async operations
         let rt = tokio::runtime::Runtime::new().map_err(|e| {
             CliError::Internal(anyhow::anyhow!("Failed to create async runtime: {}", e))

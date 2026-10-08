@@ -1,0 +1,258 @@
+// atomic-protocol — RepositoryMutationService: working-copy and change-graph
+// mutations.
+//
+// DRAFT — add-only. Every mutation carries RequestMeta (idempotency key) and
+// an ExpectedState precondition where the caller knows prior state (RFC
+// 2.2/2.3: expected-Merkle/sequence preconditions on mutating operations —
+// the fencing pattern generalized from provenance to ALL mutations).
+// Mutations commit their repository event to the outbox in the SAME write
+// transaction (RFC D8). Writes queue per repository (bounded FIFO); the
+// working-copy mutations additionally hold the workspace mutation lease
+// (lock order: workspace lease → write-queue permit → redb write txn).
+
+syntax = "proto3";
+
+package atomic;
+
+import "google/protobuf/timestamp.proto";
+import "atomic/common/common.proto";
+import "atomic/common/change.proto";   // ChangeInfo, ConflictInfo
+
+
+
+message AddFilesRequest {
+  RepositoryRef repository = 1;
+  RequestMeta meta = 2;
+  repeated string paths = 3;         // working-copy paths
+  optional ExpectedState expected = 4;
+  bool dry_run = 5;                  // report what would be tracked; no mutation
+  bool force = 6;                    // add even ignored paths
+  bool directory = 7;                // explicit directory tracking
+  bool no_recursive = 8;             // directories without their contents
+}
+message AddFilesResponse {
+  uint32 tracked = 1;
+  // Dry-run / tolerant report: what would be tracked, what was skipped
+  // (already tracked / ignored) and what could not be added, per path.
+  repeated string would_add = 2;
+  repeated string skipped_tracked = 3;
+  repeated string skipped_ignored = 4;
+  repeated string failed_paths = 5;
+  bool dry_run = 6;
+  ResponseMeta meta = 100;
+}
+
+message RemoveFilesRequest {
+  RepositoryRef repository = 1;
+  RequestMeta meta = 2;
+  repeated string paths = 3;
+  bool keep_working_copy = 4;        // `--keep`
+  bool dry_run = 5;                  // report what would be untracked; no mutation
+  bool force = 6;                    // remove even with uncommitted edits
+}
+message RemoveFilesResponse {
+  uint32 removed = 1;
+  ResponseMeta meta = 100;
+}
+
+message MoveFileRequest {
+  RepositoryRef repository = 1;
+  RequestMeta meta = 2;
+  string source = 3;
+  string destination = 4;
+  bool dry_run = 5;                  // validate only; no disk move
+  bool force = 6;                    // overwrite an existing destination
+}
+message MoveFileResponse { ResponseMeta meta = 100; }
+
+message RestoreRequest {
+  RepositoryRef repository = 1;
+  RequestMeta meta = 2;
+  repeated string paths = 3;         // empty = whole tree
+  bool force = 4;
+  reserved 5; // preview is read-only RepositoryQueryService.PreviewRestore
+}
+message RestoreResponse {
+  repeated string restored = 1;
+  ResponseMeta meta = 100;
+}
+
+message RecordRequest {
+  RepositoryRef repository = 1;
+  RequestMeta meta = 2;
+  string message = 3;
+  repeated string paths = 4;        // empty = tracked-files snapshot
+  optional ExpectedState expected = 5; // required matching view_snapshot;
+  // snapshot.view must equal this workspace's current view when publishing.
+  // Authorship override: an explicit author, or a named identity from the
+  // serving host's identity store. Absent → the host's default identity.
+  optional Author author = 6;
+  optional string identity_name = 7;
+}
+message RecordResponse {
+  ChangeInfo change = 1;
+  optional Hash view_merkle = 2;      // post-record state for the next
+                                      // expected-state precondition
+  optional string view = 3;           // view the change landed on (add-only)
+  ResponseMeta meta = 100;
+}
+
+message ReviseRequest {
+  RepositoryRef repository = 1;
+  RequestMeta meta = 2;
+  ChangeRef target = 3;
+  optional string reword_message = 4;  // `--reword`
+  optional ExpectedState expected = 5; // required matching view_snapshot
+  // The content-modification mode (add-only): `atomic revise` without
+  // --reword — re-capture the working copy into the target change. The
+  // stack surgery (unrecord → record → re-apply) is the domain's; the
+  // message/author compose client-side (editors are interactive).
+  optional ContentRevise content = 6;
+  // The `--author` override for the reword form (add-only).
+  optional Author author = 7;
+}
+// One content-mode revise (add-only): the new header message (composed
+// client-side from -m or the editor), an optional author override, and the
+// positional file filter.
+message ContentRevise {
+  string message = 1;
+  optional Author author = 2;    // `--author "Name <email>"`
+  repeated string paths = 3;     // the positional file filter
+}
+message ReviseResponse {
+  ChangeInfo change = 1;
+  ResponseMeta meta = 100;
+}
+
+message InsertChangesRequest {
+  RepositoryRef repository = 1;
+  RequestMeta meta = 2;
+  // Bare CLI promotion resolves source and parent; the daemon has no caller cwd.
+  reserved 3, 8, 10, 11;
+  oneof source {
+    Hash single_change = 4;
+    string from_view = 5;
+    string up_to_tag = 6;
+    // The bare CLI promotion (`atomic insert`), add-only: the handler
+    // resolves the current view and its parent server-side — the CLI
+    // holds no repository handle, so source/target/missing and the
+    // shared-to-shared gate data come back in the response.
+    PromoteCurrentView promote_current_view = 18;
+    // Multi-pick (`insert change <ref>...`), add-only: raw change
+    // references (full base32 or unique prefix), each resolved with the
+    // insert resolver's semantics and applied with cherry-pick.
+    ChangeSet change_set = 19;
+    // A single raw change reference (`insert <ref>`), add-only: resolved
+    // like change_set's entries, applied with the single-insert
+    // semantics (the dependency closure rides apply_dependencies).
+    string single_ref = 20;
+  }
+  optional string target_view = 7; // display hint; must agree with target.view
+  bool allow_conflicts = 9;
+  ViewRef target = 12;
+  ViewSnapshot expected_snapshot = 13;
+  optional ViewSnapshot source_snapshot = 14; // required for from_view/tag
+  // Dependency closure is the default; false is the `--deps=false` escape
+  // hatch (single-change inserts without closure).
+  optional bool apply_dependencies = 15;
+  // Preview the plan without inserting (add-only): the handler runs the
+  // same domain call with its dry-run flag and returns what the local
+  // preview prints; nothing is applied and the working copy is untouched.
+  optional bool dry_run = 16;
+  // The `insert tag --from-view` override (add-only): the source view for
+  // the up_to_tag arm; absent = the repository's current view (the CLI
+  // default the arm already carried).
+  optional string tag_from_view = 17;
+}
+// The bare promotion's source arm (add-only): everything resolves from
+// the repository — source = the current view, target = its parent unless
+// the request's target_view overrides it.
+message PromoteCurrentView {}
+// The multi-pick source (add-only): the raw change references, in the
+// order the caller named them.
+message ChangeSet {
+  repeated string changes = 1;
+}
+message InsertChangesResponse {
+  repeated ChangeInfo inserted = 1;
+  reserved 2;
+  // The post-insert conflict listing (still on disk, per file), rendered
+  // by the CLI's conflict summary. Present regardless of the outcome
+  // flag: pre-existing conflicts surface here too.
+  repeated ConflictInfo conflicts = 3;
+  // The report fields the local bodies' renders need (add-only):
+  optional string resolved_source_view = 4;  // the arm's resolved source
+  optional string resolved_target_view = 5;  // explicit or default target
+  optional bool both_views_shared = 6;  // the promotion confirm gate
+  optional Hash resolved_change = 7;  // single-ref arms' resolved change
+  optional Hash new_state = 8;  // the target's post-insert state
+  uint32 skipped_count = 9;  // source changes already in the target
+  // Set when the handler refreshed the working copy (the insert landed
+  // on the current view): the materialize counts the CLI reports.
+  optional uint64 files_updated = 10;
+  optional uint64 directories_created = 11;
+  bool has_conflicts = 12;  // the insert outcome's own flag
+  ResponseMeta meta = 100;
+}
+
+message UnrecordRequest {
+  RepositoryRef repository = 1;
+  RequestMeta meta = 2;
+  reserved 3;
+  optional ExpectedState expected = 4;
+  ViewRef view = 5; // required; expected.kind must be matching view_snapshot
+  optional ChangeRef target = 6; // absent means last reference in this view
+}
+message UnrecordResponse {
+  optional ChangeInfo removed = 1;
+  reserved 2;
+  ResponseMeta meta = 100;
+}
+
+message CreateStashRequest {
+  RepositoryRef repository = 1;
+  RequestMeta meta = 2;
+  optional string message = 3;       // uncommitted work stashed onto an
+                                      // orphan view
+  // `atomic stash push -u` (add-only): include untracked files.
+  bool include_untracked = 4;
+  // `atomic stash push -k` (add-only): keep the working copy dirty.
+  bool keep = 5;
+}
+message CreateStashResponse {
+  string stash_id = 1;
+  ResponseMeta meta = 100;
+}
+
+message ApplyStashRequest {
+  RepositoryRef repository = 1;
+  RequestMeta meta = 2;
+  string stash_id = 3;
+  reserved 4; // CLI pop composes ApplyStash then explicit DropStash
+}
+message ApplyStashResponse {
+  repeated string applied = 1;
+  ResponseMeta meta = 100;
+}
+
+message ListStashesRequest {
+  RepositoryRef repository = 1;
+}
+message ListStashesResponse {
+  repeated StashInfo stashes = 1;
+}
+message StashInfo {
+  string id = 1;
+  optional string message = 2;
+  optional google.protobuf.Timestamp created_at = 3;
+  optional Hash tree = 4;
+  // SHAPE-CONFIRM: orphan-view stash details from commands/stash.rs.
+}
+
+message DropStashRequest {
+  RepositoryRef repository = 1;
+  RequestMeta meta = 2;
+  optional string stash_id = 3;      // absent + all = `stash clear`
+  bool all = 4;
+}
+message DropStashResponse { ResponseMeta meta = 100; }

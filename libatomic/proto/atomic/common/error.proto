@@ -1,0 +1,83 @@
+// atomic-protocol — the stable error model.
+//
+// DRAFT — add-only. Enum values 28+ reserved: enum numbers are never reused.
+//
+// Vocabulary provenance:
+//  * legacy agent journal protocol (verified in source, 2026-10-01):
+//    "unsupported-version", "provenance-store", "provenance-checkpoint",
+//    "provenance-lifecycle".
+//  * sandbox branch per HANDOFF §4/§5 (Aaron's unmerged feat/remote-sandboxes):
+//    unauthorized, forbidden, view, repository, provenance, changes, submit,
+//    file-states, materialize, sandbox-token, remote, internal.
+//  * RFC D7/capability section: CAPABILITY_UNAVAILABLE, WORKSPACE_REQUIRED.
+//  * standard transport/domain classes, stable and machine-readable.
+//
+// Errors carry stable machine-readable codes plus actionable context
+// (HANDOFF §12). Transport-level failures use gRPC status with ErrorInfo as
+// the detail payload; domain refusals that must carry recovery payloads
+// (e.g. a stale-view skeleton) travel inside the response message as oneof
+// outcomes, not as transport errors.
+
+syntax = "proto3";
+
+package atomic;
+
+enum ErrorCode {
+  ERROR_CODE_UNSPECIFIED = 0;
+
+  // — capability & negotiation —
+  ERROR_CODE_CAPABILITY_UNAVAILABLE = 1;   // endpoint lacks a declared capability (RFC)
+  ERROR_CODE_PROTOCOL_VERSION_MISMATCH = 2; // legacy "unsupported-version"; fails hard both directions
+  ERROR_CODE_WORKSPACE_REQUIRED = 3;       // working-copy op without a workspace id (RFC)
+
+  // — authentication & authorization —
+  ERROR_CODE_UNAUTHORIZED = 4;              // no/invalid credentials (sandbox branch)
+  ERROR_CODE_FORBIDDEN = 5;                 // authenticated but not allowed (sandbox branch)
+  ERROR_CODE_SANDBOX_TOKEN = 6;             // invalid/expired/revoked sandbox token (sandbox branch)
+
+  // — idempotency & preconditions —
+  ERROR_CODE_IDEMPOTENCY_MISMATCH = 7;      // request-ID echo mismatch (replay detection)
+  ERROR_CODE_PRECONDITION_FAILED = 8;       // expected Merkle/sequence mismatch
+  ERROR_CODE_GENERATION_CONFLICT = 9;       // provenance generation fencing mismatch (legacy "provenance-store" fencing flavor)
+
+  // — resource & request validity —
+  ERROR_CODE_INVALID_ARGUMENT = 10;
+  ERROR_CODE_NOT_FOUND = 11;                // change/view/tag/entity missing
+  ERROR_CODE_REPOSITORY = 12;               // repository-level failure (sandbox branch code)
+  ERROR_CODE_REPOSITORY_NOT_FOUND = 13;
+  ERROR_CODE_RESOURCE_EXHAUSTED = 14;       // limits: write queue full, message too large
+  ERROR_CODE_RATE_LIMITED = 15;
+
+  // — view & change semantics —
+  ERROR_CODE_VIEW = 16;                     // view not visible to caller (sandbox branch)
+  ERROR_CODE_VIEW_STALE = 17;               // effective snapshot mismatch (carries skeleton)
+  ERROR_CODE_CHANGE_REJECTED = 18;          // sandbox "submit" refusal
+
+  // — provenance journal (store-domain codes, verified in the legacy surface) —
+  ERROR_CODE_PROVENANCE_STORE = 19;         // journal reserve/append failures
+  ERROR_CODE_PROVENANCE_CHECKPOINT = 20;    // prepare/load/bind/acknowledge failures
+  ERROR_CODE_PROVENANCE_LIFECYCLE = 21;     // stop/resume/abandon/status failures
+
+  // — sandbox data ops (sandbox branch codes) —
+  ERROR_CODE_PROVENANCE = 22;               // sandbox provenance publication
+  ERROR_CODE_CHANGES = 23;                  // change fetch/landing
+  ERROR_CODE_FILE_STATES = 24;              // sandbox file-state slice
+  ERROR_CODE_MATERIALIZE = 25;              // materialize failures
+
+  // — remote & transport —
+  ERROR_CODE_REMOTE = 26;                   // remote/iroh dialing failures (sandbox branch)
+  ERROR_CODE_INTERNAL = 27;                 // legacy journal protocol + sandbox branch; server bug
+
+  reserved 28 to 999; // add-only headroom; numbers are never reused
+}
+
+// The machine-readable error detail attached to a failure. `context` carries
+// operation-specific key/values (e.g. {"expected_generation": "3",
+// "actual_generation": "4"}); contract tests assert on code + context keys,
+// never on message prose.
+message ErrorInfo {
+  ErrorCode code = 1;
+  string message = 2;
+  map<string, string> context = 3;
+  optional string request_id = 4;  // echoed idempotency key when known
+}

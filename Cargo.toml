@@ -4,6 +4,7 @@ members = [
     "atomic-agent",
     "atomic-canonical",
     "atomic-cli",
+    "atomic-client",
     "atomic-core",
     "atomic-config",
     "atomic-identity",
@@ -12,6 +13,8 @@ members = [
     "atomic-repository",
     "atomic-semantic",
     "atomic-teams",
+    "atomic-wasm",
+    "libatomic",
 ]
 
 [workspace.package]
@@ -27,6 +30,7 @@ rust-version = "1.90"
 # Core
 atomic-agent = { path = "atomic-agent" }
 atomic-canonical = { path = "atomic-canonical" }
+atomic-client = { path = "atomic-client" }
 atomic-core = { path = "atomic-core" }
 atomic-config = { path = "atomic-config" }
 atomic-identity = { path = "atomic-identity" }
@@ -35,6 +39,18 @@ atomic-remote = { path = "atomic-remote" }
 atomic-repository = { path = "atomic-repository" }
 atomic-semantic = { path = "atomic-semantic" }
 atomic-teams = { path = "atomic-teams" }
+libatomic = { path = "libatomic" }
+
+# gRPC (one contract, many transports)
+tonic = "0.12"
+prost = "0.13"
+prost-types = "0.13"
+tonic-build = "0.12"
+protox = "0.7"
+tokio-stream = "0.1"
+tower = "0.4"
+libc = "0.2"
+hyper-util = { version = "0.1", features = ["tokio"] }
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }

@@ -54,6 +54,17 @@ pub enum SandboxCommands {
 
 impl Command for Sandbox {
     fn run(&self) -> CliResult<()> {
+        // Route every form through the service layer: the handler runs the
+        // same domain calls (view creation, copy-on-write provisioning,
+        // OCI stage/seal) and the CLI renders the local reports.
+        let routed = match &self.command {
+            SandboxCommands::Create(cmd) => crate::commands::rpc::sandbox_create(cmd)?,
+            SandboxCommands::Stage(cmd) => crate::commands::rpc::sandbox_stage(cmd)?,
+            SandboxCommands::Seal(cmd) => crate::commands::rpc::sandbox_seal(cmd)?,
+        };
+        if routed {
+            return Ok(());
+        }
         match &self.command {
             SandboxCommands::Create(cmd) => cmd.run(),
             SandboxCommands::Stage(cmd) => cmd.run(),

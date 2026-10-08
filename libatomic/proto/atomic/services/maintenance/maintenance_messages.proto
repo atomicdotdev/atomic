@@ -1,0 +1,102 @@
+// atomic-protocol — MaintenanceService: repository repair and consistency.
+//
+// DRAFT — add-only. `atomic doctor` folds into Repair (the
+// mutating actions) and CheckRepository (the read-only consistency check,
+// split out per the read/write principle — a check never gates on a
+// mutation or enters the write queue; see COVERAGE §9). ReindexWorkspace is
+// the separate explicit file-index mutation formerly hidden in Status.
+
+syntax = "proto3";
+
+package atomic;
+
+import "atomic/common/common.proto";
+
+message CompactDatabaseRequest {
+  RepositoryRef repository = 1;
+  // Correlates this physical maintenance attempt. Unlike logical mutations,
+  // compaction is repeatable, without a durable replay receipt (CONTRACT.md).
+  RequestMeta meta = 2;
+}
+message CompactDatabaseResponse {
+  // Canonical physical path, available only to local administrative callers.
+  string database = 1;
+  uint64 before_bytes = 2;
+  uint64 after_bytes = 3;
+  uint64 reclaimed_bytes = 4;
+  ResponseMeta meta = 100;
+}
+
+
+
+enum RepairAction {
+  REPAIR_ACTION_UNSPECIFIED = 0;
+  REPAIR_ACTION_REBUILD_DEPENDENCY_INDEX = 1;   // CHANGE_DEPS rebuild
+  REPAIR_ACTION_MATERIALIZE_CRDT = 2;           // CRDT tables from FileOps
+  reserved 3;                                   // was CONSISTENCY_CHECK —
+                                                 // split to CheckRepository
+  REPAIR_ACTION_REINDEX_WORKING_COPY = 4;       // `status --reindex`
+}
+message RepairRequest {
+  RepositoryRef repository = 1;
+  RequestMeta meta = 2;
+  RepairAction action = 3;
+  // --force on the CLI verb: re-index / re-apply even when rows exist.
+  bool force = 4;
+  // View for MATERIALIZE_CRDT (defaults to the current view server-side).
+  string view = 5;
+}
+// Why FileOps were not materialized (mirrors CrdtMaterializeSkipStats).
+message CrdtSkipStats {
+  uint64 non_create_trunk = 1;
+  uint64 unresolved_path = 2;
+  uint64 unresolved_line = 3;
+  uint64 missing_content_range = 4;
+  uint64 non_insert_branch = 5;
+  uint64 non_insert_leaf = 6;
+}
+message RepairResponse {
+  repeated string findings = 1;
+  // The headline count: changes indexed (dep-index repair) or changes
+  // applied (CRDT materialize).
+  uint64 repaired = 2;
+  // REBUILD_DEPENDENCY_INDEX render data.
+  uint64 indexed = 3;
+  uint64 skipped = 4;
+  uint64 failed = 5;
+  // MATERIALIZE_CRDT render data (mirrors CrdtMaterializeOutcome).
+  uint64 changes_scanned = 6;
+  uint64 changes_applied = 7;
+  uint64 file_ops_applied = 8;
+  uint64 file_ops_already_materialized = 9;
+  uint64 file_ops_skipped = 10;
+  uint64 elapsed_ms = 11;
+  uint64 trunks_created = 12;
+  uint64 branches_created = 13;
+  uint64 leaves_created = 14;
+  CrdtSkipStats skip_stats = 15;
+  repeated string skip_samples = 16;
+  // REINDEX_WORKING_COPY render data.
+  uint64 reindexed = 17;
+  ResponseMeta meta = 100;
+}
+message CheckRepositoryRequest {
+  RepositoryRef repository = 1;
+}
+message CheckRepositoryResponse {
+  repeated string findings = 1;
+  bool consistent = 2;
+  // Render data mirroring VerifyReport.
+  uint64 clean_files_checked = 3;
+  uint64 uncommitted_skipped = 4;
+  uint64 conflicted_files = 5;
+}
+
+message ReindexWorkspaceRequest {
+  RepositoryRef repository = 1; // workspace_id required
+  RequestMeta meta = 2;
+}
+message ReindexWorkspaceResponse {
+  uint64 indexed = 1;
+  ResponseMeta meta = 100;
+}

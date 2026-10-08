@@ -244,7 +244,10 @@ pub(crate) fn build_hunks_from_diff(
 /// Uses ANSI escape codes to highlight changed tokens:
 /// - Deletions: bright red text on light red background
 /// - Insertions: bright green text on light green background
-pub(super) fn print_word_diff_line(
+///
+/// Shared by the local unified renderer and the service-layer hook's
+/// word-diff render (one render, two data sources).
+pub(crate) fn print_word_diff_line(
     content: &[u8],
     hunks: &[atomic_core::diff::ChangeHunk],
     is_deletion: bool,
@@ -289,7 +292,7 @@ pub(super) fn print_word_diff_line(
 /// + const result = calculateSum(a, b, c);     <- light green background
 ///                                   ^^^^      <- dark green: ", c" added
 /// ```
-pub(super) fn print_semantic_word_diff_line(token_changes: &[TokenChange<'_>], is_deletion: bool) {
+pub(crate) fn print_semantic_word_diff_line(token_changes: &[TokenChange<'_>], is_deletion: bool) {
     for tc in token_changes {
         match tc {
             TokenChange::Unchanged { token, .. } => {

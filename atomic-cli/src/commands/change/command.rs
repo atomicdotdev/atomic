@@ -75,6 +75,26 @@ pub struct ChangeCmd {
     pub full_hash: bool,
 }
 
+/// Everything the change renders need beyond the change itself: the causal
+/// decision graph(s) and (for `--show-deps`) dependency messages. The local
+/// path fetches these from the repository; the routed path gets them from
+/// the wire (GetChange's bundle + provenance ledger). One render either way.
+pub(crate) struct ChangeRenderData {
+    pub ledger_graphs: Vec<(Hash, ProvenanceGraph)>,
+    pub dep_messages: std::collections::HashMap<Hash, String>,
+}
+
+impl ChangeRenderData {
+    /// The local repository path. Dependency messages (for `--show-deps`)
+    /// are filled by the caller once the change's dependency list is known.
+    pub(crate) fn from_repo(repo: &Repository, hash: &Hash) -> Self {
+        Self {
+            ledger_graphs: repo.find_provenance_for_change(hash).unwrap_or_default(),
+            dep_messages: std::collections::HashMap::new(),
+        }
+    }
+}
+
 impl ChangeCmd {
     /// Create a new ChangeCmd with default settings.
     pub fn new() -> Self {
@@ -291,7 +311,7 @@ impl ChangeCmd {
         change: &Change,
         hash: &Hash,
         sequence: Option<u64>,
-        repo: &Repository,
+        data: &ChangeRenderData,
     ) -> String {
         let mut output = String::new();
         let hash_len = self.get_hash_length();
@@ -343,17 +363,9 @@ impl ChangeCmd {
             for dep_hash in &change.hashed.dependencies {
                 let dep_hash_str = format_hash_with_length(dep_hash, 12);
                 let dep_msg = if self.show_deps {
-                    repo.load_change(dep_hash)
-                        .ok()
-                        .map(|c| {
-                            c.hashed
-                                .header
-                                .message
-                                .lines()
-                                .next()
-                                .unwrap_or("")
-                                .to_string()
-                        })
+                    data.dep_messages
+                        .get(dep_hash)
+                        .cloned()
                         .unwrap_or_else(|| "[unable to load]".to_string())
                 } else {
                     String::new()
@@ -433,7 +445,7 @@ impl ChangeCmd {
         }
 
         // Change ledger (causal decision DAG from .provenance file)
-        output.push_str(&self.format_change_ledger(hash, repo));
+        output.push_str(&self.format_change_ledger(&data.ledger_graphs));
 
         output
     }
@@ -564,29 +576,20 @@ impl ChangeCmd {
     ///
     /// Displays the structured provenance graph stored in the `.provenance`
     /// file: goals, tool executions, explorations, commitments, and patch
-    /// proposals that led to this change.
-    fn format_change_ledger(&self, change_hash: &Hash, repo: &Repository) -> String {
+    /// proposals that led to this change. The graphs arrive from the render
+    /// data (repository or wire — one render either way).
+    fn format_change_ledger(&self, graphs: &[(Hash, ProvenanceGraph)]) -> String {
         let mut output = String::new();
 
-        let graphs = match repo.find_provenance_for_change(change_hash) {
-            Ok(g) if !g.is_empty() => g,
-            Ok(_) => {
-                output.push_str(&format!(
-                    "{}\n",
-                    hint("No provenance graph found for this change.")
-                ));
-                return output;
-            }
-            Err(e) => {
-                output.push_str(&format!(
-                    "{}\n",
-                    hint(&format!("Failed to load provenance: {}", e))
-                ));
-                return output;
-            }
-        };
+        if graphs.is_empty() {
+            output.push_str(&format!(
+                "{}\n",
+                hint("No provenance graph found for this change.")
+            ));
+            return output;
+        }
 
-        for (_graph_hash, graph) in &graphs {
+        for (_graph_hash, graph) in graphs {
             output.push_str(&format!("{}\n", emphasis("=== Change Ledger ===")));
             output.push_str(&format!("  Session: {}\n", info(&graph.session_id)));
             output.push_str(&format!(
@@ -659,21 +662,26 @@ impl ChangeCmd {
     /// `.provenance` file — for JSON output. Mirrors the `=== Change Ledger ===`
     /// section of the default text format. Missing/corrupt provenance is
     /// non-fatal: the ledger simply stays empty (and is omitted from the JSON).
-    fn load_json_ledger(&self, hash: &Hash, repo: &Repository) -> Vec<JsonChangeLedger> {
-        repo.find_provenance_for_change(hash)
-            .unwrap_or_default()
+    fn load_json_ledger(&self, graphs: &[(Hash, ProvenanceGraph)]) -> Vec<JsonChangeLedger> {
+        graphs
             .iter()
             .map(|(graph_hash, graph)| JsonChangeLedger::from_graph(graph_hash, graph))
             .collect()
     }
 
     /// Print the change in the configured format.
-    fn print_change(&self, change: &Change, hash: &Hash, sequence: Option<u64>, repo: &Repository) {
+    pub(crate) fn print_change(
+        &self,
+        change: &Change,
+        hash: &Hash,
+        sequence: Option<u64>,
+        data: &ChangeRenderData,
+    ) {
         let output = match self.format {
-            ChangeFormat::Default => self.format_default(change, hash, sequence, repo),
+            ChangeFormat::Default => self.format_default(change, hash, sequence, data),
             ChangeFormat::Short => self.format_short(change, hash, sequence),
             ChangeFormat::Json => {
-                let ledger = self.load_json_ledger(hash, repo);
+                let ledger = self.load_json_ledger(&data.ledger_graphs);
                 self.format_json(change, hash, sequence, ledger)
             }
         };
@@ -738,6 +746,10 @@ impl Command for ChangeCmd {
     /// - The change is not found
     /// - The hash prefix is ambiguous
     fn run(&self) -> CliResult<()> {
+        if crate::commands::rpc::change(self)? {
+            return Ok(());
+        }
+
         // Find and open repository
         let repo_root = find_repository_root()?;
         let repo = crate::commands::open_readonly_repository(&repo_root).map_err(|e| match e {
@@ -761,8 +773,22 @@ impl Command for ChangeCmd {
             other => CliError::Internal(anyhow::anyhow!("{}", other)),
         })?;
 
+        // The render data from the repository (dep messages for --show-deps)
+        let mut data = ChangeRenderData::from_repo(&repo, &hash);
+        if self.show_deps {
+            for dep_hash in &change.hashed.dependencies {
+                let message = repo
+                    .load_change(dep_hash)
+                    .ok()
+                    .and_then(|c| c.hashed.header.message.lines().next().map(str::to_string));
+                if let Some(message) = message {
+                    data.dep_messages.insert(*dep_hash, message);
+                }
+            }
+        }
+
         // Print the change
-        self.print_change(&change, &hash, sequence, &repo);
+        self.print_change(&change, &hash, sequence, &data);
 
         Ok(())
     }

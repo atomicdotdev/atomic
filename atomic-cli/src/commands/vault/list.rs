@@ -68,8 +68,58 @@ pub struct List {
     pub json: bool,
 }
 
+/// One vault listing row (path, entry type, content size, updated-at) —
+/// the shape both the local body (repo-read) and the routed hook
+/// (wire-carried) render.
+pub(crate) struct EntryRow {
+    pub path: String,
+    pub entry_type: String,
+    pub size: u64,
+    pub updated_at: String,
+}
+
+/// The shared render — the exact local body's table and JSON shapes.
+pub(crate) fn render_rows(rows: &[EntryRow], json: bool) {
+    if json {
+        let json: Vec<serde_json::Value> = rows
+            .iter()
+            .map(|e| {
+                serde_json::json!({
+                    "path": e.path,
+                    "type": e.entry_type,
+                    "size": e.size,
+                    "updated_at": e.updated_at,
+                })
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&json).unwrap());
+        return;
+    }
+    if rows.is_empty() {
+        println!("No vault entries found.");
+        return;
+    }
+    for entry in rows {
+        println!(
+            "  {:12} {:>8}  {}",
+            entry.entry_type,
+            format_size(entry.size),
+            entry.path,
+        );
+    }
+    let count_label = if rows.len() == 1 { "entry" } else { "entries" };
+    println!("\n{} {}", rows.len(), count_label);
+}
+
 impl Command for List {
     fn run(&self) -> CliResult<()> {
+        // Every form routes (the whole-vault listing carries its
+        // type/size/date columns on the wire; --prefix/--type ride the
+        // request's filters).
+        if crate::commands::rpc::vault_list(self)? {
+            return Ok(());
+        }
+
         let root = find_repository_root()?;
         let repo = Repository::open(&root).map_err(CliError::Repository)?;
 
@@ -80,41 +130,18 @@ impl Command for List {
             .vault_list(prefix, type_filter)
             .map_err(CliError::Repository)?;
 
-        if self.json {
-            let json: Vec<serde_json::Value> = entries
+        render_rows(
+            &entries
                 .iter()
-                .map(|e| {
-                    serde_json::json!({
-                        "path": e.path,
-                        "type": e.entry_type,
-                        "size": e.content_size,
-                        "updated_at": e.updated_at,
-                    })
+                .map(|e| EntryRow {
+                    path: e.path.clone(),
+                    entry_type: e.entry_type.to_string(),
+                    size: e.content_size as u64,
+                    updated_at: e.updated_at.clone(),
                 })
-                .collect();
-            println!("{}", serde_json::to_string_pretty(&json).unwrap());
-        } else {
-            if entries.is_empty() {
-                println!("No vault entries found.");
-                return Ok(());
-            }
-
-            for entry in &entries {
-                println!(
-                    "  {:12} {:>8}  {}",
-                    entry.entry_type,
-                    format_size(entry.content_size as u64),
-                    entry.path,
-                );
-            }
-
-            let count_label = if entries.len() == 1 {
-                "entry"
-            } else {
-                "entries"
-            };
-            println!("\n{} {}", entries.len(), count_label);
-        }
+                .collect::<Vec<_>>(),
+            self.json,
+        );
 
         Ok(())
     }

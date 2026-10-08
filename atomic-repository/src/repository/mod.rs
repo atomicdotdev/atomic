@@ -77,13 +77,16 @@ use crate::RepositoryError;
 
 // ── Sub-modules (new) ───────────────────────────────────────────────────
 
-mod database;
+pub mod database;
 mod deferred_tree;
 mod filter;
 mod materialize;
+pub use materialize::{ViewEntry, ViewEntryKind, ViewSnapshot};
+mod revise;
 mod sandbox;
 mod semantic_materialize;
 mod split;
+mod stash;
 mod switch;
 mod views;
 
@@ -97,8 +100,10 @@ pub use filter::{
     collect_view_change_ids, collect_visible_change_ids, collect_visible_change_ids_with_deps,
     expand_indexed_dependency_closure, view_set_id,
 };
+pub use revise::{ReviseOutcome, RewordOutcome};
 pub use sandbox::{SealOptions, SealResult, StageOptions, StageResult, SANDBOX_POINTER};
 pub use split::{SplitChange, SplitOptions, SplitOutcome};
+pub use stash::{StashEntry, StashPushOptions, DEFAULT_STASH_MESSAGE, STASH_PREFIX};
 pub use views::{ManifestApplyOutcome, ViewInfo};
 
 // Re-import workspace helpers from `switch` so they are available to
@@ -144,6 +149,7 @@ pub use vault_identity::VaultIdentity;
 pub use vault_intent::{
     IntentCreateOptions, IntentCreateResult, IntentDeleteResult, IntentInfo, IntentUpdateOptions,
 };
+pub use vault_intent::{FEATURE_SCAFFOLD, REVIEW_SCAFFOLD};
 pub use vault_kg_enrich::KgEnrichStats;
 pub use vault_names::{derive_intent_prefix, generate_goal_name};
 pub use verify::{VerifyProblem, VerifyReport};
@@ -622,6 +628,15 @@ default = "{}"
             let dot_dir = dir.join(DOT_DIR);
             // A database distinguishes a repository from a config directory
             if dot_dir.is_dir() && database::has_database(&dot_dir) {
+                return Ok(dir);
+            }
+            // A sandbox working tree has no `.atomic/` of its own — it
+            // carries a pointer to the canonical graph. Treat the
+            // sandbox root as a valid repository root;
+            // `Repository::open*` resolves the pointer (the same rule
+            // the CLI's root finder applies, so service-layer
+            // resolution accepts sandboxed working trees).
+            if dir.join(SANDBOX_POINTER).is_file() {
                 return Ok(dir);
             }
             current = dir.parent().map(Path::to_path_buf);

@@ -1,0 +1,62 @@
+// atomic-protocol — GitInteropService: the git import/push pipelines.
+//
+// DRAFT — add-only. Git interop is LOCAL-only (working copies and git
+// mirrors are local). `git hooks install/uninstall` only writes .git/hooks
+// shim files — no RPC (exempt, file-only). Import may create the repository
+// (init_with_view) on first run — bootstrap-adjacent, flagged in COVERAGE.
+
+syntax = "proto3";
+
+package atomic;
+
+import "atomic/common/common.proto";
+
+
+
+message ImportFromGitRequest {
+  RepositoryRef repository = 1;      // absent = create (bootstrap form)
+  RequestMeta meta = 2;
+  optional string source_path = 3;   // local git checkout (LOCAL scope)
+  optional string branch = 4;
+  bool all_branches = 5;
+  bool incremental = 6;              // post-commit hook shims use this
+  reserved 7;
+  bool with_crdt = 8;
+  optional string destination_path = 9; // required only when repository absent;
+  // an existing repository instead requires its registered workspace_id.
+  // Bootstrap never guesses a destination from daemon cwd or source_path.
+}
+message ImportFromGitResponse {
+  uint64 changes_imported = 1;
+  repeated string views_created = 2;
+  reserved 3;
+  RepositoryRef repository = 4; // includes registered workspace, also on bootstrap
+  ResponseMeta meta = 100;
+}
+
+message PushToGitRequest {
+  RepositoryRef repository = 1;
+  RequestMeta meta = 2;
+  optional string message = 3;        // -m
+  bool no_push = 4;                   // --no-push (shadow commits only)
+  optional string branch = 5;
+}
+message PushToGitResponse {
+  optional string shadow_commit = 1;
+  bool pushed = 2;
+  repeated string validation_findings = 3;
+  ResponseMeta meta = 100;
+}
+
+message PreviewGitImportRequest {
+  optional RepositoryRef repository = 1;
+  string source_path = 2; // local principal only; read source, never initialize
+  optional string branch = 3;
+  bool all_branches = 4;
+  bool incremental = 5;
+  bool with_crdt = 6;
+}
+message PreviewGitImportResponse {
+  uint64 changes = 1;
+  repeated string views = 2;
+}

@@ -375,6 +375,18 @@ pub enum CliError {
         operation: String,
     },
 
+    /// A domain refusal surfaced by the service layer — the contract's
+    /// stable error vocabulary (the message carries the code and the
+    /// reason, e.g. `atomic:PRECONDITION_FAILED: ...`).
+    ///
+    /// This is an expected, user-fixable condition (not a bug): the domain
+    /// refused the operation and the message says what to do about it.
+    #[error("{message}")]
+    ServiceRefusal {
+        /// The domain's refusal, with its stable code prefix.
+        message: String,
+    },
+
     // Internal Errors
     /// An unexpected internal error occurred.
     ///
@@ -652,6 +664,7 @@ impl CliError {
             | Self::Cancelled
             | Self::FileAlreadyTracked { .. }
             | Self::RequiresForce { .. }
+            | Self::ServiceRefusal { .. }
             | Self::ViewAlreadyExists { .. } => 1,
 
             // Command-line usage errors

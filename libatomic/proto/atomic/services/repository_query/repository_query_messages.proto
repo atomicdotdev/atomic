@@ -1,0 +1,209 @@
+// atomic-protocol — RepositoryQueryService: read-only repository operations.
+//
+// DRAFT — add-only. Reads execute as independent concurrent read
+// transactions (RFC concurrency model); no global write lock is ever assumed.
+// LOCAL-scoped reads are working-copy-aware (status/DiffWorkingCopy against the
+// tree); BOTH reads (log/change/Diff/PreviewMutation) are semantically identical on
+// the local daemon and the hosted server (D6/D7 — the CLI-vs-RPC parity
+// targets).
+
+syntax = "proto3";
+
+package atomic;
+
+import "atomic/common/common.proto";
+import "atomic/common/change.proto";
+import "atomic/common/pagination.proto";
+
+
+
+message StatusRequest {
+  RepositoryRef repository = 1;
+  reserved 2; // allow_reindex violated read-only execution
+}
+// Mirrors RepositoryStatus (atomic-repository/src/status.rs:390): view,
+// merkle state, per-file entries, and the stale-index count that drives the
+// --reindex hint (unindexed tracked files are conservatively reported
+// Modified; explicit ReindexWorkspace resolves them).
+message StatusResponse {
+  string view = 1;
+  optional Hash view_merkle = 2;
+  repeated FileStatusEntry files = 3;
+  uint32 modified_count = 4;
+  uint32 deleted_count = 5;
+  uint32 untracked_count = 6;
+  uint32 added_count = 7;
+  uint32 conflicted_count = 8;
+  uint32 stale_index_count = 9;   // non-zero → `status --reindex` would
+                                    // resolve false positives
+  ViewSnapshot snapshot = 10;
+  bool needs_reindex = 11;         // stale_index_count > 0
+}
+// atomic's file-status vocabulary, source-verified (status.rs:136):
+// Modified, Deleted, Untracked, Added, Conflicted — no git-shaped states.
+enum FileStatus {
+  FILE_STATUS_UNSPECIFIED = 0;
+  FILE_STATUS_MODIFIED = 1;
+  FILE_STATUS_DELETED = 2;
+  FILE_STATUS_UNTRACKED = 3;
+  FILE_STATUS_ADDED = 4;
+  FILE_STATUS_CONFLICTED = 5;
+}
+// Mirrors FileStatusEntry (status.rs:263).
+message FileStatusEntry {
+  string path = 1;
+  FileStatus status = 2;
+  optional uint64 inode = 3;         // opaque handle; present for tracked files
+  optional Hash recorded_hash = 4;   // recorded graph content
+  optional Hash current_hash = 5;    // on-disk content when hashed
+  optional string details = 6;       // conflict type, permissions, etc.
+}
+
+message LogRequest {
+  RepositoryRef repository = 1;
+  bool all_views = 2;                  // `--all`
+  optional string view = 3; // required unless all_views; no daemon current-view default
+  optional PageCursor cursor = 4;
+  optional PageBudget budget = 5;
+  repeated string path_filter = 6;      // `--path`: entries whose changes touch it
+  bool tags_only = 7;                  // tagged entries only
+}
+message LogResponse {
+  repeated ChangeLogEntry entries = 1;
+  optional PageCursor next_cursor = 2;
+}
+// ChangeLogEntry lives in atomic/common/change.proto (shared change-domain).
+
+message GetChangeRequest {
+  RepositoryRef repository = 1;
+  ChangeRef ref = 2;
+  ChangeIncludes includes = 3;
+  optional ViewRef view = 4; // required when ref is a view-log sequence
+  // Reconstruct the per-file content around the change (add-only):
+  // `diff -c` needs each touched file's pre/post-change bytes — the
+  // legacy no-file_ops fallback and the FileOps context padding. The
+  // handler reads them from the graph; the response carries them.
+  bool include_file_contents = 5;
+}
+// Sections fetched by flag instead of by verb — the combine that keeps
+// GetChange one RPC.
+message ChangeIncludes {
+  bool metadata = 1;
+  bool graph_section = 2;
+  bool semantic_section = 3;
+  bool signatures = 4;
+  bool content_chunks = 5;
+}
+message GetChangeResponse {
+  ChangeInfo change = 1;
+  optional VersionedBytes graph_section = 2;
+  optional VersionedBytes semantic_section = 3;
+  repeated ChangeSignature signatures = 4;
+  optional bytes content_chunks = 5;
+  // The complete change as versioned-opaque bytes (schema
+  // "atomic.change.v3") — deserialize with atomic-core for full-detail
+  // rendering (hunks, content, unhashed sections) without a second
+  // server-side render per client need.
+  optional VersionedBytes change_bundle = 6;
+  // The causal decision graph(s) explaining this change (schema
+  // "atomic.prov.graph.v1", one per covering graph, in order).
+  repeated VersionedBytes provenance_ledger = 7;
+  // The change's sequence on the resolved view, when known.
+  optional uint64 sequence = 8;
+  // Per-file reconstructed content (add-only), present when the request
+  // set include_file_contents: each touched file's bytes before and after
+  // the change, as the graph holds them.
+  repeated ChangeFileContent file_contents = 9;
+}
+// One file's content around a change (add-only): what the graph
+// reconstruction reads server-side for `diff -c` (the legacy
+// no-file_ops fallback) and the FileOps hunks' context padding.
+message ChangeFileContent {
+  string path = 1;
+  optional bytes before = 2;  // pre-change content (absent = none/unreadable)
+  optional bytes after = 3;   // post-change content (absent = none/unreadable)
+}
+// ChangeInfo lives in atomic/common/change.proto (shared change-domain).
+
+message DiffRequest {
+  RepositoryRef repository = 1;
+  reserved 2; // working_copy moved to a LOCAL, workspace-aware method
+  oneof scope {
+    RefPairScope refs = 3;             // view/tag/change-pair diff
+  }
+  bool stat_only = 4;
+  bool word_diff = 5;                  // word-level highlight inside hunks
+}
+message DiffWorkingCopyRequest {
+  RepositoryRef repository = 1; // workspace_id required
+  WorkingCopyScope working_copy = 2;
+  bool stat_only = 3;
+  bool word_diff = 4;           // word-level highlight inside hunks
+}
+message WorkingCopyScope {
+  bool include_untracked = 1;
+  repeated string paths = 2;           // working-copy paths (LOCAL semantics)
+}
+message RefPairScope {
+  string from_view = 1;
+  string to_view = 2;
+}
+message DiffChunk {
+  string path = 1;
+  optional bytes patch = 2;            // unified diff hunks (absent when stat-only)
+  uint64 additions = 3;
+  uint64 deletions = 4;
+  bool binary = 5;
+}
+
+message ListConflictsRequest {
+  RepositoryRef repository = 1;
+}
+message ListConflictsResponse {
+  repeated ConflictInfo conflicts = 1;
+}
+
+message PreviewMutationRequest {
+  RepositoryRef repository = 1;
+  reserved 2; // filesystem restore has its own LOCAL preview
+  oneof operation {
+    InsertPreview insert = 3;
+    UnrecordPreview unrecord = 4;
+  }
+}
+message PreviewRestoreRequest {
+  RepositoryRef repository = 1; // workspace_id required
+  repeated string paths = 2; // workspace-root-relative
+  bool force = 3;
+  // The single-file pristine-content arm (add-only): `restore --dry-run
+  // <file>` dumps that one file's pristine bytes to stdout. When set, the
+  // response additionally carries the path's pristine content (absent =
+  // the graph holds no content for it — the CLI's not-found error).
+  optional string content_path = 4;
+}
+message InsertPreview {
+  oneof source {
+    Hash single_change = 1;
+    string from_view = 2;
+    string up_to_tag = 3;
+  }
+  string target_view = 4; // required; dependency closure is always enforced
+  bool allow_conflicts = 5;
+}
+message UnrecordPreview {
+  ViewRef view = 1;
+  optional ChangeRef target = 2; // absent means last change in this view
+}
+message PreviewMutationResponse {
+  repeated string affected_paths = 1;
+  repeated ChangeInfo changes = 2;
+  repeated ConflictInfo conflicts = 3;
+  ViewSnapshot snapshot = 4;
+  // The restore preview's would-untrack list (add-only): Added files
+  // that a restore would untrack but keep on disk.
+  repeated string untracked = 5;
+  // The single-file restore preview's pristine bytes (add-only): present
+  // iff the request named a content_path the graph holds content for.
+  optional bytes pristine_content = 6;
+}
+// ConflictInfo lives in atomic/common/change.proto (shared change-domain).

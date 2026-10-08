@@ -1,0 +1,480 @@
+// atomic-protocol — ProvenanceService: the provenance tracking contract —
+// session/turn journal, generation fencing, checkpoint phases, frozen-
+// envelope storage, session ledger, provenance projection.
+//
+// DRAFT — add-only. Context: the legacy agent journal protocol and the
+// `atomic agent database-owner` command that served it are being FULLY
+// DISMANTLED; atomicd becomes the only storage owner. What carries forward
+// is the provenance tracking semantics below — verified against the
+// provenance store source (atomic-repository/src/redb_change_store/
+// provenance.rs, 2026-10-01). The legacy process machinery (fs2 election,
+// JSON frames, per-request re-opens, reconnect-retry, version-in-frame) is
+// deliberately NOT carried.
+//
+// The semantics, semantics-for-semantics:
+//  * Generation fencing on every mutation: ReserveTurn grants the
+//    generation; every subsequent op carries expected_generation; bind/
+//    acknowledge advance to attempt_generation. A mismatch is
+//    GENERATION_CONFLICT — never a silent race.
+//  * Request-ID discipline: RequestMeta.request_id (UUID v4) on every
+//    mutation, echoed, mismatch = IDEMPOTENCY_MISMATCH.
+//  * Caller-supplied `now` (RequestMeta.observed_at) — observation time
+//    arrives on the wire, never from server clocks.
+//  * Separate RPCs at the checkpoint phase boundaries — the named
+//    crash-injection failpoints (before/after-envelope-commit,
+//    after-checkpoint-prepare, before-frozen-page-continuation,
+//    frozen-page-unavailable, after-checkpoint-bind) sit EXACTLY at
+//    reserve→append→prepare→load→bind→acknowledge seams. Collapsing
+//    prepare/bind/acknowledge destroys the crash-safety test story.
+//  * Frozen-envelope paging: fragment shape {cursor{seq,offset}, bytes,
+//    complete}, page fragment budget (256), client-side reassembly with
+//    strict continuity validation. Frozen loads are PAGED-ONLY: cursor
+//    absent = first page; a complete journal may arrive as a single page.
+//    (A legacy unpaged form existed as compat with the dismantled
+//    protocol — deliberately not carried.)
+//  * Turn lifecycle: stop/resume/abandon combined into one UpdateTurn with
+//    an action enum (no crash-injection seams live there); status is the
+//    read-side GetTurn.
+//  * Authorization (sandbox matrix, HANDOFF §5): the first ReserveTurn
+//    claims the session for its view; later ops from another view →
+//    FORBIDDEN. After a successful remote reserve, envelope/checkpoint ops
+//    on that turn from another view → FORBIDDEN. Remote callers present the
+//    sandbox token; local callers ride the transport principal.
+//
+// The legacy 13-op journal surface folds into 8 journal RPCs below (its
+// liveness op is daemon Health; its process-shutdown op is daemon
+// lifecycle, not a protocol op). Session ledger ops (`atomic session`)
+// and provenance projection reads (`provenance trace/show`) join this
+// service as the same domain.
+
+syntax = "proto3";
+
+package atomic;
+
+import "google/protobuf/timestamp.proto";
+import "atomic/common/common.proto";
+import "atomic/common/pagination.proto";
+
+// ————— turn & checkpoint state (source: redb_change_store/provenance.rs) —————
+
+enum StopCause {
+  STOP_CAUSE_UNSPECIFIED = 0;
+  STOP_CAUSE_USER_REQUESTED = 1;
+  STOP_CAUSE_LEASE_EXPIRED = 2;
+  STOP_CAUSE_PROCESS_EXITED = 3;
+  STOP_CAUSE_HOOK_FAILURE = 4;
+  STOP_CAUSE_SYSTEM_SHUTDOWN = 5;
+  STOP_CAUSE_ABANDONED = 6;
+}
+
+enum ProvenanceTurnState {
+  PROVENANCE_TURN_STATE_UNSPECIFIED = 0;
+  PROVENANCE_TURN_STATE_RUNNING = 1;
+  PROVENANCE_TURN_STATE_STOPPED = 2;
+  PROVENANCE_TURN_STATE_CHECKPOINTING = 3;
+  PROVENANCE_TURN_STATE_COMPLETED = 4;
+  PROVENANCE_TURN_STATE_ABANDONED = 5;
+}
+
+enum CheckpointPhase {
+  CHECKPOINT_PHASE_UNSPECIFIED = 0;
+  CHECKPOINT_PHASE_PREPARED = 1;
+  CHECKPOINT_PHASE_HASH_BOUND = 2;
+  CHECKPOINT_PHASE_PUBLISHED = 3;
+}
+
+message StopState {
+  StopCause cause = 1;
+  google.protobuf.Timestamp observed_at = 2;
+  optional uint64 last_event_seq = 3;
+  bool resumable = 4;
+}
+
+message StoredProvenanceTurn {
+  uint32 schema_version = 1;
+  uint64 provenance_id = 2;    // ProvenanceId(u64)
+  string session_id = 3;
+  uint32 turn_number = 4;
+  ProvenanceTurnState state = 5;
+  uint64 generation = 6;       // the granted generation (fencing)
+  uint64 next_event_seq = 7;
+  google.protobuf.Timestamp created_at = 8;
+  google.protobuf.Timestamp updated_at = 9;
+  optional google.protobuf.Timestamp completed_at = 10;
+  optional Hash final_hash = 11;
+  optional ProvenanceCheckpointAttempt checkpoint_attempt = 12;
+  optional StopState stop_state = 13;   // present when STOPPED or ABANDONED
+}
+
+// Checkpoint source — exact fields from ProvenanceCheckpointSource.
+message CheckpointSource {
+  string agent_name = 1;
+  string agent_display_name = 2;
+  string agent_vendor = 3;
+  repeated Hash change_hashes = 4;
+  optional Hash previous_provenance = 5;
+  optional string plan_id = 6;
+  uint32 ledger_turn_number = 7;
+}
+
+message ProvenanceCheckpointAttempt {
+  uint64 attempt_generation = 1;    // bind/acknowledge advance to this
+  uint64 frozen_event_count = 2;   // exclusive journal-seq cutoff
+  CheckpointSource source = 3;
+  CheckpointPhase phase = 4;
+  optional Hash provenance_hash = 5;
+  optional SessionTurn session_turn = 6;
+  optional Hash manifest_hash = 7;
+  google.protobuf.Timestamp prepared_at = 8;
+  google.protobuf.Timestamp updated_at = 9;
+}
+
+// ————— wire envelopes —————
+
+// Legacy {event_id, bytes} journal envelope + the schema/type URL the unified
+// contract requires (HANDOFF §6: align with the Reactor event envelope so
+// the two contracts rhyme).
+message WireEnvelope {
+  string event_id = 1;
+  string type_url = 2;
+  bytes envelope = 3;
+}
+
+// JournalAppendAck {event_id, sequence} — exact shape.
+message EnvelopeAck {
+  string event_id = 1;
+  uint64 sequence = 2;
+}
+
+// Frozen page fragments (source: FrozenProvenanceFragment/Page/Cursor).
+// One envelope larger than a page budget spans fragments; clients reassemble
+// with strict continuity validation (cursor must continue the previous page).
+message FrozenFragment {
+  PageCursor cursor = 1;   // {seq, offset} — the pagination primitive's seed
+  bytes bytes = 2;
+  bool complete = 3;       // marks envelope end for reassembly
+}
+
+message FrozenPage {
+  repeated FrozenFragment fragments = 1;
+  PageCursor next = 2;      // next page cursor; absent field = end
+}
+
+// ————— service —————
+
+
+
+// ————— journal ops —————
+
+message ReserveTurnRequest {
+  RepositoryRef repository = 1;
+  RequestMeta meta = 2;
+  string session_id = 3;
+  uint32 turn_number = 4;
+  ViewRef view = 5; // required; sandbox must match grant; claim only unused sessions
+}
+message ReserveTurnResponse {
+  StoredProvenanceTurn turn = 1;   // carries the granted generation
+  bool committed = 2;
+  ResponseMeta meta = 100;
+}
+
+message AppendEnvelopesRequest {
+  RepositoryRef repository = 1;
+  RequestMeta meta = 2;
+  uint64 provenance_id = 3;
+  uint64 expected_generation = 4;  // fencing on every mutation
+  repeated WireEnvelope envelopes = 5;
+}
+message AppendEnvelopesResponse {
+  repeated EnvelopeAck acknowledgements = 1;
+  ResponseMeta meta = 100;
+}
+
+message PrepareCheckpointRequest {
+  RepositoryRef repository = 1;
+  RequestMeta meta = 2;
+  uint64 provenance_id = 3;
+  uint64 expected_generation = 4;
+  CheckpointSource source = 5;
+  bool reuse_frozen_changes = 6;
+}
+message PrepareCheckpointResponse {
+  ProvenanceCheckpointAttempt attempt = 1;   // CheckpointPrepared{attempt}
+  ResponseMeta meta = 100;
+}
+
+message LoadFrozenEnvelopesRequest {
+  RepositoryRef repository = 1;
+  uint64 provenance_id = 2;
+  uint64 attempt_generation = 3;      // from the PrepareCheckpoint response
+  uint64 frozen_event_count = 4;      // exclusive journal-seq cutoff
+  optional PageCursor cursor = 5;    // absent = first page
+  optional PageBudget budget = 6;
+}
+message LoadFrozenEnvelopesResponse {
+  FrozenPage page = 1;               // fragments + next cursor; a complete
+                                     // journal may arrive as a single page
+}
+
+message BindCheckpointHashRequest {
+  RepositoryRef repository = 1;
+  RequestMeta meta = 2;
+  uint64 provenance_id = 3;
+  uint64 expected_generation = 4;
+  Hash hash = 5;               // manifest hash
+  SessionTurn session_turn = 6;
+}
+message BindCheckpointHashResponse {
+  ProvenanceCheckpointAttempt attempt = 1;
+  ResponseMeta meta = 100;
+}
+
+message AcknowledgeCheckpointRequest {
+  RepositoryRef repository = 1;
+  RequestMeta meta = 2;
+  uint64 provenance_id = 3;
+  uint64 expected_generation = 4;
+  Hash manifest_hash = 5;
+  google.protobuf.Timestamp completed_at = 6;   // caller-supplied
+}
+message AcknowledgeCheckpointResponse { ResponseMeta meta = 100; }
+
+// ————— turn lifecycle —————
+
+enum TurnAction {
+  TURN_ACTION_UNSPECIFIED = 0;
+  TURN_ACTION_STOP = 1;
+  TURN_ACTION_RESUME = 2;
+  TURN_ACTION_ABANDON = 3;
+}
+
+message UpdateTurnRequest {
+  RepositoryRef repository = 1;
+  RequestMeta meta = 2;          // observed_at = the lifecycle observation time
+  string session_id = 3;
+  uint32 turn_number = 4;
+  TurnAction action = 5;
+  optional StopCause cause = 6;      // STOP
+  optional bool resumable = 7;       // STOP
+  uint64 expected_generation = 8; // required, nonzero; lookup never grants a generation
+}
+message UpdateTurnResponse {
+  StoredProvenanceTurn turn = 1;    // TurnLifecycle{turn}
+  ResponseMeta meta = 100;
+}
+
+message GetTurnRequest {
+  RepositoryRef repository = 1;
+  string session_id = 2;
+  uint32 turn_number = 3;
+}
+message GetTurnResponse {
+  optional StoredProvenanceTurn turn = 1;
+}
+
+// ————— session ledger —————
+
+message GetSessionRequest {
+  RepositoryRef repository = 1;
+  string session_id = 2;
+  optional uint32 from_turn = 3;
+  optional uint32 to_turn = 4;
+}
+message GetSessionResponse {
+  repeated StoredProvenanceTurn turns = 1;
+  // SHAPE-CONFIRM (Slice 2): session-stamp fields beyond turns live in the
+  // session ledger; finalize against commands/session.rs.
+  // The complete session ledger as versioned-opaque bytes (schema
+  // "atomic.session.ledger.v1": JSON of the {record, turns} pair).
+  optional VersionedBytes ledger_bundle = 2;
+  // Turn → intent resolution (vault paths and explicit plan ids), the
+  // client-side inheritance chain starts from this.
+  repeated SessionTurnIntent turn_intents = 3;
+  optional Hash manifest_head = 4;
+  optional Hash parent_manifest = 5;
+  optional uint32 fork_turn = 6;
+}
+
+// One turn's resolved intent (from plan_id or the vault's session links).
+message SessionTurnIntent {
+  uint32 turn = 1;
+  string intent = 2;
+}
+
+message ForkSessionRequest {
+  RepositoryRef repository = 1;
+  RequestMeta meta = 2;
+  string session_id = 3;
+  string forked_session_id = 4;
+  // The turn boundary (add-only): inherits turns 0..=N — the local
+  // `session fork --at-turn` semantics.
+  optional uint32 at_turn = 5;
+}
+message ForkSessionResponse {
+  string session_id = 1;
+  ResponseMeta meta = 100;
+  // The fork report (add-only): both manifest hashes, so the client
+  // prints the local fork report.
+  optional Hash parent_manifest = 2;
+  optional Hash child_manifest = 3;
+  optional uint32 fork_turn = 4;
+}
+
+message RebuildSessionIndexRequest {
+  RepositoryRef repository = 1;
+  RequestMeta meta = 2;
+}
+message RebuildSessionIndexResponse {
+  ResponseMeta meta = 100;
+  // The rebuild report (add-only): the indexed/present/corrupt counts the
+  // local body prints.
+  uint64 indexed = 1;
+  uint64 already_present = 2;
+  uint64 corrupt = 3;
+}
+
+// ————— provenance projection —————
+
+message GetProvenanceRequest {
+  RepositoryRef repository = 1;
+  Hash change = 2;
+  ViewRef view = 3; // must match sandbox grant; change must be visible
+}
+message GetProvenanceResponse {
+  VersionedBytes provenance = 1;   // captured per-turn provenance for the change
+}
+
+message ExportProvenanceRequest {
+  RepositoryRef repository = 1;
+  reserved 2, 4; // mutation header and daemon-held signer selection removed
+  Hash change = 3;
+  ViewRef view = 5;
+  // The person DID that signs/anchors the projection (add-only): resolved
+  // CLIENT-SIDE from the identity store (a config file read, not redb) and
+  // carried on the wire — the handler never reads the caller's identities.
+  optional string person_did = 6;
+  // The raw `provenance trace/show` target (add-only): a bare base32 hash,
+  // a hash prefix, or `urn:atomic:change:<base32>`. When set, the handler
+  // resolves it with the local resolver's exact semantics (prefix match
+  // against the whole change store, URN strip, ambiguity refusal) and
+  // ignores `change`.
+  optional string target = 7;
+}
+message ExportProvenanceResponse {
+  bytes prov_jsonld = 1;           // W3C PROV projection
+  reserved 2; // caller signs; no daemon private-key operation under a read cap
+  // The trace inputs (add-only): the resolved change hash plus one bundle per
+  // explaining graph (most-recent first) — the domain ProvenanceGraph JSON,
+  // the mapped ProvActivityInput JSON (schema "atomic.prov.input.v1"), the
+  // graph's own hash, and the pre-walked prior-turn activity URNs the
+  // human chain renders.
+  optional Hash resolved_change = 3;
+  repeated ProvenanceTraceBundle graphs = 4;
+}
+
+// One explaining provenance graph, wire-carried for the client renders
+// (add-only; schema "atomic.prov.graph.v1" = the domain ProvenanceGraph
+// JSON, schema "atomic.prov.input.v1" = the ProvActivityInput JSON).
+message ProvenanceTraceBundle {
+  optional Hash graph_hash = 1;         // the stored graph's content hash
+  VersionedBytes graph = 2;             // atomic.prov.graph.v1
+  VersionedBytes input = 3;            // atomic.prov.input.v1
+  repeated string prior_activities = 4; // activity URNs of the `previous`
+                                         // chain, oldest first; empty entry
+                                         // = "(graph unavailable)"
+  bool chain_truncated = 5;            // the 64-hop walk cap was hit
+}
+
+// — typed turn dispatch (transition seam; see provenance_service.proto) —
+
+message DispatchTurnEventRequest {
+  RepositoryRef repository = 1;
+  RequestMeta meta = 2;
+  string agent_id = 3;                 // agent registry key (e.g. "opencode")
+  optional string agent_display_name = 4;
+  optional string agent_identity = 5;  // resolved client-side (selection chain)
+  TurnEventBody event = 6;             // the typed agent event
+}
+message TurnEventBody {
+  string session_id = 1;
+  string event_type = 2;               // session_start|turn_start|turn_end|session_end|pre_tool_use|post_tool_use
+  optional string prompt = 3;
+  optional string tool_name = 4;
+  optional string tool_use_id = 5;
+  google.protobuf.Timestamp timestamp = 6;
+  optional bytes raw_json = 7;         // opaque agent context (never parsed here)
+}
+message DispatchTurnEventResponse {
+  string session_id = 1;
+  bool recorded = 2;
+  optional Hash change_hash = 3;
+  optional string view = 4;
+  repeated string files = 5;
+  repeated string warnings = 6;
+  ResponseMeta meta = 100;
+}
+
+// — typed agent-turn reasoning (`atomic agent explain`; add-only) —
+
+message ExplainTurnsRequest {
+  RepositoryRef repository = 1;
+  RequestMeta meta = 2;
+  string session_id = 3;
+  optional uint32 turn = 4;      // 1-indexed; absent = most recent
+  bool all = 5;                  // every turn in the session
+  bool save = 6;                 // write the reasoning into the change
+  string model = 7;              // the Claude CLI model
+  // The session record's client-resolved fields (the session store is a
+  // working-copy file read, not redb — resolved client-side, add-only).
+  string view_name = 8;
+  optional string transcript_path = 9;
+  repeated string files_touched = 10;
+  string agent_name = 11;
+}
+message ExplainTurnsResponse {
+  repeated ExplainTurnResult turns = 1;
+  // The session has no recorded turns on its view (the early-out line).
+  bool session_has_no_turns = 2;
+  ResponseMeta meta = 100;
+}
+message ExplainTurnResult {
+  uint32 turn_number = 1;        // 1-indexed
+  string message = 2;            // the change's header message
+  bool no_transcript = 3;        // the skip branch
+  // The generated reasoning (schema "atomic.agent.reasoning.v1" — the
+  // domain TurnReasoning JSON).
+  optional VersionedBytes reasoning = 4;
+  optional string generation_error = 5;
+  uint32 anchored = 6;           // graph-anchored code learnings count
+  bool saved = 7;                // the reasoning landed in the change
+  optional string save_error = 8;
+  // The learnings context-file save outcome (its Display text).
+  optional string context_saved = 9;
+  optional string context_save_error = 10;
+  // The explained change's hash (the save line's 12-char reference).
+  optional Hash change = 11;
+}
+
+// — recent session ledgers (the `session show` no-arg listing) —
+
+message ListSessionsRequest {
+  RepositoryRef repository = 1;
+  uint32 limit = 2;                 // most recent N (CLI default 10)
+}
+message ListSessionsResponse {
+  repeated SessionSummary sessions = 1;
+  // The complete recent-session ledgers as versioned-opaque bytes (schema
+  // "atomic.session.ledgers.v1": JSON array of {record, turns} pairs) —
+  // the client renders listings/JSON from the domain shape it knows.
+  optional VersionedBytes ledgers_bundle = 2;
+  // Vault-derived intent count per session, parallel to `sessions` order.
+  repeated uint32 intent_counts = 3;
+}
+message SessionSummary {
+  string session_id = 1;
+  optional string view = 2;          // view_name
+  uint32 turn_count = 3;
+  optional google.protobuf.Timestamp started_at = 4;
+  optional google.protobuf.Timestamp ended_at = 5;
+}

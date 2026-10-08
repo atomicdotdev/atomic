@@ -1,0 +1,77 @@
+// atomic-protocol — shared change-domain types.
+//
+// DRAFT — add-only. Shared across RepositoryQueryService,
+// RepositoryMutationService, and friends. Shapes are verified against the
+// atomic source (2026-10-02) — this is ATOMIC's model (patch theory, a
+// semantic change graph), NOT git's:
+//  * a change has NO commit-parents. Its position in a view is a log
+//    SEQUENCE together with the Merkle state after applying it (HistoryEntry,
+//    atomic-repository/src/history/types.rs:79); its graph edges are
+//    DEPENDENCIES (StoredChangeMeta's dependency hash table: index 0 =
+//    self hash, 1+ = dependency hashes — redb_change_store/mod.rs:181).
+//  * the change header carries message/description/timestamp/authors
+//    (atomic-core/src/change/header.rs:197); authors are name/email
+//    records, not DIDs.
+
+syntax = "proto3";
+
+package atomic;
+
+import "google/protobuf/timestamp.proto";
+import "atomic/common/common.proto";
+
+// A change author (atomic-core ChangeHeader's Author: name + optional email).
+message Author {
+  string name = 1;
+  optional string email = 2;
+}
+
+// Log entry — mirrors HistoryEntry: the change's position in a view's log,
+// with the MERKLE STATE AFTER applying it (the view's merkle chain — not a
+// commit-parent link).
+message ChangeLogEntry {
+  Hash hash = 1;
+  uint64 sequence = 2;                // position in the view's log (the CLI's #N)
+  Hash state = 3;                     // view Merkle state after this change
+  optional string message = 4;       // ChangeHeader.message
+  optional string description = 5;
+  repeated Author authors = 6;
+  optional google.protobuf.Timestamp recorded_at = 7;   // ChangeHeader.timestamp
+  repeated Hash dependencies = 8;    // change-graph edges (no commit-parents)
+  optional string view = 9;          // which view's log (for --all)
+  bool is_tagged = 10;
+}
+
+// Change metadata — mirrors StoredChangeMeta: header + dependency hash table
+// + section counts/flags. The actual sections (graph/semantic/chunks/
+// signatures) are fetched layer-selectively via ChangeIncludes. Note the
+// known CLI issue on draft-view change serialization (invalid section type:
+// 0x04) — a CLI/format mismatch, not corruption; reconciled outside the
+// contract.
+message ChangeInfo {
+  Hash hash = 1;
+  optional string message = 2;
+  optional string description = 3;
+  repeated Author authors = 4;
+  optional google.protobuf.Timestamp recorded_at = 5;
+  repeated Hash dependencies = 6;    // dependency hashes (hash_table[1..])
+  uint32 graph_section_count = 7;
+  uint32 semantic_section_count = 8;
+  uint32 content_chunk_count = 9;
+  bool has_provenance = 10;
+  bool has_unhashed = 11;
+  bool has_signature = 12;
+}
+
+// A working-copy conflict (the CONFLICTS table's model).
+message ConflictInfo {
+  string path = 1;
+  optional string view = 2;
+  optional Hash base = 3;
+  // SHAPE-CONFIRM: conflict-side details from the CONFLICTS table model.
+  // Render details (add-only): the conflict kind, the marker line, and
+  // the change-hash sides involved.
+  optional string kind = 4;
+  optional uint64 line = 5;
+  repeated string sides = 6;
+}

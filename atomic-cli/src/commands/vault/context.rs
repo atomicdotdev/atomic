@@ -82,7 +82,7 @@ const JSON_SCHEMA_VERSION: u32 = 1;
 const CANDIDATE_JSON_SCHEMA_VERSION: u32 = 1;
 
 /// Identifies the ranking recipe in run provenance and future retrieval evals.
-const RANKER_VERSION: &str = "vault-context-v2";
+pub(crate) const RANKER_VERSION: &str = "vault-context-v2";
 
 /// Fetch this many times `--limit` from typed KG search so body and graph
 /// signals can rerank a useful candidate pool.
@@ -170,6 +170,8 @@ pub struct Context {
 
 impl Command for Context {
     fn run(&self) -> CliResult<()> {
+        // Argument validation is client-side presentation: it always runs,
+        // before any service routing engages.
         let as_json = self.json || self.format.eq_ignore_ascii_case("json");
         if !as_json && !self.format.eq_ignore_ascii_case("md") {
             return Err(CliError::InvalidArgument {
@@ -181,6 +183,15 @@ impl Command for Context {
             return Err(CliError::InvalidArgument {
                 message: format!("--limit must be between 1 and {MAX_LIMIT}"),
             });
+        }
+
+        // Every form routes: the gather+rank runs in the service layer
+        // (the ranking recipe lives in exactly one place — the handler),
+        // and the renders below are presentation. The local body keeps
+        // its own gather+rank for the no-service fallback (outside a
+        // repository) until the legacy body retires.
+        if crate::commands::rpc::vault_context(self)? {
+            return Ok(());
         }
 
         let root = find_repository_root()?;
@@ -404,7 +415,7 @@ struct CandidateScore {
 
 /// A memory selected for output.
 #[derive(Clone, Debug, PartialEq)]
-struct MemoryItem {
+pub(crate) struct MemoryItem {
     /// Canonical RDF/resource identity when present, otherwise the KG identity.
     memory_id: String,
     /// Identity currently used by the KG. This may differ from `memory_id`.
@@ -774,9 +785,34 @@ fn truncate_chars(s: &str, max_chars: usize) -> String {
 
 // Rendering
 
+/// Convert the wire's ranked ContextItems into the render's MemoryItems —
+/// the service layer's gather+rank already computed these; the renders are
+/// presentation (one render, two data sources).
+pub(crate) fn wire_items(items: &[atomic_client::proto::ContextItem]) -> Vec<MemoryItem> {
+    items
+        .iter()
+        .map(|item| MemoryItem {
+            memory_id: item.memory_id.clone(),
+            kg_node_id: item.kg_node_id.clone(),
+            revision_hash: item.revision_hash.clone(),
+            content_hash: item.content_hash.clone(),
+            path: item.path.clone(),
+            name: item.name.clone(),
+            kind: item.kind.clone(),
+            status: item.status.clone(),
+            updated_at: item.updated_at.clone(),
+            introduced_by: item.introduced_by,
+            score: item.score,
+            why_matched: item.why_matched.clone(),
+            body: item.body.clone().unwrap_or_default(),
+            truncated: item.truncated,
+        })
+        .collect()
+}
+
 /// Render the prompt-ready markdown block. Empty input renders to an
 /// empty string so callers can prepend unconditionally.
-fn render_md(items: &[MemoryItem]) -> String {
+pub(crate) fn render_md(items: &[MemoryItem]) -> String {
     if items.is_empty() {
         return String::new();
     }
@@ -814,7 +850,7 @@ fn render_md(items: &[MemoryItem]) -> String {
 }
 
 /// Render body-free candidate metadata for a small first-pass prompt.
-fn render_candidates_md(items: &[MemoryItem]) -> String {
+pub(crate) fn render_candidates_md(items: &[MemoryItem]) -> String {
     if items.is_empty() {
         return String::new();
     }
@@ -849,7 +885,11 @@ fn render_candidates_md(items: &[MemoryItem]) -> String {
 
 /// Render the compact candidate contract. It deliberately contains no body,
 /// preview, or prompt-ready context field.
-fn render_candidates_json(items: &[MemoryItem], request: &Context, limit: usize) -> String {
+pub(crate) fn render_candidates_json(
+    items: &[MemoryItem],
+    request: &Context,
+    limit: usize,
+) -> String {
     let values: Vec<serde_json::Value> = items
         .iter()
         .map(|item| {
@@ -884,7 +924,12 @@ fn render_candidates_json(items: &[MemoryItem], request: &Context, limit: usize)
 
 /// Render a single-call envelope containing both injectable text and exact
 /// memory exposure metadata for run provenance.
-fn render_json(items: &[MemoryItem], md: &str, request: &Context, limit: usize) -> String {
+pub(crate) fn render_json(
+    items: &[MemoryItem],
+    md: &str,
+    request: &Context,
+    limit: usize,
+) -> String {
     let values: Vec<serde_json::Value> = items
         .iter()
         .map(|item| {
