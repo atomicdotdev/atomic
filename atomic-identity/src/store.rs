@@ -400,13 +400,18 @@ impl IdentityStore {
 
     /// Get the default store path.
     ///
-    /// The default location is `~/.atomic/identities/` in the user's home directory.
+    /// The default location is `~/.atomic/identities/` under the global
+    /// config directory — the same resolution as `config.toml`, so
+    /// `ATOMIC_CONFIG_DIR` relocates the identity store too. The env
+    /// override is the only reliable cross-platform isolation:
+    /// `dirs::home_dir()` on Windows resolves the profile known-folder,
+    /// not `HOME`.
     fn default_store_path() -> Result<PathBuf, IdentityError> {
-        let home_dir = dirs::home_dir().ok_or(IdentityError::Config(
+        let config_dir = atomic_config::global_config_dir().ok_or(IdentityError::Config(
             atomic_config::ConfigError::NoConfigDir,
         ))?;
 
-        Ok(home_dir.join(".atomic").join("identities"))
+        Ok(config_dir.join("identities"))
     }
 
     /// Get the store's root directory.
