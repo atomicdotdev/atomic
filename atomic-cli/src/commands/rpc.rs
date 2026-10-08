@@ -2437,20 +2437,32 @@ pub fn view_list(args: &super::view::List) -> CliResult<bool> {
         super::view::list::print_local_json(&json_views, current)?;
         return Ok(true);
     }
-    for view in &response.views {
-        // Scope + parent annotations mirror the local listing's metadata.
-        let kind = match pb::ViewScope::try_from(view.scope) {
-            Ok(pb::ViewScope::Draft) => " [draft]",
-            Ok(pb::ViewScope::Shared) => " [shared]",
-            _ => "",
+    let entries: Vec<super::view::list::ViewEntry> =
+        response.views.iter().map(super::view::list::ViewEntry::from_wire).collect();
+
+    // Same filter + hierarchy rendering as the local listing, so both
+    // paths look identical (see #194).
+    let (visible, hidden) =
+        super::view::list::compute_visibility(&entries, args.all);
+    let ordered = super::view::list::tree_order(&entries, &visible);
+
+    let max_name_len = ordered
+        .iter()
+        .map(|(_, entry)| entry.name.len())
+        .max()
+        .unwrap_or(0);
+
+    for (depth, entry) in &ordered {
+        let line = if args.short {
+            super::view::list::render_short_line(entry, *depth)
+        } else {
+            super::view::list::render_line(entry, *depth, max_name_len)
         };
-        let parent = view
-            .parent
-            .as_ref()
-            .map(|parent| format!(" (parent: {parent})"))
-            .unwrap_or_default();
-        let marker = if view.current { " (current)" } else { "" };
-        println!("{}{}{}{}", view.name, kind, parent, marker);
+        println!("{}", line);
+    }
+
+    if hidden > 0 {
+        print_hint(&super::view::list::summary_line(hidden));
     }
     Ok(true)
 }

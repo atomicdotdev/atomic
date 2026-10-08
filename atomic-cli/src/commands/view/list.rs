@@ -147,8 +147,8 @@ impl List {
 
 /// A view prepared for rendering, carrying the metadata the tree needs.
 #[derive(Debug, Clone)]
-struct ViewEntry {
-    name: String,
+pub(crate) struct ViewEntry {
+    pub(crate) name: String,
     parent: Option<String>,
     /// Changes recorded into this view that are not visible through the
     /// parent chain. Zero means the view has nothing of its own to show.
@@ -198,6 +198,40 @@ impl ViewEntry {
             has_info: false,
         }
     }
+
+    /// Build from the wire `ViewInfo` the daemon returns over RPC. Carries
+    /// the same metadata as the local listing, so both paths render
+    /// identically.
+    pub(crate) fn from_wire(view: &atomic_client::proto::ViewInfo) -> Self {
+        let kind = match atomic_client::proto::ViewScope::try_from(view.scope) {
+            Ok(atomic_client::proto::ViewScope::Draft) => "draft",
+            _ => "shared",
+        };
+        let state_short = view
+            .head
+            .as_ref()
+            .and_then(|hash| hash.value.clone().try_into().ok())
+            .map(|bytes: [u8; 32]| {
+                let full = atomic_core::types::Merkle(bytes).to_base32();
+                if full.len() > 12 {
+                    full[..12].to_string()
+                } else {
+                    full
+                }
+            })
+            .unwrap_or_else(|| "-".to_string());
+        ViewEntry {
+            name: view.name.clone(),
+            parent: view.parent.clone(),
+            own_change_count: view.own_change_count.unwrap_or(view.change_count),
+            change_count: view.change_count,
+            inherited_change_count: view.inherited_change_count.unwrap_or(0),
+            kind,
+            state_short,
+            is_current: view.current,
+            has_info: true,
+        }
+    }
 }
 
 /// Decide which views are shown.
@@ -206,7 +240,7 @@ impl ViewEntry {
 /// it has changes of its own, or it is the current view, or it is an
 /// ancestor of such a view (so the hierarchy stays connected). Returns the
 /// visible name set and the hidden count.
-fn compute_visibility(entries: &[ViewEntry], show_all: bool) -> (HashSet<String>, usize) {
+pub(crate) fn compute_visibility(entries: &[ViewEntry], show_all: bool) -> (HashSet<String>, usize) {
     if show_all {
         let all = entries.iter().map(|e| e.name.clone()).collect();
         return (all, 0);
@@ -245,7 +279,7 @@ fn compute_visibility(entries: &[ViewEntry], show_all: bool) -> (HashSet<String>
 /// parent, or with a parent missing from the listing) at depth 0, each
 /// child level one step deeper. Roots and siblings sort alphabetically.
 /// Cycles in the parent data are cut by a visited set.
-fn tree_order<'a>(
+pub(crate) fn tree_order<'a>(
     entries: &'a [ViewEntry],
     visible: &HashSet<String>,
 ) -> Vec<(usize, &'a ViewEntry)> {
@@ -326,7 +360,7 @@ fn tree_prefix(entry: &ViewEntry, depth: usize) -> String {
 }
 
 /// Render one view line for the default (metadata) mode.
-fn render_line(entry: &ViewEntry, depth: usize, width: usize) -> String {
+pub(crate) fn render_line(entry: &ViewEntry, depth: usize, width: usize) -> String {
     let prefix = tree_prefix(entry, depth);
     let name = style_view(&entry.name);
 
@@ -375,12 +409,12 @@ fn render_line(entry: &ViewEntry, depth: usize, width: usize) -> String {
 }
 
 /// Render one view line for `--short` mode (names only).
-fn render_short_line(entry: &ViewEntry, depth: usize) -> String {
+pub(crate) fn render_short_line(entry: &ViewEntry, depth: usize) -> String {
     format!("{}{}", tree_prefix(entry, depth), style_view(&entry.name))
 }
 
 /// The trailing hint describing hidden views.
-fn summary_line(hidden: usize) -> String {
+pub(crate) fn summary_line(hidden: usize) -> String {
     let noun = if hidden == 1 { "view" } else { "views" };
     format!(
         "{} {} not shown because contained no changes. -a to view them.",
