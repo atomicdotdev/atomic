@@ -1393,7 +1393,8 @@ impl Command for QueryCode {
             Err(atomic_repository::ContentSearchError::IndexNotFound) => {
                 println!(
                     "Content index not found.\n\n  \
-                         Run `atomic vault query enrich` to build it, then retry."
+                         Run `atomic vault query index` to build it, then retry.\n  \
+                         (`atomic vault query enrich` also builds it as part of full enrichment.)"
                 );
                 return Ok(());
             }
