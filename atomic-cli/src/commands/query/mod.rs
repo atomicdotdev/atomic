@@ -1380,13 +1380,6 @@ impl Command for QueryCode {
     fn run(&self) -> CliResult<()> {
         let root = find_repository_root()?;
 
-        if !atomic_repository::has_content_index(&root) {
-            let spinner = create_spinner("Building content index...");
-            atomic_repository::build_content_index(&root)
-                .map_err(|e| CliError::Internal(anyhow::anyhow!("index build failed: {e}")))?;
-            finish_success(&spinner, "content index built");
-        }
-
         let opts = atomic_repository::ContentSearchOptions {
             path_filter: self.path_filter.clone(),
             file_type: self.file_type.clone(),
@@ -1400,7 +1393,8 @@ impl Command for QueryCode {
             Err(atomic_repository::ContentSearchError::IndexNotFound) => {
                 println!(
                     "Content index not found.\n\n  \
-                         Run `atomic vault query enrich` to build it, then retry."
+                         Run `atomic vault query index` to build it, then retry.\n  \
+                         (`atomic vault query enrich` also builds it as part of full enrichment.)"
                 );
                 return Ok(());
             }
