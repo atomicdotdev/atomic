@@ -944,6 +944,28 @@ impl Service {
 // ---------------------------------------------------------------------------
 
 impl Service {
+    pub fn prepare_attestation(
+        &self,
+        request: pb::PrepareAttestationRequest,
+    ) -> CliResult<pb::PrepareAttestationResponse> {
+        self.call(move |backend| async move {
+            match backend {
+                Backend::Local(state) => services_agent::AttestationImpl { state }
+                    .prepare_attestation(Request::new(request))
+                    .await
+                    .map(|response| response.into_inner()),
+                Backend::Reactor(channel) => {
+                    let mut attestation =
+                        pb::attestation_service_client::AttestationServiceClient::new(channel);
+                    attestation
+                        .prepare_attestation(request)
+                        .await
+                        .map(|response| response.into_inner())
+                }
+            }
+        })
+    }
+
     pub fn record_attestation(
         &self,
         request: pb::RecordAttestationRequest,

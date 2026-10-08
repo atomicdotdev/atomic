@@ -185,6 +185,18 @@ pub fn attach_proof(mut value: Value, public_key: &PublicKey, signature: &Signat
     value
 }
 
+/// The signature a value's proof carries — what `--signed` hands to the
+/// recording service after a key holder signed `--prepare`'s bytes elsewhere.
+pub fn proof_signature(value: &Value) -> Result<Signature> {
+    let proof: Proof = value
+        .as_object()
+        .and_then(|obj| obj.get(PROP_PROOF))
+        .cloned()
+        .and_then(|p| serde_json::from_value(p).ok())
+        .ok_or_else(|| CanonicalError::Proof("node carries no proof".into()))?;
+    decode_proof_value(&proof.proof_value)
+}
+
 /// Generic verify over a JSON-LD value — the same three checks as the typed
 /// path: (1) the content hash recomputes over `hashing_view`, (2) the signature
 /// verifies over `jcs(signing_view)`, (3) the proof's verificationMethod DID

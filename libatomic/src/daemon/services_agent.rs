@@ -16,12 +16,14 @@ use atomic_canonical::did::did_for_public_key;
 use atomic_canonical::gate::{validate_intent, validate_memory};
 use atomic_canonical::lift::lift_intent;
 use atomic_canonical::memory::lift_memory;
+use atomic_canonical::proof;
 use atomic_canonical::{
     lift_and_attest, lift_and_attest_memory, verify, verify_memory, CanonicalNode, MemoryNode,
 };
 use atomic_core::change::attestation::Attestation;
 use atomic_core::pristine::VaultEntryType;
 use atomic_core::types::Base32;
+use atomic_identity::signing::Signature;
 use atomic_identity::{Identity, IdentityStore};
 use atomic_repository::IntentCreateOptions;
 use atomic_repository::IntentUpdateOptions;
@@ -2531,6 +2533,45 @@ fn load_identity(name: Option<&str>) -> Result<IdentityMaterial, Status> {
     Ok(IdentityMaterial { identity, keypair })
 }
 
+/// Load an identity for VERIFICATION only — the public key, never a secret
+/// key. The external-signing flow (`--prepare`/`--signed`) must work for an
+/// identity whose key is held elsewhere, so it may not touch the key store.
+/// The name is required: an unbound caller cannot borrow the daemon's
+/// default human key by signing as nobody (CONTRACT "Sandbox and vault
+/// writes": unbound grants cannot use daemon default human keys).
+fn load_identity_public(name: &str) -> Result<Identity, Status> {
+    let store = IdentityStore::open_default()
+        .map_err(|error| domain_status(ErrorCode::Internal, format!("identity store: {error}")))?;
+    if name.is_empty() {
+        return Err(domain_status(
+            ErrorCode::InvalidArgument,
+            "an externally-signed attestation names the identity it is signed by",
+        ));
+    }
+    store
+        .load_by_name(name)
+        .map_err(|error| domain_status(ErrorCode::NotFound, format!("identity '{name}': {error}")))
+}
+
+/// The pre-attest gate the CLI's `attest` body applies: refuse violations
+/// signing cannot fill (everything except `proof` and `attributedTo`), so a
+/// signer never signs a node recording would refuse anyway.
+fn refuse_unfillable(node: &CanonicalNode) -> Result<(), Status> {
+    let report = validate_intent(node);
+    let blocking: Vec<_> = report
+        .results
+        .iter()
+        .filter(|v| !matches!(v.path.as_deref(), Some("proof") | Some("attributedTo")))
+        .collect();
+    if !blocking.is_empty() {
+        return Err(domain_status(
+            ErrorCode::PreconditionFailed,
+            format!("the intent does not conform: {report}"),
+        ));
+    }
+    Ok(())
+}
+
 /// blake3 source hash of (frontmatter + body) — the attestation freshness
 /// anchor, mirroring the CLI bridges.
 fn source_content_hash(frontmatter: &Map<String, Value>, body: &str) -> String {
@@ -2555,11 +2596,61 @@ fn write_all(path: &std::path::Path, bytes: &[u8]) -> Result<(), Status> {
 impl attestation_service_server::AttestationService for AttestationImpl {
     async fn prepare_attestation(
         &self,
-        _request: Request<PrepareAttestationRequest>,
+        request: Request<PrepareAttestationRequest>,
     ) -> Result<Response<PrepareAttestationResponse>, Status> {
-        Err(Status::unimplemented(
-            "PrepareAttestation (external signing) lands with its slice",
-        ))
+        let request = request.into_inner();
+        let target = request.target.clone().ok_or_else(|| {
+            domain_status(ErrorCode::InvalidArgument, "attestation target required")
+        })?;
+        let target_kind = target.kind.ok_or_else(|| {
+            domain_status(
+                ErrorCode::InvalidArgument,
+                "attestation target kind required",
+            )
+        })?;
+        let handle =
+            self.state
+                .resolve(request.repository.as_ref().ok_or_else(|| {
+                    domain_status(ErrorCode::InvalidArgument, "repository required")
+                })?)?;
+        self.state.log_rpc("PrepareAttestation", Some(&handle));
+        let gate_handle = handle.clone();
+        let _gate = gate_handle.exclusive().await;
+        let identity_name = request.identity_did.clone();
+
+        let response = tokio::task::spawn_blocking(move || match target_kind {
+            TargetKind::IntentId(intent_id) => {
+                let repo = handle.repository()?;
+                let entry = repo
+                    .vault_intent_show(&intent_id)
+                    .map_err(repository_error)?;
+                let frontmatter = parse_frontmatter(&entry)?;
+                let body = body_of(&entry);
+                // No key here: everything that must agree with verification —
+                // the author, the content hash, the canonical bytes — is
+                // computed now, so the external signer only ever signs bytes.
+                let identity = load_identity_public(&identity_name)?;
+                let node = lift_intent(&frontmatter, &body).map_err(|error| {
+                    domain_status(ErrorCode::InvalidArgument, format!("attest: {error}"))
+                })?;
+                refuse_unfillable(&node)?;
+                let prepared = proof::prepare_attestation(node.to_value(), &identity.public_key);
+                let document = serde_json::to_string(&prepared.value)
+                    .map_err(|e| Status::internal(e.to_string()))?;
+                Ok::<_, Status>(PrepareAttestationResponse {
+                    document,
+                    signing_bytes: prepared.signing_bytes,
+                    snapshot: None,
+                })
+            }
+            other => Err(domain_status(
+                ErrorCode::InvalidArgument,
+                format!("attestation target {other:?} lands with its slice"),
+            )),
+        })
+        .await
+        .map_err(|e| Status::internal(e.to_string()))??;
+        Ok(Response::new(response))
     }
 
     async fn record_attestation(
@@ -2582,6 +2673,7 @@ impl attestation_service_server::AttestationService for AttestationImpl {
         let _gate = gate_handle.exclusive().await;
         let identity_name = request.identity_did.clone();
         let meta = request.meta.clone();
+        let caller_signature = request.signature.clone();
 
         let response = tokio::task::spawn_blocking(move || match target_kind {
             TargetKind::IntentId(intent_id) => {
@@ -2591,16 +2683,62 @@ impl attestation_service_server::AttestationService for AttestationImpl {
                     .map_err(repository_error)?;
                 let frontmatter = parse_frontmatter(&entry)?;
                 let body = body_of(&entry);
-                let material = load_identity(if identity_name.is_empty() {
-                    None
+                let (node, public_key): (CanonicalNode, _) = if caller_signature.is_empty() {
+                    // Sign here, with this machine's key — the plain `attest`.
+                    let material = load_identity(if identity_name.is_empty() {
+                        None
+                    } else {
+                        Some(&identity_name)
+                    })?;
+                    (
+                        lift_and_attest(&frontmatter, &body, &material.identity, &material.keypair)
+                            .map_err(|error| {
+                                domain_status(
+                                    ErrorCode::InvalidArgument,
+                                    format!("attest: {error}"),
+                                )
+                            })?,
+                        material.identity.public_key.clone(),
+                    )
                 } else {
-                    Some(&identity_name)
-                })?;
-                let node: CanonicalNode =
-                    lift_and_attest(&frontmatter, &body, &material.identity, &material.keypair)
-                        .map_err(|error| {
-                            domain_status(ErrorCode::InvalidArgument, format!("attest: {error}"))
+                    // The key was held elsewhere: verify the caller's
+                    // signature against the target AS IT IS NOW (a stale or
+                    // altered intent hashes differently, so an old signature
+                    // cannot land), and attach exactly the proof it earned.
+                    // No secret key is loaded.
+                    let identity = load_identity_public(&identity_name)?;
+                    let unattested = lift_intent(&frontmatter, &body).map_err(|error| {
+                        domain_status(ErrorCode::InvalidArgument, format!("attest: {error}"))
+                    })?;
+                    refuse_unfillable(&unattested)?;
+                    let prepared =
+                        proof::prepare_attestation(unattested.to_value(), &identity.public_key);
+                    let signature = Signature::from_slice(&caller_signature).map_err(|error| {
+                        domain_status(ErrorCode::InvalidArgument, format!("signature: {error}"))
+                    })?;
+                    signature
+                        .verify(&prepared.signing_bytes, &identity.public_key)
+                        .map_err(|_| {
+                            domain_status(
+                                ErrorCode::PreconditionFailed,
+                                format!(
+                                    "the signature does not verify against intent {intent_id} \
+                                     as it is now (re-run --prepare)",
+                                ),
+                            )
                         })?;
+                    (
+                        serde_json::from_value(proof::attach_proof(
+                            prepared.value,
+                            &identity.public_key,
+                            &signature,
+                        ))
+                        .map_err(|e| {
+                            domain_status(ErrorCode::Internal, format!("attested intent: {e}"))
+                        })?,
+                        identity.public_key.clone(),
+                    )
+                };
                 let report = validate_intent(&node);
                 if !report.conforms {
                     return Err(domain_status(
@@ -2608,7 +2746,7 @@ impl attestation_service_server::AttestationService for AttestationImpl {
                         format!("attested intent does not conform: {}", report),
                     ));
                 }
-                verify(&node, &material.keypair.public).map_err(|error| {
+                verify(&node, &public_key).map_err(|error| {
                     domain_status(ErrorCode::Internal, format!("self-check failed: {error}"))
                 })?;
                 let normalized = normalized_id(&repo, &intent_id);

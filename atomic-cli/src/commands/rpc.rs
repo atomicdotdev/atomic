@@ -803,14 +803,61 @@ pub fn intent_attest(args: &super::intent::attest::IntentAttest) -> CliResult<bo
     let Some(session) = Service::open()? else {
         return Ok(false);
     };
+    let target = pb::AttestationTarget {
+        kind: Some(TargetKind::IntentId(args.id.clone())),
+    };
+
+    // Signing elsewhere, step 1: say what to sign — the document and the
+    // bytes a key holder elsewhere (a browser, a hardware token, a signing
+    // service) signs. No key on this machine is involved.
+    if args.prepare {
+        let request = pb::PrepareAttestationRequest {
+            repository: Some(session.reference.clone()),
+            meta: request_meta(),
+            target: Some(target),
+            identity_did: args.identity.clone().unwrap_or_default(),
+            view: None,
+        };
+        let response = session.prepare_attestation(request)?;
+        let document: serde_json::Value = serde_json::from_str(&response.document)
+            .map_err(|e| CliError::Internal(anyhow::anyhow!("prepared document: {e}")))?;
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "document": document,
+                "signingBytes": data_encoding::BASE64.encode(&response.signing_bytes),
+            }))
+            .unwrap()
+        );
+        return Ok(true);
+    }
+
+    // Signing elsewhere, step 2: record an attestation signed elsewhere. The
+    // file holds the `--prepare` document with its proof attached; the service
+    // re-derives the document from the intent AS IT IS NOW and verifies the
+    // signature against it, so a stale or altered intent is refused.
+    let caller_signature = if let Some(path) = &args.signed {
+        let text = std::fs::read_to_string(path).map_err(CliError::Io)?;
+        let signed: serde_json::Value =
+            serde_json::from_str(&text).map_err(|e| CliError::InvalidArgument {
+                message: format!("{} is not JSON: {e}", path.display()),
+            })?;
+        atomic_canonical::proof::proof_signature(&signed)
+            .map_err(|e| CliError::InvalidArgument {
+                message: format!("not an attested intent: {e}"),
+            })?
+            .as_bytes()
+            .to_vec()
+    } else {
+        Vec::new()
+    };
+
     let request = pb::RecordAttestationRequest {
         repository: Some(session.reference.clone()),
         meta: request_meta(),
-        target: Some(pb::AttestationTarget {
-            kind: Some(TargetKind::IntentId(args.id.clone())),
-        }),
+        target: Some(target),
         identity_did: args.identity.clone().unwrap_or_default(),
-        signature: Vec::new(),
+        signature: caller_signature,
         view: None,
         expected_snapshot: None,
     };
@@ -838,7 +885,7 @@ pub fn intent_validate(args: &super::intent::validate::IntentValidate) -> CliRes
     let Some(session) = Service::open()? else {
         return Ok(false);
     };
-    validate_entity(&session, Kind::Intent, &args.id_or_path)
+    validate_entity(&session, Kind::Intent, &args.id_or_path, args.json)
 }
 
 pub fn intent_verify(args: &super::intent::verify::IntentVerify) -> CliResult<bool> {
@@ -953,7 +1000,7 @@ pub fn intent_show(args: &super::intent::show::IntentShow) -> CliResult<bool> {
     Ok(true)
 }
 
-fn validate_entity(session: &Service, kind: Kind, id: &str) -> CliResult<bool> {
+fn validate_entity(session: &Service, kind: Kind, id: &str, json: bool) -> CliResult<bool> {
     let request = pb::ValidateVaultEntityRequest {
         repository: Some(session.reference.clone()),
         kind: kind as i32,
@@ -964,6 +1011,24 @@ fn validate_entity(session: &Service, kind: Kind, id: &str) -> CliResult<bool> {
         view: None,
     };
     let response = session.validate_vault_entity(request)?;
+    if json {
+        // Same top-level shape the local body's `report_json` prints; the
+        // wire carries each violation as one message string, so an entry is
+        // its message.
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "conforms": response.valid,
+                "results": response
+                    .issues
+                    .iter()
+                    .map(|issue| serde_json::json!({ "message": issue }))
+                    .collect::<Vec<_>>(),
+            }))
+            .unwrap()
+        );
+        return Ok(true);
+    }
     if response.valid {
         println!("conforms: yes");
     } else {
@@ -1046,7 +1111,7 @@ pub fn memory_validate(args: &super::memory::validate::MemoryValidate) -> CliRes
     let Some(session) = Service::open()? else {
         return Ok(false);
     };
-    validate_entity(&session, Kind::Memory, &args.id_or_path)
+    validate_entity(&session, Kind::Memory, &args.id_or_path, args.json)
 }
 
 pub fn memory_verify(args: &super::memory::verify::MemoryVerify) -> CliResult<bool> {
