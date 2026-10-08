@@ -227,19 +227,21 @@ impl Repository {
     pub fn materialize_view_to(&self, view: &str, dir: &Path) -> Result<usize, RepositoryError> {
         std::fs::create_dir_all(dir)?;
 
+        // The view as it renders — its own added and moved files included,
+        // whichever view is checked out.
         let mut count = 0usize;
-        for path in self.visible_file_paths(view)? {
-            let bytes = match self.get_file_content_on_view(&path, view)? {
-                Some(bytes) => bytes,
-                None => continue,
-            };
-            let target = dir.join(&path);
+        self.materialize_view_entries(view, |entry| -> Result<(), std::io::Error> {
+            if entry.kind == super::ViewEntryKind::Directory {
+                return Ok(());
+            }
+            let target = dir.join(&entry.path);
             if let Some(parent) = target.parent() {
                 std::fs::create_dir_all(parent)?;
             }
-            std::fs::write(&target, &bytes)?;
+            std::fs::write(&target, &entry.content)?;
             count += 1;
-        }
+            Ok(())
+        })??;
 
         Ok(count)
     }
@@ -523,6 +525,25 @@ mod tests {
         assert!(
             !dest.join(DOT_DIR).exists(),
             "the canonical graph must not be cloned into the sandbox"
+        );
+    }
+
+    #[test]
+    fn a_sandbox_never_sees_its_pointer_as_untracked() {
+        let dir = tempdir().unwrap();
+        let repo = repo_with_recorded_file(&dir.path().join("repo"), "hello.txt", b"hi\n");
+        let sandbox = dir.path().join("agent-1");
+        repo.provision_sandbox(&sandbox, "dev").unwrap();
+        std::fs::write(sandbox.join("new.txt"), b"new\n").unwrap();
+        drop(repo);
+
+        let opened = Repository::open_existing(&sandbox).unwrap();
+        let status = opened.status(Default::default()).unwrap();
+        let untracked: Vec<_> = status.untracked().map(|e| e.path().to_path_buf()).collect();
+        assert_eq!(
+            untracked,
+            vec![PathBuf::from("new.txt")],
+            "the pointer can carry a credential; `record --all` must never pick it up"
         );
     }
 }

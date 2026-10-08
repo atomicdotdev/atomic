@@ -13,6 +13,7 @@ members = [
     "atomic-repository",
     "atomic-semantic",
     "atomic-teams",
+    "atomic-wasm",
     "libatomic",
 ]
 
