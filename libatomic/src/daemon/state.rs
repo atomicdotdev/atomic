@@ -13,6 +13,8 @@ use crate::atomic::ErrorCode;
 use crate::atomic::{ErrorInfo, RepositoryRef};
 use atomic_repository::redb_change_store::RedbChangeStore;
 use atomic_repository::Repository;
+
+use super::sandbox_grants::{InMemorySandboxGrants, SandboxGrants};
 use tonic::{Code, Status};
 
 use prost::Message;
@@ -149,6 +151,7 @@ pub struct DaemonState {
     repos: Mutex<HashMap<Vec<u8>, std::sync::Arc<RepoHandle>>>,
     pub shutdown: tokio::sync::Notify,
     log_path: Option<PathBuf>,
+    grants: std::sync::Arc<dyn SandboxGrants>,
 }
 
 impl DaemonState {
@@ -157,7 +160,21 @@ impl DaemonState {
             repos: Mutex::new(HashMap::new()),
             shutdown: tokio::sync::Notify::new(),
             log_path: std::env::var_os(ENV_LOG_REQUESTS).map(PathBuf::from),
+            grants: std::sync::Arc::new(InMemorySandboxGrants::new()),
         }
+    }
+
+    /// Keep sandbox grants in `grants` instead — a host that persists them in
+    /// its own database, say. Install it before serving: grants issued by the
+    /// sandbox handlers resolve through here.
+    pub fn with_sandbox_grants(mut self, grants: std::sync::Arc<dyn SandboxGrants>) -> Self {
+        self.grants = grants;
+        self
+    }
+
+    /// Where this state's sandbox grants live.
+    pub fn sandbox_grants(&self) -> &std::sync::Arc<dyn SandboxGrants> {
+        &self.grants
     }
 
     /// Register (or return the already-registered) handle for a repository

@@ -26,6 +26,10 @@
 use std::path::Path;
 use std::sync::Arc;
 
+// The per-service session methods (compact, …) — same `Service` type,
+// split out the same way libatomic splits its handler impls.
+mod compact;
+
 use atomic_client::proto as pb;
 use libatomic::daemon::services;
 use libatomic::daemon::services_agent;
@@ -55,8 +59,6 @@ use tonic::transport::Channel;
 use tonic::{Request, Status};
 
 use crate::error::{CliError, CliResult};
-
-mod compact;
 
 /// The service-area selector. `ATOMIC_SERVICE` wins; `ATOMIC_RPC` is the
 /// legacy alias (1 → reactor, anything else → local); unset routes local.
@@ -125,9 +127,31 @@ impl Service {
         Self::open_root(&root)
     }
 
+    /// Open a session for administering the repository at the ambient
+    /// path — `atomic sandbox open/renew/close`. Refused inside a remote
+    /// sandbox (grant administration is local to the serving host).
+    pub fn open_admin() -> CliResult<Service> {
+        if let Some((root, _)) = crate::remote_sandbox::current() {
+            return Err(crate::remote_sandbox::refusal(
+                &root,
+                "sandbox administration happens on the host that serves the repository",
+            ));
+        }
+        Self::open()?.ok_or_else(|| CliError::RepositoryNotFound {
+            searched_path: std::env::current_dir().unwrap_or_default(),
+        })
+    }
+
     /// Open the service session for an explicit repository path (the
     /// Reactor's typed dispatch always passes the canonical root).
     pub fn open_root(root: &Path) -> CliResult<Option<Service>> {
+        // A remote sandbox holds no repository the service could resolve —
+        // only a pointer and its cache. Its commands run their local bodies
+        // over the cache, which reaches the serving host through the
+        // sandbox link (see `crate::remote_sandbox`).
+        if atomic_repository::find_remote_sandbox(root).is_some() {
+            return Ok(None);
+        }
         let mode = mode();
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -1568,6 +1592,72 @@ impl Service {
 // ---------------------------------------------------------------------------
 
 impl Service {
+    pub fn open_sandbox(
+        &self,
+        request: pb::OpenSandboxRequest,
+    ) -> CliResult<pb::OpenSandboxResponse> {
+        self.call(move |backend| async move {
+            match backend {
+                Backend::Local(state) => services_sandbox::SandboxImpl { state }
+                    .open_sandbox(Request::new(request))
+                    .await
+                    .map(|response| response.into_inner()),
+                Backend::Reactor(channel) => {
+                    let mut sandbox =
+                        pb::sandbox_service_client::SandboxServiceClient::new(channel);
+                    sandbox
+                        .open_sandbox(request)
+                        .await
+                        .map(|response| response.into_inner())
+                }
+            }
+        })
+    }
+
+    pub fn renew_sandbox(
+        &self,
+        request: pb::RenewSandboxRequest,
+    ) -> CliResult<pb::RenewSandboxResponse> {
+        self.call(move |backend| async move {
+            match backend {
+                Backend::Local(state) => services_sandbox::SandboxImpl { state }
+                    .renew_sandbox(Request::new(request))
+                    .await
+                    .map(|response| response.into_inner()),
+                Backend::Reactor(channel) => {
+                    let mut sandbox =
+                        pb::sandbox_service_client::SandboxServiceClient::new(channel);
+                    sandbox
+                        .renew_sandbox(request)
+                        .await
+                        .map(|response| response.into_inner())
+                }
+            }
+        })
+    }
+
+    pub fn close_sandbox(
+        &self,
+        request: pb::CloseSandboxRequest,
+    ) -> CliResult<pb::CloseSandboxResponse> {
+        self.call(move |backend| async move {
+            match backend {
+                Backend::Local(state) => services_sandbox::SandboxImpl { state }
+                    .close_sandbox(Request::new(request))
+                    .await
+                    .map(|response| response.into_inner()),
+                Backend::Reactor(channel) => {
+                    let mut sandbox =
+                        pb::sandbox_service_client::SandboxServiceClient::new(channel);
+                    sandbox
+                        .close_sandbox(request)
+                        .await
+                        .map(|response| response.into_inner())
+                }
+            }
+        })
+    }
+
     pub fn create_sandbox_tree(
         &self,
         request: pb::CreateSandboxTreeRequest,
@@ -1640,6 +1730,29 @@ impl Service {
 // ---------------------------------------------------------------------------
 
 impl Service {
+    /// `GenerateTriageReview` — the canonical triage report, wire-carried
+    /// ("atomic.triage.report.v1"); the CLI renders its skins over it.
+    pub fn generate_triage_review(
+        &self,
+        request: pb::GenerateTriageReviewRequest,
+    ) -> CliResult<pb::GenerateTriageReviewResponse> {
+        self.call(move |backend| async move {
+            match backend {
+                Backend::Local(state) => services_triage::TriageImpl { state }
+                    .generate_triage_review(Request::new(request))
+                    .await
+                    .map(|response| response.into_inner()),
+                Backend::Reactor(channel) => {
+                    let mut triage = pb::triage_service_client::TriageServiceClient::new(channel);
+                    triage
+                        .generate_triage_review(request)
+                        .await
+                        .map(|response| response.into_inner())
+                }
+            }
+        })
+    }
+
     pub fn list_triage_candidates(
         &self,
         request: pb::ListTriageCandidatesRequest,

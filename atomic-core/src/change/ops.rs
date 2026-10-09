@@ -213,6 +213,65 @@ impl FileOps {
         &mut self.line_ops
     }
 
+    /// Every existing node these operations name — the changes that created
+    /// the file, lines and tokens they touch. Ids this change creates carry
+    /// the placeholder `NodeId::ROOT` until it is applied, and are left out.
+    ///
+    /// These ids are applied as they are, so whoever applies a change it did
+    /// not record checks them (a remote sandbox's change may name only its
+    /// own view's nodes).
+    pub fn referenced_node_ids(&self) -> std::collections::BTreeSet<crate::types::NodeId> {
+        let mut ids = std::collections::BTreeSet::new();
+        let leaf = |op: &LeafOp, ids: &mut std::collections::BTreeSet<_>| match op {
+            LeafOp::Insert { after, .. } => ids.extend(after.map(|l| l.change_id())),
+            LeafOp::Delete { leaf } | LeafOp::Replace { leaf, .. } | LeafOp::Restore { leaf } => {
+                ids.insert(leaf.change_id());
+            }
+        };
+        ids.insert(self.trunk_id.change_id());
+        match &self.trunk_op {
+            Some(TrunkOp::Delete { trunk })
+            | Some(TrunkOp::Move { trunk, .. })
+            | Some(TrunkOp::Undelete { trunk }) => {
+                ids.insert(trunk.change_id());
+            }
+            Some(TrunkOp::Create { .. }) | None => {}
+        }
+        for line in &self.line_ops {
+            ids.insert(line.branch_id().change_id());
+            match line.operation() {
+                BranchOp::Insert { after, content } => {
+                    ids.extend(after.map(|b| b.change_id()));
+                    content.iter().for_each(|op| leaf(op, &mut ids));
+                }
+                BranchOp::Delete { branch, content } => {
+                    ids.insert(branch.change_id());
+                    content.iter().for_each(|op| leaf(op, &mut ids));
+                }
+                BranchOp::Modify {
+                    branch,
+                    old_content,
+                    new_content,
+                } => {
+                    ids.insert(branch.change_id());
+                    old_content
+                        .iter()
+                        .chain(new_content)
+                        .for_each(|op| leaf(op, &mut ids));
+                }
+                BranchOp::Restore { branch } => {
+                    ids.insert(branch.change_id());
+                }
+                BranchOp::Reparent { branch, new_after } => {
+                    ids.insert(branch.change_id());
+                    ids.extend(new_after.map(|b| b.change_id()));
+                }
+            }
+        }
+        ids.remove(&crate::types::NodeId::ROOT);
+        ids
+    }
+
     /// Adds a line operation.
     pub fn add_line_op(&mut self, op: LineOps) {
         self.line_ops.push(op);

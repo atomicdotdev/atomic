@@ -1,120 +1,46 @@
 use super::*;
 
 impl Record {
-    /// Build AI provenance from CLI flags and environment variables.
-    ///
-    /// Environment variables take precedence over CLI flags for consistency
-    /// with AI tool integrations that set environment variables.
-    pub(super) fn build_provenance(&self) -> Option<Provenance> {
+    /// The AI authorship parts from CLI flags and environment variables —
+    /// the shared vocabulary [`Provenance::from_authorship_parts`] builds
+    /// from, so the local body, the routed body and the handler produce
+    /// the identical provenance. Environment variables shadow the flags,
+    /// as AI tool integrations set them.
+    pub(crate) fn authorship_parts(&self) -> Option<AuthorshipParts> {
         // Check if AI-assisted via flag or environment variable
         let ai_enabled = self.ai_assisted
             || std::env::var("ATOMIC_AI_ENABLED")
                 .map(|v| v == "true" || v == "1")
                 .unwrap_or(false);
-
         if !ai_enabled {
             return None;
         }
 
-        // Get provider (required for provenance)
+        // Provider is required: without it there is no meaningful
+        // provenance to carry.
         let provider = self
             .ai_provider
             .clone()
-            .or_else(|| std::env::var("ATOMIC_AI_PROVIDER").ok());
+            .or_else(|| std::env::var("ATOMIC_AI_PROVIDER").ok())?;
 
-        let provider = match provider {
-            Some(p) => p,
-            None => {
-                // No provider specified - can't create meaningful provenance
-                return None;
-            }
-        };
-
-        // Get model (required for provenance)
         let model = self
             .ai_model
             .clone()
             .or_else(|| std::env::var("ATOMIC_AI_MODEL").ok())
             .unwrap_or_else(|| "unknown".to_string());
 
-        // Parse vendor from provider string
-        let vendor = AIVendor::parse(&provider);
-
-        // Get tool type
-        let tool_from_env = std::env::var("ATOMIC_AI_TOOL").ok();
-
-        let tool_str = self
+        let tool = self
             .ai_tool
             .clone()
-            .or(tool_from_env)
-            .unwrap_or_else(|| "cli".to_string());
+            .or_else(|| std::env::var("ATOMIC_AI_TOOL").ok())
+            .or_else(|| Some("cli".to_string()));
 
-        let tool = match tool_str.to_lowercase().as_str() {
-            "api" => AITool::Api,
-            "chat" => AITool::Chat,
-            "cli" => AITool::Cli("atomic".to_string()),
-            "ci" => AITool::CI("atomic-ci".to_string()),
-            "code-review" | "codereview" => AITool::CodeReview("atomic".to_string()),
-            // AI coding assistants - treat as editors/IDEs
-            "opencode" => AITool::Editor("opencode".to_string()),
-            "cursor" => AITool::Editor("cursor".to_string()),
-            "aider" => AITool::Cli("aider".to_string()),
-            "claude-code" | "claude_code" => AITool::Cli("claude-code".to_string()),
-            other => {
-                // Check prefixes FIRST before contains patterns
-                // This ensures "cli:opencode" becomes Cli("opencode") not Editor("cli:opencode")
-                if other.starts_with("cli:") {
-                    AITool::Cli(other.trim_start_matches("cli:").to_string())
-                } else if other.starts_with("ci:") {
-                    AITool::CI(other.trim_start_matches("ci:").to_string())
-                } else if other.starts_with("editor:") {
-                    AITool::Editor(other.trim_start_matches("editor:").to_string())
-                // Then check for editor or IDE plugin patterns
-                } else if other.contains("editor")
-                    || other.contains("zed")
-                    || other.contains("vscode")
-                    || other.contains("vim")
-                    || other.contains("emacs")
-                {
-                    AITool::Editor(other.to_string())
-                } else if other.contains("plugin") || other.contains("copilot") {
-                    AITool::IdePlugin(other.to_string())
-                } else if other.contains("aider") || other.contains("claude-code") {
-                    AITool::Cli(other.to_string())
-                } else {
-                    AITool::Other(other.to_string())
-                }
-            }
-        };
-
-        // Get suggestion type
-        let suggestion_str = self
+        let suggestion_type = self
             .ai_suggestion_type
             .clone()
             .or_else(|| std::env::var("ATOMIC_AI_SUGGESTION_TYPE").ok())
-            .unwrap_or_else(|| "collaborative".to_string());
+            .or_else(|| Some("collaborative".to_string()));
 
-        let suggestion_type = match suggestion_str.to_lowercase().as_str() {
-            "complete" => SuggestionType::Complete,
-            "partial" => SuggestionType::Partial,
-            "collaborative" => SuggestionType::Collaborative,
-            "selection" => SuggestionType::Selection,
-            "review" => SuggestionType::Review,
-            "documentation" | "docs" => SuggestionType::Documentation,
-            "debugging" | "debug" => SuggestionType::Debugging,
-            "refactoring" | "refactor" => SuggestionType::Refactoring,
-            "testing" | "test" => SuggestionType::Testing,
-            _ => SuggestionType::Collaborative,
-        };
-
-        // Build the provenance
-        let mut builder = Provenance::builder()
-            .vendor(vendor)
-            .model(&model)
-            .tool(tool)
-            .suggestion_type(suggestion_type);
-
-        // Add optional fields from CLI or environment
         let input_tokens = self.ai_input_tokens.or_else(|| {
             std::env::var("ATOMIC_AI_INPUT_TOKENS")
                 .ok()
@@ -125,43 +51,43 @@ impl Record {
                 .ok()
                 .and_then(|s| s.parse().ok())
         });
+        let request_id = self
+            .ai_request_id
+            .clone()
+            .or_else(|| std::env::var("ATOMIC_AI_REQUEST_ID").ok());
+        let session_id = self
+            .ai_session_id
+            .clone()
+            .or_else(|| std::env::var("ATOMIC_AI_SESSION_ID").ok());
 
-        if let Some(input) = input_tokens {
-            builder = builder.input_tokens(input);
-        }
-        if let Some(output) = output_tokens {
-            builder = builder.output_tokens(output);
-        }
+        Some(AuthorshipParts {
+            provider,
+            model,
+            tool,
+            suggestion_type,
+            input_tokens,
+            output_tokens,
+            request_id,
+            session_id,
+        })
+    }
 
+    /// Build AI provenance from CLI flags and environment variables.
+    ///
+    /// The shared parts (see [`Self::authorship_parts`]), plus the fields
+    /// only the local body carries today (cost): the wire carries the
+    /// parts; this fills what only a local caller knows.
+    pub(super) fn build_provenance(&self) -> Option<Provenance> {
+        let mut provenance = Provenance::from_authorship_parts(&self.authorship_parts()?);
         let cost = self.ai_cost_usd.or_else(|| {
             std::env::var("ATOMIC_AI_COST_USD")
                 .ok()
                 .and_then(|s| s.parse().ok())
         });
         if let Some(cost_usd) = cost {
-            builder = builder.cost_usd(cost_usd);
+            provenance.cost = Cost::from_usd(cost_usd);
         }
-
-        let request_id = self
-            .ai_request_id
-            .clone()
-            .or_else(|| std::env::var("ATOMIC_AI_REQUEST_ID").ok());
-        if let Some(req_id) = request_id {
-            builder = builder.request_id(req_id);
-        }
-
-        let session_id = self
-            .ai_session_id
-            .clone()
-            .or_else(|| std::env::var("ATOMIC_AI_SESSION_ID").ok());
-        if let Some(sess_id) = session_id {
-            builder = builder.session_id(sess_id);
-        }
-
-        // Add timestamp
-        builder = builder.timestamp(chrono::Utc::now().timestamp());
-
-        Some(builder.build())
+        Some(provenance)
     }
 
     /// Build RecordOptions from command-line arguments.

@@ -1,4 +1,5 @@
 use super::*;
+use atomic_core::change::{AITool, AIVendor, SuggestionType};
 
 // Tests
 

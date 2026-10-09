@@ -57,6 +57,10 @@ impl Repository {
         // Build the final header (may get message from options)
         let final_header = build_header(header, &options);
 
+        // A remote sandbox's cache takes the rows it is about to read.
+        self.hydrate_remote_sandbox()
+            .map_err(RecordError::Repository)?;
+
         // Get repository status to find modified files
         let status_t0 = std::time::Instant::now();
         let mut status_options = StatusOptions::default();
@@ -1002,8 +1006,24 @@ impl Repository {
             );
         }
 
-        let change = assembly_result.into_change();
+        let mut change = assembly_result.into_change();
         stats.dependency_count = change.dependencies().len();
+
+        // Unhashed data (the agent's condensed transcript, reasoning) rides
+        // the change from here: the local change store's file and — the
+        // point of the seam — a remote sandbox's SubmitChange bytes, which
+        // carry exactly what this record serialized. It used to be attached
+        // AFTER the record and re-saved to a store a sandbox never reads,
+        // so expeditions recorded changes whose provenance said nothing
+        // about how they were made.
+        if let Some(unhashed) = options.get_unhashed() {
+            let entry = change.unhashed.get_or_insert_with(|| serde_json::json!({}));
+            if let Some(obj) = entry.as_object_mut() {
+                for (key, value) in unhashed.as_object().into_iter().flatten() {
+                    obj.insert(key.clone(), value.clone());
+                }
+            }
+        }
 
         let serialize_t0 = std::time::Instant::now();
         // Serialize to V3 format and compute content hash.
@@ -1206,6 +1226,9 @@ impl Repository {
                         }
                     }
                 }
+                // A remote sandbox's change that didn't land isn't recorded
+                // anywhere: that is a failure, not a warning.
+                Err(e) if self.is_remote_sandbox() => return Err(RecordError::Repository(e)),
                 Err(e) => {
                     outcome.add_error("apply".to_string(), e.to_string());
                 }

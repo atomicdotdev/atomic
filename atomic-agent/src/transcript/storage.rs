@@ -59,6 +59,21 @@ pub struct UnhashedTurnData {
     /// The server shows a "redacted" badge instead of the transcript viewer.
     #[serde(default)]
     pub redacted: bool,
+
+    /// The turn's LLM input tokens, as the agent's turn-end hook reported
+    /// them. `None` when the agent reports no usage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_tokens: Option<u64>,
+
+    /// The turn's LLM output tokens, as the agent's turn-end hook reported
+    /// them. `None` when the agent reports no usage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_tokens: Option<u64>,
+
+    /// The turn's step count (LLM round-trips), as the agent's turn-end
+    /// hook reported it. `None` when the agent reports no usage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub step_count: Option<u32>,
 }
 
 impl UnhashedTurnData {
@@ -84,7 +99,24 @@ impl UnhashedTurnData {
             tools_used,
             reasoning: None,
             redacted: false,
+            input_tokens: None,
+            output_tokens: None,
+            step_count: None,
         }
+    }
+
+    /// Attach the turn's LLM usage, as the agent's turn-end hook reported
+    /// it: the turn's token cost and its step count.
+    pub fn with_usage(
+        mut self,
+        input_tokens: Option<u64>,
+        output_tokens: Option<u64>,
+        step_count: Option<u32>,
+    ) -> Self {
+        self.input_tokens = input_tokens;
+        self.output_tokens = output_tokens;
+        self.step_count = step_count;
+        self
     }
 
     /// Set the reasoning summary.

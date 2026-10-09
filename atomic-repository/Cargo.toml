@@ -11,6 +11,7 @@ rust-version.workspace = true
 [dependencies]
 atomic-core = { workspace = true }
 atomic-canonical = { workspace = true }
+blake3 = { workspace = true }
 atomic-config = { workspace = true }
 atomic-identity = { workspace = true }
 atomic-semantic = { workspace = true }

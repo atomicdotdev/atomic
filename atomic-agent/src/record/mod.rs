@@ -66,7 +66,6 @@ mod tests;
 use std::path::Path;
 
 use atomic_core::change::ChangeHeader;
-use atomic_core::types::Base32;
 
 use atomic_repository::status::RepositoryStatus;
 
@@ -406,6 +405,12 @@ pub fn record_turn(
     // HashedChange.metadata — part of the change's cryptographic identity.
     // This means session structure (turn number, timing, files, agent name)
     // is tamper-evident and commutes via patch theory.
+    // The turn's unhashed data — the condensed transcript: every assistant
+    // reply and tool call — rides the record itself, so it lands wherever
+    // the change lands: the local change store, or the owner through a
+    // remote sandbox's SubmitChange. Attached after the record it reached
+    // only a store the sandbox never reads.
+    let unhashed_data = build_unhashed_turn_data(options, &status_files);
     let mut record_options = atomic_repository::record::RecordOptions::new()
         .with_all(true)
         .view(options.session.view_name.clone())
@@ -418,6 +423,15 @@ pub fn record_turn(
         .enrich_kg(false)
         .provenance(vec![provenance_entry])
         .metadata_bytes(envelope_bytes);
+    if let Some(data) = &unhashed_data {
+        if let Ok(value) = serde_json::to_value(data) {
+            // The same envelope shape `attach_unhashed` writes, so every
+            // reader (outpost's Provenance tab, `agent explain`) sees one
+            // form.
+            record_options = record_options
+                .with_unhashed(serde_json::json!({ transcript::UNHASHED_KEY: value }));
+        }
+    }
 
     if manifest.is_some() {
         record_options = record_options.with_all(false).paths(status_files.clone());
@@ -440,7 +454,7 @@ pub fn record_turn(
         }
     }
 
-    let mut outcome = match repo.record(header, record_options) {
+    let outcome = match repo.record(header, record_options) {
         Ok(outcome) => outcome,
         Err(atomic_repository::record::RecordError::NothingToRecord) => {
             return Err(AgentError::EmptyTurn {
@@ -465,80 +479,15 @@ pub fn record_turn(
         .collect();
     let file_count = recorded_files.len();
 
-    // Step 6: Condense transcript + generate reasoning + attach to unhashed
+    // Step 6: unhashed transcript data.
     //
-    // Read the agent's transcript file, condense it into structured entries,
-    // optionally generate an AI reasoning summary, anchor code learnings to
-    // the CRDT graph, then attach everything to the change's unhashed section.
-    //
-    // All of this is non-fatal — if any step fails, the change is still valid.
-    // The unhashed data is also stored in TurnRecordOutcome so the orchestrator
-    // can log/display it.
-
-    let unhashed_data: Option<transcript::UnhashedTurnData> =
-        build_unhashed_turn_data(options, &recorded_files, &outcome);
-
-    if let Some(ref data) = unhashed_data {
-        let entry_count = data.entry_count();
-        let has_reasoning = data.has_reasoning();
-        match transcript::attach_unhashed(outcome.change_mut(), data) {
-            Ok(()) => {
-                log::info!(
-                    "Attached transcript ({} entries{}) to change for turn {}",
-                    entry_count,
-                    if has_reasoning { " + reasoning" } else { "" },
-                    options.turn_number,
-                );
-
-                // The store wrote the change file during record(), before
-                // this unhashed data existed. Re-save so the file on disk
-                // carries the transcript. The unhashed section is outside
-                // the hash, so the content hash is unchanged and the file
-                match atomic_repository::Repository::canonical_dot_dir(repo_root)
-                    .map(|dot| dot.join("changes"))
-                    .map_err(|e| e.to_string())
-                    .and_then(|dir| {
-                        atomic_repository::ChangeStore::new(
-                            dir,
-                            atomic_repository::DEFAULT_CACHE_CAPACITY,
-                        )
-                        .map_err(|e| e.to_string())
-                    }) {
-                    Ok(store) => match store.save_change(outcome.change()) {
-                        Ok(saved) if saved == *outcome.hash() => {}
-                        Ok(saved) => {
-                            log::warn!(
-                                "Re-saved change hash {} differs from recorded {} — \
-                                 unhashed data may be orphaned",
-                                saved.to_base32(),
-                                outcome.hash().to_base32(),
-                            );
-                        }
-                        Err(e) => {
-                            log::warn!(
-                                "Failed to persist transcript on change {} (non-fatal): {}",
-                                outcome.hash().to_base32(),
-                                e
-                            );
-                        }
-                    },
-                    Err(e) => {
-                        log::warn!(
-                            "Could not open change store to persist transcript \
-                             (non-fatal): {}",
-                            e
-                        );
-                    }
-                }
-            }
-            Err(e) => {
-                log::warn!(
-                    "Failed to attach unhashed data to change (non-fatal): {}",
-                    e
-                );
-            }
-        }
-    }
+    // Condensed and attached BEFORE the record (RecordOptions's
+    // `with_unhashed`), so it rides the change wherever the record puts it —
+    // including a remote sandbox's SubmitChange bytes. The old
+    // attach-then-re-save here wrote to a change store a sandbox never
+    // reads, so expeditions recorded changes whose provenance said nothing
+    // about how they were made. What remains is the display copy for the
+    // outcome; non-fatal, exactly as before.
 
     let hash = *outcome.hash();
 

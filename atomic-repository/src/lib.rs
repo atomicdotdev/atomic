@@ -89,13 +89,16 @@
 // Core modules
 pub mod apply;
 pub mod changestore;
+pub mod diff_engine;
 pub mod error;
 pub mod ignore;
+pub mod intent_bridge;
 pub mod manifest;
 pub mod record;
 pub mod repository;
 pub mod status;
 pub mod tracking;
+pub mod triage;
 
 // Phase 7 additions
 pub mod archive;

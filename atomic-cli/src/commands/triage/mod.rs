@@ -17,9 +17,16 @@ use crate::commands::complete::complete_view_names;
 use crate::commands::{find_repository_root, Command};
 use crate::error::{CliError, CliResult};
 
-pub mod model;
+// The canonical report model and the projection that populates it live in
+// the repository layer now; these re-exports keep the renders (output.rs)
+// and every test reading the same.
+pub mod model {
+    pub use atomic_repository::triage::model::*;
+}
 pub mod output;
-pub mod project;
+pub mod project {
+    pub use atomic_repository::triage::report::{build_report, build_walkthrough, TaskFact};
+}
 
 /// Triage a feature view against a target before insert.
 ///
@@ -324,38 +331,44 @@ pub struct TriageReview {
 
 impl Command for TriageReview {
     fn run(&self) -> CliResult<()> {
-        // STRUCTURAL LIMIT (recorded in REAC::aaron::27): the canonical
-        // report builder (`project::build_report` — the change → file →
-        // task → intent → acceptance-criterion join) is a ~2000-line
-        // module entangled with CLI-only presentation helpers (hunk
-        // display summaries, the `diff -c` builder, the intent bridge);
-        // porting it into the handler layer is a separate migration and
-        // GenerateTriageReview refuses until it lands. This command keeps
-        // its local body — the one remaining redb-open on a routed surface.
+        // Routed first (REAC::aaron::27's structural limit resolved: the
+        // canonical report builder moved into the repository layer, and
+        // GenerateTriageReview serves it). The local body stays for a
+        // no-service context — it runs the same builder directly.
+        if let Some(report) = crate::commands::rpc::triage_review(self)? {
+            return render_report(self, &report);
+        }
+
         let root = find_repository_root()?;
         let repo = Repository::open(&root).map_err(CliError::Repository)?;
         let (feature, into) = resolve_views(&repo, self.feature.as_deref(), self.into.as_deref())?;
 
         let report = project::build_report(&repo, &feature, &into)?;
-
-        // Output selection precedence:
-        // attest > html > json > walkthrough > CLI dashboard.
-        if self.attest {
-            let signed = output::attest_report(&report, self.identity.as_deref())?;
-            println!("{}", serde_json::to_string_pretty(&signed).unwrap());
-        } else if self.html {
-            let html = output::render_html(&report);
-            write_and_open_html(&html, &report, self.output.as_deref(), !self.no_open)?;
-        } else if self.json {
-            println!("{}", serde_json::to_string_pretty(&report).unwrap());
-        } else if self.walkthrough {
-            output::print_walkthrough(&report);
-        } else {
-            output::print_report(&report);
-        }
-
-        Ok(())
+        render_report(self, &report)
     }
+}
+
+/// The output selection, shared by the routed and the local body: attest >
+/// html > json > walkthrough > CLI dashboard.
+fn render_report(
+    review: &TriageReview,
+    report: &atomic_repository::triage::TriageReport,
+) -> CliResult<()> {
+    if review.attest {
+        let signed = output::attest_report(report, review.identity.as_deref())?;
+        println!("{}", serde_json::to_string_pretty(&signed).unwrap());
+    } else if review.html {
+        let html = output::render_html(report);
+        write_and_open_html(&html, report, review.output.as_deref(), !review.no_open)?;
+    } else if review.json {
+        println!("{}", serde_json::to_string_pretty(report).unwrap());
+    } else if review.walkthrough {
+        output::print_walkthrough(report);
+    } else {
+        output::print_report(report);
+    }
+
+    Ok(())
 }
 
 /// Resolve the `(source, target)` view pair a triage run operates on.

@@ -1,8 +1,8 @@
 //! Resumable pending provenance journal stored alongside redb-native changes.
 
 use atomic_core::change::session::{
-    encode_session_event_key, encode_session_turn_key, session_turn_namespace, SessionEvent,
-    SessionTurn,
+    decode_session_turn_key, encode_session_event_key, encode_session_turn_key,
+    session_turn_namespace, SessionEvent, SessionTurn,
 };
 use atomic_core::pristine::tables;
 use atomic_core::types::Hash;
@@ -367,6 +367,31 @@ impl RedbChangeStore {
             .get(id.get())?
             .map(|value| StoredProvenanceTurn::from_bytes(value.value()))
             .transpose()
+    }
+
+    /// The highest turn number recorded for `session_id`, if any.
+    ///
+    /// A session's turns are one contiguous, turn-ordered run of keys (the
+    /// namespace is a fixed prefix, the number is big-endian at the end), so
+    /// the last key in that range is the highest turn. Callers asking "is this
+    /// turn number taken?" want this, not a walk from turn 1 — the turn number
+    /// comes off the wire, and a walk to it opens a read transaction per step.
+    pub fn last_provenance_turn_for(&self, session_id: &str) -> RedbStoreResult<Option<u32>> {
+        let txn = self.db.begin_read()?;
+        let index = txn.open_table(tables::PROVENANCE_TURN_INDEX)?;
+        let lo = turn_key(session_id, 0);
+        let hi = turn_key(session_id, u32::MAX);
+        let Some(last) = index.range::<&[u8; 40]>(&lo..=&hi)?.next_back() else {
+            return Ok(None);
+        };
+        let (key, _) = last?;
+        let (namespace, turn) = decode_session_turn_key(key.value());
+        if namespace != session_turn_namespace(session_id) {
+            return Err(RedbStoreError::Corrupt(
+                "session-turn index returned a key outside the session's range".to_string(),
+            ));
+        }
+        Ok(Some(turn))
     }
 
     /// Return a reserved turn by external session identity and turn number.

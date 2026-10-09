@@ -84,6 +84,11 @@ pub struct SealResult {
 /// instead of looking for a local `.atomic/`.
 pub const SANDBOX_POINTER: &str = ".atomic-sandbox";
 
+/// A remote sandbox's own directory, beside its pointer: the local cache of
+/// its repository's rows (`cache/`, an ordinary repository whose working
+/// tree is the sandbox). Never tracked.
+pub const SANDBOX_CACHE_DIR: &str = ".atomic-sandbox.d";
+
 /// Persisted contents of a sandbox pointer: where the canonical graph lives
 /// and which view this sandbox operates on.
 #[derive(Debug, Serialize, Deserialize)]
@@ -92,6 +97,87 @@ struct SandboxPointer {
     canonical: PathBuf,
     /// View this sandbox operates on.
     view: String,
+}
+
+/// The repository a remote sandbox's grant is for, as the serving host
+/// names it (its `RepositoryRef`): an authority and an opaque id, hex.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteRepositoryRef {
+    pub authority: String,
+    /// The repository id's bytes, lowercase hex.
+    pub repository_id: String,
+}
+
+/// A remote sandbox's [`SANDBOX_POINTER`]: which repository and view its
+/// grant reaches, and the token that proves it. No address — how the
+/// sandbox reaches the serving host is the host's business (the CLI speaks
+/// to whatever serves its daemon socket).
+///
+/// It holds a credential, so it is written readable by its owner only
+/// ([`write_remote_sandbox_pointer`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteSandboxPointer {
+    pub repository: RemoteRepositoryRef,
+    pub view: String,
+    /// The view's id as the host issued it (`ViewRef.view_id`), hex.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub view_id: Option<String>,
+    pub token: String,
+}
+
+impl RemoteSandboxPointer {
+    /// The pointer at `dir`, if `dir` holds a remote one.
+    pub fn read(dir: &Path) -> Option<Self> {
+        let bytes = std::fs::read(dir.join(SANDBOX_POINTER)).ok()?;
+        serde_json::from_slice(&bytes).ok()
+    }
+}
+
+/// Write `pointer` as `dir`'s [`SANDBOX_POINTER`], mode 0600 (it carries a
+/// token).
+pub fn write_remote_sandbox_pointer(
+    dir: &Path,
+    pointer: &RemoteSandboxPointer,
+) -> Result<PathBuf, RepositoryError> {
+    use std::io::Write;
+    let path = dir.join(SANDBOX_POINTER);
+    let bytes = serde_json::to_vec_pretty(pointer)
+        .map_err(|e| RepositoryError::Serialization(e.to_string()))?;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&path)?;
+    // An existing file keeps its mode through `open`; tighten it anyway.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    file.write_all(&bytes)?;
+    Ok(path)
+}
+
+/// Walk up from `start` to the nearest [`SANDBOX_POINTER`]; if it is a
+/// remote one, the sandbox's root and its pointer. Stops at a real
+/// repository root.
+pub fn find_remote_sandbox(start: &Path) -> Option<(PathBuf, RemoteSandboxPointer)> {
+    let mut dir = if start.is_absolute() {
+        start.to_path_buf()
+    } else {
+        std::env::current_dir().ok()?.join(start)
+    };
+    loop {
+        if dir.join(SANDBOX_POINTER).is_file() {
+            return RemoteSandboxPointer::read(&dir).map(|p| (dir, p));
+        }
+        if super::database::has_database(&dir.join(DOT_DIR)) || !dir.pop() {
+            return None;
+        }
+    }
 }
 
 /// Walk up from `start` looking for a [`SANDBOX_POINTER`] file. If found,
@@ -107,8 +193,18 @@ pub(super) fn detect_sandbox(start: &Path) -> Option<(PathBuf, PathBuf, String)>
         let pointer = dir.join(SANDBOX_POINTER);
         if pointer.is_file() {
             let bytes = std::fs::read(&pointer).ok()?;
-            let parsed: SandboxPointer = serde_json::from_slice(&bytes).ok()?;
-            return Some((dir.clone(), parsed.canonical, parsed.view));
+            if let Ok(parsed) = serde_json::from_slice::<SandboxPointer>(&bytes) {
+                return Some((dir.clone(), parsed.canonical, parsed.view));
+            }
+            // A remote pointer names a repository served elsewhere; locally,
+            // the graph is the sandbox's cache (once `atomic sandbox
+            // materialize` has made it).
+            let remote: RemoteSandboxPointer = serde_json::from_slice(&bytes).ok()?;
+            let cache = remote_cache_root(&dir);
+            return cache
+                .join(DOT_DIR)
+                .is_dir()
+                .then(|| (dir.clone(), cache, remote.view));
         }
         // Stop if we reach a real repository root — that's not a sandbox.
         if super::database::has_database(&dir.join(DOT_DIR)) {
@@ -120,7 +216,43 @@ pub(super) fn detect_sandbox(start: &Path) -> Option<(PathBuf, PathBuf, String)>
     }
 }
 
+/// Where a remote sandbox rooted at `working_root` keeps its cache.
+pub fn remote_cache_root(working_root: &Path) -> PathBuf {
+    working_root.join(SANDBOX_CACHE_DIR).join("cache")
+}
+
 impl Repository {
+    /// Make (or remake) a remote sandbox's cache from `skeleton`: an empty
+    /// repository under [`SANDBOX_CACHE_DIR`] holding the view's rows, with
+    /// the sandbox as its working tree and the tree on disk as the clean
+    /// baseline. Call it right after writing the view's files.
+    pub fn create_remote_sandbox_cache(
+        working_root: &Path,
+        skeleton: &super::SandboxSkeleton,
+    ) -> Result<Self, RepositoryError> {
+        let cache = remote_cache_root(working_root);
+        if cache.exists() {
+            std::fs::remove_dir_all(&cache)?;
+        }
+        std::fs::create_dir_all(&cache)?;
+        drop(Self::init(&cache)?);
+        let repo = Self::open_sandbox(working_root, &cache, &skeleton.view.name)?;
+        repo.import_sandbox_skeleton(skeleton)?;
+        repo.reindex_working_copy()?;
+        // The view's vault arrived as files, as after a pull: its tables
+        // come from them.
+        if repo.vault_dir().exists() {
+            repo.bootstrap_vault_from_working_copy()?;
+        }
+        Ok(repo)
+    }
+
+    /// Whether this is a remote sandbox's cache (its graph arrives from the
+    /// repository's owner, and its changes go back to it).
+    pub fn is_remote_sandbox(&self) -> bool {
+        self.is_sandbox && self.dot_dir.starts_with(self.root.join(SANDBOX_CACHE_DIR))
+    }
+
     /// Open a repository for an agent sandbox.
     ///
     /// The agent's private working tree is at `working_root`, but the graph

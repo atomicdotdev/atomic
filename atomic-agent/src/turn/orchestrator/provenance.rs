@@ -483,10 +483,19 @@ impl TurnOrchestrator {
         Ok(())
     }
 
-    /// Read a Sherpa JSONL trace file and create provenance nodes for
-    /// every record, preserving the full agent-trace + Sherpa extension data.
+    /// Read the turn's Sherpa trace and create provenance nodes for what
+    /// the agent actually did. The trace is the harness's transcript — the
+    /// Claude Code JSONL shape (`type: user/assistant`, content blocks) —
+    /// condensed by the same parser that builds the change's unhashed
+    /// transcript, so the session graph and the change's agent turn tell
+    /// one story.
     ///
-    /// Returns `true` if at least one record was successfully ingested.
+    /// Every tool call becomes an Execution node (a bash command, a write),
+    /// every assistant reply an LlmResponse node. The older CB-journal
+    /// `record_type` shape nothing writes any more produced zero nodes, and
+    /// a turn's graph said only that a change happened — never how.
+    ///
+    /// Returns `true` if at least one node was ingested.
     pub(crate) fn ingest_sherpa_trace(
         &self,
         session_id: &str,
@@ -494,9 +503,10 @@ impl TurnOrchestrator {
         trace_path: &Path,
     ) -> AgentResult<bool> {
         use crate::provenance::types::{GraphNode, NodeKind};
+        use crate::transcript::EntryType;
 
-        let content = match std::fs::read_to_string(trace_path) {
-            Ok(content) => content,
+        let raw = match std::fs::read(trace_path) {
+            Ok(raw) => raw,
             Err(error) => {
                 log::warn!(
                     "sherpa trace: failed to read {}: {}",
@@ -506,104 +516,45 @@ impl TurnOrchestrator {
                 return Ok(false);
             }
         };
+        let now_ms = chrono::Utc::now().timestamp_millis();
         let mut drafts = Vec::new();
-        for (line_no, line) in content.lines().enumerate() {
-            if line.trim().is_empty() {
-                continue;
-            }
-            let record: serde_json::Value = match serde_json::from_str(line) {
-                Ok(record) => record,
-                Err(error) => {
-                    log::warn!("sherpa trace: line {} parse error: {}", line_no + 1, error);
-                    continue;
+        for (index, entry) in
+            transcript::condense_transcript(&raw, transcript::format_for_agent("sherpa"))
+                .into_iter()
+                .enumerate()
+        {
+            let (kind, summary) = match entry.entry_type {
+                EntryType::Tool => {
+                    let tool = entry.tool_name.as_deref().unwrap_or("tool");
+                    let detail = entry.content.as_deref().unwrap_or_default();
+                    (
+                        NodeKind::Execution,
+                        if detail.is_empty() {
+                            format!("ran {tool}")
+                        } else {
+                            format!("{tool}: {detail}")
+                        },
+                    )
                 }
-            };
-            let dev_atomic = &record["metadata"]["dev.atomic"];
-            let record_type = dev_atomic["record_type"].as_str().unwrap_or("unknown");
-            let timestamp = record["timestamp"]
-                .as_str()
-                .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
-                .map(|value| value.timestamp_millis())
-                .unwrap_or(0);
-            let (kind, summary) = match record_type {
-                "intent" => (
-                    NodeKind::Goal,
-                    dev_atomic["intent_title"]
-                        .as_str()
-                        .unwrap_or("intent")
-                        .to_string(),
-                ),
-                "commitment" => {
-                    let file = record["files"]
-                        .as_array()
-                        .and_then(|files| files.first())
-                        .and_then(|file| file["path"].as_str())
-                        .unwrap_or("");
-                    (NodeKind::Commitment, format!("wrote {file}"))
-                }
-                "execution" => (
-                    NodeKind::Execution,
-                    dev_atomic["command"]
-                        .as_str()
-                        .unwrap_or("command")
-                        .to_string(),
-                ),
-                "todo" => (
-                    NodeKind::Todo,
-                    format!(
-                        "[{}] {}",
-                        dev_atomic["todo_id"].as_str().unwrap_or(""),
-                        dev_atomic["content"].as_str().unwrap_or("")
-                    ),
-                ),
-                "todo_status" => (
-                    NodeKind::TodoStatusChange,
-                    format!(
-                        "{}: {} → {}",
-                        dev_atomic["todo_id"].as_str().unwrap_or(""),
-                        dev_atomic["from_status"].as_str().unwrap_or(""),
-                        dev_atomic["to_status"].as_str().unwrap_or("")
-                    ),
-                ),
-                "phase_transition" => (
-                    NodeKind::PhaseTransition,
-                    format!(
-                        "{} → {}",
-                        dev_atomic["from_phase"].as_str().unwrap_or(""),
-                        dev_atomic["to_phase"].as_str().unwrap_or("")
-                    ),
-                ),
-                "lesson" => (
-                    NodeKind::Lesson,
-                    dev_atomic["label"].as_str().unwrap_or("lesson").to_string(),
-                ),
-                "llm_response" => (
+                EntryType::Assistant => (
                     NodeKind::LlmResponse,
-                    truncate_prompt(dev_atomic["reply"].as_str().unwrap_or("llm response"), 200),
+                    truncate_prompt(entry.content.as_deref().unwrap_or("llm response"), 200),
                 ),
-                "verification" => (
-                    NodeKind::Verification,
-                    dev_atomic["summary"]
-                        .as_str()
-                        .unwrap_or("verification")
-                        .to_string(),
-                ),
-                "human_gate" => (
-                    NodeKind::HumanGateResolution,
-                    format!(
-                        "resolution: {}",
-                        dev_atomic["resolution"].as_str().unwrap_or("")
-                    ),
-                ),
-                _ => continue,
+                // The user's prompt is already the turn's goal marker; tool
+                // results live in the change's unhashed transcript.
+                EntryType::User => continue,
             };
-            let discriminator = format!("sherpa:{}", blake3::hash(line.as_bytes()).to_hex());
-            let event_id = stable_journal_id(session_id, turn_number, &discriminator);
-            let node =
-                GraphNode::new(&event_id, kind, timestamp, summary).with_detail(dev_atomic.clone());
+            let event_id = stable_journal_id(session_id, turn_number, &format!("sherpa:{index}"));
+            let detail = serde_json::json!({
+                "source": "sherpa",
+                "entry_type": format!("{:?}", entry.entry_type),
+                "tool": entry.tool_name,
+                "detail": entry.content,
+            });
+            let node = GraphNode::new(&event_id, kind, now_ms, summary).with_detail(detail);
             drafts.push(JournalDraft {
                 event_id,
-                timestamp_ms: timestamp,
+                timestamp_ms: now_ms,
                 causal_parent_ids: Vec::new(),
                 event: ProvenanceJournalEvent::GraphDelta {
                     nodes: vec![node],

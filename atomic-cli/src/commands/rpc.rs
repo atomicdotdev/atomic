@@ -664,6 +664,7 @@ pub fn record(args: &super::record::Record) -> CliResult<bool> {
             .map(|path| relativize(path, &root))
             .collect(),
         expected: None,
+        ai_authorship: None,
         author,
         identity_name,
     };
@@ -6628,6 +6629,37 @@ pub(crate) fn triage_candidates(
 // ---------------------------------------------------------------------------
 // tags (TagService)
 // ---------------------------------------------------------------------------
+
+/// `triage review` over GenerateTriageReview — the full report bundle (the
+/// verdict, findings, intents, criteria, changes, walkthrough), versioned
+/// `atomic.triage.report.v1`, so the CLI renders the same report over the
+/// service as the local builder produced.
+pub(crate) fn triage_review(
+    args: &super::triage::TriageReview,
+) -> CliResult<Option<atomic_repository::triage::TriageReport>> {
+    let Some(session) = Service::open()? else {
+        return Ok(None);
+    };
+    let request = pb::GenerateTriageReviewRequest {
+        repository: Some(session.reference.clone()),
+        from_view: args.feature.clone().unwrap_or_default(),
+        to_view: args.into.clone().unwrap_or_default(),
+        report: None,
+    };
+    let response = session.generate_triage_review(request)?;
+    let Some(bundle) = response
+        .report
+        .as_ref()
+        .filter(|bytes| bytes.schema == "atomic.triage.report.v1")
+    else {
+        return Err(CliError::Internal(anyhow::anyhow!(
+            "the service returned no triage report bundle"
+        )));
+    };
+    let report = serde_json::from_slice(&bundle.payload)
+        .map_err(|e| CliError::Internal(anyhow::anyhow!("the wire report does not parse: {e}")))?;
+    Ok(Some(report))
+}
 
 /// One wire tag → the domain record shape the local render functions
 /// consume (name, view, sequence, state, timestamp, annotation, kind,
