@@ -22,14 +22,10 @@
 //!
 //! # Routing
 //!
-//! While the daemon is reachable this command is a thin RPC client: the
-//! typed event travels to `ProvenanceService.DispatchTurnEvent`, where the
-//! daemon hosts the turn orchestrator against the repository databases it
-//! owns — this process never opens redb. When the daemon is down the
-//! in-process orchestrator fallback runs (auto mode only; `ATOMIC_RPC=1`
-//! is strict and never falls back); its journal sink starts the daemon
-//! per D4, so even the fallback's provenance flows over the service
-//! layer.
+//! Both service modes call `ProvenanceService.DispatchTurnEvent`: local mode
+//! runs the libatomic handler in-process, and reactor mode calls it over the
+//! daemon socket. The receiver records parsing and transport outcomes under
+//! `receive`; the shared handler records dispatch outcomes by event type.
 
 use std::io::Read;
 use std::sync::Arc;
@@ -72,19 +68,6 @@ pub struct ReceiveResult {
 
 impl Command for Receive {
     fn run(&self) -> CliResult<()> {
-        // The typed event arrives on stdin — no agent hook parsing here.
-        let mut input = Vec::new();
-        std::io::stdin().read_to_end(&mut input).map_err(|e| {
-            CliError::Io(std::io::Error::new(
-                e.kind(),
-                format!("Failed to read typed event from stdin: {}", e),
-            ))
-        })?;
-        let event: TurnEvent =
-            serde_json::from_slice(&input).map_err(|e| CliError::InvalidArgument {
-                message: format!("Invalid typed TurnEvent JSON: {}", e),
-            })?;
-
         let repo_root = crate::commands::find_repository_root_from(&self.repository)?;
 
         let registry = AgentRegistry::with_defaults();
@@ -96,21 +79,40 @@ impl Command for Receive {
         let agent_name = agent.name().to_string();
         let agent_display = agent.display_name().to_string();
 
-        // The identity selection chain resolves client-side (env > global
-        // setting > server profile) and rides the request.
-        let agent_identity =
-            super::identity::resolve_effective_agent_identity().map(|(name, _)| name);
+        // Keep the entry-point outcome separate from the service's event-type
+        // outcome: malformed stdin and transport failures never reach the
+        // service, but a later successful receive must clear those failures.
+        let dispatch = (|| {
+            let mut input = Vec::new();
+            std::io::stdin().read_to_end(&mut input).map_err(|e| {
+                CliError::Io(std::io::Error::new(
+                    e.kind(),
+                    format!("Failed to read typed event from stdin: {}", e),
+                ))
+            })?;
+            let event: TurnEvent =
+                serde_json::from_slice(&input).map_err(|e| CliError::InvalidArgument {
+                    message: format!("Invalid typed TurnEvent JSON: {}", e),
+                })?;
 
-        // The service area dispatches the SAME handler both transports
-        // serve: in-process over libatomic (local mode, the default) or
-        // over the daemon socket (reactor mode, D4). There is no second
-        // local dispatch implementation to fall back to.
-        let result = crate::commands::rpc::dispatch_turn_event(
+            let agent_identity =
+                super::identity::resolve_effective_agent_identity().map(|(name, _)| name);
+
+            // Both local and daemon transports call the same libatomic handler.
+            crate::commands::rpc::dispatch_turn_event(
+                &repo_root,
+                &event,
+                &agent_name,
+                &agent_display,
+                agent_identity,
+            )
+        })();
+        let result = super::health::record_result(
             &repo_root,
-            &event,
             &agent_name,
             &agent_display,
-            agent_identity,
+            "receive",
+            dispatch,
         )?;
 
         for warning in &result.warnings {

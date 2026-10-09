@@ -3798,65 +3798,72 @@ impl provenance_service_server::ProvenanceService for ProvenanceImpl {
             .clone()
             .unwrap_or_else(|| agent_id.clone());
         let identity = request.agent_identity.clone();
-        let body = request
+        let verb = request
             .event
-            .ok_or_else(|| domain_status(ErrorCode::InvalidArgument, "typed event required"))?;
-        let hook_type = hook_type(&body.event_type).ok_or_else(|| {
-            domain_status(
-                ErrorCode::InvalidArgument,
-                format!("unknown event type '{}'", body.event_type),
-            )
-        })?;
-        let raw_json = body
-            .raw_json
             .as_ref()
-            .filter(|bytes| !bytes.is_empty())
-            .and_then(|bytes| serde_json::from_slice::<Value>(bytes).ok());
-        let event = TurnEvent {
-            session_id: body.session_id.clone(),
-            event_type: hook_type,
-            transcript_path: None,
-            prompt: body.prompt.clone(),
-            tool_name: body.tool_name.clone(),
-            tool_use_id: body.tool_use_id.clone(),
-            timestamp: body
-                .timestamp
+            .map(|body| body.event_type.clone())
+            .unwrap_or_else(|| "dispatch_turn_event".to_string());
+        let dispatch = async {
+            let body = request
+                .event
+                .ok_or_else(|| domain_status(ErrorCode::InvalidArgument, "typed event required"))?;
+            let hook_type = hook_type(&body.event_type).ok_or_else(|| {
+                domain_status(
+                    ErrorCode::InvalidArgument,
+                    format!("unknown event type '{}'", body.event_type),
+                )
+            })?;
+            let raw_json = body
+                .raw_json
                 .as_ref()
-                .map(timestamp_domain)
-                .unwrap_or_else(chrono::Utc::now),
-            raw_json,
-        };
+                .filter(|bytes| !bytes.is_empty())
+                .and_then(|bytes| serde_json::from_slice::<Value>(bytes).ok());
+            let event = TurnEvent {
+                session_id: body.session_id.clone(),
+                event_type: hook_type,
+                transcript_path: None,
+                prompt: body.prompt.clone(),
+                tool_name: body.tool_name.clone(),
+                tool_use_id: body.tool_use_id.clone(),
+                timestamp: body
+                    .timestamp
+                    .as_ref()
+                    .map(timestamp_domain)
+                    .unwrap_or_else(chrono::Utc::now),
+                raw_json,
+            };
 
-        // The daemon hosts the turn orchestrator: it owns the repository
-        // databases, so the dispatch (session view, recording, journal
-        // checkpoint) runs in-process with a direct journal sink.
-        let sink = DirectJournalSink::open(&handle.root)
-            .map_err(|error| domain_status(ErrorCode::ProvenanceStore, error))?;
-        let mut orchestrator =
-            TurnOrchestrator::new(handle.root.clone())
-                .await
-                .map_err(|error| {
-                    domain_status(ErrorCode::Internal, format!("orchestrator: {error}"))
-                })?;
-        orchestrator.set_agent(agent_id, display);
-        orchestrator.set_agent_identity(identity);
-        orchestrator.set_journal_sink(Arc::new(sink));
-        let result = orchestrator.dispatch(event).await.map_err(|error| {
-            domain_status(ErrorCode::Internal, format!("dispatch failed: {error}"))
-        })?;
+            // Local and RPC transports share this handler and its health report.
+            let sink = DirectJournalSink::open(&handle.root)
+                .map_err(|error| domain_status(ErrorCode::ProvenanceStore, error))?;
+            let mut orchestrator =
+                TurnOrchestrator::new(handle.root.clone())
+                    .await
+                    .map_err(|error| {
+                        domain_status(ErrorCode::Internal, format!("orchestrator: {error}"))
+                    })?;
+            orchestrator.set_agent(agent_id.clone(), display.clone());
+            orchestrator.set_agent_identity(identity);
+            orchestrator.set_journal_sink(Arc::new(sink));
+            let result = orchestrator.dispatch(event).await.map_err(|error| {
+                domain_status(ErrorCode::Internal, format!("dispatch failed: {error}"))
+            })?;
 
-        let recorded = result.change_recorded.as_ref();
-        Ok(Response::new(DispatchTurnEventResponse {
-            session_id: result.session_id.clone(),
-            recorded: recorded.is_some(),
-            change_hash: recorded.map(|outcome| super::convert::hash_proto(&outcome.hash)),
-            view: result.view.clone(),
-            files: recorded
-                .map(|outcome| outcome.recorded_file_list().to_vec())
-                .unwrap_or_default(),
-            warnings: result.warnings.clone(),
-            meta: response_meta(&meta),
-        }))
+            let recorded = result.change_recorded.as_ref();
+            Ok(Response::new(DispatchTurnEventResponse {
+                session_id: result.session_id.clone(),
+                recorded: recorded.is_some(),
+                change_hash: recorded.map(|outcome| super::convert::hash_proto(&outcome.hash)),
+                view: result.view.clone(),
+                files: recorded
+                    .map(|outcome| outcome.recorded_file_list().to_vec())
+                    .unwrap_or_default(),
+                warnings: result.warnings.clone(),
+                meta: response_meta(&meta),
+            }))
+        }
+        .await;
+        atomic_agent::hook_health::record_result(&handle.root, &agent_id, &display, &verb, dispatch)
     }
 
     async fn reserve_turn(

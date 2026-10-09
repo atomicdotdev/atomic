@@ -48,6 +48,7 @@ mod provenance_rpc;
 pub(crate) mod receive;
 mod status;
 
+pub(crate) use atomic_agent::hook_health as health;
 use clap::{Args, Subcommand};
 
 use crate::commands::Command;
