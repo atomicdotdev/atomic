@@ -84,7 +84,7 @@ fn commands_reject_global_config_and_git_only_directories() {
     }
 
     assert!(!config.join("content-index").exists());
-    assert!(!config.join("pristine.redb").exists());
+    assert!(!config.join("atomic.redb").exists());
     assert!(!project.join(".atomic").exists());
 }
 

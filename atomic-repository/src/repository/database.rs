@@ -57,6 +57,18 @@ pub fn has_database(dot_dir: &Path) -> bool {
     dot_dir.join(DATABASE_FILE).is_file() || dot_dir.join(LEGACY_PRISTINE_FILE).is_file()
 }
 
+/// Resolve the current layout for entry points that promise not to migrate.
+/// Ordinary opens use `ensure_database`; workspace preflight and native repair
+/// must defer layout changes to an explicit ordinary open.
+pub(super) fn require_current_database(dot_dir: &Path) -> Result<PathBuf, RepositoryError> {
+    if dot_dir.join(LEGACY_PRISTINE_FILE).is_file() {
+        return Err(RepositoryError::InvalidRepository {
+            reason: "legacy database layout requires migration before workspace preflight or native repair; run `atomic view list` to migrate the repository, then retry".to_string(),
+        });
+    }
+    existing(dot_dir.join(DATABASE_FILE), dot_dir)
+}
+
 /// Return `.atomic/atomic.redb`, merging a legacy layout into it first.
 ///
 /// # Errors

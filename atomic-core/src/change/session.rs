@@ -27,7 +27,266 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::types::Hash;
+use crate::types::{Hash, SetId};
+
+/// Why Atomic cannot safely attribute the current working-copy bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionIncompleteOrigin {
+    /// Git moved the working copy, but the pre-checkout source cannot be
+    /// established well enough to attribute the resulting bytes.
+    UnknownPostCheckout,
+    /// A Git HEAD/index transition happened between managed turn boundaries
+    /// without authenticated commit-time capture. Only the observed operation
+    /// is attributed (RFC §10.3.2); the session stays incomplete until
+    /// reviewed. This is observation quality, not a commit policy: RFC §19
+    /// Q2 (reject vs. allow-and-synthesize for inseparable operations) is
+    /// UNDECIDED and no managed inseparable capture is implemented.
+    UnattributedGitOperation,
+    /// A turn boundary or Git observation could not be made at all (missing
+    /// baseline, failed end observation), so no attribution is possible and
+    /// the observation gap itself is durable evidence (review R3).
+    ObservationUnavailable,
+    /// Turn recording failed: the working-copy content work could not be
+    /// turned into a durable change. The refusal preserves what happened so
+    /// the turn can be retried (review R3; never surfaced as success).
+    UnrecordedWork,
+    /// Session finalization could not sign/persist its attestation. The
+    /// session must not claim a clean end while its evidence chain is
+    /// unwritable (review R3/R6; AC3 "block finalization on failure").
+    UnfinalizedAttestation,
+    /// A managed Git commit was authenticated by a verified commit-time
+    /// capture, but the exact baseline→index / index→worktree reassembly
+    /// (RFC §10.3.2) has not produced an exactly-attributed change. Per the
+    /// owner-approved RFC §19 Q2 policy (2026-09-14, allow-as-incomplete):
+    /// the commit is carried as synthesis with observed-operation-only
+    /// attribution, the session stays durably incomplete until reviewed,
+    /// and the capture is retained as recovery evidence. NEVER classified
+    /// `ManagedGitCommitCaptured`, never an approximate path-level split.
+    ManagedCaptureAwaitingReassembly,
+}
+
+impl std::fmt::Display for SessionIncompleteOrigin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnknownPostCheckout => write!(f, "unknown post-checkout origin"),
+            Self::UnattributedGitOperation => write!(f, "unattributed Git operation"),
+            Self::ObservationUnavailable => write!(f, "boundary observation unavailable"),
+            Self::UnrecordedWork => write!(f, "turn work could not be recorded"),
+            Self::UnfinalizedAttestation => write!(f, "session attestation could not be finalized"),
+            Self::ManagedCaptureAwaitingReassembly => {
+                write!(f, "managed capture awaits exact reassembly (RFC §10.3.2)")
+            }
+        }
+    }
+}
+
+/// Durable refusal details for a managed agent session.
+///
+/// This is intentionally a plain serializable value. Git drift/WIP capture can
+/// construct it without coupling the session ledger to Git-specific APIs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IncompleteSession {
+    pub reason: String,
+    pub paths: Vec<String>,
+    pub recovery_ref: String,
+    pub origin: SessionIncompleteOrigin,
+    /// External hashes/OIDs of Git commits observed between the session's
+    /// boundaries that no authenticated capture binds (RFC §10.5
+    /// `unbound_commits`). Empty for refusals that carry no commit evidence.
+    #[serde(default)]
+    pub unbound_commits: Vec<String>,
+}
+
+impl IncompleteSession {
+    /// Build deterministic refusal details, removing empty and duplicate paths.
+    pub fn new(
+        reason: impl Into<String>,
+        paths: impl IntoIterator<Item = String>,
+        recovery_ref: impl Into<String>,
+        origin: SessionIncompleteOrigin,
+    ) -> Self {
+        let mut paths: Vec<String> = paths.into_iter().filter(|path| !path.is_empty()).collect();
+        paths.sort();
+        paths.dedup();
+        Self {
+            reason: reason.into(),
+            paths,
+            recovery_ref: recovery_ref.into(),
+            origin,
+            unbound_commits: Vec::new(),
+        }
+    }
+
+    /// Attach observed-but-unbound commit identifiers to these refusal details.
+    ///
+    /// Recording an unbound commit claims nothing about authorship: it is the
+    /// durable observation that the commit happened and no authenticated
+    /// capture covers it (RFC §10.3.2, §10.5).
+    pub fn with_unbound_commits(mut self, commits: Vec<String>) -> Self {
+        let mut commits: Vec<String> = commits
+            .into_iter()
+            .filter(|commit| !commit.is_empty())
+            .collect();
+        commits.sort();
+        commits.dedup();
+        self.unbound_commits = commits;
+        self
+    }
+}
+
+impl std::fmt::Display for IncompleteSession {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}; recovery ref {}; origin {}",
+            self.reason, self.recovery_ref, self.origin
+        )?;
+        if !self.paths.is_empty() {
+            write!(f, "; affected paths: {}", self.paths.join(", "))?;
+        }
+        if !self.unbound_commits.is_empty() {
+            write!(f, "; unbound commits: {}", self.unbound_commits.join(", "))?;
+        }
+        Ok(())
+    }
+}
+
+// Managed turn boundaries and outcomes (CB-12A, RFC §10.1/§10.2)
+
+/// Git-side checkpoint captured at a managed turn boundary (RFC §10.1).
+///
+/// This is the durable, serializable mirror of the bridge's Git observation
+/// token. OIDs stay hex strings (Git is SHA-1/SHA-256 dual); the index digest
+/// is already an Atomic `Hash`. A boundary without this checkpoint means the
+/// observation could not be made; turn-end classification then refuses to
+/// claim `ObservationOnly` and records the observation gap explicitly.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct GitBoundaryCheckpoint {
+    /// Resolved HEAD commit OID (hex), `None` while HEAD is unborn.
+    pub head_oid: Option<String>,
+    /// Symbolic HEAD target (branch name), when attached.
+    pub head_symref: Option<String>,
+    /// Tree OID of the HEAD commit, when resolvable.
+    pub head_tree: Option<String>,
+    /// Digest of the primary Git index file, when readable.
+    pub index_digest: Option<Hash>,
+    /// Tree OID represented by the primary index, when readable.
+    pub index_tree: Option<String>,
+    /// Whether an `index.lock` was present at observation time.
+    pub index_locked: bool,
+    /// Git's reported in-progress operation state (e.g. `rebase`, `merge`).
+    pub repository_state: String,
+    /// Present Git sequence-operation markers.
+    pub markers: Vec<String>,
+}
+
+/// One durable managed turn boundary (RFC §10.1).
+///
+/// Fields the repository cannot compute yet stay `None` and are documented at
+/// their use sites: `manifest` and `conversion_policy` require the Phase 4
+/// manifest engine, `snapshot` is set only when a baseline-relative snapshot
+/// change exists at capture time.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TurnBoundary {
+    /// Working-copy identity (base32 of the canonical ULID bytes).
+    pub working_copy: String,
+    /// Governing repository operation, when one is known.
+    pub operation: Option<String>,
+    /// The Atomic view the working copy is aligned to.
+    pub view: String,
+    /// Order-sensitive view state (Merkle fold over the change sequence).
+    pub view_state: Option<Hash>,
+    /// Order-invariant view identity over the effective projection closure.
+    pub set_id: Option<SetId>,
+    /// Baseline-relative snapshot change covering pending edits, if captured.
+    pub snapshot: Option<Hash>,
+    /// Git checkpoint including the primary index (RFC §10.1).
+    pub git: Option<GitBoundaryCheckpoint>,
+    /// Repository manifest root (Phase 4; `None` until that engine ships).
+    pub manifest: Option<Hash>,
+    /// Conversion policy fingerprint (attributes/filters/capabilities;
+    /// Phase 4; `None` until computed).
+    pub conversion_policy: Option<Hash>,
+    /// Session this boundary belongs to.
+    pub session_id: String,
+    /// Turn this boundary belongs to (1-indexed like `SessionEnvelope`).
+    pub turn: u32,
+    /// Wall-clock capture time (Unix seconds; excluded from equality checks).
+    pub at: i64,
+}
+
+/// Semantic outcome of a managed turn (RFC §10.2). `EmptyTurn` is removed: a
+/// clean worktree is classified, never treated as "nothing happened".
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ManagedTurnOutcome {
+    /// Working-copy files changed and durable Atomic changes were recorded.
+    ContentChanges {
+        /// External hashes of the durable changes created by the turn.
+        durable: Vec<Hash>,
+        /// Snapshot change covering the new-durable→worktree remainder.
+        snapshot: Option<Hash>,
+    },
+    /// No working-copy content change, but Git-side repository state moved
+    /// between the turn boundaries (HEAD, primary index or refs).
+    ///
+    /// `operations` carries observed-operation-only attribution: it records
+    /// that the observation happened and what moved, never who authored it.
+    /// `capture` is the verified commit-time capture binding, when one exists.
+    /// Its presence does NOT classify the turn as `ManagedGitCommitCaptured` —
+    /// that classification requires the exact baseline→index and
+    /// index→worktree reassembly (RFC §10.3.2), which stays unimplemented
+    /// until RFC §19 Q2 is resolved (owner deferral 2026-09-13).
+    RepositoryOperations {
+        operations: Vec<String>,
+        capture: Option<Hash>,
+    },
+    /// Semantic equality: HEAD/index targets, repository state and
+    /// agent-attributable operations are unchanged (timestamps excluded).
+    ///
+    /// Today's equality check covers the Git checkpoint fields above plus the
+    /// absence of agent-attributable changes in the turn window; repository/
+    /// worktree manifest equality requires the Phase 4 manifest engine and is
+    /// documented as an inherited gap rather than claimed.
+    ObservationOnly,
+}
+
+impl ManagedTurnOutcome {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        postcard::to_allocvec(self).expect("ManagedTurnOutcome serialization")
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, postcard::Error> {
+        postcard::from_bytes(bytes)
+    }
+}
+
+/// Durable lifecycle outcome for an indexed agent session.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionStatus {
+    #[default]
+    Active,
+    Ended,
+    Incomplete(IncompleteSession),
+}
+
+impl SessionStatus {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Ended => "ended",
+            Self::Incomplete(_) => "incomplete",
+        }
+    }
+
+    pub fn incomplete(&self) -> Option<&IncompleteSession> {
+        match self {
+            Self::Incomplete(outcome) => Some(outcome),
+            Self::Active | Self::Ended => None,
+        }
+    }
+}
 
 /// Repository-indexed identity and current state for an agent session.
 ///
@@ -45,6 +304,113 @@ pub struct SessionRecord {
     pub turn_count: u32,
     pub started_at: i64,
     pub ended_at: Option<i64>,
+    pub status: SessionStatus,
+}
+
+/// SessionRecord encoding written before durable lifecycle outcomes existed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SessionRecordV1 {
+    session_id: String,
+    json_path: String,
+    view_name: Option<String>,
+    parent_view: Option<String>,
+    first_provenance: Option<Hash>,
+    latest_provenance: Option<Hash>,
+    turn_count: u32,
+    started_at: i64,
+    ended_at: Option<i64>,
+}
+
+/// `IncompleteSession` encoding written before unbound-commit evidence
+/// existed (review ATOM::aaron::8 R1): the refusal fields are preserved, only
+/// the appended `unbound_commits` slot is absent.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct IncompleteSessionV2 {
+    reason: String,
+    paths: Vec<String>,
+    recovery_ref: String,
+    origin: SessionIncompleteOrigin,
+}
+
+/// `SessionStatus` encoding written before unbound-commit evidence existed.
+/// Variant order must match [`SessionStatus`]: postcard encodes enums by
+/// discriminant, not name.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+enum SessionStatusV2 {
+    Active,
+    Ended,
+    Incomplete(IncompleteSessionV2),
+}
+
+/// SessionRecord encoding written between the lifecycle-status and
+/// unbound-commit field additions.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SessionRecordV2 {
+    session_id: String,
+    json_path: String,
+    view_name: Option<String>,
+    parent_view: Option<String>,
+    first_provenance: Option<Hash>,
+    latest_provenance: Option<Hash>,
+    turn_count: u32,
+    started_at: i64,
+    ended_at: Option<i64>,
+    status: SessionStatusV2,
+}
+
+impl From<SessionRecordV2> for SessionRecord {
+    fn from(value: SessionRecordV2) -> Self {
+        let status = match value.status {
+            // The refusal reason, paths and recovery ref survive the decode
+            // (review R1: an exact pre-CB12A incomplete SessionRecord used to
+            // decode as Active, discarding the refusal).
+            SessionStatusV2::Incomplete(incomplete) => {
+                SessionStatus::Incomplete(IncompleteSession {
+                    reason: incomplete.reason,
+                    paths: incomplete.paths,
+                    recovery_ref: incomplete.recovery_ref,
+                    origin: incomplete.origin,
+                    unbound_commits: Vec::new(),
+                })
+            }
+            SessionStatusV2::Active => SessionStatus::Active,
+            SessionStatusV2::Ended => SessionStatus::Ended,
+        };
+        Self {
+            session_id: value.session_id,
+            json_path: value.json_path,
+            view_name: value.view_name,
+            parent_view: value.parent_view,
+            first_provenance: value.first_provenance,
+            latest_provenance: value.latest_provenance,
+            turn_count: value.turn_count,
+            started_at: value.started_at,
+            ended_at: value.ended_at,
+            status,
+        }
+    }
+}
+
+impl From<SessionRecordV1> for SessionRecord {
+    fn from(value: SessionRecordV1) -> Self {
+        let status = if value.ended_at.is_some() {
+            SessionStatus::Ended
+        } else {
+            SessionStatus::Active
+        };
+        Self {
+            session_id: value.session_id,
+            json_path: value.json_path,
+            view_name: value.view_name,
+            parent_view: value.parent_view,
+            first_provenance: value.first_provenance,
+            latest_provenance: value.latest_provenance,
+            turn_count: value.turn_count,
+            started_at: value.started_at,
+            ended_at: value.ended_at,
+            status,
+        }
+    }
 }
 
 /// Index entry connecting one session turn to its immutable Atomic objects.
@@ -63,6 +429,15 @@ pub struct SessionTurn {
     /// Todo snapshot captured at the end of this turn.
     #[serde(default)]
     pub todos: Vec<SessionTodo>,
+    /// Turn-start boundary captured by the managed orchestrator (CB-12A).
+    #[serde(default)]
+    pub boundary_start: Option<TurnBoundary>,
+    /// Turn-end boundary captured when this turn's outcome was classified.
+    #[serde(default)]
+    pub boundary_end: Option<TurnBoundary>,
+    /// Semantic classification of the turn (RFC §10.2; replaces `EmptyTurn`).
+    #[serde(default)]
+    pub outcome: Option<ManagedTurnOutcome>,
 }
 
 /// Result of atomically appending one checkpoint turn and advancing its head.
@@ -176,6 +551,44 @@ impl From<SessionTurnV1> for SessionTurn {
             timestamp: value.timestamp,
             plan_id: None,
             todos: Vec::new(),
+            boundary_start: None,
+            boundary_end: None,
+            outcome: None,
+        }
+    }
+}
+
+/// SessionTurn encoding written between the plan/todo and CB-12A
+/// boundary/outcome field additions (review ATOM::aaron::8 R1): plan and todo
+/// evidence is preserved, only the appended boundary/outcome slots are absent.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SessionTurnV2 {
+    session_id: String,
+    turn_number: u32,
+    goal: Option<String>,
+    provenance_hash: Hash,
+    change_hashes: Vec<Hash>,
+    previous_provenance: Option<Hash>,
+    timestamp: i64,
+    plan_id: Option<String>,
+    todos: Vec<SessionTodo>,
+}
+
+impl From<SessionTurnV2> for SessionTurn {
+    fn from(value: SessionTurnV2) -> Self {
+        Self {
+            session_id: value.session_id,
+            turn_number: value.turn_number,
+            goal: value.goal,
+            provenance_hash: value.provenance_hash,
+            change_hashes: value.change_hashes,
+            previous_provenance: value.previous_provenance,
+            timestamp: value.timestamp,
+            plan_id: value.plan_id,
+            todos: value.todos,
+            boundary_start: None,
+            boundary_end: None,
+            outcome: None,
         }
     }
 }
@@ -189,6 +602,34 @@ struct SessionManifestV1 {
     turns: Vec<SessionTurnV1>,
     parent_session: Option<Hash>,
     fork_turn: Option<u32>,
+}
+
+/// SessionManifest encoding whose turns predate the CB-12A boundary/outcome
+/// fields but carry plan/todo data (review ATOM::aaron::8 R1).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SessionManifestV2 {
+    schema_version: u8,
+    session_id: String,
+    goal_provenance: Option<Hash>,
+    turns: Vec<SessionTurnV2>,
+    parent_session: Option<Hash>,
+    fork_turn: Option<u32>,
+}
+
+/// Decode `bytes` with a shape whose decode exactly reproduces the input.
+///
+/// Decode-then-re-encode equality guarantees complete consumption and a
+/// byte-exact layout match, so a truncated or misaligned payload can never be
+/// silently reinterpreted as an older shape that drops appended fields
+/// (review ATOM::aaron::8 R1). postcard encodings are canonical for these
+/// types, so a valid decode of matching layout always re-encodes identically.
+pub(crate) fn decode_exact_shape<T>(bytes: &[u8]) -> Option<T>
+where
+    T: serde::de::DeserializeOwned + Serialize,
+{
+    let value: T = postcard::from_bytes(bytes).ok()?;
+    let reencoded = postcard::to_allocvec(&value).ok()?;
+    (reencoded == bytes).then_some(value)
 }
 
 /// Portable, content-addressed root for an Atomic session ledger.
@@ -211,7 +652,15 @@ impl SessionRecord {
     }
 
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, postcard::Error> {
-        postcard::from_bytes(bytes)
+        if let Some(record) = decode_exact_shape::<SessionRecord>(bytes) {
+            return Ok(record);
+        }
+        if let Some(record) = decode_exact_shape::<SessionRecordV2>(bytes) {
+            return Ok(record.into());
+        }
+        decode_exact_shape::<SessionRecordV1>(bytes)
+            .map(SessionRecord::from)
+            .ok_or(postcard::Error::DeserializeBadEncoding)
     }
 }
 
@@ -221,8 +670,15 @@ impl SessionTurn {
     }
 
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, postcard::Error> {
-        postcard::from_bytes(bytes)
-            .or_else(|_| postcard::from_bytes::<SessionTurnV1>(bytes).map(SessionTurn::from))
+        if let Some(turn) = decode_exact_shape::<SessionTurn>(bytes) {
+            return Ok(turn);
+        }
+        if let Some(turn) = decode_exact_shape::<SessionTurnV2>(bytes) {
+            return Ok(turn.into());
+        }
+        decode_exact_shape::<SessionTurnV1>(bytes)
+            .map(SessionTurn::from)
+            .ok_or(postcard::Error::DeserializeBadEncoding)
     }
 }
 
@@ -232,8 +688,21 @@ impl SessionManifest {
     }
 
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, postcard::Error> {
-        postcard::from_bytes(bytes).or_else(|_| {
-            postcard::from_bytes::<SessionManifestV1>(bytes).map(|legacy| Self {
+        if let Some(manifest) = decode_exact_shape::<SessionManifest>(bytes) {
+            return Ok(manifest);
+        }
+        if let Some(legacy) = decode_exact_shape::<SessionManifestV2>(bytes) {
+            return Ok(Self {
+                schema_version: 2,
+                session_id: legacy.session_id,
+                goal_provenance: legacy.goal_provenance,
+                turns: legacy.turns.into_iter().map(SessionTurn::from).collect(),
+                parent_session: legacy.parent_session,
+                fork_turn: legacy.fork_turn,
+            });
+        }
+        decode_exact_shape::<SessionManifestV1>(bytes)
+            .map(|legacy| Self {
                 schema_version: 2,
                 session_id: legacy.session_id,
                 goal_provenance: legacy.goal_provenance,
@@ -241,7 +710,7 @@ impl SessionManifest {
                 parent_session: legacy.parent_session,
                 fork_turn: legacy.fork_turn,
             })
-        })
+            .ok_or(postcard::Error::DeserializeBadEncoding)
     }
 
     /// Return the content hash of this exact manifest encoding.
@@ -922,12 +1391,43 @@ mod tests {
             turn_count: 2,
             started_at: 100,
             ended_at: None,
+            status: SessionStatus::Incomplete(IncompleteSession::new(
+                "working copy moved during managed turn",
+                vec!["src/z.rs".into(), "src/a.rs".into(), "src/a.rs".into()],
+                "refs/atomic/wip/run-1",
+                SessionIncompleteOrigin::UnknownPostCheckout,
+            )),
         };
 
         assert_eq!(
             SessionRecord::from_bytes(&record.to_bytes()).unwrap(),
             record
         );
+        assert_eq!(
+            record.status.incomplete().unwrap().paths,
+            vec!["src/a.rs", "src/z.rs"]
+        );
+    }
+
+    #[test]
+    fn test_session_record_reads_pre_status_encoding() {
+        let legacy = SessionRecordV1 {
+            session_id: "legacy-session".into(),
+            json_path: ".atomic/sessions/legacy-session.json".into(),
+            view_name: Some("legacy-view".into()),
+            parent_view: Some("main".into()),
+            first_provenance: None,
+            latest_provenance: None,
+            turn_count: 0,
+            started_at: 100,
+            ended_at: Some(200),
+        };
+
+        let bytes = postcard::to_allocvec(&legacy).unwrap();
+        let loaded = SessionRecord::from_bytes(&bytes).unwrap();
+        assert_eq!(loaded.session_id, "legacy-session");
+        assert_eq!(loaded.status, SessionStatus::Ended);
+        assert_eq!(loaded.ended_at, Some(200));
     }
 
     #[test]
@@ -947,6 +1447,9 @@ mod tests {
                 status: "completed".into(),
                 priority: "high".into(),
             }],
+            boundary_start: None,
+            boundary_end: None,
+            outcome: None,
         };
         assert_eq!(SessionTurn::from_bytes(&turn.to_bytes()).unwrap(), turn);
 
@@ -973,6 +1476,9 @@ mod tests {
                     timestamp: 100,
                     plan_id: None,
                     todos: Vec::new(),
+                    boundary_start: None,
+                    boundary_end: None,
+                    outcome: None,
                 },
                 SessionTurn {
                     session_id: "sess-1".into(),
@@ -985,6 +1491,9 @@ mod tests {
                     timestamp: 50,
                     plan_id: None,
                     todos: Vec::new(),
+                    boundary_start: None,
+                    boundary_end: None,
+                    outcome: None,
                 },
             ]
         };
@@ -1018,6 +1527,9 @@ mod tests {
             timestamp: 100,
             plan_id: None,
             todos: Vec::new(),
+            boundary_start: None,
+            boundary_end: None,
+            outcome: None,
         };
         let a = make_turn(Hash::of(b"a"));
         let b = make_turn(Hash::of(b"b"));
@@ -1056,6 +1568,85 @@ mod tests {
         assert_eq!(loaded.session_id, "legacy");
         assert_eq!(loaded.plan_id, None);
         assert!(loaded.todos.is_empty());
+        assert!(loaded.boundary_start.is_none());
+        assert!(loaded.boundary_end.is_none());
+        assert!(loaded.outcome.is_none());
+    }
+
+    #[test]
+    fn test_turn_boundary_roundtrip() {
+        let boundary = TurnBoundary {
+            working_copy: "01ABCDEF26CHARSULID0000000".into(),
+            operation: None,
+            view: "main".into(),
+            view_state: Some(Hash::of(b"merkle")),
+            set_id: Some(crate::types::SetId::ZERO),
+            snapshot: None,
+            git: Some(GitBoundaryCheckpoint {
+                head_oid: Some("0123456789abcdef0123456789abcdef01234567".into()),
+                head_symref: Some("refs/heads/main".into()),
+                head_tree: Some("tree1".into()),
+                index_digest: Some(Hash::of(b"index")),
+                index_tree: Some("tree2".into()),
+                index_locked: false,
+                repository_state: "".into(),
+                markers: vec![],
+            }),
+            manifest: None,
+            conversion_policy: None,
+            session_id: "sess-b".into(),
+            turn: 3,
+            at: 42,
+        };
+        let bytes = postcard::to_allocvec(&boundary).unwrap();
+        let loaded: TurnBoundary = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(loaded, boundary);
+        // Phase 4 fields stay None — they are never faked.
+        assert!(loaded.manifest.is_none());
+        assert!(loaded.conversion_policy.is_none());
+    }
+
+    #[test]
+    fn test_managed_turn_outcome_roundtrip() {
+        let outcomes = vec![
+            ManagedTurnOutcome::ContentChanges {
+                durable: vec![Hash::of(b"c1")],
+                snapshot: None,
+            },
+            ManagedTurnOutcome::RepositoryOperations {
+                operations: vec!["HEAD a -> b".into()],
+                capture: Some(Hash::of(b"capture")),
+            },
+            ManagedTurnOutcome::ObservationOnly,
+        ];
+        for outcome in outcomes {
+            assert_eq!(
+                ManagedTurnOutcome::from_bytes(&outcome.to_bytes()).unwrap(),
+                outcome
+            );
+        }
+    }
+
+    #[test]
+    fn test_incomplete_session_carries_unbound_commits() {
+        let incomplete = IncompleteSession::new(
+            "unexplained Git transition",
+            Vec::<String>::new(),
+            String::new(),
+            SessionIncompleteOrigin::UnattributedGitOperation,
+        )
+        .with_unbound_commits(vec!["abc".into(), "abc".into(), "def".into()]);
+        assert_eq!(
+            incomplete.unbound_commits,
+            vec!["abc".to_string(), "def".to_string()]
+        );
+        let bytes = postcard::to_allocvec(&incomplete).unwrap();
+        let loaded: IncompleteSession = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(loaded, incomplete);
+        assert_eq!(
+            loaded.origin,
+            SessionIncompleteOrigin::UnattributedGitOperation
+        );
     }
 
     #[test]
@@ -1097,5 +1688,116 @@ mod tests {
         assert_eq!(loaded.turns.len(), 1);
         assert_eq!(loaded.turns[0].plan_id, None);
         assert!(loaded.turns[0].todos.is_empty());
+    }
+
+    // CB-12A fix-session regressions (review ATOM::aaron::8 R1): the decode
+    // chain must support the exact immediately-preceding layouts and must
+    // reject misaligned current-format bytes instead of falling back to a
+    // much older shape that silently drops fields.
+
+    /// Encode the exact pre-CB12A SessionRecord layout: `IncompleteSession`
+    /// without `unbound_commits`. The refusal must survive the roundtrip.
+    #[test]
+    fn legacy_incomplete_session_stays_incomplete() {
+        let record = SessionRecord {
+            session_id: "old-incomplete".into(),
+            json_path: "session.json".into(),
+            view_name: None,
+            parent_view: None,
+            first_provenance: None,
+            latest_provenance: None,
+            turn_count: 1,
+            started_at: 1,
+            ended_at: None,
+            status: SessionStatus::Incomplete(IncompleteSession::new(
+                "retain refusal",
+                vec!["tracked.txt".into()],
+                "refs/atomic/wip/old",
+                SessionIncompleteOrigin::UnknownPostCheckout,
+            )),
+        };
+        let mut bytes = record.to_bytes();
+        assert_eq!(bytes.pop(), Some(0)); // newly appended empty unbound_commits
+        let loaded = SessionRecord::from_bytes(&bytes).unwrap();
+        let incomplete = loaded
+            .status
+            .incomplete()
+            .expect("pre-CB12A incomplete must stay incomplete, not become Active");
+        assert_eq!(incomplete.reason, "retain refusal");
+        assert_eq!(incomplete.paths, vec!["tracked.txt".to_string()]);
+        assert_eq!(incomplete.recovery_ref, "refs/atomic/wip/old");
+        assert_eq!(
+            incomplete.origin,
+            SessionIncompleteOrigin::UnknownPostCheckout
+        );
+        assert!(incomplete.unbound_commits.is_empty());
+    }
+
+    /// Encode the exact pre-CB12A SessionTurn layout: plan/todos present,
+    /// boundaries/outcome absent. Plan and todo evidence must survive.
+    #[test]
+    fn legacy_plan_todo_turn_survives() {
+        let turn = SessionTurn {
+            session_id: "old-turn".into(),
+            turn_number: 1,
+            goal: None,
+            provenance_hash: Hash::of(b"provenance"),
+            change_hashes: vec![],
+            previous_provenance: None,
+            timestamp: 1,
+            plan_id: Some("old-plan".into()),
+            todos: vec![SessionTodo {
+                id: "t".into(),
+                content: "retain todo".into(),
+                status: "open".into(),
+                priority: "high".into(),
+            }],
+            boundary_start: None,
+            boundary_end: None,
+            outcome: None,
+        };
+        let mut bytes = turn.to_bytes();
+        assert_eq!(&bytes[bytes.len() - 3..], &[0, 0, 0]);
+        bytes.truncate(bytes.len() - 3);
+        let loaded = SessionTurn::from_bytes(&bytes).unwrap();
+        assert_eq!(loaded.plan_id.as_deref(), Some("old-plan"));
+        assert_eq!(loaded.todos.len(), 1);
+        assert_eq!(loaded.todos[0].content, "retain todo");
+    }
+
+    /// Current-format bytes must roundtrip, and a byte truncated off the
+    /// current encoding must be REJECTED — never reinterpreted as an older
+    /// shape (the review's R1 truncated-decode counterexample).
+    #[test]
+    fn session_record_roundtrip_and_reject_misaligned_current_bytes() {
+        let record = SessionRecord {
+            session_id: "current".into(),
+            json_path: "session.json".into(),
+            view_name: Some("main".into()),
+            parent_view: None,
+            first_provenance: None,
+            latest_provenance: None,
+            turn_count: 0,
+            started_at: 7,
+            ended_at: None,
+            status: SessionStatus::Incomplete(
+                IncompleteSession::new(
+                    "unexplained",
+                    Vec::<String>::new(),
+                    String::new(),
+                    SessionIncompleteOrigin::UnattributedGitOperation,
+                )
+                .with_unbound_commits(vec!["abc".into()]),
+            ),
+        };
+        let bytes = record.to_bytes();
+        assert_eq!(SessionRecord::from_bytes(&bytes).unwrap(), record);
+
+        let mut truncated = bytes.clone();
+        truncated.pop();
+        assert!(
+            SessionRecord::from_bytes(&truncated).is_err(),
+            "truncated current-format bytes must not decode as a legacy shape"
+        );
     }
 }

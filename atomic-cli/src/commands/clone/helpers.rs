@@ -304,6 +304,43 @@ impl Drop for CleanupGuard {
     }
 }
 
+/// Explicit bootstrap boundary for the clone transport phase.
+///
+/// A clone's transport runs before any persistent working copy exists, so it
+/// has no working-copy authority to hold: this marker names the boundary
+/// instead of fabricating a working-copy ID. Repository-local phases (view
+/// alignment, materialization) enter a workspace transaction only after
+/// `Repository::init` has created the working copy.
+#[derive(Debug)]
+pub struct CloneBootstrapBoundary {
+    /// The transport URL.
+    url: String,
+    /// Directory receiving the clone; no working copy exists during transport.
+    target_path: PathBuf,
+}
+
+impl CloneBootstrapBoundary {
+    /// Open the pre-repository transport boundary. No working-copy ID exists
+    /// or is fabricated here; Git-checkout adoption (`--into-existing`) stays
+    /// a CB-10A bootstrap and is refused for Atomic materialization.
+    pub fn begin(target_path: PathBuf) -> Self {
+        Self {
+            url: String::new(),
+            target_path,
+        }
+    }
+
+    /// The transport phase has no working-copy authority by construction.
+    pub fn working_copy(&self) -> Option<atomic_core::WorkingCopyId> {
+        None
+    }
+
+    /// The directory the transport writes into.
+    pub fn target_path(&self) -> &Path {
+        &self.target_path
+    }
+}
+
 // Change Operations
 
 /// Save a downloaded change to the repository's change store.

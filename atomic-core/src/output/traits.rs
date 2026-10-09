@@ -625,6 +625,16 @@ pub struct Writer<W: Write> {
     buffer: Vec<u8>,
     /// Whether the last byte written was a newline
     at_newline: bool,
+    /// Number of conflict markers the output layer emitted.
+    ///
+    /// This counts only markers written through
+    /// [`VertexBuffer::output_conflict_marker`] — i.e. conflict regions the
+    /// renderer actually produced. Source content that merely *contains*
+    /// marker-shaped text (documentation examples, test fixtures) is written
+    /// through [`VertexBuffer::output_line`] and does not increment this, so
+    /// callers can tell a rendered conflict apart from incidental marker
+    /// content.
+    conflict_markers: usize,
 }
 
 impl<W: Write> Writer<W> {
@@ -634,7 +644,16 @@ impl<W: Write> Writer<W> {
             writer,
             buffer: Vec::new(),
             at_newline: true,
+            conflict_markers: 0,
         }
+    }
+
+    /// Whether the output layer emitted at least one conflict marker.
+    ///
+    /// Returns `true` only for a conflict region the renderer actually
+    /// produced, never for source bytes that happen to look like markers.
+    pub fn has_conflict_markers(&self) -> bool {
+        self.conflict_markers > 0
     }
 
     /// Get a reference to the underlying writer.
@@ -683,6 +702,8 @@ impl<W: Write> VertexBuffer for Writer<W> {
         id: usize,
         changes: Option<&[Hash]>,
     ) -> Result<(), std::io::Error> {
+        self.conflict_markers += 1;
+
         // Ensure we're on a new line
         if !self.at_newline {
             self.writer.write_all(b"\n")?;

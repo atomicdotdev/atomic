@@ -14,8 +14,13 @@ use std::path::{Path, PathBuf};
 
 use atomic_core::change::{Author, ChangeHeader};
 use atomic_core::types::Hash;
+use atomic_core::WorkingCopyId;
 use atomic_repository::{RecordOptions, Repository};
 use tempfile::TempDir;
+
+fn working_copy(repo: &Repository) -> WorkingCopyId {
+    repo.require_working_copy_id().expect("working copy id")
+}
 
 fn create_test_repo() -> (Repository, TempDir, PathBuf) {
     let temp = TempDir::new().expect("Failed to create temp dir");
@@ -39,7 +44,7 @@ fn record_change(repo: &Repository, message: &str) -> Hash {
         .build();
 
     let outcome = repo
-        .record(header, RecordOptions::default())
+        .record(working_copy(repo), header, RecordOptions::default())
         .expect("Failed to record");
 
     *outcome.hash()
@@ -93,7 +98,8 @@ fn test_simple_add_then_modify() {
     let v2 = "fn main() {\n    println!(\"hello world\");\n}\n";
 
     write_file(&repo_path, "test.rs", v1);
-    repo.add("test.rs", Default::default()).unwrap();
+    repo.add(working_copy(&repo), "test.rs", Default::default())
+        .unwrap();
     let h1 = record_change(&repo, "add test.rs");
 
     write_file(&repo_path, "test.rs", v2);
@@ -117,7 +123,8 @@ fn test_three_sequential_modifications() {
     let v3 = "line1\nmodified\nline3\nextra\n";
 
     write_file(&repo_path, "data.txt", v1);
-    repo.add("data.txt", Default::default()).unwrap();
+    repo.add(working_copy(&repo), "data.txt", Default::default())
+        .unwrap();
     let h1 = record_change(&repo, "add");
 
     write_file(&repo_path, "data.txt", v2);
@@ -263,7 +270,8 @@ fn main() {
 
     // Record version 1
     write_file(&repo_path, "src/main.rs", v1);
-    repo.add("src/main.rs", Default::default()).unwrap();
+    repo.add(working_copy(&repo), "src/main.rs", Default::default())
+        .unwrap();
     let h1 = record_change(&repo, "initial");
     assert_content_matches(&repo, "src/main.rs", v1);
 
@@ -296,7 +304,7 @@ fn main() {
 // content duplication in the change graph after globalization.
 //
 // This test isolates the bug to the change graph layer (record + globalize +
-// apply) by using repo.record() directly, with no import pipeline involved.
+// apply) by using repo.record(working_copy(&repo), ) directly, with no import pipeline involved.
 // ═══════════════════════════════════════════════════════════════════════════
 
 #[test]
@@ -352,7 +360,8 @@ fn test_hyperfine_content_duplication_bug() {
         "src/main.rs",
         &String::from_utf8_lossy(&versions[0]),
     );
-    repo.add("src/main.rs", Default::default()).unwrap();
+    repo.add(working_copy(&repo), "src/main.rs", Default::default())
+        .unwrap();
     let _ = record_change(&repo, "Initial commit");
 
     // Read via the CRDT-driven walker (task #24).  The view-filtered
@@ -470,7 +479,8 @@ fn test_hyperfine_crdt_audit() {
         "src/main.rs",
         &String::from_utf8_lossy(&versions[0]),
     );
-    repo.add("src/main.rs", Default::default()).unwrap();
+    repo.add(working_copy(&repo), "src/main.rs", Default::default())
+        .unwrap();
     let _ = record_change(&repo, "Initial commit");
 
     // Walk each commit, audit the CRDT topology after each.
@@ -820,7 +830,8 @@ fn test_hyperfine_extended_commit_sequence() {
         "src/main.rs",
         &String::from_utf8_lossy(&versions[0].1),
     );
-    repo.add("src/main.rs", Default::default()).unwrap();
+    repo.add(working_copy(&repo), "src/main.rs", Default::default())
+        .unwrap();
     let _ = record_change(&repo, &format!("Commit 1 ({})", versions[0].0));
 
     let content = repo
@@ -947,7 +958,8 @@ fn test_hyperfine_pairwise_transitions() {
             "src/main.rs",
             &String::from_utf8_lossy(&before_output.stdout),
         );
-        repo.add("src/main.rs", Default::default()).unwrap();
+        repo.add(working_copy(&repo), "src/main.rs", Default::default())
+            .unwrap();
         let _ = record_change(&repo, &format!("before: {}", before_sha));
 
         let content = repo
@@ -1137,7 +1149,8 @@ fn main() {
 
     // Step 1: initial
     write_file(&repo_path, "bench.rs", v1);
-    repo.add("bench.rs", Default::default()).unwrap();
+    repo.add(working_copy(&repo), "bench.rs", Default::default())
+        .unwrap();
     let h1 = record_change(&repo, "initial");
     assert_content_matches(&repo, "bench.rs", v1);
 
@@ -1258,7 +1271,8 @@ fn main() {
 ";
 
     write_file(&repo_path, "src/main.rs", v1);
-    repo.add("src/main.rs", Default::default()).unwrap();
+    repo.add(working_copy(&repo), "src/main.rs", Default::default())
+        .unwrap();
     let _h1 = record_change(&repo, "initial");
     assert_content_matches(&repo, "src/main.rs", v1);
 
@@ -1372,7 +1386,8 @@ fn main() {
 ";
 
     write_file(&repo_path, "src/main.rs", v1);
-    repo.add("src/main.rs", Default::default()).unwrap();
+    repo.add(working_copy(&repo), "src/main.rs", Default::default())
+        .unwrap();
     let _h1 = record_change(&repo, "initial");
 
     write_file(&repo_path, "src/main.rs", v2);
@@ -1611,7 +1626,8 @@ fn test_crdt_walker_simple_add() {
 
     let v1 = "alpha\nbeta\ngamma\n";
     write_file(&repo_path, "data.txt", v1);
-    repo.add("data.txt", Default::default()).unwrap();
+    repo.add(working_copy(&repo), "data.txt", Default::default())
+        .unwrap();
     record_change(&repo, "add");
 
     let got = crdt_output(&repo, "data.txt");
@@ -1630,7 +1646,8 @@ fn test_crdt_walker_after_modify() {
     let v2 = "alpha\nBETA\ngamma\n"; // one-line Modify
 
     write_file(&repo_path, "data.txt", v1);
-    repo.add("data.txt", Default::default()).unwrap();
+    repo.add(working_copy(&repo), "data.txt", Default::default())
+        .unwrap();
     record_change(&repo, "add");
 
     write_file(&repo_path, "data.txt", v2);
@@ -1653,7 +1670,8 @@ fn test_crdt_walker_after_insert() {
     let v2 = "alpha\nbeta\nDELTA\ngamma\n"; // insert in the middle
 
     write_file(&repo_path, "data.txt", v1);
-    repo.add("data.txt", Default::default()).unwrap();
+    repo.add(working_copy(&repo), "data.txt", Default::default())
+        .unwrap();
     record_change(&repo, "add");
 
     write_file(&repo_path, "data.txt", v2);
@@ -1679,7 +1697,8 @@ fn test_crdt_walker_after_delete() {
     let v2 = "alpha\ngamma\ndelta\n"; // delete `beta`
 
     write_file(&repo_path, "data.txt", v1);
-    repo.add("data.txt", Default::default()).unwrap();
+    repo.add(working_copy(&repo), "data.txt", Default::default())
+        .unwrap();
     record_change(&repo, "add");
 
     write_file(&repo_path, "data.txt", v2);
@@ -1705,7 +1724,8 @@ fn test_crdt_walker_prepend_in_second_commit() {
     let v2 = "first\nsecond\nthird\n";
 
     write_file(&repo_path, "data.txt", v1);
-    repo.add("data.txt", Default::default()).unwrap();
+    repo.add(working_copy(&repo), "data.txt", Default::default())
+        .unwrap();
     record_change(&repo, "add");
 
     write_file(&repo_path, "data.txt", v2);
@@ -1730,7 +1750,8 @@ fn test_crdt_walker_modify_then_insert_below() {
     let v2 = "alpha\nBETA\nNEW\ngamma\n"; // modify beta + insert NEW
 
     write_file(&repo_path, "data.txt", v1);
-    repo.add("data.txt", Default::default()).unwrap();
+    repo.add(working_copy(&repo), "data.txt", Default::default())
+        .unwrap();
     record_change(&repo, "add");
 
     write_file(&repo_path, "data.txt", v2);
@@ -1752,7 +1773,8 @@ fn test_crdt_walker_two_separate_modifies() {
     let v2 = "alpha\nBETA\ngamma\nDELTA\nepsilon\n";
 
     write_file(&repo_path, "data.txt", v1);
-    repo.add("data.txt", Default::default()).unwrap();
+    repo.add(working_copy(&repo), "data.txt", Default::default())
+        .unwrap();
     record_change(&repo, "add");
 
     write_file(&repo_path, "data.txt", v2);
@@ -1772,7 +1794,8 @@ fn test_crdt_walker_modify_in_block_with_insert_after_block() {
     let v2 = "a\nB\nC\nd\nNEW\ne\n";
 
     write_file(&repo_path, "data.txt", v1);
-    repo.add("data.txt", Default::default()).unwrap();
+    repo.add(working_copy(&repo), "data.txt", Default::default())
+        .unwrap();
     record_change(&repo, "add");
 
     write_file(&repo_path, "data.txt", v2);
@@ -1847,7 +1870,8 @@ fn test_crdt_walker_hyperfine_sequence_byte_exact() {
         "src/main.rs",
         &String::from_utf8_lossy(&versions[0]),
     );
-    repo.add("src/main.rs", Default::default()).unwrap();
+    repo.add(working_copy(&repo), "src/main.rs", Default::default())
+        .unwrap();
     record_change(&repo, "Initial commit");
     let got = crdt_output(&repo, "src/main.rs");
     assert_eq!(
@@ -1885,7 +1909,8 @@ fn test_crdt_walker_hyperfine_sequence_offline_fixture() {
         "src/main.rs",
         &String::from_utf8_lossy(versions[0].1),
     );
-    repo.add("src/main.rs", Default::default()).unwrap();
+    repo.add(working_copy(&repo), "src/main.rs", Default::default())
+        .unwrap();
     record_change(&repo, "Initial commit");
 
     let got = crdt_output(&repo, "src/main.rs");

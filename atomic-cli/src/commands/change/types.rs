@@ -678,6 +678,7 @@ pub(super) fn count_atoms<H>(hunks: &[GraphOp<H>]) -> (usize, usize) {
             GraphOp::DelRoot { .. } => {
                 edges += 1;
             }
+            GraphOp::SetAttr { .. } => {}
         }
     }
 
@@ -709,6 +710,7 @@ pub(super) fn hunk_atom_info<H>(graph_op: &GraphOp<H>) -> String {
         GraphOp::ResurrectZombies { .. } => "(~edges: resurrect zombies)".to_string(),
         GraphOp::AddRoot { .. } => "(+1 span: root)".to_string(),
         GraphOp::DelRoot { .. } => "(~edges: delete root)".to_string(),
+        GraphOp::SetAttr { value, .. } => format!("(attribute: {value:?})"),
     }
 }
 
@@ -778,6 +780,10 @@ pub(super) fn hunk_to_summary<H>(graph_op: &GraphOp<H>) -> JsonHunkSummary {
         GraphOp::DelRoot { .. } => JsonHunkSummary {
             hunk_type: "DelRoot".to_string(),
             path: None,
+        },
+        GraphOp::SetAttr { path, .. } => JsonHunkSummary {
+            hunk_type: "SetAttr".to_string(),
+            path: Some(path.clone()),
         },
     }
 }

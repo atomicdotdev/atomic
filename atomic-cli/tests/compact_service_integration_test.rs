@@ -36,8 +36,19 @@ fn local_compaction_preserves_views_journal_changes_and_dirty_sandbox() {
     let mut repo = Repository::init(&root).unwrap();
     let contents = b"recorded contents\n";
     std::fs::write(root.join("file.txt"), contents).unwrap();
-    repo.add("file.txt", Default::default()).unwrap();
-    let hash = *repo.record_all("compaction fixture").unwrap().hash();
+    repo.add(
+        repo.require_working_copy_id().unwrap(),
+        "file.txt",
+        Default::default(),
+    )
+    .unwrap();
+    let hash = *repo
+        .record_all(
+            repo.require_working_copy_id().unwrap(),
+            "compaction fixture",
+        )
+        .unwrap()
+        .hash();
     let change_path = ChangeStore::new(repo.changes_dir(), DEFAULT_CACHE_CAPACITY)
         .unwrap()
         .change_path(&hash);
@@ -45,7 +56,8 @@ fn local_compaction_preserves_views_journal_changes_and_dirty_sandbox() {
     let view = repo.current_view().to_owned();
     repo.create_view("compact-child").unwrap();
     let views = repo.list_views().unwrap();
-    repo.provision_sandbox(&sandbox, &view).unwrap();
+    repo.provision_sandbox(repo.require_working_copy_id().unwrap(), &sandbox, &view)
+        .unwrap();
     let store = repo.redb_change_store().unwrap();
     let turn = store.reserve_provenance_turn("compact", 1, 1).unwrap();
     let envelope = serde_json::to_vec(&serde_json::json!({

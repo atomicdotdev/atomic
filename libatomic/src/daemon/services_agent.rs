@@ -1068,16 +1068,21 @@ fn memory_list_attestation(
 /// the vault directory (relative to the repository root).
 fn add_vault_files_recursive(
     repo: &atomic_repository::Repository,
+    working_copy: atomic_core::types::WorkingCopyId,
     dir: &std::path::Path,
 ) -> Result<(), Status> {
     if let Ok(entries) = std::fs::read_dir(dir) {
         for entry in entries.flatten() {
             let path = entry.path();
             if path.is_dir() {
-                add_vault_files_recursive(repo, &path)?;
+                add_vault_files_recursive(repo, working_copy, &path)?;
             } else if path.is_file() {
                 if let Ok(relative) = path.strip_prefix(repo.root()) {
-                    let _ = repo.add(relative, atomic_repository::TrackingOptions::default());
+                    let _ = repo.add(
+                        working_copy,
+                        relative,
+                        atomic_repository::TrackingOptions::default(),
+                    );
                 }
             }
         }
@@ -2218,7 +2223,9 @@ impl vault_service_server::VaultService for VaultImpl {
         let _gate = gate_handle.exclusive().await;
         let meta = request.meta.clone();
         let (already, vault_dir, recorded) = tokio::task::spawn_blocking(move || {
-            let repo = handle.repository()?;
+            let (repo, workspace) =
+                handle.workspace_repository(atomic_repository::WorkspaceTxnMode::Reconcile)?;
+            let working_copy = workspace.working_copy();
             if repo.has_vault().unwrap_or(false) {
                 return Ok::<_, Status>((true, None, false));
             }
@@ -2226,7 +2233,7 @@ impl vault_service_server::VaultService for VaultImpl {
             let vault_dir = repo.vault_dir().display().to_string();
             // Track every vault file (the local body's recursive add).
             if repo.vault_dir().exists() {
-                add_vault_files_recursive(&repo, &repo.vault_dir())?;
+                add_vault_files_recursive(&repo, working_copy, &repo.vault_dir())?;
             }
             // Record the defaults as their own change; NothingToRecord is
             // the local body's silent no-op, other failures only log.
@@ -2234,7 +2241,7 @@ impl vault_service_server::VaultService for VaultImpl {
             let options = atomic_repository::RecordOptions::new()
                 .add_path(".vault")
                 .detect_raw_renames(false);
-            let recorded = match repo.record(header, options) {
+            let recorded = match repo.record(working_copy, header, options) {
                 Ok(_) => true,
                 Err(atomic_repository::RecordError::NothingToRecord) => false,
                 Err(_) => false,
@@ -3659,7 +3666,9 @@ impl knowledge_service_server::KnowledgeService for KnowledgeImpl {
         let _gate = gate_handle.exclusive().await;
         let meta = request.meta.clone();
         let response = tokio::task::spawn_blocking(move || {
-            let repo = handle.repository()?;
+            let (repo, workspace) =
+                handle.workspace_repository(atomic_repository::WorkspaceTxnMode::Reconcile)?;
+            let working_copy = workspace.working_copy();
             let processed = match action {
                 KnowledgeMaintainAction::Enrich => {
                     // Per-change scope (`enrich --changes`): enrich only
@@ -3675,7 +3684,7 @@ impl knowledge_service_server::KnowledgeService for KnowledgeImpl {
                             }
                             let mut bytes = [0u8; 32];
                             bytes.copy_from_slice(&hash.value);
-                            repo.kg_enrich_change(&atomic_core::types::Merkle(bytes))
+                            repo.kg_enrich_change(working_copy, &atomic_core::types::Merkle(bytes))
                                 .map_err(repository_error)?;
                             total += 1;
                         }
@@ -3693,12 +3702,24 @@ impl knowledge_service_server::KnowledgeService for KnowledgeImpl {
                     }
                     let mut total: u64 = 0;
                     total += repo.kg_enrich_views().map_err(repository_error)? as u64;
-                    total += repo.kg_enrich_files().map_err(repository_error)? as u64;
-                    total += repo.kg_enrich_modules().map_err(repository_error)? as u64;
-                    total += repo.kg_enrich_changes().map_err(repository_error)? as u64;
-                    total += repo.kg_enrich_entities().map_err(repository_error)? as u64;
-                    total += repo.kg_enrich_includes().map_err(repository_error)? as u64;
-                    total += repo.kg_enrich_calls().map_err(repository_error)? as u64;
+                    total += repo
+                        .kg_enrich_files(working_copy)
+                        .map_err(repository_error)? as u64;
+                    total += repo
+                        .kg_enrich_modules(working_copy)
+                        .map_err(repository_error)? as u64;
+                    total += repo
+                        .kg_enrich_changes(working_copy)
+                        .map_err(repository_error)? as u64;
+                    total += repo
+                        .kg_enrich_entities(working_copy)
+                        .map_err(repository_error)? as u64;
+                    total += repo
+                        .kg_enrich_includes(working_copy)
+                        .map_err(repository_error)? as u64;
+                    total += repo
+                        .kg_enrich_calls(working_copy)
+                        .map_err(repository_error)? as u64;
                     total
                 }
                 KnowledgeMaintainAction::Reindex => {

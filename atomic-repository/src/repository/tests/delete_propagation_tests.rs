@@ -11,10 +11,12 @@ use atomic_core::change::{Atom, ChangeHeader, GraphOp};
 use atomic_core::types::Hash;
 
 use crate::record::{RecordError, RecordOptions};
+use std::collections::HashSet;
 
 fn record_all(repo: &Repository, message: &str) -> Result<RecordOutcome, RecordError> {
     let header = ChangeHeader::new(message);
     repo.record(
+        repo.require_working_copy_id().unwrap(),
         header,
         RecordOptions::new()
             .with_all(true)
@@ -61,7 +63,7 @@ fn describe_op(op: &GraphOp<Option<Hash>>) -> String {
 
 /// Build: base 5-line file on dev, whole-file delete recorded on feature.
 /// Returns (tempdir, repo, delete-change hash, op descriptions).
-fn record_whole_file_delete() -> (TempDir, Repository, Hash, Vec<String>) {
+fn record_whole_file_delete() -> (TempDir, TestRepository, Hash, Vec<String>) {
     let (temp, mut repo) = create_temp_repo();
     let file = temp.path().join("f.txt");
 
@@ -214,4 +216,175 @@ fn whole_file_delete_insert_removes_file_on_target_view() {
         on_disk.unwrap_or_default(),
         ops.join("\n  ")
     );
+}
+
+#[derive(Debug, Clone, Copy)]
+enum MaterializeMode {
+    Parallel,
+    Sequential,
+    SelectedParallel,
+    SelectedSequential,
+    Prefix,
+}
+
+fn materialize_path(repo: &TestRepository, path: &str, mode: MaterializeMode) -> MaterializeResult {
+    match mode {
+        MaterializeMode::Parallel => repo.materialize().unwrap(),
+        MaterializeMode::Sequential => repo.materialize_sequential().unwrap(),
+        MaterializeMode::SelectedParallel => repo
+            .materialize_paths(HashSet::from([path.to_string()]))
+            .unwrap(),
+        MaterializeMode::SelectedSequential => repo
+            .materialize_paths_sequential(HashSet::from([path.to_string()]))
+            .unwrap(),
+        MaterializeMode::Prefix => repo.materialize_prefix(path).unwrap(),
+    }
+}
+
+#[test]
+fn every_materializer_preserves_present_empty_file() {
+    let (temp, repo) = create_temp_repo();
+    let path = "nested/empty.txt";
+    let file = temp.path().join(path);
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    std::fs::write(&file, []).unwrap();
+    repo.add(path, TrackingOptions::default()).unwrap();
+    record_all(&repo, "add empty file").unwrap();
+
+    for mode in [
+        MaterializeMode::Parallel,
+        MaterializeMode::Sequential,
+        MaterializeMode::SelectedParallel,
+        MaterializeMode::SelectedSequential,
+        MaterializeMode::Prefix,
+    ] {
+        std::fs::write(&file, b"stale bytes").unwrap();
+        let result = materialize_path(&repo, path, mode);
+        assert!(
+            file.is_file(),
+            "{mode:?} must create the tracked empty file"
+        );
+        assert_eq!(
+            std::fs::read(&file).unwrap(),
+            Vec::<u8>::new(),
+            "{mode:?} must truncate stale bytes for a tracked empty file"
+        );
+        assert_eq!(result.files_deleted, 0, "{mode:?} deleted a present file");
+        assert_eq!(repo.get_file_content(path).unwrap(), Some(Vec::new()));
+        assert!(matches!(
+            repo.get_materialized_entry_on_view(path, "dev").unwrap(),
+            MaterializedEntry::Present { bytes, .. } if bytes.is_empty()
+        ));
+    }
+}
+
+#[test]
+fn every_materializer_removes_explicitly_absent_file() {
+    let (temp, mut repo, hash, _ops) = record_whole_file_delete();
+    let path = "f.txt";
+    let file = temp.path().join(path);
+
+    repo.switch_view("dev").unwrap();
+    repo.insert_change_rec(
+        &hash,
+        crate::apply::InsertOptions::default().apply_deps(true),
+    )
+    .unwrap();
+
+    for mode in [
+        MaterializeMode::Parallel,
+        MaterializeMode::Sequential,
+        MaterializeMode::SelectedParallel,
+        MaterializeMode::SelectedSequential,
+        MaterializeMode::Prefix,
+    ] {
+        std::fs::write(&file, b"stale bytes that must not survive").unwrap();
+        let result = materialize_path(&repo, path, mode);
+        assert!(!file.exists(), "{mode:?} must remove an absent file");
+        assert_eq!(result.files_deleted, 1, "{mode:?} deletion count");
+        assert_eq!(repo.get_file_content(path).unwrap(), None);
+        assert!(matches!(
+            repo.get_materialized_entry_on_view(path, "dev").unwrap(),
+            MaterializedEntry::Absent { .. }
+        ));
+    }
+}
+
+#[test]
+fn sole_view_deletion_remains_absent_across_every_materializer() {
+    let (temp, repo) = create_temp_repo();
+    let path = "sole.txt";
+    let file = temp.path().join(path);
+    std::fs::write(&file, b"sole-view content\n").unwrap();
+    repo.add(path, TrackingOptions::default()).unwrap();
+    record_all(&repo, "add sole-view file").unwrap();
+    std::fs::remove_file(&file).unwrap();
+    record_all(&repo, "delete sole-view file").unwrap();
+
+    assert!(matches!(
+        repo.get_materialized_entry_on_view(path, "dev").unwrap(),
+        MaterializedEntry::Absent { .. }
+    ));
+    for mode in [
+        MaterializeMode::Parallel,
+        MaterializeMode::Sequential,
+        MaterializeMode::SelectedParallel,
+        MaterializeMode::SelectedSequential,
+        MaterializeMode::Prefix,
+    ] {
+        std::fs::write(&file, b"recreated stale bytes").unwrap();
+        let result = materialize_path(&repo, path, mode);
+        assert!(!file.exists(), "{mode:?} must honor sole-view deletion");
+        assert_eq!(result.files_deleted, 1, "{mode:?} deletion count");
+    }
+}
+
+#[test]
+fn flattened_view_replays_lifecycle_in_causal_order() {
+    let (temp, mut repo) = create_temp_repo();
+    let deleted = temp.path().join("deleted.txt");
+    let inherited_empty = temp.path().join("inherited-empty.txt");
+    std::fs::write(&deleted, b"base content\n").unwrap();
+    std::fs::write(&inherited_empty, []).unwrap();
+    repo.add("deleted.txt", TrackingOptions::default()).unwrap();
+    repo.add("inherited-empty.txt", TrackingOptions::default())
+        .unwrap();
+    record_all(&repo, "base files").unwrap();
+
+    repo.create_view_from("feature", "dev").unwrap();
+    repo.switch_view("feature").unwrap();
+    let feature_empty = temp.path().join("feature-empty.txt");
+    std::fs::write(&feature_empty, []).unwrap();
+    repo.add("feature-empty.txt", TrackingOptions::default())
+        .unwrap();
+    record_all(&repo, "feature empty file").unwrap();
+    std::fs::remove_file(&deleted).unwrap();
+    record_all(&repo, "delete base file").unwrap();
+
+    let closure = repo.effective_history(Some("feature")).unwrap();
+    repo.create_shared_view("flattened").unwrap();
+    for entry in closure {
+        repo.insert_change(
+            &entry.hash,
+            crate::apply::InsertOptions::with_dependencies().view("flattened"),
+        )
+        .unwrap();
+    }
+    repo.align_to_view("flattened").unwrap();
+    repo.reindex_working_copy().unwrap();
+
+    assert!(matches!(
+        repo.get_materialized_entry_on_view("deleted.txt", "flattened")
+            .unwrap(),
+        MaterializedEntry::Absent { .. }
+    ));
+    for path in ["inherited-empty.txt", "feature-empty.txt"] {
+        assert!(matches!(
+            repo.get_materialized_entry_on_view(path, "flattened")
+                .unwrap(),
+            MaterializedEntry::Present { bytes, .. } if bytes.is_empty()
+        ));
+    }
+    let status = repo.status(StatusOptions::default()).unwrap();
+    assert!(status.is_clean(), "flattened closure status: {status:?}");
 }

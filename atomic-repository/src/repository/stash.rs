@@ -80,14 +80,17 @@ impl Repository {
     /// when the working copy is clean (never an error).
     pub fn stash_push(&mut self, options: StashPushOptions) -> Result<Option<StashEntry>, String> {
         use crate::status::StatusOptions;
+        let working_copy = self.require_working_copy_id().map_err(|e| e.to_string())?;
         let status = self
-            .status(StatusOptions::default())
+            .status(working_copy, StatusOptions::default())
             .map_err(|e| e.to_string())?;
         if status.is_clean() {
             return Ok(None);
         }
 
-        let source_view = self.current_view().to_string();
+        let source_view = self
+            .desired_view_name(working_copy)
+            .map_err(|e| e.to_string())?;
         let stash_message = options
             .message
             .unwrap_or_else(|| DEFAULT_STASH_MESSAGE.to_string());
@@ -158,7 +161,7 @@ impl Repository {
 
         // Restore the working copy to a clean state (unless keep).
         if !options.keep {
-            self.materialize().map_err(|e| e.to_string())?;
+            self.materialize(working_copy).map_err(|e| e.to_string())?;
         }
 
         Ok(Some(StashEntry {

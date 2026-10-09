@@ -3,13 +3,21 @@
 #[cfg(test)]
 #[allow(clippy::module_inception)]
 mod tests {
+    use crate::change::MemoryChangeStore;
     use crate::output::repo::conflict::{FileConflict, FileConflictType};
-    use crate::output::repo::file::FileOutputResult;
+    use crate::output::repo::file::{
+        output_file_with_filter, FileOutputError, FileOutputOptions, FileOutputResult,
+    };
     use crate::output::repo::repository::types::{
         MaterializeError, MaterializeOptions, OutputItem,
     };
-    use crate::output::repo::repository::MaterializeResult;
-    use crate::types::{Inode, Position};
+    use crate::output::repo::repository::{materialize_view, MaterializeResult};
+    use crate::output::Memory;
+    use crate::pristine::{GraphTxnT, PristineError, TreeTxnT};
+    use crate::types::{
+        ChangePosition, EdgeFlags, GraphNode, Hash, Inode, NodeId, Position, SerializedGraphEdge,
+    };
+    use std::collections::HashMap;
     use std::time::SystemTime;
 
     // ========================================================================
@@ -578,5 +586,298 @@ mod tests {
 
         assert!(debug.contains("OutputItem"));
         assert!(debug.contains("test.rs"));
+    }
+
+    #[derive(Default)]
+    struct ScriptedTxn {
+        tree: Vec<(String, Inode)>,
+        positions: HashMap<Inode, Position<NodeId>>,
+        edges: HashMap<GraphNode<NodeId>, Vec<SerializedGraphEdge>>,
+        blocks: HashMap<Position<NodeId>, GraphNode<NodeId>>,
+        block_ends: HashMap<Position<NodeId>, GraphNode<NodeId>>,
+        external: HashMap<NodeId, Hash>,
+        forward_fault: Option<GraphNode<NodeId>>,
+    }
+
+    impl ScriptedTxn {
+        fn add_tree_file(&mut self, path: &str, inode: Inode, position: Position<NodeId>) {
+            self.tree.push((path.to_string(), inode));
+            self.positions.insert(inode, position);
+        }
+
+        fn add_edge(
+            &mut self,
+            source: GraphNode<NodeId>,
+            flags: EdgeFlags,
+            dest: Position<NodeId>,
+            introduced_by: NodeId,
+        ) {
+            self.edges
+                .entry(source)
+                .or_default()
+                .push(SerializedGraphEdge::new(flags, dest, introduced_by));
+        }
+
+        fn fail_forward_adjacency(&mut self, node: GraphNode<NodeId>) {
+            self.forward_fault = Some(node);
+        }
+    }
+
+    impl GraphTxnT for ScriptedTxn {
+        type Adj = std::vec::IntoIter<Result<SerializedGraphEdge, PristineError>>;
+
+        fn get_external(&self, id: NodeId) -> Result<Option<Hash>, PristineError> {
+            Ok(self.external.get(&id).copied())
+        }
+
+        fn get_internal(&self, hash: &Hash) -> Result<Option<NodeId>, PristineError> {
+            Ok(self
+                .external
+                .iter()
+                .find_map(|(id, candidate)| (candidate == hash).then_some(*id)))
+        }
+
+        fn iter_adjacent(
+            &self,
+            node: GraphNode<NodeId>,
+            min_flag: EdgeFlags,
+            max_flag: EdgeFlags,
+        ) -> Result<Self::Adj, PristineError> {
+            if self.forward_fault == Some(node) && !min_flag.contains(EdgeFlags::PARENT) {
+                return Ok(vec![Err(PristineError::Inconsistent {
+                    message: "scripted forward adjacency failure".to_string(),
+                })]
+                .into_iter());
+            }
+
+            let edges = self
+                .edges
+                .get(&node)
+                .into_iter()
+                .flatten()
+                .filter(|edge| edge.flag() >= min_flag && edge.flag() <= max_flag)
+                .copied()
+                .map(Ok)
+                .collect::<Vec<_>>();
+            Ok(edges.into_iter())
+        }
+
+        fn find_block(
+            &self,
+            position: Position<NodeId>,
+        ) -> Result<GraphNode<NodeId>, PristineError> {
+            self.blocks
+                .get(&position)
+                .copied()
+                .ok_or(PristineError::BlockNotFound {
+                    change: position.change.get(),
+                    pos: position.pos.get(),
+                })
+        }
+
+        fn find_block_end(
+            &self,
+            position: Position<NodeId>,
+        ) -> Result<GraphNode<NodeId>, PristineError> {
+            self.block_ends
+                .get(&position)
+                .copied()
+                .ok_or(PristineError::BlockNotFound {
+                    change: position.change.get(),
+                    pos: position.pos.get(),
+                })
+        }
+
+        fn has_vertex(&self, node: GraphNode<NodeId>) -> Result<bool, PristineError> {
+            Ok(self.edges.contains_key(&node))
+        }
+
+        fn get_node_type(&self, _node_id: NodeId) -> Result<Option<u8>, PristineError> {
+            Ok(None)
+        }
+
+        fn get_rev_deps(&self, _dep_id: NodeId) -> Result<Vec<NodeId>, PristineError> {
+            Ok(Vec::new())
+        }
+
+        fn has_change_in_graph(&self, change_id: NodeId) -> Result<bool, PristineError> {
+            Ok(self.edges.keys().any(|node| node.change == change_id))
+        }
+    }
+
+    impl TreeTxnT for ScriptedTxn {
+        fn get_inode(&self, path: &str) -> Result<Option<Inode>, PristineError> {
+            Ok(self
+                .tree
+                .iter()
+                .find_map(|(candidate, inode)| (candidate == path).then_some(*inode)))
+        }
+
+        fn get_directory_flags(&self, _inode: Inode) -> Result<Option<u8>, PristineError> {
+            Ok(None)
+        }
+
+        fn get_path(&self, inode: Inode) -> Result<Option<String>, PristineError> {
+            Ok(self
+                .tree
+                .iter()
+                .find_map(|(path, candidate)| (*candidate == inode).then(|| path.clone())))
+        }
+
+        fn inode_position(&self, inode: Inode) -> Result<Option<Position<NodeId>>, PristineError> {
+            Ok(self.positions.get(&inode).copied())
+        }
+
+        fn position_inode(
+            &self,
+            position: Position<NodeId>,
+        ) -> Result<Option<Inode>, PristineError> {
+            Ok(self
+                .positions
+                .iter()
+                .find_map(|(inode, candidate)| (*candidate == position).then_some(*inode)))
+        }
+
+        fn iter_tree(
+            &self,
+        ) -> Result<
+            Box<dyn Iterator<Item = Result<(String, Inode), PristineError>> + '_>,
+            PristineError,
+        > {
+            Ok(Box::new(self.tree.iter().cloned().map(Ok)))
+        }
+
+        fn iter_inode_vertices(
+            &self,
+            _inode: Inode,
+        ) -> Result<
+            Box<
+                dyn Iterator<Item = Result<(GraphNode<NodeId>, SerializedGraphEdge), PristineError>>
+                    + '_,
+            >,
+            PristineError,
+        > {
+            Ok(Box::new(std::iter::empty()))
+        }
+
+        fn get_file_index(
+            &self,
+            _path: &str,
+        ) -> Result<Option<(i64, u32, u64, Hash)>, PristineError> {
+            Ok(None)
+        }
+
+        fn iter_file_index(&self) -> Result<Vec<(String, i64, u32, u64, Hash)>, PristineError> {
+            Ok(Vec::new())
+        }
+    }
+
+    fn test_position(change: u64, pos: u64) -> Position<NodeId> {
+        Position::new(NodeId::new(change), ChangePosition::new(pos))
+    }
+
+    fn test_node(change: u64, start: u64, end: u64) -> GraphNode<NodeId> {
+        GraphNode::new(
+            NodeId::new(change),
+            ChangePosition::new(start),
+            ChangePosition::new(end),
+        )
+    }
+
+    fn sorted_paths(working_copy: &Memory) -> Vec<String> {
+        let mut paths = working_copy.list_all_paths();
+        paths.sort();
+        paths
+    }
+
+    #[test]
+    fn materialize_view_renders_entire_batch_before_mutating_working_copy() {
+        let first_position = test_position(1, 0);
+        let second_position = test_position(2, 0);
+        let first_inode = Inode::new(10);
+        let second_inode = Inode::new(11);
+
+        let mut txn = ScriptedTxn::default();
+        txn.add_tree_file("first.txt", first_inode, first_position);
+        txn.add_tree_file("newdir/second.txt", second_inode, second_position);
+        txn.fail_forward_adjacency(second_position.inode_node());
+
+        let changes = MemoryChangeStore::new();
+        let working_copy = Memory::new();
+        working_copy.add_file("first.txt", b"preexisting first content");
+        let original_inode = working_copy.get_inode("first.txt");
+        let original_paths = sorted_paths(&working_copy);
+
+        let error = materialize_view(&txn, &changes, &working_copy, MaterializeOptions::new())
+            .expect_err("the second file should fail during graph rendering");
+
+        match error {
+            MaterializeError::FileOutput {
+                path,
+                source: FileOutputError::Graph(PristineError::Inconsistent { message }),
+            } => {
+                assert_eq!(path, "newdir/second.txt");
+                assert_eq!(message, "scripted forward adjacency failure");
+            }
+            other => panic!("unexpected materialize error: {other:?}"),
+        }
+
+        assert_eq!(
+            working_copy.get_file_contents("first.txt").as_deref(),
+            Some(b"preexisting first content".as_slice())
+        );
+        assert_eq!(working_copy.get_inode("first.txt"), original_inode);
+        assert_eq!(sorted_paths(&working_copy), original_paths);
+        assert_eq!(working_copy.get_file_contents("newdir/second.txt"), None);
+    }
+
+    #[test]
+    fn single_file_output_does_not_open_writer_before_content_render_succeeds() {
+        let position = test_position(1, 0);
+        let content_position = test_position(2, 0);
+        let content_node = test_node(2, 0, 4);
+        let inode = Inode::new(12);
+
+        let mut txn = ScriptedTxn::default();
+        txn.add_edge(
+            position.inode_node(),
+            EdgeFlags::BLOCK,
+            content_position,
+            NodeId::new(2),
+        );
+        txn.add_edge(
+            content_node,
+            EdgeFlags::PARENT | EdgeFlags::BLOCK,
+            position,
+            NodeId::new(2),
+        );
+        txn.blocks.insert(content_position, content_node);
+        txn.external.insert(NodeId::new(2), Hash::of(b"missing"));
+
+        let changes = MemoryChangeStore::new();
+        let working_copy = Memory::new();
+        working_copy.add_file("existing.txt", b"preexisting content");
+        let original_inode = working_copy.get_inode("existing.txt");
+        let original_paths = sorted_paths(&working_copy);
+
+        let error = output_file_with_filter(
+            &txn,
+            &changes,
+            &working_copy,
+            inode,
+            position,
+            "existing.txt",
+            FileOutputOptions::new(),
+            None,
+        )
+        .expect_err("missing change content should fail the render phase");
+
+        assert!(matches!(error, FileOutputError::ChangeStore(_)));
+        assert_eq!(
+            working_copy.get_file_contents("existing.txt").as_deref(),
+            Some(b"preexisting content".as_slice())
+        );
+        assert_eq!(working_copy.get_inode("existing.txt"), original_inode);
+        assert_eq!(sorted_paths(&working_copy), original_paths);
     }
 }

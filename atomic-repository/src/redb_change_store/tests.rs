@@ -1068,6 +1068,9 @@ fn bound_checkpoint_repairs_only_legacy_ledger_ordinal() {
         timestamp: 3,
         plan_id: None,
         todos: Vec::new(),
+        boundary_start: None,
+        boundary_end: None,
+        outcome: None,
     };
     store
         .bind_provenance_checkpoint_hash(

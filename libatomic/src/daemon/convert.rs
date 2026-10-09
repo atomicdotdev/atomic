@@ -30,6 +30,20 @@ pub fn timestamp_domain(stamp: &prost_types::Timestamp) -> chrono::DateTime<chro
         .unwrap_or_else(chrono::Utc::now)
 }
 
+/// Native attribute-only changes remain MODIFIED for existing wire clients;
+/// the optional diagnostic preserves the subtype for native CLI rendering.
+pub const TYPE_CHANGED_DETAIL: &str = "file type changed";
+pub const PERMISSIONS_CHANGED_DETAIL: &str = "file permissions changed";
+
+pub fn file_status_details(entry: &atomic_repository::FileStatusEntry) -> Option<String> {
+    use atomic_repository::FileStatus;
+    match entry.status() {
+        FileStatus::TypeChanged => Some(TYPE_CHANGED_DETAIL.to_string()),
+        FileStatus::PermissionsChanged => Some(PERMISSIONS_CHANGED_DETAIL.to_string()),
+        _ => entry.details().map(str::to_string),
+    }
+}
+
 pub fn file_status_proto(status: atomic_repository::status::FileStatus) -> pb::FileStatus {
     use atomic_repository::status::FileStatus as Domain;
     match status {
@@ -38,9 +52,8 @@ pub fn file_status_proto(status: atomic_repository::status::FileStatus) -> pb::F
         Domain::Untracked => pb::FileStatus::Untracked,
         Domain::Added => pb::FileStatus::Added,
         Domain::Conflicted => pb::FileStatus::Conflicted,
-        Domain::Clean | Domain::TypeChanged | Domain::PermissionsChanged => {
-            pb::FileStatus::Unspecified
-        }
+        Domain::Clean => pb::FileStatus::Unspecified,
+        Domain::TypeChanged | Domain::PermissionsChanged => pb::FileStatus::Modified,
     }
 }
 

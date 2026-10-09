@@ -214,6 +214,15 @@ mod tests {
         assert_eq!(extract_parent(""), "");
     }
 
+    #[test]
+    fn test_ancestor_directories_are_parent_first() {
+        assert_eq!(
+            ancestor_directories("src/domain/model.rs"),
+            vec!["src".to_string(), "src/domain".to_string()]
+        );
+        assert!(ancestor_directories("Cargo.toml").is_empty());
+    }
+
     // Position Conversion Tests
 
     #[test]
@@ -292,5 +301,266 @@ mod tests {
         let gf = GlobalizedFile::new("test.rs");
         let hunks = gf.into_hunks();
         assert!(hunks.is_empty());
+    }
+
+    #[test]
+    fn test_globalize_name_conflict_verifies_graph_and_collects_complete_dependencies() {
+        use crate::pristine::{MutTxnT, Pristine};
+        use crate::SerializedGraphEdge;
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let pristine = Pristine::open(dir.path().join("pristine")).unwrap();
+        let winner_hash = Hash::of(b"winner inode");
+        let loser_hash = Hash::of(b"loser inode");
+        let parent_hash = Hash::of(b"parent directory");
+        let name_hash = Hash::of(b"losing moved name");
+        let solve_hash = Hash::of(b"resolution change");
+
+        let (winner, loser, source, name, name_change, solve_change) = {
+            let mut txn = pristine.write_txn().unwrap();
+            let winner_change = txn.register_change(&winner_hash).unwrap();
+            let loser_change = txn.register_change(&loser_hash).unwrap();
+            let parent_change = txn.register_change(&parent_hash).unwrap();
+            let name_change = txn.register_change(&name_hash).unwrap();
+            let solve_change = txn.register_change(&solve_hash).unwrap();
+
+            let winner = Position::new(winner_change, ChangePosition::new(5));
+            let loser = Position::new(loser_change, ChangePosition::new(7));
+            let source = GraphNode::new(
+                parent_change,
+                ChangePosition::new(3),
+                ChangePosition::new(3),
+            );
+            let name = GraphNode::new(
+                name_change,
+                ChangePosition::new(11),
+                ChangePosition::new(23),
+            );
+            let alive = EdgeFlags::FOLDER | EdgeFlags::BLOCK;
+            txn.put_graph(
+                source,
+                SerializedGraphEdge::new(alive, name.start_pos(), name_change),
+            )
+            .unwrap();
+            txn.put_graph(
+                source,
+                SerializedGraphEdge::new(
+                    alive | EdgeFlags::DELETED,
+                    name.start_pos(),
+                    solve_change,
+                ),
+            )
+            .unwrap();
+            txn.put_graph(name, SerializedGraphEdge::new(alive, loser, name_change))
+                .unwrap();
+            for (inode, introduced_by) in [(winner, winner_change), (loser, loser_change)] {
+                txn.put_graph(
+                    GraphNode::new(inode.change, inode.pos, inode.pos),
+                    SerializedGraphEdge::new(EdgeFlags::PARENT, Position::ROOT, introduced_by),
+                )
+                .unwrap();
+            }
+            txn.commit().unwrap();
+            (winner, loser, source, name, name_change, solve_change)
+        };
+
+        let txn = pristine.read_txn().unwrap();
+        let mut invalid_ctx = GlobalizeContext::new(&txn);
+        let invalid = globalize_solve_name_conflict(
+            &mut invalid_ctx,
+            "src/conflict.txt",
+            winner,
+            [NameConflictClaim::new(loser, source, name, solve_change)],
+        );
+        assert!(matches!(
+            invalid,
+            Err(GlobalizeError::InvalidNameConflict { .. })
+        ));
+        assert!(invalid_ctx.dependencies().is_empty());
+
+        let mut solve_ctx = GlobalizeContext::new(&txn);
+        let solve = globalize_solve_name_conflict(
+            &mut solve_ctx,
+            "src/conflict.txt",
+            winner,
+            [NameConflictClaim::new(loser, source, name, name_change)],
+        )
+        .unwrap();
+        let GraphOp::SolveNameConflict {
+            name: solve_update,
+            path,
+        } = solve
+        else {
+            unreachable!();
+        };
+        assert_eq!(path, "src/conflict.txt");
+        assert_eq!(solve_update.inode.change, Some(winner_hash));
+        assert_eq!(solve_update.edges[0].from.change, Some(parent_hash));
+        assert_eq!(solve_update.edges[0].to.change, Some(name_hash));
+        assert_eq!(solve_update.edges[0].introduced_by, Some(name_hash));
+        assert_eq!(
+            solve_ctx.dependencies(),
+            &HashSet::from([winner_hash, loser_hash, parent_hash, name_hash])
+        );
+
+        let mut unsolve_ctx = GlobalizeContext::new(&txn);
+        let unsolve = globalize_unsolve_name_conflict(
+            &mut unsolve_ctx,
+            "src/conflict.txt",
+            winner,
+            [NameConflictClaim::new(loser, source, name, solve_change)],
+        )
+        .unwrap();
+        let GraphOp::UnsolveNameConflict { name, .. } = unsolve else {
+            unreachable!();
+        };
+        assert_eq!(
+            name.edges[0].previous,
+            EdgeFlags::FOLDER | EdgeFlags::BLOCK | EdgeFlags::DELETED
+        );
+        assert_eq!(name.edges[0].flag, EdgeFlags::FOLDER | EdgeFlags::BLOCK);
+        assert_eq!(name.edges[0].introduced_by, Some(solve_hash));
+        assert_eq!(
+            unsolve_ctx.dependencies(),
+            &HashSet::from([winner_hash, loser_hash, parent_hash, name_hash, solve_hash,])
+        );
+    }
+
+    #[test]
+    fn top_level_name_conflict_globalizes_compacts_expands_and_applies() {
+        use crate::apply::{write_edge_map, CachedWriteGraphTxn, Workspace};
+        use crate::change::format_v3::compact::{CompactGraphOp, Compactor};
+        use crate::change::format_v3::HashDedupTable;
+        use crate::change::Change;
+        use crate::pristine::{MutTxnT, Pristine};
+        use crate::SerializedGraphEdge;
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let pristine = Pristine::open(dir.path().join("pristine")).unwrap();
+        let winner_hash = Hash::of(b"top-level winner inode");
+        let loser_hash = Hash::of(b"top-level loser inode");
+        let name_hash = Hash::of(b"top-level losing name");
+        let resolution_hash = Hash::of(b"top-level resolution");
+        let winner_inode = Inode::new(41);
+
+        let (winner, loser, name, name_change, resolution_change) = {
+            let mut txn = pristine.write_txn().unwrap();
+            let winner_change = txn.register_change(&winner_hash).unwrap();
+            let loser_change = txn.register_change(&loser_hash).unwrap();
+            let name_change = txn.register_change(&name_hash).unwrap();
+            let resolution_change = txn.register_change(&resolution_hash).unwrap();
+            let winner = Position::new(winner_change, ChangePosition::new(5));
+            let loser = Position::new(loser_change, ChangePosition::new(7));
+            let name = GraphNode::new(
+                name_change,
+                ChangePosition::new(11),
+                ChangePosition::new(23),
+            );
+            let alive = EdgeFlags::FOLDER | EdgeFlags::BLOCK;
+
+            txn.put_graph(
+                GraphNode::root(),
+                SerializedGraphEdge::new(alive, name.start_pos(), name_change),
+            )
+            .unwrap();
+            txn.put_graph(name, SerializedGraphEdge::new(alive, loser, name_change))
+                .unwrap();
+            for (inode, introduced_by) in [(winner, winner_change), (loser, loser_change)] {
+                txn.put_graph(
+                    GraphNode::new(inode.change, inode.pos, inode.pos),
+                    SerializedGraphEdge::new(EdgeFlags::PARENT, Position::ROOT, introduced_by),
+                )
+                .unwrap();
+            }
+            txn.put_inode(winner_inode, winner).unwrap();
+            txn.commit().unwrap();
+            (winner, loser, name, name_change, resolution_change)
+        };
+
+        let expanded = {
+            let txn = pristine.read_txn().unwrap();
+            let mut ctx = GlobalizeContext::new(&txn);
+            let solve = globalize_solve_name_conflict(
+                &mut ctx,
+                "conflict.txt",
+                winner,
+                [NameConflictClaim::new(
+                    loser,
+                    GraphNode::root(),
+                    name,
+                    name_change,
+                )],
+            )
+            .unwrap();
+            let GraphOp::SolveNameConflict { name, .. } = &solve else {
+                unreachable!();
+            };
+            assert_eq!(name.edges[0].from.change, Some(Hash::NONE));
+
+            // Match Change::serialize: index 0 is the zero placeholder, which is
+            // also Hash::NONE. Option::None remains the 0xFFFF wire sentinel.
+            let mut table = HashDedupTable::new(*Hash::NONE.as_bytes());
+            for dependency in ctx.dependencies_sorted() {
+                table.insert(*dependency.as_bytes()).unwrap();
+            }
+            let compactor = Compactor::new(&table);
+            let compact = compactor.compact_graph_op(&solve).unwrap();
+            let CompactGraphOp::SolveNameConflict { name, .. } = &compact else {
+                unreachable!();
+            };
+            assert_eq!(name.edges[0].from.change, 0);
+
+            let expanded = compactor.expand_graph_op(&compact).unwrap();
+            assert_eq!(expanded, solve);
+            let GraphOp::SolveNameConflict { name, .. } = &expanded else {
+                unreachable!();
+            };
+            assert_eq!(name.edges[0].from.change, Some(Hash::NONE));
+            expanded
+        };
+
+        let GraphOp::SolveNameConflict { name: update, .. } = expanded else {
+            unreachable!();
+        };
+        {
+            let txn = pristine.write_txn().unwrap();
+            let mut cached = CachedWriteGraphTxn::new(&txn).unwrap();
+            let mut workspace = Workspace::new();
+            write_edge_map(
+                &mut cached,
+                &mut workspace,
+                resolution_change,
+                &update,
+                &Change::default(),
+                false,
+            )
+            .unwrap();
+            drop(cached);
+            txn.commit().unwrap();
+        }
+
+        let txn = pristine.read_txn().unwrap();
+        let expected = EdgeFlags::FOLDER | EdgeFlags::BLOCK;
+        let mut saw_original = false;
+        let mut saw_resolution = false;
+        for edge in txn
+            .iter_adjacent(GraphNode::root(), EdgeFlags::empty(), EdgeFlags::all())
+            .unwrap()
+        {
+            let edge = edge.unwrap();
+            if edge.dest() != name.start_pos() {
+                continue;
+            }
+            saw_original |= edge.flag() == expected && edge.introduced_by() == name_change;
+            saw_resolution |= edge.flag() == expected | EdgeFlags::DELETED
+                && edge.introduced_by() == resolution_change;
+        }
+        assert!(
+            saw_original,
+            "additive apply must retain the original claim"
+        );
+        assert!(saw_resolution, "solve must add the deleted ROOT claim edge");
     }
 }

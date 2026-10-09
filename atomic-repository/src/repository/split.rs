@@ -260,13 +260,19 @@ impl Repository {
     ///   if a requested change is unknown or not in the source view's own log.
     /// - [`RepositoryError::ViewSplitHasDependents`] if changes remaining in the
     ///   source depend on the split-out set and `cascade` is not set.
-    pub fn split_view(&mut self, options: SplitOptions) -> Result<SplitOutcome, RepositoryError> {
+    pub fn split_view(
+        &mut self,
+        working_copy: WorkingCopyId,
+        options: SplitOptions,
+    ) -> Result<SplitOutcome, RepositoryError> {
+        self.validate_working_copy(working_copy)?;
+        let desired_view = self.desired_view_name(working_copy)?;
         let db = |e: PristineError| RepositoryError::Database(e.to_string());
 
         let from_view_name = options
             .from_view
             .clone()
-            .unwrap_or_else(|| self.current_view.clone());
+            .unwrap_or_else(|| desired_view.clone());
 
         if options.changes.is_empty() {
             return Err(RepositoryError::InvalidOperation {
@@ -398,7 +404,7 @@ impl Repository {
         let mut files_written = 0usize;
         let mut files_removed = 0usize;
 
-        if from_view_name == self.current_view {
+        if from_view_name == desired_view {
             // Collect the paths touched by the removed changes.
             let mut affected: Vec<String> = Vec::new();
             for change in move_set.iter() {
@@ -420,7 +426,7 @@ impl Repository {
                 // it alive) or *revert* its content (an earlier change still
                 // owns it), so we split affected paths by post-split
                 // visibility and handle each accordingly.
-                let post_visible = self.visible_file_paths(&self.current_view)?;
+                let post_visible = self.visible_file_paths(&desired_view)?;
                 let mut to_remove: Vec<String> = Vec::new();
                 let mut to_write: std::collections::HashSet<String> =
                     std::collections::HashSet::new();
@@ -441,13 +447,13 @@ impl Repository {
                 }
                 if !to_remove.is_empty() {
                     let refs: Vec<&str> = to_remove.iter().map(|s| s.as_str()).collect();
-                    let _ = self.del_file_index_batch(&refs);
+                    let _ = self.del_file_index_batch(working_copy, &refs);
                     files_removed = to_remove.len();
                 }
 
                 if !to_write.is_empty() {
                     let n = to_write.len();
-                    self.materialize_paths(to_write)?;
+                    self.materialize_paths(working_copy, to_write)?;
                     files_written = n;
                 }
 
@@ -456,7 +462,7 @@ impl Repository {
                 // Conservative default: don't touch the working copy; just drop
                 // the stale FILE_INDEX entries so `status` recomputes.
                 let refs: Vec<&str> = affected.iter().map(|s| s.as_str()).collect();
-                let _ = self.del_file_index_batch(&refs);
+                let _ = self.del_file_index_batch(working_copy, &refs);
             }
         }
 

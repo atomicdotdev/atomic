@@ -70,7 +70,9 @@ impl sandbox_service_server::SandboxService for SandboxImpl {
         let root = handle.root.clone();
         let (resolved_dest, view, created_draft, files_cloned, repo_root) =
             tokio::task::spawn_blocking(move || {
-                let mut repo = handle.repository()?;
+                let (mut repo, workspace) =
+                    handle.workspace_repository(atomic_repository::WorkspaceTxnMode::Reconcile)?;
+                let working_copy = workspace.working_copy();
                 let dest = dest
                     .map(std::path::PathBuf::from)
                     .unwrap_or_else(|| default_sandbox_dest(&root, &name));
@@ -92,7 +94,7 @@ impl sandbox_service_server::SandboxService for SandboxImpl {
                     (view, false)
                 };
                 let count = repo
-                    .provision_sandbox(&dest, &view)
+                    .provision_sandbox(working_copy, &dest, &view)
                     .map_err(repository_error)?;
                 Ok::<_, Status>((
                     dest.display().to_string(),
