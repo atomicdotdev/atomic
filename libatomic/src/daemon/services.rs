@@ -1601,6 +1601,28 @@ impl repository_mutation_service_server::RepositoryMutationService for MutationI
                     .unwrap_or_else(|| handle.current_view());
                 let dry_run = request.dry_run.unwrap_or(false);
                 let apply_dependencies = request.apply_dependencies.unwrap_or(true);
+                // Insert may refresh the current working copy below. Refuse
+                // before publishing any membership, rather than overwriting
+                // edits (including untracked files) during materialization.
+                // Promotion and non-current targets do not refresh this tree.
+                if !dry_run
+                    && target == repo.current_view()
+                    && !matches!(
+                        request.source.as_ref(),
+                        Some(insert_changes_request::Source::PromoteCurrentView(_))
+                    )
+                {
+                    let status = repo
+                        .status(StatusOptions::default())
+                        .map_err(repository_error)?;
+                    if !status.is_clean() || status.has_untracked() || status.has_conflicts() {
+                        return Err(domain_status(
+                            ErrorCode::PreconditionFailed,
+                            "insert would refresh a working copy with unrecorded changes; \
+                             record, stash, or move those files aside before inserting",
+                        ));
+                    }
+                }
                 // How the working copy refreshes after the insert — the
                 // per-arm policy the local bodies apply (the bare
                 // promotion never rematerializes: its target view is not
