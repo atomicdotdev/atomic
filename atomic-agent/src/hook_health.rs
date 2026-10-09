@@ -1,4 +1,4 @@
-//! Hook liveness and failure reporting for `atomic agent status`.
+//! Shared hook liveness and failure reporting for CLI and service dispatch.
 //!
 //! Two independent signals, because they answer different questions:
 //!
@@ -50,8 +50,8 @@ const SESSION_ID_PREFIX: &str = "ses_";
 /// How a single hook dispatch ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub(super) enum FireOutcome {
-    /// The event dispatched and the recorder committed it.
+pub enum FireOutcome {
+    /// The event dispatched successfully; it may not have needed a new change.
     Ok,
     /// The event reached the dispatcher but failed.
     Error,
@@ -59,7 +59,7 @@ pub(super) enum FireOutcome {
 
 impl FireOutcome {
     /// The wire name, used in human output.
-    pub(super) fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             FireOutcome::Ok => "ok",
             FireOutcome::Error => "error",
@@ -69,7 +69,7 @@ impl FireOutcome {
 
 /// The most recent dispatch of one verb for one agent.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(super) struct VerbHealth {
+pub struct VerbHealth {
     /// RFC3339 timestamp of the most recent dispatch, successful or not.
     pub last_fired: String,
     /// Outcome of that most recent dispatch.
@@ -84,7 +84,7 @@ pub(super) struct VerbHealth {
 
 /// One agent's hook health.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(super) struct AgentHealth {
+pub struct AgentHealth {
     pub display_name: String,
     /// Keyed by hook verb (`session-start`, `before-tool`, …).
     pub verbs: BTreeMap<String, VerbHealth>,
@@ -92,7 +92,7 @@ pub(super) struct AgentHealth {
 
 /// The whole `.atomic/hook-health.json` document.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(super) struct HookHealth {
+pub struct HookHealth {
     pub schema_version: u32,
     /// RFC3339 timestamp of the last write.
     pub updated_at: String,
@@ -101,7 +101,7 @@ pub(super) struct HookHealth {
 
 impl HookHealth {
     /// An empty document, ready for its first [`HookHealth::record`].
-    pub(super) fn empty(now: &str) -> Self {
+    pub fn empty(now: &str) -> Self {
         Self {
             schema_version: HEALTH_SCHEMA_VERSION,
             updated_at: now.to_string(),
@@ -112,7 +112,7 @@ impl HookHealth {
     /// Fold one dispatch into the record, preserving `last_ok` across a
     /// later failure so a hook that has *never* succeeded is
     /// distinguishable from one that worked and then broke.
-    pub(super) fn record(
+    pub fn record(
         &mut self,
         agent: &str,
         display_name: &str,
@@ -156,7 +156,7 @@ impl HookHealth {
     ///
     /// Health is diagnostic, so a corrupt file must never fail the command
     /// that is trying to explain what is wrong.
-    pub(super) fn read(repo_root: &Path) -> Option<Self> {
+    pub fn read(repo_root: &Path) -> Option<Self> {
         let path = repo_root.join(".atomic").join("hook-health.json");
         let bytes = std::fs::read(path).ok()?;
         serde_json::from_slice(&bytes).ok()
@@ -167,15 +167,11 @@ impl HookHealth {
     /// Best-effort: a failure here is dropped rather than propagated, because
     /// the caller is a hook that is already on its way out and must not turn
     /// bookkeeping into a hook failure.
-    pub(super) fn write(&self, repo_root: &Path) {
+    pub fn write(&self, repo_root: &Path) {
         let Ok(bytes) = serde_json::to_vec_pretty(self) else {
             return;
         };
-        crate::commands::agent::write_atomic(
-            &repo_root.join(".atomic"),
-            "hook-health.json",
-            &bytes,
-        );
+        write_atomic(&repo_root.join(".atomic"), "hook-health.json", &bytes);
     }
 }
 
@@ -195,7 +191,7 @@ impl HookHealth {
 ///
 /// Returns without doing anything if the repository is missing, so it is safe
 /// to call from a hook that may run outside a workspace.
-pub(super) fn record_fire(
+pub fn record_fire(
     repo_root: &Path,
     agent: &str,
     display_name: &str,
@@ -213,6 +209,66 @@ pub(super) fn record_fire(
     let mut health = HookHealth::read(repo_root).unwrap_or_else(|| HookHealth::empty(&now));
     health.record(agent, display_name, verb, outcome, detail, &now);
     health.write(repo_root);
+}
+
+/// Record a dispatch outcome without changing its result or error.
+///
+/// Used at both CLI entry points and the shared service handler so failures
+/// before orchestration (including parsing and transport errors) remain visible.
+///
+/// # Examples
+///
+/// ```no_run
+/// use atomic_agent::hook_health::record_result;
+/// use std::path::Path;
+///
+/// let dispatch: Result<(), std::io::Error> = Ok(());
+/// let result = record_result(Path::new("."), "opencode", "OpenCode", "receive", dispatch);
+/// assert!(result.is_ok());
+/// ```
+pub fn record_result<T, E: std::fmt::Display>(
+    repo_root: &Path,
+    agent: &str,
+    display_name: &str,
+    verb: &str,
+    result: Result<T, E>,
+) -> Result<T, E> {
+    match &result {
+        Ok(_) => record_fire(repo_root, agent, display_name, verb, FireOutcome::Ok, None),
+        Err(error) => record_fire(
+            repo_root,
+            agent,
+            display_name,
+            verb,
+            FireOutcome::Error,
+            Some(&error.to_string()),
+        ),
+    }
+    result
+}
+
+fn write_atomic(dir: &Path, name: &str, bytes: &[u8]) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    if std::fs::create_dir_all(dir).is_err() {
+        return;
+    }
+    // Concurrent dispatchers must never share a temporary file.
+    let path = dir.join(name);
+    let tmp = dir.join(format!(
+        "{name}.{}.{}.tmp",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    if std::fs::write(&tmp, bytes).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+        return;
+    }
+    if std::fs::rename(&tmp, &path).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
 }
 
 /// Exclusive lock over the health file's read-modify-write.
@@ -267,7 +323,7 @@ impl HookHealthLock {
 /// Agents with no recorded fires are omitted entirely: absence is already
 /// reported by the `hooks_installed` flag, and a row of empty timestamps
 /// would read as a second, contradictory answer.
-pub(super) fn summarize(health: &HookHealth) -> Vec<AgentHookSummary> {
+pub fn summarize(health: &HookHealth) -> Vec<AgentHookSummary> {
     let mut out: Vec<AgentHookSummary> = health
         .agents
         .iter()
@@ -315,7 +371,7 @@ pub(super) fn summarize(health: &HookHealth) -> Vec<AgentHookSummary> {
 
 /// One agent's health, flattened for display.
 #[derive(Debug, Clone, Serialize)]
-pub(super) struct AgentHookSummary {
+pub struct AgentHookSummary {
     pub name: String,
     pub display_name: String,
     pub last_fired: Option<String>,
@@ -326,14 +382,17 @@ pub(super) struct AgentHookSummary {
 }
 
 impl AgentHookSummary {
-    /// A one-line liveness phrase for the human report, e.g.
-    /// `last fired 4m ago` or `no successful dispatch`.
-    pub(super) fn liveness(&self) -> String {
+    /// Describe the age of the last success relative to the current time.
+    pub fn liveness(&self) -> String {
+        self.liveness_at(&chrono::Utc::now().to_rfc3339())
+    }
+
+    fn liveness_at(&self, now: &str) -> String {
         match (&self.last_fired, &self.last_ok) {
             (None, _) => "never fired".to_string(),
             (Some(_), None) => "fired, never succeeded".to_string(),
-            (Some(fired), Some(ok)) => {
-                let age = relative_age(fired, ok);
+            (Some(_), Some(ok)) => {
+                let age = relative_age(now, ok);
                 format!("last ok {age}")
             }
         }
@@ -346,7 +405,7 @@ impl AgentHookSummary {
 
 /// One parsed line of `hook-errors.log`.
 #[derive(Debug, Clone, Serialize)]
-pub(super) struct HookErrorEntry {
+pub struct HookErrorEntry {
     /// RFC3339 timestamp, verbatim — the file's two writers do not agree on
     /// precision, so it is not normalized.
     pub at: String,
@@ -358,7 +417,7 @@ pub(super) struct HookErrorEntry {
 
 /// A bounded, aggregated read of `hook-errors.log`.
 #[derive(Debug, Clone, Serialize)]
-pub(super) struct HookErrors {
+pub struct HookErrors {
     /// Number of entries parsed in the window that was read.
     pub total: usize,
     /// Physical lines consumed, including continuation lines folded into an
@@ -380,7 +439,7 @@ pub(super) struct HookErrors {
 
 /// A group of similar errors, counted.
 #[derive(Debug, Clone, Serialize)]
-pub(super) struct ErrorClass {
+pub struct ErrorClass {
     /// Stable-ish signature used to group entries.
     pub signature: String,
     /// A representative message.
@@ -393,7 +452,7 @@ pub(super) struct ErrorClass {
 /// Returns `None` when the file is absent. A file that exists but cannot be
 /// read or parsed yields an empty report rather than an error, because the
 /// point of the report is to explain the situation.
-pub(super) fn read_errors(repo_root: &Path) -> Option<HookErrors> {
+pub fn read_errors(repo_root: &Path) -> Option<HookErrors> {
     let path = repo_root.join(".atomic").join("hook-errors.log");
     let meta = std::fs::metadata(&path).ok()?;
     let file_len = meta.len();
@@ -662,7 +721,7 @@ mod tests {
         assert_eq!(rows[0].name, "opencode");
         assert_eq!(rows[0].verbs_recorded, 1);
         assert!(rows[0].failing_verbs.is_empty());
-        assert_eq!(rows[0].liveness(), "last ok 0s ago");
+        assert_eq!(rows[0].liveness_at(now), "last ok 0s ago");
     }
 
     #[test]
@@ -697,7 +756,29 @@ mod tests {
             rows[0].last_ok.as_deref(),
             Some("2026-09-25T17:00:00+00:00")
         );
-        assert_eq!(rows[0].liveness(), "last ok 1h ago");
+        assert_eq!(
+            rows[0].liveness_at("2026-09-25T18:00:00+00:00"),
+            "last ok 1h ago"
+        );
+    }
+
+    #[test]
+    fn a_stale_success_ages_even_when_no_new_hook_fires() {
+        let mut health = HookHealth::empty("2026-09-25T17:00:00+00:00");
+        health.record(
+            "opencode",
+            "OpenCode",
+            "before-tool",
+            FireOutcome::Ok,
+            None,
+            "2026-09-25T17:00:00+00:00",
+        );
+        let rows = summarize(&health);
+        assert_eq!(rows[0].last_fired, rows[0].last_ok);
+        assert_eq!(
+            rows[0].liveness_at("2026-09-27T17:00:00+00:00"),
+            "last ok 2d ago"
+        );
     }
 
     #[test]

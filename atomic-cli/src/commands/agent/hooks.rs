@@ -321,30 +321,13 @@ impl Command for Hooks {
             Ok::<_, CliError>(dispatch_result)
         });
 
-        let result = match dispatch {
-            Ok(result) => {
-                super::health::record_fire(
-                    &repo_root,
-                    &agent_name,
-                    &agent_display,
-                    &self.verb,
-                    super::health::FireOutcome::Ok,
-                    None,
-                );
-                result
-            }
-            Err(e) => {
-                super::health::record_fire(
-                    &repo_root,
-                    &agent_name,
-                    &agent_display,
-                    &self.verb,
-                    super::health::FireOutcome::Error,
-                    Some(&e.to_string()),
-                );
-                return Err(e);
-            }
-        };
+        let result = super::health::record_result(
+            &repo_root,
+            &agent_name,
+            &agent_display,
+            &self.verb,
+            dispatch,
+        )?;
 
         // Log warnings via log crate (not stderr — that leaks into agent TUIs)
         for warning in &result.warnings {

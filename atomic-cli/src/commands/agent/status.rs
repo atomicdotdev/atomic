@@ -533,7 +533,7 @@ fn print_hook_health(repo_root: &std::path::Path, installed: &[&str], registry: 
         let display = registry
             .get(name)
             .map_or_else(|| (*name).to_string(), |a| a.display_name().to_string());
-        println!("  ⚠ {display} — hooks installed but never recorded a turn");
+        println!("  ⚠ {display} — hooks installed; no successful dispatch recorded");
     }
 
     if let Some(errors) = &errors {
