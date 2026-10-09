@@ -4,8 +4,8 @@
 //! machine face (closed-vocab `code` / `severity` / `suggested_query`) and a
 //! human face (`message` / `remedy`), mirroring the structure documented in
 //! `atomic/docs/triage.md` ("Output: one model, four skins"). This module only
-//! defines the serializable shapes; [`super::report`] populates them and
-//! [`super::output`] renders the bounded CLI skin.
+//! defines the serializable shapes; [`super::report`] populates them and the
+//! CLI (`atomic-cli/src/commands/triage/output.rs`) renders the bounded skin.
 
 use std::collections::BTreeMap;
 

@@ -7,6 +7,11 @@
 //! socket (`ATOMIC_SERVICE=reactor`), so every check of what landed reads
 //! the repository through the server, never beside it.
 
+// The sandbox rides a Unix socket end to end — the same surface the
+// forwarder serves in the VM. There is no Windows story to test here yet;
+// the other socket-based integration tests gate the same way.
+#![cfg(not(windows))]
+
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::Arc;

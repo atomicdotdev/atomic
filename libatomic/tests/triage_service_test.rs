@@ -121,7 +121,7 @@ async fn the_review_arrives_as_the_wire_report_shape() {
     );
     // A verdict exists (blocked here: an orphan change, no intent join).
     assert_eq!(
-        serde_json::to_value(&report.verdict).unwrap(),
+        serde_json::to_value(report.verdict).unwrap(),
         serde_json::json!("blocked")
     );
     assert!(report.findings.iter().any(|f| f.code == "ORPHAN_CHANGE"));

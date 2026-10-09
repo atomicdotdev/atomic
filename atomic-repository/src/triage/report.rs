@@ -846,10 +846,11 @@ fn task_headline(text: &str) -> &str {
 
 /// Group the candidate modifications into ordered semantic layers.
 ///
-/// Pure and deterministic: clusters modified paths by [`layer_key`], orders
-/// clusters foundations-first by a Kahn toposort over the module-level
-/// projection of `file_deps` (a layer that is imported reads before its
-/// importer), breaking ties — and cycles — lexicographically, then attaches
+/// Pure and deterministic: clusters modified paths by their layer key
+/// (`layer_key`), orders clusters foundations-first by a Kahn toposort over
+/// the module-level projection of `file_deps` (a layer that is imported reads
+/// before its importer), breaking ties — and cycles — lexicographically, then
+/// attaches
 /// the tasks, criteria, and changes that land in each layer plus a template
 /// prose rationale. No repo access; every input is already pinned by the
 /// report.

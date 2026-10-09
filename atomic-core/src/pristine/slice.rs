@@ -203,7 +203,7 @@ impl ReadTxn {
 
     /// The rows `record` reads for `inodes`, on the view `view_id`.
     /// `visible` is the view's change set, and it bounds the CRDT rows as well
-    /// as the graph: see [`ReadTxn::export_crdt`].
+    /// as the graph — see the private `export_crdt` below.
     pub fn export_graph_slice(
         &self,
         inodes: &[u64],

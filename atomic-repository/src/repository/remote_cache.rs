@@ -445,9 +445,9 @@ impl Repository {
         Ok(ids)
     }
 
-    /// `view`'s effective state ([`effective_state`]): what a change recorded
-    /// against the view is fenced on, and what
-    /// [`Repository::insert_submitted_change`] compares `base_state` to.
+    /// `view`'s effective state: what a change recorded against the view is
+    /// fenced on, and what [`Repository::insert_submitted_change`] compares
+    /// `base_state` to.
     pub fn sandbox_effective_state(&self, view: &str) -> Result<Hash, RepositoryError> {
         let txn = self.pristine.read_txn().map_err(db)?;
         let state =

@@ -1395,28 +1395,6 @@ pub fn build_hunks_from_diff(
     hunks
 }
 
-/// Format a diff stat line graph.
-///
-/// Creates the +/- visual representation for stat output.
-///
-/// # Arguments
-///
-/// * `insertions` - Number of insertions
-/// * `deletions` - Number of deletions
-/// * `max_width` - Maximum width for the graph
-///
-/// # Returns
-///
-/// A string containing + and - characters.
-/// Print a line with word-level diff highlighting.
-///
-/// Uses ANSI escape codes to highlight changed tokens:
-/// - Deletions: bright red text on light red background
-/// - Insertions: bright green text on light green background
-///
-/// Shared by the local unified renderer and the service-layer hook's
-/// word-diff render (one render, two data sources).
-
 /// Build the real per-file unified diff for a recorded change WITHOUT printing.
 ///
 /// This is the computation `atomic diff -c <hash>` runs, factored out so other

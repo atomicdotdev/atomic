@@ -66,7 +66,6 @@ mod tests;
 use std::path::Path;
 
 use atomic_core::change::ChangeHeader;
-use atomic_core::types::Base32;
 
 use atomic_repository::status::RepositoryStatus;
 
@@ -455,7 +454,7 @@ pub fn record_turn(
         }
     }
 
-    let mut outcome = match repo.record(header, record_options) {
+    let outcome = match repo.record(header, record_options) {
         Ok(outcome) => outcome,
         Err(atomic_repository::record::RecordError::NothingToRecord) => {
             return Err(AgentError::EmptyTurn {
