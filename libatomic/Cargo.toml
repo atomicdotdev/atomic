@@ -1,0 +1,49 @@
+[package]
+name = "libatomic"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "The one Atomic service-layer library: the protobuf contract (proto + codegen + the descriptor checker) and the handlers the atomicd transport serves and the CLI calls in-process"
+
+[dependencies]
+# Domain crates — the service layer executes on these.
+atomic-agent = { workspace = true }
+atomic-canonical = { workspace = true }
+atomic-core = { workspace = true }
+atomic-identity = { workspace = true }
+atomic-objects = { workspace = true }
+atomic-remote = { workspace = true }
+atomic-repository = { workspace = true }
+atomic-semantic = { workspace = true }
+bytes = { workspace = true }
+
+# gRPC: the generated contract (this crate owns the codegen).
+tonic = { workspace = true }
+prost = { workspace = true }
+prost-types = { workspace = true }
+
+# Async: the handlers are async and offload redb work to the blocking pool.
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+futures-core = "0.3"
+
+# Domain support.
+serde_json = { workspace = true }
+chrono = { workspace = true }
+blake3 = { workspace = true }
+data-encoding = { workspace = true }
+similar = { workspace = true }
+ulid = { workspace = true }
+redb = { workspace = true }
+anyhow = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[build-dependencies]
+tonic-build = { workspace = true }
+protox = { workspace = true }

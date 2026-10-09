@@ -505,6 +505,16 @@ pub const CHANGE_CHUNKS: TableDefinition<&[u8; 36], &[u8; 32]> =
 pub const CHANGE_UNHASHED: TableDefinition<&[u8; 32], &[u8]> =
     TableDefinition::new("change_unhashed");
 
+/// Change signatures (Ed25519 over the content hash).
+///
+/// Key: change content hash (blake3, 32 bytes)
+/// Value: compressed postcard `ChangeSignature`
+///
+/// Like CHANGE_UNHASHED, the signature does not affect the change's identity —
+/// re-signing the same change with a different key never changes its hash.
+pub const CHANGE_SIGNATURES: TableDefinition<&[u8; 32], &[u8]> =
+    TableDefinition::new("change_signatures");
+
 // Pending provenance journal tables used by the redb-native change store.
 pub const PROVENANCE_STORE_META: TableDefinition<&str, u64> =
     TableDefinition::new("provenance_store_meta");
@@ -656,6 +666,16 @@ pub const KG_INDEX_META: TableDefinition<&str, u32> = TableDefinition::new("kg_i
 ///
 /// Stores embeddings for semantic similarity search over vault content.
 pub const EMBEDDINGS: TableDefinition<&str, &[u8]> = TableDefinition::new("embeddings");
+
+// Database Metadata
+
+/// Repository database metadata: key → value bytes
+///
+/// Holds the schema version (`SCHEMA_VERSION_KEY`, little-endian u64) and, for
+/// databases merged from the legacy `pristine.redb` + `changes.redb` layout,
+/// the `.atomic/legacy/` directory the old files were moved to
+/// (`LEGACY_DIR_KEY`, UTF-8).
+pub const ATOMIC_META: TableDefinition<&str, &[u8]> = TableDefinition::new("atomic_meta");
 
 // KG Edge Key / FTS Helpers
 
@@ -830,6 +850,21 @@ pub fn decode_change_file_key(key: &[u8; 36]) -> ([u8; 32], u32) {
 }
 
 // Key Encoding Helpers
+//
+// Endianness. A key that gets range-scanned is big-endian, so its bytes sort
+// in the same order as the numbers they encode — that is what makes a
+// `range(lo..=hi)` over these tables mean what it says (e.g. every row for
+// one inode: `encode_inode_vertex(inode, 0, 0, 0)` through
+// `encode_inode_vertex(inode, u64::MAX, u64::MAX, u64::MAX)`). A value that is
+// only ever looked up by its exact key can be little-endian; sorting never
+// happens, so byte order costs nothing. That covers the serialized graph edge
+// and the CRDT trunk/branch/leaf ids, which are opaque and point-looked-up
+// (`crdt::tables`).
+//
+// The two rules meet in files that handle both, so match the writer rather
+// than the neighbours: decode an id with that type's own `from_bytes`
+// (`TrunkId`, `BranchId`, `LeafId`) rather than slicing bytes by hand, and the
+// two sides cannot drift.
 
 /// Encode a span as 24 bytes for use as a graph key
 #[inline]

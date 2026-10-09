@@ -6,13 +6,11 @@ fn test_init_creates_structure() {
     let repo = Repository::init(temp_dir.path()).unwrap();
 
     assert!(repo.dot_dir().exists());
-    assert!(repo.pristine_path().exists());
+    assert_eq!(repo.database_path(), repo.dot_dir().join(DATABASE_FILE));
+    assert!(repo.database_path().exists());
+    assert!(!repo.dot_dir().join(LEGACY_PRISTINE_FILE).exists());
+    assert!(!repo.dot_dir().join(LEGACY_CHANGE_STORE_FILE).exists());
     assert!(repo.changes_dir().exists());
-    assert_eq!(
-        repo.redb_change_store_path(),
-        repo.dot_dir().join(REDB_CHANGE_STORE_FILE)
-    );
-    assert!(!repo.redb_change_store_path().exists());
     assert!(repo.config_path().exists());
 }
 
@@ -38,18 +36,14 @@ fn test_open_existing() {
 }
 
 #[test]
-fn test_open_legacy_repository_defers_redb_store_without_touching_changes() {
+fn test_open_leaves_filesystem_changes_untouched() {
     let (temp_dir, repo) = create_temp_repo();
-    let store_path = repo.redb_change_store_path();
     let legacy_change = repo.changes_dir().join("legacy-change");
     std::fs::write(&legacy_change, b"existing filesystem authority").unwrap();
     drop(repo);
 
-    assert!(!store_path.exists());
-
     let reopened = Repository::open(temp_dir.path()).unwrap();
-    assert_eq!(reopened.redb_change_store_path(), store_path);
-    assert!(!store_path.exists());
+    assert!(reopened.database_path().exists());
     assert_eq!(
         std::fs::read(&legacy_change).unwrap(),
         b"existing filesystem authority"
@@ -57,7 +51,7 @@ fn test_open_legacy_repository_defers_redb_store_without_touching_changes() {
 }
 
 #[test]
-fn test_canonical_change_store_path_follows_sandbox_pointer() {
+fn test_canonical_database_path_follows_sandbox_pointer() {
     let temp_dir = TempDir::new().unwrap();
     let repo_root = temp_dir.path().join("repo");
     let sandbox = temp_dir.path().join("agent-sandbox");
@@ -66,8 +60,8 @@ fn test_canonical_change_store_path_follows_sandbox_pointer() {
         .unwrap();
 
     assert_eq!(
-        Repository::canonical_change_store_path(&sandbox).unwrap(),
-        repo.redb_change_store_path()
+        Repository::canonical_database_path(&sandbox).unwrap(),
+        repo.database_path()
     );
 }
 
@@ -141,7 +135,7 @@ fn test_is_internal_path() {
     let (_temp_dir, repo) = create_temp_repo();
 
     assert!(repo.is_internal_path(repo.dot_dir()));
-    assert!(repo.is_internal_path(repo.pristine_path()));
+    assert!(repo.is_internal_path(repo.database_path()));
     assert!(repo.is_internal_path(repo.changes_dir()));
     assert!(!repo.is_internal_path(repo.root().join("src")));
 }

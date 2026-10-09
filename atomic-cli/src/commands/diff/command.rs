@@ -81,6 +81,16 @@ pub struct Diff {
     #[arg(long, add = ArgValueCompleter::new(complete_view_names))]
     pub view: Option<String>,
 
+    /// View-pair diff: diff FROM this view (requires --to).
+    ///
+    /// Routes through the daemon when reachable.
+    #[arg(long, requires = "to", add = ArgValueCompleter::new(complete_view_names))]
+    pub from: Option<String>,
+
+    /// View-pair diff: diff TO this view (requires --from).
+    #[arg(long, requires = "from", add = ArgValueCompleter::new(complete_view_names))]
+    pub to: Option<String>,
+
     /// Enable token-level diff highlighting (CRDT-powered).
     ///
     /// Shows exactly which tokens changed within a line, not just
@@ -109,6 +119,8 @@ impl Diff {
             untracked: false,
             cached: false,
             view: None,
+            from: None,
+            to: None,
             word_diff: false,
             json: false,
         }
@@ -238,6 +250,10 @@ impl Command for Diff {
     /// 3. Computes diffs for modified files
     /// 4. Displays the diffs in the requested format
     fn run(&self) -> CliResult<()> {
+        if crate::commands::rpc::diff(self)? {
+            return Ok(());
+        }
+
         // Find the repository root
         let repo_root = find_repository_root()?;
 

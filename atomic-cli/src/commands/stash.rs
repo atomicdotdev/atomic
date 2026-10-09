@@ -79,7 +79,7 @@ use clap::{Parser, Subcommand};
 
 use atomic_repository::record::RecordOptions;
 use atomic_repository::status::StatusOptions;
-use atomic_repository::Repository;
+use atomic_repository::{Repository, StashPushOptions};
 
 use crate::commands::{find_repository_root, format_timestamp_relative, Command};
 use crate::error::{CliError, CliResult};
@@ -195,46 +195,7 @@ pub enum StashSubcommand {
 
 // Stash Entry
 
-/// Information about a stash entry.
-#[derive(Debug, Clone)]
-pub struct StashEntry {
-    /// Index of the stash (0 = most recent).
-    pub index: usize,
-    /// Name of the stash view.
-    pub view_name: String,
-    /// View the stash was created from.
-    pub source_view: String,
-    /// Message describing the stash.
-    pub message: String,
-    /// When the stash was created.
-    pub created_at: DateTime<Utc>,
-}
-
-impl StashEntry {
-    /// Format the stash reference (e.g., "stash@{0}").
-    pub fn reference(&self) -> String {
-        format!("stash@{{{}}}", self.index)
-    }
-
-    /// Format the stash entry for display.
-    ///
-    /// Returns a human-readable string like:
-    /// `stash@{0}: On dev: Fix authentication bug`
-    pub fn display(&self) -> String {
-        format!(
-            "{}: On {}: {}",
-            self.reference(),
-            self.source_view,
-            self.message
-        )
-    }
-}
-
-impl std::fmt::Display for StashEntry {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.display())
-    }
-}
+pub use atomic_repository::StashEntry;
 
 // Implementation
 
@@ -282,104 +243,14 @@ impl Stash {
 
     /// List all stash views, sorted by creation time (newest first).
     fn list_stashes(&self, repo: &Repository) -> CliResult<Vec<StashEntry>> {
-        let views = repo.list_views().map_err(CliError::Repository)?;
-
-        let mut stashes: Vec<StashEntry> = views
-            .into_iter()
-            .filter(|name| name.starts_with(STASH_PREFIX))
-            .filter_map(|name| {
-                // Parse stash metadata from view info
-                let _info = repo.get_view_info(&name).ok()?;
-
-                // Extract source view and message from view name or metadata
-                // Format: stash/auto_{timestamp} or stash/{source}_{timestamp}_{message}
-                let parts: Vec<&str> = name
-                    .trim_start_matches(STASH_PREFIX)
-                    .splitn(3, '_')
-                    .collect();
-
-                let (source_view, message, timestamp) = if parts.len() >= 2 {
-                    let ts: i64 = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
-                    let src = if parts[0] == "auto" {
-                        "unknown".to_string()
-                    } else {
-                        parts[0].to_string()
-                    };
-                    let msg = parts
-                        .get(2)
-                        .map(|s| s.to_string())
-                        .unwrap_or_else(|| DEFAULT_STASH_MESSAGE.to_string());
-                    (src, msg, ts)
-                } else {
-                    ("unknown".to_string(), DEFAULT_STASH_MESSAGE.to_string(), 0)
-                };
-
-                let created_at =
-                    DateTime::from_timestamp_millis(timestamp).unwrap_or_else(Utc::now);
-
-                Some(StashEntry {
-                    index: 0, // Will be set after sorting
-                    view_name: name,
-                    source_view,
-                    message,
-                    created_at,
-                })
-            })
-            .collect();
-
-        // Sort by creation time, newest first
-        stashes.sort_by_key(|s| std::cmp::Reverse(s.created_at));
-
-        // Assign indices after sorting
-        for (i, stash) in stashes.iter_mut().enumerate() {
-            stash.index = i;
-        }
-
-        Ok(stashes)
+        repo.stash_list()
+            .map_err(|message| CliError::Internal(anyhow::anyhow!(message)))
     }
 
     /// Parse a stash reference (e.g., "stash@{0}", "0", or view name).
     fn parse_stash_ref(&self, repo: &Repository, reference: Option<&str>) -> CliResult<StashEntry> {
-        let stashes = self.list_stashes(repo)?;
-
-        if stashes.is_empty() {
-            return Err(CliError::InvalidArgument {
-                message: "No stashes found".to_string(),
-            });
-        }
-
-        let reference = reference.unwrap_or("0");
-
-        // Try to parse as index
-        let index = if reference.starts_with("stash@{") && reference.ends_with('}') {
-            // Format: stash@{N}
-            reference[7..reference.len() - 1].parse::<usize>().ok()
-        } else {
-            // Try as plain number
-            reference.parse::<usize>().ok()
-        };
-
-        if let Some(idx) = index {
-            return stashes.into_iter().find(|s| s.index == idx).ok_or_else(|| {
-                CliError::InvalidArgument {
-                    message: format!("stash@{{{}}} does not exist", idx),
-                }
-            });
-        }
-
-        // Try as view name
-        let full_name = if reference.starts_with(STASH_PREFIX) {
-            reference.to_string()
-        } else {
-            format!("{}{}", STASH_PREFIX, reference)
-        };
-
-        stashes
-            .into_iter()
-            .find(|s| s.view_name == full_name)
-            .ok_or_else(|| CliError::InvalidArgument {
-                message: format!("Stash '{}' not found", reference),
-            })
+        repo.stash_resolve(reference)
+            .map_err(|message| CliError::InvalidArgument { message })
     }
 
     /// Execute stash push from another command (e.g., `view switch --stash`).
@@ -403,131 +274,36 @@ impl Stash {
         include_untracked: bool,
         keep: bool,
     ) -> CliResult<()> {
-        // Check for uncommitted changes
-        let status = repo
-            .status(StatusOptions::default())
-            .map_err(CliError::Repository)?;
-
-        if status.is_clean() {
-            print_warning("No local changes to save");
-            return Ok(());
-        }
-
-        // Get current view for metadata
-        let source_view = repo.current_view().to_string();
-
-        // Generate stash message
-        let stash_message = message
-            .or_else(|| self.message.clone())
-            .unwrap_or_else(|| DEFAULT_STASH_MESSAGE.to_string());
-
-        // Create stash view name with metadata
-        let timestamp = Utc::now().timestamp_millis();
-        let safe_source = source_view.replace('/', "-");
-        let safe_message = stash_message
-            .chars()
-            .take(30)
-            .filter(|c| c.is_alphanumeric() || *c == '-' || *c == '_' || *c == ' ')
-            .collect::<String>()
-            .replace(' ', "-");
-
-        let stash_name = format!(
-            "{}{}_{}_{}",
-            STASH_PREFIX, safe_source, timestamp, safe_message
-        );
-
-        // Create orphan stash view
-        repo.create_view(&stash_name)
-            .map_err(CliError::Repository)?;
-
-        // ── Save dirty files as raw bytes to a sidecar directory ────────
-        //
-        // Stash is a **pure working-copy operation**.  We save the exact
-        // bytes of every dirty file to `.atomic/stashes/<stash_name>/`.
-        // This is completely immune to graph mutations — even if the user
-        // records new changes between push and pop, pop will restore the
-        // exact content that was stashed.
-        //
-        // We do NOT go through the graph/record/apply machinery at all.
-
-        let stash_dir = repo.dot_dir().join("stashes").join(&stash_name);
-        std::fs::create_dir_all(&stash_dir).map_err(|e| {
-            CliError::Internal(anyhow::anyhow!("Failed to create stash dir: {}", e))
-        })?;
-
-        // Collect every dirty file (modified + added)
-        let mut stashed_paths: Vec<String> = Vec::new();
-
-        for entry in status.modified() {
-            let p = entry.path().to_string_lossy().to_string();
-            let abs = repo.root().join(&p);
-            if abs.is_file() {
-                let rel_dir = stash_dir.join(
-                    std::path::Path::new(&p)
-                        .parent()
-                        .unwrap_or(std::path::Path::new("")),
-                );
-                let _ = std::fs::create_dir_all(&rel_dir);
-                let _ = std::fs::copy(&abs, stash_dir.join(&p));
-                stashed_paths.push(p);
+        // The domain owns the flow (status check, orphan view, raw-bytes
+        // sidecar, materialize); this is the presentation half.
+        let options = StashPushOptions {
+            message: message.or_else(|| self.message.clone()),
+            include_untracked: include_untracked || self.include_untracked,
+            keep: keep || self.keep,
+        };
+        match repo
+            .stash_push(options)
+            .map_err(|message| CliError::Internal(anyhow::anyhow!(message)))?
+        {
+            None => {
+                print_warning("No local changes to save");
             }
-        }
-
-        for entry in status.added() {
-            let p = entry.path().to_string_lossy().to_string();
-            let abs = repo.root().join(&p);
-            if abs.is_file() {
-                let rel_dir = stash_dir.join(
-                    std::path::Path::new(&p)
-                        .parent()
-                        .unwrap_or(std::path::Path::new("")),
-                );
-                let _ = std::fs::create_dir_all(&rel_dir);
-                let _ = std::fs::copy(&abs, stash_dir.join(&p));
-                stashed_paths.push(p);
-            }
-        }
-
-        if include_untracked || self.include_untracked {
-            for entry in status.untracked() {
-                let p = entry.path().to_string_lossy().to_string();
-                let abs = repo.root().join(&p);
-                if abs.is_file() {
-                    let rel_dir = stash_dir.join(
-                        std::path::Path::new(&p)
-                            .parent()
-                            .unwrap_or(std::path::Path::new("")),
-                    );
-                    let _ = std::fs::create_dir_all(&rel_dir);
-                    let _ = std::fs::copy(&abs, stash_dir.join(&p));
-                    stashed_paths.push(p);
+            Some(entry) => {
+                // Recompute the display reference from the listing (the
+                // entry's index is assigned by stash_list).
+                let stash_ref = repo
+                    .stash_list()
+                    .map_err(|message| CliError::Internal(anyhow::anyhow!(message)))?
+                    .iter()
+                    .find(|s| s.view_name == entry.view_name)
+                    .map(|s| s.reference())
+                    .unwrap_or_else(|| "stash@{0}".to_string());
+                print_success(&format!("Saved working copy to {stash_ref}"));
+                if !keep && !self.keep {
+                    print_success("Working copy restored to clean state");
                 }
             }
         }
-
-        // Write a manifest so we know which files were stashed
-        let manifest_path = stash_dir.join("MANIFEST");
-        let manifest_content = stashed_paths.join("\n");
-        std::fs::write(&manifest_path, &manifest_content).map_err(|e| {
-            CliError::Internal(anyhow::anyhow!("Failed to write stash manifest: {}", e))
-        })?;
-
-        // Get stash index for display
-        let stashes = self.list_stashes(repo)?;
-        let stash_ref = stashes
-            .iter()
-            .find(|s| s.view_name == stash_name)
-            .map(|s| s.reference())
-            .unwrap_or_else(|| "stash@{0}".to_string());
-
-        print_success(&format!("Saved working copy to {}", stash_ref));
-
-        // Restore working copy to clean state (unless --keep)
-        if !keep && !self.keep {
-            repo.materialize().map_err(CliError::Repository)?;
-            print_success("Working copy restored to clean state");
-        }
-
         Ok(())
     }
 
@@ -558,53 +334,19 @@ impl Stash {
         Ok(())
     }
 
-    /// Apply a stash to the current working copy.
-    ///
-    /// Reads raw file bytes from the sidecar directory
-    /// (`.atomic/stashes/<view_name>/`) and writes them to disk.
-    /// This is a pure filesystem operation — no graph interaction.
+    /// Apply a stash to the current working copy: the sidecar bytes are
+    /// copied back to disk (a pure filesystem operation — no graph
+    /// interaction; the domain owns the MANIFEST walk).
     fn apply_stash(&self, repo: &mut Repository, stash: &StashEntry) -> CliResult<()> {
-        let stash_dir = repo.dot_dir().join("stashes").join(&stash.view_name);
-        let manifest_path = stash_dir.join("MANIFEST");
+        let (_entry, applied) = repo
+            .stash_apply(Some(&stash.view_name))
+            .map_err(|message| CliError::Internal(anyhow::anyhow!(message)))?;
 
-        if !manifest_path.exists() {
-            return Err(CliError::Internal(anyhow::anyhow!(
-                "Stash sidecar not found: {}",
-                manifest_path.display()
-            )));
-        }
-
-        let manifest = std::fs::read_to_string(&manifest_path).map_err(|e| {
-            CliError::Internal(anyhow::anyhow!("Failed to read stash manifest: {}", e))
-        })?;
-
-        let repo_root = repo.root().to_path_buf();
-        let mut files_restored = 0usize;
-
-        for line in manifest.lines() {
-            let path = line.trim();
-            if path.is_empty() {
-                continue;
-            }
-            let src = stash_dir.join(path);
-            let dst = repo_root.join(path);
-
-            if src.is_file() {
-                if let Some(parent) = dst.parent() {
-                    let _ = std::fs::create_dir_all(parent);
-                }
-                if std::fs::copy(&src, &dst).is_ok() {
-                    files_restored += 1;
-                }
-            }
-        }
-
-        if files_restored > 0 {
+        if !applied.is_empty() {
             print_success(&format!("Applied {} to working copy", stash.reference()));
         } else {
             print_warning("Stash was already applied or is empty");
         }
-
         Ok(())
     }
 
@@ -661,55 +403,41 @@ impl Stash {
 
     /// Execute stash drop.
     fn run_drop(&self, repo: &mut Repository, stash_ref: Option<&str>) -> CliResult<()> {
-        let stash = self.parse_stash_ref(repo, stash_ref)?;
-
-        // Delete the sidecar directory
-        let stash_dir = repo.dot_dir().join("stashes").join(&stash.view_name);
-        if stash_dir.exists() {
-            let _ = std::fs::remove_dir_all(&stash_dir);
-        }
-
-        // Delete the stash view
-        repo.delete_view(&stash.view_name)
-            .map_err(CliError::Repository)?;
-
+        let stash = repo
+            .stash_drop(stash_ref)
+            .map_err(|message| CliError::InvalidArgument { message })?;
         print_success(&format!("Dropped {}", stash.reference()));
         Ok(())
     }
 
     /// Execute stash clear.
     fn run_clear(&self, repo: &mut Repository, force: bool) -> CliResult<()> {
-        let stashes = self.list_stashes(repo)?;
-
-        if stashes.is_empty() {
-            println!("No stashes to clear");
-            return Ok(());
-        }
-
         if !force {
-            println!(
-                "This will delete {} stash(es). Are you sure? [y/N] ",
-                stashes.len()
-            );
+            let count = repo
+                .stash_list()
+                .map_err(|message| CliError::Internal(anyhow::anyhow!(message)))?
+                .len();
+            if count == 0 {
+                println!("No stashes to clear");
+                return Ok(());
+            }
+            println!("This will delete {count} stash(es). Are you sure? [y/N] ");
             std::io::Write::flush(&mut std::io::stdout()).ok();
-
             let mut input = String::new();
             std::io::stdin().read_line(&mut input).ok();
-
             if !input.trim().eq_ignore_ascii_case("y") {
                 println!("Aborted");
                 return Ok(());
             }
         }
-
-        let count = stashes.len();
-        for stash in stashes {
-            repo.delete_view(&stash.view_name)
-                .map_err(CliError::Repository)?;
+        let count = repo
+            .stash_clear()
+            .map_err(|message| CliError::InvalidArgument { message })?;
+        if count == 0 {
+            println!("No stashes to clear");
+        } else {
+            print_success(&format!("Cleared {count} stash(es)"));
         }
-
-        print_success(&format!("Cleared {} stash(es)", count));
-
         Ok(())
     }
 }
@@ -723,6 +451,51 @@ impl Default for Stash {
 impl Command for Stash {
     /// Execute the stash command.
     fn run(&self) -> CliResult<()> {
+        // Route through the daemon when reachable (the domain module is
+        // shared, so behavior is identical); show stays local and clear
+        // keeps its confirmation prompt locally.
+        match &self.command {
+            None => {
+                if crate::commands::rpc::stash_push(
+                    self.message.clone(),
+                    self.include_untracked,
+                    self.keep,
+                )? {
+                    return Ok(());
+                }
+            }
+            Some(StashSubcommand::Push {
+                message,
+                include_untracked,
+                keep,
+            }) => {
+                if crate::commands::rpc::stash_push(message.clone(), *include_untracked, *keep)? {
+                    return Ok(());
+                }
+            }
+            Some(StashSubcommand::Pop { stash }) => {
+                if crate::commands::rpc::stash_pop(stash.clone())? {
+                    return Ok(());
+                }
+            }
+            Some(StashSubcommand::Apply { stash }) => {
+                if crate::commands::rpc::stash_apply(stash.clone())? {
+                    return Ok(());
+                }
+            }
+            Some(StashSubcommand::List) => {
+                if crate::commands::rpc::stash_list()? {
+                    return Ok(());
+                }
+            }
+            Some(StashSubcommand::Drop { stash })
+                if crate::commands::rpc::stash_drop(stash.clone(), false)? =>
+            {
+                return Ok(());
+            }
+            _ => {}
+        }
+
         // Find repository
         let repo_root = find_repository_root()?;
         let mut repo = Repository::open(&repo_root).map_err(CliError::Repository)?;

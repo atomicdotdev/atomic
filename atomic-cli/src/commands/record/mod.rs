@@ -410,6 +410,7 @@ mod format;
 mod provenance;
 
 pub(super) use command::*;
+pub(crate) use format::render_dry_run;
 
 #[cfg(test)]
 mod tests;

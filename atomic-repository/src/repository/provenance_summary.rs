@@ -43,8 +43,10 @@ use crate::history::HistoryOptions;
 
 /// Summary of AI-vs-human change attribution for a single view.
 ///
-/// Counts unique changes, not lines.
-#[derive(Debug, Clone, Default)]
+/// Counts unique changes, not lines. Serializes as the
+/// "atomic.provenance.summary.v1" bundle the AttestationService serves
+/// (the client renders it with its existing summary code).
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct ProvenanceSummary {
     /// The view this summary covers.
     pub view_name: String,

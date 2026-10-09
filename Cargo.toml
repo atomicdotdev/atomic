@@ -4,6 +4,7 @@ members = [
     "atomic-agent",
     "atomic-canonical",
     "atomic-cli",
+    "atomic-client",
     "atomic-core",
     "atomic-config",
     "atomic-identity",
@@ -12,10 +13,12 @@ members = [
     "atomic-repository",
     "atomic-semantic",
     "atomic-teams",
+    "atomic-wasm",
+    "libatomic",
 ]
 
 [workspace.package]
-version = "0.18.3"
+version = "0.19.1"
 edition = "2021"
 authors = ["Atomic Contributors"]
 license = "Apache-2.0"
@@ -27,6 +30,7 @@ rust-version = "1.90"
 # Core
 atomic-agent = { path = "atomic-agent" }
 atomic-canonical = { path = "atomic-canonical" }
+atomic-client = { path = "atomic-client" }
 atomic-core = { path = "atomic-core" }
 atomic-config = { path = "atomic-config" }
 atomic-identity = { path = "atomic-identity" }
@@ -35,10 +39,28 @@ atomic-remote = { path = "atomic-remote" }
 atomic-repository = { path = "atomic-repository" }
 atomic-semantic = { path = "atomic-semantic" }
 atomic-teams = { path = "atomic-teams" }
+libatomic = { path = "libatomic" }
+
+# gRPC (one contract, many transports)
+tonic = "0.12"
+prost = "0.13"
+prost-types = "0.13"
+tonic-build = "0.12"
+protox = "0.7"
+tokio-stream = "0.1"
+tower = "0.4"
+libc = "0.2"
+hyper-util = { version = "0.1", features = ["tokio"] }
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+# Admission control for JSON that will be hashed, signed or verified. Runs on
+# the raw bytes, ahead of the parse, so the faults a parsed value can no longer
+# report -- a repeated member, nesting past the depth cap, a string that is not
+# a sequence of Unicode scalar values, a number outside the profile -- are
+# refused with a named error rather than collapsed or rounded.
+jcs-admit = "0.1"
 postcard = { version = "1.0", features = ["alloc"] }
 toml = "0.8"
 semver = "1"

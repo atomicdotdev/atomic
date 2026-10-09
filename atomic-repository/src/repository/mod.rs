@@ -58,6 +58,7 @@ use crate::ignore::IgnoreRules;
 use crate::record::{
     build_header, filter_files, RecordError, RecordOptions, RecordOutcome, RecordStats,
 };
+use crate::redb_change_store::RedbChangeStore;
 
 use crate::remote::{RemoteConfig, RemoteEntry};
 use crate::status::{
@@ -76,23 +77,33 @@ use crate::RepositoryError;
 
 // ── Sub-modules (new) ───────────────────────────────────────────────────
 
+pub mod database;
 mod deferred_tree;
 mod filter;
 mod materialize;
+pub use materialize::{ViewEntry, ViewEntryKind, ViewSnapshot};
+mod revise;
 mod sandbox;
 mod semantic_materialize;
 mod split;
+mod stash;
 mod switch;
 mod views;
 
 // Re-export public items so external callers and sibling sub-modules that
 // use `use super::*;` continue to resolve them at `crate::repository::…`.
+pub use database::{
+    database_lock_wait, ensure_database, has_database, DATABASE_FILE, LEGACY_CHANGE_STORE_FILE,
+    LEGACY_DIR, LEGACY_PRISTINE_FILE,
+};
 pub use filter::{
     collect_view_change_ids, collect_visible_change_ids, collect_visible_change_ids_with_deps,
     expand_indexed_dependency_closure, view_set_id,
 };
+pub use revise::{ReviseOutcome, RewordOutcome};
 pub use sandbox::{SealOptions, SealResult, StageOptions, StageResult, SANDBOX_POINTER};
 pub use split::{SplitChange, SplitOptions, SplitOutcome};
+pub use stash::{StashEntry, StashPushOptions, DEFAULT_STASH_MESSAGE, STASH_PREFIX};
 pub use views::{ManifestApplyOutcome, ViewInfo};
 
 // Re-import workspace helpers from `switch` so they are available to
@@ -138,6 +149,7 @@ pub use vault_identity::VaultIdentity;
 pub use vault_intent::{
     IntentCreateOptions, IntentCreateResult, IntentDeleteResult, IntentInfo, IntentUpdateOptions,
 };
+pub use vault_intent::{FEATURE_SCAFFOLD, REVIEW_SCAFFOLD};
 pub use vault_kg_enrich::KgEnrichStats;
 pub use vault_names::{derive_intent_prefix, generate_goal_name};
 pub use verify::{VerifyProblem, VerifyReport};
@@ -156,13 +168,11 @@ pub const DEFAULT_VIEW: &str = "dev";
 /// Backward-compatible alias for [`DEFAULT_VIEW`].
 pub const DEFAULT_STACK: &str = DEFAULT_VIEW;
 
-/// Canonical redb change-store filename inside [`.atomic`](DOT_DIR).
+/// How long ordinary opens wait for another process's database handle.
 ///
-/// The filesystem-backed [`ChangeStore`] remains authoritative during the
-/// additive migration. This database is the single repository-local location
-/// for redb-native changes and provenance and is opened by the repository owner
-/// service, not by ordinary `Repository` handles.
-pub const REDB_CHANGE_STORE_FILE: &str = "changes.redb";
+/// The agent database owner holds `atomic.redb` only while it serves a hook
+/// request, so a short wait rides out those holds instead of failing.
+const DEFAULT_DATABASE_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Subdirectory inside `.atomic/` that holds per-view workspace state.
 ///
@@ -306,9 +316,9 @@ default = "{}"
         let wc_id_path = dot_dir.join("working_copy_id");
         std::fs::write(&wc_id_path, "")?;
 
-        // Initialize the pristine database (redb creates the file)
+        // Initialize the repository database (redb creates the file)
         let pristine = Arc::new(
-            Pristine::open(dot_dir.join("pristine.redb"))
+            Pristine::open(dot_dir.join(DATABASE_FILE))
                 .map_err(|e| RepositoryError::Database(e.to_string()))?,
         );
 
@@ -324,9 +334,9 @@ default = "{}"
         }
         ensure_workspace_dir(&dot_dir, view_name)?;
 
-        // Initialize the filesystem authority. The owner service creates and
-        // exclusively holds `changes.redb` on first start, avoiding a competing
-        // writable handle in ordinary repository processes.
+        // Initialize the filesystem authority. The redb change and provenance
+        // tables live in the same database; the owner service creates them on
+        // first use.
         let change_store = ChangeStore::new(dot_dir.join("changes"), DEFAULT_CACHE_CAPACITY)
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
@@ -356,21 +366,25 @@ default = "{}"
     ///
     /// * `path` - A path inside the repository (or the repository root)
     ///
+    /// A repository in the legacy `pristine.redb` + `changes.redb` layout is
+    /// merged into `atomic.redb` first (see [`ensure_database`]). A database
+    /// held by another process is waited on for a few seconds.
+    ///
     /// # Errors
     ///
     /// Returns an error if no repository is found.
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, RepositoryError> {
-        if let Some((working_root, canonical, view)) = sandbox::detect_sandbox(path.as_ref()) {
+        Self::wait_for_database(DEFAULT_DATABASE_WAIT, || Self::open_once(path.as_ref()))
+    }
+
+    fn open_once(path: &Path) -> Result<Self, RepositoryError> {
+        if let Some((working_root, canonical, view)) = sandbox::detect_sandbox(path) {
             return Self::open_sandbox(working_root, canonical, &view);
         }
-        let root = Self::find_root(path.as_ref())?;
+        let root = Self::find_root(path)?;
         let dot_dir = root.join(DOT_DIR);
 
-        // Open the pristine database
-        let pristine = Arc::new(
-            Pristine::open(dot_dir.join("pristine.redb"))
-                .map_err(|e| RepositoryError::Database(e.to_string()))?,
-        );
+        let pristine = Arc::new(Pristine::open(ensure_database(&dot_dir)?)?);
 
         // Read current view from config or use default
         let current_view =
@@ -399,18 +413,23 @@ default = "{}"
     /// is deferred until `write_txn()` is actually called.
     ///
     /// Use this for short-lived processes (agent hooks, background jobs)
-    /// where blocking on the init write lock would hang the process.
+    /// where blocking on the init write lock would hang the process. Like
+    /// [`open`](Self::open), it merges a legacy layout and briefly waits for a
+    /// database held by another process.
     pub fn open_existing<P: AsRef<Path>>(path: P) -> Result<Self, RepositoryError> {
-        if let Some((working_root, canonical, view)) = sandbox::detect_sandbox(path.as_ref()) {
+        Self::wait_for_database(DEFAULT_DATABASE_WAIT, || {
+            Self::open_existing_once(path.as_ref())
+        })
+    }
+
+    fn open_existing_once(path: &Path) -> Result<Self, RepositoryError> {
+        if let Some((working_root, canonical, view)) = sandbox::detect_sandbox(path) {
             return Self::open_sandbox(working_root, canonical, &view);
         }
-        let root = Self::find_root(path.as_ref())?;
+        let root = Self::find_root(path)?;
         let dot_dir = root.join(DOT_DIR);
 
-        let pristine = Arc::new(
-            Pristine::open_existing(dot_dir.join("pristine.redb"))
-                .map_err(RepositoryError::from)?,
-        );
+        let pristine = Arc::new(Pristine::open_existing(ensure_database(&dot_dir)?)?);
 
         let current_view =
             Self::read_current_view(&dot_dir).unwrap_or_else(|_| DEFAULT_STACK.to_string());
@@ -460,18 +479,23 @@ default = "{}"
     /// let repo = Repository::open_readonly(".")?;
     /// let status = repo.status(StatusOptions::default())?;
     /// ```
+    ///
+    /// Merging a legacy layout needs one writable open, exactly like a redb
+    /// format upgrade; afterwards the database is reopened read-only.
     pub fn open_readonly<P: AsRef<Path>>(path: P) -> Result<Self, RepositoryError> {
-        if let Some((working_root, canonical, view)) = sandbox::detect_sandbox(path.as_ref()) {
+        Self::wait_for_database(DEFAULT_DATABASE_WAIT, || {
+            Self::open_readonly_once(path.as_ref())
+        })
+    }
+
+    fn open_readonly_once(path: &Path) -> Result<Self, RepositoryError> {
+        if let Some((working_root, canonical, view)) = sandbox::detect_sandbox(path) {
             return Self::open_sandbox_readonly(working_root, canonical, &view);
         }
-        let root = Self::find_root(path.as_ref())?;
+        let root = Self::find_root(path)?;
         let dot_dir = root.join(DOT_DIR);
 
-        // Open the pristine database in read-only mode
-        let pristine = Arc::new(
-            Pristine::open_readonly(dot_dir.join("pristine.redb"))
-                .map_err(RepositoryError::from)?,
-        );
+        let pristine = Arc::new(Pristine::open_readonly(ensure_database(&dot_dir)?)?);
 
         // Read current view from config or use default
         let current_view =
@@ -504,7 +528,7 @@ default = "{}"
         path: P,
         timeout: std::time::Duration,
     ) -> Result<Self, RepositoryError> {
-        Self::wait_for_database(timeout, || Self::open_existing(path.as_ref()))
+        Self::wait_for_database(timeout, || Self::open_existing_once(path.as_ref()))
     }
 
     /// Read-only counterpart of [`Self::open_existing_wait`].
@@ -512,7 +536,7 @@ default = "{}"
         path: P,
         timeout: std::time::Duration,
     ) -> Result<Self, RepositoryError> {
-        Self::wait_for_database(timeout, || Self::open_readonly(path.as_ref()))
+        Self::wait_for_database(timeout, || Self::open_readonly_once(path.as_ref()))
     }
 
     fn wait_for_database(
@@ -544,7 +568,7 @@ default = "{}"
     /// # Requirements
     ///
     /// The provided `pristine` **must** have been opened from
-    /// `<path>/.atomic/pristine.redb` (i.e. the same repository that
+    /// `<path>/.atomic/atomic.redb` (i.e. the same repository that
     /// `path` resolves to). Passing a `Pristine` from a different
     /// repository will silently couple one repo's configuration and
     /// change store with another repo's database, leading to corruption.
@@ -576,8 +600,9 @@ default = "{}"
     /// Find the repository root by searching for .atomic directory.
     ///
     /// Starts at the given path and walks up to parent directories until
-    /// a `.atomic` directory is found that contains `pristine.redb` (indicating
-    /// it's a repository, not just a config directory like `~/.atomic/`).
+    /// a `.atomic` directory is found that contains a repository database
+    /// (`atomic.redb`, or the legacy `pristine.redb`), distinguishing it from a
+    /// config directory like `~/.atomic/`.
     ///
     /// The search stops at the user's home directory to prevent accidentally
     /// treating the entire home directory as a repository.
@@ -601,9 +626,17 @@ default = "{}"
             }
 
             let dot_dir = dir.join(DOT_DIR);
-            // Check that .atomic/ exists AND contains pristine.redb
-            // This distinguishes a repository from a config directory
-            if dot_dir.is_dir() && dot_dir.join("pristine.redb").exists() {
+            // A database distinguishes a repository from a config directory
+            if dot_dir.is_dir() && database::has_database(&dot_dir) {
+                return Ok(dir);
+            }
+            // A sandbox working tree has no `.atomic/` of its own — it
+            // carries a pointer to the canonical graph. Treat the
+            // sandbox root as a valid repository root;
+            // `Repository::open*` resolves the pointer (the same rule
+            // the CLI's root finder applies, so service-layer
+            // resolution accepts sandboxed working trees).
+            if dir.join(SANDBOX_POINTER).is_file() {
                 return Ok(dir);
             }
             current = dir.parent().map(Path::to_path_buf);
@@ -640,14 +673,13 @@ default = "{}"
         Ok(Self::find_root(path.as_ref())?.join(DOT_DIR))
     }
 
-    /// Resolve the canonical redb change-store path without opening redb.
+    /// Resolve the canonical repository database path without opening redb.
     ///
-    /// Sandboxes resolve to the owning repository's `.atomic/changes.redb`,
-    /// never to a sandbox-local database.
-    pub fn canonical_change_store_path<P: AsRef<Path>>(
-        path: P,
-    ) -> Result<PathBuf, RepositoryError> {
-        Ok(Self::canonical_dot_dir(path)?.join(REDB_CHANGE_STORE_FILE))
+    /// Sandboxes resolve to the owning repository's `.atomic/atomic.redb`,
+    /// never to a sandbox-local database. A legacy repository has not been
+    /// merged yet until [`ensure_database`] runs.
+    pub fn canonical_database_path<P: AsRef<Path>>(path: P) -> Result<PathBuf, RepositoryError> {
+        Ok(Self::canonical_dot_dir(path)?.join(DATABASE_FILE))
     }
 
     /// Get the repository root path.
@@ -662,22 +694,16 @@ default = "{}"
         &self.dot_dir
     }
 
-    /// Get the pristine (database) file path.
+    /// Get the repository database path.
     #[inline]
-    pub fn pristine_path(&self) -> PathBuf {
-        self.dot_dir.join("pristine.redb")
+    pub fn database_path(&self) -> PathBuf {
+        self.dot_dir.join(DATABASE_FILE)
     }
 
     /// Get the changes directory path.
     #[inline]
     pub fn changes_dir(&self) -> PathBuf {
         self.dot_dir.join("changes")
-    }
-
-    /// Get the canonical redb change-store path.
-    #[inline]
-    pub fn redb_change_store_path(&self) -> PathBuf {
-        self.dot_dir.join(REDB_CHANGE_STORE_FILE)
     }
 
     /// Get the current view name.
@@ -794,6 +820,22 @@ default = "{}"
     #[inline]
     pub fn pristine(&self) -> &Pristine {
         &self.pristine
+    }
+
+    /// The redb change and provenance store, sharing this handle's database.
+    ///
+    /// redb refuses a second handle on the same file while this repository is
+    /// open, even within one process, so co-located callers use this instead
+    /// of [`RedbChangeStore::open`].
+    pub fn redb_change_store(&self) -> Result<RedbChangeStore, RepositoryError> {
+        let database =
+            self.pristine
+                .shared_database()
+                .ok_or_else(|| RepositoryError::InvalidOperation {
+                    message: "the change store needs a writable repository handle".to_string(),
+                })?;
+        RedbChangeStore::from_database(database)
+            .map_err(|error| RepositoryError::Database(error.to_string()))
     }
 
     /// Read the current view from the config file.

@@ -1,6 +1,7 @@
 use std::time::{Duration, Instant};
 
-use atomic_repository::{Repository, RepositoryError};
+use atomic_repository::redb_change_store::{RedbChangeStore, RedbStoreError};
+use atomic_repository::{Repository, RepositoryError, DATABASE_FILE};
 
 #[test]
 fn database_wait_is_bounded_and_does_not_retry_non_contention_errors() {
@@ -13,7 +14,11 @@ fn database_wait_is_bounded_and_does_not_retry_non_contention_errors() {
     assert!(start.elapsed() >= Duration::from_millis(100));
     assert!(start.elapsed() < Duration::from_secs(2));
     drop(held);
-    std::fs::write(root.join(".atomic/pristine.redb"), b"corrupt database").unwrap();
+    std::fs::write(
+        root.join(".atomic").join(DATABASE_FILE),
+        b"corrupt database",
+    )
+    .unwrap();
     let start = Instant::now();
     let result = Repository::open_existing_wait(&root, Duration::from_secs(10));
     assert!(matches!(result, Err(RepositoryError::Database(_))));
@@ -43,4 +48,37 @@ fn sandbox_database_wait_uses_the_canonical_database() {
     let opened = opener.join().unwrap();
     assert!(opened.is_sandbox());
     assert_eq!(opened.dot_dir(), root.join(".atomic"));
+}
+
+// The change store inside the merged database gets the same bounded-wait
+// treatment (the daemon's journal sink opens it per hook operation).
+
+#[test]
+fn change_store_open_waits_for_a_held_handle_then_succeeds() {
+    let temp = tempfile::TempDir::new().unwrap();
+    let database = temp.path().join("atomic.redb");
+    let held = RedbChangeStore::open(&database).unwrap();
+    let opener = std::thread::spawn(move || {
+        RedbChangeStore::open_existing_wait(&database, Duration::from_secs(5)).unwrap()
+    });
+    std::thread::sleep(Duration::from_millis(100));
+    drop(held);
+    let opened = opener.join().unwrap();
+    // A store-level operation succeeds on the waited open.
+    opened
+        .load_provenance_envelopes(atomic_repository::redb_change_store::ProvenanceId::new(0))
+        .unwrap();
+}
+
+#[test]
+fn change_store_open_wait_is_bounded_and_reports_busy() {
+    let temp = tempfile::TempDir::new().unwrap();
+    let database = temp.path().join("atomic.redb");
+    let held = RedbChangeStore::open(&database).unwrap();
+    let start = Instant::now();
+    let result = RedbChangeStore::open_existing_wait(&database, Duration::from_millis(100));
+    assert!(matches!(result, Err(RedbStoreError::Database(_))));
+    assert!(start.elapsed() >= Duration::from_millis(100));
+    assert!(start.elapsed() < Duration::from_secs(2));
+    drop(held);
 }

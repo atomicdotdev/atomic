@@ -103,6 +103,12 @@ impl Switch {
 
 impl Command for Switch {
     fn run(&self) -> CliResult<()> {
+        // Route the plain form through the daemon; --force/--stash stay
+        // local (the wire carries no bypass of the dirty-copy gate).
+        if crate::commands::rpc::view_switch(self)? {
+            return Ok(());
+        }
+
         // Get the view name
         let name = self
             .name
@@ -310,15 +316,19 @@ mod tests {
         // Change to the repo directory
         std::env::set_current_dir(repo_path).unwrap();
 
-        // Try to switch to a non-existent view
+        // Try to switch to a non-existent view. The plain form routes
+        // through the service area; the refusal is the domain's.
         let cmd = Switch::with_name("nonexistent");
         let result = cmd.run();
         assert!(result.is_err());
         match result.unwrap_err() {
-            CliError::ViewNotFound { name } => {
-                assert_eq!(name, "nonexistent");
+            CliError::ServiceRefusal { message } => {
+                assert!(
+                    message.contains("view 'nonexistent' not found"),
+                    "unexpected refusal: {message}"
+                );
             }
-            other => panic!("Expected ViewNotFound, got: {:?}", other),
+            other => panic!("Expected the view-not-found refusal, got: {:?}", other),
         }
     }
 

@@ -249,5 +249,11 @@ fn inherited_changes_are_rejected_in_forked_view() {
 fn empty_view_reports_nothing_to_unrecord() {
     let dir = TempDir::new().unwrap();
     drop(Repository::init(dir.path()).unwrap());
-    assert!(run(dir.path(), &["unrecord"], false).contains("nothing to unrecord"));
+    // The bare form routes through the service layer; the domain's own
+    // refusal names the empty view.
+    let output = run(dir.path(), &["unrecord"], false);
+    assert!(
+        output.to_lowercase().contains("empty"),
+        "should report the empty view, got: {output}"
+    );
 }

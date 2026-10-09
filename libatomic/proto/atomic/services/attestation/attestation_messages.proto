@@ -1,0 +1,138 @@
+// atomic-protocol — AttestationService: the external-signing flow and
+// attestation records.
+//
+// DRAFT — add-only.
+//
+// Covers `atomic intent attest --prepare/--signed` (REMOTE-capable — that is
+// the point of the feature: a signer holding the key elsewhere — browser,
+// hardware token, remote signing service — needs only the public key), the
+// direct attest verbs (`intent attest`, `memory attest`), verification
+// (`intent verify`, `memory verify`), graph-level attestations
+// (`agent attest`), and change signatures.
+//
+// RecordAttestation verifies the signature against --identity's key AND the
+// attested target AS IT IS NOW (not as it was at prepare time) — prepare and
+// record are two calls by design; the gap is the human/hardware signing step.
+
+syntax = "proto3";
+
+package atomic;
+
+// All targets are resolved within the named view's effective perspective.
+// Sandbox view must match its grant; graph-stats sessions must be owned by it.
+// Vault attestations are view-local versions, never replacements of inherited
+// attestations. A sandbox signer must match the grant's acting identity; no
+// daemon default-key fallback. Signature verification is not authorization.
+
+import "google/protobuf/timestamp.proto";
+import "atomic/common/common.proto";
+import "atomic/common/pagination.proto";
+
+// What is being attested. One service, one target shape, no per-kind RPCs.
+message AttestationTarget {
+  oneof kind {
+    string intent_id = 1;      // `intent attest`
+    string memory_id = 2;      // `memory attest`
+    Hash change_hash = 3;      // change signatures
+    GraphStatsRef graph_stats = 4;  // `agent attest` (AI-cost/token attestations)
+  }
+}
+
+message GraphStatsRef {
+  optional string session_id = 1;
+  optional uint32 turn_number = 2;
+  optional Hash change_hash = 3;
+}
+
+
+
+message PrepareAttestationRequest {
+  RepositoryRef repository = 1;
+  RequestMeta meta = 2;
+  AttestationTarget target = 3;
+  string identity_did = 4;
+  ViewRef view = 5;
+}
+message PrepareAttestationResponse {
+  string document = 1;       // canonical document (displayed to the signer)
+  bytes signing_bytes = 2;   // the exact bytes covered by the signature
+  ViewSnapshot snapshot = 3;
+}
+
+message RecordAttestationRequest {
+  RepositoryRef repository = 1;
+  RequestMeta meta = 2;
+  AttestationTarget target = 3;
+  string identity_did = 4;
+  bytes signature = 5;
+  ViewRef view = 6;
+  ViewSnapshot expected_snapshot = 7;
+  // SHAPE-CONFIRM (Slice N): whether the prepared document hash rides the
+  // request; today `--signed` verifies against the intent as it is now.
+}
+message RecordAttestationResponse {
+  AttestationInfo attestation = 1;
+  ResponseMeta meta = 100;
+}
+
+message VerifyAttestationRequest {
+  RepositoryRef repository = 1;
+  oneof target {
+    string attestation_id = 2;
+    AttestationTarget subject = 3;
+  }
+  ViewRef view = 4;
+  // Local key resolution hint: identity-store name (default identity when
+  // absent) — the public key that verifies the attestation (add-only).
+  optional string identity_name = 5;
+}
+message VerifyAttestationResponse {
+  bool valid = 1;
+  optional string reason = 2;
+}
+
+message ListAttestationsRequest {
+  RepositoryRef repository = 1;
+  optional AttestationTarget filter = 2;
+  optional PageCursor cursor = 3;
+  optional PageBudget budget = 4;
+  ViewRef view = 5;
+  // Resolve ONE attestation by hash or prefix (add-only): `agent attest
+  // --hash` — the hash names an attestation, which the change-oriented Log
+  // cannot resolve. The response carries the detail bundle.
+  optional string hash_prefix = 6;
+  // The provenance-summary mode (add-only): `agent attest --summary
+  // [--view V]` — the response carries the summary bundle instead of the
+  // attestation list.
+  optional string summary_view = 7;
+  // With summary_view (add-only): summarize only the delta of the view
+  // relative to this parent — `agent attest --pending PARENT --view V`.
+  optional string pending_parent = 8;
+}
+message ListAttestationsResponse {
+  repeated AttestationInfo attestations = 1;
+  optional PageCursor next_cursor = 2;
+  // One resolved attestation's full detail (add-only; schema
+  // "atomic.attestation.detail.v1"): JSON {"hash": `<base32>`,
+  // "attestation": `<domain Attestation>`, "coverage": [{"view": string,
+  // "covered": uint, "total": uint}]} — the client renders the detail with
+  // the same code the local body runs.
+  optional VersionedBytes detail_bundle = 3;
+  // The AI provenance summary (add-only; schema
+  // "atomic.provenance.summary.v1"): JSON {"summary":
+  // `<domain ProvenanceSummary>`, "parent": string | null} — `parent` is
+  // the summarized view's recorded parent (the draft-view hint).
+  optional VersionedBytes summary_bundle = 4;
+}
+
+message AttestationInfo {
+  string id = 1;
+  AttestationTarget target = 2;
+  string identity_did = 3;
+  optional bytes signature = 4;
+  google.protobuf.Timestamp recorded_at = 5;
+  // Local-surface helpers (paths of the tracked attestation entry and the
+  // transition sidecar) — informational, add-only.
+  optional string vault_path = 6;
+  optional string sidecar_path = 7;
+}

@@ -78,6 +78,7 @@ use std::path::PathBuf;
 
 use atomic_core::change::{Change, ChangeHeader};
 use atomic_core::types::{Base32, Hash};
+use atomic_identity::IdentityStore;
 use atomic_repository::{
     HistoryEntry, HistoryOptions, RecordOptions, Repository, StatusOptions, UnrecordOptions,
 };
@@ -354,7 +355,12 @@ impl Revise {
     }
 
     /// Get the message for the revised change.
-    fn get_message(&self, original_message: &str) -> CliResult<String> {
+    ///
+    /// Shared by the local body and the service-layer hook: the editor and
+    /// the no-edit fallback are client-side by design, so the routed reword
+    /// path composes the message with this SAME code (seeded with the
+    /// change's current message fetched over the wire) and sends it.
+    pub(crate) fn get_message(&self, original_message: &str) -> CliResult<String> {
         // If explicit message provided, use it
         if let Some(ref msg) = self.message {
             return Ok(msg.clone());
@@ -429,7 +435,7 @@ impl Revise {
     }
 
     /// Parse author string into name and email.
-    fn parse_author(&self) -> Option<(String, Option<String>)> {
+    pub(crate) fn parse_author(&self) -> Option<(String, Option<String>)> {
         self.author.as_ref().map(|author_str| {
             // Try to parse "Name <email>" format
             if let Some(start) = author_str.find('<') {
@@ -583,12 +589,6 @@ impl Revise {
             original_change.hashed.header.authors.first().cloned()
         };
 
-        // Handle --reword mode differently: create a new change with same content
-        // but different header, rather than going through working copy
-        if self.reword {
-            return self.execute_reword(repo, &original_change, &message, author, &pending_changes);
-        }
-
         // Build header for content modification mode
         let mut header_builder = ChangeHeader::builder().message(&message);
         if let Some(author) = author {
@@ -654,72 +654,6 @@ impl Revise {
 
         Ok(new_hash)
     }
-
-    /// Execute reword operation - creates new change with same content but new header.
-    ///
-    /// This is cleaner than going through working copy because:
-    /// 1. We preserve exact same hunks/content
-    /// 2. No risk of capturing unintended working copy changes
-    /// 3. Works correctly even with pending changes to re-apply
-    fn execute_reword(
-        &self,
-        repo: &Repository,
-        original_change: &Change,
-        message: &str,
-        author: Option<atomic_core::change::Author>,
-        pending_changes: &[Hash],
-    ) -> CliResult<Hash> {
-        // Build new header with updated message
-        let mut new_header = original_change.hashed.header.clone();
-        new_header.message = message.to_string();
-
-        // Update author if provided
-        if let Some(new_author) = author {
-            new_header.authors = vec![new_author];
-        }
-
-        // Create new change with same hunks but new header
-        let new_change = Change::with_file_ops(
-            new_header,
-            original_change.hashed.hunks.clone(),
-            original_change.hashed.file_ops.clone(),
-            original_change.contents.clone(),
-            original_change.hashed.dependencies.clone(),
-        );
-
-        // Save the new change
-        let new_hash = repo.save_change(&new_change).map_err(|e| {
-            CliError::Internal(anyhow::anyhow!("Failed to save reworded change: {}", e))
-        })?;
-
-        // Insert the new change into the view (it replaces the unrecorded one)
-        repo.insert_change(&new_hash, Default::default())
-            .map_err(|e| {
-                CliError::Internal(anyhow::anyhow!("Failed to apply reworded change: {}", e))
-            })?;
-
-        // Re-apply pending changes
-        if !pending_changes.is_empty() {
-            print_hint(&format!("Re-applying {} changes...", pending_changes.len()));
-
-            for hash in pending_changes {
-                repo.reinsert_change(hash, None).map_err(|e| {
-                    print_warning(&format!(
-                        "Failed to re-apply change {}: {}",
-                        format_hash(hash, false),
-                        e
-                    ));
-                    CliError::Internal(anyhow::anyhow!(
-                        "Failed to re-apply change {}: {}",
-                        format_hash(hash, false),
-                        e
-                    ))
-                })?;
-            }
-        }
-
-        Ok(new_hash)
-    }
 }
 
 impl Default for Revise {
@@ -740,9 +674,21 @@ impl Command for Revise {
     /// 5. Record the revised change
     /// 6. Re-apply subsequent changes
     fn run(&self) -> CliResult<()> {
+        // Route EVERY form through the service layer (BEFORE any local
+        // repository open): the reference resolves over the wire's Log,
+        // the message composes client-side (an explicit -m, or the SAME
+        // editor flow the local body runs, seeded with the change's
+        // current message fetched over the wire), the dry-run preview
+        // renders over the wire's log entries, and the stack surgery —
+        // reword or content re-capture — is the domain's, applied
+        // atomically by the handler.
+        if crate::commands::rpc::revise(self)? {
+            return Ok(());
+        }
+
         // Find and open repository
         let repo_root = find_repository_root()?;
-        let repo = Repository::open(&repo_root).map_err(CliError::Repository)?;
+        let mut repo = Repository::open(&repo_root).map_err(CliError::Repository)?;
 
         // Resolve the reference
         let (sequence, entry) = self.resolve_reference(&repo)?;
@@ -750,6 +696,48 @@ impl Command for Revise {
         // Dry run mode
         if self.dry_run {
             return self.display_dry_run(&repo, sequence, &entry);
+        }
+
+        // Reword mode: the whole stack surgery is the domain's (the same
+        // code path the daemon's Revise RPC calls). The message resolves
+        // client-side (arg, editor, or original); the author too.
+        if self.reword {
+            let original = repo
+                .load_change(&entry.hash)
+                .map_err(|e| CliError::Internal(anyhow::anyhow!("Failed to load change: {}", e)))?;
+            let message = self.get_message(&original.hashed.header.message.clone())?;
+            let author = self
+                .parse_author()
+                .map(|(name, email)| atomic_core::change::Author {
+                    name,
+                    email,
+                    identity: None,
+                });
+
+            let change_ref = self.parse_reference();
+            println!(
+                "Revising change {} (sequence #{})...",
+                change_ref.description(),
+                sequence
+            );
+
+            let outcome = repo
+                .reword_change(&entry.hash, &message, author)
+                .map_err(CliError::Repository)?;
+
+            println!();
+            print_success(&format!(
+                "Revised {} → {}",
+                format_hash(&entry.hash, false),
+                format_hash(&outcome.new_hash, false)
+            ));
+            if !outcome.reinserted.is_empty() {
+                print_hint(&format!(
+                    "Re-applied {} pending change(s).",
+                    outcome.reinserted.len()
+                ));
+            }
+            return Ok(());
         }
 
         // Check for uncommitted changes if not in reword mode

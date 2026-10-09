@@ -149,7 +149,9 @@
 
 mod error;
 mod inode_graph;
+pub mod merge;
 pub mod ontology;
+pub mod schema;
 pub(crate) mod span_index;
 pub mod tables;
 mod traits;

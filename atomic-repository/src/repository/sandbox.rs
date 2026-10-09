@@ -111,7 +111,7 @@ pub(super) fn detect_sandbox(start: &Path) -> Option<(PathBuf, PathBuf, String)>
             return Some((dir.clone(), parsed.canonical, parsed.view));
         }
         // Stop if we reach a real repository root — that's not a sandbox.
-        if dir.join(DOT_DIR).join("pristine.redb").is_file() {
+        if super::database::has_database(&dir.join(DOT_DIR)) {
             return None;
         }
         if !dir.pop() {
@@ -125,8 +125,8 @@ impl Repository {
     ///
     /// The agent's private working tree is at `working_root`, but the graph
     /// lives in the **canonical** repository found from `canonical`. All
-    /// sandboxes opened this way read and write the same `pristine` and
-    /// `changes` store, so there is exactly one graph. `view` selects which
+    /// sandboxes opened this way read and write the same repository database
+    /// and `changes` store, so there is exactly one graph. `view` selects which
     /// view this sandbox operates on (typically the agent's own draft view).
     ///
     /// The canonical `current_view` file on disk is left untouched — the view
@@ -166,7 +166,7 @@ impl Repository {
         let canonical_root = Self::find_root(canonical)?;
         let dot_dir = canonical_root.join(DOT_DIR);
 
-        let path = dot_dir.join("pristine.redb");
+        let path = super::ensure_database(&dot_dir)?;
         let pristine = if read_only {
             Pristine::open_readonly(path)
         } else {
@@ -227,19 +227,21 @@ impl Repository {
     pub fn materialize_view_to(&self, view: &str, dir: &Path) -> Result<usize, RepositoryError> {
         std::fs::create_dir_all(dir)?;
 
+        // The view as it renders — its own added and moved files included,
+        // whichever view is checked out.
         let mut count = 0usize;
-        for path in self.visible_file_paths(view)? {
-            let bytes = match self.get_file_content_on_view(&path, view)? {
-                Some(bytes) => bytes,
-                None => continue,
-            };
-            let target = dir.join(&path);
+        self.materialize_view_entries(view, |entry| -> Result<(), std::io::Error> {
+            if entry.kind == super::ViewEntryKind::Directory {
+                return Ok(());
+            }
+            let target = dir.join(&entry.path);
             if let Some(parent) = target.parent() {
                 std::fs::create_dir_all(parent)?;
             }
-            std::fs::write(&target, &bytes)?;
+            std::fs::write(&target, &entry.content)?;
             count += 1;
-        }
+            Ok(())
+        })??;
 
         Ok(count)
     }
@@ -523,6 +525,25 @@ mod tests {
         assert!(
             !dest.join(DOT_DIR).exists(),
             "the canonical graph must not be cloned into the sandbox"
+        );
+    }
+
+    #[test]
+    fn a_sandbox_never_sees_its_pointer_as_untracked() {
+        let dir = tempdir().unwrap();
+        let repo = repo_with_recorded_file(&dir.path().join("repo"), "hello.txt", b"hi\n");
+        let sandbox = dir.path().join("agent-1");
+        repo.provision_sandbox(&sandbox, "dev").unwrap();
+        std::fs::write(sandbox.join("new.txt"), b"new\n").unwrap();
+        drop(repo);
+
+        let opened = Repository::open_existing(&sandbox).unwrap();
+        let status = opened.status(Default::default()).unwrap();
+        let untracked: Vec<_> = status.untracked().map(|e| e.path().to_path_buf()).collect();
+        assert_eq!(
+            untracked,
+            vec![PathBuf::from("new.txt")],
+            "the pointer can carry a credential; `record --all` must never pick it up"
         );
     }
 }

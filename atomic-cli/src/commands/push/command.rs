@@ -1010,6 +1010,15 @@ impl Command for Push {
     /// - `CliError::RemoteError` - Network/server error (including servers
     ///   that predate view-manifest support)
     fn run(&self) -> CliResult<()> {
+        // Route every form through the service layer: the network sync IS
+        // domain — the handler performs it end to end and returns the
+        // report this render prints. The client-side pieces (remote-name
+        // resolution read, the credential check, the auth headers) are
+        // config/identity reads, never redb.
+        if crate::commands::rpc::push(self)? {
+            return Ok(());
+        }
+
         // Create async runtime for HTTP operations
         let runtime = tokio::runtime::Runtime::new().map_err(|e| {
             CliError::Internal(anyhow::anyhow!("Failed to create async runtime: {}", e))

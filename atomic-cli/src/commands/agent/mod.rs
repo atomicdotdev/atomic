@@ -37,15 +37,16 @@
 //! hooks subcommand → parse JSON → TurnOrchestrator.dispatch() → Atomic change
 //! ```
 
-mod attest;
+pub(crate) mod attest;
 mod disable;
 mod enable;
-mod explain;
+pub(crate) mod explain;
 pub(crate) mod health;
 mod hooks;
 mod identity;
 mod lifecycle;
-mod owner;
+mod provenance_rpc;
+pub(crate) mod receive;
 mod status;
 
 use std::path::Path;
@@ -246,10 +247,6 @@ pub enum AgentCommands {
     /// nothing is suppressed; `lifecycle end --json` returns the run summary.
     Lifecycle(Lifecycle),
 
-    /// Run or inspect the repository-local redb database owner.
-    #[command(name = "database-owner", hide = true)]
-    DatabaseOwner(owner::DatabaseOwner),
-
     /// Select or inspect the agent identity that recording hooks sign as.
     ///
     /// `set` makes every hooked agent on this machine record under a
@@ -283,6 +280,25 @@ pub enum AgentCommands {
     /// invocation. It appears here for documentation purposes only.
     #[command(hide = true)]
     Hooks(hooks::Hooks),
+
+    /// Drive the RPC provenance journal sink through its full trait flow
+    /// against a reachable daemon (the integration suite's harness).
+    ///
+    /// **This command is hidden** — it exists for the test suite, not for
+    /// users.
+    #[command(hide = true)]
+    JournalRpcSelftest(provenance_rpc::JournalRpcSelftest),
+
+    /// Receive one typed `TurnEvent` from a verified dispatcher (Reactor).
+    ///
+    /// stdin carries an already-typed event (no agent hook parsing); the
+    /// result is the `agent hooks --json` shape so the dispatcher can mark
+    /// the delivery published.
+    ///
+    /// **This command is hidden** — it is called by the Atomic Reactor's
+    /// adapter, not by users.
+    #[command(hide = true)]
+    Receive(receive::Receive),
 }
 
 impl Command for Agent {
@@ -294,9 +310,10 @@ impl Command for Agent {
             AgentCommands::Explain(cmd) => cmd.run(),
             AgentCommands::Attest(cmd) => cmd.run(),
             AgentCommands::Lifecycle(cmd) => cmd.run(),
-            AgentCommands::DatabaseOwner(cmd) => cmd.run(),
             AgentCommands::Identity(cmd) => cmd.run(),
             AgentCommands::Hooks(cmd) => cmd.run(),
+            AgentCommands::JournalRpcSelftest(cmd) => cmd.run(),
+            AgentCommands::Receive(cmd) => cmd.run(),
         }
     }
 }

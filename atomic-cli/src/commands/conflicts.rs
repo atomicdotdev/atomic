@@ -43,6 +43,12 @@ impl Conflicts {
 
 impl Command for Conflicts {
     fn run(&self) -> CliResult<()> {
+        // Route through the daemon when reachable (a read; the render
+        // comes from the wire's ConflictInfo kind/line/sides).
+        if crate::commands::rpc::conflicts(self.short)? {
+            return Ok(());
+        }
+
         let repo_root = find_repository_root()?;
         let repo = crate::commands::open_readonly_repository(&repo_root).map_err(|e| {
             CliError::InvalidRepository {

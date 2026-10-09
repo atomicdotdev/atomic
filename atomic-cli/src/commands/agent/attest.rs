@@ -47,15 +47,15 @@ pub struct Attest {
     /// Cannot be combined with `--summary` / `--pending` (those are
     /// provenance-summary modes, not attestation lookups).
     #[arg(long, value_name = "HASH", conflicts_with_all = ["summary", "pending"])]
-    hash: Option<String>,
+    pub(crate) hash: Option<String>,
 
     /// Filter to attestations covering changes in this view.
     #[arg(long, value_name = "VIEW")]
-    view: Option<String>,
+    pub(crate) view: Option<String>,
 
     /// Show verbose output with model breakdown and coverage.
     #[arg(short, long)]
-    verbose: bool,
+    pub(crate) verbose: bool,
 
     /// Show a project-level AI provenance summary instead of the attestation list.
     ///
@@ -68,17 +68,223 @@ pub struct Attest {
     /// use `--pending <parent_view>` to summarize only the delta — otherwise
     /// inherited human/system changes will be counted in the denominator.
     #[arg(short, long)]
-    summary: bool,
+    pub(crate) summary: bool,
 
     /// Summarize the **pending delta** of `--view` relative to the given
     /// parent view (e.g., `--pending dev`). Only changes that are in
     /// `--view` but not in `<parent>` are classified. Implies `--summary`
     /// and requires `--view` to be set.
     #[arg(long, value_name = "PARENT_VIEW")]
-    pending: Option<String>,
+    pub(crate) pending: Option<String>,
 }
 
 impl Attest {
+    /// The `--summary`/`--pending` render, pure over the wire-carried
+    /// domain summary — the same lines the local body prints (headline
+    /// percentage, source/tool breakdown, the verbose internals, the
+    /// data-quality warnings, and the draft-view hint when the view has
+    /// a recorded parent).
+    pub(crate) fn render_summary(
+        summary: &atomic_repository::ProvenanceSummary,
+        view_name: &str,
+        pending_parent: Option<&str>,
+        view_parent: Option<&str>,
+        verbose: bool,
+    ) {
+        let header_line = match pending_parent {
+            Some(parent) => format!("Pending work: {} → {}", view_name, parent),
+            None => format!("Project: {}", view_name),
+        };
+        println!("{}", header_line);
+        println!();
+
+        // Headline.
+        match summary.ai_authored_pct() {
+            None => {
+                println!("No authored changes in this view yet.");
+            }
+            Some(pct) => {
+                let denom = summary.authored_denominator();
+                println!(
+                    "AI-authored: {:.0}% ({} of {} authored change{})",
+                    pct,
+                    summary.ai_changes,
+                    denom,
+                    if denom == 1 { "" } else { "s" },
+                );
+                if summary.human_changes > 0 {
+                    println!(
+                        "Human-authored: {} change{}",
+                        summary.human_changes,
+                        if summary.human_changes == 1 { "" } else { "s" },
+                    );
+                }
+                if !summary.by_vendor.is_empty() {
+                    let parts: Vec<String> = summary
+                        .by_vendor
+                        .iter()
+                        .map(|(v, n)| format!("{} {}", pretty_vendor(v), n))
+                        .collect();
+                    println!("AI sources: {}", parts.join(" · "));
+                }
+                if !summary.by_tool.is_empty() {
+                    let parts: Vec<String> = summary
+                        .by_tool
+                        .iter()
+                        .map(|(t, n)| format!("{} {}", pretty_tool(t), n))
+                        .collect();
+                    println!("Tools: {}", parts.join(" · "));
+                }
+            }
+        }
+
+        // Verbose: internal accounting.
+        if verbose {
+            println!();
+            println!(
+                "System/bootstrap changes excluded: {}",
+                summary.system_changes
+            );
+            println!("Needs attention: {}", summary.needs_attention_changes);
+            println!("Unreadable: {}", summary.unreadable_changes);
+            if !summary.by_model.is_empty() {
+                let parts: Vec<String> = summary
+                    .by_model
+                    .iter()
+                    .map(|(m, n)| format!("{} {}", m, n))
+                    .collect();
+                println!("Models: {}", parts.join(" · "));
+            }
+        }
+
+        // Non-zero data-quality conditions always surface (even without -v).
+        if summary.needs_attention_changes > 0 {
+            println!();
+            print_warning(&format!(
+                "{} change(s) have an agent-identity author but no embedded provenance — possible recording pipeline issue. Excluded from the percentage.",
+                summary.needs_attention_changes,
+            ));
+        }
+        if summary.unreadable_changes > 0 {
+            println!();
+            print_warning(&format!(
+                "{} change(s) could not be loaded and are excluded from the percentage.",
+                summary.unreadable_changes,
+            ));
+        }
+
+        // On the canonical path, if the user actually selected a forked /
+        // draft view, point them at --pending. Detection is exact (via
+        // the view's recorded parent — repo-read locally, wire-carried on
+        // the routed path), so this never fires for canonical views.
+        if pending_parent.is_none() {
+            if let Some(parent) = view_parent {
+                println!();
+                println!("This looks like a draft view. To summarize only pending work:");
+                println!(
+                    "  atomic agent attest --pending {} --view {}",
+                    parent, view_name
+                );
+            }
+        }
+    }
+
+    /// The `--hash` detail render, pure over the wire-carried domain
+    /// attestation and per-view coverage rows — the same lines the local
+    /// body prints.
+    pub(crate) fn render_detail(
+        hash: &atomic_core::types::Hash,
+        attest: &Attestation,
+        coverage: &[CoverageRow],
+    ) {
+        println!("Attestation {}", format_hash(hash, false));
+        println!();
+
+        // Agent info
+        println!("Agent:     {}", attest.agent);
+        println!("Session:   {}", attest.session_id);
+        println!(
+            "Changes:   {}",
+            format_count(attest.change_count(), "change")
+        );
+
+        if attest.duration_wall_ms > 0 {
+            println!("Wall time: {}", attest.wall_duration_display());
+        }
+        if attest.duration_api_ms > 0 {
+            println!("API time:  {}", attest.api_duration_display());
+        }
+        if attest.cost_usd > 0.0 {
+            println!("Cost:      {}", format_cost(attest.cost_usd));
+        }
+        if attest.total_tokens() > 0 {
+            println!("Tokens:    {}", format_tokens(attest.total_tokens()));
+        }
+        if !attest.code_changes.is_empty() {
+            println!(
+                "Code:      +{} -{}",
+                attest.code_changes.lines_added, attest.code_changes.lines_removed,
+            );
+        }
+
+        if attest.cost_usd == 0.0 && attest.total_tokens() == 0 {
+            println!();
+            println!("Note: Cost and token data pending.");
+            println!("  Claude Code does not expose this in the SessionEnd hook.");
+            println!("  Use 'atomic agent attest --enrich' when available.");
+        }
+
+        if let Some(ref prev) = attest.previous_attestation {
+            println!("Previous:  {}", format_hash(prev, false));
+        }
+
+        if let Some(ref notes) = attest.notes {
+            println!("Notes:     {}", notes);
+        }
+
+        println!();
+
+        // Model breakdown (only if there's data)
+        if !attest.models.is_empty() {
+            println!("Model Breakdown:");
+            for model in &attest.models {
+                println!("  {}", model);
+            }
+            println!();
+        }
+
+        // Changes covered
+        if !attest.changes_covered.is_empty() {
+            println!("Changes Covered ({}):", attest.change_count(),);
+            for change_hash in &attest.changes_covered {
+                println!("  {}", format_hash(change_hash, false));
+            }
+        }
+        println!();
+
+        // Coverage per view (the handler computed the rows; the bars and
+        // percentages render here).
+        let mut has_coverage = false;
+        for row in coverage {
+            if row.total == 0 || row.covered == 0 {
+                continue;
+            }
+            if !has_coverage {
+                println!("Coverage:");
+                has_coverage = true;
+            }
+            let pct = (row.covered as f64 / row.total as f64) * 100.0;
+            let bar_width = 20;
+            let filled = ((pct / 100.0) * bar_width as f64) as usize;
+            let empty = bar_width - filled;
+            let bar = format!("{}{}", "█".repeat(filled), "░".repeat(empty),);
+            println!(
+                "  {:<20} {} {}/{} ({:.0}%)",
+                row.view, bar, row.covered, row.total, pct,
+            );
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn default_for_test() -> Self {
         Self {
@@ -93,6 +299,10 @@ impl Attest {
 
 impl Command for Attest {
     fn run(&self) -> CliResult<()> {
+        if crate::commands::rpc::agent_attest(self)? {
+            return Ok(());
+        }
+
         let repo_root = find_repository_root()?;
         let repo = Repository::open(&repo_root).map_err(|e| match e {
             atomic_repository::RepositoryError::NotFound { path } => CliError::RepositoryNotFound {
@@ -150,112 +360,31 @@ impl Attest {
             .clone()
             .unwrap_or_else(|| repo.current_view().to_string());
 
-        let (summary, header_line) = if let Some(parent_view) = self.pending.as_deref() {
+        let (summary, pending_parent) = if let Some(parent_view) = self.pending.as_deref() {
             let s = repo
                 .provenance_summary_pending(&view_name, parent_view)
                 .map_err(CliError::Repository)?;
-            (s, format!("Pending work: {} → {}", view_name, parent_view))
+            (s, Some(parent_view.to_string()))
         } else {
             let s = repo
                 .provenance_summary(&view_name)
                 .map_err(CliError::Repository)?;
-            (s, format!("Project: {}", view_name))
+            (s, None)
         };
+        // The draft-view hint source: the view's recorded parent, read
+        // the same way the routed path reads it off the wire's bundle.
+        let view_parent = repo
+            .get_view_info(&view_name)
+            .ok()
+            .and_then(|info| info.parent_name);
 
-        println!("{}", header_line);
-        println!();
-
-        // Headline.
-        match summary.ai_authored_pct() {
-            None => {
-                println!("No authored changes in this view yet.");
-            }
-            Some(pct) => {
-                let denom = summary.authored_denominator();
-                println!(
-                    "AI-authored: {:.0}% ({} of {} authored change{})",
-                    pct,
-                    summary.ai_changes,
-                    denom,
-                    if denom == 1 { "" } else { "s" },
-                );
-                if summary.human_changes > 0 {
-                    println!(
-                        "Human-authored: {} change{}",
-                        summary.human_changes,
-                        if summary.human_changes == 1 { "" } else { "s" },
-                    );
-                }
-                if !summary.by_vendor.is_empty() {
-                    let parts: Vec<String> = summary
-                        .by_vendor
-                        .iter()
-                        .map(|(v, n)| format!("{} {}", pretty_vendor(v), n))
-                        .collect();
-                    println!("AI sources: {}", parts.join(" · "));
-                }
-                if !summary.by_tool.is_empty() {
-                    let parts: Vec<String> = summary
-                        .by_tool
-                        .iter()
-                        .map(|(t, n)| format!("{} {}", pretty_tool(t), n))
-                        .collect();
-                    println!("Tools: {}", parts.join(" · "));
-                }
-            }
-        }
-
-        // Verbose: internal accounting.
-        if self.verbose {
-            println!();
-            println!(
-                "System/bootstrap changes excluded: {}",
-                summary.system_changes
-            );
-            println!("Needs attention: {}", summary.needs_attention_changes);
-            println!("Unreadable: {}", summary.unreadable_changes);
-            if !summary.by_model.is_empty() {
-                let parts: Vec<String> = summary
-                    .by_model
-                    .iter()
-                    .map(|(m, n)| format!("{} {}", m, n))
-                    .collect();
-                println!("Models: {}", parts.join(" · "));
-            }
-        }
-
-        // Non-zero data-quality conditions always surface (even without -v).
-        if summary.needs_attention_changes > 0 {
-            println!();
-            print_warning(&format!(
-                "{} change(s) have an agent-identity author but no embedded provenance — possible recording pipeline issue. Excluded from the percentage.",
-                summary.needs_attention_changes,
-            ));
-        }
-        if summary.unreadable_changes > 0 {
-            println!();
-            print_warning(&format!(
-                "{} change(s) could not be loaded and are excluded from the percentage.",
-                summary.unreadable_changes,
-            ));
-        }
-
-        // On the canonical path, if the user actually selected a forked /
-        // draft view, point them at --pending. Detection is exact (via the
-        // view's recorded parent), so this never fires for canonical views.
-        if self.pending.is_none() {
-            if let Ok(info) = repo.get_view_info(&view_name) {
-                if let Some(parent) = info.parent_name {
-                    println!();
-                    println!("This looks like a draft view. To summarize only pending work:");
-                    println!(
-                        "  atomic agent attest --pending {} --view {}",
-                        parent, view_name,
-                    );
-                }
-            }
-        }
-
+        Self::render_summary(
+            &summary,
+            &view_name,
+            pending_parent.as_deref(),
+            view_parent.as_deref(),
+            self.verbose,
+        );
         Ok(())
     }
 
@@ -577,6 +706,21 @@ impl Attest {
             );
         }
     }
+}
+
+/// One per-view coverage row off the wire's detail bundle.
+pub(crate) struct CoverageRow {
+    pub view: String,
+    pub covered: usize,
+    pub total: usize,
+}
+
+/// The wire's coverage row shape (deserialized from the detail bundle).
+#[derive(serde::Deserialize)]
+pub(crate) struct CoverageRowWire {
+    pub view: String,
+    pub covered: usize,
+    pub total: usize,
 }
 
 // Formatting Helpers

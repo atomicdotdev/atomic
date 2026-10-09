@@ -48,6 +48,14 @@ pub struct TurnRecordOptions<'a> {
     /// author falls back to the plus-tag of the default identity, exactly
     /// as before agent identities existed.
     pub agent_identity: Option<String>,
+
+    /// Override for the identity store directory.
+    ///
+    /// If `None`, uses `~/.atomic/identities/`. Set this for testing — it
+    /// threads to every identity resolution the turn records (author,
+    /// signing key, delegation URN on the envelope) so they all see the
+    /// same store.
+    pub identity_dir: Option<std::path::PathBuf>,
 }
 
 /// The result of recording a turn as an Atomic change.

@@ -289,6 +289,13 @@ impl Default for Remote {
 
 impl Command for Remote {
     fn run(&self) -> CliResult<()> {
+        // Route every form through the service layer: the registry lives in
+        // the repository database, and the handler runs the exact domain
+        // call each local body makes.
+        if crate::commands::rpc::remote(self)? {
+            return Ok(());
+        }
+
         match &self.command {
             None => self.list_remotes(),
             Some(RemoteSubcommand::Add(add)) => self.add_remote(add),

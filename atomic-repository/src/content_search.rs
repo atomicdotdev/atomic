@@ -505,6 +505,7 @@ impl From<IndexError> for ContentSearchError {
             IndexError::Io(ref e) if e.kind() == std::io::ErrorKind::NotFound => {
                 ContentSearchError::IndexNotFound
             }
+            IndexError::IndexNotFound(_) => ContentSearchError::IndexNotFound,
             IndexError::InvalidPattern(p) => ContentSearchError::InvalidPattern(p),
             IndexError::CorruptIndex(msg) => ContentSearchError::CorruptIndex(msg),
             IndexError::LockConflict(_) => ContentSearchError::LockConflict,

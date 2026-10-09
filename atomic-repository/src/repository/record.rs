@@ -1009,15 +1009,48 @@ impl Repository {
         // Serialize to V3 format and compute content hash.
         // We keep the raw V3 bytes so we can save them directly to disk
         // without re-serializing (which would produce a different hash).
+        //
+        // Signing: the SIGNATURE section is unhashed, so the content hash is
+        // a pure function of the unsigned content. We therefore serialize
+        // unsigned first, obtain the content hash, sign it, then re-serialize
+        // with the signature attached — the hash is identical both times and
+        // the change's identity is unaffected by who signed it.
         let mut v3_bytes = Vec::new();
         let computed_hash = change
             .serialize(&mut v3_bytes)
             .map_err(|e| RecordError::ChangeStore(e.to_string()))?;
 
-        // Reload the change from the V3 buffer to get a clean deserialized form
-        let (final_change, verified_hash) = Change::deserialize(&mut v3_bytes.as_slice())
-            .map_err(|e| RecordError::ChangeStore(e.to_string()))?;
-        debug_assert_eq!(computed_hash, verified_hash);
+        let change = if let Some(signing) = options.signing_identity() {
+            let signature = atomic_core::change::signing::sign_change(
+                &signing.signer_did,
+                &signing.secret_key,
+                &computed_hash,
+                chrono::Utc::now().timestamp(),
+            );
+            let mut signed = change;
+            signed.signature = Some(signature);
+            let mut signed_bytes = Vec::new();
+            let signed_hash = signed
+                .serialize(&mut signed_bytes)
+                .map_err(|e| RecordError::ChangeStore(e.to_string()))?;
+            debug_assert_eq!(
+                signed_hash, computed_hash,
+                "SIGNATURE section must not affect the change hash"
+            );
+            // Round-trip the signed bytes for a clean deserialized form
+            let (final_signed, verified_hash) =
+                Change::deserialize(&mut signed_bytes.as_slice())
+                    .map_err(|e| RecordError::ChangeStore(e.to_string()))?;
+            debug_assert_eq!(signed_hash, verified_hash);
+            v3_bytes = signed_bytes;
+            final_signed
+        } else {
+            // Unsigned path: round-trip the unsigned bytes as before
+            let (final_change, verified_hash) = Change::deserialize(&mut v3_bytes.as_slice())
+                .map_err(|e| RecordError::ChangeStore(e.to_string()))?;
+            debug_assert_eq!(computed_hash, verified_hash);
+            final_change
+        };
 
         if trace_record {
             eprintln!(
@@ -1026,7 +1059,7 @@ impl Repository {
             );
         }
 
-        let mut outcome = RecordOutcome::new(final_change, computed_hash, stats);
+        let mut outcome = RecordOutcome::new(change, computed_hash, stats);
         // Stash the original V3 bytes so save_change can write them directly
         // instead of re-serializing (which may produce a different hash).
         outcome.set_v3_bytes(v3_bytes);

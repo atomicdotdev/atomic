@@ -63,6 +63,7 @@ mod provenance;
 mod session_end;
 mod session_start;
 mod turn;
+pub mod wait_budget;
 
 #[cfg(test)]
 mod tests;

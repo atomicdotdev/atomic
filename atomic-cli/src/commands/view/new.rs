@@ -91,7 +91,7 @@ const INVALID_CHARS: &[char] = &['/', '\\', '\0', ':', '*', '?', '"', '<', '>', 
 /// # Returns
 ///
 /// `Ok(())` if the name is valid, or an error describing why it's invalid.
-fn validate_view_name(name: &str) -> Result<(), String> {
+pub(crate) fn validate_view_name(name: &str) -> Result<(), String> {
     // Check for empty name
     if name.is_empty() {
         return Err("View name cannot be empty".to_string());
@@ -274,6 +274,12 @@ impl New {
 
 impl Command for New {
     fn run(&self) -> CliResult<()> {
+        // Route EVERY form through the daemon — from/empty/plain and the
+        // --parent draft-workspace composition (the request's Parent arm).
+        if crate::commands::rpc::view_create(self)? {
+            return Ok(());
+        }
+
         // Get the view name
         let name = self
             .name
@@ -670,15 +676,19 @@ mod tests {
         let cmd = New::with_name("duplicate");
         assert!(cmd.run().is_ok());
 
-        // Try to create it again
+        // Try to create it again. The plain form routes through the
+        // service area; the refusal is the domain's.
         let cmd = New::with_name("duplicate");
         let result = cmd.run();
         assert!(result.is_err());
         match result.unwrap_err() {
-            CliError::ViewAlreadyExists { name } => {
-                assert_eq!(name, "duplicate");
+            CliError::ServiceRefusal { message } => {
+                assert!(
+                    message.contains("view 'duplicate' already exists"),
+                    "unexpected refusal: {message}"
+                );
             }
-            other => panic!("Expected ViewAlreadyExists, got: {:?}", other),
+            other => panic!("Expected the duplicate-view refusal, got: {:?}", other),
         }
     }
 
@@ -724,15 +734,20 @@ mod tests {
 
         std::env::set_current_dir(repo_path).unwrap();
 
-        // Try to create a view from a nonexistent source
+        // Try to create a view from a nonexistent source. The --from
+        // form routes through the service area; the refusal is the
+        // domain's.
         let cmd = New::with_name("new-view").with_from("nonexistent");
         let result = cmd.run();
         assert!(result.is_err());
         match result.unwrap_err() {
-            CliError::ViewNotFound { name } => {
-                assert_eq!(name, "nonexistent");
+            CliError::ServiceRefusal { message } => {
+                assert!(
+                    message.contains("view 'nonexistent' not found"),
+                    "unexpected refusal: {message}"
+                );
             }
-            other => panic!("Expected ViewNotFound, got: {:?}", other),
+            other => panic!("Expected the view-not-found refusal, got: {:?}", other),
         }
     }
     // -------------------------------------------------------------------------

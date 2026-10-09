@@ -69,6 +69,7 @@ use crate::error::{CliError, CliResult};
 // Phase 2: Core Local Commands
 pub mod add;
 pub mod change;
+pub mod compact;
 pub mod complete;
 pub mod completions;
 pub mod conflicts;
@@ -85,6 +86,7 @@ pub mod record;
 pub mod remove;
 pub mod restore;
 pub mod revise;
+pub(crate) mod rpc;
 pub mod sandbox;
 pub mod session;
 pub mod split;
@@ -136,6 +138,7 @@ pub use add::Add;
 pub use agent::Agent;
 pub use change::ChangeCmd;
 pub use clone::Clone;
+pub use compact::Compact;
 pub use completions::Completions;
 pub use conflicts::Conflicts;
 pub use diff::Diff;
@@ -238,8 +241,9 @@ pub const DOT_DIR: &str = ".atomic";
 /// Find the repository root by searching upward from the current directory.
 ///
 /// This function starts at the current working directory and walks up
-/// the directory tree looking for a `.atomic` directory. This allows
-/// commands to work from any subdirectory within a repository.
+/// the directory tree looking for `.atomic/pristine.redb` or a sandbox
+/// pointer. This allows commands to work from any subdirectory within a
+/// repository without mistaking global configuration for a repository.
 ///
 /// # Returns
 ///
@@ -247,7 +251,7 @@ pub const DOT_DIR: &str = ".atomic";
 ///
 /// # Errors
 ///
-/// Returns [`CliError::RepositoryNotFound`] if no `.atomic` directory
+/// Returns [`CliError::RepositoryNotFound`] if no repository
 /// is found before reaching the filesystem root.
 ///
 /// # Example
@@ -276,7 +280,7 @@ pub fn find_repository_root() -> CliResult<PathBuf> {
 ///
 /// # Errors
 ///
-/// Returns [`CliError::RepositoryNotFound`] if no `.atomic` directory is found.
+/// Returns [`CliError::RepositoryNotFound`] if no repository is found.
 ///
 /// # Example
 ///
@@ -293,7 +297,11 @@ pub fn find_repository_root_from(start_path: &Path) -> CliResult<PathBuf> {
 
     loop {
         let dot_dir = current.join(DOT_DIR);
-        if dot_dir.is_dir() {
+        // A bare `.atomic/` may hold global configuration (e.g. ~/.atomic),
+        // not a repository. Require the repository's graph database too —
+        // the SAME predicate Repository::find_root applies (atomic.redb,
+        // or the legacy pristine.redb before the #230 database merge).
+        if dot_dir.is_dir() && atomic_repository::repository::database::has_database(&dot_dir) {
             return Ok(current);
         }
 
@@ -343,15 +351,7 @@ pub fn find_repository_root_from(start_path: &Path) -> CliResult<PathBuf> {
 /// ```
 pub fn open_repository(path: Option<&Path>) -> CliResult<Repository> {
     let repo_path = match path {
-        Some(p) => {
-            // If a path is provided, check if it's a repository or search from there
-            let dot_dir = p.join(DOT_DIR);
-            if dot_dir.is_dir() {
-                p.to_path_buf()
-            } else {
-                find_repository_root_from(p)?
-            }
-        }
+        Some(p) => find_repository_root_from(p)?,
         None => find_repository_root()?,
     };
 
@@ -644,7 +644,9 @@ mod tests {
             let mut check = temp.path().to_path_buf();
             let mut found = false;
             loop {
-                if check.join(DOT_DIR).is_dir() {
+                if atomic_repository::repository::database::has_database(&check.join(DOT_DIR))
+                    || check.join(SANDBOX_POINTER).is_file()
+                {
                     found = true;
                     break;
                 }
@@ -671,7 +673,7 @@ mod tests {
     #[test]
     fn test_find_repository_root_in_current() {
         let temp = TempDir::new().unwrap();
-        std::fs::create_dir(temp.path().join(DOT_DIR)).unwrap();
+        let _repo = Repository::init(temp.path()).unwrap();
 
         let result = find_repository_root_from(temp.path());
         assert!(result.is_ok());
@@ -687,7 +689,7 @@ mod tests {
     #[test]
     fn test_find_repository_root_in_parent() {
         let temp = TempDir::new().unwrap();
-        std::fs::create_dir(temp.path().join(DOT_DIR)).unwrap();
+        let _repo = Repository::init(temp.path()).unwrap();
 
         let subdir = temp.path().join("subdir").join("deep");
         std::fs::create_dir_all(&subdir).unwrap();
@@ -701,6 +703,28 @@ mod tests {
             .unwrap_or_else(|_| temp.path().to_path_buf());
         let actual = result.unwrap();
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_find_repository_root_skips_config_directory() {
+        let temp = TempDir::new().unwrap();
+        let _repo = Repository::init(temp.path()).unwrap();
+        let subdir = temp.path().join("subdir");
+        std::fs::create_dir_all(subdir.join(DOT_DIR)).unwrap();
+
+        let root = find_repository_root_from(&subdir).unwrap();
+        assert_eq!(root, temp.path().canonicalize().unwrap());
+    }
+
+    #[test]
+    fn test_find_repository_root_in_sandbox() {
+        let temp = TempDir::new().unwrap();
+        std::fs::write(temp.path().join(SANDBOX_POINTER), "pointer").unwrap();
+        let subdir = temp.path().join("subdir");
+        std::fs::create_dir(&subdir).unwrap();
+
+        let root = find_repository_root_from(&subdir).unwrap();
+        assert_eq!(root, temp.path().canonicalize().unwrap());
     }
 
     // -------------------------------------------------------------------------

@@ -329,6 +329,35 @@ impl Command for Restore {
     /// 4. If `--dry-run`, preview changes
     /// 5. Otherwise, restore files to pristine state
     fn run(&self) -> CliResult<()> {
+        // Route every form through the daemon when reachable — the
+        // non-dry-run forms over Restore; the dry-run previews over
+        // PreviewRestore (the listing form, and the single-file
+        // pristine-bytes dump through the content arm). The single-file
+        // shape check stats the working copy only — never a redb open.
+        if crate::commands::rpc::restore(self)? {
+            return Ok(());
+        }
+        if self.dry_run {
+            // The single-file dump applies only when the argument is
+            // exactly one concrete file (the local body's rule: a
+            // directory or trailing-slash filter has no pristine bytes
+            // of its own and previews as a listing).
+            let single_file_arg = self.files.len() == 1
+                && !self.files[0].ends_with('/')
+                && find_repository_root()
+                    .map(|root| !root.join(&self.files[0]).is_dir())
+                    .unwrap_or(true);
+            if single_file_arg && crate::commands::rpc::restore_single_dry_run(&self.files[0])? {
+                return Ok(());
+            }
+            if crate::commands::rpc::restore_preview(self.files.clone())? {
+                return Ok(());
+            }
+        }
+
+        // The NOT-A-REPOSITORY FALLBACK (and the unreachable-daemon
+        // fallback): the root lookup below reports the same refusal
+        // without opening redb when no repository surrounds the cwd.
         // Find repository
         let repo_root = find_repository_root()?;
         let repo = Repository::open(&repo_root).map_err(CliError::Repository)?;
@@ -447,7 +476,7 @@ impl Command for Restore {
 }
 
 /// Format a count with singular/plural word.
-fn format_count(count: usize, word: &str) -> String {
+pub(crate) fn format_count(count: usize, word: &str) -> String {
     if count == 1 {
         format!("{} {}", count, word)
     } else {

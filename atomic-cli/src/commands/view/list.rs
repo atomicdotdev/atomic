@@ -41,6 +41,7 @@ use std::time::Duration;
 use clap::Parser;
 use serde::Serialize;
 
+use atomic_core::types::Base32;
 use atomic_remote::{HttpRemote, HttpRemoteConfig, RemoteViewInfo};
 use atomic_repository::repository::ViewInfo;
 use atomic_repository::Repository;
@@ -146,8 +147,8 @@ impl List {
 
 /// A view prepared for rendering, carrying the metadata the tree needs.
 #[derive(Debug, Clone)]
-struct ViewEntry {
-    name: String,
+pub(crate) struct ViewEntry {
+    pub(crate) name: String,
     parent: Option<String>,
     /// Changes recorded into this view that are not visible through the
     /// parent chain. Zero means the view has nothing of its own to show.
@@ -197,6 +198,40 @@ impl ViewEntry {
             has_info: false,
         }
     }
+
+    /// Build from the wire `ViewInfo` the daemon returns over RPC. Carries
+    /// the same metadata as the local listing, so both paths render
+    /// identically.
+    pub(crate) fn from_wire(view: &atomic_client::proto::ViewInfo) -> Self {
+        let kind = match atomic_client::proto::ViewScope::try_from(view.scope) {
+            Ok(atomic_client::proto::ViewScope::Draft) => "draft",
+            _ => "shared",
+        };
+        let state_short = view
+            .head
+            .as_ref()
+            .and_then(|hash| hash.value.clone().try_into().ok())
+            .map(|bytes: [u8; 32]| {
+                let full = atomic_core::types::Merkle(bytes).to_base32();
+                if full.len() > 12 {
+                    full[..12].to_string()
+                } else {
+                    full
+                }
+            })
+            .unwrap_or_else(|| "-".to_string());
+        ViewEntry {
+            name: view.name.clone(),
+            parent: view.parent.clone(),
+            own_change_count: view.own_change_count.unwrap_or(view.change_count),
+            change_count: view.change_count,
+            inherited_change_count: view.inherited_change_count.unwrap_or(0),
+            kind,
+            state_short,
+            is_current: view.current,
+            has_info: true,
+        }
+    }
 }
 
 /// Decide which views are shown.
@@ -205,7 +240,10 @@ impl ViewEntry {
 /// it has changes of its own, or it is the current view, or it is an
 /// ancestor of such a view (so the hierarchy stays connected). Returns the
 /// visible name set and the hidden count.
-fn compute_visibility(entries: &[ViewEntry], show_all: bool) -> (HashSet<String>, usize) {
+pub(crate) fn compute_visibility(
+    entries: &[ViewEntry],
+    show_all: bool,
+) -> (HashSet<String>, usize) {
     if show_all {
         let all = entries.iter().map(|e| e.name.clone()).collect();
         return (all, 0);
@@ -244,7 +282,7 @@ fn compute_visibility(entries: &[ViewEntry], show_all: bool) -> (HashSet<String>
 /// parent, or with a parent missing from the listing) at depth 0, each
 /// child level one step deeper. Roots and siblings sort alphabetically.
 /// Cycles in the parent data are cut by a visited set.
-fn tree_order<'a>(
+pub(crate) fn tree_order<'a>(
     entries: &'a [ViewEntry],
     visible: &HashSet<String>,
 ) -> Vec<(usize, &'a ViewEntry)> {
@@ -325,7 +363,7 @@ fn tree_prefix(entry: &ViewEntry, depth: usize) -> String {
 }
 
 /// Render one view line for the default (metadata) mode.
-fn render_line(entry: &ViewEntry, depth: usize, width: usize) -> String {
+pub(crate) fn render_line(entry: &ViewEntry, depth: usize, width: usize) -> String {
     let prefix = tree_prefix(entry, depth);
     let name = style_view(&entry.name);
 
@@ -374,12 +412,12 @@ fn render_line(entry: &ViewEntry, depth: usize, width: usize) -> String {
 }
 
 /// Render one view line for `--short` mode (names only).
-fn render_short_line(entry: &ViewEntry, depth: usize) -> String {
+pub(crate) fn render_short_line(entry: &ViewEntry, depth: usize) -> String {
     format!("{}{}", tree_prefix(entry, depth), style_view(&entry.name))
 }
 
 /// The trailing hint describing hidden views.
-fn summary_line(hidden: usize) -> String {
+pub(crate) fn summary_line(hidden: usize) -> String {
     let noun = if hidden == 1 { "view" } else { "views" };
     format!(
         "{} {} not shown because contained no changes. -a to view them.",
@@ -520,6 +558,10 @@ impl List {
 
 impl Command for List {
     fn run(&self) -> CliResult<()> {
+        if crate::commands::rpc::view_list(self)? {
+            return Ok(());
+        }
+
         // Remote listing takes over entirely when --remote is present.
         if let Some(remote_arg) = &self.remote {
             return self.run_remote(remote_arg);
@@ -616,21 +658,21 @@ struct JsonViewList {
     views: Vec<JsonView>,
 }
 
-#[derive(Debug, Serialize, PartialEq, Eq)]
-struct JsonView {
-    name: String,
-    current: bool,
-    scope: String,
-    parent: Option<String>,
-    change_count: u64,
-    own_change_count: Option<u64>,
-    inherited_change_count: Option<u64>,
-    state: Option<String>,
-    set_id: Option<String>,
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub(crate) struct JsonView {
+    pub(crate) name: String,
+    pub(crate) current: bool,
+    pub(crate) scope: String,
+    pub(crate) parent: Option<String>,
+    pub(crate) change_count: u64,
+    pub(crate) own_change_count: Option<u64>,
+    pub(crate) inherited_change_count: Option<u64>,
+    pub(crate) state: Option<String>,
+    pub(crate) set_id: Option<String>,
 }
 
 impl JsonView {
-    fn from_local(info: &atomic_repository::ViewInfo, current: bool) -> Self {
+    pub(crate) fn from_local(info: &atomic_repository::ViewInfo, current: bool) -> Self {
         Self {
             name: info.name.clone(),
             current,
@@ -642,6 +684,35 @@ impl JsonView {
             own_change_count: Some(info.own_change_count),
             inherited_change_count: Some(info.inherited_change_count),
             state: Some(info.state_base32()),
+            set_id: None,
+        }
+    }
+
+    /// One view off the wire's ViewInfo — the routed twin of
+    /// [`JsonView::from_local`]: the handler classifies own/inherited
+    /// change counts and carries the head state, so the JSON document
+    /// renders identically from wire data.
+    pub(crate) fn from_wire(view: &atomic_client::proto::ViewInfo) -> Self {
+        let own = view.own_change_count.unwrap_or(view.change_count);
+        let inherited = view.inherited_change_count.unwrap_or(0);
+        Self {
+            name: view.name.clone(),
+            current: view.current,
+            scope: match atomic_client::proto::ViewScope::try_from(view.scope) {
+                Ok(atomic_client::proto::ViewScope::Draft) => "draft".to_string(),
+                _ => "shared".to_string(),
+            },
+            parent: view.parent.clone(),
+            change_count: own.saturating_add(inherited),
+            own_change_count: Some(own),
+            inherited_change_count: Some(inherited),
+            state: view.head.as_ref().and_then(|hash| {
+                hash.value
+                    .clone()
+                    .try_into()
+                    .ok()
+                    .map(|bytes: [u8; 32]| atomic_core::types::Merkle(bytes).to_base32())
+            }),
             set_id: None,
         }
     }
@@ -689,6 +760,22 @@ fn print_json(output: &JsonViewList) -> CliResult<()> {
         serde_json::to_string_pretty(output).map_err(|error| CliError::Internal(error.into()))?;
     println!("{}", json);
     Ok(())
+}
+
+/// The local-source JSON document, printed from wire-carried views — the
+/// same document shape the local body emits (repository_root and the
+/// current-view marker resolve client-side, exactly like the local
+/// path).
+pub(crate) fn print_local_json(views: &[JsonView], current_view: Option<String>) -> CliResult<()> {
+    let repo_root = crate::commands::find_repository_root()?;
+    print_json(&JsonViewList {
+        schema_version: VIEW_LIST_JSON_SCHEMA_VERSION,
+        source: "local",
+        repository_root: Some(repo_root.to_string_lossy().into_owned()),
+        remote: None,
+        current_view,
+        views: views.to_vec(),
+    })
 }
 
 // Tests

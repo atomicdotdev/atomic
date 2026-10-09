@@ -43,13 +43,13 @@ atomic agent enable
 
 ### Repository owner locks and connection recovery
 
-Agent hooks are short-lived processes, while redb permits only one writable process to open a database. Atomic therefore starts one long-lived **database owner per canonical repository**. Hooks send committed provenance requests to that owner instead of opening the repository's redb change store directly.
+Agent hooks are short-lived processes, while redb permits only one process at a time to open a database file. Atomic therefore starts one long-lived **database owner per canonical repository**. Hooks send committed provenance requests to that owner instead of opening the repository's provenance journal directly. The journal lives in the repository database, `.atomic/atomic.redb`, alongside the graph, so the owner opens that file only while it serves a request and leaves it free for other `atomic` commands in between.
 
 Each repository has an independent ownership namespace:
 
 | Resource | Location | Purpose |
 |---|---|---|
-| redb change store | `.atomic/changes.redb` | Mutable provenance journal and checkpoint state |
+| repository database | `.atomic/atomic.redb` | Graph, views, sessions, vault, and the provenance journal with its checkpoint state |
 | owner election lock | `.atomic/changes-owner.lock` | OS-backed authority deciding which process may own that database |
 | Unix endpoint | `/tmp/atomic-owner-<repository-digest>.sock` | Local IPC transport on macOS and Linux |
 | Windows endpoint | `\\.\pipe\atomic-owner-<repository-digest>` | Local IPC transport on Windows |
@@ -63,16 +63,18 @@ Agent A ─┐                         Agent C ─┐
 Agent B ─┴─> Project 1 owner       Agent D ─┴─> Project 2 owner
                  │                                  │
                  v                                  v
-       Project 1 changes.redb             Project 2 changes.redb
+       Project 1 atomic.redb              Project 2 atomic.redb
 ```
 
 The **lock is the authority; the socket or named pipe is only transport**. The lock file may remain on disk after normal operation, but an unlocked file does not block a new owner. If an owner crashes, the OS releases its lock automatically. Recovery then proceeds as follows:
 
 1. A hook cannot reach the old endpoint and starts or reconnects to an owner.
 2. Owner candidates race for that repository's `changes-owner.lock`.
-3. Only the lock winner may open `changes.redb`.
+3. Only the lock winner serves provenance requests against `atomic.redb`.
 4. On Unix, the winner removes any stale socket left by the dead owner and binds a fresh endpoint.
 5. The hook retries with the same request/event ID, so a request committed before the crash is acknowledged once rather than applied twice.
+
+Repositories created before `atomic.redb` kept graph state in `.atomic/pristine.redb` and the journal in `.atomic/changes.redb`. The first open by a newer `atomic` merges both into `atomic.redb`, verifies every table against its source, and moves the old files to `.atomic/legacy/<timestamp>/`. If an owner started by an older `atomic` still holds `changes.redb`, run `atomic agent database-owner shutdown` in that repository first.
 
 Within one repository, redb write transactions are serialized by design, while reads and independent repositories can proceed concurrently. Startup, reconnect, and retry loops are bounded so a broken owner fails instead of hanging hooks indefinitely. Checkpoint attempts, event cutoffs, and fencing generations let interrupted turns resume without rewriting completed session turns.
 
@@ -81,6 +83,36 @@ Current operational considerations:
 - Owners remain alive until explicitly shut down; an idle timeout or user-level owner registry is a future resource-management improvement for machines that touch many repositories.
 - Unix endpoints use `/tmp` to stay below macOS Unix-socket path limits. A future hardening step should move them into a user-private runtime directory where available, enforce restrictive socket permissions, and validate peer credentials.
 - A 96-bit endpoint digest makes accidental cross-project collisions extraordinarily unlikely, but the repository-local lock remains the final ownership check.
+
+### Reclaiming unused database space
+
+Run explicit maintenance when the repository is quiet:
+
+```bash
+atomic compact
+atomic compact --repository /path/to/repo --json
+```
+
+The command compacts the existing `.atomic/atomic.redb` and reports its
+before/after sizes and reclaimed bytes. It preserves history, views,
+provenance, change files and unrecorded working files. It does not delete
+live data or deduplicate change objects; zero bytes reclaimed is a valid result.
+
+Compaction runs through libatomic, in-process by default. With
+`ATOMIC_SERVICE=reactor`, it uses the same handler through the configured
+Reactor service; that service must advertise `CompactDatabase`. An older or
+unavailable service produces an error, with no local fallback.
+
+Other database readers and writers must release their handles. Lock waiting
+uses `ATOMIC_DB_LOCK_WAIT_MS` (30 seconds by default); a busy database produces
+an error that can be retried. Once blocking maintenance starts, it finishes
+independently of the caller, including the bounded lock wait. Use a quiet period:
+other commands may time out while the database is being compacted. Persistent
+savepoints block compaction and are never deleted automatically.
+
+This is manual maintenance of an existing combined database, with no implicit
+initialization or migration. Hosted Storage's open-handle cache requires separate
+maintenance coordination before online compaction can be supported.
 
 ### Provenance Graphs
 
@@ -426,6 +458,13 @@ cargo install --path atomic-cli
 # Verify installation
 atomic --version
 ```
+
+Local builds include their source commit in the version output, for example
+`atomic 0.19.1 (dev 4b143dfbcad2)`, with `-dirty` appended for tracked changes.
+The release workflow sets `ATOMIC_BUILD_CHANNEL=release` to report only the
+package version. Development builds distributed later retain their embedded
+commit; Git is not required to run them. When building from a source archive,
+set `ATOMIC_BUILD_COMMIT` to the source commit, or the output shows `dev unknown`.
 
 To install a locally built binary system-wide, the destination directory may require administrator privileges. On macOS, replacing the file rather than overwriting its existing inode also avoids retaining stale Gatekeeper provenance metadata:
 

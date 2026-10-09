@@ -1,0 +1,8 @@
+{
+  "vector": "v679f56481420e45a",
+  "divergence": "RFC 8785 treats every number as a double, so 2^53+1 canonicalizes to the double it rounds to",
+  "input": "{\"n\":9007199254740993}",
+  "expect": {
+    "canonical": "{\"n\":9007199254740992}"
+  }
+}

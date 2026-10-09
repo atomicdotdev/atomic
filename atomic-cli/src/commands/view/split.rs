@@ -86,6 +86,13 @@ pub struct Split {
 
 impl Command for Split {
     fn run(&self) -> CliResult<()> {
+        // Route through the daemon when reachable (BEFORE any local
+        // repository open). Dry-run previews stay local — the analysis is
+        // a read, and the CLI renders its own preview.
+        if !self.dry_run && crate::commands::rpc::view_split(self)? {
+            return Ok(());
+        }
+
         let repo_root = find_repository_root()?;
         let mut repo = Repository::open(&repo_root).map_err(|e| match e {
             atomic_repository::RepositoryError::NotFound { path } => CliError::RepositoryNotFound {

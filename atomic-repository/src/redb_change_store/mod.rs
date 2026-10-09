@@ -1,11 +1,12 @@
 //! redb-native change storage for Atomic VCS.
 //!
 //! This module implements [`RedbChangeStore`], which stores change data directly
-//! in redb tables instead of `.change` files. Production repositories keep the
-//! store at `.atomic/changes.redb`; the repository owner service is the sole
-//! long-lived opener and ordinary [`crate::Repository`] handles expose only its
-//! canonical path. Direct [`RedbChangeStore::open`] calls are intended for the
-//! owner service, standalone stores, and tests.
+//! in redb tables instead of `.change` files. Production repositories keep these
+//! tables in the repository database, `.atomic/atomic.redb`, next to the graph.
+//! The agent database owner opens it with [`RedbChangeStore::open_existing`]
+//! while serving a request; a process that already holds a [`crate::Repository`]
+//! uses [`crate::Repository::redb_change_store`] to share that handle.
+//! [`RedbChangeStore::open`] creates standalone stores, mainly for tests.
 //!
 //! # Sub-modules
 //!
@@ -28,10 +29,11 @@ pub use queries::{StoreStats, StoredContentChunk};
 use atomic_core::change::format_v3::{self, ChangeReader, FormatError, SectionType};
 use atomic_core::change::{Change, ChangeHeader};
 use atomic_core::pristine::tables;
-use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
+use redb::{Builder, Database, ReadableDatabase, ReadableTable, TableDefinition};
 use std::fmt;
 use std::io::Cursor;
 use std::path::Path;
+use std::sync::Arc;
 use thiserror::Error;
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -137,6 +139,14 @@ pub enum RedbStoreError {
 /// Convenience result type for redb store operations.
 pub type RedbStoreResult<T> = Result<T, RedbStoreError>;
 
+impl RedbStoreError {
+    /// Whether opening failed because another handle holds the database file.
+    pub fn is_database_busy(&self) -> bool {
+        matches!(self, Self::Database(inner)
+            if matches!(inner.as_ref(), redb::DatabaseError::DatabaseAlreadyOpen))
+    }
+}
+
 impl From<redb::DatabaseError> for RedbStoreError {
     fn from(e: redb::DatabaseError) -> Self {
         RedbStoreError::Database(Box::new(e))
@@ -203,6 +213,9 @@ pub struct StoredChangeMeta {
 
     /// Whether unhashed data is stored.
     pub has_unhashed: bool,
+
+    /// Whether a signature is stored.
+    pub has_signature: bool,
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -228,7 +241,7 @@ pub struct StoredChangeMeta {
 /// | `PROVENANCE_JOURNAL_EVENTS` | `[u8; 16]` | immutable event | Ordered pending provenance |
 /// | `PROVENANCE_FINAL_HASHES` | `[u8; 32]` | `u64` | Final hash → reserved turn |
 pub struct RedbChangeStore {
-    db: Database,
+    db: Arc<Database>,
 }
 
 impl RedbChangeStore {
@@ -239,17 +252,59 @@ impl RedbChangeStore {
     ///
     /// # Arguments
     ///
-    /// * `path` - Path to the redb database file. Repository-integrated callers
-    ///   use [`crate::Repository::canonical_change_store_path`], which resolves
-    ///   to `.atomic/changes.redb` (including from agent sandboxes).
+    /// * `path` - Path to the redb database file, created if missing. Use
+    ///   [`open_existing`](Self::open_existing) for a repository database so a
+    ///   missing or not-yet-merged repository is never replaced by an empty one.
     ///
     /// # Errors
     ///
     /// Returns an error if the database cannot be opened or tables cannot be created.
     pub fn open<P: AsRef<Path>>(path: P) -> RedbStoreResult<Self> {
-        let db = Database::create(path)?;
+        Self::from_database(Arc::new(Database::create(path)?))
+    }
 
-        // Create all tables on first use
+    /// Open the store in an existing database file without creating it.
+    ///
+    /// Repository callers pass [`crate::ensure_database`]'s result here.
+    pub fn open_existing<P: AsRef<Path>>(path: P) -> RedbStoreResult<Self> {
+        Self::from_database(Arc::new(Builder::new().open(path)?))
+    }
+
+    /// Open the store in an existing database file, waiting at most
+    /// `timeout` for an incompatible process handle to close. Other errors
+    /// return immediately.
+    ///
+    /// redb refuses any open while another process holds the database —
+    /// short-lived writers (a recording agent turn, a gated daemon
+    /// mutation) are given this grace instead of failing the open. The
+    /// same policy [`crate::Repository::open_existing_wait`] applies to
+    /// repository opens.
+    pub fn open_existing_wait<P: AsRef<Path>>(
+        path: P,
+        timeout: std::time::Duration,
+    ) -> RedbStoreResult<Self> {
+        let start = std::time::Instant::now();
+        loop {
+            match Self::open_existing(path.as_ref()) {
+                Err(RedbStoreError::Database(db))
+                    if matches!(db.as_ref(), redb::DatabaseError::DatabaseAlreadyOpen)
+                        && start.elapsed() < timeout =>
+                {
+                    std::thread::sleep(
+                        std::time::Duration::from_millis(10)
+                            .min(timeout.saturating_sub(start.elapsed())),
+                    );
+                }
+                result => return result,
+            }
+        }
+    }
+
+    /// Use the store's tables in an already-open database, creating any that
+    /// are missing.
+    pub fn from_database(db: Arc<Database>) -> RedbStoreResult<Self> {
+        atomic_core::pristine::schema::check_schema_version(&db.begin_read()?)
+            .map_err(|error| RedbStoreError::Corrupt(error.to_string()))?;
         {
             let txn = db.begin_write()?;
             {
@@ -259,6 +314,7 @@ impl RedbChangeStore {
                 let _ = txn.open_table(tables::CONTENT_CHUNKS)?;
                 let _ = txn.open_table(tables::CHANGE_CHUNKS)?;
                 let _ = txn.open_table(tables::CHANGE_UNHASHED)?;
+                let _ = txn.open_table(tables::CHANGE_SIGNATURES)?;
                 Self::initialize_provenance_tables(&txn)?;
             }
             txn.commit()?;
@@ -317,6 +373,7 @@ impl RedbChangeStore {
         let mut semantic_sections: Vec<(u32, Vec<u8>)> = Vec::new();
         let mut content_chunks: Vec<(u32, [u8; 32], Vec<u8>)> = Vec::new();
         let mut unhashed_payload: Option<Vec<u8>> = None;
+        let mut signature_payload: Option<Vec<u8>> = None;
 
         let mut graph_idx = 0u32;
         let mut semantic_idx = 0u32;
@@ -356,6 +413,9 @@ impl RedbChangeStore {
                 SectionType::Unhashed => {
                     unhashed_payload = Some(section.payload.clone());
                 }
+                SectionType::Signature => {
+                    signature_payload = Some(section.payload.clone());
+                }
             }
         }
 
@@ -375,6 +435,7 @@ impl RedbChangeStore {
             content_chunk_count: content_chunks.len() as u32,
             has_provenance: provenance_payload.is_some(),
             has_unhashed: unhashed_payload.is_some(),
+            has_signature: signature_payload.is_some(),
         };
 
         // Serialize and compress metadata
@@ -431,6 +492,14 @@ impl RedbChangeStore {
                 let compressed = zstd::encode_all(unhashed.as_slice(), 3)
                     .map_err(|e| RedbStoreError::Serialization(e.to_string()))?;
                 unhashed_table.insert(&content_hash, compressed.as_slice())?;
+            }
+
+            // CHANGE_SIGNATURES
+            if let Some(signature) = &signature_payload {
+                let mut sig_table = txn.open_table(tables::CHANGE_SIGNATURES)?;
+                let compressed = zstd::encode_all(signature.as_slice(), 3)
+                    .map_err(|e| RedbStoreError::Serialization(e.to_string()))?;
+                sig_table.insert(&content_hash, compressed.as_slice())?;
             }
         }
         txn.commit()?;

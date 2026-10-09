@@ -83,6 +83,16 @@ pub struct Unrecord {
 
 impl Command for Unrecord {
     fn run(&self) -> CliResult<()> {
+        // Route through the daemon when reachable (non-dry-run); the local
+        // path below is unchanged.
+        if crate::commands::rpc::unrecord(self)? {
+            return Ok(());
+        }
+        // The dry-run form is a read — PreviewMutation (UnrecordPreview).
+        if self.dry_run && crate::commands::rpc::unrecord_preview(self.change.clone())? {
+            return Ok(());
+        }
+
         let repo_root = find_repository_root()?;
         let repo = Repository::open(&repo_root).map_err(|e| match e {
             atomic_repository::RepositoryError::NotFound { path } => CliError::RepositoryNotFound {

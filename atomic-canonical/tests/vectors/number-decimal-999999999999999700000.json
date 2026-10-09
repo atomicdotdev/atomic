@@ -1,0 +1,8 @@
+{
+  "vector": "vaa33c34f7bd1058b",
+  "divergence": "decimal notation retained just below the 1e21 threshold",
+  "input": "{\"n\":999999999999999700000}",
+  "expect": {
+    "canonical": "{\"n\":999999999999999700000}"
+  }
+}

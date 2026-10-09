@@ -283,8 +283,10 @@ impl Command for Hooks {
             // Set the agent identity so new sessions get the correct name
             // (e.g., "claude-code" / "Claude Code" instead of "unknown")
             orchestrator.set_agent(&agent_name, &agent_display);
-            orchestrator
-                .set_journal_sink(Arc::new(super::owner::OwnerJournalSink::new(&repo_root)));
+            // The journal goes over the daemon's ProvenanceService —
+            // D4 start-or-retry: the sink starts the daemon when it is
+            // down (the daemon is the only journal writer).
+            orchestrator.set_journal_sink(super::provenance_rpc::sink_for(&repo_root));
 
             // The delegated identity to sign recorded turns as, resolved
             // through the selection chain (env var > global setting >

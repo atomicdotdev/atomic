@@ -31,6 +31,7 @@ fn options<'a>(
         turn_duration_ms: 1000,
         prompt: Some(prompt.to_string()),
         agent_identity: None,
+        identity_dir: None,
     }
 }
 

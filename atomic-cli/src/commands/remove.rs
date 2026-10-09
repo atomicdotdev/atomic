@@ -232,6 +232,12 @@ impl Command for Remove {
     ///    b. If not --keep, delete from disk
     /// 3. Display results
     fn run(&self) -> CliResult<()> {
+        // Route through the daemon when reachable (the plain, non-dry-run,
+        // non-force forms); the local path below stays byte-identical.
+        if crate::commands::rpc::remove(self)? {
+            return Ok(());
+        }
+
         // Find repository
         let repo_root = find_repository_root()?;
         let repo = Repository::open(&repo_root).map_err(CliError::Repository)?;

@@ -52,6 +52,7 @@ mod agent_error;
 mod commands;
 mod error;
 mod output;
+mod service;
 
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 
@@ -61,6 +62,7 @@ use commands::{
     ChangeCmd,
     Clone,
     Command,
+    Compact,
     Completions,
     Conflicts,
     Diff,
@@ -160,7 +162,7 @@ fn apply_agent_help(cmd: clap::Command) -> clap::Command {
 /// are truly independent.
 #[derive(Parser, Debug)]
 #[command(name = "atomic")]
-#[command(author, version, about, long_about = None)]
+#[command(author, version = env!("ATOMIC_CLI_VERSION"), about, long_about = None)]
 #[command(propagate_version = true)]
 #[command(arg_required_else_help = true)]
 struct Cli {
@@ -445,6 +447,9 @@ enum Commands {
     /// Use this for explicit maintenance tasks that may scan stored changes,
     /// such as backfilling the dependency index for legacy repositories.
     Doctor(Doctor),
+
+    /// Reclaim unused space in the repository database.
+    Compact(Compact),
 
     /// Git interoperability commands.
     ///
@@ -858,21 +863,11 @@ enum Commands {
     /// ```
     Update(Update),
 
-    /// Project the code-review candidate set of a feature view against a target.
+    /// Project the code-review candidate set of a view against a target.
     ///
-    /// Reports the change hashes visible to the feature view but not the
-    /// target, their transitive dependency-closure additions, and which of
-    /// those additions are "baggage" (not covered by any intent).
-    ///
-    /// # Examples
-    ///
-    /// ```text
-    /// # Human-readable summary
-    /// atomic triage candidates feature --into dev
-    ///
-    /// # Machine-readable worklist
-    /// atomic triage candidates feature --into dev --json
-    /// ```
+    /// Both arguments are optional: the source view defaults to the current
+    /// view and the target to that view's parent, so `atomic triage review`
+    /// with no arguments asks whether the current view is ready to promote.
     Triage(Triage),
 
     /// Generate a shell completion script.
@@ -1005,6 +1000,7 @@ fn main() {
         Commands::Diff(diff) => diff.run(),
 
         Commands::Doctor(doctor) => doctor.run(),
+        Commands::Compact(compact) => compact.run(),
 
         Commands::Git(git) => git.run(),
 

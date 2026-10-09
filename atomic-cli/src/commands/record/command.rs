@@ -15,6 +15,10 @@ impl Command for Record {
     /// 8. Apply the change to the current view
     /// 9. Display the result
     fn run(&self) -> CliResult<()> {
+        if crate::commands::rpc::record(self)? {
+            return Ok(());
+        }
+
         // Find repository
         let repo_root = find_repository_root()?;
         let repo = Repository::open(&repo_root).map_err(CliError::Repository)?;
@@ -40,7 +44,23 @@ impl Command for Record {
         let header = header_builder.build();
 
         // Build record options
-        let options = self.build_options()?;
+        let mut options = self.build_options()?;
+
+        // Resolve the signing identity and attach signing credentials.
+        // The signing identity is the same one that supplied the author.
+        // When no identity is available the change records unsigned.
+        match self.resolve_signing_identity()? {
+            Some(signing) => {
+                options = options.with_signing_identity(signing);
+            }
+            None => {
+                print_warning(
+                    "No signing identity available — recording change UNSIGNED. \
+                     Others cannot verify authorship. Run `atomic identity new` \
+                     and `atomic identity default <name>` to enable signing.",
+                );
+            }
+        }
 
         // If --all, first add all untracked files
         if self.all {

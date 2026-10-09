@@ -6,10 +6,10 @@ use crate::turn::phase::{self, Action, Event, TransitionContext};
 use crate::turn::session::AgentSession;
 
 use super::{vendor_from_agent_name, DispatchResult, TurnOrchestrator};
-
-// Session lifecycle operations use short writable handles, just like recording.
-// Retry acquisition only; replaying the whole lifecycle could fork/switch twice.
-const SESSION_DATABASE_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+// Session lifecycle opens use the shared database-wait budget: retry
+// acquisition only, never replay — replaying the lifecycle could fork/switch
+// the agent view twice.
+use super::wait_budget;
 
 impl TurnOrchestrator {
     /// Handle a SessionStart event.
@@ -225,7 +225,7 @@ impl TurnOrchestrator {
         if session.parent_view.is_none() {
             match atomic_repository::Repository::open_existing_wait(
                 &self.repo_root,
-                SESSION_DATABASE_WAIT,
+                wait_budget::database_wait(),
             ) {
                 Ok(repo) if repo.is_sandbox() => {
                     // A sandbox is a materialized copy of the project; `record`
@@ -380,7 +380,7 @@ impl TurnOrchestrator {
     ) {
         match atomic_repository::Repository::open_existing_wait(
             &self.repo_root,
-            SESSION_DATABASE_WAIT,
+            wait_budget::database_wait(),
         ) {
             Ok(repo) => {
                 if let Err(e) = repo.upsert_session_lifecycle(
@@ -457,7 +457,7 @@ impl TurnOrchestrator {
                 // parent's files.
                 if let Ok(mut repo) = atomic_repository::Repository::open_existing_wait(
                     &self.repo_root,
-                    SESSION_DATABASE_WAIT,
+                    wait_budget::database_wait(),
                 ) {
                     let current = repo.current_view().to_string();
 

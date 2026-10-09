@@ -195,6 +195,12 @@ impl Command for Move {
     ///    b. Move the actual file on disk
     /// 5. Display results
     fn run(&self) -> CliResult<()> {
+        // Route through the daemon when reachable (plain form only — the
+        // wire carries no dry-run/force); the local path is unchanged.
+        if crate::commands::rpc::mv(self)? {
+            return Ok(());
+        }
+
         // Find repository
         let repo_root = find_repository_root()?;
         let repo = Repository::open(&repo_root).map_err(CliError::Repository)?;

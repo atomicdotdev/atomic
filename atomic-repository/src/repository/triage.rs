@@ -22,12 +22,12 @@
 use super::*;
 
 use atomic_core::pristine::ontology::edge_kind;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// Whether a closure addition is covered by an intent in the knowledge graph.
 ///
 /// Serialized as a lowercase string (`"covered"`, `"uncovered"`, `"unknown"`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Coverage {
     /// At least one modified file is touched by a task node.
@@ -41,7 +41,7 @@ pub enum Coverage {
 }
 
 /// A closure addition flagged as baggage (uncovered or coverage-unknown).
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BaggageEntry {
     /// The change hash (base32).
     pub change: String,
@@ -52,7 +52,7 @@ pub struct BaggageEntry {
 }
 
 /// The triage candidate set for a `feature` view relative to a `target` view.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CandidateSet {
     /// The feature (source) view name.
     pub feature: String,

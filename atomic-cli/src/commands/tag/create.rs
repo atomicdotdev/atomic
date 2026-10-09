@@ -166,6 +166,13 @@ impl Create {
 
 impl Command for Create {
     fn run(&self) -> CliResult<()> {
+        // Route every form through the service layer (the handler runs the
+        // same domain flow: the existing-tag pre-check, the --force delete,
+        // the Release kind create).
+        if crate::commands::rpc::tag_create(self)? {
+            return Ok(());
+        }
+
         // Get the tag name
         let name = self
             .name

@@ -81,49 +81,57 @@ impl Record {
             .status(StatusOptions::default())
             .map_err(CliError::Repository)?;
 
-        let mut has_changes = false;
-
-        println!("Would record:");
-
-        for entry in status.entries() {
-            // Skip untracked unless --all
-            if matches!(entry.status(), FileStatus::Untracked) && !self.all {
-                continue;
-            }
-
-            // Skip clean files
-            if matches!(entry.status(), FileStatus::Clean) {
-                continue;
-            }
-
-            // Filter by specified files if any
-            if !self.files.is_empty() {
-                let path_str = entry.path().to_string_lossy();
-                if !self.files.iter().any(|f| path_str.contains(f)) {
-                    continue;
-                }
-            }
-
-            has_changes = true;
-            let status_desc = match entry.status() {
-                FileStatus::Added => "new file:",
-                FileStatus::Modified => "modified:",
-                FileStatus::Deleted => "deleted: ",
-                FileStatus::Untracked => "new file:",
-                FileStatus::TypeChanged => "typechange:",
-                FileStatus::PermissionsChanged => "permissions:",
-                FileStatus::Conflicted => "conflicted:",
-                FileStatus::Clean => continue,
-            };
-
-            println!("  {}  {}", status_desc, entry.path().to_string_lossy());
-        }
-
-        if !has_changes {
-            println!("  (no changes to record)");
-        }
-
+        let entries = status
+            .entries()
+            .iter()
+            .map(|entry| (entry.status(), entry.path().to_string_lossy().into_owned()))
+            .collect::<Vec<_>>();
+        render_dry_run(&entries, self.all, &self.files);
         Ok(())
+    }
+}
+
+/// The dry-run preview, pure over its inputs — the same lines the local
+/// body prints, shared with the routed path (the wire's Status entries
+/// drive it; the status vocabulary maps to the local descriptions).
+pub(crate) fn render_dry_run(entries: &[(FileStatus, String)], all: bool, files: &[String]) {
+    let mut has_changes = false;
+
+    println!("Would record:");
+
+    for (status, path) in entries {
+        // Skip untracked unless --all
+        if matches!(status, FileStatus::Untracked) && !all {
+            continue;
+        }
+
+        // Skip clean files
+        if matches!(status, FileStatus::Clean) {
+            continue;
+        }
+
+        // Filter by specified files if any
+        if !files.is_empty() && !files.iter().any(|f| path.contains(f)) {
+            continue;
+        }
+
+        has_changes = true;
+        let status_desc = match status {
+            FileStatus::Added => "new file:",
+            FileStatus::Modified => "modified:",
+            FileStatus::Deleted => "deleted: ",
+            FileStatus::Untracked => "new file:",
+            FileStatus::TypeChanged => "typechange:",
+            FileStatus::PermissionsChanged => "permissions:",
+            FileStatus::Conflicted => "conflicted:",
+            FileStatus::Clean => continue,
+        };
+
+        println!("  {}  {}", status_desc, path);
+    }
+
+    if !has_changes {
+        println!("  (no changes to record)");
     }
 }
 

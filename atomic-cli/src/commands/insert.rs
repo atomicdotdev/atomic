@@ -15,7 +15,7 @@ use atomic_repository::{
 };
 
 use crate::commands::complete::{complete_change_hashes, complete_view_names};
-use crate::commands::{format_hash, require_repository};
+use crate::commands::{find_repository_root, format_hash, require_repository};
 use crate::error::{CliError, CliResult};
 use crate::output;
 
@@ -51,23 +51,24 @@ pub struct Insert {
     /// into (default: current view). For the bare `atomic insert` promotion
     /// it overrides the target (default: the current view's parent).
     #[arg(long, visible_alias = "to", add = ArgValueCompleter::new(complete_view_names))]
-    view: Option<String>,
+    pub(crate) view: Option<String>,
 
-    /// Insert dependencies automatically.
-    #[arg(long, default_value = "true")]
-    deps: bool,
+    /// Insert dependencies automatically. Pass `--deps=false` to skip the
+    /// dependency closure (the explicit opt-out the wire carries).
+    #[arg(long, action = clap::ArgAction::Set, num_args = 0..=1, default_value = "true", default_missing_value = "true")]
+    pub(crate) deps: bool,
 
     /// Allow conflicts during insert.
     #[arg(long)]
-    allow_conflicts: bool,
+    pub(crate) allow_conflicts: bool,
 
     /// Preview the promotion without inserting anything.
     #[arg(short = 'n', long)]
-    dry_run: bool,
+    pub(crate) dry_run: bool,
 
     /// Skip the confirmation prompt when promoting between two shared views.
     #[arg(long)]
-    confirm: bool,
+    pub(crate) confirm: bool,
 
     /// Repository path.
     #[arg(short = 'R', long)]
@@ -109,8 +110,9 @@ pub struct ViewArgs {
     #[arg(long, visible_alias = "to", add = ArgValueCompleter::new(complete_view_names))]
     to_view: Option<String>,
 
-    /// Insert dependencies automatically.
-    #[arg(long, default_value = "true")]
+    /// Insert dependencies automatically. Pass `--deps=false` to skip the
+    /// dependency closure (the explicit opt-out the wire carries).
+    #[arg(long, action = clap::ArgAction::Set, num_args = 0..=1, default_value = "true", default_missing_value = "true")]
     deps: bool,
 
     /// Allow conflicts during insert.
@@ -137,8 +139,9 @@ pub struct TagArgs {
     #[arg(long, visible_alias = "to", add = ArgValueCompleter::new(complete_view_names))]
     to_view: Option<String>,
 
-    /// Insert dependencies automatically.
-    #[arg(long, default_value = "true")]
+    /// Insert dependencies automatically. Pass `--deps=false` to skip the
+    /// dependency closure (the explicit opt-out the wire carries).
+    #[arg(long, action = clap::ArgAction::Set, num_args = 0..=1, default_value = "true", default_missing_value = "true")]
     deps: bool,
 
     /// Allow conflicts during insert.
@@ -161,8 +164,9 @@ pub struct ChangeArgs {
     #[arg(long, visible_alias = "to", add = ArgValueCompleter::new(complete_view_names))]
     to_view: Option<String>,
 
-    /// Insert dependencies automatically.
-    #[arg(long, default_value = "true")]
+    /// Insert dependencies automatically. Pass `--deps=false` to skip the
+    /// dependency closure (the explicit opt-out the wire carries).
+    #[arg(long, action = clap::ArgAction::Set, num_args = 0..=1, default_value = "true", default_missing_value = "true")]
     deps: bool,
 
     /// Allow conflicts during insert.
@@ -190,22 +194,85 @@ pub struct PreviewArgs {
 
 impl crate::commands::Command for Insert {
     fn run(&self) -> CliResult<()> {
-        let repo_path = self.repository.as_ref().map(std::path::Path::new);
-        let repo = require_repository(repo_path)?;
+        // Route EVERY form through the service layer — BEFORE any local
+        // repository open (the routed path must never touch redb). The
+        // --deps escape hatch rides apply_dependencies (the handler
+        // applies or skips the closure server-side); the dry-run previews
+        // ride the request's dry_run flag (the handler computes the plan
+        // with the same domain call); the tag --from-view override rides
+        // tag_from_view; multi-pick references resolve handler-side with
+        // the resolver's semantics; the bare promotion resolves source
+        // and parent through the promote arm (the pre-flight read and the
+        // confirmed insert are the same RPC's two phases).
+        let route_ok = match &self.command {
+            Some(InsertSubcommand::View(args)) => crate::commands::rpc::insert_from_view(
+                &args.from_view,
+                args.to_view.clone(),
+                args.allow_conflicts,
+                args.deps,
+                args.dry_run,
+            )?,
+            Some(InsertSubcommand::Tag(args)) => crate::commands::rpc::insert_up_to_tag(
+                &args.tag_name,
+                args.from_view.clone(),
+                args.to_view.clone(),
+                args.allow_conflicts,
+                args.deps,
+                args.dry_run,
+            )?,
+            Some(InsertSubcommand::Change(args)) => crate::commands::rpc::insert_changes(
+                &args.changes,
+                args.to_view.clone(),
+                args.allow_conflicts,
+            )?,
+            None if self.change.is_some() => crate::commands::rpc::insert_single(
+                self.change.as_deref().expect("guarded above"),
+                self.view.clone(),
+                self.allow_conflicts,
+                self.deps,
+            )?,
+            None => crate::commands::rpc::insert_promote(self)?,
+            Some(InsertSubcommand::Preview(args)) => false, // dispatched below (a read)
+        };
+        if route_ok {
+            return Ok(());
+        }
 
+        // The fallback (an unreachable daemon / outside a repository)
+        // opens the repository LAZILY per arm; the bare promotion manages
+        // its own handles.
+        let repo_path = self.repository.as_ref().map(std::path::Path::new);
         match &self.command {
-            Some(InsertSubcommand::View(args)) => run_view_insert(&repo, args),
-            Some(InsertSubcommand::Tag(args)) => run_tag(&repo, args),
-            Some(InsertSubcommand::Change(args)) => run_change_insert(&repo, args),
-            Some(InsertSubcommand::Preview(args)) => run_preview(&repo, args),
+            Some(InsertSubcommand::View(args)) => {
+                run_view_insert(&require_repository(repo_path)?, args)
+            }
+            Some(InsertSubcommand::Tag(args)) => run_tag(&require_repository(repo_path)?, args),
+            Some(InsertSubcommand::Change(args)) => {
+                run_change_insert(&require_repository(repo_path)?, args)
+            }
+            Some(InsertSubcommand::Preview(args)) => {
+                // A read: route through the daemon when reachable (the
+                // current view resolves client-side).
+                if crate::commands::rpc::insert_preview(
+                    &args.from_view,
+                    args.to_view.clone(),
+                    args.up_to_tag.clone(),
+                )? {
+                    Ok(())
+                } else {
+                    run_preview(&require_repository(repo_path)?, args)
+                }
+            }
             None => {
                 if let Some(ref change_str) = self.change {
                     // Insert a single change into the current (or --view) view.
-                    run_single_insert(&repo, change_str, self)
+                    run_single_insert(&require_repository(repo_path)?, change_str, self)
                 } else {
                     // No change and no subcommand: promote the current view's
-                    // changes into its parent view.
-                    run_promote_to_parent(&repo, self)
+                    // changes into its parent view (the local fallback — the
+                    // routed path resolves source and parent through the
+                    // promote arm).
+                    run_promote_to_parent(&find_repository_root()?, self)
                 }
             }
         }
@@ -269,7 +336,19 @@ fn run_single_insert(repo: &Repository, change_str: &str, args: &Insert) -> CliR
 ///
 /// The working copy is intentionally NOT rematerialized: the target view is
 /// not checked out, so the current view's on-disk state is unchanged.
-fn run_promote_to_parent(repo: &Repository, args: &Insert) -> CliResult<()> {
+///
+/// The NOT-A-REPOSITORY FALLBACK: the routed path (`rpc::insert_promote`)
+/// resolves the source, the parent, the missing set, and the
+/// shared-to-shared gate through the promote arm server-side — this
+/// body runs only when the service layer is unreachable (outside a
+/// repository, where the root lookup below reports the same refusal
+/// without opening redb).
+fn run_promote_to_parent(repo_root: &std::path::Path, args: &Insert) -> CliResult<()> {
+    // The pre-flight reads through a READ-ONLY handle: it coexists with
+    // the daemon, so the routed path never collides on the redb lock.
+    let repo = Repository::open_readonly(repo_root).map_err(|e| CliError::InvalidRepository {
+        reason: e.to_string(),
+    })?;
     let source = repo.current_view().to_string();
     let source_info = repo
         .get_view_info(&source)
@@ -323,12 +402,7 @@ fn run_promote_to_parent(repo: &Repository, args: &Insert) -> CliResult<()> {
         println!();
         for (i, hash) in missing.iter().enumerate() {
             if let Ok(change) = repo.load_change(hash) {
-                let message = &change.hashed.header.message;
-                let short_msg = if message.len() > 50 {
-                    format!("{}...", &message[..47])
-                } else {
-                    message.to_string()
-                };
+                let short_msg = output::truncate_bytes(&change.hashed.header.message, 50);
                 println!("  {}. {} {}", i + 1, format_hash(hash, true), short_msg);
             } else {
                 println!("  {}. {}", i + 1, format_hash(hash, true));
@@ -366,6 +440,23 @@ fn run_promote_to_parent(repo: &Repository, args: &Insert) -> CliResult<()> {
         }
     }
 
+    // Release the read-only handle before routing (the daemon opens the
+    // repository for the insert).
+    drop(repo);
+    // The confirmed promotion routes through the daemon when reachable;
+    // the local path is the fallback. The --deps escape hatch rides the
+    // request's apply_dependencies.
+    if crate::commands::rpc::insert_from_view(
+        &source,
+        Some(target.clone()),
+        args.allow_conflicts,
+        args.deps,
+        false,
+    )? {
+        return Ok(());
+    }
+
+    let repo = Repository::open(repo_root).map_err(CliError::Repository)?;
     let options = CrossViewInsertOptions::new(&source, &target)
         .with_dependencies(args.deps)
         .allow_conflicts(args.allow_conflicts);
@@ -608,12 +699,7 @@ fn run_preview(repo: &Repository, args: &PreviewArgs) -> CliResult<()> {
         for (i, hash) in missing.iter().enumerate() {
             // Try to load change header for more info
             if let Ok(change) = repo.load_change(hash) {
-                let message = &change.hashed.header.message;
-                let short_msg = if message.len() > 50 {
-                    format!("{}...", &message[..47])
-                } else {
-                    message.to_string()
-                };
+                let short_msg = output::truncate_bytes(&change.hashed.header.message, 50);
                 println!("  {}. {} {}", i + 1, format_hash(hash, true), short_msg);
             } else {
                 println!("  {}. {}", i + 1, format_hash(hash, true));
@@ -659,7 +745,7 @@ fn parse_change_hash(repo: &Repository, hash_str: &str) -> CliResult<Hash> {
 }
 
 /// Print the outcome of a single insert operation.
-fn print_insert_outcome(
+pub(crate) fn print_insert_outcome(
     applied: &[Hash],
     new_state: atomic_core::types::Merkle,
     has_conflicts: bool,
@@ -688,33 +774,50 @@ fn print_conflict_summary(repo: &Repository) {
         Ok(c) => c,
         Err(_) => return,
     };
-    if conflicts.is_empty() {
+    let entries = conflicts
+        .iter()
+        .map(|(path, records)| ConflictSummaryEntry {
+            path: path.clone(),
+            line: records.first().and_then(|c| c.line),
+        })
+        .collect::<Vec<_>>();
+    print_conflict_summary_entries(&entries);
+}
+
+/// One still-conflicted file for the inline summary: the path plus the
+/// first record's line — the two things the summary line prints (the
+/// wire carries exactly these).
+pub(crate) struct ConflictSummaryEntry {
+    pub path: String,
+    pub line: Option<u32>,
+}
+
+/// The inline conflicted-file listing over however the caller obtained
+/// the entries (the local repository read, or the wire's conflict
+/// listing) — one render, byte-identical by construction.
+pub(crate) fn print_conflict_summary_entries(entries: &[ConflictSummaryEntry]) {
+    if entries.is_empty() {
         return;
     }
     println!();
-    let file_word = if conflicts.len() == 1 {
-        "file"
-    } else {
-        "files"
-    };
+    let file_word = if entries.len() == 1 { "file" } else { "files" };
     output::print_warning(&format!(
         "{} conflicted {} — resolve markers, then record:",
-        conflicts.len(),
+        entries.len(),
         file_word
     ));
-    for (path, records) in &conflicts {
-        let where_ = records
-            .first()
-            .and_then(|c| c.line)
+    for entry in entries {
+        let where_ = entry
+            .line
             .map(|l| format!(" (line {})", l))
             .unwrap_or_default();
-        println!("    {}{}", path, where_);
+        println!("    {}{}", entry.path, where_);
     }
     output::print_hint("See 'atomic conflicts' for details.");
 }
 
 /// Print the outcome of a cross-view insert operation.
-fn print_cross_view_outcome(outcome: &CrossViewInsertOutcome, dry_run: bool) {
+pub(crate) fn print_cross_view_outcome(outcome: &CrossViewInsertOutcome, dry_run: bool) {
     println!();
 
     if dry_run {

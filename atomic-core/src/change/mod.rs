@@ -102,6 +102,7 @@ pub mod ops;
 mod provenance;
 pub mod provenance_graph;
 pub mod session;
+pub mod signing;
 mod store;
 
 // Re-export all public types

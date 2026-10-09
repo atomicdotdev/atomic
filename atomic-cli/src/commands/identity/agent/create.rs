@@ -188,6 +188,12 @@ impl Create {
             ))
         })?;
         let certificate = cert::mint(&delegator, &delegator_keypair, &terms);
+        // Admitted before anything is persisted, so a refusal leaves no agent
+        // identity behind without the certificate that was meant to cover it.
+        let document =
+            cert::encode_for_storage(&certificate).map_err(|e| CliError::InvalidArgument {
+                message: format!("this grant would be refused when it is read back: {e}"),
+            })?;
 
         // 5. Persist. The identity and its key first — a certificate naming a
         //    key that was never stored is worse than no certificate.
@@ -195,9 +201,6 @@ impl Create {
             .save_with_keypair(&agent, &keypair, None)
             .map_err(|e| CliError::Internal(anyhow::anyhow!("Failed to save identity: {e}")))?;
 
-        let document = serde_json::to_string_pretty(&certificate).map_err(|e| {
-            CliError::Internal(anyhow::anyhow!("Failed to encode certificate: {e}"))
-        })?;
         let delegation_id = terms.id.to_base32();
         store
             .save_delegation(&delegation_id, &document)

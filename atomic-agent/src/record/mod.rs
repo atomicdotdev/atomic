@@ -71,7 +71,6 @@ use atomic_core::types::Base32;
 use atomic_repository::status::RepositoryStatus;
 
 use crate::error::{AgentError, AgentResult};
-use crate::identity::build_agent_author;
 use crate::transcript;
 
 // Re-export primary types
@@ -99,12 +98,13 @@ fn build_turn_header(
 ) -> ChangeHeader {
     let message = build_turn_message(options, status, untracked_paths);
 
-    let author = build_agent_author(
-        &options.session.agent_name,
-        &options.session.agent_display_name,
-        &options.session.session_id,
-        options.agent_identity.as_deref(),
-    );
+    let author = crate::identity::resolve_agent_author(&crate::identity::AgentAuthorOptions {
+        agent_name: &options.session.agent_name,
+        agent_display_name: &options.session.agent_display_name,
+        session_id: &options.session.session_id,
+        identity_dir: options.identity_dir.clone(),
+        agent_identity: options.agent_identity.clone(),
+    });
 
     ChangeHeader::builder()
         .message(message)
@@ -421,6 +421,23 @@ pub fn record_turn(
 
     if manifest.is_some() {
         record_options = record_options.with_all(false).paths(status_files.clone());
+    }
+
+    // Sign the turn with the identity whose public key the header claims:
+    // the selected agent identity when one is in force, else the default
+    // identity behind the plus-tag. `None` records unsigned (legacy
+    // behavior) — and never fails the turn.
+    match crate::identity::resolve_turn_signer(
+        options.agent_identity.as_deref(),
+        options.identity_dir.as_deref(),
+    ) {
+        Some(signing) => {
+            log::debug!("Signing turn as {}", signing.signer_did);
+            record_options = record_options.with_signing_identity(signing);
+        }
+        None => {
+            log::debug!("Recording turn unsigned: no signing identity resolved");
+        }
     }
 
     let mut outcome = match repo.record(header, record_options) {

@@ -72,7 +72,7 @@ impl Diff {
     /// single parseable document rather than a rendered diff it has to
     /// re-parse. `change` is `Some` for `atomic diff -c <hash>`; `view` is
     /// populated only for working-copy diffs.
-    pub(super) fn render(
+    pub(crate) fn render(
         &self,
         file_diffs: &[FileDiff],
         stats: &DiffStats,
@@ -109,7 +109,7 @@ impl Diff {
     /// dead end for someone who typed `atomic diff` expecting to see a
     /// change. Naming a real, copy-pasteable `-c` command for the most
     /// recent changes on this view turns the dead end into a next step.
-    pub(super) fn print_no_pending_changes(&self, repo: &Repository, view: &str) {
+    pub(crate) fn print_no_pending_changes(&self, repo: &Repository, view: &str) {
         if self.json {
             let _ = json::print_json(&json::JsonDiff::empty(Some(view)));
             return;
@@ -185,7 +185,7 @@ impl Diff {
     /// Returns `true` when no files were specified (no filtering) or when
     /// the path exactly matches one of the given files. A leading `./` on
     /// either side is tolerated.
-    pub(super) fn file_matches_filter(&self, path: &str) -> bool {
+    pub(crate) fn file_matches_filter(&self, path: &str) -> bool {
         if self.files.is_empty() {
             return true;
         }
@@ -200,7 +200,7 @@ impl Diff {
     /// line, rebuilding the aggregate stats from the surviving entries.
     ///
     /// This is a no-op when no positional files were specified.
-    pub(super) fn filter_file_diffs(
+    pub(crate) fn filter_file_diffs(
         &self,
         file_diffs: Vec<FileDiff>,
         stats: DiffStats,
@@ -453,7 +453,11 @@ impl Diff {
         self.print_change_file_diffs(change, change_hash, config, file_diffs, stats)
     }
 
-    fn print_change_file_diffs(
+    /// Render a recorded change's computed file diffs — the header for the
+    /// human unified form, then the configured format. Shared by the local
+    /// `-c` body and the service-layer hook (one render, two data sources:
+    /// the file diffs arrive from the graph or the wire).
+    pub(crate) fn print_change_file_diffs(
         &self,
         change: &Change,
         change_hash: &Hash,
@@ -512,7 +516,7 @@ impl Diff {
             .is_some()
     }
 
-    pub(super) fn build_git_import_file_diffs(
+    pub(crate) fn build_git_import_file_diffs(
         change: &Change,
     ) -> Option<(Vec<FileDiff>, DiffStats)> {
         let diff_files_value = change
@@ -767,99 +771,23 @@ impl Diff {
         // Parse algorithm for diffing
         let algorithm = self.parse_algorithm()?;
 
-        // Compute diffs for each file using state-based content retrieval
-        let mut file_diffs = Vec::new();
-        let mut stats = DiffStats::new();
-
+        // Compute the per-file before/after content from the graph, then
+        // build the diffs with the SAME builder the routed path runs over
+        // wire-carried content (one computation, two data sources).
+        let mut entries = Vec::with_capacity(modified_files.len());
         for file_path in &modified_files {
-            // Get content BEFORE the change was applied
             let before_content = match repo.get_file_content_before_change(file_path, hash) {
                 Ok(content) => content.unwrap_or_default(),
                 Err(_) => Vec::new(),
             };
-
-            // Get content AFTER the change was applied
             let after_content = match repo.get_file_content_after_change(file_path, hash) {
                 Ok(content) => content.unwrap_or_default(),
                 Err(_) => Vec::new(),
             };
-
-            // Determine the type of change based on before/after content
-            let file_diff = match (before_content.is_empty(), after_content.is_empty()) {
-                // File was added (no content before, has content after)
-                (true, false) => {
-                    let mut diff = FileDiff::added(file_path);
-                    let lines: Vec<_> = after_content.split(|&b| b == b'\n').collect();
-                    let line_count = lines.len();
-
-                    if !after_content.is_empty() {
-                        let mut graph_op = DiffHunk::new(0, 0, 1, line_count);
-                        for (i, line_bytes) in lines.iter().enumerate() {
-                            let line_content = String::from_utf8_lossy(line_bytes).into_owned();
-                            graph_op.add_line(HunkLine::added(line_content, i + 1));
-                        }
-                        diff.add_hunk(graph_op);
-                    }
-
-                    diff.stats = FileDiffStats::added(file_path, line_count);
-                    diff
-                }
-
-                // File was deleted (has content before, no content after)
-                (false, true) => {
-                    let mut diff = FileDiff::deleted(file_path);
-                    let lines: Vec<_> = before_content.split(|&b| b == b'\n').collect();
-                    let line_count = lines.len();
-
-                    if !before_content.is_empty() {
-                        let mut graph_op = DiffHunk::new(1, line_count, 0, 0);
-                        for (i, line_bytes) in lines.iter().enumerate() {
-                            let line_content = String::from_utf8_lossy(line_bytes).into_owned();
-                            graph_op.add_line(HunkLine::removed(line_content, i + 1));
-                        }
-                        diff.add_hunk(graph_op);
-                    }
-
-                    diff.stats = FileDiffStats::deleted(file_path, line_count);
-                    diff
-                }
-
-                // File was modified (has content both before and after)
-                (false, false) => {
-                    let mut diff = FileDiff::modified(file_path);
-
-                    // Compute diff between old (before) and new (after) content
-                    let diff_result = diff_text(&before_content, &after_content, algorithm);
-
-                    if !diff_result.is_unchanged() {
-                        let old_lines: Vec<_> = before_content.split(|&b| b == b'\n').collect();
-                        let new_lines: Vec<_> = after_content.split(|&b| b == b'\n').collect();
-
-                        // Build hunks with context
-                        let hunks = build_hunks_from_diff(
-                            &diff_result,
-                            &old_lines,
-                            &new_lines,
-                            config.context_lines,
-                        );
-                        for graph_op in hunks {
-                            diff.add_hunk(graph_op);
-                        }
-                    }
-
-                    diff.compute_stats();
-                    diff
-                }
-
-                // No content at all (shouldn't happen for files in change)
-                (true, true) => {
-                    continue; // Skip files with no content
-                }
-            };
-
-            stats.add_file(file_diff.stats.clone());
-            file_diffs.push(file_diff);
+            entries.push((file_path.clone(), before_content, after_content));
         }
+        let (file_diffs, stats) =
+            legacy_content_file_diffs(&entries, algorithm, config.context_lines);
 
         if file_diffs.is_empty() {
             self.print_no_changes();
@@ -995,6 +923,119 @@ pub(crate) fn change_file_diffs(
     change_hash: &Hash,
     config: &DiffOutputConfig,
 ) -> CliResult<(Vec<FileDiff>, DiffStats)> {
+    // The before-content fetch: the file's recorded state prior to the
+    // change, read from the graph. The wire path has no such fetch — it
+    // passes a `None` resolver and the hunks render zero-context, the
+    // same degradation this path applies when the read fails.
+    change_file_diffs_with(change, config, |path| {
+        repo.get_file_content_before_change(path, change_hash)
+            .ok()
+            .flatten()
+    })
+}
+
+/// Build the legacy (no-file_ops) change's file diffs from per-file
+/// before/after content — the computation `atomic diff -c` runs for
+/// legacy changes, factored out so the local body (graph-read content)
+/// and the routed hook (wire-carried content) run the SAME code:
+/// added (no before), deleted (no after), or modified (diffed with the
+/// configured algorithm and context).
+pub(crate) fn legacy_content_file_diffs(
+    entries: &[(String, Vec<u8>, Vec<u8>)],
+    algorithm: Algorithm,
+    context_lines: usize,
+) -> (Vec<FileDiff>, DiffStats) {
+    let mut file_diffs = Vec::new();
+    let mut stats = DiffStats::new();
+
+    for (file_path, before_content, after_content) in entries {
+        // Determine the type of change based on before/after content
+        let file_diff = match (before_content.is_empty(), after_content.is_empty()) {
+            // File was added (no content before, has content after)
+            (true, false) => {
+                let mut diff = FileDiff::added(file_path);
+                let lines: Vec<_> = after_content.split(|&b| b == b'\n').collect();
+                let line_count = lines.len();
+
+                if !after_content.is_empty() {
+                    let mut graph_op = DiffHunk::new(0, 0, 1, line_count);
+                    for (i, line_bytes) in lines.iter().enumerate() {
+                        let line_content = String::from_utf8_lossy(line_bytes).into_owned();
+                        graph_op.add_line(HunkLine::added(line_content, i + 1));
+                    }
+                    diff.add_hunk(graph_op);
+                }
+
+                diff.stats = FileDiffStats::added(file_path, line_count);
+                diff
+            }
+
+            // File was deleted (has content before, no content after)
+            (false, true) => {
+                let mut diff = FileDiff::deleted(file_path);
+                let lines: Vec<_> = before_content.split(|&b| b == b'\n').collect();
+                let line_count = lines.len();
+
+                if !before_content.is_empty() {
+                    let mut graph_op = DiffHunk::new(1, line_count, 0, 0);
+                    for (i, line_bytes) in lines.iter().enumerate() {
+                        let line_content = String::from_utf8_lossy(line_bytes).into_owned();
+                        graph_op.add_line(HunkLine::removed(line_content, i + 1));
+                    }
+                    diff.add_hunk(graph_op);
+                }
+
+                diff.stats = FileDiffStats::deleted(file_path, line_count);
+                diff
+            }
+
+            // File was modified (has content both before and after)
+            (false, false) => {
+                let mut diff = FileDiff::modified(file_path);
+
+                // Compute diff between old (before) and new (after) content
+                let diff_result = diff_text(before_content, after_content, algorithm);
+
+                if !diff_result.is_unchanged() {
+                    let old_lines: Vec<_> = before_content.split(|&b| b == b'\n').collect();
+                    let new_lines: Vec<_> = after_content.split(|&b| b == b'\n').collect();
+
+                    // Build hunks with context
+                    let hunks =
+                        build_hunks_from_diff(&diff_result, &old_lines, &new_lines, context_lines);
+                    for graph_op in hunks {
+                        diff.add_hunk(graph_op);
+                    }
+                }
+
+                diff.compute_stats();
+                diff
+            }
+
+            // No content at all (shouldn't happen for files in change)
+            (true, true) => {
+                continue; // Skip files with no content
+            }
+        };
+
+        stats.add_file(file_diff.stats.clone());
+        file_diffs.push(file_diff);
+    }
+
+    (file_diffs, stats)
+}
+
+/// The resolver-parameterized core of [`change_file_diffs`]: `before`
+/// supplies a file's pre-change content for context padding (a `None`
+/// answer pads nothing — zero-context hunks, still at true offsets).
+pub(crate) fn change_file_diffs_with<F>(
+    change: &Change,
+    config: &DiffOutputConfig,
+    before: F,
+) -> CliResult<(Vec<FileDiff>, DiffStats)>
+where
+    F: Fn(&str) -> Option<Vec<u8>>,
+{
     // Git-imported changes carry Git's captured +/- lines in unhashed metadata.
     if let Some((file_diffs, stats)) = Diff::build_git_import_file_diffs(change) {
         return Ok((file_diffs, stats));
@@ -1099,17 +1140,13 @@ pub(crate) fn change_file_diffs(
             }
         }
 
-        // Fetch the file's recorded before-content so hunks can be padded with
+        // Fetch the file's before-content so hunks can be padded with
         // context lines. Only needed for unified output with a non-zero
-        // --context; failures degrade to zero context.
+        // --context; a `None` answer degrades to zero context.
         let before_lines: Option<Vec<Vec<u8>>> =
             if config.format == DiffFormat::Unified && config.context_lines > 0 {
-                match repo.get_file_content_before_change(file_path, change_hash) {
-                    Ok(Some(content)) => {
-                        Some(content.split(|&b| b == b'\n').map(|l| l.to_vec()).collect())
-                    }
-                    _ => None,
-                }
+                before(file_path)
+                    .map(|content| content.split(|&b| b == b'\n').map(|l| l.to_vec()).collect())
             } else {
                 None
             };

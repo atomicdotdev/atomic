@@ -652,7 +652,7 @@ impl TurnOrchestrator {
         let ledger = {
             let repository = atomic_repository::Repository::open_readonly_wait(
                 &self.repo_root,
-                std::time::Duration::from_secs(10),
+                super::wait_budget::database_wait(),
             )
             .map_err(|error| AgentError::ProvenanceJournalFailed {
                 session_id: session_id.to_string(),
@@ -822,20 +822,24 @@ impl TurnOrchestrator {
                 }
             };
 
-        let repository = atomic_repository::Repository::open_existing_wait(
-            &self.repo_root,
-            std::time::Duration::from_secs(10),
-        )
-        .map_err(|error| AgentError::ProvenanceJournalFailed {
-            session_id: session_id.to_string(),
-            reason: error.to_string(),
-        })?;
-        let publication = repository
-            .publish_provenance_checkpoint(&graph, session_turn)
+        // The owner opens the same database file to record the acknowledgement,
+        // so this handle must be closed before calling it.
+        let publication = {
+            let repository = atomic_repository::Repository::open_existing_wait(
+                &self.repo_root,
+                super::wait_budget::database_wait(),
+            )
             .map_err(|error| AgentError::ProvenanceJournalFailed {
                 session_id: session_id.to_string(),
                 reason: error.to_string(),
             })?;
+            repository
+                .publish_provenance_checkpoint(&graph, session_turn)
+                .map_err(|error| AgentError::ProvenanceJournalFailed {
+                    session_id: session_id.to_string(),
+                    reason: error.to_string(),
+                })?
+        };
         sink.acknowledge_checkpoint(
             &checkpoint,
             publication.manifest_hash,

@@ -29,6 +29,10 @@ pub struct MemoryVerify {
 
 impl Command for MemoryVerify {
     fn run(&self) -> CliResult<()> {
+        if crate::commands::rpc::memory_verify(self)? {
+            return Ok(());
+        }
+
         let root = find_repository_root()?;
         let repo = Repository::open(&root).map_err(CliError::Repository)?;
 

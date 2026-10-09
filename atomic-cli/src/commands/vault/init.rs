@@ -25,6 +25,12 @@ pub struct Init;
 
 impl Command for Init {
     fn run(&self) -> CliResult<()> {
+        // Route every form through the service layer: vault init operates
+        // inside an EXISTING repository (it requires one), so it routes
+        // normally via the daemon (the handler runs the exact local flow).
+        if crate::commands::rpc::vault_init()? {
+            return Ok(());
+        }
         let root = find_repository_root()?;
         let mut repo = Repository::open(&root).map_err(|e| CliError::InvalidRepository {
             reason: e.to_string(),

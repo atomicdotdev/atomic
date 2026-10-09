@@ -145,9 +145,10 @@ impl Renew {
         })?;
         let certificate = cert::mint(&delegator, &keypair, &terms);
 
-        let document = serde_json::to_string_pretty(&certificate).map_err(|e| {
-            CliError::Internal(anyhow::anyhow!("Failed to encode certificate: {e}"))
-        })?;
+        let document =
+            cert::encode_for_storage(&certificate).map_err(|e| CliError::InvalidArgument {
+                message: format!("this grant would be refused when it is read back: {e}"),
+            })?;
         store
             .save_delegation(&terms.id.to_base32(), &document)
             .map_err(|e| CliError::Internal(anyhow::anyhow!("Failed to store certificate: {e}")))?;

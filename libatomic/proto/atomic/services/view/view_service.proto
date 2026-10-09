@@ -1,0 +1,71 @@
+// atomic-protocol — ViewService definition (the RPC contract).
+// DRAFT — add-only. Messages for this service live in
+// atomic/services/view/view_messages.proto · shared primitives in atomic/common/.
+
+syntax = "proto3";
+
+package atomic;
+
+import "atomic/common/options.proto";
+import "atomic/services/view/view_messages.proto";
+
+service ViewService {
+  // `atomic view list [-v]` (+ remote listing via RepositoryRef.authority —
+  // the SAME method serves local daemon and hosted server; routing is
+  // explicit in the ref, per RFC D7).
+  rpc ListViews(ListViewsRequest) returns (ListViewsResponse) {
+    option (atomic.execution_scope) = EXECUTION_SCOPE_BOTH;
+    option (atomic.required_capability) = "repository.read";
+    option (atomic.allowed_caller) = CALLER_CLASS_LOCAL;
+    option (atomic.allowed_caller) = CALLER_CLASS_REMOTE_IDENTITY;
+    option (atomic.effect) = RPC_EFFECT_REPOSITORY_READ;
+  }
+  // Repository-only creation; CLI split --switch composes SwitchView.
+  rpc CreateView(CreateViewRequest) returns (CreateViewResponse) {
+    option (atomic.execution_scope) = EXECUTION_SCOPE_BOTH;
+    option (atomic.required_capability) = "view.create";
+    option (atomic.allowed_caller) = CALLER_CLASS_LOCAL;
+    option (atomic.allowed_caller) = CALLER_CLASS_REMOTE_IDENTITY;
+    option (atomic.effect) = RPC_EFFECT_REPOSITORY_WRITE;
+  }
+  // `atomic view switch` — the working copy follows.
+  rpc SwitchView(SwitchViewRequest) returns (SwitchViewResponse) {
+    option (atomic.execution_scope) = EXECUTION_SCOPE_LOCAL;
+    option (atomic.required_capability) = "view.switch";
+    option (atomic.required_capability) = "working-copy.write";
+    option (atomic.allowed_caller) = CALLER_CLASS_LOCAL;
+    option (atomic.effect) = RPC_EFFECT_REPOSITORY_WRITE;
+    option (atomic.effect) = RPC_EFFECT_WORKSPACE_WRITE;
+  }
+  // `atomic view delete`
+  rpc DeleteView(DeleteViewRequest) returns (DeleteViewResponse) {
+    option (atomic.execution_scope) = EXECUTION_SCOPE_BOTH;
+    option (atomic.required_capability) = "view.delete";
+    option (atomic.allowed_caller) = CALLER_CLASS_LOCAL;
+    option (atomic.allowed_caller) = CALLER_CLASS_REMOTE_IDENTITY;
+    option (atomic.effect) = RPC_EFFECT_REPOSITORY_WRITE;
+    option (atomic.effect) = RPC_EFFECT_DAEMON_WRITE; // revoke bound sandbox grants
+  }
+  // `atomic view promote` — set a view's scope to Shared with no parent
+  // (RFC's `view:promote` capability). Not a change-insertion op.
+  rpc SetViewScope(SetViewScopeRequest) returns (SetViewScopeResponse) {
+    option (atomic.execution_scope) = EXECUTION_SCOPE_BOTH;
+    option (atomic.required_capability) = "view.promote";
+    option (atomic.allowed_caller) = CALLER_CLASS_LOCAL;
+    option (atomic.allowed_caller) = CALLER_CLASS_REMOTE_IDENTITY;
+    option (atomic.effect) = RPC_EFFECT_REPOSITORY_WRITE;
+  }
+  // `atomic view split` — fork a draft AND remove the chosen changes from
+  // the source under a reverse-dependency guard, atomically (add-only;
+  // supersedes the old "split = CreateView composition" mapping, which
+  // could not remove from the source or enforce the guard).
+  rpc SplitView(SplitViewRequest) returns (SplitViewResponse) {
+    option (atomic.execution_scope) = EXECUTION_SCOPE_LOCAL;
+    option (atomic.required_capability) = "view.create";
+    option (atomic.required_capability) = "view.write";
+    option (atomic.required_capability) = "working-copy.write";
+    option (atomic.allowed_caller) = CALLER_CLASS_LOCAL;
+    option (atomic.effect) = RPC_EFFECT_REPOSITORY_WRITE;
+    option (atomic.effect) = RPC_EFFECT_WORKSPACE_WRITE; // materialize reconcile
+  }
+}
