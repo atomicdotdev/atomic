@@ -1125,7 +1125,9 @@ impl Repository {
 
 #[cfg(test)]
 mod tests {
-    use super::{forbidden_path, sandbox_entry_parent, sandbox_entry_path, write_sandbox_entry};
+    use super::{forbidden_path, sandbox_entry_path, write_sandbox_entry};
+    #[cfg(unix)]
+    use super::sandbox_entry_parent;
     use crate::{ViewEntryKind, DOT_DIR, SANDBOX_CACHE_DIR, SANDBOX_POINTER};
 
     /// A path off the wire only ever resolves inside the tree, and never
