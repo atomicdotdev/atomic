@@ -41,48 +41,91 @@ atomic agent enable
 #   - Provenance graph (why the agent made each decision)
 ```
 
-### Repository owner locks and connection recovery
+### Repository access through libatomic
 
-Agent hooks are short-lived processes, while redb permits only one process at a time to open a database file. Atomic therefore starts one long-lived **database owner per canonical repository**. Hooks send committed provenance requests to that owner instead of opening the repository's provenance journal directly. The journal lives in the repository database, `.atomic/atomic.redb`, alongside the graph, so the owner opens that file only while it serves a request and leaves it free for other `atomic` commands in between.
+CLI repository operations, including agent provenance recording, use the
+libatomic service handlers. The default mode (`ATOMIC_SERVICE=local`) runs
+those handlers inside the CLI process, without starting a background owner
+or creating a socket. Graph, views, sessions, vault, and the provenance journal
+share `.atomic/atomic.redb`.
 
-Each repository has an independent ownership namespace:
+With `ATOMIC_SERVICE=reactor`, the CLI calls the same handlers through the
+separate `atomicd` service over a Unix socket. Reactor mode still requires its
+socket and does not fall back to local execution if the service is unavailable.
+`ATOMIC_RPC=1` is the legacy alias for Reactor mode; an explicit
+`ATOMIC_SERVICE=local` or `reactor` takes precedence. Use the same mode for
+commands accessing a repository; do not mix local access with an active Reactor
+service accessing that repository.
 
-| Resource | Location | Purpose |
-|---|---|---|
-| repository database | `.atomic/atomic.redb` | Graph, views, sessions, vault, and the provenance journal with its checkpoint state |
-| owner election lock | `.atomic/changes-owner.lock` | OS-backed authority deciding which process may own that database |
-| Unix endpoint | `/tmp/atomic-owner-<repository-digest>.sock` | Local IPC transport on macOS and Linux |
-| Windows endpoint | `\\.\pipe\atomic-owner-<repository-digest>` | Local IPC transport on Windows |
+The old per-repository `atomic agent database-owner` command, its
+`changes-owner.lock` election, and its `/tmp/atomic-owner-*.sock` endpoints
+have been removed from the current CLI. Processes started by an older binary
+can still be running after an upgrade. Stop them using the steps below.
 
-These runtime resources do **not** require `sudo`. The owner process runs as the current user: it creates the repository lock and database under the user-writable `.atomic` directory and creates its Unix socket in `/tmp`, which is a shared, sticky-bit-protected runtime directory. Elevated privileges are only needed when installing or replacing the `atomic` executable in a system-owned prefix such as `/usr/local/bin`; they are unrelated to socket creation or owner election.
+### Upgrading from legacy database owners (0.19.1 and earlier)
 
-The endpoint digest is derived from the canonical `.atomic` path and uses 96 bits of BLAKE3 output. Different project paths therefore get different owners, locks, databases, and endpoints. Multiple agents working in one project intentionally share that project's owner; agents working in other projects use different owners and proceed independently. Agent sandboxes and symlinked paths resolve back to the canonical repository, so they share its owner rather than creating competing databases. A clone at a different path gets its own owner.
+Replacing the executable does not stop existing processes. Before upgrading,
+pause agent hooks and let active Atomic commands finish. Keep hooks paused
+through cleanup and installation. These macOS/Linux steps also work when you
+cannot locate the original repository, including test or workshop repositories
+created under `/tmp`.
 
-```text
-Agent A ─┐                         Agent C ─┐
-Agent B ─┴─> Project 1 owner       Agent D ─┴─> Project 2 owner
-                 │                                  │
-                 v                                  v
-       Project 1 atomic.redb              Project 2 atomic.redb
+List Atomic processes belonging to your user:
+
+```sh
+pgrep -u "$(id -u)" -x atomic
 ```
 
-The **lock is the authority; the socket or named pipe is only transport**. The lock file may remain on disk after normal operation, but an unlocked file does not block a new owner. If an owner crashes, the OS releases its lock automatically. Recovery then proceeds as follows:
+Once active work has finished, stop those processes with SIGTERM:
 
-1. A hook cannot reach the old endpoint and starts or reconnects to an owner.
-2. Owner candidates race for that repository's `changes-owner.lock`.
-3. Only the lock winner serves provenance requests against `atomic.redb`.
-4. On Unix, the winner removes any stale socket left by the dead owner and binds a fresh endpoint.
-5. The hook retries with the same request/event ID, so a request committed before the crash is acknowledged once rather than applied twice.
+```sh
+pkill -TERM -u "$(id -u)" -x atomic
+```
 
-Repositories created before `atomic.redb` kept graph state in `.atomic/pristine.redb` and the journal in `.atomic/changes.redb`. The first open by a newer `atomic` merges both into `atomic.redb`, verifies every table against its source, and moves the old files to `.atomic/legacy/<timestamp>/`. If an owner started by an older `atomic` still holds `changes.redb`, run `atomic agent database-owner shutdown` in that repository first.
+This stops all processes named exactly `atomic` belonging to your user, across
+repositories and versions. It does not match `atomicd` or another user's
+processes. Coordinate with other users if their old processes are also running.
+If you know the repository and still have the old executable, you can instead
+request its owner's shutdown with that executable:
 
-Within one repository, redb write transactions are serialized by design, while reads and independent repositories can proceed concurrently. Startup, reconnect, and retry loops are bounded so a broken owner fails instead of hanging hooks indefinitely. Checkpoint attempts, event cutoffs, and fencing generations let interrupted turns resume without rewriting completed session turns.
+```sh
+/path/to/old/atomic agent database-owner shutdown --repository /path/to/repo
+```
 
-Current operational considerations:
+Check again and wait until no matching processes remain:
 
-- Owners remain alive until explicitly shut down; an idle timeout or user-level owner registry is a future resource-management improvement for machines that touch many repositories.
-- Unix endpoints use `/tmp` to stay below macOS Unix-socket path limits. A future hardening step should move them into a user-private runtime directory where available, enforce restrictive socket permissions, and validate peer credentials.
-- A 96-bit endpoint digest makes accidental cross-project collisions extraordinarily unlikely, but the repository-local lock remains the final ownership check.
+```sh
+pgrep -u "$(id -u)" -x atomic
+```
+
+No output with exit status 1 means no matches; other errors need investigation.
+Do not continue while PIDs are still listed. `pkill` also returns 1 if there
+were no matching processes.
+
+After the old processes have exited, list leftover legacy sockets owned by
+your user:
+
+```sh
+find /tmp/ -maxdepth 1 -type s -user "$(id -un)" -name 'atomic-owner-*.sock' -print
+```
+
+Then remove those leftover sockets:
+
+```sh
+find /tmp/ -maxdepth 1 -type s -user "$(id -un)" -name 'atomic-owner-*.sock' -exec rm {} +
+```
+
+Socket removal does not stop a running owner or release its database lock.
+Leave `.atomic/changes-owner.lock` and database files in place; the OS releases
+process locks when the owner exits. These commands only remove legacy socket
+files, not Reactor's `atomicd.sock`. Run them as your normal user, without `sudo`.
+
+Now rerun your installer and check `atomic --version` before resuming hooks.
+For repositories using `.atomic/pristine.redb` and `.atomic/changes.redb`, the
+first open by the newer CLI merges them into `.atomic/atomic.redb`, verifies
+the copied tables, and archives the old files under `.atomic/legacy/<timestamp>/`.
+If you already replaced the binary, the process-stop and socket-cleanup steps
+still apply; the new CLI no longer has the old `database-owner shutdown` command.
 
 ### Reclaiming unused database space
 
@@ -445,6 +488,8 @@ Full documentation at **[docs.atomic.dev](https://docs.atomic.dev/)**.
 
 ## Building
 
+If replacing an older binary, first follow [the legacy upgrade steps](#upgrading-from-legacy-database-owners-0191-and-earlier).
+
 ```bash
 # Build all crates
 cargo build --release
@@ -476,7 +521,7 @@ sudo chmod 0755 /usr/local/bin/atomic
 /usr/local/bin/atomic --version
 ```
 
-Do not run normal Atomic commands or the database owner with `sudo`. Repository state, owner locks, and `/tmp/atomic-owner-*.sock` endpoints should remain owned by the user running Atomic.
+Do not run normal Atomic commands or legacy cleanup with `sudo`; repository state and runtime files should remain owned by the user running Atomic.
 
 ## Project Structure
 
