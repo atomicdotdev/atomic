@@ -114,6 +114,10 @@ message GetChangeResponse {
   // set include_file_contents: each touched file's bytes before and after
   // the change, as the graph holds them.
   repeated ChangeFileContent file_contents = 9;
+  // Stored identities of provenance_ledger, in the same order and with the
+  // same length. Carry the original hashes: reserializing a graph upgraded
+  // from an older storage schema may produce a different content hash.
+  repeated Hash provenance_ledger_hashes = 10;
 }
 // One file's content around a change (add-only): what the graph
 // reconstruction reads server-side for `diff -c` (the legacy

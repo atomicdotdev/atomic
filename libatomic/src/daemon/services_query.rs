@@ -301,13 +301,16 @@ pub async fn get_change_impl(
             .find_provenance_for_change(&hash)
             .map_err(|error| domain_status(ErrorCode::Repository, error.to_string()))?
             .into_iter()
-            .map(|(_graph_hash, graph)| {
+            .map(|(graph_hash, graph)| {
                 let payload = serde_json::to_vec(&graph)
                     .map_err(|error| domain_status(ErrorCode::Internal, error.to_string()))?;
-                Ok::<VersionedBytes, Status>(VersionedBytes {
-                    schema: "atomic.prov.graph.v1".to_string(),
-                    payload,
-                })
+                Ok::<_, Status>((
+                    hash_proto(&graph_hash),
+                    VersionedBytes {
+                        schema: "atomic.prov.graph.v1".to_string(),
+                        payload,
+                    },
+                ))
             })
             .collect::<Result<Vec<_>, _>>()?;
         // Per-file content reconstruction (`diff -c`): each touched
@@ -348,6 +351,7 @@ pub async fn get_change_impl(
     .map_err(|error| Status::internal(error.to_string()))??;
 
     let (change, hash, sequence, change_bundle, provenance_ledger, file_contents) = change;
+    let (provenance_ledger_hashes, provenance_ledger) = provenance_ledger.into_iter().unzip();
     let header = &change.hashed.header;
     Ok(Response::new(GetChangeResponse {
         change: Some(ChangeInfo {
@@ -380,6 +384,7 @@ pub async fn get_change_impl(
         content_chunks: None,
         change_bundle,
         provenance_ledger,
+        provenance_ledger_hashes,
         sequence,
         file_contents,
     }))
