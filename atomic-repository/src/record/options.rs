@@ -74,6 +74,13 @@ pub struct RecordOptions {
     /// Whether to enrich the knowledge graph for the newly recorded change.
     enrich_kg: bool,
 
+    /// Unhashed data carried on the recorded change (the agent's condensed
+    /// transcript, reasoning) — attached before the change is serialized, so
+    /// it rides BOTH the local change store and a remote sandbox's
+    /// `SubmitChange` bytes. Outside the content hash by construction: the
+    /// change's identity is unaffected.
+    unhashed: Option<serde_json::Value>,
+
     /// AI provenance information for this change.
     ///
     /// When recording AI-assisted changes, this captures metadata about
@@ -255,6 +262,16 @@ impl RecordOptions {
         self
     }
 
+    /// Attach unhashed data to the recorded change — the agent's condensed
+    /// transcript and reasoning. Applied before serialization, so it rides
+    /// the local change store's file AND a remote sandbox's SubmitChange
+    /// bytes. The content hash is unaffected (the section is unhashed).
+    #[must_use]
+    pub fn with_unhashed(mut self, unhashed: serde_json::Value) -> Self {
+        self.unhashed = Some(unhashed);
+        self
+    }
+
     /// Set whether to enrich the knowledge graph after recording.
     ///
     /// Defaults to true for normal user records. Agent hooks may disable this
@@ -420,6 +437,11 @@ impl RecordOptions {
 
     /// Get the AI provenance information.
     #[must_use]
+    /// The unhashed data to carry on the recorded change, if any.
+    pub fn get_unhashed(&self) -> Option<&serde_json::Value> {
+        self.unhashed.as_ref()
+    }
+
     pub fn get_provenance(&self) -> &[Provenance] {
         &self.provenance
     }
@@ -471,6 +493,7 @@ impl RecordOptions {
 impl Default for RecordOptions {
     fn default() -> Self {
         Self {
+            unhashed: None,
             paths: Vec::new(),
             all: false,
             algorithm: Algorithm::Myers,

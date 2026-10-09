@@ -14,7 +14,17 @@
 //!
 //! ```text
 //! atomic sandbox create <NAME> [--dest <PATH>] [--view <VIEW>]
+//! atomic sandbox open <VIEW> [--acting-as <DID>] [--ttl <SECS>] [--capability <CAP>]... [--dest <DIR>]
+//! atomic sandbox renew <VIEW> [--ttl <SECS>]
+//! atomic sandbox close <VIEW>
+//! atomic sandbox materialize        # inside a remote sandbox
 //! ```
+//!
+//! A **remote** sandbox is a directory holding only a pointer
+//! (`.atomic-sandbox`: repository, view, token — no address) for a machine
+//! that reaches the repository through whatever serves its daemon socket.
+//! `open` mints its grant on the host and prints (or writes) the pointer;
+//! `materialize`, run inside it, writes the view's tree and its cache.
 
 use std::path::PathBuf;
 
@@ -50,6 +60,21 @@ pub enum SandboxCommands {
     /// Produces a single-layer deployable image of the full merged state —
     /// "run this exact version" anywhere an OCI runtime is available.
     Seal(Seal),
+
+    /// Grant a remote sandbox one view, and print its pointer.
+    ///
+    /// The pointer (repository, view, token) goes in an empty directory as
+    /// `.atomic-sandbox`; `atomic sandbox materialize` there writes the view.
+    Open(Open),
+
+    /// Extend a remote sandbox's grant.
+    Renew(Renew),
+
+    /// Revoke a remote sandbox's grant now.
+    Close(Close),
+
+    /// Inside a remote sandbox: write its view's tree and make its cache.
+    Materialize(Materialize),
 }
 
 impl Command for Sandbox {
@@ -57,7 +82,20 @@ impl Command for Sandbox {
         // Route every form through the service layer: the handler runs the
         // same domain calls (view creation, copy-on-write provisioning,
         // OCI stage/seal) and the CLI renders the local reports.
+        if let Some((root, _)) = crate::remote_sandbox::current() {
+            return match &self.command {
+                SandboxCommands::Materialize(cmd) => cmd.run(),
+                _ => Err(crate::remote_sandbox::refusal(
+                    &root,
+                    "only `atomic sandbox materialize` runs inside a remote sandbox",
+                )),
+            };
+        }
         let routed = match &self.command {
+            SandboxCommands::Open(cmd) => return cmd.run(),
+            SandboxCommands::Renew(cmd) => return cmd.run(),
+            SandboxCommands::Close(cmd) => return cmd.run(),
+            SandboxCommands::Materialize(cmd) => return cmd.run(),
             SandboxCommands::Create(cmd) => crate::commands::rpc::sandbox_create(cmd)?,
             SandboxCommands::Stage(cmd) => crate::commands::rpc::sandbox_stage(cmd)?,
             SandboxCommands::Seal(cmd) => crate::commands::rpc::sandbox_seal(cmd)?,
@@ -69,6 +107,10 @@ impl Command for Sandbox {
             SandboxCommands::Create(cmd) => cmd.run(),
             SandboxCommands::Stage(cmd) => cmd.run(),
             SandboxCommands::Seal(cmd) => cmd.run(),
+            SandboxCommands::Open(_)
+            | SandboxCommands::Renew(_)
+            | SandboxCommands::Close(_)
+            | SandboxCommands::Materialize(_) => unreachable!("handled above"),
         }
     }
 }
@@ -251,6 +293,187 @@ impl Command for Seal {
         println!("  Manifest:     {}", result.manifest_digest);
         println!("  Files:        {}", result.files);
 
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// remote sandboxes
+// ---------------------------------------------------------------------------
+
+/// What a remote sandbox's grant carries when `--capability` is not given:
+/// enough to read and land its view's work and its agent's provenance.
+const DEFAULT_CAPABILITIES: &[&str] = &[
+    "sandbox.read",
+    "sandbox.submit",
+    "provenance.read",
+    "provenance.write",
+    "agent.checkpoint",
+    "vault.read",
+    "vault.write",
+];
+
+fn request_meta() -> Option<atomic_client::proto::RequestMeta> {
+    Some(atomic_client::proto::RequestMeta {
+        request_id: uuid::Uuid::new_v4().to_string(),
+        observed_at: None,
+    })
+}
+
+fn view_ref(view: &str) -> atomic_client::proto::ViewRef {
+    libatomic::daemon::sandbox_wire::view_ref(view)
+}
+
+fn expiry(stamp: Option<&prost_types::Timestamp>) -> String {
+    stamp
+        .and_then(|t| chrono::DateTime::from_timestamp(t.seconds, 0))
+        .map(|t| t.to_rfc3339())
+        .unwrap_or_else(|| "-".to_string())
+}
+
+/// Grant a remote sandbox one view, and print its pointer.
+#[derive(Parser, Debug)]
+pub struct Open {
+    /// The view the sandbox reaches.
+    #[arg(value_name = "VIEW")]
+    pub view: String,
+
+    /// The identity the sandbox's work is attributed to (an agent's DID).
+    #[arg(long, value_name = "DID")]
+    pub acting_as: Option<String>,
+
+    /// How long the grant lasts, in seconds (1..31536000; renew it with
+    /// `atomic sandbox renew`).
+    #[arg(long, value_name = "SECS", default_value_t = 7200)]
+    pub ttl: u64,
+
+    /// A capability to grant (repeatable). Defaults to reading and
+    /// submitting the view, its provenance, and its vault.
+    #[arg(long = "capability", value_name = "CAP")]
+    pub capabilities: Vec<String>,
+
+    /// Write the pointer into this directory (created if needed, mode 0600)
+    /// instead of printing it.
+    #[arg(long, value_name = "DIR")]
+    pub dest: Option<PathBuf>,
+}
+
+impl Command for Open {
+    fn run(&self) -> CliResult<()> {
+        let session = crate::service::Service::open_admin()?;
+        let capabilities = if self.capabilities.is_empty() {
+            DEFAULT_CAPABILITIES.iter().map(|c| c.to_string()).collect()
+        } else {
+            self.capabilities.clone()
+        };
+        let opened = session
+            .open_sandbox(atomic_client::proto::OpenSandboxRequest {
+                repository: Some(session.reference.clone()),
+                meta: request_meta(),
+                view: self.view.clone(),
+                acting_as_did: self.acting_as.clone(),
+                ttl_secs: Some(self.ttl),
+                capabilities,
+                target: Some(view_ref(&self.view)),
+            })?
+            .opened
+            .ok_or_else(|| CliError::Internal(anyhow::anyhow!("OpenSandbox returned nothing")))?;
+        let pointer = crate::remote_sandbox::pointer_from(&opened)?;
+        match &self.dest {
+            Some(dest) => {
+                std::fs::create_dir_all(dest).map_err(CliError::Io)?;
+                let path = atomic_repository::write_remote_sandbox_pointer(dest, &pointer)
+                    .map_err(CliError::Repository)?;
+                println!("Remote sandbox for view '{}' opened", pointer.view);
+                println!("  Pointer:      {}", path.display());
+                println!("  Expires:      {}", expiry(opened.expires_at.as_ref()));
+                println!("  Next:         run `atomic sandbox materialize` there");
+            }
+            None => println!(
+                "{}",
+                serde_json::to_string_pretty(&pointer).map_err(|e| CliError::Internal(e.into()))?
+            ),
+        }
+        Ok(())
+    }
+}
+
+/// Extend a remote sandbox's grant.
+#[derive(Parser, Debug)]
+pub struct Renew {
+    /// The sandbox's view.
+    #[arg(value_name = "VIEW")]
+    pub view: String,
+
+    /// New lifetime from now, in seconds.
+    #[arg(long, value_name = "SECS", default_value_t = 7200)]
+    pub ttl: u64,
+}
+
+impl Command for Renew {
+    fn run(&self) -> CliResult<()> {
+        let session = crate::service::Service::open_admin()?;
+        let renewed = session.renew_sandbox(atomic_client::proto::RenewSandboxRequest {
+            repository: Some(session.reference.clone()),
+            meta: request_meta(),
+            view: self.view.clone(),
+            ttl_secs: self.ttl,
+            target: Some(view_ref(&self.view)),
+        })?;
+        println!(
+            "Sandbox grant for '{}' now expires {}",
+            self.view,
+            expiry(renewed.expires_at.as_ref())
+        );
+        Ok(())
+    }
+}
+
+/// Revoke a remote sandbox's grant now.
+#[derive(Parser, Debug)]
+pub struct Close {
+    /// The sandbox's view.
+    #[arg(value_name = "VIEW")]
+    pub view: String,
+}
+
+impl Command for Close {
+    fn run(&self) -> CliResult<()> {
+        let session = crate::service::Service::open_admin()?;
+        let closed = session.close_sandbox(atomic_client::proto::CloseSandboxRequest {
+            repository: Some(session.reference.clone()),
+            meta: request_meta(),
+            view: self.view.clone(),
+            target: Some(view_ref(&self.view)),
+        })?;
+        if closed.revoked {
+            println!("Sandbox grant for '{}' revoked", self.view);
+        } else {
+            println!("No live sandbox grant for '{}'", self.view);
+        }
+        Ok(())
+    }
+}
+
+/// Inside a remote sandbox: write its view's tree and make its cache.
+#[derive(Parser, Debug)]
+pub struct Materialize {}
+
+impl Command for Materialize {
+    fn run(&self) -> CliResult<()> {
+        let Some((root, _)) = crate::remote_sandbox::current() else {
+            return Err(CliError::InvalidArgument {
+                message: "not in a remote sandbox: no remote `.atomic-sandbox` pointer here or \
+                          above (make one with `atomic sandbox open <view> --dest <dir>` on the \
+                          host)"
+                    .to_string(),
+            });
+        };
+        let (entries, view) = crate::remote_sandbox::materialize(&root)?;
+        println!(
+            "Materialized {entries} entries of view '{view}' into {}",
+            root.display()
+        );
         Ok(())
     }
 }

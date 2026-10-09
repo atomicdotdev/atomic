@@ -82,7 +82,7 @@ use std::path::PathBuf;
 
 use clap::Parser;
 
-use atomic_core::change::{AITool, AIVendor, Author, ChangeHeader, Provenance, SuggestionType};
+use atomic_core::change::{Author, AuthorshipParts, ChangeHeader, Cost, Provenance};
 use atomic_core::diff::Algorithm;
 use atomic_core::types::Base32;
 use atomic_identity::{Identity, IdentityStore, IdentityUsage};

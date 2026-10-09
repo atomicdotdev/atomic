@@ -52,6 +52,7 @@ mod agent_error;
 mod commands;
 mod error;
 mod output;
+mod remote_sandbox;
 mod service;
 
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
@@ -963,6 +964,26 @@ fn main() {
         // Disable colors globally
         console::set_colors_enabled(false);
         console::set_colors_enabled_stderr(false);
+    }
+
+    // A remote sandbox's cache reaches its serving repository through this
+    // link; and in a remote sandbox only the commands that work off its
+    // cache run — nothing may open a repository the sandbox does not have.
+    remote_sandbox::install_link();
+    if let Some((root, pointer)) = remote_sandbox::current() {
+        let name = matches.subcommand_name().unwrap_or_default();
+        if !remote_sandbox::command_allowed(name) {
+            let err = remote_sandbox::refusal(
+                &root,
+                &format!(
+                    "`atomic {name}` needs the repository itself; this sandbox reaches only \
+                     view '{}' through its grant",
+                    pointer.view
+                ),
+            );
+            print_error(&err.to_string());
+            std::process::exit(err.exit_code());
+        }
     }
 
     // Execute the command and handle errors

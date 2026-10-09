@@ -151,6 +151,9 @@ pub(crate) mod types;
 
 pub use command::*;
 pub use types::*;
+// The per-file hunk summaries over a change's hunks live with the triage
+// projection in the repository layer now; the change command renders them.
+pub use atomic_repository::triage::{hunk_display_summaries, HunkDisplaySummary};
 
 #[cfg(test)]
 mod tests;

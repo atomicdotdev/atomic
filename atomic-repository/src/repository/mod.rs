@@ -82,6 +82,12 @@ mod deferred_tree;
 mod filter;
 mod materialize;
 pub use materialize::{ViewEntry, ViewEntryKind, ViewSnapshot};
+mod remote_cache;
+pub use remote_cache::{
+    set_remote_sandbox_link, write_sandbox_entry, ChangeFile, RemoteSandboxLink, SandboxSkeleton,
+    SandboxSlice, SpanBytes, SubmitRejection, Submitted, SubmittedOutcome,
+    SANDBOX_GRAPH_SLICE_SCHEMA, SANDBOX_SKELETON_SCHEMA,
+};
 mod revise;
 mod sandbox;
 mod semantic_materialize;
@@ -101,7 +107,11 @@ pub use filter::{
     expand_indexed_dependency_closure, view_set_id,
 };
 pub use revise::{ReviseOutcome, RewordOutcome};
-pub use sandbox::{SealOptions, SealResult, StageOptions, StageResult, SANDBOX_POINTER};
+pub use sandbox::{
+    find_remote_sandbox, remote_cache_root, write_remote_sandbox_pointer, RemoteRepositoryRef,
+    RemoteSandboxPointer, SealOptions, SealResult, StageOptions, StageResult, SANDBOX_CACHE_DIR,
+    SANDBOX_POINTER,
+};
 pub use split::{SplitChange, SplitOptions, SplitOutcome};
 pub use stash::{StashEntry, StashPushOptions, DEFAULT_STASH_MESSAGE, STASH_PREFIX};
 pub use views::{ManifestApplyOutcome, ViewInfo};

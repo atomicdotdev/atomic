@@ -4,9 +4,11 @@
 //! (the view diff, the dependency-closure additions, and the baggage
 //! classification) plus the view-pair resolution the local bodies
 //! perform, and carries the domain JSON so the CLI renders the local
-//! reports. `GenerateTriageReview` (the canonical report builder) is a
-//! separate structural migration — see the guard note in the CLI's
-//! `triage review` dispatch.
+//! reports. `GenerateTriageReview` builds the canonical report
+//! (`atomic_repository::triage::build_report` — the projection moved out
+//! of the CLI) and carries it the same way: the dashboard, walkthrough,
+//! HTML, attest export and outpost's readers all render client-side over
+//! the wire-carried domain report.
 
 use std::sync::Arc;
 
@@ -118,17 +120,40 @@ impl triage_service_server::TriageService for TriageImpl {
 
     async fn generate_triage_review(
         &self,
-        _request: Request<GenerateTriageReviewRequest>,
+        request: Request<GenerateTriageReviewRequest>,
     ) -> Result<Response<GenerateTriageReviewResponse>, Status> {
-        // The canonical report builder (the CLI's triage/project.rs — the
-        // change → file → task → intent → acceptance-criterion join) is a
-        // 2000-line module entangled with CLI-only presentation helpers
-        // (hunk display summaries, the diff -c builder, the intent
-        // bridge); porting it is a separate structural migration. This
-        // stays an explicit refusal — never a silent local fallback.
-        Err(Status::unimplemented(
-            "GenerateTriageReview lands with its slice (the canonical report builder \
-             migration — see the CLI's triage review dispatch note)",
-        ))
+        let request = request.into_inner();
+        let handle = self.state.resolve(request.repository.as_ref().unwrap())?;
+        self.state.log_rpc("GenerateTriageReview", Some(&handle));
+        let gate_handle = handle.clone();
+        let _gate = gate_handle.exclusive().await;
+        let feature_arg = request.from_view.clone();
+        let into_arg = request.to_view.clone();
+        let report = tokio::task::spawn_blocking(move || {
+            let repo = handle.repository_readonly()?;
+            // Empty strings read as "not given" — the same defaults the
+            // local `resolve_views` applies (current view; its parent).
+            let feature = (!feature_arg.is_empty()).then_some(feature_arg.as_str());
+            let into = (!into_arg.is_empty()).then_some(into_arg.as_str());
+            let (feature, target) = resolve_triage_views(&repo, feature, into)?;
+            let report = atomic_repository::triage::build_report(&repo, &feature, &target)
+                .map_err(repository_error)?;
+            let payload = serde_json::to_vec(&report)
+                .map_err(|error| Status::internal(format!("triage report encode: {error}")))?;
+            Ok::<_, Status>(payload)
+        })
+        .await
+        .map_err(|e| Status::internal(e.to_string()))??;
+        // The report is the whole answer (the walkthrough layers and risks
+        // above are a parser-free projection a caller may want later; the
+        // CLI's renders and outpost's readers all consume the report).
+        Ok(Response::new(GenerateTriageReviewResponse {
+            layers: Vec::new(),
+            risks: Vec::new(),
+            report: Some(VersionedBytes {
+                schema: "atomic.triage.report.v1".to_string(),
+                payload: report,
+            }),
+        }))
     }
 }

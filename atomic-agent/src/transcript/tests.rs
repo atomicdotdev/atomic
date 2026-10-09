@@ -997,3 +997,38 @@ fn test_last_assistant_text_none_when_no_assistant() {
     let jsonl = r#"{"type":"user","text":"hello"}"#;
     assert_eq!(last_assistant_text(jsonl.as_bytes(), "opencode"), None);
 }
+
+// A text-only assistant turn serializes its content as a bare string —
+// atomic-llm's untagged MessageContent, the same shape Claude Code's JSONL
+// uses for plain replies. Dropping it left the change's provenance unable
+// to say how the turn ended.
+
+#[test]
+fn test_condense_assistant_string_content() {
+    let jsonl = [
+        r#"{"type":"user","message":{"role":"user","content":"write it"}}"#,
+        r#"{"type":"assistant","message":{"role":"assistant","content":"Wrote it; that completes the task."}}"#,
+    ]
+    .join("\n");
+
+    let entries = condense_transcript(jsonl.as_bytes(), "jsonl");
+    assert_eq!(
+        entries.len(),
+        2,
+        "both turns of the conversation: {entries:?}"
+    );
+    assert!(entries[0].is_user());
+    assert!(
+        entries[1].is_assistant(),
+        "the bare-string reply condenses: {entries:?}"
+    );
+    assert_eq!(
+        entries[1].content.as_deref(),
+        Some("Wrote it; that completes the task.")
+    );
+    assert_eq!(
+        last_assistant_text(jsonl.as_bytes(), "jsonl").as_deref(),
+        Some("Wrote it; that completes the task."),
+        "the final answer is found in a string-content line"
+    );
+}

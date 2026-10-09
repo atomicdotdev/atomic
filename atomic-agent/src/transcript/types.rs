@@ -169,9 +169,23 @@ pub(crate) struct TranscriptLine {
 }
 
 /// An assistant message containing content blocks.
+///
+/// The content is untagged: a text-only assistant turn serializes its
+/// content as a bare string (atomic-llm's `MessageContent::Text`; Claude
+/// Code's JSONL does the same), a tool-carrying one as a block array. Both
+/// are turns of the conversation — dropping either leaves the change's
+/// provenance unable to say how the turn ended.
 #[derive(Debug, Deserialize)]
 pub(crate) struct AssistantMessage {
-    pub content: Vec<ContentBlock>,
+    pub content: AssistantContent,
+}
+
+/// An assistant message's content: a bare string or a block array.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub(crate) enum AssistantContent {
+    Plain(String),
+    Blocks(Vec<ContentBlock>),
 }
 
 /// A content block within an assistant message.

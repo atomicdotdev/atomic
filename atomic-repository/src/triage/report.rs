@@ -20,17 +20,14 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use atomic_canonical::node::CanonicalNode;
 use atomic_canonical::{intent_substance_hash, triage_reference, validate_intent, TriagePins};
+use atomic_core::change::{Change, GraphOp, ProvenanceGraph};
 use atomic_core::pristine::ontology::edge_kind;
 use atomic_core::types::{Base32, Hash};
-use atomic_repository::Repository;
 
-use atomic_core::change::Change;
-
-use crate::commands::change::{hunk_display_summaries, HunkDisplaySummary};
-use crate::commands::diff::{change_file_diffs, DiffFormat, DiffOutputConfig, FileChangeStatus};
-use crate::commands::intent::bridge;
-use crate::commands::provenance::command::load_graphs;
-use crate::error::CliError;
+use crate::diff_engine::{change_file_diffs, DiffFormat, DiffOutputConfig, FileChangeStatus};
+use crate::error::RepositoryError;
+use crate::intent_bridge as bridge;
+use crate::Repository;
 
 use super::model::*;
 
@@ -89,25 +86,16 @@ pub fn build_report(
     repo: &Repository,
     feature: &str,
     target: &str,
-) -> Result<TriageReport, CliError> {
+) -> Result<TriageReport, RepositoryError> {
     // 1. The candidate set (T0): only-in-feature, closure additions, baggage.
-    let set = repo
-        .triage_candidate_set(feature, target)
-        .map_err(CliError::Repository)?;
+    let set = repo.triage_candidate_set(feature, target)?;
 
     // 2. The pinned view Merkle (the materialized state the report is about).
-    let view_merkle = repo
-        .get_view_info(feature)
-        .map_err(CliError::Repository)?
-        .state_base32();
+    let view_merkle = repo.get_view_info(feature)?.state_base32();
 
     // Promotion scope: an unreviewed change BLOCKS promotion into a shared
     // view, but is only a warning into a draft. Resolved once here.
-    let target_is_shared = repo
-        .get_view_info(target)
-        .map_err(CliError::Repository)?
-        .scope
-        .is_shared();
+    let target_is_shared = repo.get_view_info(target)?.scope.is_shared();
 
     // 3. The change → intent join.
     //
@@ -232,9 +220,7 @@ pub fn build_report(
         // Second hop: each task's parent intent (HAS_TASK) and satisfied ACs.
         let mut reached = false;
         for task in &touching_tasks {
-            let tsub = repo
-                .vault_kg_neighbors(task, 1)
-                .map_err(CliError::Repository)?;
+            let tsub = repo.vault_kg_neighbors(task, 1)?;
             for e in &tsub.edges {
                 if e.to_id == *task && kind_is(&e.kind, edge_kind::HAS_TASK) {
                     reached = true;
@@ -829,7 +815,7 @@ pub fn build_report(
 /// The narrative-relevant slice of a reached intent's task: id, text, the
 /// paths its `::file-ref`s touch, and the criteria it satisfies.
 #[derive(Debug, Clone)]
-pub(crate) struct TaskFact {
+pub struct TaskFact {
     pub id: String,
     pub text: String,
     pub touches: Vec<String>,
@@ -867,7 +853,7 @@ fn task_headline(text: &str) -> &str {
 /// the tasks, criteria, and changes that land in each layer plus a template
 /// prose rationale. No repo access; every input is already pinned by the
 /// report.
-pub(crate) fn build_walkthrough(
+pub fn build_walkthrough(
     change_paths: &[(String, Vec<String>)],
     file_module: &BTreeMap<String, String>,
     file_deps: &BTreeSet<(String, String)>,
@@ -1001,11 +987,11 @@ pub(crate) fn build_walkthrough(
         .collect()
 }
 
-fn coverage_label(cov: &atomic_repository::Coverage) -> &'static str {
+fn coverage_label(cov: &crate::Coverage) -> &'static str {
     match cov {
-        atomic_repository::Coverage::Covered => "covered",
-        atomic_repository::Coverage::Uncovered => "uncovered",
-        atomic_repository::Coverage::Unknown => "unknown",
+        crate::Coverage::Covered => "covered",
+        crate::Coverage::Uncovered => "uncovered",
+        crate::Coverage::Unknown => "unknown",
     }
 }
 
@@ -1124,11 +1110,176 @@ fn load_provenance_compact(repo: &Repository, hash_b32: &str) -> Option<serde_js
     }))
 }
 
+// ── The change-view hunk summaries (moved from the CLI's `atomic change`)
+// ──────────────────────────────────────────────────────────────────────────
+
+/// One changed file's summary in a change: a change-type symbol (`+`/`-`/
+/// `~`/`±`), the path, and a per-file hunk summary — the same view
+/// `atomic change` prints, embedded in the report's `changes[].files`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HunkDisplaySummary {
+    pub symbol: &'static str,
+    pub path: String,
+    pub info: String,
+}
+
+#[derive(Debug, Clone)]
+struct HunkDisplayAggregate {
+    symbol: &'static str,
+    total: usize,
+    infos: std::collections::BTreeMap<String, usize>,
+}
+
+/// Per-file hunk summaries over a change's hunks, aggregated by path.
+pub fn hunk_display_summaries<H>(hunks: &[GraphOp<H>]) -> Vec<HunkDisplaySummary> {
+    let mut by_path: std::collections::BTreeMap<String, HunkDisplayAggregate> =
+        std::collections::BTreeMap::new();
+
+    for graph_op in hunks {
+        let (symbol, path) = hunk_symbol_and_path(graph_op);
+        let info = hunk_atom_info(graph_op);
+        let aggregate = by_path.entry(path).or_insert_with(|| HunkDisplayAggregate {
+            symbol,
+            total: 0,
+            infos: std::collections::BTreeMap::new(),
+        });
+        aggregate.symbol = merge_hunk_symbols(aggregate.symbol, symbol);
+        aggregate.total += 1;
+        *aggregate.infos.entry(info).or_insert(0) += 1;
+    }
+
+    by_path
+        .into_iter()
+        .map(|(path, aggregate)| HunkDisplaySummary {
+            symbol: aggregate.symbol,
+            path,
+            info: format_hunk_aggregate_info(aggregate.total, &aggregate.infos),
+        })
+        .collect()
+}
+
+/// Get symbol and path for a graph_op (for display).
+fn hunk_symbol_and_path<H>(graph_op: &GraphOp<H>) -> (&'static str, String) {
+    match graph_op {
+        GraphOp::FileAdd { path, .. } => ("+", path.clone()),
+        GraphOp::FileDel { path, .. } => ("-", path.clone()),
+        GraphOp::FileMove { path, .. } => ("→", path.clone()),
+        GraphOp::FileUndel { path, .. } => ("↑", path.clone()),
+        GraphOp::DirAdd { path, .. } => ("📁+", path.clone()),
+        GraphOp::DirDel { path, .. } => ("📁-", path.clone()),
+        GraphOp::DirUndel { path, .. } => ("📁↑", path.clone()),
+        GraphOp::Edit { local, .. } => ("~", local.path.clone()),
+        GraphOp::Replacement { local, .. } => ("±", local.path.clone()),
+        GraphOp::SolveNameConflict { path, .. } => ("✓", path.clone()),
+        GraphOp::UnsolveNameConflict { path, .. } => ("!", path.clone()),
+        GraphOp::SolveOrderConflict { local, .. } => ("✓", local.path.clone()),
+        GraphOp::UnsolveOrderConflict { local, .. } => ("!", local.path.clone()),
+        GraphOp::ResurrectZombies { local, .. } => ("↑", local.path.clone()),
+        GraphOp::AddRoot { .. } => ("◉", "(root)".to_string()),
+        GraphOp::DelRoot { .. } => ("⊘", "(root)".to_string()),
+    }
+}
+
+/// What one graph_op does, in display terms.
+fn hunk_atom_info<H>(graph_op: &GraphOp<H>) -> String {
+    match graph_op {
+        GraphOp::FileAdd { contents, .. } => {
+            if contents.is_some() {
+                "(+3 vertices: name, inode, content)".to_string()
+            } else {
+                "(+2 vertices: name, inode)".to_string()
+            }
+        }
+        GraphOp::FileDel { .. } => "(~edges: mark deleted)".to_string(),
+        GraphOp::FileUndel { .. } => "(~edges: resurrect)".to_string(),
+        GraphOp::FileMove { .. } => "(+1 span, ~1 edge: rename)".to_string(),
+        GraphOp::DirAdd { .. } => "(+2 vertices: name, inode)".to_string(),
+        GraphOp::DirDel { .. } => "(~edges: mark deleted)".to_string(),
+        GraphOp::DirUndel { .. } => "(~edges: resurrect)".to_string(),
+        GraphOp::Edit { .. } => "(+1 span: new content)".to_string(),
+        GraphOp::Replacement { .. } => "(+1 span, ~1 edge: replace)".to_string(),
+        GraphOp::SolveNameConflict { .. } => "(~edges: resolve name conflict)".to_string(),
+        GraphOp::UnsolveNameConflict { .. } => "(~edges: unresolve name conflict)".to_string(),
+        GraphOp::SolveOrderConflict { .. } => "(~edges: resolve order conflict)".to_string(),
+        GraphOp::UnsolveOrderConflict { .. } => "(~edges: unresolve order conflict)".to_string(),
+        GraphOp::ResurrectZombies { .. } => "(~edges: resurrect zombies)".to_string(),
+        GraphOp::AddRoot { .. } => "(+1 span: root)".to_string(),
+        GraphOp::DelRoot { .. } => "(~edges: delete root)".to_string(),
+    }
+}
+
+fn merge_hunk_symbols(current: &'static str, next: &'static str) -> &'static str {
+    if current == next {
+        return current;
+    }
+    if current == "±" || next == "±" {
+        return "±";
+    }
+    match (current, next) {
+        ("+", "~") | ("~", "+") | ("+", "-") | ("-", "+") | ("~", "-") | ("-", "~") => "±",
+        ("📁+", "📁-") | ("📁-", "📁+") => "±",
+        _ => current,
+    }
+}
+
+fn format_hunk_aggregate_info(
+    total: usize,
+    infos: &std::collections::BTreeMap<String, usize>,
+) -> String {
+    if total == 1 {
+        return infos
+            .keys()
+            .next()
+            .cloned()
+            .unwrap_or_else(|| "(1 hunk)".to_string());
+    }
+
+    let details = infos
+        .iter()
+        .map(|(info, count)| format!("{}x {}", count, trim_hunk_info(info)))
+        .collect::<Vec<_>>()
+        .join("; ");
+    format!("({} hunks: {})", total, details)
+}
+
+fn trim_hunk_info(info: &str) -> &str {
+    info.strip_prefix('(')
+        .and_then(|s| s.strip_suffix(')'))
+        .unwrap_or(info)
+}
+
+// ── The provenance slice (moved from the CLI's provenance command) ─────────
+
+/// Load a change's provenance graphs: REV_DEPS-backed lookup, with a
+/// disk-scan fallback when REV_DEPS registration missed the change.
+/// Errors if no graph explains the change.
+pub(crate) fn load_graphs(
+    repo: &Repository,
+    change_hash: &Hash,
+) -> Result<Vec<(Hash, ProvenanceGraph)>, RepositoryError> {
+    let mut graphs = repo.find_provenance_for_change(change_hash)?;
+    if graphs.is_empty() {
+        graphs = repo.find_provenance_for_change_scan(change_hash)?;
+    }
+    if graphs.is_empty() {
+        return Err(RepositoryError::InvalidOperation {
+            message: format!(
+                "no provenance graph explains change {}",
+                change_hash.to_base32()
+            ),
+        });
+    }
+    // Most-recent first (a change explained by >1 graph shows all; the newest
+    // leads). Both loaders sort/return unspecified order, so sort here.
+    graphs.sort_by_key(|(_, g)| std::cmp::Reverse(g.timestamp));
+    Ok(graphs)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{RecordOptions, Repository};
     use atomic_core::change::ChangeHeader;
-    use atomic_repository::{RecordOptions, Repository};
     use tempfile::TempDir;
 
     fn record_all(repo: &Repository, message: &str) {
@@ -1207,8 +1358,8 @@ mod tests {
         assert!(report.reference.starts_with("urn:atomic:triage:"));
     }
 
-    fn intent_opts(title: &str) -> atomic_repository::IntentCreateOptions {
-        atomic_repository::IntentCreateOptions {
+    fn intent_opts(title: &str) -> crate::IntentCreateOptions {
+        crate::IntentCreateOptions {
             title: title.to_string(),
             priority: Some("medium".to_string()),
             assignee: None,

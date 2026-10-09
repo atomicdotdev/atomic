@@ -264,7 +264,6 @@ pub(crate) fn build_turn_envelope(
 pub(crate) fn build_unhashed_turn_data(
     options: &TurnRecordOptions<'_>,
     recorded_files: &[String],
-    _outcome: &atomic_repository::record::RecordOutcome,
 ) -> Option<transcript::UnhashedTurnData> {
     // Check if we have a transcript file
     let transcript_path = options.session.transcript_path.as_ref()?;
@@ -304,13 +303,29 @@ pub(crate) fn build_unhashed_turn_data(
     }
 
     // Build the base unhashed data
-    let data = transcript::UnhashedTurnData::new(
+    let mut data = transcript::UnhashedTurnData::new(
         &options.session.session_id,
         options.turn_number,
         format,
         entries,
         recorded_files,
     );
+
+    // The turn's LLM usage rides the hook event's raw JSON (the sherpa
+    // turn-end handler inserts it alongside turn_number). The cost of a
+    // turn belongs to its record as much as what it did.
+    if let Some(raw) = options.event.raw_json.as_ref() {
+        let get_u64 = |key: &str| raw.get(key).and_then(|v| v.as_u64());
+        if let Some(input) = get_u64("input_tokens") {
+            data.input_tokens = Some(input);
+        }
+        if let Some(output) = get_u64("output_tokens") {
+            data.output_tokens = Some(output);
+        }
+        if let Some(steps) = get_u64("step_count") {
+            data.step_count = Some(steps as u32);
+        }
+    }
 
     // Reasoning generation is NOT done here — it's too slow for the hook
     // hot path (calls Claude CLI, 30+ seconds) and potentially recursive

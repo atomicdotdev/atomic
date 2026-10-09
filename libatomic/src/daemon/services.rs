@@ -12,7 +12,9 @@ use crate::atomic::ErrorCode;
 use crate::atomic::*;
 use atomic_core::change::Author;
 use atomic_core::change::ChangeHeader;
+use atomic_core::change::Provenance;
 use atomic_core::pristine::ViewTxnT;
+use atomic_core::types::Base32;
 use atomic_identity::IdentityStore;
 use atomic_repository::apply::{CrossViewInsertOptions, InsertOptions};
 use atomic_repository::record::RecordOptions;
@@ -22,6 +24,7 @@ use atomic_repository::{HistoryOptions, Repository};
 use tonic::{Request, Response, Status};
 
 use super::convert::*;
+use super::sandbox_wire::hash_from_proto;
 use super::state::{domain_status, repository_error, DaemonState};
 
 // ---------------------------------------------------------------------------
@@ -1034,6 +1037,119 @@ fn resolve_author() -> Result<Option<Author>, String> {
     )))
 }
 
+/// Refuse unless the workspace's current view is at the state the caller
+/// last saw: `expected` names the view's merkle root (or the view snapshot
+/// carrying it), and the record response's `view_merkle` is the next call's
+/// expected state. The other fence forms (generation, sequence) are
+/// refused as unsupported-for-record — an unreadable fence must never
+/// pass as a checked one.
+pub(crate) fn check_record_fence(
+    repo: &atomic_repository::Repository,
+    view: &str,
+    expected: &ExpectedState,
+) -> Result<(), Status> {
+    use expected_state::Kind;
+    let current = repo.get_view_info(view).map_err(repository_error)?.state;
+    let (fenced_view, expected_root) = match &expected.kind {
+        Some(Kind::MerkleRoot(hash)) => (view.to_string(), hash.clone()),
+        Some(Kind::ViewSnapshot(snapshot)) => {
+            let name = snapshot
+                .view
+                .as_ref()
+                .and_then(|view| view.name.clone())
+                .unwrap_or_else(|| view.to_string());
+            let root = snapshot
+                .own_merkle
+                .clone()
+                .or_else(|| snapshot.effective_state.clone())
+                .ok_or_else(|| {
+                    domain_status(ErrorCode::InvalidArgument, "the fence carries no state")
+                })?;
+            (name, root)
+        }
+        _ => {
+            return Err(domain_status(
+                ErrorCode::InvalidArgument,
+                "Record fences on the view's merkle root (merkle_root or view_snapshot)",
+            ))
+        }
+    };
+    if fenced_view != view {
+        return Err(domain_status(
+            ErrorCode::ViewStale,
+            format!("the fence names view '{fenced_view}' but the workspace is on '{view}'"),
+        ));
+    }
+    let expected_root = hash_from_proto(Some(&expected_root)).map_err(|error| {
+        domain_status(
+            ErrorCode::InvalidArgument,
+            format!("the fence's state hash: {error}"),
+        )
+    })?;
+    if expected_root != current {
+        return Err(domain_status(
+            ErrorCode::ViewStale,
+            format!(
+                "view '{view}' has moved on (expected {}, at {}) — re-read and try again",
+                expected_root.to_base32(),
+                current.to_base32()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Refuse unless `view` is at the state `expected` names — the write-path
+/// fence shared by insert, promote and the vault writes, checked inside the
+/// repository gate so the compare-and-write is one serialized step. The
+/// snapshot's `own_merkle` compares against the view's own root (the state
+/// a log read reports); its `effective_state` against the view's effective
+/// state (what it sees through its parent chain).
+pub(crate) fn check_view_fence(
+    repo: &atomic_repository::Repository,
+    view: &str,
+    expected: &ViewSnapshot,
+) -> Result<(), Status> {
+    let named = expected
+        .view
+        .as_ref()
+        .and_then(|view| view.name.clone())
+        .unwrap_or_else(|| view.to_string());
+    if named != view {
+        return Err(domain_status(
+            ErrorCode::ViewStale,
+            format!("the fence names view '{named}' but the write targets '{view}'"),
+        ));
+    }
+    let stale = |saw: String, at: String| {
+        domain_status(
+            ErrorCode::ViewStale,
+            format!("view '{view}' has moved on (expected {saw}, at {at}) — re-read and try again"),
+        )
+    };
+    match (&expected.own_merkle, &expected.effective_state) {
+        (Some(saw), _) => {
+            let saw = hash_from_proto(Some(saw))
+                .map_err(|error| domain_status(ErrorCode::InvalidArgument, error))?;
+            let at = repo.get_view_info(view).map_err(repository_error)?.state;
+            if saw != at {
+                return Err(stale(saw.to_base32(), at.to_base32()));
+            }
+        }
+        (None, saw) => {
+            let saw = hash_from_proto(saw.as_ref())
+                .map_err(|error| domain_status(ErrorCode::InvalidArgument, error))?;
+            let at = repo
+                .sandbox_effective_state(view)
+                .map_err(repository_error)?;
+            if saw != at {
+                return Err(stale(saw.to_base32(), at.to_base32()));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Authorship for a record: an explicit wire author wins; else a named
 /// identity from the serving host's store; else the default identity.
 fn resolve_author_for(
@@ -1165,6 +1281,8 @@ impl repository_mutation_service_server::RepositoryMutationService for MutationI
         let meta = request.meta.unwrap_or_default();
         let author = request.author;
         let identity_name = request.identity_name;
+        let expected = request.expected;
+        let ai = request.ai_authorship;
         let view = handle.current_view();
         let result = tokio::task::spawn_blocking(move || {
             if message.trim().is_empty() {
@@ -1190,6 +1308,30 @@ impl repository_mutation_service_server::RepositoryMutationService for MutationI
                 options = options.paths(paths.clone());
             }
             let repo = handle.repository()?;
+            // The fence: the workspace's current view must be at the state
+            // the caller last saw — a stale expectation means someone
+            // recorded in between, and this caller's read is no longer
+            // current. The response's view_merkle is that next state.
+            if let Some(expected) = &expected {
+                check_record_fence(&repo, &view, expected)?;
+            }
+            // The AI authorship, when the caller carries it: the change's
+            // provenance says what assisted it (vendor, model, tool,
+            // suggestion, tokens, session). Absent → human-authored.
+            if let Some(ai) = &ai {
+                options = options.add_provenance(Provenance::from_authorship_parts(
+                    &atomic_core::change::AuthorshipParts {
+                        provider: ai.provider.clone(),
+                        model: ai.model.clone(),
+                        tool: ai.tool.clone(),
+                        suggestion_type: ai.suggestion_type.clone(),
+                        input_tokens: ai.input_tokens,
+                        output_tokens: ai.output_tokens,
+                        request_id: ai.request_id.clone(),
+                        session_id: ai.session_id.clone(),
+                    },
+                ));
+            }
             let outcome = repo
                 .record(header, options)
                 .map_err(|error| domain_status(ErrorCode::ChangeRejected, error.to_string()))?;
@@ -1599,6 +1741,16 @@ impl repository_mutation_service_server::RepositoryMutationService for MutationI
                     .target_view
                     .clone()
                     .unwrap_or_else(|| handle.current_view());
+                // The fence: the target view must be at the state the
+                // caller last saw — two concurrent inserters (two
+                // expeditions merging into the same view) can't both
+                // land on a stale read silently. Dry runs read only and
+                // don't fence.
+                if !request.dry_run.unwrap_or(false) {
+                    if let Some(expected) = &request.expected_snapshot {
+                        check_view_fence(&repo, &target, expected)?;
+                    }
+                }
                 let dry_run = request.dry_run.unwrap_or(false);
                 let apply_dependencies = request.apply_dependencies.unwrap_or(true);
                 // Insert may refresh the current working copy below. Refuse

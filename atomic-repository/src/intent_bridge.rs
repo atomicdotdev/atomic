@@ -39,12 +39,15 @@ use std::path::PathBuf;
 
 use serde_json::{Map, Value};
 
+use crate::error::RepositoryError;
+use crate::Repository;
 use atomic_canonical::lift::lift_intent;
 use atomic_canonical::CanonicalNode;
 use atomic_core::pristine::VaultEntry;
-use atomic_repository::Repository;
 
-use crate::error::{CliError, CliResult};
+/// The bridge's result type — the repository's own error (the CLI's wraps
+/// it, and anything else that reaches here maps to `InvalidOperation`).
+pub type BridgeResult<T> = Result<T, RepositoryError>;
 
 /// The two lift inputs pulled off a stored `VaultEntry`.
 pub struct LiftInputs {
@@ -59,10 +62,12 @@ pub struct LiftInputs {
 /// `frontmatter_json` is parsed exactly as the repository itself parses it
 /// (`serde_json::from_str` into a `Map`). A malformed frontmatter string is a
 /// clean argument error rather than an internal panic.
-pub fn inputs_from_entry(entry: &VaultEntry) -> CliResult<LiftInputs> {
+pub fn inputs_from_entry(entry: &VaultEntry) -> BridgeResult<LiftInputs> {
     let frontmatter: Map<String, Value> =
-        serde_json::from_str(&entry.frontmatter_json).map_err(|e| CliError::InvalidArgument {
-            message: format!("intent frontmatter is not valid JSON: {e}"),
+        serde_json::from_str(&entry.frontmatter_json).map_err(|e| {
+            RepositoryError::InvalidOperation {
+                message: format!("intent frontmatter is not valid JSON: {e}"),
+            }
         })?;
     let body = String::from_utf8_lossy(&entry.content_bytes).into_owned();
     Ok(LiftInputs { frontmatter, body })
@@ -72,16 +77,16 @@ pub fn inputs_from_entry(entry: &VaultEntry) -> CliResult<LiftInputs> {
 ///
 /// `vault_intent_show` normalizes the ID (`"PIMO-1"` / `"pimo-1"` / `"1"`) and
 /// resolves the stored entry.
-pub fn read_intent(repo: &Repository, id: &str) -> CliResult<LiftInputs> {
-    let entry = repo.vault_intent_show(id).map_err(CliError::Repository)?;
+pub fn read_intent(repo: &Repository, id: &str) -> BridgeResult<LiftInputs> {
+    let entry = repo.vault_intent_show(id)?;
     inputs_from_entry(&entry)
 }
 
 /// Lift the given inputs into a canonical node, mapping a lift failure (unknown
 /// directive, missing `id`, malformed `:::ref`, …) to a clean argument error so
 /// the CLI reports it gracefully instead of surfacing an internal error.
-pub fn lift(inputs: &LiftInputs) -> CliResult<CanonicalNode> {
-    lift_intent(&inputs.frontmatter, &inputs.body).map_err(|e| CliError::InvalidArgument {
+pub fn lift(inputs: &LiftInputs) -> BridgeResult<CanonicalNode> {
+    lift_intent(&inputs.frontmatter, &inputs.body).map_err(|e| RepositoryError::InvalidOperation {
         message: format!("could not lift intent: {e}"),
     })
 }
@@ -114,7 +119,7 @@ fn sanitize_id(id: &str) -> String {
 /// 3. Otherwise fall back to the raw arg uppercased (numeric ids missing from the
 ///    manifest stay as the bare number — the same on both paths, so reconciliation
 ///    still holds).
-pub fn normalized_id(repo: &Repository, id: &str) -> CliResult<String> {
+pub fn normalized_id(repo: &Repository, id: &str) -> BridgeResult<String> {
     // Resolution lives in exactly one place — the repository resolver — which
     // fills in the current project + author for a bare number, matches full
     // human keys, and resolves ULIDs/prefixes. When nothing resolves (e.g. a
@@ -128,7 +133,7 @@ pub fn normalized_id(repo: &Repository, id: &str) -> CliResult<String> {
 
 /// The tracked-vault path for an intent's attestation:
 /// `attestations/<sanitized-normalized-id>/attested.md`.
-pub fn attestation_vault_path(repo: &Repository, id: &str) -> CliResult<String> {
+pub fn attestation_vault_path(repo: &Repository, id: &str) -> BridgeResult<String> {
     Ok(format!(
         "attestations/{}/attested.md",
         sanitize_id(&normalized_id(repo, id)?)
@@ -138,7 +143,7 @@ pub fn attestation_vault_path(repo: &Repository, id: &str) -> CliResult<String> 
 /// The directory that holds an intent's canonical sidecar artifacts:
 /// `<dot_dir>/canonical/intents/<sanitized-normalized-id>/`. Keyed off the SAME
 /// normalized id as the tracked vault path (critic #4).
-pub fn sidecar_dir(repo: &Repository, id: &str) -> CliResult<PathBuf> {
+pub fn sidecar_dir(repo: &Repository, id: &str) -> BridgeResult<PathBuf> {
     Ok(repo
         .dot_dir()
         .join("canonical")
@@ -147,7 +152,7 @@ pub fn sidecar_dir(repo: &Repository, id: &str) -> CliResult<PathBuf> {
 }
 
 /// The attested-node sidecar file for an intent.
-pub fn attested_sidecar_path(repo: &Repository, id: &str) -> CliResult<PathBuf> {
+pub fn attested_sidecar_path(repo: &Repository, id: &str) -> BridgeResult<PathBuf> {
     Ok(sidecar_dir(repo, id)?.join("attested.jsonld"))
 }
 
@@ -156,7 +161,7 @@ pub fn attested_sidecar_path(repo: &Repository, id: &str) -> CliResult<PathBuf> 
 /// wrote (it sanitized the RAW CLI arg, un-normalized). Probing both lets the
 /// dual-read fallback find pre-upgrade sidecars regardless of the id form the
 /// original `attest` was invoked with. De-dups when the two coincide.
-fn attested_sidecar_candidates(repo: &Repository, id: &str) -> CliResult<Vec<PathBuf>> {
+fn attested_sidecar_candidates(repo: &Repository, id: &str) -> BridgeResult<Vec<PathBuf>> {
     let normalized = attested_sidecar_path(repo, id)?;
     let raw = repo
         .dot_dir()
@@ -231,14 +236,13 @@ pub fn load_attestation(
     repo: &Repository,
     id: &str,
     inputs: &LiftInputs,
-) -> CliResult<Attestation> {
+) -> BridgeResult<Attestation> {
     // 1) Tracked vault entry (new authoritative source). The body is the
     //    pretty JSON-LD node (+ a trailing '\n'); the classification parses
     //    it straight to a CanonicalNode.
     let vpath = attestation_vault_path(repo, id)?;
     let tracked = repo
-        .vault_retrieve(&vpath)
-        .map_err(CliError::Repository)?
+        .vault_retrieve(&vpath)?
         .map(|entry| TrackedAttestation {
             vault_path: vpath.clone(),
             frontmatter_json: entry.frontmatter_json,
@@ -352,8 +356,8 @@ pub fn classify_attestation(sources: AttestationSources, inputs: &LiftInputs) ->
 /// path; `normalize_intent_id` is private, so we match the manifest keys
 /// case-insensitively (the manifest keys are the normalized IDs, e.g.
 /// `"PIMO-1"`). Returns `None` if the intent has no manifest entry / path.
-pub fn vault_path_for(repo: &Repository, id: &str) -> CliResult<Option<String>> {
-    let manifest = repo.vault_manifest().map_err(CliError::Repository)?;
+pub fn vault_path_for(repo: &Repository, id: &str) -> BridgeResult<Option<String>> {
+    let manifest = repo.vault_manifest()?;
     Ok(manifest
         .intents
         .iter()
@@ -365,11 +369,11 @@ pub fn vault_path_for(repo: &Repository, id: &str) -> CliResult<Option<String>> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::IntentCreateOptions;
     use atomic_canonical::lift_and_attest;
     use atomic_core::pristine::VaultEntryType;
     use atomic_identity::identity::Identity;
     use atomic_identity::keypair::KeyPair;
-    use atomic_repository::IntentCreateOptions;
     use tempfile::tempdir;
 
     /// Build inputs for a minimal, liftable intent and attest them into a node.

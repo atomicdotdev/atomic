@@ -39,6 +39,7 @@ similar = { workspace = true }
 ulid = { workspace = true }
 redb = { workspace = true }
 anyhow = { workspace = true }
+rand = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]

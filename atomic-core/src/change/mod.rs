@@ -127,7 +127,7 @@ pub use graph_op::{AtomRef, GraphOp, HunkAtomIter};
 pub use local::{Local, LocalByte};
 pub use ops::{FileOps, FileOpsStats, LineOps};
 pub use provenance::{
-    AITool, AIVendor, Cost, PromptContent, Provenance, SuggestionType, TokenUsage,
+    AITool, AIVendor, AuthorshipParts, Cost, PromptContent, Provenance, SuggestionType, TokenUsage,
 };
 pub use store::{ChangeStore, MemoryChangeStore, MemoryStoreError};
 

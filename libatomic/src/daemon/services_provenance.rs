@@ -37,8 +37,9 @@ use tonic::{Request, Response, Status};
 
 use super::convert::hash_proto;
 use super::provenance_core as core;
+use super::sandbox_grants::{SandboxCaller, SandboxGrants};
 use super::services_agent::response_meta;
-use super::state::{domain_status, DaemonState};
+use super::state::{domain_status, DaemonState, RepoHandle};
 
 // ---------------------------------------------------------------------------
 // domain ↔ protobuf mapping
@@ -216,6 +217,97 @@ fn hash_is_blake3(hash: &crate::atomic::Hash) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// sandbox scope — what a sandbox principal may touch
+// ---------------------------------------------------------------------------
+
+/// What a sandbox principal must own for a turn/checkpoint RPC.
+enum TurnScope<'a> {
+    /// ReserveTurn: a session its view started, or one nobody has used,
+    /// which becomes its own.
+    Claim(&'a str),
+    /// A turn its view reserved.
+    Provenance(u64),
+    /// PrepareCheckpoint: a turn its view reserved, explaining only changes
+    /// its view can see.
+    Prepare(u64, &'a [Hash]),
+    /// A session its view owns — or one nobody has written to (asking after
+    /// it is harmless; the store answers "no such turn").
+    Session(&'a str),
+}
+
+/// Refuse a sandbox's turn/checkpoint request outside its grant (blocking:
+/// opens the journal or the repository, and drops it, before the handler
+/// opens its own).
+fn check_turn_scope(
+    handle: &RepoHandle,
+    grants: &dyn SandboxGrants,
+    caller: &SandboxCaller,
+    scope: TurnScope<'_>,
+) -> Result<(), Status> {
+    let grant = &caller.grant;
+    let forbidden = |what: &str| {
+        domain_status(
+            ErrorCode::Forbidden,
+            format!("{what} is not this sandbox's (view '{}')", grant.view),
+        )
+    };
+    // Whether nothing has ever been recorded for the session: one indexed
+    // lookup for its highest turn, never a walk to a wire-supplied number.
+    let unused = |session_id: &str| -> Result<bool, Status> {
+        let store = handle.change_store()?;
+        let last = store
+            .last_provenance_turn_for(session_id)
+            .map_err(|e| domain_status(ErrorCode::ProvenanceStore, e.to_string()))?;
+        Ok(last.is_none())
+    };
+    let owns_turn = |id: u64| grants.owns_provenance(grant, id).map_err(|e| e.status());
+    match scope {
+        TurnScope::Claim(session_id) => {
+            let unused = unused(session_id)?;
+            if !grants
+                .claim_session(grant, session_id, unused)
+                .map_err(|e| e.status())?
+            {
+                return Err(forbidden("that session"));
+            }
+        }
+        TurnScope::Provenance(id) => {
+            if !owns_turn(id)? {
+                return Err(forbidden("that provenance turn"));
+            }
+        }
+        TurnScope::Prepare(id, explained) => {
+            if !owns_turn(id)? {
+                return Err(forbidden("that provenance turn"));
+            }
+            let repo = handle.repository_readonly()?;
+            if let Some(foreign) = repo
+                .first_foreign_change(&grant.view, explained)
+                .map_err(|e| domain_status(ErrorCode::Repository, e.to_string()))?
+            {
+                return Err(domain_status(
+                    ErrorCode::Forbidden,
+                    format!(
+                        "change {} is not on view '{}'",
+                        atomic_core::types::Base32::to_base32(&foreign),
+                        grant.view
+                    ),
+                ));
+            }
+        }
+        TurnScope::Session(session_id) => {
+            let owns = grants
+                .owns_session(grant, session_id)
+                .map_err(|e| e.status())?;
+            if !owns && !unused(session_id)? {
+                return Err(forbidden("that session"));
+            }
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // ProvenanceService — the eight journal RPCs
 // ---------------------------------------------------------------------------
 
@@ -223,19 +315,47 @@ pub async fn reserve_turn_impl(
     state: &Arc<DaemonState>,
     request: Request<ReserveTurnRequest>,
 ) -> Result<Response<ReserveTurnResponse>, Status> {
+    let caller = state.sandbox_caller(&request)?;
     let request = request.into_inner();
     let handle = state.resolve(request.repository.as_ref().unwrap())?;
     state.log_rpc("ReserveTurn", Some(&handle));
+    if let Some(caller) = &caller {
+        caller.require("agent.checkpoint")?;
+        caller.require_target(
+            &handle,
+            request.repository.as_ref().unwrap(),
+            request.view.as_ref(),
+        )?;
+    }
+    let grants = state.sandbox_grants().clone();
     let gate_handle = handle.clone();
     let _gate = gate_handle.exclusive().await;
+    if let Some(caller) = &caller {
+        caller.revalidate(state)?;
+    }
     let meta = request.meta.clone();
     let now = observed_now(&request.meta);
     let session_id = request.session_id.clone();
     let turn_number = request.turn_number;
     let response = tokio::task::spawn_blocking(move || {
+        if let Some(caller) = &caller {
+            check_turn_scope(
+                &handle,
+                grants.as_ref(),
+                caller,
+                TurnScope::Claim(&session_id),
+            )?;
+        }
         let store = handle.change_store()?;
         let turn =
             core::reserve_turn(&store, &session_id, turn_number, now).map_err(core_status)?;
+        // The turn is the sandbox's from here on: its envelopes, checkpoint
+        // and acknowledgement are refused to anyone else.
+        if let Some(caller) = &caller {
+            grants
+                .bind_provenance(&caller.grant, turn.provenance_id.get())
+                .map_err(|e| e.status())?;
+        }
         // reserve_provenance_turn returns only after txn.commit().
         Ok::<_, Status>(ReserveTurnResponse {
             turn: Some(stored_turn_proto(&turn)),
@@ -252,11 +372,20 @@ pub async fn append_envelopes_impl(
     state: &Arc<DaemonState>,
     request: Request<AppendEnvelopesRequest>,
 ) -> Result<Response<AppendEnvelopesResponse>, Status> {
+    let caller = state.sandbox_caller(&request)?;
     let request = request.into_inner();
     let handle = state.resolve(request.repository.as_ref().unwrap())?;
     state.log_rpc("AppendEnvelopes", Some(&handle));
+    if let Some(caller) = &caller {
+        caller.require("provenance.write")?;
+        caller.require_target(&handle, request.repository.as_ref().unwrap(), None)?;
+    }
+    let grants = state.sandbox_grants().clone();
     let gate_handle = handle.clone();
     let _gate = gate_handle.exclusive().await;
+    if let Some(caller) = &caller {
+        caller.revalidate(state)?;
+    }
     let meta = request.meta.clone();
     let now = observed_now(&request.meta);
     let provenance_id = request.provenance_id;
@@ -267,6 +396,14 @@ pub async fn append_envelopes_impl(
         .map(|envelope| (envelope.event_id, envelope.envelope))
         .collect();
     let response = tokio::task::spawn_blocking(move || {
+        if let Some(caller) = &caller {
+            check_turn_scope(
+                &handle,
+                grants.as_ref(),
+                caller,
+                TurnScope::Provenance(provenance_id),
+            )?;
+        }
         let store = handle.change_store()?;
         let refs: Vec<(&str, &[u8])> = batch
             .iter()
@@ -301,11 +438,20 @@ pub async fn prepare_checkpoint_impl(
     state: &Arc<DaemonState>,
     request: Request<PrepareCheckpointRequest>,
 ) -> Result<Response<PrepareCheckpointResponse>, Status> {
+    let caller = state.sandbox_caller(&request)?;
     let request = request.into_inner();
     let handle = state.resolve(request.repository.as_ref().unwrap())?;
     state.log_rpc("PrepareCheckpoint", Some(&handle));
+    if let Some(caller) = &caller {
+        caller.require("agent.checkpoint")?;
+        caller.require_target(&handle, request.repository.as_ref().unwrap(), None)?;
+    }
+    let grants = state.sandbox_grants().clone();
     let gate_handle = handle.clone();
     let _gate = gate_handle.exclusive().await;
+    if let Some(caller) = &caller {
+        caller.revalidate(state)?;
+    }
     let meta = request.meta.clone();
     let now = observed_now(&request.meta);
     let provenance_id = request.provenance_id;
@@ -316,7 +462,16 @@ pub async fn prepare_checkpoint_impl(
         .as_ref()
         .ok_or_else(|| domain_status(ErrorCode::InvalidArgument, "checkpoint source is required"))?
         .clone();
+    let explained = checkpoint_source_domain(&source).change_hashes;
     let response = tokio::task::spawn_blocking(move || {
+        if let Some(caller) = &caller {
+            check_turn_scope(
+                &handle,
+                grants.as_ref(),
+                caller,
+                TurnScope::Prepare(provenance_id, &explained),
+            )?;
+        }
         let store = handle.change_store()?;
         let attempt = core::prepare_checkpoint(
             &store,
@@ -341,11 +496,20 @@ pub async fn load_frozen_envelopes_impl(
     state: &Arc<DaemonState>,
     request: Request<LoadFrozenEnvelopesRequest>,
 ) -> Result<Response<LoadFrozenEnvelopesResponse>, Status> {
+    let caller = state.sandbox_caller(&request)?;
     let request = request.into_inner();
     let handle = state.resolve(request.repository.as_ref().unwrap())?;
     state.log_rpc("LoadFrozenEnvelopes", Some(&handle));
+    if let Some(caller) = &caller {
+        caller.require("provenance.read")?;
+        caller.require_target(&handle, request.repository.as_ref().unwrap(), None)?;
+    }
+    let grants = state.sandbox_grants().clone();
     let gate_handle = handle.clone();
     let _gate = gate_handle.exclusive().await;
+    if let Some(caller) = &caller {
+        caller.revalidate(state)?;
+    }
     let provenance_id = request.provenance_id;
     let attempt_generation = request.attempt_generation;
     let frozen_event_count = request.frozen_event_count;
@@ -362,6 +526,14 @@ pub async fn load_frozen_envelopes_impl(
         .and_then(|budget| budget.max_bytes)
         .map(|max| max as usize);
     let response = tokio::task::spawn_blocking(move || {
+        if let Some(caller) = &caller {
+            check_turn_scope(
+                &handle,
+                grants.as_ref(),
+                caller,
+                TurnScope::Provenance(provenance_id),
+            )?;
+        }
         let store = handle.change_store()?;
         let page = core::load_frozen_page(
             &store,
@@ -403,11 +575,20 @@ pub async fn bind_checkpoint_hash_impl(
     state: &Arc<DaemonState>,
     request: Request<BindCheckpointHashRequest>,
 ) -> Result<Response<BindCheckpointHashResponse>, Status> {
+    let caller = state.sandbox_caller(&request)?;
     let request = request.into_inner();
     let handle = state.resolve(request.repository.as_ref().unwrap())?;
     state.log_rpc("BindCheckpointHash", Some(&handle));
+    if let Some(caller) = &caller {
+        caller.require("agent.checkpoint")?;
+        caller.require_target(&handle, request.repository.as_ref().unwrap(), None)?;
+    }
+    let grants = state.sandbox_grants().clone();
     let gate_handle = handle.clone();
     let _gate = gate_handle.exclusive().await;
+    if let Some(caller) = &caller {
+        caller.revalidate(state)?;
+    }
     let meta = request.meta.clone();
     let now = observed_now(&request.meta);
     let provenance_id = request.provenance_id;
@@ -425,6 +606,14 @@ pub async fn bind_checkpoint_hash_impl(
         .clone()
         .ok_or_else(|| domain_status(ErrorCode::InvalidArgument, "session turn is required"))?;
     let response = tokio::task::spawn_blocking(move || {
+        if let Some(caller) = &caller {
+            check_turn_scope(
+                &handle,
+                grants.as_ref(),
+                caller,
+                TurnScope::Provenance(provenance_id),
+            )?;
+        }
         let store = handle.change_store()?;
         let session_turn = enriched_session_turn(
             &store,
@@ -456,11 +645,20 @@ pub async fn acknowledge_checkpoint_impl(
     state: &Arc<DaemonState>,
     request: Request<AcknowledgeCheckpointRequest>,
 ) -> Result<Response<AcknowledgeCheckpointResponse>, Status> {
+    let caller = state.sandbox_caller(&request)?;
     let request = request.into_inner();
     let handle = state.resolve(request.repository.as_ref().unwrap())?;
     state.log_rpc("AcknowledgeCheckpoint", Some(&handle));
+    if let Some(caller) = &caller {
+        caller.require("agent.checkpoint")?;
+        caller.require_target(&handle, request.repository.as_ref().unwrap(), None)?;
+    }
+    let grants = state.sandbox_grants().clone();
     let gate_handle = handle.clone();
     let _gate = gate_handle.exclusive().await;
+    if let Some(caller) = &caller {
+        caller.revalidate(state)?;
+    }
     let meta = request.meta.clone();
     // Caller-supplied completion time — never the server clock.
     let completed_at = request.completed_at.as_ref().map(|stamp| stamp.seconds);
@@ -470,6 +668,14 @@ pub async fn acknowledge_checkpoint_impl(
     let expected_generation = request.expected_generation;
     let manifest_hash = hash_domain(&request.manifest_hash)?;
     let response = tokio::task::spawn_blocking(move || {
+        if let Some(caller) = &caller {
+            check_turn_scope(
+                &handle,
+                grants.as_ref(),
+                caller,
+                TurnScope::Provenance(provenance_id),
+            )?;
+        }
         let store = handle.change_store()?;
         core::acknowledge_checkpoint(
             &store,
@@ -492,11 +698,20 @@ pub async fn update_turn_impl(
     state: &Arc<DaemonState>,
     request: Request<UpdateTurnRequest>,
 ) -> Result<Response<UpdateTurnResponse>, Status> {
+    let caller = state.sandbox_caller(&request)?;
     let request = request.into_inner();
     let handle = state.resolve(request.repository.as_ref().unwrap())?;
     state.log_rpc("UpdateTurn", Some(&handle));
+    if let Some(caller) = &caller {
+        caller.require("provenance.write")?;
+        caller.require_target(&handle, request.repository.as_ref().unwrap(), None)?;
+    }
+    let grants = state.sandbox_grants().clone();
     let gate_handle = handle.clone();
     let _gate = gate_handle.exclusive().await;
+    if let Some(caller) = &caller {
+        caller.revalidate(state)?;
+    }
     let meta = request.meta.clone();
     let observed_at = observed_now(&request.meta);
     let session_id = request.session_id.clone();
@@ -519,6 +734,14 @@ pub async fn update_turn_impl(
         ));
     }
     let response = tokio::task::spawn_blocking(move || {
+        if let Some(caller) = &caller {
+            check_turn_scope(
+                &handle,
+                grants.as_ref(),
+                caller,
+                TurnScope::Session(&session_id),
+            )?;
+        }
         let store = handle.change_store()?;
         let turn = match action {
             TurnAction::Stop => {
@@ -568,14 +791,31 @@ pub async fn get_turn_impl(
     state: &Arc<DaemonState>,
     request: Request<GetTurnRequest>,
 ) -> Result<Response<GetTurnResponse>, Status> {
+    let caller = state.sandbox_caller(&request)?;
     let request = request.into_inner();
     let handle = state.resolve(request.repository.as_ref().unwrap())?;
     state.log_rpc("GetTurn", Some(&handle));
+    if let Some(caller) = &caller {
+        caller.require("provenance.read")?;
+        caller.require_target(&handle, request.repository.as_ref().unwrap(), None)?;
+    }
+    let grants = state.sandbox_grants().clone();
     let gate_handle = handle.clone();
     let _gate = gate_handle.exclusive().await;
+    if let Some(caller) = &caller {
+        caller.revalidate(state)?;
+    }
     let session_id = request.session_id.clone();
     let turn_number = request.turn_number;
     let response = tokio::task::spawn_blocking(move || {
+        if let Some(caller) = &caller {
+            check_turn_scope(
+                &handle,
+                grants.as_ref(),
+                caller,
+                TurnScope::Session(&session_id),
+            )?;
+        }
         let store = handle.change_store()?;
         let turn = core::get_turn(&store, &session_id, turn_number).map_err(core_status)?;
         Ok::<_, Status>(GetTurnResponse {

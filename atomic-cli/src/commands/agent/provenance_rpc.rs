@@ -117,6 +117,19 @@ impl ProvenanceRpcSink {
 /// orchestrator fails the turn with the reason instead of silently
 /// dropping provenance.
 pub(crate) fn sink_for(root: &Path) -> Arc<dyn ProvenanceJournalSink> {
+    // A remote sandbox journals into the repository that serves it, over
+    // whatever serves the daemon socket, with its grant's token — whatever
+    // the service mode says, and never by starting a daemon or resolving a
+    // path the server does not have.
+    if let Some((_, pointer)) = atomic_repository::find_remote_sandbox(root) {
+        return match crate::remote_sandbox::reference(&pointer) {
+            Ok(reference) => {
+                let _ = SANDBOX_TOKEN.set(pointer.token.into_bytes());
+                Arc::new(ProvenanceRpcSink { reference })
+            }
+            Err(reason) => Arc::new(RefusedJournalSink { reason }),
+        };
+    }
     match crate::service::mode() {
         crate::service::Mode::Local => match DirectJournalSink::open(root) {
             Ok(sink) => Arc::new(sink),
@@ -184,12 +197,30 @@ fn request_meta(now: i64) -> Option<pb::RequestMeta> {
     })
 }
 
+/// A remote sandbox's token, when this process journals for one: every
+/// journal request carries it, and the transport is never started.
+static SANDBOX_TOKEN: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+
 fn provenance_client(
     client: AtomicClient,
-) -> pb::provenance_service_client::ProvenanceServiceClient<tonic::transport::Channel> {
-    pb::provenance_service_client::ProvenanceServiceClient::new(client.channel.clone())
+) -> pb::provenance_service_client::ProvenanceServiceClient<crate::remote_sandbox::SandboxChannel> {
+    let channel = tonic::service::interceptor::InterceptedService::new(
+        client.channel.clone(),
+        crate::remote_sandbox::TokenInterceptor::new(SANDBOX_TOKEN.get().map(Vec::as_slice)),
+    );
+    pb::provenance_service_client::ProvenanceServiceClient::new(channel)
         .max_decoding_message_size(MAX_MESSAGE_BYTES)
         .max_encoding_message_size(MAX_MESSAGE_BYTES)
+}
+
+/// Connect for one journal request: start the transport when it is down
+/// (D4) — except for a remote sandbox, which has none of its own.
+async fn connect_for_journal() -> Result<AtomicClient, String> {
+    if SANDBOX_TOKEN.get().is_some() {
+        AtomicClient::connect_existing().await
+    } else {
+        AtomicClient::connect_or_start().await
+    }
 }
 
 /// The legacy `request_with_reconnect`, ported: up to three attempts,
@@ -205,7 +236,7 @@ where
 {
     let mut last_error: Option<anyhow::Error> = None;
     for _ in 0..3 {
-        let client = match AtomicClient::connect_or_start().await {
+        let client = match connect_for_journal().await {
             Ok(client) => client,
             Err(error) => {
                 last_error = Some(anyhow!("daemon rpc {operation} failed: {error}"));
