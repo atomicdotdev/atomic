@@ -10,8 +10,13 @@ use std::path::{Path, PathBuf};
 
 use atomic_core::change::{Author, ChangeHeader};
 use atomic_core::types::{Hash, SetId};
+use atomic_core::WorkingCopyId;
 use atomic_repository::{InsertOptions, RecordOptions, Repository, SplitOptions};
 use tempfile::TempDir;
+
+fn working_copy(repo: &Repository) -> WorkingCopyId {
+    repo.require_working_copy_id().expect("working copy id")
+}
 
 fn init_repo() -> (Repository, TempDir, PathBuf) {
     let temp = TempDir::new().expect("temp dir");
@@ -22,7 +27,8 @@ fn init_repo() -> (Repository, TempDir, PathBuf) {
 
 fn write_and_add(repo: &Repository, root: &Path, name: &str, content: &str) {
     fs::write(root.join(name), content).expect("write file");
-    repo.add(name, Default::default()).expect("add file");
+    repo.add(working_copy(repo), name, Default::default())
+        .expect("add file");
 }
 
 fn record(repo: &Repository, message: &str) -> Hash {
@@ -31,7 +37,7 @@ fn record(repo: &Repository, message: &str) -> Hash {
         .author(Author::new("Test", Some("test@example.com")))
         .build();
     *repo
-        .record(header, RecordOptions::default())
+        .record(working_copy(repo), header, RecordOptions::default())
         .expect("record")
         .hash()
 }
@@ -60,7 +66,7 @@ fn view_set_id_round_trips_home_after_split_and_reinsert() {
     );
 
     // Split the middle change out into a draft. dev is now {a, c}.
-    repo.split_view(SplitOptions::new("escape", vec![c2]))
+    repo.split_view(working_copy(&repo), SplitOptions::new("escape", vec![c2]))
         .expect("split c2 into escape");
 
     let set_after_split = repo.view_set_id(&dev).expect("set id after split");

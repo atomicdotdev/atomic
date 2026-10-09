@@ -2,6 +2,12 @@
 
 A Semantic Change Graph (SCG) to track memory, intent, provenance, and change as a single unit of work.  This is the evolution of source code management in the era of agents and agentic coding.
 
+The Git causal bridge is temporarily supported on **Unix only (Linux and macOS)**.
+Windows bridge support is deferred while its platform contract is defined; native
+Atomic functionality continues to be tested on Windows. See the
+[temporary platform policy](docs/RFC-ATOMIC-GIT-CAUSAL-BRIDGE.md#temporary-platform-support-pr-207)
+for the CI scope and requirements for re-enabling Windows bridge tests.
+
 ## Why Atomic?
 
 Git was designed for humans writing code in text editors. It tracks lines in files. That worked for 20 years.

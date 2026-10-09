@@ -1,5 +1,25 @@
 use super::*;
 
+const ATOM_CHANGE_MAGIC: &[u8; 4] = b"ATOM";
+const ATOM_CHANGE_FILE_HEADER_LEN: usize = 64;
+const ATOM_CHANGE_FILE_VERSION_V1: u32 = 1;
+const ATOM_CHANGE_FILE_VERSION_V2: u32 = 2;
+
+fn atom_change_file_version(bytes: &[u8]) -> Result<u32, RepositoryError> {
+    if bytes.len() < ATOM_CHANGE_FILE_HEADER_LEN {
+        return Err(RepositoryError::Serialization(format!(
+            "change object is too short for an ATOM file header: expected at least {ATOM_CHANGE_FILE_HEADER_LEN} bytes, found {}",
+            bytes.len()
+        )));
+    }
+    if &bytes[..4] != ATOM_CHANGE_MAGIC {
+        return Err(RepositoryError::Serialization(
+            "change object does not begin with ATOM file-header magic".to_string(),
+        ));
+    }
+    Ok(u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]))
+}
+
 impl Repository {
     // Change Storage Methods
 
@@ -27,20 +47,28 @@ impl Repository {
     ///
     /// ```rust,ignore
     /// let repo = Repository::open(".")?;
-    /// let rules = repo.ignore_rules();
+    /// let rules = repo.ignore_rules(working_copy)?;
     ///
     /// if rules.is_ignored(Path::new("target/debug"), true) {
     ///     println!("Path is ignored");
     /// }
     /// ```
-    pub fn ignore_rules(&self) -> IgnoreRules {
+    pub fn ignore_rules(
+        &self,
+        working_copy: WorkingCopyId,
+    ) -> Result<IgnoreRules, RepositoryError> {
+        self.validate_working_copy(working_copy)?;
+        Ok(self.load_ignore_rules())
+    }
+
+    pub(super) fn load_ignore_rules(&self) -> IgnoreRules {
         IgnoreRules::load(&self.root)
     }
 
     /// Check if a path should be ignored.
     ///
     /// This is a convenience method that loads ignore rules and checks the path.
-    /// If you need to check multiple paths, use [`Self::ignore_rules()`] instead
+    /// If you need to check multiple paths, use [`Self::ignore_rules`] instead
     /// to avoid reloading the rules for each check.
     ///
     /// # Arguments
@@ -51,9 +79,13 @@ impl Repository {
     /// # Returns
     ///
     /// `true` if the path should be ignored, `false` otherwise.
-    pub fn is_ignored(&self, path: &Path, is_dir: bool) -> bool {
-        let rules = self.ignore_rules();
-        rules.is_ignored(path, is_dir)
+    pub fn is_ignored(
+        &self,
+        working_copy: WorkingCopyId,
+        path: &Path,
+        is_dir: bool,
+    ) -> Result<bool, RepositoryError> {
+        Ok(self.ignore_rules(working_copy)?.is_ignored(path, is_dir))
     }
 
     /// Save a change to the repository.
@@ -85,38 +117,61 @@ impl Repository {
     /// println!("Saved change: {}", hash.to_base32());
     /// ```
     pub fn save_change(&self, change: &Change) -> Result<Hash, RepositoryError> {
+        self.pristine
+            .require_repository_capability(CHANGE_FORMAT_VNEXT_CAPABILITY)
+            .map_err(RepositoryError::from)?;
         self.change_store
             .save_change(change)
             .map_err(|e| RepositoryError::Database(e.to_string()))
     }
 
-    /// Save a change using pre-serialized V3 bytes (hash-stable).
+    /// Save a change using pre-serialized ATOM bytes (hash-stable).
     ///
-    /// This writes the exact V3 bytes to disk, ensuring the file hash matches
-    /// the hash registered in the pristine graph. Without this, re-serializing
-    /// the deserialized Change can produce a different hash (different hash table
-    /// ordering, different chunk boundaries, etc.), causing "change not found"
-    /// errors on push.
+    /// This writes the exact bytes to disk after inspecting the explicit ATOM
+    /// file-header version. Version 1 is legacy; version 2 requires the durable
+    /// `change-format-vnext` repository capability before persistence.
     ///
     /// # Arguments
     ///
     /// * `hash` - The content hash (from the original serialization)
-    /// * `v3_bytes` - The exact V3 bytes to write to disk
+    /// * `change_bytes` - The exact ATOM bytes to write to disk
     /// * `_change` - The deserialized Change (unused, kept for API compatibility)
     pub(crate) fn save_change_bytes(
         &self,
         hash: &Hash,
-        v3_bytes: &[u8],
+        change_bytes: &[u8],
+        change: &Change,
+    ) -> Result<Hash, RepositoryError> {
+        if atom_change_file_version(change_bytes)? == ATOM_CHANGE_FILE_VERSION_V2 {
+            self.pristine
+                .require_repository_capability(CHANGE_FORMAT_VNEXT_CAPABILITY)
+                .map_err(RepositoryError::from)?;
+        }
+        self.save_change_bytes_after_capability_declaration(hash, change_bytes, change)
+    }
+
+    /// Write pre-serialized bytes after the caller has declared V2 capability
+    /// before opening its graph transaction.
+    pub(crate) fn save_change_bytes_after_capability_declaration(
+        &self,
+        hash: &Hash,
+        change_bytes: &[u8],
         _change: &Change,
     ) -> Result<Hash, RepositoryError> {
-        // Write the exact V3 bytes to the file store (no re-serialization).
-        // This ensures the hash in the filename matches the hash in the pristine.
+        match atom_change_file_version(change_bytes)? {
+            ATOM_CHANGE_FILE_VERSION_V1 | ATOM_CHANGE_FILE_VERSION_V2 => {}
+            version => {
+                return Err(RepositoryError::Serialization(format!(
+                    "unsupported ATOM change file-header version {version}; supported versions are 1 and 2"
+                )))
+            }
+        }
+
         let change_path = self.change_store.change_path(hash);
         if let Some(parent) = change_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::write(&change_path, v3_bytes)?;
-
+        std::fs::write(&change_path, change_bytes)?;
         Ok(*hash)
     }
 
@@ -624,6 +679,68 @@ impl Repository {
         txn.commit()
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
         Ok(())
+    }
+
+    /// Persist a managed-agent incomplete outcome without indexing a turn.
+    ///
+    /// Returns the canonical stored outcome. If duplicate callbacks present a
+    /// different value, the first durable recovery object is preserved.
+    pub fn mark_session_incomplete(
+        &self,
+        session_id: &str,
+        view_name: Option<String>,
+        parent_view: Option<String>,
+        incomplete: &atomic_core::change::session::IncompleteSession,
+    ) -> Result<atomic_core::change::session::IncompleteSession, RepositoryError> {
+        let json_path = self
+            .dot_dir
+            .join("sessions")
+            .join(format!("{}.json", session_id))
+            .to_string_lossy()
+            .to_string();
+        let mut txn = self
+            .pristine
+            .write_txn()
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        let persisted = txn
+            .mark_session_incomplete(session_id, &json_path, view_name, parent_view, incomplete)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        txn.commit()
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        Ok(persisted)
+    }
+
+    /// Attach durable turn boundaries and the semantic outcome to an already
+    /// indexed turn row (CB-12A, RFC §10.1/§10.2).
+    ///
+    /// Returns `Ok(None)` when no turn row carries this provenance hash (the
+    /// turn recorded no provenance — git-only or observation-only outcomes
+    /// have no ledger row by design).
+    #[allow(clippy::too_many_arguments)]
+    pub fn attach_turn_boundary(
+        &self,
+        session_id: &str,
+        provenance_hash: &Hash,
+        boundary_start: &atomic_core::change::session::TurnBoundary,
+        boundary_end: &atomic_core::change::session::TurnBoundary,
+        outcome: &atomic_core::change::session::ManagedTurnOutcome,
+    ) -> Result<Option<bool>, RepositoryError> {
+        let mut txn = self
+            .pristine
+            .write_txn()
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        let attached = txn
+            .attach_turn_boundary(
+                session_id,
+                provenance_hash,
+                boundary_start,
+                boundary_end,
+                outcome,
+            )
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        txn.commit()
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        Ok(Some(attached))
     }
 
     /// Create a forked session from a parent at a turn boundary.

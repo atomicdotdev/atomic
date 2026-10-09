@@ -174,6 +174,16 @@ impl super::CrdtChangeBuilder {
 
         let trunk_id = self.add_file(path, encoding);
 
+        // Binary/unknown-encoding content is an OPAQUE trunk: the semantic
+        // layer records no line or token ops for it. The trunk's bytes live
+        // in the graph; tokenizing random binary into per-line branches and
+        // per-byte leaves made a 1 MB binary add emit ~4100 branches and
+        // ~1M leaves (a 24s apply) for zero semantic value. Text content
+        // keeps the full line/token decomposition.
+        if encoding.is_none() {
+            return trunk_id;
+        }
+
         let tokenizer = ContentTokenizer::new(content);
         let mut prev_branch: Option<crate::crdt::BranchId> = None;
 
@@ -221,8 +231,8 @@ impl super::CrdtChangeBuilder {
     }
 
     /// Marks a file for deletion.
-    pub fn delete_file(&mut self, trunk_id: TrunkId) {
-        let file_op = FileOps::delete(trunk_id, String::new());
+    pub fn delete_file(&mut self, trunk_id: TrunkId, path: &str) {
+        let file_op = FileOps::delete(trunk_id, path.to_string());
         self.file_ops.push(file_op);
         self.stats.files_deleted += 1;
     }

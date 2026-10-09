@@ -274,9 +274,20 @@ fn globalize_replace<T>(
 where
     T: GraphTxnT + TreeTxnT + InodeGraphOps,
 {
-    if should_use_opaque_generated_vertices(&local.path) {
-        return globalize_replace_whole_file(ctx, inode, inode_pos, content, local, encoding);
-    }
+    // NOTE (review ::26 R1 follow-up, 2026-09-16): the historical
+    // `should_use_opaque_generated_vertices` early-return here routed EVERY
+    // Replace hunk of an opaque path (lockfiles/checksums) to whole-file
+    // replacement — using the hunk's SLICED content (just the modified
+    // lines). A lockfile-only modification of lines 2 and 6 therefore
+    // became two sequential whole-file replaces carrying one line each,
+    // destroying the other lines (12-of-67 bytes rendered — a real
+    // data-loss defect). Targeted per-line surgery is classification-blind:
+    // the deletion and insertion operate on graph vertices, so an
+    // opaque-classified file with per-line structure takes the SAME
+    // targeted path. The monolithic-vertex and empty-file shapes still
+    // fall back to whole-file replacement below (bounds-check +
+    // sorted.is_empty()), and whole-file lifecycle paths (add/delete/
+    // globalize_replace_whole_file) keep their opaque insert shape.
 
     let sorted = collect_sorted_content_vertices_cached(ctx, inode, inode_pos)?;
 
@@ -499,6 +510,10 @@ fn globalize_delete<T>(
 where
     T: GraphTxnT + TreeTxnT + InodeGraphOps,
 {
+    // Whole-file lifecycle changes must always depend on the inode's creating
+    // change, including zero-byte files whose deletion has no content edges.
+    ctx.add_dependency_by_id(inode_pos.change)?;
+
     if should_use_opaque_generated_vertices(&local.path) {
         let content_vertices = find_content_vertices(ctx.txn(), inode, inode_pos)?;
         let deletion_edges = build_deletion_edges(ctx, &content_vertices)?;

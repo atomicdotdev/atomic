@@ -7,6 +7,7 @@ Welcome to the Atomic VCS documentation. This directory contains comprehensive d
 | Document | Description | Audience |
 |----------|-------------|----------|
 | [CLI Reference](../atomic-cli/README.md) | Complete command reference for the `atomic` CLI | Users, Everyone |
+| [Bridge Operating Guide](./bridge-operating-guide.md) | Git bridge enable/disable, trust, recovery, privacy, and observability (CB-13C; exercised against the shipping CLI) | Users, Agents |
 | [Stack Walkthrough](./walkthrough-stacks.md) | Hands-on tutorial for stacks, apply, and stash | Users, Contributors |
 | [Attestation Design](./attestation-design.md) | Graph-level audit nodes for AI cost, tokens, and compliance | Developers, Contributors |
 | [Intent Identity](./intent-identity.md) | ULID + `PROJECT::author::seq` intent identity and reference resolution | Users, Contributors |

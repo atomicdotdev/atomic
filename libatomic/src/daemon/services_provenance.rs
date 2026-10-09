@@ -193,6 +193,9 @@ fn enriched_session_turn(
         timestamp: now,
         plan_id: None,
         todos: Vec::new(),
+        boundary_start: None,
+        boundary_end: None,
+        outcome: None,
     };
     if let Ok(Some(stored)) = store.get_provenance_turn(id) {
         if let Some(attempt) = stored.checkpoint_attempt {

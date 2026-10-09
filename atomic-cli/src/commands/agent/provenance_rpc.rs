@@ -355,6 +355,9 @@ fn journal_checkpoint_attempt(
                 .unwrap_or(0),
             plan_id: None,
             todos: Vec::new(),
+            boundary_start: None,
+            boundary_end: None,
+            outcome: None,
         }),
         manifest_hash: attempt.manifest_hash.as_ref().and_then(|hash| {
             hash.value
@@ -1170,6 +1173,9 @@ impl Command for JournalRpcSelftest {
             timestamp: now + 3,
             plan_id: None,
             todos: Vec::new(),
+            boundary_start: None,
+            boundary_end: None,
+            outcome: None,
         };
         let bound = sink
             .bind_checkpoint_hash(&checkpoint, graph_hash, session_turn, now + 3)

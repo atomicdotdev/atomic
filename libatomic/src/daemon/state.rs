@@ -107,6 +107,87 @@ impl RepoHandle {
         })
     }
 
+    /// Enter an explicit working-copy boundary inside the blocking request.
+    /// The caller retains the returned transaction for the whole operation;
+    /// its ordered graph/workspace locks must not be dropped after reading ID.
+    pub fn workspace_repository(
+        &self,
+        mode: atomic_repository::WorkspaceTxnMode,
+    ) -> Result<(Repository, atomic_repository::WorkspaceTxn), Status> {
+        self.workspace_repository_for_switch(mode, None)
+    }
+
+    /// The only force recovery allowed here is retrying the exact view whose
+    /// native switch completed before its separate Git projection failed.
+    pub(super) fn workspace_repository_for_switch(
+        &self,
+        mode: atomic_repository::WorkspaceTxnMode,
+        target: Option<&str>,
+    ) -> Result<(Repository, atomic_repository::WorkspaceTxn), Status> {
+        use atomic_repository::{
+            RepositoryError, UnanchoredWorkspace, WorkspaceRemediation, WorkspaceTxnMode,
+            WorkspaceTxnStart,
+        };
+        if mode == WorkspaceTxnMode::Force {
+            return Err(domain_status(
+                ErrorCode::InvalidArgument,
+                "service workspace entry cannot force reconciliation",
+            ));
+        }
+        let deadline = std::time::Instant::now() + database_open_wait();
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            let mut repo = match mode {
+                WorkspaceTxnMode::Observe => Repository::open_readonly_wait(&self.root, remaining),
+                WorkspaceTxnMode::Reconcile => {
+                    Repository::open_for_workspace_transaction_wait(&self.root, remaining)
+                }
+                WorkspaceTxnMode::Force => unreachable!(),
+            }
+            .map_err(repository_error)?;
+            let start = repo
+                .begin_workspace_txn(mode)
+                .and_then(|start| match start {
+                    WorkspaceTxnStart::Remediation(WorkspaceRemediation::Unanchored {
+                        state:
+                            UnanchoredWorkspace::AtomicCheckpointDrift {
+                                ref desired_view, ..
+                            },
+                        ..
+                    }) if mode == WorkspaceTxnMode::Reconcile
+                        && target == Some(desired_view.as_str()) =>
+                    {
+                        repo.begin_workspace_txn(WorkspaceTxnMode::Force)
+                    }
+                    other => Ok(other),
+                });
+            match start {
+                Ok(WorkspaceTxnStart::Ready(workspace)) => return Ok((repo, workspace)),
+                Ok(WorkspaceTxnStart::Remediation(remediation)) => {
+                    return Err(domain_status(
+                        ErrorCode::PreconditionFailed,
+                        format!(
+                            "workspace reconciliation required: {}",
+                            remediation.describe()
+                        ),
+                    ))
+                }
+                Err(RepositoryError::LockContended { .. })
+                    if std::time::Instant::now() < deadline =>
+                {
+                    // Never keep a read handle while waiting: the lock owner
+                    // may need to open the database writable to finish.
+                    drop(repo);
+                    std::thread::sleep(
+                        std::time::Duration::from_millis(10)
+                            .min(deadline.saturating_duration_since(std::time::Instant::now())),
+                    );
+                }
+                Err(error) => return Err(repository_error(error)),
+            }
+        }
+    }
+
     /// Open the repository database READ-ONLY for this query, with the
     /// read-concurrency wait: redb refuses any open while a writable
     /// handle exists (this or another process), so a short-lived writer —
@@ -133,7 +214,7 @@ impl RepoHandle {
     /// sequentially under the gate (the same open/close-per-op discipline
     /// #230's orchestrator applies).
     pub fn change_store(&self) -> Result<RedbChangeStore, Status> {
-        let dot_dir = self.root.join(".atomic");
+        let dot_dir = Repository::canonical_dot_dir(&self.root).map_err(repository_error)?;
         let path = atomic_repository::ensure_database(&dot_dir)
             .map_err(|error| domain_status(ErrorCode::Repository, error.to_string()))?;
         RedbChangeStore::open_existing_wait(&path, database_open_wait()).map_err(|error| {
@@ -142,6 +223,23 @@ impl RepoHandle {
                 format!("failed to open {}: {error}", path.display()),
             )
         })
+    }
+}
+
+/// Shared adapter for service paths that already own a repository handle.
+pub(super) fn enter_workspace(
+    repo: &mut Repository,
+    mode: atomic_repository::WorkspaceTxnMode,
+) -> Result<atomic_repository::WorkspaceTxn, Status> {
+    match repo.begin_workspace_txn(mode).map_err(repository_error)? {
+        atomic_repository::WorkspaceTxnStart::Ready(workspace) => Ok(workspace),
+        atomic_repository::WorkspaceTxnStart::Remediation(remediation) => Err(domain_status(
+            ErrorCode::PreconditionFailed,
+            format!(
+                "workspace reconciliation required: {}",
+                remediation.describe()
+            ),
+        )),
     }
 }
 

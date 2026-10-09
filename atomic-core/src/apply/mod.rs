@@ -225,6 +225,7 @@
 //! [`Workspace`]: crate::apply::Workspace
 //! [`ConflictTracker`]: crate::apply::ConflictTracker
 
+mod attribute;
 mod change;
 pub mod conflict;
 pub mod edge;
@@ -235,10 +236,12 @@ pub mod insertion;
 pub mod position;
 mod workspace;
 
+pub use attribute::apply_set_attr;
+
 // Re-export core change application functions
 pub use change::{
-    compute_new_state, is_change_on_view, validate_can_apply, verify_dependencies,
-    ApplyResult as ApplyChangeResult, ChangeToApply,
+    compute_new_state, is_change_on_view, validate_can_apply, validate_can_apply_with_frontier,
+    verify_causal_frontier, verify_dependencies, ApplyResult as ApplyChangeResult, ChangeToApply,
 };
 
 // Re-export error types
@@ -253,8 +256,10 @@ pub use position::{
 };
 
 // Re-export atom application functions
-pub use edge::{find_source_vertex, find_target_vertex, write_edge_map};
-pub use insertion::write_new_vertex;
+pub use edge::{
+    find_source_vertex, find_target_vertex, write_edge_map, write_edge_map_with_frontier,
+};
+pub use insertion::{write_new_vertex, write_new_vertex_with_frontier};
 
 // Re-export conflict tracking types
 pub use conflict::{

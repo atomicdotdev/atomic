@@ -80,6 +80,9 @@ pub enum ObjectFamily {
     Attest,
     /// A view-snapshot object (`ViewSnapshot`) — a view's membership + lineage.
     View,
+    /// A `.conflict` object — the complete graph-backed conflict state of a
+    /// view (RFC §8.3 conflict snapshot packs, CB-8B).
+    Conflict,
 }
 
 impl ObjectFamily {
@@ -93,6 +96,7 @@ impl ObjectFamily {
             ObjectFamily::Provenance => "provenance",
             ObjectFamily::Attest => "attest",
             ObjectFamily::View => "views",
+            ObjectFamily::Conflict => "conflicts",
         }
     }
 
@@ -104,18 +108,20 @@ impl ObjectFamily {
             "provenance" => Some(ObjectFamily::Provenance),
             "attest" => Some(ObjectFamily::Attest),
             "views" => Some(ObjectFamily::View),
+            "conflicts" => Some(ObjectFamily::Conflict),
             _ => None,
         }
     }
 
     /// Every family, for iteration (inventory scans, closure walks).
-    pub fn all() -> [ObjectFamily; 5] {
+    pub fn all() -> [ObjectFamily; 6] {
         [
             ObjectFamily::Change,
             ObjectFamily::Tag,
             ObjectFamily::Provenance,
             ObjectFamily::Attest,
             ObjectFamily::View,
+            ObjectFamily::Conflict,
         ]
     }
 }

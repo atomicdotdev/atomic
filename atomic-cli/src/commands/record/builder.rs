@@ -15,6 +15,7 @@ impl Record {
             dry_run: false,
             skip_binary: false,
             allow_conflict_markers: false,
+            resolve_name_conflicts: Vec::new(),
             max_size: None,
             ai_assisted: false,
             ai_provider: None,

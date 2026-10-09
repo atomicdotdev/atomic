@@ -12,8 +12,13 @@ use std::path::{Path, PathBuf};
 use atomic_core::change::{Author, ChangeHeader};
 use atomic_core::pristine::ViewScope;
 use atomic_core::types::{Hash, Merkle};
+use atomic_core::WorkingCopyId;
 use atomic_repository::{manifest::ViewManifest, RecordOptions, Repository, RepositoryError};
 use tempfile::TempDir;
+
+fn working_copy(repo: &Repository) -> WorkingCopyId {
+    repo.require_working_copy_id().expect("working copy id")
+}
 
 fn init_repo() -> (Repository, TempDir, PathBuf) {
     let temp = TempDir::new().expect("temp dir");
@@ -24,7 +29,8 @@ fn init_repo() -> (Repository, TempDir, PathBuf) {
 
 fn write_and_add(repo: &Repository, root: &Path, name: &str, content: &str) {
     fs::write(root.join(name), content).expect("write file");
-    repo.add(name, Default::default()).expect("add file");
+    repo.add(working_copy(repo), name, Default::default())
+        .expect("add file");
 }
 
 fn record(repo: &Repository, message: &str) -> Hash {
@@ -33,7 +39,7 @@ fn record(repo: &Repository, message: &str) -> Hash {
         .author(Author::new("Test", Some("test@example.com")))
         .build();
     *repo
-        .record(header, RecordOptions::default())
+        .record(working_copy(repo), header, RecordOptions::default())
         .expect("record")
         .hash()
 }
@@ -51,7 +57,8 @@ fn build_origin() -> (Repository, TempDir, PathBuf, Vec<Hash>) {
     // Fork a draft the way session views are created: copy of the log,
     // Draft scope, parented on dev.
     repo.create_view_from("orange", "dev").expect("fork draft");
-    repo.switch_view("orange").expect("switch to draft");
+    repo.switch_view(working_copy(&repo), "orange")
+        .expect("switch to draft");
 
     write_and_add(&repo, &root, "tracks.txt", "A -> B\n");
     let c3 = record(&repo, "inbound track");
