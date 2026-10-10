@@ -211,6 +211,13 @@ pub(crate) struct ToolInput {
     pub description: Option<String>,
     #[serde(default)]
     pub command: Option<String>,
+    /// A command as an argument list — the shape tools that shell out to
+    /// a CLI take (sherpa's `atomic` tool: `{"args": ["triage",
+    /// "review", ...]}`). Joined with spaces for the display detail, so
+    /// the transcript says `atomic: triage review …` rather than just
+    /// the tool's name.
+    #[serde(default)]
+    pub args: Option<Vec<String>>,
     #[serde(default)]
     pub pattern: Option<String>,
     #[serde(default)]
