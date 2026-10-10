@@ -48,16 +48,22 @@ pub struct ProvenanceTrace {
     /// `attributedTo`/`contentHash`/`proof`) instead of the plain projection.
     #[arg(long)]
     pub sign: bool,
+
+    /// Wrap projections in an exporter-signed DSSE envelope. This authenticates
+    /// the export, not original authorship or the truth of the graph's claims.
+    #[cfg(feature = "dsse-export")]
+    #[arg(long, requires = "json")]
+    pub dsse: bool,
 }
 
 /// Project the PROV JSON-LD named subgraph for a change.
 ///
 /// Prints the UNSIGNED projection by default — the baseline's "signable" unit,
-/// a derived view whose integrity comes from `turnParent` hash-linking and the
-/// already-signed primaries it references. `--sign` emits the SIGNABLE standalone
-/// artifact instead: a top-level `attributedTo`/`contentHash`/`proof` envelope
-/// injected by the shared signing path (the person's `did:atomic` signs the whole
-/// subgraph), for handing to an auditor as a self-verifying bundle.
+/// a derived view of captured metadata. It neither verifies `turnParent`
+/// references nor signatures on referenced primaries. `--sign` emits the
+/// SIGNABLE standalone artifact instead: a top-level
+/// `attributedTo`/`contentHash`/`proof` envelope injected by the shared signing path (the person's `did:atomic` signs the whole
+/// subgraph), for an auditor who independently selects and trusts the exporter key.
 #[derive(Parser, Debug)]
 #[command(name = "show")]
 pub struct ProvenanceShow {
@@ -72,6 +78,11 @@ pub struct ProvenanceShow {
     /// Emit the SIGNABLE artifact — sign the graph instead of the plain projection.
     #[arg(long)]
     pub sign: bool,
+
+    /// Wrap projections in an exporter-signed DSSE envelope.
+    #[cfg(feature = "dsse-export")]
+    #[arg(long)]
+    pub dsse: bool,
 }
 
 impl Command for ProvenanceTrace {
@@ -116,6 +127,10 @@ impl Command for ProvenanceTrace {
                     }
                 })
                 .collect::<Vec<_>>();
+            #[cfg(feature = "dsse-export")]
+            if self.dsse {
+                return print_dsse(&values, &keypair);
+            }
             print_value(&values, self.sign);
             return Ok(());
         }
@@ -186,6 +201,10 @@ impl Command for ProvenanceShow {
             })
             .collect::<Vec<_>>();
 
+        #[cfg(feature = "dsse-export")]
+        if self.dsse {
+            return print_dsse(&values, &keypair);
+        }
         print_value(&values, self.sign);
         Ok(())
     }
@@ -466,4 +485,14 @@ fn print_activity_chain_local(
         }
     }
     print_activity_chain(input, &priors, truncated);
+}
+
+#[cfg(feature = "dsse-export")]
+fn print_dsse(values: &[serde_json::Value], keypair: &atomic_identity::KeyPair) -> CliResult<()> {
+    let envelope = atomic_canonical::provenance_export::sign_provenance_export(values, keypair)
+        .map_err(|e| CliError::Internal(anyhow::anyhow!(e)))?;
+    let value =
+        serde_json::to_value(envelope).map_err(|e| CliError::Internal(anyhow::anyhow!(e)))?;
+    print_value(&[value], true);
+    Ok(())
 }

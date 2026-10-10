@@ -1,0 +1,31 @@
+name: Provenance DSSE interoperability
+
+on:
+  pull_request:
+    branches: [dev]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -Dwarnings
+
+jobs:
+  export-consumer:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.90
+        with:
+          components: clippy
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install independent Ed25519 verifier
+        run: python -m pip install 'cryptography==50.0.0'
+      - name: Feature API tests and examples
+        run: cargo test --locked -p atomic-canonical --features dsse-export
+      - name: Real CLI export and independent consumption
+        run: cargo test --locked -p atomic-cli --features dsse-export --test provenance_integration_test
+        env:
+          ATOMIC_DSSE_PYTHON: python
+      - name: Feature lint
+        run: cargo clippy --locked --no-deps -p atomic-canonical -p atomic-cli --features dsse-export -- -D warnings

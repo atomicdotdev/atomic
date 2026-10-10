@@ -41,6 +41,8 @@ pub mod memory;
 pub mod node;
 pub mod proof;
 pub mod prov;
+#[cfg(feature = "dsse-export")]
+pub mod provenance_export;
 pub mod render;
 pub mod triage_ref;
 pub mod vocab;
