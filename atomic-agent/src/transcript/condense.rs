@@ -311,6 +311,7 @@ fn extract_tool_detail(tool_name: &str, input: &serde_json::Value) -> Option<Str
     parsed
         .description
         .or(parsed.command)
+        .or_else(|| parsed.args.as_ref().map(|a| a.join(" ")))
         .or(parsed.file_path)
         .or(parsed.notebook_path)
         .or(parsed.pattern)
