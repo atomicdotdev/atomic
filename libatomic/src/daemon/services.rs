@@ -299,8 +299,13 @@ impl repository_query_service_server::RepositoryQueryService for QueryImpl {
             // A query: the read-only open (with the read-concurrency wait)
             // keeps Status working under concurrent writers.
             let repo = handle.repository_readonly()?;
+            // Use the default options (ignored files excluded) so the daemon
+            // path is byte-for-byte consistent with the local `atomic status`
+            // fallback. `StatusOptions::all()` sets `include_ignored: true`,
+            // and the wire has no FILE_STATUS_IGNORED variant, so ignored
+            // paths would surface as UNTRACKED and leak past `.atomicignore`.
             let status = repo
-                .status(StatusOptions::all())
+                .status(StatusOptions::default())
                 .map_err(repository_error)?;
             let files = status
                 .entries()
