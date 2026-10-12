@@ -62,6 +62,18 @@ jobs:
         shell: bash
         run: ATOMIC_BIN="$PWD/target/debug/atomic" bash tests/harness/run_all.sh 09
 
+      - name: Retain native delegation evaluation
+        if: matrix.os == 'ubuntu-latest'
+        run: python3 tools/native-evaluation/run.py --output "${{ runner.temp }}/atomic-delegation-evaluation"
+
+      - name: Upload native delegation evaluation
+        if: always() && matrix.os == 'ubuntu-latest'
+        uses: actions/upload-artifact@v4
+        with:
+          name: atomic-delegation-evaluation-${{ github.sha }}
+          path: ${{ runner.temp }}/atomic-delegation-evaluation
+          if-no-files-found: ignore
+
   fmt:
     name: Format
     runs-on: ubuntu-latest
