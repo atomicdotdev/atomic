@@ -240,7 +240,7 @@ impl Status {
     }
 
     /// Get status options based on command settings.
-    fn get_status_options(&self) -> StatusOptions {
+    pub(crate) fn get_status_options(&self) -> StatusOptions {
         let mut options = StatusOptions::default();
 
         if self.no_untracked {

@@ -289,6 +289,7 @@ impl repository_query_service_server::RepositoryQueryService for QueryImpl {
         request: Request<StatusRequest>,
     ) -> Result<Response<StatusResponse>, Status> {
         let request = request.into_inner();
+        let options = status_options_domain(request.options);
         let handle = self
             .state
             .resolve(request.repository.as_ref().unwrap_or(&default_ref()))?;
@@ -299,14 +300,12 @@ impl repository_query_service_server::RepositoryQueryService for QueryImpl {
             // A query: the read-only open (with the read-concurrency wait)
             // keeps Status working under concurrent writers.
             let repo = handle.repository_readonly()?;
-            // Use the default options (ignored files excluded) so the daemon
-            // path is byte-for-byte consistent with the local `atomic status`
-            // fallback. `StatusOptions::all()` sets `include_ignored: true`,
-            // and the wire has no FILE_STATUS_IGNORED variant, so ignored
-            // paths would surface as UNTRACKED and leak past `.atomicignore`.
-            let status = repo
-                .status(StatusOptions::default())
-                .map_err(repository_error)?;
+            // Compute exactly what the caller requested: the CLI sends its
+            // resolved StatusOptions on the wire (absent = domain defaults,
+            // which exclude ignored files — a fixed StatusOptions::all()
+            // used to leak node_modules/ and dist/ back as UNTRACKED, since
+            // the wire has no FILE_STATUS_IGNORED variant).
+            let status = repo.status(options).map_err(repository_error)?;
             let files = status
                 .entries()
                 .iter()

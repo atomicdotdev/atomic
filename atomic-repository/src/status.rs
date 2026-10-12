@@ -643,7 +643,7 @@ impl Default for RepositoryStatus {
 ///
 /// These options allow customizing which files are included in the status
 /// and how the computation is performed.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StatusOptions {
     /// Include untracked files in the status.
     ///

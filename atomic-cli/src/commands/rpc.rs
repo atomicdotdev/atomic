@@ -214,6 +214,25 @@ fn full_hash(hash: &Option<pb::Hash>) -> String {
 /// `--debug-ignore` stays local: it reads ignore files (`.atomicignore`
 /// plus the user's global ignore list) without touching the repository
 /// databases, so it needs no wire.
+/// Domain `StatusOptions` → wire. The full set is sent — every field set,
+/// not just the non-defaults — so the daemon computes exactly the read the
+/// local body would have performed, and path scoping and `--no-untracked`
+/// ride the wire too (the parity the fixed handler options could never
+/// give).
+fn status_options_proto(options: &atomic_repository::status::StatusOptions) -> pb::StatusOptions {
+    pb::StatusOptions {
+        include_untracked: Some(options.include_untracked),
+        include_ignored: Some(options.include_ignored),
+        respect_ignore_files: Some(options.respect_ignore_files),
+        hash_contents: Some(options.hash_contents),
+        path_filters: options
+            .path_filters
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect(),
+    }
+}
+
 pub fn status(args: &super::status::Status) -> CliResult<bool> {
     if args.debug_ignore {
         return Ok(false);
@@ -253,6 +272,7 @@ pub fn status(args: &super::status::Status) -> CliResult<bool> {
     }
     let request = pb::StatusRequest {
         repository: Some(session.reference.clone()),
+        options: Some(status_options_proto(&args.get_status_options())),
     };
     let response = session.status(request)?;
 
@@ -518,6 +538,7 @@ pub fn add(args: &super::add::Add) -> CliResult<bool> {
         // CLI does today, over the service layer.
         let request = pb::StatusRequest {
             repository: Some(session.reference.clone()),
+            options: None,
         };
         let status = session.status(request)?;
         status
@@ -588,6 +609,7 @@ pub fn record(args: &super::record::Record) -> CliResult<bool> {
     if args.dry_run {
         let response = session.status(pb::StatusRequest {
             repository: Some(session.reference.clone()),
+            options: None,
         })?;
         let entries = response
             .files
@@ -634,6 +656,7 @@ pub fn record(args: &super::record::Record) -> CliResult<bool> {
     if args.all {
         let status = session.status(pb::StatusRequest {
             repository: Some(session.reference.clone()),
+            options: None,
         })?;
         let untracked: Vec<String> = status
             .files
@@ -3961,6 +3984,7 @@ pub fn revise(args: &super::revise::Revise) -> CliResult<bool> {
     if !args.reword {
         let status = session.status(pb::StatusRequest {
             repository: Some(session.reference.clone()),
+            options: None,
         })?;
         let clean = status.files.iter().all(|file| {
             !matches!(

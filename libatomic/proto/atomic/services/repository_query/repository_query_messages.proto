@@ -20,6 +20,22 @@ import "atomic/common/pagination.proto";
 message StatusRequest {
   RepositoryRef repository = 1;
   reserved 2; // allow_reindex violated read-only execution
+  // The caller's status options (add-only), mirroring StatusOptions
+  // (atomic-repository/src/status.rs). Absent = all defaults. The daemon
+  // computes status with exactly these, so `--no-untracked`, a path scope,
+  // and ignore handling behave identically on the local body and the wire
+  // — one source of truth for what a status read means.
+  optional StatusOptions options = 3;
+}
+// Mirrors StatusOptions (atomic-repository/src/status.rs:640). Every field
+// is an optional wrapper so an explicit `false` is distinguishable from
+// unset; unset resolves to the field's domain default (noted per field).
+message StatusOptions {
+  optional bool include_untracked = 1;     // default true
+  optional bool include_ignored = 2;       // default false
+  optional bool respect_ignore_files = 3;  // default true
+  optional bool hash_contents = 4;         // default true
+  repeated string path_filters = 5;        // default empty (no filter)
 }
 // Mirrors RepositoryStatus (atomic-repository/src/status.rs:390): view,
 // merkle state, per-file entries, and the stale-index count that drives the
