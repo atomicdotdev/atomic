@@ -90,6 +90,9 @@ service outage, each observation is spooled to its own immutable file under
 `.atomic/hook-log-pending/`; a successful append replays pending observations
 idempotently. Status can report pending observations while the service is down.
 
+See [Hook Health and Session Logs](../docs/hook-health.md) for the status JSON
+fields and troubleshooting workflow.
+
 ## Agent Identity
 
 Agent changes are attributed using a `+tag` email format derived from the user's default identity in `~/.atomic/identities/`. This ties every agent change to the human who authorized it while making it immediately clear in logs, blame, and UI that the change came from an agent.

@@ -7,6 +7,7 @@ Welcome to the Atomic VCS documentation. This directory contains comprehensive d
 | Document | Description | Audience |
 |----------|-------------|----------|
 | [CLI Reference](../atomic-cli/README.md) | Complete command reference for the `atomic` CLI | Users, Everyone |
+| [Hook Health and Session Logs](./hook-health.md) | Diagnose hook failures and inspect per-session health | Users, Integration developers |
 | [Stack Walkthrough](./walkthrough-stacks.md) | Hands-on tutorial for stacks, apply, and stash | Users, Contributors |
 | [Attestation Design](./attestation-design.md) | Graph-level audit nodes for AI cost, tokens, and compliance | Developers, Contributors |
 | [Intent Identity](./intent-identity.md) | ULID + `PROJECT::author::seq` intent identity and reference resolution | Users, Contributors |
@@ -21,6 +22,7 @@ Welcome to the Atomic VCS documentation. This directory contains comprehensive d
 
 - **New to Atomic?** Start with [COMPARISON.md](./COMPARISON.md) to understand what makes Atomic different
 - **Using the CLI?** See the [CLI Reference](../atomic-cli/README.md) for every command and option
+- **Are agent hooks working?** See [Hook Health and Session Logs](./hook-health.md) for liveness, failures, and session correlation
 - **Learning stacks?** Walk through the [Stack Walkthrough](./walkthrough-stacks.md) step by step
 - **AI audit trail?** Read the [Attestation Design](./attestation-design.md) for graph-level cost and compliance tracking
 - **Working with intents?** See [Intent Identity](./intent-identity.md) for how they're named and referenced, and [Intent Knowledge Graph](./intent-graph.md) for querying them
