@@ -8,9 +8,10 @@
 //! ## Unsigned by default; **signable** on demand
 //! Per the baseline, the provenance graph is "one addressable, **signable** unit
 //! you can hand to an auditor whole" — *signable*, not *signed*. It is a derived
-//! view whose `used`/`generated` edges point at already-signed primaries
-//! (intents, memories, changes), and its own chain integrity comes from
-//! `turnParent` hash-linking — so the default projection carries **no** proof
+//! view of captured metadata, with references to primaries that may carry their
+//! own signatures. The projection does not verify those signatures or the
+//! parent chain and its `turnParent` is an activity reference, not a verified
+//! hash chain. The default projection carries **no** proof
 //! envelope. [`attest_prov`] / [`verify_prov`] are the opt-in "signable" path:
 //! when you need a standalone, tamper-evident bundle, they sign/verify the graph
 //! through the *same* canonicalization/signing path every other node type uses
