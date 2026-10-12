@@ -179,24 +179,42 @@ impl Command for Hooks {
             })?;
 
         // Parse the agent-specific JSON into a common TurnEvent
-        let event = agent.parse_event(hook_type, &input).map_err(|e| {
-            // Log to stderr but don't fail hard on parse errors for
-            // non-critical hooks (tool use events)
-            if hook_type.is_tool_use() {
-                eprintln!(
-                    "[atomic] Warning: failed to parse {} {} input: {}",
-                    self.agent_name, self.verb, e
-                );
-                // Return a generic event so we can continue
-                return CliError::Internal(anyhow!("Hook parse failed: {}", e));
+        let event = match agent.parse_event(hook_type, &input) {
+            Ok(event) => event,
+            Err(e) => {
+                // The hook ran but could not be understood — an agent
+                // upgrade that changed the payload shape lands here, and
+                // without a record it is indistinguishable from a hook that
+                // was never installed. Best-effort: the repo root is not
+                // resolved yet, so this is skipped outside a workspace.
+                if let Ok(root) = find_repository_root() {
+                    let _ = super::hook_log::record_result::<(), _>(
+                        &root,
+                        &super::hook_log::HookContext::from_input(&input),
+                        agent.name(),
+                        agent.display_name(),
+                        &self.verb,
+                        Err(&e),
+                    );
+                }
+                // Log to stderr but don't fail hard on parse errors for
+                // non-critical hooks (tool use events)
+                if hook_type.is_tool_use() {
+                    eprintln!(
+                        "[atomic] Warning: failed to parse {} {} input: {}",
+                        self.agent_name, self.verb, e
+                    );
+                    // Return a generic event so we can continue
+                    return Err(CliError::Internal(anyhow!("Hook parse failed: {}", e)));
+                }
+                return Err(CliError::Internal(anyhow!(
+                    "Failed to parse hook input for {} {}: {}",
+                    self.agent_name,
+                    self.verb,
+                    e
+                )));
             }
-            CliError::Internal(anyhow!(
-                "Failed to parse hook input for {} {}: {}",
-                self.agent_name,
-                self.verb,
-                e
-            ))
-        })?;
+        };
 
         // Find the repository root. Agents whose hooks run detached from the
         // workspace (e.g., Antigravity plugin hooks, which execute with the
@@ -268,6 +286,7 @@ impl Command for Hooks {
 
         let agent_name = agent.name().to_string();
         let agent_display = agent.display_name().to_string();
+        let hook_context = super::hook_log::HookContext::from_event(&event);
 
         // Keep hooks quiet on stdout/stderr — Claude Code surfaces both, so
         // route diagnostics through `log` instead.
@@ -278,7 +297,11 @@ impl Command for Hooks {
             self.verb
         );
 
-        let result = rt.block_on(async {
+        // Record liveness before propagating, so a failing dispatch still
+        // leaves evidence that the hook ran. Without this the shell guard's
+        // `|| true` makes a dead hook indistinguishable from one that was
+        // never installed.
+        let dispatch = rt.block_on(async {
             // Create the orchestrator
             let mut orchestrator =
                 atomic_agent::turn::orchestrator::TurnOrchestrator::new(&repo_root)
@@ -332,7 +355,16 @@ impl Command for Hooks {
                 .map_err(|e| CliError::Internal(anyhow!("Failed to dispatch hook event: {}", e)))?;
 
             Ok::<_, CliError>(dispatch_result)
-        })?;
+        });
+
+        let result = super::hook_log::record_result(
+            &repo_root,
+            &hook_context,
+            &agent_name,
+            &agent_display,
+            &self.verb,
+            dispatch,
+        )?;
 
         // Log warnings via log crate (not stderr — that leaks into agent TUIs)
         for warning in &result.warnings {

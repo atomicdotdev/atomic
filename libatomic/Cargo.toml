@@ -41,6 +41,7 @@ redb = { workspace = true }
 anyhow = { workspace = true }
 rand = { workspace = true }
 uuid = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

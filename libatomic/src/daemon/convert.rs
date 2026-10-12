@@ -57,6 +57,36 @@ pub fn file_status_proto(status: atomic_repository::status::FileStatus) -> pb::F
     }
 }
 
+/// Wire `StatusOptions` → domain `StatusOptions`. `None` means every
+/// default; inside a present message, each unset wrapper resolves to that
+/// field's domain default (atomic-repository/src/status.rs:677), so a
+/// partial message is a full message with the gaps filled by the defaults
+/// — never by whatever the handler happened to prefer.
+pub fn status_options_domain(
+    options: Option<pb::StatusOptions>,
+) -> atomic_repository::status::StatusOptions {
+    let defaults = atomic_repository::status::StatusOptions::default();
+    let Some(options) = options else {
+        return defaults;
+    };
+    atomic_repository::status::StatusOptions {
+        include_untracked: options
+            .include_untracked
+            .unwrap_or(defaults.include_untracked),
+        include_ignored: options.include_ignored.unwrap_or(defaults.include_ignored),
+        path_filters: options
+            .path_filters
+            .into_iter()
+            .map(std::path::PathBuf::from)
+            .collect(),
+        respect_ignore_files: options
+            .respect_ignore_files
+            .unwrap_or(defaults.respect_ignore_files),
+        hash_contents: options.hash_contents.unwrap_or(defaults.hash_contents),
+        ..defaults
+    }
+}
+
 /// Intent lifecycle strings (vault_intent_*) ↔ the proto entity status.
 pub fn intent_status_to_proto(status: &str) -> Option<pb::VaultEntityStatus> {
     match status {
@@ -93,5 +123,65 @@ pub fn hook_type(name: &str) -> Option<atomic_agent::event::HookType> {
         "pre_tool_use" => Some(HookType::PreToolUse),
         "post_tool_use" => Some(HookType::PostToolUse),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use atomic_repository::status::StatusOptions;
+
+    #[test]
+    fn absent_options_is_domain_default() {
+        assert_eq!(
+            status_options_domain(None),
+            StatusOptions {
+                include_untracked: true,
+                include_ignored: false,
+                path_filters: vec![],
+                respect_ignore_files: true,
+                hash_contents: true,
+                ..StatusOptions::default()
+            }
+        );
+    }
+
+    #[test]
+    fn unset_wrappers_resolve_to_defaults_not_false() {
+        // A present message with only path_filters set must NOT turn the
+        // unset bools off — proto3 presence defaults them to false.
+        let wire = pb::StatusOptions {
+            path_filters: vec!["src/main.rs".to_string()],
+            ..Default::default()
+        };
+        let domain = status_options_domain(Some(wire));
+        assert!(domain.include_untracked);
+        assert!(!domain.include_ignored);
+        assert!(domain.respect_ignore_files);
+        assert!(domain.hash_contents);
+        assert_eq!(
+            domain.path_filters,
+            vec![std::path::PathBuf::from("src/main.rs")]
+        );
+    }
+
+    #[test]
+    fn full_message_maps_verbatim() {
+        let wire = pb::StatusOptions {
+            include_untracked: Some(false),
+            include_ignored: Some(true),
+            respect_ignore_files: Some(false),
+            hash_contents: Some(false),
+            path_filters: vec!["a".to_string(), "b".to_string()],
+        };
+        let domain = status_options_domain(Some(wire));
+        assert!(!domain.include_untracked);
+        assert!(domain.include_ignored);
+        assert!(!domain.respect_ignore_files);
+        assert!(!domain.hash_contents);
+        assert_eq!(
+            domain.path_filters,
+            vec![std::path::PathBuf::from("a"), std::path::PathBuf::from("b")]
+        );
     }
 }

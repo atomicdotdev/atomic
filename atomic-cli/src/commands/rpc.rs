@@ -172,7 +172,7 @@ fn kg_edge_domain(edge: &pb::KgEdge) -> atomic_core::pristine::vault::KgEdge {
     }
 }
 
-fn request_meta() -> Option<pb::RequestMeta> {
+pub(crate) fn request_meta() -> Option<pb::RequestMeta> {
     Some(pb::RequestMeta {
         request_id: uuid::Uuid::new_v4().to_string(),
         observed_at: None,
@@ -214,6 +214,25 @@ fn full_hash(hash: &Option<pb::Hash>) -> String {
 /// `--debug-ignore` stays local: it reads ignore files (`.atomicignore`
 /// plus the user's global ignore list) without touching the repository
 /// databases, so it needs no wire.
+/// Domain `StatusOptions` → wire. The full set is sent — every field set,
+/// not just the non-defaults — so the daemon computes exactly the read the
+/// local body would have performed, and path scoping and `--no-untracked`
+/// ride the wire too (the parity the fixed handler options could never
+/// give).
+fn status_options_proto(options: &atomic_repository::status::StatusOptions) -> pb::StatusOptions {
+    pb::StatusOptions {
+        include_untracked: Some(options.include_untracked),
+        include_ignored: Some(options.include_ignored),
+        respect_ignore_files: Some(options.respect_ignore_files),
+        hash_contents: Some(options.hash_contents),
+        path_filters: options
+            .path_filters
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect(),
+    }
+}
+
 pub fn status(args: &super::status::Status) -> CliResult<bool> {
     if args.debug_ignore || args.no_reconcile || args.git {
         return Ok(false);
@@ -256,6 +275,7 @@ pub fn status(args: &super::status::Status) -> CliResult<bool> {
     }
     let request = pb::StatusRequest {
         repository: Some(session.reference.clone()),
+        options: Some(status_options_proto(&args.get_status_options())),
     };
     let response = session.status(request)?;
 
@@ -411,6 +431,7 @@ pub fn add(args: &super::add::Add) -> CliResult<bool> {
         // CLI does today, over the service layer.
         let request = pb::StatusRequest {
             repository: Some(session.reference.clone()),
+            options: None,
         };
         let status = session.status(request)?;
         status
@@ -497,6 +518,7 @@ pub fn record(args: &super::record::Record) -> CliResult<bool> {
     if args.dry_run {
         let response = session.status(pb::StatusRequest {
             repository: Some(session.reference.clone()),
+            options: None,
         })?;
         let entries = response
             .files
@@ -543,6 +565,7 @@ pub fn record(args: &super::record::Record) -> CliResult<bool> {
     if args.all {
         let status = session.status(pb::StatusRequest {
             repository: Some(session.reference.clone()),
+            options: None,
         })?;
         let untracked: Vec<String> = status
             .files
@@ -2969,6 +2992,7 @@ pub fn view_switch(args: &super::view::Switch) -> CliResult<bool> {
     if args.stash && !args.force {
         let status = session.status(pb::StatusRequest {
             repository: Some(session.reference.clone()),
+            options: None,
         })?;
         let dirty = status.files.iter().any(|file| {
             file.status != pb::FileStatus::Unspecified as i32
@@ -3940,6 +3964,7 @@ pub fn revise(args: &super::revise::Revise) -> CliResult<bool> {
     if !args.reword {
         let status = session.status(pb::StatusRequest {
             repository: Some(session.reference.clone()),
+            options: None,
         })?;
         let clean = status.files.iter().all(|file| {
             !matches!(
@@ -6917,6 +6942,7 @@ pub fn dispatch_turn_event(
     agent_id: &str,
     agent_display: &str,
     agent_identity: Option<String>,
+    hook_context: &atomic_agent::hook_log::HookContext,
 ) -> CliResult<crate::commands::agent::receive::ReceiveResult> {
     let Some(session) = Service::open_root(root)? else {
         return Err(CliError::InvalidArgument {
@@ -6929,7 +6955,7 @@ pub fn dispatch_turn_event(
         agent_id: agent_id.to_string(),
         agent_display_name: Some(agent_display.to_string()),
         agent_identity,
-        event: Some(turn_event_body(event)),
+        event: Some(turn_event_body(event, hook_context)),
     })?;
     Ok(crate::commands::agent::receive::ReceiveResult {
         session_id: response.session_id,
@@ -6944,9 +6970,13 @@ pub fn dispatch_turn_event(
     })
 }
 
-fn turn_event_body(event: &atomic_agent::event::TurnEvent) -> pb::TurnEventBody {
+fn turn_event_body(
+    event: &atomic_agent::event::TurnEvent,
+    hook_context: &atomic_agent::hook_log::HookContext,
+) -> pb::TurnEventBody {
     pb::TurnEventBody {
         session_id: event.session_id.clone(),
+        parent_session_id: hook_context.parent_session_id.clone(),
         event_type: match event.event_type {
             atomic_agent::event::HookType::SessionStart => "session_start",
             atomic_agent::event::HookType::SessionEnd => "session_end",

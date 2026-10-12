@@ -70,6 +70,8 @@ const METHOD_MATRIX: &[(&str, &str)] = &[
     ("AttestationService", "VerifyAttestation"),
     ("KnowledgeService", "QueryGraph"),
     ("ProvenanceService", "DispatchTurnEvent"),
+    ("ProvenanceService", "AppendHookLog"),
+    ("ProvenanceService", "LoadHookLog"),
     ("ProvenanceService", "ReserveTurn"),
     ("ProvenanceService", "AppendEnvelopes"),
     ("ProvenanceService", "PrepareCheckpoint"),
@@ -122,6 +124,27 @@ impl daemon_service_server::DaemonService for DaemonImpl {
                         required_capabilities: vec!["maintenance.admin".to_string()],
                         allowed_callers: vec![CallerClass::Local as i32],
                         effects: vec![RpcEffect::RepositoryWrite as i32],
+                    }
+                } else if *service == "ProvenanceService"
+                    && matches!(*method, "AppendHookLog" | "LoadHookLog")
+                {
+                    let write = *method == "AppendHookLog";
+                    MethodDescriptorInfo {
+                        service: service.to_string(),
+                        method: method.to_string(),
+                        scope: ExecutionScope::Local as i32,
+                        required_capabilities: vec![if write {
+                            "provenance.write"
+                        } else {
+                            "provenance.read"
+                        }
+                        .to_string()],
+                        allowed_callers: vec![CallerClass::Local as i32],
+                        effects: vec![if write {
+                            RpcEffect::RepositoryWrite
+                        } else {
+                            RpcEffect::RepositoryRead
+                        } as i32],
                     }
                 } else {
                     MethodDescriptorInfo {
@@ -266,6 +289,7 @@ impl repository_query_service_server::RepositoryQueryService for QueryImpl {
         request: Request<StatusRequest>,
     ) -> Result<Response<StatusResponse>, Status> {
         let request = request.into_inner();
+        let options = status_options_domain(request.options);
         let handle = self
             .state
             .resolve(request.repository.as_ref().unwrap_or(&default_ref()))?;
@@ -273,13 +297,19 @@ impl repository_query_service_server::RepositoryQueryService for QueryImpl {
         let gate_handle = handle.clone();
         let _gate = gate_handle.exclusive().await;
         let result = tokio::task::spawn_blocking(move || {
-            // The service query remains observation-only; the CLI's separate
-            // Git coordinator performs ordinary reconciliation before calling.
+            // Observe uses a read-only open with the read-concurrency wait and
+            // retains the working-copy boundary for the whole query. The CLI's
+            // separate Git coordinator performs ordinary reconciliation.
             let (repo, workspace) =
                 handle.workspace_repository(atomic_repository::WorkspaceTxnMode::Observe)?;
             let working_copy = workspace.working_copy();
+            // Compute exactly what the caller requested: the CLI sends its
+            // resolved StatusOptions on the wire (absent = domain defaults,
+            // which exclude ignored files — a fixed StatusOptions::all()
+            // used to leak node_modules/ and dist/ back as UNTRACKED, since
+            // the wire has no FILE_STATUS_IGNORED variant).
             let status = repo
-                .status(working_copy, StatusOptions::all())
+                .status(working_copy, options)
                 .map_err(repository_error)?;
             let files = status
                 .entries()

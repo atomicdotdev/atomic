@@ -187,6 +187,9 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "toml",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
  "walkdir",
  "watchman_client",
  "windows-sys 0.61.2",
@@ -1944,6 +1947,7 @@ dependencies = [
  "tokio-stream",
  "tonic",
  "tonic-build",
+ "tracing",
  "ulid",
  "uuid",
 ]

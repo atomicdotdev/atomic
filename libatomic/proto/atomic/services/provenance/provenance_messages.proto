@@ -55,6 +55,41 @@ import "google/protobuf/timestamp.proto";
 import "atomic/common/common.proto";
 import "atomic/common/pagination.proto";
 
+// Operational diagnostics survive outside the running-turn provenance journal.
+message HookLogEvent {
+  string event_id = 1;
+  optional string session_id = 2;
+  optional string parent_session_id = 3;
+  string agent = 4;
+  string display_name = 5;
+  string verb = 6;
+  string outcome = 7; // ok | error
+  optional string detail = 8;
+  string at = 9; // RFC3339, retained across retries
+}
+message AppendHookLogRequest {
+  RepositoryRef repository = 1;
+  RequestMeta meta = 2;
+  HookLogEvent event = 3;
+}
+message AppendHookLogResponse {
+  uint64 sequence = 1;
+  ResponseMeta meta = 100;
+}
+message LoadHookLogRequest {
+  RepositoryRef repository = 1;
+  RequestMeta meta = 2;
+  optional string session_id = 3;
+  uint64 after_sequence = 4;
+  uint32 limit = 5; // bounded to 512
+}
+message HookLogEntry {
+  uint64 sequence = 1;
+  HookLogEvent event = 2;
+}
+message LoadHookLogResponse {
+  repeated HookLogEntry entries = 1;
+}
 // ————— turn & checkpoint state (source: redb_change_store/provenance.rs) —————
 
 enum StopCause {
@@ -404,6 +439,7 @@ message TurnEventBody {
   optional string tool_use_id = 5;
   google.protobuf.Timestamp timestamp = 6;
   optional bytes raw_json = 7;         // opaque agent context (never parsed here)
+  optional string parent_session_id = 8; // client-resolved correlation across processes
 }
 message DispatchTurnEventResponse {
   string session_id = 1;

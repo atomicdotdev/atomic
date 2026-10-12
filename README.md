@@ -452,9 +452,14 @@ Every change stores two parallel representations:
 |---------|-------------|
 | `atomic agent enable` | Install agent hooks (auto-detect or `--agent claude-code`) |
 | `atomic agent disable` | Remove agent hooks |
-| `atomic agent status` | Show active sessions and hook status (`--json` for tooling) |
+| `atomic agent status` | Show sessions, hook liveness, and failures (`--json` for tooling) |
 | `atomic agent explain <id>` | Generate AI reasoning summary for a session |
 | `atomic agent attest` | List and inspect attestations |
+
+Hook health is computed from session-scoped logs, so concurrent agents retain
+their own outcomes and a child's success cannot hide a parent's failure. See
+[Hook Health and Session Logs](docs/hook-health.md) for diagnosis, JSON fields,
+and parent-session correlation.
 
 ### Vault Commands
 

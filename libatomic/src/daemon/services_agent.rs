@@ -3803,6 +3803,19 @@ pub struct ProvenanceImpl {
 
 #[tonic::async_trait]
 impl provenance_service_server::ProvenanceService for ProvenanceImpl {
+    async fn append_hook_log(
+        &self,
+        request: Request<crate::atomic::AppendHookLogRequest>,
+    ) -> Result<Response<crate::atomic::AppendHookLogResponse>, Status> {
+        crate::daemon::services_provenance::append_hook_log_impl(&self.state, request).await
+    }
+
+    async fn load_hook_log(
+        &self,
+        request: Request<crate::atomic::LoadHookLogRequest>,
+    ) -> Result<Response<crate::atomic::LoadHookLogResponse>, Status> {
+        crate::daemon::services_provenance::load_hook_log_impl(&self.state, request).await
+    }
     async fn dispatch_turn_event(
         &self,
         request: Request<DispatchTurnEventRequest>,
@@ -3819,65 +3832,119 @@ impl provenance_service_server::ProvenanceService for ProvenanceImpl {
             .clone()
             .unwrap_or_else(|| agent_id.clone());
         let identity = request.agent_identity.clone();
-        let body = request
+        let verb = request
             .event
-            .ok_or_else(|| domain_status(ErrorCode::InvalidArgument, "typed event required"))?;
-        let hook_type = hook_type(&body.event_type).ok_or_else(|| {
-            domain_status(
-                ErrorCode::InvalidArgument,
-                format!("unknown event type '{}'", body.event_type),
-            )
-        })?;
-        let raw_json = body
-            .raw_json
             .as_ref()
-            .filter(|bytes| !bytes.is_empty())
-            .and_then(|bytes| serde_json::from_slice::<Value>(bytes).ok());
-        let event = TurnEvent {
-            session_id: body.session_id.clone(),
-            event_type: hook_type,
-            transcript_path: None,
-            prompt: body.prompt.clone(),
-            tool_name: body.tool_name.clone(),
-            tool_use_id: body.tool_use_id.clone(),
-            timestamp: body
-                .timestamp
+            .map(|body| body.event_type.clone())
+            .unwrap_or_else(|| "dispatch_turn_event".to_string());
+        let mut hook_context = atomic_agent::hook_log::HookContext::default();
+        if let Some(body) = &request.event {
+            let raw_json = body
+                .raw_json
                 .as_ref()
-                .map(timestamp_domain)
-                .unwrap_or_else(chrono::Utc::now),
-            raw_json,
-        };
+                .and_then(|bytes| serde_json::from_slice(bytes).ok());
+            let event = TurnEvent {
+                session_id: body.session_id.clone(),
+                raw_json,
+                ..TurnEvent::new(
+                    &body.session_id,
+                    atomic_agent::event::HookType::SessionStart,
+                )
+            };
+            hook_context = atomic_agent::hook_log::HookContext::from_event_payload(&event);
+            if body
+                .parent_session_id
+                .as_deref()
+                .is_some_and(|parent| !parent.is_empty())
+            {
+                hook_context.parent_session_id = body.parent_session_id.clone();
+            }
+        }
+        let dispatch = async {
+            let body = request
+                .event
+                .ok_or_else(|| domain_status(ErrorCode::InvalidArgument, "typed event required"))?;
+            let hook_type = hook_type(&body.event_type).ok_or_else(|| {
+                domain_status(
+                    ErrorCode::InvalidArgument,
+                    format!("unknown event type '{}'", body.event_type),
+                )
+            })?;
+            let raw_json = body
+                .raw_json
+                .as_ref()
+                .filter(|bytes| !bytes.is_empty())
+                .and_then(|bytes| serde_json::from_slice::<Value>(bytes).ok());
+            let event = TurnEvent {
+                session_id: body.session_id.clone(),
+                event_type: hook_type,
+                transcript_path: None,
+                prompt: body.prompt.clone(),
+                tool_name: body.tool_name.clone(),
+                tool_use_id: body.tool_use_id.clone(),
+                timestamp: body
+                    .timestamp
+                    .as_ref()
+                    .map(timestamp_domain)
+                    .unwrap_or_else(chrono::Utc::now),
+                raw_json,
+            };
 
-        // The daemon hosts the turn orchestrator: it owns the repository
-        // databases, so the dispatch (session view, recording, journal
-        // checkpoint) runs in-process with a direct journal sink.
-        let sink = DirectJournalSink::open(&handle.root)
-            .map_err(|error| domain_status(ErrorCode::ProvenanceStore, error))?;
-        let mut orchestrator =
-            TurnOrchestrator::new(handle.root.clone())
-                .await
-                .map_err(|error| {
-                    domain_status(ErrorCode::Internal, format!("orchestrator: {error}"))
-                })?;
-        orchestrator.set_agent(agent_id, display);
-        orchestrator.set_agent_identity(identity);
-        orchestrator.set_journal_sink(Arc::new(sink));
-        let result = orchestrator.dispatch(event).await.map_err(|error| {
-            domain_status(ErrorCode::Internal, format!("dispatch failed: {error}"))
-        })?;
+            // Local and RPC transports share this handler and its health report.
+            let sink = DirectJournalSink::open(&handle.root)
+                .map_err(|error| domain_status(ErrorCode::ProvenanceStore, error))?;
+            let mut orchestrator =
+                TurnOrchestrator::new(handle.root.clone())
+                    .await
+                    .map_err(|error| {
+                        domain_status(ErrorCode::Internal, format!("orchestrator: {error}"))
+                    })?;
+            orchestrator.set_agent(agent_id.clone(), display.clone());
+            orchestrator.set_agent_identity(identity);
+            orchestrator.set_journal_sink(Arc::new(sink));
+            let result = orchestrator.dispatch(event).await.map_err(|error| {
+                domain_status(ErrorCode::Internal, format!("dispatch failed: {error}"))
+            })?;
 
-        let recorded = result.change_recorded.as_ref();
-        Ok(Response::new(DispatchTurnEventResponse {
-            session_id: result.session_id.clone(),
-            recorded: recorded.is_some(),
-            change_hash: recorded.map(|outcome| super::convert::hash_proto(&outcome.hash)),
-            view: result.view.clone(),
-            files: recorded
-                .map(|outcome| outcome.recorded_file_list().to_vec())
-                .unwrap_or_default(),
-            warnings: result.warnings.clone(),
-            meta: response_meta(&meta),
-        }))
+            let recorded = result.change_recorded.as_ref();
+            Ok(Response::new(DispatchTurnEventResponse {
+                session_id: result.session_id.clone(),
+                recorded: recorded.is_some(),
+                change_hash: recorded.map(|outcome| super::convert::hash_proto(&outcome.hash)),
+                view: result.view.clone(),
+                files: recorded
+                    .map(|outcome| outcome.recorded_file_list().to_vec())
+                    .unwrap_or_default(),
+                warnings: result.warnings.clone(),
+                meta: response_meta(&meta),
+            }))
+        }
+        .await;
+        atomic_agent::hook_log::record_result(
+            &hook_context,
+            &agent_id,
+            &display,
+            &verb,
+            dispatch,
+            |event| {
+                let append = (|| {
+                    let store = handle.change_store().map_err(|error| error.to_string())?;
+                    store
+                        .append_session_log(event)
+                        .map_err(|error| error.to_string())?;
+                    if let Err(error) = atomic_agent::hook_log::flush_pending(&handle.root, &store)
+                    {
+                        tracing::warn!("hook log spool: {error}");
+                    }
+                    Ok::<_, String>(())
+                })();
+                if let Err(error) = append {
+                    tracing::debug!("hook log storage unavailable, spooling event: {error}");
+                    return atomic_agent::hook_log::spool(&handle.root, event);
+                }
+                Ok(())
+            },
+        )
     }
 
     async fn reserve_turn(
