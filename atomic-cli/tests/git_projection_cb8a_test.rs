@@ -545,24 +545,20 @@ fn index_manifest_alone_projects_to_stage_zero() {
         atomic_text(&switched)
     );
 
-    // The snapshot bytes are still in the worktree (they were never
-    // committed) and the index was aligned to the projected view tree.
-    let _index_after = index_tree_oid(&fixture);
-    assert!(
-        !String::from_utf8_lossy(index_before.as_bytes()).contains("pending snapshot edit"),
-        "snapshot content never enters the index: {index_before}"
+    // The child inherits the same recorded tree, so switching cannot stage
+    // the pending edit. Check the actual index tree and blob, not status text
+    // (which does not include file contents).
+    assert_eq!(
+        index_tree_oid(&fixture),
+        index_before,
+        "switch must preserve the recorded index tree"
     );
-    let _ = index_tree_ignored(&fixture);
-    let atomic_status = atomic_ok(fixture.root(), fixture.home(), &["status"]);
-    assert!(
-        !atomic_status.contains("pending snapshot edit") || true,
-        "status is observable: {atomic_status}"
+    assert_eq!(
+        git(fixture.root(), &["show", ":tracked.txt"]),
+        "anchor me",
+        "unrecorded snapshot content must not enter stage zero"
     );
-}
-
-fn index_tree_ignored(fixture: &Colocated) -> bool {
-    let _ = fixture;
-    true
+    atomic_ok(fixture.root(), fixture.home(), &["status"]);
 }
 
 // ── Explicit Draft publication (RFC §8.1 "Publishing a Draft is explicit") ─

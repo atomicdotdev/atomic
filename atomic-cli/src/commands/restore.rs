@@ -206,7 +206,11 @@ impl Restore {
         for entry in status.entries() {
             let file_status = entry.status();
             match file_status {
-                FileStatus::Modified | FileStatus::Deleted | FileStatus::Added => {
+                FileStatus::Modified
+                | FileStatus::Deleted
+                | FileStatus::Added
+                | FileStatus::TypeChanged
+                | FileStatus::PermissionsChanged => {
                     let path_str = entry.path().to_string_lossy();
                     if self.matches_filter(&path_str) {
                         out.push((entry.path().to_path_buf(), file_status));
@@ -258,7 +262,7 @@ impl Restore {
         repo: &Repository,
         working_copy: atomic_core::WorkingCopyId,
         view: &str,
-        repo_root: &Path,
+        _repo_root: &Path,
         path: &Path,
         status: FileStatus,
     ) -> CliResult<RestoreOutcome> {
@@ -278,23 +282,13 @@ impl Restore {
             CliError::Internal(anyhow::anyhow!("Failed to get file content: {}", e))
         })?;
 
-        let full_path = repo_root.join(path);
-
         match content {
-            Some(bytes) => {
-                // Ensure parent directory exists (a Deleted file may have had
-                // its directory removed too).
-                if let Some(parent) = full_path.parent() {
-                    std::fs::create_dir_all(parent).map_err(|e| {
-                        CliError::Internal(anyhow::anyhow!("Failed to create directory: {}", e))
-                    })?;
-                }
-
-                // Write content
-                std::fs::write(&full_path, bytes).map_err(|e| {
-                    CliError::Internal(anyhow::anyhow!("Failed to write file: {}", e))
-                })?;
-
+            Some(_) => {
+                repo.materialize_paths(
+                    working_copy,
+                    std::collections::HashSet::from([path.to_string_lossy().into_owned()]),
+                )
+                .map_err(CliError::Repository)?;
                 Ok(RestoreOutcome::Restored)
             }
             None => {
@@ -382,6 +376,10 @@ impl Command for Restore {
             WorkspaceTxnMode::Force => unreachable!("restore never forces workspace entry"),
         }
         .map_err(CliError::Repository)?;
+        if !self.dry_run {
+            repo.hydrate_remote_sandbox()
+                .map_err(CliError::Repository)?;
+        }
         let workspace = enter_workspace(&mut repo, mode)?;
         let working_copy = workspace.working_copy();
         let workspace_view = workspace.view().name.clone();

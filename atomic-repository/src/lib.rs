@@ -91,14 +91,17 @@ pub mod apply;
 pub mod change_source;
 pub mod changestore;
 pub mod content_filter;
+pub mod diff_engine;
 pub mod error;
 pub mod git_binding;
 pub mod ignore;
+pub mod intent_bridge;
 pub mod manifest;
 pub mod record;
 pub mod repository;
 pub mod status;
 pub mod tracking;
+pub mod triage;
 pub mod wip;
 
 // Phase 7 additions

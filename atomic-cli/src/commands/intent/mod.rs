@@ -33,7 +33,12 @@ use crate::commands::Command;
 use crate::error::CliResult;
 
 pub mod attest;
-pub mod bridge;
+// The read→lift bridge lives in the repository layer now (the canonical
+// triage report runs there); this re-export keeps every intent verb's
+// imports reading the same.
+pub mod bridge {
+    pub use atomic_repository::intent_bridge::*;
+}
 pub mod delete;
 pub mod key_cache;
 pub mod link;

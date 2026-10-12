@@ -187,7 +187,14 @@ fn read_file(root: &Path, path: &str) -> Result<Option<File>, RepositoryError> {
     let full = file_path(root, path)?;
     let metadata = match fs::symlink_metadata(&full) {
         Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            return Ok(None)
+        }
         Err(error) => return Err(error.into()),
     };
     let kind = if metadata.is_dir() {

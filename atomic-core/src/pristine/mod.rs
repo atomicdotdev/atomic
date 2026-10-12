@@ -160,6 +160,7 @@ mod path_claim;
 mod ref_mapping;
 pub mod schema;
 mod set_id_index;
+pub mod slice;
 pub(crate) mod span_index;
 pub mod tables;
 mod traits;

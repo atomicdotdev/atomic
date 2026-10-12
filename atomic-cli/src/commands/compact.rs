@@ -20,8 +20,11 @@ pub struct Compact {
 
 impl Command for Compact {
     fn run(&self) -> CliResult<()> {
+        // Resolve relative paths in the caller's working directory, before
+        // sending them to a service process with its own working directory.
+        let repository = std::path::absolute(&self.repository)?;
         let service =
-            Service::open_root(&self.repository)?.ok_or_else(|| CliError::RepositoryNotFound {
+            Service::open_root(&repository)?.ok_or_else(|| CliError::RepositoryNotFound {
                 searched_path: self.repository.clone(),
             })?;
         let report = service.compact_database(CompactDatabaseRequest {

@@ -38,7 +38,6 @@ impl Repository {
             options,
             UntrackedScanPolicy::Always,
             true,
-            false,
             None,
         )
     }
@@ -63,7 +62,7 @@ impl Repository {
         } else {
             UntrackedScanPolicy::Never
         };
-        self.status_inner(working_copy, options, policy, false, true, None)
+        self.status_inner(working_copy, options, policy, false, None)
     }
 
     fn status_inner(
@@ -72,7 +71,6 @@ impl Repository {
         options: StatusOptions,
         untracked_policy: UntrackedScanPolicy,
         hash_untracked: bool,
-        for_record: bool,
         change_source_override: Option<&dyn crate::change_source::ChangeSource>,
     ) -> Result<RepositoryStatus, RepositoryError> {
         let view_name = self.desired_view_name(working_copy)?;
@@ -552,6 +550,24 @@ impl Repository {
 
             found_on_disk.insert(path.clone());
 
+            // Reappearing historical paths need a structural add/undelete or
+            // move before their attributes can be updated. Reporting only a
+            // mode/kind difference would hide that lifecycle transition from
+            // record and could leave the path canonically absent afterward.
+            if has_graph && !projected_present_paths.contains(path) {
+                let mut entry = FileStatusEntry::new(path.clone(), FileStatus::Added);
+                if let Some(inode) = inode {
+                    entry.set_inode(inode);
+                }
+                if options.hash_contents {
+                    if let Ok(hash) = hash_file_contents(&abs_path) {
+                        entry.set_current_hash(hash);
+                    }
+                }
+                status.add_entry(entry);
+                continue;
+            }
+
             if has_graph {
                 if let (Some(inode), Some(position)) = (
                     inode,
@@ -599,20 +615,6 @@ impl Repository {
                         continue;
                     }
                 }
-            }
-
-            if has_graph && !projected_present_paths.contains(path) {
-                let mut entry = FileStatusEntry::new(path.clone(), FileStatus::Added);
-                if let Some(inode) = inode {
-                    entry.set_inode(inode);
-                }
-                if options.hash_contents {
-                    if let Ok(hash) = hash_file_contents(&abs_path) {
-                        entry.set_current_hash(hash);
-                    }
-                }
-                status.add_entry(entry);
-                continue;
             }
 
             // Not yet recorded → Added
@@ -744,9 +746,12 @@ impl Repository {
         }
 
         // PATH_CLAIMS conflicts are authoritative and visible even before a
-        // materialize has persisted compatibility conflict rows. A12 file
-        // conflicts become recordable Modified entries once markers are removed;
-        // A11 and directory conflicts have no in-file marker channel.
+        // materialize has persisted compatibility conflict rows. Once a
+        // materialized A12 file conflict has its markers removed, both public
+        // status and record report Modified: the working-copy resolution is
+        // pending record, which still has to commit SolveNameConflict. A11,
+        // directory, and unmaterialized conflicts remain Conflicted because
+        // marker-free bytes alone do not establish a working-copy resolution.
         for (path, conflict) in &projected_name_conflicts {
             let normalized = PathBuf::from(path);
             if !options.path_filters.is_empty()
@@ -763,8 +768,7 @@ impl Repository {
                 .and_then(|bytes| super::materialize::first_conflict_marker_line(&bytes))
                 .is_some();
             let path_sides = conflict.sides_at_path(path);
-            let marker_resolved_a12 = for_record
-                && persisted_name_paths.contains(path)
+            let marker_resolved_a12 = persisted_name_paths.contains(path)
                 && !conflict.is_rename_conflict()
                 && !has_markers
                 && path_sides.iter().all(|side| !side.is_directory())
@@ -912,7 +916,6 @@ impl Repository {
             working_copy,
             options,
             UntrackedScanPolicy::Never,
-            false,
             false,
             Some(source),
         )

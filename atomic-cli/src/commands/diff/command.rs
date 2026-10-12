@@ -633,9 +633,9 @@ impl Command for Diff {
         let files_to_diff: Vec<_> = if self.files.is_empty() {
             // Diff all modified and added files
             let mut entries: Vec<_> = status
-                .modified()
-                .chain(status.added())
-                .chain(status.deleted())
+                .entries()
+                .iter()
+                .filter(|entry| entry.status().is_dirty())
                 .map(|e| (e.path().to_path_buf(), e.status()))
                 .collect();
 
@@ -771,12 +771,34 @@ impl Command for Diff {
                         }
                     }
                 }
-                FileStatus::Modified => {
+                FileStatus::Modified | FileStatus::TypeChanged | FileStatus::PermissionsChanged => {
                     // For modified files, compute the actual diff
                     let full_path = repo_root.join(path);
 
                     // Read current (new) content from working copy
-                    let new_content = match std::fs::read(&full_path) {
+                    let read_content = || -> std::io::Result<Vec<u8>> {
+                        let metadata = std::fs::symlink_metadata(&full_path)?;
+                        if metadata.file_type().is_symlink() {
+                            #[cfg(unix)]
+                            {
+                                use std::os::unix::ffi::OsStrExt;
+                                return Ok(std::fs::read_link(&full_path)?
+                                    .as_os_str()
+                                    .as_bytes()
+                                    .to_vec());
+                            }
+                            #[cfg(not(unix))]
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::Unsupported,
+                                "symlink diff is unsupported on this platform",
+                            ));
+                        }
+                        if metadata.is_dir() {
+                            return Ok(Vec::new());
+                        }
+                        std::fs::read(&full_path)
+                    };
+                    let new_content = match read_content() {
                         Ok(c) => c,
                         Err(_) => continue,
                     };
@@ -792,7 +814,8 @@ impl Command for Diff {
                     let diff_result = diff_text(&old_content, &new_content, algorithm);
 
                     // Convert to FileDiff
-                    let mut file_diff = FileDiff::modified(&path_str);
+                    let mut file_diff =
+                        FileDiff::new(&path_str, FileChangeStatus::from(*file_status));
 
                     // Build hunks from diff result
                     if !diff_result.is_unchanged() {

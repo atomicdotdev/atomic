@@ -69,12 +69,18 @@ message SandboxSkeleton {
   ViewSnapshot snapshot = 4;
   repeated ChangeLogEntry own_log = 5;
   VersionedBytes vault = 6; // target's effective vault, including its overlay
-  // SHAPE-CONFIRM (Slice 3): skeleton takes its view's vault; draft views
-  // render as themselves.
+  // SETTLED (from #224's SandboxSkeleton): graph_slice is what a cache
+  // imports — the kernel skeleton whole (the view as itself, each ancestor in
+  // its perspective with its own log/state/parent, and the raw graph rows),
+  // schema "atomic.sandbox.skeleton.v1" (atomic_repository::SandboxSkeleton::
+  // to_bytes). rows/ancestors/snapshot are a readable projection of it
+  // (SandboxViewRow.content and SandboxAncestorView.head/log stay unset);
+  // own_log is not sent. The view's vault travels as its .vault files in the
+  // materialized tree and the cache indexes them, so vault is unset.
 }
 
 message SandboxContentSpan {
-  uint64 inode = 1;
+  uint64 inode = 1;  // 0: not attributed — a span is keyed by (change, offset)
   uint64 offset = 2;
   uint64 length = 3;
   Hash change = 4;
@@ -85,6 +91,10 @@ message SandboxSlice {
   repeated SandboxViewRow rows = 1;         // the rows record reads
   repeated SandboxContentSpan content_spans = 2; // the content spans
   ViewSnapshot snapshot = 3;
+  // The raw graph rows the cache imports for the requested inodes, schema
+  // "atomic.sandbox.graph-slice.v1" (atomic_repository::SandboxSlice::
+  // rows_to_bytes); content_spans carry their bytes beside them.
+  VersionedBytes graph_slice = 4;
 }
 
 // ————— grant admin (LOCAL-only, mint/renew/revoke) —————
@@ -216,6 +226,7 @@ message TreeEntry {
   TreeEntryKind kind = 2;
   optional Hash content = 3;
   optional bytes inline = 4;       // small blobs may ride the entry
+  optional uint32 mode = 5;        // Unix permission bits as recorded
 }
 enum TreeEntryKind {
   TREE_ENTRY_KIND_UNSPECIFIED = 0;
@@ -271,6 +282,10 @@ message PublishProvenanceRequest {
   optional ViewRef target = 9;
   // Turn ownership, graph identity and explained-change visibility are checked
   // again at publication. A payload cannot replace another session's state.
+  // The full session turn (goal, change hashes, previous provenance, plan,
+  // todos) as JSON, schema "atomic.session.turn.v1"; `turn` must name the
+  // same (session, turn). Required: the index entry is published from it.
+  VersionedBytes session_turn = 10;
 }
 message PublishProvenanceResponse {
   oneof outcome {
@@ -282,7 +297,11 @@ message PublishProvenanceResponse {
 message ProvenancePublished {
   Hash provenance_hash = 1;
   google.protobuf.Timestamp published_at = 2;
-  // SHAPE-CONFIRM (Slice 3): publication record shape from Aaron's branch.
+  // SETTLED (from #224's SessionCheckpointPublication): the session manifest
+  // the turn landed in, and the publication record itself as JSON, schema
+  // "atomic.session.checkpoint-publication.v1".
+  Hash manifest_hash = 3;
+  VersionedBytes publication = 4;
 }
 
 message SubmitChangeRequest {
@@ -328,12 +347,13 @@ message ChangeRefused {
 // identity, until expiry.
 //
 // CONTRACT BEHAVIOR (HANDOFF §10.2 recommendation, on record for Lee):
-// the grant registry is EPHEMERAL — only blake3 hashes of tokens are stored,
-// grant-admin issuance replay is memory-only and invalidated with its grant;
-// no durable response/outbox/event payload may contain the token,
-// the registry dies with the daemon process, and a restart invalidates all
-// sandbox tokens (fail-closed). Local admin reissues via OpenSandbox to recover;
-// this is documented contract behavior, not an outage.
+// only blake3 hashes of tokens are stored, grant-admin issuance replay is
+// memory-only and invalidated with its grant; no durable response/outbox/event
+// payload may contain the token. Whether grants survive a restart is the
+// host's choice (CONTRACT.md): libatomic's default registry is in-memory, so
+// it dies with the process and a restart invalidates all sandbox tokens
+// (fail-closed; local admin reissues via OpenSandbox — documented behavior,
+// not an outage); a host may persist grants in its own store instead.
 //
 // TTL bounds: 1s..31536000s (365d) with checked arithmetic — one absurd
 // --ttl (or an unrelated poisoned lock) must never take the registry down.

@@ -187,6 +187,22 @@ async fn reactor_cli_uses_same_handler_over_socket_without_fallback() {
         .await
         .unwrap();
     let result = report(output);
+    for args in [
+        vec!["compact", "--json"],
+        vec!["compact", "--repository", ".", "--json"],
+    ] {
+        let mut relative = Command::new(env!("CARGO_BIN_EXE_atomic"));
+        relative
+            .args(args)
+            .current_dir(&root)
+            .env("ATOMIC_SERVICE", "reactor")
+            .env("ATOMIC_DAEMON_SOCKET", &socket)
+            .env("ATOMIC_DAEMON_BIN", root.join("no-daemon-binary"));
+        let output = tokio::task::spawn_blocking(move || relative.output().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(report(output)["database"], result["database"]);
+    }
     assert_eq!(
         result["database"],
         root.join(".atomic/atomic.redb")

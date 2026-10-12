@@ -133,6 +133,19 @@ struct SherpaHookInput {
     /// `trace_file`.
     #[serde(default, alias = "trace_file")]
     transcript_path: Option<String>,
+
+    /// The turn's LLM usage, as the harness's turn-end payload reports it.
+    /// Rides the event's raw JSON into the turn's unhashed data — the
+    /// change's provenance carries what the turn cost, not just what it
+    /// did.
+    #[serde(default)]
+    input_tokens: Option<u64>,
+
+    #[serde(default)]
+    output_tokens: Option<u64>,
+
+    #[serde(default)]
+    step_count: Option<u32>,
 }
 
 // ---------------------------------------------------------------------------
@@ -271,13 +284,33 @@ impl AgentHook for SherpaHook {
                 }
 
                 // turn_number stored in raw_json so the orchestrator can
-                // include it in the SessionEnvelope.
+                // include it in the SessionEnvelope. The usage fields ride
+                // the same way — the recording reads them back out for the
+                // turn's unhashed data.
                 if let Some(ref mut raw_json) = event.raw_json {
                     if let Some(obj) = raw_json.as_object_mut() {
                         obj.insert(
                             "turn_number".to_string(),
                             serde_json::Value::Number(parsed.turn_number.into()),
                         );
+                        if let Some(v) = parsed.input_tokens {
+                            obj.insert(
+                                "input_tokens".to_string(),
+                                serde_json::Value::Number(v.into()),
+                            );
+                        }
+                        if let Some(v) = parsed.output_tokens {
+                            obj.insert(
+                                "output_tokens".to_string(),
+                                serde_json::Value::Number(v.into()),
+                            );
+                        }
+                        if let Some(v) = parsed.step_count {
+                            obj.insert(
+                                "step_count".to_string(),
+                                serde_json::Value::Number(u64::from(v).into()),
+                            );
+                        }
                     }
                 }
             }

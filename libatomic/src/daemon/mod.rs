@@ -21,7 +21,11 @@
 //! - [`services_provenance`] — the ProvenanceService journal-port wire handlers.
 //! - [`services_query`] — the heavy query handlers + ViewService.
 //! - [`services_maintenance`] — MaintenanceService (doctor).
-//! - [`services_sandbox`] — SandboxService (the local sandbox trees).
+//! - [`services_sandbox`] — SandboxService: local sandbox trees, grant
+//!   admin, and the remote-sandbox data ops.
+//! - [`sandbox_grants`] — sandbox grants and the host's grant-store seam.
+//! - [`sandbox_wire`] — kernel ↔ protobuf for the sandbox data ops (both
+//!   sides: the handlers and a host's cache-side link).
 //! - [`services_tag`] — TagService (tag create/delete/list/show).
 //! - [`services_sync`] — SyncService (remote registry, push/pull).
 //! - [`provenance_core`] — the shared provenance journal core.
@@ -37,6 +41,8 @@
 pub mod convert;
 pub mod journal_sink;
 pub mod provenance_core;
+pub mod sandbox_grants;
+pub mod sandbox_wire;
 pub mod services;
 pub mod services_agent;
 pub mod services_maintenance;

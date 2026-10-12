@@ -398,3 +398,93 @@ fn view_state_repo(repo: &Repository, name: &str) -> ViewState {
     let txn = repo.pristine.read_txn().unwrap();
     txn.get_view(name).unwrap().unwrap()
 }
+
+#[test]
+fn shared_sandbox_advance_preserves_host_baseline_and_private_work() {
+    let (dir, repo) = create_temp_repo();
+    std::fs::write(dir.path().join("file.txt"), b"base\n").unwrap();
+    repo.add_batch(&["file.txt"]).unwrap();
+    repo.record_all("base").unwrap();
+    repo.materialize().unwrap();
+    let wc = repo.working_copy();
+    let before = repo.working_copy_record(wc).unwrap();
+    let sandbox = tempfile::TempDir::new().unwrap();
+    repo.provision_sandbox(sandbox.path(), "dev").unwrap();
+    std::fs::write(dir.path().join("file.txt"), b"host private edit\n").unwrap();
+    std::fs::write(dir.path().join("scratch.txt"), b"private scratch\n").unwrap();
+    drop(repo);
+
+    let worker = Repository::open_sandbox(sandbox.path(), dir.path(), "dev").unwrap();
+    std::fs::write(sandbox.path().join("file.txt"), b"sandbox edit\n").unwrap();
+    worker
+        .record(
+            worker.require_working_copy_id().unwrap(),
+            ChangeHeader::new("sandbox advances shared view"),
+            RecordOptions::new().with_all(true),
+        )
+        .unwrap();
+    drop(worker);
+
+    let mut host = Repository::open(dir.path()).unwrap();
+    let observed = host.begin_workspace_txn(WorkspaceTxnMode::Observe).unwrap();
+    assert!(matches!(observed, WorkspaceTxnStart::Ready(_)));
+    drop(observed);
+    assert_eq!(
+        host.working_copy_record(wc).unwrap(),
+        before,
+        "observation must not write"
+    );
+    assert!(host
+        .status(wc, StatusOptions::default())
+        .unwrap()
+        .modified()
+        .any(|e| e.path() == Path::new("file.txt")));
+    let reconciled = host
+        .begin_workspace_txn(WorkspaceTxnMode::Reconcile)
+        .unwrap();
+    assert!(matches!(reconciled, WorkspaceTxnStart::Ready(_)));
+    drop(reconciled);
+    let after = host.working_copy_record(wc).unwrap();
+    assert_ne!(after.desired_state, before.desired_state);
+    assert_eq!(after.desired_state, view_state_repo(&host, "dev").state);
+    assert_eq!(after.materialized_state, before.materialized_state);
+    assert_eq!(after.materialized_manifest, before.materialized_manifest);
+    assert_eq!(
+        std::fs::read(dir.path().join("file.txt")).unwrap(),
+        b"host private edit\n"
+    );
+    assert_eq!(
+        std::fs::read(dir.path().join("scratch.txt")).unwrap(),
+        b"private scratch\n"
+    );
+    let head = host.sole_operation_head(working_copy_scope(wc)).unwrap();
+    assert_eq!(
+        host.operation_details(head)
+            .unwrap()
+            .operation
+            .payload()
+            .kind,
+        atomic_core::operation::OperationKind::ReconcileWorkingCopy
+    );
+    let second = tempfile::TempDir::new().unwrap();
+    host.provision_sandbox(wc, second.path(), "dev").unwrap();
+    drop(host);
+    let mut reopened = Repository::open(dir.path()).unwrap();
+    assert!(matches!(
+        reopened
+            .begin_workspace_txn(WorkspaceTxnMode::Reconcile)
+            .unwrap(),
+        WorkspaceTxnStart::Ready(_)
+    ));
+    assert_eq!(reopened.working_copy_record(wc).unwrap(), after);
+}
+
+#[test]
+fn workspace_entry_still_rejects_an_unknown_registration_state() {
+    let (_dir, mut repo) = create_temp_repo();
+    force_stale_desired_state(&repo, Hash::of(b"not a prior view state"));
+    assert!(matches!(
+        repo.begin_workspace_txn(WorkspaceTxnMode::Observe),
+        Err(RepositoryError::InvalidRepository { .. })
+    ));
+}

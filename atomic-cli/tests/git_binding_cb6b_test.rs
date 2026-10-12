@@ -148,6 +148,18 @@ fn transfer_to_client(publisher: &Path, remote_dir: &Path, client: &Path) {
         ],
         "push branch + binding namespace",
     );
+    // libgit2 and the system Git executable can use different default branch
+    // names. A push does not update a bare remote's symbolic HEAD; point it
+    // at the published branch so the fresh clone actually checks it out.
+    let publisher_git = git2::Repository::open(publisher).expect("publisher git");
+    let head = publisher_git.head().expect("publisher HEAD");
+    let branch_ref = head.name().expect("named publisher branch");
+    assert!(branch_ref.starts_with("refs/heads/"));
+    run_git(
+        remote_dir,
+        &["symbolic-ref", "HEAD", branch_ref],
+        "set remote default branch",
+    );
     run_git(
         publisher.parent().unwrap(),
         &[

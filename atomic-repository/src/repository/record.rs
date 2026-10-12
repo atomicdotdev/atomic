@@ -709,6 +709,10 @@ impl Repository {
         // Build the final header (may get message from options).
         let final_header = build_header(header, &options);
 
+        // A remote sandbox's cache takes the rows it is about to read.
+        self.hydrate_remote_sandbox()
+            .map_err(RecordError::Repository)?;
+
         // Get repository status to find modified files
         let status_t0 = std::time::Instant::now();
         let mut status_options = StatusOptions::default();
@@ -927,11 +931,11 @@ impl Repository {
         // `prepare_name_resolution` path can supersede the losing claims inside
         // a recorded change.
         //
-        // The resolution itself accepts only a side whose rendered bytes equal
-        // the working tree byte-for-byte; a third value or an ambiguous match
-        // is reported, never chosen. Read-only and observation-only turns never
-        // reach the record body, and renaming/directory conflicts are left to
-        // their own flows.
+        // An exact content selection retains that side's identity. An explicit
+        // edited resolution records the new content against a canonically
+        // ordered claimant and supersedes the other name claims. Observation
+        // never resolves anything; rename/directory conflicts use their own
+        // flows, and preserve-content requests retain their strict contract.
         // Review ::15 blocker support (user decision "Preserve current
         // files"): paths in `resolve_name_conflicts` are EXPLICIT resolution
         // targets — they qualify without --all and may carry MULTIPLE
@@ -2201,6 +2205,22 @@ impl Repository {
 
         stats.dependency_count = change.dependencies().len();
 
+        // Unhashed data (the agent's condensed transcript, reasoning) rides
+        // the change from here: the local change store's file and — the
+        // point of the seam — a remote sandbox's SubmitChange bytes, which
+        // carry exactly what this record serialized. It used to be attached
+        // AFTER the record and re-saved to a store a sandbox never reads,
+        // so expeditions recorded changes whose provenance said nothing
+        // about how they were made.
+        if let Some(unhashed) = options.get_unhashed() {
+            let entry = change.unhashed.get_or_insert_with(|| serde_json::json!({}));
+            if let Some(obj) = entry.as_object_mut() {
+                for (key, value) in unhashed.as_object().into_iter().flatten() {
+                    obj.insert(key.clone(), value.clone());
+                }
+            }
+        }
+
         let serialize_t0 = std::time::Instant::now();
         // Serialize to V3 format and compute content hash.
         // We keep the raw V3 bytes so we can save them directly to disk
@@ -2611,6 +2631,9 @@ impl Repository {
                         }
                     }
                 }
+                // A remote sandbox's change that didn't land isn't recorded
+                // anywhere: that is a failure, not a warning.
+                Err(e) if self.is_remote_sandbox() => return Err(RecordError::Repository(e)),
                 Err(e) => {
                     outcome.add_error("apply".to_string(), e.to_string());
                 }
@@ -3243,6 +3266,25 @@ fn prepare_name_resolution(
         if content == working {
             matching.push((*side).clone());
         }
+    }
+    if matching.is_empty() && !preserve_mode {
+        // This is an explicit record of edited resolution bytes, not an
+        // observation or a request to preserve one existing incarnation.
+        // Keep a stable graph identity as the edit's base. Order by canonical
+        // introducing hash and position, never local inode allocation, TREE,
+        // previously selected view, or import order. The resolution operation
+        // retains every losing claim as history and depends on all sides.
+        let mut candidates = Vec::with_capacity(sides.len());
+        for side in &sides {
+            let hash = external_hashes.get(&side.position.change).ok_or_else(|| {
+                RecordError::Database(format!(
+                    "name conflict at '{path}' has no canonical identity for a claimant"
+                ))
+            })?;
+            candidates.push(((*hash, side.position.pos), (*side).clone()));
+        }
+        candidates.sort_by_key(|(identity, _)| *identity);
+        matching.push(candidates.remove(0).1);
     }
     if matching.len() != 1 {
         // Review ::15 blocker support (user decision "Preserve current

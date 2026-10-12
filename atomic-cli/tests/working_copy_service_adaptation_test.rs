@@ -74,6 +74,30 @@ async fn socket_record_all_keeps_rename_identity_and_view_switch_renders_live_pa
     let result = tokio::task::spawn_blocking(move || {
         let cli = |args: &[&str]| run(root.path(), home.path(), &socket, args);
         let record = |message: &str| { cli(&["record", "-am", message, "--author", "Service Regression"]); };
+        // The actual Reactor socket uses the same attribute-aware diff/restore
+        // behavior as local libatomic, without changing the RPC schema.
+        {
+            use std::os::unix::fs::{PermissionsExt, symlink};
+            let path = root.path().join("attributes.txt");
+            fs::write(&path, b"original attributes\n").unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+            record("attribute baseline");
+            fs::write(&path, b"edited attributes\n").unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+            assert!(cli(&["diff", "--no-color"]).contains("+edited attributes"));
+            assert!(cli(&["restore", "--dry-run"]).contains("attributes.txt"));
+            cli(&["restore", "attributes.txt"]);
+            assert_eq!(fs::read(&path).unwrap(), b"original attributes\n");
+            assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o644);
+            fs::remove_file(&path).unwrap();
+            symlink("missing-target", &path).unwrap();
+            cli(&["restore", "attributes.txt"]);
+            assert!(!fs::symlink_metadata(&path).unwrap().file_type().is_symlink());
+            assert_eq!(fs::read(&path).unwrap(), b"original attributes\n");
+            // Keep the pre-existing history-position assertions below stable.
+            cli(&["unrecord"]);
+            fs::remove_file(&path).unwrap();
+        }
         fs::write(root.path().join("revise-first.txt"), b"original\n").unwrap();
         record("revise first");
         fs::write(root.path().join("revise-second.txt"), b"independent\n").unwrap();

@@ -81,9 +81,11 @@ fn compute_working_copy_diff(
     for entry in status.entries() {
         let entry_status = entry.status();
         let wanted = match entry_status {
-            DomainFileStatus::Modified | DomainFileStatus::Added | DomainFileStatus::Deleted => {
-                true
-            }
+            DomainFileStatus::Modified
+            | DomainFileStatus::Added
+            | DomainFileStatus::Deleted
+            | DomainFileStatus::TypeChanged
+            | DomainFileStatus::PermissionsChanged => true,
             DomainFileStatus::Untracked => include_untracked,
             _ => false,
         };
@@ -108,7 +110,14 @@ fn compute_working_copy_diff(
         };
         let new_content: Option<Vec<u8>> = match file_status {
             DomainFileStatus::Deleted => None,
-            _ => std::fs::read(handle.root.join(&path)).ok(),
+            _ => Some(
+                working_copy_diff_bytes(&handle.root.join(&path)).map_err(|error| {
+                    domain_status(
+                        ErrorCode::Repository,
+                        format!("cannot read {}: {error}", path.display()),
+                    )
+                })?,
+            ),
         };
 
         let old_text = String::from_utf8_lossy(&old_content).into_owned();
@@ -173,6 +182,26 @@ fn compute_working_copy_diff(
         });
     }
     Ok(chunks)
+}
+
+fn working_copy_diff_bytes(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            return Ok(std::fs::read_link(path)?.as_os_str().as_bytes().to_vec());
+        }
+        #[cfg(not(unix))]
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "symlink diff is unsupported on this platform",
+        ));
+    }
+    if metadata.is_dir() {
+        return Ok(Vec::new());
+    }
+    std::fs::read(path)
 }
 
 /// The wire's downcased file status for a diff chunk — the CLI renders
@@ -303,13 +332,16 @@ pub async fn get_change_impl(
             .find_provenance_for_change(&hash)
             .map_err(|error| domain_status(ErrorCode::Repository, error.to_string()))?
             .into_iter()
-            .map(|(_graph_hash, graph)| {
+            .map(|(graph_hash, graph)| {
                 let payload = serde_json::to_vec(&graph)
                     .map_err(|error| domain_status(ErrorCode::Internal, error.to_string()))?;
-                Ok::<VersionedBytes, Status>(VersionedBytes {
-                    schema: "atomic.prov.graph.v1".to_string(),
-                    payload,
-                })
+                Ok::<_, Status>((
+                    hash_proto(&graph_hash),
+                    VersionedBytes {
+                        schema: "atomic.prov.graph.v1".to_string(),
+                        payload,
+                    },
+                ))
             })
             .collect::<Result<Vec<_>, _>>()?;
         // Per-file content reconstruction (`diff -c`): each touched
@@ -350,6 +382,7 @@ pub async fn get_change_impl(
     .map_err(|error| Status::internal(error.to_string()))??;
 
     let (change, hash, sequence, change_bundle, provenance_ledger, file_contents) = change;
+    let (provenance_ledger_hashes, provenance_ledger) = provenance_ledger.into_iter().unzip();
     let header = &change.hashed.header;
     Ok(Response::new(GetChangeResponse {
         change: Some(ChangeInfo {
@@ -382,6 +415,7 @@ pub async fn get_change_impl(
         content_chunks: None,
         change_bundle,
         provenance_ledger,
+        provenance_ledger_hashes,
         sequence,
         file_contents,
     }))

@@ -1,5 +1,29 @@
 use super::*;
 
+// Preview and mutation select the same paths, using the caller's transaction.
+fn removal_candidates<T: TreeTxnT>(
+    txn: &T,
+    path: &Path,
+    options: &TrackingOptions,
+) -> Result<Vec<(String, Inode)>, RepositoryError> {
+    let normalized = normalize_path(path);
+    let files = if options.recursive {
+        tracked_under_prefix(txn, &normalized)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?
+    } else {
+        get_inode(txn, &normalized)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?
+            .map(|inode| vec![(normalized, inode)])
+            .unwrap_or_default()
+    };
+    if files.is_empty() && !options.force {
+        return Err(RepositoryError::FileNotTracked {
+            path: path.to_path_buf(),
+        });
+    }
+    Ok(files)
+}
+
 impl Repository {
     // File Tracking Methods
 
@@ -410,49 +434,19 @@ impl Repository {
         self.validate_working_copy(working_copy)?;
         let path = path.as_ref();
         let mut stats = TrackingStats::new();
-        let normalized = normalize_path(path);
-
+        if options.dry_run {
+            let txn = self
+                .pristine
+                .read_txn()
+                .map_err(|e| RepositoryError::Database(e.to_string()))?;
+            stats.files_removed = removal_candidates(&txn, path, &options)?.len();
+            return Ok(stats);
+        }
         let mut txn = self
             .pristine
             .write_txn()
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
-
-        // Check if the path is tracked first (for non-recursive case)
-        let _is_path_tracked =
-            is_tracked(&txn, &normalized).map_err(|e| RepositoryError::Database(e.to_string()))?;
-
-        // Get all files under this path if recursive
-        let to_remove = if options.recursive {
-            let files = tracked_under_prefix(&txn, &normalized)
-                .map_err(|e| RepositoryError::Database(e.to_string()))?;
-
-            // If no files found and not forced, error
-            if files.is_empty() && !options.force {
-                return Err(RepositoryError::FileNotTracked {
-                    path: path.to_path_buf(),
-                });
-            }
-            files
-        } else {
-            // Just the single path
-            if let Some(inode) = get_inode(&txn, &normalized)
-                .map_err(|e| RepositoryError::Database(e.to_string()))?
-            {
-                vec![(normalized.clone(), inode)]
-            } else {
-                if !options.force {
-                    return Err(RepositoryError::FileNotTracked {
-                        path: path.to_path_buf(),
-                    });
-                }
-                vec![]
-            }
-        };
-
-        if options.dry_run {
-            stats.files_removed = to_remove.len();
-            return Ok(stats);
-        }
+        let to_remove = removal_candidates(&txn, path, &options)?;
 
         for (file_path, _inode) in to_remove {
             remove_from_tree(&mut txn, &file_path)

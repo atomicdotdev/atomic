@@ -20,6 +20,7 @@ adoption-test-injection = []
 unicode-normalization = "0.1"
 atomic-core = { workspace = true }
 atomic-canonical = { workspace = true }
+blake3 = { workspace = true }
 atomic-config = { workspace = true }
 atomic-identity = { workspace = true }
 atomic-objects = { workspace = true }
@@ -55,7 +56,6 @@ flate2 = "1.0"
 sha1 = "0.10"
 sha2 = "0.10"
 fs2 = "0.4"
-blake3 = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }

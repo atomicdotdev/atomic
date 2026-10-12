@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use atomic_core::operation::OperationScope;
 use atomic_core::pristine::{ViewState, ViewTxnT, WorkingCopyRecord, WorkingCopyTxnT};
-use atomic_core::{OperationId, WorkingCopyId};
+use atomic_core::{Merkle, OperationId, WorkingCopyId};
 use serde::Deserialize;
 
 use super::git_observation::{
@@ -1217,6 +1217,14 @@ impl Repository {
                     }) {
                         return Ok(WorkspaceTxnStart::Remediation(remediation));
                     }
+                    // Another working copy may have appended to our shared
+                    // view. Advance only this registration, under its lease;
+                    // its materialized baseline and private files stay intact.
+                    record = self.advance_working_copy_registration_locked(
+                        &operation_lock,
+                        record,
+                        &view,
+                    )?;
                     (
                         self.consolidate_operation_heads_locked(&operation_lock)?,
                         recovered_observation,
@@ -1325,12 +1333,31 @@ impl Repository {
                 name: format!("id {}", record.desired_view),
             })?;
         if view.state != record.desired_state {
-            return Err(RepositoryError::InvalidRepository {
-                reason: format!(
-                    "working-copy {} expects view '{}' at {}, but the view is at {}",
-                    working_copy, view.name, record.desired_state, view.state
-                ),
-            });
+            // A shared view can advance without materializing every working
+            // copy that follows it. A recorded prefix is a valid prior
+            // registration, not evidence of a damaged repository. Observe
+            // leaves the registration unchanged; a mutating entry journals
+            // the advance after recovery and Git preconditions have passed.
+            let mut known_state = record.desired_state == Merkle::ZERO;
+            for entry in txn
+                .iter_changes(&view, 0)
+                .map_err(|error| RepositoryError::Database(error.to_string()))?
+            {
+                let (_, _, state) =
+                    entry.map_err(|error| RepositoryError::Database(error.to_string()))?;
+                if state == record.desired_state {
+                    known_state = true;
+                    break;
+                }
+            }
+            if !known_state {
+                return Err(RepositoryError::InvalidRepository {
+                    reason: format!(
+                        "working-copy {} expects view '{}' at {}, but the view is at {}",
+                        working_copy, view.name, record.desired_state, view.state
+                    ),
+                });
+            }
         }
         Ok((record, view))
     }

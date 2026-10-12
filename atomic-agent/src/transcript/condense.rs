@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 
 use super::types::{
-    AssistantMessage, CondensedEntry, EntryType, ToolInput, ToolUseSummary, TranscriptLine,
+    AssistantContent, AssistantMessage, CondensedEntry, EntryType, ToolInput, ToolUseSummary,
+    TranscriptLine,
 };
 
 // Transcript Parsing (Claude Code JSONL)
@@ -54,7 +55,16 @@ pub fn condense_claude_transcript(raw: &[u8]) -> Vec<CondensedEntry> {
             }
             "assistant" => {
                 if let Ok(msg) = serde_json::from_value::<AssistantMessage>(parsed.message) {
-                    for block in &msg.content {
+                    let blocks = match msg.content {
+                        AssistantContent::Plain(text) => {
+                            if !text.is_empty() {
+                                entries.push(CondensedEntry::assistant(&text));
+                            }
+                            Vec::new()
+                        }
+                        AssistantContent::Blocks(blocks) => blocks,
+                    };
+                    for block in &blocks {
                         match block.r#type.as_str() {
                             "text" if !block.text.is_empty() => {
                                 entries.push(CondensedEntry::assistant(&block.text));
@@ -301,6 +311,7 @@ fn extract_tool_detail(tool_name: &str, input: &serde_json::Value) -> Option<Str
     parsed
         .description
         .or(parsed.command)
+        .or_else(|| parsed.args.as_ref().map(|a| a.join(" ")))
         .or(parsed.file_path)
         .or(parsed.notebook_path)
         .or(parsed.pattern)

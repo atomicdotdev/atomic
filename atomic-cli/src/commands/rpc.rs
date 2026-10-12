@@ -573,6 +573,7 @@ pub fn record(args: &super::record::Record) -> CliResult<bool> {
             .map(|path| relativize(path, &root))
             .collect(),
         expected: None,
+        ai_authorship: None,
         author,
         identity_name,
     };
@@ -1696,6 +1697,7 @@ fn file_diff_from_chunk(
         Some("added") => FileChangeStatus::Added,
         Some("deleted") => FileChangeStatus::Deleted,
         Some("untracked") => FileChangeStatus::Untracked,
+        Some("typechanged") => FileChangeStatus::TypeChanged,
         _ => FileChangeStatus::Modified,
     };
 
@@ -1703,7 +1705,7 @@ fn file_diff_from_chunk(
         FileChangeStatus::Added => FileDiff::added(&chunk.path),
         FileChangeStatus::Deleted => FileDiff::deleted(&chunk.path),
         FileChangeStatus::Untracked => FileDiff::new(&chunk.path, FileChangeStatus::Untracked),
-        _ => FileDiff::modified(&chunk.path),
+        _ => FileDiff::new(&chunk.path, status),
     };
 
     if chunk.binary {
@@ -1724,7 +1726,12 @@ fn file_diff_from_chunk(
     }
 
     let diff_result = diff_text(&old_content, &new_content, *algorithm);
-    if diff_result.is_unchanged() {
+    if diff_result.is_unchanged()
+        && !matches!(
+            chunk.status.as_deref(),
+            Some("typechanged" | "permissionschanged")
+        )
+    {
         return None;
     }
     let old_lines: Vec<_> = old_content.split(|&b| b == b'\n').collect();
@@ -1835,17 +1842,10 @@ pub fn change(args: &super::change::command::ChangeCmd) -> CliResult<bool> {
         .map(atomic_core::types::Merkle)
         .ok_or_else(|| CliError::Internal(anyhow::anyhow!("malformed hash")))?;
 
-    // The causal decision graph(s): JSON bytes → the domain ProvenanceGraph.
-    let ledger_graphs = response
-        .provenance_ledger
-        .iter()
-        .filter_map(|bytes| {
-            let graph: atomic_core::change::ProvenanceGraph =
-                serde_json::from_slice(&bytes.payload).ok()?;
-            let graph_hash = atomic_core::types::Merkle([0u8; 32]);
-            Some((graph_hash, graph))
-        })
-        .collect::<Vec<_>>();
+    let ledger_graphs = decode_change_ledger(
+        &response.provenance_ledger,
+        &response.provenance_ledger_hashes,
+    )?;
 
     // Dependency messages for --show-deps: per-dep metadata lookups.
     let mut dep_messages = std::collections::HashMap::new();
@@ -1886,6 +1886,49 @@ pub fn change(args: &super::change::command::ChangeCmd) -> CliResult<bool> {
     };
     args.print_change(&change, &hash, response.sequence, &data);
     Ok(true)
+}
+
+fn decode_change_ledger(
+    ledger: &[pb::VersionedBytes],
+    hashes: &[pb::Hash],
+) -> CliResult<Vec<(Merkle, atomic_core::change::ProvenanceGraph)>> {
+    if ledger.len() != hashes.len() {
+        return Err(CliError::Internal(anyhow::anyhow!(
+            "provenance ledger/hash count mismatch ({} graphs, {} hashes); \
+             if using an older service, upgrade it to return stored provenance hashes",
+            ledger.len(),
+            hashes.len(),
+        )));
+    }
+    ledger
+        .iter()
+        .zip(hashes)
+        .map(|(bytes, hash)| {
+            if hash.algorithm != pb::HashAlgorithm::Blake3 as i32 {
+                return Err(CliError::Internal(anyhow::anyhow!(
+                    "unsupported provenance hash algorithm: {}",
+                    hash.algorithm,
+                )));
+            }
+            let value: [u8; 32] = hash.value.as_slice().try_into().map_err(|_| {
+                CliError::Internal(anyhow::anyhow!(
+                    "malformed provenance hash: expected 32 bytes"
+                ))
+            })?;
+            if bytes.schema != "atomic.prov.graph.v1" {
+                return Err(CliError::Internal(anyhow::anyhow!(
+                    "unsupported provenance graph schema: {}",
+                    bytes.schema,
+                )));
+            }
+            let graph = serde_json::from_slice(&bytes.payload).map_err(|error| {
+                CliError::Internal(anyhow::anyhow!("provenance graph payload: {error}"))
+            })?;
+            // Use the stored identity, not a hash of the JSON or of an upgraded
+            // graph reserialized by this client. Neither is the original artifact.
+            Ok((Merkle(value), graph))
+        })
+        .collect()
 }
 
 /// `atomic diff --from X --to Y` over the Diff RPC's RefPairScope arm —
@@ -2433,8 +2476,8 @@ pub fn view_list(args: &super::view::List) -> CliResult<bool> {
         return Ok(false); // the remote listing (scope-out remote surface)
     }
     // `view list` is #207's explicit registration/migration entry for a new
-    // linked worktree. Perform only the typed identity migration here; the
-    // service's list query keeps its read-only contract.
+    // linked worktree or an older native repository. Migrate before opening
+    // the service session; ListViews itself keeps its read-only contract.
     if let Ok(root) = super::find_repository_root() {
         match atomic_repository::Repository::open_readonly_wait(
             &root,
@@ -2444,7 +2487,18 @@ pub fn view_list(args: &super::view::List) -> CliResult<bool> {
             Err(atomic_repository::RepositoryError::WorkingCopyMigrationRequired { .. }) => {
                 drop(atomic_repository::Repository::open(&root).map_err(CliError::Repository)?);
             }
-            Err(error) => return Err(CliError::Repository(error)),
+            Err(error) => {
+                // Inspect the schema without requiring its completion. Do not
+                // turn arbitrary query errors into a writable recovery open.
+                let needs_path_migration =
+                    atomic_repository::Repository::open_readonly_for_native_repair(&root)
+                        .and_then(|repo| repo.path_claim_migration_required())
+                        .unwrap_or(false);
+                if !needs_path_migration {
+                    return Err(CliError::Repository(error));
+                }
+                drop(atomic_repository::Repository::open(&root).map_err(CliError::Repository)?);
+            }
         }
     }
     let Some(session) = Service::open()? else {
@@ -2756,7 +2810,7 @@ pub fn remove(args: &super::remove::Remove) -> CliResult<bool> {
         repository: Some(session.reference.clone()),
         meta: None,
         paths: args.paths.clone(),
-        keep_working_copy: args.keep,
+        keep_working_copy: !args.delete || args.keep,
         dry_run: args.dry_run,
         force: args.force,
     };
@@ -6555,6 +6609,37 @@ pub(crate) fn triage_candidates(
 // tags (TagService)
 // ---------------------------------------------------------------------------
 
+/// `triage review` over GenerateTriageReview — the full report bundle (the
+/// verdict, findings, intents, criteria, changes, walkthrough), versioned
+/// `atomic.triage.report.v1`, so the CLI renders the same report over the
+/// service as the local builder produced.
+pub(crate) fn triage_review(
+    args: &super::triage::TriageReview,
+) -> CliResult<Option<atomic_repository::triage::TriageReport>> {
+    let Some(session) = Service::open()? else {
+        return Ok(None);
+    };
+    let request = pb::GenerateTriageReviewRequest {
+        repository: Some(session.reference.clone()),
+        from_view: args.feature.clone().unwrap_or_default(),
+        to_view: args.into.clone().unwrap_or_default(),
+        report: None,
+    };
+    let response = session.generate_triage_review(request)?;
+    let Some(bundle) = response
+        .report
+        .as_ref()
+        .filter(|bytes| bytes.schema == "atomic.triage.report.v1")
+    else {
+        return Err(CliError::Internal(anyhow::anyhow!(
+            "the service returned no triage report bundle"
+        )));
+    };
+    let report = serde_json::from_slice(&bundle.payload)
+        .map_err(|e| CliError::Internal(anyhow::anyhow!("the wire report does not parse: {e}")))?;
+    Ok(Some(report))
+}
+
 /// One wire tag → the domain record shape the local render functions
 /// consume (name, view, sequence, state, timestamp, annotation, kind,
 /// metadata).
@@ -6893,4 +6978,87 @@ fn timestamp_proto(time: chrono::DateTime<chrono::Utc>) -> prost_types::Timestam
 /// always passes the canonical root).
 pub fn root_from(path: &Path) -> CliResult<PathBuf> {
     crate::commands::find_repository_root_from(path)
+}
+
+#[cfg(test)]
+mod change_ledger_tests {
+    use super::*;
+    use atomic_core::change::ProvenanceGraph;
+
+    fn fixture() -> (pb::VersionedBytes, pb::Hash) {
+        let graph = ProvenanceGraph::builder("session", "opencode").build();
+        (
+            pb::VersionedBytes {
+                schema: "atomic.prov.graph.v1".into(),
+                payload: serde_json::to_vec(&graph).unwrap(),
+            },
+            pb::Hash {
+                value: Merkle::of(b"original stored artifact").0.to_vec(),
+                algorithm: pb::HashAlgorithm::Blake3 as i32,
+            },
+        )
+    }
+
+    #[test]
+    fn preserves_stored_identity_instead_of_rehashing_upgraded_graph() {
+        let (bytes, hash) = fixture();
+        let result = decode_change_ledger(&[bytes], std::slice::from_ref(&hash)).unwrap();
+        assert_eq!(result[0].0.as_bytes().as_slice(), hash.value);
+        assert_ne!(result[0].0, Merkle::of(&result[0].1.serialize().unwrap()));
+        assert!(decode_change_ledger(&[], &[]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn refuses_missing_or_extra_hashes_including_older_services() {
+        let (bytes, hash) = fixture();
+        let error = decode_change_ledger(&[bytes], &[]).unwrap_err().to_string();
+        assert!(error.contains("ledger/hash count mismatch"));
+        assert!(error.contains("upgrade"));
+        assert!(decode_change_ledger(&[], &[hash]).is_err());
+    }
+
+    #[test]
+    fn refuses_malformed_hashes_and_unknown_algorithms() {
+        let (bytes, hash) = fixture();
+        for invalid in [
+            pb::Hash {
+                value: vec![1; 31],
+                ..hash.clone()
+            },
+            pb::Hash {
+                value: vec![1; 33],
+                ..hash.clone()
+            },
+            pb::Hash {
+                algorithm: 0,
+                ..hash.clone()
+            },
+            pb::Hash {
+                algorithm: 99,
+                ..hash
+            },
+        ] {
+            assert!(decode_change_ledger(std::slice::from_ref(&bytes), &[invalid]).is_err());
+        }
+    }
+
+    #[test]
+    fn refuses_invalid_graphs_instead_of_silently_dropping_ledger_entries() {
+        let (bytes, hash) = fixture();
+        for invalid in [
+            pb::VersionedBytes {
+                payload: b"not JSON".to_vec(),
+                ..bytes.clone()
+            },
+            pb::VersionedBytes {
+                schema: "atomic.prov.graph.future".into(),
+                ..bytes
+            },
+        ] {
+            let (valid, _) = fixture();
+            assert!(
+                decode_change_ledger(&[valid, invalid], &[hash.clone(), hash.clone()]).is_err()
+            );
+        }
+    }
 }

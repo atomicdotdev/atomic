@@ -4,12 +4,12 @@
 //! machine face (closed-vocab `code` / `severity` / `suggested_query`) and a
 //! human face (`message` / `remedy`), mirroring the structure documented in
 //! `atomic/docs/triage.md` ("Output: one model, four skins"). This module only
-//! defines the serializable shapes; [`super::project`] populates them and
-//! [`super::output`] renders the bounded CLI skin.
+//! defines the serializable shapes; [`super::report`] populates them and the
+//! CLI (`atomic-cli/src/commands/triage/output.rs`) renders the bounded skin.
 
 use std::collections::BTreeMap;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use atomic_canonical::vocab::FINDING_CODE;
 
@@ -22,37 +22,37 @@ use atomic_canonical::vocab::FINDING_CODE;
 
 /// A materialized view failed its baseline: a view-scoped verification record
 /// with a failing outcome on a reached intent's acceptance criterion.
-pub(crate) const F_VIEW_VERIFY_FAIL: &str = FINDING_CODE[0];
-pub(crate) const F_GATE_VIOLATION: &str = FINDING_CODE[1];
-pub(crate) const F_SCOPE_OUT_BREACH: &str = FINDING_CODE[2];
-pub(crate) const F_ORPHAN_CHANGE: &str = FINDING_CODE[3];
-pub(crate) const F_MET_AC_NO_EVIDENCE: &str = FINDING_CODE[4];
-pub(crate) const F_UNMET_AC_WITH_CANDIDATE: &str = FINDING_CODE[5];
-pub(crate) const F_BAGGAGE_DEP: &str = FINDING_CODE[6];
+pub const F_VIEW_VERIFY_FAIL: &str = FINDING_CODE[0];
+pub const F_GATE_VIOLATION: &str = FINDING_CODE[1];
+pub const F_SCOPE_OUT_BREACH: &str = FINDING_CODE[2];
+pub const F_ORPHAN_CHANGE: &str = FINDING_CODE[3];
+pub const F_MET_AC_NO_EVIDENCE: &str = FINDING_CODE[4];
+pub const F_UNMET_AC_WITH_CANDIDATE: &str = FINDING_CODE[5];
+pub const F_BAGGAGE_DEP: &str = FINDING_CODE[6];
 /// A caller of modified code that lives outside the candidate change-set — a
 /// blast-radius entity that may be affected but is not itself under review.
-pub(crate) const F_BLAST_UNREVIEWED: &str = FINDING_CODE[7];
+pub const F_BLAST_UNREVIEWED: &str = FINDING_CODE[7];
 /// A granted `done` whose reviewable substance drifted from its triage pin
 /// (T5b freshness reconciliation).
-pub(crate) const F_STALE_TRIAGE: &str = FINDING_CODE[8];
+pub const F_STALE_TRIAGE: &str = FINDING_CODE[8];
 /// A promoted intent has an in-flight `REMEDIATES`-linked intent (T6b).
 /// Informational — surfaced, never blocking.
-pub(crate) const F_OPEN_REMEDIATION: &str = FINDING_CODE[9];
+pub const F_OPEN_REMEDIATION: &str = FINDING_CODE[9];
 /// A reached work intent whose changes are not covered by an independent,
 /// completed review intent (the review-coverage promotion gate).
-pub(crate) const F_UNREVIEWED_CHANGE: &str = FINDING_CODE[10];
+pub const F_UNREVIEWED_CHANGE: &str = FINDING_CODE[10];
 /// A candidate change for promotion into a shared target whose managed
 /// provenance evidence fails the trusted publication gate (CB-12B). Blocking
 /// for shared targets only; content correctness is separate.
-pub(crate) const F_PUBLICATION_GATE: &str = FINDING_CODE[11];
+pub const F_PUBLICATION_GATE: &str = FINDING_CODE[11];
 
 // All twelve closed-vocabulary finding codes are now populated by `build_report`.
 
 // ── Severities ──────────────────────────────────────────────────────────────
 
-pub(crate) const SEV_BLOCK: &str = "block";
-pub(crate) const SEV_WARN: &str = "warn";
-pub(crate) const SEV_INFO: &str = "info";
+pub const SEV_BLOCK: &str = "block";
+pub const SEV_WARN: &str = "warn";
+pub const SEV_INFO: &str = "info";
 
 // ── The report ──────────────────────────────────────────────────────────────
 
@@ -61,7 +61,7 @@ pub(crate) const SEV_INFO: &str = "info";
 /// `Stale` is emitted by T5b freshness reconciliation: a granted `done` whose
 /// substance drifted from its pin yields a `STALE_TRIAGE` finding and, absent
 /// any blocking finding, a `stale` verdict.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Verdict {
     Ready,
@@ -71,7 +71,7 @@ pub enum Verdict {
 
 /// The full canonical triage report: a verdict, the pins that reproduce it, a
 /// bounded summary, and the per-intent / per-change / per-finding detail.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TriageReport {
     /// The `urn:atomic:triage:<blake3>` content address of the pinned inputs.
     pub reference: String,
@@ -90,7 +90,7 @@ pub struct TriageReport {
 }
 
 /// The pinned inputs the report is a fact about (the evidence-bundle role).
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Inputs {
     pub feature: String,
     pub target: String,
@@ -103,7 +103,7 @@ pub struct Inputs {
 }
 
 /// Bounded counts — the summary skin the CLI leads with.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Summary {
     pub changes: usize,
     pub files: usize,
@@ -115,7 +115,7 @@ pub struct Summary {
 }
 
 /// An intent reached by the candidate set (a "testsuite").
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IntentReport {
     pub id: String,
     pub why: Option<String>,
@@ -129,7 +129,7 @@ pub struct IntentReport {
 }
 
 /// A single acceptance criterion under an intent (a "testcase").
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CriterionReport {
     pub id: String,
     pub text: String,
@@ -143,7 +143,7 @@ pub struct CriterionReport {
 /// One changed file in a candidate change: a change-type symbol (`+`/`-`/`~`/
 /// `±`), the path, and a per-file hunk summary — the same view `atomic change`
 /// prints. No diff reconstruction; full content is one `review_command` away.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileChange {
     pub symbol: String,
     pub path: String,
@@ -152,21 +152,21 @@ pub struct FileChange {
 
 /// A single unified-diff line: a tag (`+` add / `-` delete / ` ` context) and
 /// the line's text content (no trailing newline).
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DiffLineView {
     pub tag: String,
     pub content: String,
 }
 
 /// A single unified-diff hunk: its `@@ -a,b +c,d @@` header and its lines.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DiffHunkView {
     pub header: String,
     pub lines: Vec<DiffLineView>,
 }
 
 /// The real unified diff for one file in a candidate change.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DiffFileView {
     pub path: String,
     /// `added` / `modified` / `deleted`.
@@ -175,7 +175,7 @@ pub struct DiffFileView {
 }
 
 /// A candidate change and the join facts attached to it.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChangeReport {
     pub id: String,
     /// The change's commit message (trimmed). Empty if the change could not be
@@ -207,7 +207,7 @@ pub struct ChangeReport {
 /// (a module), the tasks/criteria/changes that land there, and a deterministic
 /// prose rationale. The `Vec<WalkthroughLayer>` order on [`TriageReport`] IS
 /// the reading order (foundations first, entry points last).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WalkthroughLayer {
     /// Stable layer id: `layer:<module>` (e.g. `layer:atomic-core/src/pristine`).
     pub id: String,
@@ -235,7 +235,7 @@ pub struct WalkthroughLayer {
 }
 
 /// A finding — the machine + human face of one issue.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Finding {
     pub code: String,
     pub severity: String,
@@ -248,7 +248,7 @@ pub struct Finding {
 }
 
 impl Finding {
-    pub(crate) fn new(
+    pub fn new(
         code: &str,
         severity: &str,
         focus: impl Into<String>,
@@ -264,18 +264,18 @@ impl Finding {
         }
     }
 
-    pub(crate) fn with_query(mut self, q: impl Into<String>) -> Self {
+    pub fn with_query(mut self, q: impl Into<String>) -> Self {
         self.suggested_query = Some(q.into());
         self
     }
 
-    pub(crate) fn with_remedy(mut self, r: impl Into<String>) -> Self {
+    pub fn with_remedy(mut self, r: impl Into<String>) -> Self {
         self.remedy = Some(r.into());
         self
     }
 
     /// Sort rank: block (0) → warn (1) → info (2), then anything else last.
-    pub(crate) fn severity_rank(&self) -> u8 {
+    pub fn severity_rank(&self) -> u8 {
         match self.severity.as_str() {
             SEV_BLOCK => 0,
             SEV_WARN => 1,

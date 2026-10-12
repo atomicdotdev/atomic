@@ -110,7 +110,14 @@ pub(crate) fn observe_candidate(
     let native_path = root.join(native);
     let observation = match fs::symlink_metadata(&native_path) {
         Ok(metadata) => CandidateObservation::Present(observe_metadata(native_path, &metadata)),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => CandidateObservation::Missing,
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            CandidateObservation::Missing
+        }
         Err(error) => {
             return Err(ChangeSourceError::Io {
                 path: path.escaped(),

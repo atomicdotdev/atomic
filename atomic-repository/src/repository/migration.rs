@@ -4,12 +4,29 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use atomic_core::pristine::{
-    decode_inode_vertex, decode_position, encode_path_claim_event, encode_position, GraphTxnT,
-    PathClaimEntry, TreeTxnT, ViewTxnT, INODES, INODE_GRAPH, PATH_CLAIMS, PATH_CLAIM_SCHEMA_KEY,
-    PATH_CLAIM_SCHEMA_VERSION, PRISTINE_META, REV_INODES, REV_TREE, TREE,
+    decode_inode_vertex, decode_position, decode_vertex, encode_path_claim_event, encode_position,
+    GraphTxnT, PathClaimEntry, TreeTxnT, ViewTxnT, GRAPH, INODES, INODE_GRAPH, PATH_CLAIMS,
+    PATH_CLAIM_SCHEMA_KEY, PATH_CLAIM_SCHEMA_VERSION, PRISTINE_META, REV_INODES, REV_TREE, TREE,
 };
 use atomic_core::ChangePosition;
-use redb::{ReadableDatabase, ReadableMultimapTable, ReadableTable};
+use redb::{ReadableDatabase, ReadableMultimapTable, ReadableTable, TableHandle};
+
+impl Repository {
+    /// Inspect path-claim migration state, including repositories predating
+    /// the metadata table. Use a native-repair read-only open for this check.
+    pub fn path_claim_migration_required(&self) -> Result<bool, RepositoryError> {
+        match self.pristine.path_claim_migration_required() {
+            Ok(required) => Ok(required),
+            Err(atomic_core::pristine::PristineError::Table(error))
+                if matches!(error.as_ref(), redb::TableError::TableDoesNotExist(name)
+                    if name == PRISTINE_META.name()) =>
+            {
+                Ok(true)
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+}
 
 pub(super) fn migrate_path_claims_if_required(
     pristine_path: &Path,
@@ -25,9 +42,15 @@ pub(super) fn migrate_path_claims_if_required(
     }
 
     drop(pristine);
-    let recovered_inodes = inode_graph_position_index(pristine_path)?;
+    let (recovered_inodes, applied_changes) = inode_graph_position_index(pristine_path)?;
     let pristine = Pristine::open(pristine_path).map_err(RepositoryError::from)?;
-    let plan = prepare_migration(&pristine, change_store, current_view, &recovered_inodes)?;
+    let plan = prepare_migration(
+        &pristine,
+        change_store,
+        current_view,
+        &recovered_inodes,
+        &applied_changes,
+    )?;
     drop(pristine);
     commit_migration(pristine_path, plan)?;
     Pristine::open_existing(pristine_path).map_err(RepositoryError::from)
@@ -39,9 +62,11 @@ struct MigrationPlan {
     recovered_inodes: Vec<(Inode, Position<NodeId>)>,
 }
 
+type MigrationGraphIndex = (HashMap<Position<NodeId>, Inode>, HashSet<NodeId>);
+
 fn inode_graph_position_index(
     pristine_path: &Path,
-) -> Result<HashMap<Position<NodeId>, Inode>, RepositoryError> {
+) -> Result<MigrationGraphIndex, RepositoryError> {
     let db = redb::Builder::new()
         .set_cache_size(8 * 1024 * 1024 * 1024)
         .open(pristine_path)
@@ -98,7 +123,27 @@ fn inode_graph_position_index(
             })
             .or_insert(inode);
     }
-    Ok(positions)
+    // Unrecord removes view membership, not ambient history. Include edge
+    // introducers too: a deletion can own edges without owning any vertices.
+    let graph = read
+        .open_multimap_table(GRAPH)
+        .map_err(|error| RepositoryError::Database(error.to_string()))?;
+    let mut applied = HashSet::new();
+    for row in graph
+        .iter()
+        .map_err(|error| RepositoryError::Database(error.to_string()))?
+    {
+        let (key, edges) = row.map_err(|error| RepositoryError::Database(error.to_string()))?;
+        applied.insert(NodeId::new(decode_vertex(key.value()).0));
+        for edge in edges {
+            let edge = edge.map_err(|error| RepositoryError::Database(error.to_string()))?;
+            // GRAPH encodes the introducing change as the final LE u64.
+            applied.insert(NodeId::new(u64::from_le_bytes(
+                edge.value()[16..24].try_into().unwrap(),
+            )));
+        }
+    }
+    Ok((positions, applied))
 }
 
 fn prepare_migration(
@@ -106,6 +151,7 @@ fn prepare_migration(
     change_store: &ChangeStore,
     current_view: &str,
     recovered_inode_index: &HashMap<Position<NodeId>, Inode>,
+    applied_changes: &HashSet<NodeId>,
 ) -> Result<MigrationPlan, RepositoryError> {
     let txn = pristine
         .read_txn()
@@ -132,22 +178,23 @@ fn prepare_migration(
         }
     }
 
+    for (change_id, _) in txn
+        .list_registered_changes()
+        .map_err(|error| RepositoryError::Database(error.to_string()))?
+    {
+        if !change_id.is_root() && applied_changes.contains(&change_id) && seen.insert(change_id) {
+            reachable.push(change_id);
+        }
+    }
+
     // Stable dependency-first order independent of view enumeration. A change's
     // direct dependencies always precede it in every validated closure; use a
     // small DFS over the reachable union to preserve that invariant globally.
-    let reachable_set: HashSet<NodeId> = reachable.iter().copied().collect();
     let mut ordered = Vec::with_capacity(reachable.len());
     let mut visiting = HashSet::new();
     let mut visited = HashSet::new();
     for change_id in reachable {
-        visit_change(
-            &txn,
-            change_id,
-            &reachable_set,
-            &mut visiting,
-            &mut visited,
-            &mut ordered,
-        )?;
+        visit_change(&txn, change_id, &mut visiting, &mut visited, &mut ordered)?;
     }
 
     let mut claims = Vec::new();
@@ -317,7 +364,6 @@ fn prepare_migration(
 fn visit_change<T: GraphTxnT>(
     txn: &T,
     change_id: NodeId,
-    reachable: &HashSet<NodeId>,
     visiting: &mut HashSet<NodeId>,
     visited: &mut HashSet<NodeId>,
     ordered: &mut Vec<NodeId>,
@@ -347,8 +393,8 @@ fn visit_change<T: GraphTxnT>(
                     dependency
                 ))
             })?;
-        if reachable.contains(&dependency_id) {
-            visit_change(txn, dependency_id, reachable, visiting, visited, ordered)?;
+        if !dependency_id.is_root() {
+            visit_change(txn, dependency_id, visiting, visited, ordered)?;
         }
     }
     visiting.remove(&change_id);

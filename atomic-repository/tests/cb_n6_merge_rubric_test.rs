@@ -45,6 +45,27 @@ fn listed_conflict_paths(repo: &Repository) -> BTreeSet<String> {
         .collect()
 }
 
+fn assert_pending_name_resolution(repo: &Repository, path: &str) {
+    let status = repo
+        .status(working_copy(repo), StatusOptions::default())
+        .expect("status before record");
+    let entries: Vec<_> = status
+        .entries()
+        .iter()
+        .filter(|entry| entry.path() == Path::new(path))
+        .collect();
+    assert_eq!(entries.len(), 1, "pending resolution must appear once");
+    assert_eq!(
+        entries[0].status(),
+        FileStatus::Modified,
+        "edited resolution must match dev's working-copy status"
+    );
+    assert!(
+        repo.get_file_content(path).is_err(),
+        "status must leave the canonical name conflict unresolved until record"
+    );
+}
+
 fn remove_if_present(path: &Path) {
     if path.exists() {
         fs::remove_file(path).expect("remove materialized file");
@@ -164,10 +185,12 @@ fn a12_resolution_is_explicit_order_independent_and_reopen_stable() {
         .expect("fork unresolved sibling");
 
     fs::write(&same, b"from-left\n").expect("choose exact left claimant");
-    assert!(
-        conflicted_paths(&repo).contains("same.txt"),
-        "public status must remain typed-conflicted until SolveNameConflict commits"
-    );
+    assert_pending_name_resolution(&repo, "same.txt");
+    // Reopening must preserve the distinction between the edited working copy
+    // and the still-conflicted recorded graph.
+    drop(repo);
+    let repo = Repository::open(root).expect("reopen pending resolution");
+    assert_pending_name_resolution(&repo, "same.txt");
     let resolution = record_all(&repo, "resolve same-path claim");
     let solves: Vec<_> = resolution
         .change()
@@ -219,6 +242,92 @@ fn a12_resolution_is_explicit_order_independent_and_reopen_stable() {
 #[test]
 fn a12_inherited_resolution_uses_the_effective_closure() {
     assert_inherited_resolution(false);
+}
+
+#[test]
+fn edited_name_resolution_is_order_independent_and_preserves_concurrent_rename() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path();
+    let mut repo = Repository::init(root).unwrap();
+    fs::write(root.join("seed.txt"), b"seed\n").unwrap();
+    repo.add(working_copy(&repo), "seed.txt", Default::default())
+        .unwrap();
+    record_all(&repo, "base");
+    for view in ["left", "right", "ab", "ba"] {
+        repo.create_view_from(view, "dev").unwrap();
+    }
+    let mut changes = Vec::new();
+    for (view, bytes) in [
+        ("left", b"left\n".as_slice()),
+        ("right", b"right\n".as_slice()),
+    ] {
+        repo.switch_view(working_copy(&repo), view).unwrap();
+        fs::write(root.join("same.txt"), bytes).unwrap();
+        repo.add(working_copy(&repo), "same.txt", Default::default())
+            .unwrap();
+        changes.push(*record_all(&repo, view).hash());
+    }
+    let mut winners = Vec::new();
+    for (view, order) in [("ab", [0, 1]), ("ba", [1, 0])] {
+        repo.switch_view(working_copy(&repo), view).unwrap();
+        for index in order {
+            repo.insert_change(&changes[index], InsertOptions::default())
+                .unwrap();
+        }
+        repo.materialize(working_copy(&repo)).unwrap();
+        assert!(conflicted_paths(&repo).contains("same.txt"));
+        fs::write(root.join("same.txt"), b"edited merge\n").unwrap();
+        assert_pending_name_resolution(&repo, "same.txt");
+        let resolution = record_all(&repo, "merge both contents");
+        assert!(changes
+            .iter()
+            .all(|hash| resolution.change().dependencies().contains(hash)));
+        winners.push(
+            resolution
+                .change()
+                .hunks()
+                .iter()
+                .find_map(|op| match op {
+                    GraphOp::SolveNameConflict { name, .. } => Some(name.inode),
+                    _ => None,
+                })
+                .unwrap(),
+        );
+        assert_eq!(
+            repo.get_file_content("same.txt").unwrap().unwrap(),
+            b"edited merge\n"
+        );
+        assert!(repo.list_conflicts(working_copy(&repo)).unwrap().is_empty());
+        fs::remove_file(root.join("same.txt")).unwrap();
+        repo.materialize(working_copy(&repo)).unwrap();
+        assert_eq!(fs::read(root.join("same.txt")).unwrap(), b"edited merge\n");
+    }
+    assert_eq!(
+        winners[0], winners[1],
+        "local insertion order cannot select the identity"
+    );
+    // Renaming the non-selected identity later must recover its original bytes.
+    let (loser, bytes) = if winners[0].change == Some(changes[0]) {
+        ("right", b"right\n".as_slice())
+    } else {
+        ("left", b"left\n".as_slice())
+    };
+    repo.switch_view(working_copy(&repo), loser).unwrap();
+    assert_eq!(fs::read(root.join("same.txt")).unwrap(), bytes);
+    fs::rename(root.join("same.txt"), root.join("saved.txt")).unwrap();
+    let renamed = record_all(&repo, "rename original other identity");
+    repo.switch_view(working_copy(&repo), "ab").unwrap();
+    repo.insert_change(renamed.hash(), InsertOptions::default())
+        .unwrap();
+    repo.materialize(working_copy(&repo)).unwrap();
+    assert_eq!(fs::read(root.join("same.txt")).unwrap(), b"edited merge\n");
+    assert_eq!(fs::read(root.join("saved.txt")).unwrap(), bytes);
+    drop(repo);
+    let repo = Repository::open(root).unwrap();
+    repo.materialize(working_copy(&repo)).unwrap();
+    assert_eq!(fs::read(root.join("same.txt")).unwrap(), b"edited merge\n");
+    assert_eq!(fs::read(root.join("saved.txt")).unwrap(), bytes);
+    assert!(repo.list_conflicts(working_copy(&repo)).unwrap().is_empty());
 }
 
 #[test]

@@ -7,9 +7,10 @@ use std::borrow::Borrow;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use crate::types::{Inode, Merkle, NodeId};
+use serde::{Deserialize, Serialize};
 
 use crate::pristine::error::PristineError;
+use crate::types::{Inode, Merkle, NodeId};
 
 use super::graph::GraphTxnT;
 
@@ -421,7 +422,7 @@ impl EffectiveProjectionClosure {
 /// assert_eq!(scope as u8, 1);
 /// assert!(scope.is_shared());
 /// ```
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash, Default)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash, Default, Serialize, Deserialize)]
 #[repr(u8)]
 pub enum ViewScope {
     /// Personal workspace (feature, bug, experiment).

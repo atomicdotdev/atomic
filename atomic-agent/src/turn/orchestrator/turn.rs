@@ -571,6 +571,22 @@ impl TurnOrchestrator {
                             // inherited baseline changes from the parent view.
                             session.recorded_change_hashes.push(outcome.hash);
 
+                            // Trace envelopes belong to the running journal.
+                            // Include them before save_turn_provenance freezes
+                            // and publishes the checkpoint for this turn.
+                            if let Some(trace_path) = event
+                                .raw_json
+                                .as_ref()
+                                .and_then(|raw| raw.get("trace_file"))
+                                .and_then(|value| value.as_str())
+                            {
+                                self.ingest_sherpa_trace(
+                                    session_id,
+                                    turn_number,
+                                    Path::new(trace_path),
+                                )?;
+                            }
+
                             // CB-12A: attach the boundary pair onto the ledger
                             // turn row and persist the ContentChanges
                             // classification in the session ledger. Provenance
@@ -628,22 +644,6 @@ impl TurnOrchestrator {
                             // Clear current_prompt so the next turn doesn't
                             // reuse this turn's prompt as the change message.
                             session.clear_current_prompt();
-
-                            // Sherpa: ingest the JSONL trace file into the provenance accumulator
-                            // so the resulting ProvenanceGraph has rich node data (file attribution,
-                            // bash commands, todo structure) instead of just the thin Goal node.
-                            if let Some(trace_path) = event
-                                .raw_json
-                                .as_ref()
-                                .and_then(|r| r.get("trace_file"))
-                                .and_then(|v| v.as_str())
-                            {
-                                self.ingest_sherpa_trace(
-                                    session_id,
-                                    turn_number,
-                                    Path::new(trace_path),
-                                )?;
-                            }
 
                             // Provenance: inject reasoning blocks as Decision nodes
                             // and the agent's closing message as an LlmResponse node,

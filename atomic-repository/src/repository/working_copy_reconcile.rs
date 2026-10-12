@@ -112,6 +112,46 @@ impl WorkingCopyReconcileOutcome {
 }
 
 impl Repository {
+    /// Follow a verified advance of the same view without claiming that its
+    /// new contents have been materialized in this physical working copy.
+    pub(super) fn advance_working_copy_registration_locked(
+        &self,
+        operation_lock: &super::locks::WorkingCopyOperationLockGuard,
+        record: WorkingCopyRecord,
+        view: &ViewState,
+    ) -> Result<WorkingCopyRecord, RepositoryError> {
+        if record.desired_state == view.state {
+            return Ok(record);
+        }
+        self.validate_working_copy(record.id)?;
+        let before = working_copy_state_ref(record.clone());
+        let mut advanced = record.clone();
+        advanced.desired_state = view.state;
+        let after = working_copy_state_ref(advanced.clone());
+        let prepared = self.prepare_registration_transition(
+            operation_lock,
+            record.id,
+            view,
+            view,
+            &before,
+            &after,
+        )?;
+        let operation = prepared.operation().id();
+        let effect = Self::registration_effect(record.id, &before, &after);
+        let observed_before = self.observe_operation_effect(record.id, &effect.target)?;
+        self.apply_operation_metadata_locked(operation_lock, operation)?;
+        let observed_after = self.observe_operation_effect(record.id, &effect.target)?;
+        self.record_effect_outcome(
+            operation_lock,
+            operation,
+            effect.ordinal,
+            observed_before,
+            observed_after,
+        )?;
+        self.finalize_operation_verified(operation_lock, operation)?;
+        Ok(advanced)
+    }
+
     /// Diagnose a working copy's registration against `target_view` read-only.
     ///
     /// This performs no recovery, migration, or mutation: it reads the

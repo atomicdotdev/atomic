@@ -2021,6 +2021,89 @@ impl Repository {
         )
     }
 
+    /// Git directories are implicit: deleting their last descendant also
+    /// retires their canonical path claims. Native directory identities stay
+    /// explicit, including empty directories nested below an imported parent.
+    fn with_git_directory_deletions(
+        &self,
+        txn: &atomic_core::pristine::ReadTxn,
+        visibility: &atomic_core::pristine::GraphVisibilityClosure,
+        files: &[atomic_core::record::workflow::RecordedFile],
+        deleted_paths: &[String],
+    ) -> Result<Vec<atomic_core::record::workflow::RecordedFile>, RepositoryError> {
+        use atomic_core::record::workflow::{DetectionKind, RecordedFile};
+        let mut files = files.to_vec();
+        let mut removed: std::collections::BTreeSet<String> =
+            deleted_paths.iter().cloned().collect();
+        removed.extend(
+            files
+                .iter()
+                .filter_map(|file| file.old_path().map(str::to_owned)),
+        );
+        if removed.is_empty() {
+            return Ok(files);
+        }
+        let projection = self.project_tree_for_visibility(txn, visibility)?;
+        let mut remaining: std::collections::BTreeSet<String> =
+            projection.present.keys().cloned().collect();
+        // A conflicting descendant is still present; never discard its parent.
+        remaining.extend(projection.name_conflicts.keys().cloned());
+        for path in &removed {
+            remaining.remove(path);
+        }
+        for file in &files {
+            if file.kind() != Some(DetectionKind::Deleted) && !file.is_deleted_directory() {
+                remaining.insert(file.path().to_string());
+            }
+        }
+        let mut candidates: Vec<_> = projection
+            .present_metadata
+            .into_values()
+            .filter(|side| {
+                side.is_directory()
+                    && removed
+                        .iter()
+                        .any(|path| path.starts_with(&format!("{}/", side.path)))
+            })
+            .collect();
+        candidates.sort_by_key(|side| (std::cmp::Reverse(side.path.len()), side.path.clone()));
+        for side in candidates {
+            let prefix = format!("{}/", side.path);
+            if remaining
+                .range(prefix.clone()..)
+                .next()
+                .is_some_and(|path| path.starts_with(&prefix))
+            {
+                continue;
+            }
+            let hash = txn
+                .get_external(side.position.change)
+                .map_err(|error| RepositoryError::Database(error.to_string()))?
+                .ok_or_else(|| RepositoryError::InvalidRepository {
+                    reason: format!(
+                        "directory '{}' has no canonical introducing change",
+                        side.path
+                    ),
+                })?;
+            let introducing = self
+                .change_store
+                .load_change(&hash)
+                .map_err(|error| RepositoryError::Database(error.to_string()))?;
+            if !matches!(
+                introducing.origin(),
+                ChangeOrigin::GitSynthesized { .. } | ChangeOrigin::GitResolution { .. }
+            ) {
+                continue;
+            }
+            remaining.remove(&side.path);
+            let mut deleted = RecordedFile::new_deleted_directory(side.path);
+            deleted.set_inode(side.inode);
+            deleted.set_position(side.position);
+            files.push(deleted);
+        }
+        Ok(files)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn synthesize_git_change_locked(
         &self,
@@ -2074,6 +2157,12 @@ impl Repository {
             } else {
                 let visibility =
                     super::filter::assembly_visibility_excluding(&txn, &view, assembly_excluded)?;
+                let recorded_files = self.with_git_directory_deletions(
+                    &txn,
+                    &visibility,
+                    recorded_files,
+                    deleted_paths,
+                )?;
                 let view_graph = atomic_core::pristine::ViewGraph::new(&txn, visibility);
                 // CB-9C: imported trees legitimately contain empty tracked
                 // files (`.gitkeep`, lockfile placeholders). Their FileAdd
@@ -2094,7 +2183,7 @@ impl Repository {
                     .max(AssemblyOptions::DEFAULT_MAX_CONTENT_SIZE);
                 match assemble_change(
                     &view_graph,
-                    recorded_files,
+                    &recorded_files,
                     header.clone(),
                     &AssemblyOptions::new()
                         .max_content_size(content_budget)

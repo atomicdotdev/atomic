@@ -644,6 +644,10 @@ fn content_clean_name_conflict_is_resolved_by_record() {
     );
     assert!(!on_disk.contains("<<<<<<<"), "no markers remain on disk");
     assert!(
+        conflicted_entry_paths(&repo).iter().any(|p| p == "new.txt"),
+        "unmaterialized competing claims must stay Conflicted despite marker-free bytes"
+    );
+    assert!(
         repo.get_file_content("new.txt").is_err(),
         "the ambiguity is still unresolved before the record"
     );
@@ -697,26 +701,25 @@ fn resolving_a_name_conflict_leaves_other_paths_untouched() {
     );
 }
 
-/// A third value that matches no incarnation (or more than one) must be
-/// refused, never silently resolved to a lineage.
+/// A normal explicit record can resolve a name conflict with edited bytes.
+/// The separate preserve-content API still refuses an unmatched incarnation.
 #[test]
-fn third_value_name_conflict_is_refused_not_chosen() {
+fn edited_name_conflict_is_recorded_as_an_explicit_resolution() {
     let (_temp, repo, new_file) = make_two_incarnation_name_conflict();
 
     std::fs::write(&new_file, "third-value\n").unwrap();
-    let outcome = record_all(&repo, "third value must not resolve");
-    // Either the record refuses with NothingToRecord or it reports the path as
-    // an error — in both cases the ambiguity must remain.
-    if let Ok(outcome) = outcome {
-        assert!(
-            !outcome.recorded_files().iter().any(|p| p == "new.txt"),
-            "a third value must not be recorded as a winner"
-        );
-    }
-    assert!(
-        repo.get_file_content("new.txt").is_err(),
-        "a third value must leave the name conflict unresolved"
+    let outcome = record_all(&repo, "record edited resolution").unwrap();
+    assert!(outcome.recorded_files().iter().any(|p| p == "new.txt"));
+    assert_eq!(
+        repo.get_file_content("new.txt").unwrap().unwrap(),
+        b"third-value\n"
     );
+    assert!(outcome
+        .change()
+        .hunks()
+        .iter()
+        .any(|op| matches!(op, atomic_core::change::GraphOp::SolveNameConflict { .. })));
+    assert!(outcome.change().dependencies().len() >= 2);
 }
 
 /// Review ::15 blocker support (user decision "Preserve current files"):

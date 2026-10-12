@@ -21,14 +21,7 @@ impl Fixture {
     }
 
     fn run(&self, args: &[&str]) -> String {
-        let output = Command::new(env!("CARGO_BIN_EXE_atomic"))
-            .args(args)
-            .current_dir(self.root.path())
-            .env("ATOMIC_HOME", self.home.path())
-            .env("ATOMIC_NONINTERACTIVE", "1")
-            .env("NO_COLOR", "1")
-            .output()
-            .unwrap();
+        let output = self.output(args);
         assert!(
             output.status.success(),
             "atomic {args:?}:\n{}\n{}",
@@ -36,6 +29,17 @@ impl Fixture {
             String::from_utf8_lossy(&output.stderr)
         );
         String::from_utf8(output.stdout).unwrap()
+    }
+
+    fn output(&self, args: &[&str]) -> std::process::Output {
+        Command::new(env!("CARGO_BIN_EXE_atomic"))
+            .args(args)
+            .current_dir(self.root.path())
+            .env("ATOMIC_HOME", self.home.path())
+            .env("ATOMIC_NONINTERACTIVE", "1")
+            .env("NO_COLOR", "1")
+            .output()
+            .unwrap()
     }
 
     fn write(&self, path: &str, bytes: &[u8]) {
@@ -133,10 +137,74 @@ fn inserting_rename_refreshes_both_names_in_opposite_import_orders() {
     f.record("bill renames");
     for target in ["ab", "ba"] {
         f.switch(target);
+        let conflict_bytes = f.read("f.txt");
+        let conflict_path = f.root.path().join("f.txt");
+        let refuse_without_publication = || {
+            let before = Repository::open_readonly(f.root.path())
+                .unwrap()
+                .get_view_info(target)
+                .unwrap()
+                .state;
+            let file_bytes = fs::read(&conflict_path).ok();
+            let file_kind = fs::symlink_metadata(&conflict_path).unwrap().file_type();
+            let local = f.read("local.txt");
+            let output = f.output(&["insert", "from-view", "bill", "--to-view", target]);
+            assert!(
+                !output.status.success(),
+                "insert must preserve unrecorded work"
+            );
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(stderr.contains("unrecorded changes"), "{stderr}");
+            let after = Repository::open_readonly(f.root.path())
+                .unwrap()
+                .get_view_info(target)
+                .unwrap()
+                .state;
+            assert_eq!(before, after, "refusal must not insert the rename");
+            assert_eq!(fs::read(&conflict_path).ok(), file_bytes);
+            assert_eq!(
+                fs::symlink_metadata(&conflict_path).unwrap().file_type(),
+                file_kind
+            );
+            assert_eq!(f.read("local.txt"), local);
+            assert!(!f.root.path().join("bill.txt").exists());
+        };
+
+        // #248 refuses all unrecorded work before publishing membership,
+        // including edits unrelated to the insertion's surgical refresh.
         f.write("local.txt", b"unrecorded local edit\n");
-        f.run(&["insert", "from-view", "bill", "--to-view", target]);
-        assert_eq!(f.read("local.txt"), b"unrecorded local edit\n");
+        refuse_without_publication();
         f.write("local.txt", b"recorded local file\n");
+        let mut edited_markers = conflict_bytes.clone();
+        edited_markers.extend_from_slice(b"local conflict resolution in progress\n");
+        f.write("f.txt", &edited_markers);
+        refuse_without_publication();
+        f.write("f.txt", &conflict_bytes);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{symlink, PermissionsExt};
+            let permissions = fs::metadata(&conflict_path).unwrap().permissions();
+            fs::set_permissions(&conflict_path, fs::Permissions::from_mode(0o755)).unwrap();
+            refuse_without_publication();
+            assert_eq!(
+                fs::metadata(&conflict_path).unwrap().permissions().mode() & 0o777,
+                0o755
+            );
+            fs::set_permissions(&conflict_path, permissions).unwrap();
+
+            // Equal referent bytes do not make a symlink the recorded file.
+            let outside = TempDir::new().unwrap();
+            let referent = outside.path().join("conflict.txt");
+            fs::write(&referent, &conflict_bytes).unwrap();
+            fs::remove_file(&conflict_path).unwrap();
+            symlink(&referent, &conflict_path).unwrap();
+            refuse_without_publication();
+            assert_eq!(fs::read(&referent).unwrap(), conflict_bytes);
+            fs::remove_file(&conflict_path).unwrap();
+            f.write("f.txt", &conflict_bytes);
+        }
+        // The exact recorded conflict render has no unrecorded changes.
+        f.run(&["insert", "from-view", "bill", "--to-view", target]);
         assert_eq!(f.read("f.txt"), b"sally body\n");
         assert_eq!(f.read("bill.txt"), b"bill body\n");
         let status = f.run(&["status", "--short"]);

@@ -237,6 +237,75 @@ fn fixed_header(message: &str) -> ChangeHeader {
 // ── AC-1: normal assembly, hashed origin, graph-context dependencies ───
 
 #[test]
+fn git_deletion_preserves_native_empty_directories_inside_imported_parents() {
+    let dir = TempDir::new().unwrap();
+    let repo = Repository::init(dir.path()).unwrap();
+    let wc = repo.require_working_copy_id().unwrap();
+    let origin = GitSynthesisOrigin::root(oid20(0x71), oid20(0x72)).unwrap();
+    repo.synthesize_git_change(
+        fixed_header("import directory anchors"),
+        &[memory_add("sub/inner/file.txt", b"file\n")],
+        origin.clone(),
+        crate::git_synthesis_metadata(&origin, &[], None),
+        Vec::new(),
+        &[],
+        false,
+        &empty_verification(),
+        InsertOptions::default(),
+        &[],
+        &single_file_expectation("sub/inner/file.txt", b"file\n"),
+        None,
+        &[],
+        false,
+    )
+    .unwrap();
+    repo.materialize(wc).unwrap();
+    std::fs::create_dir(dir.path().join("sub/keep-empty")).unwrap();
+    repo.add_directory(wc, "sub/keep-empty", TrackingOptions::default())
+        .unwrap();
+    repo.record(
+        wc,
+        fixed_header("native explicit empty directory"),
+        RecordOptions::new().with_all(true),
+    )
+    .unwrap();
+    let native_inode = repo.get_file_inode("sub/keep-empty").unwrap().unwrap();
+    let delete = repo
+        .record_foreign_deleted_file("sub/inner/file.txt")
+        .unwrap();
+    let origin = GitSynthesisOrigin::first_parent(oid20(0x73), oid20(0x74), oid20(0x71)).unwrap();
+    repo.synthesize_git_change(
+        fixed_header("delete Git last file"),
+        &[delete],
+        origin.clone(),
+        crate::git_synthesis_metadata(&origin, &[], None),
+        Vec::new(),
+        &["sub/inner/file.txt".to_string()],
+        false,
+        &empty_verification(),
+        InsertOptions::default(),
+        &[],
+        &full_tree_expectation(&[], &[]),
+        None,
+        &[],
+        false,
+    )
+    .unwrap();
+    repo.materialize(wc).unwrap();
+    assert!(!dir.path().join("sub/inner").exists());
+    assert!(dir.path().join("sub/keep-empty").is_dir());
+    assert_eq!(
+        repo.get_file_inode("sub/keep-empty").unwrap(),
+        Some(native_inode)
+    );
+    drop(repo);
+    let repo = Repository::open(dir.path()).unwrap();
+    repo.materialize(wc).unwrap();
+    assert!(!dir.path().join("sub/inner").exists());
+    assert!(dir.path().join("sub/keep-empty").is_dir());
+}
+
+#[test]
 fn synthesized_multi_file_root_change_reconstructs_every_path() {
     let directory = TempDir::new().unwrap();
     let repo = Repository::init(directory.path()).unwrap();

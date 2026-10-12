@@ -387,6 +387,129 @@ impl Provenance {
     pub fn builder() -> ProvenanceBuilder {
         ProvenanceBuilder::default()
     }
+}
+
+/// The wire/CLI-facing parts of an AI-assisted record: what
+/// [`Provenance::from_authorship_parts`] builds from. See its doc for the
+/// string vocabularies.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AuthorshipParts {
+    /// The AI service provider ("anthropic", "openai", …); the vendor
+    /// parses from it.
+    pub provider: String,
+    pub model: String,
+    pub tool: Option<String>,
+    pub suggestion_type: Option<String>,
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub request_id: Option<String>,
+    pub session_id: Option<String>,
+}
+
+impl Provenance {
+    /// The authorship a record carries when it was AI-assisted — the wire
+    /// form of the CLI's `--ai-*` flags and the contract's
+    /// `RecordRequest.ai_authorship`, so the routed body, the handler and
+    /// the local body build the identical provenance from one vocabulary.
+    ///
+    /// `provider` is the AI service provider (the vendor parses from it:
+    /// "anthropic", "openai", "google", …); `tool` is free-form ("cli",
+    /// "editor:cursor", "api", "opencode", …); `suggestion_type` is the
+    /// closed vocabulary ("complete", "partial", "collaborative",
+    /// "selection", "review", "documentation", "debugging", "refactoring",
+    /// "testing"). Absent strings take the local body's defaults ("cli",
+    /// "collaborative").
+    pub fn from_authorship_parts(parts: &AuthorshipParts) -> Self {
+        let tool = match parts
+            .tool
+            .as_deref()
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+        {
+            Some(tool_str) => {
+                let lower = tool_str.to_lowercase();
+                match lower.as_str() {
+                    "api" => AITool::Api,
+                    "chat" => AITool::Chat,
+                    "cli" => AITool::Cli("atomic".to_string()),
+                    "ci" => AITool::CI("atomic-ci".to_string()),
+                    "code-review" | "codereview" => AITool::CodeReview("atomic".to_string()),
+                    // AI coding assistants — treated as editors/IDEs.
+                    "opencode" => AITool::Editor("opencode".to_string()),
+                    "cursor" => AITool::Editor("cursor".to_string()),
+                    "aider" => AITool::Cli("aider".to_string()),
+                    "claude-code" | "claude_code" => AITool::Cli("claude-code".to_string()),
+                    other => {
+                        // Prefix forms first, so "cli:opencode" stays a CLI
+                        // tool named opencode; then the editor/IDE/plugin
+                        // patterns; anything else is what it says it is.
+                        if let Some(named) = other.strip_prefix("cli:") {
+                            AITool::Cli(named.to_string())
+                        } else if let Some(named) = other.strip_prefix("ci:") {
+                            AITool::CI(named.to_string())
+                        } else if let Some(named) = other.strip_prefix("editor:") {
+                            AITool::Editor(named.to_string())
+                        } else if other.contains("editor")
+                            || other.contains("zed")
+                            || other.contains("vscode")
+                            || other.contains("vim")
+                            || other.contains("emacs")
+                        {
+                            AITool::Editor(other.to_string())
+                        } else if other.contains("plugin") || other.contains("copilot") {
+                            AITool::IdePlugin(other.to_string())
+                        } else if other.contains("aider") || other.contains("claude-code") {
+                            AITool::Cli(other.to_string())
+                        } else if other == "cli" {
+                            AITool::Cli("atomic".to_string())
+                        } else {
+                            AITool::Other(other.to_string())
+                        }
+                    }
+                }
+            }
+            None => AITool::Cli("atomic".to_string()),
+        };
+        let suggestion_type = match parts
+            .suggestion_type
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_lowercase())
+        {
+            Some(suggestion) => match suggestion.as_str() {
+                "complete" => SuggestionType::Complete,
+                "partial" => SuggestionType::Partial,
+                "collaborative" => SuggestionType::Collaborative,
+                "selection" => SuggestionType::Selection,
+                "review" => SuggestionType::Review,
+                "documentation" | "docs" => SuggestionType::Documentation,
+                "debugging" | "debug" => SuggestionType::Debugging,
+                "refactoring" | "refactor" => SuggestionType::Refactoring,
+                "testing" | "test" => SuggestionType::Testing,
+                _ => SuggestionType::Collaborative,
+            },
+            None => SuggestionType::Collaborative,
+        };
+        let mut builder = Self::builder()
+            .vendor(AIVendor::parse(&parts.provider))
+            .model(parts.model.trim())
+            .tool(tool)
+            .suggestion_type(suggestion_type);
+        if let Some(input) = parts.input_tokens {
+            builder = builder.input_tokens(input);
+        }
+        if let Some(output) = parts.output_tokens {
+            builder = builder.output_tokens(output);
+        }
+        if let Some(request_id) = &parts.request_id {
+            builder = builder.request_id(request_id.clone());
+        }
+        if let Some(session_id) = &parts.session_id {
+            builder = builder.session_id(session_id.clone());
+        }
+        builder.timestamp(chrono::Utc::now().timestamp()).build()
+    }
 
     /// Set the prompt from text (hashed for privacy).
     pub fn with_prompt_hashed(mut self, prompt: &str) -> Self {

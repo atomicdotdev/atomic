@@ -2322,7 +2322,7 @@ fn merge_resolution_frontier_failpoint_fails_closed() {
         merge_change.origin(),
         ChangeOrigin::GitResolution { .. }
     ));
-    assert!(frontier_closure_of(&repo, &merge_change).len() > 0);
+    assert!(!frontier_closure_of(&repo, &merge_change).is_empty());
 }
 
 /// Review C4 (AC-1/publication safety): a superseded assembly exclusion that

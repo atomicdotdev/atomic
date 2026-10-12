@@ -1799,11 +1799,22 @@ fn empty_directory_projection_emits_loss_and_binding_round_trip_preserves_it() {
     git_commit(&root, "base");
     atomic_ok(&root, &home, &["git", "import", "--no-vault"]);
 
-    // Delete the file: the directory stays tracked (DirAdd alive) but holds
-    // no files, so the Git projection cannot represent it.
+    // Git directories are implicit. Deleting the last child must retire the
+    // imported directory too, without inventing an empty-directory loss.
     fs::remove_dir_all(root.join("sub")).unwrap();
     let _delete = git_commit(&root, "delete last file in dir");
     atomic_ok(&root, &home, &["git", "import", "--no-vault"]);
+
+    let repo = open_repo(&root);
+    assert!(repo.empty_directory_loss_notes("main").unwrap().is_empty());
+    drop(repo);
+
+    // A native, explicitly tracked empty directory remains meaningful Atomic
+    // state even though Git cannot represent it. Reuse the historical path
+    // to cover the distinction between an implicit and an explicit identity.
+    fs::create_dir(root.join("sub")).unwrap();
+    atomic_ok(&root, &home, &["add", "sub"]);
+    atomic_ok(&root, &home, &["record", "-m", "native empty directory"]);
 
     let repo = open_repo(&root);
     // (a) Explicit EmptyDirectory loss for the omitted directory.

@@ -574,6 +574,49 @@ fn provenance_turn_reservation_is_idempotent_and_persistent() {
 }
 
 #[test]
+fn the_last_recorded_turn_says_whether_a_session_was_ever_used() {
+    let (_dir, store) = temp_store();
+
+    // A session with no turns at all is unused; the moment one is reserved it
+    // is not, whichever turn it was. This is what the owner's authz asks
+    // before letting a sandbox claim a session id, so "somewhere above the
+    // turn I asked about" must not read as unused.
+    assert_eq!(store.last_provenance_turn_for("none").unwrap(), None);
+
+    // Reserve out of order, and past the low turns, so ordering matters.
+    for turn in [7u32, 2, 5] {
+        store.reserve_provenance_turn("sparse", turn, 0).unwrap();
+    }
+    assert_eq!(store.last_provenance_turn_for("sparse").unwrap(), Some(7));
+    assert!(store.last_provenance_turn_for("sparse").unwrap().is_some());
+
+    // Reserving the lowest turn last is still "used": the last key is the
+    // highest, not the most recent write.
+    store.reserve_provenance_turn("sparse", 1, 0).unwrap();
+    assert_eq!(store.last_provenance_turn_for("sparse").unwrap(), Some(7));
+
+    // Turn 0 is a number like any other and counts.
+    let zero = temp_store();
+    zero.1.reserve_provenance_turn("zero", 0, 0).unwrap();
+    assert_eq!(zero.1.last_provenance_turn_for("zero").unwrap(), Some(0));
+
+    // Another session's turns are not this one's, and vice versa — the
+    // namespace is a hashed prefix, so the range has to stop at it.
+    store.reserve_provenance_turn("other", 4, 0).unwrap();
+    assert_eq!(store.last_provenance_turn_for("other").unwrap(), Some(4));
+    assert_eq!(store.last_provenance_turn_for("sparse").unwrap(), Some(7));
+    assert_eq!(store.last_provenance_turn_for("nope").unwrap(), None);
+
+    // Turn number at the top of the range, which is what the wire allows.
+    let big = temp_store();
+    big.1.reserve_provenance_turn("big", u32::MAX, 0).unwrap();
+    assert_eq!(
+        big.1.last_provenance_turn_for("big").unwrap(),
+        Some(u32::MAX)
+    );
+}
+
+#[test]
 fn provenance_events_are_ordered_idempotent_and_fenced() {
     let (_dir, store) = temp_store();
     let turn = store.reserve_provenance_turn("session-a", 0, 1).unwrap();
