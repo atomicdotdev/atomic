@@ -67,6 +67,8 @@ const METHOD_MATRIX: &[(&str, &str)] = &[
     ("AttestationService", "VerifyAttestation"),
     ("KnowledgeService", "QueryGraph"),
     ("ProvenanceService", "DispatchTurnEvent"),
+    ("ProvenanceService", "AppendHookLog"),
+    ("ProvenanceService", "LoadHookLog"),
     ("ProvenanceService", "ReserveTurn"),
     ("ProvenanceService", "AppendEnvelopes"),
     ("ProvenanceService", "PrepareCheckpoint"),
@@ -119,6 +121,27 @@ impl daemon_service_server::DaemonService for DaemonImpl {
                         required_capabilities: vec!["maintenance.admin".to_string()],
                         allowed_callers: vec![CallerClass::Local as i32],
                         effects: vec![RpcEffect::RepositoryWrite as i32],
+                    }
+                } else if *service == "ProvenanceService"
+                    && matches!(*method, "AppendHookLog" | "LoadHookLog")
+                {
+                    let write = *method == "AppendHookLog";
+                    MethodDescriptorInfo {
+                        service: service.to_string(),
+                        method: method.to_string(),
+                        scope: ExecutionScope::Local as i32,
+                        required_capabilities: vec![if write {
+                            "provenance.write"
+                        } else {
+                            "provenance.read"
+                        }
+                        .to_string()],
+                        allowed_callers: vec![CallerClass::Local as i32],
+                        effects: vec![if write {
+                            RpcEffect::RepositoryWrite
+                        } else {
+                            RpcEffect::RepositoryRead
+                        } as i32],
                     }
                 } else {
                     MethodDescriptorInfo {

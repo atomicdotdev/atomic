@@ -10,6 +10,19 @@ import "atomic/common/options.proto";
 import "atomic/services/provenance/provenance_messages.proto";
 
 service ProvenanceService {
+  // Session-scoped operational events. Local diagnostics, no turn reservation.
+  rpc AppendHookLog(AppendHookLogRequest) returns (AppendHookLogResponse) {
+    option (atomic.execution_scope) = EXECUTION_SCOPE_LOCAL;
+    option (atomic.required_capability) = "provenance.write";
+    option (atomic.allowed_caller) = CALLER_CLASS_LOCAL;
+    option (atomic.effect) = RPC_EFFECT_REPOSITORY_WRITE;
+  }
+  rpc LoadHookLog(LoadHookLogRequest) returns (LoadHookLogResponse) {
+    option (atomic.execution_scope) = EXECUTION_SCOPE_LOCAL;
+    option (atomic.required_capability) = "provenance.read";
+    option (atomic.allowed_caller) = CALLER_CLASS_LOCAL;
+    option (atomic.effect) = RPC_EFFECT_REPOSITORY_READ;
+  }
   // Grants the generation for this session/turn. The first reserve claims
   // the session for the caller's view (authorization matrix).
   rpc ReserveTurn(ReserveTurnRequest) returns (ReserveTurnResponse) {

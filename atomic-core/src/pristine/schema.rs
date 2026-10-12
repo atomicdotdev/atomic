@@ -111,6 +111,9 @@ pub(crate) fn visit_tables(visitor: &mut impl TableVisitor) -> PristineResult<()
     visitor.table(PROVENANCE_FINAL_HASHES)?;
 
     // Sessions
+    visitor.table(SESSION_LOG)?;
+    visitor.table(SESSION_LOG_IDS)?;
+    visitor.table(SESSION_LOG_INDEX)?;
     visitor.table(SESSION_EVENTS)?;
     visitor.table(SESSION_TODOS)?;
     visitor.table(SESSION_PHASES)?;

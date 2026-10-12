@@ -114,6 +114,10 @@ struct StatusJson {
     /// it.
     #[serde(skip_serializing_if = "Option::is_none")]
     hook_health: Option<Vec<super::health::AgentHookSummary>>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    hook_sessions: Vec<super::health::SessionHookHealth>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hook_health_error: Option<String>,
     /// A bounded, aggregated read of `.atomic/hook-errors.log`. Absent when
     /// the file does not exist.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -181,7 +185,17 @@ impl AgentStatus {
             files_touched: sessions.iter().map(|s| s.files_touched.len()).sum(),
         };
 
-        let health = super::health::HookHealth::read(repo_root);
+        let (health, hook_health_error) = match super::hook_log::read(repo_root) {
+            Ok(health) => (health, None),
+            Err(error) => (
+                super::hook_log::pending_health(repo_root),
+                Some(error.to_string()),
+            ),
+        };
+        let hook_sessions = health
+            .as_ref()
+            .map(|health| health.sessions.values().cloned().collect())
+            .unwrap_or_default();
         let hook_health = health
             .as_ref()
             .map(super::health::summarize)
@@ -192,10 +206,10 @@ impl AgentStatus {
         // successful dispatch is silently losing every turn. Report it by
         // name so a caller does not have to correlate the two lists.
         //
-        // Only when the health file exists at all: with no file there is no
+        // Only when observations exist at all: with no events there is no
         // evidence either way, and calling a freshly-upgraded repository
         // "never recorded" would be a false alarm on every machine.
-        let silent_agents: Vec<String> = if health.is_none() {
+        let silent_agents: Vec<String> = if health.is_none() || hook_health_error.is_some() {
             Vec::new()
         } else {
             installed
@@ -236,6 +250,8 @@ impl AgentStatus {
             ),
             sessions_error,
             hook_health,
+            hook_sessions,
+            hook_health_error,
             hook_errors,
             silent_agents,
         }
@@ -485,17 +501,22 @@ impl Command for AgentStatus {
 /// healthy log proves nothing about whether the recorder is running, and a
 /// live recorder proves nothing about what it failed to do earlier.
 fn print_hook_health(repo_root: &std::path::Path, installed: &[&str], registry: &AgentRegistry) {
-    let health = super::health::HookHealth::read(repo_root);
+    let mut log_unavailable = false;
+    let health = super::hook_log::read(repo_root).unwrap_or_else(|error| {
+        log_unavailable = true;
+        eprintln!("  ⚠ Hook log unavailable: {error}");
+        super::hook_log::pending_health(repo_root)
+    });
     let rows = health
         .as_ref()
         .map(super::health::summarize)
         .unwrap_or_default();
     let errors = super::health::read_errors(repo_root);
 
-    // With no health file at all there is no evidence either way, so stay
+    // With no observations there is no evidence either way, so stay
     // quiet rather than accusing a freshly-upgraded repository of never
     // having recorded.
-    let silent: Vec<&str> = if health.is_none() {
+    let silent: Vec<&str> = if health.is_none() || log_unavailable {
         Vec::new()
     } else {
         installed
@@ -524,6 +545,27 @@ fn print_hook_health(repo_root: &std::path::Path, installed: &[&str], registry: 
         println!("  {marker} {display} — {}", row.liveness());
         if !failing.is_empty() {
             println!("{failing}");
+        }
+    }
+
+    // Attribute outstanding failures to their sessions.
+    if let Some(health) = &health {
+        for session in health.sessions.values() {
+            let failing: Vec<_> = session
+                .health
+                .verbs
+                .iter()
+                .filter(|(_, verb)| verb.outcome == super::health::FireOutcome::Error)
+                .map(|(name, _)| name.as_str())
+                .collect();
+            if !failing.is_empty() {
+                println!(
+                    "    session {} (parent {}) — failing: {}",
+                    session.session_id.as_deref().unwrap_or("unattributed"),
+                    session.parent_session_id.as_deref().unwrap_or("—"),
+                    failing.join(", ")
+                );
+            }
         }
     }
 

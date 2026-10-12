@@ -1,21 +1,5 @@
-//! Shared hook liveness and failure reporting for CLI and service dispatch.
-//!
-//! Two independent signals, because they answer different questions:
-//!
-//! - **Health** ([`HookHealth`], `.atomic/hook-health.json`) — written by
-//!   [`record_fire`] on every hook dispatch. Answers "are the hooks still
-//!   alive?" A hook that is installed but has not fired for hours is broken
-//!   in a way that nothing else reports: the shell guard in
-//!   `atomic-agent::hooks` ends in `|| true`, so a hook that dies is
-//!   indistinguishable from a hook that was never installed.
-//! - **Errors** ([`HookErrors`], `.atomic/hook-errors.log`) — appended by the
-//!   git-shadow validator and by the agent plugins. Answers "what went
-//!   wrong?" This file is unbounded and append-only with no rotation, so
-//!   only a bounded tail is ever read.
-//!
-//! Neither signal subsumes the other: a healthy log says nothing about
-//! whether the recorder is running, and a healthy recorder says nothing
-//! about what it failed to do earlier.
+//! Hook health projected from immutable, session-scoped operational logs.
+//! Legacy plugin/git-shadow errors remain readable from `hook-errors.log`.
 
 use std::collections::BTreeMap;
 use std::io::{Seek, SeekFrom};
@@ -23,7 +7,7 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-/// Version of the `.atomic/hook-health.json` document.
+/// Version of the computed health report.
 const HEALTH_SCHEMA_VERSION: u32 = 1;
 
 /// How many bytes of `hook-errors.log` tail to read.
@@ -90,13 +74,22 @@ pub struct AgentHealth {
     pub verbs: BTreeMap<String, VerbHealth>,
 }
 
-/// The whole `.atomic/hook-health.json` document.
+/// Computed report; persistence belongs to the operational event log.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HookHealth {
     pub schema_version: u32,
-    /// RFC3339 timestamp of the last write.
+    /// RFC3339 timestamp of the newest observation.
     pub updated_at: String,
     pub agents: BTreeMap<String, AgentHealth>,
+    pub sessions: BTreeMap<String, SessionHookHealth>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionHookHealth {
+    pub agent: String,
+    pub session_id: Option<String>,
+    pub parent_session_id: Option<String>,
+    pub health: AgentHealth,
 }
 
 impl HookHealth {
@@ -106,6 +99,7 @@ impl HookHealth {
             schema_version: HEALTH_SCHEMA_VERSION,
             updated_at: now.to_string(),
             agents: BTreeMap::new(),
+            sessions: BTreeMap::new(),
         }
     }
 
@@ -130,192 +124,102 @@ impl HookHealth {
             });
         entry.display_name = display_name.to_string();
 
-        // A failure must not erase the last known-good dispatch: the gap
-        // between `last_ok` and `last_fired` is what says "this worked, then
-        // broke" rather than "this never worked".
-        let last_ok = match outcome {
-            FireOutcome::Ok => Some(now.to_string()),
-            FireOutcome::Error => entry.verbs.get(verb).and_then(|v| v.last_ok.clone()),
-        };
+        fold_verb(&mut entry.verbs, verb, outcome, detail, now);
+        if observed_at(now) >= observed_at(&self.updated_at) {
+            self.updated_at = now.to_string();
+        }
+    }
 
-        entry.verbs.insert(
-            verb.to_string(),
-            VerbHealth {
-                last_fired: now.to_string(),
-                outcome,
-                detail: detail.map(truncate_detail),
-                last_ok,
-            },
+    /// Build a report from observations, including out-of-order outage replay.
+    pub fn from_events(events: Vec<crate::hook_log::SessionLogEvent>) -> Option<Self> {
+        let mut report = Self::empty(&events.first()?.at);
+        for event in events {
+            report.record_event(&event);
+        }
+        Some(report)
+    }
+
+    /// Incremental projection, safe for pages and older events replayed after
+    /// an outage. Only a success in the same session can heal that session.
+    pub fn record_event(&mut self, event: &crate::hook_log::SessionLogEvent) {
+        let outcome = if event.outcome == "ok" {
+            FireOutcome::Ok
+        } else {
+            FireOutcome::Error
+        };
+        self.record(
+            &event.agent,
+            &event.display_name,
+            &event.verb,
+            outcome,
+            event.detail.as_deref(),
+            &event.at,
         );
-
-        self.updated_at = now.to_string();
-    }
-
-    /// Read the record for a repository, treating any missing or malformed
-    /// file as "no health data yet".
-    ///
-    /// Health is diagnostic, so a corrupt file must never fail the command
-    /// that is trying to explain what is wrong.
-    pub fn read(repo_root: &Path) -> Option<Self> {
-        let path = repo_root.join(".atomic").join("hook-health.json");
-        let bytes = std::fs::read(path).ok()?;
-        serde_json::from_slice(&bytes).ok()
-    }
-
-    /// Persist the record, replacing the file atomically.
-    ///
-    /// Best-effort: a failure here is dropped rather than propagated, because
-    /// the caller is a hook that is already on its way out and must not turn
-    /// bookkeeping into a hook failure.
-    pub fn write(&self, repo_root: &Path) {
-        let Ok(bytes) = serde_json::to_vec_pretty(self) else {
-            return;
-        };
-        write_atomic(&repo_root.join(".atomic"), "hook-health.json", &bytes);
+        let key = serde_json::to_string(&(&event.agent, &event.session_id))
+            .expect("string tuple serializes");
+        let session = self
+            .sessions
+            .entry(key)
+            .or_insert_with(|| SessionHookHealth {
+                agent: event.agent.clone(),
+                session_id: event.session_id.clone(),
+                parent_session_id: event.parent_session_id.clone(),
+                health: AgentHealth {
+                    display_name: event.display_name.clone(),
+                    verbs: BTreeMap::new(),
+                },
+            });
+        if event.parent_session_id.is_some() {
+            session.parent_session_id = event.parent_session_id.clone();
+        }
+        fold_verb(
+            &mut session.health.verbs,
+            &event.verb,
+            outcome,
+            event.detail.as_deref(),
+            &event.at,
+        );
     }
 }
 
-/// Record one hook dispatch against the repository's health file.
-///
-/// Several agents can record into one repository at the same time, so the
-/// read-modify-write runs under an exclusive lock on `.atomic/hook-health.lock`.
-/// Without it the last writer wins and silently discards whatever the others
-/// had just recorded — which for a first-ever fire means an agent stays
-/// missing from the health record and is reported as having "never recorded",
-/// the exact false alarm this feature exists to raise.
-///
-/// The lock is best-effort in one direction only: it is never held long enough
-/// to matter, because the critical section is a few hundred bytes of JSON. If
-/// it cannot be taken the record is still written unlocked — losing a
-/// timestamp is a better outcome than not recording the fire at all.
-///
-/// Returns without doing anything if the repository is missing, so it is safe
-/// to call from a hook that may run outside a workspace.
-pub fn record_fire(
-    repo_root: &Path,
-    agent: &str,
-    display_name: &str,
+fn observed_at(at: &str) -> Option<chrono::DateTime<chrono::FixedOffset>> {
+    chrono::DateTime::parse_from_rfc3339(at).ok()
+}
+
+fn fold_verb(
+    verbs: &mut BTreeMap<String, VerbHealth>,
     verb: &str,
     outcome: FireOutcome,
     detail: Option<&str>,
+    at: &str,
 ) {
-    let atomic_dir = repo_root.join(".atomic");
-    if !atomic_dir.is_dir() {
+    let previous = verbs.get(verb);
+    let last_ok = previous.and_then(|state| state.last_ok.clone());
+    let last_ok = if outcome == FireOutcome::Ok
+        && last_ok
+            .as_deref()
+            .is_none_or(|ok| observed_at(at) >= observed_at(ok))
+    {
+        Some(at.to_string())
+    } else {
+        last_ok
+    };
+    if let Some(previous) = verbs
+        .get_mut(verb)
+        .filter(|state| observed_at(&state.last_fired) > observed_at(at))
+    {
+        previous.last_ok = last_ok;
         return;
     }
-
-    let now = chrono::Utc::now().to_rfc3339();
-    let _guard = HookHealthLock::acquire(&atomic_dir);
-    let mut health = HookHealth::read(repo_root).unwrap_or_else(|| HookHealth::empty(&now));
-    health.record(agent, display_name, verb, outcome, detail, &now);
-    health.write(repo_root);
-}
-
-/// Record a dispatch outcome without changing its result or error.
-///
-/// Used at both CLI entry points and the shared service handler so failures
-/// before orchestration (including parsing and transport errors) remain visible.
-///
-/// # Examples
-///
-/// ```no_run
-/// use atomic_agent::hook_health::record_result;
-/// use std::path::Path;
-///
-/// let dispatch: Result<(), std::io::Error> = Ok(());
-/// let result = record_result(Path::new("."), "opencode", "OpenCode", "receive", dispatch);
-/// assert!(result.is_ok());
-/// ```
-pub fn record_result<T, E: std::fmt::Display>(
-    repo_root: &Path,
-    agent: &str,
-    display_name: &str,
-    verb: &str,
-    result: Result<T, E>,
-) -> Result<T, E> {
-    match &result {
-        Ok(_) => record_fire(repo_root, agent, display_name, verb, FireOutcome::Ok, None),
-        Err(error) => record_fire(
-            repo_root,
-            agent,
-            display_name,
-            verb,
-            FireOutcome::Error,
-            Some(&error.to_string()),
-        ),
-    }
-    result
-}
-
-fn write_atomic(dir: &Path, name: &str, bytes: &[u8]) {
-    use std::sync::atomic::{AtomicU64, Ordering};
-
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-
-    if std::fs::create_dir_all(dir).is_err() {
-        return;
-    }
-    // Concurrent dispatchers must never share a temporary file.
-    let path = dir.join(name);
-    let tmp = dir.join(format!(
-        "{name}.{}.{}.tmp",
-        std::process::id(),
-        COUNTER.fetch_add(1, Ordering::Relaxed)
-    ));
-    if std::fs::write(&tmp, bytes).is_err() {
-        let _ = std::fs::remove_file(&tmp);
-        return;
-    }
-    if std::fs::rename(&tmp, &path).is_err() {
-        let _ = std::fs::remove_file(&tmp);
-    }
-}
-
-/// Exclusive lock over the health file's read-modify-write.
-///
-/// Retries for a bounded time rather than blocking indefinitely: a hook that
-/// hangs is worse than one that loses a timestamp, and a hook cannot hang the
-/// agent. If the lock cannot be taken within the budget the guard is inert and
-/// the write proceeds anyway, degraded to last-writer-wins.
-///
-/// `flock` is released by the kernel when the holder's descriptor closes, so a
-/// process that dies mid-write cannot wedge the file.
-struct HookHealthLock {
-    _file: Option<std::fs::File>,
-}
-
-impl HookHealthLock {
-    /// Total time to keep retrying before giving up and writing unlocked.
-    const BUDGET: std::time::Duration = std::time::Duration::from_millis(50);
-
-    /// Pause between attempts; short enough to stay inside the budget.
-    const BACKOFF: std::time::Duration = std::time::Duration::from_micros(200);
-
-    fn acquire(atomic_dir: &Path) -> Self {
-        use fs2::FileExt;
-
-        let path = atomic_dir.join("hook-health.lock");
-        let Ok(file) = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(&path)
-        else {
-            return Self { _file: None };
-        };
-
-        let deadline = std::time::Instant::now() + Self::BUDGET;
-        loop {
-            match file.try_lock_exclusive() {
-                Ok(()) => return Self { _file: Some(file) },
-                Err(_) if std::time::Instant::now() < deadline => {
-                    std::thread::sleep(Self::BACKOFF);
-                }
-                Err(_) => return Self { _file: None },
-            }
-        }
-    }
+    verbs.insert(
+        verb.to_string(),
+        VerbHealth {
+            last_fired: at.to_string(),
+            outcome,
+            detail: detail.map(truncate_detail),
+            last_ok,
+        },
+    );
 }
 
 /// Flatten a health record into one row per agent, for display and JSON.
@@ -332,19 +236,19 @@ pub fn summarize(health: &HookHealth) -> Vec<AgentHookSummary> {
                 .verbs
                 .values()
                 .map(|v| v.last_fired.as_str())
-                .max()
+                .max_by_key(|at| observed_at(at))
                 .map(str::to_string);
             let last_ok = agent
                 .verbs
                 .values()
                 .filter_map(|v| v.last_ok.as_deref())
-                .max()
+                .max_by_key(|at| observed_at(at))
                 .map(str::to_string);
             let last_error = agent
                 .verbs
                 .values()
                 .filter(|v| v.outcome == FireOutcome::Error)
-                .max_by_key(|v| v.last_fired.as_str())
+                .max_by_key(|v| observed_at(&v.last_fired))
                 .map(|v| v.last_fired.clone());
             let failing: Vec<String> = agent
                 .verbs
@@ -366,6 +270,32 @@ pub fn summarize(health: &HookHealth) -> Vec<AgentHookSummary> {
         .collect();
 
     out.sort_by(|a, b| a.name.cmp(&b.name));
+    // A successful child must not clear a parent's outstanding failure.
+    if !health.sessions.is_empty() {
+        for row in &mut out {
+            let mut failing = std::collections::BTreeSet::new();
+            let mut last_error = None;
+            for session in health
+                .sessions
+                .values()
+                .filter(|session| session.agent == row.name)
+            {
+                for (verb, state) in &session.health.verbs {
+                    if state.outcome == FireOutcome::Error {
+                        failing.insert(verb.clone());
+                        if last_error
+                            .as_deref()
+                            .is_none_or(|at| observed_at(&state.last_fired) >= observed_at(at))
+                        {
+                            last_error = Some(state.last_fired.clone());
+                        }
+                    }
+                }
+            }
+            row.failing_verbs = failing.into_iter().collect();
+            row.last_error = last_error;
+        }
+    }
     out
 }
 
@@ -797,52 +727,75 @@ mod tests {
     }
 
     #[test]
-    fn health_round_trips_through_disk() {
-        let dir = tmp_repo();
-        let root = dir.path();
-        std::fs::create_dir_all(root.join(".atomic")).unwrap();
-
-        let now = "2026-09-25T18:00:00+00:00";
-        let mut health = HookHealth::empty(now);
-        health.record(
-            "claude-code",
-            "Claude Code",
-            "stop",
-            FireOutcome::Ok,
-            None,
-            now,
+    fn a_child_success_does_not_heal_a_parent_failure() {
+        let event = |session: &str, parent: Option<&str>, outcome: &str, at: &str| {
+            crate::hook_log::SessionLogEvent {
+                event_id: session.into(),
+                session_id: Some(session.into()),
+                parent_session_id: parent.map(str::to_owned),
+                agent: "opencode".into(),
+                display_name: "OpenCode".into(),
+                verb: "before-tool".into(),
+                outcome: outcome.into(),
+                detail: None,
+                at: at.into(),
+            }
+        };
+        let health = HookHealth::from_events(vec![
+            event("child", Some("parent"), "ok", "2026-09-25T18:00:00Z"),
+            event("parent", None, "error", "2026-09-25T17:00:00Z"),
+        ])
+        .unwrap();
+        assert_eq!(summarize(&health)[0].failing_verbs, ["before-tool"]);
+        let child = health
+            .sessions
+            .values()
+            .find(|row| row.session_id.as_deref() == Some("child"))
+            .unwrap();
+        assert_eq!(child.parent_session_id.as_deref(), Some("parent"));
+        assert_eq!(child.health.verbs["before-tool"].outcome, FireOutcome::Ok);
+        assert_eq!(
+            summarize(&health)[0].last_error.as_deref(),
+            Some("2026-09-25T17:00:00Z")
         );
-        health.write(root);
-
-        let read = HookHealth::read(root).expect("health file round-trips");
-        assert_eq!(read.schema_version, 1);
-        assert!(read.agents.contains_key("claude-code"));
     }
 
     #[test]
-    fn missing_or_corrupt_health_reads_as_absent() {
-        let dir = tmp_repo();
-        let root = dir.path();
-        std::fs::create_dir_all(root.join(".atomic")).unwrap();
-        assert!(HookHealth::read(root).is_none());
-
-        std::fs::write(root.join(".atomic/hook-health.json"), b"{not json").unwrap();
-        assert!(HookHealth::read(root).is_none());
-    }
-
-    #[test]
-    fn record_fire_is_a_noop_outside_a_repository() {
-        let dir = tmp_repo();
-        // No .atomic directory: must not create one, must not panic.
-        record_fire(
-            dir.path(),
+    fn replayed_older_observations_preserve_latest_outcome_and_last_success() {
+        let mut health = HookHealth::empty("2026-10-12T10:00:00Z");
+        // Fractional precision and timezone offsets do not sort as strings.
+        health.record(
             "opencode",
             "OpenCode",
-            "stop",
+            "before-tool",
+            FireOutcome::Error,
+            Some("new failure"),
+            "2026-10-12T10:00:00.500Z",
+        );
+        health.record(
+            "opencode",
+            "OpenCode",
+            "before-tool",
             FireOutcome::Ok,
             None,
+            "2026-10-12T11:00:00+01:00",
         );
-        assert!(!dir.path().join(".atomic").exists());
+        let verb = &health.agents["opencode"].verbs["before-tool"];
+        assert_eq!(verb.outcome, FireOutcome::Error);
+        assert_eq!(verb.last_ok.as_deref(), Some("2026-10-12T11:00:00+01:00"));
+        assert_eq!(verb.detail.as_deref(), Some("new failure"));
+        health.record(
+            "opencode",
+            "OpenCode",
+            "after-tool",
+            FireOutcome::Ok,
+            None,
+            "2026-10-12T10:00:00Z",
+        );
+        assert_eq!(
+            summarize(&health)[0].last_fired.as_deref(),
+            Some("2026-10-12T10:00:00.500Z")
+        );
     }
 
     #[test]
@@ -978,43 +931,6 @@ mod tests {
             "",
         ] {
             let _ = error_signature(msg);
-        }
-    }
-
-    #[test]
-    fn concurrent_writers_all_land() {
-        // Several agents record into one repository at once. Without the
-        // lock the last writer wins and the rest are discarded; for a first
-        // fire that means the agent stays missing and is reported as having
-        // "never recorded" — the false alarm this feature exists to raise.
-        let dir = tmp_repo();
-        let root = dir.path();
-        std::fs::create_dir_all(root.join(".atomic")).unwrap();
-
-        let verbs = [
-            "before-tool",
-            "after-tool",
-            "session-start",
-            "stop",
-            "user-prompt",
-        ];
-        std::thread::scope(|s| {
-            for verb in verbs {
-                s.spawn(move || {
-                    for _ in 0..5 {
-                        record_fire(root, "opencode", "OpenCode", verb, FireOutcome::Ok, None);
-                    }
-                });
-            }
-        });
-
-        let health = HookHealth::read(root).expect("health file is readable");
-        let recorded = &health.agents["opencode"].verbs;
-        for verb in verbs {
-            assert!(
-                recorded.contains_key(verb),
-                "{verb} was lost to a racing write"
-            );
         }
     }
 

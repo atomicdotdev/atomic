@@ -65,7 +65,30 @@ The recording workflow on each turn end:
 2. **Add** — track any new files the agent created (filtering out `node_modules`, `target`, etc.)
 3. **Record** — create an Atomic change with AI provenance metadata
 
-No daemon. No Watchman required. No git. Each hook invocation is a standalone process that opens the repo, does its work, and exits. Codex is the one lifecycle-specific exception: because Codex caps `SessionEnd` hooks at three seconds, the hook hands finalization to a short-lived background worker after safely forwarding the event payload.
+No Watchman or Git is required. Each hook invocation is a standalone process. Database operations use the shared service handlers: local mode runs them in-process; reactor mode calls the daemon. Codex is the one lifecycle-specific exception: because Codex caps `SessionEnd` hooks at three seconds, the hook hands finalization to a short-lived background worker after safely forwarding the event payload.
+
+## Hook Health and Session Logs
+
+`atomic agent status` reports the last successful hook dispatch and outstanding
+failures. `--json` includes aggregate `hook_health`, session-scoped `hook_sessions`
+(with parent IDs and per-verb outcomes), and `hook_health_error` when the log cannot
+be loaded. A child's successful hook cannot clear its parent's failure.
+
+Native hooks, typed `agent receive`, and the shared dispatch handler emit
+structured Rust `tracing` events. The service appends immutable observations to
+the session log in `.atomic/atomic.redb`, independently of provenance turn state.
+Event IDs make append retries idempotent; transactional writes retain concurrent
+parent/child activity. Health is projected from the log rather than a shared
+`hook-health.json` snapshot. Existing plugin and git-shadow errors are also read
+from the bounded tail of `hook-errors.log`.
+
+Session IDs come from hook payloads. Bridges can explicitly carry correlation
+across processes with `ATOMIC_SESSION_ID` and `ATOMIC_PARENT_SESSION_ID`; typed
+dispatch forwards the resolved parent ID on the service request. Malformed input
+without an identifiable session remains an unassigned diagnostic. During a
+service outage, each observation is spooled to its own immutable file under
+`.atomic/hook-log-pending/`; a successful append replays pending observations
+idempotently. Status can report pending observations while the service is down.
 
 ## Agent Identity
 

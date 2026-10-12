@@ -172,7 +172,7 @@ fn kg_edge_domain(edge: &pb::KgEdge) -> atomic_core::pristine::vault::KgEdge {
     }
 }
 
-fn request_meta() -> Option<pb::RequestMeta> {
+pub(crate) fn request_meta() -> Option<pb::RequestMeta> {
     Some(pb::RequestMeta {
         request_id: uuid::Uuid::new_v4().to_string(),
         observed_at: None,
@@ -6870,6 +6870,7 @@ pub fn dispatch_turn_event(
     agent_id: &str,
     agent_display: &str,
     agent_identity: Option<String>,
+    hook_context: &atomic_agent::hook_log::HookContext,
 ) -> CliResult<crate::commands::agent::receive::ReceiveResult> {
     let Some(session) = Service::open_root(root)? else {
         return Err(CliError::InvalidArgument {
@@ -6882,7 +6883,7 @@ pub fn dispatch_turn_event(
         agent_id: agent_id.to_string(),
         agent_display_name: Some(agent_display.to_string()),
         agent_identity,
-        event: Some(turn_event_body(event)),
+        event: Some(turn_event_body(event, hook_context)),
     })?;
     Ok(crate::commands::agent::receive::ReceiveResult {
         session_id: response.session_id,
@@ -6897,9 +6898,13 @@ pub fn dispatch_turn_event(
     })
 }
 
-fn turn_event_body(event: &atomic_agent::event::TurnEvent) -> pb::TurnEventBody {
+fn turn_event_body(
+    event: &atomic_agent::event::TurnEvent,
+    hook_context: &atomic_agent::hook_log::HookContext,
+) -> pb::TurnEventBody {
     pb::TurnEventBody {
         session_id: event.session_id.clone(),
+        parent_session_id: hook_context.parent_session_id.clone(),
         event_type: match event.event_type {
             atomic_agent::event::HookType::SessionStart => "session_start",
             atomic_agent::event::HookType::SessionEnd => "session_end",

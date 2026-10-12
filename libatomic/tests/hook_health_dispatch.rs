@@ -16,6 +16,69 @@ enum Dispatch {
 }
 
 impl Dispatch {
+    fn duplicate(&self) -> Self {
+        match self {
+            Self::Local(service) => Self::Local(ProvenanceImpl {
+                state: service.state.clone(),
+            }),
+            Self::Rpc(client) => Self::Rpc(client.clone()),
+        }
+    }
+
+    async fn append(&mut self, request: libatomic::atomic::AppendHookLogRequest) -> u64 {
+        match self {
+            Self::Local(service) => {
+                service
+                    .append_hook_log(Request::new(request))
+                    .await
+                    .unwrap()
+                    .into_inner()
+                    .sequence
+            }
+            Self::Rpc(client) => {
+                client
+                    .append_hook_log(request)
+                    .await
+                    .unwrap()
+                    .into_inner()
+                    .sequence
+            }
+        }
+    }
+
+    async fn load(
+        &mut self,
+        reference: &RepositoryRef,
+        session: Option<&str>,
+        after: u64,
+        limit: u32,
+    ) -> Vec<libatomic::atomic::HookLogEntry> {
+        let request = libatomic::atomic::LoadHookLogRequest {
+            repository: Some(reference.clone()),
+            session_id: session.map(str::to_owned),
+            after_sequence: after,
+            limit,
+            ..Default::default()
+        };
+        match self {
+            Self::Local(service) => {
+                service
+                    .load_hook_log(Request::new(request))
+                    .await
+                    .unwrap()
+                    .into_inner()
+                    .entries
+            }
+            Self::Rpc(client) => {
+                client
+                    .load_hook_log(request)
+                    .await
+                    .unwrap()
+                    .into_inner()
+                    .entries
+            }
+        }
+    }
     async fn fire(&mut self, request: DispatchTurnEventRequest) -> Result<(), Box<Status>> {
         let result = match self {
             Self::Local(service) => service
@@ -40,6 +103,22 @@ fn request(reference: &RepositoryRef, event_type: &str) -> DispatchTurnEventRequ
         }),
         ..Default::default()
     }
+}
+
+fn read_health(root: &std::path::Path) -> HookHealth {
+    let store = atomic_repository::redb_change_store::RedbChangeStore::open_existing(
+        root.join(".atomic/atomic.redb"),
+    )
+    .unwrap();
+    HookHealth::from_events(
+        store
+            .load_session_log(None, 0, 512)
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.event)
+            .collect(),
+    )
+    .unwrap()
 }
 
 #[tokio::test]
@@ -82,7 +161,7 @@ async fn local_and_rpc_dispatch_record_success_validation_failure_and_recovery()
             .fire(request(&reference, "session_start"))
             .await
             .unwrap();
-        let health = HookHealth::read(repo.path()).unwrap();
+        let health = read_health(repo.path());
         let verb = &health.agents["opencode"].verbs["session_start"];
         assert_eq!(verb.outcome, FireOutcome::Ok);
         let last_ok = verb.last_ok.clone();
@@ -92,7 +171,7 @@ async fn local_and_rpc_dispatch_record_success_validation_failure_and_recovery()
             .await
             .unwrap_err();
         assert_eq!(invalid.code(), tonic::Code::InvalidArgument);
-        let health = HookHealth::read(repo.path()).unwrap();
+        let health = read_health(repo.path());
         let invalid = &health.agents["opencode"].verbs["invalid-event"];
         assert_eq!(invalid.outcome, FireOutcome::Error);
         assert!(invalid
@@ -110,7 +189,7 @@ async fn local_and_rpc_dispatch_record_success_validation_failure_and_recovery()
             .await
             .unwrap_err();
         assert_eq!(failure.code(), tonic::Code::Internal);
-        let health = HookHealth::read(repo.path()).unwrap();
+        let health = read_health(repo.path());
         let verb = &health.agents["opencode"].verbs["session_start"];
         assert_eq!(verb.outcome, FireOutcome::Error);
         assert_eq!(verb.last_ok, last_ok);
@@ -122,10 +201,70 @@ async fn local_and_rpc_dispatch_record_success_validation_failure_and_recovery()
             .fire(request(&reference, "session_start"))
             .await
             .unwrap();
-        let health = HookHealth::read(repo.path()).unwrap();
+        let health = read_health(repo.path());
         let verb = &health.agents["opencode"].verbs["session_start"];
         assert_eq!(verb.outcome, FireOutcome::Ok);
         assert!(verb.detail.is_none());
+
+        // Overlapping callers use the same service gate and retain explicit
+        // parent lineage on the wire, including events that fail validation.
+        let before = dispatch.load(&reference, None, 0, 512).await.len();
+        let mut callers = Vec::new();
+        for index in 0..24 {
+            let mut caller = dispatch.duplicate();
+            let mut event = request(&reference, "concurrent-invalid");
+            let body = event.event.as_mut().unwrap();
+            body.session_id = format!("child-{}", index % 3);
+            body.parent_session_id = Some("service-health".into());
+            callers.push(tokio::spawn(async move {
+                caller.fire(event).await.unwrap_err()
+            }));
+        }
+        for caller in callers {
+            assert_eq!(caller.await.unwrap().code(), tonic::Code::InvalidArgument);
+        }
+        assert_eq!(
+            dispatch.load(&reference, None, 0, 512).await.len(),
+            before + 24
+        );
+        for index in 0..3 {
+            let session = format!("child-{index}");
+            let page = dispatch.load(&reference, Some(&session), 0, 5).await;
+            let rest = dispatch
+                .load(&reference, Some(&session), page.last().unwrap().sequence, 5)
+                .await;
+            assert_eq!(page.len() + rest.len(), 8);
+            assert!(page.iter().chain(&rest).all(|entry| entry
+                .event
+                .as_ref()
+                .unwrap()
+                .parent_session_id
+                .as_deref()
+                == Some("service-health")));
+        }
+
+        let append = libatomic::atomic::AppendHookLogRequest {
+            repository: Some(reference.clone()),
+            event: Some(libatomic::atomic::HookLogEvent {
+                event_id: uuid::Uuid::new_v4().to_string(),
+                session_id: None,
+                parent_session_id: None,
+                agent: "opencode".into(),
+                display_name: "OpenCode".into(),
+                verb: "receive".into(),
+                outcome: "error".into(),
+                detail: Some("invalid JSON".into()),
+                at: chrono::Utc::now().to_rfc3339(),
+            }),
+            ..Default::default()
+        };
+        let sequence = dispatch.append(append.clone()).await;
+        assert_eq!(dispatch.append(append).await, sequence);
+        assert_eq!(
+            dispatch.load(&reference, None, 0, 512).await.len(),
+            before + 25
+        );
+        assert!(!repo.path().join(".atomic/hook-health.json").exists());
         for task in tasks {
             task.abort();
         }

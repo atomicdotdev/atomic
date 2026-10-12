@@ -176,13 +176,13 @@ impl Command for Hooks {
                 // was never installed. Best-effort: the repo root is not
                 // resolved yet, so this is skipped outside a workspace.
                 if let Ok(root) = find_repository_root() {
-                    super::health::record_fire(
+                    let _ = super::hook_log::record_result::<(), _>(
                         &root,
+                        &super::hook_log::HookContext::from_input(&input),
                         agent.name(),
                         agent.display_name(),
                         &self.verb,
-                        super::health::FireOutcome::Error,
-                        Some(&e.to_string()),
+                        Err(&e),
                     );
                 }
                 // Log to stderr but don't fail hard on parse errors for
@@ -257,6 +257,7 @@ impl Command for Hooks {
 
         let agent_name = agent.name().to_string();
         let agent_display = agent.display_name().to_string();
+        let hook_context = super::hook_log::HookContext::from_event(&event);
 
         // Keep hooks quiet on stdout/stderr — Claude Code surfaces both, so
         // route diagnostics through `log` instead.
@@ -321,8 +322,9 @@ impl Command for Hooks {
             Ok::<_, CliError>(dispatch_result)
         });
 
-        let result = super::health::record_result(
+        let result = super::hook_log::record_result(
             &repo_root,
+            &hook_context,
             &agent_name,
             &agent_display,
             &self.verb,

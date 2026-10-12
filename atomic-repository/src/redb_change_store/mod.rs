@@ -16,6 +16,7 @@
 mod batch;
 mod provenance;
 mod queries;
+mod session_log;
 
 pub use batch::StoredSection;
 pub use provenance::{
@@ -25,6 +26,7 @@ pub use provenance::{
     StoredProvenanceEvent, StoredProvenanceTurn, MAX_FROZEN_PAGE_FRAGMENTS,
 };
 pub use queries::{StoreStats, StoredContentChunk};
+pub use session_log::{SessionLogEvent, StoredSessionLogEvent};
 
 use atomic_core::change::format_v3::{self, ChangeReader, FormatError, SectionType};
 use atomic_core::change::{Change, ChangeHeader};
@@ -316,6 +318,9 @@ impl RedbChangeStore {
                 let _ = txn.open_table(tables::CHANGE_UNHASHED)?;
                 let _ = txn.open_table(tables::CHANGE_SIGNATURES)?;
                 Self::initialize_provenance_tables(&txn)?;
+                let _ = txn.open_table(tables::SESSION_LOG)?;
+                let _ = txn.open_table(tables::SESSION_LOG_IDS)?;
+                let _ = txn.open_table(tables::SESSION_LOG_INDEX)?;
             }
             txn.commit()?;
         }

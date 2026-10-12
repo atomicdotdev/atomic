@@ -1109,6 +1109,46 @@ impl Service {
         })
     }
 
+    pub fn append_hook_log(
+        &self,
+        request: pb::AppendHookLogRequest,
+    ) -> CliResult<pb::AppendHookLogResponse> {
+        self.call(move |backend| async move {
+            match backend {
+                Backend::Local(state) => services_agent::ProvenanceImpl { state }
+                    .append_hook_log(Request::new(request))
+                    .await
+                    .map(|response| response.into_inner()),
+                Backend::Reactor(channel) => {
+                    pb::provenance_service_client::ProvenanceServiceClient::new(channel)
+                        .append_hook_log(request)
+                        .await
+                        .map(|response| response.into_inner())
+                }
+            }
+        })
+    }
+
+    pub fn load_hook_log(
+        &self,
+        request: pb::LoadHookLogRequest,
+    ) -> CliResult<pb::LoadHookLogResponse> {
+        self.call(move |backend| async move {
+            match backend {
+                Backend::Local(state) => services_agent::ProvenanceImpl { state }
+                    .load_hook_log(Request::new(request))
+                    .await
+                    .map(|response| response.into_inner()),
+                Backend::Reactor(channel) => {
+                    pb::provenance_service_client::ProvenanceServiceClient::new(channel)
+                        .load_hook_log(request)
+                        .await
+                        .map(|response| response.into_inner())
+                }
+            }
+        })
+    }
+
     pub fn list_sessions(
         &self,
         request: pb::ListSessionsRequest,

@@ -82,6 +82,7 @@ impl Command for Receive {
         // Keep the entry-point outcome separate from the service's event-type
         // outcome: malformed stdin and transport failures never reach the
         // service, but a later successful receive must clear those failures.
+        let mut hook_context = super::hook_log::HookContext::from_input(&[]);
         let dispatch = (|| {
             let mut input = Vec::new();
             std::io::stdin().read_to_end(&mut input).map_err(|e| {
@@ -90,10 +91,17 @@ impl Command for Receive {
                     format!("Failed to read typed event from stdin: {}", e),
                 ))
             })?;
+            hook_context = super::hook_log::HookContext::from_input(&input);
             let event: TurnEvent =
                 serde_json::from_slice(&input).map_err(|e| CliError::InvalidArgument {
                     message: format!("Invalid typed TurnEvent JSON: {}", e),
                 })?;
+            let mut event_context = super::hook_log::HookContext::from_event(&event);
+            event_context.parent_session_id = hook_context
+                .parent_session_id
+                .clone()
+                .or(event_context.parent_session_id);
+            hook_context = event_context;
 
             let agent_identity =
                 super::identity::resolve_effective_agent_identity().map(|(name, _)| name);
@@ -105,10 +113,12 @@ impl Command for Receive {
                 &agent_name,
                 &agent_display,
                 agent_identity,
+                &hook_context,
             )
         })();
-        let result = super::health::record_result(
+        let result = super::hook_log::record_result(
             &repo_root,
+            &hook_context,
             &agent_name,
             &agent_display,
             "receive",

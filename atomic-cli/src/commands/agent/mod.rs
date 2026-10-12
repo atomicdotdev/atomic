@@ -49,6 +49,7 @@ pub(crate) mod receive;
 mod status;
 
 pub(crate) use atomic_agent::hook_health as health;
+pub(crate) mod hook_log;
 use clap::{Args, Subcommand};
 
 use crate::commands::Command;

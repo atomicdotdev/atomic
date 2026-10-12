@@ -3782,6 +3782,19 @@ pub struct ProvenanceImpl {
 
 #[tonic::async_trait]
 impl provenance_service_server::ProvenanceService for ProvenanceImpl {
+    async fn append_hook_log(
+        &self,
+        request: Request<crate::atomic::AppendHookLogRequest>,
+    ) -> Result<Response<crate::atomic::AppendHookLogResponse>, Status> {
+        crate::daemon::services_provenance::append_hook_log_impl(&self.state, request).await
+    }
+
+    async fn load_hook_log(
+        &self,
+        request: Request<crate::atomic::LoadHookLogRequest>,
+    ) -> Result<Response<crate::atomic::LoadHookLogResponse>, Status> {
+        crate::daemon::services_provenance::load_hook_log_impl(&self.state, request).await
+    }
     async fn dispatch_turn_event(
         &self,
         request: Request<DispatchTurnEventRequest>,
@@ -3803,6 +3816,29 @@ impl provenance_service_server::ProvenanceService for ProvenanceImpl {
             .as_ref()
             .map(|body| body.event_type.clone())
             .unwrap_or_else(|| "dispatch_turn_event".to_string());
+        let mut hook_context = atomic_agent::hook_log::HookContext::default();
+        if let Some(body) = &request.event {
+            let raw_json = body
+                .raw_json
+                .as_ref()
+                .and_then(|bytes| serde_json::from_slice(bytes).ok());
+            let event = TurnEvent {
+                session_id: body.session_id.clone(),
+                raw_json,
+                ..TurnEvent::new(
+                    &body.session_id,
+                    atomic_agent::event::HookType::SessionStart,
+                )
+            };
+            hook_context = atomic_agent::hook_log::HookContext::from_event_payload(&event);
+            if body
+                .parent_session_id
+                .as_deref()
+                .is_some_and(|parent| !parent.is_empty())
+            {
+                hook_context.parent_session_id = body.parent_session_id.clone();
+            }
+        }
         let dispatch = async {
             let body = request
                 .event
@@ -3863,7 +3899,31 @@ impl provenance_service_server::ProvenanceService for ProvenanceImpl {
             }))
         }
         .await;
-        atomic_agent::hook_health::record_result(&handle.root, &agent_id, &display, &verb, dispatch)
+        atomic_agent::hook_log::record_result(
+            &hook_context,
+            &agent_id,
+            &display,
+            &verb,
+            dispatch,
+            |event| {
+                let append = (|| {
+                    let store = handle.change_store().map_err(|error| error.to_string())?;
+                    store
+                        .append_session_log(event)
+                        .map_err(|error| error.to_string())?;
+                    if let Err(error) = atomic_agent::hook_log::flush_pending(&handle.root, &store)
+                    {
+                        tracing::warn!("hook log spool: {error}");
+                    }
+                    Ok::<_, String>(())
+                })();
+                if let Err(error) = append {
+                    tracing::debug!("hook log storage unavailable, spooling event: {error}");
+                    return atomic_agent::hook_log::spool(&handle.root, event);
+                }
+                Ok(())
+            },
+        )
     }
 
     async fn reserve_turn(

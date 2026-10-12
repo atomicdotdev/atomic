@@ -528,6 +528,14 @@ pub const PROVENANCE_EVENT_INDEX: TableDefinition<&[u8; 32], &[u8; 16]> =
 pub const PROVENANCE_FINAL_HASHES: TableDefinition<&[u8; 32], u64> =
     TableDefinition::new("provenance_final_hashes");
 
+/// Operational diagnostics, independent of provenance turn lifecycle.
+pub const SESSION_LOG: TableDefinition<u64, &[u8]> = TableDefinition::new("session_log");
+/// Retry deduplication: event UUID → committed sequence.
+pub const SESSION_LOG_IDS: TableDefinition<&str, u64> = TableDefinition::new("session_log_ids");
+/// File-independent session lookup: (BLAKE3(session ID), sequence BE) → sequence.
+pub const SESSION_LOG_INDEX: TableDefinition<&[u8; 40], u64> =
+    TableDefinition::new("session_log_index");
+
 // Session Tables (provenance-derived session data)
 //
 // Populated from every provenance graph, regardless of the producing agent.

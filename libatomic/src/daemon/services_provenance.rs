@@ -40,6 +40,113 @@ use super::provenance_core as core;
 use super::services_agent::response_meta;
 use super::state::{domain_status, DaemonState};
 
+pub fn hook_log_domain(
+    event: crate::atomic::HookLogEvent,
+) -> atomic_repository::redb_change_store::SessionLogEvent {
+    atomic_repository::redb_change_store::SessionLogEvent {
+        event_id: event.event_id,
+        session_id: event.session_id,
+        parent_session_id: event.parent_session_id,
+        agent: event.agent,
+        display_name: event.display_name,
+        verb: event.verb,
+        outcome: event.outcome,
+        detail: event.detail,
+        at: event.at,
+    }
+}
+
+pub fn hook_log_proto(
+    event: atomic_repository::redb_change_store::SessionLogEvent,
+) -> crate::atomic::HookLogEvent {
+    crate::atomic::HookLogEvent {
+        event_id: event.event_id,
+        session_id: event.session_id,
+        parent_session_id: event.parent_session_id,
+        agent: event.agent,
+        display_name: event.display_name,
+        verb: event.verb,
+        outcome: event.outcome,
+        detail: event.detail,
+        at: event.at,
+    }
+}
+
+pub async fn append_hook_log_impl(
+    state: &Arc<DaemonState>,
+    request: Request<crate::atomic::AppendHookLogRequest>,
+) -> Result<Response<crate::atomic::AppendHookLogResponse>, Status> {
+    let request = request.into_inner();
+    let reference = request
+        .repository
+        .as_ref()
+        .ok_or_else(|| Status::invalid_argument("repository required"))?;
+    let handle = state.resolve(reference)?;
+    state.log_rpc("AppendHookLog", Some(&handle));
+    let gate_handle = handle.clone();
+    let _gate = gate_handle.exclusive().await;
+    let event = hook_log_domain(
+        request
+            .event
+            .ok_or_else(|| Status::invalid_argument("event required"))?,
+    );
+    let response = tokio::task::spawn_blocking(move || {
+        let store = handle.change_store()?;
+        let sequence = store
+            .append_session_log(&event)
+            .map_err(|error| domain_status(ErrorCode::ProvenanceStore, error.to_string()))?;
+        if let Err(error) = atomic_agent::hook_log::flush_pending(&handle.root, &store) {
+            tracing::warn!("hook log spool: {error}");
+        }
+        Ok::<_, Status>(crate::atomic::AppendHookLogResponse {
+            sequence,
+            meta: response_meta(&request.meta),
+        })
+    })
+    .await
+    .map_err(|error| Status::internal(error.to_string()))??;
+    Ok(Response::new(response))
+}
+
+pub async fn load_hook_log_impl(
+    state: &Arc<DaemonState>,
+    request: Request<crate::atomic::LoadHookLogRequest>,
+) -> Result<Response<crate::atomic::LoadHookLogResponse>, Status> {
+    let request = request.into_inner();
+    let reference = request
+        .repository
+        .as_ref()
+        .ok_or_else(|| Status::invalid_argument("repository required"))?;
+    let handle = state.resolve(reference)?;
+    state.log_rpc("LoadHookLog", Some(&handle));
+    let gate_handle = handle.clone();
+    let _gate = gate_handle.exclusive().await;
+    let response = tokio::task::spawn_blocking(move || {
+        let store = handle.change_store()?;
+        let entries = store
+            .load_session_log(
+                request.session_id.as_deref(),
+                request.after_sequence,
+                if request.limit == 0 {
+                    512
+                } else {
+                    request.limit as usize
+                },
+            )
+            .map_err(|error| domain_status(ErrorCode::ProvenanceStore, error.to_string()))?
+            .into_iter()
+            .map(|entry| crate::atomic::HookLogEntry {
+                sequence: entry.sequence,
+                event: Some(hook_log_proto(entry.event)),
+            })
+            .collect();
+        Ok::<_, Status>(crate::atomic::LoadHookLogResponse { entries })
+    })
+    .await
+    .map_err(|error| Status::internal(error.to_string()))??;
+    Ok(Response::new(response))
+}
+
 // ---------------------------------------------------------------------------
 // domain ↔ protobuf mapping
 // ---------------------------------------------------------------------------

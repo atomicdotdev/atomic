@@ -88,6 +88,7 @@ pub mod error;
 pub mod event;
 pub mod export;
 pub mod hook_health;
+pub mod hook_log;
 pub mod hooks;
 pub mod identity;
 pub mod integrations;

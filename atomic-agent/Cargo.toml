@@ -44,6 +44,9 @@ anyhow = { workspace = true }
 
 # Logging
 log = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+uuid = { workspace = true }
 
 # Filesystem traversal (fallback watcher when Watchman unavailable)
 walkdir = { workspace = true }
