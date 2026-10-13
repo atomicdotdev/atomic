@@ -12,10 +12,10 @@ Ship **three artifacts** that every downstream phase depends on:
 2. **`ProjectId`** — a stable, unique project identity minted at `atomic init` and cast
    into IRIs so that future cross-project SPARQL queries have a canonical namespace per
    repository.
-3. **Native SHACL engine** — parse and evaluate SHACL shapes against the property-graph
-   KG. No hand-coded Rust validators. Enterprise users add custom shapes in
-   `.atomic/shapes/*.ttl`; the engine evaluates them the same way it evaluates builtin
-   shapes.
+3. **SHACL integration using PurRDF** — adapt workflow data to RDF and evaluate
+   builtin and enterprise-authored shapes with an existing engine, provisionally
+   `purrdf-shapes = 3.0.1`. No hand-rolled validator or constraint evaluator.
+   Enterprise users add custom shapes in `.atomic/shapes/*.ttl`.
 
 Everything else — projectors, storage cutover, inference, consumers — comes later.
 This keeps Phase 1 reviewable while guaranteeing that IRIs are stable and validation
@@ -295,30 +295,42 @@ projector actually emits project-qualified IRIs yet. This is deliberate:
 projectors come in Phase 2, but the identity must exist first so that Phase 2
 can use it without a second migration.
 
-### 1.4 SHACL validation engine (`atomic_core::kg::shacl`)
+### 1.4 SHACL integration (PurRDF, existing engine)
 
-**Decision:** SHACL is the primary validation mechanism. We do not write hand-coded
-Rust checks that mirror SHACL rules. We parse SHACL shapes and evaluate them against
-the property-graph KG.
+**Decision:** SHACL shapes are the primary workflow-policy definitions. Use an
+existing SHACL engine, not hand-coded checks or an Atomic-owned subset evaluator.
+The provisional choice is **`purrdf-shapes = "=3.0.1"`** from
+[PurRDF](https://github.com/Blackcat-Informatics/purrdf).
 
-**Dependencies:** `oxttl` (~20 crates) + `oxrdf` for parsing Turtle / RDF. These are
-acceptable per the 2026-07-06 decision in `docs/shacl-oxirs-spike-findings.md`.
-`oxirs` (~432 crates, silently drops `sh:node`/`sh:sparql`) is still rejected.
+The [initial spike](./shacl-purrdf-spike-findings.md) compiled the published crate
+without source changes and passed eleven tests. The reproducible standalone package
+is [`tools/shacl-purrdf-spike`](../tools/shacl-purrdf-spike/README.md), outside the
+Atomic workspace. This is evidence for adoption, not proof of complete conformance.
 
-**What the engine supports (Phase 1):**
+**Observed in the spike:**
 
-| SHACL feature | Status | Rationale |
-|---|---|---|
-| `sh:NodeShape`, `sh:PropertyShape` | ✓ | Core shape types |
-| `sh:targetClass`, `sh:targetSubjectsOf`, `sh:targetObjectsOf` | ✓ | Target declaration |
-| `sh:class`, `sh:datatype`, `sh:minCount`, `sh:maxCount` | ✓ | Cardinality and typing |
-| `sh:minExclusive`, `sh:minInclusive`, `sh:maxExclusive`, `sh:maxInclusive` | ✓ | Range checks |
-| `sh:minLength`, `sh:maxLength`, `sh:pattern` | ✓ | String constraints |
-| `sh:hasValue`, `sh:in` | ✓ | Enumerated values |
-| `sh:node` | ✗ | Defer; complex nesting |
-| `sh:or`, `sh:and`, `sh:not` | ✓ | Boolean logic |
-| `sh:sparql` | ✗ | Requires SPARQL; defer to federation phase |
-| `sh:property` paths (`sh:path`) | ✓ | Predicate, inverse, sequence (limited) |
+| SHACL behavior | Result |
+|---|---|
+| Target class + required/exactly-one property | Positive and negative fixtures pass |
+| Nested `sh:node` with enum constraints | Enforced; no deferral to Phase 2 |
+| Local `sh:sparql` conditional requirements | Enforced; independent of federation |
+| Inverse and sequence paths | Enforced; complex report path retained |
+| Class, datatype, and `sh:or` | Positive and negative fixtures pass |
+| Report focus/path/shape/component/severity/message | Present; separate paths do not collapse |
+| Malformed cardinality parameter / malformed SPARQL query | Shape loading returns an error |
+| Unsupported SHACL-JS | Returns an error, even with an empty data graph |
+| Valid shape with no applicable focus nodes | Conforms vacuously; target coverage must be reported separately |
+
+PurRDF documents broader Core/SPARQL support; additional constructs must be covered
+by profile regression tests before we depend on them. `oxttl` and `oxrdf` are
+parser/data-model utilities, **not** the validation engine.
+
+**Toolchain/deployment gate:** PurRDF 3.0.1 requires **Rust 1.98**, while Atomic
+currently declares **1.90**. The spike uses a separate toolchain and resolves 73
+dependency packages (including target-specific packages). M3 must explicitly choose
+an approved MSRV upgrade for embedded use or a separately built PurRDF runner.
+Do not silently raise Atomic's MSRV. Either deployment runs the same SHACL shapes;
+there is no hand-rolled fallback.
 
 **Builtin shape graphs:**
 
@@ -334,15 +346,27 @@ acceptable per the 2026-07-06 decision in `docs/shacl-oxirs-spike-findings.md`.
   - no managed turn is governed by more than one intent;
   - every turn has exactly one provenance graph;
   - every generated change is covered by the session attestation;
-  - every attestation has a signer DID and valid proof.
+  - every attestation has the required signer identity and an explicit successful
+    verification result supplied by a separate cryptographic verifier.
+
+SHACL cannot establish signature validity by itself. These shapes define the
+intended profiles; fixture tests in Phase 1 prove their behavior, while complete
+live projection and mandatory publication enforcement land in Phase 2. Running
+shapes without applicable focus nodes must not be presented as complete audit evidence.
 
 **Enterprise custom shapes:**
 
-Repository directory `.atomic/shapes/*.ttl` is loaded automatically on `atomic query
-validate` and on every `vault sync`. Failed shapes are reported in the CLI with
-`sh:focusNode`, `sh:resultPath`, and `sh:resultMessage`.
+Repository directory `.atomic/shapes/*.ttl` is loaded on `atomic query validate`.
+Automatic `vault sync` validation and publication hooks land in Phase 2. Builtin
+and enterprise shapes use the same engine; policy changes do not require Rust code.
+Use explicit validation profiles so teams can select applicable workflow rules.
 
-Example enterprise shape:
+Report `sh:focusNode`, `sh:resultPath`, `sh:sourceShape`,
+`sh:sourceConstraintComponent`, `sh:resultSeverity`, and `sh:resultMessage`, retaining
+complex path structure and multiple findings. Shape parse/load/execution errors
+are distinct from violations and must never yield a successful validation result.
+
+Example enterprise traceability shape (illustrative, not a complete SOX policy):
 
 ```turtle
 @prefix atomic: <https://atomic.dev/ns/workflow#> .
@@ -363,52 +387,26 @@ Example enterprise shape:
   ] .
 ```
 
-**API surface:**
+**Integration boundary — adaptation, not evaluation:**
 
-```rust
-// atomic-core/src/kg/shacl.rs (new module)
-pub struct ShaclValidator { ... }
+1. Adapt a read-only workflow snapshot into RDF with canonical predicates/types,
+   full resource IRIs, typed literals, and properly scoped blank nodes. Existing
+   legacy workflow terms are translated at this boundary; AST relationships are
+   excluded. This does not require a storage cutover or rewriting signed objects.
+2. Load builtin and selected enterprise shape bundles with explicit base IRIs and
+   controlled imports. Do not fetch arbitrary remote shape imports implicitly.
+3. Call PurRDF's existing API. The spike uses
+   `purrdf_shapes::engine::validate_graphs(data_nt, shapes_ttl, shapes_base)`;
+   assess its prepared-shape/dataset APIs for production snapshot reuse.
+4. Preserve its standard validation report; adapt presentation to CLI JSON/text
+   without losing source shapes, paths, messages, or severity.
 
-impl ShaclValidator {
-    /// Load a shape graph from a .ttl file.
-    pub fn load_shapes(&mut self, ttl: &str) -> Result<(), ShaclError>;
-
-    /// Validate the KG (property-graph read interface) against loaded shapes.
-    pub fn validate(&self, kg: &dyn KgRead) -> ValidationReport;
-
-    /// Validate a single focus node.
-    pub fn validate_node(&self, kg: &dyn KgRead, node: &NodeId, shape: &ShapeId)
-        -> Result<(), Vec<ConstraintViolation>>;
-}
-
-pub struct ValidationReport {
-    pub conforms: bool,
-    pub results: Vec<ConstraintViolation>,
-}
-
-pub struct ConstraintViolation {
-    pub focus_node: String,     // IRI
-    pub result_path: Option<String>,
-    pub severity: Severity,     // sh:Violation, sh:Warning, sh:Info
-    pub message: String,
-    pub shape: String,
-}
-```
-
-The validator operates over a small **graph-access trait**, not redb directly:
-
-```rust
-pub trait KgRead {
-    fn subjects(&self) -> Box<dyn Iterator<Item = &str>>;
-    fn types(&self, node: &str) -> Vec<&str>;
-    fn objects(&self, subject: &str, predicate: &str) -> Vec<&str>;
-    fn has_property(&self, subject: &str, predicate: &str, object: &str) -> bool;
-    fn literal(&self, subject: &str, predicate: &str) -> Vec<Literal>;
-}
-```
-
-This trait is implemented for the property-graph tables (`kg_nodes`, `kg_edges`)
-and also for an in-memory `oxrdf::Dataset` during tests.
+Atomic code owns snapshot adaptation, profile selection, invocation, and report
+presentation only. PurRDF owns shape parsing and constraint execution. Missing
+projection facts remain missing—no guessed links or bespoke policy evaluator.
+Record snapshot/profile identity and target coverage; an empty target set does not
+prove workflow completeness. The adapter's fidelity needs integration tests beyond
+the synthetic spike. No OWL inference is performed by this boundary in Phase 1.
 
 **CLI:**
 
@@ -461,11 +459,10 @@ Tests:
 | Projector rewrite (`vault.rs`, `vcs.rs`, `session.rs`, `attestation.rs`, `findings.rs`) | Phase 2 |
 | `reconcile()` pipeline | Phase 2 |
 | OWL 2 RL inference engine (`kg::reason`) | Phase 2 |
-| `sh:sparql` and advanced path expressions | Federation phase |
+| Cross-project SPARQL endpoints / federation catalogs | Later federation phase |
 | Consumer cutover (`query`, triage, daemon, proto) | Phase 2 |
 | Code-structure edges (`calls`, `defines`, `exports`, `includes`, `modifiesEntity`) | When sourced from AST |
 | Scope-qualified entity IDs | Same — when code-structure edges are needed |
-| `sh:node` (shape nesting) | Phase 2 |
 | Project identity rotation / fork command | Phase 2 |
 | DID binding on `ProjectIdentity.issuer` | Phase 2 |
 
@@ -482,12 +479,20 @@ Tests:
 6. **Project identity:** `atomic init` creates a `ProjectId`; `atomic project identity show`
    displays it; the ID round-trips through base32 encoding; IRIs minted via `kg::iri`
    match the canonical format.
-7. **SHACL engine:** `projection-1.0.0.ttl` and `publication-1.0.0.ttl` parse and
-   evaluate against a test property graph without error.
+7. **SHACL integration:** PurRDF evaluates positive and negative fixtures for both
+   builtin profiles, nested shapes, local SPARQL conditions, and property paths.
+   No Atomic-owned constraint evaluator. The MSRV/deployment decision is explicit.
 8. **Custom shapes:** placing a `.ttl` in `.atomic/shapes/` causes `atomic query validate`
-   to load and evaluate it.
-9. **Conformance report:** `ValidationReport` produces `sh:focusNode`, `sh:resultPath`,
-   `sh:resultMessage` for every violation.
+   to load and evaluate it using the same engine as builtin profiles.
+9. **Conformance report:** preserve standard focus/path/source/component/severity/
+   message fields and complex path structures. Parse/runtime failures are errors,
+   never conformance. Report the selected profile and target coverage separately.
+10. **Adapter fidelity:** real workflow snapshots preserve resource identity, types,
+    typed literals, and missing facts. Empty or partial projections must not be
+    described as complete audit evidence.
+11. **Regression corpus:** retain the isolated spike, add the existing gate fixtures
+    and relevant W3C cases, and compare against an independent SHACL implementation
+    before enabling mandatory production gates.
 
 ## 4. Milestones
 
@@ -509,32 +514,45 @@ Tests:
 - CLI: `atomic project identity show`
 - Property tests: round-trip, percent-encoding, strict base32 parsing
 
-### M3 — SHACL engine + builtin shapes (one PR, depends on M1)
+### M3 — PurRDF SHACL integration + builtin shapes (depends on M1/M2)
 
-- `oxttl` + `oxrdf` dependency
-- `atomic_core::kg::shacl` module with `ShaclValidator`, `KgRead` trait,
-  `ValidationReport`, `ConstraintViolation`
-- `projection-1.0.0.ttl` and `publication-1.0.0.ttl`
-- In-memory `oxrdf::Dataset` adapter for `KgRead` (testing)
-- CLI: `atomic query validate`
-- Custom shape loader from `.atomic/shapes/*.ttl`
-- Test: a synthetic property graph passes/fails each builtin shape as expected
+- Retain the standalone `purrdf-shapes = 3.0.1` spike and lockfile.
+- Resolve Rust 1.98 versus Atomic's 1.90 MSRV: approved embedded upgrade or separate
+  validation runner. Select deployment before adding workspace dependencies.
+- Implement the read-only workflow-to-RDF adapter and a thin PurRDF invocation layer;
+  no custom SHACL evaluator, policy-rule compilation, or hand-coded mirror checks.
+- `projection-1.0.0.ttl` and `publication-1.0.0.ttl`, including local SPARQL rules
+  wherever workflow consistency requires them.
+- CLI: `atomic query validate`, profile selection, standard reports and error exits.
+- Custom shape loader from `.atomic/shapes/*.ttl`, controlled imports, no-target
+  diagnostics, and snapshot/profile identification.
+- Positive/negative profile fixtures, adapter integration tests, existing gate
+  regressions, and independent-validator comparisons before production enforcement.
 
 ## 5. Development notes
 
-### Why not oxirs?
+### Engine selection and historical decision
 
-`oxirs` (~432 transitive deps) silently drops `sh:node` and `sh:sparql`. We write
-the subset we need (~800–1200 lines) against `oxrdf`/`oxttl`, grow it only when a
-shape requires it, and keep the graph-access trait small enough to extract later
-into a standalone crate if the engine becomes general-purpose.
+The [OxiRS spike](./shacl-oxirs-spike-findings.md) tested **0.3.1**, with nested/
+SPARQL constraints silently unenforced, lost result paths, and a large dependency
+footprint. Do not generalize those findings to every future OxiRS release.
 
-### Why `KgRead` trait instead of redb directly?
+The [PurRDF 3.0.1 spike](./shacl-purrdf-spike-findings.md) passed the initial probes
+for those failure categories. It is the provisional Phase 1 engine choice, subject
+to the MSRV decision and broader regression coverage. A version number alone is
+not a conformance or maturity guarantee.
 
-The trait abstracts over property-graph tables, `oxrdf::Dataset`, and any future
-RDF store. Validation tests run against an in-memory dataset without a database.
-If the engine ever needs to move into a standalone crate (e.g. for the Circuit
-Breaker workflow), the trait goes with it and redb does not.
+This plan replaces the historical direction of hand-coded workflow gates / an
+in-house SHACL subset with **SHACL shapes executed by an existing engine**. Existing
+cryptographic verification and identity/authorization checks remain separate;
+SHACL evaluates their recorded results, not signatures themselves.
+
+### Why an RDF snapshot adapter instead of redb inside the engine?
+
+Keep the database and authoritative objects in Atomic. Adapt workflow facts to
+PurRDF's RDF input and retain its reports. This allows either embedded validation
+or an isolated runner without maintaining a second authoritative store. The engine
+integration must not pull source-code relationship extraction into Phase 1.
 
 ### Enterprise workflow shapes
 
