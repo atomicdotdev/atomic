@@ -516,15 +516,7 @@ impl Repository {
         // `del_view` enforces:
         // - Shared views cannot be deleted (returns CannotDeleteSharedView)
         // - Views with children cannot be deleted (returns ViewHasChildren)
-        // Remove workspace directory for this view before deleting
-        // the view from the database.  This cleans up any shelved
-        // artifacts (node_modules, dist, etc.) that were stored when
-        // the user last switched away from this view.
-        let ws = workspace_path(&self.dot_dir, name);
-        if ws.is_dir() {
-            let _ = std::fs::remove_dir_all(&ws);
-        }
-
+        // - Views selected by a working copy cannot be deleted
         txn.del_view(&view).map_err(|e| match &e {
             atomic_core::pristine::PristineError::CannotDeleteSharedView { name } => {
                 RepositoryError::InvalidOperation {
@@ -550,6 +542,14 @@ impl Repository {
 
         txn.commit()
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+        // Only clean up legacy shelved artifacts after deletion is durable.
+        // A refused deletion or failed commit must preserve the user's files.
+        // Cleanup remains best-effort because the view is already deleted.
+        let ws = workspace_path(&self.dot_dir, name);
+        if ws.is_dir() {
+            let _ = std::fs::remove_dir_all(&ws);
+        }
 
         Ok(())
     }
@@ -1041,7 +1041,7 @@ impl Repository {
                                 return Err(RepositoryError::ManifestDiverged {
                                     view: manifest.name.clone(),
                                     at: local_len as u64,
-                                })
+                                });
                             }
                         }
                     }
@@ -1063,7 +1063,7 @@ impl Repository {
                     return Err(RepositoryError::ManifestParentMissing {
                         view: manifest.name.clone(),
                         parent: name,
-                    })
+                    });
                 }
                 Err(e) => return Err(e),
             }

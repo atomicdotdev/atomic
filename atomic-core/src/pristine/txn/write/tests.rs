@@ -207,6 +207,39 @@ mod tests {
     }
 
     #[test]
+    fn test_del_view_removes_orphan_reverse_memberships() {
+        let dir = tempdir().unwrap();
+        let pristine = Pristine::open(dir.path().join("pristine")).unwrap();
+        let mut txn = pristine.write_txn().unwrap();
+        let parent = txn.open_or_create_view("parent").unwrap();
+        let view = txn
+            .create_view("old", ViewScope::Draft, Some(parent.id))
+            .unwrap();
+        let other = txn
+            .create_view("other", ViewScope::Draft, Some(parent.id))
+            .unwrap();
+        let hash = Hash::of(b"retained change");
+        let change = txn.register_change(&hash).unwrap();
+        // An earlier incomplete cleanup can leave reverse rows without a
+        // corresponding forward row. Deletion must clear the whole view prefix.
+        {
+            let mut table = txn.txn.open_table(REV_VIEW_CHANGES).unwrap();
+            table
+                .insert(&encode_view_seq(view.id, change.get()), 7)
+                .unwrap();
+            table
+                .insert(&encode_view_seq(other.id, change.get()), 9)
+                .unwrap();
+        }
+        txn.del_view(&view).unwrap();
+        txn.commit().unwrap();
+        let txn = pristine.read_txn().unwrap();
+        assert_eq!(txn.get_change_seq(&view, change).unwrap(), None);
+        assert_eq!(txn.get_change_seq(&other, change).unwrap(), Some(9));
+        assert_eq!(txn.get_external(change).unwrap(), Some(hash));
+    }
+
+    #[test]
     fn test_del_view_preserves_other_views() {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("pristine");

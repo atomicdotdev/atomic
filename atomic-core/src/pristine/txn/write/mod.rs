@@ -1620,25 +1620,24 @@ impl<'a> MutTxnT for WriteTxn<'a> {
             table.remove(view.name.as_str())?;
         }
 
-        // Remove all change log entries for this view
-        {
-            let mut table = self.txn.open_table(VIEW_CHANGES)?;
-            for seq in 0..view.change_count {
-                let key = encode_view_seq(view.id, seq);
-                table.remove(&key)?;
-            }
-        }
-
-        // Remove all reverse change log entries
-        {
-            let mut rev_table = self.txn.open_table(REV_VIEW_CHANGES)?;
-            let table = self.txn.open_table(VIEW_CHANGES)?;
-            for seq in 0..view.change_count {
-                let key = encode_view_seq(view.id, seq);
-                if let Some(change_id) = table.get(&key)? {
-                    let rev_key = encode_view_seq(view.id, change_id.value());
-                    rev_table.remove(&rev_key)?;
+        // Clear each membership index independently by view ID. Looking up
+        // reverse keys through an already-cleared forward index leaves stale
+        // memberships behind, which can affect a later view that reuses the ID.
+        // Prefix cleanup also removes rows left by earlier incomplete cleanup.
+        for definition in [VIEW_CHANGES, REV_VIEW_CHANGES] {
+            let mut table = self.txn.open_table(definition)?;
+            let keys = {
+                let start = encode_view_seq(view.id, 0);
+                let end = encode_view_seq(view.id, u64::MAX);
+                let mut keys = Vec::new();
+                for entry in table.range::<&[u8; 16]>(&start..=&end)? {
+                    let (key, _) = entry?;
+                    keys.push(*key.value());
                 }
+                keys
+            };
+            for key in &keys {
+                table.remove(key)?;
             }
         }
 
