@@ -224,3 +224,42 @@ fn malformed_or_unsupported_pre_serialized_bytes_do_not_mutate() {
 // Capability entries are additive metadata. Binaries predating the generic
 // fence do not know to inspect them and therefore cannot be forced to reject a
 // repository without an intentionally incompatible outer-layout redesign.
+
+#[test]
+fn received_legacy_change_keeps_original_hash_bytes_and_survives_reopen() {
+    let hex: String = include_str!(
+        "../../../../atomic-core/src/change/format_v3/fixtures/cb_fmt1_legacy_v1_object.hex"
+    )
+    .chars()
+    .filter(|c| !c.is_ascii_whitespace())
+    .collect();
+    let bytes: Vec<u8> = (0..hex.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+        .collect();
+    let (change, hash) = Change::deserialize(&mut std::io::Cursor::new(&bytes)).unwrap();
+    assert_ne!(
+        change.hash().unwrap(),
+        hash,
+        "current writer changes legacy identity"
+    );
+    let (temp, repo) = create_temp_repo();
+    assert_eq!(repo.import_change_bytes(&hash, &bytes).unwrap(), hash);
+    assert_eq!(
+        std::fs::read(repo.change_store().change_path(&hash)).unwrap(),
+        bytes
+    );
+    drop(repo);
+    let repo = Repository::open(temp.path()).unwrap();
+    assert_eq!(repo.load_change(&hash).unwrap().contents, change.contents);
+    let wrong = Hash::of(b"wrong remote manifest hash");
+    assert!(repo.import_change_bytes(&wrong, &bytes).is_err());
+    assert!(!repo.has_change(&wrong));
+    let mut corrupt = bytes.clone();
+    corrupt[0] ^= 1;
+    assert!(repo.import_change_bytes(&hash, &corrupt).is_err());
+    assert_eq!(
+        std::fs::read(repo.change_store().change_path(&hash)).unwrap(),
+        bytes
+    );
+}

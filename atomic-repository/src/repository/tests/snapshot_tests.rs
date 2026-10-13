@@ -60,6 +60,59 @@ fn snapshot_chain(
 }
 
 #[test]
+fn pending_snapshot_can_follow_only_an_identical_canonical_baseline() {
+    let (directory, mut repo) = create_temp_repo();
+    let snapshots = snapshot_chain(&directory, &mut repo, &[b"pending\n"]);
+    let working_copy = repo.working_copy();
+    let snapshot_view = Repository::snapshot_view_name(working_copy);
+    let bytes = persisted_change_bytes(&repo, &snapshots[0]);
+    repo.create_draft_view("agent-child", "dev").unwrap();
+    repo.set_current_view("agent-child").unwrap();
+    repo.ensure_snapshot_view(working_copy).unwrap();
+    assert_eq!(
+        repo.get_view_info(&snapshot_view)
+            .unwrap()
+            .parent_name
+            .as_deref(),
+        Some("agent-child")
+    );
+    assert_eq!(direct_view_hashes(&repo, &snapshot_view), snapshots);
+    assert_eq!(persisted_change_bytes(&repo, &snapshots[0]), bytes);
+
+    {
+        let mut txn = repo.pristine.write_txn().unwrap();
+        txn.create_view("different-baseline", ViewScope::Shared, None)
+            .unwrap();
+        txn.commit().unwrap();
+    }
+    repo.set_current_view("different-baseline").unwrap();
+    let error = repo.ensure_snapshot_view(working_copy).unwrap_err();
+    assert!(error.to_string().contains("different baseline"), "{error}");
+    assert_eq!(
+        repo.get_view_info(&snapshot_view)
+            .unwrap()
+            .parent_name
+            .as_deref(),
+        Some("agent-child")
+    );
+    assert_eq!(direct_view_hashes(&repo, &snapshot_view), snapshots);
+    assert_eq!(
+        std::fs::read(directory.path().join("retention.txt")).unwrap(),
+        b"pending\n"
+    );
+    drop(repo);
+    let repo = Repository::open(directory.path()).unwrap();
+    assert_eq!(persisted_change_bytes(&repo, &snapshots[0]), bytes);
+    assert_eq!(
+        repo.get_view_info(&snapshot_view)
+            .unwrap()
+            .parent_name
+            .as_deref(),
+        Some("agent-child")
+    );
+}
+
+#[test]
 fn snapshot_replacement_is_baseline_relative_private_and_journaled() {
     let (directory, mut repo) = create_temp_repo();
     let working_copy = repo.working_copy();

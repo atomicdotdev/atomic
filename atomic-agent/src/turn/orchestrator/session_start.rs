@@ -361,6 +361,8 @@ impl TurnOrchestrator {
             }
         }
 
+        self.coordinate_session_view(&session.view_name)?;
+
         // Save the new session
         self.session_store.save(&session)?;
 
@@ -583,6 +585,8 @@ impl TurnOrchestrator {
                         }
                     }
                 }
+
+                self.coordinate_session_view(&session.view_name)?;
 
                 // Persist so subsequent hooks find this session.
                 self.session_store.save(&session)?;

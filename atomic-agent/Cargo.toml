@@ -61,12 +61,14 @@ dirs = { workspace = true }
 # Read-only access to OpenCode's session store (transcript recovery)
 rusqlite = { workspace = true }
 
+# Resolve the exact HEAD tree for verified repository-operation receipts.
+git2 = { workspace = true }
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Threading"] }
 
 [dev-dependencies]
 tempfile = { workspace = true }
-git2 = { workspace = true }
 
 serial_test = { workspace = true }
 

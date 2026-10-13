@@ -190,7 +190,28 @@ impl Repository {
                     });
                 }
                 if view.parent != Some(baseline.id) {
-                    if view.change_count != 0 {
+                    let same_baseline = match view.parent {
+                        Some(parent) => {
+                            match ViewTxnT::get_view_by_id(&txn, parent)
+                                .map_err(RepositoryError::from)?
+                            {
+                                Some(parent) => {
+                                    let old = super::effective_projection_closure(&txn, &parent)?;
+                                    let new = super::effective_projection_closure(&txn, &baseline)?;
+                                    old.iter_dependency_first()
+                                        .copied()
+                                        .collect::<std::collections::BTreeSet<_>>()
+                                        == new
+                                            .iter_dependency_first()
+                                            .copied()
+                                            .collect::<std::collections::BTreeSet<_>>()
+                                }
+                                None => false,
+                            }
+                        }
+                        None => false,
+                    };
+                    if view.change_count != 0 && !same_baseline {
                         return Err(RepositoryError::InvalidOperation {
                             message: format!(
                                 "snapshot view '{}' still contains a snapshot for a different baseline",

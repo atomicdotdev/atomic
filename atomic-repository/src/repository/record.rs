@@ -2540,15 +2540,17 @@ impl Repository {
         if options.get_apply_after_record() && outcome.was_saved() {
             let apply_opts = InsertOptions::default().view(&target_view);
             let apply_t0 = std::time::Instant::now();
-            let apply_result = (|| {
-                #[cfg(test)]
-                if RECORD_APPLY_FAULT.with(|fault| fault.replace(false)) {
-                    return Err(RepositoryError::InvalidOperation {
-                        message: "injected record apply failure".into(),
-                    });
-                }
+            #[cfg(test)]
+            let inject_apply_failure = RECORD_APPLY_FAULT.with(|fault| fault.replace(false));
+            #[cfg(not(test))]
+            let inject_apply_failure = false;
+            let apply_result = if inject_apply_failure {
+                Err(RepositoryError::InvalidOperation {
+                    message: "injected record apply failure".into(),
+                })
+            } else {
                 self.write_recorded_replacing(&outcome, apply_opts, lifecycle.removal())
-            })();
+            };
             match apply_result {
                 Ok(apply_outcome) => {
                     outcome.set_applied(apply_outcome.new_state);

@@ -21,6 +21,7 @@ use git2::{ObjectType, Repository as GitRepository};
 
 use atomic_config::ContentFilterConfig;
 use atomic_core::operation::GitHashAlgorithm;
+use atomic_core::Base32;
 use atomic_objects::content_key;
 use atomic_repository::{
     compare_project_state, compare_project_to_index, compare_project_to_worktree,
@@ -620,6 +621,114 @@ pub(crate) fn sync_git_head_to_view(
     Ok(ShadowSwitchSync::Synchronized(receipt))
 }
 
+/// Selecting an inherited agent view does not materialize the worktree.
+/// Reuse its already verified Git tree and preserve both staged and unstaged
+/// edits. This narrower transition is valid only for identical closures.
+pub(crate) fn sync_inherited_agent_view(root: &Path, view: &str) -> CliResult<()> {
+    let git = match GitRepository::open(root) {
+        Ok(git) if shadow_sync_active(&git) => git,
+        _ => return Ok(()),
+    };
+    let repo = Repository::open_for_workspace_transaction_wait(
+        root,
+        atomic_repository::database_lock_wait(),
+    )
+    .map_err(CliError::Repository)?;
+    if repo.is_sandbox()
+        && !repo
+            .bridge_workspace_active()
+            .map_err(CliError::Repository)?
+    {
+        return Ok(());
+    }
+    let Some(before) = super::checkpoint::read_checkpoint(root).map_err(checkpoint_error_of)?
+    else {
+        return Err(git_error(
+            "agent view selection requires a verified bridge checkpoint",
+        ));
+    };
+    let old = repo
+        .view_identity(&before.view)
+        .map_err(CliError::Repository)?;
+    let new = repo.view_identity(view).map_err(CliError::Repository)?;
+    if old.set_id != new.set_id
+        || old.closure_len != new.closure_len
+        || old.merkle.to_base32() != before.atomic_state
+    {
+        drop(repo);
+        return crate::commands::view::switch::finish_service_switch(root, view);
+    }
+    let common = repo
+        .try_lock_shadow_commit()
+        .map_err(CliError::Repository)?
+        .ok_or_else(|| git_error("another Git projection is in flight; retry agent startup"))?;
+    let head = git
+        .head()
+        .and_then(|h| h.peel_to_commit())
+        .map_err(|e| git_error(e.to_string()))?;
+    if head.id().to_string() != before.git_head || head.tree_id().to_string() != before.git_tree {
+        return Err(git_error("Git HEAD changed during agent view selection"));
+    }
+    let (policy, _) = current_conversion_policy(root, &git)?;
+    let project = repo
+        .project_tree(view, &policy)
+        .map_err(|e| git_error(e.to_string()))?;
+    if project.git.root.as_bytes() != head.tree_id().as_bytes() {
+        return Err(git_error(
+            "agent view does not project to the checkpointed Git tree",
+        ));
+    }
+    let (target_ref, intended_head, symref) = match resolve_head_policy(&repo, &git, view)? {
+        HeadPolicy::SharedBranch { branch_ref } => (
+            branch_ref.clone(),
+            atomic_core::operation::GitRefTarget::Symbolic(branch_ref.clone()),
+            Some(branch_ref),
+        ),
+        HeadPolicy::Draft { view_ref } => (
+            view_ref,
+            atomic_core::operation::GitRefTarget::Direct(to_core_oid(head.id())?),
+            None,
+        ),
+        HeadPolicy::Ephemeral { .. } => {
+            return Err(git_error("agent view must not be an ephemeral Git view"))
+        }
+    };
+    journal_projection_publication(
+        &repo,
+        &git,
+        view,
+        &target_ref,
+        Some(atomic_core::operation::GitRefTarget::Direct(to_core_oid(
+            head.id(),
+        )?)),
+        Some(intended_head),
+        Vec::new(),
+        None,
+        Some(atomic_repository::ProjectionCheckpointPlan {
+            git_head_symref: symref,
+            git_head: to_core_oid(head.id())?,
+            git_tree: to_core_oid(head.tree_id())?,
+        }),
+        Some(&common),
+    )?;
+    let working_copy = repo
+        .require_working_copy_id()
+        .map_err(CliError::Repository)?;
+    super::ref_mapping::refresh_mapping_observation(
+        &repo,
+        working_copy,
+        &git,
+        view,
+        Some(&head.id().to_string()),
+        Some(&common),
+    )?;
+    // A pending snapshot remains a separate recovery object on the same
+    // canonical baseline; reparenting is allowed only after closure equality.
+    repo.ensure_snapshot_view(working_copy)
+        .map_err(CliError::Repository)?;
+    Ok(())
+}
+
 /// Refresh the verified workspace checkpoint from the live repository
 /// handle (CB-8A). redb admits only one writable handle per process, so the
 /// bridge verifier's own writable open cannot run while a repository handle
@@ -675,7 +784,7 @@ pub(crate) fn sync_git_projection_after_record(
     view: &str,
     change_hash: &atomic_core::types::Hash,
 ) -> CliResult<()> {
-    let git_repo = match GitRepository::discover(repo_root) {
+    let git_repo = match GitRepository::open(repo_root) {
         Ok(repo) => repo,
         Err(_) => return Ok(()),
     };
@@ -683,6 +792,13 @@ pub(crate) fn sync_git_projection_after_record(
         return Ok(());
     }
     let repo = Repository::open(repo_root).map_err(CliError::Repository)?;
+    if repo.is_sandbox()
+        && !repo
+            .bridge_workspace_active()
+            .map_err(CliError::Repository)?
+    {
+        return Ok(());
+    }
     let working_copy = repo
         .require_working_copy_id()
         .map_err(CliError::Repository)?;

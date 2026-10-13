@@ -443,7 +443,13 @@ pub struct TurnOrchestrator {
     /// descriptor, so a second open in the same process deadlocks on
     /// itself.
     pub(crate) publication_lock_held: bool,
+
+    /// Embedding CLI coordinates a newly selected session view with its Git
+    /// bridge before any turn-start baseline can be observed.
+    session_view_coordinator: Option<SessionViewCoordinator>,
 }
+
+type SessionViewCoordinator = fn(&Path, &str) -> Result<(), String>;
 
 impl TurnOrchestrator {
     /// Create a new orchestrator for the given repository.
@@ -484,6 +490,7 @@ impl TurnOrchestrator {
             boundary_refusal: None,
             journal_sink: None,
             publication_lock_held: false,
+            session_view_coordinator: None,
         })
     }
 
@@ -507,6 +514,7 @@ impl TurnOrchestrator {
             boundary_refusal: None,
             journal_sink: None,
             publication_lock_held: false,
+            session_view_coordinator: None,
         }
     }
 
@@ -549,6 +557,19 @@ impl TurnOrchestrator {
     /// Route provenance mutations through a committed repository owner.
     pub fn set_journal_sink(&mut self, sink: Arc<dyn ProvenanceJournalSink>) {
         self.journal_sink = Some(sink);
+    }
+
+    /// Coordinate bridge state after selecting a session view, before tools
+    /// or turn-start observation. Native library callers need no coordinator.
+    pub fn set_session_view_coordinator(&mut self, coordinate: SessionViewCoordinator) {
+        self.session_view_coordinator = Some(coordinate);
+    }
+
+    fn coordinate_session_view(&self, view: &str) -> AgentResult<()> {
+        if let Some(coordinate) = self.session_view_coordinator {
+            coordinate(&self.repo_root, view).map_err(crate::error::AgentError::Internal)?;
+        }
+        Ok(())
     }
 
     /// Record that the embedding process already holds the turn

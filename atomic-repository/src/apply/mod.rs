@@ -111,10 +111,10 @@ pub use types::{InsertError, InsertOptions, InsertOutcome, InsertResult, InsertS
 pub(crate) use types::format_hashes;
 
 use atomic_core::apply::{
-    apply_file_ops_batched, apply_set_attr, compute_new_state, validate_can_apply_with_frontier,
-    verify_causal_frontier, verify_dependencies, write_edge_map_with_frontier,
-    write_new_vertex_with_frontier, CachedWriteGraphTxn, ConflictTracker, MissingContextConflict,
-    Workspace, ZombieConflict,
+    apply_file_ops_batched_with_inodes, apply_set_attr, compute_new_state,
+    validate_can_apply_with_frontier, verify_causal_frontier, verify_dependencies,
+    write_edge_map_with_frontier, write_new_vertex_with_frontier, CachedWriteGraphTxn,
+    ConflictTracker, MissingContextConflict, Workspace, ZombieConflict,
 };
 use atomic_core::change::{Atom, AtomRef, Change, GraphOp};
 use atomic_core::pristine::{GraphTxnT, MutTxnT, WriteTxn};
@@ -431,9 +431,29 @@ fn apply_change_hunks_locked(
                 file_ops_count
             );
         }
-        let _crdt_stats = apply_file_ops_batched(txn, change_id, file_ops).map_err(
-            |e: atomic_core::pristine::PristineError| InsertError::Database(e.to_string()),
-        )?;
+        // FileAdd positions already have stable identities. TREE may still
+        // describe another closure, or have no binding until projection runs.
+        let mut created_inodes = std::collections::HashMap::new();
+        for hunk in hunks {
+            if let GraphOp::FileAdd {
+                add_inode, path, ..
+            } = hunk
+            {
+                let position = atomic_core::types::Position::new(change_id, add_inode.start);
+                let inode = atomic_core::pristine::TreeTxnT::position_inode(txn, position)
+                    .map_err(|error| InsertError::Database(error.to_string()))?
+                    .ok_or_else(|| {
+                        InsertError::Database(format!(
+                            "FileAdd for '{path}' has no inode at {position}"
+                        ))
+                    })?;
+                created_inodes.insert(path.clone(), inode);
+            }
+        }
+        let _crdt_stats =
+            apply_file_ops_batched_with_inodes(txn, change_id, file_ops, &created_inodes).map_err(
+                |e: atomic_core::pristine::PristineError| InsertError::Database(e.to_string()),
+            )?;
         let crdt_ms = crdt_start.elapsed().as_millis();
         if trace_record {
             eprintln!(

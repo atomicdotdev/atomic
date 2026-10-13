@@ -1293,3 +1293,29 @@ fn test_compact_graph_op_full_postcard_roundtrip_via_bytes() {
 
     assert_eq!(op, expanded);
 }
+
+#[test]
+fn legacy_empty_name_markers_are_read_only_compatibility() {
+    let table = make_name_conflict_table();
+    let compactor = Compactor::new(&table);
+    let name = compactor
+        .compact_edge_update(&EdgeUpdate {
+            edges: vec![],
+            inode: make_position(Some(make_hash(0xB0)), 41),
+        })
+        .unwrap();
+    for op in [
+        CompactGraphOp::SolveNameConflict {
+            name: name.clone(),
+            path: "file.txt".into(),
+        },
+        CompactGraphOp::UnsolveNameConflict {
+            name,
+            path: "file.txt".into(),
+        },
+    ] {
+        let legacy = compactor.expand_legacy_graph_op(&op).unwrap();
+        assert!(compactor.expand_graph_op(&op).is_err());
+        assert!(compactor.compact_graph_op(&legacy).is_err());
+    }
+}

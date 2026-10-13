@@ -277,6 +277,23 @@ impl Command for Hooks {
         let boundary_refusal =
             guard_agent_boundary(&repo_root, &mut managed, &event.session_id, hook_type)?;
 
+        // Session selection can now publish a Git projection. Validate the
+        // original boundary before the orchestrator changes the desired view;
+        // a raw checkout or an in-progress Git operation must not be hidden by
+        // an automatic session fork. TurnStart also covers fallback creation
+        // when a host omitted session-start.
+        if matches!(hook_type, HookType::SessionStart | HookType::TurnStart) {
+            let mut repo = Repository::open_for_workspace_transaction_wait(
+                &repo_root,
+                atomic_repository::database_lock_wait(),
+            )
+            .map_err(CliError::Repository)?;
+            let _workspace = crate::commands::workspace_txn::enter_workspace(
+                &mut repo,
+                WorkspaceTxnMode::Reconcile,
+            )?;
+        }
+
         // Create a tokio runtime for the async orchestrator
         // Hook handlers are short-lived — one runtime per invocation is fine.
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -313,6 +330,10 @@ impl Command for Hooks {
             // Set the agent identity so new sessions get the correct name
             // (e.g., "claude-code" / "Claude Code" instead of "unknown")
             orchestrator.set_agent(&agent_name, &agent_display);
+            orchestrator.set_session_view_coordinator(|root, view| {
+                crate::commands::git::shadow::sync_inherited_agent_view(root, view)
+                    .map_err(|error| error.to_string())
+            });
             // The journal goes over the daemon's ProvenanceService —
             // D4 start-or-retry: the sink starts the daemon when it is
             // down (the daemon is the only journal writer).
@@ -354,6 +375,21 @@ impl Command for Hooks {
                 .await
                 .map_err(|e| CliError::Internal(anyhow!("Failed to dispatch hook event: {}", e)))?;
 
+            // Agent recording uses the repository directly, so finish the same
+            // bridge projection as an ordinary CLI/service record. Keep all
+            // provenance/refusal checks ahead of this publication.
+            drop(orchestrator);
+            if dispatch_result.incomplete.is_none() {
+                if let (Some(outcome), Some(view)) =
+                    (&dispatch_result.change_recorded, &dispatch_result.view)
+                {
+                    crate::commands::git::shadow::sync_git_projection_after_record(
+                        &repo_root,
+                        view,
+                        &outcome.hash,
+                    )?;
+                }
+            }
             Ok::<_, CliError>(dispatch_result)
         });
 

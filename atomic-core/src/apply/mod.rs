@@ -268,6 +268,7 @@ pub use conflict::{
 
 // Re-export FileOps application
 pub use file_ops::{
-    apply_file_ops, apply_file_ops_batched, apply_file_ops_batched_groups, ApplyFileOpsStats,
+    apply_file_ops, apply_file_ops_batched, apply_file_ops_batched_groups,
+    apply_file_ops_batched_with_inodes, ApplyFileOpsStats,
 };
 pub use graph_batch::CachedWriteGraphTxn;

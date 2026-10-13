@@ -989,18 +989,8 @@ fn manifest_from_pack(
 
 /// The local `save_downloaded_change` — deserialize, verify the hash, save.
 fn save_downloaded_change(repo: &Repository, hash: &Hash, data: Bytes) -> Result<(), String> {
-    let mut cursor = std::io::Cursor::new(&data[..]);
-    let (change, computed) = atomic_core::change::Change::deserialize(&mut cursor)
-        .map_err(|error| format!("Failed to deserialize change: {error}"))?;
-    if computed != *hash {
-        return Err(format!(
-            "Hash mismatch: expected {}, got {}",
-            hash.to_base32(),
-            computed.to_base32()
-        ));
-    }
-    repo.save_change(&change)
-        .map(|_hash| ())
+    repo.import_change_bytes(hash, &data)
+        .map(|_| ())
         .map_err(|error| format!("Failed to save change: {error}"))
 }
 

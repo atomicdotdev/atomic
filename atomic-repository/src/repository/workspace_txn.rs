@@ -888,6 +888,13 @@ impl Repository {
         if read_workspace_checkpoint(self.root())?.is_some() {
             return Ok(true);
         }
+        // Sandboxes share the canonical config but have their own working-
+        // copy identity. Provisioning copies files (including .git), not the
+        // host's bridge enrollment. Only a local verified checkpoint enrolls
+        // a sandbox; inheriting the host flag would require a missing anchor.
+        if self.is_sandbox() {
+            return Ok(false);
+        }
         let config = atomic_config::RepoConfig::load(&self.dot_dir().join("config.toml")).map_err(
             |error| RepositoryError::InvalidRepository {
                 reason: format!("cannot load the repository configuration: {error}"),

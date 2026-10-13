@@ -21,12 +21,10 @@
 //! This module provides the helper functions that support these operations.
 
 use std::collections::HashSet;
-use std::io::Cursor;
 use std::path::{Path, PathBuf};
 
 use bytes::Bytes;
 
-use atomic_core::change::Change;
 use atomic_core::types::{Base32, Hash};
 use atomic_remote::RemoteError;
 use atomic_repository::{Repository, ViewManifest};
@@ -370,25 +368,9 @@ impl CloneBootstrapBoundary {
 /// save_downloaded_change(&repo, &expected_hash, data)?;
 /// ```
 pub fn save_downloaded_change(repo: &Repository, hash: &Hash, data: Bytes) -> CliResult<()> {
-    // Deserialize the change from bytes
-    let mut cursor = Cursor::new(&data[..]);
-    let (change, computed_hash) = Change::deserialize(&mut cursor)
-        .map_err(|e| CliError::Internal(anyhow::anyhow!("Failed to deserialize change: {}", e)))?;
-
-    // Verify the hash matches what we expected
-    if computed_hash != *hash {
-        return Err(CliError::Internal(anyhow::anyhow!(
-            "Hash mismatch: expected {}, got {}",
-            hash.to_base32(),
-            computed_hash.to_base32()
-        )));
-    }
-
-    // Save to the change store
-    repo.save_change(&change)
-        .map_err(|e| CliError::Internal(anyhow::anyhow!("Failed to save change: {}", e)))?;
-
-    Ok(())
+    repo.import_change_bytes(hash, &data)
+        .map(|_| ())
+        .map_err(|e| CliError::Internal(anyhow::anyhow!("Failed to save change: {}", e)))
 }
 
 // View Manifests

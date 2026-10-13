@@ -27,6 +27,7 @@ fn init() -> tempfile::TempDir {
     root
 }
 
+#[cfg(unix)]
 fn commit_git_paths(root: &Path, message: &str, paths: &[&str]) {
     let git = git2::Repository::open(root).unwrap();
     let mut index = git.index().unwrap();
@@ -43,6 +44,8 @@ fn commit_git_paths(root: &Path, message: &str, paths: &[&str]) {
         .unwrap();
 }
 
+// Git bridge integration currently requires Unix raw-byte path support.
+#[cfg(unix)]
 #[test]
 fn git_import_retires_empty_parent_directories_and_recreates_them() {
     let root = tempfile::tempdir().unwrap();

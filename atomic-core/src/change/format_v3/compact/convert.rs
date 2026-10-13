@@ -190,6 +190,45 @@ impl<'t> Compactor<'t> {
     /// Returns an error if any hash index in the compact operation
     /// is out of bounds for the dedup table.
     pub fn expand_graph_op(&self, op: &CompactGraphOp) -> FormatResult<GraphOp<Option<Hash>>> {
+        self.expand_graph_op_versioned(op, false)
+    }
+
+    /// Historical V1 writers emitted empty name-resolution markers. They had
+    /// no graph effects; retain them when reading their original hashed bytes.
+    /// New writes and V2 reads still require explicit losing-claim transitions.
+    pub(crate) fn expand_legacy_graph_op(
+        &self,
+        op: &CompactGraphOp,
+    ) -> FormatResult<GraphOp<Option<Hash>>> {
+        self.expand_graph_op_versioned(op, true)
+    }
+
+    fn expand_graph_op_versioned(
+        &self,
+        op: &CompactGraphOp,
+        legacy: bool,
+    ) -> FormatResult<GraphOp<Option<Hash>>> {
+        if legacy {
+            match op {
+                CompactGraphOp::SolveNameConflict { name, path }
+                    if name.edges.is_empty() && !path.is_empty() =>
+                {
+                    return Ok(GraphOp::SolveNameConflict {
+                        name: self.expand_edge_update(name)?,
+                        path: path.clone(),
+                    });
+                }
+                CompactGraphOp::UnsolveNameConflict { name, path }
+                    if name.edges.is_empty() && !path.is_empty() =>
+                {
+                    return Ok(GraphOp::UnsolveNameConflict {
+                        name: self.expand_edge_update(name)?,
+                        path: path.clone(),
+                    });
+                }
+                _ => {}
+            }
+        }
         op.validate_serialized_name_conflict()
             .map_err(|reason| FormatError::InvalidGraphOp {
                 operation: op.type_name(),

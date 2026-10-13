@@ -125,6 +125,24 @@ impl Repository {
             .map_err(|e| RepositoryError::Database(e.to_string()))
     }
 
+    /// Verify and store a received ATOM object without changing its identity.
+    ///
+    /// Remote manifests reference the original serialized hash. Re-encoding a
+    /// legacy object with the current writer would invalidate those references.
+    /// Verification precedes both capability declaration and persistence.
+    pub fn import_change_bytes(&self, hash: &Hash, bytes: &[u8]) -> Result<Hash, RepositoryError> {
+        let (change, computed) = Change::deserialize(&mut std::io::Cursor::new(bytes))
+            .map_err(|error| RepositoryError::Serialization(error.to_string()))?;
+        if computed != *hash {
+            return Err(RepositoryError::Serialization(format!(
+                "Hash mismatch: expected {}, got {}",
+                hash.to_base32(),
+                computed.to_base32()
+            )));
+        }
+        self.save_change_bytes(hash, bytes, &change)
+    }
+
     /// Save a change using pre-serialized ATOM bytes (hash-stable).
     ///
     /// This writes the exact bytes to disk after inspecting the explicit ATOM

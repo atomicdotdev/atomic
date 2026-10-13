@@ -169,7 +169,18 @@ pub fn capture_turn_boundary(
 
     Some(TurnBoundary {
         working_copy,
-        operation: None,
+        operation: (|| {
+            use atomic_core::pristine::OperationTxnT;
+            let id = repo.require_working_copy_id().ok()?;
+            let txn = repo.pristine().read_txn().ok()?;
+            let heads = txn
+                .get_operation_heads(atomic_core::operation::OperationScope::WorkingCopy(id))
+                .ok()?;
+            match heads.as_slice() {
+                [head] => Some(head.to_string()),
+                _ => None,
+            }
+        })(),
         view,
         view_state,
         set_id,
@@ -359,6 +370,155 @@ fn checkout_journaled(
     false
 }
 
+/// Explain Atomic's own projection only through verified operation receipts
+/// after the captured working-copy head. Reflog messages and commit metadata
+/// are not authority. Every Git transition must form an exact before/after
+/// chain, so a foreign commit mixed into the turn remains unexplained.
+fn projection_journaled(
+    repo: &atomic_repository::Repository,
+    options: &TurnRecordOptions<'_>,
+    start: &GitBoundaryCheckpoint,
+    end: &GitBoundaryCheckpoint,
+) -> bool {
+    use atomic_core::operation::{
+        ActorRef, EffectTarget, EffectValue, GitHeadState, GitStateRef, OperationKind,
+        OperationScope,
+    };
+    use atomic_repository::OperationVerificationState;
+    let Some(boundary) = options.session.boundary_start.as_ref() else {
+        return false;
+    };
+    let Some(start_operation) = boundary.operation.as_deref() else {
+        return false;
+    };
+    let Ok(working_copy) = repo.require_working_copy_id() else {
+        return false;
+    };
+    if boundary.working_copy != working_copy.to_string()
+        || start.index_locked
+        || end.index_locked
+        || !start.markers.is_empty()
+        || !end.markers.is_empty()
+        || start.repository_state != end.repository_state
+    {
+        return false;
+    }
+    let Ok(log) = repo.operation_log(OperationScope::WorkingCopy(working_copy), None, true) else {
+        return false;
+    };
+    if !matches!(
+        log.head_state,
+        atomic_repository::OperationHeadState::Single(_)
+    ) {
+        return false;
+    }
+    let Some(start_index) = log
+        .entries
+        .iter()
+        .position(|entry| entry.operation.id().to_string() == start_operation)
+    else {
+        return false;
+    };
+    fn checkpoint(
+        git: &git2::Repository,
+        state: &GitStateRef,
+        template: &GitBoundaryCheckpoint,
+    ) -> Option<GitBoundaryCheckpoint> {
+        let (oid, symref) = match &state.head {
+            GitHeadState::Attached { symref, oid } => (oid, Some(symref.clone())),
+            GitHeadState::Detached { oid } => (oid, None),
+            _ => return None,
+        };
+        let hex = |oid: &atomic_core::operation::GitObjectId| {
+            oid.as_bytes()
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        };
+        let mut checkpoint = template.clone();
+        checkpoint.head_oid = Some(hex(oid));
+        checkpoint.head_symref = symref;
+        // Before publication the index may contain partial staging. HEAD's
+        // tree must come from its commit, independently of the index tree.
+        checkpoint.head_tree = Some(
+            git.find_commit(git2::Oid::from_bytes(oid.as_bytes()).ok()?)
+                .ok()?
+                .tree_id()
+                .to_string(),
+        );
+        Some(checkpoint)
+    }
+    let Ok(git) = git2::Repository::discover(repo.root()) else {
+        return false;
+    };
+    let mut current = start.clone();
+    let mut saw_projection = false;
+    for entry in &log.entries[start_index + 1..] {
+        let payload = entry.operation.payload();
+        if payload.working_copy != Some(working_copy) {
+            continue;
+        }
+        let git_effect = payload.delta.effects.iter().any(|effect| {
+            matches!(
+                effect.target,
+                EffectTarget::GitHead { .. }
+                    | EffectTarget::GitIndex { .. }
+                    | EffectTarget::GitRef { .. }
+            )
+        });
+        if !git_effect {
+            continue;
+        }
+        if entry.verification != OperationVerificationState::Verified
+            || payload.kind != OperationKind::ExportGitRefs
+            || !matches!(&payload.actor, ActorRef::System { name } if name == "repository-projection-publish")
+        {
+            return false;
+        }
+        let (Some(before), Some(after)) = (&payload.before.git, &payload.delta.after.git) else {
+            return false;
+        };
+        let (Some(mut before), Some(mut after)) = (
+            checkpoint(&git, before, &current),
+            checkpoint(&git, after, &current),
+        ) else {
+            return false;
+        };
+        // Checkpoint state is the recorded baseline, which can omit the
+        // index or predate partial staging. The verified effect leases are
+        // the authority for the exact index transition. Without an index
+        // effect this operation cannot explain an index change at all.
+        for effect in &payload.delta.effects {
+            if let EffectTarget::GitIndex {
+                working_copy: owner,
+            } = effect.target
+            {
+                if owner != working_copy {
+                    return false;
+                }
+                let (EffectValue::GitIndex(old), EffectValue::GitIndex(new)) =
+                    (&effect.expected_old, &effect.expected_new)
+                else {
+                    return false;
+                };
+                for (checkpoint, index) in [(&mut before, old), (&mut after, new)] {
+                    checkpoint.index_digest = Some(index.digest);
+                    checkpoint.index_tree = index
+                        .tree
+                        .as_ref()
+                        .map(|oid| oid.as_bytes().iter().map(|b| format!("{b:02x}")).collect());
+                }
+            }
+        }
+        if !checkpoints_semantically_equal(&current, &before) {
+            return false;
+        }
+        current = after;
+        saw_projection = true;
+    }
+    saw_projection && checkpoints_semantically_equal(&current, end)
+}
+
 /// The classification of one Git transition between turn boundaries.
 struct GitTransitionClassification {
     operations: Vec<String>,
@@ -375,6 +535,7 @@ struct GitTransitionClassification {
 /// authority.
 #[allow(clippy::too_many_arguments)]
 fn classify_git_transition(
+    repo: &atomic_repository::Repository,
     repo_root: &Path,
     options: &TurnRecordOptions<'_>,
     start_git: &GitBoundaryCheckpoint,
@@ -492,6 +653,15 @@ fn classify_git_transition(
         };
     }
 
+    if projection_journaled(repo, options, start_git, end_git) {
+        return GitTransitionClassification {
+            operations,
+            capture: None,
+            incomplete: None,
+            exact_commit_oid: None,
+        };
+    }
+
     // No capture. An anchored journaled checkout explains the move without
     // implying any commit authorship (review R4: worktree- and window-bound).
     let not_before = boundary_start_at(options);
@@ -555,7 +725,7 @@ fn boundary_start_at(options: &TurnRecordOptions<'_>) -> i64 {
 /// Classify a turn whose working copy is clean (no durable content change).
 #[allow(clippy::too_many_arguments)]
 fn classify_clean_turn(
-    _repo: &atomic_repository::Repository,
+    repo: &atomic_repository::Repository,
     repo_root: &Path,
     options: &TurnRecordOptions<'_>,
     boundary_start: Option<TurnBoundary>,
@@ -677,6 +847,7 @@ fn classify_clean_turn(
     // in Atomic, so the exact ManagedGitCommitCaptured classification is
     // unavailable (synthesis/import remains).
     let classification = classify_git_transition(
+        repo,
         repo_root,
         options,
         &start_git,
@@ -702,6 +873,7 @@ fn classify_clean_turn(
 /// when there is no observed transition to classify (missing baseline, failed
 /// end observation, or semantic checkpoint equality).
 fn classify_dirty_turn_git_transition(
+    repo: &atomic_repository::Repository,
     repo_root: &Path,
     options: &TurnRecordOptions<'_>,
     boundary_end: Option<&TurnBoundary>,
@@ -721,6 +893,7 @@ fn classify_dirty_turn_git_transition(
     // no remainder beyond the commit, the recorded delta IS the commit
     // delta (exact — ManagedGitCommitCaptured).
     let classification = classify_git_transition(
+        repo,
         repo_root,
         options,
         &start_git,
@@ -1050,7 +1223,7 @@ pub fn record_turn(
         options.turn_number,
     );
     let git_transition =
-        classify_dirty_turn_git_transition(repo_root, options, dirty_boundary_end.as_ref());
+        classify_dirty_turn_git_transition(&repo, repo_root, options, dirty_boundary_end.as_ref());
 
     // Step 3: Add — track any new files the agent created
     // Agents create new files all the time (new modules, tests, configs).

@@ -533,12 +533,26 @@ where
     T: crate::pristine::CrdtTxnT + crate::pristine::GraphTxnT,
     C: crate::change::ChangeStore,
 {
-    use crate::types::Hash;
-
     let trunk_id = match txn.get_trunk_by_path(path)? {
         Some(t) => t,
         None => return Ok(Vec::new()),
     };
+    output_trunk_via_crdt(txn, changes, trunk_id)
+}
+
+/// Read semantic content by stable identity when the caller has resolved a
+/// view's path through the graph. The ambient path index may describe a rename
+/// visible only in another view; it is not a view-local ownership oracle.
+pub fn output_trunk_via_crdt<T, C>(
+    txn: &T,
+    changes: &C,
+    trunk_id: TrunkId,
+) -> Result<Vec<u8>, CrdtOutputError<C::Error>>
+where
+    T: crate::pristine::CrdtTxnT + crate::pristine::GraphTxnT,
+    C: crate::change::ChangeStore,
+{
+    use crate::types::Hash;
 
     let mut out: Vec<u8> = Vec::new();
 

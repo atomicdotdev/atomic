@@ -19,11 +19,9 @@
 //! This module provides the helper functions that support these operations.
 
 use std::collections::HashSet;
-use std::io::Cursor;
 
 use bytes::Bytes;
 
-use atomic_core::change::Change;
 use atomic_core::types::{Base32, Hash, Merkle};
 use atomic_remote::{ChangelistEntry, RemoteError, StateResponse};
 use atomic_repository::history::HistoryEntry;
@@ -195,25 +193,9 @@ pub fn find_local_only_changes(
 /// save_downloaded_change(&repo, &expected_hash, data)?;
 /// ```
 pub fn save_downloaded_change(repo: &Repository, hash: &Hash, data: Bytes) -> CliResult<()> {
-    // Deserialize the change from bytes
-    let mut cursor = Cursor::new(&data[..]);
-    let (change, computed_hash) = Change::deserialize(&mut cursor)
-        .map_err(|e| CliError::Internal(anyhow::anyhow!("Failed to deserialize change: {}", e)))?;
-
-    // Verify the hash matches what we expected
-    if computed_hash != *hash {
-        return Err(CliError::Internal(anyhow::anyhow!(
-            "Hash mismatch: expected {}, got {}",
-            hash.to_base32(),
-            computed_hash.to_base32()
-        )));
-    }
-
-    // Save to the change store
-    repo.save_change(&change)
-        .map_err(|e| CliError::Internal(anyhow::anyhow!("Failed to save change: {}", e)))?;
-
-    Ok(())
+    repo.import_change_bytes(hash, &data)
+        .map(|_| ())
+        .map_err(|e| CliError::Internal(anyhow::anyhow!("Failed to save change: {}", e)))
 }
 
 // Error Conversion

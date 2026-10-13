@@ -3760,6 +3760,7 @@ impl Repository {
 
         let mut expected_trunk_encoding: Option<u8> = None;
         let mut trunk_created = false;
+        let mut created_trunk = None;
         let mut trunk_deleted = false;
         let mut branches: std::collections::BTreeMap<atomic_core::crdt::BranchId, ExpectedBranch> =
             std::collections::BTreeMap::new();
@@ -3893,6 +3894,7 @@ impl Repository {
                     match ops.trunk_op() {
                         Some(atomic_core::crdt::TrunkOp::Create { encoding, .. }) => {
                             trunk_created = true;
+                            created_trunk = Some(resolved_trunk);
                             expected_trunk_encoding = Some(crdt_encoding_u8(encoding.as_ref()));
                         }
                         // Trunk lifecycle is part of the replayed domain
@@ -4055,7 +4057,50 @@ impl Repository {
         // must claim this path (mapping integrity) and its Alive/Deleted
         // state must agree with the closure replay — a live file whose trunk
         // row was tombstoned by nobody is corruption, not a waiver.
-        let Some(trunk_key) = txn.get_trunk_by_path(path).map_err(|e| e.to_string())? else {
+        // Resolve the closure's stable identity first. A private snapshot or
+        // another view may have moved its ambient path index. Accept that
+        // derived location only when an applied out-of-closure Move proves it;
+        // a missing/corrupt index without such history remains an error.
+        let indexed_trunk = txn.get_trunk_by_path(path).map_err(|e| e.to_string())?;
+        let expected_identity = identity_trunks.iter().next().copied().or(created_trunk);
+        let mut concurrent_path = false;
+        let mut resolved_trunk = indexed_trunk;
+        if let Some(expected) = expected_identity {
+            if let Some(row) = txn
+                .get_crdt_trunk(&encode_trunk_id(&expected))
+                .map_err(|e| e.to_string())?
+            {
+                if row.path != path
+                    && txn
+                        .get_trunk_by_path(&row.path)
+                        .map_err(|e| e.to_string())?
+                        == Some(expected)
+                {
+                    for (writer_id, writer_hash) in
+                        txn.list_registered_changes().map_err(|e| e.to_string())?
+                    {
+                        if visibility.contains(writer_id)
+                            || !txn
+                                .has_change_in_graph(writer_id)
+                                .map_err(|e| e.to_string())?
+                        {
+                            continue;
+                        }
+                        let writer = self.load_change(&writer_hash).map_err(|e| e.to_string())?;
+                        if writer.file_ops().iter().any(|ops| {
+                            matches!(ops.trunk_op(),
+                            Some(atomic_core::crdt::TrunkOp::Move { trunk, new_path })
+                                if *trunk == expected && *new_path == row.path)
+                        }) {
+                            concurrent_path = true;
+                            resolved_trunk = Some(expected);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        let Some(trunk_key) = resolved_trunk else {
             if trunk_created {
                 return Err(
                     "the closure created this trunk but the staged CRDT tables hold no \
@@ -4079,8 +4124,8 @@ impl Repository {
             }
             return Ok(());
         };
-        if let Some(expected_trunk) = identity_trunks.iter().next() {
-            if &trunk_key != expected_trunk {
+        if let Some(expected_trunk) = expected_identity {
+            if trunk_key != expected_trunk {
                 return Err(format!(
                     "the path→trunk mapping for '{path}' resolves to {:?} but the closure's \
                      semantic move targets {:?}; the moved trunk identity must match the \
@@ -4095,7 +4140,7 @@ impl Repository {
             .ok_or_else(|| {
                 "the path→trunk mapping resolves but the trunk row is missing".to_string()
             })?;
-        if trunk_row.path != path {
+        if trunk_row.path != path && !concurrent_path {
             return Err(format!(
                 "the path→trunk mapping resolves to a trunk row claiming path {:?}; the \
                  semantic index is corrupt",
@@ -4717,13 +4762,14 @@ impl Repository {
         // corruption the row checks missed — an orphan branch, an unvalidated
         // chain entry, or a diverged payload — never a tolerated
         // reconstruction.
-        let actual = atomic_core::output::crdt::output_file_via_crdt(txn, &self.change_store, path)
-            .map_err(|error| {
-                format!(
-                    "the semantic reconstruction consumers read failed for '{path}': {error}; \
+        let actual =
+            atomic_core::output::crdt::output_trunk_via_crdt(txn, &self.change_store, trunk_key)
+                .map_err(|error| {
+                    format!(
+                        "the semantic reconstruction consumers read failed for '{path}': {error}; \
                  the staged CRDT state is corrupt"
-                )
-            })?;
+                    )
+                })?;
         let mut expected_consumer_bytes: Vec<u8> = Vec::new();
         for branch_id in &actual_chain {
             match consumer_domain.get(branch_id) {

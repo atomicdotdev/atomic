@@ -681,7 +681,11 @@ impl Change {
                         GraphSectionPayload::from_postcard_bytes(&section.payload)?;
                     let compactor = compact::Compactor::new(&hash_table);
                     for compact_op in graph_payload.ops() {
-                        hunks.push(compactor.expand_graph_op(compact_op)?);
+                        hunks.push(if strict_v2 {
+                            compactor.expand_graph_op(compact_op)?
+                        } else {
+                            compactor.expand_legacy_graph_op(compact_op)?
+                        });
                     }
                 }
                 SectionType::Semantic => {

@@ -287,7 +287,12 @@ fn make_bare_remote(temp: &TempDir) -> std::path::PathBuf {
     let remote_dir = temp.path().join("remote.git");
     fs::create_dir_all(&remote_dir).expect("remote dir");
     let git_init = Command::new("git")
-        .args(["init", "--bare", remote_dir.to_str().unwrap()])
+        .args([
+            "init",
+            "--bare",
+            "--initial-branch=master",
+            remote_dir.to_str().unwrap(),
+        ])
         .output()
         .expect("init bare");
     assert!(git_init.status.success(), "bare init failed");

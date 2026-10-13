@@ -260,6 +260,17 @@ fn git_deletion_preserves_native_empty_directories_inside_imported_parents() {
     )
     .unwrap();
     repo.materialize(wc).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        // Windows observes the imported 0644 file as 0666. Exercise the
+        // same attribute-only record on Unix before deleting the file.
+        fs::set_permissions(
+            dir.path().join("sub/inner/file.txt"),
+            fs::Permissions::from_mode(0o666),
+        )
+        .unwrap();
+    }
     std::fs::create_dir(dir.path().join("sub/keep-empty")).unwrap();
     repo.add_directory(wc, "sub/keep-empty", TrackingOptions::default())
         .unwrap();
