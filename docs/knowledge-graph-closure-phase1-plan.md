@@ -1,727 +1,574 @@
-# Phase 1 Implementation Plan: KG Referential Closure
+# Phase 1 Implementation Plan: KG Referential Closure — Quick Win
 
 > Status: **draft plan.** Implements Phase 1 ("Referential closure") of
 > [`knowledge-graph-closure-rfc.md`](./knowledge-graph-closure-rfc.md).
-> Branch: `feat/semweb-knowledge-graph`. Survey references verified against `dev` at `5ddcf1b`.
+> Branch: `feat/semweb-knowledge-graph`.
 
-## 1. Phase 1 scope (from the RFC)
+## Guiding principle for Phase 1
 
-- Versioned OWL 2 RL ontology, optional OWL 2 DL companion, SHACL shape graph.
-- Breaking graph-format cutover to canonical RDF IRIs; no compatibility vocabulary.
-- Coverage test: every current predicate / entity type / edge kind has exactly one
-  canonical replacement.
-- Signed stable `ProjectId`, project-qualified mutable-resource IRIs, algorithm-qualified
-  content-object IRIs.
-- Intent / session / turn / provenance / change / attestation nodes.
-- Required direct shortcut edges (`implements`, `explainedBy`, `attestedBy`).
-- Backfill and projection validation.
+Ship **three artifacts** that every downstream phase depends on:
 
-Explicitly **not** Phase 1: `AIContribution` nodes and cost aggregates (Phase 2),
-`query ask` evidence envelopes (Phase 3), review closure digests / `reviewsClosure`
-(Phase 4), federation and named-graph catalogs (Phase 5), `Execution` nodes (no
-structured execution capture exists yet — see D11).
+1. **`atomic:` namespace** — a canonical workflow ontology (`.ttl` + Rust registry).
+2. **`ProjectId`** — a stable, unique project identity minted at `atomic init` and cast
+   into IRIs so that future cross-project SPARQL queries have a canonical namespace per
+   repository.
+3. **Native SHACL engine** — parse and evaluate SHACL shapes against the property-graph
+   KG. No hand-coded Rust validators. Enterprise users add custom shapes in
+   `.atomic/shapes/*.ttl`; the engine evaluates them the same way it evaluates builtin
+   shapes.
 
-## 2. Current state (survey findings)
+Everything else — projectors, storage cutover, inference, consumers — comes later.
+This keeps Phase 1 reviewable while guaranteeing that IRIs are stable and validation
+is real SHACL from day one.
 
-### 2.1 Storage
+## What we deliberately skip in Phase 1
 
-- The KG is a **JSON property graph**, not a triple store:
-  `KgNode { id, kind, label, summary, source, metadata }` and
-  `KgEdge { from_id, to_id, kind, metadata }` (`atomic-core/src/pristine/vault.rs:462,516`).
-- Tables (`atomic-core/src/pristine/tables.rs:797-830`): `kg_nodes`, `kg_edges`
-  (key `from\0to\0kind`, `encode_edge_key` L856), `kg_edges_from`, `kg_edges_to`,
-  `kg_fts`, `kg_fts_by_node`, `kg_index_meta`. No predicate or type index.
-- The predicate string is **part of the edge key**, so renaming means rewriting keys.
-- `upsert_kg_edge` (`txn/write/triples.rs:380`) accepts any string. `ontology::is_known_predicate`
-  has no callers.
-- `kg_neighbors` (`traits/triples.rs:18-68`) is kind-blind, bidirectional BFS with depth ≤ 2;
-  it is the main read primitive (query plans, `vault context`, RAG, daemon).
+**No code-block-level mapping.** AST and Tree-Sitter already produce call graphs,
+definitions, exports, imports, and entity relationships. Building a parallel system
+to emit `atomic:calls`, `atomic:defines`, `atomic:exports`, `atomic:includes`,
+`atomic:modifiesEntity`, and scope-qualified source-entity IDs duplicates information
+we get from parsers for free. Those edges are deferred until we need them for queries
+that the syntax index cannot answer (e.g. federated cross-project search).
 
-### 2.2 The KG is entirely derived
-
-Every node/edge comes from one of three producers, all over authoritative objects:
-
-| Producer | File | Source tag | Trigger |
-|---|---|---|---|
-| Vault projection | `atomic-repository/src/repository/vault_triples.rs` | `vault` | every `vault_store` (intent/memory/goal writes, `vault sync`, record w/ vault sync), `query reindex` |
-| VCS/AST enrichment | `atomic-repository/src/repository/vault_kg_enrich.rs` | `vcs`, `ast` | clone, pull, git import, record (`kg_enrich_change`), `query enrich` |
-| Session ledger | `atomic-core/src/pristine/txn/write/session_kg.rs` | `session_ledger` | turn append/rewrite, session lifecycle, sidecar pull, `session rebuild` |
-
-**Consequence for the cutover:** nothing in the KG needs in-place rewriting. A storage-
-generation bump + full rebuild from canonical objects *is* the migration, and the RFC's
-"fail on unclassifiable overloaded edge" rule becomes a projector-level guarantee (each
-projector knows its endpoint classes at emit time).
-
-`vault sync` and `query enrich` share **no** code; they meet only on shared ID strings.
-
-### 2.3 Vocabulary inventory (`atomic-core/src/pristine/ontology.rs`)
-
-- 6 prefix labels (no IRIs), 30 `predicate::*` CURIEs, 16 `entity_type::*` (`vault:*`),
-  29 `edge_kind::*` SCREAMING_CASE strings.
-- Actually emitted: 19 uppercase kinds + `prov:{wasDerivedFrom,used,wasAssociatedWith,
-  hadPlan,hadMember,generated,wasInformedBy}`, `atom:informedBy`, `vault:{explainedBy,hasTodo}`.
-- Defined but never emitted: all `dc:*`, `skos:*`, `rdf:type` (as edge), `vault:{status,
-  priority,assignedTo,blocks,...}` predicates, `IMPORTS`, `VISIBLE_FROM`, and 12 of 16
-  `entity_type` values.
-- Typing: `kind` string on every node; `metadata.rdf_type` (prefixed, e.g. `vault:Session`)
-  only on the 4 session-ledger node kinds. **No real `rdf:type` anywhere.**
-
-### 2.4 Identity problems
-
-- Change node IDs are **12-char base32 prefixes** in three places
-  (`vault_kg_enrich.rs:1089 truncate_hash`, `session_kg.rs:46 change_node_id`,
-  `vault_triples.rs:1268 rdf_target_to_kg_id`). Full hash survives only in metadata.
-- `identity:` IDs are display names (`identity:{author.name}` vs `identity:{fm.developer}`);
-  intents write `author`/`created_by` which the KG ignores, so intents have no author edge.
-- `todo:X` from `urn:atomic:todo:X` collides with the legacy session-global todo form.
-- `LINKED_INTENT` targets `intent:{raw}` without uppercasing/manifest resolution.
-- **No `ProjectId` exists.** Closest: remote `ProjectInfo.id: Uuid` (server-assigned),
-  `VaultManifest.intent_prefix` (4-char human code), `repository_identity` DID in
-  `provenance_gate.rs:76`.
-
-### 2.5 Overloaded / misused relations (confirmed in code)
-
-| Current | Uses | Lines |
-|---|---|---|
-| `DEPENDS_ON` | change→change; intent→intent (fallback for any `:::ref`) | enrich :409,:526; triples :1158 |
-| `MODIFIES` | change→file; change→entity **only on record-time path**, not bulk | enrich :436,:554,:624 |
-| `ON_VIEW` | change→*working copy's desired view* (not membership!); session→view | enrich :386,:514; session_kg :320 |
-| `prov:wasAssociatedWith` | tool_result→goal | triples :1002 |
-| `prov:hadPlan` | session→intent **and** turn→intent | session_kg :389-397 |
-| `prov:hadMember` | session→turn | session_kg :381 |
-| `prov:wasDerivedFrom` | memory→{anything}; session→session (fork) | triples :978; session_kg :456 |
-
-### 2.6 Facts captured but never projected
-
-- `Attestation` (`atomic-core/src/change/attestation.rs:153`): `session_id`,
-  `changes_covered`, `signer` (`did:atomic:…` or `session-mac:{sid}`), `signature`,
-  `previous_attestation`, `provenance_root`, … Stored as `.attest` files.
-  **No KG projection.**
-- Canonical intent/memory attestations (signed JSON-LD vault entries) — explicitly skipped
-  by the KG (`vault_triples.rs:53`).
-- `SessionTurn` (`atomic-core/src/change/session.rs:418`): `plan_id`, `goal`,
-  `provenance_hash`, `change_hashes`, `previous_provenance`, `outcome`, boundaries —
-  partially projected (no outcome/boundaries).
-- AI `Provenance` on changes (model/tokens/cost) — Phase 2.
-
-### 2.7 Consumers that hardcode kind strings
-
-- `atomic-cli/src/commands/query/mod.rs`: `callers` (`to_uppercase()=="CALLS"` :1231,:1255),
-  HTML `EDGE_COLORS` (:748-755), `ask` system prompt (:1971-1976), text output.
-- `atomic-repository/src/triage/report.rs` (`kind_is` at :35, case-insensitive, ~12 sites),
-  `atomic-repository/src/repository/triage.rs:231,305`.
-- `atomic-repository/src/repository/vault_intent.rs:1770,1776` (`atom:informedBy`).
-- `atomic-cli/src/commands/vault/context.rs:470-473` (filters `node.kind == "memory"`).
-- libatomic daemon copies: `services_agent.rs:131,3372-3387`, `services_query.rs:1001-1038,1059`.
-- Wire: `libatomic/proto/.../knowledge_messages.proto:123` `KGEdge.relation` (free string).
-- Out-of-repo: `../noname` (`atomic.ts:700,1928`, `kgHops.ts:202-245`, `BlastTriage.tsx`,
-  `MemoryView.tsx`), `../the-hive/packages/shared/src/types/kg.ts:40-48`.
-- ~110 test assertion sites (largest: `vault_triples.rs` ~40, `ontology.rs` ~31,
-  `atomic-cli/tests/session_integration_test.rs` ~17).
-
-### 2.8 Existing Semantic Web pieces and constraints
-
-- `atomic-canonical` already emits signed JSON-LD with context
-  `https://atomic.dev/ns/ctx.jsonld` mapping `atom:` → `https://atomic.dev/ns#`, and URNs
-  `urn:atomic:{intent,memory,change,...}:`. Content hash = `blake3(JCS(node))`, which covers
-  the `@context` **URL string** but not the term definitions behind it.
-- `atomic provenance` projects PROV JSON-LD on demand (`atomic-canonical/src/prov.rs`);
-  not written to the KG.
-- **No RDF/OWL/SHACL crates** in the workspace; no `.ttl` files.
-- **Standing decision (2026-07-06, `docs/shacl-oxirs-spike-findings.md`):** no SHACL engine
-  ships in `atomic`; SHACL runs as a Circuit Breaker (CB) workflow; atomic keeps hand-coded
-  gates and ships shapes `.ttl` as data. oxirs rejected (~432 crates, silently drops
-  `sh:node`/`sh:sparql`). `oxttl` (~20 crates) noted as acceptable.
-- Schema/upgrade machinery: `SCHEMA_VERSION` only rejects newer DBs (`schema.rs`);
-  **capability fences** (`capability.rs`, `required-capability/<id>`) make older binaries
-  fail closed; `kg_index_meta` holds lazy per-index markers (`fts_reverse_schema` = 2 is the
-  precedent for a KG rebuild-on-write).
-
-## 3. Target model for Phase 1
-
-### 3.1 Namespaces
-
-| Prefix | IRI | Role |
-|---|---|---|
-| `atomic:` | `https://atomic.dev/ns/workflow#` | the one workflow ontology |
-| `prov:` | `http://www.w3.org/ns/prov#` | reused directly |
-| `dcterms:` | `http://purl.org/dc/terms/` | `created`, `modified`, `description`, `subject` |
-| `skos:` | `http://www.w3.org/2004/02/skos/core#` | `Concept`, `broader`, `narrower`, `related` |
-| `rdf:`/`rdfs:`/`owl:`/`xsd:` | standard | |
-
-Ontology IRI `https://atomic.dev/ns/workflow`, version IRI
-`https://atomic.dev/ns/workflow/1.0.0`.
-
-### 3.2 Node identity (replaces `kind:local` IDs)
-
-| Kind | IRI | Notes |
-|---|---|---|
-| Project | `urn:atomic:project:<pid>` | `<pid>` from the project identity object (D5) |
-| Change | `urn:atomic:change:blake3-256:<base32>` | full hash, canonical uppercase base32 per D4; kills `truncate_hash` |
-| Provenance graph | `urn:atomic:provenance:blake3-256:<base32>` | |
-| Attestation | `urn:atomic:attestation:blake3-256:<base32>` | hash of `.attest` object |
-| Intent (incl. review) | `urn:atomic:project:<pid>:intent:<ulid>` | ULID lowercase canonical |
-| Goal / Memory / Skill / ToolResult | `urn:atomic:project:<pid>:{goal,memory,skill,tool-result}:<encoded-name>` | |
-| AC / Task / ScopeItem / Constraint | `urn:atomic:project:<pid>:intent:<ulid>:{ac,task,scope,constraint}:<id>` | qualified by parent intent |
-| Session / Turn / Todo | `urn:atomic:project:<pid>:session:<sid>[:turn:<n> \| :todo:<id>]` | session-qualified todos only |
-| View | `urn:atomic:project:<pid>:view:<pct-encoded>` | |
-| File / Module | `urn:atomic:project:<pid>:{file,module}:<pct-encoded path>` | |
-| Source entity | `urn:atomic:project:<pid>:entity:<pct path>#<kind>:<qualified-name>[~<ordinal>]` | per D10; file stays in the ID, line becomes a literal shown beside it |
-| Identity | `did:atomic:…` when known; else `urn:atomic:project:<pid>:identity:<encoded-name>` + `atomic:Unknown`-style finding | stops display-name identity merging |
-| Concept | `urn:atomic:project:<pid>:concept:<encoded-label>` typed `skos:Concept` | |
-| Finding | `urn:atomic:project:<pid>:finding:<code>:<subject-hash>` | e.g. `MissingHistoricalPlanId` |
-
-A single `atomic_core::kg::iri` module owns all minting and parsing (percent-encoding per
-RFC 3987 path rules); producers never format IDs by hand. The FTS ranking prefix checks
-(`txn/write/triples.rs:268-280`, duplicated in `read.rs`) switch to type lookups.
-
-### 3.3 Edge mapping (complete replacement table)
-
-Every row below is a test fixture for the coverage test (M1).
-
-**Classes** — `entity_type::*` and `kind` values → `rdf:type`:
-
-| Current | Canonical |
+| Skipped | Why |
 |---|---|
-| `vault:Goal` / `goal` | `atomic:Goal` |
-| `vault:Intent` / `intent` | `atomic:WorkIntent` (+ `FeatureIntent`/`BugIntent`/`ReviewIntent`/… from canonical `kind`; `ManagedIntent` from lifecycle status) |
-| `vault:Memory` / `memory` | `atomic:Memory` |
-| `vault:Skill` / `skill` | `atomic:Skill` |
-| `vault:ToolResult` / `tool_result` | `atomic:ToolResult` |
-| `vault:File` / `file` | `atomic:File` |
-| `vault:Identity` / `identity` | `atomic:Identity` |
-| `vault:Concept` / `concept` | `skos:Concept` |
-| `vault:Session` / `session` | `atomic:Session` |
-| `vault:SessionTurn` / `session_turn` | `atomic:SessionTurn` (+ `atomic:ManagedTurn` when `plan_id` present) |
-| `vault:Todo` / `todo` | `atomic:Todo` |
-| `vault:ProvenanceGraph` / `provenance` | `atomic:ProvenanceGraph` |
-| `vault:Task` / `task` | `atomic:Task` |
-| `vault:AcceptanceCriterion` / `acceptance_criterion` | `atomic:AcceptanceCriterion` |
-| `vault:ScopeItem` / `scope` | `atomic:ScopeItem` |
-| `vault:Constraint` / `constraint` | `atomic:Constraint` |
-| `change` | `atomic:Change` |
-| `view` | `atomic:View` |
-| `module` | `atomic:Module` |
-| `entity` | `atomic:SourceEntity` (language kind stays a literal `atomic:entityKind`) |
-| *(new)* | `atomic:Attestation`, `atomic:Finding` |
+| `atomic:defines`, `atomic:exports`, `atomic:calls`, `atomic:modifiesEntity` | Tree-Sitter / `atomic-semantic` resolves these on demand |
+| `atomic:includes`, `atomic:imports` | File inclusion graphs are cheap to compute from source |
+| `atomic:modulePartOfModule`, `atomic:filePartOfModule` | Module hierarchy derivable from paths |
+| Scope-qualified entity IDs | Deferred to a phase that needs stable entity references |
+| Parser changes for scope chains / parameter types | Not needed without entity materialization |
+| `query callers` KG-backed rewrite | Live-parsed implementation stays |
 
-**Predicates** — split by endpoint class where overloaded:
+We keep **file-level** `atomic:modifiesFile` and `atomic:directlyOnView` because those
+are workflow facts, not code-structure facts.
 
-| Current | Endpoints | Canonical |
+## 1. Phase 1 scope
+
+### 1.1 Ontology (`atomic-core/ontology/workflow-1.0.0.ttl`)
+
+**Namespace:** `atomic:` → `https://atomic.dev/ns/workflow#`
+
+Ontology IRI: `https://atomic.dev/ns/workflow`
+Version IRI: `https://atomic.dev/ns/workflow/1.0.0`
+
+**Classes** (workflow-level only):
+
+| Canonical class | Superclass | Note |
 |---|---|---|
-| `prov:hadMember` | session→turn | `atomic:hasTurn` (inverse `atomic:turnOfSession`) |
-| `prov:hadPlan` | turn→intent | `atomic:hasPlan` (inverse `atomic:governsTurn`) |
-| `prov:hadPlan` | session→intent | **dropped**; derivable as session `hasTurn`/`hasPlan` |
-| `prov:generated` | turn→change | `atomic:generatedChange` ⊑ `prov:generated` (inverse `atomic:generatedBy`) |
-| `prov:wasInformedBy` | turn→turn | `prov:wasInformedBy` (keep) |
-| `prov:wasDerivedFrom` | memory→source; session→session (fork) | `prov:wasDerivedFrom` (keep; fork metadata stays edge-level) |
-| `prov:used` | tool_result→file | `prov:used` (keep) |
-| `prov:wasAssociatedWith` | tool_result→goal | `atomic:linkedGoal` |
-| `atom:informedBy` | intent→memory/source | `atomic:informedBy` ⊑ `prov:wasDerivedFrom` |
-| `vault:explainedBy` | turn→provenance | `atomic:explainedBy` |
-| `vault:hasTodo` | turn→todo | `atomic:hasTodo` |
-| `BLOCKS` / `BLOCKED_BY` | intent↔intent | `atomic:blocks` / `atomic:blockedBy` (inverses; emit one, infer the other) |
-| `ASSIGNED_TO` | intent→identity | `atomic:assignedTo` |
-| `LINKED_INTENT` | goal→intent | `atomic:linkedIntent` (target now manifest-resolved) |
-| `LINKED_GOAL` | intent→goal | `atomic:linkedGoal` |
-| `REFERENCES` | entry→memory, entry→file | `atomic:references` |
-| `HAS_LABEL` | intent→concept | `atomic:hasLabel` |
-| `HAS_TASK` | intent→task | `atomic:hasTask` |
-| `HAS_ACCEPTANCE_CRITERION` | intent→AC | `atomic:hasAcceptanceCriterion` |
-| `HAS_SCOPE_IN` / `HAS_SCOPE_OUT` | intent→scope | `atomic:hasScopeIn` / `atomic:hasScopeOut` ⊑ `atomic:hasScopeItem` |
-| `HAS_CONSTRAINT` | intent→constraint | `atomic:hasConstraint` |
-| `SATISFIES` | task→AC | `atomic:satisfies` |
-| `TOUCHES` | task→file | `atomic:touches` |
-| `SCOPE_OUT_FILE` | intent→file | `atomic:scopeOutFile` |
-| `REMEDIATES` | intent→intent | `atomic:remediates` |
-| `REVIEWS` | review intent→intent | `atomic:reviews` (inverse `atomic:reviewedBy`) |
-| `DEPENDS_ON` | change→change | `atomic:directlyDependsOnChange` ⊑ `atomic:dependsOn` |
-| `DEPENDS_ON` | intent→intent | `atomic:dependsOnIntent` ⊑ `atomic:dependsOn` |
-| `MODIFIES` | change→file | `atomic:modifiesFile` ⊑ `atomic:modifies` |
-| `MODIFIES` | change→entity | `atomic:modifiesEntity` ⊑ `atomic:modifies` (emitted on **both** bulk and record paths) |
-| `ON_VIEW` | change→view | `atomic:directlyOnView` — **recomputed from `VIEW_CHANGES[view]` own entries**, not the working copy's desired view |
-| `ON_VIEW` | session→view | `atomic:sessionViewContext` |
-| `CHILD_OF` | view→view | `atomic:childViewOf` |
-| `VISIBLE_FROM` | (never emitted) | `atomic:visibleFrom` — query-time operator only in Phase 1 |
-| `DEFINES` | file→entity | `atomic:defines` |
-| `EXPORTS` | file→entity | `atomic:exports` ⊑ `atomic:defines` |
-| `INCLUDES` | file→file | `atomic:includes` |
-| `IMPORTS` | (never emitted) | `atomic:imports` ⊑ `atomic:includes` (declared; extraction split deferred) |
-| `CALLS` | entity→entity | `atomic:calls` |
-| `PART_OF` | file→module / module→module | `atomic:filePartOfModule` / `atomic:modulePartOfModule` ⊑ `atomic:partOf` |
-| `AUTHORED_BY` | change/goal/intent→identity | `atomic:authoredBy` ⊑ `prov:wasAttributedTo` (intents now emit it from `author`/`created_by`) |
-| `vault:status`, `vault:priority` | literal | `atomic:status`, `atomic:priority` (datatype properties) |
-| `vault:appliesTo` | entity→concept | `atomic:appliesTo` |
-| `vault:blocks`… duplicate predicate constants | — | removed (uppercase twins already mapped above) |
-| `dc:type` | — | removed (never emitted) |
-| `dc:creator` | — | `atomic:authoredBy` |
-| `dc:date` | — | `dcterms:created` / `dcterms:modified` from typed source fields |
-| `dc:description` | — | `dcterms:description` |
-| `skos:broader`/`narrower`/`related` | — | kept |
-| `skos:subject` | — | removed; `dcterms:subject` |
-| `rdf:type` | — | real type assertions (§3.4) |
+| `atomic:WorkIntent` | `owl:Thing` | Base for all intents |
+| `atomic:FeatureIntent` | `atomic:WorkIntent` | From canonical `kind` |
+| `atomic:BugIntent` | `atomic:WorkIntent` | From canonical `kind` |
+| `atomic:ReviewIntent` | `atomic:WorkIntent` | From canonical `kind` |
+| `atomic:ManagedIntent` | `atomic:WorkIntent` | Lifecycle status |
+| `atomic:Goal` | `owl:Thing` | |
+| `atomic:Memory` | `owl:Thing` | |
+| `atomic:Skill` | `owl:Thing` | |
+| `atomic:ToolResult` | `owl:Thing` | |
+| `atomic:Task` | `owl:Thing` | |
+| `atomic:AcceptanceCriterion` | `owl:Thing` | |
+| `atomic:ScopeItem` | `owl:Thing` | |
+| `atomic:Constraint` | `owl:Thing` | |
+| `atomic:Todo` | `owl:Thing` | |
+| `atomic:Session` | `owl:Thing` | |
+| `atomic:SessionTurn` | `owl:Thing` | |
+| `atomic:ManagedTurn` | `atomic:SessionTurn` | When `plan_id` present |
+| `atomic:ProvenanceGraph` | `owl:Thing` | |
+| `atomic:Attestation` | `owl:Thing` | |
+| `atomic:Finding` | `owl:Thing` | Historical-gap findings |
+| `atomic:Change` | `owl:Thing` | |
+| `atomic:View` | `owl:Thing` | |
+| `atomic:File` | `owl:Thing` | Workflow artifact, not code entity |
+| `atomic:Identity` | `owl:Thing` | |
+| `atomic:Concept` | `skos:Concept` | |
 
-**New Phase 1 edges** (no current equivalent):
+**Object properties** (workflow edges only):
 
-| Edge | Source fact |
+| Property | Domain | Range | Inverse | Super |
+|---|---|---|---|---|
+| `atomic:hasTurn` | `atomic:Session` | `atomic:SessionTurn` | `atomic:turnOfSession` | — |
+| `atomic:hasPlan` | `atomic:SessionTurn` | `atomic:WorkIntent` | `atomic:governsTurn` | — |
+| `atomic:generatedChange` | `atomic:SessionTurn` | `atomic:Change` | `atomic:generatedBy` | `prov:generated` |
+| `atomic:informedBy` | `atomic:WorkIntent` | `atomic:Memory` | — | `prov:wasDerivedFrom` |
+| `atomic:explainedBy` | `atomic:SessionTurn` | `atomic:ProvenanceGraph` | — | — |
+| `atomic:hasTodo` | `atomic:SessionTurn` | `atomic:Todo` | — | — |
+| `atomic:blocks` | `atomic:WorkIntent` | `atomic:WorkIntent` | `atomic:blockedBy` | — |
+| `atomic:assignedTo` | `atomic:WorkIntent` | `atomic:Identity` | — | — |
+| `atomic:linkedIntent` | `atomic:Goal` | `atomic:WorkIntent` | — | — |
+| `atomic:linkedGoal` | `atomic:WorkIntent` | `atomic:Goal` | — | — |
+| `atomic:references` | `owl:Thing` | `owl:Thing` | — | — |
+| `atomic:hasLabel` | `atomic:WorkIntent` | `skos:Concept` | — | — |
+| `atomic:hasTask` | `atomic:WorkIntent` | `atomic:Task` | — | — |
+| `atomic:hasAcceptanceCriterion` | `atomic:WorkIntent` | `atomic:AcceptanceCriterion` | — | — |
+| `atomic:hasScopeIn` | `atomic:WorkIntent` | `atomic:ScopeItem` | — | `atomic:hasScopeItem` |
+| `atomic:hasScopeOut` | `atomic:WorkIntent` | `atomic:ScopeItem` | — | `atomic:hasScopeItem` |
+| `atomic:hasConstraint` | `atomic:WorkIntent` | `atomic:Constraint` | — | — |
+| `atomic:satisfies` | `atomic:Task` | `atomic:AcceptanceCriterion` | — | — |
+| `atomic:touches` | `atomic:Task` | `atomic:File` | — | — |
+| `atomic:scopeOutFile` | `atomic:WorkIntent` | `atomic:File` | — | — |
+| `atomic:remediates` | `atomic:WorkIntent` | `atomic:WorkIntent` | — | — |
+| `atomic:reviews` | `atomic:ReviewIntent` | `atomic:WorkIntent` | `atomic:reviewedBy` | — |
+| `atomic:directlyDependsOnChange` | `atomic:Change` | `atomic:Change` | — | `atomic:dependsOn` |
+| `atomic:dependsOnIntent` | `atomic:WorkIntent` | `atomic:WorkIntent` | — | `atomic:dependsOn` |
+| `atomic:modifiesFile` | `atomic:Change` | `atomic:File` | — | `atomic:modifies` |
+| `atomic:directlyOnView` | `atomic:Change` | `atomic:View` | — | — |
+| `atomic:sessionViewContext` | `atomic:Session` | `atomic:View` | — | — |
+| `atomic:childViewOf` | `atomic:View` | `atomic:View` | — | — |
+| `atomic:visibleFrom` | — | — | — | Query-time operator |
+| `atomic:authoredBy` | `owl:Thing` | `atomic:Identity` | — | `prov:wasAttributedTo` |
+| `atomic:coversChange` | `atomic:Attestation` | `atomic:Change` | — | — |
+| `atomic:attests` | `atomic:Attestation` | `atomic:SessionTurn` | — | — |
+| `atomic:signedBy` | `atomic:Attestation` | `atomic:Identity` | — | — |
+| `atomic:previousAttestation` | `atomic:Attestation` | `atomic:Attestation` | — | — |
+| `atomic:implements` | `atomic:Change` | `atomic:WorkIntent` | — | — |
+| `atomic:attestedBy` | `atomic:Change` | `atomic:Attestation` | — | — |
+| `atomic:aboutResource` | `atomic:Finding` | `owl:Thing` | — | — |
+
+Note: `atomic:dependsOn` and `atomic:ancestorView` are declared `owl:TransitiveProperty`
+but are **not** materialized in Phase 1.
+
+**Datatype properties:**
+
+| Property | Domain | Range |
+|---|---|---|
+| `atomic:status` | `atomic:WorkIntent` | `xsd:string` |
+| `atomic:priority` | `atomic:WorkIntent` | `xsd:string` |
+| `atomic:findingCode` | `atomic:Finding` | `xsd:string` |
+
+**Property chains** (declared in TTL, materialized in Phase 2):
+
+- `atomic:generatedChange ∘ atomic:hasPlan` → `atomic:implements`
+- `atomic:generatedChange ∘ atomic:explainedBy` → `atomic:explainedBy` (on Change)
+
+**What the ontology does NOT contain:**
+
+`atomic:defines`, `atomic:exports`, `atomic:calls`, `atomic:includes`,
+`atomic:imports`, `atomic:modulePartOfModule`, `atomic:filePartOfModule`,
+`atomic:modifiesEntity`, and the `atomic:SourceEntity` class are omitted. They
+describe code structure inside files; that is the syntax index's job.
+
+### 1.2 Rust term registry (`atomic_core::kg::ontology`)
+
+Rewrite `atomic-core/src/pristine/ontology.rs`:
+
+```rust
+pub enum Class { WorkIntent, FeatureIntent, ... }
+pub enum Predicate { HasTurn, HasPlan, ... }
+
+impl Class {
+    pub fn iri(&self) -> &'static str;
+    pub fn curie(&self) -> &'static str;
+    pub fn parents(&self) -> &'static [Class];
+}
+
+impl Predicate {
+    pub fn iri(&self) -> &'static str;
+    pub fn curie(&self) -> &'static str;
+    pub fn domain(&self) -> Option<Class>;
+    pub fn range(&self) -> Option<Class>;
+    pub fn inverse(&self) -> Option<Predicate>;
+    pub fn super_predicate(&self) -> Option<Predicate>;
+}
+
+pub static PREFIXES: &[(&str, &str)] = &[
+    ("atomic", "https://atomic.dev/ns/workflow#"),
+    ("prov", "http://www.w3.org/ns/prov#"),
+    ("dcterms", "http://purl.org/dc/terms/"),
+    ("skos", "http://www.w3.org/2004/02/skos/core#"),
+    ("rdf", "http://www.w3.org/1999/02/22-rdf-syntax-ns#"),
+    ("rdfs", "http://www.w3.org/2000/01/rdf-schema#"),
+    ("owl", "http://www.w3.org/2002/07/owl#"),
+    ("xsd", "http://www.w3.org/2001/XMLSchema#"),
+];
+```
+
+Embed the TTL via `include_str!("../../ontology/workflow-1.0.0.ttl")` so the Rust
+source and the TTL cannot drift.
+
+### 1.3 Project identity (`atomic_core::kg::project_id` + `atomic_core::kg::iri`)
+
+**Design goal:** a single stable identifier per repository that survives views,
+inserts, unrecords, and clone/pull/push, and becomes the `<pid>` component in
+project-qualified IRIs.
+
+**Format:**
+- 256-bit random ID generated at `atomic init` time.
+- Canonical encoding: uppercase RFC 4648 base32 (52 characters, no padding), same
+  alphabet as `Hash::to_base32`.
+- Display form: the base32 string.
+- URN prefix: `urn:atomic:project:<pid>`.
+
+**Storage:**
+- Dedicated table `PROJECT_IDENTITY` in pristine (not `VIEW_CHANGES`, therefore
+  view-independent and immune to insert/unrecord).
+- Schema: `current_hash` → the content-addressed object hash of the signed identity
+  object; `created_at` → timestamp. A `previous` chain column is reserved for rotation
+  (deferred), so the schema is forward-compatible.
+
+**Identity object (content-addressed, signed JSON-LD):**
+
+```jsonld
+{
+  "@context": "https://atomic.dev/ns/ctx.jsonld",
+  "@type": "atomic:ProjectIdentity",
+  "atomic:projectId": "ABCD...EFGH",   // the 52-char base32
+  "atomic:createdAt": "2026-01-15T09:00:00Z",
+  "atomic:schemaVersion": 2,
+  "atomic:issuer": "did:atomic:..."     // optional in Phase 1; may be unknown
+}
+```
+
+- Content hash = `blake3(JCS(normalized_bytes))`.
+- Signed by the initializing identity if available; unsigned is allowed in Phase 1
+  (the object schema reserves the `proof` field).
+
+**Why not `.vault/` or view metadata?**
+A `.vault/` file is a change-tracked artifact. It can be absent on some views,
+in conflict, or unrecorded. Project identity must be the same on every view and
+survive all graph mutations. The only place that guarantees this is a repository-level
+pristine table outside the view system.
+
+**Transport:**
+- Clone / pull / push carry the project identity object as a repository-level
+  sidecar (not a change). The receiving side stores it in its own `PROJECT_IDENTITY`
+  table if the table is empty; if already populated, the clone keeps its own identity
+  (a cloned project is a new project).
+- No fork command in Phase 1; fork semantics (new identity with
+  `prov:wasDerivedFrom` pointing at origin) come later.
+
+**API:**
+
+```rust
+// atomic-core/src/kg/project_id.rs
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct ProjectId([u8; 32]);
+
+impl ProjectId {
+    pub fn generate() -> Self;           // OsRng → 32 bytes
+    pub fn from_base32(s: &str) -> Result<Self, ProjectIdError>;
+    pub fn to_base32(&self) -> String;   // 52-char uppercase, no padding
+    pub fn to_urn(&self) -> String;      // urn:atomic:project:<base32>
+}
+
+// atomic-core/src/kg/iri.rs
+pub fn mint_intent_iri(pid: &ProjectId, ulid: &str) -> String;
+pub fn mint_goal_iri(pid: &ProjectId, encoded_name: &str) -> String;
+pub fn mint_memory_iri(pid: &ProjectId, encoded_name: &str) -> String;
+pub fn mint_session_iri(pid: &ProjectId, sid: &str) -> String;
+pub fn mint_view_iri(pid: &ProjectId, view_name: &str) -> String;
+pub fn mint_file_iri(pid: &ProjectId, path: &str) -> String;
+// ... and parser functions for the reverse direction
+```
+
+All minting functions percent-encode path/ name segments per RFC 3987 and guarantee
+round-trip stability. Property tests cover paths with spaces, `#`, `:`, non-ASCII,
+and the empty string.
+
+**CLI:**
+
+```bash
+# Show the project identity
+atomic project identity show
+# → project: ABCDEFGH...12345678
+#   urn: urn:atomic:project:ABCDEFGH...12345678
+#   created: 2026-01-15T09:00:00Z
+```
+
+**Phase 1 IRI usage:**
+
+The projectors (Phase 2) will emit IRIs like:
+
+```
+urn:atomic:project:<pid>:intent:<ulid>
+urn:atomic:project:<pid>:goal:<encoded-name>
+urn:atomic:project:<pid>:memory:<encoded-name>
+urn:atomic:project:<pid>:session:<sid>
+urn:atomic:project:<pid>:view:<encoded-name>
+urn:atomic:project:<pid>:file:<pct-encoded-path>
+```
+
+In Phase 1 we only mint the `ProjectId` and provide the IRI functions; no
+projector actually emits project-qualified IRIs yet. This is deliberate:
+projectors come in Phase 2, but the identity must exist first so that Phase 2
+can use it without a second migration.
+
+### 1.4 SHACL validation engine (`atomic_core::kg::shacl`)
+
+**Decision:** SHACL is the primary validation mechanism. We do not write hand-coded
+Rust checks that mirror SHACL rules. We parse SHACL shapes and evaluate them against
+the property-graph KG.
+
+**Dependencies:** `oxttl` (~20 crates) + `oxrdf` for parsing Turtle / RDF. These are
+acceptable per the 2026-07-06 decision in `docs/shacl-oxirs-spike-findings.md`.
+`oxirs` (~432 crates, silently drops `sh:node`/`sh:sparql`) is still rejected.
+
+**What the engine supports (Phase 1):**
+
+| SHACL feature | Status | Rationale |
+|---|---|---|
+| `sh:NodeShape`, `sh:PropertyShape` | ✓ | Core shape types |
+| `sh:targetClass`, `sh:targetSubjectsOf`, `sh:targetObjectsOf` | ✓ | Target declaration |
+| `sh:class`, `sh:datatype`, `sh:minCount`, `sh:maxCount` | ✓ | Cardinality and typing |
+| `sh:minExclusive`, `sh:minInclusive`, `sh:maxExclusive`, `sh:maxInclusive` | ✓ | Range checks |
+| `sh:minLength`, `sh:maxLength`, `sh:pattern` | ✓ | String constraints |
+| `sh:hasValue`, `sh:in` | ✓ | Enumerated values |
+| `sh:node` | ✗ | Defer; complex nesting |
+| `sh:or`, `sh:and`, `sh:not` | ✓ | Boolean logic |
+| `sh:sparql` | ✗ | Requires SPARQL; defer to federation phase |
+| `sh:property` paths (`sh:path`) | ✓ | Predicate, inverse, sequence (limited) |
+
+**Builtin shape graphs:**
+
+- `atomic-core/ontology/shapes/projection-1.0.0.ttl` — projection profile:
+  - every generated change has `atomic:implements`, `atomic:explainedBy`, and
+    `atomic:attestedBy` shortcuts;
+  - shortcut targets equal the authoritative intermediate path targets;
+  - all referenced canonical nodes exist;
+  - full hashes (not abbreviated labels) in durable IDs.
+
+- `atomic-core/ontology/shapes/publication-1.0.0.ttl` — publication profile:
+  - every managed `SessionTurn` has exactly one `atomic:hasPlan` intent;
+  - no managed turn is governed by more than one intent;
+  - every turn has exactly one provenance graph;
+  - every generated change is covered by the session attestation;
+  - every attestation has a signer DID and valid proof.
+
+**Enterprise custom shapes:**
+
+Repository directory `.atomic/shapes/*.ttl` is loaded automatically on `atomic query
+validate` and on every `vault sync`. Failed shapes are reported in the CLI with
+`sh:focusNode`, `sh:resultPath`, and `sh:resultMessage`.
+
+Example enterprise shape:
+
+```turtle
+@prefix atomic: <https://atomic.dev/ns/workflow#> .
+@prefix sh:     <http://www.w3.org/ns/shacl#> .
+
+<#SoxChangeShape>
+  a sh:NodeShape ;
+  sh:targetClass atomic:Change ;
+  sh:property [
+    sh:path atomic:attestedBy ;
+    sh:minCount 1 ;
+    sh:message "SOX: every change must be attested."
+  ] ;
+  sh:property [
+    sh:path atomic:implements ;
+    sh:minCount 1 ;
+    sh:message "SOX: every change must trace to an intent."
+  ] .
+```
+
+**API surface:**
+
+```rust
+// atomic-core/src/kg/shacl.rs (new module)
+pub struct ShaclValidator { ... }
+
+impl ShaclValidator {
+    /// Load a shape graph from a .ttl file.
+    pub fn load_shapes(&mut self, ttl: &str) -> Result<(), ShaclError>;
+
+    /// Validate the KG (property-graph read interface) against loaded shapes.
+    pub fn validate(&self, kg: &dyn KgRead) -> ValidationReport;
+
+    /// Validate a single focus node.
+    pub fn validate_node(&self, kg: &dyn KgRead, node: &NodeId, shape: &ShapeId)
+        -> Result<(), Vec<ConstraintViolation>>;
+}
+
+pub struct ValidationReport {
+    pub conforms: bool,
+    pub results: Vec<ConstraintViolation>,
+}
+
+pub struct ConstraintViolation {
+    pub focus_node: String,     // IRI
+    pub result_path: Option<String>,
+    pub severity: Severity,     // sh:Violation, sh:Warning, sh:Info
+    pub message: String,
+    pub shape: String,
+}
+```
+
+The validator operates over a small **graph-access trait**, not redb directly:
+
+```rust
+pub trait KgRead {
+    fn subjects(&self) -> Box<dyn Iterator<Item = &str>>;
+    fn types(&self, node: &str) -> Vec<&str>;
+    fn objects(&self, subject: &str, predicate: &str) -> Vec<&str>;
+    fn has_property(&self, subject: &str, predicate: &str, object: &str) -> bool;
+    fn literal(&self, subject: &str, predicate: &str) -> Vec<Literal>;
+}
+```
+
+This trait is implemented for the property-graph tables (`kg_nodes`, `kg_edges`)
+and also for an in-memory `oxrdf::Dataset` during tests.
+
+**CLI:**
+
+```bash
+# Validate against all loaded shapes (builtin + .atomic/shapes/)
+atomic query validate
+
+# Validate against a specific shape
+atomic query validate --shape <iri>
+
+# Validate a specific node
+atomic query validate --node <iri>
+
+# Output validation report as JSON or human-readable
+atomic query validate --format json|text
+```
+
+### 1.5 Legacy term coverage
+
+`LEGACY_TERMS` (test-only, gated by `#[cfg(test)]`):
+
+```rust
+pub enum Replacement {
+    One { class: Class },
+    OnePred { predicate: Predicate },
+    SplitByEndpoint(&[(Option<Class>, Option<Class>, Predicate)]),
+    Removed { reason: &'static str },
+}
+
+static LEGACY_TERMS: &[(/* old */ &'static str, Replacement)] = &[ ... ];
+```
+
+Tests:
+
+1. Every legacy `predicate::*`, `entity_type::*`, and `edge_kind::*` constant appears
+   exactly once in `LEGACY_TERMS`.
+2. Every `One`/`Split` target exists in the TTL.
+3. TTL ↔ Rust consistency: parsed with `oxttl` + `oxrdf` (**dev-dependencies only**).
+   Every class/property in the TTL has a corresponding Rust enum variant, and vice
+   versa, with matching domain/range.
+4. No emitted string starts with `vault:`, `atom:`, or is SCREAMING_CASE.
+
+## 2. Out of scope for Phase 1
+
+| Item | Deferred to |
 |---|---|
-| `Attestation atomic:coversChange Change` | `Attestation.changes_covered` |
-| `Attestation atomic:attests SessionTurn` | attestation `session_id` + covered change ∈ turn `change_hashes` (D8: exact once the turn is recorded; interim inference only when unique) |
-| `Attestation atomic:signedBy Identity` | `Attestation.signer` (`did:atomic` or MAC signer) |
-| `Attestation atomic:previousAttestation Attestation` | `previous_attestation` |
-| `Attestation atomic:verificationResult atomic:{Verified,Unverifiable,Failed}` | asserted **only** by the verifier pass (never inferred) |
-| `Change atomic:implements Intent` | inferred: `generatedBy ∘ hasPlan` |
-| `Change atomic:explainedBy ProvenanceGraph` | inferred: `generatedBy ∘ explainedBy` |
-| `Change atomic:attestedBy Attestation` | inferred: inverse of `coversChange` |
-| `Finding atomic:aboutResource X`, `atomic:findingCode` | historical gaps (`MissingHistoricalPlanId`, `MissingAttestation`, …) |
+| `KgEdge.graph` (`Asserted`/`Inferred`) | Phase 2 |
+| `kg_types` / `kg_types_rev` tables | Phase 2 |
+| Storage generation 2 / `KG_GENERATION` | Phase 2 |
+| Projector rewrite (`vault.rs`, `vcs.rs`, `session.rs`, `attestation.rs`, `findings.rs`) | Phase 2 |
+| `reconcile()` pipeline | Phase 2 |
+| OWL 2 RL inference engine (`kg::reason`) | Phase 2 |
+| `sh:sparql` and advanced path expressions | Federation phase |
+| Consumer cutover (`query`, triage, daemon, proto) | Phase 2 |
+| Code-structure edges (`calls`, `defines`, `exports`, `includes`, `modifiesEntity`) | When sourced from AST |
+| Scope-qualified entity IDs | Same — when code-structure edges are needed |
+| `sh:node` (shape nesting) | Phase 2 |
+| Project identity rotation / fork command | Phase 2 |
+| DID binding on `ProjectIdentity.issuer` | Phase 2 |
 
-### 3.4 Storage shape
+## 3. Acceptance criteria
 
-Keep the property-graph tables (they already serve FTS, neighbors, and UI) but make them
-RDF-faithful:
-
-- `KgEdge.kind` → absolute predicate IRI. The write API takes a typed
-  `Predicate` (ontology constant), not `&str`; unknown IRIs are unrepresentable on write and
-  rejected on read.
-- New field `KgEdge.graph: Asserted | Inferred` (serde default `Asserted`), with
-  `metadata.derivation = { rule, ontology_version, premises: [edge keys] }` on inferred edges.
-- **Types in a dedicated index**, not as `rdf:type` edges: new multimap tables
-  `kg_types` (node IRI → class IRI) and `kg_types_rev` (class → node). Reason: storing
-  classes as edge targets would make every node a 2-hop neighbor of every same-typed node
-  under the kind-blind `kg_neighbors` BFS. RDF export emits them as `rdf:type` triples.
-  Entailed superclasses are stored with `graph = Inferred`.
-- `KgNode.kind` is **removed**; display category derives from the most specific type.
-  `metadata.rdf_type` is removed. `KgNode.source` stays (it drives `kg_clear_derived`).
-- `kg_index_meta["kg_generation"]` records `{ontology_version, projector_version,
-  inference_profile, built_at}` per the RFC's "projection generation".
-- Register new tables in `schema.rs::visit_tables`; retire nothing (same table names, new
-  contents after rebuild).
+1. `workflow-1.0.0.ttl` is parseable by `oxttl` and contains no axioms outside the
+   supported RL subset.
+2. `atomic_core::kg::ontology::Class::iri()` returns the correct absolute IRI for
+   every variant.
+3. `atomic_core::kg::ontology::Predicate::domain()` and `::range()` match the TTL.
+4. `LEGACY_TERMS` coverage test passes: all old constants mapped, no unmapped survivors.
+5. Workspace lint: no legacy `vault:*`, `atom:*`, or SCREAMING_CASE kind strings
+   outside `LEGACY_TERMS`.
+6. **Project identity:** `atomic init` creates a `ProjectId`; `atomic project identity show`
+   displays it; the ID round-trips through base32 encoding; IRIs minted via `kg::iri`
+   match the canonical format.
+7. **SHACL engine:** `projection-1.0.0.ttl` and `publication-1.0.0.ttl` parse and
+   evaluate against a test property graph without error.
+8. **Custom shapes:** placing a `.ttl` in `.atomic/shapes/` causes `atomic query validate`
+   to load and evaluate it.
+9. **Conformance report:** `ValidationReport` produces `sh:focusNode`, `sh:resultPath`,
+   `sh:resultMessage` for every violation.
 
 ## 4. Milestones
 
-The RFC forbids a dual-write window, so M3, M4 and M7 land together on this branch and
-merge as one release. M1, M2, M5 and M6 are additive and can be reviewed independently.
+### M1 — Ontology + registry (one PR)
 
-### M1 — Ontology artifacts and term registry (additive, no behavior change)
+- `workflow-1.0.0.ttl`
+- `atomic_core::kg::ontology` module
+- `LEGACY_TERMS` + coverage tests
+- TTL ↔ Rust consistency test (`oxttl`/`oxrdf` as dev-deps)
 
-- `atomic-core/ontology/workflow-1.0.0.ttl`: OWL 2 RL ontology — classes (§3.3), object
-  and datatype properties with domain/range, inverses, subproperty hierarchy, the two
-  property chains, `atomic:dependsOn` as `owl:TransitiveProperty`, safe disjointness
-  (`AIContribution`/`WorkIntent` deferred with Phase 2 classes), and `atomic:Execution` /
-  `atomic:partOfTurn` declared but not projected (D11).
-- `atomic-core/ontology/workflow-1.0.0-dl.ttl`: optional DL companion (can slip).
-- Rewrite `atomic-core/src/pristine/ontology.rs` as `atomic_core::kg::ontology`:
-  `Class` and `Predicate` enums with `iri()`, `curie()`, domain/range metadata, and a
-  `PREFIXES` table for display compaction. Embed the `.ttl` via `include_str!`.
-- `LEGACY_TERMS` table (test-only): every old constant → `Replacement::{One(term),
-  SplitByEndpoint([(domain, range, term)]), Removed(reason)}`.
-- Tests:
-  - coverage: each of the 30 + 16 + 29 legacy constants appears exactly once in
-    `LEGACY_TERMS`, and every `One`/`Split` target exists in the TTL;
-  - TTL ↔ Rust consistency: every Rust term is declared in the TTL with matching
-    domain/range and vice versa (parse with `oxttl`/`oxrdf` as **dev-dependencies only**);
-  - no emitted string starts with `vault:`, `atom:`, or is SCREAMING_CASE (enforced again in
-    M4 over a rebuilt fixture repo).
-- Doc: update the AGENTS.md table section; amend the RFC to state that frozen historical
-  document formats are read-only inputs, not a compatibility vocabulary (D3); publish
-  dereferenceable docs at the namespace (ops task, tracked separately).
+### M2 — Project identity + IRI minting (one PR, depends on M1)
 
-### M2 — Project identity and IRI minting
+- `atomic_core::kg::project_id` (`ProjectId`, base32, URN)
+- `atomic_core::kg::iri` (mint/parse for every node kind)
+- `PROJECT_IDENTITY` pristine table
+- Identity object (JSON-LD, content-addressed, optionally signed)
+- `atomic init` mints on creation; upgrading repos mint on first writable open
+- Minimal clone/pull/push transport (repository-level sidecar)
+- CLI: `atomic project identity show`
+- Property tests: round-trip, percent-encoding, strict base32 parsing
 
-- `atomic-canonical` ctx v2 on `https://atomic.dev/ns/workflow#` with an object
-  schema-version bump; v1 frozen for verification only; all new writes are v2 (D3).
-- `atomic-canonical`: new `ProjectIdentity` node (`issuer` DID, `createdAt`, 256-bit random
-  id, schema version, proof), gate rules, JCS hash. Project ID = base32 of the random id.
-- Storage and transport per D5: its own pristine node type plus a
-  `PROJECT_IDENTITY` table, carried by clone/push/pull as a repository-level object).
-  `atomic init` mints it; upgrading an existing repo mints it on the first writable open by
-  a signing identity, otherwise fails with `KgNeedsProjectIdentity` and an actionable message.
-- `atomic project identity show|fork` (fork records `prov:wasDerivedFrom` origin). Rotation
-  chain deferred, but the object schema reserves `previousIdentity`.
-- Import collision check: same id + different verified object → reject.
-- `atomic_core::kg::iri`: mint/parse for every row of §3.2; property tests for round trip and
-  percent-encoding of paths with spaces, `#`, `:`, non-ASCII.
-- Strict canonical base32 parser for content-addressed URNs (D4): rejects lowercase,
-  padding, wrong length and nonzero trailing bits; tested against `Hash::to_base32`.
+### M3 — SHACL engine + builtin shapes (one PR, depends on M1)
 
-### M3 — Storage generation 2 (lands with M4/M7)
+- `oxttl` + `oxrdf` dependency
+- `atomic_core::kg::shacl` module with `ShaclValidator`, `KgRead` trait,
+  `ValidationReport`, `ConstraintViolation`
+- `projection-1.0.0.ttl` and `publication-1.0.0.ttl`
+- In-memory `oxrdf::Dataset` adapter for `KgRead` (testing)
+- CLI: `atomic query validate`
+- Custom shape loader from `.atomic/shapes/*.ttl`
+- Test: a synthetic property graph passes/fails each builtin shape as expected
 
-- `KgEdge.graph`, typed `Predicate` write API, `kg_types`/`kg_types_rev` tables, removal of
-  `KgNode.kind`/`metadata.rdf_type`, read-side rejection of non-IRI kinds.
-- Capability fence `kg-semweb-v1` in `capability.rs` so older binaries fail closed.
-- `KG_GENERATION` constant plus `kg_index_meta["kg_generation"]`. The upgrade rebuild runs
-  automatically on the first writable open and via `atomic query reindex --full`,
-  regardless of repository size. The marker is written in the same transaction as the final
-  rebuild batch, so the rebuild happens exactly once per generation (D6). The upgrade path
-  clears all `kg_*` tables and runs M4's reconcile.
-- `kg_neighbors` gains an optional predicate filter and direction; unfiltered behavior kept
-  for `vault context`/RAG (they now filter by type, not `kind`).
+## 5. Development notes
 
-### M4 — Projector rewrite and unified reconcile (lands with M3/M7)
+### Why not oxirs?
 
-- New module `atomic-repository/src/kg/` with one projector per family, all emitting via
-  the typed API:
-  - `vault.rs` (from `vault_triples.rs`): intents (canonical `kind` → intent subclass;
-    lifecycle → `ManagedIntent`), memories, goals, skills, tool results, decomposition
-    children, `:::ref` edges split by edge name, author edges for intents.
-  - `vcs.rs` (from `vault_kg_enrich.rs`): views + `childViewOf`, `directlyOnView` from
-    `VIEW_CHANGES`, changes (full hash), `directlyDependsOnChange`, `modifiesFile`,
-    `authoredBy`, modules/files.
-  - `ast.rs`: entities, `defines`/`exports`/`includes`/`calls`, `modifiesEntity` on both
-    paths.
-  - Scope-qualified entity IDs (D10): add `Entity.scope` (enclosing containers) to all
-    seven `atomic-semantic` parsers plus normalized parameter types for overloading languages;
-    update `query callers` display and `extract_path_from_id` to read node data; print
-    `path:startLine-endLine` beside every entity ID; accept `path:line` and
-    `path#kind:scope::name` as CLI entity arguments.
-  - `session.rs`: move the vocabulary out of `atomic-core/.../session_kg.rs` (keep the
-    record-time hook in core, but it calls the shared emitter), sessions, turns, todos,
-    provenance graphs, `ManagedTurn` typing.
-  - `attestation.rs` (**new**): load `.attest` objects, emit Attestation node and §3.3 edges;
-    run signature verification (reuse `provenance_gate` verification + MAC provider) and
-    assert `verificationResult`.
-  - `findings.rs` (**new**): `MissingHistoricalPlanId`, `MissingProvenance`,
-    `MissingAttestation`, `UnverifiableAttestation` — never guessed links.
-- `reconcile(scope)` pipeline (RFC "Sync and enrichment contract"): ingest vault → discover
-  VCS/session/provenance/attestation objects → project → verify → infer (M5) → validate
-  (M6) → publish generation + stats. `vault sync`, `query enrich`, `query reindex`, clone,
-  pull and import all call it (full or incremental scope). Record-time incremental
-  enrichment calls the same projectors for the new objects.
-- Determinism: projectors sort inputs; output digest = blake3 over sorted canonical N-Triples.
+`oxirs` (~432 transitive deps) silently drops `sh:node` and `sh:sparql`. We write
+the subset we need (~800–1200 lines) against `oxrdf`/`oxttl`, grow it only when a
+shape requires it, and keep the graph-access trait small enough to extract later
+into a standalone crate if the engine becomes general-purpose.
 
-### M5 — OWL 2 RL inference (additive engine; wired in M4)
+### Why `KgRead` trait instead of redb directly?
 
-- `atomic_core::kg::reason`: forward-chaining to fixpoint over rules **generated from the
-  TTL** (so the ontology is data): `rdfs:subClassOf`, `rdfs:subPropertyOf`,
-  `owl:inverseOf`, `rdfs:domain`/`rdfs:range` typing, 2-step `owl:propertyChainAxiom`.
-- Transitive properties (`atomic:dependsOn`, `atomic:ancestorView`) are **not**
-  materialized; query operators compute closure from an explicit seed set.
-- Every inferred edge/type carries a derivation record; inferred edges never overwrite an
-  asserted edge with the same key (asserted wins, derivation is appended).
-- `verificationResult` and any proof-validity term are excluded from rule heads.
-- Tests: golden fixtures per rule; idempotence (re-running adds nothing); order-independence.
+The trait abstracts over property-graph tables, `oxrdf::Dataset`, and any future
+RDF store. Validation tests run against an in-memory dataset without a database.
+If the engine ever needs to move into a standalone crate (e.g. for the Circuit
+Breaker workflow), the trait goes with it and redb does not.
 
-### M6 — Validation (SHACL as data + hand-coded checks)
+### Enterprise workflow shapes
 
-Per D1:
+The `.atomic/shapes/` convention is intentionally simple: drop a `.ttl` file, run
+`atomic query validate`. No registry, no compilation step. A CI pipeline can run
+`atomic query validate --format json` and fail on any `sh:Violation` severity.
 
-- `atomic-core/ontology/shapes/projection-1.0.0.ttl` and `publication-1.0.0.ttl`
-  (normative). Projection profile: shortcut agreement, referential existence, full-hash IDs,
-  every generated change has `implements`/`explainedBy`/`attestedBy`. Publication profile:
-  managed turn has exactly one `hasPlan`; managed intent governs ≥1 turn; turn has exactly
-  one provenance graph; every generated change is covered by the session attestation;
-  attestation has signer + verified proof.
-- Rust `kg::validate` implements each shape rule (one function per `sh:` rule ID, as in
-  `atomic-canonical/src/gate.rs`) over a small graph-access trait, and produces a report keyed
-  by shape/path IRIs. If it grows into a general SHACL evaluator, extract it into a
-  dedicated `atomic-core`-free crate that CB can consume or that can be published (D1).
-- **Publication profile hooks into `provenance_gate.rs`** (the existing boundary for
-  shared-view insert, triage promotion, push, Git export) behind policy
-  `[provenance] require_plan = true` (default off). Absent `plan_id` fails publication.
-- Projection failure → deterministic repair (re-run projectors for the offending subjects)
-  → revalidate → if still failing, generation is marked non-conforming and query output says
-  so.
-- `atomic query export --format nquads|turtle [--inferred]` (hand-rolled serializer, no
-  deps) so the CB workflow can run real SHACL; differential fixture corpus checked into
-  `atomic-core/ontology/shapes/fixtures/` with expected conforms/violations for both the
-  Rust checks and CB.
+### Why view-independent storage for project identity?
 
-### M7 — Consumer cutover (lands with M3/M4)
+If project identity lived in a `.vault/` file (a tracked change), it would:
+- be invisible on views that don't include that change;
+- be lost on `unrecord`;
+- diverge across views in a merge.
 
-- `query_plan.rs`: new steps `Relation { predicate, direction }`, `DirectViewMembers`,
-  `ImplementingChanges`, `DependencyClosure { seeds }`, `TypeFilter`; `Filter` on `kind`
-  becomes type-based; plan JSON schema version bump.
-- CLI `query`: `callers` → `atomic:calls`; graph colour map keyed by IRI; DOT/text output
-  compacts IRIs to CURIEs via `PREFIXES`; JSON emits absolute IRIs; `ask` prompt lists
-  canonical predicates and IRI forms.
-- Triage (`atomic-repository/src/triage/report.rs` `kind_is`, `repository/triage.rs`), `vault_intent.rs` informedBy checks,
-  `vault/context.rs` memory filter (type `atomic:Memory`).
-- libatomic daemon duplicates (`services_agent.rs`, `services_query.rs`); `rpc.rs`.
-- Proto: document `KGEdge.relation` as an absolute IRI; add `types` repeated field to the node
-  message; bump knowledge service API version.
-- No compatibility shim for JSON/RPC consumers; the release is announced as breaking (D7).
-- Update ~110 test assertion sites; add a lint test that greps the workspace for legacy
-  kind literals outside `LEGACY_TERMS`.
+Cross-project SPARQL assumes every repository in the federation has one stable
+`urn:atomic:project:<pid>` that never changes. A repository-level pristine table
+outside the view system is the only place that guarantees this.
 
-## 5. Acceptance tests for Phase 1
+### Phase 2 expectations
 
-Mapped to RFC acceptance criteria 1-4, 7, 8:
+Phase 2 will:
+- rewrite projectors to emit project-qualified IRIs using `kg::iri`;
+- implement `kg_types`/`kg_types_rev` for type indexing;
+- add the OWL 2 RL inference engine;
+- wire SHACL validation into `vault sync` and publication gates;
+- cut over consumers to use canonical IRIs.
 
-1. **Closure path (AC1):** integration test drives a managed agent turn with `plan_id` →
-   record → attest; asserts the change reaches intent, provenance graph, attestation,
-   session and turn via asserted edges, and that `implements`/`explainedBy`/`attestedBy`
-   shortcuts exist and agree.
-2. **Repair (AC2):** delete all `kg_*` contents → `reconcile --full` → graph digest equals
-   the incrementally built graph's digest.
-3. **Inference (AC3):** golden test for inverses, hierarchy and both property chains;
-   rerun is a no-op.
-4. **Validation (AC4):** fixtures for each shape rule (positive + negative); publication
-   gate refuses push when `require_plan` and a managed turn lacks `plan_id`.
-5. **Historical gaps (AC7):** pre-`plan_id` turn yields `MissingHistoricalPlanId` finding and
-   **no** `implements` edge.
-6. **Coverage (AC8):** M1 coverage test + workspace lint for legacy literals.
-7. **Membership:** `directlyOnView` for a change inserted into `dev` from `feature` lists it on
-   both views (both have it in `VIEW_CHANGES`) and never on the working copy's desired view
-   unless it is a member.
+Because Phase 1 already minted `ProjectId`, Phase 2 projectors can use it
+immediately without a second migration or ID rewrite.
 
-## 6. Suggested order of work
+---
 
-1. M1 (ontology + registry + coverage test) — establishes the vocabulary everyone reviews.
-2. M2 (project identity + IRIs) — unblocks every projector.
-3. M5 (reasoner) in parallel with M3 (storage) — independent.
-4. M4 (projectors + reconcile) on top of M2/M3/M5.
-5. M6 (validation + export + gate).
-6. M7 (consumers), then the end-to-end acceptance suite; merge M3+M4+M6+M7 as one release.
+## Appendix: Why we skip code-block mapping now
 
-## 7. Risks
-
-- **Rebuild cost on large repos** (AST + CALLS fan-out). Mitigation: D6, progress output,
-  incremental reconcile by changed objects.
-- **Edge-key growth** from absolute IRIs (~40-80 bytes per key). Acceptable for redb; can
-  intern predicate IRIs to `u16` later if measured.
-- **Attestation verification on receiving remotes**: MAC attestations are unverifiable
-  without the key (per `provenance_gate`); they must project as `Unverifiable`, never
-  `Verified`, and the projection profile must treat that as a reported state, not a repair loop.
-- **Out-of-repo clients** break on release day by design (D7); the API version bump makes the failure loud.
-- **`atom:` vs `atomic:` confusion** in reviews: write D3 (v1 frozen and read-only, v2 for new objects) into AGENTS.md.
-
-## 8. Decisions and open questions
-
-### 8.1 Resolved
-
-**D1 — SHACL enforcement location: option (a).** Shapes ship as `.ttl` data and are the
-normative source. Atomic implements hand-coded checks that mirror them and exports RDF for
-the CB workflow. Implementation rule:
-- Start with hand-coded checks in `kg::validate`, one function per shape rule (the
-  `atomic-canonical/src/gate.rs` pattern).
-- Write the checks against a small graph-access trait (subjects, objects, types,
-  literals), not against redb or `KgNode` directly, so they can move later without a
-  rewrite.
-- **Extraction trigger:** if the checks start to look like a real SHACL implementation
-  (generic `sh:` constraint dispatch, property-path evaluation, `sh:node`/`sh:sparql`
-  semantics, a shapes loader), move them into a dedicated crate (working name
-  `atomic-shacl`). That crate depends only on an RDF term model, never on `atomic-core`, so
-  CB can pull it in, it can be relocated, or it can be published separately.
-
-**D2 — OWL 2 RL implementation (RFC open question 1): option (a), written in-house.** Options considered:
-
-| Option | What it is | Cons |
-|---|---|---|
-| **(a) In-house rule engine** (chosen) | Forward-chaining over rules generated from our TTL: subClassOf/subPropertyOf, inverseOf, domain/range, 2-step property chains | We own correctness and must test every rule. It covers only the RL rules we implement, so the TTL loader must **reject** unsupported axioms (fail closed, the oxirs lesson) rather than silently ignore them |
-| (b) `reasonable` crate | OWL 2 RL reasoner (Brick Schema project), Datalog on `datafrog` + `oxrdf` | Latest release is a prerelease (`0.5.0-a1`) from a small research-driven project. It materializes the full RL rule set, which produces many trivial triples (`owl:Thing`, reflexive `sameAs`, …) we'd filter out. It works on its own in-memory graph, so every reconcile copies the KG in and out of redb. It keeps no per-triple derivation records (rule + premises), which the RFC requires |
-| (c) Datalog library (`datafrog` 2.0, `ascent` 0.8, `crepe`) + our rules | We write the RL rules; the library evaluates them to a fixpoint | Fixpoint evaluation is the easy part, and we still write and test every rule. `ascent`/`crepe` compile rules from macros, so the ontology stops being data. Derivation tracking is still ours. Worth it only if (a) turns out too slow |
-| (d) DL/EL reasoners (`rustdl` OWL 2 DL on `horned-owl`, `whelk-el` OWL 2 EL) | Description-logic classification | Wrong job: they classify the ontology's class hierarchy rather than deriving instance edges, so they don't scale to deriving `implements` across a large KG. The RFC deliberately keeps DL off the conformance path |
-| (e) RDF store + rules (`oxigraph` 0.5) | SPARQL store; rules written as `CONSTRUCT` queries looped to a fixpoint | No OWL reasoning built in. A second database next to redb (two copies to keep in sync), a large dependency tree, and we still write the rules by hand |
-| (f) External (Jena, RDFox, GraphDB, or inference inside CB like SHACL) | Mature reasoners outside the binary | JVM or service dependency. Local queries need the derived shortcuts (`implements`, `attestedBy`) in the local KG, so offline repos would lose them, and query correctness would depend on an external workflow |
-
-Decision: (a). The TTL loader rejects any axiom outside the supported rule set. Option (c)
-is the fallback only if profiling shows the fixpoint loop is a bottleneck.
-
-**D3 — Canonical document namespace: option (b), applied narrowly.**
-- New signed objects use a **ctx v2** built on the canonical `atomic:` workflow namespace
-  (`https://atomic.dev/ns/workflow#`), under a bumped object schema version.
-- Existing signed objects stay byte-for-byte unchanged.
-- ctx v1 is **frozen** as a read-only historical input format. The KG projector translates
-  it to canonical terms through a fixed, tested mapping, so `atom:` terms never reach KG
-  storage, queries, APIs, or new objects.
-- `https://atomic.dev/ns#` stays published with permanently fixed meaning (option (c) is
-  ruled out).
-- Why (b) over (a): the RFC gives `atomic:` sole ownership of workflow concepts, requires
-  every producer to emit canonical terms, and rejects `atom:*` variants after migration.
-  Byte stability protects only *existing* objects, not future ones. Both options read v1
-  forever; the difference is that (a) keeps producing the legacy format, while narrow (b)
-  closes it off.
-- Consequences:
-  - `atomic-canonical` gains ctx v2 plus a schema-version bump for Intent, Memory,
-    delegation, PROV graph and `ProjectIdentity` objects.
-  - The gate accepts v1 only to verify existing objects. All new writes are v2, including a
-    revision of a v1 object (its `previousRevision` points at the v1 hash).
-  - Work lands in M2 (documents) and M4 (the v1 → canonical mapping in the vault projector).
-- **RFC clarification required** (M1 doc task): frozen historical document formats are
-  read-only inputs, not a compatibility vocabulary.
-
-**D4 — Content-hash URN encoding: base32, algorithm-qualified, exactly specified.**
-`urn:atomic:change:blake3-256:<base32>`. The RFC doesn't choose an encoding, so this is
-a judgment call.
-- Why base32:
-  - It's already used in `urn:atomic:change:`, so hex would add a second identity break on
-    top of the full-hash migration.
-  - It's shorter: 52 characters versus 64 for hex.
-  - RFC 4648 base32 is a multibase encoding, which fits the RFC's "multihash-compatible" goal.
-- Normative encoding (the RFC's acceptance criteria depend on byte-identical IDs across
-  implementations):
-  1. **Alphabet:** standard RFC 4648 §6 (`A–Z2–7`), not base32hex, Crockford, or a custom
-     variant.
-  2. **Case:** uppercase is canonical (confirmed: keep current behavior). This is exactly what `Hash::to_base32` emits today
-     (`atomic-core/src/types/hash.rs:260`) and matches every existing change ID on disk and
-     in the CLI. The multibase equivalent is prefix `B`.
-  3. **No padding:** 52 characters, and the final 4 bits must be zero.
-  4. **Strict parsing:** reject any non-canonical form rather than normalizing it. The
-     existing `from_base32` is case-insensitive and doesn't check the trailing bits, so URN
-     parsing gets a new strict parser. Lenient prefix lookup in the CLI is unaffected.
-  5. A test proves `Hash::to_base32` output round-trips through the strict parser.
-- Scope: applies to every content-addressed URN (change, provenance, attestation,
-  project identity, file-version) and to `blake3-256:` evidence digests.
-- Cost: standard BLAKE3 tools (`b3sum`) print hex, so external verifiers get a documented
-  conversion step.
-
-**D5 — Where the signed `ProjectId` lives: option (a), its own pristine node type.** The
-first recommendation (a tracked `.vault/project/identity.jsonld` file) assumed snapshot
-semantics. In atomic a `.vault/` file is content recorded *as a change* in the graph, so:
-- its existence and bytes depend on which view you're on, because of the view filter;
-- it can be unrecorded, edited by a later change, or put in conflict;
-- it can diverge between views.
-
-Project identity is a repository-level fact that must be the same on every view and
-survive insert/unrecord. It also can't be derived from changes, because changes are global
-content-addressed objects: the same change can belong to many projects, and nothing
-guarantees a unique genesis change.
-
-| Option | Cons |
-|---|---|
-| **(a) Dedicated content-addressed, signed object registered as its own pristine node type** (`node_type::PROJECT = 4`, next to CHANGE/TAG/ATTESTATION/PROVENANCE) (chosen). Bytes in the change store; a singleton pristine table `PROJECT_IDENTITY` holds the current hash plus the rotation chain. It is not in any view's `VIEW_CHANGES`, so no view filters, inserts or unrecords it | Needs a new transport object class. Today the push/pull contract excludes sidecars (`atomic-remote/src/sync.rs:476`), so clone/push/pull must learn to carry it, and the server should bind the identity hash to its `ProjectInfo.id` |
-| (b) Metadata on the root view's `ViewState` | Still view-scoped: it travels and changes with one view, and other views can't verify it independently |
-| (c) Server-assigned `ProjectInfo.id` (UUID) | Requires a remote, so local-only repos have no identity; it's not signed by the user and can't be verified offline |
-| ~~(d) Tracked `.vault/` file~~ | Rejected: view-dependent, as explained above |
-
-Under (a), fork is an explicit command that mints a new object with `prov:wasDerivedFrom`
-pointing at the origin. The issuer DID binds the project to an identity now; org binding
-comes later through delegation (`ResourceRef`).
-
-**D6 — KG rebuild on upgrade: both triggers, regardless of repository size.** The rebuild
-runs automatically on the first writable open, and `atomic query reindex --full` runs it
-explicitly. It must happen **exactly once** per KG generation:
-- A compiled `KG_GENERATION` constant. A rebuild runs only when the stored
-  `kg_index_meta["kg_generation"]` is lower.
-- The generation marker is written in the **same write transaction as the final rebuild
-  batch**. An interrupted rebuild leaves no marker and restarts cleanly (clear, then
-  rebuild) on the next writable open. It never leaves a half-marked KG.
-- Repositories created by the new binary (`init`, `clone`) are stamped with the current
-  generation at creation and never trigger an upgrade rebuild.
-- Pull, import, incremental reconcile and `reindex --full` never lower or clear the marker;
-  `--full` re-stamps the same generation.
-- `KG_GENERATION` bumps only on breaking ontology or projector changes, not on every
-  release. Routine upgrades don't rebuild.
-- Read-only opens on an old-generation KG return `KgNeedsRebuild`, naming the command to run.
-- Tests: a second open after the upgrade performs zero rebuild work; a rebuild killed
-  midway completes on the next open; a fresh clone never rebuilds.
-
-**D7 — External JSON/RPC clients:** this release is announced loudly as breaking, so there
-is no compatibility shim and no coordination gate on `noname`/`the-hive`. The API version
-bump stays, so stale clients fail loudly rather than misreading data.
-
-**D8 — Attestation → turn mapping: option (b), with (a) as the interim.** Record the turn
-number in the attestation format at capture time, because the RFC classes turn identity as
-a capture-time fact. Until the format change lands, infer the turn only when exactly one
-turn's `change_hashes` ⊆ `changes_covered`. Otherwise emit an `AmbiguousAttestationTurn`
-finding and no `attests` edge.
-
-**D9 — Domain separation: provided by project identity, used later by federation.**
-Each atomic repository is its own domain; federation is how domains are kept apart in
-cross-project search (e.g. `testing/hello-world` vs `production/hello-world`, and later
-scoping by identity/org so a caller never searches someone else's projects). Content
-hashes stay global: the same change bytes hash the same in every project, which insert,
-pull and clone depend on.
-- Phase 1 obligation: a durable, signed project identity (D5) that later phases can read,
-  plus project-qualified IRIs for mutable resources (§3.2).
-- Deferred to Phase 5: the catalog, named project graphs, explicit query scope and
-  authorization that use that identity to keep projects separate in federated queries.
-- No change-format or hash-construction change in Phase 1.
-
-**D10 — Source-entity identity: option (b), scope-qualified IDs.** Where it comes from:
-- The RFC's node model lists Entity as a "project-qualified **stable** entity URN" from
-  the syntax/semantic index, and goal 6 requires portable identities.
-- Today's entity IDs are `entity:{file}:{name}:{line}` (`vault_kg_enrich.rs:587`), so they
-  contain the line number. Adding one line above a function changes its ID.
-- As a result, `modifiesEntity` edges from older changes point at IDs that no longer
-  exist, one function can end up with several IDs over time, and a full rebuild produces
-  different IDs than incremental enrichment. That breaks the "full rebuild equals
-  incremental" acceptance test and blame-style queries.
-- The line number is also doing a hidden job: the extractor (`atomic-semantic`, `Entity`
-  at `entity.rs:123`) emits methods by bare name (`fmt`, `find`) with no enclosing type, so
-  `impl Display for User { fn fmt }` and `impl Display for Order { fn fmt }` in one file are
-  told apart only by their lines.
-
-**Decision: a scope-qualified name instead of the line.**
-
-```text
-urn:atomic:project:<pid>:entity:<pct-path>#<kind>:<scope>::<name>[(<param-types>)][~<n>]
-```
-
-| Part | Meaning |
-|---|---|
-| `<pct-path>` | file path, percent-encoded (as today) |
-| `<kind>` | `EntityKind` (`function`, `method`, `class`, `interface`, `type-alias`, `const`, `enum`, `module`, …) |
-| `<scope>::<name>` | the chain of enclosing containers plus the name, joined by `::` in every language, each segment percent-encoded |
-| `(<param-types>)` | only in languages with overloading (Java, C++, Swift, TypeScript overload signatures): normalized parameter types from the signature |
-| `~<n>` | last-resort ordinal, by order of appearance, when everything above still collides (e.g. two `#[cfg]` variants of the same `fn`) |
-
-Line, end line, column and signature become literals on the node (`atomic:startLine`, …).
-
-The file stays in the ID. The examples below show only the fragment after `#`; the full ID
-for the `fmt` example is
-`urn:atomic:project:<pid>:entity:src%2Flib.rs#method:<User%20as%20Display>::fmt`.
-
-**Finding code still works, and line numbers stay visible.** Current consumers:
-
-| Consumer | Where it gets the line today | Change needed |
-|---|---|---|
-| `query entities <file>` | parses the file live with tree-sitter; never reads KG IDs (`query/mod.rs:1292-1342`) | none |
-| `query neighbors` / `search` text and JSON | node metadata `line`/`end_line` (`query/mod.rs:585, 648-665`) | none: the line stays on the node |
-| `query callers` display | **parses the ID**, stripping the trailing `:line` (`query/mod.rs:1267-1277`) | format `path:line` from node data |
-| Search ranking `extract_path_from_id` | **parses the ID** with `rsplitn(3, ':')` (`vault_triples.rs:629-645`) | read the path from node data |
-| Agents following the code-intelligence skill | read the line straight out of the copied ID | every result line prints `path:startLine-endLine` beside the ID |
-
-Display rule: anywhere an entity is shown to a person or an agent, print
-`path:startLine-endLine` with the ID. That line is always current, because it is refreshed
-on every enrichment, whereas a line embedded in an ID is frozen at the moment the ID was
-copied.
-
-Lookup by location: entity arguments in the CLI also accept `path:line` (for example
-`atomic query neighbors src/lib.rs:55`) and the shorthand `path#kind:scope::name`. Both
-resolve to the full IRI within the current project, so nobody has to type the URN.
-
-Examples:
-
-| Source | Today | Proposed fragment |
-|---|---|---|
-| `pub fn greet()` in `src/lib.rs` | `entity:src/lib.rs:greet:12` | `#function:greet` |
-| `impl User { fn new() }` | `entity:src/lib.rs:new:40` | `#method:User::new` |
-| `impl Display for User { fn fmt }` | `entity:src/lib.rs:fmt:55` | `#method:<User as Display>::fmt` |
-| `mod tests { fn it_works() }` | `entity:src/lib.rs:it_works:90` | `#function:tests::it_works` |
-| Python `class Repo: def get(self)` | `entity:repo.py:get:8` | `#method:Repo::get` |
-| Java `void put(int)` / `void put(String)` | two line-based IDs | `#method:Cache::put(int)` / `#method:Cache::put(String)` |
-| `#[cfg(unix)] fn open` / `#[cfg(windows)] fn open` | two line-based IDs | `#function:open` / `#function:open~2` |
-
-How it behaves compared with line-based IDs:
-
-| Edit | Line-based ID | Scope-qualified ID |
-|---|---|---|
-| Add or remove lines above, edit the body, reformat | changes | **stable** |
-| Rename the function | changes | changes (a real semantic change; the semantic diff's `ChangeType::Renamed` can later link old → new with `atomic:renamedFrom`) |
-| Move it to another file, or into/out of a type | changes | changes |
-| Change parameter types (overloading languages only) | stable unless lines move | changes |
-
-The payoff is that `modifiesEntity` edges from every change that ever touched a function
-converge on one node, so "history of this function" becomes a direct query, and full
-rebuild and incremental enrichment produce identical IDs.
-
-Cost: each of the seven parsers in `atomic-semantic/src/parsers/` (rust, typescript,
-python, go, java, cpp, swift) must record its enclosing scope chain (a new
-`Entity.scope: Vec<String>` field) and, for overloading languages, normalized parameter
-types. `CALLS` resolution stays name-based as today.
-
-| Option | Cons |
-|---|---|
-| (a) Keep line-based IDs | Breaks rebuild determinism and history queries, as described |
-| **(b) Scope-qualified IDs, as above** (chosen) | Extractor work in all seven parsers; the ordinal can shift if a new same-named duplicate appears earlier in the file (rare) |
-| (c) CRDT `LeafId` / syntax-index stable IDs | Survives renames too, but depends on the semantic layer being finished (AGENTS.md: "in progress"), which would put Phase 1 behind it |
-
-Work lands in M4 (extractor scope chains, ID minting, `callers` display, search ranking,
-`path:line` and shorthand lookup).
-
-**D11 — `Execution` nodes: option (a).** Declare `atomic:Execution` and `atomic:partOfTurn`
-in the ontology only. Project nothing until capture records structured executions
-(`ProvActivityInput.used` is always empty today).
-
-All Phase 1 decisions are resolved; there are no open questions.
+The existing `vault_kg_enrich.rs` pipeline extracts `CALLS`, `DEFINES`, `EXPORTS`,
+`INCLUDES`, `PART_OF`, and `MODIFIES` (entity) by walking source files and emitting
+KG edges. This duplicates `atomic-semantic`'s syntax index, produces stale line-based
+entity IDs, and generates millions of mostly-unqueried edges. The right time to
+materialize code-structure edges in the KG is when we need them for federated
+queries that the syntax index cannot answer. Until then, `atomic:File` stays as a
+workflow artifact and Tree-Sitter handles everything inside it.
