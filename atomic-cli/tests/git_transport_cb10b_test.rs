@@ -740,6 +740,15 @@ fn clone_unbound_history_refuses_with_explicit_foreign_synthesis_guidance() {
         ],
         "push branch only",
     );
+    // libgit2 and the Git CLI can use different configured default branches.
+    // Advertise the branch actually published so clone reaches the unbound
+    // history check instead of failing on an unborn remote HEAD.
+    let publisher_ref = git_text(&publisher, &["symbolic-ref", "HEAD"]);
+    assert_git(
+        &remote_dir,
+        &["symbolic-ref", "HEAD", publisher_ref.trim()],
+        "advertise published branch",
+    );
 
     let clone_dir = temp.path().join("clone");
     let clone_key = write_key_file(temp.path(), "clone-key.hex", 0x57);
