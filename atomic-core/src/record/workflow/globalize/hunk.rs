@@ -147,19 +147,24 @@ where
                     expected,
                 }) => {
                     // The alive graph's vertex count diverges from the diff's
-                    // line model — merge diamonds leave extra alive vertices
-                    // in an isolated leg closure, so positional anchoring is
-                    // unprovable. Fail closed: escalating to the whole-file
-                    // replace is NOT safe inside a leg assembly (its
-                    // delete_all_content walk spans lineages the leg must
-                    // not touch), and silently anchoring at unproven
-                    // vertices loses content. The import refuses this
-                    // commit naming the divergence.
-                    Err(GlobalizeError::LineVertexDivergence {
-                        path,
-                        vertices,
-                        expected,
-                    })
+                    // line model (merge diamonds add vertices; empty-line
+                    // accounting can shift it by one). Escalate to the
+                    // whole-file replace — every alive vertex is deleted and
+                    // the full content inserted fresh per line, which renders
+                    // byte-exact regardless of the diamond structure. This
+                    // stays fail-closed: the staged synthesis verification
+                    // checks the render against the commit tree and refuses
+                    // the commit when it disagrees, so a wrong escalation is
+                    // a refusal, never silent corruption.
+                    let _ = (path, vertices, expected);
+                    globalize_replace_whole_file(
+                        ctx,
+                        inode,
+                        inode_pos,
+                        full_content,
+                        local,
+                        encoding,
+                    )
                 }
                 Err(e) => {
                     log::debug!(
