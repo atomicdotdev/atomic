@@ -5244,6 +5244,38 @@ impl ParallelImporter {
         parsed: &ParsedCommit,
         binding: &atomic_repository::git_binding::GitStateBinding,
     ) -> CliResult<ImportedCommitInfo> {
+        // An anchor may extend an existing interpretation with Atomic-only
+        // changes (for example the imported repository's .atomicignore).
+        // Keep the original immutable interpretation when it is contained
+        // in the binding and still proves the same Git tree. Equal bytes
+        // alone must not authorize replacing unrelated causal identities.
+        let existing_closure = repo
+            .git_commit_closure(&parsed.git_sha)
+            .map_err(|e| CliError::Internal(e.into()))?;
+        if let Some(existing) = &existing_closure {
+            let bound = &binding.payload().ordered_changes;
+            if !existing.iter().all(|hash| bound.contains(hash)) {
+                return Err(git_error(format!(
+                    "binding for {} does not contain its persisted interpretation closure",
+                    parsed.git_sha
+                )));
+            }
+            if existing.len() != bound.len() {
+                let projection = repo
+                    .project_tree_for_change_closure(
+                        &self.options.target_view,
+                        existing,
+                        &conversion_policy(git)?,
+                    )
+                    .map_err(|e| CliError::Internal(e.into()))?;
+                if projection.git.root.as_bytes() != parsed.tree_oid.as_bytes() {
+                    return Err(git_error(format!(
+                        "persisted interpretation closure for {} does not reproduce its Git tree",
+                        parsed.git_sha
+                    )));
+                }
+            }
+        }
         let outcome = repo
             .resurrect_binding_exact(git, binding, &self.options.target_view, None)
             .map_err(|e| CliError::Internal(e.into()))?;
@@ -5254,14 +5286,9 @@ impl ParallelImporter {
         // SHA provenance.
         let mut restored_hashes: Vec<ContentHash> = outcome.inserted.clone();
         restored_hashes.extend(outcome.already_present.iter().copied());
-        if !restored_hashes.is_empty() {
-            if let Err(error) = repo.record_git_commit_closure(&parsed.git_sha, &restored_hashes) {
-                print_warning(&format!(
-                    "Resurrection {}: could not persist its interpretation closure ({error}); \
-                     later incremental imports may refuse descendants of it.",
-                    parsed.short_sha
-                ));
-            }
+        if existing_closure.is_none() && !restored_hashes.is_empty() {
+            repo.record_git_commit_closure(&parsed.git_sha, &restored_hashes)
+                .map_err(|e| CliError::Internal(e.into()))?;
         }
         print_info(&format!(
             "Resurrected verified binding for {} ({} change(s) restored, {} already present{}), \
@@ -5714,7 +5741,9 @@ impl ParallelImporter {
                         let mut attr_rec = RecordedFile::new(&file.path);
                         attr_rec.set_kind(atomic_core::record::workflow::DetectionKind::Modified);
                         if let Some((inode, position)) = repo
-                            .get_inode_and_position(&file.path)
+                            .get_inode_and_position_on_view_excluding(
+                                &file.path, &target, &excluded,
+                            )
                             .map_err(|e| CliError::Internal(e.into()))?
                         {
                             attr_rec.set_inode(inode);
@@ -5793,11 +5822,15 @@ impl ParallelImporter {
                         .unwrap_or("");
                     let can_emit_move = parent_path.is_empty()
                         || repo
-                            .get_inode_and_position(parent_path)
+                            .get_inode_and_position_on_view_excluding(
+                                parent_path,
+                                &target,
+                                &excluded,
+                            )
                             .map_err(|e| CliError::Internal(e.into()))?
                             .is_some();
                     let inode_pos = repo
-                        .get_inode_and_position(old_path)
+                        .get_inode_and_position_on_view_excluding(old_path, &target, &excluded)
                         .map_err(|e| CliError::Internal(e.into()))?;
                     let new_bytes = file.new_content.as_deref().unwrap_or(&[]);
                     let ambiguous = renamed_pairing_is_ambiguous(baseline.as_slice(), new_bytes);
@@ -6024,7 +6057,9 @@ impl ParallelImporter {
                         self.old_bytes_for(repo, file)
                     };
                     let mut detected = DetectedFile::modified(&file.path);
-                    if let Ok(Some((inode, pos))) = repo.get_inode_and_position(&file.path) {
+                    if let Ok(Some((inode, pos))) = repo
+                        .get_inode_and_position_on_view_excluding(&file.path, &target, &excluded)
+                    {
                         detected.inode = Some(inode);
                         detected.position = Some(pos);
                     }
@@ -6044,7 +6079,7 @@ impl ParallelImporter {
                     // the whole-file replacement record — the same shape
                     // their add used.
                     let recorded = if repo
-                        .get_inode_and_position(&file.path)
+                        .get_inode_and_position_on_view_excluding(&file.path, &target, &excluded)
                         .map_err(|e| CliError::Internal(e.into()))?
                         .is_some()
                     {
@@ -6065,11 +6100,13 @@ impl ParallelImporter {
                             && repo
                                 .path_has_persisted_conflict(&file.path, &target)
                                 .map_err(|e| CliError::Internal(e.into()))?;
-                        repo.record_foreign_modified_file(
+                        repo.record_foreign_modified_file_on_view_excluding(
                             &file.path,
                             &old_content,
                             new_content,
                             conflicted,
+                            &target,
+                            &excluded,
                         )
                         .map_err(|message| {
                             CliError::Internal(anyhow::anyhow!(
@@ -6107,7 +6144,9 @@ impl ParallelImporter {
                         let mut attr_rec = RecordedFile::new(&file.path);
                         attr_rec.set_kind(atomic_core::record::workflow::DetectionKind::Modified);
                         if let Some((inode, position)) = repo
-                            .get_inode_and_position(&file.path)
+                            .get_inode_and_position_on_view_excluding(
+                                &file.path, &target, &excluded,
+                            )
                             .map_err(|e| CliError::Internal(e.into()))?
                         {
                             attr_rec.set_inode(inode);

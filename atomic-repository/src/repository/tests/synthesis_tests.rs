@@ -1250,6 +1250,68 @@ fn reference_registered_change_verifies_the_effective_projection_before_publicat
     );
 }
 
+#[test]
+fn rejected_synthesis_journal_does_not_poison_a_different_retry() {
+    let directory = TempDir::new().unwrap();
+    let repo = Repository::init(directory.path()).unwrap();
+    let origin = GitSynthesisOrigin::root(oid20(0x73), oid20(0x74)).unwrap();
+    let rejected = repo
+        .synthesize_git_change(
+            fixed_header("rejected import"),
+            &[memory_add("doc.txt", b"rejected bytes\n")],
+            origin.clone(),
+            crate::git_synthesis_metadata(&origin, &[], None),
+            Vec::new(),
+            &[],
+            false,
+            &empty_verification(),
+            InsertOptions::default(),
+            &[],
+            &single_file_expectation("doc.txt", b"different expected bytes\n"),
+            None,
+            &[],
+            false,
+        )
+        .unwrap_err();
+    assert!(
+        rejected
+            .to_string()
+            .contains("staged synthesis verification failed"),
+        "{rejected}"
+    );
+    assert!(repo
+        .get_file_content_on_view("doc.txt", repo.current_view())
+        .unwrap()
+        .is_none());
+    drop(repo);
+
+    let repo = Repository::open(directory.path()).unwrap();
+    let origin = GitSynthesisOrigin::root(oid20(0x75), oid20(0x76)).unwrap();
+    repo.synthesize_git_change(
+        fixed_header("valid retry with a different hash"),
+        &[memory_add("doc.txt", b"accepted bytes\n")],
+        origin.clone(),
+        crate::git_synthesis_metadata(&origin, &[], None),
+        Vec::new(),
+        &[],
+        false,
+        &empty_verification(),
+        InsertOptions::default(),
+        &[],
+        &single_file_expectation("doc.txt", b"accepted bytes\n"),
+        None,
+        &[],
+        false,
+    )
+    .unwrap();
+    assert_eq!(
+        repo.get_file_content_on_view("doc.txt", repo.current_view())
+            .unwrap()
+            .unwrap(),
+        b"accepted bytes\n"
+    );
+}
+
 // ── Review C1: positive token-level equality after an edit flow — the
 // applier-keyed leaf rows must reconstruct the edited line's tokens exactly,
 // across a reload, with no stale predecessor tokens alive ────────────────

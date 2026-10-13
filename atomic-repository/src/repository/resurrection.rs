@@ -1280,7 +1280,11 @@ impl Repository {
             let change = self.load_change(hash)?;
             let tree_projection =
                 self.plan_tree_projection(&mut txn, change_id, *hash, &change, &[], false)?;
-            self.apply_tree_projection(&mut txn, &tree_projection, view_name, false)?;
+            // Register canonical claims now, but project derived paths only
+            // after publishing the restored closure below. The target may
+            // still be empty here; projecting it would erase the very paths
+            // the next imported commit needs to modify.
+            self.apply_tree_projection(&mut txn, &tree_projection, view_name, true)?;
         }
 
         // ── The mandatory projection proof (RFC §5.2, §12.5): recompute the
@@ -1357,6 +1361,10 @@ impl Repository {
             });
         }
         txn.update_view(&view).map_err(pristine_map)?;
+
+        if view_name == self.current_view {
+            self.realign_tree_projection_in_txn(&mut txn, view_name)?;
+        }
 
         // Lease re-check before the mutation becomes visible: the Git lease
         // observed before the proof must still hold (the three-attempt guard

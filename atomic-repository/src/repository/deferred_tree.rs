@@ -905,16 +905,12 @@ impl Repository {
                     {
                         staged
                     }
-                    Some(occupied) => {
-                        return Err(RepositoryError::InvalidOperation {
-                            message: format!(
-                                "cannot add '{}': path is already bound to graph inode {}",
-                                path,
-                                occupied.get()
-                            ),
-                        });
-                    }
-                    None => txn
+                    // TREE is an ambient lookup, not ownership in this
+                    // change's closure. A private workspace snapshot or
+                    // another view may already bind the same path. Keep
+                    // that graph identity and allocate one for this FileAdd;
+                    // canonical path claims surface any real name conflict.
+                    Some(_) | None => txn
                         .alloc_inode()
                         .map_err(|error| RepositoryError::Database(error.to_string()))?,
                 }
@@ -1518,7 +1514,31 @@ impl Repository {
                 })?;
             visible_hashes.insert(hash);
         }
-        let ordered_ops = causally_order_tree_ops(txn, &journal.ops)?;
+        // The compatibility journal is a file outside the graph transaction.
+        // A staged synthesis can write it and then fail verification, rolling
+        // back the registered change and all canonical claims. Such orphan
+        // rows describe no graph history and must not poison the next import.
+        // Validate all registered owners, including this transaction's staged
+        // change; missing inode metadata for those owners still fails closed.
+        let mut registered = HashMap::new();
+        let mut graph_ops = Vec::new();
+        for op in &journal.ops {
+            let known = match registered.get(&op.change) {
+                Some(known) => *known,
+                None => {
+                    let known = txn
+                        .get_internal(&op.change)
+                        .map_err(|error| RepositoryError::Database(error.to_string()))?
+                        .is_some();
+                    registered.insert(op.change, known);
+                    known
+                }
+            };
+            if known {
+                graph_ops.push(op.clone());
+            }
+        }
+        let ordered_ops = causally_order_tree_ops(txn, &graph_ops)?;
         let desired = desired_tree_paths_for_txn(txn, &ordered_ops, &visible_hashes)?;
         for (external_position, state) in desired {
             let internal_change = txn

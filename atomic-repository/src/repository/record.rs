@@ -8,6 +8,11 @@ use atomic_core::pristine::{
     CachedGraphTxn, GraphTxnT, GraphVisibilityClosure, PathClaimId, ViewGraph, ViewMembershipSet,
 };
 
+#[cfg(test)]
+thread_local! {
+    pub(super) static RECORD_APPLY_FAULT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 #[derive(Debug, Clone)]
 struct FileMovePlan {
     old_path: String,
@@ -139,19 +144,32 @@ impl Repository {
         new_content: &[u8],
         force_whole_file_replace: bool,
     ) -> Result<atomic_core::record::workflow::RecordedFile, String> {
-        let txn = self
-            .pristine
-            .read_txn()
-            .map_err(|e| format!("cannot open pristine: {e}"))?;
-        let inode = txn
-            .get_inode(path)
-            .map_err(|e| format!("cannot read inode for '{path}': {e}"))?
-            .ok_or_else(|| format!("path '{path}' has no inode binding"))?;
-        let position = txn
-            .inode_position(inode)
-            .map_err(|e| format!("cannot read position for '{path}': {e}"))?
-            .ok_or_else(|| format!("inode {inode:?} has no graph position"))?;
-        drop(txn);
+        self.record_foreign_modified_file_on_view_excluding(
+            path,
+            old_content,
+            new_content,
+            force_whole_file_replace,
+            &self.current_view,
+            &[],
+        )
+    }
+
+    /// Record a foreign edit using the same canonical closure as its baseline
+    /// and staged verification. Derived TREE bindings may belong to another
+    /// view, or be absent after an interrupted import.
+    pub fn record_foreign_modified_file_on_view_excluding(
+        &self,
+        path: &str,
+        old_content: &[u8],
+        new_content: &[u8],
+        force_whole_file_replace: bool,
+        view_name: &str,
+        excluded: &[Hash],
+    ) -> Result<atomic_core::record::workflow::RecordedFile, String> {
+        let (inode, position) = self
+            .get_inode_and_position_on_view_excluding(path, view_name, excluded)
+            .map_err(|e| format!("cannot resolve '{path}' in view '{view_name}': {e}"))?
+            .ok_or_else(|| format!("path '{path}' is absent from view '{view_name}'"))?;
         let (existing_trunk_id, existing_branches) =
             self.resolve_existing_semantic_state(path, inode)?;
         use atomic_core::record::workflow::{record_modified_file, DetectedFile};
@@ -2518,10 +2536,20 @@ impl Repository {
         // We use write_recorded() instead of insert_change() because it creates
         // the TREE and INODES entries for FileAdd hunks, which is necessary
         // for the file to be recognized as tracked with graph content.
+        let mut apply_error = None;
         if options.get_apply_after_record() && outcome.was_saved() {
             let apply_opts = InsertOptions::default().view(&target_view);
             let apply_t0 = std::time::Instant::now();
-            match self.write_recorded_replacing(&outcome, apply_opts, lifecycle.removal()) {
+            let apply_result = (|| {
+                #[cfg(test)]
+                if RECORD_APPLY_FAULT.with(|fault| fault.replace(false)) {
+                    return Err(RepositoryError::InvalidOperation {
+                        message: "injected record apply failure".into(),
+                    });
+                }
+                self.write_recorded_replacing(&outcome, apply_opts, lifecycle.removal())
+            })();
+            match apply_result {
                 Ok(apply_outcome) => {
                     outcome.set_applied(apply_outcome.new_state);
                     if target_view == desired_view {
@@ -2631,11 +2659,8 @@ impl Repository {
                         }
                     }
                 }
-                // A remote sandbox's change that didn't land isn't recorded
-                // anywhere: that is a failure, not a warning.
-                Err(e) if self.is_remote_sandbox() => return Err(RecordError::Repository(e)),
                 Err(e) => {
-                    outcome.add_error("apply".to_string(), e.to_string());
+                    apply_error = Some(e);
                 }
             }
             if trace_record {
@@ -2654,6 +2679,14 @@ impl Repository {
                 self.abort_prepared_metadata_operation(&operation_lock, &operation)
                     .map_err(RecordError::Repository)?;
             }
+        }
+
+        // Saved change bytes are not a successful record until the change
+        // lands in the target view. Abort the prepared operation above before
+        // returning the original error; all callers (including libatomic)
+        // then stop instead of publishing a stale view as a successful record.
+        if let Some(error) = apply_error {
+            return Err(RecordError::Repository(error));
         }
 
         // Deflate vault working copy changes (if vault is initialized)
@@ -2834,6 +2867,40 @@ impl Repository {
         };
 
         Ok(Some((inode, position)))
+    }
+
+    /// Resolve a recorded path's identity through the canonical graph and an
+    /// explicit assembly closure. TREE alone cannot decide whether the path
+    /// exists or which inode owns it. Genuine name conflicts remain errors.
+    pub fn get_inode_and_position_on_view_excluding(
+        &self,
+        path: &str,
+        view_name: &str,
+        excluded: &[Hash],
+    ) -> Result<Option<(Inode, Position<NodeId>)>, RepositoryError> {
+        let txn = self
+            .pristine
+            .read_txn()
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        let view = txn
+            .get_view(view_name)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?
+            .ok_or_else(|| RepositoryError::ViewNotFound {
+                name: view_name.to_string(),
+            })?;
+        let visibility = super::filter::assembly_visibility_excluding(&txn, &view, excluded)?;
+        let projection = self.project_tree_for_visibility_scoped(&txn, &visibility, Some(path))?;
+        if projection.name_conflicts.contains_key(path) {
+            return Err(RepositoryError::InvalidOperation {
+                message: format!(
+                    "path '{path}' has an unresolved name conflict in view '{view_name}'"
+                ),
+            });
+        }
+        Ok(projection
+            .present
+            .get(path)
+            .map(|item| (item.inode, item.position)))
     }
 
     /// Record all changes with a message.
