@@ -156,6 +156,7 @@ pub use types::{RecordedFile, RecordingResult, RecordingStats};
 
 use crate::change::{Encoding, FileOps, Local};
 use crate::crdt::{BranchId, TrunkId};
+use crate::diff::DiffOp;
 use crate::diff::Line;
 use crate::output::WorkingCopyRead;
 use crate::pristine::PathClaimId;
@@ -537,6 +538,48 @@ where
         return Ok(recorded);
     }
 
+    // ::26 R1 second follow-up (2026-10-13): the per-line fall-through above
+    // is only safe when the existing branches carry the newline-split shape.
+    // A generated file this module itself added holds ONE whole-content
+    // branch (the fast path above), so a per-line diff binds its Modify ops
+    // to line numbers that have no vertices and corrupts the staged render:
+    // `atomic git import` of a repository whose lockfile changed after its
+    // initial commit rendered Cargo.lock at 3,050 of 89,750 bytes and failed
+    // the staged synthesis verification. Route the opaque-shape modify through
+    // the same sentinel replace as an explicit force below: it deletes every
+    // alive vertex, inserts the full content fresh, and its CRDT ops
+    // tombstone the bound branches, so the recorded shape is one the graph
+    // can render exactly.
+    //
+    // The diff is computed before the force decision so the multi-line
+    // deletion check below can inspect its ops.
+    let comparison = compare_content(old_content, &new_content, options.get_algorithm());
+
+    // ::26 R1 third follow-up (2026-10-13): a contiguous multi-line deletion
+    // region recorded against a graph whose vertices span an earlier
+    // insertion commit leaves the additive graph in a state the alive walk
+    // classifies as a cyclic conflict — the staged render emits conflict
+    // markers and `atomic status` reports the file modified immediately after
+    // a clean record. Reproduced natively (record an insertion commit, then a
+    // commit deleting a 38-line contiguous region: the render keeps the
+    // deleted lines and adds markers) and through `atomic git import`, whose
+    // staged verification refused the change ("staged path ... renders 27472
+    // byte(s) but the commit tree expects 23819 byte(s)"). Single-line
+    // deletions are unaffected. Route the modify through the sentinel
+    // whole-file replace below — the same fail-safe shape used for binary
+    // content: every alive vertex is deleted and the full content inserted
+    // fresh, which renders byte-exact regardless of the graph's diamond
+    // structure.
+    let has_multi_line_deletion = comparison.diff_ops.iter().any(|op| match op {
+        DiffOp::Delete { len, .. } => *len > 1,
+        DiffOp::Replace { old_len, .. } => *old_len > 1,
+        _ => false,
+    });
+    let force_whole_file = options.get_force_whole_file_replace()
+        || (super::globalize::should_use_opaque_generated_vertices(&detected.path)
+            && existing_branches.is_some_and(|branches| !branches.is_empty()))
+        || has_multi_line_deletion;
+
     // Whole-file-replace safety fallback: if the caller's `old_content` came
     // from resolving a fork or cyclic conflict (see
     // `retrieve_content_with_filter_and_fork_info`), it isn't guaranteed to
@@ -551,7 +594,7 @@ where
     // targeted per-vertex diff that would trust old_content's mismatched
     // shape. This mirrors the delete+add workaround that was used manually to
     // recover a corrupted file before this fix existed.
-    if options.get_force_whole_file_replace() {
+    if force_whole_file {
         let mut replace_hunk = BuiltHunk::new_replace_with_lines(
             Local::new(&detected.path, 1),
             Some(encoding),
@@ -585,9 +628,6 @@ where
 
         return Ok(recorded);
     }
-
-    // Compare content and build hunks
-    let comparison = compare_content(old_content, &new_content, options.get_algorithm());
 
     // Handle binary files: compare_content returns is_binary=true with zero
     // diff_ops when either old or new content contains null bytes.  Since we
