@@ -85,6 +85,25 @@ pub enum GlobalizeError {
         line: u64,
     },
 
+    /// The alive graph holds a different number of content vertices than the
+    /// diff's old-file line model expects.
+    ///
+    /// Merge diamonds leave extra alive vertices in an isolated closure, so
+    /// the positional line→vertex mapping cannot be proven. Callers must
+    /// escalate to the whole-file replace instead of anchoring at unproven
+    /// vertices.
+    #[error(
+        "Vertex/line divergence for {path}: {vertices} alive content vertices for {expected} old lines"
+    )]
+    LineVertexDivergence {
+        /// The file path
+        path: String,
+        /// Alive content vertices found
+        vertices: usize,
+        /// Old-file lines the diff was computed against
+        expected: usize,
+    },
+
     /// The file has no content to globalize.
     ///
     /// This is not necessarily an error - empty files may be intentional.
