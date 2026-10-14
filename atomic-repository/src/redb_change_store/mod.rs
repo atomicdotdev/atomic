@@ -492,19 +492,23 @@ impl RedbChangeStore {
             }
 
             // CHANGE_UNHASHED
+            let mut unhashed_table = txn.open_table(tables::CHANGE_UNHASHED)?;
             if let Some(unhashed) = &unhashed_payload {
-                let mut unhashed_table = txn.open_table(tables::CHANGE_UNHASHED)?;
                 let compressed = zstd::encode_all(unhashed.as_slice(), 3)
                     .map_err(|e| RedbStoreError::Serialization(e.to_string()))?;
                 unhashed_table.insert(&content_hash, compressed.as_slice())?;
+            } else {
+                unhashed_table.remove(&content_hash)?;
             }
 
             // CHANGE_SIGNATURES
+            let mut sig_table = txn.open_table(tables::CHANGE_SIGNATURES)?;
             if let Some(signature) = &signature_payload {
-                let mut sig_table = txn.open_table(tables::CHANGE_SIGNATURES)?;
                 let compressed = zstd::encode_all(signature.as_slice(), 3)
                     .map_err(|e| RedbStoreError::Serialization(e.to_string()))?;
                 sig_table.insert(&content_hash, compressed.as_slice())?;
+            } else {
+                sig_table.remove(&content_hash)?;
             }
         }
         txn.commit()?;
@@ -543,6 +547,14 @@ impl RedbChangeStore {
     /// Useful for `atomic log`, header inspection, dependency resolution.
     pub fn load_meta(&self, hash: &[u8; 32]) -> RedbStoreResult<StoredChangeMeta> {
         let txn = self.db.begin_read()?;
+        self.load_meta_in_txn(&txn, hash)
+    }
+
+    fn load_meta_in_txn(
+        &self,
+        txn: &redb::ReadTransaction,
+        hash: &[u8; 32],
+    ) -> RedbStoreResult<StoredChangeMeta> {
         let table = txn.open_table(tables::CHANGE_META)?;
 
         let value = table.get(hash)?.ok_or_else(|| RedbStoreError::NotFound {
