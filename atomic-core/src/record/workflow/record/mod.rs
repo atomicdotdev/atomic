@@ -575,10 +575,23 @@ where
         DiffOp::Replace { old_len, .. } => *old_len > 1,
         _ => false,
     });
+    // ::26 R1 fifth follow-up (2026-10-13): the semantic branch count must
+    // match the diff's old-file line model — the recorder creates one branch
+    // per line, and every positional hunk below indexes that 1:1 domain. A
+    // divergence (the add-time tokenizer created 347 branches for a
+    // 346-line file without a trailing newline) means the diff's line
+    // numbers do not address the live branch domain: the graph and the
+    // semantic layer would silently disagree. Detect it at record time —
+    // where both counts are available — and route through the sentinel
+    // whole-file replace, which tombstones every prior branch and rebuilds
+    // the semantic chain fresh so both layers agree again.
+    let branch_line_divergence = existing_branches
+        .is_some_and(|branches| branches.len() != Line::from_bytes(old_content).len());
     let force_whole_file = options.get_force_whole_file_replace()
         || (super::globalize::should_use_opaque_generated_vertices(&detected.path)
             && existing_branches.is_some_and(|branches| !branches.is_empty()))
-        || has_multi_line_deletion;
+        || has_multi_line_deletion
+        || branch_line_divergence;
 
     // Whole-file-replace safety fallback: if the caller's `old_content` came
     // from resolving a fork or cyclic conflict (see

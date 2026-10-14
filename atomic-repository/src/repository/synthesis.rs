@@ -4747,32 +4747,6 @@ impl Repository {
             }
         }
         if replay_alive_bytes.as_slice() != expected_bytes {
-            if std::env::var_os("ATOMIC_DEBUG_DELETION").is_some() {
-                let first_diff = replay_alive_bytes
-                    .iter()
-                    .zip(expected_bytes.iter())
-                    .position(|(a, b)| a != b)
-                    .unwrap_or_else(|| replay_alive_bytes.len().min(expected_bytes.len()));
-                eprintln!(
-                    "[debug-deletion] semantic MISMATCH path={path} replay={} expected={} first_diff_at={first_diff} chain_len={}",
-                    replay_alive_bytes.len(),
-                    expected_bytes.len(),
-                    actual_chain.len()
-                );
-                eprintln!(
-                    "[debug-deletion] replay[..first_diff+64]={:?}",
-                    String::from_utf8_lossy(
-                        &replay_alive_bytes
-                            [first_diff..(first_diff + 64).min(replay_alive_bytes.len())]
-                    )
-                );
-                eprintln!(
-                    "[debug-deletion] expected[..first_diff+64]={:?}",
-                    String::from_utf8_lossy(
-                        &expected_bytes[first_diff..(first_diff + 64).min(expected_bytes.len())]
-                    )
-                );
-            }
             return Err(format!(
                 "the closure's semantic operations render {} byte(s) for the alive lines but \
                      the commit tree expects {} byte(s); the semantic closure must regenerate \
