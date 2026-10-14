@@ -1,6 +1,6 @@
 # Atomic Git Bridge — Operating Guide
 
-Updated 2026-10-13 for PR #207, source `27d06ff` (`atomic 0.19.1`).
+Updated 2026-10-13 for the Git bridge follow-up fixes (`atomic 0.19.1`).
 The bridge must be enabled for each repository. It is not enabled by default.
 Use Linux or macOS; Windows bridge support has not been validated.
 
@@ -15,10 +15,9 @@ The bridge imports Git history, projects Atomic records into Git, checks that
 both sides agree, and helps switch between views and branches. Git hooks and
 an optional watcher notice changes; commands still check the current state.
 
-**Known bug:** after recording an edit and rename with Atomic, creating a new
-Git branch and committing there can make `reconcile` fail with
-`view '<branch>' not found`. See the [reproduction](bridge-review-testing.md#9-known-failure-new-git-branch-after-atomic-records).
-This remains unfixed in the tested revision.
+After recording with Atomic, you can create a Git branch, commit there, and
+run `atomic git bridge reconcile`. Test both directions with the
+[branch walkthrough](bridge-review-testing.md#9-new-git-branch-after-atomic-records).
 
 Other limits:
 
