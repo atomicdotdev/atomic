@@ -141,31 +141,6 @@ where
                 encoding,
             ) {
                 Ok(ops) => Ok(ops),
-                Err(GlobalizeError::LineVertexDivergence {
-                    path,
-                    vertices,
-                    expected,
-                }) => {
-                    // The alive graph's vertex count diverges from the diff's
-                    // line model (merge diamonds add vertices; empty-line
-                    // accounting can shift it by one). Escalate to the
-                    // whole-file replace — every alive vertex is deleted and
-                    // the full content inserted fresh per line, which renders
-                    // byte-exact regardless of the diamond structure. This
-                    // stays fail-closed: the staged synthesis verification
-                    // checks the render against the commit tree and refuses
-                    // the commit when it disagrees, so a wrong escalation is
-                    // a refusal, never silent corruption.
-                    let _ = (path, vertices, expected);
-                    globalize_replace_whole_file(
-                        ctx,
-                        inode,
-                        inode_pos,
-                        full_content,
-                        local,
-                        encoding,
-                    )
-                }
                 Err(e) => {
                     log::debug!(
                         "globalize_hunk: insert failed ({:?}), falling back to replace",
@@ -217,25 +192,6 @@ where
     T: GraphTxnT + TreeTxnT + InodeGraphOps,
 {
     let vertices = collect_sorted_content_vertices_cached(ctx, inode, inode_pos)?;
-
-    // ::26 R1 fourth follow-up (2026-10-13): the positional line→vertex
-    // mapping in `classify_insert` is only provable when the alive graph
-    // holds exactly one content vertex per old-file line. Merge diamonds
-    // leave extra alive vertices in the isolated assembly closure — an
-    // insertion commit on a file whose history spans a merge anchored at
-    // silent wrong vertices and the staged render lost the inserted content
-    // (b110aa70 in atomicdotdev/atomic: rendered 68,762 of 74,206 bytes).
-    // When the counts diverge, refuse the positional anchor; the caller
-    // escalates to the whole-file replace.
-    if let Some(expected) = old_line_count {
-        if vertices.len() != expected {
-            return Err(GlobalizeError::LineVertexDivergence {
-                path: local.path.clone(),
-                vertices: vertices.len(),
-                expected,
-            });
-        }
-    }
 
     let position = classify_insert(&vertices, inode_pos, built.old_start, old_line_count)?;
 

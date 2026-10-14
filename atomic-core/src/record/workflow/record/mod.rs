@@ -470,7 +470,13 @@ where
     recorded.set_kind(DetectionKind::Modified);
 
     // Count lines in old content for precise insertion point detection
-    let old_line_count = old_content.iter().filter(|&&b| b == b'\n').count();
+    // Count LINES — newline-split segments including a no-trailing-newline
+    // remainder — matching the graph's per-line vertex split, the CRDT
+    // branch-per-line model, and the diff's line numbering. A raw `\n` count
+    // under-reports files that don't end with a newline (346 for a 347-line
+    // file), which desyncs every positional hunk index from the branch and
+    // vertex domains downstream.
+    let old_line_count = Line::from_bytes(old_content).len();
     recorded.set_old_line_count(old_line_count);
 
     // Copy inode and position if available
@@ -575,23 +581,19 @@ where
         DiffOp::Replace { old_len, .. } => *old_len > 1,
         _ => false,
     });
-    // ::26 R1 fifth follow-up (2026-10-13): the semantic branch count must
-    // match the diff's old-file line model — the recorder creates one branch
-    // per line, and every positional hunk below indexes that 1:1 domain. A
-    // divergence (the add-time tokenizer created 347 branches for a
-    // 346-line file without a trailing newline) means the diff's line
-    // numbers do not address the live branch domain: the graph and the
-    // semantic layer would silently disagree. Detect it at record time —
-    // where both counts are available — and route through the sentinel
-    // whole-file replace, which tombstones every prior branch and rebuilds
-    // the semantic chain fresh so both layers agree again.
-    let branch_line_divergence = existing_branches
-        .is_some_and(|branches| branches.len() != Line::from_bytes(old_content).len());
+    // ::26 R1 fifth follow-up (2026-10-13): count LINES — newline-split
+    // segments including a no-trailing-newline remainder — matching the
+    // graph's per-line vertex split, the CRDT branch-per-line model, and the
+    // diff's line numbering. A raw `\n` count under-reports files that don't
+    // end with a newline (346 for a 347-line file), which desyncs every
+    // positional hunk index from the branch and vertex domains downstream.
+    let old_line_count = Line::from_bytes(old_content).len();
+    recorded.set_old_line_count(old_line_count);
+
     let force_whole_file = options.get_force_whole_file_replace()
         || (super::globalize::should_use_opaque_generated_vertices(&detected.path)
             && existing_branches.is_some_and(|branches| !branches.is_empty()))
-        || has_multi_line_deletion
-        || branch_line_divergence;
+        || has_multi_line_deletion;
 
     // Whole-file-replace safety fallback: if the caller's `old_content` came
     // from resolving a fork or cyclic conflict (see
