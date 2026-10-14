@@ -46,6 +46,122 @@ that the syntax index cannot answer (e.g. federated cross-project search).
 We keep **file-level** `atomic:modifiesFile` and `atomic:directlyOnView` because those
 are workflow facts, not code-structure facts.
 
+## Current code (starting point)
+
+Verified against `dev` at `5ddcf1b`. Line numbers drift; search for the named symbol if a
+reference is off.
+
+### C.1 Storage
+
+- The KG is a **JSON property graph**, not a triple store:
+  `KgNode { id, kind, label, summary, source, metadata }` and
+  `KgEdge { from_id, to_id, kind, metadata }` (`atomic-core/src/pristine/vault.rs:462,516`).
+- Tables (`atomic-core/src/pristine/tables.rs:797-830`): `kg_nodes`, `kg_edges`
+  (key `from\0to\0kind`, `encode_edge_key` L856), `kg_edges_from`, `kg_edges_to`,
+  `kg_fts`, `kg_fts_by_node`, `kg_index_meta`. No predicate or type index.
+- The predicate string is **part of the edge key**, so renaming means rewriting keys.
+- `upsert_kg_edge` (`txn/write/triples.rs:380`) accepts any string. `ontology::is_known_predicate`
+  has no callers.
+- `kg_neighbors` (`traits/triples.rs:18-68`) is kind-blind, bidirectional BFS with depth ≤ 2;
+  it is the main read primitive (query plans, `vault context`, RAG, daemon).
+
+### C.2 The KG is entirely derived
+
+Every node/edge comes from one of three producers, all over authoritative objects:
+
+| Producer | File | Source tag | Trigger |
+|---|---|---|---|
+| Vault projection | `atomic-repository/src/repository/vault_triples.rs` | `vault` | every `vault_store` (intent/memory/goal writes, `vault sync`, record w/ vault sync), `query reindex` |
+| VCS/AST enrichment | `atomic-repository/src/repository/vault_kg_enrich.rs` | `vcs`, `ast` | clone, pull, git import, record (`kg_enrich_change`), `query enrich` |
+| Session ledger | `atomic-core/src/pristine/txn/write/session_kg.rs` | `session_ledger` | turn append/rewrite, session lifecycle, sidecar pull, `session rebuild` |
+
+**Consequence for the cutover:** nothing in the KG needs in-place rewriting. A storage-
+generation bump + full rebuild from canonical objects *is* the migration, and the RFC's
+"fail on unclassifiable overloaded edge" rule becomes a projector-level guarantee (each
+projector knows its endpoint classes at emit time).
+
+`vault sync` and `query enrich` share **no** code; they meet only on shared ID strings.
+
+### C.3 Vocabulary inventory (`atomic-core/src/pristine/ontology.rs`)
+
+- 6 prefix labels (no IRIs), 30 `predicate::*` CURIEs, 16 `entity_type::*` (`vault:*`),
+  29 `edge_kind::*` SCREAMING_CASE strings.
+- Actually emitted: 19 uppercase kinds + `prov:{wasDerivedFrom,used,wasAssociatedWith,
+  hadPlan,hadMember,generated,wasInformedBy}`, `atom:informedBy`, `vault:{explainedBy,hasTodo}`.
+- Defined but never emitted: all `dc:*`, `skos:*`, `rdf:type` (as edge), `vault:{status,
+  priority,assignedTo,blocks,...}` predicates, `IMPORTS`, `VISIBLE_FROM`, and 12 of 16
+  `entity_type` values.
+- Typing: `kind` string on every node; `metadata.rdf_type` (prefixed, e.g. `vault:Session`)
+  only on the 4 session-ledger node kinds. **No real `rdf:type` anywhere.**
+
+### C.4 Identity problems
+
+- Change node IDs are **12-char base32 prefixes** in three places
+  (`vault_kg_enrich.rs:1089 truncate_hash`, `session_kg.rs:46 change_node_id`,
+  `vault_triples.rs:1268 rdf_target_to_kg_id`). Full hash survives only in metadata.
+- `identity:` IDs are display names (`identity:{author.name}` vs `identity:{fm.developer}`);
+  intents write `author`/`created_by` which the KG ignores, so intents have no author edge.
+- `todo:X` from `urn:atomic:todo:X` collides with the legacy session-global todo form.
+- `LINKED_INTENT` targets `intent:{raw}` without uppercasing/manifest resolution.
+- **No `ProjectId` exists.** Closest: remote `ProjectInfo.id: Uuid` (server-assigned),
+  `VaultManifest.intent_prefix` (4-char human code), `repository_identity` DID in
+  `provenance_gate.rs:76`.
+
+### C.5 Overloaded / misused relations (confirmed in code)
+
+| Current | Uses | Lines |
+|---|---|---|
+| `DEPENDS_ON` | change→change; intent→intent (fallback for any `:::ref`) | enrich :409,:526; triples :1158 |
+| `MODIFIES` | change→file; change→entity **only on record-time path**, not bulk | enrich :436,:554,:624 |
+| `ON_VIEW` | change→*working copy's desired view* (not membership!); session→view | enrich :386,:514; session_kg :320 |
+| `prov:wasAssociatedWith` | tool_result→goal | triples :1002 |
+| `prov:hadPlan` | session→intent **and** turn→intent | session_kg :389-397 |
+| `prov:hadMember` | session→turn | session_kg :381 |
+| `prov:wasDerivedFrom` | memory→{anything}; session→session (fork) | triples :978; session_kg :456 |
+
+### C.6 Facts captured but never projected
+
+- `Attestation` (`atomic-core/src/change/attestation.rs:153`): `session_id`,
+  `changes_covered`, `signer` (`did:atomic:…` or `session-mac:{sid}`), `signature`,
+  `previous_attestation`, `provenance_root`, … Stored as `.attest` files.
+  **No KG projection.**
+- Canonical intent/memory attestations (signed JSON-LD vault entries) — explicitly skipped
+  by the KG (`vault_triples.rs:53`).
+- `SessionTurn` (`atomic-core/src/change/session.rs:418`): `plan_id`, `goal`,
+  `provenance_hash`, `change_hashes`, `previous_provenance`, `outcome`, boundaries —
+  partially projected (no outcome/boundaries).
+- AI `Provenance` on changes (model/tokens/cost): not part of Phase 1.
+
+### C.7 Consumers that hardcode kind strings
+
+- `atomic-cli/src/commands/query/mod.rs`: `callers` (`to_uppercase()=="CALLS"` :1231,:1255),
+  HTML `EDGE_COLORS` (:748-755), `ask` system prompt (:1971-1976), text output.
+- `atomic-repository/src/triage/report.rs` (`kind_is` at :35, case-insensitive, ~12 sites),
+  `atomic-repository/src/repository/triage.rs:231,305`.
+- `atomic-repository/src/repository/vault_intent.rs:1770,1776` (`atom:informedBy`).
+- `atomic-cli/src/commands/vault/context.rs:470-473` (filters `node.kind == "memory"`).
+- libatomic daemon copies: `services_agent.rs:131,3372-3387`, `services_query.rs:1001-1038,1059`.
+- Wire: `libatomic/proto/.../knowledge_messages.proto:123` `KGEdge.relation` (free string).
+- Out-of-repo clients (`../noname`, `../the-hive`) also match kind strings; the release is
+  announced as breaking, so they are not updated as part of this plan.
+- ~110 test assertion sites (largest: `vault_triples.rs` ~40, `ontology.rs` ~31,
+  `atomic-cli/tests/session_integration_test.rs` ~17).
+
+### C.8 Existing Semantic Web pieces and constraints
+
+- `atomic-canonical` emits signed JSON-LD with context `https://atomic.dev/ns/ctx.jsonld`,
+  mapping the old `atom:` prefix to `https://atomic.dev/ns#`. Its content hash is
+  `blake3(JCS(node))`, which covers the `@context` **URL string** but not the term
+  definitions behind it. Signed documents are never rewritten.
+- `atomic provenance` projects PROV JSON-LD on demand (`atomic-canonical/src/prov.rs`);
+  it is not written to the KG.
+- No RDF/OWL/SHACL crates are in the workspace and there are no `.ttl` files yet. SHACL
+  engine selection is in §1.4 and `docs/shacl-purrdf-spike-findings.md`.
+- Upgrade machinery: `SCHEMA_VERSION` only rejects newer databases (`schema.rs`);
+  **capability fences** (`capability.rs`, `required-capability/<id>`) make older binaries
+  fail closed; `kg_index_meta` holds per-index markers (`fts_reverse_schema` = 2 is the
+  precedent for a KG rebuild).
+
 ## 1. Phase 1 scope
 
 ### 1.1 Ontology (`atomic-core/ontology/workflow-1.0.0.ttl`)
@@ -243,6 +359,14 @@ pristine table outside the view system.
 
 **Transport:**
 
+> **Phase 1 implementation boundary.** `atomic clone` is HTTP-only (plus a Git bootstrap
+> path that never contacts storage), so identity transport over clone, pull and push all
+> depends on server support in `atomic-storage`, which is owned by another effort. In
+> Phase 1, implement only the local pieces: minting in the `atomic init` command (not in
+> `Repository::init`), the `PROJECT_IDENTITY` table, the upgrade rule, and the CLI. **Do
+> not change push, pull, clone, `atomic-remote`, or the daemon's sync code yet.** The rules
+> below are the target behavior that the later transport work implements.
+
 Clones keep the origin's identity, and pulls never change it. Rules:
 
 - **Where minting happens.** Only the `atomic init` command mints a new identity.
@@ -298,7 +422,19 @@ pub fn mint_file_iri(pid: &ProjectId, path: &str) -> String;
 ```
 
 All minting functions percent-encode path/ name segments per RFC 3987 and guarantee
-round-trip stability. Property tests cover paths with spaces, `#`, `:`, non-ASCII,
+round-trip stability.
+
+**Identifier casing.** Every identifier inside a URN is uppercase: base32 hashes and
+project IDs (as `Hash::to_base32` emits) and intent ULIDs (uppercase Crockford, as
+`ulid::Ulid::to_string()` emits, `vault_intent.rs:141`). Parsers for URNs are strict: they
+reject lowercase, padding, wrong length, and (for base32) nonzero trailing bits. The
+existing `Hash::from_base32` is case-insensitive, so URN parsing needs a new strict parser;
+lenient prefix lookup in CLI arguments is unaffected.
+
+**Old-layout intents.** Intents created before the ULID layout live at
+`intents/<view>/<session-uuid>/<turn>/intent.md` (e.g. `ATOM-2` in this repo's vault) and
+carry no ULID. The projector resolves their identity through the vault manifest; if none is
+recorded, it emits a finding instead of inventing an ID. Property tests cover paths with spaces, `#`, `:`, non-ASCII,
 and the empty string.
 
 **CLI:**
@@ -510,10 +646,10 @@ new generation, not an in-place data migration.
 
 | Producer | Today | Phase 1 |
 |---|---|---|
-| Vault projection | `vault_triples.rs` | intents (subclass from canonical `kind`), memories, goals, skills, tool results, decomposition children, `:::ref` edges split by edge name (`dependsOnIntent`, `blockedBy`, `remediates`, `reviews`) |
+| Vault projection | `vault_triples.rs` | intents (subclass from canonical `kind`), memories, goals, skills, tool results, decomposition children, `:::ref` edges split by edge name (`dependsOnIntent`, `blockedBy`, `remediates`, `reviews`). Signed canonical documents keep their old `atom:` terms; the projector translates them through `LEGACY_TERMS` at projection time and never rewrites signed bytes |
 | VCS projection | `vault_kg_enrich.rs` (VCS part) | views and `childViewOf`, changes (full hash), `directlyDependsOnChange`, `modifiesFile`, `authoredBy`, and `directlyOnView` recomputed from `VIEW_CHANGES` (today `ON_VIEW` records the working copy's desired view, not membership) |
 | Session ledger | `session_kg.rs` | sessions, turns (`ManagedTurn` when `plan_id` is present), todos, provenance graphs; `hasTurn`, `hasPlan`, `generatedChange`, `turnExplainedBy`, `hasTodo`, `sessionViewContext` |
-| Attestations (**new**) | not projected | `Attestation` nodes, `coversChange`, `attests`, `signedBy`, `previousAttestation`, and the verifier's recorded result (never inferred) |
+| Attestations (**new**) | not projected | `Attestation` nodes, `coversChange`, `attests`, `signedBy`, `previousAttestation`, and the verifier's recorded result (never inferred). **Turn mapping:** an attestation records `session_id` and `changes_covered` but no turn number, so emit `attests` only when exactly one turn of that session has `change_hashes` ⊆ `changes_covered`; otherwise emit an `AmbiguousAttestationTurn` finding and no `attests` edge. MAC-signed attestations (`session-mac:{sid}`) can't be verified without the key and record `Unverifiable`, never `Verified` |
 | Findings (**new**) | none | `MissingHistoricalPlanId`, `MissingAttestation`, `AmbiguousAttestationTurn`, `UnverifiableAttestation`; never guessed links |
 | AST enrichment | `vault_kg_enrich.rs` (AST part) | **removed** from the KG: no entity nodes, `CALLS`, `DEFINES`, `EXPORTS`, `INCLUDES`, `PART_OF` |
 
@@ -559,9 +695,11 @@ hooks); unifying them into one `reconcile()` pipeline is Phase 2.
 6. **Project identity:** `atomic init` creates a `ProjectId`; `atomic project identity show`
    displays it; the ID round-trips through base32 encoding; IRIs minted via `kg::iri`
    match the canonical format.
-   - A clone (from Atomic storage and from a local path) has the origin's identity.
-   - A pull never changes a populated identity; a differing remote identity is reported.
-   - Pushing a different identity to a bound storage project is rejected.
+   - `Repository::init` (as called by `atomic clone`) does not mint an identity.
+   - **Deferred until `atomic-storage` implements identity transport (owned by another
+     effort):** a clone has the origin's identity; a pull never changes a populated
+     identity and reports a differing one; pushing a different identity to a bound
+     storage project is rejected. Do not implement or test these in Phase 1.
 7. **SHACL integration:** PurRDF evaluates positive and negative fixtures for both
    builtin profiles, nested shapes, local SPARQL conditions, and property paths.
    No Atomic-owned constraint evaluator. The MSRV/deployment decision is explicit.
@@ -598,10 +736,11 @@ hooks); unifying them into one `reconcile()` pipeline is Phase 2.
 - `PROJECT_IDENTITY` pristine table
 - Identity object (JSON-LD, content-addressed, optionally signed)
 - The `atomic init` command mints (not `Repository::init`); upgrading repos without a
-  remote mint on first writable open; repos with a remote adopt on pull
-- Clone/pull/push identity transport, including Atomic storage: clone adopts, pull never
-  changes a populated identity, first push binds the storage project, mismatched pushes
-  are rejected
+  remote mint on first writable open; repos with a remote stay unminted until transport
+  lands (or the owner runs `atomic project identity init`)
+- **Not in Phase 1:** clone/pull/push identity transport. It waits for `atomic-storage`
+  (see the boundary note in §1.3); leave push, pull, clone, `atomic-remote`, and the daemon's
+  sync code unchanged
 - CLI: `atomic project identity show` and `atomic project identity init`
 - Property tests: round-trip, percent-encoding, strict base32 parsing
 
