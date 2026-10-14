@@ -4150,7 +4150,6 @@ impl ParallelImporter {
                 } else {
                     self.verify_claimed_change_closure(
                         source,
-                        branch_name,
                         &parsed,
                         claimed_hashes.as_deref(),
                         &policy,
@@ -4319,7 +4318,6 @@ impl ParallelImporter {
     fn verify_claimed_change_closure(
         &self,
         source: Option<&Repository>,
-        branch_name: &str,
         parsed: &ParsedCommit,
         encoded_hashes: Option<&[String]>,
         policy: &ConversionPolicy,
@@ -4347,8 +4345,11 @@ impl ParallelImporter {
                 })
             })
             .collect::<CliResult<Vec<_>>>()?;
-        let closure = source
-            .project_tree_for_change_closure(branch_name, &hashes, policy)
+        // A newly discovered Git branch has no Atomic view until validation
+        // succeeds. The claimed roots must prove the tree from the ambient
+        // graph without depending on that target view or a surviving source view.
+        let mut closure = source
+            .project_change_closure(&hashes, policy)
             .map_err(|error| {
                 git_error(format!(
                     "commit {} carries an unverifiable Atomic change closure: {error}",
@@ -4356,6 +4357,32 @@ impl ParallelImporter {
                 ))
             })?;
         let expected = git_object_id(policy.object_format, parsed.tree_oid)?;
+        if closure.git.root != expected {
+            // Older record projections named only the recorded change, not the
+            // whole state (a rename need not depend on a prior content edit).
+            // Recover that state from the declared source view, never from the
+            // new target branch. The complete tree must still match, and every
+            // claimed change must belong to the historical membership.
+            let message = parsed.full_message();
+            let historical = parse_header_trailer(&message, "Atomic-View")
+                .zip(parse_header_trailer(&message, "Atomic-State"))
+                .and_then(|(view, state)| {
+                    ContentHash::from_base32(state.as_bytes()).map(|state| (view, state))
+                })
+                .and_then(|(view, state)| source.change_roots_at_state(&view, state).ok());
+            if let Some(roots) = historical {
+                if hashes.iter().all(|hash| roots.contains(hash)) {
+                    closure = source
+                        .project_change_closure(&roots, policy)
+                        .map_err(|error| {
+                            git_error(format!(
+                            "commit {} carries an unverifiable Atomic historical state: {error}",
+                            parsed.git_sha
+                        ))
+                        })?;
+                }
+            }
+        }
         verify_prospective_equivalence(&closure, &expected).map_err(|error| {
             git_error(format!(
                 "commit {} carries a forged Atomic change closure: {error}",

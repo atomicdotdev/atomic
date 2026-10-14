@@ -1181,6 +1181,18 @@ impl Repository {
         state: Merkle,
         policy: &ConversionPolicy,
     ) -> Result<ProjectTree, ProjectTreeError> {
+        let roots = self.change_roots_at_state(view_name, state)?;
+        self.project_change_closure(&roots, policy)
+    }
+
+    /// Resolve a view's historical membership, including its live parent chain,
+    /// without selecting or materializing the view. Callers proving an old Git
+    /// projection must also compare the resulting closure with that commit's tree.
+    pub fn change_roots_at_state(
+        &self,
+        view_name: &str,
+        state: Merkle,
+    ) -> Result<Vec<Hash>, ProjectTreeError> {
         let txn = self.pristine.read_txn().map_err(repo_error)?;
         let view = txn
             .get_view(view_name)
@@ -1215,8 +1227,7 @@ impl Repository {
                     })?,
             );
         }
-        drop(txn);
-        self.project_tree_for_change_closure(view_name, &roots, policy)
+        Ok(roots)
     }
 
     /// Project the complete tree represented by explicit Atomic change roots and
@@ -1237,9 +1248,25 @@ impl Repository {
         self.project_change_closure_with_txn(&txn, roots, policy)
     }
 
+    /// Project explicit change roots and their validated dependency closure
+    /// without requiring a view to contain them. This permits verifying Git
+    /// history before its target view is created, or after a source view is
+    /// deleted. All path, content and attribute resolution uses the closure.
+    pub fn project_change_closure(
+        &self,
+        roots: &[Hash],
+        policy: &ConversionPolicy,
+    ) -> Result<ProjectTree, ProjectTreeError> {
+        if !policy.platform.lossless_unix_paths {
+            return Err(ProjectTreeError::UnsupportedPlatformPath);
+        }
+        let txn = self.pristine.read_txn().map_err(repo_error)?;
+        self.project_change_closure_with_txn(&txn, roots, policy)
+    }
+
     /// The closure projection computed over an explicit transaction.
     ///
-    /// Identical to [`Self::project_tree_for_change_closure`], but usable
+    /// Identical to [`Self::project_change_closure`], but usable
     /// with a write transaction so the CB-6C resurrection builder can prove
     /// the projected tree against a binding inside the same isolated write
     /// transaction that applied the closure — before any membership is

@@ -137,6 +137,106 @@ fn root_key(root: &Path) -> std::path::PathBuf {
 }
 
 #[test]
+fn new_git_branch_after_atomic_rename_reconciles_and_round_trips() {
+    for hooks in [true, false] {
+        let f = Fixture::new();
+        let git = |args: &[&str]| {
+            let output = Command::new("git")
+                .args(args)
+                .current_dir(f.root())
+                .env("ATOMIC_SERVICE", "local")
+                .env("ATOMIC_CONFIG_DIR", f.root().join(".git/test-config"))
+                .env("ATOMIC_NONINTERACTIVE", "1")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?}: {}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        if !hooks {
+            git(&["config", "core.hooksPath", ".git/no-hooks"]);
+        }
+        fs::write(f.root().join("tracked.txt"), b"atomic edit\n").unwrap();
+        f.atomic(&["record", "-am", "atomic edit"]);
+        fs::rename(f.root().join("tracked.txt"), f.root().join("renamed.txt")).unwrap();
+        f.atomic(&["record", "-am", "atomic rename"]);
+        let inode = atomic_repository::Repository::open(f.root())
+            .unwrap()
+            .get_file_inode("renamed.txt")
+            .unwrap()
+            .unwrap();
+        git(&["switch", "-c", "foreign-edit"]);
+        fs::write(f.root().join("renamed.txt"), b"Git edit\n").unwrap();
+        git(&["add", "renamed.txt"]);
+        git(&["commit", "-qm", "foreign edit"]);
+        assert!(!atomic_repository::Repository::open(f.root())
+            .unwrap()
+            .view_exists("foreign-edit")
+            .unwrap());
+        f.atomic(&["git", "bridge", "reconcile"]);
+        f.atomic(&["git", "bridge", "verify"]);
+        for (branch, bytes) in [
+            ("main", b"atomic edit\n".as_slice()),
+            ("foreign-edit", b"Git edit\n".as_slice()),
+        ] {
+            git(&["switch", branch]);
+            f.atomic(&["git", "bridge", "reconcile"]);
+            f.atomic(&["git", "bridge", "verify"]);
+            assert_eq!(fs::read(f.root().join("renamed.txt")).unwrap(), bytes);
+            assert!(!f.root().join("tracked.txt").exists());
+            assert!(f.atomic(&["status", "--short"]).trim().is_empty());
+            let repo = atomic_repository::Repository::open(f.root()).unwrap();
+            assert_eq!(repo.get_file_inode("renamed.txt").unwrap(), Some(inode));
+        }
+    }
+}
+
+#[test]
+fn copied_projection_headers_do_not_authorize_a_different_git_tree() {
+    let f = Fixture::new();
+    fs::write(f.root().join("tracked.txt"), b"atomic edit\n").unwrap();
+    f.atomic(&["record", "-am", "legitimate projection"]);
+    let git = git2::Repository::open(f.root()).unwrap();
+    let parent = git.head().unwrap().peel_to_commit().unwrap();
+    let message = parent.message().unwrap().to_string();
+    git.branch("forged", &parent, false).unwrap();
+    git.set_head("refs/heads/forged").unwrap();
+    fs::write(f.root().join("tracked.txt"), b"different foreign content\n").unwrap();
+    let mut index = git.index().unwrap();
+    index.add_path(Path::new("tracked.txt")).unwrap();
+    index.write().unwrap();
+    let tree = git.find_tree(index.write_tree().unwrap()).unwrap();
+    let sig = git.signature().unwrap();
+    let head = git
+        .commit(Some("HEAD"), &sig, &sig, &message, &tree, &[&parent])
+        .unwrap();
+    let before = atomic_repository::Repository::open(f.root())
+        .unwrap()
+        .get_view_changes(None)
+        .unwrap();
+    let out = f
+        .command()
+        .args(["git", "bridge", "reconcile"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("forged Atomic change closure"));
+    assert_eq!(git.head().unwrap().target(), Some(head));
+    let repo = atomic_repository::Repository::open(f.root()).unwrap();
+    assert!(!repo.view_exists("forged").unwrap());
+    assert_eq!(repo.get_view_changes(None).unwrap(), before);
+    assert_eq!(
+        fs::read(f.root().join("tracked.txt")).unwrap(),
+        b"different foreign content\n"
+    );
+}
+
+#[test]
 fn rename_status_restore_does_not_poison_foreign_import() {
     for short in [false, true] {
         let f = Fixture::new();

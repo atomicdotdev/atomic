@@ -23,6 +23,52 @@ fn comparable(entry: &RepositoryEntry) -> (&[u8], &[u8], u32, InodeKind) {
 }
 
 #[test]
+fn explicit_closure_projection_survives_source_view_deletion_and_reopen() {
+    let temp = TempDir::new().unwrap();
+    let mut repo = Repository::init(temp.path()).unwrap();
+    let wc = working_copy(&repo);
+    repo.create_view("source").unwrap();
+    repo.switch_view(wc, "source").unwrap();
+    fs::write(temp.path().join("old.txt"), b"original\n").unwrap();
+    repo.add(wc, "old.txt", Default::default()).unwrap();
+    let original = *repo.record_all(wc, "original").unwrap().hash();
+    fs::rename(temp.path().join("old.txt"), temp.path().join("new.txt")).unwrap();
+    let renamed = *repo.record_all(wc, "rename").unwrap().hash();
+    let policy = ConversionPolicy::new(GitHashAlgorithm::Sha1);
+    let expected = repo.project_tree("source", &policy).unwrap();
+    assert_eq!(
+        repo.project_change_closure(&[renamed], &policy).unwrap(),
+        expected
+    );
+    // Roots plus dependency closure determine paths, regardless of the selected
+    // view or whether any surviving view still references those changes.
+    repo.switch_view(wc, "dev").unwrap();
+    repo.delete_view("source").unwrap();
+    drop(repo);
+    let repo = Repository::open(temp.path()).unwrap();
+    assert_eq!(
+        repo.project_change_closure(&[renamed], &policy).unwrap(),
+        expected
+    );
+    let prior = repo.project_change_closure(&[original], &policy).unwrap();
+    assert!(prior
+        .manifest
+        .entries
+        .iter()
+        .any(|e| e.path.as_bytes() == b"old.txt"));
+    assert!(!prior
+        .manifest
+        .entries
+        .iter()
+        .any(|e| e.path.as_bytes() == b"new.txt"));
+    assert!(!repo.view_exists("source").unwrap());
+    assert!(!temp.path().join("old.txt").exists());
+    assert!(!temp.path().join("new.txt").exists());
+    let unknown = atomic_core::Hash::of(b"unknown closure root");
+    assert!(repo.project_change_closure(&[unknown], &policy).is_err());
+}
+
+#[test]
 #[cfg(unix)]
 fn graph_projection_and_git_parser_agree_for_sha1_and_sha256() {
     use std::os::unix::fs::{symlink, PermissionsExt};

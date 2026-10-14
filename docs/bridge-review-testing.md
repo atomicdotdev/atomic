@@ -1,14 +1,10 @@
-# PR #207: review and testing walkthrough
+# Git bridge: review and testing walkthrough
 
 Companion to the [bridge operating guide](bridge-operating-guide.md).
-Updated 2026-10-13 for source `27d06ffb664400f6788b6fae0c4bee91e9a92c61`
-(`atomic 0.19.1`). Record the actual commit and `atomic --version` with results.
+Updated 2026-10-13 (`atomic 0.19.1`). Record the actual commit and
+`atomic --version` with results.
 Use Linux or macOS for bridge/RPC tests. Windows bridge support has not been
 validated.
-
-**Known bug:** the new-Git-branch steps in section 9 fail after Atomic records,
-even with the normal Git hooks installed. The bug is not fixed. It has not yet
-been compared against `dev`.
 
 Run sections 1–5 in order in one **fresh Bash shell**. They use temporary
 repositories and keys and do not push anything. Sections 6–8 cover agent,
@@ -16,7 +12,7 @@ service, and database tests.
 
 ## 1. Build and isolate the test
 
-Start in a checkout of the PR branch (`feat/atomic-sidecar-for-git`). Rust/Cargo,
+Start in a checkout of `dev` or the follow-up branch being tested. Rust/Cargo,
 Git, Python 3, and the repository's normal build prerequisites are required.
 This builds the default configuration, without fault-injection features.
 
@@ -258,7 +254,7 @@ Database migration is separate from `git bridge cutover`. See
 [operating guide section 14](bridge-operating-guide.md#14-bridge-cutover-and-database-migration)
 for cutover limits.
 
-## 9. Known failure: new Git branch after Atomic records
+## 9. New Git branch after Atomic records
 
 Run this in a **fresh test repo immediately after sections 1–4**, before
 disabling the bridge or running the agent test:
@@ -269,44 +265,65 @@ printf 'Git edit\n' > renamed.txt
 git add renamed.txt
 git commit -qm 'review: foreign Git edit'
 atomic git bridge reconcile
+atomic git bridge verify
+git switch main
+atomic git bridge reconcile
+test "$(cat renamed.txt)" = 'atomic edit'
+git switch foreign-edit
+atomic git bridge reconcile
+test "$(cat renamed.txt)" = 'Git edit'
+atomic git bridge verify
 ```
 
 Expected: reconcile imports the commit and verify passes. Switching between
 `main` and `foreign-edit`, then reconciling, should show `atomic edit` and
 `Git edit` respectively.
 
-**Observed on `27d06ff`, default build, macOS, local service mode:**
-
-```text
-Git error: commit <oid> carries an unverifiable Atomic change closure:
-repository projection failed: view 'foreign-edit' not found
-```
-
-`reconcile` exits 4. This fails both with Atomic hooks installed and with a
-custom hook path that prevents installation. Earlier steps pass. The existing
-`git_bridge_workspace_test` suite passes but does not catch this sequence.
-
-Keep the failed repo for debugging. The cause and comparison against `dev`
-have not been confirmed. This bug needs a fix before these basic bridge
-workflows can be marked ready to merge.
+This sequence failed on `27d06ff` because import required the new Atomic view
+to exist and treated a record's change list as the whole historical state.
+The regression test now checks branch switching with hooks enabled and disabled,
+including file contents and inode identity. A separate test confirms that copied
+projection headers cannot authorize different Git contents.
 
 ## 10. Evidence and reporting
 
-Validation performed for this documentation refresh (macOS, `27d06ff` plus
-documentation-only edits; the binary reports a `-dirty` suffix):
+For the full CLI, repository and libatomic test suites, use the same crash-test
+feature as CI:
+
+```sh
+cargo test --locked -p atomic-cli -p atomic-repository -p libatomic \
+  --features atomic-cli/adoption-test-injection --no-fail-fast
+```
+
+The feature enables test-only fault injection. Some crash-recovery tests expect
+those injection points and fail when the feature is omitted. Keep production
+builds on their normal feature configuration.
+
+Local regression validation for the follow-up fixes (macOS, `dev` at `5ddcf1b`
+plus the working-tree fixes on `fix/bridge-new-branch-reconcile`; the binary
+reports a `-dirty` suffix):
 
 | Check | Result |
 | --- | --- |
-| Default-build commands extracted from sections 1–5, in fresh repos | PASS |
-| `git_bridge_workspace_test` | 4 passed |
-| `working_copy_service_adaptation_test` (real RPC socket) | 1 passed |
-| `git_bridge_cb13d_test` (injection build) | 21 passed |
-| `git_cutover_cb13b_test` (injection build) | 4 passed |
+| `bridge_agent_workflow_regression_test` | 10 passed |
+| `git_bridge_cb10a_test` | 26 passed |
+| `native_view_materialization_regression_test` | 2 passed |
+| `project_tree_cb4a_test` + `effective_projection_3b_test` | 4 passed |
 | Database consolidation + migration recovery suites listed in §7 | 4 passed |
-| Section 9 combined new-branch reproduction | FAIL, exit 4, with and without installed hooks |
-| OpenCode/model workflow | Not rerun in this documentation refresh |
+| `working_copy_service_adaptation_test` (RPC socket) | 1 passed |
+| Section 9 regression, with and without hooks | PASS |
+| Standalone native and bridge walkthrough, including branch round trips | PASS |
+| Full CLI, repository and libatomic suites with the CI feature above | 4,225 passed; 91 existing skips |
+| OpenCode/model workflow | Not rerun for these fixes |
 
-The passing checks do not resolve the section 9 failure.
+The full-suite skips are 84 documentation examples, four performance cases,
+and three known reftable, SHA-256 and sparse-checkout import limitations.
+
+After updating this follow-up branch to `dev` at `4426dc6`, all 50 selected
+bridge, projection, native-view, RPC and migration tests passed again, including
+the new view split/delete confirmation tests. The standalone native and Git
+walkthrough, formatting and Clippy also passed on that base. The full-suite
+counts above refer to the earlier `5ddcf1b` run.
 
 Before this documentation refresh, [CI run 38344469173](https://github.com/atomicdotdev/atomic/actions/runs/38344469173)
 passed all eight jobs on `27d06ff`, including Linux/macOS/Windows native test
