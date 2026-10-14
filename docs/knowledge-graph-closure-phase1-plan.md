@@ -200,6 +200,9 @@ Version IRI: `https://atomic.dev/ns/workflow/1.0.0`
 | `atomic:File` | `owl:Thing` | Workflow artifact, not code entity |
 | `atomic:Identity` | `owl:Thing` | |
 | `atomic:Concept` | `skos:Concept` | |
+| `atomic:Project` | `owl:Thing` | The `urn:atomic:project:<pid>` node |
+| `atomic:ProjectIdentity` | `owl:Thing` | The signed identity object (§1.3) |
+| `atomic:VerificationStatus` | `owl:Thing` | Individuals `atomic:Verified`, `atomic:Unverifiable`, `atomic:Failed` |
 
 **Object properties** (workflow edges only):
 
@@ -244,6 +247,23 @@ Version IRI: `https://atomic.dev/ns/workflow/1.0.0`
 | `atomic:implements` | `atomic:Change` | `atomic:WorkIntent` | — | — |
 | `atomic:attestedBy` | `atomic:Change` | `atomic:Attestation` | — | — |
 | `atomic:aboutResource` | `atomic:Finding` | `owl:Thing` | — | — |
+| `atomic:dependsOn` | — | — | — | `owl:TransitiveProperty`; parent of `directlyDependsOnChange` / `dependsOnIntent` |
+| `atomic:modifies` | `atomic:Change` | — | — | Parent of `modifiesFile` |
+| `atomic:hasScopeItem` | `atomic:WorkIntent` | `atomic:ScopeItem` | — | Parent of `hasScopeIn` / `hasScopeOut` |
+| `atomic:ancestorView` | `atomic:View` | `atomic:View` | — | `owl:TransitiveProperty` |
+| `atomic:turnOfSession` | `atomic:SessionTurn` | `atomic:Session` | `atomic:hasTurn` | — |
+| `atomic:governsTurn` | `atomic:WorkIntent` | `atomic:SessionTurn` | `atomic:hasPlan` | — |
+| `atomic:generatedBy` | `atomic:Change` | `atomic:SessionTurn` | `atomic:generatedChange` | Used by both property chains |
+| `atomic:blockedBy` | `atomic:WorkIntent` | `atomic:WorkIntent` | `atomic:blocks` | — |
+| `atomic:reviewedBy` | `atomic:WorkIntent` | `atomic:ReviewIntent` | `atomic:reviews` | — |
+| `atomic:verificationResult` | `atomic:Attestation` | `atomic:VerificationStatus` | — | Written only by the cryptographic verifier, never inferred; MAC-signed attestations record `atomic:Unverifiable` |
+| `atomic:hasIdentity` | `atomic:Project` | `atomic:ProjectIdentity` | — | — |
+| `atomic:issuer` | `atomic:ProjectIdentity` | `atomic:Identity` | — | — |
+
+**Reused PROV terms** (declared with `rdfs:isDefinedBy <http://www.w3.org/ns/prov#>`,
+not redefined): `prov:wasInformedBy` (turn → previous turn), `prov:wasDerivedFrom`
+(memory → source, forked session → parent), `prov:used` (tool result → file), and the
+parents `prov:generated` and `prov:wasAttributedTo`.
 
 Note: `atomic:dependsOn` and `atomic:ancestorView` are declared `owl:TransitiveProperty`
 but are **not** materialized in Phase 1.
@@ -252,9 +272,20 @@ but are **not** materialized in Phase 1.
 
 | Property | Domain | Range |
 |---|---|---|
-| `atomic:status` | `atomic:WorkIntent` | `xsd:string` |
-| `atomic:priority` | `atomic:WorkIntent` | `xsd:string` |
+| `atomic:status` | — | `xsd:string` |
+| `atomic:priority` | — | `xsd:string` |
 | `atomic:findingCode` | `atomic:Finding` | `xsd:string` |
+| `atomic:projectId` | `atomic:ProjectIdentity` | `xsd:string` (52-character uppercase base32) |
+| `atomic:schemaVersion` | `atomic:ProjectIdentity` | `xsd:nonNegativeInteger` |
+| `atomic:turnNumber` | `atomic:SessionTurn` | `xsd:nonNegativeInteger` |
+
+`atomic:status` and `atomic:priority` have **no domain**: tasks, acceptance criteria,
+todos, and sessions also carry a status (and todos a priority), and an OWL domain is an
+inference rule, so a `WorkIntent` domain would infer each of them to be an intent. Shapes
+constrain the allowed values per class.
+
+**Reused literal terms:** `rdfs:label` (labels), `dcterms:description` (summaries),
+`dcterms:created` / `dcterms:modified` (timestamps).
 
 **Property chains** (declared in TTL as `owl:propertyChainAxiom` for Phase 2 inference):
 
@@ -338,16 +369,25 @@ an explicit fork (later phase) mints a new one.
 
 ```jsonld
 {
-  "@context": "https://atomic.dev/ns/ctx.jsonld",
+  "@context": { "atomic": "https://atomic.dev/ns/workflow#",
+                "dcterms": "http://purl.org/dc/terms/" },
   "@type": "atomic:ProjectIdentity",
-  "atomic:projectId": "ABCD...EFGH",   // the 52-char base32
-  "atomic:createdAt": "2026-01-15T09:00:00Z",
-  "atomic:schemaVersion": 2,
-  "atomic:issuer": "did:atomic:..."     // optional in Phase 1; may be unknown
+  "atomic:projectId": "ABCD...EFGH",
+  "dcterms:created": "2026-01-15T09:00:00Z",
+  "atomic:schemaVersion": 1,
+  "atomic:issuer": "did:atomic:..."
 }
 ```
 
-- Content hash = `blake3(JCS(normalized_bytes))`.
+- `atomic:projectId` is the 52-character uppercase base32 ID. `atomic:issuer` is
+  optional in Phase 1 and may be unknown.
+- The `@context` is **inline**, so the hashed bytes include the term definitions and their
+  meaning can never drift. The existing `https://atomic.dev/ns/ctx.jsonld` context is not
+  used: it defines the old `atom:` prefix but not `atomic:`, so `atomic:` terms would not
+  expand to the workflow namespace.
+- Content hash = `blake3("atomic.project-identity.v1" ‖ 0x00 ‖ JCS(object))`. The type
+  prefix keeps identity hashes distinct from every other object type. Existing object
+  hashes (changes, attestations, provenance, canonical intents and memories) are unchanged.
 - Signed by the initializing identity if available; unsigned is allowed in Phase 1
   (the object schema reserves the `proof` field).
 
@@ -495,12 +535,23 @@ PurRDF documents broader Core/SPARQL support; additional constructs must be cove
 by profile regression tests before we depend on them. `oxttl` and `oxrdf` are
 parser/data-model utilities, **not** the validation engine.
 
-**Toolchain/deployment gate:** PurRDF 3.0.1 requires **Rust 1.98**, while Atomic
-currently declares **1.90**. The spike uses a separate toolchain and resolves 73
-dependency packages (including target-specific packages). M3 must explicitly choose
-an approved MSRV upgrade for embedded use or a separately built PurRDF runner.
-Do not silently raise Atomic's MSRV. Either deployment runs the same SHACL shapes;
-there is no hand-rolled fallback.
+**Toolchain (decided by Lee, 2026-10-14): scoped Rust 1.98 bump.** PurRDF 3.0.1 requires
+Rust 1.98; the workspace declares 1.90 (`Cargo.toml:27`). This repo passes CI's
+`cargo clippy --workspace -- -D warnings` with `rust-version = "1.98"`, but every crate
+inherits the workspace `rust-version`, and sibling repos build these crates by path with
+older pins (`atomic-storage`: `rust:1.94` Docker images; `basecamp/sherpa-server`:
+`rust-version = "1.94"`). A workspace-wide bump would break them. So:
+
+- PurRDF lives in its **own crate** (working name `atomic-shacl`) with
+  `rust-version = "1.98"`, depended on only by `atomic-cli` (and libatomic, if the daemon
+  validates).
+- The shared library crates (`atomic-core`, `atomic-repository`, `atomic-remote`,
+  `atomic-agent`, `atomic-canonical`, `atomic-identity`, `atomic-objects`,
+  `atomic-config`, …) stay at 1.90 and **must not depend on the SHACL crate**.
+  `atomic query validate` wires it in at the CLI layer.
+- The release workflow (`.github/workflows/release.yml:129`) moves to 1.98. The CI MSRV
+  job (`ci.yml:136`) checks the library crates on 1.90 and `atomic-cli` on 1.98.
+- Do not raise the workspace `rust-version`. There is no hand-rolled fallback validator.
 
 **Builtin shape graphs:**
 
@@ -612,10 +663,97 @@ pub enum Replacement {
 static LEGACY_TERMS: &[(/* old */ &'static str, Replacement)] = &[ ... ];
 ```
 
+The table below is the complete content of `LEGACY_TERMS` (approved by Lee,
+2026-10-14). The code has the old constants in `atomic-core/src/pristine/ontology.rs`
+(6 prefixes, 30 `predicate::*`, 16 `entity_type::*`, 29 `edge_kind::*`) but no mapping;
+each appears below exactly once. "Removed" rows carry their reason into
+`Replacement::Removed`.
+
+#### Classes (`entity_type::*` and node `kind` values)
+
+| Old | Replacement |
+|---|---|
+| `vault:Goal` / `goal` | `atomic:Goal` |
+| `vault:Intent` / `intent` | `atomic:WorkIntent`, plus `FeatureIntent` / `BugIntent` / `ReviewIntent` from the canonical `kind`, and `ManagedIntent` from lifecycle status |
+| `vault:Memory` / `memory` | `atomic:Memory` |
+| `vault:Skill` / `skill` | `atomic:Skill` |
+| `vault:ToolResult` / `tool_result` | `atomic:ToolResult` |
+| `vault:File` / `file` | `atomic:File` |
+| `vault:Identity` / `identity` | `atomic:Identity` |
+| `vault:Concept` / `concept` | `atomic:Concept` (⊑ `skos:Concept`, per §1.1) |
+| `vault:Session` / `session` | `atomic:Session` |
+| `vault:SessionTurn` / `session_turn` | `atomic:SessionTurn`, plus `atomic:ManagedTurn` when `plan_id` is present |
+| `vault:Todo` / `todo` | `atomic:Todo` |
+| `vault:ProvenanceGraph` / `provenance` | `atomic:ProvenanceGraph` |
+| `vault:Task` / `task` | `atomic:Task` |
+| `vault:AcceptanceCriterion` / `acceptance_criterion` | `atomic:AcceptanceCriterion` |
+| `vault:ScopeItem` / `scope` | `atomic:ScopeItem` |
+| `vault:Constraint` / `constraint` | `atomic:Constraint` |
+| `change` | `atomic:Change` |
+| `view` | `atomic:View` |
+| `module` | **Removed**: module hierarchy is derivable from paths (plan "What we skip") |
+| `entity` | **Removed**: source entities stay in the syntax index (plan "What we skip") |
+| *(new)* | `atomic:Attestation`, `atomic:Finding`; `atomic:Project`, `atomic:ProjectIdentity` |
+
+#### Predicates and edge kinds
+
+| Old | Endpoints | Replacement |
+|---|---|---|
+| `prov:hadMember` | session → turn | `atomic:hasTurn` |
+| `prov:hadPlan` | turn → intent | `atomic:hasPlan` |
+| `prov:hadPlan` | session → intent | **Removed**: derivable as session `hasTurn` → turn `hasPlan` |
+| `prov:generated` | turn → change | `atomic:generatedChange` (⊑ `prov:generated`) |
+| `prov:wasInformedBy` | turn → previous turn | `prov:wasInformedBy`, kept as PROV |
+| `prov:wasDerivedFrom` | memory → source; forked session → parent | `prov:wasDerivedFrom`, kept as PROV |
+| `prov:used` | tool result → file | `prov:used`, kept as PROV |
+| `prov:wasAssociatedWith` | tool result → goal | `atomic:linkedGoal` (PROV association is for activity → agent) |
+| `prov:wasGeneratedBy` | never emitted | **Removed** |
+| `atom:informedBy` | intent → memory/source | `atomic:informedBy` (⊑ `prov:wasDerivedFrom`) |
+| `vault:explainedBy` | turn → provenance graph | `atomic:turnExplainedBy` (⊑ `atomic:explainedBy`) |
+| `vault:hasTodo` | turn → todo | `atomic:hasTodo` |
+| `BLOCKS` / `BLOCKED_BY` | intent ↔ intent | `atomic:blocks` / `atomic:blockedBy` (inverses) |
+| `ASSIGNED_TO` | intent → identity | `atomic:assignedTo` |
+| `LINKED_INTENT` | goal → intent | `atomic:linkedIntent` (target now resolved through the manifest) |
+| `LINKED_GOAL` | intent → goal | `atomic:linkedGoal` |
+| `REFERENCES` | entry → memory, entry → file | `atomic:references` |
+| `HAS_LABEL` | intent → concept | `atomic:hasLabel` |
+| `HAS_TASK` | intent → task | `atomic:hasTask` |
+| `HAS_ACCEPTANCE_CRITERION` | intent → criterion | `atomic:hasAcceptanceCriterion` |
+| `HAS_SCOPE_IN` / `HAS_SCOPE_OUT` | intent → scope item | `atomic:hasScopeIn` / `atomic:hasScopeOut` (⊑ `atomic:hasScopeItem`) |
+| `HAS_CONSTRAINT` | intent → constraint | `atomic:hasConstraint` |
+| `SATISFIES` | task → criterion | `atomic:satisfies` |
+| `TOUCHES` | task → file | `atomic:touches` |
+| `SCOPE_OUT_FILE` | intent → file | `atomic:scopeOutFile` |
+| `REMEDIATES` | intent → intent | `atomic:remediates` |
+| `REVIEWS` | review intent → intent | `atomic:reviews` |
+| `DEPENDS_ON` | change → change | `atomic:directlyDependsOnChange` (⊑ `atomic:dependsOn`) |
+| `DEPENDS_ON` | intent → intent | `atomic:dependsOnIntent` (⊑ `atomic:dependsOn`) |
+| `MODIFIES` | change → file | `atomic:modifiesFile` (⊑ `atomic:modifies`) |
+| `MODIFIES` | change → entity | **Removed**: code structure (plan "What we skip") |
+| `ON_VIEW` | change → view | `atomic:directlyOnView`, recomputed from `VIEW_CHANGES` (today it records the working copy's desired view, not membership) |
+| `ON_VIEW` | session → view | `atomic:sessionViewContext` |
+| `CHILD_OF` | view → parent view | `atomic:childViewOf` |
+| `VISIBLE_FROM` | never emitted | `atomic:visibleFrom`, declared as a query-time operator, never stored |
+| `AUTHORED_BY` | change/goal/intent → identity | `atomic:authoredBy` (⊑ `prov:wasAttributedTo`); intents now emit it from `author`/`created_by` |
+| `DEFINES`, `EXPORTS`, `INCLUDES`, `IMPORTS`, `CALLS` | code structure | **Removed**: syntax index (plan "What we skip") |
+| `PART_OF` | file → module, module → module | **Removed**: derivable from paths |
+| `vault:status`, `vault:priority` | literal | `atomic:status`, `atomic:priority` (no domain; see §1.1) |
+| `vault:blocks`, `vault:blockedBy`, `vault:assignedTo`, `vault:linkedIntent`, `vault:linkedGoal`, `vault:references`, `vault:hasLabel` | never emitted; duplicates of the uppercase kinds | **Removed**: the uppercase twins are mapped above |
+| `vault:appliesTo` | never emitted | **Removed** |
+| `dc:type`, `dc:creator`, `dc:date`, `dc:description` | never emitted | **Removed** (creator → `authoredBy`; dates and descriptions come from typed source fields, see §1.1 datatype properties) |
+| `skos:broader`, `skos:narrower`, `skos:subject`, `skos:related` | never emitted | **Removed** |
+| `rdf:type` (as an edge) | never emitted | **Removed**: types are stored in `kg_types` (§1.6) |
+
+#### Prefix constants
+
+| Old | Replacement |
+|---|---|
+| `prefix::{ATOM, PROV, SKOS, DC, VAULT, RDF}` | **Removed**: replaced by the `PREFIXES` table in `kg::ontology` (§1.2) |
+
 Tests:
 
-1. Every legacy `predicate::*`, `entity_type::*`, and `edge_kind::*` constant appears
-   exactly once in `LEGACY_TERMS`.
+1. Every legacy `prefix::*`, `predicate::*`, `entity_type::*`, and `edge_kind::*` constant
+   appears exactly once in `LEGACY_TERMS`.
 2. Every `One`/`Split` target exists in the TTL.
 3. TTL ↔ Rust consistency: parsed with `oxttl` + `oxrdf` (**dev-dependencies only**).
    Every class/property in the TTL has a corresponding Rust enum variant, and vice
@@ -704,7 +842,8 @@ hooks); unifying them into one `reconcile()` pipeline is Phase 2.
      storage project is rejected. Do not implement or test these in Phase 1.
 7. **SHACL integration:** PurRDF evaluates positive and negative fixtures for both
    builtin profiles, nested shapes, local SPARQL conditions, and property paths.
-   No Atomic-owned constraint evaluator. The MSRV/deployment decision is explicit.
+   No Atomic-owned constraint evaluator. PurRDF lives in `atomic-shacl` at Rust 1.98;
+   the shared library crates still build on 1.90 (CI MSRV job).
 8. **Custom shapes:** placing a `.ttl` in `.atomic/shapes/` causes `atomic query validate`
    to load and evaluate it using the same engine as builtin profiles.
 9. **Conformance report:** preserve standard focus/path/source/component/severity/
@@ -761,8 +900,9 @@ Lands as one PR (or a stack merged together): the RFC allows no dual-write windo
 ### M4 — PurRDF SHACL integration + builtin shapes (depends on M1/M3)
 
 - Retain the standalone `purrdf-shapes = 3.0.1` spike and lockfile.
-- Resolve Rust 1.98 versus Atomic's 1.90 MSRV: approved embedded upgrade or separate
-  validation runner. Select deployment before adding workspace dependencies.
+- New `atomic-shacl` crate at `rust-version = "1.98"`, used only by `atomic-cli`; shared
+  library crates stay at 1.90 (§1.4 Toolchain). Release workflow to 1.98; CI MSRV job split
+  into library crates on 1.90 and `atomic-cli` on 1.98.
 - Implement the read-only workflow-to-RDF adapter and a thin PurRDF invocation layer;
   no custom SHACL evaluator, policy-rule compilation, or hand-coded mirror checks.
 - `projection-1.0.0.ttl` and `publication-1.0.0.ttl`, including local SPARQL rules
@@ -782,8 +922,8 @@ SPARQL constraints silently unenforced, lost result paths, and a large dependenc
 footprint. Do not generalize those findings to every future OxiRS release.
 
 The [PurRDF 3.0.1 spike](./shacl-purrdf-spike-findings.md) passed the initial probes
-for those failure categories. It is the provisional Phase 1 engine choice, subject
-to the MSRV decision and broader regression coverage. A version number alone is
+for those failure categories. It is the Phase 1 engine choice, built with the scoped
+Rust 1.98 bump (§1.4 Toolchain) and subject to broader regression coverage. A version number alone is
 not a conformance or maturity guarantee.
 
 This plan replaces the historical direction of hand-coded workflow gates / an
