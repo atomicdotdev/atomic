@@ -3389,6 +3389,38 @@ impl Repository {
                 message: format!("staged retrieval failed for '{path}': {error}"),
             })?;
             if rendered.as_slice() != expected.bytes.as_slice() {
+                if std::env::var_os("ATOMIC_DEBUG_DELETION").is_some() {
+                    let first_diff = rendered
+                        .iter()
+                        .zip(expected.bytes.iter())
+                        .position(|(a, b)| a != b)
+                        .unwrap_or_else(|| rendered.len().min(expected.bytes.len()));
+                    eprintln!(
+                        "[debug-deletion] graph MISMATCH path={path} commit={} rendered={} expected={} first_diff_at={first_diff}",
+                        final_change.hashed.header.message.lines().next().unwrap_or(""),
+                        rendered.len(),
+                        expected.bytes.len()
+                    );
+                    eprintln!(
+                        "[debug-deletion] rendered[..first_diff+72]={:?}",
+                        String::from_utf8_lossy(
+                            &rendered[first_diff..(first_diff + 72).min(rendered.len())]
+                        )
+                    );
+                    eprintln!(
+                        "[debug-deletion] expected[..first_diff+72]={:?}",
+                        String::from_utf8_lossy(
+                            &expected.bytes[first_diff..(first_diff + 72).min(expected.bytes.len())]
+                        )
+                    );
+                    eprintln!(
+                        "[debug-deletion] rendered tail={:?} expected tail={:?}",
+                        String::from_utf8_lossy(&rendered[rendered.len().saturating_sub(48)..]),
+                        String::from_utf8_lossy(
+                            &expected.bytes[expected.bytes.len().saturating_sub(48)..]
+                        )
+                    );
+                }
                 return Err(RepositoryError::InvalidOperation {
                     message: format!(
                         "staged path '{path}' renders {} byte(s) but the commit tree expects {} byte(s)",
