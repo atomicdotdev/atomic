@@ -147,12 +147,18 @@
 //! with appropriate coordination.
 
 pub mod alive;
+mod attribute;
 pub mod crdt;
 mod error;
 pub mod filesystem;
 pub mod memory;
 pub mod repo;
 mod traits;
+
+pub use attribute::{
+    platform_symlink_mode, project_inode_attributes, InodeAttributeConflict,
+    InodeAttributeProjection, InodeMaterialization, InodeStatusFacts, DEFAULT_REGULAR_MODE,
+};
 
 // Re-export error types
 pub use error::{

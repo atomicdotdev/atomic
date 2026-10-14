@@ -253,6 +253,9 @@ impl Repository {
                 name: name.to_string(),
             })?;
 
+        if scope.is_shared() {
+            self.ensure_view_has_no_snapshots(&txn, &view)?;
+        }
         view.kind = scope;
         // Clear parent when promoting to Shared root view
         if scope.is_shared() {
@@ -310,6 +313,9 @@ impl Repository {
             None => None,
         };
 
+        if scope.is_shared() {
+            self.ensure_view_has_no_snapshots(&txn, &view)?;
+        }
         view.kind = scope;
         // A Shared view is a root; it never carries a parent.
         view.parent = if scope.is_shared() { None } else { parent_id };
@@ -468,6 +474,84 @@ impl Repository {
             .is_some())
     }
 
+    /// Preview which changes would lose their last view reference on deletion.
+    ///
+    /// Returns hashes in the view's own log order. Inherited changes are not
+    /// removed, and changes referenced by another view (including through
+    /// indexed transitive dependencies) are retained. The analysis is local
+    /// to this repository; it does not check remote copies.
+    ///
+    /// Rejects current, Shared, and parent views just like deletion does.
+    pub fn view_deletion_orphans(&self, name: &str) -> Result<Vec<Hash>, RepositoryError> {
+        if name == self.current_view {
+            return Err(RepositoryError::CannotDeleteCurrentView {
+                name: name.to_string(),
+            });
+        }
+
+        let db = |e: atomic_core::pristine::PristineError| RepositoryError::Database(e.to_string());
+        let txn = self.pristine.read_txn().map_err(db)?;
+        let view =
+            txn.get_view(name)
+                .map_err(db)?
+                .ok_or_else(|| RepositoryError::ViewNotFound {
+                    name: name.to_string(),
+                })?;
+        if view.kind.is_shared() {
+            return Err(RepositoryError::InvalidOperation {
+                message: format!(
+                    "cannot delete shared view '{}': shared views are permanent",
+                    name
+                ),
+            });
+        }
+        let children = txn.get_children_views(view.id).map_err(db)?;
+        if !children.is_empty() {
+            return Err(RepositoryError::InvalidOperation {
+                message: format!(
+                    "cannot delete view '{}': has child views ({}). Delete or reparent children first.",
+                    name,
+                    children.iter().map(|v| v.name.as_str()).collect::<Vec<_>>().join(", ")
+                ),
+            });
+        }
+
+        let candidates: Vec<NodeId> = txn
+            .iter_changes(&view, 0)
+            .map_err(db)?
+            .map(|entry| entry.map(|(_, id, _)| id).map_err(db))
+            .collect::<Result<_, _>>()?;
+        if candidates.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // The union of the remaining own logs also covers all parent chains:
+        // ancestors remain, and views with children cannot be deleted.
+        let mut retained = HashSet::new();
+        for other_name in txn.list_views().map_err(db)? {
+            if other_name == name {
+                continue;
+            }
+            if let Some(other) = txn.get_view(&other_name).map_err(db)? {
+                for entry in txn.iter_changes(&other, 0).map_err(db)? {
+                    let (_, id, _) = entry.map_err(db)?;
+                    retained.insert(id);
+                }
+            }
+        }
+        expand_indexed_dependency_closure(&txn, &mut retained, &db)?;
+
+        candidates
+            .into_iter()
+            .filter(|id| !retained.contains(id))
+            .map(|id| {
+                txn.get_external(id).map_err(db)?.ok_or_else(|| {
+                    RepositoryError::Database(format!("Change {} has no external hash", id.0))
+                })
+            })
+            .collect()
+    }
+
     /// Delete a view from the repository.
     ///
     /// This removes the view and all its associated metadata, but does not
@@ -510,15 +594,7 @@ impl Repository {
         // `del_view` enforces:
         // - Shared views cannot be deleted (returns CannotDeleteSharedView)
         // - Views with children cannot be deleted (returns ViewHasChildren)
-        // Remove workspace directory for this view before deleting
-        // the view from the database.  This cleans up any shelved
-        // artifacts (node_modules, dist, etc.) that were stored when
-        // the user last switched away from this view.
-        let ws = workspace_path(&self.dot_dir, name);
-        if ws.is_dir() {
-            let _ = std::fs::remove_dir_all(&ws);
-        }
-
+        // - Views selected by a working copy cannot be deleted
         txn.del_view(&view).map_err(|e| match &e {
             atomic_core::pristine::PristineError::CannotDeleteSharedView { name } => {
                 RepositoryError::InvalidOperation {
@@ -544,6 +620,14 @@ impl Repository {
 
         txn.commit()
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+        // Only clean up legacy shelved artifacts after deletion is durable.
+        // A refused deletion or failed commit must preserve the user's files.
+        // Cleanup remains best-effort because the view is already deleted.
+        let ws = workspace_path(&self.dot_dir, name);
+        if ws.is_dir() {
+            let _ = std::fs::remove_dir_all(&ws);
+        }
 
         Ok(())
     }
@@ -616,22 +700,26 @@ impl Repository {
         // actual graph membership rather than by assuming the own log is a
         // superset of the parent (which only holds for `create_view_from`
         // drafts, not for record- or split-created drafts).
+        let membership = view_membership(&txn, &view)?;
         let (parent_name, own_change_count, inherited_change_count) = match view.parent {
             Some(parent_id) => {
-                match txn
+                let parent = txn
                     .get_view_by_id(parent_id)
                     .map_err(|e| RepositoryError::Database(e.to_string()))?
-                {
-                    Some(parent) => {
-                        let parent_visible = collect_visible_change_ids(&txn, &parent)?;
-                        let own_ids = collect_view_change_ids(&txn, &view)?;
-                        let own = own_ids.difference(&parent_visible).count() as u64;
-                        (Some(parent.name), own, parent_visible.len() as u64)
-                    }
-                    None => (None, view.change_count, 0),
-                }
+                    .ok_or_else(|| {
+                        RepositoryError::Database(format!(
+                            "view '{}' ({}) references missing parent {}",
+                            view.name, view.id, parent_id
+                        ))
+                    })?;
+                let inherited = view_membership(&txn, &parent)?;
+                let own = membership
+                    .iter()
+                    .filter(|change_id| !inherited.contains(**change_id))
+                    .count() as u64;
+                (Some(parent.name), own, inherited.len() as u64)
             }
-            None => (None, view.change_count, 0),
+            None => (None, membership.len() as u64, 0),
         };
 
         Ok(ViewInfo {
@@ -665,7 +753,7 @@ impl Repository {
     /// Create a view with an explicit scope and optional named parent.
     ///
     /// The view's change log starts empty; this only establishes identity.
-    fn create_view_with_identity(
+    pub fn create_view_with_identity(
         &mut self,
         name: &str,
         scope: ViewScope,
@@ -717,6 +805,11 @@ impl Repository {
     /// The exported manifest is verified before it is returned, so a
     /// corrupted log surfaces here rather than on the receiving end.
     pub fn view_manifest(&self, name: &str) -> Result<ViewManifest, RepositoryError> {
+        if name.starts_with("wc/") {
+            return Err(RepositoryError::InvalidOperation {
+                message: format!("private working-copy view '{}' cannot be exported", name),
+            });
+        }
         let txn = self
             .pristine
             .read_txn()
@@ -728,6 +821,24 @@ impl Repository {
             .ok_or_else(|| RepositoryError::ViewNotFound {
                 name: name.to_string(),
             })?;
+
+        // Export is allowed only after the complete projection domain has been
+        // dependency-validated. The manifest still carries this view's own log;
+        // parent manifests carry inherited membership during root-to-leaf sync.
+        let projection = effective_projection_closure(&txn, &view)?;
+        for change_id in projection.iter_dependency_first().copied() {
+            let hash = txn
+                .get_external(change_id)
+                .map_err(|e| RepositoryError::Database(e.to_string()))?
+                .ok_or_else(|| {
+                    RepositoryError::Database(format!(
+                        "change {} in view '{}' projection has no external hash",
+                        change_id.get(),
+                        name
+                    ))
+                })?;
+            self.ensure_exchangeable_change(&hash)?;
+        }
 
         let parent = match view.parent {
             Some(parent_id) => txn
@@ -792,6 +903,15 @@ impl Repository {
                     view: manifest.name.clone(),
                     count: 1,
                     first: hash.to_base32(),
+                });
+            }
+            if self.load_change(hash)?.kind().is_snapshot() {
+                return Err(RepositoryError::InvalidOperation {
+                    message: format!(
+                        "private snapshot {} cannot be imported into view '{}'",
+                        hash.to_base32(),
+                        manifest.name
+                    ),
                 });
             }
         }
@@ -910,6 +1030,15 @@ impl Repository {
             let mut seen: HashSet<Hash> = HashSet::with_capacity(manifest.changes.len());
             for hash in &manifest.changes {
                 let change = self.load_change(hash)?;
+                if change.kind().is_snapshot() {
+                    return Err(RepositoryError::InvalidOperation {
+                        message: format!(
+                            "private snapshot {} cannot be imported into view '{}'",
+                            hash.to_base32(),
+                            manifest.name
+                        ),
+                    });
+                }
                 for dep in change.dependencies() {
                     if seen.contains(dep) {
                         continue;
@@ -990,7 +1119,7 @@ impl Repository {
                                 return Err(RepositoryError::ManifestDiverged {
                                     view: manifest.name.clone(),
                                     at: local_len as u64,
-                                })
+                                });
                             }
                         }
                     }
@@ -1012,7 +1141,7 @@ impl Repository {
                     return Err(RepositoryError::ManifestParentMissing {
                         view: manifest.name.clone(),
                         parent: name,
-                    })
+                    });
                 }
                 Err(e) => return Err(e),
             }
@@ -1060,4 +1189,42 @@ pub struct ManifestApplyOutcome {
     pub replayed: usize,
     /// The view's merkle state after apply (equals the declared state).
     pub state: Merkle,
+}
+
+/// Expand `ids` in-place with the transitive dependencies of retained changes,
+/// using the pristine change dependency index only.
+fn expand_indexed_dependency_closure<T: atomic_core::pristine::GraphTxnT, F>(
+    txn: &T,
+    ids: &mut HashSet<NodeId>,
+    db: &F,
+) -> Result<(), RepositoryError>
+where
+    F: Fn(atomic_core::pristine::PristineError) -> RepositoryError,
+{
+    let mut queue: std::collections::VecDeque<NodeId> = ids.iter().copied().collect();
+    let mut unindexed_count = 0usize;
+
+    while let Some(change_id) = queue.pop_front() {
+        if !txn.is_change_deps_indexed(change_id).map_err(db)? {
+            unindexed_count += 1;
+            continue;
+        }
+        let deps = txn.get_change_deps(change_id).map_err(db)?;
+        for dep_hash in deps {
+            if let Some(dep_id) = txn.get_internal(&dep_hash).map_err(db)? {
+                if ids.insert(dep_id) {
+                    queue.push_back(dep_id);
+                }
+            }
+        }
+    }
+
+    if unindexed_count > 0 {
+        log::debug!(
+            "orphan analysis skipped {} unindexed changes; run dependency-index repair to backfill legacy repos",
+            unindexed_count
+        );
+    }
+
+    Ok(())
 }

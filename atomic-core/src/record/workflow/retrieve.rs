@@ -46,10 +46,8 @@ use crate::output::alive::RetrieveOptions;
 use crate::output::repo::{
     output_file_to_buffer, output_file_to_buffer_with_options, FileOutputOptions,
 };
-use crate::pristine::{GraphTxnT, PristineError};
+use crate::pristine::{GraphTxnT, GraphVisibilityClosure, PristineError};
 use crate::types::{NodeId, Position};
-
-use std::collections::HashSet;
 
 use super::super::error::{RecordError, RecordResult};
 
@@ -298,10 +296,10 @@ where
 
 // STATE-BASED CONTENT RETRIEVAL
 
-/// Retrieve content with a change filter for state-based retrieval.
+/// Retrieve content with validated graph visibility for state-based retrieval.
 ///
 /// This function retrieves file content at a specific historical state by
-/// filtering the graph to only include vertices from a specific set of changes.
+/// filtering the graph to a validated dependency closure.
 /// This is essential for code review workflows where you want to see what a
 /// specific change actually modified.
 ///
@@ -333,7 +331,7 @@ where
 /// * `txn` - Transaction providing graph access
 /// * `changes` - Change store for span content
 /// * `position` - Position in the graph (identifies the file)
-/// * `options` - Retrieve options including the change filter
+/// * `options` - Retrieve options including graph visibility
 ///
 /// # Returns
 ///
@@ -347,13 +345,11 @@ where
 ///
 /// ```rust,ignore
 /// use atomic_core::output::alive::RetrieveOptions;
-/// use std::collections::HashSet;
+/// use atomic_core::pristine::GraphVisibilityClosure;
 ///
-/// // Get changes applied before a specific change
-/// let change_set: HashSet<NodeId> = get_changes_up_to_sequence(&txn, &view, 5)?;
-///
-/// // Create options with the filter
-/// let options = RetrieveOptions::new().with_change_filter(change_set);
+/// let membership = get_membership_up_to_sequence(&txn, &view, 5)?;
+/// let visibility = GraphVisibilityClosure::try_from_membership(&txn, &membership)?;
+/// let options = RetrieveOptions::new().with_graph_visibility(visibility);
 ///
 /// // Retrieve content at that state
 /// let content = retrieve_content_with_filter(&txn, &changes, position, options)?;
@@ -402,7 +398,7 @@ where
         return Ok((Vec::new(), false));
     }
 
-    // Convert RetrieveOptions to FileOutputOptions, preserving the change filter
+    // Convert RetrieveOptions to FileOutputOptions, preserving graph visibility.
     let mut file_opts = FileOutputOptions::new();
     if options.include_deleted {
         file_opts = file_opts.include_deleted(true);
@@ -437,7 +433,7 @@ where
 /// * `txn` - Transaction providing graph and view access
 /// * `changes` - Change store for span content
 /// * `position` - Position in the graph (identifies the file)
-/// * `change_set` - Set of change NodeIds to include
+/// * `graph_visibility` - Validated dependency closure to include
 ///
 /// # Returns
 ///
@@ -447,22 +443,23 @@ where
 ///
 /// ```rust,ignore
 /// // Get the change set for the parent state
-/// let change_set = get_changes_up_to_sequence(&txn, &view, parent_seq)?;
+/// let membership = get_membership_up_to_sequence(&txn, &view, parent_seq)?;
+/// let visibility = GraphVisibilityClosure::try_from_membership(&txn, &membership)?;
 ///
 /// // Retrieve content at that state
-/// let before_content = retrieve_content_at_state(&txn, &changes, position, change_set)?;
+/// let before_content = retrieve_content_at_state(&txn, &changes, position, visibility)?;
 /// ```
 pub fn retrieve_content_at_state<T, C>(
     txn: &T,
     changes: &C,
     position: Position<NodeId>,
-    change_set: HashSet<NodeId>,
+    graph_visibility: GraphVisibilityClosure,
 ) -> RecordResult<Vec<u8>>
 where
     T: GraphTxnT,
     C: ChangeStore,
 {
-    let options = RetrieveOptions::new().with_change_filter(change_set);
+    let options = RetrieveOptions::new().with_graph_visibility(graph_visibility);
     retrieve_content_with_filter(txn, changes, position, options)
 }
 

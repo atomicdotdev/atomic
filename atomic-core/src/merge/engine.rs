@@ -17,7 +17,49 @@ use super::three_way::{three_way_merge, tokenize, MergeToken, ThreeWayResult};
 use super::{ConflictGroup, MergeOutcome, MergeSource};
 use crate::change::ChangeStore;
 use crate::pristine::{GraphTxnT, PristineError};
-use crate::types::{GraphNode, Hash, NodeId};
+use crate::types::{GraphNode, NodeId};
+
+/// Errors produced while reading the data required for a semantic merge.
+#[derive(Debug)]
+pub enum SemanticMergeError {
+    /// Pristine graph or ID-mapping access failed.
+    Pristine(PristineError),
+    /// Change content could not be loaded.
+    ChangeStore(Box<dyn std::error::Error + Send + Sync>),
+}
+
+impl SemanticMergeError {
+    fn change_store<E>(error: E) -> Self
+    where
+        E: std::error::Error + Send + Sync + 'static,
+    {
+        Self::ChangeStore(Box::new(error))
+    }
+}
+
+impl std::fmt::Display for SemanticMergeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Pristine(error) => write!(f, "pristine error: {error}"),
+            Self::ChangeStore(error) => write!(f, "change store error: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for SemanticMergeError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Pristine(error) => Some(error),
+            Self::ChangeStore(error) => Some(error.as_ref()),
+        }
+    }
+}
+
+impl From<PristineError> for SemanticMergeError {
+    fn from(error: PristineError) -> Self {
+        Self::Pristine(error)
+    }
+}
 
 /// The semantic merge engine.
 ///
@@ -78,27 +120,18 @@ impl<'a, T: GraphTxnT, C: ChangeStore> SemanticMergeEngine<'a, T, C> {
     /// 7. If no edits overlap → [`MergeOutcome::AutoMerged`].
     /// 8. If edits overlap   → [`MergeOutcome::Conflict`].
     ///
-    /// Falls back to [`MergeOutcome::NoCrdtData`] when:
-    /// - The conflict is not 2-way
-    /// - Content bytes cannot be retrieved
-    /// - No common ancestor can be determined
+    /// Falls back to [`MergeOutcome::NoCrdtData`] when the semantic shape is
+    /// unsupported or no ancestor/subsumption relationship can be found.
     ///
     /// # Errors
     ///
-    /// Returns [`PristineError`] on database access failure.
-    pub fn try_merge(&self, group: &ConflictGroup) -> Result<MergeOutcome, PristineError> {
+    /// Returns [`SemanticMergeError`] when pristine graph access, ID mapping,
+    /// or change content retrieval fails.
+    pub fn try_merge(&self, group: &ConflictGroup) -> Result<MergeOutcome, SemanticMergeError> {
         // ── Step 1: Read content for every vertex in the group ────────
-        //
-        // If any vertex's content is unreadable we give up immediately.
         let mut vertex_contents: Vec<(GraphNode<NodeId>, Vec<u8>)> = Vec::new();
         for v in &group.vertices {
-            match self.get_vertex_content(v) {
-                Ok(c) => vertex_contents.push((*v, c)),
-                Err(e) => {
-                    log::debug!("try_merge: cannot read vertex {}: {}", v, e);
-                    return Ok(MergeOutcome::NoCrdtData);
-                }
-            }
+            vertex_contents.push((*v, self.get_vertex_content(v)?));
         }
         if vertex_contents.is_empty() {
             return Ok(MergeOutcome::NoCrdtData);
@@ -170,21 +203,9 @@ impl<'a, T: GraphTxnT, C: ChangeStore> SemanticMergeEngine<'a, T, C> {
         //      concurrent insertions where one side is a token-level
         //      superset of the other)
         let base_content = if let Some(ref ancestor) = group.ancestor {
-            match self.get_vertex_content(ancestor) {
-                Ok(c) => Some(c),
-                Err(e) => {
-                    log::debug!("try_merge: cannot read ancestor {}: {}", ancestor, e);
-                    None
-                }
-            }
+            Some(self.get_vertex_content(ancestor)?)
         } else if let Some(ref parent) = group.parent {
-            match self.find_ancestor_content(parent, v_left.change, v_right.change) {
-                Ok(content) => content, // Some or None
-                Err(e) => {
-                    log::debug!("try_merge: ancestor search failed: {}", e);
-                    None
-                }
-            }
+            self.find_ancestor_content(parent, v_left.change, v_right.change)?
         } else {
             None
         };
@@ -257,7 +278,7 @@ impl<'a, T: GraphTxnT, C: ChangeStore> SemanticMergeEngine<'a, T, C> {
         right: &[u8],
         v_left: &GraphNode<NodeId>,
         v_right: &GraphNode<NodeId>,
-    ) -> Result<MergeOutcome, PristineError> {
+    ) -> Result<MergeOutcome, SemanticMergeError> {
         let base_tokens = tokenize(base);
         let left_tokens = tokenize(left);
         let right_tokens = tokenize(right);
@@ -304,7 +325,10 @@ impl<'a, T: GraphTxnT, C: ChangeStore> SemanticMergeEngine<'a, T, C> {
     /// Read the content bytes for a graph vertex from the change store.
     ///
     /// Returns an empty `Vec` for root or empty (structural) vertices.
-    fn get_vertex_content(&self, vertex: &GraphNode<NodeId>) -> Result<Vec<u8>, PristineError> {
+    fn get_vertex_content(
+        &self,
+        vertex: &GraphNode<NodeId>,
+    ) -> Result<Vec<u8>, SemanticMergeError> {
         if vertex.is_root() || vertex.start == vertex.end {
             return Ok(Vec::new());
         }
@@ -314,16 +338,21 @@ impl<'a, T: GraphTxnT, C: ChangeStore> SemanticMergeEngine<'a, T, C> {
             return Ok(Vec::new());
         }
 
+        let hash = self
+            .txn
+            .get_external(vertex.change)?
+            .ok_or(PristineError::ChangeNotFound {
+                id: vertex.change.get(),
+            })?;
         let mut buf = vec![0u8; len];
 
-        let txn = self.txn;
-        let hash_fn = |id: NodeId| -> Option<Hash> { txn.get_external(id).ok().flatten() };
-
         self.changes
-            .get_contents(hash_fn, *vertex, &mut buf)
-            .map_err(|e| PristineError::Inconsistent {
-                message: format!("ChangeStore::get_contents failed for {}: {}", vertex, e),
-            })?;
+            .get_contents(
+                |id| (id == vertex.change).then_some(hash),
+                *vertex,
+                &mut buf,
+            )
+            .map_err(SemanticMergeError::change_store)?;
 
         Ok(buf)
     }
@@ -338,7 +367,7 @@ impl<'a, T: GraphTxnT, C: ChangeStore> SemanticMergeEngine<'a, T, C> {
         parent: &GraphNode<NodeId>,
         left_change: NodeId,
         right_change: NodeId,
-    ) -> Result<Option<Vec<u8>>, PristineError> {
+    ) -> Result<Option<Vec<u8>>, SemanticMergeError> {
         // Look at all forward edges from the parent, including deleted ones.
         let forward_edges = self.txn.iter_forward(*parent, true)?;
 
@@ -447,7 +476,7 @@ impl<'a, T: GraphTxnT> TxnOnlyMergeEngine<'a, T> {
 mod tests {
     use super::*;
     use crate::change::{Change, ChangeHeader, MemoryChangeStore};
-    use crate::types::{ChangePosition, EdgeFlags, GraphNode, NodeId};
+    use crate::types::{ChangePosition, EdgeFlags, GraphNode, Hash, NodeId};
 
     /// Minimal mock that satisfies [`GraphTxnT`] for unit testing.
     ///
@@ -456,12 +485,16 @@ mod tests {
     struct MockTxn {
         /// Map from NodeId → Hash for `get_external`.
         externals: std::collections::HashMap<NodeId, Hash>,
+        fail_external: Option<NodeId>,
+        fail_adjacency: bool,
     }
 
     impl MockTxn {
         fn new() -> Self {
             Self {
                 externals: std::collections::HashMap::new(),
+                fail_external: None,
+                fail_adjacency: false,
             }
         }
 
@@ -474,6 +507,11 @@ mod tests {
         type Adj = std::vec::IntoIter<Result<crate::types::SerializedGraphEdge, PristineError>>;
 
         fn get_external(&self, id: NodeId) -> Result<Option<Hash>, PristineError> {
+            if self.fail_external == Some(id) {
+                return Err(PristineError::Inconsistent {
+                    message: "scripted get_external failure".to_string(),
+                });
+            }
             Ok(self.externals.get(&id).copied())
         }
 
@@ -491,6 +529,11 @@ mod tests {
             _min_flag: EdgeFlags,
             _max_flag: EdgeFlags,
         ) -> Result<Self::Adj, PristineError> {
+            if self.fail_adjacency {
+                return Err(PristineError::Inconsistent {
+                    message: "scripted ancestor graph failure".to_string(),
+                });
+            }
             Ok(Vec::new().into_iter())
         }
 
@@ -527,6 +570,7 @@ mod tests {
     fn make_change(store: &MemoryChangeStore, content: &[u8]) -> Hash {
         let mut change = Change::empty(ChangeHeader::new("test change"));
         change.contents = content.to_vec();
+        change.finalize();
         store.insert_change(change).expect("insert_change")
     }
 
@@ -560,25 +604,16 @@ mod tests {
 
     #[test]
     fn skips_three_way_conflicts() {
-        let txn = MockTxn::new();
+        let mut txn = MockTxn::new();
         let store = MemoryChangeStore::new();
+        let hash = make_change(&store, b"abcdefghijklmnop");
+        let id = NodeId::new(1);
+        txn.register(id, hash);
         let engine = SemanticMergeEngine::new(&txn, &store);
 
-        let v1 = GraphNode::new(
-            NodeId::new(1),
-            ChangePosition::new(0),
-            ChangePosition::new(5),
-        );
-        let v2 = GraphNode::new(
-            NodeId::new(2),
-            ChangePosition::new(0),
-            ChangePosition::new(5),
-        );
-        let v3 = GraphNode::new(
-            NodeId::new(3),
-            ChangePosition::new(0),
-            ChangePosition::new(5),
-        );
+        let v1 = GraphNode::new(id, ChangePosition::new(0), ChangePosition::new(5));
+        let v2 = GraphNode::new(id, ChangePosition::new(5), ChangePosition::new(10));
+        let v3 = GraphNode::new(id, ChangePosition::new(10), ChangePosition::new(15));
 
         let group = ConflictGroup::new(vec![v1, v2, v3]);
         let outcome = engine.try_merge(&group).unwrap();
@@ -780,34 +815,71 @@ mod tests {
         let _c: &MemoryChangeStore = engine.change_store();
     }
 
-    // ---- SemanticMergeEngine: content read failure → NoCrdtData -----------
+    // ---- SemanticMergeEngine: operational failures propagate ---------------
 
     #[test]
-    fn unreadable_left_returns_no_crdt_data() {
-        let txn = MockTxn::new(); // No externals registered.
+    fn get_external_failure_propagates() {
+        let mut txn = MockTxn::new();
+        txn.fail_external = Some(NodeId::new(99));
         let store = MemoryChangeStore::new();
         let engine = SemanticMergeEngine::new(&txn, &store);
-
-        // Vertices reference NodeId(99) which has no external hash.
-        let v1 = GraphNode::new(
+        let vertex = GraphNode::new(
             NodeId::new(99),
             ChangePosition::new(0),
             ChangePosition::new(5),
         );
-        let v2 = GraphNode::new(
-            NodeId::new(99),
-            ChangePosition::new(5),
-            ChangePosition::new(10),
+
+        let error = engine
+            .try_merge(&ConflictGroup::new(vec![vertex]))
+            .expect_err("get_external failure must propagate");
+        assert!(matches!(
+            error,
+            SemanticMergeError::Pristine(PristineError::Inconsistent { .. })
+        ));
+    }
+
+    #[test]
+    fn change_store_failure_propagates() {
+        let mut txn = MockTxn::new();
+        let id = NodeId::new(1);
+        txn.register(id, Hash::of(b"missing change"));
+        let store = MemoryChangeStore::new();
+        let engine = SemanticMergeEngine::new(&txn, &store);
+        let vertex = GraphNode::new(id, ChangePosition::new(0), ChangePosition::new(5));
+
+        let error = engine
+            .try_merge(&ConflictGroup::new(vec![vertex]))
+            .expect_err("change-store failure must propagate");
+        assert!(matches!(error, SemanticMergeError::ChangeStore(_)));
+    }
+
+    #[test]
+    fn ancestor_graph_failure_propagates() {
+        let mut txn = MockTxn::new();
+        let store = MemoryChangeStore::new();
+        let left_hash = make_change(&store, b"left");
+        let right_hash = make_change(&store, b"right");
+        let left_id = NodeId::new(1);
+        let right_id = NodeId::new(2);
+        txn.register(left_id, left_hash);
+        txn.register(right_id, right_hash);
+        txn.fail_adjacency = true;
+        let engine = SemanticMergeEngine::new(&txn, &store);
+        let left = GraphNode::new(left_id, ChangePosition::new(0), ChangePosition::new(4));
+        let right = GraphNode::new(right_id, ChangePosition::new(0), ChangePosition::new(5));
+        let parent = GraphNode::new(
+            NodeId::new(3),
+            ChangePosition::new(0),
+            ChangePosition::new(0),
         );
 
-        let ancestor = GraphNode::new(
-            NodeId::new(99),
-            ChangePosition::new(0),
-            ChangePosition::new(5),
-        );
-        let group = ConflictGroup::new(vec![v1, v2]).with_ancestor(ancestor);
-        let outcome = engine.try_merge(&group).unwrap();
-        assert!(matches!(outcome, MergeOutcome::NoCrdtData));
+        let error = engine
+            .try_merge(&ConflictGroup::new(vec![left, right]).with_parent(parent))
+            .expect_err("ancestor traversal failure must propagate");
+        assert!(matches!(
+            error,
+            SemanticMergeError::Pristine(PristineError::Inconsistent { .. })
+        ));
     }
 
     // ---- SemanticMergeEngine: code-like auto-merge -------------------------

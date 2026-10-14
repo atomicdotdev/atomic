@@ -68,20 +68,24 @@ fn compute_working_copy_diff(
     include_untracked: bool,
     stat_only: bool,
 ) -> Result<Vec<DiffChunk>, Status> {
-    // A query: read-only open with the read-concurrency wait.
-    let repo = handle.repository_readonly()?;
-    let view = repo.current_view().to_string();
+    // Observation-only service read, after any CLI Git reconciliation.
+    let (repo, workspace) =
+        handle.workspace_repository(atomic_repository::WorkspaceTxnMode::Observe)?;
+    let working_copy = workspace.working_copy();
+    let view = workspace.view().name.clone();
     let status = repo
-        .status(StatusOptions::default())
+        .status(working_copy, StatusOptions::default())
         .map_err(repository_error)?;
 
     let mut targets: Vec<(std::path::PathBuf, DomainFileStatus)> = Vec::new();
     for entry in status.entries() {
         let entry_status = entry.status();
         let wanted = match entry_status {
-            DomainFileStatus::Modified | DomainFileStatus::Added | DomainFileStatus::Deleted => {
-                true
-            }
+            DomainFileStatus::Modified
+            | DomainFileStatus::Added
+            | DomainFileStatus::Deleted
+            | DomainFileStatus::TypeChanged
+            | DomainFileStatus::PermissionsChanged => true,
             DomainFileStatus::Untracked => include_untracked,
             _ => false,
         };
@@ -106,7 +110,14 @@ fn compute_working_copy_diff(
         };
         let new_content: Option<Vec<u8>> = match file_status {
             DomainFileStatus::Deleted => None,
-            _ => std::fs::read(handle.root.join(&path)).ok(),
+            _ => Some(
+                working_copy_diff_bytes(&handle.root.join(&path)).map_err(|error| {
+                    domain_status(
+                        ErrorCode::Repository,
+                        format!("cannot read {}: {error}", path.display()),
+                    )
+                })?,
+            ),
         };
 
         let old_text = String::from_utf8_lossy(&old_content).into_owned();
@@ -171,6 +182,26 @@ fn compute_working_copy_diff(
         });
     }
     Ok(chunks)
+}
+
+fn working_copy_diff_bytes(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            return Ok(std::fs::read_link(path)?.as_os_str().as_bytes().to_vec());
+        }
+        #[cfg(not(unix))]
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "symlink diff is unsupported on this platform",
+        ));
+    }
+    if metadata.is_dir() {
+        return Ok(Vec::new());
+    }
+    std::fs::read(path)
 }
 
 /// The wire's downcased file status for a diff chunk — the CLI renders
@@ -689,8 +720,12 @@ impl view_service_server::ViewService for ViewImpl {
         let _gate = gate_handle.exclusive().await;
         let handle_for_task = handle.clone();
         let files_written = tokio::task::spawn_blocking(move || -> Result<u64, Status> {
-            let mut repo = handle_for_task.repository()?;
             let name = request.view.trim().to_string();
+            let (mut repo, workspace) = handle_for_task.workspace_repository_for_switch(
+                atomic_repository::WorkspaceTxnMode::Reconcile,
+                Some(&name),
+            )?;
+            let working_copy = workspace.working_copy();
             if !repo.view_exists(&name).map_err(repository_error)? {
                 return Err(domain_status(
                     ErrorCode::View,
@@ -700,11 +735,9 @@ impl view_service_server::ViewService for ViewImpl {
             // The CLI's safety gate, verbatim: refuse to switch away
             // from a dirty working copy — unless the caller explicitly
             // bypassed it (--force/--stash, an informed client decision).
-            if !request.bypass_dirty_check.unwrap_or(false)
-                && handle_for_task.current_view() != name
-            {
+            if !request.bypass_dirty_check.unwrap_or(false) && workspace.view().name != name {
                 let status = repo
-                    .status(StatusOptions::default())
+                    .status(working_copy, StatusOptions::default())
                     .map_err(repository_error)?;
                 if !status.is_clean() {
                     return Err(domain_status(
@@ -714,7 +747,9 @@ impl view_service_server::ViewService for ViewImpl {
                     ));
                 }
             }
-            let result = repo.switch_view(&name).map_err(repository_error)?;
+            let result = repo
+                .switch_view(working_copy, &name)
+                .map_err(repository_error)?;
             Ok(result.files_written as u64)
         })
         .await
@@ -738,8 +773,13 @@ impl view_service_server::ViewService for ViewImpl {
         tokio::task::spawn_blocking(move || -> Result<(), Status> {
             let mut repo = handle_for_task.repository()?;
             let name = request.view.trim().to_string();
-            // Never switch implicitly: refuse the current view.
-            if handle_for_task.current_view() == name {
+            let working_copy = repo.require_working_copy_id().map_err(repository_error)?;
+            // Never switch implicitly: use the registered working-copy view.
+            if repo
+                .desired_view_name(working_copy)
+                .map_err(repository_error)?
+                == name
+            {
                 return Err(domain_status(
                     ErrorCode::View,
                     format!("cannot delete the current view '{name}' — switch first"),
@@ -751,7 +791,14 @@ impl view_service_server::ViewService for ViewImpl {
                     format!("view '{name}' not found"),
                 ));
             }
+            let scope = repo.get_view_info(&name).map_err(repository_error)?.scope;
+            // Keep deletion eligibility ahead of mapping effects: a refused
+            // Shared/parent delete must preserve every mapping and Git ref.
             repo.delete_view(&name).map_err(repository_error)?;
+            if scope == atomic_core::pristine::ViewScope::Draft {
+                repo.reconcile_mapping_after_view_delete(working_copy, &name, scope)
+                    .map_err(repository_error)?;
+            }
             Ok(())
         })
         .await
@@ -809,7 +856,8 @@ impl view_service_server::ViewService for ViewImpl {
         let handle_for_task = handle.clone();
         let result = tokio::task::spawn_blocking(
             move || -> Result<SplitViewResponse, Status> {
-                let mut repo = handle_for_task.repository()?;
+                let (mut repo, workspace) = handle_for_task.workspace_repository(atomic_repository::WorkspaceTxnMode::Reconcile)?;
+            let working_copy = workspace.working_copy();
                 let mut changes = Vec::with_capacity(request.changes.len());
                 for hash in &request.changes {
                     let mut bytes = [0u8; 32];
@@ -823,7 +871,7 @@ impl view_service_server::ViewService for ViewImpl {
                     changes.push(atomic_core::types::Merkle(bytes));
                 }
                 let outcome = repo
-                    .split_view(atomic_repository::SplitOptions {
+                    .split_view(working_copy, atomic_repository::SplitOptions {
                         target_view: request.name.clone(),
                         from_view: if request.from_view.is_empty() {
                             None

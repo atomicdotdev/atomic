@@ -64,20 +64,30 @@ pub(crate) fn visit_tables(visitor: &mut impl TableVisitor) -> PristineResult<()
     // Graph
     visitor.multimap(GRAPH)?;
     visitor.multimap(INODE_GRAPH)?;
+    visitor.multimap(POSITION_ATTRS)?;
+    visitor.multimap(INODE_ATTRS)?;
 
     // Views
     visitor.table(VIEWS)?;
+    visitor.table(WORKING_COPIES)?;
+    visitor.table(OPERATIONS)?;
+    visitor.table(OP_HEADS)?;
+    visitor.table(EFFECT_RECEIPTS)?;
     visitor.table(VIEW_CHANGES)?;
     visitor.table(REV_VIEW_CHANGES)?;
+    visitor.table(VIEW_SET_ID_INDEX)?;
     visitor.table(CONFLICTS)?;
 
     // File tree
+    visitor.table(PRISTINE_META)?;
+    visitor.multimap(PATH_CLAIMS)?;
     visitor.table(TREE)?;
     visitor.table(REV_TREE)?;
     visitor.table(INODES)?;
     visitor.table(REV_INODES)?;
     visitor.table(DIRECTORIES)?;
     visitor.table(FILE_INDEX)?;
+    visitor.table(FILE_INDEX_V2)?;
 
     // Dependencies
     visitor.multimap(DEPS)?;
@@ -92,6 +102,12 @@ pub(crate) fn visit_tables(visitor: &mut impl TableVisitor) -> PristineResult<()
     visitor.table(TAG_RECORDS)?;
     visitor.table(TAG_NAME_INDEX)?;
     visitor.table(GIT_SHA_INDEX)?;
+    visitor.table(GIT_COMMIT_CLOSURES)?;
+    visitor.table(BRIDGE_EVENT_CAPTURES)?;
+    visitor.table(BRIDGE_EVENT_CAPTURE_ANCHORS)?;
+    visitor.table(BRIDGE_REF_CAPTURE_TOKENS)?;
+    visitor.table(BINDINGS)?;
+    visitor.table(REF_MAPPINGS)?;
 
     // Redb-native change store
     visitor.table(CHANGE_META)?;

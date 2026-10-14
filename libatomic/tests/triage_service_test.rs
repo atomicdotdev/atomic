@@ -16,7 +16,7 @@
 use std::sync::Arc;
 
 use atomic_core::change::Author;
-use atomic_repository::{InsertOptions, RecordOptions, Repository, TrackingOptions};
+use atomic_repository::{RecordOptions, Repository, TrackingOptions};
 use libatomic::daemon::services_triage::TriageImpl;
 use libatomic::daemon::state::DaemonState;
 use tempfile::TempDir;
@@ -38,44 +38,47 @@ fn host() -> (TempDir, std::path::PathBuf, Arc<DaemonState>, RepositoryRef) {
     let root = dir.path().join("repo");
     {
         let mut repo = Repository::init(&root).unwrap();
+        let working_copy = repo.require_working_copy_id().unwrap();
         write(&root, "README.md", "hello\n");
-        repo.add("README.md", TrackingOptions::default()).unwrap();
+        repo.add(working_copy, "README.md", TrackingOptions::default())
+            .unwrap();
         let header = ChangeHeader::builder()
             .message("first")
             .author(Author::new("Test", Some("test@example.com")))
             .build();
         let outcome = repo
             .record(
+                working_copy,
                 header,
                 RecordOptions::new()
                     .with_all(true)
                     .save_to_store(true)
-                    .apply_after_record(false),
+                    .apply_after_record(true),
             )
             .unwrap();
-        repo.write_recorded(&outcome, InsertOptions::default())
-            .unwrap();
+        assert!(outcome.was_applied());
 
         repo.create_view_from("feat", "dev").unwrap();
-        repo.switch_view("feat").unwrap();
+        repo.switch_view(working_copy, "feat").unwrap();
         write(&root, "src/lib.rs", "pub fn f() {}\n");
-        repo.add("src/lib.rs", TrackingOptions::default()).unwrap();
+        repo.add(working_copy, "src/lib.rs", TrackingOptions::default())
+            .unwrap();
         let header = ChangeHeader::builder()
             .message("a feature")
             .author(Author::new("Test", Some("test@example.com")))
             .build();
         let outcome = repo
             .record(
+                working_copy,
                 header,
                 RecordOptions::new()
                     .with_all(true)
                     .save_to_store(true)
-                    .apply_after_record(false),
+                    .apply_after_record(true),
             )
             .unwrap();
-        repo.write_recorded(&outcome, InsertOptions::default())
-            .unwrap();
-        repo.switch_view("dev").unwrap();
+        assert!(outcome.was_applied());
+        repo.switch_view(working_copy, "dev").unwrap();
     }
     let state = Arc::new(DaemonState::new());
     let root = root.canonicalize().unwrap();

@@ -43,12 +43,22 @@ impl Legacy {
 
 fn record(repo: &Repository, root: &Path, name: &str, message: &str) {
     fs::write(root.join(name), format!("{message}\n")).unwrap();
-    repo.add(name, Default::default()).unwrap();
+    repo.add(
+        repo.require_working_copy_id().unwrap(),
+        name,
+        Default::default(),
+    )
+    .unwrap();
     let header = ChangeHeader::builder()
         .message(message)
         .author(Author::new("Test", Some("test@example.com")))
         .build();
-    repo.record(header, RecordOptions::default()).unwrap();
+    repo.record(
+        repo.require_working_copy_id().unwrap(),
+        header,
+        RecordOptions::default(),
+    )
+    .unwrap();
 }
 
 fn history(repo: &Repository) -> Vec<Hash> {
@@ -63,6 +73,13 @@ fn history(repo: &Repository) -> Vec<Hash> {
 /// (without the newer metadata table) and, optionally, the provenance
 /// journal in `changes.redb`.
 fn legacy_repository(with_change_store: bool) -> Legacy {
+    legacy_repository_with_setup(with_change_store, |_| {})
+}
+
+fn legacy_repository_with_setup(
+    with_change_store: bool,
+    setup: impl FnOnce(&Repository),
+) -> Legacy {
     let temp = TempDir::new().unwrap();
     let root = temp.path().join("repo");
     let mut repo = Repository::init(&root).unwrap();
@@ -71,6 +88,7 @@ fn legacy_repository(with_change_store: bool) -> Legacy {
     repo.create_view("feature").unwrap();
     let history = history(&repo);
     let views = repo.list_views().unwrap();
+    setup(&repo);
     drop(repo);
 
     let dot_dir = root.join(".atomic");
@@ -166,7 +184,7 @@ fn legacy_repository_is_still_found_before_merging() {
     assert!(Repository::is_repository(&legacy.root));
     assert_eq!(
         Repository::find_root(&legacy.root.join("a.txt")).unwrap(),
-        legacy.root
+        legacy.root.canonicalize().unwrap()
     );
 }
 
@@ -284,20 +302,14 @@ fn a_held_legacy_pristine_is_reported_busy() {
 
 #[test]
 fn sandbox_open_merges_the_canonical_repository() {
-    let legacy = legacy_repository(true);
+    // Register the sandbox before creating the legacy fixture so migration
+    // must carry its durable working-copy identity into the consolidated DB.
+    let legacy = legacy_repository_with_setup(true, |repo| {
+        let sandbox = repo.root().parent().unwrap().join("sandbox");
+        repo.provision_sandbox(repo.require_working_copy_id().unwrap(), &sandbox, "dev")
+            .unwrap();
+    });
     let sandbox = legacy.root.parent().unwrap().join("sandbox");
-    {
-        // Provisioning needs an open repository; restore the legacy layout
-        // afterwards so the sandbox open is the first to see it.
-        let repo = Repository::open(&legacy.root).unwrap();
-        repo.provision_sandbox(&sandbox, "dev").unwrap();
-    }
-    let retired = legacy.retired().remove(0);
-    fs::remove_file(legacy.dot_dir().join(DATABASE_FILE)).unwrap();
-    for file in [LEGACY_PRISTINE_FILE, LEGACY_CHANGE_STORE_FILE] {
-        fs::rename(retired.join(file), legacy.dot_dir().join(file)).unwrap();
-    }
-    fs::remove_dir(&retired).unwrap();
 
     let opened = Repository::open_existing(&sandbox).unwrap();
 

@@ -1,8 +1,8 @@
 //! Stash: temporary storage of uncommitted working-copy changes.
 //!
 //! Stashes are **orphan views** paired with a raw-bytes sidecar under
-//! `.atomic/stashes/<view-name>/`. The sidecar holds the exact bytes of
-//! every stashed file plus a `MANIFEST` listing files and deletions. Applying
+//! `.atomic/stashes/<view-name>/`. The sidecar holds each stashed entry's bytes,
+//! kind and permissions plus a `MANIFEST` listing files and deletions. Applying
 //! a stash restores working-copy operations without changing the graph.
 //! Deletions are fenced by the original recorded content to avoid deleting
 //! a file edited since the stash was saved.
@@ -41,6 +41,114 @@ struct StashManifest {
 struct StashedDeletion {
     path: String,
     recorded_hash: String,
+}
+
+// The sidecar preserves the entry's own kind and permissions. In particular,
+// a symlink payload is the link itself, even when its target does not exist.
+// This also keeps existing regular-file sidecars and both manifests readable.
+fn copy_stash_entry(
+    source: &std::path::Path,
+    destination: &std::path::Path,
+) -> std::io::Result<()> {
+    let metadata = std::fs::symlink_metadata(source)?;
+    let source_type = metadata.file_type();
+    if !source_type.is_file() && !source_type.is_dir() && !source_type.is_symlink() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "cannot stash a special filesystem entry",
+        ));
+    }
+    if let Some(parent) = destination.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    match std::fs::symlink_metadata(destination) {
+        Ok(existing) => {
+            // Never follow the destination's leaf symlink while restoring a
+            // regular file. A directory is removed only when empty, so a type
+            // change cannot erase unrelated children added since the stash.
+            if source_type.is_symlink()
+                || existing.file_type().is_symlink()
+                || source_type.is_dir() != existing.is_dir()
+            {
+                if existing.is_dir() {
+                    std::fs::remove_dir(destination)?;
+                } else {
+                    std::fs::remove_file(destination)?;
+                }
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    if source_type.is_symlink() {
+        let target = std::fs::read_link(source)?;
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(target, destination)?;
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_file(target, destination)?;
+        #[cfg(not(any(unix, windows)))]
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "symlink stashes are unsupported on this platform",
+        ));
+    } else if source_type.is_dir() {
+        std::fs::create_dir_all(destination)?;
+        std::fs::set_permissions(destination, metadata.permissions())?;
+    } else {
+        std::fs::copy(source, destination)?;
+    }
+    Ok(())
+}
+
+fn stash_entry_path(root: &std::path::Path, path: &str) -> Result<std::path::PathBuf, String> {
+    use std::path::Component;
+    let relative = std::path::Path::new(path);
+    if path.is_empty()
+        || relative
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+        || relative.starts_with(".atomic")
+        || relative.starts_with(".atomic-sandbox")
+    {
+        return Err(format!("invalid stashed file path: {path}"));
+    }
+    // The leaf may be a symlink; only parents must be real directories.
+    let mut destination = root.to_path_buf();
+    let mut components = relative.components().peekable();
+    while let Some(component) = components.next() {
+        destination.push(component);
+        if components.peek().is_some() {
+            match std::fs::symlink_metadata(&destination) {
+                Ok(metadata) if metadata.file_type().is_symlink() => {
+                    return Err(format!("refusing stashed file through symlink: {path}"));
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(format!("cannot inspect stashed file {path}: {error}")),
+            }
+        }
+    }
+    Ok(destination)
+}
+
+// A captured addition has no recorded version to materialize. Before removing
+// it from the working copy, verify that the saved entry still matches it.
+fn same_stash_entry(left: &std::path::Path, right: &std::path::Path) -> std::io::Result<bool> {
+    let a = std::fs::symlink_metadata(left)?;
+    let b = std::fs::symlink_metadata(right)?;
+    if a.file_type() != b.file_type() {
+        return Ok(false);
+    }
+    if a.file_type().is_symlink() {
+        return Ok(std::fs::read_link(left)? == std::fs::read_link(right)?);
+    }
+    if a.permissions() != b.permissions() {
+        return Ok(false);
+    }
+    if a.is_dir() {
+        return Ok(true);
+    }
+    Ok(std::fs::read(left)? == std::fs::read(right)?)
 }
 
 // A deletion is a working-copy operation, not a new claim about graph paths.
@@ -127,14 +235,18 @@ impl Repository {
     /// when the working copy is clean (never an error).
     pub fn stash_push(&mut self, options: StashPushOptions) -> Result<Option<StashEntry>, String> {
         use crate::status::StatusOptions;
+        let working_copy = self.require_working_copy_id().map_err(|e| e.to_string())?;
         let status = self
-            .status(StatusOptions::default())
+            .status(working_copy, StatusOptions::default())
             .map_err(|e| e.to_string())?;
-        if status.is_clean() {
+        if status.is_clean() && !(options.include_untracked && status.untracked().next().is_some())
+        {
             return Ok(None);
         }
 
-        let source_view = self.current_view().to_string();
+        let source_view = self
+            .desired_view_name(working_copy)
+            .map_err(|e| e.to_string())?;
         let stash_message = options
             .message
             .unwrap_or_else(|| DEFAULT_STASH_MESSAGE.to_string());
@@ -177,25 +289,18 @@ impl Repository {
             .collect::<Result<Vec<_>, String>>()?;
         let mut stashed_paths: Vec<String> = Vec::new();
         let snapshot_path = |p: String| -> Result<(), String> {
-            let abs = self.root().join(&p);
-            let rel_dir = stash_dir.join(
-                std::path::Path::new(&p)
-                    .parent()
-                    .unwrap_or(std::path::Path::new("")),
-            );
-            std::fs::create_dir_all(&rel_dir)
-                .map_err(|e| format!("cannot create stash directory for {p}: {e}"))?;
-            std::fs::copy(&abs, stash_dir.join(&p))
-                .map_err(|e| format!("cannot stash {p}: {e}"))?;
+            let abs = stash_entry_path(self.root(), &p)?;
+            let destination = stash_entry_path(&stash_dir, &p)?;
+            copy_stash_entry(&abs, &destination).map_err(|e| format!("cannot stash {p}: {e}"))?;
             Ok(())
         };
 
-        for entry in status.modified() {
-            let p = entry.path().to_string_lossy().to_string();
-            snapshot_path(p.clone())?;
-            stashed_paths.push(p);
-        }
-        for entry in status.added() {
+        for entry in status
+            .modified()
+            .chain(status.permissions_changed())
+            .chain(status.type_changed())
+            .chain(status.added())
+        {
             let p = entry.path().to_string_lossy().to_string();
             snapshot_path(p.clone())?;
             stashed_paths.push(p);
@@ -207,6 +312,17 @@ impl Repository {
                 stashed_paths.push(p);
             }
         }
+        let mut additions: Vec<_> = status
+            .added()
+            .chain(status.untracked().filter(|_| options.include_untracked))
+            .map(|entry| entry.path().to_string_lossy().to_string())
+            .collect();
+        let restore_paths = stashed_paths
+            .iter()
+            .filter(|path| !additions.contains(path))
+            .chain(deleted.iter().map(|entry| &entry.path))
+            .cloned()
+            .collect();
 
         // Keep the legacy file-only format readable. Deletion-aware stashes
         // need explicit operations; an absent payload must never mean delete.
@@ -225,9 +341,43 @@ impl Repository {
         std::fs::write(stash_dir.join("MANIFEST"), manifest)
             .map_err(|e| format!("failed to write stash manifest: {e}"))?;
 
-        // Restore the working copy to a clean state (unless keep).
+        // An explicit restore applies canonical modes as well as contents;
+        // full materialization deliberately preserves existing file modes.
+        // Only reset entries whose working state was captured above.
         if !options.keep {
-            self.materialize().map_err(|e| e.to_string())?;
+            self.materialize_paths(working_copy, restore_paths)
+                .map_err(|e| e.to_string())?;
+            // Status classifies these against the selected graph closure.
+            // Their bytes are now in the stash; materialization intentionally
+            // leaves such unrecorded files alone. Remove children before their
+            // (possibly empty) directories, and undo only pending tracking.
+            additions.sort_by_key(|path| std::cmp::Reverse(path.len()));
+            for path in additions {
+                let source = stash_entry_path(self.root(), &path)?;
+                let saved = stash_entry_path(&stash_dir, &path)?;
+                if !same_stash_entry(&source, &saved).map_err(|e| e.to_string())? {
+                    return Err(format!(
+                        "cannot reset stashed addition '{path}': file changed since it was stashed"
+                    ));
+                }
+                if std::fs::symlink_metadata(&source)
+                    .map_err(|e| e.to_string())?
+                    .is_dir()
+                {
+                    std::fs::remove_dir(&source).map_err(|e| e.to_string())?;
+                } else {
+                    std::fs::remove_file(&source).map_err(|e| e.to_string())?;
+                }
+                self.remove(
+                    working_copy,
+                    &path,
+                    crate::TrackingOptions {
+                        force: true,
+                        ..Default::default()
+                    },
+                )
+                .map_err(|e| e.to_string())?;
+            }
         }
 
         Ok(Some(StashEntry {
@@ -383,13 +533,9 @@ impl Repository {
 
         let mut applied: Vec<String> = Vec::new();
         for path in &manifest.files {
-            let src = stash_dir.join(path);
-            let dst = self.root().join(path);
-            if let Some(parent) = dst.parent() {
-                std::fs::create_dir_all(parent)
-                    .map_err(|e| format!("cannot restore stashed file {path}: {e}"))?;
-            }
-            std::fs::copy(&src, &dst)
+            let src = stash_entry_path(&stash_dir, path)?;
+            let dst = stash_entry_path(self.root(), path)?;
+            copy_stash_entry(&src, &dst)
                 .map_err(|e| format!("cannot restore stashed file {path}: {e}"))?;
             applied.push(path.to_string());
         }

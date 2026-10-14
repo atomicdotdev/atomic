@@ -22,7 +22,7 @@ use super::schema::{
     SCHEMA_VERSION, SCHEMA_VERSION_KEY,
 };
 use super::tables::ATOMIC_META;
-use super::txn::open_database;
+use super::txn::{open_database, require_supported_repository_capabilities};
 
 /// Cache for the handles a merge opens. Merges stream each table once, so a
 /// large cache buys nothing and would only inflate the migrating process.
@@ -80,6 +80,7 @@ impl LegacyDatabases {
     pub fn add(&mut self, path: &Path) -> PristineResult<()> {
         let database = open_database(path, false, MERGE_CACHE_BYTES)?;
         check_schema_version(&database.begin_read()?)?;
+        require_supported_repository_capabilities(&database.begin_read()?)?;
         self.sources.push((path.to_path_buf(), database));
         Ok(())
     }

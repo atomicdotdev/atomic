@@ -197,11 +197,7 @@ pub(crate) fn render_recent_sessions(
         sw = ses_width,
     );
     for ((record, turns), intent_count) in ledgers.into_iter().zip(intent_counts) {
-        let status = if record.ended_at.is_some() {
-            "ended"
-        } else {
-            "active"
-        };
+        let status = record.status.label();
         let activity = turns
             .last()
             .map(|turn| turn.timestamp)
@@ -289,14 +285,18 @@ pub(crate) fn render_session_detail(
     }
 
     println!("Session {}", record.session_id);
-    println!(
-        "  Status: {}",
-        if record.ended_at.is_some() {
-            "ended"
-        } else {
-            "active"
+    println!("  Status: {}", record.status.label());
+    if let Some(incomplete) = record.status.incomplete() {
+        println!("  Reason: {}", incomplete.reason);
+        println!("  Origin: {}", incomplete.origin);
+        println!("  Recovery ref: {}", incomplete.recovery_ref);
+        if !incomplete.paths.is_empty() {
+            println!("  Affected paths:");
+            for path in &incomplete.paths {
+                println!("    {}", path);
+            }
         }
-    );
+    }
     if let Some(view) = &record.view_name {
         println!("  View: {}", view);
     }

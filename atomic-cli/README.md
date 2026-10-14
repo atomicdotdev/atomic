@@ -47,6 +47,40 @@ atomic push origin
 | `-h, --help` | Print help information |
 | `-V, --version` | Print version |
 
+## Logging
+
+The terminal shows warnings; `-v` or `RUST_LOG` shows more. Every command also
+writes `info` and above to a daily file, `~/.atomic/logs/atomic.YYYY-MM-DD.log`
+(UTC date; `logs/` under `ATOMIC_CONFIG_DIR` when that is set), in a directory
+only you can read. The last seven files are kept. Each line starts with the
+time and process id, then names the command and the spans it ran in:
+
+```
+2026-09-28T21:30:23.133637Z pid=4242  INFO ThreadId(01) atomic{cmd=git import}:import{branch="main" commits=50}:write{commits=50}:commit{n=3 of=50 sha=1b9c1fec}: atomic::git::import: write 1b9c1fec …
+```
+
+Each span also logs its duration when it closes (`close time.busy=…`).
+
+Besides each crate's own lines, the file carries these targets, which you can
+filter on (for example `ATOMIC_LOG=warn,atomic::git::hook=info`):
+
+| Target | What it records |
+|--------|-----------------|
+| `atomic::logging::command` | Each command's start (version, cwd) and finish (outcome, exit code, error) |
+| `atomic::printed` | The ✓/ℹ/⚠/✗ status messages a command printed for you, at their level (file only) |
+| `atomic::git::import` | `git import` progress: per-commit parse/write lines, phase timings, decisions |
+| `atomic::git::hook` | The evidence each Git hook journaled: checkouts, ref transactions, rewrites, deferred observations |
+| `atomic::bridge::event` | Every bridge event the repository's event journal records (reconcile outcomes, refusals, recoveries, binding transfers), as JSON; like the journal, only once the bridge is enabled or from an explicit bridge command |
+
+Git bridge operations run in spans too: `reconcile`, `import_head`, `export`,
+`verify`, `switch` (with a line per step reached) and `pre_push`.
+
+| Variable | Effect |
+|----------|--------|
+| `ATOMIC_LOG` | The file's filter, in `RUST_LOG` syntax (default `warn,atomic=info`); `off` turns the file off |
+| `ATOMIC_LOG_DIR` | Write the file to this directory instead; it must be an absolute path |
+| `RUST_LOG` | The terminal's filter |
+
 ---
 
 ## Command Reference
@@ -862,7 +896,9 @@ Global identity configuration is stored in `~/.config/atomic/` (or platform equi
 
 | Variable | Description |
 |----------|-------------|
-| `ATOMIC_LOG` | Set log level (`trace`, `debug`, `info`, `warn`, `error`) |
+| `ATOMIC_LOG` | The log file's filter, in `RUST_LOG` syntax; `off` turns the file off (see [Logging](#logging)) |
+| `ATOMIC_LOG_DIR` | Directory for the log file, an absolute path |
+| `RUST_LOG` | The terminal's log filter |
 | `NO_COLOR` | Disable colored output (standard convention) |
 
 ---

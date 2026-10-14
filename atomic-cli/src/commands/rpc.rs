@@ -234,7 +234,10 @@ fn status_options_proto(options: &atomic_repository::status::StatusOptions) -> p
 }
 
 pub fn status(args: &super::status::Status) -> CliResult<bool> {
-    if args.debug_ignore {
+    if args.debug_ignore || args.no_reconcile || args.git {
+        return Ok(false);
+    }
+    if !super::workspace_txn::prepare_service_query(true)? {
         return Ok(false);
     }
     let Some(session) = Service::open()? else {
@@ -276,117 +279,7 @@ pub fn status(args: &super::status::Status) -> CliResult<bool> {
     };
     let response = session.status(request)?;
 
-    if args.json {
-        // The IDE JSON contract — schema_version/repository_root are the
-        // client's own; everything else rides StatusResponse.
-        let root = crate::commands::find_repository_root()?;
-        let entries: Vec<serde_json::Value> = response
-            .files
-            .iter()
-            .map(|file| {
-                let name = match pb::FileStatus::try_from(file.status) {
-                    Ok(pb::FileStatus::Modified) => "modified",
-                    Ok(pb::FileStatus::Deleted) => "deleted",
-                    Ok(pb::FileStatus::Untracked) => "untracked",
-                    Ok(pb::FileStatus::Added) => "added",
-                    Ok(pb::FileStatus::Conflicted) => "conflicted",
-                    _ => "clean",
-                };
-                let code = match pb::FileStatus::try_from(file.status) {
-                    Ok(pb::FileStatus::Modified) => "M",
-                    Ok(pb::FileStatus::Deleted) => "D",
-                    Ok(pb::FileStatus::Untracked) => "?",
-                    Ok(pb::FileStatus::Added) => "A",
-                    Ok(pb::FileStatus::Conflicted) => "C",
-                    _ => "-",
-                };
-                serde_json::json!({
-                    "path": file.path,
-                    "status": name,
-                    "code": code,
-                    "details": file.details,
-                })
-            })
-            .collect();
-        let clean = entries.is_empty();
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
-                "schema_version": 1,
-                "repository_root": root.display().to_string(),
-                "view": response.view,
-                "state": short_hash(&response.view_merkle),
-                "clean": clean,
-                "needs_reindex": response.needs_reindex,
-                "stale_index_count": response.stale_index_count,
-                "entries": entries,
-            }))
-            .map_err(|e| CliError::Internal(e.into()))?
-        );
-        return Ok(true);
-    }
-
-    if args.short {
-        for file in &response.files {
-            let code = match pb::FileStatus::try_from(file.status) {
-                Ok(pb::FileStatus::Modified) => "M",
-                Ok(pb::FileStatus::Deleted) => "D",
-                Ok(pb::FileStatus::Untracked) => "?",
-                Ok(pb::FileStatus::Added) => "A",
-                Ok(pb::FileStatus::Conflicted) => "C",
-                _ => " ",
-            };
-            println!("{code}  {}", file.path);
-        }
-        return Ok(true);
-    }
-
-    println!("On view {}", response.view);
-    if response.view_merkle.is_some() {
-        println!("State: {}...", short_hash(&response.view_merkle));
-    }
-    println!();
-    let dirty: Vec<_> = response
-        .files
-        .iter()
-        .filter(|f| {
-            f.status != pb::FileStatus::Unspecified as i32
-                && f.status != pb::FileStatus::Untracked as i32
-        })
-        .collect();
-    if !dirty.is_empty() {
-        println!("Changes to be recorded:");
-        println!();
-        for file in &dirty {
-            let label = match pb::FileStatus::try_from(file.status) {
-                Ok(pb::FileStatus::Added) => "new file",
-                Ok(pb::FileStatus::Deleted) => "deleted",
-                Ok(pb::FileStatus::Conflicted) => "conflicted",
-                _ => "modified",
-            };
-            println!("\t{label}:   {}", file.path);
-        }
-    }
-    let untracked: Vec<_> = response
-        .files
-        .iter()
-        .filter(|f| f.status == pb::FileStatus::Untracked as i32)
-        .collect();
-    if !untracked.is_empty() {
-        if !dirty.is_empty() {
-            println!();
-        }
-        println!("Untracked files:");
-        println!("  (use \"atomic add <file>...\" to include in what will be recorded)");
-        println!();
-        for file in &untracked {
-            println!("\t{}", file.path);
-        }
-        println!();
-        println!("Use \"atomic add <file>...\" to track files");
-    } else if dirty.is_empty() {
-        println!("nothing else to record");
-    }
+    args.render_service_status(response)?;
     Ok(true)
 }
 
@@ -550,9 +443,6 @@ pub fn add(args: &super::add::Add) -> CliResult<bool> {
     } else {
         args.files.clone()
     };
-    for path in &paths {
-        println!("Adding: {path}");
-    }
     let request = pb::AddFilesRequest {
         repository: Some(session.reference.clone()),
         meta: request_meta(),
@@ -564,6 +454,9 @@ pub fn add(args: &super::add::Add) -> CliResult<bool> {
         no_recursive: args.no_recursive,
     };
     let response = session.add_files(request)?;
+    for path in &paths {
+        println!("Adding: {path}");
+    }
     if response.dry_run {
         for path in &response.would_add {
             println!("Would add: {path}");
@@ -579,6 +472,17 @@ pub fn add(args: &super::add::Add) -> CliResult<bool> {
         }
         println!("Would add {} file(s)", response.would_add.len());
         return Ok(true);
+    }
+    if response.tracked > 0 {
+        let requested = paths
+            .iter()
+            .map(std::path::PathBuf::from)
+            .collect::<Vec<_>>();
+        if let Err(error) = super::add::finish_service_add(&root, &requested) {
+            print_warning(&format!(
+                "durable tracking succeeded but intent-to-add index entries failed: {error}"
+            ));
+        }
     }
     println!("✓ Added {} file(s)", response.tracked);
     Ok(true)
@@ -603,6 +507,11 @@ fn relativize(path: &str, root: &Path) -> String {
 /// `--dry-run` is the Status read's preview — the same "Would record"
 /// lines the local body prints, rendered from the wire's file entries.
 pub fn record(args: &super::record::Record) -> CliResult<bool> {
+    // These #207 operations have no RecordRequest representation yet. Keep
+    // their existing native boundary rather than silently discard the flags.
+    if args.allow_conflict_markers || !args.resolve_name_conflicts.is_empty() {
+        return Ok(false);
+    }
     let Some(session) = Service::open()? else {
         return Ok(false);
     };
@@ -697,7 +606,19 @@ pub fn record(args: &super::record::Record) -> CliResult<bool> {
             "record produced no change"
         )));
     };
-    let view = response.view.unwrap_or_default();
+    let view = response
+        .view
+        .ok_or_else(|| CliError::Internal(anyhow::anyhow!("record returned no view")))?;
+    let bytes: [u8; 32] = change
+        .hash
+        .as_ref()
+        .and_then(|hash| hash.value.as_slice().try_into().ok())
+        .ok_or_else(|| CliError::Internal(anyhow::anyhow!("record returned an invalid hash")))?;
+    crate::commands::git::shadow::sync_git_projection_after_record(
+        &root,
+        &view,
+        &atomic_core::types::Hash::from_bytes(bytes),
+    )?;
     println!(
         "[{} {}/{}] {}",
         view,
@@ -1718,6 +1639,9 @@ pub fn vault_show(args: &super::vault::show::Show) -> CliResult<bool> {
 /// ("reserved for future use") with no local behavior and no wire shape,
 /// so it keeps the local body.
 pub fn diff(args: &super::diff::command::Diff) -> CliResult<bool> {
+    if args.git || args.snapshot {
+        return Ok(false);
+    }
     // The view-pair form (--from/--to) is the Diff RPC's RefPairScope arm.
     if let (Some(from), Some(to)) = (&args.from, &args.to) {
         return diff_view_pair(args, from, to);
@@ -1729,6 +1653,7 @@ pub fn diff(args: &super::diff::command::Diff) -> CliResult<bool> {
     if args.cached {
         return Ok(false); // reserved for future use: a no-op flag needs no wire
     }
+    super::workspace_txn::prepare_service_query(false)?;
     let session = match Service::open()? {
         Some(session) => session,
         None => return Ok(false),
@@ -1797,6 +1722,7 @@ fn file_diff_from_chunk(
         Some("added") => FileChangeStatus::Added,
         Some("deleted") => FileChangeStatus::Deleted,
         Some("untracked") => FileChangeStatus::Untracked,
+        Some("typechanged") => FileChangeStatus::TypeChanged,
         _ => FileChangeStatus::Modified,
     };
 
@@ -1804,7 +1730,7 @@ fn file_diff_from_chunk(
         FileChangeStatus::Added => FileDiff::added(&chunk.path),
         FileChangeStatus::Deleted => FileDiff::deleted(&chunk.path),
         FileChangeStatus::Untracked => FileDiff::new(&chunk.path, FileChangeStatus::Untracked),
-        _ => FileDiff::modified(&chunk.path),
+        _ => FileDiff::new(&chunk.path, status),
     };
 
     if chunk.binary {
@@ -1825,7 +1751,12 @@ fn file_diff_from_chunk(
     }
 
     let diff_result = diff_text(&old_content, &new_content, *algorithm);
-    if diff_result.is_unchanged() {
+    if diff_result.is_unchanged()
+        && !matches!(
+            chunk.status.as_deref(),
+            Some("typechanged" | "permissionschanged")
+        )
+    {
         return None;
     }
     let old_lines: Vec<_> = old_content.split(|&b| b == b'\n').collect();
@@ -2569,6 +2500,32 @@ pub fn view_list(args: &super::view::List) -> CliResult<bool> {
     if args.remote.is_some() {
         return Ok(false); // the remote listing (scope-out remote surface)
     }
+    // `view list` is #207's explicit registration/migration entry for a new
+    // linked worktree or an older native repository. Migrate before opening
+    // the service session; ListViews itself keeps its read-only contract.
+    if let Ok(root) = super::find_repository_root() {
+        match atomic_repository::Repository::open_readonly_wait(
+            &root,
+            atomic_repository::database_lock_wait(),
+        ) {
+            Ok(_) => {}
+            Err(atomic_repository::RepositoryError::WorkingCopyMigrationRequired { .. }) => {
+                drop(atomic_repository::Repository::open(&root).map_err(CliError::Repository)?);
+            }
+            Err(error) => {
+                // Inspect the schema without requiring its completion. Do not
+                // turn arbitrary query errors into a writable recovery open.
+                let needs_path_migration =
+                    atomic_repository::Repository::open_readonly_for_native_repair(&root)
+                        .and_then(|repo| repo.path_claim_migration_required())
+                        .unwrap_or(false);
+                if !needs_path_migration {
+                    return Err(CliError::Repository(error));
+                }
+                drop(atomic_repository::Repository::open(&root).map_err(CliError::Repository)?);
+            }
+        }
+    }
     let Some(session) = Service::open()? else {
         return Ok(false);
     };
@@ -2878,7 +2835,7 @@ pub fn remove(args: &super::remove::Remove) -> CliResult<bool> {
         repository: Some(session.reference.clone()),
         meta: None,
         paths: args.paths.clone(),
-        keep_working_copy: args.keep,
+        keep_working_copy: !args.delete || args.keep,
         dry_run: args.dry_run,
         force: args.force,
     };
@@ -3031,15 +2988,36 @@ pub fn view_switch(args: &super::view::Switch) -> CliResult<bool> {
             message: "View name is required".to_string(),
         });
     };
-    // --force/--stash are the caller's informed decision to leave the
-    // dirty working copy behind; the server refusal stays the default.
+    // Save dirty tracked work before switching; --stash is not permission
+    // to discard it. Keep the server's dirty check after creating the stash
+    // so edits racing the two requests are still refused.
+    if args.stash && !args.force {
+        let status = session.status(pb::StatusRequest {
+            repository: Some(session.reference.clone()),
+            options: None,
+        })?;
+        let dirty = status.files.iter().any(|file| {
+            file.status != pb::FileStatus::Unspecified as i32
+                && file.status != pb::FileStatus::Untracked as i32
+        });
+        if status.view != name && dirty {
+            session.create_stash(pb::CreateStashRequest {
+                repository: Some(session.reference.clone()),
+                meta: None,
+                message: Some(format!("Auto-stash before switching to {name}")),
+                include_untracked: false,
+                keep: false,
+            })?;
+        }
+    }
     let request = pb::SwitchViewRequest {
         repository: Some(session.reference.clone()),
         meta: None,
         view: name.clone(),
-        bypass_dirty_check: Some(args.force || args.stash),
+        bypass_dirty_check: Some(args.force),
     };
     let response = session.switch_view(request)?;
+    super::view::switch::finish_service_switch(&super::find_repository_root()?, &name)?;
     print_success(&format!(
         "Switched to view: {} ({} files updated)",
         name, response.files_written
@@ -3055,6 +3033,7 @@ fn view_switch_plain(session: &Service, name: &str) -> CliResult<()> {
         bypass_dirty_check: None,
     };
     let response = session.switch_view(request)?;
+    super::view::switch::finish_service_switch(&super::find_repository_root()?, name)?;
     print_success(&format!(
         "Switched to view: {} ({} files updated)",
         name, response.files_written
@@ -3375,6 +3354,7 @@ fn insert_cross_view_outcome(
         changes_applied: response.inserted.len(),
         applied_hashes: insert_applied_hashes(response),
         skipped_hashes: vec![Merkle::ZERO; response.skipped_count as usize],
+        affected_paths: std::collections::HashSet::new(),
         new_state: response
             .new_state
             .as_ref()
@@ -5605,7 +5585,7 @@ pub fn agent_explain(args: &super::agent::explain::Explain) -> CliResult<bool> {
             continue;
         }
         if let Some(error) = &result.generation_error {
-            if !result.reasoning.is_some() {
+            if result.reasoning.is_none() {
                 print!("  Generating reasoning via Claude CLI ({})...", args.model);
                 if error.is_empty() {
                     println!(" ✓");

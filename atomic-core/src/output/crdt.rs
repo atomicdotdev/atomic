@@ -533,12 +533,26 @@ where
     T: crate::pristine::CrdtTxnT + crate::pristine::GraphTxnT,
     C: crate::change::ChangeStore,
 {
-    use crate::types::Hash;
-
     let trunk_id = match txn.get_trunk_by_path(path)? {
         Some(t) => t,
         None => return Ok(Vec::new()),
     };
+    output_trunk_via_crdt(txn, changes, trunk_id)
+}
+
+/// Read semantic content by stable identity when the caller has resolved a
+/// view's path through the graph. The ambient path index may describe a rename
+/// visible only in another view; it is not a view-local ownership oracle.
+pub fn output_trunk_via_crdt<T, C>(
+    txn: &T,
+    changes: &C,
+    trunk_id: TrunkId,
+) -> Result<Vec<u8>, CrdtOutputError<C::Error>>
+where
+    T: crate::pristine::CrdtTxnT + crate::pristine::GraphTxnT,
+    C: crate::change::ChangeStore,
+{
+    use crate::types::Hash;
 
     let mut out: Vec<u8> = Vec::new();
 
@@ -567,12 +581,22 @@ where
         let start = out.len();
         out.resize(start + len, 0);
 
-        // hash_fn re-created per call to keep the &txn borrow re-entrant.
-        let hash_fn = |id: crate::types::NodeId| -> Option<Hash> {
-            if id.is_root() {
-                None
+        // Resolve the content owner before entering ChangeStore's infallible
+        // callback boundary so pristine errors cannot masquerade as absence.
+        let content_hash = if graph_node.change.is_root() {
+            None
+        } else {
+            Some(txn.get_external(graph_node.change)?.ok_or(
+                crate::pristine::PristineError::ChangeNotFound {
+                    id: graph_node.change.get(),
+                },
+            )?)
+        };
+        let hash_fn = move |id: crate::types::NodeId| -> Option<Hash> {
+            if id == graph_node.change {
+                content_hash
             } else {
-                txn.get_external(id).ok().flatten()
+                None
             }
         };
 

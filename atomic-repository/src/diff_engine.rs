@@ -1547,7 +1547,9 @@ where
             Some(TrunkOp::Create { .. }) => FileChangeStatus::Added,
             Some(TrunkOp::Delete { .. }) => FileChangeStatus::Deleted,
             Some(TrunkOp::Move { .. }) => FileChangeStatus::Renamed,
-            Some(TrunkOp::Undelete { .. }) => FileChangeStatus::Modified,
+            Some(TrunkOp::Undelete { .. })
+            | Some(TrunkOp::SetMode { .. })
+            | Some(TrunkOp::SetKind { .. }) => FileChangeStatus::Modified,
             None => FileChangeStatus::Modified,
         };
 

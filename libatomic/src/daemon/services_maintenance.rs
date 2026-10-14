@@ -71,7 +71,7 @@ impl MaintenanceService for MaintenanceImpl {
         let gate_handle = handle.clone();
         let _gate = gate_handle.exclusive().await;
         let result = tokio::task::spawn_blocking(move || -> Result<RepairResponse, Status> {
-            let repo = handle.repository()?;
+            let mut repo = handle.repository()?;
             match action {
                 RepairAction::RebuildDependencyIndex => {
                     let (indexed, skipped, failed) = repo
@@ -90,7 +90,14 @@ impl MaintenanceService for MaintenanceImpl {
                 RepairAction::ReindexWorkingCopy => {
                     // `status --reindex`: rebuild the working-copy index so
                     // stale rows stop producing false positives.
-                    let reindexed = repo.reindex_working_copy().map_err(repository_error)?;
+                    let workspace = super::state::enter_workspace(
+                        &mut repo,
+                        atomic_repository::WorkspaceTxnMode::Reconcile,
+                    )?;
+                    let working_copy = workspace.working_copy();
+                    let reindexed = repo
+                        .reindex_working_copy(working_copy)
+                        .map_err(repository_error)?;
                     Ok(RepairResponse {
                         findings: Vec::new(),
                         reindexed: reindexed as u64,
@@ -158,13 +165,21 @@ impl MaintenanceService for MaintenanceImpl {
         // open while a writable handle (including compaction) is live.
         let root = handle.root.clone();
         let result = tokio::task::spawn_blocking(move || {
-            let repo = atomic_repository::Repository::open_readonly(&root).map_err(|error| {
-                domain_status(
-                    ErrorCode::Repository,
-                    format!("failed to open repository read-only: {error}"),
-                )
-            })?;
-            let report = repo.verify_working_copy().map_err(repository_error)?;
+            let mut repo =
+                atomic_repository::Repository::open_readonly(&root).map_err(|error| {
+                    domain_status(
+                        ErrorCode::Repository,
+                        format!("failed to open repository read-only: {error}"),
+                    )
+                })?;
+            let workspace = super::state::enter_workspace(
+                &mut repo,
+                atomic_repository::WorkspaceTxnMode::Observe,
+            )?;
+            let working_copy = workspace.working_copy();
+            let report = repo
+                .verify_working_copy(working_copy)
+                .map_err(repository_error)?;
             Ok::<_, Status>(CheckRepositoryResponse {
                 findings: report.problems.iter().map(|p| p.to_string()).collect(),
                 consistent: report.is_healthy(),

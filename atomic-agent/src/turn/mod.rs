@@ -10,6 +10,13 @@
 //! - **`session`** — `AgentSession` struct and `SessionStore` for persisting
 //!   session state as JSON in `.atomic/sessions/`. _(Planned: Phase 17.2)_
 //!
+//! - **`capture`** — authenticated managed commit-time capture evidence
+//!   (CB-12A, RFC §10.3): one MAC-bound capture per active session written by
+//!   the pre-commit hook and verified at turn end. A verified capture is
+//!   evidence only — the `ManagedGitCommitCaptured` classification still
+//!   requires the RFC §10.3.2 reassembly, which is unimplemented while RFC
+//!   §19 Q2 is undecided.
+//!
 //! - **`orchestrator`** — `TurnOrchestrator` that dispatches `TurnEvent`s
 //!   through the state machine, manages the `FileWatcher`, and calls
 //!   `record_turn()` to create Atomic changes. _(Planned: Phase 17.3)_
@@ -45,6 +52,7 @@
 //! - [x] `session.rs` — `AgentSession`, `SessionStore`
 //! - [x] `orchestrator.rs` — `TurnOrchestrator`
 
+pub mod capture;
 pub mod orchestrator;
 pub mod phase;
 pub mod session;

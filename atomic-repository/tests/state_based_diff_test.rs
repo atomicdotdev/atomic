@@ -33,10 +33,15 @@ use std::path::{Path, PathBuf};
 
 use atomic_core::change::{Author, ChangeHeader};
 use atomic_core::types::{Base32, Hash};
+use atomic_core::WorkingCopyId;
 use atomic_repository::{
     get_files_in_change, RecordOptions, Repository, StateBeforeChange, StatusOptions,
 };
 use tempfile::TempDir;
+
+fn working_copy(repo: &Repository) -> WorkingCopyId {
+    repo.require_working_copy_id().expect("working copy id")
+}
 
 /// Create a test repository with a single recorded file.
 fn create_test_repo() -> (Repository, TempDir, PathBuf) {
@@ -52,7 +57,7 @@ fn create_test_repo() -> (Repository, TempDir, PathBuf) {
 fn create_and_add_file(repo: &Repository, repo_path: &Path, name: &str, content: &str) {
     let file_path = repo_path.join(name);
     fs::write(&file_path, content).expect("Failed to write file");
-    repo.add(name, Default::default())
+    repo.add(working_copy(repo), name, Default::default())
         .expect("Failed to add file");
 }
 
@@ -64,7 +69,7 @@ fn record_change(repo: &Repository, message: &str) -> Hash {
         .build();
 
     let outcome = repo
-        .record(header, RecordOptions::default())
+        .record(working_copy(repo), header, RecordOptions::default())
         .expect("Failed to record");
 
     *outcome.hash()
@@ -173,7 +178,7 @@ fn test_file_modification_state_retrieval() {
 
     // Check status before recording
     let status = repo
-        .status(StatusOptions::default())
+        .status(working_copy(&repo), StatusOptions::default())
         .expect("Failed to get status");
     let modified: Vec<_> = status.modified().collect();
     assert_eq!(modified.len(), 1, "Should have 1 modified file");
@@ -193,7 +198,7 @@ fn test_file_modification_state_retrieval() {
 
     // Check final status
     let final_status = repo
-        .status(StatusOptions::default())
+        .status(working_copy(&repo), StatusOptions::default())
         .expect("Failed to get final status");
     let final_modified: Vec<_> = final_status.modified().collect();
     assert_eq!(
@@ -372,7 +377,7 @@ fn test_empty_file() {
     // Create an empty file and add it to tracking
     let file_path = repo_path.join("empty.txt");
     fs::write(&file_path, "").expect("Failed to write empty file");
-    repo.add("empty.txt", Default::default())
+    repo.add(working_copy(&repo), "empty.txt", Default::default())
         .expect("Failed to add empty file");
 
     // With the default options (record_empty_files: true), recording an
@@ -383,7 +388,7 @@ fn test_empty_file() {
         .author(Author::new("Test", Some("test@example.com")))
         .build();
 
-    let result = repo.record(header, RecordOptions::default());
+    let result = repo.record(working_copy(&repo), header, RecordOptions::default());
     assert!(
         result.is_ok(),
         "Recording empty file should succeed with record_empty_files=true (default)"
@@ -393,7 +398,7 @@ fn test_empty_file() {
     // should fail with NothingToRecord because there are no content changes.
     let file_path2 = repo_path.join("empty2.txt");
     fs::write(&file_path2, "").expect("Failed to write empty file");
-    repo.add("empty2.txt", Default::default())
+    repo.add(working_copy(&repo), "empty2.txt", Default::default())
         .expect("Failed to add empty file");
 
     let header2 = ChangeHeader::builder()
@@ -401,7 +406,11 @@ fn test_empty_file() {
         .author(Author::new("Test", Some("test@example.com")))
         .build();
 
-    let result2 = repo.record(header2, RecordOptions::default().record_empty_files(false));
+    let result2 = repo.record(
+        working_copy(&repo),
+        header2,
+        RecordOptions::default().record_empty_files(false),
+    );
     assert!(
         result2.is_err(),
         "Recording empty file should fail with record_empty_files=false"
@@ -416,7 +425,7 @@ fn test_binary_content() {
     let binary_content: Vec<u8> = vec![0x00, 0x01, 0x02, 0xFF, 0xFE, 0xFD];
     let file_path = repo_path.join("binary.bin");
     fs::write(&file_path, &binary_content).expect("Failed to write binary file");
-    repo.add("binary.bin", Default::default())
+    repo.add(working_copy(&repo), "binary.bin", Default::default())
         .expect("Failed to add binary file");
     let hash = record_change(&repo, "Add binary file");
 
@@ -620,7 +629,7 @@ fn test_file_append_state_retrieval() {
 
     // Check status - file should show as modified
     let status = repo
-        .status(StatusOptions::default())
+        .status(working_copy(&repo), StatusOptions::default())
         .expect("Failed to get status");
     let modified_files: Vec<_> = status.modified().collect();
     println!("DEBUG: Modified files count: {}", modified_files.len());
@@ -680,7 +689,7 @@ fn test_file_append_state_retrieval() {
 
     // Verify final status is clean
     let final_status = repo
-        .status(StatusOptions::default())
+        .status(working_copy(&repo), StatusOptions::default())
         .expect("Failed to get final status");
     let final_modified: Vec<_> = final_status.modified().collect();
     assert!(
@@ -722,7 +731,7 @@ fn test_file_prepend_state_retrieval() {
 
     // Verify final status is clean
     let final_status = repo
-        .status(StatusOptions::default())
+        .status(working_copy(&repo), StatusOptions::default())
         .expect("Failed to get final status");
     let final_modified: Vec<_> = final_status.modified().collect();
     assert!(
@@ -759,7 +768,7 @@ fn test_file_insert_middle_state_retrieval() {
 
     // Check status before recording
     let status = repo
-        .status(StatusOptions::default())
+        .status(working_copy(&repo), StatusOptions::default())
         .expect("Failed to get status");
     let modified: Vec<_> = status.modified().collect();
     println!("DEBUG: Modified files before record: {}", modified.len());
@@ -785,7 +794,7 @@ fn test_file_insert_middle_state_retrieval() {
 
     // Verify final status is clean
     let final_status = repo
-        .status(StatusOptions::default())
+        .status(working_copy(&repo), StatusOptions::default())
         .expect("Failed to get final status");
     let final_modified: Vec<_> = final_status.modified().collect();
     assert!(

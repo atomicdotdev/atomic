@@ -55,7 +55,11 @@ jobs:
             ${{ runner.os }}-cargo-test-
 
       - name: Run tests
-        run: cargo test --workspace
+        # Temporary PR #207 policy: Git bridge integration suites are Unix-only
+        # (cfg(unix)); Linux/macOS still run them. Keep Windows native tests on.
+        # Re-enable the bridge suites after Windows support is defined and its
+        # path/mode/locking behavior is validated; see the RFC platform policy.
+        run: cargo test --workspace --features atomic-cli/adoption-test-injection --no-fail-fast
 
       - name: Run CLI semantic diff harness
         if: matrix.os == 'ubuntu-latest'

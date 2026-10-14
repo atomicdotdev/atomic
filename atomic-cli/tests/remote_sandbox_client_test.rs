@@ -442,6 +442,28 @@ fn a_remote_sandbox_records_through_the_socket_and_nothing_else() {
     write(&vm, "README.md", "hello\nfrom the sandbox\nuncommitted\n");
     let diff = ok(env.run(&vm, &["diff"]), "diff in the sandbox");
     assert!(diff.contains("uncommitted"), "{diff}");
+    let cache_before: Vec<_> = redb_files(&vm)
+        .into_iter()
+        .map(|path| {
+            let bytes = std::fs::read(&path).unwrap();
+            (path, bytes)
+        })
+        .collect();
+    ok(
+        env.run(&vm, &["restore", "--dry-run", "README.md"]),
+        "readonly remote restore preview",
+    );
+    assert_eq!(
+        std::fs::read_to_string(vm.join("README.md")).unwrap(),
+        "hello\nfrom the sandbox\nuncommitted\n"
+    );
+    for (path, bytes) in cache_before {
+        assert_eq!(
+            std::fs::read(path).unwrap(),
+            bytes,
+            "preview must not hydrate or mutate cache"
+        );
+    }
     ok(
         env.run(&vm, &["restore", "README.md"]),
         "restore in the sandbox",

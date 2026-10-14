@@ -131,7 +131,18 @@ pub(crate) fn sink_for(root: &Path) -> Arc<dyn ProvenanceJournalSink> {
         };
     }
     match crate::service::mode() {
-        crate::service::Mode::Local => match DirectJournalSink::open(root) {
+        // The direct service accepts the canonical repository root. A local
+        // sandbox or linked worktree owns its working-copy directory, but its
+        // journal remains in the common database. Resolve the caller here;
+        // do not create a second database or change the service's lock policy.
+        crate::service::Mode::Local => match (|| {
+            let dot = atomic_repository::Repository::canonical_dot_dir(root)
+                .map_err(|error| error.to_string())?;
+            let canonical = dot
+                .parent()
+                .ok_or_else(|| "canonical repository has no parent directory".to_string())?;
+            DirectJournalSink::open(canonical)
+        })() {
             Ok(sink) => Arc::new(sink),
             Err(reason) => Arc::new(RefusedJournalSink::local(reason)),
         },
@@ -386,6 +397,9 @@ fn journal_checkpoint_attempt(
                 .unwrap_or(0),
             plan_id: None,
             todos: Vec::new(),
+            boundary_start: None,
+            boundary_end: None,
+            outcome: None,
         }),
         manifest_hash: attempt.manifest_hash.as_ref().and_then(|hash| {
             hash.value
@@ -1201,6 +1215,9 @@ impl Command for JournalRpcSelftest {
             timestamp: now + 3,
             plan_id: None,
             todos: Vec::new(),
+            boundary_start: None,
+            boundary_end: None,
+            outcome: None,
         };
         let bound = sink
             .bind_checkpoint_hash(&checkpoint, graph_hash, session_turn, now + 3)

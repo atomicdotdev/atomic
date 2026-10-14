@@ -20,6 +20,7 @@
 //! 4. Return the list of [`ForkConflict`]s for the merge engine.
 
 use crate::output::alive::{AliveGraph, OrderResult, VertexId};
+use crate::pristine::PristineError;
 
 /// A detected fork conflict in the alive graph.
 ///
@@ -47,7 +48,15 @@ pub(crate) struct ForkConflict {
 /// # Returns
 ///
 /// A (possibly empty) list of fork conflicts.
-pub(crate) fn detect_fork_conflicts(graph: &AliveGraph, order: &OrderResult) -> Vec<ForkConflict> {
+///
+/// # Errors
+///
+/// Returns [`PristineError::Inconsistent`] when the order or graph edges
+/// reference a vertex that is absent from the alive graph or its SCC order.
+pub(crate) fn detect_fork_conflicts(
+    graph: &AliveGraph,
+    order: &OrderResult,
+) -> Result<Vec<ForkConflict>, PristineError> {
     use std::collections::{HashMap, HashSet, VecDeque};
 
     let mut forks = Vec::new();
@@ -56,6 +65,11 @@ pub(crate) fn detect_fork_conflicts(graph: &AliveGraph, order: &OrderResult) -> 
     let mut vertex_to_scc: HashMap<VertexId, usize> = HashMap::new();
     for (scc_idx, scc) in order.sccs.iter().enumerate() {
         for &vid in scc {
+            graph
+                .try_get_vertex(vid)
+                .ok_or_else(|| PristineError::Inconsistent {
+                    message: format!("order references missing alive graph vertex {vid:?}"),
+                })?;
             vertex_to_scc.insert(vid, scc_idx);
         }
     }
@@ -64,26 +78,43 @@ pub(crate) fn detect_fork_conflicts(graph: &AliveGraph, order: &OrderResult) -> 
     // graph's child edges (i.e. is `to` topologically downstream of
     // `from`)?  Used to filter out children that are linearly ordered
     // through the additive edge model — they form a chain, not a fork.
-    let reachable = |from: VertexId, to: VertexId| -> bool {
+    let reachable = |from: VertexId, to: VertexId| -> Result<bool, PristineError> {
         if from == to {
-            return false;
+            return Ok(false);
         }
         let mut seen: HashSet<VertexId> = HashSet::new();
         let mut queue: VecDeque<VertexId> = VecDeque::new();
         queue.push_back(from);
         seen.insert(from);
         while let Some(v) = queue.pop_front() {
+            graph
+                .try_get_vertex(v)
+                .ok_or_else(|| PristineError::Inconsistent {
+                    message: format!(
+                        "fork reachability references missing alive graph vertex {v:?}"
+                    ),
+                })?;
             for (_, child) in graph.children(v) {
-                if child.is_dummy() || !seen.insert(*child) {
+                if child.is_dummy() {
+                    continue;
+                }
+                graph
+                    .try_get_vertex(*child)
+                    .ok_or_else(|| PristineError::Inconsistent {
+                        message: format!(
+                            "fork child edge references missing alive graph vertex {child:?}"
+                        ),
+                    })?;
+                if !seen.insert(*child) {
                     continue;
                 }
                 if *child == to {
-                    return true;
+                    return Ok(true);
                 }
                 queue.push_back(*child);
             }
         }
-        false
+        Ok(false)
     };
 
     let vertex_count = graph.len_vertices();
@@ -97,11 +128,23 @@ pub(crate) fn detect_fork_conflicts(graph: &AliveGraph, order: &OrderResult) -> 
             continue;
         }
 
-        // Collect non-dummy, deduped children
+        // Collect non-dummy, deduped children.
         let mut children: Vec<VertexId> = Vec::new();
         for (_, child_vid) in graph.children(vid) {
             if child_vid.is_dummy() {
                 continue;
+            }
+            graph
+                .try_get_vertex(*child_vid)
+                .ok_or_else(|| PristineError::Inconsistent {
+                    message: format!(
+                        "fork child edge references missing alive graph vertex {child_vid:?}"
+                    ),
+                })?;
+            if !vertex_to_scc.contains_key(child_vid) {
+                return Err(PristineError::Inconsistent {
+                    message: format!("fork child {child_vid:?} is absent from SCC order"),
+                });
             }
             if !children.contains(child_vid) {
                 children.push(*child_vid);
@@ -129,16 +172,19 @@ pub(crate) fn detect_fork_conflicts(graph: &AliveGraph, order: &OrderResult) -> 
             }
         }
 
-        // Keep only non-empty content vertices (skip inodes / structural markers)
-        let content_children: Vec<VertexId> = children
-            .into_iter()
-            .filter(|&c| {
+        // Keep only non-empty content vertices (skip inodes / structural markers).
+        let mut content_children: Vec<VertexId> = Vec::new();
+        for child in children {
+            let vertex =
                 graph
-                    .try_get_vertex(c)
-                    .map(|v| !v.node.is_root() && !v.node.is_empty())
-                    .unwrap_or(false)
-            })
-            .collect();
+                    .try_get_vertex(child)
+                    .ok_or_else(|| PristineError::Inconsistent {
+                        message: format!("fork references missing alive graph vertex {child:?}"),
+                    })?;
+            if !vertex.node.is_root() && !vertex.node.is_empty() {
+                content_children.push(child);
+            }
+        }
 
         if content_children.len() <= 1 {
             continue;
@@ -150,9 +196,13 @@ pub(crate) fn detect_fork_conflicts(graph: &AliveGraph, order: &OrderResult) -> 
         // sibling's chain, not to a concurrent fork.
         let mut antichain: Vec<VertexId> = Vec::new();
         for &c in &content_children {
-            let dominated = content_children
-                .iter()
-                .any(|&other| other != c && reachable(other, c));
+            let mut dominated = false;
+            for &other in &content_children {
+                if other != c && reachable(other, c)? {
+                    dominated = true;
+                    break;
+                }
+            }
             if !dominated {
                 antichain.push(c);
             }
@@ -166,7 +216,7 @@ pub(crate) fn detect_fork_conflicts(graph: &AliveGraph, order: &OrderResult) -> 
         }
     }
 
-    forks
+    Ok(forks)
 }
 
 // ---------------------------------------------------------------------------
@@ -233,7 +283,7 @@ mod tests {
             forward_edges: Vec::new(),
         };
 
-        assert!(detect_fork_conflicts(&graph, &order).is_empty());
+        assert!(detect_fork_conflicts(&graph, &order).unwrap().is_empty());
     }
 
     #[test]
@@ -253,7 +303,7 @@ mod tests {
             forward_edges: Vec::new(),
         };
 
-        let forks = detect_fork_conflicts(&graph, &order);
+        let forks = detect_fork_conflicts(&graph, &order).unwrap();
         assert_eq!(forks.len(), 1);
         assert_eq!(forks[0].parent, VertexId::new(1));
         assert_eq!(forks[0].children.len(), 2);
@@ -278,7 +328,7 @@ mod tests {
             forward_edges: Vec::new(),
         };
 
-        assert!(detect_fork_conflicts(&graph, &order).is_empty());
+        assert!(detect_fork_conflicts(&graph, &order).unwrap().is_empty());
     }
 
     #[test]
@@ -299,7 +349,7 @@ mod tests {
             forward_edges: Vec::new(),
         };
 
-        assert!(detect_fork_conflicts(&graph, &order).is_empty());
+        assert!(detect_fork_conflicts(&graph, &order).unwrap().is_empty());
     }
 
     #[test]
@@ -325,7 +375,7 @@ mod tests {
             forward_edges: Vec::new(),
         };
 
-        let forks = detect_fork_conflicts(&graph, &order);
+        let forks = detect_fork_conflicts(&graph, &order).unwrap();
         assert_eq!(forks.len(), 1);
         assert_eq!(forks[0].children.len(), 3);
     }
@@ -343,7 +393,7 @@ mod tests {
             forward_edges: Vec::new(),
         };
 
-        assert!(detect_fork_conflicts(&graph, &order).is_empty());
+        assert!(detect_fork_conflicts(&graph, &order).unwrap().is_empty());
     }
 
     #[test]
@@ -356,6 +406,22 @@ mod tests {
             forward_edges: Vec::new(),
         };
 
-        assert!(detect_fork_conflicts(&graph, &order).is_empty());
+        assert!(detect_fork_conflicts(&graph, &order).unwrap().is_empty());
+    }
+
+    #[test]
+    fn missing_order_vertex_is_inconsistent() {
+        let graph = AliveGraph::new();
+        let order = OrderResult {
+            sccs: vec![vec![VertexId::new(7)]],
+            conflict_tree: Default::default(),
+            cyclic_conflicts: 0,
+            forward_edges: Vec::new(),
+        };
+
+        assert!(matches!(
+            detect_fork_conflicts(&graph, &order),
+            Err(PristineError::Inconsistent { .. })
+        ));
     }
 }

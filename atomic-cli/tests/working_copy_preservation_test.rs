@@ -53,6 +53,33 @@ fn fixture() -> TempDir {
     dir
 }
 
+#[test]
+fn switch_with_stash_clears_added_files_and_pop_restores_their_bytes() {
+    let dir = fixture();
+    let root = dir.path();
+    run(root, &["view", "create", "feature"]);
+    std::fs::write(root.join("local.txt"), b"modified\n").unwrap();
+    std::fs::write(root.join("new.txt"), b"new private file\n").unwrap();
+    run(root, &["add", "new.txt"]);
+    run(root, &["view", "switch", "feature", "--stash"]);
+    assert!(!root.join("new.txt").exists());
+    assert_eq!(
+        std::fs::read(root.join("local.txt")).unwrap(),
+        b"recorded\n"
+    );
+    assert!(run(root, &["status", "--short"]).trim().is_empty());
+    run(root, &["view", "switch", "dev"]);
+    run(root, &["stash", "pop"]);
+    assert_eq!(
+        std::fs::read(root.join("local.txt")).unwrap(),
+        b"modified\n"
+    );
+    assert_eq!(
+        std::fs::read(root.join("new.txt")).unwrap(),
+        b"new private file\n"
+    );
+}
+
 fn incoming(root: &Path) -> String {
     run(root, &["view", "create", "feature", "--switch"]);
     std::fs::write(root.join("incoming.txt"), "incoming\n").unwrap();

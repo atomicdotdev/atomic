@@ -901,12 +901,9 @@ switch_view "shared-main" >/dev/null 2>&1 || true
 assert_current_view "back on shared-main" "shared-main"
 assert_file_content "beta.txt restored to shared content on shared-main" "beta.txt" "beta base"
 
-del_out="$(atomic view delete local-edit 2>&1)" || true
-if echo "$del_out" | grep -qiE "deleted|removed|success"; then
-    _pass "delete local-edit draft"
-else
-    _pass "delete local-edit draft completes"
-fi
+# This draft's unmerged edit becomes orphaned; acknowledge that explicitly.
+assert_success "delete local-edit draft, preserving the shared base chain" \
+    atomic view delete local-edit --force
 
 assert_output_not_contains \
     "local-edit removed from view list" \

@@ -2,6 +2,101 @@ use super::*;
 use crate::record::RecordOptions;
 
 #[test]
+fn foreign_edit_resolves_canonical_identity_without_a_tree_binding() {
+    let (temp_dir, repo) = create_temp_repo();
+    std::fs::write(temp_dir.path().join("other.txt"), b"independent\n").unwrap();
+    repo.add("other.txt", TrackingOptions::default()).unwrap();
+    repo.record_all("unrelated file").unwrap();
+    std::fs::write(temp_dir.path().join("tracked.txt"), b"base\n").unwrap();
+    repo.add("tracked.txt", TrackingOptions::default()).unwrap();
+    let base = repo.record_all("base").unwrap();
+    assert!(base.was_applied());
+    let identity = repo.get_inode_and_position("tracked.txt").unwrap().unwrap();
+    {
+        let mut txn = repo.pristine.write_txn().unwrap();
+        txn.del_tree("tracked.txt").unwrap();
+        txn.commit().unwrap();
+    }
+    assert!(repo
+        .get_inode_and_position("tracked.txt")
+        .unwrap()
+        .is_none());
+    let recorded = repo
+        .record_foreign_modified_file("tracked.txt", b"base\n", b"edit\n", false)
+        .unwrap();
+    assert_eq!(recorded.inode(), Some(identity.0));
+    assert_eq!(recorded.position(), Some(identity.1));
+    // The same identity must be absent when its introducing change is not
+    // in the assembly closure, even though it remains in the ambient graph.
+    assert!(repo
+        .get_inode_and_position_on_view_excluding(
+            "tracked.txt",
+            repo.current_view(),
+            &[*base.hash()]
+        )
+        .unwrap()
+        .is_none());
+}
+
+#[test]
+fn failed_record_apply_returns_error_aborts_operation_and_can_retry() {
+    let (temp_dir, repo) = create_temp_repo();
+    std::fs::write(temp_dir.path().join("pending.txt"), b"preserve me\n").unwrap();
+    repo.add("pending.txt", TrackingOptions::default()).unwrap();
+    super::super::record::RECORD_APPLY_FAULT.with(|fault| fault.set(true));
+    let error = repo.record_all("must not report success").unwrap_err();
+    assert!(
+        matches!(error, crate::record::RecordError::Repository(_)),
+        "{error}"
+    );
+    assert!(error.to_string().contains("injected record apply failure"));
+    assert!(repo.log(HistoryOptions::default()).unwrap().is_empty());
+    assert_eq!(
+        std::fs::read(temp_dir.path().join("pending.txt")).unwrap(),
+        b"preserve me\n"
+    );
+    drop(repo);
+
+    // Reopen must see the aborted operation as recovered, with the unrecorded
+    // bytes intact. Retrying records once, rather than a phantom first change.
+    let repo = Repository::open(temp_dir.path()).unwrap();
+    let working_copy = repo.require_working_copy_id().unwrap();
+    let outcome = repo.record_all(working_copy, "retry").unwrap();
+    assert!(outcome.was_applied());
+    assert_eq!(repo.log(HistoryOptions::default()).unwrap().len(), 1);
+    assert_eq!(
+        repo.get_file_content("pending.txt").unwrap().unwrap(),
+        b"preserve me\n"
+    );
+}
+
+#[test]
+fn test_record_all_includes_untracked_without_pre_add() {
+    let (temp_dir, repo) = create_temp_repo();
+    std::fs::write(temp_dir.path().join("untracked.txt"), b"new content\n").unwrap();
+
+    let outcome = repo
+        .record(
+            ChangeHeader::new("record all"),
+            RecordOptions::new()
+                .with_all(true)
+                .include_untracked(true)
+                .save_to_store(true)
+                .apply_after_record(true),
+        )
+        .unwrap();
+
+    assert!(outcome.change().hunks().iter().any(
+        |operation| matches!(operation, GraphOp::FileAdd { path, .. } if path == "untracked.txt")
+    ));
+    assert!(repo.is_tracked("untracked.txt").unwrap());
+    assert!(repo
+        .status(crate::status::StatusOptions::default())
+        .unwrap()
+        .is_clean());
+}
+
+#[test]
 fn test_write_recorded_creates_tree_entries() {
     let (temp_dir, repo) = create_temp_repo();
 

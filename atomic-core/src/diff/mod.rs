@@ -612,137 +612,198 @@ pub fn merge_text(base: &[u8], ours: &[u8], theirs: &[u8]) -> Result<Vec<u8>, St
     let ours_lines: Vec<Line> = Line::from_bytes(ours);
     let theirs_lines: Vec<Line> = Line::from_bytes(theirs);
 
-    // Compute what "they" changed relative to the common base.
+    // What each side changed relative to the common base (diff3).
+    let a_delta = diff(&base_lines, &ours_lines, Algorithm::Myers);
     let b_delta = diff(&base_lines, &theirs_lines, Algorithm::Myers);
 
-    // Compute what "we" changed relative to the common base.
-    let a_delta = diff(&base_lines, &ours_lines, Algorithm::Myers);
-
-    // Build a set of base line indices that "we" modified (deleted or replaced).
-    // If B also touches any of these lines, that's a conflict.
-    let mut our_changed: std::collections::HashSet<usize> = std::collections::HashSet::new();
-    for op in a_delta.ops() {
-        match op {
-            DiffOp::Delete { old_pos, len, .. }
-            | DiffOp::Replace {
-                old_pos,
-                old_len: len,
-                ..
-            } => {
-                for i in *old_pos..(*old_pos + *len) {
-                    our_changed.insert(i);
-                }
-            }
-            _ => {}
-        }
+    /// How `ours` renders one base region.
+    #[derive(Default)]
+    struct OursRender {
+        /// ours line index for each unchanged base line.
+        kept: Vec<Option<usize>>,
+        /// ours replacement line ranges for base lines ours changed
+        /// (delete = empty replacement).
+        changed: Vec<Option<(usize, usize)>>,
+        /// lines ours inserted at a base position (emit when the walk passes).
+        inserted: Vec<Vec<usize>>,
     }
 
-    // Walk B's delta and build the merged output.
-    //
-    // We track our position in `ours_lines` via `ours_idx`.  For Equal
-    // regions we advance ours_idx by the number of base lines consumed
-    // (which maps 1:1 to ours lines in unchanged regions).  For regions
-    // B changed, we check for conflicts against our_changed.
-    let mut output: Vec<u8> = Vec::new();
-    let mut base_idx: usize = 0; // current position in base
-    let mut ours_idx: usize = 0; // current position in ours
-
-    for op in b_delta.ops() {
+    let mut mapping = OursRender {
+        kept: vec![None; base_lines.len()],
+        changed: vec![None; base_lines.len()],
+        inserted: vec![Vec::new(); base_lines.len() + 1],
+    };
+    for op in a_delta.ops() {
         match op {
-            DiffOp::Equal { old_pos, len, .. } => {
-                // B didn't change this region.  Emit from ours (which may
-                // have A' modifications for these lines).
-                // First, advance to old_pos in base.
-                let skip = old_pos - base_idx;
-                // ours_idx should already be aligned; advance by the
-                // same number of lines we skip in base.
-                ours_idx += skip;
-                base_idx = *old_pos;
-
-                // Emit `len` lines from ours at ours_idx.
+            DiffOp::Equal {
+                old_pos,
+                new_pos,
+                len,
+                ..
+            } => {
                 for i in 0..*len {
-                    if ours_idx + i < ours_lines.len() {
-                        output.extend_from_slice(ours_lines[ours_idx + i].content());
-                    }
+                    mapping.kept[*old_pos + i] = Some(*new_pos + i);
                 }
-                ours_idx += len;
-                base_idx += len;
             }
-
             DiffOp::Insert {
                 old_pos,
                 new_pos,
                 len,
             } => {
-                // B inserted lines here.  Advance ours to this point,
-                // then emit B's inserted lines from theirs.
-                let skip = old_pos - base_idx;
-                ours_idx += skip;
-                base_idx = *old_pos;
-
                 for i in 0..*len {
-                    if new_pos + i < theirs_lines.len() {
-                        output.extend_from_slice(theirs_lines[new_pos + i].content());
-                    }
+                    mapping.inserted[*old_pos].push(*new_pos + i);
                 }
-                // base_idx and ours_idx don't advance (insert is between lines)
             }
-
             DiffOp::Delete { old_pos, len, .. } => {
-                // B deleted lines from base.  Check if ours also changed them.
-                let skip = old_pos - base_idx;
-                ours_idx += skip;
-                base_idx = *old_pos;
-
                 for i in 0..*len {
-                    if our_changed.contains(&(old_pos + i)) {
-                        return Err(format!(
-                            "Conflict at base line {}: both sides modified",
-                            old_pos + i + 1
-                        ));
-                    }
+                    mapping.changed[*old_pos + i] = Some((ours_lines.len(), 0));
                 }
-                // Skip these lines in both base and ours (B deleted them).
-                ours_idx += len;
-                base_idx += len;
             }
-
             DiffOp::Replace {
                 old_pos,
                 old_len,
                 new_pos,
                 new_len,
             } => {
-                // B replaced lines.  Check for conflict.
-                let skip = old_pos - base_idx;
-                ours_idx += skip;
-                base_idx = *old_pos;
-
                 for i in 0..*old_len {
-                    if our_changed.contains(&(old_pos + i)) {
+                    mapping.changed[*old_pos + i] = Some((*new_pos, *new_len));
+                }
+            }
+        }
+    }
+
+    /// Emit how `ours` renders base lines `[from, to)` (plus the insertions
+    /// parked at `to`), failing when the region mixes an ours change with a
+    /// theirs change.
+    fn emit_ours_region(
+        mapping: &OursRender,
+        _base_lines: &[Line],
+        ours_lines: &[Line],
+        output: &mut Vec<u8>,
+        from: usize,
+        to: usize,
+        parked_until: &mut usize,
+    ) {
+        // Lines ours inserted at base positions the walk now passes come
+        // first, each exactly once.
+        while *parked_until <= from {
+            for ours_index in &mapping.inserted[*parked_until] {
+                output.extend_from_slice(ours_lines[*ours_index].content());
+            }
+            *parked_until += 1;
+        }
+        for index in from..to {
+            if let Some(ours_index) = mapping.kept[index] {
+                output.extend_from_slice(ours_lines[ours_index].content());
+            } else if let Some((start, len)) = mapping.changed[index] {
+                for i in 0..len {
+                    output.extend_from_slice(ours_lines[start + i].content());
+                }
+            }
+        }
+    }
+
+    let mut output: Vec<u8> = Vec::new();
+    let mut base_cursor = 0usize;
+    let mut parked_until = 0usize;
+    for op in b_delta.ops() {
+        match op {
+            DiffOp::Equal { old_pos, len, .. } => {
+                // B kept this region: emit ours' rendering of it.
+                emit_ours_region(
+                    &mapping,
+                    &base_lines,
+                    &ours_lines,
+                    &mut output,
+                    base_cursor,
+                    old_pos + len,
+                    &mut parked_until,
+                );
+                base_cursor = old_pos + len;
+            }
+            DiffOp::Insert {
+                old_pos,
+                new_pos,
+                len,
+            } => {
+                emit_ours_region(
+                    &mapping,
+                    &base_lines,
+                    &ours_lines,
+                    &mut output,
+                    base_cursor,
+                    *old_pos,
+                    &mut parked_until,
+                );
+                for i in 0..*len {
+                    if new_pos + i < theirs_lines.len() {
+                        output.extend_from_slice(theirs_lines[new_pos + i].content());
+                    }
+                }
+            }
+            DiffOp::Delete { old_pos, len, .. } => {
+                emit_ours_region(
+                    &mapping,
+                    &base_lines,
+                    &ours_lines,
+                    &mut output,
+                    base_cursor,
+                    *old_pos,
+                    &mut parked_until,
+                );
+                for i in 0..*len {
+                    if mapping.changed[*old_pos + i].is_some() {
                         return Err(format!(
                             "Conflict at base line {}: both sides modified",
                             old_pos + i + 1
                         ));
                     }
                 }
-                // Emit B's replacement lines from theirs.
+                base_cursor = old_pos + len;
+            }
+            DiffOp::Replace {
+                old_pos,
+                old_len,
+                new_pos,
+                new_len,
+            } => {
+                emit_ours_region(
+                    &mapping,
+                    &base_lines,
+                    &ours_lines,
+                    &mut output,
+                    base_cursor,
+                    *old_pos,
+                    &mut parked_until,
+                );
+                for i in 0..*old_len {
+                    if mapping.changed[*old_pos + i].is_some() {
+                        return Err(format!(
+                            "Conflict at base line {}: both sides modified",
+                            old_pos + i + 1
+                        ));
+                    }
+                }
                 for i in 0..*new_len {
                     if new_pos + i < theirs_lines.len() {
                         output.extend_from_slice(theirs_lines[new_pos + i].content());
                     }
                 }
-                ours_idx += old_len;
-                base_idx += old_len;
+                base_cursor = old_pos + old_len;
             }
         }
     }
-
-    // Emit any remaining lines from ours (after the last B delta op).
-    while ours_idx < ours_lines.len() {
-        output.extend_from_slice(ours_lines[ours_idx].content());
-        ours_idx += 1;
-    }
+    // Emit ours' rendering of the trailing base region plus any insertions
+    // parked at the end of the base.
+    emit_ours_region(
+        &mapping,
+        &base_lines,
+        &ours_lines,
+        &mut output,
+        base_cursor,
+        base_lines.len(),
+        &mut parked_until,
+    );
 
     Ok(output)
 }
@@ -914,5 +975,27 @@ mod tests {
         // Both should indicate changes happened
         assert!(!myers.is_unchanged());
         assert!(!patience.is_unchanged());
+    }
+}
+
+#[cfg(test)]
+mod merge3_tests {
+    use super::*;
+
+    #[test]
+    fn merge3_leading_insert_plus_trailing_replace() {
+        let base = b"anchor me\nbottom v1\n";
+        let ours = b"top edit\nanchor me\nbottom v1\n";
+        let theirs = b"anchor me\nbottom v0\n";
+        let merged = merge_text(base, ours, theirs).unwrap();
+        assert_eq!(merged, b"top edit\nanchor me\nbottom v0\n");
+    }
+
+    #[test]
+    fn merge3_overlap_conflicts() {
+        let base = b"anchor me\nmiddle v1\n";
+        let ours = b"anchor me\nmiddle carried v1\n";
+        let theirs = b"anchor me\n";
+        assert!(merge_text(base, ours, theirs).is_err());
     }
 }

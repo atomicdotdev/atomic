@@ -12,7 +12,9 @@ use std::path::Path;
 
 use atomic_core::change::ChangeStore as _;
 use atomic_core::pristine::slice::{GraphSlice, ViewSnapshotRows};
-use atomic_core::pristine::{decode_vertex, GraphTxnT, MutTxnT, TreeTxnT, ViewTxnT};
+use atomic_core::pristine::{
+    decode_vertex, GraphTxnT, MutTxnT, PathClaimMutTxnT, TreeTxnT, ViewTxnT,
+};
 use atomic_core::types::{GraphNode, Hash, NodeId};
 use serde::{Deserialize, Serialize};
 
@@ -23,8 +25,8 @@ use crate::RepositoryError;
 /// every entry (with content) the view has.
 ///
 /// `ancestors` carries the views whose changes are in the view's effective
-/// perspective — for a draft, its draft ancestors and the nearest shared
-/// ancestor — each with its *own* log, real state and real parent. Without
+/// perspective — the full parent chain, including shared ancestors — each
+/// with its *own* log, real state and real parent. Without
 /// them a cache could only hold the view parentless, count inherited history
 /// as the view's own work, and invent empty placeholders for views it was
 /// told about but never given.
@@ -368,43 +370,28 @@ fn db(e: impl std::fmt::Display) -> RepositoryError {
     RepositoryError::Database(e.to_string())
 }
 
-/// The views whose changes are in a draft's effective perspective: its draft
-/// ancestors, and the nearest shared ancestor past them. A shared view needs
-/// nobody — its perspective is its own log.
-///
-/// This mirrors the ancestor walk in [`collect_visible_change_ids`] exactly,
-/// because the cache reconstructs the union from the chain this returns: if
-/// the two ever disagree, the cache's perspective and the rows it was given
-/// disagree with it.
+/// All ancestors contributing to the canonical effective closure, including
+/// ancestors of shared views. Each is exported with its own log.
 fn sandbox_view_chain(
     txn: &atomic_core::pristine::ReadTxn,
     state: &atomic_core::pristine::ViewState,
 ) -> Result<Vec<atomic_core::pristine::ViewState>, RepositoryError> {
-    if state.kind.is_shared() {
-        return Ok(Vec::new());
-    }
-    let db = |e: atomic_core::pristine::PristineError| RepositoryError::Database(e.to_string());
-    let mut chain = Vec::new();
-    for id in txn.resolve_view_chain(state).map_err(db)? {
-        if id == state.id {
-            continue; // the view itself is exported separately
-        }
-        if let Some(ancestor) = txn.get_view_by_id(id).map_err(db)? {
-            chain.push(ancestor);
-        }
-    }
-    let mut cursor = state.parent;
-    while let Some(pid) = cursor {
-        match txn.get_view_by_id(pid).map_err(db)? {
-            Some(p) if p.kind.is_shared() => {
-                chain.push(p);
-                break;
-            }
-            Some(p) => cursor = p.parent,
-            None => break,
-        }
-    }
-    Ok(chain)
+    Ok(txn
+        .resolve_full_view_chain(state)
+        .map_err(db)?
+        .into_iter()
+        .filter(|ancestor| ancestor.id != state.id)
+        .collect())
+}
+
+fn own_change_ids(
+    txn: &atomic_core::pristine::ReadTxn,
+    view: &atomic_core::pristine::ViewState,
+) -> Result<Vec<u64>, RepositoryError> {
+    txn.iter_changes(view, 0)
+        .map_err(db)?
+        .map(|entry| entry.map(|(_, id, _)| id.get()).map_err(db))
+        .collect()
 }
 
 /// The digest of `state`'s effective perspective: the view and each view in
@@ -437,8 +424,8 @@ impl Repository {
         txn: &atomic_core::pristine::ReadTxn,
         view: &atomic_core::pristine::ViewState,
     ) -> Result<Vec<u64>, RepositoryError> {
-        let mut ids: Vec<u64> = super::collect_visible_change_ids(txn, view)?
-            .into_iter()
+        let mut ids: Vec<u64> = super::graph_visibility_closure(txn, view)?
+            .iter_dependency_first()
             .map(|id| id.get())
             .collect();
         ids.sort_unstable();
@@ -465,8 +452,8 @@ impl Repository {
     /// The view goes out as itself — its scope, its parent, its *own* change
     /// log — and its ancestors beside it, each with their own. The rows are
     /// still filtered by the union: a cache reconstructs the union from the
-    /// chain, and this builds that union the same way
-    /// [`super::collect_visible_change_ids`] does, so what the cache
+    /// chain plus transitive dependencies, using
+    /// [`super::graph_visibility_closure`], so what the cache
     /// reconstructs is what the rows were filtered by.
     pub fn export_sandbox_skeleton(
         &self,
@@ -480,26 +467,15 @@ impl Repository {
                 .ok_or_else(|| RepositoryError::ViewNotFound {
                     name: view.to_string(),
                 })?;
-        let own = super::collect_view_change_ids(&txn, &state)?;
+        let own_ids = own_change_ids(&txn, &state)?;
         let chain = sandbox_view_chain(&txn, &state)?;
-        let mut union: BTreeSet<u64> = own.iter().map(|id| id.get()).collect();
-        for ancestor in &chain {
-            union.extend(
-                super::collect_view_change_ids(&txn, ancestor)?
-                    .iter()
-                    .map(|id| id.get()),
-            );
-        }
-        let own_sorted = own.iter().map(|id| id.get()).collect();
+        let union = self.sandbox_visible(&txn, &state)?.into_iter().collect();
         let rows = txn.export_skeleton(&union, live).map_err(db)?;
         Ok(SandboxSkeleton {
-            view: txn.export_view_snapshot(&state, own_sorted),
+            view: txn.export_view_snapshot(&state, own_ids),
             ancestors: chain
                 .iter()
-                .map(|a| {
-                    let ids = super::collect_view_change_ids(&txn, a)?;
-                    Ok(txn.export_view_snapshot(a, ids.iter().map(|id| id.get()).collect()))
-                })
+                .map(|a| Ok(txn.export_view_snapshot(a, own_change_ids(&txn, a)?)))
                 .collect::<Result<Vec<_>, RepositoryError>>()?,
             rows,
         })
@@ -634,16 +610,16 @@ impl Repository {
             if txn.get_internal(hash).map_err(db)?.is_some() {
                 return Ok(Err(SubmitRejection::AlreadyPresent(hash.to_base32())));
             }
-            let visible = super::collect_visible_change_ids(&txn, &state)?;
+            let visible = super::graph_visibility_closure(&txn, &state)?;
             for dep in change.dependencies() {
                 match txn.get_internal(dep).map_err(db)? {
-                    Some(id) if visible.contains(&id) => {}
+                    Some(id) if visible.contains(id) => {}
                     _ => return Ok(Err(SubmitRejection::ForeignChange(dep.to_base32()))),
                 }
             }
             for other in &referenced {
                 if let Some(id) = txn.get_internal(other).map_err(db)? {
-                    if !visible.contains(&id) {
+                    if !visible.contains(id) {
                         return Ok(Err(SubmitRejection::ForeignChange(other.to_base32())));
                     }
                 }
@@ -716,9 +692,9 @@ impl Repository {
             }
         }
         if affected.is_empty() {
-            self.materialize()?;
+            self.materialize(self.require_working_copy_id()?)?;
         } else {
-            self.materialize_paths(affected)?;
+            self.materialize_paths(self.require_working_copy_id()?, affected)?;
         }
         Ok(())
     }
@@ -738,11 +714,11 @@ impl Repository {
                 .ok_or_else(|| RepositoryError::ViewNotFound {
                     name: view.to_string(),
                 })?;
-        let visible = super::collect_visible_change_ids(&txn, &state)?;
+        let visible = super::graph_visibility_closure(&txn, &state)?;
         let mut out = Vec::with_capacity(hashes.len());
         for hash in hashes {
             match txn.get_internal(hash).map_err(db)? {
-                Some(id) if visible.contains(&id) => {}
+                Some(id) if visible.contains(id) => {}
                 _ => return Ok(Err(SubmitRejection::ForeignChange(hash.to_base32()))),
             }
             out.push((*hash, std::fs::read(self.change_store.change_path(hash))?));
@@ -767,10 +743,10 @@ impl Repository {
                 .ok_or_else(|| RepositoryError::ViewNotFound {
                     name: view.to_string(),
                 })?;
-        let visible = super::collect_visible_change_ids(&txn, &state)?;
+        let visible = super::graph_visibility_closure(&txn, &state)?;
         for hash in hashes {
             match txn.get_internal(hash).map_err(db)? {
-                Some(id) if visible.contains(&id) => {}
+                Some(id) if visible.contains(id) => {}
                 _ => return Ok(Some(*hash)),
             }
         }
@@ -781,18 +757,28 @@ impl Repository {
     /// for.
     pub fn missing_sandbox_changes(&self) -> Result<Vec<Hash>, RepositoryError> {
         let txn = self.pristine.read_txn().map_err(db)?;
-        let state = txn
+        let view = txn
             .get_view(self.current_view())
             .map_err(db)?
             .ok_or_else(|| RepositoryError::ViewNotFound {
-                name: self.current_view().to_string(),
+                name: self.current_view().into(),
             })?;
+        let mut pending = Vec::new();
+        for id in super::view_membership(&txn, &view)?.iter() {
+            pending.push(txn.get_external(*id).map_err(db)?.ok_or_else(|| {
+                RepositoryError::Database(format!("missing change hash for {id}"))
+            })?);
+        }
+        let mut seen = std::collections::HashSet::new();
         let mut missing = Vec::new();
-        for id in super::collect_visible_change_ids(&txn, &state)? {
-            if let Some(hash) = txn.get_external(id).map_err(db)? {
-                if !self.change_store.has_change(&hash) {
-                    missing.push(hash);
-                }
+        while let Some(hash) = pending.pop() {
+            if !seen.insert(hash) {
+                continue;
+            }
+            if self.change_store.has_change(&hash) {
+                pending.extend(self.load_change(&hash)?.dependencies().iter().copied());
+            } else {
+                missing.push(hash);
             }
         }
         Ok(missing)
@@ -813,6 +799,12 @@ impl Repository {
                 )));
             }
             self.save_change_bytes(hash, bytes, &change)?;
+            let mut txn = self.pristine.write_txn().map_err(db)?;
+            let id = txn.get_internal(hash).map_err(db)?.ok_or_else(|| {
+                RepositoryError::Database(format!("owner sent unregistered change {hash}"))
+            })?;
+            txn.put_change_deps(id, change.dependencies()).map_err(db)?;
+            txn.commit().map_err(db)?;
         }
         Ok(())
     }
@@ -832,6 +824,7 @@ impl Repository {
                     .to_string(),
             });
         }
+        self.fetch_remote_sandbox_changes()?;
         let inodes = self.sandbox_slice_inodes()?;
         let slice = link()?
             .file_states(&self.root, inodes)
@@ -845,14 +838,25 @@ impl Repository {
         if !self.is_remote_sandbox() {
             return Ok(0);
         }
-        let missing = self.missing_sandbox_changes()?;
-        for batch in missing.chunks(32) {
-            let changes = link()?
-                .changes(&self.root, batch.to_vec())
-                .map_err(|message| RepositoryError::InvalidOperation { message })?;
-            self.hold_sandbox_changes(&changes)?;
+        let mut fetched = 0;
+        loop {
+            let missing = self.missing_sandbox_changes()?;
+            if missing.is_empty() {
+                return Ok(fetched);
+            }
+            for batch in missing.chunks(32) {
+                let changes = link()?
+                    .changes(&self.root, batch.to_vec())
+                    .map_err(|message| RepositoryError::InvalidOperation { message })?;
+                self.hold_sandbox_changes(&changes)?;
+                if batch.iter().any(|hash| !self.change_store.has_change(hash)) {
+                    return Err(RepositoryError::Database(
+                        "owner omitted requested changes".into(),
+                    ));
+                }
+                fetched += batch.len();
+            }
         }
-        Ok(missing.len())
     }
 
     /// In a remote sandbox, publishing a checkpoint means publishing it in
@@ -919,6 +923,8 @@ impl Repository {
             }
         };
         self.import_sandbox_skeleton(&skeleton)?;
+        self.hydrate_remote_sandbox()?;
+        self.refresh_working_copy_desired_state(self.require_working_copy_id()?)?;
         let state =
             <Hash as atomic_core::types::Base32>::from_base32(submitted.state.as_bytes())
                 .ok_or_else(|| RepositoryError::Apply("the owner sent a bad state".to_string()))?;
@@ -1000,10 +1006,10 @@ impl Repository {
                     .ok_or_else(|| RepositoryError::ViewNotFound {
                         name: view.to_string(),
                     })?;
-            let visible = super::collect_visible_change_ids(&txn, &state)?;
+            let visible = super::graph_visibility_closure(&txn, &state)?;
             for change in &graph.changes_explained {
                 match txn.get_internal(change).map_err(db)? {
-                    Some(id) if visible.contains(&id) => {}
+                    Some(id) if visible.contains(id) => {}
                     _ => return Ok(Err(SubmitRejection::ForeignChange(change.to_base32()))),
                 }
             }
@@ -1063,44 +1069,25 @@ impl Repository {
         Ok(())
     }
 
-    /// Cache side: the inodes `record` will read — each tracked file that
-    /// differs from its baseline, and every tracked directory on the way to
-    /// any changed or new path (a new file's parent is where it is added).
-    /// After [`Repository::reindex_working_copy`] on a fresh tree, a clean
-    /// file costs nothing here.
+    /// All owner inodes needed to project the canonical closure. A thin slice
+    /// cannot answer whole-tree path claims, deleted roots or attribute status.
+    /// Use the existing FileStates protocol without changing its v1 encoding.
     pub fn sandbox_slice_inodes(&self) -> Result<Vec<u64>, RepositoryError> {
-        use crate::status::{FileStatus, StatusOptions};
         use atomic_core::pristine::slice::LOCAL_INODE_FLOOR;
-
-        let status = self.status(StatusOptions::default())?;
-        let mut out = BTreeSet::new();
-        let keep = |inode: atomic_core::types::Inode, out: &mut BTreeSet<u64>| {
-            if inode.get() < LOCAL_INODE_FLOOR {
-                out.insert(inode.get());
-            }
-        };
-        for entry in status.entries() {
-            if entry.status() == FileStatus::Clean {
-                continue;
-            }
-            if let Some(inode) = entry.inode() {
-                keep(inode, &mut out);
-            } else if let Some(inode) = self.get_file_inode(entry.path())? {
-                keep(inode, &mut out);
-            }
-            let mut dir = entry.path().parent();
-            while let Some(d) = dir.filter(|d| !d.as_os_str().is_empty()) {
-                if let Some(inode) = self.get_file_inode(d)? {
-                    keep(inode, &mut out);
-                }
-                dir = d.parent();
-            }
-        }
-        Ok(out.into_iter().collect())
+        let txn = self.pristine.read_txn().map_err(db)?;
+        Ok(txn
+            .snapshot_inodes()
+            .map_err(db)?
+            .into_iter()
+            .filter_map(|(inode, _)| (inode.get() < LOCAL_INODE_FLOOR).then_some(inode.get()))
+            .collect())
     }
 
-    /// Cache side: replace this cache's graph rows and held content with
-    /// `slice`'s.
+    /// Cache side: replace graph rows and reconstruct canonical derived indexes.
+    ///
+    /// Hold the authenticated changes first, then import a slice covering every
+    /// owner inode from [`Self::sandbox_slice_inodes`]. The complete closure is
+    /// required for path/attribute projection; a thin content slice is insufficient.
     pub fn import_sandbox_slice(&self, slice: &SandboxSlice) -> Result<(), RepositoryError> {
         let view_id = {
             let txn = self.pristine.read_txn().map_err(db)?;
@@ -1113,6 +1100,63 @@ impl Repository {
         };
         let mut txn = self.pristine.write_txn().map_err(db)?;
         txn.import_graph_slice(&slice.rows, view_id).map_err(db)?;
+        let view = txn
+            .get_view(self.current_view())
+            .map_err(db)?
+            .ok_or_else(|| RepositoryError::ViewNotFound {
+                name: self.current_view().into(),
+            })?;
+        // A just-submitted change may already have its file in the cache but
+        // only receive its owner's node id in the new skeleton. Index all
+        // canonical dependencies even when no change download was necessary.
+        let mut pending = super::view_membership(&txn, &view)?
+            .iter()
+            .copied()
+            .collect::<Vec<_>>();
+        let mut indexed = std::collections::HashSet::new();
+        while let Some(id) = pending.pop() {
+            if id.is_root() || !indexed.insert(id) {
+                continue;
+            }
+            let hash = txn.get_external(id).map_err(db)?.ok_or_else(|| {
+                RepositoryError::Database(format!("missing change hash for {id}"))
+            })?;
+            let change = self.load_change(&hash)?;
+            for hash in change.dependencies() {
+                pending.push(txn.get_internal(hash).map_err(db)?.ok_or_else(|| {
+                    RepositoryError::Database(format!("missing dependency {hash}"))
+                })?);
+            }
+            txn.put_change_deps(id, change.dependencies()).map_err(db)?;
+        }
+        let closure = super::graph_visibility_closure(&txn, &view)?;
+        let mut claims = Vec::new();
+        // Reconstruct derived indexes from authenticated canonical changes and
+        // imported graph identities. TREE is never used as file history.
+        for id in closure
+            .iter_dependency_first()
+            .copied()
+            .filter(|id| !id.is_root())
+        {
+            let hash = txn.get_external(id).map_err(db)?.ok_or_else(|| {
+                RepositoryError::Database(format!("missing change hash for {id}"))
+            })?;
+            let change = self.load_change(&hash)?;
+            claims.extend(
+                super::name_resolution::path_claim_events_for_change_with_prior(
+                    &txn, id, &change, &claims,
+                )?,
+            );
+            for op in change.hunks() {
+                atomic_core::apply::apply_set_attr(&mut txn, id, op)
+                    .map_err(|error| RepositoryError::Apply(error.to_string()))?;
+            }
+        }
+        txn.reset_path_claim_migration().map_err(db)?;
+        for claim in claims {
+            txn.put_path_claim(&claim.path, &claim.event).map_err(db)?;
+        }
+        txn.complete_path_claim_migration().map_err(db)?;
         txn.commit().map_err(db)?;
         self.change_store.clear_spans();
         for span in &slice.spans {

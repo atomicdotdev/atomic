@@ -989,18 +989,8 @@ fn manifest_from_pack(
 
 /// The local `save_downloaded_change` — deserialize, verify the hash, save.
 fn save_downloaded_change(repo: &Repository, hash: &Hash, data: Bytes) -> Result<(), String> {
-    let mut cursor = std::io::Cursor::new(&data[..]);
-    let (change, computed) = atomic_core::change::Change::deserialize(&mut cursor)
-        .map_err(|error| format!("Failed to deserialize change: {error}"))?;
-    if computed != *hash {
-        return Err(format!(
-            "Hash mismatch: expected {}, got {}",
-            hash.to_base32(),
-            computed.to_base32()
-        ));
-    }
-    repo.save_change(&change)
-        .map(|_hash| ())
+    repo.import_change_bytes(hash, &data)
+        .map(|_| ())
         .map_err(|error| format!("Failed to save change: {error}"))
 }
 
@@ -1576,17 +1566,18 @@ pub async fn pull_changes_impl(
     {
         let handle = handle.clone();
         let local_view = local_view.clone();
-        let current_view = current_view.clone();
         let warnings_in = warnings.clone();
         let materialize_outcome = tokio::task::spawn_blocking(move || {
-            let repo = handle.repository()?;
+            let (repo, workspace) =
+                handle.workspace_repository(atomic_repository::WorkspaceTxnMode::Reconcile)?;
+            let working_copy = workspace.working_copy();
             let mut warnings = warnings_in;
             let mut materialized = false;
             let mut files_written = 0u64;
             let mut materialize_error: Option<String> = None;
             let mut vault_bootstrapped = false;
-            if local_view == current_view {
-                match repo.materialize() {
+            if local_view == workspace.view().name {
+                match repo.materialize(working_copy) {
                     Ok(result) => {
                         materialized = true;
                         files_written = result.files_written as u64;

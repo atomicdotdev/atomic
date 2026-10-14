@@ -17,8 +17,8 @@ use atomic_core::change::session::{SessionCheckpointPublication, SessionTurn};
 use atomic_core::change::{Author, ChangeHeader, ProvenanceGraph};
 use atomic_core::types::{Base32, Hash};
 use atomic_repository::{
-    ChangeFile, InsertOptions, RecordOptions, RemoteSandboxLink, Repository, SandboxSkeleton,
-    SandboxSlice, SubmitRejection, Submitted, SubmittedOutcome, TrackingOptions, ViewEntryKind,
+    ChangeFile, RecordOptions, RemoteSandboxLink, Repository, SandboxSkeleton, SandboxSlice,
+    SubmitRejection, Submitted, SubmittedOutcome, TrackingOptions, ViewEntryKind,
 };
 use chrono::{DateTime, Utc};
 use libatomic::atomic::sandbox_service_server::SandboxService;
@@ -78,10 +78,15 @@ fn record_options() -> RecordOptions {
 /// applied locally; in a sandbox's cache, submitted through the service.
 fn record(repo: &Repository, message: &str) -> Result<Hash, String> {
     let outcome = repo
-        .record(header(message), record_options())
+        .record(
+            repo.require_working_copy_id().unwrap(),
+            header(message),
+            record_options().apply_after_record(true),
+        )
         .map_err(|e| e.to_string())?;
-    repo.write_recorded(&outcome, InsertOptions::default())
-        .map_err(|e| e.to_string())?;
+    if !outcome.was_applied() {
+        return Err(format!("record did not apply: {:?}", outcome.errors()));
+    }
     Ok(*outcome.hash())
 }
 
@@ -95,10 +100,13 @@ fn host_with(state: DaemonState) -> Host {
     let root = dir.path().join("repo");
     {
         let repo = Repository::init(&root).unwrap();
+        let working_copy = repo.require_working_copy_id().unwrap();
         write(&root, "README.md", "hello\n");
         write(&root, "src/lib.rs", "pub fn f() {}\n");
-        repo.add("README.md", TrackingOptions::default()).unwrap();
-        repo.add("src/lib.rs", TrackingOptions::default()).unwrap();
+        repo.add(working_copy, "README.md", TrackingOptions::default())
+            .unwrap();
+        repo.add(working_copy, "src/lib.rs", TrackingOptions::default())
+            .unwrap();
         record(&repo, "first").unwrap();
     }
     let state = Arc::new(state);
@@ -521,16 +529,22 @@ fn a_sandbox_materializes_records_and_lands_on_its_view() {
         "hello\n"
     );
     assert!(
-        !vm.root.join(".atomic").exists(),
-        "nothing of the repository"
+        vm.root.join(".atomic/working_copy_id").is_file(),
+        "the sandbox owns its working-copy identity"
     );
+    assert!(!atomic_repository::has_database(&vm.root.join(".atomic")));
+    assert!(!vm.root.join(".atomic/changes").exists());
 
     // Record in the cache: the change is computed locally and lands through
     // SubmitChange.
     write(&vm.root, "README.md", "hello\nfrom the sandbox\n");
     write(&vm.root, "src/new.rs", "pub fn n() {}\n");
     vm.cache
-        .add("src/new.rs", TrackingOptions::default())
+        .add(
+            vm.cache.require_working_copy_id().unwrap(),
+            "src/new.rs",
+            TrackingOptions::default(),
+        )
         .unwrap();
     let first = record(&vm.cache, "from the sandbox").unwrap();
     let tree = host.tree("exp-1");
@@ -561,9 +575,13 @@ fn a_sandbox_materializes_records_and_lands_on_its_view() {
         "the sandbox's two changes, nothing inherited"
     );
 
-    // GetChanges: the cache fetches the change files its view has.
+    // Canonical cache hydration fetched the view's authenticated changes;
+    // another GetChanges pass is now idempotent.
     let fetched = vm.cache.fetch_remote_sandbox_changes().unwrap();
-    assert!(fetched >= 1, "the base change at least: {fetched}");
+    assert_eq!(
+        fetched, 0,
+        "hydration already held the full visible history"
+    );
     assert_eq!(
         vm.cache.missing_sandbox_changes().unwrap(),
         Vec::<Hash>::new()
@@ -593,8 +611,12 @@ fn a_stale_submit_is_refused_with_the_live_skeleton() {
     host.with_repo(|repo| {
         write(repo.root(), "src/lib.rs", "pub fn f() { 1 }\n");
         write(repo.root(), "OUT-OF-BAND.md", "elsewhere\n");
-        repo.add("OUT-OF-BAND.md", TrackingOptions::default())
-            .unwrap();
+        repo.add(
+            repo.require_working_copy_id().unwrap(),
+            "OUT-OF-BAND.md",
+            TrackingOptions::default(),
+        )
+        .unwrap();
         record(repo, "out of band").unwrap();
     });
 
@@ -636,7 +658,14 @@ fn a_stale_submit_is_refused_with_the_live_skeleton() {
 
     // But first, the stale refusal over the wire, directly: VIEW_STALE with
     // the live skeleton.
-    let outcome = fresh.cache.record(header("raw"), record_options()).unwrap();
+    let outcome = fresh
+        .cache
+        .record(
+            fresh.cache.require_working_copy_id().unwrap(),
+            header("raw"),
+            record_options(),
+        )
+        .unwrap();
     let stale = Hash::of(b"a perspective nobody has");
     let response = host
         .rt
@@ -967,7 +996,11 @@ fn several_sandboxes_record_at_once_and_stay_apart() {
                 write(&vm.root, "README.md", &format!("hello\nfrom {name}\n"));
                 write(&vm.root, &format!("{name}.txt"), &format!("only {name}\n"));
                 vm.cache
-                    .add(format!("{name}.txt"), TrackingOptions::default())
+                    .add(
+                        vm.cache.require_working_copy_id().unwrap(),
+                        format!("{name}.txt"),
+                        TrackingOptions::default(),
+                    )
                     .unwrap();
                 let first = record(&vm.cache, &format!("first by {name}")).unwrap();
                 write(
@@ -1015,7 +1048,11 @@ fn a_sandbox_on_the_checked_out_view_lands_in_the_working_copy() {
     let vm = materialize(&host, &opened);
     write(&vm.root, "from-sandbox.txt", "sandbox\n");
     vm.cache
-        .add("from-sandbox.txt", TrackingOptions::default())
+        .add(
+            vm.cache.require_working_copy_id().unwrap(),
+            "from-sandbox.txt",
+            TrackingOptions::default(),
+        )
         .unwrap();
     record(&vm.cache, "sandbox on dev").unwrap();
     assert_eq!(
@@ -1023,8 +1060,11 @@ fn a_sandbox_on_the_checked_out_view_lands_in_the_working_copy() {
         "sandbox\n"
     );
     let status = host.with_repo(|repo| {
-        repo.status(atomic_repository::status::StatusOptions::default())
-            .unwrap()
+        repo.status(
+            repo.require_working_copy_id().unwrap(),
+            atomic_repository::status::StatusOptions::default(),
+        )
+        .unwrap()
     });
     assert!(
         status
@@ -1140,6 +1180,9 @@ fn a_sandbox_publishes_provenance_for_its_own_work() {
         timestamp: graph.timestamp,
         plan_id: None,
         todos: Vec::new(),
+        boundary_start: None,
+        boundary_end: None,
+        outcome: None,
     };
 
     // Not its session yet: refused.

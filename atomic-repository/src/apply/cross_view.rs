@@ -108,6 +108,9 @@ pub struct CrossViewInsertOutcome {
     /// Hashes of changes that were inserted.
     pub applied_hashes: Vec<Hash>,
 
+    /// Canonical paths whose output may have changed, including rename sources.
+    pub affected_paths: std::collections::HashSet<String>,
+
     /// Hashes of changes that were skipped (already in target).
     pub skipped_hashes: Vec<Hash>,
 
@@ -131,6 +134,7 @@ impl CrossViewInsertOutcome {
             changes_applied: 0,
             applied_hashes: Vec::new(),
             skipped_hashes: Vec::new(),
+            affected_paths: std::collections::HashSet::new(),
             new_state: Merkle::ZERO,
             sequence: 0,
             has_conflicts: false,

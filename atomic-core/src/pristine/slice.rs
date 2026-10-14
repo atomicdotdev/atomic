@@ -173,13 +173,9 @@ impl ReadTxn {
                 out.inodes.push((k.value(), *v.value()));
             }
         }
+        // TREE/REV_TREE describe the rendered cache, not the host's currently
+        // selected view. Historical/deleted identities remain in INODES/GRAPH.
         let mut rev_tree: BTreeMap<u64, String> = BTreeMap::new();
-        for row in self.txn.open_table(REV_TREE)?.iter()? {
-            let (k, v) = row?;
-            if kept.contains(&k.value()) {
-                rev_tree.insert(k.value(), v.value().to_string());
-            }
-        }
         // Implicit directories render with no inode of their own (0): only
         // what the repository tracks goes in the tree.
         for (inode, path) in live
@@ -239,6 +235,9 @@ impl ReadTxn {
                        reach: &mut BTreeMap<[u8; 24], Reach>,
                        queue: &mut VecDeque<(GraphNode<NodeId>, Reach)>| {
             if node.is_root() {
+                // Path-claim reconstruction validates the canonical parent →
+                // name edge. Include ROOT's row without traversing all files.
+                reach.entry(vertex_key(node)).or_insert(Reach::Row);
                 return;
             }
             let key = vertex_key(node);
@@ -333,7 +332,16 @@ impl ReadTxn {
 
         let mut ids = BTreeSet::new();
         for key in reach.keys() {
-            let edges = edges_of(key)?;
+            let mut edges = edges_of(key)?;
+            if decode_vertex(key).0 == 0 {
+                // ROOT is shared with every view. Export only this closure's
+                // name edges, so unrelated paths are not exposed by the cache.
+                edges.retain(|edge| {
+                    let (change, introduced_by) = change_of_edge(edge);
+                    (change == 0 || visible.contains(&change))
+                        && (introduced_by == 0 || visible.contains(&introduced_by))
+                });
+            }
             if edges.is_empty() {
                 continue;
             }

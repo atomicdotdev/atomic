@@ -173,6 +173,9 @@ fn legacy_agent_turn_count_is_normalized_to_next_immutable_ledger_ordinal() {
                 timestamp: graph.timestamp,
                 plan_id: None,
                 todos: Vec::new(),
+                boundary_start: None,
+                boundary_end: None,
+                outcome: None,
             },
         )
         .unwrap();
@@ -288,6 +291,9 @@ fn checkpoint_recovers_idempotently_across_every_publication_boundary() {
         timestamp: graph.timestamp,
         plan_id: Some("ATOM-108".to_string()),
         todos: Vec::new(),
+        boundary_start: None,
+        boundary_end: None,
+        outcome: None,
     };
     let bound = store
         .bind_provenance_checkpoint_hash(

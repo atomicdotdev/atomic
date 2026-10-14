@@ -27,8 +27,12 @@
 //! [`Change`]: crate::change::Change
 //! [`NodeId`]: crate::types::NodeId
 
-use crate::change::Change;
-use crate::pristine::{GraphTxnT, PristineError, ViewState, ViewTxnT};
+use std::collections::BTreeSet;
+
+use crate::change::{Change, VerifiedCausalFrontier};
+use crate::pristine::{
+    GraphTxnT, GraphVisibilityClosure, PristineError, ViewMembershipSet, ViewState, ViewTxnT,
+};
 use crate::types::{Hash, Merkle, NodeId};
 
 use super::error::LocalApplyError;
@@ -72,6 +76,64 @@ pub fn verify_dependencies<T: GraphTxnT>(
     }
 
     Ok(missing)
+}
+
+/// Verify every causal-frontier root and its complete transitive dependency index.
+///
+/// A frontier root is not causal proof by itself. This verifier requires each
+/// root to be registered locally, then reuses the same cycle- and
+/// completeness-checked closure builder used by view materialization. The
+/// resulting value is the only frontier membership accepted by conflict
+/// detection.
+pub fn verify_causal_frontier<T: GraphTxnT>(
+    txn: &T,
+    change: &Change,
+) -> Result<VerifiedCausalFrontier, LocalApplyError> {
+    let frontier = change.causal_frontier();
+    if frontier.is_empty() {
+        return Ok(VerifiedCausalFrontier::empty());
+    }
+
+    let mut root_ids = Vec::with_capacity(frontier.roots().len());
+    for root in frontier.roots() {
+        let root_id = txn
+            .get_internal(root)
+            .map_err(|error| LocalApplyError::CausalFrontierInvalid {
+                reason: format!("failed to resolve frontier root {root}: {error}"),
+            })?
+            .ok_or_else(|| LocalApplyError::CausalFrontierInvalid {
+                reason: format!("frontier root {root} is not registered locally"),
+            })?;
+        root_ids.push(root_id);
+    }
+
+    let membership = ViewMembershipSet::from_ordered(root_ids);
+    let closure =
+        GraphVisibilityClosure::try_from_membership(txn, &membership).map_err(|error| {
+            LocalApplyError::CausalFrontierInvalid {
+                reason: format!("frontier dependency closure is incomplete or invalid: {error}"),
+            }
+        })?;
+
+    let mut known = BTreeSet::new();
+    for change_id in closure.iter_dependency_first() {
+        let hash = txn
+            .get_external(*change_id)
+            .map_err(|error| LocalApplyError::CausalFrontierInvalid {
+                reason: format!(
+                    "failed to resolve verified frontier change {change_id:?}: {error}"
+                ),
+            })?
+            .ok_or_else(|| LocalApplyError::CausalFrontierInvalid {
+                reason: format!("verified frontier change {change_id:?} has no external hash"),
+            })?;
+        known.insert(hash);
+    }
+
+    Ok(VerifiedCausalFrontier::from_verified(
+        frontier.clone(),
+        known,
+    ))
 }
 
 /// Check if a change has already been applied to a view.
@@ -210,6 +272,17 @@ pub fn validate_can_apply<T: ViewTxnT + GraphTxnT>(
     change_hash: &Hash,
     change: &Change,
 ) -> Result<(), LocalApplyError> {
+    validate_can_apply_with_frontier(txn, view, change_id, change_hash, change).map(|_| ())
+}
+
+/// Validate application and return the verified causal knowledge for conflict checks.
+pub fn validate_can_apply_with_frontier<T: ViewTxnT + GraphTxnT>(
+    txn: &T,
+    view: &ViewState,
+    change_id: NodeId,
+    change_hash: &Hash,
+    change: &Change,
+) -> Result<VerifiedCausalFrontier, LocalApplyError> {
     // Check if already applied
     if is_change_on_view(txn, view, change_id).map_err(|e| LocalApplyError::Internal {
         message: format!("Failed to check view: {}", e),
@@ -228,12 +301,15 @@ pub fn validate_can_apply<T: ViewTxnT + GraphTxnT>(
         });
     }
 
-    Ok(())
+    verify_causal_frontier(txn, change)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::change::{CausalFrontier, ChangeHeader, ChangeKind, ChangeOrigin};
+    use crate::operation::{GitHashAlgorithm, GitObjectId};
+    use crate::pristine::{MutTxnT, Pristine};
     use crate::types::ChangePosition;
 
     // Test Helpers
@@ -560,5 +636,73 @@ mod tests {
 
         assert!(edge.flag().is_deleted());
         assert!(edge.flag().is_block());
+    }
+
+    fn frontier_change(root: Hash) -> Change {
+        let git_oid = |byte| {
+            GitObjectId::new(GitHashAlgorithm::Sha1, vec![byte; 20])
+                .expect("valid SHA-1 test object ID")
+        };
+        Change::empty(ChangeHeader::new("merge resolution"))
+            .with_classification(
+                ChangeKind::Durable,
+                None,
+                ChangeOrigin::git_resolution(git_oid(1), vec![git_oid(2), git_oid(3)])
+                    .expect("valid merge origin"),
+                CausalFrontier::new(vec![root]).expect("canonical frontier"),
+            )
+            .expect("valid frontier-bearing change")
+    }
+
+    #[test]
+    fn causal_frontier_verification_proves_transitive_knowledge() {
+        let temp = tempfile::tempdir().unwrap();
+        let pristine = Pristine::open(temp.path().join("frontier.redb")).unwrap();
+        let dependency = Hash::of(b"frontier dependency");
+        let root = Hash::of(b"frontier root");
+
+        {
+            let mut txn = pristine.write_txn().unwrap();
+            let dependency_id = txn.register_change(&dependency).unwrap();
+            txn.put_change_deps(dependency_id, &[]).unwrap();
+            let root_id = txn.register_change(&root).unwrap();
+            txn.put_change_deps(root_id, &[dependency]).unwrap();
+            txn.commit().unwrap();
+        }
+
+        let txn = pristine.read_txn().unwrap();
+        let change = frontier_change(root);
+        let verified = verify_causal_frontier(&txn, &change).unwrap();
+
+        assert_eq!(verified.len(), 2);
+        assert!(verified.contains(&root));
+        assert!(verified.contains(&dependency));
+        assert!(change.knows_with_frontier(&dependency, &verified));
+        assert!(!change.knows_with_frontier(&Hash::of(b"unknown"), &verified));
+    }
+
+    #[test]
+    fn causal_frontier_verification_rejects_missing_or_unindexed_roots() {
+        let temp = tempfile::tempdir().unwrap();
+        let pristine = Pristine::open(temp.path().join("frontier.redb")).unwrap();
+        let missing = Hash::of(b"missing frontier root");
+        let txn = pristine.read_txn().unwrap();
+        assert!(matches!(
+            verify_causal_frontier(&txn, &frontier_change(missing)),
+            Err(LocalApplyError::CausalFrontierInvalid { .. })
+        ));
+        drop(txn);
+
+        let unindexed = Hash::of(b"unindexed frontier root");
+        {
+            let mut txn = pristine.write_txn().unwrap();
+            txn.register_change(&unindexed).unwrap();
+            txn.commit().unwrap();
+        }
+        let txn = pristine.read_txn().unwrap();
+        assert!(matches!(
+            verify_causal_frontier(&txn, &frontier_change(unindexed)),
+            Err(LocalApplyError::CausalFrontierInvalid { .. })
+        ));
     }
 }

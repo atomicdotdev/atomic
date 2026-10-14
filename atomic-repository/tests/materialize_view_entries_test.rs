@@ -22,7 +22,11 @@ fn record(repo: &Repository, message: &str) -> Hash {
         .author(Author::new("Test", Some("test@example.com")))
         .build();
     *repo
-        .record(header, RecordOptions::default())
+        .record(
+            repo.require_working_copy_id().unwrap(),
+            header,
+            RecordOptions::default(),
+        )
         .expect("record")
         .hash()
 }
@@ -48,8 +52,18 @@ fn entries_are_the_view_s_recorded_tree() {
 
     write(&root, "README.md", "hello\n");
     write(&root, "src/main.rs", "fn main() {}\n");
-    repo.add("README.md", Default::default()).unwrap();
-    repo.add("src/main.rs", Default::default()).unwrap();
+    repo.add(
+        repo.require_working_copy_id().unwrap(),
+        "README.md",
+        Default::default(),
+    )
+    .unwrap();
+    repo.add(
+        repo.require_working_copy_id().unwrap(),
+        "src/main.rs",
+        Default::default(),
+    )
+    .unwrap();
     record(&repo, "first");
     write(&root, "README.md", "hello, world\n");
     let second = record(&repo, "second");
@@ -77,6 +91,12 @@ fn entries_are_the_view_s_recorded_tree() {
         vec!["src", "README.md", "src/main.rs"],
         "directories first, then files in order"
     );
+    let directory = list.iter().find(|entry| entry.path == "src").unwrap();
+    assert_eq!(directory.kind, ViewEntryKind::Directory);
+    assert_eq!(
+        directory.mode, 0o755,
+        "clients need traversable directory permissions"
+    );
     let readme = list.iter().find(|e| e.path == "README.md").unwrap();
     assert_eq!(readme.kind, ViewEntryKind::File);
     assert_eq!(readme.content, b"hello, world\n");
@@ -89,8 +109,11 @@ fn entries_are_the_view_s_recorded_tree() {
 
     // Another view without the second change renders its own content.
     let mut repo = repo;
-    repo.split_view(SplitOptions::new("older", vec![second]))
-        .expect("split");
+    repo.split_view(
+        repo.require_working_copy_id().unwrap(),
+        SplitOptions::new("older", vec![second]),
+    )
+    .expect("split");
     let (older_on_source, older_snapshot) = entries(&repo, &view);
     let readme = older_on_source
         .iter()
@@ -103,25 +126,31 @@ fn entries_are_the_view_s_recorded_tree() {
     assert_ne!(older_snapshot.state, snapshot.state);
 }
 
-/// Another view's tree is a projection, and a read-only repository cannot
-/// project. It used to fall through to `TREE`, which is the *current* view's —
-/// handing one view's tree back under another's name, which means writing
-/// the wrong tree to disk. Refusing is the safe answer.
+/// Canonical projection renders either closure through a readonly handle;
+/// it must never return the currently selected TREE under another view's name.
 #[test]
-fn a_read_only_repository_refuses_another_views_tree() {
+fn a_read_only_repository_renders_each_views_canonical_tree() {
     let temp = TempDir::new().unwrap();
     let root = temp.path().to_path_buf();
     let mut repo = Repository::init(&root).expect("init");
     let current = repo.current_view().to_string();
 
     write(&root, "README.md", "hello\n");
-    repo.add("README.md", Default::default()).unwrap();
+    repo.add(
+        repo.require_working_copy_id().unwrap(),
+        "README.md",
+        Default::default(),
+    )
+    .unwrap();
     record(&repo, "first");
     write(&root, "README.md", "hello, world\n");
     let second = record(&repo, "second");
 
-    repo.split_view(SplitOptions::new("older", vec![second]))
-        .expect("split");
+    repo.split_view(
+        repo.require_working_copy_id().unwrap(),
+        SplitOptions::new("older", vec![second]),
+    )
+    .expect("split");
 
     // Writable: both views render, and they differ. `split_view` moves the
     // change out of the source view, so the new view is the one with it.
@@ -136,8 +165,8 @@ fn a_read_only_repository_refuses_another_views_tree() {
     assert_eq!(body(&on_current), b"hello\n");
     assert_eq!(body(&on_older), b"hello, world\n");
 
-    // Read-only: the current view still works (it needs no projection), but
-    // another view is refused rather than answered with the current tree.
+    // The canonical graph can project either closure through a readonly handle;
+    // rendering must not depend on TREE's currently materialized view.
     drop(repo);
     let readonly = Repository::open_readonly(&root).expect("open read-only");
 
@@ -152,17 +181,12 @@ fn a_read_only_repository_refuses_another_views_tree() {
     assert_eq!(body(&on_current), b"hello\n");
 
     let mut on_older = Vec::new();
-    let refused = readonly.materialize_view_entries::<()>("older", |e| {
-        on_older.push(e);
-        Ok(())
-    });
-    let err = refused.expect_err("another view must be refused");
-    assert!(
-        format!("{err}").contains("writable"),
-        "unexpected error: {err}"
-    );
-    assert!(
-        on_older.is_empty(),
-        "nothing of the wrong view was rendered"
-    );
+    readonly
+        .materialize_view_entries::<()>("older", |e| {
+            on_older.push(e);
+            Ok(())
+        })
+        .expect("readonly canonical projection")
+        .expect("sink");
+    assert_eq!(body(&on_older), b"hello, world\n");
 }

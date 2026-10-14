@@ -53,7 +53,6 @@ pub(crate) struct ToolPart {
 
 /// Turn data recovered from OpenCode's SQLite store.
 #[derive(Debug)]
-
 pub(crate) struct TurnData {
     /// JSONL transcript of the whole session, one line per content part.
     pub transcript_jsonl: String,

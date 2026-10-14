@@ -36,8 +36,19 @@ fn local_compaction_preserves_views_journal_changes_and_dirty_sandbox() {
     let mut repo = Repository::init(&root).unwrap();
     let contents = b"recorded contents\n";
     std::fs::write(root.join("file.txt"), contents).unwrap();
-    repo.add("file.txt", Default::default()).unwrap();
-    let hash = *repo.record_all("compaction fixture").unwrap().hash();
+    repo.add(
+        repo.require_working_copy_id().unwrap(),
+        "file.txt",
+        Default::default(),
+    )
+    .unwrap();
+    let hash = *repo
+        .record_all(
+            repo.require_working_copy_id().unwrap(),
+            "compaction fixture",
+        )
+        .unwrap()
+        .hash();
     let change_path = ChangeStore::new(repo.changes_dir(), DEFAULT_CACHE_CAPACITY)
         .unwrap()
         .change_path(&hash);
@@ -45,7 +56,8 @@ fn local_compaction_preserves_views_journal_changes_and_dirty_sandbox() {
     let view = repo.current_view().to_owned();
     repo.create_view("compact-child").unwrap();
     let views = repo.list_views().unwrap();
-    repo.provision_sandbox(&sandbox, &view).unwrap();
+    repo.provision_sandbox(repo.require_working_copy_id().unwrap(), &sandbox, &view)
+        .unwrap();
     let store = repo.redb_change_store().unwrap();
     let turn = store.reserve_provenance_turn("compact", 1, 1).unwrap();
     let envelope = serde_json::to_vec(&serde_json::json!({
@@ -175,6 +187,22 @@ async fn reactor_cli_uses_same_handler_over_socket_without_fallback() {
         .await
         .unwrap();
     let result = report(output);
+    for args in [
+        vec!["compact", "--json"],
+        vec!["compact", "--repository", ".", "--json"],
+    ] {
+        let mut relative = Command::new(env!("CARGO_BIN_EXE_atomic"));
+        relative
+            .args(args)
+            .current_dir(&root)
+            .env("ATOMIC_SERVICE", "reactor")
+            .env("ATOMIC_DAEMON_SOCKET", &socket)
+            .env("ATOMIC_DAEMON_BIN", root.join("no-daemon-binary"));
+        let output = tokio::task::spawn_blocking(move || relative.output().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(report(output)["database"], result["database"]);
+    }
     assert_eq!(
         result["database"],
         root.join(".atomic/atomic.redb")

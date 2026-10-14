@@ -30,7 +30,8 @@ fn record_all(repo: &Repository, message: &str) {
         .with_all(true)
         .save_to_store(true)
         .apply_after_record(true);
-    repo.record(header, options).unwrap();
+    repo.record(repo.require_working_copy_id().unwrap(), header, options)
+        .unwrap();
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────

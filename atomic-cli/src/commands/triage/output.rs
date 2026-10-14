@@ -757,6 +757,85 @@ const FILTER_SCRIPT: &str = r#"function filterFindings(sev){
   });
 }"#;
 
+const HTML_STYLE: &str = r#":root{color-scheme:light}
+*{box-sizing:border-box}
+body{margin:0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;line-height:1.5;color:#1a1a1a;background:#f6f7f9}
+header.banner{padding:24px;color:#fff}
+header.banner.blocked{background:#b3261e}
+header.banner.stale{background:#b58105}
+header.banner.ready{background:#1e7d34}
+.verdict{font-size:28px;font-weight:700;letter-spacing:1px}
+.route{font-size:18px;margin-top:4px}
+.merkle,.counts,.ref{font-size:13px;opacity:.9;margin-top:4px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+section{max-width:960px;margin:20px auto;padding:0 20px}
+h2{border-bottom:1px solid #ddd;padding-bottom:6px}
+.filters{display:flex;gap:8px;margin:12px 0}
+.filter-btn{border:1px solid #ccc;background:#fff;color:#1a1a1a;padding:6px 14px;border-radius:16px;cursor:pointer;font-size:13px}
+.filter-btn.active{background:#1a1a1a;color:#fff;border-color:#1a1a1a}
+.finding{border-left:4px solid #999;background:#fff;border-radius:6px;padding:12px 14px;margin:10px 0;box-shadow:0 1px 2px rgba(0,0,0,.06)}
+.finding.block{border-left-color:#b3261e}
+.finding.warn{border-left-color:#b58105}
+.finding.info{border-left-color:#1662c4}
+.finding-head{display:flex;align-items:center;gap:10px;margin-bottom:4px}
+.sev-badge{font-size:11px;text-transform:uppercase;font-weight:700;padding:2px 8px;border-radius:10px;color:#fff}
+.sev-badge.block{background:#b3261e}
+.sev-badge.warn{background:#b58105}
+.sev-badge.info{background:#1662c4}
+.code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-weight:600}
+.message{margin:2px 0}
+.focus,.query,.remedy{font-size:13px;color:#444;margin-top:2px}
+code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;background:#eef0f3;padding:1px 4px;border-radius:4px}
+details.intent{background:#fff;border:1px solid #e2e4e8;border-radius:6px;padding:8px 12px;margin:10px 0}
+details.intent summary{cursor:pointer;font-weight:600}
+details.change summary{cursor:pointer;font-weight:600}
+.stat{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;color:#555}
+.badge{font-size:11px;padding:2px 8px;border-radius:10px;margin-left:6px}
+.badge.ok{background:#1e7d34;color:#fff}
+.badge.bad{background:#b3261e;color:#fff}
+.badge.judge{background:#b58105;color:#fff}
+.badge.cov-covered{background:#1e7d34;color:#fff}
+.badge.cov-uncovered{background:#b3261e;color:#fff}
+.badge.cov-unknown{background:#777;color:#fff}
+.why{color:#333;font-style:italic}
+.reviewed-by{color:#1e7d34;font-weight:600;font-size:13px;margin:2px 0}
+ul.criteria,ul.violations,ul.modifies{margin:6px 0;padding-left:18px}
+.mark.met{color:#1e7d34;font-weight:700}
+.mark.unmet{color:#b3261e;font-weight:700}
+.change{background:#fff;border:1px solid #e2e4e8;border-radius:6px;padding:10px 12px;margin:10px 0}
+.change-msg{margin:4px 0;font-weight:600}
+table.files{border-collapse:collapse;margin:6px 0;width:100%}
+table.files td{padding:2px 8px;border-bottom:1px solid #f0f1f3;vertical-align:top;font-size:13px}
+table.files td.sym{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-weight:700;width:1.5em;text-align:center}
+table.files td.summary{color:#555}
+.review-cmd{font-size:12px;color:#555;margin-top:6px}
+.diff-file{margin-top:10px;font-size:13px}
+.diff-path{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-weight:600}
+.diff-status{font-size:11px;text-transform:uppercase;padding:1px 6px;border-radius:8px;color:#fff}
+.diff-status.added{background:#1e7d34}
+.diff-status.deleted{background:#b3261e}
+.diff-status.modified{background:#555}
+pre.diff{margin:4px 0 0;padding:8px 10px;background:#0d1117;color:#c9d1d9;border-radius:6px;overflow-x:auto;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;line-height:1.45}
+pre.diff .hunk-header{color:#8b949e;margin:4px 0 2px}
+pre.diff .line{white-space:pre-wrap;word-break:break-word}
+pre.diff .line.add{background:rgba(46,160,67,.18);color:#7ee787}
+pre.diff .line.del{background:rgba(248,81,73,.18);color:#ffa198}
+pre.diff .line.ctx{color:#c9d1d9}
+.empty{color:#666;font-style:italic}
+.tour-intro{color:#555;font-style:italic;margin:6px 0}
+ol.toc{margin:8px 0;padding-left:22px}
+ol.toc a{color:#1662c4;text-decoration:none}
+ol.toc a:hover{text-decoration:underline}
+details.chapter{background:#fff;border:1px solid #e2e4e8;border-radius:6px;padding:10px 12px;margin:10px 0}
+details.chapter summary{cursor:pointer;font-weight:600}
+.chapter-num{display:inline-block;min-width:22px;height:22px;line-height:22px;text-align:center;background:#1a1a1a;color:#fff;border-radius:11px;font-size:12px}
+.chapter-title{margin-left:4px}
+.rationale{color:#333;margin:8px 0 4px}
+.chapter-deps{font-size:13px;color:#555;margin:2px 0}
+.chapter-deps a{color:#1662c4;text-decoration:none}
+.chapter-deps a:hover{text-decoration:underline}
+.chapter-meta{font-size:13px;color:#555;margin:2px 0}
+.chapter-change{font-size:12px;color:#555;margin-top:8px}"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1054,82 +1133,3 @@ mod tests {
         verify_value(&signed, &identity.public_key).expect("signed report must verify");
     }
 }
-
-const HTML_STYLE: &str = r#":root{color-scheme:light}
-*{box-sizing:border-box}
-body{margin:0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;line-height:1.5;color:#1a1a1a;background:#f6f7f9}
-header.banner{padding:24px;color:#fff}
-header.banner.blocked{background:#b3261e}
-header.banner.stale{background:#b58105}
-header.banner.ready{background:#1e7d34}
-.verdict{font-size:28px;font-weight:700;letter-spacing:1px}
-.route{font-size:18px;margin-top:4px}
-.merkle,.counts,.ref{font-size:13px;opacity:.9;margin-top:4px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
-section{max-width:960px;margin:20px auto;padding:0 20px}
-h2{border-bottom:1px solid #ddd;padding-bottom:6px}
-.filters{display:flex;gap:8px;margin:12px 0}
-.filter-btn{border:1px solid #ccc;background:#fff;color:#1a1a1a;padding:6px 14px;border-radius:16px;cursor:pointer;font-size:13px}
-.filter-btn.active{background:#1a1a1a;color:#fff;border-color:#1a1a1a}
-.finding{border-left:4px solid #999;background:#fff;border-radius:6px;padding:12px 14px;margin:10px 0;box-shadow:0 1px 2px rgba(0,0,0,.06)}
-.finding.block{border-left-color:#b3261e}
-.finding.warn{border-left-color:#b58105}
-.finding.info{border-left-color:#1662c4}
-.finding-head{display:flex;align-items:center;gap:10px;margin-bottom:4px}
-.sev-badge{font-size:11px;text-transform:uppercase;font-weight:700;padding:2px 8px;border-radius:10px;color:#fff}
-.sev-badge.block{background:#b3261e}
-.sev-badge.warn{background:#b58105}
-.sev-badge.info{background:#1662c4}
-.code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-weight:600}
-.message{margin:2px 0}
-.focus,.query,.remedy{font-size:13px;color:#444;margin-top:2px}
-code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;background:#eef0f3;padding:1px 4px;border-radius:4px}
-details.intent{background:#fff;border:1px solid #e2e4e8;border-radius:6px;padding:8px 12px;margin:10px 0}
-details.intent summary{cursor:pointer;font-weight:600}
-details.change summary{cursor:pointer;font-weight:600}
-.stat{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;color:#555}
-.badge{font-size:11px;padding:2px 8px;border-radius:10px;margin-left:6px}
-.badge.ok{background:#1e7d34;color:#fff}
-.badge.bad{background:#b3261e;color:#fff}
-.badge.judge{background:#b58105;color:#fff}
-.badge.cov-covered{background:#1e7d34;color:#fff}
-.badge.cov-uncovered{background:#b3261e;color:#fff}
-.badge.cov-unknown{background:#777;color:#fff}
-.why{color:#333;font-style:italic}
-.reviewed-by{color:#1e7d34;font-weight:600;font-size:13px;margin:2px 0}
-ul.criteria,ul.violations,ul.modifies{margin:6px 0;padding-left:18px}
-.mark.met{color:#1e7d34;font-weight:700}
-.mark.unmet{color:#b3261e;font-weight:700}
-.change{background:#fff;border:1px solid #e2e4e8;border-radius:6px;padding:10px 12px;margin:10px 0}
-.change-msg{margin:4px 0;font-weight:600}
-table.files{border-collapse:collapse;margin:6px 0;width:100%}
-table.files td{padding:2px 8px;border-bottom:1px solid #f0f1f3;vertical-align:top;font-size:13px}
-table.files td.sym{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-weight:700;width:1.5em;text-align:center}
-table.files td.summary{color:#555}
-.review-cmd{font-size:12px;color:#555;margin-top:6px}
-.diff-file{margin-top:10px;font-size:13px}
-.diff-path{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-weight:600}
-.diff-status{font-size:11px;text-transform:uppercase;padding:1px 6px;border-radius:8px;color:#fff}
-.diff-status.added{background:#1e7d34}
-.diff-status.deleted{background:#b3261e}
-.diff-status.modified{background:#555}
-pre.diff{margin:4px 0 0;padding:8px 10px;background:#0d1117;color:#c9d1d9;border-radius:6px;overflow-x:auto;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;line-height:1.45}
-pre.diff .hunk-header{color:#8b949e;margin:4px 0 2px}
-pre.diff .line{white-space:pre-wrap;word-break:break-word}
-pre.diff .line.add{background:rgba(46,160,67,.18);color:#7ee787}
-pre.diff .line.del{background:rgba(248,81,73,.18);color:#ffa198}
-pre.diff .line.ctx{color:#c9d1d9}
-.empty{color:#666;font-style:italic}
-.tour-intro{color:#555;font-style:italic;margin:6px 0}
-ol.toc{margin:8px 0;padding-left:22px}
-ol.toc a{color:#1662c4;text-decoration:none}
-ol.toc a:hover{text-decoration:underline}
-details.chapter{background:#fff;border:1px solid #e2e4e8;border-radius:6px;padding:10px 12px;margin:10px 0}
-details.chapter summary{cursor:pointer;font-weight:600}
-.chapter-num{display:inline-block;min-width:22px;height:22px;line-height:22px;text-align:center;background:#1a1a1a;color:#fff;border-radius:11px;font-size:12px}
-.chapter-title{margin-left:4px}
-.rationale{color:#333;margin:8px 0 4px}
-.chapter-deps{font-size:13px;color:#555;margin:2px 0}
-.chapter-deps a{color:#1662c4;text-decoration:none}
-.chapter-deps a:hover{text-decoration:underline}
-.chapter-meta{font-size:13px;color:#555;margin:2px 0}
-.chapter-change{font-size:12px;color:#555;margin-top:8px}"#;

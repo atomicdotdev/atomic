@@ -1,5 +1,12 @@
 # Git Import Design Document
 
+> **Status (CB-13C, 2026-09-14):** the incremental importer is the
+> Git→Atomic reconciliation engine inside the colocated bridge (RFC §7, CB-5C
+> through CB-12). Supported workflows, limits, and the honest unsupported list
+> (CLI cutover, `--adopt-git`, exact managed reassembly) live in the
+> [bridge operating guide](bridge-operating-guide.md). Reconciliation counts
+> and refusal classes are observable in `.atomic/bridge/events.jsonl`.
+
 ## Overview
 
 This document describes the design for importing Git repositories into Atomic VCS.

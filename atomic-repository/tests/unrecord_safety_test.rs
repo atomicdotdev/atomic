@@ -95,15 +95,18 @@ fn inherited_dependent_also_blocks_removal() {
     let mut repo = Repository::init(dir.path()).unwrap();
     let parent = repo.current_view().to_string();
     repo.create_view_from("child", &parent).unwrap();
-    repo.switch_view("child").unwrap();
+    repo.switch_view(repo.require_working_copy_id().unwrap(), "child")
+        .unwrap();
     let a = save(&repo, "child change", vec![]);
     add_legacy_member(&repo, a);
     // The shared parent advances after the draft fork. Its new change is
     // inherited, even though it has no row in the child's own history.
-    repo.switch_view(&parent).unwrap();
+    repo.switch_view(repo.require_working_copy_id().unwrap(), &parent)
+        .unwrap();
     let b = save(&repo, "parent dependent", vec![a]);
     add_legacy_member(&repo, b);
-    repo.switch_view("child").unwrap();
+    repo.switch_view(repo.require_working_copy_id().unwrap(), "child")
+        .unwrap();
     for options in [UnrecordOptions::dry_run(), UnrecordOptions::new()] {
         let err = repo.unrecord(&a, options).unwrap_err();
         assert!(err.to_string().contains("depends on it"), "{err}");

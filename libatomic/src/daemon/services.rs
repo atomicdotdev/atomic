@@ -297,15 +297,20 @@ impl repository_query_service_server::RepositoryQueryService for QueryImpl {
         let gate_handle = handle.clone();
         let _gate = gate_handle.exclusive().await;
         let result = tokio::task::spawn_blocking(move || {
-            // A query: the read-only open (with the read-concurrency wait)
-            // keeps Status working under concurrent writers.
-            let repo = handle.repository_readonly()?;
+            // Observe uses a read-only open with the read-concurrency wait and
+            // retains the working-copy boundary for the whole query. The CLI's
+            // separate Git coordinator performs ordinary reconciliation.
+            let (repo, workspace) =
+                handle.workspace_repository(atomic_repository::WorkspaceTxnMode::Observe)?;
+            let working_copy = workspace.working_copy();
             // Compute exactly what the caller requested: the CLI sends its
             // resolved StatusOptions on the wire (absent = domain defaults,
             // which exclude ignored files — a fixed StatusOptions::all()
             // used to leak node_modules/ and dist/ back as UNTRACKED, since
             // the wire has no FILE_STATUS_IGNORED variant).
-            let status = repo.status(options).map_err(repository_error)?;
+            let status = repo
+                .status(working_copy, options)
+                .map_err(repository_error)?;
             let files = status
                 .entries()
                 .iter()
@@ -315,7 +320,7 @@ impl repository_query_service_server::RepositoryQueryService for QueryImpl {
                     inode: None,
                     recorded_hash: entry.recorded_hash().map(hash_proto),
                     current_hash: entry.current_hash().map(hash_proto),
-                    details: entry.details().map(str::to_string),
+                    details: super::convert::file_status_details(entry),
                 })
                 .collect();
             Ok::<_, Status>(StatusResponse {
@@ -515,8 +520,12 @@ impl repository_query_service_server::RepositoryQueryService for QueryImpl {
         // wait), never queued behind writers on the gate.
         let result =
             tokio::task::spawn_blocking(move || -> Result<ListConflictsResponse, Status> {
-                let repo = handle.repository_readonly()?;
-                let conflicts = repo.list_conflicts().map_err(repository_error)?;
+                let (repo, workspace) =
+                    handle.workspace_repository(atomic_repository::WorkspaceTxnMode::Observe)?;
+                let working_copy = workspace.working_copy();
+                let conflicts = repo
+                    .list_conflicts(working_copy)
+                    .map_err(repository_error)?;
                 let mut infos = Vec::new();
                 for (path, records) in &conflicts {
                     for record in records {
@@ -742,20 +751,28 @@ impl repository_query_service_server::RepositoryQueryService for QueryImpl {
         let root = handle.root.clone();
         let result =
             tokio::task::spawn_blocking(move || -> Result<PreviewMutationResponse, Status> {
-                let repo = Repository::open_readonly(&root).map_err(|error| {
+                let mut repo = Repository::open_readonly(&root).map_err(|error| {
                     domain_status(
                         ErrorCode::Repository,
                         format!("failed to open repository read-only: {error}"),
                     )
                 })?;
+                let workspace = super::state::enter_workspace(
+                    &mut repo,
+                    atomic_repository::WorkspaceTxnMode::Observe,
+                )?;
+                let working_copy = workspace.working_copy();
                 // The Restore classification WITHOUT mutation: tracked-only
                 // status pass; Added files would be untracked (kept on
                 // disk), Modified/Deleted would be restored.
                 let status = repo
-                    .status(StatusOptions {
-                        include_untracked: false,
-                        ..StatusOptions::default()
-                    })
+                    .status(
+                        working_copy,
+                        StatusOptions {
+                            include_untracked: false,
+                            ..StatusOptions::default()
+                        },
+                    )
                     .map_err(repository_error)?;
                 let mut affected: Vec<String> = Vec::new();
                 let mut untracked: Vec<String> = Vec::new();
@@ -769,7 +786,11 @@ impl repository_query_service_server::RepositoryQueryService for QueryImpl {
                     match entry.status() {
                         atomic_repository::status::FileStatus::Added => untracked.push(path),
                         atomic_repository::status::FileStatus::Modified
-                        | atomic_repository::status::FileStatus::Deleted => affected.push(path),
+                        | atomic_repository::status::FileStatus::Deleted
+                        | atomic_repository::status::FileStatus::TypeChanged
+                        | atomic_repository::status::FileStatus::PermissionsChanged => {
+                            affected.push(path)
+                        }
                         _ => {}
                     }
                 }
@@ -1177,6 +1198,109 @@ pub(crate) fn check_view_fence(
     Ok(())
 }
 
+/// A conflict is recorded state too: unchanged canonical markers may be
+/// resolved by an insertion. Everything else keeps the dirty-worktree guard.
+fn insert_would_discard_work(
+    repo: &Repository,
+    view: &str,
+    status: &atomic_repository::RepositoryStatus,
+) -> Result<bool, Status> {
+    use atomic_repository::status::FileStatus;
+    let mut conflicts = std::collections::HashSet::new();
+    for entry in status.entries() {
+        match entry.status() {
+            FileStatus::Clean => {}
+            FileStatus::Conflicted => {
+                conflicts.insert(entry.path().to_path_buf());
+            }
+            _ => return Ok(true),
+        }
+    }
+    if conflicts.is_empty() {
+        return Ok(false);
+    }
+    let mut changed = false;
+    repo.materialize_view_entries::<Status>(view, |entry| {
+        if conflicts.remove(std::path::Path::new(&entry.path)) {
+            changed |= !matches_canonical_entry(repo.root(), &entry)?;
+        }
+        Ok(())
+    })
+    .map_err(repository_error)??;
+    // A reported conflict absent from the canonical render is not safe to
+    // discard. Neither TREE nor saved materialization history proves ownership.
+    Ok(changed || !conflicts.is_empty())
+}
+
+fn matches_canonical_entry(
+    root: &std::path::Path,
+    entry: &atomic_repository::ViewEntry,
+) -> Result<bool, Status> {
+    use atomic_repository::ViewEntryKind;
+    let metadata = |path: &std::path::Path| match std::fs::symlink_metadata(path) {
+        Ok(metadata) => Ok(Some(metadata)),
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            Ok(None)
+        }
+        Err(error) => Err(repository_error(error.into())),
+    };
+    let relative = std::path::Path::new(&entry.path);
+    let mut full = root.to_path_buf();
+    // Never approve matching bytes reached through a replaced parent symlink.
+    for component in relative
+        .parent()
+        .into_iter()
+        .flat_map(|path| path.components())
+    {
+        if !matches!(component, std::path::Component::Normal(_)) {
+            return Ok(false);
+        }
+        full.push(component);
+        if !metadata(&full)?.is_some_and(|m| m.is_dir() && !m.file_type().is_symlink()) {
+            return Ok(false);
+        }
+    }
+    let path = root.join(relative);
+    let Some(metadata) = metadata(&path)? else {
+        return Ok(false);
+    };
+    let kind_matches = match entry.kind {
+        ViewEntryKind::File => metadata.is_file(),
+        ViewEntryKind::Directory => metadata.is_dir(),
+        ViewEntryKind::Symlink => metadata.file_type().is_symlink(),
+    };
+    if !kind_matches {
+        return Ok(false);
+    }
+    #[cfg(unix)]
+    if entry.kind != ViewEntryKind::Symlink {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o777 != u32::from(entry.mode) & 0o777 {
+            return Ok(false);
+        }
+    }
+    let content = match entry.kind {
+        ViewEntryKind::Directory => return Ok(true),
+        ViewEntryKind::File => std::fs::read(&path),
+        ViewEntryKind::Symlink => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::ffi::OsStrExt;
+                std::fs::read_link(&path).map(|link| link.as_os_str().as_bytes().to_vec())
+            }
+            #[cfg(not(unix))]
+            return Ok(false);
+        }
+    }
+    .map_err(|error| repository_error(error.into()))?;
+    Ok(content == entry.content)
+}
+
 /// Authorship for a record: an explicit wire author wins; else a named
 /// identity from the serving host's store; else the default identity.
 fn resolve_author_for(
@@ -1226,7 +1350,12 @@ impl repository_mutation_service_server::RepositoryMutationService for MutationI
         let directory = request.directory;
         let dry_run = request.dry_run;
         let result = tokio::task::spawn_blocking(move || {
-            let repo = handle.repository()?;
+            let (repo, workspace) = handle.workspace_repository(if dry_run {
+                atomic_repository::WorkspaceTxnMode::Observe
+            } else {
+                atomic_repository::WorkspaceTxnMode::Reconcile
+            })?;
+            let working_copy = workspace.working_copy();
             let mut tracked = 0usize;
             // The tolerant per-path report (dry-run or not): skips never
             // fail the batch; failures are collected per path.
@@ -1236,9 +1365,9 @@ impl repository_mutation_service_server::RepositoryMutationService for MutationI
             let mut failed_paths: Vec<String> = Vec::new();
             for path in &paths {
                 let result = if directory {
-                    repo.add_directory(path, options.clone())
+                    repo.add_directory(working_copy, path, options.clone())
                 } else {
-                    repo.add(path, options.clone())
+                    repo.add(working_copy, path, options.clone())
                 };
                 match result {
                     Ok(stats) => {
@@ -1310,13 +1439,24 @@ impl repository_mutation_service_server::RepositoryMutationService for MutationI
         let identity_name = request.identity_name;
         let expected = request.expected;
         let ai = request.ai_authorship;
-        let view = handle.current_view();
         let result = tokio::task::spawn_blocking(move || {
             if message.trim().is_empty() {
                 return Err(domain_status(
                     ErrorCode::InvalidArgument,
                     "record message is empty",
                 ));
+            }
+            // Reject an already stale request before workspace entry can
+            // recover operations, adopt Git history, or capture pending work.
+            // Drop this read handle before opening writable, and check again
+            // under the retained workspace lease below for intervening writes.
+            if let Some(expected) = &expected {
+                let repo = handle.repository_readonly()?;
+                let working_copy = repo.require_working_copy_id().map_err(repository_error)?;
+                let view = repo
+                    .desired_view_name(working_copy)
+                    .map_err(repository_error)?;
+                check_record_fence(&repo, &view, expected)?;
             }
             let author =
                 resolve_author_for(author.as_ref(), identity_name.as_deref()).map_err(|error| {
@@ -1334,7 +1474,10 @@ impl repository_mutation_service_server::RepositoryMutationService for MutationI
             if !paths.is_empty() {
                 options = options.paths(paths.clone());
             }
-            let repo = handle.repository()?;
+            let (repo, workspace) =
+                handle.workspace_repository(atomic_repository::WorkspaceTxnMode::Reconcile)?;
+            let working_copy = workspace.working_copy();
+            let view = workspace.view().name.clone();
             // The fence: the workspace's current view must be at the state
             // the caller last saw — a stale expectation means someone
             // recorded in between, and this caller's read is no longer
@@ -1360,7 +1503,7 @@ impl repository_mutation_service_server::RepositoryMutationService for MutationI
                 ));
             }
             let outcome = repo
-                .record(header, options)
+                .record(working_copy, header, options)
                 .map_err(|error| domain_status(ErrorCode::ChangeRejected, error.to_string()))?;
             let change = outcome.change();
             Ok::<_, Status>(RecordResponse {
@@ -1411,7 +1554,12 @@ impl repository_mutation_service_server::RepositoryMutationService for MutationI
         let gate_handle = handle.clone();
         let _gate = gate_handle.exclusive().await;
         let result = tokio::task::spawn_blocking(move || -> Result<RemoveFilesResponse, Status> {
-            let repo = handle.repository()?;
+            let (repo, workspace) = handle.workspace_repository(if request.dry_run {
+                atomic_repository::WorkspaceTxnMode::Observe
+            } else {
+                atomic_repository::WorkspaceTxnMode::Reconcile
+            })?;
+            let working_copy = workspace.working_copy();
             let options = TrackingOptions {
                 force: request.force,
                 dry_run: request.dry_run,
@@ -1436,7 +1584,7 @@ impl repository_mutation_service_server::RepositoryMutationService for MutationI
                     path.clone()
                 };
                 let stats = repo
-                    .remove(&normalized, options.clone())
+                    .remove(working_copy, &normalized, options.clone())
                     .map_err(repository_error)?;
                 removed += stats.files_removed as u32;
                 if !keep {
@@ -1475,7 +1623,12 @@ impl repository_mutation_service_server::RepositoryMutationService for MutationI
         let gate_handle = handle.clone();
         let _gate = gate_handle.exclusive().await;
         let result = tokio::task::spawn_blocking(move || -> Result<MoveFileResponse, Status> {
-            let repo = handle.repository()?;
+            let (repo, workspace) = handle.workspace_repository(if request.dry_run {
+                atomic_repository::WorkspaceTxnMode::Observe
+            } else {
+                atomic_repository::WorkspaceTxnMode::Reconcile
+            })?;
+            let working_copy = workspace.working_copy();
             // The CLI's exact validation chain, with the domain's own
             // refusal vocabulary riding the stable error codes.
             if !repo.is_tracked(&request.source).map_err(repository_error)? {
@@ -1491,44 +1644,104 @@ impl repository_mutation_service_server::RepositoryMutationService for MutationI
                     format!("file not found: {}", source_path.display()),
                 ));
             }
-            if !request.force
-                && repo
-                    .is_tracked(&request.destination)
-                    .map_err(repository_error)?
+            if repo
+                .is_tracked(&request.destination)
+                .map_err(repository_error)?
             {
                 return Err(domain_status(
                     ErrorCode::InvalidArgument,
                     format!("destination already tracked: {}", request.destination),
                 ));
             }
+            if source_path.is_dir() {
+                return Err(domain_status(
+                    ErrorCode::InvalidArgument,
+                    "directory moves are not yet supported; move tracked files individually",
+                ));
+            }
             let destination_path = handle.root.join(&request.destination);
+            let destination_metadata = std::fs::symlink_metadata(&destination_path).ok();
+            if destination_metadata.is_some() && !request.force {
+                return Err(domain_status(
+                    ErrorCode::InvalidArgument,
+                    "destination exists; use --force only for untracked content",
+                ));
+            }
+            if destination_metadata
+                .as_ref()
+                .is_some_and(|m| !m.file_type().is_file())
+            {
+                return Err(domain_status(
+                    ErrorCode::InvalidArgument,
+                    "destination is not a regular file and cannot be replaced safely",
+                ));
+            }
+            if request.dry_run {
+                return Ok(MoveFileResponse { meta: None });
+            }
             if let Some(parent) = destination_path.parent() {
-                std::fs::create_dir_all(parent).map_err(|error| {
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| domain_status(ErrorCode::Repository, e.to_string()))?;
+            }
+            // Keep forced bytes until both the disk move and stable-inode
+            // staging succeed. Never discard them on a failed rollback.
+            let backup = if destination_metadata.is_some() {
+                let path = destination_path
+                    .with_file_name(format!(".atomic-mv-backup-{}", uuid::Uuid::new_v4()));
+                std::fs::rename(&destination_path, &path)
+                    .map_err(|e| domain_status(ErrorCode::Repository, e.to_string()))?;
+                Some(path)
+            } else {
+                None
+            };
+            if let Err(error) = std::fs::rename(&source_path, &destination_path) {
+                if let Some(path) = &backup {
+                    std::fs::rename(path, &destination_path).map_err(|rollback| {
+                        domain_status(
+                            ErrorCode::Repository,
+                            format!(
+                                "move failed: {error}; restoring {} failed: {rollback}",
+                                path.display()
+                            ),
+                        )
+                    })?;
+                }
+                return Err(domain_status(ErrorCode::Repository, error.to_string()));
+            }
+            if let Err(error) = repo.move_file(working_copy, &request.source, &request.destination)
+            {
+                std::fs::rename(&destination_path, &source_path).map_err(|rollback| {
                     domain_status(
                         ErrorCode::Repository,
-                        format!("failed to create destination directory: {error}"),
+                        format!(
+                            "move staging failed: {error}; restoring source failed: {rollback}"
+                        ),
+                    )
+                })?;
+                if let Some(path) = &backup {
+                    std::fs::rename(path, &destination_path).map_err(|rollback| {
+                        domain_status(
+                            ErrorCode::Repository,
+                            format!(
+                                "move staging failed: {error}; restoring {} failed: {rollback}",
+                                path.display()
+                            ),
+                        )
+                    })?;
+                }
+                return Err(repository_error(error));
+            }
+            if let Some(path) = backup {
+                std::fs::remove_file(&path).map_err(|error| {
+                    domain_status(
+                        ErrorCode::Repository,
+                        format!(
+                            "move succeeded; backup {} could not be removed: {error}",
+                            path.display()
+                        ),
                     )
                 })?;
             }
-            if request.dry_run {
-                // Validated only: the move would happen; nothing touches disk.
-                return Ok(MoveFileResponse { meta: None });
-            }
-            // Disk move ONLY — the raw-rename working-copy shape the CLI
-            // leaves behind on purpose: record's move detection pairs the
-            // tracked-missing source with the untracked identical-content
-            // destination into a single FileOp::FileMove (inode preserved).
-            // An eager TREE rewrite here would destroy that.
-            std::fs::rename(&source_path, &destination_path).map_err(|error| {
-                domain_status(
-                    ErrorCode::Repository,
-                    format!(
-                        "failed to move {} -> {}: {error}",
-                        source_path.display(),
-                        destination_path.display()
-                    ),
-                )
-            })?;
             Ok(MoveFileResponse { meta: None })
         })
         .await
@@ -1548,16 +1761,21 @@ impl repository_mutation_service_server::RepositoryMutationService for MutationI
         let gate_handle = handle.clone();
         let _gate = gate_handle.exclusive().await;
         let result = tokio::task::spawn_blocking(move || -> Result<RestoreResponse, Status> {
-            let repo = handle.repository()?;
+            let (repo, workspace) =
+                handle.workspace_repository(atomic_repository::WorkspaceTxnMode::Reconcile)?;
+            let working_copy = workspace.working_copy();
             // Restore only ever touches TRACKED dirty files — the
             // untracked scan is skipped (the CLI's status_options).
             // One status pass classifies every path; only tracked
             // dirty states (Modified/Deleted/Added) are considered.
             let status = repo
-                .status(StatusOptions {
-                    include_untracked: false,
-                    ..StatusOptions::default()
-                })
+                .status(
+                    working_copy,
+                    StatusOptions {
+                        include_untracked: false,
+                        ..StatusOptions::default()
+                    },
+                )
                 .map_err(repository_error)?;
             let dirty: Vec<(String, atomic_repository::status::FileStatus)> = status
                 .entries()
@@ -1569,6 +1787,8 @@ impl repository_mutation_service_server::RepositoryMutationService for MutationI
                         atomic_repository::status::FileStatus::Modified
                             | atomic_repository::status::FileStatus::Deleted
                             | atomic_repository::status::FileStatus::Added
+                            | atomic_repository::status::FileStatus::TypeChanged
+                            | atomic_repository::status::FileStatus::PermissionsChanged
                     ) && (request.paths.is_empty()
                         || request.paths.iter().any(|p| path.starts_with(p.as_str())))
                 })
@@ -1583,12 +1803,17 @@ impl repository_mutation_service_server::RepositoryMutationService for MutationI
                 ));
             }
             let mut restored: Vec<String> = Vec::new();
+            let mut materialize = std::collections::HashSet::new();
             for (path, file_status) in dirty {
                 match file_status {
                     // Added: undo the add — untrack, keep on disk.
                     atomic_repository::status::FileStatus::Added => {
-                        repo.remove(&path, TrackingOptions::default().with_recursive(false))
-                            .map_err(repository_error)?;
+                        repo.remove(
+                            working_copy,
+                            &path,
+                            TrackingOptions::default().with_recursive(false),
+                        )
+                        .map_err(repository_error)?;
                         restored.push(path);
                     }
                     // Modified/Deleted: pristine content back to disk.
@@ -1596,27 +1821,19 @@ impl repository_mutation_service_server::RepositoryMutationService for MutationI
                         let content = repo
                             .get_file_content(std::path::Path::new(&path))
                             .map_err(repository_error)?;
-                        if let Some(bytes) = content {
-                            let full = handle.root.join(&path);
-                            if let Some(parent) = full.parent() {
-                                std::fs::create_dir_all(parent).map_err(|error| {
-                                    domain_status(
-                                        ErrorCode::Repository,
-                                        format!("failed to create directory: {error}"),
-                                    )
-                                })?;
-                            }
-                            std::fs::write(&full, bytes).map_err(|error| {
-                                domain_status(
-                                    ErrorCode::Repository,
-                                    format!("failed to write {}: {error}", full.display()),
-                                )
-                            })?;
+                        if content.is_some() {
+                            materialize.insert(path.clone());
                             restored.push(path);
                         }
                         // No pristine content: skip (nothing safe to do).
                     }
                 }
+            }
+            if !materialize.is_empty() {
+                // Canonical materialization restores kind and mode as well as
+                // bytes, and replaces symlinks without following their targets.
+                repo.materialize_paths(working_copy, materialize)
+                    .map_err(repository_error)?;
             }
             Ok(RestoreResponse {
                 restored,
@@ -1640,7 +1857,8 @@ impl repository_mutation_service_server::RepositoryMutationService for MutationI
         let gate_handle = handle.clone();
         let _gate = gate_handle.exclusive().await;
         let result = tokio::task::spawn_blocking(move || -> Result<ReviseResponse, Status> {
-            let mut repo = handle.repository()?;
+            let (mut repo, _workspace) =
+                handle.workspace_repository(atomic_repository::WorkspaceTxnMode::Reconcile)?;
             let target = match request
                 .target
                 .as_ref()
@@ -1761,13 +1979,36 @@ impl repository_mutation_service_server::RepositoryMutationService for MutationI
         let _gate = gate_handle.exclusive().await;
         let result =
             tokio::task::spawn_blocking(move || -> Result<InsertChangesResponse, Status> {
-                let repo = handle.repository()?;
+                // A stale insertion must not reconcile or capture the working
+                // copy before its refusal. The second check below still fences
+                // the mutation after workspace entry; dry runs remain reads.
+                if !request.dry_run.unwrap_or(false) {
+                    if let Some(expected) = &request.expected_snapshot {
+                        let repo = handle.repository_readonly()?;
+                        let working_copy =
+                            repo.require_working_copy_id().map_err(repository_error)?;
+                        let target = match &request.target_view {
+                            Some(target) => target.clone(),
+                            None => repo
+                                .desired_view_name(working_copy)
+                                .map_err(repository_error)?,
+                        };
+                        check_view_fence(&repo, &target, expected)?;
+                    }
+                }
+                let (repo, workspace) =
+                    handle.workspace_repository(if request.dry_run.unwrap_or(false) {
+                        atomic_repository::WorkspaceTxnMode::Observe
+                    } else {
+                        atomic_repository::WorkspaceTxnMode::Reconcile
+                    })?;
+                let working_copy = workspace.working_copy();
                 // The target defaults to the repository's current view (the
                 // wire's target_view is a display hint that must agree).
                 let target = request
                     .target_view
                     .clone()
-                    .unwrap_or_else(|| handle.current_view());
+                    .unwrap_or_else(|| workspace.view().name.clone());
                 // The fence: the target view must be at the state the
                 // caller last saw — two concurrent inserters (two
                 // expeditions merging into the same view) can't both
@@ -1792,9 +2033,9 @@ impl repository_mutation_service_server::RepositoryMutationService for MutationI
                     )
                 {
                     let status = repo
-                        .status(StatusOptions::default())
+                        .status(working_copy, StatusOptions::default())
                         .map_err(repository_error)?;
-                    if !status.is_clean() || status.has_untracked() || status.has_conflicts() {
+                    if insert_would_discard_work(&repo, &target, &status)? {
                         return Err(domain_status(
                             ErrorCode::PreconditionFailed,
                             "insert would refresh a working copy with unrecorded changes; \
@@ -1816,6 +2057,7 @@ impl repository_mutation_service_server::RepositoryMutationService for MutationI
                 // local bodies' print functions.
                 struct ArmReport {
                     applied: Vec<atomic_core::types::Merkle>,
+                    affected_paths: std::collections::HashSet<String>,
                     new_state: atomic_core::types::Merkle,
                     skipped: usize,
                     has_conflicts: bool,
@@ -1844,6 +2086,7 @@ impl repository_mutation_service_server::RepositoryMutationService for MutationI
                         .map_err(cross_view_error)?;
                         ArmReport {
                             applied: outcome.stats.applied_hashes.clone(),
+                            affected_paths: outcome.stats.affected_paths.clone(),
                             new_state: outcome.new_state,
                             skipped: 0,
                             has_conflicts: outcome.has_conflicts,
@@ -1869,6 +2112,7 @@ impl repository_mutation_service_server::RepositoryMutationService for MutationI
                         .map_err(cross_view_error)?;
                         ArmReport {
                             applied: outcome.stats.applied_hashes.clone(),
+                            affected_paths: outcome.stats.affected_paths.clone(),
                             new_state: outcome.new_state,
                             skipped: 0,
                             has_conflicts: outcome.has_conflicts,
@@ -1887,6 +2131,7 @@ impl repository_mutation_service_server::RepositoryMutationService for MutationI
                         let outcome = repo.insert_from_view(options).map_err(cross_view_error)?;
                         ArmReport {
                             applied: outcome.applied_hashes.clone(),
+                            affected_paths: outcome.affected_paths.clone(),
                             new_state: outcome.new_state,
                             skipped: outcome.skipped_hashes.len(),
                             has_conflicts: outcome.has_conflicts,
@@ -1904,7 +2149,7 @@ impl repository_mutation_service_server::RepositoryMutationService for MutationI
                         let from_view = request
                             .tag_from_view
                             .clone()
-                            .unwrap_or_else(|| handle.current_view());
+                            .unwrap_or_else(|| workspace.view().name.clone());
                         let options = CrossViewInsertOptions::new(&from_view, &target)
                             .up_to_tag(&tag)
                             .with_dependencies(apply_dependencies)
@@ -1913,6 +2158,7 @@ impl repository_mutation_service_server::RepositoryMutationService for MutationI
                         let outcome = repo.insert_from_view(options).map_err(cross_view_error)?;
                         ArmReport {
                             applied: outcome.applied_hashes.clone(),
+                            affected_paths: outcome.affected_paths.clone(),
                             new_state: outcome.new_state,
                             skipped: outcome.skipped_hashes.len(),
                             has_conflicts: outcome.has_conflicts,
@@ -1927,7 +2173,7 @@ impl repository_mutation_service_server::RepositoryMutationService for MutationI
                     // parent (or the explicit target override). Everything
                     // resolves HERE — the CLI holds no repository handle.
                     Some(insert_changes_request::Source::PromoteCurrentView(_)) => {
-                        let source = handle.current_view();
+                        let source = workspace.view().name.clone();
                         let source_info = repo
                             .get_view_info(&source)
                             .map_err(|error| domain_status(ErrorCode::View, error.to_string()))?;
@@ -1976,6 +2222,7 @@ impl repository_mutation_service_server::RepositoryMutationService for MutationI
                             // missing set from this same read.)
                             ArmReport {
                                 applied: missing,
+                                affected_paths: std::collections::HashSet::new(),
                                 new_state: atomic_core::types::Merkle::ZERO,
                                 skipped: 0,
                                 has_conflicts: false,
@@ -1995,6 +2242,7 @@ impl repository_mutation_service_server::RepositoryMutationService for MutationI
                                 repo.insert_from_view(options).map_err(cross_view_error)?;
                             ArmReport {
                                 applied: outcome.applied_hashes.clone(),
+                                affected_paths: outcome.affected_paths.clone(),
                                 new_state: outcome.new_state,
                                 skipped: outcome.skipped_hashes.len(),
                                 has_conflicts: outcome.has_conflicts,
@@ -2028,6 +2276,7 @@ impl repository_mutation_service_server::RepositoryMutationService for MutationI
                         };
                         ArmReport {
                             applied: outcome.applied_hashes.clone(),
+                            affected_paths: outcome.affected_paths.clone(),
                             new_state: outcome.new_state,
                             skipped: outcome.skipped_hashes.len(),
                             has_conflicts: outcome.has_conflicts,
@@ -2049,16 +2298,10 @@ impl repository_mutation_service_server::RepositoryMutationService for MutationI
                 // change — the local listings print the hash alone) and
                 // collect the touched paths for the surgical refresh.
                 let mut inserted = Vec::with_capacity(report.applied.len());
-                let mut affected_paths: std::collections::HashSet<String> =
-                    std::collections::HashSet::new();
+                let affected_paths = report.affected_paths;
                 for hash in &report.applied {
                     match repo.load_change(hash) {
                         Ok(change) => {
-                            for op in change.hunks() {
-                                if let Some(path) = op.path() {
-                                    affected_paths.insert(path.to_string());
-                                }
-                            }
                             inserted.push(change_info(&change, hash));
                         }
                         Err(_) => inserted.push(bare_change_info(hash)),
@@ -2079,18 +2322,18 @@ impl repository_mutation_service_server::RepositoryMutationService for MutationI
                 if !dry_run
                     && !report.applied.is_empty()
                     && report.refresh != Refresh::Skip
-                    && target == handle.current_view()
+                    && target == workspace.view().name.clone()
                 {
-                    let materialized =
-                        if report.refresh == Refresh::Full || affected_paths.is_empty() {
-                            repo.materialize().map_err(|error| {
+                    let materialized = if report.refresh == Refresh::Full {
+                        repo.materialize(working_copy).map_err(|error| {
+                            domain_status(ErrorCode::Materialize, error.to_string())
+                        })?
+                    } else {
+                        repo.materialize_paths(working_copy, affected_paths)
+                            .map_err(|error| {
                                 domain_status(ErrorCode::Materialize, error.to_string())
                             })?
-                        } else {
-                            repo.materialize_paths(affected_paths).map_err(|error| {
-                                domain_status(ErrorCode::Materialize, error.to_string())
-                            })?
-                        };
+                    };
                     files_updated = Some(materialized.files_written as u64);
                     directories_created = Some(materialized.directories_created as u64);
                 }
@@ -2099,7 +2342,7 @@ impl repository_mutation_service_server::RepositoryMutationService for MutationI
                 // A read failure silences the listing — the local summary
                 // returns silently too.
                 let conflicts = repo
-                    .list_conflicts()
+                    .list_conflicts(working_copy)
                     .unwrap_or_default()
                     .into_iter()
                     .flat_map(|(path, records)| {
@@ -2145,7 +2388,8 @@ impl repository_mutation_service_server::RepositoryMutationService for MutationI
         let gate_handle = handle.clone();
         let _gate = gate_handle.exclusive().await;
         let result = tokio::task::spawn_blocking(move || -> Result<UnrecordResponse, Status> {
-            let repo = handle.repository()?;
+            let (repo, _workspace) =
+                handle.workspace_repository(atomic_repository::WorkspaceTxnMode::Reconcile)?;
             let options = atomic_repository::UnrecordOptions::new();
             let outcome = match request
                 .target
@@ -2259,7 +2503,8 @@ impl repository_mutation_service_server::RepositoryMutationService for MutationI
         let gate_handle = handle.clone();
         let _gate = gate_handle.exclusive().await;
         let result = tokio::task::spawn_blocking(move || -> Result<CreateStashResponse, Status> {
-            let mut repo = handle.repository()?;
+            let (mut repo, _workspace) =
+                handle.workspace_repository(atomic_repository::WorkspaceTxnMode::Reconcile)?;
             match repo
                 .stash_push(atomic_repository::StashPushOptions {
                     message: request.message,
@@ -2297,7 +2542,8 @@ impl repository_mutation_service_server::RepositoryMutationService for MutationI
         let gate_handle = handle.clone();
         let _gate = gate_handle.exclusive().await;
         let result = tokio::task::spawn_blocking(move || -> Result<ApplyStashResponse, Status> {
-            let repo = handle.repository()?;
+            let (repo, _workspace) =
+                handle.workspace_repository(atomic_repository::WorkspaceTxnMode::Reconcile)?;
             let (_stash, applied) = repo
                 .stash_apply(if request.stash_id.is_empty() {
                     None
@@ -2381,5 +2627,42 @@ impl repository_mutation_service_server::RepositoryMutationService for MutationI
         .await
         .map_err(|error| Status::internal(format!("stash task failed: {error}")))??;
         Ok(Response::new(DropStashResponse { meta: None }))
+    }
+}
+
+#[cfg(all(test, unix))]
+mod insert_conflict_guard_tests {
+    #[test]
+    fn identical_bytes_through_a_symlinked_parent_are_not_a_recorded_worktree() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let bytes = b"recorded conflict markers\n";
+        std::fs::write(outside.path().join("file"), bytes).unwrap();
+        std::fs::set_permissions(
+            outside.path().join("file"),
+            std::fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+        symlink(outside.path(), root.path().join("parent")).unwrap();
+        let entry = atomic_repository::ViewEntry {
+            path: "parent/file".into(),
+            inode: 1,
+            kind: atomic_repository::ViewEntryKind::File,
+            mode: 0o644,
+            content: bytes.to_vec(),
+            hash: atomic_core::types::Hash::of(bytes),
+            conflict_marker_line: None,
+        };
+        assert!(!super::matches_canonical_entry(root.path(), &entry).unwrap());
+        std::fs::remove_file(root.path().join("parent")).unwrap();
+        std::fs::create_dir(root.path().join("parent")).unwrap();
+        std::fs::write(root.path().join("parent/file"), bytes).unwrap();
+        std::fs::set_permissions(
+            root.path().join("parent/file"),
+            std::fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+        assert!(super::matches_canonical_entry(root.path(), &entry).unwrap());
     }
 }

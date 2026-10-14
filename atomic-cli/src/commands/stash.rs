@@ -454,46 +454,29 @@ impl Command for Stash {
         // Route through the daemon when reachable (the domain module is
         // shared, so behavior is identical); show stays local and clear
         // keeps its confirmation prompt locally.
-        match &self.command {
-            None => {
-                if crate::commands::rpc::stash_push(
-                    self.message.clone(),
-                    self.include_untracked,
-                    self.keep,
-                )? {
-                    return Ok(());
-                }
-            }
+        let routed = match &self.command {
+            None => crate::commands::rpc::stash_push(
+                self.message.clone(),
+                self.include_untracked,
+                self.keep,
+            )?,
             Some(StashSubcommand::Push {
                 message,
                 include_untracked,
                 keep,
-            }) => {
-                if crate::commands::rpc::stash_push(message.clone(), *include_untracked, *keep)? {
-                    return Ok(());
-                }
-            }
-            Some(StashSubcommand::Pop { stash }) => {
-                if crate::commands::rpc::stash_pop(stash.clone())? {
-                    return Ok(());
-                }
-            }
+            }) => crate::commands::rpc::stash_push(message.clone(), *include_untracked, *keep)?,
+            Some(StashSubcommand::Pop { stash }) => crate::commands::rpc::stash_pop(stash.clone())?,
             Some(StashSubcommand::Apply { stash }) => {
-                if crate::commands::rpc::stash_apply(stash.clone())? {
-                    return Ok(());
-                }
+                crate::commands::rpc::stash_apply(stash.clone())?
             }
-            Some(StashSubcommand::List) => {
-                if crate::commands::rpc::stash_list()? {
-                    return Ok(());
-                }
+            Some(StashSubcommand::List) => crate::commands::rpc::stash_list()?,
+            Some(StashSubcommand::Drop { stash }) => {
+                crate::commands::rpc::stash_drop(stash.clone(), false)?
             }
-            Some(StashSubcommand::Drop { stash })
-                if crate::commands::rpc::stash_drop(stash.clone(), false)? =>
-            {
-                return Ok(());
-            }
-            _ => {}
+            _ => false,
+        };
+        if routed {
+            return Ok(());
         }
 
         // Find repository

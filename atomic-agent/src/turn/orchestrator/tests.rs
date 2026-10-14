@@ -7,7 +7,9 @@ use crate::error::AgentError;
 use crate::event::{HookType, TurnEvent};
 use crate::provenance::accumulator::ProvenanceAccumulator;
 use crate::turn::phase::Phase;
-use crate::turn::session::{AgentSession, SessionStore};
+use crate::turn::session::{
+    AgentSession, IncompleteSession, SessionIncompleteOrigin, SessionStatus, SessionStore,
+};
 use crate::watcher::fallback::FallbackWatcher;
 use crate::watcher::WatcherConfig;
 use std::fs;
@@ -303,8 +305,12 @@ async fn test_session_start_in_sandbox_adopts_view_without_forking() {
 
     // Provision a sandbox working tree bound to the agent view.
     let sandbox_dir = TempDir::new().unwrap();
-    repo.provision_sandbox(sandbox_dir.path(), "agent-sbx")
-        .unwrap();
+    repo.provision_sandbox(
+        repo.require_working_copy_id().unwrap(),
+        sandbox_dir.path(),
+        "agent-sbx",
+    )
+    .unwrap();
     drop(repo); // release the canonical pristine lock before reopening
 
     // Sanity: the sandbox opens on its provisioned view.
@@ -362,8 +368,12 @@ async fn test_sandbox_session_records_the_draft_it_forked_from() {
     repo.create_view_from("agent-sbx", "feature-x").unwrap();
 
     let sandbox_dir = TempDir::new().unwrap();
-    repo.provision_sandbox(sandbox_dir.path(), "agent-sbx")
-        .unwrap();
+    repo.provision_sandbox(
+        repo.require_working_copy_id().unwrap(),
+        sandbox_dir.path(),
+        "agent-sbx",
+    )
+    .unwrap();
     drop(repo);
 
     let session_store = SessionStore::for_repo(sandbox_dir.path()).unwrap();
@@ -395,7 +405,12 @@ async fn test_sandbox_session_on_a_root_view_records_no_parent() {
     let root = repo.current_view().to_string(); // "dev", created with no parent
 
     let sandbox_dir = TempDir::new().unwrap();
-    repo.provision_sandbox(sandbox_dir.path(), &root).unwrap();
+    repo.provision_sandbox(
+        repo.require_working_copy_id().unwrap(),
+        sandbox_dir.path(),
+        &root,
+    )
+    .unwrap();
     drop(repo);
 
     let session_store = SessionStore::for_repo(sandbox_dir.path()).unwrap();
@@ -422,8 +437,12 @@ async fn test_sandbox_without_owner_sink_does_not_create_fallback_provenance() {
     let user_view = repo.current_view().to_string();
 
     let sandbox_dir = TempDir::new().unwrap();
-    repo.provision_sandbox(sandbox_dir.path(), &user_view)
-        .unwrap();
+    repo.provision_sandbox(
+        repo.require_working_copy_id().unwrap(),
+        sandbox_dir.path(),
+        &user_view,
+    )
+    .unwrap();
     drop(repo);
 
     // Orchestrator rooted at the sandbox working tree (mirrors the hook path).
@@ -499,8 +518,12 @@ async fn test_sandbox_turn_end_leaves_canonical_current_view_untouched() {
     repo.create_view_from("agent-draft", &user_view).unwrap();
 
     let sandbox_dir = TempDir::new().unwrap();
-    repo.provision_sandbox(sandbox_dir.path(), "agent-draft")
-        .unwrap();
+    repo.provision_sandbox(
+        repo.require_working_copy_id().unwrap(),
+        sandbox_dir.path(),
+        "agent-draft",
+    )
+    .unwrap();
     drop(repo);
 
     let session_store = SessionStore::for_repo(sandbox_dir.path()).unwrap();
@@ -652,8 +675,12 @@ async fn test_turn_end_records_untracked_only_files() {
     );
 
     let repo = Repository::open(dir.path()).unwrap();
+    let working_copy = repo.require_working_copy_id().unwrap();
     let status = repo
-        .status(atomic_repository::status::StatusOptions::default())
+        .status(
+            working_copy,
+            atomic_repository::status::StatusOptions::default(),
+        )
         .unwrap();
     assert_eq!(status.untracked_count(), 0);
     assert!(
@@ -692,15 +719,18 @@ async fn test_session_attestation_covers_only_agent_recorded_changes() {
     // when the session forks. The bug we're guarding against is that
     // this baseline used to get attributed to the agent.
     let repo_for_baseline = Repository::open(dir.path()).unwrap();
+    let working_copy = repo_for_baseline.require_working_copy_id().unwrap();
     fs::write(dir.path().join("baseline.txt"), "baseline content\n").unwrap();
     repo_for_baseline
         .add(
+            working_copy,
             "baseline.txt",
             atomic_repository::tracking::TrackingOptions::default(),
         )
         .expect("track baseline.txt");
     let baseline_outcome = repo_for_baseline
         .record(
+            working_copy,
             ChangeHeader::new("baseline change"),
             atomic_repository::record::RecordOptions::new().with_all(true),
         )
@@ -823,6 +853,114 @@ async fn test_session_end_skips_attestation_when_no_recorded_changes() {
         attestations.is_empty(),
         "session with zero recorded turns must not produce an attestation",
     );
+}
+
+// CB-12A: turn-start boundaries are captured, and a git-only turn
+// (clean worktree, HEAD moved) classifies as RepositoryOperations with a
+// durable incomplete refusal — never as an empty turn (RFC §10.2).
+#[tokio::test]
+async fn test_git_only_turn_between_boundaries_classifies_and_marks_incomplete() {
+    let dir = TempDir::new().unwrap();
+    let git = git2::Repository::init(dir.path()).unwrap();
+    let repo = Repository::init(dir.path()).unwrap();
+
+    // Baseline: Atomic tracks the file so the worktree stays clean across
+    // the git-only turn.
+    std::fs::write(dir.path().join("tracked.txt"), "same\n").unwrap();
+    let working_copy = repo.require_working_copy_id().unwrap();
+    repo.add(
+        working_copy,
+        "tracked.txt",
+        atomic_repository::tracking::TrackingOptions::default(),
+    )
+    .unwrap();
+    repo.record(
+        working_copy,
+        atomic_core::change::ChangeHeader::new("baseline"),
+        atomic_repository::record::RecordOptions::new(),
+    )
+    .unwrap();
+    drop(repo);
+
+    let mut orch = make_orchestrator(&dir);
+    orch.set_agent("claude-code", "Claude Code");
+
+    let session_id = "sess-git-only";
+    orch.dispatch(session_start_event(session_id))
+        .await
+        .unwrap();
+    orch.dispatch(turn_start_event(session_id, "Wait while git moves"))
+        .await
+        .unwrap();
+
+    // The turn-start boundary must be captured in the session JSON.
+    let session = orch.session_store.load(session_id).unwrap().unwrap();
+    let baseline = session
+        .boundary_start
+        .clone()
+        .expect("turn-start boundary captured");
+    assert!(baseline.git.is_some());
+
+    // Git commits inside the turn window (hook bypassed — no capture).
+    let mut index = git.index().unwrap();
+    index.add_path(std::path::Path::new("tracked.txt")).unwrap();
+    index.write().unwrap();
+    let tree = git.find_tree(index.write_tree().unwrap()).unwrap();
+    let signature = git2::Signature::now("Turn Test", "turn@test.invalid").unwrap();
+    let parent = git.head().ok().and_then(|head| head.peel_to_commit().ok());
+    let parents: Vec<&git2::Commit> = parent.iter().collect();
+    let oid = git
+        .commit(
+            Some("HEAD"),
+            &signature,
+            &signature,
+            "bypassed",
+            &tree,
+            &parents,
+        )
+        .unwrap();
+
+    let result = orch.dispatch(turn_end_event(session_id)).await.unwrap();
+    eprintln!("DEBUG git-only result: {result:?}");
+    assert!(
+        !result.was_recorded(),
+        "a git-only turn must not record content"
+    );
+    assert!(
+        result.incomplete.is_some(),
+        "an unexplained commit must surface the durable refusal"
+    );
+
+    // Durable evidence: session JSON carries the classification, boundaries
+    // and refusal; the repository index carries the incomplete status.
+    let session = orch.session_store.load(session_id).unwrap().unwrap();
+    let entry = session
+        .outcome_for_turn(1)
+        .expect("the turn outcome is durably recorded");
+    assert!(matches!(
+        entry.outcome,
+        crate::turn::session::ManagedTurnOutcome::RepositoryOperations { .. }
+    ));
+    assert!(entry.boundary_start.is_some() && entry.boundary_end.is_some());
+    let refusal = session.incomplete().expect("session marked incomplete");
+    assert_eq!(
+        refusal.origin,
+        crate::turn::session::SessionIncompleteOrigin::UnattributedGitOperation
+    );
+    assert_eq!(refusal.unbound_commits, vec![oid.to_string()]);
+
+    // The repository index carries the incomplete status via the session
+    // ledger read path; the JSON refusal above is the crash-safe minimum.
+    let repo = Repository::open_existing(dir.path()).unwrap();
+    let txn = repo.pristine().read_txn().unwrap();
+    let record = txn.get_session_record(session_id).unwrap();
+    assert!(
+        record
+            .map(|record| record.status.incomplete().is_some())
+            .unwrap_or(false),
+        "the repository session index must carry the incomplete status"
+    );
+    drop(txn);
 }
 
 // Antigravity CLI has no SessionEnd hook — its Stop payload's
@@ -1076,20 +1214,24 @@ async fn test_full_lifecycle_multi_turn() {
     fs::write(dir.path().join("file2.rs"), "fn two() {}").unwrap();
 
     let r = orch.dispatch(turn_end_event("sess-lc")).await.unwrap();
-    assert_eq!(r.new_phase, Phase::Idle);
+    // Review R3 (ATOM::aaron::8): a record failure is durable UnrecordedWork
+    // refusal evidence. The first refusal is terminal (first writer wins):
+    // later turn/session ends surface the same refusal instead of fresh
+    // successes — the CLI reports it as nonzero.
+    assert!(r.incomplete.is_some());
 
-    // Session ends
+    // Session ends — the terminal refusal is re-surfaced, never cleared.
     let r = orch.dispatch(session_end_event("sess-lc")).await.unwrap();
-    assert_eq!(r.new_phase, Phase::Ended);
+    assert!(r.incomplete.is_some());
 
-    // Verify final session state — phase transitions and turn counting
-    // work correctly even without a real Atomic repository for recording.
-    // files_touched is only populated on successful recordings, which
-    // require a real initialized repo (tested in integration tests).
+    // Verify final session state — the refusal is durably persisted and the
+    // session is not reported as a clean end.
     let session = orch.session_store.load("sess-lc").unwrap().unwrap();
-    assert_eq!(session.turn_count, 2);
-    assert!(session.is_ended());
-    assert_eq!(session.first_prompt.as_deref(), Some("First prompt"));
+    let refusal = session
+        .incomplete()
+        .expect("record failure leaves durable refusal evidence");
+    assert_eq!(refusal.origin, SessionIncompleteOrigin::UnrecordedWork);
+    assert!(session.first_prompt.as_deref() == Some("First prompt"));
 }
 
 #[tokio::test]
@@ -1154,6 +1296,210 @@ fn make_repo_orchestrator(dir: &TempDir) -> TurnOrchestrator {
     let session_store = SessionStore::for_repo(dir.path()).unwrap();
     let watcher = FallbackWatcher::new(WatcherConfig::new(dir.path()));
     TurnOrchestrator::with_watcher(dir.path(), session_store, Box::new(watcher))
+}
+
+fn incomplete_outcome(recovery_ref: &str) -> IncompleteSession {
+    IncompleteSession::new(
+        "tracked work moved during checkout",
+        vec!["src/z.rs".into(), "src/a.rs".into(), "src/a.rs".into()],
+        recovery_ref,
+        SessionIncompleteOrigin::UnknownPostCheckout,
+    )
+}
+
+#[tokio::test]
+async fn test_managed_turn_end_persists_incomplete_without_false_recording() {
+    let dir = TempDir::new().unwrap();
+    let mut orch = make_repo_orchestrator(&dir);
+    orch.set_agent("codex", "Codex");
+    let first = incomplete_outcome("refs/atomic/wip/run-mng-1");
+    orch.set_managed_run(managed_context(Some("managed-view")));
+    orch.set_boundary_refusal(first.clone());
+
+    orch.dispatch(session_start_event("sess-incomplete-turn"))
+        .await
+        .unwrap();
+    orch.dispatch(turn_start_event(
+        "sess-incomplete-turn",
+        "edit files before checkout drift",
+    ))
+    .await
+    .unwrap();
+    fs::create_dir_all(dir.path().join("src")).unwrap();
+    fs::write(dir.path().join("src/a.rs"), "unattributed bytes\n").unwrap();
+
+    let result = orch
+        .dispatch(turn_end_event("sess-incomplete-turn"))
+        .await
+        .unwrap();
+    assert_eq!(result.incomplete.as_ref(), Some(&first));
+    assert!(!result.was_recorded());
+
+    let session = orch
+        .session_store
+        .load("sess-incomplete-turn")
+        .unwrap()
+        .unwrap();
+    assert_eq!(session.status, SessionStatus::Incomplete(first.clone()));
+    assert_eq!(session.turn_count, 0, "refusal is not a completed turn");
+    assert!(session.files_touched.is_empty());
+    assert!(session.recorded_change_hashes.is_empty());
+
+    let repo = Repository::open_existing(dir.path()).unwrap();
+    let (record, turns) = repo
+        .get_session_ledger("sess-incomplete-turn")
+        .unwrap()
+        .unwrap();
+    assert_eq!(record.status, SessionStatus::Incomplete(first.clone()));
+    assert!(
+        turns.is_empty(),
+        "refusal must not create a provenance turn"
+    );
+    drop(repo);
+
+    // A later duplicate carrying different details must return the first
+    // durable recovery object and must still avoid attribution.
+    let later = incomplete_outcome("refs/atomic/wip/later");
+    orch.set_managed_run(managed_context(Some("managed-view")));
+    orch.set_boundary_refusal(later);
+    let duplicate = orch
+        .dispatch(turn_end_event("sess-incomplete-turn"))
+        .await
+        .unwrap();
+    assert_eq!(duplicate.incomplete.as_ref(), Some(&first));
+    assert!(!duplicate.was_recorded());
+    let session = orch
+        .session_store
+        .load("sess-incomplete-turn")
+        .unwrap()
+        .unwrap();
+    assert!(session.files_touched.is_empty());
+    assert!(session.recorded_change_hashes.is_empty());
+}
+
+#[tokio::test]
+async fn test_managed_session_end_persists_incomplete_before_flush() {
+    let dir = TempDir::new().unwrap();
+    let mut orch = make_repo_orchestrator(&dir);
+    orch.set_agent("codex", "Codex");
+    let incomplete = incomplete_outcome("refs/atomic/wip/session-end");
+    orch.set_managed_run(managed_context(Some("managed-view")));
+    orch.set_boundary_refusal(incomplete.clone());
+
+    orch.dispatch(session_start_event("sess-incomplete-end"))
+        .await
+        .unwrap();
+    fs::write(dir.path().join("pending.rs"), "unattributed bytes\n").unwrap();
+
+    let result = orch
+        .dispatch(session_end_event("sess-incomplete-end"))
+        .await
+        .unwrap();
+    assert_eq!(result.incomplete.as_ref(), Some(&incomplete));
+    assert!(!result.was_recorded());
+
+    let session = orch
+        .session_store
+        .load("sess-incomplete-end")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        session.status,
+        SessionStatus::Incomplete(incomplete.clone())
+    );
+    assert_eq!(session.turn_count, 0);
+    assert!(session.files_touched.is_empty());
+    assert!(session.recorded_change_hashes.is_empty());
+    assert!(
+        !session.is_ended(),
+        "incomplete must not masquerade as ended"
+    );
+
+    let duplicate = orch
+        .dispatch(session_end_event("sess-incomplete-end"))
+        .await
+        .unwrap();
+    assert_eq!(duplicate.incomplete.as_ref(), Some(&incomplete));
+    assert!(!duplicate.was_recorded());
+}
+
+#[tokio::test]
+async fn test_unmanaged_turn_end_persists_boundary_refusal_without_recording() {
+    let dir = TempDir::new().unwrap();
+    let mut orch = make_repo_orchestrator(&dir);
+    orch.set_agent("claude-code", "Claude Code");
+    let incomplete = incomplete_outcome("refs/atomic/wip/direct-turn");
+
+    orch.dispatch(session_start_event("sess-direct-turn"))
+        .await
+        .unwrap();
+    orch.dispatch(turn_start_event("sess-direct-turn", "direct edit"))
+        .await
+        .unwrap();
+    fs::write(dir.path().join("direct.rs"), "must not be attributed\n").unwrap();
+    orch.set_boundary_refusal(incomplete.clone());
+
+    let result = orch
+        .dispatch(turn_end_event("sess-direct-turn"))
+        .await
+        .unwrap();
+    assert_eq!(result.incomplete.as_ref(), Some(&incomplete));
+    assert!(!result.was_recorded());
+
+    let session = orch
+        .session_store
+        .load("sess-direct-turn")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        session.status,
+        SessionStatus::Incomplete(incomplete.clone())
+    );
+    assert_eq!(session.turn_count, 0);
+    assert!(session.files_touched.is_empty());
+    assert!(session.recorded_change_hashes.is_empty());
+
+    let repo = Repository::open_existing(dir.path()).unwrap();
+    let (record, turns) = repo
+        .get_session_ledger("sess-direct-turn")
+        .unwrap()
+        .unwrap();
+    assert_eq!(record.status, SessionStatus::Incomplete(incomplete));
+    assert!(turns.is_empty());
+}
+
+#[tokio::test]
+async fn test_unmanaged_session_end_creates_durable_incomplete_session() {
+    let dir = TempDir::new().unwrap();
+    let mut orch = make_repo_orchestrator(&dir);
+    orch.set_agent("cursor", "Cursor");
+    let incomplete = incomplete_outcome("refs/atomic/wip/direct-session-end");
+    fs::write(dir.path().join("pending.rs"), "must not be flushed\n").unwrap();
+    orch.set_boundary_refusal(incomplete.clone());
+
+    // No SessionStart and no managed lifecycle: the explicit refusal seam must
+    // still create durable session state before the ordinary unknown-session
+    // early return or flush path can run.
+    let result = orch
+        .dispatch(session_end_event("sess-direct-end"))
+        .await
+        .unwrap();
+    assert_eq!(result.incomplete.as_ref(), Some(&incomplete));
+    assert!(!result.was_recorded());
+
+    let session = orch.session_store.load("sess-direct-end").unwrap().unwrap();
+    assert_eq!(
+        session.status,
+        SessionStatus::Incomplete(incomplete.clone())
+    );
+    assert_eq!(session.turn_count, 0);
+    assert!(session.files_touched.is_empty());
+    assert!(session.recorded_change_hashes.is_empty());
+
+    let repo = Repository::open_existing(dir.path()).unwrap();
+    let (record, turns) = repo.get_session_ledger("sess-direct-end").unwrap().unwrap();
+    assert_eq!(record.status, SessionStatus::Incomplete(incomplete));
+    assert!(turns.is_empty());
 }
 
 #[tokio::test]
@@ -1252,8 +1598,12 @@ async fn test_sandbox_session_keeps_provisioned_view_under_managed_run() {
     repo.create_view_from("agent-sbx", &user_view).unwrap();
 
     let sandbox_dir = TempDir::new().unwrap();
-    repo.provision_sandbox(sandbox_dir.path(), "agent-sbx")
-        .unwrap();
+    repo.provision_sandbox(
+        repo.require_working_copy_id().unwrap(),
+        sandbox_dir.path(),
+        "agent-sbx",
+    )
+    .unwrap();
     drop(repo);
 
     let session_store = SessionStore::for_repo(sandbox_dir.path()).unwrap();
@@ -1332,8 +1682,12 @@ async fn test_sandbox_session_files_land_in_canonical_store() {
     repo.create_view_from("agent-sbx2", &user_view).unwrap();
 
     let sandbox_dir = TempDir::new().unwrap();
-    repo.provision_sandbox(sandbox_dir.path(), "agent-sbx2")
-        .unwrap();
+    repo.provision_sandbox(
+        repo.require_working_copy_id().unwrap(),
+        sandbox_dir.path(),
+        "agent-sbx2",
+    )
+    .unwrap();
     drop(repo);
 
     let mut orch = TurnOrchestrator::new(sandbox_dir.path()).await.unwrap();
@@ -1355,5 +1709,437 @@ async fn test_sandbox_session_files_land_in_canonical_store() {
             .join(".atomic/sessions/sess-canon.json")
             .exists(),
         "sandbox session must not be stranded in a sandbox-local .atomic"
+    );
+}
+
+// CB-12A fix-session regressions (review ATOM::aaron::8 R3/R5/R6).
+
+/// Review R5 (executed probe): a clean turn whose Git checkpoint is
+/// semantically unchanged is ObservationOnly and its classification, turn
+/// count and phase transition are PERSISTED — never the old empty-turn loss
+/// behind the new fast gate (returned Idle while the session stayed Active
+/// with zero outcomes and a stale baseline).
+#[tokio::test]
+async fn test_observation_only_turn_end_persists_classification_and_phase() {
+    let dir = TempDir::new().unwrap();
+    Repository::init(dir.path()).unwrap();
+    let mut orch = make_orchestrator(&dir);
+
+    orch.dispatch(session_start_event("sess-obs-persist"))
+        .await
+        .unwrap();
+    orch.dispatch(turn_start_event("sess-obs-persist", "no-op turn"))
+        .await
+        .unwrap();
+
+    let result = orch
+        .dispatch(turn_end_event("sess-obs-persist"))
+        .await
+        .unwrap();
+    assert_eq!(result.new_phase, Phase::Idle);
+
+    let session = orch
+        .session_store
+        .load("sess-obs-persist")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        session.turn_count, 1,
+        "the observation-only turn is counted"
+    );
+    assert_eq!(
+        session.turn_outcomes.len(),
+        1,
+        "every turn persists a classification — equal checkpoints are not skipped"
+    );
+    assert!(matches!(
+        session.turn_outcomes[0].outcome,
+        ManagedTurnOutcome::ObservationOnly
+    ));
+    assert!(
+        session.boundary_start.is_none(),
+        "the consumed baseline is cleared, not retained"
+    );
+}
+
+/// Review R3 (executed probe): a git-only turn flushed at SessionEnd that
+/// classified an unexplained transition must SURFACE its durable refusal in
+/// the dispatch result — the CLI turns that into a nonzero exit — instead of
+/// returning a fresh success while only the persisted JSON carries the truth.
+#[tokio::test]
+async fn test_session_end_surfaces_incomplete_from_git_only_flush() {
+    let dir = TempDir::new().unwrap();
+    Repository::init(dir.path()).unwrap();
+    git2::Repository::init(dir.path()).unwrap();
+    let mut orch = make_orchestrator(&dir);
+
+    orch.dispatch(session_start_event("sess-end-refusal"))
+        .await
+        .unwrap();
+    orch.dispatch(turn_start_event("sess-end-refusal", "git-only turn"))
+        .await
+        .unwrap();
+
+    // Unexplained commit inside the turn window (no pre-commit capture):
+    // plain libgit2 commit on an identical tree keeps the worktree clean.
+    let git = git2::Repository::open(dir.path()).unwrap();
+    let new_head = {
+        let mut index = git.index().unwrap();
+        let tree_id = index.write_tree().unwrap();
+        let tree = git.find_tree(tree_id).unwrap();
+        let signature = git2::Signature::now("Review", "review@example.invalid").unwrap();
+        let parent = git.head().ok().and_then(|h| h.peel_to_commit().ok());
+        let parents: Vec<&git2::Commit> = parent.iter().collect();
+        git.commit(
+            Some("HEAD"),
+            &signature,
+            &signature,
+            "unexplained",
+            &tree,
+            &parents,
+        )
+        .unwrap()
+        .to_string()
+    };
+    drop(git);
+    let _ = new_head;
+
+    let result = orch
+        .dispatch(session_end_event("sess-end-refusal"))
+        .await
+        .unwrap();
+    assert!(
+        result.incomplete.is_some(),
+        "SessionEnd must surface the flush turn's durable refusal, not success"
+    );
+
+    let session = orch
+        .session_store
+        .load("sess-end-refusal")
+        .unwrap()
+        .unwrap();
+    assert!(
+        session.incomplete().is_some(),
+        "the refusal is durably persisted on the session"
+    );
+}
+
+/// Review R3/R6 (executed probe): when the attestation cannot be written,
+/// SessionEnd must fail closed — typed error plus durable refusal — instead
+/// of returning success with one unattested operation and no evidence.
+#[cfg(unix)] // the write denial is a unix chmod; windows cannot reproduce it
+#[tokio::test]
+async fn test_session_end_fails_closed_when_attestation_write_fails() {
+    let dir = TempDir::new().unwrap();
+    {
+        Repository::init(dir.path()).unwrap();
+        let mut orch = make_orchestrator(&dir);
+        orch.set_agent("agy", "Antigravity CLI");
+
+        orch.dispatch(session_start_event("sess-attest-fail"))
+            .await
+            .unwrap();
+        orch.dispatch(turn_start_event("sess-attest-fail", "record something"))
+            .await
+            .unwrap();
+        fs::write(dir.path().join("file.txt"), "content\n").unwrap();
+
+        // Not fullyIdle: the attestation is left for SessionEnd (like
+        // agents that do have a SessionEnd hook), so the chmod below hits
+        // the actual SessionEnd attestation write.
+        let stop = turn_end_event("sess-attest-fail");
+        let turn_result = orch.dispatch(stop).await.unwrap();
+        assert!(
+            turn_result.change_recorded.is_some(),
+            "the turn records first"
+        );
+        drop(orch);
+
+        // Make the change store unwritable so the SessionEnd attestation
+        // cannot persist. Unix write permissions only; nothing in the
+        // workspace under test changes.
+        use std::os::unix::fs::PermissionsExt;
+        let changes = dir.path().join(".atomic/changes");
+        fs::set_permissions(&changes, fs::Permissions::from_mode(0o555)).unwrap();
+
+        let mut orch = make_orchestrator(&dir);
+        let result = orch.dispatch(session_end_event("sess-attest-fail")).await;
+        // Restore before the fixture is deleted.
+        fs::set_permissions(&changes, fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(
+            result.is_err(),
+            "an attestation write failure must fail the session end, not return success"
+        );
+        let session = orch
+            .session_store
+            .load("sess-attest-fail")
+            .unwrap()
+            .unwrap();
+        let refusal = session
+            .incomplete()
+            .expect("the write failure leaves durable refusal evidence");
+        assert_eq!(
+            refusal.origin,
+            SessionIncompleteOrigin::UnfinalizedAttestation
+        );
+    }
+}
+
+/// CB-13D: a pending bridge-watch notice round-trips, is consumed on
+/// read, and refuses to be delivered to a different session.
+/// CB-13D ::24 R6 exactly-once replay: a notice claimed by a CRASHED
+/// consumer (its claim file remains, the writer pid is gone) is
+/// replayed on the next take. Failing before (the claim file was
+/// ignored; the notice was lost), passing after.
+/// CB-13D ::24 R6: concurrent newer notices — a newer write over the
+/// pending slot wins (the consumer takes the newest truth); the older
+/// notice is never delivered after it.
+#[test]
+fn concurrent_newer_notice_wins_over_a_pending_one() {
+    let dir = TempDir::new().unwrap();
+    let store = SessionStore::for_repo(dir.path()).unwrap();
+    store
+        .write_watch_notice("sess-race", "external-head-change", "older truth", "older")
+        .unwrap();
+    store
+        .write_watch_notice("sess-race", "unsafe-state", "newer truth", "reconcile")
+        .unwrap();
+    let notice = store.take_watch_notice("sess-race").unwrap().unwrap();
+    assert_eq!(notice.detail, "newer truth");
+    assert!(store.take_watch_notice("sess-race").unwrap().is_none());
+}
+
+#[test]
+fn crashed_consumer_claim_is_replayed_exactly_once() {
+    let dir = TempDir::new().unwrap();
+    let store = SessionStore::for_repo(dir.path()).unwrap();
+    store
+        .write_watch_notice("sess-crash", "unsafe-state", "head moved", "reconcile")
+        .unwrap();
+    // Simulate a crashed consumer: the pending notice was claimed
+    // (renamed into a claim file by a pid that no longer exists).
+    let notices = dir.path().join(".atomic/sessions/notices");
+    let pending = notices.join("sess-crash.json");
+    let dead_pid = 4_000_000_000u64; // far above any real pid
+    let claim = notices.join(format!("sess-crash.json.claim.{dead_pid}.0"));
+    std::fs::rename(&pending, &claim).unwrap();
+
+    // The replay delivers the claimed notice exactly once.
+    let notice = store.take_watch_notice("sess-crash").unwrap().unwrap();
+    assert_eq!(notice.kind, "unsafe-state");
+    assert!(store.take_watch_notice("sess-crash").unwrap().is_none());
+    assert!(!claim.exists(), "the replayed claim is consumed");
+}
+
+#[test]
+fn watch_notice_roundtrip_consumes_and_refuses_foreign_identity() {
+    let dir = TempDir::new().unwrap();
+    let store = SessionStore::for_repo(dir.path()).unwrap();
+
+    store
+        .write_watch_notice(
+            "sess-notice",
+            "external-head-change",
+            "Git HEAD moved",
+            "no action required",
+        )
+        .unwrap();
+
+    let notice = store.take_watch_notice("sess-notice").unwrap().unwrap();
+    assert_eq!(notice.kind, "external-head-change");
+    assert_eq!(notice.detail, "Git HEAD moved");
+    assert_eq!(notice.record_type, "bridge-watch-notice");
+
+    // Consumption is one-shot.
+    assert!(store.take_watch_notice("sess-notice").unwrap().is_none());
+
+    // A tampered notice whose payload names a different session is
+    // refused instead of delivered (the session path only ever holds
+    // its own file, so this is the corruption defense).
+    store
+        .write_watch_notice("sess-other", "unsafe-state", "merge in progress", "wait")
+        .unwrap();
+    let tampered =
+        std::path::Path::new(dir.path()).join(".atomic/sessions/notices/sess-notice.json");
+    std::fs::copy(
+        std::path::Path::new(dir.path()).join(".atomic/sessions/notices/sess-other.json"),
+        &tampered,
+    )
+    .unwrap();
+    assert!(
+        store.take_watch_notice("sess-notice").is_err(),
+        "a notice naming another session must not be delivered"
+    );
+    assert!(
+        store.take_watch_notice("sess-other").unwrap().is_some(),
+        "the addressed session still receives its own notice"
+    );
+}
+
+/// CB-13D (RFC §11.2 rule 6): an active managed session receives the
+/// watch daemon's notice at the next tool-call boundary, exactly once.
+#[tokio::test]
+async fn tool_boundary_surfaces_pending_watch_notice() {
+    let dir = TempDir::new().unwrap();
+    let mut orch = make_orchestrator(&dir);
+
+    orch.dispatch(session_start_event("sess-watch"))
+        .await
+        .unwrap();
+    orch.dispatch(turn_start_event("sess-watch", "Working..."))
+        .await
+        .unwrap();
+
+    // The daemon (a separate process) writes a pending notice while
+    // the session is active.
+    orch.session_store
+        .write_watch_notice(
+            "sess-watch",
+            "external-head-change",
+            "Git HEAD moved; workspace reconciling",
+            "no action required",
+        )
+        .unwrap();
+
+    let event = TurnEvent::new("sess-watch", HookType::PreToolUse).with_tool_name("Bash");
+    let result = orch.dispatch(event).await.unwrap();
+    assert!(
+        result.warnings.iter().any(|warning| {
+            warning.contains("bridge watch") && warning.contains("external-head-change")
+        }),
+        "the notice must surface before the next tool call, got {:?}",
+        result.warnings
+    );
+
+    // Consumed: the following boundary is clean.
+    let event = TurnEvent::new("sess-watch", HookType::PreToolUse).with_tool_name("Bash");
+    let result = orch.dispatch(event).await.unwrap();
+    assert!(
+        result.warnings.is_empty(),
+        "the notice is consumed exactly once, got {:?}",
+        result.warnings
+    );
+}
+
+// CB-12A AC3 (::19) — DID-signed attestations + evidence roots + trust.
+//
+// The integration contract, verified without touching the real identity
+// store path: the orchestrator's evidence roots are deterministic and
+// content-bound; an attestation signed with a real atomic-identity keypair
+// through the core DID path verifies under an explicit TrustPolicy; and a
+// session-MAC-signed attestation — what the orchestrator produces when no
+// DID identity is available — is NEVER accepted as trusted evidence.
+
+#[test]
+fn evidence_roots_are_deterministic_and_content_bound() {
+    use crate::turn::orchestrator::attestation::capture_root;
+    use crate::turn::session::TurnOutcomeEntry;
+    use atomic_core::change::session::ManagedTurnOutcome;
+
+    let dir = TempDir::new().unwrap();
+    let sessions_dir = dir.path().to_path_buf();
+
+    // Turn-outcomes root: same ledger, same root; any change, different root.
+    let outcomes = vec![TurnOutcomeEntry {
+        turn: 1,
+        outcome: ManagedTurnOutcome::ObservationOnly,
+        boundary_start: None,
+        boundary_end: None,
+    }];
+    let json = serde_json::to_vec(&outcomes).unwrap();
+    let root_a = atomic_core::types::Hash::of(&json);
+    let root_b = atomic_core::types::Hash::of(&json);
+    assert_eq!(root_a, root_b);
+    let mut outcomes_changed = outcomes.clone();
+    outcomes_changed[0].turn = 2;
+    let json_changed = serde_json::to_vec(&outcomes_changed).unwrap();
+    assert_ne!(root_a, atomic_core::types::Hash::of(&json_changed));
+
+    // Capture root: empty dir → hash of empty input; a capture file's bytes
+    // are bound — same bytes, same root; one byte, different root.
+    let session_id = "sess-roots-1";
+    std::fs::create_dir_all(dir.path().join(session_id).join("captures")).unwrap();
+    let empty = capture_root(&sessions_dir, session_id).unwrap();
+    assert_eq!(empty, atomic_core::types::Hash::initial());
+
+    let capture_path = dir
+        .path()
+        .join(session_id)
+        .join("captures")
+        .join("turn-1.attempt-1.json");
+    std::fs::write(&capture_path, r#"{"boundary":{}}"#).unwrap();
+    let with_capture = capture_root(&sessions_dir, session_id).unwrap();
+    assert_ne!(with_capture, empty);
+
+    std::fs::write(&capture_path, r#"{"boundary":{}} tampered"#).unwrap();
+    let tampered = capture_root(&sessions_dir, session_id).unwrap();
+    assert_ne!(tampered, with_capture);
+
+    // File names are bound too (sorted name pairs).
+    std::fs::write(&capture_path, r#"{"boundary":{}}"#).unwrap();
+    let other_name = dir
+        .path()
+        .join(session_id)
+        .join("captures")
+        .join("turn-1.attempt-2.json");
+    std::fs::write(&other_name, r#"{"boundary":{}}"#).unwrap();
+    let with_second = capture_root(&sessions_dir, session_id).unwrap();
+    assert_ne!(with_second, with_capture);
+}
+
+#[test]
+fn did_signed_attestation_verifies_under_explicit_trust() {
+    use atomic_canonical::did::did_for_public_key;
+    use atomic_core::change::attestation::{AttestAgent, Attestation, TrustPolicy};
+    use atomic_identity::KeyPair;
+
+    // A real keypair from atomic-identity, signed through the core DID path.
+    let keypair = KeyPair::generate();
+    let did = did_for_public_key(&keypair.public);
+
+    let mut attest = Attestation::builder("sess-did-e2e", AttestAgent::new("a", "A", "v"))
+        .changes_covered(vec![atomic_core::types::Hash::of(b"c1")])
+        .turn_outcomes_root(atomic_core::types::Hash::of(b"outcomes"))
+        .capture_root(atomic_core::types::Hash::of(b"captures"))
+        .provenance_root(atomic_core::types::Hash::of(b"provenance"))
+        .build();
+    attest.sign_with_did(&did, keypair.secret.as_bytes());
+    assert_eq!(attest.signer.as_deref(), Some(did.as_str()));
+
+    // Verifies under a policy that explicitly configures this DID.
+    let policy = TrustPolicy::new().trust(&did, *keypair.public.as_bytes());
+    policy
+        .verify(&attest)
+        .expect("DID-signed attestation under its configured trust");
+
+    // Tampering any covered root breaks it.
+    let mut tampered = attest.clone();
+    tampered.capture_root = Some(atomic_core::types::Hash::of(b"forged"));
+    assert!(policy.verify(&tampered).is_err());
+}
+
+#[test]
+fn mac_signed_attestation_is_never_trusted_evidence() {
+    use atomic_core::change::attestation::{AttestAgent, Attestation, TrustPolicy};
+
+    // What the orchestrator produces when no DID identity is available:
+    // a session-MAC-signed attestation (evidence authentication only).
+    let mut attest = Attestation::builder("sess-mac-only", AttestAgent::new("a", "A", "v"))
+        .changes_covered(vec![atomic_core::types::Hash::of(b"c1")])
+        .build();
+    attest.sign_with_mac(&"a".repeat(64));
+
+    // Even if someone misconfigures the MAC signer string as trust, the
+    // policy refuses it: symmetric session keys are never trusted evidence.
+    let signer = attest.signer.clone().unwrap();
+    let policy = TrustPolicy::new().trust(signer, [7u8; 32]);
+    let err = policy.verify(&attest).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            atomic_core::change::attestation::AttestationError::SessionMacSignerNotTrusted { .. }
+        ),
+        "session-MAC signers must be refused as trusted evidence, got {err:?}"
     );
 }

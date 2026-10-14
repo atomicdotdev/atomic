@@ -539,12 +539,17 @@ impl TreeItem {
     /// assert!(item.is_directory);
     /// ```
     pub fn directory(path: impl Into<String>, inode: Inode) -> Self {
+        Self::directory_at(path, inode, Position::ROOT)
+    }
+
+    /// Create a directory item backed by its actual graph inode position.
+    pub fn directory_at(path: impl Into<String>, inode: Inode, position: Position<NodeId>) -> Self {
         let path = path.into();
         let depth = TreeCollectOptions::path_depth(&path);
         Self {
             path,
             inode,
-            position: Position::ROOT,
+            position,
             is_directory: true,
             metadata: FileMetadata::directory(),
             depth,
@@ -838,17 +843,22 @@ pub fn collect_tree<T: TreeTxnT + GraphTxnT>(
             }
         }
 
-        // Collect the file if we're collecting files
-        if options.collect_files {
-            // Get the graph position for this inode
-            let position = match txn.inode_position(inode)? {
-                Some(pos) => pos,
-                None => {
-                    result.record_error(path.clone(), "No graph position for inode".to_string());
-                    continue;
-                }
-            };
+        let position = match txn.inode_position(inode)? {
+            Some(pos) => pos,
+            None => {
+                result.record_error(path.clone(), "No graph position for inode".to_string());
+                continue;
+            }
+        };
 
+        if txn.is_directory(inode)? {
+            if options.collect_directories && seen_directories.insert(path.clone()) {
+                result.add_directory(TreeItem::directory_at(path, inode, position));
+            }
+            continue;
+        }
+
+        if options.collect_files {
             result.add_file(TreeItem::file(path, inode, position));
         }
     }

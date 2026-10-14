@@ -144,8 +144,12 @@ async fn sandbox_uses_canonical_database_and_gate() {
     let canonical = dir.path().join("repo");
     let sandbox = dir.path().join("sandbox");
     let repo = Repository::init(&canonical).unwrap();
-    repo.provision_sandbox(&sandbox, repo.current_view())
-        .unwrap();
+    repo.provision_sandbox(
+        repo.require_working_copy_id().unwrap(),
+        &sandbox,
+        repo.current_view(),
+    )
+    .unwrap();
     drop(repo);
     let state = Arc::new(DaemonState::new());
     let main_handle = state.register(canonical.clone());

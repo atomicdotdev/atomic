@@ -13,8 +13,9 @@ use clap_complete::engine::ArgValueCompleter;
 use crate::commands::complete::complete_view_names;
 
 use atomic_core::pristine::ViewScope;
-use atomic_repository::Repository;
+use atomic_repository::{Repository, WorkspaceTxnMode};
 
+use crate::commands::workspace_txn::enter_workspace;
 use crate::commands::{find_repository_root, Command};
 use crate::error::{CliError, CliResult};
 use crate::output::{print_info, print_success};
@@ -49,14 +50,17 @@ impl Command for Promote {
         }
 
         let root = find_repository_root()?;
-        let repo = Repository::open(&root).map_err(|e| CliError::InvalidRepository {
-            reason: e.to_string(),
+        let mut repo = Repository::open_for_workspace_transaction(&root).map_err(|e| {
+            CliError::InvalidRepository {
+                reason: e.to_string(),
+            }
         })?;
+        let workspace = enter_workspace(&mut repo, WorkspaceTxnMode::Reconcile)?;
 
-        let view_name = match &self.name {
-            Some(name) => name.clone(),
-            None => repo.current_view().to_string(),
-        };
+        let view_name = self
+            .name
+            .clone()
+            .unwrap_or_else(|| workspace.view().name.clone());
 
         let info = repo
             .get_view_info(&view_name)
