@@ -117,6 +117,45 @@ impl Fixture {
         hooks.sort();
         hooks
     }
+
+    /// Run one OpenCode agent hook dispatch the way the atomic-opencode
+    /// plugin does: JSON on stdin, foreground, from the repository root.
+    fn agent_hook(&self, verb: &str, session_id: &str) -> Output {
+        use std::io::Write;
+        let payload = format!(
+            "{{\"session_id\":\"{session_id}\",\"cwd\":\"{}\",\"timestamp\":\"2026-10-14T10:30:00Z\"}}",
+            self.root().display()
+        );
+        let mut child = Command::new(ATOMIC_BIN)
+            .args(["agent", "hooks", "opencode", verb, "--foreground"])
+            .current_dir(self.root())
+            .env("HOME", self.home.path())
+            .env("ATOMIC_HOME", self.home.path().join(".atomic"))
+            .env("ATOMIC_NONINTERACTIVE", "1")
+            .env("NO_COLOR", "1")
+            .env("CLICOLOR", "0")
+            .env("TERM", "dumb")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .stdin(Stdio::piped())
+            .spawn()
+            .expect("spawn atomic agent hooks");
+        child
+            .stdin
+            .as_mut()
+            .expect("hook stdin")
+            .write_all(payload.as_bytes())
+            .expect("write hook stdin");
+        child.wait_with_output().expect("wait for agent hook")
+    }
+
+    /// A retained shadow exclude marker without bridge enrollment: written by
+    /// import/push, kept on disk by `git bridge disable`, and never removed by
+    /// plain `atomic init` inside an existing Git checkout.
+    fn retain_shadow_marker(&self) {
+        fs::create_dir_all(self.root().join(".git/info")).unwrap();
+        fs::write(self.root().join(".git/info/exclude"), b"/.atomic/\n").unwrap();
+    }
 }
 
 fn assert_success(output: &Output, what: &str) {
@@ -251,4 +290,121 @@ fn disabling_an_unanchored_bridge_restores_native_behavior() {
 
     fixture.atomic_ok(&["git", "bridge", "disable"]);
     fixture.atomic_ok(&["status"]);
+}
+
+/// The OpenCode agent bridge dispatches `atomic agent hooks opencode <verb>`
+/// on every tool call. In a colocated-but-unenrolled repository with a
+/// retained shadow exclude marker, dispatch must stay native: it may never
+/// demand a bridge checkpoint (the reported every-tool-call exit 128) and
+/// never bootstrap bridge state.
+#[test]
+fn agent_hooks_stay_native_with_a_retained_shadow_marker() {
+    let fixture = Fixture::existing_git_history();
+    fixture.retain_shadow_marker();
+    let index_before = fixture.git_text(&["ls-files", "--stage"]);
+
+    for verb in ["session-start", "user-prompt", "before-tool", "after-tool"] {
+        let output = fixture.agent_hook(verb, "ses-gate");
+        assert_success(&output, &format!("agent hooks opencode {verb}"));
+    }
+
+    assert!(
+        !fixture
+            .root()
+            .join(".atomic/bridge/workspace.json")
+            .exists(),
+        "agent hooks must not bootstrap the bridge checkpoint"
+    );
+    assert_eq!(
+        fixture.git_text(&["ls-files", "--stage"]),
+        index_before,
+        "agent hooks must not write the Git index without the bridge opt-in"
+    );
+    assert_eq!(
+        fixture.git_text(&["for-each-ref", "--format=%(refname)", "refs/atomic"]),
+        "",
+        "agent hooks must not create Atomic Git refs without the opt-in"
+    );
+}
+
+/// Hook dispatch outside an Atomic repository exits quietly: the plugin's
+/// per-dispatch gating normally prevents the call entirely, and a repository
+/// that disappears between probe and dispatch must not surface as a hook
+/// failure (which the bridge plugins' strict tool propagation would turn
+/// into a blocked tool call).
+#[test]
+fn agent_hooks_exit_quietly_outside_a_repository() {
+    for with_git in [false, true] {
+        let directory = TempDir::new().expect("tempdir");
+        let home = TempDir::new().expect("home tempdir");
+        let root = directory.path();
+        if with_git {
+            let output = Command::new("git")
+                .args(["init", "-q", "-b", "main"])
+                .current_dir(root)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .output()
+                .expect("git init");
+            assert_success(&output, "git init");
+        }
+        let payload = format!(
+            "{{\"session_id\":\"ses-none\",\"cwd\":\"{}\",\"timestamp\":\"2026-10-14T10:30:00Z\"}}",
+            root.display()
+        );
+        use std::io::Write;
+        let mut child = Command::new(ATOMIC_BIN)
+            .args([
+                "agent",
+                "hooks",
+                "opencode",
+                "session-start",
+                "--foreground",
+            ])
+            .current_dir(root)
+            .env("HOME", home.path())
+            .env("ATOMIC_NONINTERACTIVE", "1")
+            .env("NO_COLOR", "1")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .stdin(Stdio::piped())
+            .spawn()
+            .expect("spawn atomic agent hooks");
+        child
+            .stdin
+            .as_mut()
+            .expect("hook stdin")
+            .write_all(payload.as_bytes())
+            .expect("write hook stdin");
+        let output = child.wait_with_output().expect("wait for agent hook");
+        assert_success(&output, "agent hooks opencode session-start");
+        assert!(
+            !root.join(".atomic").exists(),
+            "hook dispatch must never create a repository"
+        );
+    }
+}
+
+/// An enrolled-but-unanchored workspace keeps its fail-closed refusal with
+/// the anchor-or-disable remediation at the agent boundary too.
+#[test]
+fn agent_hooks_refuse_with_remediation_when_enrolled_unanchored() {
+    let fixture = Fixture::existing_git_history();
+    fixture.atomic_ok(&["git", "bridge", "enable"]);
+
+    let refused = fixture.agent_hook("session-start", "ses-enrolled");
+    assert!(
+        !refused.status.success(),
+        "enrolled but unanchored bridge must refuse the agent boundary"
+    );
+    let text = output_text(&refused);
+    assert!(text.contains("MissingCheckpoint"), "{text}");
+    assert!(text.contains("atomic git bridge reconcile"), "{text}");
+    assert!(text.contains("atomic git bridge disable"), "{text}");
+    assert!(
+        !fixture
+            .root()
+            .join(".atomic/bridge/workspace.json")
+            .exists(),
+        "the refusal must not anchor the bridge"
+    );
 }

@@ -110,6 +110,15 @@ fn checkpoint_shadow_switch(
     view: &str,
 ) -> CliResult<()> {
     let shadow_was_synchronized = shadow_sync.is_synchronized();
+    // A native (unenrolled) colocated repository must neither fail its view
+    // switch on Git observation errors nor bootstrap the first bridge
+    // checkpoint: `.git` beside `.atomic` is not bridge consent. Only an
+    // enrolled workspace refreshes; import anchors explicitly.
+    if !shadow_was_synchronized
+        && !crate::commands::git::shadow::bridge_workspace_enrolled(repo_root)?
+    {
+        return Ok(());
+    }
     let checkpoint = match crate::commands::git::bridge::refresh_checkpoint_if_aligned(repo_root) {
         Ok(outcome) => outcome,
         Err(error) => {
@@ -360,6 +369,35 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
         String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    // -------------------------------------------------------------------------
+    // Bridge enrollment gating (RFC §2 / CB-13C)
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn checkpoint_refresh_skips_native_unenrolled_repositories() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        atomic_repository::Repository::init(root).unwrap();
+        let git = git2::Repository::init(root).unwrap();
+        // A retained exclude marker without bridge enrollment must neither
+        // fail the view switch on Git observation errors nor bootstrap the
+        // first bridge checkpoint.
+        std::fs::create_dir_all(root.join(".git").join("info")).unwrap();
+        std::fs::write(
+            root.join(".git").join("info").join("exclude"),
+            "/.atomic/\n",
+        )
+        .unwrap();
+        drop(git);
+        checkpoint_shadow_switch(
+            crate::commands::git::shadow::ShadowSwitchSync::SkippedInactive,
+            root,
+            "main",
+        )
+        .unwrap();
+        assert!(!root.join(".atomic/bridge/workspace.json").exists());
     }
 
     // -------------------------------------------------------------------------
