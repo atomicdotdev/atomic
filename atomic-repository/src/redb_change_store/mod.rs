@@ -185,8 +185,9 @@ impl From<redb::CommitError> for RedbStoreError {
 
 /// Metadata stored in the CHANGE_META table for a single change.
 ///
-/// This is the decoded form of the compressed blob. It contains everything
-/// from the V3 metadata sections: header, deps, provenance, hash table.
+/// This is the legacy prefix of the compressed blob. New V2 imports append a
+/// versioned extension containing the complete hashed HEADER payload; the prefix
+/// remains readable by existing metadata-only readers.
 ///
 /// Serialized with postcard, compressed with zstd for storage.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -218,6 +219,13 @@ pub struct StoredChangeMeta {
 
     /// Whether a signature is stored.
     pub has_signature: bool,
+}
+
+/// Optional suffix after the frozen `StoredChangeMeta` postcard prefix.
+/// Rows written before this extension remain valid without being rewritten.
+#[derive(serde::Serialize, serde::Deserialize)]
+enum StoredChangeMetaExtension {
+    V1 { header_v2: Vec<u8> },
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -367,11 +375,12 @@ impl RedbChangeStore {
         let mut cursor = Cursor::new(data);
         let mut reader = ChangeReader::open(&mut cursor)?;
 
-        let _file_header = *reader.file_header();
+        let file_header = *reader.file_header();
         let hash_table = reader.hash_table().clone();
 
         // Read all sections
         let mut meta_header: Option<ChangeHeader> = None;
+        let mut header_v2: Option<Vec<u8>> = None;
         let mut meta_deps: Vec<u16> = Vec::new();
         let mut provenance_payload: Option<Vec<u8>> = None;
         let mut graph_sections: Vec<(u32, Vec<u8>)> = Vec::new();
@@ -390,6 +399,9 @@ impl RedbChangeStore {
                         postcard::from_bytes(&section.payload)
                             .map_err(|e| RedbStoreError::Serialization(e.to_string()))?,
                     );
+                    if file_header.version == format_v3::FORMAT_VERSION {
+                        header_v2 = Some(section.payload.clone());
+                    }
                 }
                 SectionType::Dependencies => {
                     meta_deps = postcard::from_bytes(&section.payload)
@@ -444,8 +456,15 @@ impl RedbChangeStore {
         };
 
         // Serialize and compress metadata
-        let meta_bytes = postcard::to_allocvec(&meta)
+        let mut meta_bytes = postcard::to_allocvec(&meta)
             .map_err(|e| RedbStoreError::Serialization(e.to_string()))?;
+        if let Some(header_v2) = header_v2 {
+            let extension = StoredChangeMetaExtension::V1 { header_v2 };
+            meta_bytes.extend(
+                postcard::to_allocvec(&extension)
+                    .map_err(|e| RedbStoreError::Serialization(e.to_string()))?,
+            );
+        }
         let meta_compressed = zstd::encode_all(&meta_bytes[..], 3)
             .map_err(|e| RedbStoreError::Serialization(e.to_string()))?;
 
@@ -542,6 +561,13 @@ impl RedbChangeStore {
     /// This reads only from CHANGE_META — the cheapest possible read.
     /// Useful for `atomic log`, header inspection, dependency resolution.
     pub fn load_meta(&self, hash: &[u8; 32]) -> RedbStoreResult<StoredChangeMeta> {
+        self.load_meta_with_header(hash).map(|(meta, _)| meta)
+    }
+
+    fn load_meta_with_header(
+        &self,
+        hash: &[u8; 32],
+    ) -> RedbStoreResult<(StoredChangeMeta, Option<Vec<u8>>)> {
         let txn = self.db.begin_read()?;
         let table = txn.open_table(tables::CHANGE_META)?;
 
@@ -555,10 +581,24 @@ impl RedbChangeStore {
         let compressed = value.value();
         let decompressed = zstd::decode_all(compressed)
             .map_err(|e| RedbStoreError::Corrupt(format!("meta decompression failed: {}", e)))?;
-        let meta: StoredChangeMeta = postcard::from_bytes(&decompressed)
+        let (meta, suffix) = postcard::take_from_bytes::<StoredChangeMeta>(&decompressed)
             .map_err(|e| RedbStoreError::Corrupt(format!("meta deserialization failed: {}", e)))?;
-
-        Ok(meta)
+        let header_v2 = if suffix.is_empty() {
+            None
+        } else {
+            let (extension, remainder) =
+                postcard::take_from_bytes::<StoredChangeMetaExtension>(suffix).map_err(|e| {
+                    RedbStoreError::Corrupt(format!("meta extension deserialization failed: {e}"))
+                })?;
+            if !remainder.is_empty() {
+                return Err(RedbStoreError::Corrupt(
+                    "unexpected bytes after meta extension".to_string(),
+                ));
+            }
+            let StoredChangeMetaExtension::V1 { header_v2 } = extension;
+            Some(header_v2)
+        };
+        Ok((meta, header_v2))
     }
 
     // NOTE: load_change(), export_v3_file(), export_v3_bytes(), and
