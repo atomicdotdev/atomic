@@ -142,6 +142,7 @@ pub(crate) fn visit_tables(visitor: &mut impl TableVisitor) -> PristineResult<()
 
     // Vault and knowledge graph
     visitor.table(VAULT_ENTRIES)?;
+    visitor.table(VAULT_ENTRY_REVISIONS)?;
     visitor.table(VAULT_MANIFEST)?;
     visitor.table(KG_NODES)?;
     visitor.table(KG_EDGES)?;

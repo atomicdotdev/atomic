@@ -250,6 +250,7 @@ mod triage;
 mod vault;
 mod vault_defaults;
 mod vault_embeddings;
+mod vault_entry_file;
 mod vault_goal;
 mod vault_identity;
 mod vault_intent;
@@ -289,6 +290,7 @@ pub use synthesis::{
 pub use tags::{deserialize_tag, serialize_tag};
 pub use triage::{BaggageEntry, CandidateSet, Coverage};
 pub use vault_embeddings::{hash_embed, EmbedConfig, TextChunk};
+pub use vault_entry_file::VaultEntryFile;
 pub use vault_goal::{
     GoalInfo, GoalStartOptions, GoalStartResult, GoalStopOptions, GoalStopResult,
 };

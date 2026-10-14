@@ -298,7 +298,7 @@ impl Repository {
     ///
     /// Called as a side effect of `vault_store` and `vault_store_entry`.
     /// Best-effort — logs on failure but never fails the parent operation.
-    fn vault_auto_index(&self, path: &str) {
+    pub(super) fn vault_auto_index(&self, path: &str) {
         // Signed attestation blobs must not pollute semantic search, and they
         // contribute no KG triples (vault_extract_kg early-returns empty for
         // Attestation). Skip embedding entirely for them.
@@ -1097,7 +1097,7 @@ fn vault_frontmatter_string(entry: &VaultEntry, key: &str) -> Option<String> {
 }
 
 /// Update the manifest when a vault entry is stored.
-fn update_manifest_for_store(
+pub(super) fn update_manifest_for_store(
     manifest: &mut VaultManifest,
     path: &str,
     entry: &VaultEntry,

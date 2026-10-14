@@ -1254,6 +1254,20 @@ impl ReadTxn {
 
 // VaultTxnT Implementation
 
+impl ReadTxn {
+    /// Read a retained complete Vault entry file. Old databases may have none.
+    pub fn get_vault_entry_revision(&self, revision: &Hash) -> PristineResult<Option<Vec<u8>>> {
+        let table = match self.txn.open_table(VAULT_ENTRY_REVISIONS) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        Ok(table
+            .get(revision.as_bytes())?
+            .map(|value| value.value().to_vec()))
+    }
+}
+
 impl VaultTxnT for ReadTxn {
     fn get_vault_entry(&self, path: &str) -> PristineResult<Option<VaultEntry>> {
         let table = match self.txn.open_table(VAULT_ENTRIES) {

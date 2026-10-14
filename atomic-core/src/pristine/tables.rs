@@ -775,6 +775,12 @@ pub const SESSION_HEADS: TableDefinition<&str, &[u8; 32]> = TableDefinition::new
 /// on disk are generated from these entries.
 pub const VAULT_ENTRIES: TableDefinition<&str, &[u8]> = TableDefinition::new("vault_entries");
 
+/// Imported complete Vault entry files, keyed by their full revision hash.
+/// Retains source-local IDs and their origin alongside portable references.
+/// Current entries remain in VAULT_ENTRIES; deleting one does not erase files.
+pub const VAULT_ENTRY_REVISIONS: TableDefinition<&[u8; 32], &[u8]> =
+    TableDefinition::new("vault_entry_revisions");
+
 /// Vault manifest: singleton key → JSON blob
 ///
 /// Key: always "manifest"

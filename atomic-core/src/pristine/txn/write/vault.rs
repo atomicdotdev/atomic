@@ -3,13 +3,35 @@
 //! Implements both `VaultTxnT` (read) and `VaultMutTxnT` (write) for `WriteTxn`.
 
 use crate::pristine::error::{PristineError, PristineResult};
-use crate::pristine::tables::{VAULT_ENTRIES, VAULT_MANIFEST};
+use crate::pristine::tables::{VAULT_ENTRIES, VAULT_ENTRY_REVISIONS, VAULT_MANIFEST};
 use crate::pristine::traits::{VaultEntryMeta, VaultMutTxnT, VaultTxnT};
 use crate::pristine::{VaultEntry, VaultEntryType, VaultManifest};
 
 use redb::ReadableTable;
 
 use super::WriteTxn;
+
+impl WriteTxn<'_> {
+    /// Retain a validated complete entry file in the same transaction as its
+    /// restored entry. The repository layer validates the format and revision.
+    pub fn put_vault_entry_revision(
+        &mut self,
+        revision: &crate::types::Hash,
+        bytes: &[u8],
+    ) -> PristineResult<()> {
+        let mut table = self.txn.open_table(VAULT_ENTRY_REVISIONS)?;
+        if let Some(existing) = table.get(revision.as_bytes())? {
+            if existing.value() != bytes {
+                return Err(PristineError::Serialization {
+                    message: "different Vault entry files have the same revision key".into(),
+                });
+            }
+            return Ok(());
+        }
+        table.insert(revision.as_bytes(), bytes)?;
+        Ok(())
+    }
+}
 
 impl<'a> VaultTxnT for WriteTxn<'a> {
     fn get_vault_entry(&self, path: &str) -> PristineResult<Option<VaultEntry>> {
