@@ -3410,7 +3410,8 @@ impl Repository {
                     eprintln!(
                         "[debug-deletion] expected[..first_diff+72]={:?}",
                         String::from_utf8_lossy(
-                            &expected.bytes[first_diff..(first_diff + 72).min(expected.bytes.len())]
+                            &expected.bytes
+                                [first_diff..(first_diff + 72).min(expected.bytes.len())]
                         )
                     );
                     eprintln!(

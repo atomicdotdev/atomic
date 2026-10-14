@@ -11,8 +11,8 @@ fn dump_vertex_count() {
     let root = std::path::Path::new(
         "/private/var/folders/1s/0dxgtx3x7g918slqc05x8c5r0000gn/T/opencode/atomic-victory",
     );
-    let path = std::env::var("ATOMIC_DUMP_PATH")
-        .unwrap_or_else(|_| "atomic-cli/Cargo.toml".to_string());
+    let path =
+        std::env::var("ATOMIC_DUMP_PATH").unwrap_or_else(|_| "atomic-cli/Cargo.toml".to_string());
     let repo = atomic_repository::Repository::open(root).unwrap();
     let rendered = repo.get_file_content(&path).unwrap();
     println!("render len: {:?}", rendered.as_ref().map(|b| b.len()));
