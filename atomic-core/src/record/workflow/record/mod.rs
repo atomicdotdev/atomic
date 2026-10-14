@@ -590,10 +590,21 @@ where
     let old_line_count = Line::from_bytes(old_content).len();
     recorded.set_old_line_count(old_line_count);
 
+    // ::26 R1 sixth follow-up (2026-10-14): an edit at the EOF boundary of a
+    // file without a trailing newline — replacing or extending the final
+    // no-newline line, or adding one — loses or shifts the final byte in the
+    // per-line hunk slicing (observed: a +1-byte trailing-newline commit
+    // rendered 1,934 of 1,935 bytes). Either side lacking the final newline
+    // puts the edit boundary at EOF, where partial-hunk slicing is
+    // fragile; route through the sentinel whole-file replace, which
+    // rewrites the file byte-exactly.
+    let eof_boundary_edit = old_content.last().is_some_and(|&b| b != b'\n')
+        || new_content.last().is_some_and(|&b| b != b'\n');
     let force_whole_file = options.get_force_whole_file_replace()
         || (super::globalize::should_use_opaque_generated_vertices(&detected.path)
             && existing_branches.is_some_and(|branches| !branches.is_empty()))
-        || has_multi_line_deletion;
+        || has_multi_line_deletion
+        || eof_boundary_edit;
 
     // Whole-file-replace safety fallback: if the caller's `old_content` came
     // from resolving a fork or cyclic conflict (see
