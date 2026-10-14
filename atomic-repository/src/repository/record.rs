@@ -178,7 +178,17 @@ impl Repository {
         let mut detected = DetectedFile::modified(path);
         detected.inode = Some(inode);
         detected.position = Some(position);
-        let options = if force_whole_file_replace {
+        // ::26 R1 fifth follow-up (2026-10-14): the alive semantic branch
+        // count must equal the old content's line count — the positional
+        // hunks below index branches by diff line number. Histories with
+        // many accumulated in-place edits leave extra alive vertices and
+        // branches (diamond remnants), so the counts drift and positional
+        // anchoring corrupts the region. Force the sentinel whole-file
+        // replace: tombstone every prior branch and rebuild fresh, so the
+        // graph and semantic layers agree with the commit tree byte-exactly.
+        let branch_line_divergence =
+            existing_branches.len() != atomic_core::diff::Line::from_bytes(old_content).len();
+        let options = if force_whole_file_replace || branch_line_divergence {
             atomic_core::record::workflow::RecordingOptions::new().force_whole_file_replace(true)
         } else {
             atomic_core::record::workflow::RecordingOptions::new()
