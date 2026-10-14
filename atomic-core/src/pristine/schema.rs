@@ -111,6 +111,7 @@ pub(crate) fn visit_tables(visitor: &mut impl TableVisitor) -> PristineResult<()
 
     // Redb-native change store
     visitor.table(CHANGE_META)?;
+    visitor.table(CHANGE_PROVENANCE)?;
     visitor.table(CHANGE_GRAPH)?;
     visitor.table(CHANGE_SEMANTIC)?;
     visitor.table(CONTENT_CHUNKS)?;

@@ -402,6 +402,16 @@ impl<'w, W: Write> ChangeWriter<'w, W> {
     /// - Zstd compression errors.
     /// - I/O errors.
     pub fn write_provenance(&mut self, provenance: &[Provenance]) -> FormatResult<()> {
+        let payload = postcard::to_allocvec(provenance)?;
+        self.write_provenance_payload(&payload)
+    }
+
+    /// Write a pre-encoded, uncompressed PROVENANCE section payload.
+    ///
+    /// Section stores use this to export the exact payload received at import,
+    /// preserving its hashed fields. The payload must encode the provenance
+    /// sequence for this file's format version. DEPS must precede this section.
+    pub fn write_provenance_payload(&mut self, payload: &[u8]) -> FormatResult<()> {
         if self.state != WriterState::WritingMetadata {
             return Err(FormatError::UnexpectedSection {
                 got: "PROVENANCE".to_string(),
@@ -415,9 +425,7 @@ impl<'w, W: Write> ChangeWriter<'w, W> {
             });
         }
 
-        // Wrap in a Vec for serialization (slices are unsized)
-        let provenance_vec: Vec<&Provenance> = provenance.iter().collect();
-        self.write_postcard_section(SectionType::Provenance, &provenance_vec)?;
+        self.write_raw_section(SectionType::Provenance, payload)?;
         Ok(())
     }
 
