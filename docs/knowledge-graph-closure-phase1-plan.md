@@ -516,8 +516,10 @@ there is no hand-rolled fallback.
   - no managed turn is governed by more than one intent;
   - every turn has exactly one provenance graph;
   - every generated change is covered by the session attestation;
-  - every attestation has the required signer identity and an explicit successful
-    verification result supplied by a separate cryptographic verifier.
+  - every attestation is signed by an atomic identity DID (`did:atomic:…`) and has an
+    explicit successful verification result supplied by a separate cryptographic
+    verifier. MAC-signed attestations (`session-mac:{sid}`) never satisfy the publication
+    profile; agents publish with their atomic identity DID (decided by Lee, 2026-10-14).
 
 SHACL cannot establish signature validity by itself. These shapes define the
 intended profiles; fixture tests in Phase 1 prove their behavior, while complete
@@ -649,7 +651,7 @@ new generation, not an in-place data migration.
 | Vault projection | `vault_triples.rs` | intents (subclass from canonical `kind`), memories, goals, skills, tool results, decomposition children, `:::ref` edges split by edge name (`dependsOnIntent`, `blockedBy`, `remediates`, `reviews`). Signed canonical documents keep their old `atom:` terms; the projector translates them through `LEGACY_TERMS` at projection time and never rewrites signed bytes |
 | VCS projection | `vault_kg_enrich.rs` (VCS part) | views and `childViewOf`, changes (full hash), `directlyDependsOnChange`, `modifiesFile`, `authoredBy`, and `directlyOnView` recomputed from `VIEW_CHANGES` (today `ON_VIEW` records the working copy's desired view, not membership) |
 | Session ledger | `session_kg.rs` | sessions, turns (`ManagedTurn` when `plan_id` is present), todos, provenance graphs; `hasTurn`, `hasPlan`, `generatedChange`, `turnExplainedBy`, `hasTodo`, `sessionViewContext` |
-| Attestations (**new**) | not projected | `Attestation` nodes, `coversChange`, `attests`, `signedBy`, `previousAttestation`, and the verifier's recorded result (never inferred). **Turn mapping:** an attestation records `session_id` and `changes_covered` but no turn number, so emit `attests` only when exactly one turn of that session has `change_hashes` ⊆ `changes_covered`; otherwise emit an `AmbiguousAttestationTurn` finding and no `attests` edge. MAC-signed attestations (`session-mac:{sid}`) can't be verified without the key and record `Unverifiable`, never `Verified` |
+| Attestations (**new**) | not projected | `Attestation` nodes, `coversChange`, `attests`, `signedBy`, `previousAttestation`, and the verifier's recorded result (never inferred). **Turn mapping:** an attestation records `session_id` and `changes_covered` but no turn number, so emit `attests` only when exactly one turn of that session has `change_hashes` ⊆ `changes_covered`; otherwise emit an `AmbiguousAttestationTurn` finding and no `attests` edge. MAC-signed attestations (`session-mac:{sid}`) can't be verified without the key and record `Unverifiable`, never `Verified`; they never satisfy the publication profile, which requires an atomic identity DID signer |
 | Findings (**new**) | none | `MissingHistoricalPlanId`, `MissingAttestation`, `AmbiguousAttestationTurn`, `UnverifiableAttestation`; never guessed links |
 | AST enrichment | `vault_kg_enrich.rs` (AST part) | **removed** from the KG: no entity nodes, `CALLS`, `DEFINES`, `EXPORTS`, `INCLUDES`, `PART_OF` |
 
