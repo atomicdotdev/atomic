@@ -205,13 +205,35 @@ costs nothing:
 
 ## D. Open questions (need a decision; neither blocks M1–M3)
 
-1. **PurRDF needs Rust 1.98; Atomic declares 1.90** (`Cargo.toml:27`). Raise Atomic's
-   minimum Rust version, or run validation as a separately built binary? This affects
-   CI, packaging, and every contributor. Blocks M4 only.
-2. **MAC-signed attestations vs. the publication profile.** The publication shape
-   requires a signer identity and a successful verification result. MAC-signed
-   attestations (`session-mac:{sid}`) can't be verified without the key, so MAC-signed
-   work would fail it. Require DID signers for publication, or allow MAC signers that
-   `[git.trust]` explicitly trusts? Phase 1 only records MAC attestations as
-   `Unverifiable`; the decision is needed before publication gates are enforced in
-   Phase 2.
+1. **PurRDF needs Rust 1.98; Atomic declares 1.90** (`Cargo.toml:27`). Lee is happy to
+   upgrade to 1.98 as long as nothing else breaks. Findings (2026-10-14):
+
+   - **This repo is clean at 1.98.** With `rust-version = "1.98"`, CI's
+     `cargo clippy --workspace -- -D warnings` passes with no warnings on Rust 1.98.1,
+     including the clippy lints that only switch on above a given MSRV.
+   - **Where 1.90 is pinned:** `Cargo.toml:27` (`rust-version`), the CI MSRV job
+     (`.github/workflows/ci.yml:136`), and the **release build**
+     (`.github/workflows/release.yml:129`, so shipped binaries are compiled with 1.90).
+     The other CI jobs use `stable`.
+   - **What a workspace-wide bump would break.** Every crate inherits the workspace
+     `rust-version`, and Cargo refuses to build a dependency whose `rust-version` is newer
+     than the compiler. Sibling repos that build this repo's crates by path:
+
+     | Repo | Uses | Pinned Rust | Effect of a workspace-wide 1.98 bump |
+     |---|---|---|---|
+     | `atomic-storage` (owned by another effort) | `atomic-core`, `atomic-canonical`, `atomic-identity`, `atomic-objects`, `atomic-repository` | `rust-version = "1.94"`, Docker `rust:1.94-slim-bookworm` (`Dockerfile:14`, `Dockerfile.stress:11`) | **Docker builds fail** until both images and its `rust-version` move to 1.98 |
+     | `basecamp/sherpa-server` | `atomic-identity` | `rust-version = "1.94"` | No longer meets its declared minimum |
+     | `atomic-enterprise` | `atomic-agent`, `atomic-core`, `atomic-config`, `atomic-identity`, `atomic-repository`, `atomic-remote` | none | Needs a ≥ 1.98 compiler |
+
+   **Options:**
+
+   | Option | What changes | Breaks others? |
+   |---|---|---|
+   | **(a) Scoped bump** (recommended) | PurRDF lives in its own crate (working name `atomic-shacl`) with `rust-version = "1.98"`, depended on only by `atomic-cli` (and libatomic, if the daemon validates). Shared library crates stay at 1.90, and **the SHACL crate must not become a dependency of any of them** (`atomic-core`, `atomic-repository`, `atomic-remote`, `atomic-agent`, …); `atomic query validate` wires it in at the CLI layer. The release workflow moves to 1.98; the CI MSRV job checks the library crates on 1.90 and the CLI on 1.98. This is also the "dedicated package" shape already anticipated for the validator. | **No.** None of the three depends on `atomic-cli` or `libatomic`, directly or through `atomic-repository`/`atomic-remote`/`atomic-agent` (checked) |
+   | (b) Workspace-wide bump | `Cargo.toml:27`, `ci.yml:136`, `release.yml:129` → 1.98 | **Yes**, until `atomic-storage` updates its Docker images and `rust-version`, and `sherpa-server` its `rust-version` (one-line changes each, owned by others) |
+
+   Blocks M4 only.
+2. ~~**MAC-signed attestations vs. the publication profile.**~~ **Decided (Lee,
+   2026-10-14):** this is Atomic, so publication requires signing with the atomic
+   identity DID (`did:atomic:…`). MAC-signed attestations record `Unverifiable` and never
+   satisfy the publication profile. Applied to plan §1.4 and §1.6.
