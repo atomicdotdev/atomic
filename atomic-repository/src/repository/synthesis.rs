@@ -4697,9 +4697,15 @@ impl Repository {
         let mut replay_alive_bytes: Vec<u8> = Vec::new();
         let mut visited: std::collections::HashSet<atomic_core::crdt::BranchId> =
             std::collections::HashSet::new();
+        let debug_semantic = std::env::var_os("ATOMIC_DEBUG_DELETION").is_some();
         for branch_id in &actual_chain {
             visited.insert(*branch_id);
             let Some(expected) = branches.get(branch_id) else {
+                if debug_semantic {
+                    eprintln!(
+                        "[debug-deletion] chain branch {branch_id:?} UNEXPECTED (no closure entry)"
+                    );
+                }
                 // Review D2: a staged after-chain branch the closure never
                 // wrote is NOT silently skipped. The historical skip let an
                 // unexpected live branch with no vertex into the chain (the
@@ -4726,10 +4732,47 @@ impl Repository {
                 continue;
             };
             if expected.state.is_alive() {
+                if debug_semantic
+                    && replay_alive_bytes.len() <= 1254
+                    && replay_alive_bytes.len() + expected.bytes.len() > 1200
+                {
+                    eprintln!(
+                        "[debug-deletion] chain branch {branch_id:?} alive bytes={} crossing offset {} preview={:?}",
+                        expected.bytes.len(),
+                        replay_alive_bytes.len(),
+                        String::from_utf8_lossy(&expected.bytes[..expected.bytes.len().min(60)])
+                    );
+                }
                 replay_alive_bytes.extend_from_slice(&expected.bytes);
             }
         }
         if replay_alive_bytes.as_slice() != expected_bytes {
+            if std::env::var_os("ATOMIC_DEBUG_DELETION").is_some() {
+                let first_diff = replay_alive_bytes
+                    .iter()
+                    .zip(expected_bytes.iter())
+                    .position(|(a, b)| a != b)
+                    .unwrap_or_else(|| replay_alive_bytes.len().min(expected_bytes.len()));
+                eprintln!(
+                    "[debug-deletion] semantic MISMATCH path={path} replay={} expected={} first_diff_at={first_diff} chain_len={}",
+                    replay_alive_bytes.len(),
+                    expected_bytes.len(),
+                    actual_chain.len()
+                );
+                eprintln!(
+                    "[debug-deletion] replay[..first_diff+64]={:?}",
+                    String::from_utf8_lossy(
+                        &replay_alive_bytes
+                            [first_diff..(first_diff + 64).min(replay_alive_bytes.len())]
+                    )
+                );
+                eprintln!(
+                    "[debug-deletion] expected[..first_diff+64]={:?}",
+                    String::from_utf8_lossy(
+                        &expected_bytes[first_diff..(first_diff + 64).min(expected_bytes.len())]
+                    )
+                );
+            }
             return Err(format!(
                 "the closure's semantic operations render {} byte(s) for the alive lines but \
                      the commit tree expects {} byte(s); the semantic closure must regenerate \

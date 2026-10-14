@@ -4647,36 +4647,48 @@ impl ParallelImporter {
         git_repo: &GitRepository,
         target_oid: Oid,
     ) -> CliResult<Vec<Oid>> {
-        // Incremental single-branch import is the latency-sensitive path. Walk
-        // the first-parent chain from the tip and stop at the imported frontier
-        // instead of rev-walking and filtering the repository's entire history.
-        // CB-9B: every multi-parent merge on the chain also imports the
-        // complete closure of its other parents — the union state must contain
-        // every parent's knowledge before the resolution is assembled.
-        if self.options.incremental && self.options.mainline_only {
+        // Linearized import — the documented plain-import behavior. Walk the
+        // first-parent chain from the tip, stopping at the imported frontier
+        // for incremental runs. Merge commits arrive as ordinary
+        // first-parent diffs, so each file's graph stays a linear per-line
+        // chain: no concurrent lineages, no merge diamonds, and every
+        // staged verification runs against a provable structure.
+        //
+        // CB-9B's complete-closure walk (below) remains for `--all` and the
+        // bridge flows, where the union state must contain every parent's
+        // knowledge before a resolution is assembled (RFC §5.3).
+        if self.options.mainline_only {
             let mut newest_first = Vec::new();
             let mut visited: HashSet<String> = HashSet::new();
-            let mut queue = std::collections::VecDeque::new();
-            queue.push_back(target_oid);
-            while let Some(oid) = queue.pop_front() {
+            let mut current = Some(target_oid);
+            while let Some(oid) = current {
                 if self.options.imported_shas.contains(&oid.to_string()) {
-                    continue;
+                    break;
                 }
                 if !visited.insert(oid.to_string()) {
-                    continue;
+                    break;
                 }
                 newest_first.push(oid);
                 let commit = git_repo.find_commit(oid).map_err(|e| CliError::GitError {
                     message: format!("Failed to load commit {oid}: {e}"),
                 })?;
-                for parent in commit.parent_ids() {
-                    queue.push_back(parent);
-                }
+                current = if commit.parent_count() > 0 {
+                    Some(commit.parent_id(0).map_err(|e| CliError::GitError {
+                        message: format!("Failed to load parent of {oid}: {e}"),
+                    })?)
+                } else {
+                    None
+                };
             }
             newest_first.reverse();
             return Ok(newest_first);
         }
 
+        // `--all` (mainline_only=false) imports the complete reachable
+        // closure per branch: deterministically sequenced, with the
+        // missing-object boundary check and the deepening guard run against
+        // the full closure before already-indexed commits are dropped in
+        // validate_branch_prospectively.
         let mut revwalk = git_repo.revwalk().map_err(|e| CliError::GitError {
             message: format!("Failed to create revwalk: {}", e),
         })?;
@@ -5160,8 +5172,10 @@ impl ParallelImporter {
         // assembly with a hashed Git origin. CB-9B: multi-parent merges
         // assemble a journaled `GitResolution` from the union state, and
         // empty commits stay distinct through the synthesized empty-commit
-        // writer.
-        let info = if parsed.is_merge {
+        // writer. In linearized import (`mainline_only`) merges arrive as
+        // ordinary first-parent diffs and take the normal recorded-file
+        // path — no union state, no leg closures.
+        let info = if parsed.is_merge && !self.options.mainline_only {
             self.write_merge_resolution(
                 repo,
                 git,
@@ -5171,8 +5185,8 @@ impl ParallelImporter {
                 prospective,
                 boundaries,
             )?
-        } else if !parsed.is_empty {
-            self.write_commit_synthesized(
+        } else if parsed.is_empty {
+            self.write_empty_commit_synthesized(
                 repo,
                 git,
                 ledger,
@@ -5183,7 +5197,7 @@ impl ParallelImporter {
                 touched_only,
             )?
         } else {
-            self.write_empty_commit_synthesized(
+            self.write_commit_synthesized(
                 repo,
                 git,
                 ledger,
@@ -5402,7 +5416,7 @@ impl ParallelImporter {
                 },
             )
         } else {
-            if parsed.parent_oids.len() > 1 {
+            if parsed.parent_oids.len() > 1 && !self.options.mainline_only {
                 return Err(git_error(format!(
                     "commit {} has {} parents; multi-parent commits take the GitResolution \
                      path, not single-commit synthesis",

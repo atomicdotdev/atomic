@@ -699,9 +699,18 @@ pub(crate) fn build_crdt_ops_for_whole_file_replace(
         }
     }
 
-    // 2. Insert every new line fresh, chained from the start of the file,
-    //    with token-level LeafOps.
-    let mut prev_branch: Option<BranchId> = None;
+    // 2. Insert every new line fresh, chained after the LAST tombstoned
+    //    branch (not after the trunk head). The old branches remain in the
+    //    trunk's file-order chain as tombstones, so the fresh lines must
+    //    continue the chain after them — the real apply and the closure
+    //    replay then derive the same file order. Wiring the first fresh
+    //    line with `after: None` starts a second chain, and the two
+    //    interpreters walk a two-chain trunk in different orders: the graph
+    //    render stays byte-exact while the semantic closure replay rotates
+    //    the file order and refuses the commit (equal byte totals, rotated
+    //    content — observed on atomicdotdev/atomic README.md).
+    let mut prev_branch: Option<BranchId> =
+        existing_branches.and_then(|branches| branches.last().copied());
     for (new_line_idx, line) in new_lines.iter().enumerate() {
         let branch_id = alloc_branch();
         let mut prev_leaf: Option<LeafId> = None;

@@ -595,30 +595,39 @@ impl Repository {
             .read_txn()
             .map_err(|e| format!("cannot open pristine: {e}"))?;
         let inode_u64 = inode.get();
-        let existing_trunk_id = match txn.get_trunk_by_path(path) {
-            Ok(Some(trunk_key)) => Some(trunk_key),
-            _ => match txn.get_crdt_inode_trunk(inode_u64) {
-                Ok(Some(trunk_key)) => Some(decode_trunk_id(&trunk_key)),
-                _ => None,
-            },
-        };
-        let existing_branches: Vec<atomic_core::crdt::BranchId> = match existing_trunk_id.as_ref() {
-            Some(trunk_id) => match iter_trunk_branches_in_file_order(&txn, *trunk_id) {
-                Ok(all) => {
-                    let mut alive = Vec::with_capacity(all.len());
+        // A merge-era path can hold TWO trunk incarnations: the path-indexed
+        // row (possibly a stale pre-merge incarnation) and the inode-indexed
+        // trunk of the graph's current incarnation. Enumerate the alive
+        // branches of BOTH — tombstoning only one trunk's branches leaves the
+        // other trunk's stale lines alive in the semantic chain, and the
+        // staged semantic closure then refuses the change (equal byte totals,
+        // interleaved stale content).
+        let mut trunk_ids: Vec<atomic_core::crdt::TrunkId> = Vec::new();
+        if let Ok(Some(trunk_key)) = txn.get_trunk_by_path(path) {
+            trunk_ids.push(trunk_key);
+        }
+        if let Ok(Some(trunk_key)) = txn.get_crdt_inode_trunk(inode_u64) {
+            let decoded = decode_trunk_id(&trunk_key);
+            if !trunk_ids.contains(&decoded) {
+                trunk_ids.push(decoded);
+            }
+        }
+        let existing_trunk_id = trunk_ids.first().copied();
+        let existing_branches: Vec<atomic_core::crdt::BranchId> = {
+            let mut alive: Vec<atomic_core::crdt::BranchId> = Vec::new();
+            for trunk_id in &trunk_ids {
+                if let Ok(all) = iter_trunk_branches_in_file_order(&txn, *trunk_id) {
                     for b in all {
                         let bk = encode_branch_id(&b);
                         if let Ok(Some(bd)) = txn.get_crdt_branch(&bk) {
-                            if bd.state.is_alive() {
+                            if bd.state.is_alive() && !alive.contains(&b) {
                                 alive.push(b);
                             }
                         }
                     }
-                    alive
                 }
-                Err(_) => Vec::new(),
-            },
-            None => Vec::new(),
+            }
+            alive
         };
         Ok((existing_trunk_id, existing_branches))
     }
