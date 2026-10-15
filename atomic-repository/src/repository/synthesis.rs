@@ -961,116 +961,99 @@ fn global_alive_set(
     Ok(set)
 }
 
+/// FileOps paths describe the name at recording time. Stable trunk identity
+/// determines ownership after rename or path reuse; branch/vertex/token IDs
+/// are checked separately by each attribution predicate below.
+fn file_ops_target_trunk(
+    ops: &atomic_core::change::FileOps,
+    owner: atomic_core::types::NodeId,
+    trunk: atomic_core::crdt::TrunkId,
+) -> bool {
+    let raw = ops.trunk_id();
+    let resolved = if raw.change_id().is_root() {
+        atomic_core::crdt::TrunkId::new(owner, raw.file_idx())
+    } else {
+        raw
+    };
+    resolved == trunk
+}
+
 /// Whether any applied change OUTSIDE the interpreted closure recorded the
 /// semantic op that deleted `branch` (review C1/C3: tombstones are attributed
 /// by actual operations — a registered writer's Delete/Modify for the branch
 /// — not merely by graph liveness, because a whole-file replace tombstones
 /// semantic branches without graph-deleting the replaced vertices).
+#[cfg(test)]
 pub(crate) fn out_of_closure_writer_deleted_branch(
     repo_change_loader: &dyn Fn(&Hash) -> Result<Change, String>,
     txn: &atomic_core::pristine::WriteTxn<'_>,
-    path: &str,
+    trunk: atomic_core::crdt::TrunkId,
     branch: atomic_core::crdt::BranchId,
     visibility: &atomic_core::pristine::GraphVisibilityClosure,
 ) -> Result<bool, String> {
-    use atomic_core::pristine::GraphTxnT;
-    for (change_id, hash) in txn.list_registered_changes().map_err(|e| e.to_string())? {
-        if visibility.contains(change_id) {
-            continue;
-        }
-        // Review F1: a registered change is NOT an applied writer. The
-        // scanner may attribute a tombstone only to a change whose operations
-        // actually ran in the graph; a merely registered (e.g. fetched or
-        // staged) change's FileOps are not execution proof. Mirrors
-        // `applied_writer_deleted_branch` (review D2).
-        if !txn
-            .has_change_in_graph(change_id)
-            .map_err(|e| e.to_string())?
-        {
-            continue;
-        }
-        let Ok(change) = repo_change_loader(&hash) else {
-            continue;
-        };
-        for ops in change.file_ops() {
-            if ops.path() != path {
-                continue;
-            }
-            for line_op in ops.line_ops() {
-                let raw_branch = line_op.branch_id();
-                let resolved = if raw_branch.change_id().is_root() {
-                    atomic_core::crdt::BranchId::new(change_id, raw_branch.branch_idx())
-                } else {
-                    raw_branch
-                };
-                if resolved != branch {
-                    continue;
-                }
-                match line_op.operation() {
-                    // A Delete tomstones the branch; a Modify tombstones and
-                    // re-inserts the same id (either writer legitimately
-                    // produced the row's tombstone at some point).
-                    atomic_core::crdt::BranchOp::Delete { .. }
-                    | atomic_core::crdt::BranchOp::Modify { .. } => return Ok(true),
-                    _ => {}
-                }
-            }
-        }
-    }
-    Ok(false)
+    Ok(
+        SemanticDeletionEvidence::load(repo_change_loader, txn, trunk, visibility)?
+            .outside
+            .contains(&branch),
+    )
 }
 
-/// Whether ANY applied change recorded the semantic op that deleted
-/// `branch` for `path`, regardless of which closure the writer belongs to
-/// (review D2, unexpected-chain-branch attribution): a forced whole-file
-/// replace inside the interpreted closure tombstones every bound branch —
-/// including branches created by out-of-closure concurrent writers — so a
-/// genuine tombstone's writer may live on either side of the closure
-/// boundary. The loaded change must be a real applied change (a registered
-/// id alone is not a writer, review D2).
-fn applied_writer_deleted_branch(
-    repo_change_loader: &dyn Fn(&Hash) -> Result<Change, String>,
-    txn: &atomic_core::pristine::WriteTxn<'_>,
-    path: &str,
-    branch: atomic_core::crdt::BranchId,
-) -> Result<bool, String> {
-    use atomic_core::pristine::GraphTxnT;
-    for (change_id, hash) in txn.list_registered_changes().map_err(|e| e.to_string())? {
-        if !txn
-            .has_change_in_graph(change_id)
-            .map_err(|e| e.to_string())?
-        {
-            continue;
-        }
-        let Ok(change) = repo_change_loader(&hash) else {
-            continue;
-        };
-        for ops in change.file_ops() {
-            if ops.path() != path {
+/// Transaction-local deletion proofs for one exact trunk and visibility.
+/// Scan canonical applied FileOps once, rather than cloning every historical
+/// change again for every dead branch in the staged file-order chain.
+#[derive(Default)]
+pub(super) struct SemanticDeletionEvidence {
+    pub(super) applied: std::collections::HashSet<atomic_core::crdt::BranchId>,
+    pub(super) outside: std::collections::HashSet<atomic_core::crdt::BranchId>,
+}
+
+type SemanticDeletionCache = std::cell::OnceCell<Result<SemanticDeletionEvidence, String>>;
+
+impl SemanticDeletionEvidence {
+    pub(super) fn load(
+        loader: &dyn Fn(&Hash) -> Result<Change, String>,
+        txn: &atomic_core::pristine::WriteTxn<'_>,
+        trunk: atomic_core::crdt::TrunkId,
+        visibility: &atomic_core::pristine::GraphVisibilityClosure,
+    ) -> Result<Self, String> {
+        use atomic_core::pristine::GraphTxnT;
+        let mut evidence = Self::default();
+        for (change_id, hash) in txn.list_registered_changes().map_err(|e| e.to_string())? {
+            // Registration alone is never proof that FileOps executed.
+            if !txn
+                .was_change_applied(change_id)
+                .map_err(|e| e.to_string())?
+            {
                 continue;
             }
-            for line_op in ops.line_ops() {
-                let raw_branch = line_op.branch_id();
-                let resolved = if raw_branch.change_id().is_root() {
-                    atomic_core::crdt::BranchId::new(change_id, raw_branch.branch_idx())
-                } else {
-                    raw_branch
-                };
-                if resolved != branch {
+            let Ok(change) = loader(&hash) else { continue };
+            for ops in change.file_ops() {
+                if !file_ops_target_trunk(ops, change_id, trunk) {
                     continue;
                 }
-                match line_op.operation() {
-                    // A Delete tomstones the branch; a Modify tombstones and
-                    // re-inserts the same id (either writer legitimately
-                    // produced the row's tombstone at some point).
-                    atomic_core::crdt::BranchOp::Delete { .. }
-                    | atomic_core::crdt::BranchOp::Modify { .. } => return Ok(true),
-                    _ => {}
+                for line in ops.line_ops() {
+                    if !matches!(
+                        line.operation(),
+                        atomic_core::crdt::BranchOp::Delete { .. }
+                            | atomic_core::crdt::BranchOp::Modify { .. }
+                    ) {
+                        continue;
+                    }
+                    let raw = line.branch_id();
+                    let branch = if raw.change_id().is_root() {
+                        atomic_core::crdt::BranchId::new(change_id, raw.branch_idx())
+                    } else {
+                        raw
+                    };
+                    evidence.applied.insert(branch);
+                    if !visibility.contains(change_id) {
+                        evidence.outside.insert(branch);
+                    }
                 }
             }
         }
+        Ok(evidence)
     }
-    Ok(false)
 }
 
 /// Review E1: whether the GLOBAL graph genuinely proves `branch`'s bound
@@ -1086,7 +1069,7 @@ fn applied_writer_deleted_branch(
 fn graph_proves_dead_with_ownership(
     repo: &Repository,
     txn: &atomic_core::pristine::WriteTxn<'_>,
-    path: &str,
+    trunk: atomic_core::crdt::TrunkId,
     branch: atomic_core::crdt::BranchId,
     node: &atomic_core::types::GraphNode<atomic_core::types::NodeId>,
     global_alive: &std::collections::HashSet<
@@ -1118,7 +1101,7 @@ fn graph_proves_dead_with_ownership(
         .load_change(&hash)
         .map_err(|e| format!("cannot load branch vertex writer: {e}"))?;
     Ok(change_wrote_branch_vertex_for_branch(
-        &writer, path, branch, *node,
+        &writer, trunk, branch, *node,
     ))
 }
 
@@ -1165,7 +1148,7 @@ fn vertex_content_bytes(
 pub(crate) fn out_of_closure_writer_deleted_trunk(
     repo_change_loader: &dyn Fn(&Hash) -> Result<Change, String>,
     txn: &atomic_core::pristine::WriteTxn<'_>,
-    path: &str,
+    trunk: atomic_core::crdt::TrunkId,
     visibility: &atomic_core::pristine::GraphVisibilityClosure,
 ) -> Result<bool, String> {
     use atomic_core::pristine::GraphTxnT;
@@ -1176,7 +1159,7 @@ pub(crate) fn out_of_closure_writer_deleted_trunk(
         // Review F1: same application proof as the branch scanner — a
         // registered-but-unapplied change never attributes a trunk tombstone.
         if !txn
-            .has_change_in_graph(change_id)
+            .was_change_applied(change_id)
             .map_err(|e| e.to_string())?
         {
             continue;
@@ -1185,7 +1168,7 @@ pub(crate) fn out_of_closure_writer_deleted_trunk(
             continue;
         };
         for ops in change.file_ops() {
-            if ops.path() != path {
+            if !file_ops_target_trunk(ops, change_id, trunk) {
                 continue;
             }
             if matches!(
@@ -1199,21 +1182,21 @@ pub(crate) fn out_of_closure_writer_deleted_trunk(
     Ok(false)
 }
 
-/// Whether `change`'s own FileOps for `path` recorded the line op that bound
+/// Whether `change`'s own FileOps for the stable trunk recorded the line op that bound
 /// branch `branch` to `vertex` (review C1: concurrency attribution by actual
 /// operations, not bare registered ids; review E1: EXACT branch→vertex file
 /// ownership). The op must resolve to THIS branch id AND carry exactly the
-/// vertex's content range for THIS path — a different file's real vertex
+/// vertex's content range for THIS trunk — a different file's real vertex
 /// (the same change's other-file line op at that range) never proves a
 /// binding for this file's branch.
 fn change_wrote_branch_vertex_for_branch(
     change: &Change,
-    path: &str,
+    trunk: atomic_core::crdt::TrunkId,
     branch: atomic_core::crdt::BranchId,
     vertex: atomic_core::types::GraphNode<atomic_core::types::NodeId>,
 ) -> bool {
     for ops in change.file_ops() {
-        if ops.path() != path {
+        if !file_ops_target_trunk(ops, vertex.change, trunk) {
             continue;
         }
         for line_op in ops.line_ops() {
@@ -1244,19 +1227,19 @@ fn change_wrote_branch_vertex_for_branch(
 /// Whether `change`'s own FileOps key `leaf`'s id when applied (review D2:
 /// a registered NodeId is not proof of a writer — the leaf must come from
 /// the writer's own per-apply counter over the Insert/Modify content it
-/// recorded for this path and branch). The replay mirrors the apply's
+/// recorded for this trunk and branch). The replay mirrors the apply's
 /// leaf-id contract exactly: one counter per change spanning every file
 /// entry in order, advanced by every recorded leaf op.
 fn change_wrote_leaf(
     change: &Change,
-    path: &str,
+    trunk: atomic_core::crdt::TrunkId,
     branch: atomic_core::crdt::BranchId,
     leaf: atomic_core::crdt::LeafId,
 ) -> bool {
     let owner = leaf.change_id();
     let mut counter = 0u32;
     for ops in change.file_ops() {
-        let is_target = ops.path() == path;
+        let is_target = file_ops_target_trunk(ops, owner, trunk);
         for line_op in ops.line_ops() {
             let raw_branch = line_op.branch_id();
             let resolved = if raw_branch.change_id().is_root() {
@@ -2295,7 +2278,7 @@ impl Repository {
                     .map_err(|e| RepositoryError::Database(e.to_string()))?
                     .is_some();
                 let applied = txn
-                    .has_change_in_graph(change_id)
+                    .was_change_applied(change_id)
                     .map_err(|e| RepositoryError::Database(e.to_string()))?;
                 (in_view, applied)
             };
@@ -2840,7 +2823,6 @@ impl Repository {
     ) -> Result<ImportWriteOutcome, RepositoryError> {
         use crate::apply::write_change_to_graph;
         use atomic_core::apply::compute_new_state;
-        use atomic_core::pristine::GraphTxnT;
 
         // Deterministic test fault: fails the mutation stage after the
         // SynthesizeGit intent was journaled, exercising the recovery path.
@@ -2890,12 +2872,12 @@ impl Repository {
                 .map_err(|e| RepositoryError::Database(e.to_string()))?;
         }
 
-        // The change's hunks are applied only when its vertices are not yet
-        // in the global graph. A registered-but-unapplied change (interrupted
+        // The change's hunks are applied only when ingestion has not completed.
+        // A registered-but-unapplied change (interrupted
         // import, draft reference) is applied normally; anything already in
         // the graph is reference-only and was routed before this stage.
         let already_applied = txn
-            .has_change_in_graph(change_id)
+            .was_change_applied(change_id)
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
         let tree_projection = self.plan_tree_projection(
@@ -4193,6 +4175,68 @@ impl Repository {
         let mut concurrent_path = false;
         let mut resolved_trunk = indexed_trunk;
         if let Some(expected) = expected_identity {
+            // Concurrent same-name creates share the ambient path index.
+            // An explicit graph resolution may retain either inode, while
+            // PATH_TRUNK still points at the other historical claimant.
+            // Authenticate that claimant by its actual applied Create;
+            // never let the last index write choose the closure's identity.
+            if let Some(indexed) = indexed_trunk.filter(|id| *id != expected) {
+                if txn
+                    .was_change_applied(indexed.change_id())
+                    .map_err(|e| e.to_string())?
+                {
+                    if let Some(hash) = txn
+                        .get_external(indexed.change_id())
+                        .map_err(|e| e.to_string())?
+                    {
+                        let creator = self.load_change(&hash).map_err(|e| e.to_string())?;
+                        let mut real_claimant = creator.file_ops().iter().any(|ops| {
+                            ops.path() == path
+                                && file_ops_target_trunk(ops, indexed.change_id(), indexed)
+                                && matches!(
+                                    ops.trunk_op(),
+                                    Some(atomic_core::crdt::TrunkOp::Create { .. })
+                                )
+                        });
+                        // A competing identity can arrive by rename as well
+                        // as creation at this path. Authenticate both its
+                        // creation and an applied Move to this exact path.
+                        if !real_claimant
+                            && creator.file_ops().iter().any(|ops| {
+                                file_ops_target_trunk(ops, indexed.change_id(), indexed)
+                                    && matches!(
+                                        ops.trunk_op(),
+                                        Some(atomic_core::crdt::TrunkOp::Create { .. })
+                                    )
+                            })
+                        {
+                            for (owner, hash) in
+                                txn.list_registered_changes().map_err(|e| e.to_string())?
+                            {
+                                if !txn.was_change_applied(owner).map_err(|e| e.to_string())? {
+                                    continue;
+                                }
+                                let writer = self.load_change(&hash).map_err(|e| e.to_string())?;
+                                if writer.file_ops().iter().any(|ops| {
+                                    file_ops_target_trunk(ops, owner, indexed)
+                                        && matches!(ops.trunk_op(), Some(atomic_core::crdt::TrunkOp::Move { trunk, new_path })
+                                            if *trunk == indexed && new_path == path)
+                                }) {
+                                    real_claimant = true;
+                                    break;
+                                }
+                            }
+                        }
+                        let row_agrees = txn
+                            .get_crdt_trunk(&encode_trunk_id(&indexed))
+                            .map_err(|e| e.to_string())?
+                            .is_some_and(|row| row.path == path);
+                        if real_claimant && row_agrees {
+                            resolved_trunk = Some(expected);
+                        }
+                    }
+                }
+            }
             if let Some(row) = txn
                 .get_crdt_trunk(&encode_trunk_id(&expected))
                 .map_err(|e| e.to_string())?
@@ -4208,7 +4252,7 @@ impl Repository {
                     {
                         if visibility.contains(writer_id)
                             || !txn
-                                .has_change_in_graph(writer_id)
+                                .was_change_applied(writer_id)
                                 .map_err(|e| e.to_string())?
                         {
                             continue;
@@ -4310,7 +4354,7 @@ impl Repository {
             let loader = |hash: &Hash| -> Result<Change, String> {
                 self.load_change(hash).map_err(|e| e.to_string())
             };
-            if out_of_closure_writer_deleted_trunk(&loader, txn, path, visibility)? {
+            if out_of_closure_writer_deleted_trunk(&loader, txn, trunk_key, visibility)? {
                 // A validated out-of-closure writer recorded the semantic
                 // delete: genuine concurrent state (review D2).
                 concurrent_state = true;
@@ -4330,6 +4374,8 @@ impl Repository {
             // text tokens). Lifecycle was verified above (review D2).
             return Ok(());
         }
+
+        let deletion_evidence = SemanticDeletionCache::new();
 
         // ── 3. Row agreement for the closure's own branch domain. ──────────
         //
@@ -4458,6 +4504,23 @@ impl Repository {
             ConsumerLine,
         > = std::collections::HashMap::new();
 
+        // A tombstoned historical chain that anchors no live line has no
+        // ordering effect on this closure. Audit every live line and all of
+        // its recorded ancestors, including deleted anchors it still uses.
+        let mut ordering_domain = std::collections::HashSet::new();
+        for (id, branch) in &branches {
+            if !branch.state.is_alive() {
+                continue;
+            }
+            let mut next = Some(*id);
+            while let Some(id) = next {
+                if !ordering_domain.insert(id) {
+                    break;
+                }
+                next = branches.get(&id).and_then(|branch| branch.after);
+            }
+        }
+        let mut concurrent_after = None;
         let mut replay_alive_ids: Vec<atomic_core::crdt::BranchId> = Vec::new();
         for (branch_id, expected) in &branches {
             let branch_key = encode_branch_id(branch_id);
@@ -4477,6 +4540,71 @@ impl Repository {
                     "branch {branch_id:?} claims a different trunk than the closure \
                      replayed for '{path}'; branch ownership must match the closure"
                 ));
+            }
+            if closure_created.contains(branch_id) && ordering_domain.contains(branch_id) {
+                let stored = txn
+                    .get_crdt_branch_after(&branch_key)
+                    .map_err(|e| e.to_string())?
+                    .ok_or_else(|| {
+                        format!("branch {branch_id:?} has no recorded after-reference")
+                    })?;
+                let actual_after = if stored == [0u8; 12] {
+                    None
+                } else {
+                    Some(atomic_core::crdt::tables::decode_branch_id(&stored))
+                };
+                if actual_after != expected.after {
+                    if concurrent_after.is_none() {
+                        let mut bindings = std::collections::HashSet::new();
+                        for (owner, hash) in
+                            txn.list_registered_changes().map_err(|e| e.to_string())?
+                        {
+                            // Ambient AFTER can reflect another valid leg
+                            // inside this merge closure too. Authenticate the
+                            // exact binding against an applied canonical op;
+                            // closure-local order still supplies expected bytes.
+                            if !txn.was_change_applied(owner).map_err(|e| e.to_string())? {
+                                continue;
+                            }
+                            let writer = self.load_change(&hash).map_err(|e| e.to_string())?;
+                            let resolve = |id: atomic_core::crdt::BranchId| {
+                                if id.change_id().is_root() {
+                                    atomic_core::crdt::BranchId::new(owner, id.branch_idx())
+                                } else {
+                                    id
+                                }
+                            };
+                            for ops in writer
+                                .file_ops()
+                                .iter()
+                                .filter(|ops| file_ops_target_trunk(ops, owner, trunk_key))
+                            {
+                                for line in ops.line_ops() {
+                                    let predecessor = match line.operation() {
+                                        atomic_core::crdt::BranchOp::Insert { after, .. } => after,
+                                        atomic_core::crdt::BranchOp::Reparent {
+                                            new_after, ..
+                                        } => new_after,
+                                        _ => continue,
+                                    };
+                                    bindings.insert((
+                                        resolve(line.branch_id()),
+                                        predecessor.map(resolve),
+                                    ));
+                                }
+                            }
+                        }
+                        concurrent_after = Some(bindings);
+                    }
+                    if !concurrent_after
+                        .as_ref()
+                        .unwrap()
+                        .contains(&(*branch_id, actual_after))
+                    {
+                        return Err(format!("branch {branch_id:?} has an after-reference that no applied canonical writer recorded"));
+                    }
+                    concurrent_state = true;
+                }
             }
             let row_vertex = txn
                 .get_crdt_branch_vertex(&branch_key)
@@ -4515,7 +4643,7 @@ impl Repository {
                         Some(node) => graph_proves_dead_with_ownership(
                             self,
                             txn,
-                            path,
+                            trunk_key,
                             *branch_id,
                             node,
                             &global_alive,
@@ -4526,9 +4654,14 @@ impl Repository {
                         let loader = |hash: &Hash| -> Result<Change, String> {
                             self.load_change(hash).map_err(|e| e.to_string())
                         };
-                        out_of_closure_writer_deleted_branch(
-                            &loader, txn, path, *branch_id, visibility,
-                        )?
+                        deletion_evidence
+                            .get_or_init(|| {
+                                SemanticDeletionEvidence::load(&loader, txn, trunk_key, visibility)
+                            })
+                            .as_ref()
+                            .map_err(Clone::clone)?
+                            .outside
+                            .contains(branch_id)
                     };
                     if !attributed {
                         return Err(
@@ -4606,7 +4739,7 @@ impl Repository {
                             .load_change(&writer_hash)
                             .map_err(|e| format!("cannot load concurrent writer: {e}"))?;
                         if !change_wrote_branch_vertex_for_branch(
-                            &writer, path, *branch_id, *row_node,
+                            &writer, trunk_key, *branch_id, *row_node,
                         ) {
                             return Err(format!(
                                 "branch {branch_id:?} is bound to {row_node:?} but the \
@@ -4684,8 +4817,9 @@ impl Repository {
                     let writer = self
                         .load_change(&writer_hash)
                         .map_err(|e| format!("cannot load concurrent writer: {e}"))?;
-                    if !change_wrote_branch_vertex_for_branch(&writer, path, *branch_id, *row_node)
-                    {
+                    if !change_wrote_branch_vertex_for_branch(
+                        &writer, trunk_key, *branch_id, *row_node,
+                    ) {
                         return Err(format!(
                             "branch {branch_id:?} was deleted by the closure but the staged \
                              row is alive bound to {row_node:?}; no applied out-of-closure \
@@ -4781,7 +4915,7 @@ impl Repository {
                             let writer = self
                                 .load_change(&writer_hash)
                                 .map_err(|e| format!("cannot load leaf writer: {e}"))?;
-                            change_wrote_leaf(&writer, path, *branch_id, leaf_id)
+                            change_wrote_leaf(&writer, trunk_key, *branch_id, leaf_id)
                         };
                     if !attributed {
                         return Err(format!(
@@ -4813,21 +4947,29 @@ impl Repository {
             }
         }
 
-        // The closure's semantic replay must regenerate the commit tree:
-        // its alive lines aggregate - joined in the staged after-chain's
-        // file order - to exactly the expected bytes. The CONTENT comes
-        // from the closure replay (each line's own writer blob slice); the
-        // ORDER comes from the staged chain, so a corrupted after-chain
-        // reorders or drops lines and fails closed here (review B2).
+        // Reconstruct the selected closure with its own recorded order.
+        // Ambient AFTER rows are audited above, including exact attribution
+        // for genuine out-of-closure reparenting; they cannot order this view.
+        let closure_chain = super::record::semantic_branch_order(
+            &branches
+                .iter()
+                .map(|(id, branch)| (*id, branch.after))
+                .collect(),
+        )?;
+        let replay_alive_bytes: Vec<u8> = closure_chain
+            .iter()
+            .filter_map(|id| branches.get(id))
+            .filter(|branch| branch.state.is_alive())
+            .flat_map(|branch| branch.bytes.iter().copied())
+            .collect();
         let actual_chain =
             iter_trunk_branches_in_file_order(txn, trunk_key).map_err(|e| e.to_string())?;
-        let mut replay_alive_bytes: Vec<u8> = Vec::new();
         let mut visited: std::collections::HashSet<atomic_core::crdt::BranchId> =
             std::collections::HashSet::new();
         let debug_semantic = std::env::var_os("ATOMIC_DEBUG_DELETION").is_some();
         for branch_id in &actual_chain {
             visited.insert(*branch_id);
-            let Some(expected) = branches.get(branch_id) else {
+            let Some(_expected) = branches.get(branch_id) else {
                 if debug_semantic {
                     eprintln!(
                         "[debug-deletion] chain branch {branch_id:?} UNEXPECTED (no closure entry)"
@@ -4852,26 +4994,13 @@ impl Repository {
                     *branch_id,
                     visibility,
                     &global_alive,
+                    &deletion_evidence,
                 )? {
                     consumer_domain.insert(*branch_id, ConsumerLine::Writer(writer_vertex));
                     concurrent_state = true;
                 }
                 continue;
             };
-            if expected.state.is_alive() {
-                if debug_semantic
-                    && replay_alive_bytes.len() <= 1254
-                    && replay_alive_bytes.len() + expected.bytes.len() > 1200
-                {
-                    eprintln!(
-                        "[debug-deletion] chain branch {branch_id:?} alive bytes={} crossing offset {} preview={:?}",
-                        expected.bytes.len(),
-                        replay_alive_bytes.len(),
-                        String::from_utf8_lossy(&expected.bytes[..expected.bytes.len().min(60)])
-                    );
-                }
-                replay_alive_bytes.extend_from_slice(&expected.bytes);
-            }
         }
         if replay_alive_bytes.as_slice() != expected_bytes {
             return Err(format!(
@@ -4967,6 +5096,7 @@ impl Repository {
         global_alive: &std::collections::HashSet<
             atomic_core::types::GraphNode<atomic_core::types::NodeId>,
         >,
+        deletion_evidence: &SemanticDeletionCache,
     ) -> Result<Option<atomic_core::types::GraphNode<atomic_core::types::NodeId>>, String> {
         use atomic_core::crdt::tables::encode_branch_id;
         use atomic_core::pristine::{CrdtTxnT, GraphTxnT};
@@ -5003,13 +5133,21 @@ impl Repository {
                 .map_err(|e| e.to_string())?
                 .as_ref()
             {
-                Some(node) => {
-                    graph_proves_dead_with_ownership(self, txn, path, branch, node, global_alive)?
-                }
+                Some(node) => graph_proves_dead_with_ownership(
+                    self,
+                    txn,
+                    trunk_key,
+                    branch,
+                    node,
+                    global_alive,
+                )?,
                 None => false,
-            } || out_of_closure_writer_deleted_branch(
-                &loader, txn, path, branch, visibility,
-            )? || applied_writer_deleted_branch(&loader, txn, path, branch)?;
+            } || deletion_evidence
+                .get_or_init(|| SemanticDeletionEvidence::load(&loader, txn, trunk_key, visibility))
+                .as_ref()
+                .map_err(Clone::clone)?
+                .applied
+                .contains(&branch);
             if !attributed {
                 return Err(
                     "the staged file-order chain contains a branch the closure never wrote \
@@ -5056,7 +5194,7 @@ impl Repository {
         // FileOps must record THIS branch id bound to THIS vertex for this
         // path; a different file's vertex at a matching range is not this
         // branch's content.
-        if !change_wrote_branch_vertex_for_branch(&writer, path, branch, row_node) {
+        if !change_wrote_branch_vertex_for_branch(&writer, trunk_key, branch, row_node) {
             return Err(format!(
                 "branch {branch:?} is bound to {row_node:?} but no applied out-of-closure \
                  change recorded that binding for '{path}'; the binding is corruption"

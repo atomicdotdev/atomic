@@ -129,6 +129,14 @@ pub fn retrieve_graph<T: GraphTxnT>(
     // Shared causal-dominance memo across every aliveness check in this walk.
     let mut dep_memo: HashMap<(NodeId, NodeId), bool> = HashMap::new();
     let mut dead_contexts = std::collections::HashSet::new();
+    // A liveness query needs only reachability to any live bytes, independent
+    // of the owner-specific ordering of bypass edges. Share dead visits across
+    // root edges so overlapping deleted histories are scanned once.
+    let mut liveness_dead_seen = std::collections::HashSet::new();
+    // Negative reachability proofs are independent of the bypass owner.
+    // Reuse only fully explored subgraphs with no live successor at all;
+    // positive walks retain their owner-specific ordering and attachment.
+    let mut empty_dead_subgraphs = std::collections::HashSet::new();
 
     // Add dummy span at index 0
     result.graph.push_vertex(AliveVertex::DUMMY);
@@ -202,6 +210,9 @@ pub fn retrieve_graph<T: GraphTxnT>(
         let mut bypass_children: Vec<VertexId> = Vec::new();
 
         for edge in forward_edges {
+            if options.stop_at_first_content && result.graph.total_bytes() > 0 {
+                break;
+            }
             result.edges_traversed += 1;
 
             let dest_pos = edge.dest;
@@ -251,6 +262,8 @@ pub fn retrieve_graph<T: GraphTxnT>(
                         &mut alive_memo,
                         &mut chain_memo,
                         &mut dep_memo,
+                        &mut liveness_dead_seen,
+                        &mut empty_dead_subgraphs,
                         &mut result,
                     )?;
                     // Collect bypass children; placement decided after
@@ -299,6 +312,8 @@ pub fn retrieve_graph<T: GraphTxnT>(
                             &mut alive_memo,
                             &mut chain_memo,
                             &mut dep_memo,
+                            &mut liveness_dead_seen,
+                            &mut empty_dead_subgraphs,
                             &mut result,
                         )?;
                         for succ_vid in successors {
@@ -325,6 +340,8 @@ pub fn retrieve_graph<T: GraphTxnT>(
                         &mut alive_memo,
                         &mut chain_memo,
                         &mut dep_memo,
+                        &mut liveness_dead_seen,
+                        &mut empty_dead_subgraphs,
                         &mut result,
                     )?;
                     for succ_vid in successors {
@@ -387,6 +404,11 @@ pub fn retrieve_graph<T: GraphTxnT>(
             let current_vertex = result.graph.get_vertex_mut(vid).unwrap();
             current_vertex.n_children = children_end - current_vertex.children;
         }
+    }
+
+    // The opt-in boolean query does not need to reconstruct line ordering.
+    if options.stop_at_first_content {
+        return Ok(result);
     }
 
     // Adjacent independent replacements leave each new span anchored to
@@ -528,10 +550,17 @@ fn walk_through_dead<T: GraphTxnT>(
     alive_memo: &mut std::collections::HashMap<GraphNode<NodeId>, bool>,
     chain_memo: &mut std::collections::HashMap<(GraphNode<NodeId>, GraphNode<NodeId>), bool>,
     dep_memo: &mut std::collections::HashMap<(NodeId, NodeId), bool>,
+    liveness_dead_seen: &mut std::collections::HashSet<GraphNode<NodeId>>,
+    empty_dead_subgraphs: &mut std::collections::HashSet<GraphNode<NodeId>>,
     result: &mut RetrieveResult,
 ) -> Result<Vec<VertexId>, PristineError> {
     use std::collections::HashSet;
     let mut live_successors: Vec<VertexId> = Vec::new();
+    if empty_dead_subgraphs.contains(&dead_vertex)
+        || (options.stop_at_first_content && !liveness_dead_seen.insert(dead_vertex))
+    {
+        return Ok(live_successors);
+    }
 
     // BFS through dead vertices, recording live ones we encounter.
     //
@@ -550,6 +579,7 @@ fn walk_through_dead<T: GraphTxnT>(
     let mut queue: Vec<GraphNode<NodeId>> = vec![dead_vertex];
     seen.insert(dead_vertex);
     dead_visited.insert(dead_vertex);
+    let mut saw_live_successor = false;
 
     while let Some(current) = queue.pop() {
         // Walk current's forward edges (include deleted so we can chain
@@ -560,7 +590,10 @@ fn walk_through_dead<T: GraphTxnT>(
             let next_pos = edge.dest;
             let next_vertex = txn.find_block(next_pos)?;
 
-            if seen.contains(&next_vertex) {
+            if seen.contains(&next_vertex)
+                || empty_dead_subgraphs.contains(&next_vertex)
+                || (options.stop_at_first_content && liveness_dead_seen.contains(&next_vertex))
+            {
                 continue;
             }
             seen.insert(next_vertex);
@@ -574,6 +607,7 @@ fn walk_through_dead<T: GraphTxnT>(
             let alive = memo_vertex_alive(options, txn, next_vertex, alive_memo, dep_memo)?;
 
             if alive {
+                saw_live_successor = true;
                 // Live successor. Only surface it as a bypass child when
                 // there is no OTHER alive parent outside the dead chain.
                 // Ancestors of `owner_parent` in the already-built alive
@@ -630,6 +664,10 @@ fn walk_through_dead<T: GraphTxnT>(
                     new_id
                 };
 
+                if options.stop_at_first_content && result.graph.total_bytes() > 0 {
+                    return Ok(vec![vid]);
+                }
+
                 if !has_alive_alt_parent && !live_successors.contains(&vid) {
                     let mut shadowed_by_existing = false;
                     for existing_vid in live_successors.iter().copied() {
@@ -675,11 +713,19 @@ fn walk_through_dead<T: GraphTxnT>(
                 // CRDT conflicts).
                 // Still dead — keep walking through it.
                 dead_visited.insert(next_vertex);
+                if options.stop_at_first_content {
+                    liveness_dead_seen.insert(next_vertex);
+                }
                 queue.push(next_vertex);
             }
         }
     }
 
+    if !options.stop_at_first_content && !saw_live_successor {
+        // Every outgoing route was exhausted under the same immutable
+        // transaction/filter. This says nothing about positive bypass paths.
+        empty_dead_subgraphs.extend(dead_visited);
+    }
     Ok(live_successors)
 }
 

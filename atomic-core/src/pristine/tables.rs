@@ -334,6 +334,11 @@ pub const REV_CHANGE_DEPS: MultimapTableDefinition<&[u8; 32], u64> =
 pub const CHANGE_DEPS_INDEXED: TableDefinition<u64, u64> =
     TableDefinition::new("change_deps_indexed");
 
+/// Completed canonical change ingestion, independent of view membership.
+/// Written atomically with graph, attribute and semantic effects. Registration
+/// alone never creates an entry. This is not a file-visibility index.
+pub const APPLIED_CHANGES: TableDefinition<u64, u8> = TableDefinition::new("applied_changes");
+
 // State Tables
 
 /// View states: (view_id, merkle) → sequence

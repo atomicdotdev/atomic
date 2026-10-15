@@ -149,6 +149,7 @@
 //! The `INODE_GRAPH` secondary index enables O(n) file traversal where n is
 //! proportional to file size, rather than O(N) where N is total graph size.
 
+mod applied_changes;
 mod attribute;
 mod bindings;
 mod capability;
