@@ -3803,6 +3803,53 @@ impl Repository {
         let mut closure_created: std::collections::HashSet<atomic_core::crdt::BranchId> =
             std::collections::HashSet::new();
 
+        // The caller has already resolved this path through the canonical
+        // graph filtered by the effective closure and rejected name conflicts.
+        // Its stable inode position, not the ambient path index, identifies
+        // the file whose semantic history we must replay. Bind that identity
+        // to its creating FileOps through the same change's canonical FileAdd.
+        // A deleted predecessor with the same path belongs to another trunk.
+        let mut canonical_trunks = std::collections::HashSet::new();
+        for (change_id, change, _) in staged_closure {
+            if *change_id != file_position.change {
+                continue;
+            }
+            for hunk in change.hunks() {
+                if let atomic_core::change::GraphOp::FileAdd {
+                    add_inode,
+                    path: created_path,
+                    ..
+                } = hunk
+                {
+                    if add_inode.start != file_position.pos {
+                        continue;
+                    }
+                    for ops in change.file_ops() {
+                        if ops.path() == created_path
+                            && matches!(
+                                ops.trunk_op(),
+                                Some(atomic_core::crdt::TrunkOp::Create { .. })
+                            )
+                        {
+                            let raw = ops.trunk_id();
+                            let resolved = if raw.change_id().is_root() {
+                                atomic_core::crdt::TrunkId::new(*change_id, raw.file_idx())
+                            } else {
+                                raw
+                            };
+                            canonical_trunks.insert(resolved);
+                        }
+                    }
+                }
+            }
+        }
+        if canonical_trunks.len() > 1 {
+            return Err(format!(
+                "multiple semantic trunks claim the canonical inode for '{path}'"
+            ));
+        }
+        let canonical_trunk = canonical_trunks.into_iter().next();
+
         // ── 1a. Trunk-identity discovery across Move ops (review CB-9C R2). ─
         //
         // A pure imported rename is a real semantic move: the closure's move
@@ -3852,7 +3899,7 @@ impl Repository {
             .filter(|(_, target)| target.as_str() != path)
             .map(|(trunk, _)| *trunk)
             .collect();
-        if identity_trunks.len() > 1 {
+        if canonical_trunk.is_none() && identity_trunks.len() > 1 {
             return Err(format!(
                 "{} distinct trunks' final moves retarget path '{path}' inside one \
                  interpreted closure; the semantic move chain is contradictory",
@@ -3920,9 +3967,16 @@ impl Repository {
                 };
                 let trunk_followed = identity_trunks.contains(&resolved_trunk)
                     && !moved_away.contains(&resolved_trunk);
-                let is_target = ((ops.path() == path && !moved_away.contains(&resolved_trunk))
-                    || trunk_followed)
-                    && !superseded.contains(&resolved_trunk);
+                let is_target = match canonical_trunk {
+                    Some(identity) => resolved_trunk == identity,
+                    // Retain compatibility with semantic-only legacy creates
+                    // which have no canonical FileAdd binding.
+                    None => {
+                        ((ops.path() == path && !moved_away.contains(&resolved_trunk))
+                            || trunk_followed)
+                            && !superseded.contains(&resolved_trunk)
+                    }
+                };
                 if is_target {
                     match ops.trunk_op() {
                         Some(atomic_core::crdt::TrunkOp::Create { encoding, .. }) => {
@@ -4095,7 +4149,9 @@ impl Repository {
         // derived location only when an applied out-of-closure Move proves it;
         // a missing/corrupt index without such history remains an error.
         let indexed_trunk = txn.get_trunk_by_path(path).map_err(|e| e.to_string())?;
-        let expected_identity = identity_trunks.iter().next().copied().or(created_trunk);
+        let expected_identity = canonical_trunk
+            .or_else(|| identity_trunks.iter().next().copied())
+            .or(created_trunk);
         let mut concurrent_path = false;
         let mut resolved_trunk = indexed_trunk;
         if let Some(expected) = expected_identity {

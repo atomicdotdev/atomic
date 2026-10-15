@@ -958,3 +958,216 @@ fn test_retrieve_result_fields() {
     assert_eq!(result.positions_visited, 100);
     assert_eq!(result.edges_traversed, 500);
 }
+
+// A deleted intermediate node must be contracted at its actual predecessor.
+// In Hyperfine commit 65 the direct child is downstream of the bypass child;
+// deferring the bypass to that direct child creates a cycle that is absent
+// from the canonical graph.
+fn bypass_fixture(
+    ordered: bool,
+    reverse_edges: bool,
+) -> (
+    FaultGraphTxn,
+    Position<NodeId>,
+    GraphNode<NodeId>,
+    GraphNode<NodeId>,
+) {
+    let mut txn = FaultGraphTxn::default();
+    let start = test_pos(1, 0);
+    let root = start.inode_node();
+    let dead = test_node(2, 0, 10);
+    let bypass = test_node(3, 0, 10);
+    let direct = test_node(4, 0, 10);
+    for node in [root, dead, bypass, direct] {
+        txn.resolve_block(node.start_pos(), node);
+        txn.resolve_block_end(node.end_pos(), node);
+    }
+    for (from, to, flags) in [
+        (root, dead, EdgeFlags::BLOCK | EdgeFlags::DELETED),
+        (root, direct, EdgeFlags::BLOCK),
+        (dead, bypass, EdgeFlags::BLOCK),
+    ] {
+        txn.add_edge(from, flags, to.start_pos());
+        txn.add_edge(to, flags | EdgeFlags::PARENT, from.end_pos());
+    }
+    if ordered {
+        txn.add_edge(bypass, EdgeFlags::BLOCK, direct.start_pos());
+        txn.add_edge(
+            direct,
+            EdgeFlags::PARENT | EdgeFlags::BLOCK,
+            bypass.end_pos(),
+        );
+    }
+    if reverse_edges {
+        for edges in txn.edges.values_mut() {
+            edges.reverse();
+        }
+    }
+    (txn, start, bypass, direct)
+}
+
+#[test]
+fn bypass_does_not_reverse_canonical_order() {
+    for reverse in [false, true] {
+        let (txn, start, bypass, direct) = bypass_fixture(true, reverse);
+        let result = retrieve_graph(
+            &txn,
+            start,
+            RetrieveOptions::new()
+                .with_graph_visibility(visibility([1, 2, 3, 4, 99].map(NodeId::new))),
+        )
+        .unwrap();
+        let find = |node| {
+            result
+                .graph
+                .iter_vertices()
+                .find(|(_, v)| v.node == node)
+                .unwrap()
+                .0
+        };
+        let a = find(bypass);
+        let b = find(direct);
+        assert!(super::alive_graph_reaches(&result.graph, a, b));
+        assert!(
+            !super::alive_graph_reaches(&result.graph, b, a),
+            "bypass created a reverse edge"
+        );
+        assert!(super::alive_graph_reaches(
+            &result.graph,
+            VertexId::new(1),
+            a
+        ));
+    }
+}
+
+#[test]
+fn bypass_preserves_unordered_successors() {
+    for reverse in [false, true] {
+        let (txn, start, bypass, direct) = bypass_fixture(false, reverse);
+        let result = retrieve_graph(
+            &txn,
+            start,
+            RetrieveOptions::new()
+                .with_graph_visibility(visibility([1, 2, 3, 4, 99].map(NodeId::new))),
+        )
+        .unwrap();
+        let find = |node| {
+            result
+                .graph
+                .iter_vertices()
+                .find(|(_, v)| v.node == node)
+                .unwrap()
+                .0
+        };
+        let a = find(bypass);
+        let b = find(direct);
+        assert!(super::alive_graph_reaches(
+            &result.graph,
+            VertexId::new(1),
+            a
+        ));
+        assert!(super::alive_graph_reaches(
+            &result.graph,
+            VertexId::new(1),
+            b
+        ));
+        assert!(!super::alive_graph_reaches(&result.graph, a, b));
+        assert!(
+            !super::alive_graph_reaches(&result.graph, b, a),
+            "bypass serialized independent successors"
+        );
+    }
+}
+
+#[test]
+fn adjacent_replacement_contexts_follow_visible_graph_witnesses() {
+    for reverse_edges in [false, true] {
+        let mut txn = FaultGraphTxn::default();
+        let root = test_node(1, 0, 0);
+        let old_a = test_node(1, 10, 20);
+        let old_b = test_node(1, 20, 30);
+        let tail = test_node(1, 30, 40);
+        let new_a = test_node(2, 0, 10);
+        let new_b = test_node(3, 0, 10);
+        for node in [root, old_a, old_b, tail, new_a, new_b] {
+            txn.resolve_block(node.start_pos(), node);
+            txn.resolve_block_end(node.end_pos(), node);
+        }
+        for (from, to, deleted, change) in [
+            (root, old_a, false, 1),
+            (old_a, old_b, false, 1),
+            (old_b, tail, false, 1),
+            (root, old_a, true, 2),
+            (root, new_a, false, 2),
+            (new_a, old_b, false, 2),
+            (old_a, old_b, true, 3),
+            (old_a, new_b, false, 3),
+            (new_b, tail, false, 3),
+        ] {
+            let flags = if deleted {
+                EdgeFlags::BLOCK | EdgeFlags::DELETED
+            } else {
+                EdgeFlags::BLOCK
+            };
+            txn.edges
+                .entry(from)
+                .or_default()
+                .push(SerializedGraphEdge::new(
+                    flags,
+                    to.start_pos(),
+                    NodeId::new(change),
+                ));
+            txn.edges
+                .entry(to)
+                .or_default()
+                .push(SerializedGraphEdge::new(
+                    flags | EdgeFlags::PARENT,
+                    from.end_pos(),
+                    NodeId::new(change),
+                ));
+        }
+        if reverse_edges {
+            for edges in txn.edges.values_mut() {
+                edges.reverse();
+            }
+        }
+        for (changes, first, second) in [
+            (vec![1, 2, 3], new_a, new_b),
+            (vec![1, 3, 2], new_a, new_b),
+            (vec![1, 2], new_a, old_b),
+            (vec![1, 3], old_a, new_b),
+            (vec![1], old_a, old_b),
+        ] {
+            let result = retrieve_graph(
+                &txn,
+                root.start_pos(),
+                RetrieveOptions::new()
+                    .with_graph_visibility(visibility(changes.into_iter().map(NodeId::new))),
+            )
+            .unwrap();
+            let find = |node| {
+                result
+                    .graph
+                    .iter_vertices()
+                    .find(|(_, v)| v.node == node)
+                    .unwrap()
+                    .0
+            };
+            assert!(super::alive_graph_reaches(
+                &result.graph,
+                find(first),
+                find(second)
+            ));
+            assert!(!super::alive_graph_reaches(
+                &result.graph,
+                find(second),
+                find(first)
+            ));
+            assert!(super::alive_graph_reaches(
+                &result.graph,
+                find(second),
+                find(tail)
+            ));
+        }
+    }
+}

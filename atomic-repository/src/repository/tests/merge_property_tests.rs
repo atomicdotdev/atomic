@@ -184,6 +184,15 @@ fn build_commuting(
     disk_bytes(&temp, "f.txt")
 }
 
+#[test]
+fn adjacent_replacements_preserve_base_line_order() {
+    let base = vec!["alpha".into(), "bravo".into(), "charlie".into()];
+    for order_ab in [true, false] {
+        let actual = build_commuting(&base, (0, "ALPHA".into()), (1, "BRAVO".into()), order_ab);
+        assert_eq!(String::from_utf8_lossy(&actual), "ALPHA\nBRAVO\ncharlie\n");
+    }
+}
+
 /// A disjoint edit for the widened commutation property: boundary
 /// insertions as well as interior replacements.
 #[derive(Clone, Debug)]
@@ -257,6 +266,22 @@ fn build_commuting_eds(base: &[String], a: &Ed, b: &Ed, order_ab: bool) -> Vec<u
     repo.materialize().unwrap();
 
     disk_bytes(&temp, "f.txt")
+}
+
+#[test]
+fn same_anchor_edits_still_conflict() {
+    let base = vec!["alpha".into(), "bravo".into(), "charlie".into()];
+    for a in [Ed::Prepend("FIRST".into()), Ed::Replace(0, "FIRST".into())] {
+        for order_ab in [true, false] {
+            let actual = build_commuting_eds(&base, &a, &Ed::Replace(0, "SECOND".into()), order_ab);
+            assert!(
+                has_markers(&actual),
+                "same-anchor edits must remain a conflict"
+            );
+            let text = String::from_utf8(actual).unwrap();
+            assert!(text.contains("FIRST") && text.contains("SECOND"));
+        }
+    }
 }
 
 /// Commutation including BOUNDARY edits (prepend/append), not just interior

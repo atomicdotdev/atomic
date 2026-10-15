@@ -1042,8 +1042,11 @@ fn update_trunk_path<T: MutTxnT>(
 
     // Get existing trunk
     if let Some(mut serialized) = txn.get_crdt_trunk(&key)? {
-        // Remove old path index
-        txn.del_crdt_path_trunk(&serialized.path)?;
+        // Another identity may now occupy the old path in the ambient index.
+        // Moving this trunk must not remove that other candidate's binding.
+        if txn.get_trunk_by_path(&serialized.path)? == Some(trunk_id) {
+            txn.del_crdt_path_trunk(&serialized.path)?;
+        }
 
         // Update path
         serialized.path = new_path.to_string();
@@ -1165,6 +1168,37 @@ fn update_leaf_content<T: MutTxnT>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn moving_old_identity_preserves_another_paths_index_binding() {
+        use crate::pristine::{CrdtTxnT, Pristine};
+        let temp = tempfile::tempdir().unwrap();
+        let pristine = Pristine::open(temp.path().join("move.redb")).unwrap();
+        let mut txn = pristine.write_txn().unwrap();
+        for change in [NodeId::new(1), NodeId::new(2)] {
+            let inode = txn.alloc_inode().unwrap();
+            apply_file_ops_batched_with_inodes(
+                &mut txn,
+                change,
+                &[FileOps::create(
+                    TrunkId::new(NodeId::ROOT, 0),
+                    "same".into(),
+                    None,
+                )],
+                &HashMap::from([("same".to_string(), inode)]),
+            )
+            .unwrap();
+        }
+        update_trunk_path(&mut txn, TrunkId::new(NodeId::new(1), 0), "moved").unwrap();
+        assert_eq!(
+            txn.get_trunk_by_path("same").unwrap(),
+            Some(TrunkId::new(NodeId::new(2), 0))
+        );
+        assert_eq!(
+            txn.get_trunk_by_path("moved").unwrap(),
+            Some(TrunkId::new(NodeId::new(1), 0))
+        );
+    }
 
     #[test]
     fn explicit_create_inodes_survive_opposite_orders_and_ambient_paths() {

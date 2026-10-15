@@ -975,7 +975,11 @@ where
         return Ok(anchor);
     }
 
-    if let Some(inode) = ctx.txn().get_inode(directory_path)? {
+    if let Some(inode) = ctx.txn().get_inode(directory_path)?.filter(|inode| {
+        !ctx.vacated_bindings
+            .get(directory_path)
+            .is_some_and(|inodes| inodes.contains(inode))
+    }) {
         if let Some(position) = ctx.txn().inode_position(inode)? {
             let hash = ctx.txn().get_external(position.change)?.ok_or(
                 GlobalizeError::MissingExternalHash {
