@@ -1009,6 +1009,14 @@ pub(super) struct SemanticDeletionEvidence {
 
 type SemanticDeletionCache = std::cell::OnceCell<Result<SemanticDeletionEvidence, String>>;
 
+/// Evidence shared by branch checks within one staged file verification.
+struct SemanticBranchContext<'a> {
+    visibility: &'a atomic_core::pristine::GraphVisibilityClosure,
+    global_alive:
+        &'a std::collections::HashSet<atomic_core::types::GraphNode<atomic_core::types::NodeId>>,
+    deletion_evidence: &'a SemanticDeletionCache,
+}
+
 impl SemanticDeletionEvidence {
     pub(super) fn load(
         loader: &dyn Fn(&Hash) -> Result<Change, String>,
@@ -4992,9 +5000,11 @@ impl Repository {
                     path,
                     trunk_key,
                     *branch_id,
-                    visibility,
-                    &global_alive,
-                    &deletion_evidence,
+                    SemanticBranchContext {
+                        visibility,
+                        global_alive: &global_alive,
+                        deletion_evidence: &deletion_evidence,
+                    },
                 )? {
                     consumer_domain.insert(*branch_id, ConsumerLine::Writer(writer_vertex));
                     concurrent_state = true;
@@ -5092,14 +5102,15 @@ impl Repository {
         path: &str,
         trunk_key: atomic_core::crdt::TrunkId,
         branch: atomic_core::crdt::BranchId,
-        visibility: &atomic_core::pristine::GraphVisibilityClosure,
-        global_alive: &std::collections::HashSet<
-            atomic_core::types::GraphNode<atomic_core::types::NodeId>,
-        >,
-        deletion_evidence: &SemanticDeletionCache,
+        context: SemanticBranchContext<'_>,
     ) -> Result<Option<atomic_core::types::GraphNode<atomic_core::types::NodeId>>, String> {
         use atomic_core::crdt::tables::encode_branch_id;
         use atomic_core::pristine::{CrdtTxnT, GraphTxnT};
+        let SemanticBranchContext {
+            visibility,
+            global_alive,
+            deletion_evidence,
+        } = context;
         let branch_key = encode_branch_id(&branch);
         let row = txn
             .get_crdt_branch(&branch_key)

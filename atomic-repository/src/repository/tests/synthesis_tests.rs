@@ -1921,7 +1921,7 @@ fn first_branch(
 #[test]
 fn staged_verification_refuses_an_unattributed_after_reference() {
     use atomic_core::crdt::{tables::encode_branch_id, BranchId};
-    use atomic_core::pristine::{CrdtTxnT, MutTxnT};
+    use atomic_core::pristine::MutTxnT;
     let mut base = CorruptedBase::new(false);
     let (key, _, _) = first_branch(&base.repo, "f.txt");
     let mut txn = base.repo.pristine().write_txn().unwrap();

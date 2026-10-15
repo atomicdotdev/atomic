@@ -6809,7 +6809,7 @@ impl ParallelImporter {
             files.insert(
                 path.clone(),
                 ParsedFile {
-                    new_mode: git_mode_at(&merge_tree, &path),
+                    new_mode: git_mode_at(git, &merge_tree, &path),
                     path,
                     operation: FileOperation::Modified,
                     new_content: Some(entry.repository_bytes.clone()),
