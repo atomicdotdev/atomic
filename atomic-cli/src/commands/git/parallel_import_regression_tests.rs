@@ -132,3 +132,30 @@ fn fallback_rename_preserves_both_raw_paths() {
     );
     assert_eq!(parsed[0].old_content, parsed[0].new_content);
 }
+
+#[test]
+fn tree_lookup_preserves_nested_raw_names_and_modes_on_every_host() {
+    let root = tempfile::tempdir().unwrap();
+    let git = GitRepository::init(root.path()).unwrap();
+    let content = b"raw nested content\n";
+    let mut nested = git.treebuilder(None).unwrap();
+    nested
+        .insert(
+            b"file-\xff%\t".as_slice(),
+            git.blob(content).unwrap(),
+            0o100755,
+        )
+        .unwrap();
+    let mut builder = git.treebuilder(None).unwrap();
+    builder
+        .insert(b"dir-\xfe".as_slice(), nested.write().unwrap(), 0o040000)
+        .unwrap();
+    let tree = git.find_tree(builder.write().unwrap()).unwrap();
+    let path = atomic_repository::escape_repo_path(b"dir-\xfe/file-\xff%\t");
+
+    assert!(tree_entry_exists(&git, &tree, &path));
+    assert_eq!(git_mode_at(&git, &tree, &path), Some(0o100755));
+    assert_eq!(get_file_content(&git, &tree, &path).unwrap(), content);
+    assert!(!tree_entry_exists(&git, &tree, "missing"));
+    assert!(git_tree_entry(&git, &tree, "dir%00name").is_err());
+}

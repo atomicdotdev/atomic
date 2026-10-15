@@ -2236,7 +2236,7 @@ fn merge_resolution_frontier_failpoint_fails_closed() {
     git_commit(&root, "base");
 
     // Import the pre-merge history first.
-    atomic_ok(&root, &home, &["git", "import", "--no-vault"]);
+    atomic_ok(&root, &home, &["git", "import", "--all", "--no-vault"]);
     let before_changes = {
         let repo = open_repo(&root);
         repo.effective_history(Some("main")).unwrap().len()
@@ -2271,7 +2271,7 @@ fn merge_resolution_frontier_failpoint_fails_closed() {
     let failed = atomic_env(
         &root,
         &home,
-        &["git", "import", "--incremental", "--no-vault"],
+        &["git", "import", "--all", "--incremental", "--no-vault"],
         &[("ATOMIC_FAIL_SYNTHESIS_DEPS_INDEX", "1")],
     );
     assert!(
@@ -2314,7 +2314,7 @@ fn merge_resolution_frontier_failpoint_fails_closed() {
     atomic_ok(
         &root,
         &home,
-        &["git", "import", "--incremental", "--no-vault"],
+        &["git", "import", "--all", "--incremental", "--no-vault"],
     );
     let repo = open_repo(&root);
     let merge_change = change_of(&repo, "main", &merge);

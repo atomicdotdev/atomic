@@ -449,12 +449,15 @@ pub fn retrieve_graph<T: GraphTxnT>(
 /// Pair a deleted incoming binding with new content inserted by the same
 /// change at that exact predecessor. These are canonical graph witnesses,
 /// independent of path indexes, local insertion order, and Git metadata.
+type ReplacementRoot = (GraphNode<NodeId>, GraphNode<NodeId>);
+type ReplacementRootsMemo = HashMap<GraphNode<NodeId>, Vec<ReplacementRoot>>;
+
 fn replacement_roots<T: GraphTxnT>(
     txn: &T,
     options: &RetrieveOptions,
     dead: GraphNode<NodeId>,
-    memo: &mut HashMap<GraphNode<NodeId>, Vec<(GraphNode<NodeId>, GraphNode<NodeId>)>>,
-) -> Result<Vec<(GraphNode<NodeId>, GraphNode<NodeId>)>, PristineError> {
+    memo: &mut ReplacementRootsMemo,
+) -> Result<Vec<ReplacementRoot>, PristineError> {
     if let Some(roots) = memo.get(&dead) {
         return Ok(roots.clone());
     }

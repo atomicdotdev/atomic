@@ -8089,7 +8089,7 @@ fn parse_commit(
                 let mode = if operation == FileOperation::Deleted {
                     None
                 } else {
-                    git_mode_at(&tree, &path)
+                    git_mode_at(git_repo, &tree, &path)
                 };
                 union_paths.entry(path.clone()).or_insert_with(|| {
                     vec![ParsedFile {
@@ -8363,7 +8363,7 @@ fn parse_diff_files(
                 FileOperation::Modified | FileOperation::Deleted | FileOperation::Renamed
             ) {
                 parent_tree.and_then(|pt| {
-                    pt.get_path(&canonical_tree_path(&path))
+                    git_tree_entry(git_repo, pt, &path)
                         .ok()
                         .filter(|entry| entry.kind() == Some(git2::ObjectType::Commit))
                         .and_then(|entry| {
@@ -8593,7 +8593,7 @@ fn parse_diff_files_via_git_cli(
         let new_mode = if operation == FileOperation::Deleted {
             None
         } else {
-            git_mode_at(tree, &path)
+            git_mode_at(git_repo, tree, &path)
         };
         files.push(ParsedFile {
             path,
@@ -8712,20 +8712,18 @@ fn expected_materialization(git_mode: u32) -> CliResult<ExpectedMaterialization>
     Ok(expected)
 }
 
-fn git_mode_at(tree: &Tree<'_>, path: &str) -> Option<u32> {
-    tree.get_path(&canonical_tree_path(path))
+fn git_mode_at(git_repo: &GitRepository, tree: &Tree<'_>, path: &str) -> Option<u32> {
+    git_tree_entry(git_repo, tree, path)
         .ok()
         .map(|entry| entry.filemode() as u32)
 }
 
 /// Whether a path exists in the tree (any entry kind).
-fn tree_entry_exists(_git_repo: &GitRepository, tree: &Tree, path: &str) -> bool {
-    tree.get_path(&canonical_tree_path(path)).is_ok()
+fn tree_entry_exists(git_repo: &GitRepository, tree: &Tree, path: &str) -> bool {
+    git_tree_entry(git_repo, tree, path).is_ok()
 }
 
-/// Get file content from a git tree.
-/// A Git tree lookup path from the canonical String identity: the reversible
-/// escape decodes back to the exact raw bytes (review CB-9C R7).
+/// A physical filesystem path decoded from the canonical String identity.
 pub(super) fn canonical_tree_path(path: &str) -> PathBuf {
     match atomic_repository::unescape_repo_path(path) {
         Ok(raw) => {
@@ -8736,22 +8734,50 @@ pub(super) fn canonical_tree_path(path: &str) -> PathBuf {
             }
             #[cfg(not(unix))]
             {
-                let _ = raw;
-                PathBuf::from(path)
+                match String::from_utf8(raw) {
+                    Ok(decoded) => PathBuf::from(decoded),
+                    Err(_) => PathBuf::from(path),
+                }
             }
         }
         Err(_) => PathBuf::from(path),
     }
 }
 
+/// Look up raw Git path components without routing them through host paths.
+/// Git trees can contain names (including non-UTF-8 bytes) that the host
+/// filesystem cannot represent. Their repository identities must still be
+/// decoded exactly for blob, gitlink, existence, and mode lookups.
+fn git_tree_entry(
+    git_repo: &GitRepository,
+    tree: &Tree<'_>,
+    path: &str,
+) -> CliResult<git2::TreeEntry<'static>> {
+    let raw = atomic_repository::unescape_repo_path(path)
+        .map_err(|error| git_error(format!("invalid encoded Git path '{path}': {error}")))?;
+    let mut components = raw.split(|byte| *byte == b'/').peekable();
+    let mut current = tree.clone();
+    while let Some(component) = components.next() {
+        if component.is_empty() || component.contains(&0) {
+            return Err(git_error(format!("invalid Git tree path '{path}'")));
+        }
+        let entry = current
+            .get_name_bytes(component)
+            .ok_or_else(|| git_error(format!("Path not found in tree: '{path}'")))?;
+        if components.peek().is_none() {
+            return Ok(entry.to_owned());
+        }
+        current = git_repo
+            .find_tree(entry.id())
+            .map_err(|error| git_error(format!("cannot read Git subtree for '{path}': {error}")))?;
+    }
+    Err(git_error(format!("invalid empty Git tree path '{path}'")))
+}
+
 fn get_file_content(git_repo: &GitRepository, tree: &Tree, path: &str) -> CliResult<Vec<u8>> {
     // CB-9C path fidelity: the String identity is the reversible escape of
     // the raw Git bytes, so the tree lookup decodes before reading.
-    let entry = tree
-        .get_path(&canonical_tree_path(path))
-        .map_err(|e| CliError::GitError {
-            message: format!("Path not found in tree: {}", e),
-        })?;
+    let entry = git_tree_entry(git_repo, tree, path)?;
 
     if entry.kind() == Some(ObjectType::Commit) {
         return Ok(entry.id().to_string().into_bytes());
