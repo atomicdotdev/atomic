@@ -8,6 +8,13 @@ use atomic_core::pristine::{
     CachedGraphTxn, GraphTxnT, GraphVisibilityClosure, PathClaimId, ViewGraph, ViewMembershipSet,
 };
 
+/// Canonical trunk, live lines in closure order, and all observed line identities.
+type ExistingSemanticState = (
+    Option<atomic_core::crdt::TrunkId>,
+    Vec<atomic_core::crdt::BranchId>,
+    Vec<atomic_core::crdt::BranchId>,
+);
+
 /// Walk the line order recorded by one effective closure. Ambient AFTER
 /// rows may have been reparented by a different view and are not a baseline.
 pub(super) fn semantic_branch_order(
@@ -957,14 +964,7 @@ impl Repository {
         inode: atomic_core::types::Inode,
         view_name: &str,
         excluded: &[Hash],
-    ) -> Result<
-        (
-            Option<atomic_core::crdt::TrunkId>,
-            Vec<atomic_core::crdt::BranchId>,
-            Vec<atomic_core::crdt::BranchId>,
-        ),
-        String,
-    > {
+    ) -> Result<ExistingSemanticState, String> {
         use atomic_core::crdt::tables::decode_trunk_id;
         use atomic_core::pristine::CrdtTxnT;
 
