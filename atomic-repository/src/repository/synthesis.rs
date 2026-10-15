@@ -1839,6 +1839,15 @@ impl Repository {
     /// against the staged graph projection before the transaction commits.
     /// `hashed_metadata` is hash-covered caller metadata (CB-9B raw foreign
     /// facts); empty when none.
+    ///
+    /// `supersede` names the genuinely replaced history to remove from the
+    /// target view in the same transaction: view members whose Git origin is
+    /// outside the import's full target closure. Assembly exclusions that are
+    /// sibling legs of that same closure (invisible while this commit
+    /// assembles, but part of the import target) must not appear here — the
+    /// later merge resolution re-references them through
+    /// `ensure_union_state`, and a mid-walk eviction would leave descendant
+    /// commits assembling against a missing baseline.
     #[allow(clippy::too_many_arguments)]
     pub fn synthesize_git_change(
         &self,
@@ -1855,7 +1864,7 @@ impl Repository {
         expectation: &StagedExpectation,
         git_commit_sha: Option<&str>,
         parent_interpretation_closure: &[Hash],
-        supersede_excluded: bool,
+        supersede: &[Hash],
     ) -> Result<SynthesisOutcome, RepositoryError> {
         let working_copy = self.require_working_copy_id()?;
         // Reentrant under an outer workspace transaction on the same thread;
@@ -1876,7 +1885,7 @@ impl Repository {
             expectation,
             git_commit_sha,
             parent_interpretation_closure,
-            supersede_excluded,
+            supersede,
         )
     }
 
@@ -1934,7 +1943,7 @@ impl Repository {
             // R1): its assembly exclusions are sibling lineages that the union
             // legitimately contains, so they are never superseded from the
             // view — `ensure_union_state` re-references them first.
-            false,
+            &[],
         )
     }
 
@@ -1959,7 +1968,7 @@ impl Repository {
         parent_interpretation_closure: &[Hash],
         expectation: &StagedExpectation,
         assembly_excluded: &[Hash],
-        supersede_excluded: bool,
+        supersede: &[Hash],
     ) -> Result<SynthesisOutcome, RepositoryError> {
         let working_copy = self.require_working_copy_id()?;
         let operation_lock = self.try_lock_operation(working_copy)?;
@@ -1978,7 +1987,7 @@ impl Repository {
             expectation,
             git_commit_sha,
             parent_interpretation_closure,
-            supersede_excluded,
+            supersede,
         )
     }
 
@@ -2000,7 +2009,7 @@ impl Repository {
         parent_interpretation_closure: &[Hash],
         expectation: &StagedExpectation,
         assembly_excluded: &[Hash],
-        supersede_excluded: bool,
+        supersede: &[Hash],
     ) -> Result<SynthesisOutcome, RepositoryError> {
         self.synthesize_git_change_locked(
             workspace.operation_lock(),
@@ -2017,7 +2026,7 @@ impl Repository {
             expectation,
             git_commit_sha,
             parent_interpretation_closure,
-            supersede_excluded,
+            supersede,
         )
     }
 
@@ -2121,7 +2130,7 @@ impl Repository {
         expectation: &StagedExpectation,
         git_commit_sha: Option<&str>,
         parent_interpretation_closure: &[Hash],
-        supersede_excluded: bool,
+        supersede: &[Hash],
     ) -> Result<SynthesisOutcome, RepositoryError> {
         use atomic_core::pristine::ViewTxnT;
         use atomic_core::record::workflow::assemble_change;
@@ -2292,19 +2301,19 @@ impl Repository {
             };
             if in_view {
                 // Review C4: an already-known hash cannot bypass the
-                // supersede alignment. When this synthesis would supersede
-                // assembly exclusions, the published effective view must not
-                // still contain them — including through ancestors. A
+                // supersede alignment. When this synthesis supersedes
+                // genuinely replaced history, the published effective view
+                // must not still contain it — including through ancestors. A
                 // survivor means the boundary cannot be aligned without
                 // touching ancestor/unrelated work: refuse instead of
-                // reporting a clean already-in-view outcome.
-                if supersede_excluded && !assembly_excluded.is_empty() {
+                // reporting a clean already-in-view outcome. Same-closure
+                // sibling legs are never superseded and legitimately survive.
+                if !supersede.is_empty() {
                     let txn = self
                         .pristine
                         .read_txn()
                         .map_err(|e| RepositoryError::Database(e.to_string()))?;
-                    let survivors =
-                        self.surviving_exclusions(&txn, view_name, assembly_excluded)?;
+                    let survivors = self.surviving_exclusions(&txn, view_name, supersede)?;
                     if !survivors.is_empty() {
                         let named = survivors
                             .iter()
@@ -2337,6 +2346,15 @@ impl Repository {
                         .load_change(&hash)
                         .map_err(|e| RepositoryError::Database(e.to_string()))?;
                     let txn = operation_lock.begin_write_immediate()?;
+                    // Verification mode (review C4): prove the effective
+                    // boundary only when every assembly exclusion left the
+                    // effective membership (genuinely replaced history);
+                    // retained same-closure sibling legs keep the isolated
+                    // assembly filter, which is this commit's own
+                    // interpretation.
+                    let verify_effective = self
+                        .surviving_exclusions(&*txn, view_name, assembly_excluded)?
+                        .is_empty();
                     let verification = self.verify_staged_projection(
                         &txn,
                         view_name,
@@ -2344,7 +2362,7 @@ impl Repository {
                         assembly_excluded,
                         expectation,
                         &hash,
-                        supersede_excluded,
+                        verify_effective,
                     );
                     // The transaction is dropped uncommitted: this is a
                     // read-side proof, not a mutation stage.
@@ -2381,21 +2399,24 @@ impl Repository {
                     timings,
                     assembly_excluded,
                     expectation,
-                    supersede_excluded,
+                    supersede,
                 );
             }
         }
 
         // 3. Journal the SynthesizeGit intent before any visible effect.
         //
-        // CB-9B review B4: when the caller supersedes its assembly
-        // exclusions (single-parent rewrite synthesis), the excluded
+        // CB-9B review B4: when the caller supersedes genuinely replaced
+        // history (single-parent rewrite synthesis), the replaced
         // Git-origin members that live in THIS view leave the view in the
         // same journal operation that adds the new change, so the published
         // boundary equals the commit's exact interpreted closure. Members
         // living in ancestor views are never removed: ancestor views are
         // shared perspectives whose membership other work depends on
-        // (review B4: preserve other views/history).
+        // (review B4: preserve other views/history). Same-closure sibling
+        // legs are assembly-excluded but never superseded: the import target
+        // still reaches them, and the merge resolution re-references them
+        // through `ensure_union_state`.
         let working_copy = operation_lock.working_copy();
         let (before_state, after_state, sequence, removal_transitions) = {
             let txn = self
@@ -2410,19 +2431,17 @@ impl Repository {
                 })?;
             let mut excluded_ids: std::collections::HashSet<atomic_core::types::NodeId> =
                 std::collections::HashSet::new();
-            if supersede_excluded {
-                for excluded in assembly_excluded {
-                    let id = txn
-                        .get_internal(excluded)
-                        .map_err(|e| RepositoryError::Database(e.to_string()))?
-                        .ok_or_else(|| RepositoryError::InvalidOperation {
-                            message: format!(
-                                "superseded assembly exclusion names change {} which is not registered locally",
-                                excluded.to_base32()
-                            ),
-                        })?;
-                    excluded_ids.insert(id);
-                }
+            for excluded in supersede {
+                let id = txn
+                    .get_internal(excluded)
+                    .map_err(|e| RepositoryError::Database(e.to_string()))?
+                    .ok_or_else(|| RepositoryError::InvalidOperation {
+                        message: format!(
+                            "superseded assembly exclusion names change {} which is not registered locally",
+                            excluded.to_base32()
+                        ),
+                    })?;
+                excluded_ids.insert(id);
             }
             let mut removal_transitions: Vec<MetadataTransition> = Vec::new();
             let mut after_view_state = Merkle::ZERO;
@@ -2526,7 +2545,7 @@ impl Repository {
             expectation,
             git_commit_sha,
             parent_interpretation_closure,
-            supersede_excluded,
+            supersede,
         );
 
         match apply_result {
@@ -2555,10 +2574,12 @@ impl Repository {
     /// apply.
     ///
     /// Review C4: the reference path carries the same supersede alignment and
-    /// pre-publication verification duties as the apply path — excluded
-    /// target-local members leave the view inside the same transaction,
-    /// ancestor survivors refuse before commit, and the staged proof runs
-    /// against the actual post-alignment effective view closure.
+    /// pre-publication verification duties as the apply path — genuinely
+    /// replaced target-local members leave the view inside the same
+    /// transaction, ancestor survivors refuse before commit, and the staged
+    /// proof runs against the actual post-alignment effective view closure
+    /// whenever every assembly exclusion left the effective membership
+    /// (retained same-closure sibling legs keep the isolated filter).
     ///
     /// Review D1: the prepared operation carries the exact lease set the
     /// fresh-apply path prepares — every target-local exclusion becomes a
@@ -2578,7 +2599,7 @@ impl Repository {
         mut timings: super::ImportWriteTimings,
         assembly_excluded: &[Hash],
         expectation: &StagedExpectation,
-        supersede_excluded: bool,
+        supersede: &[Hash],
     ) -> Result<SynthesisOutcome, RepositoryError> {
         use atomic_core::apply::compute_new_state;
 
@@ -2593,7 +2614,9 @@ impl Repository {
         // FINAL position after the compaction — never the pre-removal count.
         // Preparing stale leases here committed membership that the lease
         // verification then rejected outside the transaction, leaving a
-        // Prepared head that blocked ordinary reopen (review D1).
+        // Prepared head that blocked ordinary reopen (review D1). Only the
+        // genuinely replaced history in `supersede` becomes removal leases;
+        // same-closure sibling legs stay members of the union.
         let (before_state, after_state, final_sequence, removal_transitions) = {
             let txn = self
                 .pristine
@@ -2607,19 +2630,17 @@ impl Repository {
                 })?;
             let mut excluded_ids: std::collections::HashSet<atomic_core::types::NodeId> =
                 std::collections::HashSet::new();
-            if supersede_excluded {
-                for excluded in assembly_excluded {
-                    let id = txn
-                        .get_internal(excluded)
-                        .map_err(|e| RepositoryError::Database(e.to_string()))?
-                        .ok_or_else(|| RepositoryError::InvalidOperation {
-                            message: format!(
-                                "superseded assembly exclusion names change {} which is not registered locally",
-                                excluded.to_base32()
-                            ),
-                        })?;
-                    excluded_ids.insert(id);
-                }
+            for excluded in supersede {
+                let id = txn
+                    .get_internal(excluded)
+                    .map_err(|e| RepositoryError::Database(e.to_string()))?
+                    .ok_or_else(|| RepositoryError::InvalidOperation {
+                        message: format!(
+                            "superseded assembly exclusion names change {} which is not registered locally",
+                            excluded.to_base32()
+                        ),
+                    })?;
+                excluded_ids.insert(id);
             }
             let mut removal_transitions: Vec<MetadataTransition> = Vec::new();
             let mut after_view_state = Merkle::ZERO;
@@ -2708,12 +2729,13 @@ impl Repository {
         let apply_start = std::time::Instant::now();
         let apply_result = (|| -> Result<ImportWriteOutcome, RepositoryError> {
             let mut txn = operation_lock.begin_write_immediate()?;
-            // Review C4: supersede target-local exclusions and refuse
+            // Review C4: supersede target-local replaced history and refuse
             // ancestor survivors BEFORE the reference is published, mirroring
-            // the apply path's alignment contract.
-            if supersede_excluded {
-                self.supersede_excluded_members_locked(&mut txn, view_name, assembly_excluded)?;
-                let survivors = self.surviving_exclusions(&*txn, view_name, assembly_excluded)?;
+            // the apply path's alignment contract. Same-closure sibling legs
+            // are never superseded and stay members of the union.
+            if !supersede.is_empty() {
+                self.supersede_excluded_members_locked(&mut txn, view_name, supersede)?;
+                let survivors = self.surviving_exclusions(&*txn, view_name, supersede)?;
                 if !survivors.is_empty() {
                     let named = survivors
                         .iter()
@@ -2745,6 +2767,12 @@ impl Repository {
                 .map_err(|e| RepositoryError::Database(e.to_string()))?;
             // Review C4: the referenced change must render its commit tree
             // through the post-alignment view before the transaction commits.
+            // The effective boundary is proven when every assembly exclusion
+            // left the effective membership; retained sibling legs keep the
+            // isolated assembly filter (this commit's own interpretation).
+            let verify_effective = self
+                .surviving_exclusions(&*txn, view_name, assembly_excluded)?
+                .is_empty();
             self.verify_staged_projection(
                 &txn,
                 view_name,
@@ -2754,7 +2782,7 @@ impl Repository {
                 assembly_excluded,
                 expectation,
                 hash,
-                supersede_excluded,
+                verify_effective,
             )?;
             let outcome = ImportWriteOutcome {
                 hash: *hash,
@@ -2808,7 +2836,7 @@ impl Repository {
         expectation: &StagedExpectation,
         git_commit_sha: Option<&str>,
         parent_interpretation_closure: &[Hash],
-        supersede_excluded: bool,
+        supersede: &[Hash],
     ) -> Result<ImportWriteOutcome, RepositoryError> {
         use crate::apply::write_change_to_graph;
         use atomic_core::apply::compute_new_state;
@@ -2965,21 +2993,23 @@ impl Repository {
         let projection_done = commit_start.elapsed();
 
         // CB-9B review B4 + C4: align the published target to the exact
-        // intended closure BEFORE verification. Every superseded assembly
-        // exclusion leaves this view inside the same transaction, so the
-        // staged full-tree check below proves the post-publication view
-        // state — not just the isolated interpretation — and a failing check
-        // aborts before commit, so no misaligned boundary or failing
-        // successor is ever published.
-        if supersede_excluded {
-            self.supersede_excluded_members_locked(&mut txn, view_name, assembly_excluded)?;
+        // intended closure BEFORE verification. Genuinely replaced history
+        // in `supersede` leaves this view inside the same transaction, so
+        // the staged full-tree check below can prove the post-publication
+        // view state — not just the isolated interpretation — and a failing
+        // check aborts before commit, so no misaligned boundary or failing
+        // successor is ever published. Same-closure sibling legs are
+        // assembly-excluded but never superseded; the isolated filter
+        // remains their proof, and the merge resolution re-references them.
+        if !supersede.is_empty() {
+            self.supersede_excluded_members_locked(&mut txn, view_name, supersede)?;
             // Review C4: the alignment removes target-local members only.
             // An exclusion that also lives in an ANCESTOR view survives the
             // removal and would remain visible in the published effective
             // view while a filtered check hid it. Refuse before commit:
             // ancestor views are shared perspectives and are never
             // flattened or deleted to make alignment pass.
-            let survivors = self.surviving_exclusions(&*txn, view_name, assembly_excluded)?;
+            let survivors = self.surviving_exclusions(&*txn, view_name, supersede)?;
             if !survivors.is_empty() {
                 let named = survivors
                     .iter()
@@ -3000,9 +3030,17 @@ impl Repository {
         // Fail-closed verification of the staged state, still inside the
         // same pristine write transaction: an error aborts before commit, so
         // no failing state or successor can become visible or verified.
-        // The supersede path verifies the ACTUAL post-alignment effective
-        // view closure — no exclusion subtraction — so the proof covers
-        // exactly what publication will show (review C4).
+        // Verification mode (review C4): when every assembly exclusion left
+        // the effective membership (genuinely replaced history was evicted,
+        // or there were no exclusions), the check proves the ACTUAL
+        // post-alignment effective view closure — no exclusion subtraction —
+        // covering exactly what publication will show. Retained sibling
+        // legs keep the isolated assembly filter: the proof is this commit's
+        // own interpreted closure, and the union boundary is the merge
+        // resolution's staged check.
+        let verify_effective = self
+            .surviving_exclusions(&*txn, view_name, assembly_excluded)?
+            .is_empty();
         self.verify_staged_projection(
             &txn,
             view_name,
@@ -3010,7 +3048,7 @@ impl Repository {
             assembly_excluded,
             expectation,
             hash,
-            supersede_excluded,
+            verify_effective,
         )
         .map_err(|error| RepositoryError::InvalidOperation {
             message: format!(

@@ -749,6 +749,7 @@ impl Default for ClosureLedger {
             ancestry: HashMap::new(),
             closures: HashMap::new(),
             member_origins: None,
+            target_closure: None,
         }
     }
 }
@@ -767,6 +768,12 @@ pub(crate) struct ClosureLedger {
     closures: HashMap<String, std::sync::Arc<HashSet<ContentHash>>>,
     /// Full-chain view membership with Git origins, loaded once per run.
     member_origins: Option<Vec<(ContentHash, Option<String>)>>,
+    /// The complete Git ancestry of this import's target tip (the branch
+    /// closure the walk accumulates). Members whose Git origin is inside
+    /// this set are sibling legs of the same import target — never
+    /// superseded from the view — while origins outside it are genuinely
+    /// replaced history. `None` only before the walk sets it.
+    target_closure: Option<std::sync::Arc<HashSet<String>>>,
 }
 
 impl ClosureLedger {
@@ -882,6 +889,10 @@ impl ClosureLedger {
     /// persisted/reconstructed ancestor closure. Non-Git members (native
     /// Atomic work) cannot be attributed and stay visible: their content is
     /// genuinely part of the view state Git commits build on.
+    ///
+    /// These exclusions are ASSEMBLY visibility only. Which of them are
+    /// genuinely replaced history — and may leave the view — is decided by
+    /// [`ClosureLedger::supersede_exclusions_for`].
     fn exclusions_for(
         &mut self,
         repo: &Repository,
@@ -917,6 +928,58 @@ impl ClosureLedger {
             }
         }
         Ok(exclusions)
+    }
+
+    /// The genuinely replaced history among `sha`'s assembly exclusions:
+    /// excluded view members whose Git origin is ALSO outside this import's
+    /// full target closure. These — and only these — may leave the target
+    /// view when `sha` lands.
+    ///
+    /// An assembly exclusion whose origin IS inside the target closure is a
+    /// sibling leg of the same import target: the walk reaches it (or the
+    /// merge that reunifies the legs) later, the merge resolution
+    /// re-references it through `ensure_union_state`, and evicting it
+    /// mid-walk would leave descendant commits assembling against a missing
+    /// baseline — the sibling-eviction corruption. Origins outside the
+    /// target closure are history the target replaced (e.g. an incremental
+    /// import after a force-push rewrite): evicting them keeps the published
+    /// boundary equal to the commit's interpreted closure.
+    fn supersede_exclusions_for(
+        &mut self,
+        repo: &Repository,
+        git: &GitRepository,
+        sha: &str,
+        target_view: &str,
+        has_git_parent: bool,
+    ) -> CliResult<Vec<ContentHash>> {
+        let assembly = self.exclusions_for(repo, git, sha, target_view, has_git_parent)?;
+        if assembly.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Clone the Arc before the mutable `origins_for` call: no borrow of
+        // `self` may outlive it.
+        let target = match self.target_closure.clone() {
+            Some(target) => target,
+            // No target closure known: the historical behavior (evict every
+            // assembly exclusion) stays fail-safe for callers that never
+            // establish the walk's target.
+            None => return Ok(assembly),
+        };
+        let mut origins: HashMap<ContentHash, Option<String>> = HashMap::new();
+        for (hash, origin_sha) in self.origins_for(repo, target_view)? {
+            origins.insert(hash, origin_sha);
+        }
+        let mut superseded = Vec::with_capacity(assembly.len());
+        for hash in assembly {
+            let replaced = origins
+                .get(&hash)
+                .and_then(|origin| origin.as_deref())
+                .is_some_and(|origin| !target.contains(origin));
+            if replaced {
+                superseded.push(hash);
+            }
+        }
+        Ok(superseded)
     }
 
     /// Record that importing `sha` introduced `hash` into `target_view`.
@@ -4416,8 +4479,21 @@ impl ParallelImporter {
         let import_start = Instant::now();
         let mut line_index = ImportLineIndex::default();
         let write_start = Instant::now();
-        let (write_stats, all_imported_commits) =
-            self.phase2_write(repo, &plan.commits, &mut line_index, plan.boundaries())?;
+        // The import target tip for the supersede gate: the branch this walk
+        // accumulates into the target view. A resolvable local branch names
+        // its tip; a detached §7.5 import falls back to the walked commits.
+        let target_tip = self.open_git_repo().ok().and_then(|git| {
+            git.find_branch(branch_name, git2::BranchType::Local)
+                .ok()
+                .and_then(|branch| branch.get().target())
+        });
+        let (write_stats, all_imported_commits) = self.phase2_write(
+            repo,
+            &plan.commits,
+            &mut line_index,
+            plan.boundaries(),
+            target_tip,
+        )?;
         // CB-13C F4: a phase-2 failure is a FAILED partial import — the
         // landed commits are durable and accounted in the stats; the
         // caller surfaces the failure and the aggregate still emits.
@@ -4806,6 +4882,7 @@ impl ParallelImporter {
         commits: &[VerifiedImportCommit],
         line_index: &mut ImportLineIndex,
         boundaries: &[&'static str],
+        target_tip: Option<git2::Oid>,
     ) -> CliResult<(WriteStats, Vec<ImportedCommitInfo>)> {
         let working_copy = repo
             .require_working_copy_id()
@@ -4817,6 +4894,29 @@ impl ParallelImporter {
         let mut batch_start = Instant::now();
         let git = self.open_git_repo()?;
         let mut ledger = ClosureLedger::default();
+        // The import target's full Git closure: the ancestry the walk
+        // accumulates into the target view. Assembly exclusions whose Git
+        // origin is inside this set are sibling legs of the same target and
+        // are never superseded from the view (see
+        // `supersede_exclusions_for`); origins outside it are genuinely
+        // replaced history. A resolvable branch tip defines the closure
+        // exactly; otherwise this run's walked commits are the best
+        // available approximation.
+        if let Some(tip) = target_tip {
+            let tip_sha = tip.to_string();
+            let closure = ledger
+                .ancestry_of(&git, &tip_sha)
+                .map_err(|e| CliError::GitError {
+                    message: format!("cannot read target tip {tip_sha} ancestry: {e}"),
+                })?;
+            ledger.target_closure = Some(closure);
+        } else {
+            let closure: HashSet<String> = commits
+                .iter()
+                .map(|candidate| candidate.parsed.git_sha.clone())
+                .collect();
+            ledger.target_closure = Some(std::sync::Arc::new(closure));
+        }
         // The last commit this batch writes verifies the whole tree even when
         // earlier commits verify only the paths they touch.
         let last_written = commits
@@ -5462,6 +5562,18 @@ impl ParallelImporter {
         // own Git parent's interpreted closure with Git parent-tree
         // baselines. Full ancestor chains participate through the filter.
         let excluded = ledger.exclusions_for(
+            repo,
+            git,
+            &parsed.git_sha,
+            &target,
+            !parsed.parent_oids.is_empty(),
+        )?;
+        // Genuinely replaced history among those exclusions: origins outside
+        // the import target's full closure. Same-closure sibling legs stay
+        // view members (the merge resolution re-references them), so a
+        // mid-walk eviction can never leave a descendant commit assembling
+        // against a missing baseline.
+        let superseded = ledger.supersede_exclusions_for(
             repo,
             git,
             &parsed.git_sha,
@@ -6289,14 +6401,16 @@ impl ParallelImporter {
                 &expectation,
                 Some(&parsed.git_sha),
                 &parent_closure,
-                // CB-9B review B4: a single-parent commit's assembly
-                // exclusions are Git-origin members outside its interpreted
-                // closure — history the commit's Git ancestry replaced. They
-                // leave the target view in the same transaction, so the
-                // published boundary equals the isolated interpretation the
-                // staged check verifies, and the import never exits 4 after
-                // publishing a diverged boundary.
-                true,
+                // CB-9B review B4: the genuinely replaced history among this
+                // commit's assembly exclusions — origins outside the import
+                // target's full closure — leaves the target view in the same
+                // transaction, so the published boundary equals the isolated
+                // interpretation the staged check verifies and the import
+                // never exits 4 after publishing a diverged boundary.
+                // Same-closure sibling legs are excluded from assembly only:
+                // the walk still reaches them, and evicting them mid-walk
+                // would corrupt later commits' baselines.
+                &superseded,
             )
             .map_err(|e| CliError::Internal(e.into()))?;
         let progress_reported = progress.finish();
@@ -6449,6 +6563,16 @@ impl ParallelImporter {
             &self.options.target_view,
             !parsed.parent_oids.is_empty(),
         )?;
+        // Genuinely replaced history among the exclusions — same gate as
+        // write_commit_synthesized: sibling legs of the import target stay
+        // view members.
+        let superseded = ledger.supersede_exclusions_for(
+            repo,
+            git,
+            &parsed.git_sha,
+            &self.options.target_view,
+            !parsed.parent_oids.is_empty(),
+        )?;
         let parent_closure: Vec<atomic_core::types::Hash> = if parsed.parent_oids.is_empty() {
             Vec::new()
         } else {
@@ -6477,9 +6601,10 @@ impl ParallelImporter {
                 ),
                 &excluded,
                 // CB-9B review B4: an empty commit still advances the exact
-                // interpreted closure — superseded exclusions leave the view
-                // in the same transaction (see write_commit_synthesized).
-                true,
+                // interpreted closure — genuinely replaced history leaves the
+                // view in the same transaction (see write_commit_synthesized);
+                // same-closure sibling legs stay members.
+                &superseded,
             )
             .map_err(|e| CliError::Internal(e.into()))?;
         // Index git SHA → Atomic change in GIT_SHA_INDEX
