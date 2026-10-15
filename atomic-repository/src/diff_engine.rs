@@ -1515,6 +1515,67 @@ pub fn legacy_content_file_diffs(
     (file_diffs, stats)
 }
 
+/// Recover before/after bytes for displaying a whole-file CRDT rewrite.
+///
+/// Such rewrites tombstone old branch identities without embedding their text,
+/// then insert a fresh, numbered chain from the file-start sentinel. These are
+/// storage operations, not a human-readable diff. Deleted branch numbers may
+/// include historical tombstones, so callers must obtain the before-content
+/// from recorded history rather than treating those numbers as text offsets.
+/// The resolver is called only after recognizing the rewrite's operation shape.
+/// Ordinary edits, file lifecycle operations, and incomplete chains return None.
+pub fn whole_file_replacement_text(
+    ops: &atomic_core::change::FileOps,
+    contents: &[u8],
+    before: impl FnOnce() -> Option<Vec<u8>>,
+) -> Option<(Vec<u8>, Vec<u8>)> {
+    if ops.trunk_op().is_some() {
+        return None;
+    }
+    let mut deletions = 0;
+    let mut previous = None;
+    let mut next_line = 1;
+    let mut previous_end = None;
+    let mut bytes = Vec::new();
+    for line in ops.line_ops() {
+        match line.operation() {
+            BranchOp::Delete { content, .. } if content.is_empty() && previous.is_none() => {
+                deletions += 1;
+                if line.old_line_num() != Some(deletions) {
+                    return None;
+                }
+            }
+            BranchOp::Insert { after, .. }
+                if *after == previous && line.new_line_num() == Some(next_line) =>
+            {
+                // Leaf tokens omit line terminators. The canonical byte ranges
+                // preserve blank lines, CRLF, and an unterminated final line.
+                let (start, end) = line.content_range()?;
+                let start = usize::try_from(start.get()).ok()?;
+                let end = usize::try_from(end.get()).ok()?;
+                if previous_end.is_some_and(|previous| previous != start) {
+                    return None;
+                }
+                bytes.extend_from_slice(contents.get(start..end)?);
+                previous_end = Some(end);
+                previous = Some(line.branch_id());
+                next_line += 1;
+            }
+            _ => return None,
+        }
+    }
+    if deletions == 0 {
+        return None;
+    }
+    let before = before()?;
+    // A normal edit may delete a blank line with empty tokens. A rewrite
+    // tombstones at least every old line (plus any observed historical IDs).
+    if deletions < atomic_core::diff::Line::from_bytes(&before).len() {
+        return None;
+    }
+    Some((before, bytes))
+}
+
 /// The resolver-parameterized core of [`change_file_diffs`]: `before`
 /// supplies a file's pre-change content for context padding (a `None`
 /// answer pads nothing — zero-context hunks, still at true offsets).
@@ -1559,6 +1620,28 @@ where
             FileChangeStatus::Renamed => FileDiff::modified(file_path),
             _ => FileDiff::modified(file_path),
         };
+
+        // Whole-file rewrites preserve graph/CRDT identities by deleting and
+        // reinserting every line. Display their actual text delta instead of
+        // exposing empty tombstones and unchanged reinserted lines. This also
+        // needs the baseline for --stat and -U0, not just for context padding.
+        if let Some((before_content, after_content)) =
+            whole_file_replacement_text(ops, &change.contents, || before(file_path))
+        {
+            let result = diff_text(&before_content, &after_content, Algorithm::Myers);
+            let old_lines: Vec<_> = before_content.split(|&b| b == b'\n').collect();
+            let new_lines: Vec<_> = after_content.split(|&b| b == b'\n').collect();
+            for mut hunk in
+                build_hunks_from_diff(&result, &old_lines, &new_lines, config.context_lines)
+            {
+                hunk.lines = repair_diff_lines(hunk.lines);
+                file_diff.add_hunk(hunk);
+            }
+            file_diff.compute_stats();
+            stats.add_file(file_diff.stats.clone());
+            file_diffs.push(file_diff);
+            continue;
+        }
 
         // Pass 1: flatten line operations into numbered changed lines.
         let mut insertions = 0usize;
