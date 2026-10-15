@@ -8767,8 +8767,10 @@ fn git_tree_entry(
         if components.peek().is_none() {
             return Ok(entry.to_owned());
         }
+        let subtree_id = entry.id();
+        drop(entry);
         current = git_repo
-            .find_tree(entry.id())
+            .find_tree(subtree_id)
             .map_err(|error| git_error(format!("cannot read Git subtree for '{path}': {error}")))?;
     }
     Err(git_error(format!("invalid empty Git tree path '{path}'")))
