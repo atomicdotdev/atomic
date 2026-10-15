@@ -1917,6 +1917,22 @@ fn first_branch(
 /// skip let the consumer walker fail with OrphanBranch while the graph
 /// output stayed intact.
 #[test]
+fn staged_verification_refuses_an_unattributed_after_reference() {
+    use atomic_core::crdt::{tables::encode_branch_id, BranchId};
+    use atomic_core::pristine::{CrdtTxnT, MutTxnT};
+    let mut base = CorruptedBase::new(false);
+    let (key, _, _) = first_branch(&base.repo, "f.txt");
+    let mut txn = base.repo.pristine().write_txn().unwrap();
+    txn.put_crdt_branch_after(
+        &key,
+        &encode_branch_id(&BranchId::new(NodeId::new(9999), 0)),
+    )
+    .unwrap();
+    txn.commit().unwrap();
+    base.finish_refusal(b"inherited text\n", "no applied canonical writer recorded");
+}
+
+#[test]
 fn staged_verification_refuses_an_unexpected_chain_branch() {
     use atomic_core::crdt::tables::{
         encode_branch_id, encode_branch_value, encode_trunk_id, SerializedBranch,
@@ -2094,7 +2110,7 @@ fn out_of_closure_tombstone_attribution_requires_an_applied_writer() {
     let branch_attributed = super::super::synthesis::out_of_closure_writer_deleted_branch(
         &loader,
         &txn,
-        "f.txt",
+        trunk,
         branch,
         &visibility,
     )
@@ -2106,12 +2122,116 @@ fn out_of_closure_tombstone_attribution_requires_an_applied_writer() {
     let trunk_attributed = super::super::synthesis::out_of_closure_writer_deleted_trunk(
         &loader,
         &txn,
-        "f.txt",
+        trunk,
         &visibility,
     )
     .unwrap();
     assert!(
         !trunk_attributed,
         "a registered-but-unapplied change must not attribute a trunk tombstone"
+    );
+
+    // Once ingestion is proven, attribution uses stable identity. A different
+    // incarnation at the same spelling must not borrow this writer's delete.
+    txn.mark_change_applied(id).unwrap();
+    assert!(
+        super::super::synthesis::out_of_closure_writer_deleted_branch(
+            &loader,
+            &txn,
+            trunk,
+            branch,
+            &visibility,
+        )
+        .unwrap()
+    );
+    assert!(
+        super::super::synthesis::out_of_closure_writer_deleted_trunk(
+            &loader,
+            &txn,
+            trunk,
+            &visibility,
+        )
+        .unwrap()
+    );
+    let other_trunk = TrunkId::new(NodeId::new(8), 0);
+    assert!(
+        !super::super::synthesis::out_of_closure_writer_deleted_branch(
+            &loader,
+            &txn,
+            other_trunk,
+            branch,
+            &visibility,
+        )
+        .unwrap()
+    );
+    assert!(
+        !super::super::synthesis::out_of_closure_writer_deleted_trunk(
+            &loader,
+            &txn,
+            other_trunk,
+            &visibility,
+        )
+        .unwrap()
+    );
+}
+
+#[test]
+fn deletion_evidence_loads_each_applied_writer_once_for_all_its_lines() {
+    use super::super::synthesis::SemanticDeletionEvidence;
+    use atomic_core::change::{Change, ChangeHeader, FileOps, LineOps};
+    use atomic_core::crdt::{BranchId, TrunkId};
+    use atomic_core::pristine::{GraphVisibilityClosure, MutTxnT, ViewMembershipSet};
+    use atomic_core::types::{Hash, NodeId};
+
+    let (_temp, repo) = create_temp_repo();
+    let trunk = TrunkId::new(NodeId::new(7), 0);
+    let mut ops = FileOps::edit(trunk, "same-path.txt".into());
+    for index in 0..80 {
+        ops.add_line_op(LineOps::delete_empty(BranchId::new(NodeId::ROOT, index)));
+    }
+    let change = Change::with_file_ops(
+        ChangeHeader::builder()
+            .message("many semantic deletions")
+            .build(),
+        Vec::new(),
+        vec![ops],
+        Vec::new(),
+        Vec::new(),
+    );
+    let hash = change.serialize(&mut Vec::new()).unwrap();
+    let calls = std::cell::Cell::new(0);
+    let loader = |candidate: &Hash| -> Result<Change, String> {
+        if *candidate != hash {
+            return Err("not this writer".into());
+        }
+        calls.set(calls.get() + 1);
+        Ok(change.clone())
+    };
+    let mut txn = repo.pristine().write_txn().unwrap();
+    let id = txn.register_change(&hash).unwrap();
+    txn.put_change_deps(id, &[]).unwrap();
+    txn.mark_change_applied(id).unwrap();
+    let empty = GraphVisibilityClosure::empty();
+    let evidence = SemanticDeletionEvidence::load(&loader, &txn, trunk, &empty).unwrap();
+    for index in 0..80 {
+        let branch = BranchId::new(id, index);
+        assert!(evidence.applied.contains(&branch));
+        assert!(evidence.outside.contains(&branch));
+    }
+    assert_eq!(calls.get(), 1, "one canonical load covers all 80 lines");
+    let visible = GraphVisibilityClosure::try_from_membership(
+        &txn,
+        &ViewMembershipSet::from_ordered(vec![id]),
+    )
+    .unwrap();
+    let in_closure = SemanticDeletionEvidence::load(&loader, &txn, trunk, &visible).unwrap();
+    assert_eq!(in_closure.applied.len(), 80);
+    assert!(in_closure.outside.is_empty());
+    let other =
+        SemanticDeletionEvidence::load(&loader, &txn, TrunkId::new(NodeId::new(8), 0), &empty)
+            .unwrap();
+    assert!(
+        other.applied.is_empty(),
+        "same spelling cannot borrow another trunk's proof"
     );
 }

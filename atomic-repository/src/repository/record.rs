@@ -8,6 +8,66 @@ use atomic_core::pristine::{
     CachedGraphTxn, GraphTxnT, GraphVisibilityClosure, PathClaimId, ViewGraph, ViewMembershipSet,
 };
 
+/// Walk the line order recorded by one effective closure. Ambient AFTER
+/// rows may have been reparented by a different view and are not a baseline.
+pub(super) fn semantic_branch_order(
+    after: &std::collections::BTreeMap<
+        atomic_core::crdt::BranchId,
+        Option<atomic_core::crdt::BranchId>,
+    >,
+) -> Result<Vec<atomic_core::crdt::BranchId>, String> {
+    let mut successors = std::collections::BTreeMap::<_, Vec<_>>::new();
+    for (branch, predecessor) in after {
+        if predecessor.is_some_and(|id| !after.contains_key(&id)) {
+            return Err(format!(
+                "semantic branch {branch:?} has a predecessor outside its closure"
+            ));
+        }
+        successors.entry(*predecessor).or_default().push(*branch);
+    }
+    let mut stack = successors.remove(&None).unwrap_or_default();
+    stack.reverse();
+    let mut ordered = Vec::with_capacity(after.len());
+    while let Some(branch) = stack.pop() {
+        ordered.push(branch);
+        if let Some(mut children) = successors.remove(&Some(branch)) {
+            children.reverse();
+            stack.extend(children);
+        }
+    }
+    if ordered.len() != after.len() {
+        return Err("semantic closure contains a cyclic line order".into());
+    }
+    Ok(ordered)
+}
+
+/// A whole-file resolution supersedes every line identity observed in its
+/// parent closure. A line that one replay considers dead can still be alive
+/// in the ambient table after a concurrent Modify. Persist its deletion too,
+/// so the resolution dominates both histories in either ingestion order.
+fn complete_semantic_replacement(
+    mut recorded: atomic_core::record::workflow::RecordedFile,
+    observed: &[atomic_core::crdt::BranchId],
+) -> atomic_core::record::workflow::RecordedFile {
+    if recorded
+        .hunks()
+        .iter()
+        .any(|hunk| hunk.deleted_lines == [usize::MAX])
+    {
+        if let Some(mut ops) = recorded.crdt_ops().cloned() {
+            let addressed: std::collections::HashSet<_> =
+                ops.line_ops().iter().map(|line| line.branch_id()).collect();
+            for branch in observed {
+                if !addressed.contains(branch) {
+                    ops.add_line_op(atomic_core::change::LineOps::delete_empty(*branch));
+                }
+            }
+            recorded.set_crdt_ops(ops);
+        }
+    }
+    recorded
+}
+
 #[cfg(test)]
 thread_local! {
     pub(super) static RECORD_APPLY_FAULT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -121,6 +181,378 @@ impl Repository {
         )
     }
 
+    /// Record an explicit foreign merge result for a same-path file conflict.
+    /// Uses the native name-resolution policy and canonical claims; no TREE
+    /// binding or import order chooses the retained inode. Returns None when
+    /// the selected closure has no name conflict at this path.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # fn example(repo: &atomic_repository::Repository) -> Result<(), String> {
+    /// let records = repo.record_foreign_name_resolution_on_view_excluding(
+    ///     "config.txt", b"merged settings\n", "main", &[],
+    /// )?;
+    /// // Include these records in the GitResolution for the parent union.
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    /// Refuses directory or rename conflicts and unreadable graph or semantic
+    /// state. Equal-content claimants in an explicit foreign merge are resolved
+    /// by canonical identity, with the losing claims retained in history.
+    pub fn record_foreign_name_resolution_on_view_excluding(
+        &self,
+        path: &str,
+        new_content: &[u8],
+        view_name: &str,
+        excluded: &[Hash],
+    ) -> Result<Option<Vec<atomic_core::record::workflow::RecordedFile>>, String> {
+        use atomic_core::output::alive::RetrieveOptions;
+        use atomic_core::record::workflow::{
+            record_modified_file, DetectedFile, RecordedFile, RecordingOptions,
+        };
+        let txn = self.pristine.read_txn().map_err(|e| e.to_string())?;
+        let view = txn
+            .get_view(view_name)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("view '{view_name}' does not exist"))?;
+        let visibility = super::filter::assembly_visibility_excluding(&txn, &view, excluded)
+            .map_err(|e| e.to_string())?;
+        let projection = self
+            .project_tree_for_visibility_scoped(&txn, &visibility, Some(path))
+            .map_err(|e| e.to_string())?;
+        let Some(conflict) = projection.name_conflicts.get(path) else {
+            return Ok(None);
+        };
+        let cached = CachedGraphTxn::new(&txn).map_err(|e| e.to_string())?;
+        let resolution = prepare_name_resolution(
+            &txn,
+            &cached,
+            &self.change_store,
+            &visibility,
+            path,
+            conflict,
+            new_content,
+            NameResolutionPolicy::ForeignMerge,
+        )
+        .map_err(|e| e.to_string())?;
+        let winner = resolution.winner;
+        let mut records = Vec::new();
+        for side in conflict.sides_at_path(path) {
+            if side.inode == winner.inode {
+                continue;
+            }
+            let bindings = super::materialize::live_names_for_path(
+                &txn,
+                &self.change_store,
+                side.position,
+                path,
+                &visibility.iter_dependency_first().copied().collect(),
+            )
+            .map_err(|e| e.to_string())?;
+            let mut unlinked = RecordedFile::new(path);
+            unlinked.set_inode(side.inode);
+            unlinked.set_position(side.position);
+            unlinked.set_name_conflict_resolution(winner.position, bindings);
+            // Match native resolution: unlink losing names, retain their
+            // graph content and semantic identities as historical evidence.
+            let (trunk, _, _) =
+                self.resolve_existing_semantic_state(path, side.inode, view_name, excluded)?;
+            if let Some(trunk) = trunk {
+                unlinked.set_crdt_ops(atomic_core::change::FileOps::new(
+                    trunk,
+                    path.to_string(),
+                    None,
+                ));
+            }
+            records.push(unlinked);
+        }
+        let (old_content, _) = super::content::retrieve_content_with_filter_fast_with_fork_info(
+            &txn,
+            &self.change_store,
+            winner.inode,
+            winner.position,
+            RetrieveOptions::new().with_graph_visibility(visibility),
+        )
+        .map_err(|e| e.to_string())?;
+        if old_content != new_content {
+            let (trunk, branches, observed) =
+                self.resolve_existing_semantic_state(path, winner.inode, view_name, excluded)?;
+            let memory = atomic_core::output::memory::Memory::new();
+            memory.add_file(path, new_content);
+            let mut detected = DetectedFile::modified(path);
+            detected.inode = Some(winner.inode);
+            detected.position = Some(winner.position);
+            let record = record_modified_file(
+                &memory,
+                &detected,
+                &old_content,
+                None,
+                &RecordingOptions::new()
+                    .unlimited_file_size()
+                    .force_whole_file_replace(true),
+                trunk,
+                Some(&branches),
+            )?;
+            records.push(complete_semantic_replacement(record, &observed));
+        } else {
+            // The foreign merge may resolve permissions/kind even when its
+            // bytes equal the retained claimant. Expose that exact survivor
+            // for the caller's attribute writes, never a losing path claimant.
+            let mut survivor = RecordedFile::new(path);
+            survivor.set_kind(atomic_core::record::workflow::DetectionKind::Modified);
+            survivor.set_inode(winner.inode);
+            survivor.set_position(winner.position);
+            records.push(survivor);
+        }
+        Ok(Some(records))
+    }
+
+    /// Paths with causally concurrent semantic writers in the selected closure.
+    ///
+    /// A foreign merge must explicitly resolve these histories even when their
+    /// graph bytes agree. FileOps and dependency edges establish concurrency;
+    /// canonical FileAdd positions and filtered path claims establish identity.
+    /// No Git merge-base heuristic or ambient semantic row selects a writer.
+    /// Errors reading canonical changes, dependencies, or path claims propagate.
+    pub fn foreign_merge_concurrent_semantic_paths(
+        &self,
+        view_name: &str,
+        excluded: &[Hash],
+    ) -> Result<std::collections::BTreeSet<String>, String> {
+        use atomic_core::crdt::{BranchId, TrunkId, TrunkOp};
+        use std::collections::{HashMap, HashSet};
+        let txn = self.pristine.read_txn().map_err(|e| e.to_string())?;
+        let view = txn
+            .get_view(view_name)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("view '{view_name}' does not exist"))?;
+        let visibility = super::filter::assembly_visibility_excluding(&txn, &view, excluded)
+            .map_err(|e| e.to_string())?;
+        let mut dependencies: HashMap<NodeId, Vec<NodeId>> = HashMap::new();
+        let mut writers: HashMap<TrunkId, HashSet<NodeId>> = HashMap::new();
+        let mut line_writers: HashMap<(TrunkId, BranchId), HashSet<NodeId>> = HashMap::new();
+        let mut positions = HashMap::new();
+        for id in visibility
+            .iter_dependency_first()
+            .copied()
+            .filter(|id| !id.is_root())
+        {
+            let hash = txn
+                .get_external(id)
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| format!("closure change {id} has no hash"))?;
+            let change = self.load_change(&hash).map_err(|e| e.to_string())?;
+            let mut parents = Vec::new();
+            for hash in change.dependencies() {
+                let parent = txn
+                    .get_internal(hash)
+                    .map_err(|e| e.to_string())?
+                    .ok_or_else(|| format!("change {id} has an unregistered dependency {hash}"))?;
+                if !parent.is_root() && !dependencies.contains_key(&parent) {
+                    return Err(format!(
+                        "dependency {parent} is missing before closure change {id}"
+                    ));
+                }
+                parents.push(parent);
+            }
+            let mut ancestors = HashSet::new();
+            let mut pending = parents.clone();
+            while let Some(parent) = pending.pop() {
+                if ancestors.insert(parent) {
+                    if let Some(prior) = dependencies.get(&parent) {
+                        pending.extend(prior.iter().copied());
+                    }
+                }
+            }
+            dependencies.insert(id, parents);
+            for ops in change.file_ops() {
+                let raw = ops.trunk_id();
+                let trunk = if raw.change_id().is_root() {
+                    TrunkId::new(id, raw.file_idx())
+                } else {
+                    raw
+                };
+                if matches!(ops.trunk_op(), Some(TrunkOp::Create { .. })) {
+                    for hunk in change.hunks() {
+                        if let GraphOp::FileAdd {
+                            path, add_inode, ..
+                        } = hunk
+                        {
+                            if path == ops.path() {
+                                positions.insert(Position::new(id, add_inode.start), trunk);
+                            }
+                        }
+                    }
+                }
+                if ops.trunk_op().is_some() || !ops.line_ops().is_empty() {
+                    let frontier = writers.entry(trunk).or_default();
+                    frontier.retain(|writer| !ancestors.contains(writer));
+                    frontier.insert(id);
+                }
+                // A later edit to another line does not resolve this line's
+                // concurrent writers merely by depending on both histories.
+                for line in ops.line_ops() {
+                    let raw = line.branch_id();
+                    let branch = if raw.change_id().is_root() {
+                        BranchId::new(id, raw.branch_idx())
+                    } else {
+                        raw
+                    };
+                    let frontier = line_writers.entry((trunk, branch)).or_default();
+                    frontier.retain(|writer| !ancestors.contains(writer));
+                    frontier.insert(id);
+                }
+            }
+        }
+        let mut concurrent: HashSet<_> = writers
+            .iter()
+            .filter(|(_, frontier)| frontier.len() > 1)
+            .map(|(trunk, _)| *trunk)
+            .collect();
+        concurrent.extend(
+            line_writers
+                .iter()
+                .filter(|(_, frontier)| frontier.len() > 1)
+                .map(|((trunk, _), _)| *trunk),
+        );
+        let claims = super::name_resolution::reduce_path_claims(&txn, &visibility)
+            .map_err(|e| e.to_string())?;
+        Ok(claims
+            .present
+            .iter()
+            .chain(
+                claims
+                    .conflicts
+                    .values()
+                    .flat_map(|conflict| conflict.sides.iter()),
+            )
+            .filter(|claim| {
+                positions
+                    .get(&claim.position)
+                    .is_some_and(|trunk| concurrent.contains(trunk))
+            })
+            .map(|claim| claim.path.clone())
+            .collect())
+    }
+
+    /// Resolve directory identities selected by a foreign merge tree, retaining
+    /// surviving children through explicit same-path structural moves.
+    ///
+    /// Git directories have no inode identity. Independently introduced
+    /// directories therefore need a canonical name resolution in addition to
+    /// any file resolutions. The returned records must precede `file_records`
+    /// so assembly uses the selected directory anchors for new children too.
+    /// All claims come from the exact parent closure; no TREE binding selects
+    /// the winner and no losing directory's children are silently discarded.
+    pub fn record_foreign_directory_resolutions_on_view_excluding(
+        &self,
+        directories: &std::collections::BTreeSet<String>,
+        file_records: &[atomic_core::record::workflow::RecordedFile],
+        view_name: &str,
+        excluded: &[Hash],
+    ) -> Result<Vec<atomic_core::record::workflow::RecordedFile>, String> {
+        use atomic_core::record::workflow::{DetectionKind, RecordedFile};
+        let txn = self.pristine.read_txn().map_err(|e| e.to_string())?;
+        let view = txn
+            .get_view(view_name)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("view '{view_name}' does not exist"))?;
+        let visibility = super::filter::assembly_visibility_excluding(&txn, &view, excluded)
+            .map_err(|e| e.to_string())?;
+        let reduced = super::name_resolution::reduce_path_claims(&txn, &visibility)
+            .map_err(|e| e.to_string())?;
+        let mut conflicts: Vec<_> = reduced
+            .conflicts
+            .iter()
+            .filter(|(path, conflict)| {
+                directories.contains(*path) && conflict.sides.iter().any(|side| side.is_directory())
+            })
+            .collect();
+        conflicts.sort_by_key(|(path, _)| (path.matches('/').count(), *path));
+        let mut records = Vec::new();
+        let mut replaced_parents = std::collections::HashSet::new();
+        let mut losing = std::collections::HashSet::new();
+        for record in file_records {
+            if record.name_conflict_resolution().is_some()
+                || record.kind() == Some(DetectionKind::Deleted)
+            {
+                if let Some(position) = record.position() {
+                    losing.insert(position);
+                }
+            }
+        }
+        for (path, conflict) in conflicts {
+            if conflict.is_rename_conflict()
+                || conflict.sides.iter().any(|side| !side.is_directory())
+            {
+                return Err(format!(
+                    "cannot resolve mixed-kind or renamed directory '{path}'"
+                ));
+            }
+            let mut sides = Vec::new();
+            for side in conflict.sides_at_path(path) {
+                let hash = txn
+                    .get_external(side.position.change)
+                    .map_err(|e| e.to_string())?
+                    .ok_or_else(|| format!("directory '{path}' has no canonical identity"))?;
+                sides.push(((hash, side.position.pos), side));
+            }
+            sides.sort_by_key(|(key, _)| *key);
+            let Some((_, winner)) = sides.first() else {
+                continue;
+            };
+            for (_, side) in sides.iter().skip(1) {
+                losing.insert(side.position);
+                replaced_parents.insert(side.position);
+                let mut record = RecordedFile::new(path);
+                record.set_kind(DetectionKind::Modified);
+                record.set_inode(side.inode);
+                record.set_position(side.position);
+                record.set_name_conflict_resolution(
+                    winner.position,
+                    side.claims.iter().map(|claim| claim.name).collect(),
+                );
+                records.push(record);
+            }
+        }
+        // Resolve the directory names first, then reconnect each surviving
+        // immediate child to the selected parent. Nested directories use the
+        // same operation, retaining both their inode and their descendants.
+        let mut children: Vec<_> = reduced
+            .present
+            .iter()
+            .chain(
+                reduced
+                    .conflicts
+                    .values()
+                    .flat_map(|conflict| conflict.sides.iter()),
+            )
+            .collect();
+        children.sort_by_key(|side| (&side.path, side.position));
+        children.dedup_by_key(|side| (&side.path, side.position));
+        for child in children {
+            if losing.contains(&child.position) {
+                continue;
+            }
+            for source in &child.claims {
+                if !replaced_parents.contains(&source.parent.end_pos()) {
+                    continue;
+                }
+                let mut record = RecordedFile::new(&child.path);
+                record.set_kind(DetectionKind::Moved);
+                record.set_old_path(child.path.clone());
+                record.set_inode(child.inode);
+                record.set_position(child.position);
+                record.set_exact_source_claim(*source);
+                records.push(record);
+            }
+        }
+        Ok(records)
+    }
+
     /// Record a modified file against an explicit baseline while binding the
     /// edit to the file's existing CRDT trunk and alive branches (CB-9B
     /// review F4).
@@ -170,7 +602,7 @@ impl Repository {
             .get_inode_and_position_on_view_excluding(path, view_name, excluded)
             .map_err(|e| format!("cannot resolve '{path}' in view '{view_name}': {e}"))?
             .ok_or_else(|| format!("path '{path}' is absent from view '{view_name}'"))?;
-        let (existing_trunk_id, existing_branches) =
+        let (existing_trunk_id, existing_branches, observed) =
             self.resolve_existing_semantic_state(path, inode, view_name, excluded)?;
         use atomic_core::record::workflow::{record_modified_file, DetectedFile};
         let memory_wc = atomic_core::output::memory::Memory::new();
@@ -206,6 +638,7 @@ impl Repository {
                 Some(existing_branches.as_slice())
             },
         )
+        .map(|recorded| complete_semantic_replacement(recorded, &observed))
     }
 
     /// Record a foreign modification for a path that a Git-detected rename
@@ -231,7 +664,7 @@ impl Repository {
             .get_inode_and_position_on_view_excluding(old_path, &self.current_view, &[])
             .map_err(|e| e.to_string())?
             .ok_or_else(|| format!("path '{old_path}' is absent from the selected closure"))?;
-        let (existing_trunk_id, existing_branches) =
+        let (existing_trunk_id, existing_branches, observed) =
             self.resolve_existing_semantic_state(old_path, inode, &self.current_view, &[])?;
         use atomic_core::record::workflow::{record_modified_file, DetectedFile};
         let memory_wc = atomic_core::output::memory::Memory::new();
@@ -257,6 +690,7 @@ impl Repository {
                 Some(existing_branches.as_slice())
             },
         )
+        .map(|recorded| complete_semantic_replacement(recorded, &observed))
     }
 
     /// The exact alive structural path claim for `path` on `view_name`, or
@@ -373,7 +807,7 @@ impl Repository {
             .ok_or_else(|| {
                 format!("move source '{old_path}' has no alive path claim on view '{view_name}'")
             })?;
-        let (existing_trunk_id, existing_branches) =
+        let (existing_trunk_id, existing_branches, observed) =
             self.resolve_existing_semantic_state(old_path, inode, view_name, excluded)?;
         let existing_trunk_id = existing_trunk_id.ok_or_else(|| {
             format!("path '{old_path}' has no CRDT trunk for its canonical inode")
@@ -412,7 +846,7 @@ impl Repository {
                  no semantic FileOps"
             ));
         }
-        Ok(recorded)
+        Ok(complete_semantic_replacement(recorded, &observed))
     }
 
     /// Record a foreign Git deletion bound to the ACTUAL deleted trunk
@@ -448,7 +882,7 @@ impl Repository {
             .get_inode_and_position_on_view_excluding(path, view_name, excluded)
             .map_err(|e| e.to_string())?
             .ok_or_else(|| format!("path '{path}' is absent from view '{view_name}'"))?;
-        let (existing_trunk_id, existing_branches) =
+        let (existing_trunk_id, _, observed) =
             self.resolve_existing_semantic_state(path, inode, view_name, excluded)?;
         let existing_trunk_id = existing_trunk_id.ok_or_else(|| {
             format!(
@@ -468,9 +902,10 @@ impl Repository {
                 "cannot import deletion '{path}': canonical FileDel is empty"
             ));
         }
-        // Bind the semantic deletion to the real trunk and alive branches.
+        // Deletion dominates every line observed in this file's closure,
+        // including lines concurrently restored in the ambient table.
         let mut ops = FileOps::delete(existing_trunk_id, path.to_string());
-        for branch in existing_branches {
+        for branch in observed {
             ops.add_line_op(atomic_core::change::LineOps::delete_empty(branch));
         }
         recorded.set_crdt_ops(ops);
@@ -512,10 +947,10 @@ impl Repository {
     }
 
     /// Resolve the existing CRDT semantic state of a tracked path: the
-    /// current trunk (path index first — the authoritative "trunk of this
-    /// path" mapping; the inode index can lag when the CRDT layer allocated
-    /// a parallel inode for synthesized flows) and its alive branches in
-    /// file order. Errors fail closed.
+    /// canonical trunk, alive branches in closure-local file order, and all
+    /// observed branch identities. The latter is the deletion domain of a
+    /// whole-file resolution; it must not depend on ambient lifecycle rows.
+    /// Errors fail closed.
     fn resolve_existing_semantic_state(
         &self,
         path: &str,
@@ -526,10 +961,10 @@ impl Repository {
         (
             Option<atomic_core::crdt::TrunkId>,
             Vec<atomic_core::crdt::BranchId>,
+            Vec<atomic_core::crdt::BranchId>,
         ),
         String,
     > {
-        use atomic_core::crdt::queries::iter_trunk_branches_in_file_order;
         use atomic_core::crdt::tables::decode_trunk_id;
         use atomic_core::pristine::CrdtTxnT;
 
@@ -580,7 +1015,7 @@ impl Repository {
         }
         let existing_trunk_id = trunks.into_iter().next();
         let Some(trunk) = existing_trunk_id else {
-            return Ok((None, Vec::new()));
+            return Ok((None, Vec::new(), Vec::new()));
         };
         let indexed = txn
             .get_crdt_inode_trunk(inode.get())
@@ -596,6 +1031,7 @@ impl Repository {
         let visibility = super::filter::assembly_visibility_excluding(&txn, &view, excluded)
             .map_err(|e| e.to_string())?;
         let mut alive = std::collections::HashMap::new();
+        let mut after = std::collections::BTreeMap::new();
         for change_id in visibility
             .iter_dependency_first()
             .copied()
@@ -624,26 +1060,40 @@ impl Repository {
                         raw
                     };
                     use atomic_core::crdt::BranchOp;
+                    let resolve = |id: atomic_core::crdt::BranchId| {
+                        if id.change_id().is_root() {
+                            atomic_core::crdt::BranchId::new(change_id, id.branch_idx())
+                        } else {
+                            id
+                        }
+                    };
                     match line.operation() {
-                        BranchOp::Insert { .. }
-                        | BranchOp::Modify { .. }
-                        | BranchOp::Restore { .. } => {
+                        BranchOp::Insert {
+                            after: predecessor, ..
+                        } => {
+                            alive.insert(branch, true);
+                            after.insert(branch, predecessor.map(resolve));
+                        }
+                        BranchOp::Modify { .. } | BranchOp::Restore { .. } => {
                             alive.insert(branch, true);
                         }
                         BranchOp::Delete { .. } => {
                             alive.insert(branch, false);
                         }
-                        _ => {}
+                        BranchOp::Reparent { new_after, .. } => {
+                            after.insert(branch, new_after.map(resolve));
+                        }
                     }
                 }
             }
         }
-        let existing_branches = iter_trunk_branches_in_file_order(&txn, trunk)
-            .map_err(|e| e.to_string())?
-            .into_iter()
+        let observed = semantic_branch_order(&after)?;
+        let existing_branches = observed
+            .iter()
+            .copied()
             .filter(|branch| alive.get(branch) == Some(&true))
             .collect();
-        Ok((existing_trunk_id, existing_branches))
+        Ok((existing_trunk_id, existing_branches, observed))
     }
 
     /// This is the main entry point for creating a change from working copy
@@ -1772,7 +2222,11 @@ impl Repository {
                             path,
                             conflict,
                             &repository_bytes,
-                            preserve_mode,
+                            if preserve_mode {
+                                NameResolutionPolicy::PreserveWorkingIdentity
+                            } else {
+                                NameResolutionPolicy::EditedContent
+                            },
                         ) {
                             Ok(resolution) => Some(resolution),
                             Err(error) => {
@@ -3293,6 +3747,13 @@ fn move_similarity(old: &[u8], new: &[u8]) -> (u16, crate::record::MoveBasis) {
     (score, MoveBasis::ContentSimilarity)
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NameResolutionPolicy {
+    EditedContent,
+    PreserveWorkingIdentity,
+    ForeignMerge,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn prepare_name_resolution(
     txn: &atomic_core::pristine::ReadTxn,
@@ -3302,11 +3763,12 @@ fn prepare_name_resolution(
     path: &str,
     conflict: &super::name_resolution::ProjectedNameConflict,
     working: &[u8],
-    preserve_mode: bool,
+    policy: NameResolutionPolicy,
 ) -> Result<PreparedNameResolution, RecordError> {
     use atomic_core::record::workflow::globalize::{
         globalize_solve_name_conflict, GlobalizeContext, NameConflictClaim,
     };
+    let preserve_mode = policy == NameResolutionPolicy::PreserveWorkingIdentity;
 
     if conflict.is_rename_conflict() {
         return Err(RecordError::Database(format!(
@@ -3377,6 +3839,15 @@ fn prepare_name_resolution(
         }
         candidates.sort_by_key(|(identity, _)| *identity);
         matching.push(candidates.remove(0).1);
+    }
+    if matching.len() > 1 && policy == NameResolutionPolicy::ForeignMerge {
+        // A Git merge explicitly selects a single file at this path but does
+        // not carry Atomic inode identities. When multiple claims have exactly
+        // those bytes, choose a stable canonical identity for the explicit
+        // SolveNameConflict operation. This does not deduplicate graph history
+        // or use ambient TREE / local allocation order to hide a conflict.
+        matching.sort_by_key(|side| (external_hashes[&side.position.change], side.position.pos));
+        matching.truncate(1);
     }
     if matching.len() != 1 {
         // Review ::15 blocker support (user decision "Preserve current

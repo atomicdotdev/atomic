@@ -334,6 +334,7 @@ impl Pristine {
             write_txn.open_multimap_table(CHANGE_DEPS)?;
             write_txn.open_multimap_table(REV_CHANGE_DEPS)?;
             write_txn.open_table(CHANGE_DEPS_INDEXED)?;
+            crate::pristine::applied_changes::initialize(&write_txn)?;
 
             // State tables
             write_txn.open_table(STATES)?;
@@ -655,6 +656,7 @@ impl Pristine {
     ) -> PristineResult<WriteTxn<'_>> {
         let mut txn = self.db.writable_db()?.begin_write()?;
         let _ = txn.set_durability(durability);
+        crate::pristine::applied_changes::initialize(&txn)?;
         Ok(WriteTxn::new(
             txn,
             &self.next_node_id,

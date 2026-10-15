@@ -1907,28 +1907,16 @@ impl Repository {
         let before_visibility = graph_visibility_closure(&txn, &before_view)?;
         let before_projection = self.project_tree_for_visibility(&txn, &before_visibility)?;
 
-        // Check if the change's edges are already in the global GRAPH.
-        //
-        // A change is "already in the global graph" when it is registered
-        // (has a NodeId) AND at least one of its vertices exists in the
-        // GRAPH B-tree.  `has_change_in_graph` performs a single O(log N)
-        // range scan — far cheaper and more reliable than the previous
-        // approach of loading the Change file and probing individual hunks.
-        //
-        // This correctly handles:
-        //   - Changes recorded on a Draft view (edges in GRAPH only)
-        //     → returns false, so hunks are re-applied to the global GRAPH
-        //   - Changes already inserted into a Shared view (edges in GRAPH)
-        //     → returns true, so redundant hunk application is skipped
-        //   - Changes with only EdgeUpdate hunks (no FileAdd/DirAdd)
-        //     → correctly detected via the range scan
+        // Ingestion is independent of the selected view and of whether this
+        // change created vertices. Edge-only deletes and attribute changes
+        // already in the ambient graph must also be reference-only inserts.
         let t_check = std::time::Instant::now();
         let already_in_graph = if let Some(node_id) = txn
             .get_internal(hash)
             .map_err(|e| RepositoryError::Database(e.to_string()))?
         {
             let in_graph = txn
-                .has_change_in_graph(node_id)
+                .was_change_applied(node_id)
                 .map_err(|e| RepositoryError::Database(e.to_string()))?;
             log::debug!(
                 "insert_change: hash={} node_id={:?} already_in_graph={}",

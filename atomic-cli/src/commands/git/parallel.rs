@@ -5174,6 +5174,26 @@ impl ParallelImporter {
                 squash_insert: None,
             });
         }
+        // All-parent traversal can visit another leg between a commit and
+        // its child. Synthesis aligns the view to that leg, so exclusions
+        // alone cannot recover the next parent's missing membership. Restore
+        // its canonical closure by reference before resolving file identities;
+        // never reinterpret an already stored file as a fresh FileAdd.
+        if !self.options.mainline_only && parsed.parent_oids.len() == 1 {
+            let parent_sha = parsed.parent_oids[0].to_string();
+            let closure = ledger.interpreted_closure(repo, git, &parent_sha)?;
+            if closure.is_empty() {
+                return Err(git_error(format!(
+                    "commit {} parent {} has no interpreted closure",
+                    parsed.git_sha, parent_sha
+                )));
+            }
+            let mut members: Vec<_> = closure.iter().copied().collect();
+            members.sort();
+            repo.ensure_union_state(&self.options.target_view, &members)
+                .map_err(|e| CliError::Internal(e.into()))?;
+        }
+
         // CB-9A: root and single-parent commits use normal recorded-file
         // assembly with a hashed Git origin. CB-9B: multi-parent merges
         // assemble a journaled `GitResolution` from the union state, and
@@ -5380,8 +5400,7 @@ impl ParallelImporter {
     ) -> CliResult<ImportedCommitInfo> {
         use atomic_core::output::memory::Memory;
         use atomic_core::record::workflow::{
-            record_added_file, record_deleted_file, record_modified_file, DetectedFile,
-            RecordingOptions,
+            record_added_file, record_modified_file, DetectedFile, RecordingOptions,
         };
 
         let working_copy = repo
@@ -6128,7 +6147,9 @@ impl ParallelImporter {
                             &file.path,
                             &old_content,
                             new_content,
-                            conflicted,
+                            // Full-history truncations retain the file's
+                            // identity through a content-only replacement.
+                            conflicted || (!self.options.mainline_only && new_content.is_empty()),
                             &target,
                             &excluded,
                         )
@@ -6534,9 +6555,7 @@ impl ParallelImporter {
         boundaries: &[&'static str],
     ) -> CliResult<ImportedCommitInfo> {
         use atomic_core::output::memory::Memory;
-        use atomic_core::record::workflow::{
-            record_added_file, record_deleted_file, DetectedFile, RecordingOptions,
-        };
+        use atomic_core::record::workflow::{record_added_file, DetectedFile, RecordingOptions};
 
         let working_copy = repo
             .require_working_copy_id()
@@ -6617,8 +6636,11 @@ impl ParallelImporter {
         .map_err(|e| CliError::Internal(e.into()))?;
 
         // Record the union→merge-tree delta through the normal workflow.
-        // The candidate path set is the union of the per-parent diffs from
-        // Phase 1; the recorded delta is classified against the exact union
+        // Per-parent Git diffs alone cannot identify the delta: identical
+        // parent blobs can still render differently in the Atomic union
+        // (independent reverts and criss-cross resolutions, for example).
+        // Include every path in the verified merge manifest, plus deletions
+        // from Phase 1. Classify the delta against the exact union
         // visibility (parents' closures only — not the whole view) so
         // reverting side-parent content and resolving conflicts are both
         // captured without inheriting unrelated lineages. Storage and
@@ -6628,16 +6650,83 @@ impl ParallelImporter {
         // the local-record size cap must not refuse a large tracked binary
         // (the 500 MB opaque corpus).
         let core_options = RecordingOptions::new().unlimited_file_size();
+        // Equal Git blobs can still have independent semantic writers. In
+        // particular, two branches can make the same edit and then merge
+        // without any parent-to-merge diff. Record that convergence as an
+        // explicit causal resolution instead of leaving a last-applied row
+        // to choose the line's identity.
+        let convergent_paths = repo
+            .foreign_merge_concurrent_semantic_paths(&target, &excluded)
+            .map_err(|message| {
+                git_error(format!("cannot inspect merge semantic writers: {message}"))
+            })?;
+        let mut files: std::collections::BTreeMap<_, _> = parsed
+            .files
+            .iter()
+            .cloned()
+            .map(|file| (file.path.clone(), file))
+            .collect();
+        let merge_tree = git
+            .find_tree(parsed.tree_oid)
+            .map_err(|e| git_error(e.to_string()))?;
+        let mut attribute_paths: std::collections::HashSet<_> = files.keys().cloned().collect();
+        attribute_paths.extend(convergent_paths.iter().cloned());
+        for entry in &prospective.manifest.entries {
+            if entry.disposition != atomic_repository::ManifestDisposition::Included {
+                continue;
+            }
+            let path = String::from_utf8_lossy(entry.path.as_bytes()).into_owned();
+            // Parent-relative Delete + Rename/Add can share a destination.
+            // They are candidate paths, not two actions on the parent union:
+            // deleting that path can remove the already-correct survivor.
+            // The verified target manifest defines one desired state per path;
+            // canonical union claims still select its inode and name resolution.
+            files.insert(
+                path.clone(),
+                ParsedFile {
+                    new_mode: git_mode_at(&merge_tree, &path),
+                    path,
+                    operation: FileOperation::Modified,
+                    new_content: Some(entry.repository_bytes.clone()),
+                    old_content: None,
+                    diff_lines: None,
+                    old_path: None,
+                },
+            );
+        }
+        let files: Vec<_> = files.into_values().collect();
         let mut recorded_files: Vec<RecordedFile> = Vec::new();
         let mut deleted_paths: Vec<String> = Vec::new();
         let mut added_paths: Vec<&str> = Vec::new();
-        for file in &parsed.files {
+        let mut resolved_names = std::collections::HashSet::new();
+        for file in &files {
+            if let Some(bytes) = &file.new_content {
+                if let Some(records) = repo
+                    .record_foreign_name_resolution_on_view_excluding(
+                        &file.path, bytes, &target, &excluded,
+                    )
+                    .map_err(|message| {
+                        git_error(format!(
+                            "cannot resolve merge path '{}': {message}",
+                            file.path
+                        ))
+                    })?
+                {
+                    recorded_files.extend(records);
+                    resolved_names.insert(file.path.clone());
+                }
+            }
+        }
+        for file in &files {
+            if resolved_names.contains(&file.path) {
+                continue;
+            }
             if file.new_content.is_some()
                 && repo
-                    .get_file_content_on_view_excluding(&file.path, &target, &excluded)
+                    .get_inode_and_position_on_view_excluding(&file.path, &target, &excluded)
                     .map_err(|e| {
                         CliError::Internal(anyhow::anyhow!(
-                            "cannot read exact union baseline for '{}': {e}",
+                            "cannot resolve exact union identity for '{}': {e}",
                             file.path
                         ))
                     })?
@@ -6651,7 +6740,10 @@ impl ParallelImporter {
                 .map_err(|e| CliError::Internal(e.into()))?;
         }
         let record_start = std::time::Instant::now();
-        for file in &parsed.files {
+        for file in &files {
+            if resolved_names.contains(&file.path) {
+                continue;
+            }
             let union_bytes = repo
                 .get_file_content_on_view_excluding(&file.path, &target, &excluded)
                 .map_err(|e| {
@@ -6661,10 +6753,12 @@ impl ParallelImporter {
                     ))
                 })?;
             match (&file.new_content, union_bytes) {
-                (Some(new_content), Some(union_content)) if union_content == *new_content => {
+                (Some(new_content), Some(union_content))
+                    if union_content == *new_content && !convergent_paths.contains(&file.path) =>
+                {
                     // The union already matches the merge tree here.
                 }
-                (Some(new_content), Some(_union_content)) => {
+                (Some(new_content), Some(union_content)) => {
                     // The union may hold conflicting spans (both sides
                     // edited the same region additively). A resolution
                     // replaces the file's whole content region with the
@@ -6677,7 +6771,14 @@ impl ParallelImporter {
                     // conflicted union render forces the whole-file-replace
                     // safety path.
                     let rec = repo
-                        .record_resolution_modified_file(&file.path, new_content, &target, true)
+                        .record_foreign_modified_file_on_view_excluding(
+                            &file.path,
+                            &union_content,
+                            new_content,
+                            true,
+                            &target,
+                            &excluded,
+                        )
                         .map_err(|message| {
                             CliError::Internal(anyhow::anyhow!(
                                 "cannot record merge resolution for '{}': {message}",
@@ -6715,19 +6816,10 @@ impl ParallelImporter {
                     }
                 }
                 (None, Some(_union_content)) => {
-                    let (inode, position) = repo
-                        .get_inode_and_position(&file.path)
-                        .map_err(|error| CliError::Internal(error.into()))?
-                        .ok_or_else(|| {
-                            git_error(format!(
-                                "cannot import merge deletion '{}': no stable inode binding",
-                                file.path
-                            ))
-                        })?;
-                    let mut detected = DetectedFile::deleted(&file.path);
-                    detected.inode = Some(inode);
-                    detected.position = Some(position);
-                    let recorded = record_deleted_file(&detected, &core_options)
+                    let recorded = repo
+                        .record_foreign_deleted_file_on_view_excluding(
+                            &file.path, &target, &excluded,
+                        )
                         .map_err(|message| CliError::Internal(anyhow::anyhow!(message)))?;
                     if recorded.is_empty() {
                         return Err(CliError::Internal(anyhow::anyhow!(
@@ -6741,6 +6833,68 @@ impl ParallelImporter {
                 (None, None) => {}
             }
         }
+        // The Git merge selects attributes as well as bytes. Carry them on
+        // the same canonical survivor/addition record, including chmod-only
+        // merges whose content required no hunk. Never write attributes on
+        // the losing records of a name resolution.
+        for file in &files {
+            let Some(mode) = file.new_mode.filter(|_| file.new_content.is_some()) else {
+                continue;
+            };
+            let expected = expected_materialization(mode)?;
+            let existing = recorded_files.iter().rposition(|record| {
+                record.path() == file.path
+                    && record.name_conflict_resolution().is_none()
+                    && record.kind() != Some(atomic_core::record::workflow::DetectionKind::Deleted)
+            });
+            // Full-tree comparison must not manufacture attribute-only
+            // records for untouched files whose union already matches.
+            if existing.is_none() && !attribute_paths.contains(&file.path) {
+                continue;
+            }
+            let index = if let Some(index) = existing {
+                index
+            } else {
+                let (inode, position) = repo
+                    .get_inode_and_position_on_view_excluding(&file.path, &target, &excluded)
+                    .map_err(|e| CliError::Internal(e.into()))?
+                    .ok_or_else(|| {
+                        git_error(format!(
+                            "merge attribute resolution for '{}' has no canonical inode",
+                            file.path
+                        ))
+                    })?;
+                let mut record = RecordedFile::new(&file.path);
+                record.set_kind(atomic_core::record::workflow::DetectionKind::Modified);
+                record.set_inode(inode);
+                record.set_position(position);
+                recorded_files.push(record);
+                recorded_files.len() - 1
+            };
+            recorded_files[index].set_attr(atomic_core::change::InodeAttr::Mode(expected.mode()));
+            recorded_files[index].set_attr(atomic_core::change::InodeAttr::Kind(expected.kind()));
+        }
+        let mut directories = std::collections::BTreeSet::new();
+        merge_tree
+            .walk(git2::TreeWalkMode::PreOrder, |prefix, entry| {
+                if entry.kind() == Some(git2::ObjectType::Tree) {
+                    if let Some(name) = entry.name() {
+                        directories.insert(format!("{prefix}{name}"));
+                    }
+                }
+                git2::TreeWalkResult::Ok
+            })
+            .map_err(|e| git_error(e.to_string()))?;
+        let mut directory_records = repo
+            .record_foreign_directory_resolutions_on_view_excluding(
+                &directories,
+                &recorded_files,
+                &target,
+                &excluded,
+            )
+            .map_err(|message| git_error(format!("cannot resolve merge directories: {message}")))?;
+        directory_records.append(&mut recorded_files);
+        recorded_files = directory_records;
         let record_ms = record_start.elapsed().as_millis();
 
         let metadata = git_resolution_metadata(
