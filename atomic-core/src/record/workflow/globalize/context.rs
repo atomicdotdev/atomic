@@ -60,6 +60,10 @@ pub struct GlobalizeContext<'txn, T> {
     /// many hunks in a single recorded file. Cache that traversal once.
     pub(super) content_vertices_cache: std::collections::HashMap<Inode, Vec<GraphNode<NodeId>>>,
 
+    /// Bindings removed by the same change, before destination parents resolve.
+    pub(super) vacated_bindings:
+        std::collections::HashMap<String, std::collections::HashSet<Inode>>,
+
     /// Directory inode anchors available to additions in the change being built.
     ///
     /// Persisted anchors carry an external hash; directories introduced by this
@@ -93,6 +97,7 @@ where
             position_cache: std::collections::HashMap::new(),
             content_vertices_cache: std::collections::HashMap::new(),
             directory_anchors: std::collections::HashMap::new(),
+            vacated_bindings: std::collections::HashMap::new(),
         }
     }
 
@@ -118,7 +123,17 @@ where
             position_cache: std::collections::HashMap::new(),
             content_vertices_cache: std::collections::HashMap::new(),
             directory_anchors: std::collections::HashMap::new(),
+            vacated_bindings: std::collections::HashMap::new(),
         }
+    }
+
+    /// Register a binding removed by the same atomic change. A new parent
+    /// directory at that path must receive a distinct graph identity.
+    pub fn vacate_binding(&mut self, path: &str, inode: Inode) {
+        self.vacated_bindings
+            .entry(path.to_owned())
+            .or_default()
+            .insert(inode);
     }
 
     /// Append content to the buffer and return the position range.

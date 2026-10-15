@@ -276,7 +276,7 @@ fn merge_imports_every_parent_closure_and_resolves_with_verified_frontier() {
     let root = fixture.root.as_path();
     let home = fixture.home.as_path();
 
-    atomic_ok(root, home, &["git", "import", "--no-vault"]);
+    atomic_ok(root, home, &["git", "import", "--all", "--no-vault"]);
 
     let repo = open_repo(root);
     let base_change = {
@@ -462,7 +462,7 @@ fn octopus_merge_imports_all_three_parent_closures() {
     git(&root, &["checkout", "-q", "main"]);
     git(&root, &["merge", "-q", "--ff-only", "leg-a"]);
 
-    atomic_ok(&root, &home, &["git", "import", "--no-vault"]);
+    atomic_ok(&root, &home, &["git", "import", "--all", "--no-vault"]);
 
     let repo = open_repo(&root);
     let entries = repo.effective_history(Some("main")).unwrap();
@@ -542,7 +542,7 @@ fn concurrent_change_conflicts_after_reload_and_resolution_never_replays() {
     let base = git(&root, &["rev-parse", "HEAD"]);
 
     // Pre-merge import.
-    atomic_ok(&root, &home, &["git", "import", "--no-vault"]);
+    atomic_ok(&root, &home, &["git", "import", "--all", "--no-vault"]);
 
     // Fork a draft view from the pre-merge state and record a concurrent
     // edit that shares the base context.
@@ -584,7 +584,7 @@ fn concurrent_change_conflicts_after_reload_and_resolution_never_replays() {
     atomic_ok(
         &root,
         &home,
-        &["git", "import", "--incremental", "--no-vault"],
+        &["git", "import", "--all", "--incremental", "--no-vault"],
     );
 
     let repo = open_repo(&root);
@@ -1199,7 +1199,7 @@ fn merge_legs_record_no_sibling_dependency_in_both_orders() {
         let root = fixture.root.as_path();
         let home = fixture.home.as_path();
 
-        atomic_ok(root, home, &["git", "import", "--no-vault"]);
+        atomic_ok(root, home, &["git", "import", "--all", "--no-vault"]);
 
         let repo = open_repo(root);
         assert_no_sibling_dependency(&repo, "main", &fixture.side_a, &fixture.side_b);
@@ -2475,7 +2475,7 @@ fn merge_with_empty_tip_parent_imports_both_closures() {
     git(&root, &["checkout", "-q", "main"]);
     git(&root, &["merge", "-q", "--ff-only", "side-a"]);
 
-    atomic_ok(&root, &home, &["git", "import", "--no-vault"]);
+    atomic_ok(&root, &home, &["git", "import", "--all", "--no-vault"]);
 
     let repo = open_repo(&root);
     // The empty leg stays a distinct Change::empty with the EmptyCommit

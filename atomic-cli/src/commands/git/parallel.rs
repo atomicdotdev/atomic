@@ -4224,7 +4224,14 @@ impl ParallelImporter {
             // canonical String identity decodes before filesystem access.
             let physical = root.join(canonical_tree_path(path));
             let Some(entry) = expected.get(repo_path.as_bytes()) else {
-                if physical.symlink_metadata().is_ok() {
+                let prefix = format!("{path}/");
+                let needs_directory = expected
+                    .keys()
+                    .any(|candidate| candidate.starts_with(prefix.as_bytes()));
+                if physical
+                    .symlink_metadata()
+                    .is_ok_and(|metadata| !(needs_directory && metadata.file_type().is_dir()))
+                {
                     return Err(git_error(format!(
                         "deleted Git path '{path}' is still present in the worktree"
                     )));
@@ -4936,7 +4943,7 @@ impl ParallelImporter {
                 if file.operation == FileOperation::Deleted {
                     continue;
                 }
-                let abs_path = repo_root.join(&file.path);
+                let abs_path = repo_root.join(canonical_tree_path(&file.path));
                 if let Ok(metadata) = std::fs::metadata(&abs_path) {
                     use std::time::SystemTime;
                     let mtime = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
@@ -4949,8 +4956,7 @@ impl ParallelImporter {
                     let content_hash = std::fs::read(&abs_path)
                         .map(|bytes| Hash::of(&bytes))
                         .unwrap_or(Hash::ZERO);
-                    // Normalize path to forward slashes for TREE compatibility
-                    let normalized = file.path.replace('\\', "/");
+                    let normalized = file.path.clone();
                     index_entries.push((normalized, secs, nanos, size, content_hash));
                 }
             }
@@ -5892,13 +5898,14 @@ impl ParallelImporter {
                                 self.old_bytes_for(repo, file)
                             };
                             let mut move_rec = repo
-                                .record_foreign_moved_file(
+                                .record_foreign_moved_file_excluding(
                                     &target,
                                     &file.path,
                                     old_path,
                                     &old_content,
                                     &new_content_owned,
                                     false,
+                                    &excluded,
                                 )
                                 .map_err(|message| {
                                     CliError::Internal(anyhow::anyhow!(
@@ -5936,10 +5943,13 @@ impl ParallelImporter {
                                 // to the actual deleted trunk (review CB-9C
                                 // R2) so the semantic lifecycle tombstones
                                 // instead of leaving the old trunk Alive.
-                                let deleted_record =
-                                    repo.record_foreign_deleted_file(old_path).map_err(
-                                        |message| CliError::Internal(anyhow::anyhow!(message)),
-                                    )?;
+                                let deleted_record = repo
+                                    .record_foreign_deleted_file_on_view_excluding(
+                                        old_path, &target, &excluded,
+                                    )
+                                    .map_err(|message| {
+                                        CliError::Internal(anyhow::anyhow!(message))
+                                    })?;
                                 if deleted_record.is_empty() {
                                     return Err(CliError::Internal(anyhow::anyhow!(
                                         "cannot import ambiguous rename source '{}': canonical FileDel is empty",
@@ -6193,7 +6203,9 @@ impl ParallelImporter {
                     // placeholder-trunk delete tombstoned nobody and left the
                     // moved-to/created trunk row Alive after graph deletion.
                     let recorded = repo
-                        .record_foreign_deleted_file(&file.path)
+                        .record_foreign_deleted_file_on_view_excluding(
+                            &file.path, &target, &excluded,
+                        )
                         .map_err(|message| CliError::Internal(anyhow::anyhow!(message)))?;
                     recorded_files.push(recorded);
                 }
@@ -7894,17 +7906,22 @@ fn parse_commit(
     // delta, not just the first-parent delta. A path where the merge reverts
     // side-parent content or resolves a conflict differs from the union but
     // may equal the first parent, so the file list is the union of the
-    // per-parent diffs (deduped by path; Deleted wins over other states).
+    // per-parent diffs. Keep the first-parent operation for shared paths:
+    // all deltas describe the same target bytes, but replacing a Rename with
+    // a side-parent Modify loses its old path and retains a stale name.
     if is_merge {
         trace_git_import(format!(
             "parse-union {} candidate_paths={}",
             short_sha,
             files.len()
         ));
-        let mut union_paths: std::collections::BTreeMap<String, ParsedFile> =
+        let mut union_paths: std::collections::BTreeMap<String, Vec<ParsedFile>> =
             std::collections::BTreeMap::new();
         for file in files {
-            union_paths.insert(file.path.clone(), file);
+            // A rename can replace an existing destination inode. Retain
+            // both its deletion and the move, in delta order: dropping the
+            // deletion leaves two canonical name claimants at the target.
+            union_paths.entry(file.path.clone()).or_default().push(file);
         }
         for parent_number in 1..commit.parent_count() {
             let parent_tree = commit
@@ -7926,15 +7943,10 @@ fn parse_commit(
             for delta in side_diff.deltas() {
                 let new_file = delta.new_file();
                 let old_file = delta.old_file();
-                if new_file.mode() == git2::FileMode::Commit
-                    || old_file.mode() == git2::FileMode::Commit
-                {
-                    continue;
-                }
                 let path = new_file
-                    .path()
-                    .or_else(|| old_file.path())
-                    .map(|p| p.to_string_lossy().to_string())
+                    .path_bytes()
+                    .or_else(|| old_file.path_bytes())
+                    .map(atomic_repository::escape_repo_path)
                     .unwrap_or_default();
                 if path.is_empty() {
                     continue;
@@ -7947,16 +7959,15 @@ fn parse_commit(
                 let new_content = if operation == FileOperation::Deleted {
                     None
                 } else {
-                    get_file_content(git_repo, &tree, &path).ok()
+                    Some(get_file_content(git_repo, &tree, &path)?)
                 };
                 let mode = if operation == FileOperation::Deleted {
                     None
                 } else {
                     git_mode_at(&tree, &path)
                 };
-                union_paths.insert(
-                    path.clone(),
-                    ParsedFile {
+                union_paths.entry(path.clone()).or_insert_with(|| {
+                    vec![ParsedFile {
                         path,
                         operation,
                         new_content,
@@ -7964,11 +7975,11 @@ fn parse_commit(
                         diff_lines: None,
                         old_path: None,
                         new_mode: mode,
-                    },
-                );
+                    }]
+                });
             }
         }
-        files = union_paths.into_values().collect();
+        files = union_paths.into_values().flatten().collect();
     }
     let is_empty = files.is_empty();
 
@@ -8145,37 +8156,11 @@ fn parse_diff_files(
                 if origin != '+' && origin != '-' && origin != ' ' {
                     return true;
                 }
-                let path = delta
-                    .new_file()
-                    .path()
-                    .or_else(|| delta.old_file().path())
-                    .map(|p| p.to_string_lossy().to_string())
-                    .unwrap_or_default();
-
-                // The diff-line map uses the same canonical identity as the
-                // parsed deltas (reversible escape), so capture and lookup
-                // agree for raw non-UTF-8 paths.
                 let line_path = delta
                     .new_file()
-                    .path()
-                    .or_else(|| delta.old_file().path())
-                    .map(|p| {
-                        #[cfg(unix)]
-                        let raw = {
-                            use std::os::unix::ffi::OsStrExt;
-                            p.as_os_str().as_bytes().to_vec()
-                        };
-                        #[cfg(not(unix))]
-                        let raw = p.as_os_str().to_string_lossy().into_owned().into_bytes();
-                        let needs_escaping = raw
-                            .iter()
-                            .any(|byte| !byte.is_ascii_graphic() || *byte == b'%');
-                        if needs_escaping {
-                            atomic_repository::escape_repo_path(&raw)
-                        } else {
-                            String::from_utf8_lossy(&raw).into_owned()
-                        }
-                    })
+                    .path_bytes()
+                    .or_else(|| delta.old_file().path_bytes())
+                    .map(atomic_repository::escape_repo_path)
                     .unwrap_or_default();
 
                 lines_by_path
@@ -8202,27 +8187,7 @@ fn parse_diff_files(
     // Refusing here (the historical behavior) lost the file from the imported
     // history instead of preserving it.
     let delta_path = |file: &git2::DiffFile| -> CliResult<Option<String>> {
-        let Some(path) = file.path() else {
-            return Ok(None);
-        };
-        // Raw bytes are unix-only; windows paths are always well-formed UTF-16
-        // round-trips, so the escape is applied to the UTF-8 bytes instead.
-        #[cfg(unix)]
-        let raw = {
-            use std::os::unix::ffi::OsStrExt;
-            path.as_os_str().as_bytes().to_vec()
-        };
-        #[cfg(not(unix))]
-        let raw = path.as_os_str().to_string_lossy().into_owned().into_bytes();
-        let needs_escaping = raw
-            .iter()
-            .any(|byte| !byte.is_ascii_graphic() || *byte == b'%');
-        if needs_escaping {
-            Ok(Some(atomic_repository::escape_repo_path(&raw)))
-        } else {
-            // ASCII-safe and UTF-8 by construction.
-            Ok(Some(String::from_utf8_lossy(&raw).into_owned()))
-        }
+        Ok(file.path_bytes().map(atomic_repository::escape_repo_path))
     };
 
     let mut files = Vec::new();
@@ -8378,23 +8343,40 @@ fn parse_diff_files(
     // Modified delta carrying the exact old bytes, new bytes, and the new
     // canonical mode. Kind and mode then ride the graph-backed attribute
     // registers instead of a spurious delete/recreate.
-    let mut normalized: Vec<ParsedFile> = Vec::with_capacity(files.len());
-    for file in files {
-        if file.operation == FileOperation::Added {
-            if let Some(previous) = normalized.iter_mut().rev().find(|previous| {
-                previous.path == file.path && previous.operation == FileOperation::Deleted
-            }) {
-                // Merge delete+add into one typechange modification.
-                previous.operation = FileOperation::Modified;
-                previous.new_content = file.new_content.clone();
-                previous.new_mode = file.new_mode;
-                continue;
-            }
-        }
-        normalized.push(file);
-    }
+    Ok(normalize_typechanges(files))
+}
 
-    Ok(normalized)
+fn normalize_typechanges(files: Vec<ParsedFile>) -> Vec<ParsedFile> {
+    // libgit2 can emit Added before Deleted for the same path. Pair both
+    // orders before merge deduplication or prospective folding can discard
+    // the addition. Preserve the old target bytes as the modify baseline.
+    let deletions: HashMap<_, _> = files
+        .iter()
+        .filter(|file| file.operation == FileOperation::Deleted)
+        .map(|file| (file.path.clone(), file.old_content.clone()))
+        .collect();
+    let typechanges: HashSet<_> = files
+        .iter()
+        .filter(|file| file.operation == FileOperation::Added && deletions.contains_key(&file.path))
+        .map(|file| file.path.clone())
+        .collect();
+    files
+        .into_iter()
+        .filter_map(|mut file| {
+            if typechanges.contains(&file.path) {
+                if file.operation == FileOperation::Deleted {
+                    return None;
+                }
+                if file.operation == FileOperation::Added {
+                    file.operation = FileOperation::Modified;
+                    file.old_content = deletions[&file.path].clone();
+                    // The two deltas' line streams are not one coherent diff.
+                    file.diff_lines = None;
+                }
+            }
+            Some(file)
+        })
+        .collect()
 }
 
 fn parse_diff_files_via_git_cli(
@@ -8414,6 +8396,7 @@ fn parse_diff_files_via_git_cli(
         .arg("diff-tree")
         .arg("-r")
         .arg("--name-status")
+        .arg("-z")
         .arg("-M")
         .arg(parent_oid.to_string())
         .arg(commit_oid.to_string())
@@ -8432,83 +8415,70 @@ fn parse_diff_files_via_git_cli(
     }
 
     let mut files = Vec::new();
-    for line in String::from_utf8_lossy(&output.stdout).lines() {
-        if line.is_empty() {
-            continue;
+    // NUL framing preserves tabs, newlines, non-UTF-8 bytes, and literal '%'.
+    // Never parse Git's display quoting as a repository path.
+    let mut fields = output.stdout.split(|byte| *byte == 0);
+    while let Some(status) = fields.next() {
+        if status.is_empty() {
+            break;
         }
-        let mut parts = line.split('\t');
-        let status = parts.next().unwrap_or_default();
-        let Some(kind) = status.chars().next() else {
-            continue;
+        let kind = status[0];
+        let source = fields
+            .next()
+            .filter(|path| !path.is_empty())
+            .ok_or_else(|| git_error("missing path in git diff-tree output"))?;
+        let old_path =
+            matches!(kind, b'R' | b'C').then(|| atomic_repository::escape_repo_path(source));
+        let raw_path = if old_path.is_some() {
+            fields
+                .next()
+                .filter(|path| !path.is_empty())
+                .ok_or_else(|| git_error("missing destination in git diff-tree output"))?
+        } else {
+            source
         };
-
-        match kind {
-            'A' => {
-                let Some(path) = parts.next() else { continue };
-                files.push(ParsedFile {
-                    path: path.to_string(),
-                    operation: FileOperation::Added,
-                    new_content: get_file_content(git_repo, tree, path).ok(),
-                    old_content: None,
-                    diff_lines: None,
-                    old_path: None,
-                    new_mode: git_mode_at(tree, path),
-                });
+        let path = atomic_repository::escape_repo_path(raw_path);
+        let operation = match kind {
+            b'A' => FileOperation::Added,
+            b'M' | b'T' => FileOperation::Modified,
+            b'D' => FileOperation::Deleted,
+            b'R' => FileOperation::Renamed,
+            b'C' => FileOperation::Copied,
+            _ => {
+                return Err(git_error(format!(
+                    "unsupported git diff-tree status: {}",
+                    String::from_utf8_lossy(status)
+                )))
             }
-            'M' => {
-                let Some(path) = parts.next() else { continue };
-                files.push(ParsedFile {
-                    path: path.to_string(),
-                    operation: FileOperation::Modified,
-                    new_content: get_file_content(git_repo, tree, path).ok(),
-                    old_content: get_file_content(git_repo, parent_tree, path).ok(),
-                    diff_lines: None,
-                    old_path: None,
-                    new_mode: git_mode_at(tree, path),
-                });
-            }
-            'D' => {
-                let Some(path) = parts.next() else { continue };
-                files.push(ParsedFile {
-                    path: path.to_string(),
-                    operation: FileOperation::Deleted,
-                    new_content: None,
-                    old_content: get_file_content(git_repo, parent_tree, path).ok(),
-                    diff_lines: None,
-                    old_path: None,
-                    new_mode: None,
-                });
-            }
-            'R' => {
-                let Some(old_path) = parts.next() else {
-                    continue;
-                };
-                let Some(path) = parts.next() else { continue };
-                files.push(ParsedFile {
-                    path: path.to_string(),
-                    operation: FileOperation::Renamed,
-                    new_content: get_file_content(git_repo, tree, path).ok(),
-                    old_content: get_file_content(git_repo, parent_tree, old_path).ok(),
-                    diff_lines: None,
-                    old_path: Some(old_path.to_string()),
-                    new_mode: git_mode_at(tree, path),
-                });
-            }
-            'C' => {
-                let old_path = parts.next();
-                let Some(path) = parts.next() else { continue };
-                files.push(ParsedFile {
-                    path: path.to_string(),
-                    operation: FileOperation::Copied,
-                    new_content: get_file_content(git_repo, tree, path).ok(),
-                    old_content: None,
-                    diff_lines: None,
-                    old_path: old_path.map(|path| path.to_string()),
-                    new_mode: git_mode_at(tree, path),
-                });
-            }
-            _ => {}
-        }
+        };
+        let new_content = if operation == FileOperation::Deleted {
+            None
+        } else {
+            Some(get_file_content(git_repo, tree, &path)?)
+        };
+        let old_content = if matches!(operation, FileOperation::Added | FileOperation::Copied) {
+            None
+        } else {
+            Some(get_file_content(
+                git_repo,
+                parent_tree,
+                old_path.as_deref().unwrap_or(&path),
+            )?)
+        };
+        let new_mode = if operation == FileOperation::Deleted {
+            None
+        } else {
+            git_mode_at(tree, &path)
+        };
+        files.push(ParsedFile {
+            path,
+            operation,
+            new_content,
+            old_content,
+            diff_lines: None,
+            old_path,
+            new_mode,
+        });
     }
 
     Ok(files)
@@ -8618,20 +8588,20 @@ fn expected_materialization(git_mode: u32) -> CliResult<ExpectedMaterialization>
 }
 
 fn git_mode_at(tree: &Tree<'_>, path: &str) -> Option<u32> {
-    tree.get_path(Path::new(path))
+    tree.get_path(&canonical_tree_path(path))
         .ok()
         .map(|entry| entry.filemode() as u32)
 }
 
 /// Whether a path exists in the tree (any entry kind).
 fn tree_entry_exists(_git_repo: &GitRepository, tree: &Tree, path: &str) -> bool {
-    tree.get_path(Path::new(path)).is_ok()
+    tree.get_path(&canonical_tree_path(path)).is_ok()
 }
 
 /// Get file content from a git tree.
 /// A Git tree lookup path from the canonical String identity: the reversible
 /// escape decodes back to the exact raw bytes (review CB-9C R7).
-fn canonical_tree_path(path: &str) -> PathBuf {
+pub(super) fn canonical_tree_path(path: &str) -> PathBuf {
     match atomic_repository::unescape_repo_path(path) {
         Ok(raw) => {
             #[cfg(unix)]
@@ -8657,6 +8627,10 @@ fn get_file_content(git_repo: &GitRepository, tree: &Tree, path: &str) -> CliRes
         .map_err(|e| CliError::GitError {
             message: format!("Path not found in tree: {}", e),
         })?;
+
+    if entry.kind() == Some(ObjectType::Commit) {
+        return Ok(entry.id().to_string().into_bytes());
+    }
 
     if entry.kind() != Some(ObjectType::Blob) {
         return Err(CliError::GitError {
@@ -8702,6 +8676,10 @@ fn parse_commit_message(message: &str) -> (String, Option<String>) {
 // ═══════════════════════════════════════════════════════════════════════════
 // Tests
 // ═══════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+#[path = "parallel_import_regression_tests.rs"]
+mod import_regression_tests;
 
 #[cfg(test)]
 mod tests {

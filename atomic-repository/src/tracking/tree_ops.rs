@@ -119,9 +119,9 @@ impl TreeProjectionPlan {
 
         let mut affected_parents = HashSet::<String>::new();
         for (inode, entry) in &self.entries {
-            let Some(desired) = &entry.path else {
+            if entry.path.is_none() {
                 continue;
-            };
+            }
             if let Some(current) = txn
                 .get_path(*inode)
                 .map_err(|error| TreeProjectionError::Database(error.to_string()))?
@@ -133,6 +133,13 @@ impl TreeProjectionPlan {
                     final_paths.remove(&current);
                 }
             }
+        }
+        // Remove every previous binding before installing destinations. This
+        // must not depend on HashMap iteration order for overlapping moves.
+        for (inode, entry) in &self.entries {
+            let Some(desired) = &entry.path else {
+                continue;
+            };
             if let Some(path) = desired {
                 if let Some(parent) = direct_parent(path) {
                     affected_parents.insert(parent.to_string());
@@ -150,15 +157,19 @@ impl TreeProjectionPlan {
                 || txn
                     .is_directory(inode)
                     .map_err(|error| TreeProjectionError::Database(error.to_string()))?;
+            let empty = !final_paths
+                .keys()
+                .any(|path| direct_parent(path) == Some(parent.as_str()));
+            if !is_directory && empty {
+                // An old parent can become a regular file after its last child moves.
+                continue;
+            }
             if !is_directory {
                 return Err(TreeProjectionError::IncompleteMetadata(format!(
                     "projected parent '{}' is not a directory",
                     parent
                 )));
             }
-            let empty = !final_paths
-                .keys()
-                .any(|path| direct_parent(path) == Some(parent.as_str()));
             let entry = self.entries.entry(inode).or_default();
             entry.kind = Some(TreeProjectionKind::Directory);
             entry.directory_flags = Some(if empty {

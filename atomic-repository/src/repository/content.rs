@@ -1001,14 +1001,11 @@ enum LinearStep {
 
 /// Choose the single live successor of `current` for a linear content walk.
 ///
-/// In the additive graph model a superseded span keeps its original alive
-/// `BLOCK` edge *alongside* a new `DELETED` edge. A walk that merely skipped
-/// `DELETED` edges would therefore still follow the alive edge into the
-/// superseded span and resurrect stale content. This helper instead treats any
-/// destination that has a visible `DELETED` edge as dead, so an in-place
-/// replacement (delete old span + insert new span off the same predecessor)
-/// resolves to just the new span. Genuine conflict forks and delete-throughs
-/// return [`LinearStep::Bail`] so the caller defers to the full graph walk.
+/// In the additive graph model a deleted destination can still lead to live
+/// descendants. Even when there is exactly one direct live successor, walking
+/// only that successor may skip an insertion reachable through the dead chain.
+/// Any visible deletion therefore requires the full graph traversal, which
+/// contracts dead chains and preserves their ordering and concurrent branches.
 fn select_linear_successor<T>(
     txn: &T,
     inode: Inode,
@@ -1022,8 +1019,7 @@ where
     use atomic_core::types::EdgeFlags;
 
     let mut alive: Vec<atomic_core::types::GraphNode<NodeId>> = Vec::new();
-    let mut deleted: std::collections::HashSet<atomic_core::types::GraphNode<NodeId>> =
-        std::collections::HashSet::new();
+    let mut has_deleted_successor = false;
 
     while let Some(edge_result) = txn.next_inode_adj(adj) {
         let edge = edge_result?;
@@ -1048,26 +1044,18 @@ where
             continue;
         }
         if flags.contains(EdgeFlags::DELETED) {
-            deleted.insert(dest);
+            has_deleted_successor = true;
         } else if !alive.contains(&dest) {
             alive.push(dest);
         }
     }
 
-    // A destination that is both alive (original edge) and deleted (superseding
-    // edge) is dead from this view's perspective.
-    alive.retain(|d| !deleted.contains(d));
+    if has_deleted_successor {
+        return Ok(LinearStep::Bail);
+    }
 
     match alive.len() {
-        0 => {
-            if deleted.is_empty() {
-                Ok(LinearStep::End)
-            } else {
-                // The only successors here were deleted; the live continuation
-                // lies past a dead vertex — defer to the full graph walk.
-                Ok(LinearStep::Bail)
-            }
-        }
+        0 => Ok(LinearStep::End),
         1 => Ok(LinearStep::Follow(alive[0])),
         _ => Ok(LinearStep::Bail),
     }

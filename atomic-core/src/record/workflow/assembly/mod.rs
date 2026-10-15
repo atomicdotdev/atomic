@@ -575,6 +575,18 @@ where
 
     // Create globalization context
     let mut glob_ctx = GlobalizeContext::new(txn);
+    for file in files {
+        if let Some(inode) = file.inode() {
+            if let Some(old_path) = file.old_path() {
+                glob_ctx.vacate_binding(old_path, inode);
+            } else if matches!(
+                file.kind(),
+                Some(crate::record::workflow::DetectionKind::Deleted)
+            ) {
+                glob_ctx.vacate_binding(file.path(), inode);
+            }
+        }
+    }
     let mut ctx = AssemblyContext::new(header);
     let mut stats = AssemblyStats::new();
     let mut globalized_files = Vec::new();
