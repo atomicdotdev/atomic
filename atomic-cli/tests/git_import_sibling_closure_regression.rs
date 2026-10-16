@@ -1,4 +1,4 @@
-// Temporary Unix-only Git bridge support to unblock Windows native CI.
+// Temporary Unix-only Git shim support to unblock Windows native CI.
 // Revisit after Windows support is defined; see the RFC temporary platform policy.
 #![cfg(unix)]
 
@@ -7,7 +7,7 @@
 //! respect the assembly exclusions.
 //!
 //! Original failure (`git import --all` on the closure walk; the same class
-//! stopped atomicdotdev/atomic at commit 19 of 354): bridge sequencing lands
+//! stopped atomicdotdev/atomic at commit 19 of 354): shim sequencing lands
 //! base → A → B (sibling of A) → C (child of A) → merge. Two defects made
 //! that walk fail closed:
 //!
@@ -25,7 +25,7 @@
 //!
 //! The fixture below reproduces both in miniature. Pre-fix, `--all` fails at
 //! B (semantic closure) or at C (stacked escalation); post-fix, all five
-//! commits land, the final render is byte-exact, and the bridge verifies.
+//! commits land, the final render is byte-exact, and the shim verifies.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -75,7 +75,7 @@ fn git(root: &Path, args: &[&str]) -> String {
         .to_string()
 }
 
-/// Commit with a controlled committer date (the deterministic bridge
+/// Commit with a controlled committer date (the deterministic shim
 /// sequencing's first tie-break), so the sibling lands between the parent
 /// and its child.
 fn commit_at(root: &Path, date: &str, message: &str) -> String {
@@ -241,13 +241,13 @@ fn all_import_sibling_leg_never_evicts_its_own_ancestry() {
         "materialized f/a.txt must equal the Git tree byte-for-byte"
     );
 
-    // Both CLIs agree the workspace is clean, and the bridge verifies.
+    // Both CLIs agree the workspace is clean, and the shim verifies.
     let status = atomic_ok(root, home, &["status"]);
     assert!(
         status.contains("nothing to record"),
         "atomic status must be clean after import, got: {status}"
     );
-    atomic_ok(root, home, &["git", "bridge", "verify"]);
+    atomic_ok(root, home, &["git", "shim", "verify"]);
 
     // Incremental re-import is idempotent.
     let again = atomic_ok(
@@ -279,7 +279,7 @@ fn plain_import_stays_a_first_parent_walk() {
         status.contains("nothing to record"),
         "atomic status must be clean after plain import, got: {status}"
     );
-    atomic_ok(root, home, &["git", "bridge", "verify"]);
+    atomic_ok(root, home, &["git", "shim", "verify"]);
     let on_disk = fs::read(root.join("f/a.txt")).unwrap();
     let git_tree = {
         let out = Command::new("git")

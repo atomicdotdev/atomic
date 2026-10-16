@@ -564,7 +564,7 @@ impl Repository {
     /// edit to the file's existing CRDT trunk and alive branches (CB-9B
     /// review F4).
     ///
-    /// The bridge importer drives this for foreign deltas: the baseline is
+    /// The shim importer drives this for foreign deltas: the baseline is
     /// the commit's own context (Git parent-tree bytes in leg mode), never
     /// silently re-read from the view. The semantic state resolution is the
     /// same as [`Self::record_resolution_modified_file`]: the file's current

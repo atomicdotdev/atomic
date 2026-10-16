@@ -491,7 +491,7 @@ pub struct ParsedCommit {
     /// change origin. Never used as Atomic dependencies.
     pub parent_oids: Vec<Oid>,
     /// Committer time (Unix seconds), the first deterministic tie-break for
-    /// bridge sequencing.
+    /// shim sequencing.
     pub committer_time: i64,
     /// Whether this is a merge commit.
     pub is_merge: bool,
@@ -698,7 +698,7 @@ pub struct ParallelImportOptions {
     pub validate_equivalence: bool,
     /// Verify only the paths each single-parent commit touches, and the whole
     /// tree at the last written commit and at merges. Set by `git import`;
-    /// bridge reconcile keeps the full-tree check on every commit.
+    /// shim reconcile keeps the full-tree check on every commit.
     pub verify_touched_paths: bool,
 }
 
@@ -1113,7 +1113,7 @@ impl ProspectiveImportPlan {
 
 /// Fold the Git tree `tree_oid` into the tree OID the prospective gate must
 /// compare against: the complete Git tree MINUS the entries this import
-/// declares excluded — the conversion policy's bridge-private paths
+/// declares excluded — the conversion policy's Shim-private paths
 /// (`.atomic*/`, `.vault/`) and the import-ignore patterns (e.g. a Rust
 /// workspace's `Cargo.lock`).
 ///
@@ -1133,7 +1133,7 @@ pub(crate) fn import_expected_tree_oid(
 ) -> CliResult<GitObjectId> {
     // Fold the Git tree into the tree OID the prospective gate must compare
     // against: the complete Git tree MINUS the entries the versioned
-    // conversion policy declares bridge-private (`.atomic*/`, `.vault/`).
+    // conversion policy declares Shim-private (`.atomic*/`, `.vault/`).
     // No tracked path is ever stripped: RFC tree-fidelity (§8.4 table, line
     // 648) and the colocated status contract (line 844) say tracked entries
     // are never excluded by ignore rules (review ::26 R1/R2). Raw component and
@@ -1536,7 +1536,7 @@ impl ProspectiveProjectTree {
             .map_err(|e| git_error(format!("cannot fold prospective manifest: {e}")))?;
         // CB-9B ::15 AC-3: the gate proves the projection is EXACTLY the
         // commit's complete Git tree minus ONLY the entries the versioned
-        // conversion policy declares bridge-private (`.atomic*/`, `.vault/`)
+        // conversion policy declares Shim-private (`.atomic*/`, `.vault/`)
         // — never any ignore-rule exclusion of tracked files (RFC §8.4;
         // review ::26 R1). The exclusion set is deterministic and derived
         // before the fold, so the comparison stays unforgeable evidence that
@@ -1770,7 +1770,7 @@ pub(crate) fn verify_commit_closure_objects_with_shallow(
 /// Kahn's algorithm over the collected parent→child edges with a min-heap
 /// keyed by (committer time, tagged OID bytes). Identical repositories
 /// always produce identical ordering regardless of revwalk internals, and
-/// every import labels this as bridge sequencing. Returns the ordered OIDs
+/// every import labels this as shim sequencing. Returns the ordered OIDs
 /// and the number of sibling ties that had to be broken by the
 /// (committer time, OID) rule.
 pub(crate) fn sequence_commits_deterministically(
@@ -1843,7 +1843,7 @@ pub(crate) fn sequence_commits_deterministically(
     while let Some(entry) = ready.pop() {
         if !ready.is_empty() {
             // At least one sibling was ready: the (committer time, OID) rule
-            // decided who goes first — record it for the bridge label.
+            // decided who goes first — record it for the shim label.
             tie_breaks += 1;
         }
         ordered.push(entry.oid);
@@ -1862,7 +1862,7 @@ pub(crate) fn sequence_commits_deterministically(
     }
     if ordered.len() != commit_oids.len() {
         return Err(git_error(format!(
-            "bridge sequencing could not order all collected commits ({} of {}); the Git graph \
+            "shim sequencing could not order all collected commits ({} of {}); the Git graph \
              is cyclic or incomplete",
             ordered.len(),
             commit_oids.len()
@@ -1879,7 +1879,7 @@ pub(crate) fn sequence_commits_deterministically(
 /// importing it now would fabricate a second, differently-derived history
 /// below changes the view already contains. Returns the count of deepened
 /// commits so callers can diagnose; the walk order is the deterministic
-/// bridge order.
+/// shim order.
 pub(crate) fn detect_deepened_history(
     git: &GitRepository,
     ordered_oids: &[Oid],
@@ -1927,7 +1927,7 @@ pub(crate) fn detect_deepened_history(
     Err(git_error(format!(
         "Git history deepened below already-imported commits: {} unindexed commit(s) (oldest \
          {}) sit below indexed descendants; deepening must never silently reinterpret prior \
-         bridge sequencing. Import the deepened history into a fresh view or explicitly \
+         shim sequencing. Import the deepened history into a fresh view or explicitly \
          rebuild the affected view.",
         deepened.len(),
         deepened.last().cloned().unwrap_or_default()
@@ -4087,11 +4087,11 @@ impl ParallelImporter {
         }
 
         // CB-9A §7: deterministic topological sequencing — Kahn's algorithm
-        // with (committer time, tagged OID) tie-breaks, labeled as bridge
+        // with (committer time, tagged OID) tie-breaks, labeled as shim
         // sequencing.
         let (commit_oids, tie_breaks) = sequence_commits_deterministically(&git, &collected)?;
         trace_git_import(format!(
-            "bridge sequencing: {} commits ordered by (committer time, oid); {} tie-break(s)",
+            "shim sequencing: {} commits ordered by (committer time, oid); {} tie-break(s)",
             commit_oids.len(),
             tie_breaks
         ));
@@ -4123,7 +4123,7 @@ impl ParallelImporter {
         // The complete-tree expectation (review R3) must start from the
         // current durable projection: the source view when importing from
         // another repository, otherwise this repository's own view (the
-        // incremental git-shadow-sync flow). Bridge-private files tracked
+        // incremental git-shadow-sync flow). Shim-private files tracked
         // in the view but absent from Git (e.g. `.atomicignore`) then stay
         // in the expectation exactly as they stay alive in the view.
         let current = match source {
@@ -4738,7 +4738,7 @@ impl ParallelImporter {
         // staged verification runs against a provable structure.
         //
         // CB-9B's complete-closure walk (below) remains for `--all` and the
-        // bridge flows, where the union state must contain every parent's
+        // shim flows, where the union state must contain every parent's
         // knowledge before a resolution is assembled (RFC §5.3).
         if self.options.mainline_only {
             let mut newest_first = Vec::new();
@@ -7488,12 +7488,12 @@ impl ParallelImporter {
                 // otherwise manufacture the linkage tier.
                 let anchor_binds_event = anchored_operation
                     .map(|operation| {
-                        repo.bridge_anchor_binds_operation(line.as_bytes(), operation)
+                        repo.shim_anchor_binds_operation(line.as_bytes(), operation)
                             .unwrap_or(false)
                     })
                     .unwrap_or(false);
                 let authenticated = !event_id.is_empty()
-                    && repo.bridge_event_captured(line.as_bytes()).unwrap_or(false)
+                    && repo.shim_event_captured(line.as_bytes()).unwrap_or(false)
                     && anchored_operation.is_some()
                     && anchor_binds_event
                     && operation_verified
@@ -9636,8 +9636,8 @@ mod tests {
         let repo = GitRepository::init(temp.path()).unwrap();
         repo.set_head("refs/heads/main").unwrap();
         let signature = git2::Signature::new(
-            "Bridge",
-            "bridge@example.com",
+            "Shim",
+            "shim@example.com",
             &git2::Time::new(committer_time, 0),
         )
         .unwrap();
@@ -9674,7 +9674,7 @@ mod tests {
     }
 
     #[test]
-    fn bridge_sequencing_orders_parents_before_children_and_is_deterministic() {
+    fn shim_sequencing_orders_parents_before_children_and_is_deterministic() {
         let (_temp, git) = chained_git_repo(4, 1_700_000_000);
         // Collect in an arbitrary order; sequencing must restore the causal
         // order regardless of input order.
@@ -9719,14 +9719,14 @@ mod tests {
     }
 
     #[test]
-    fn bridge_sequencing_breaks_ties_by_committer_time_then_tagged_oid() {
+    fn shim_sequencing_breaks_ties_by_committer_time_then_tagged_oid() {
         // Two independent roots committed at the same time: the ready set has
         // two entries, so the (committer time, OID) rule decides the order.
         let temp = tempfile::TempDir::new().unwrap();
         let git = GitRepository::init(temp.path()).unwrap();
         let signature = git2::Signature::new(
-            "Bridge",
-            "bridge@example.com",
+            "Shim",
+            "shim@example.com",
             &git2::Time::new(1_700_000_000, 0),
         )
         .unwrap();
@@ -9749,7 +9749,7 @@ mod tests {
         assert_eq!(ordered.len(), 2);
         assert!(
             tie_breaks >= 1,
-            "the tie must be recorded as a bridge decision"
+            "the tie must be recorded as a shim decision"
         );
         // Same committer time: the lower tagged OID bytes win.
         let mut by_oid = roots.clone();
@@ -9757,8 +9757,8 @@ mod tests {
         assert_eq!(ordered, by_oid, "ties break by tagged OID bytes");
         // A later committer time wins over a lower OID.
         let later_signature = git2::Signature::new(
-            "Bridge",
-            "bridge@example.com",
+            "Shim",
+            "shim@example.com",
             &git2::Time::new(1_700_000_100, 0),
         )
         .unwrap();

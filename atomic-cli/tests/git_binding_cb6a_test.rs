@@ -1,4 +1,4 @@
-// Temporary Unix-only Git bridge support to unblock Windows native CI.
+// Temporary Unix-only Git shim support to unblock Windows native CI.
 // Revisit after Windows support is defined; see the RFC temporary platform policy.
 #![cfg(unix)]
 
@@ -7,7 +7,7 @@
 //! Proves through the real CLI binary and real Git plumbing:
 //! - a signed binding publishes to a create-only `refs/atomic/bindings/...` ref,
 //! - an identical retry is idempotent,
-//! - `atomic git bridge binding verify` recomputes content and applies the
+//! - `atomic git shim binding verify` recomputes content and applies the
 //!   trust policy (unknown signer → explicit UNTRUSTED),
 //! - no transcripts, prompts, or unhashed private bodies enter any packed Git
 //!   object, while root verification still succeeds afterwards.
@@ -71,10 +71,10 @@ fn setup_fixture(root: &Path, home: &Path) {
             .expect("commit");
     }
 
-    // Import the Git history into Atomic and anchor the bridge baseline.
+    // Import the Git history into Atomic and anchor the shim baseline.
     let import = atomic(root, home, &["git", "import", "--no-vault"]);
     assert_init(&import);
-    let reconcile = atomic(root, home, &["git", "bridge", "reconcile"]);
+    let reconcile = atomic(root, home, &["git", "shim", "reconcile"]);
     assert_init(&reconcile);
 
     // Create a real recorded edit so a causal operation exists to bind.
@@ -126,7 +126,7 @@ fn publish_is_create_only_idempotent_and_verifies_under_trust_policy() {
         &home,
         &[
             "git",
-            "bridge",
+            "shim",
             "binding",
             "publish",
             "--key-file",
@@ -145,7 +145,7 @@ fn publish_is_create_only_idempotent_and_verifies_under_trust_policy() {
         &home,
         &[
             "git",
-            "bridge",
+            "shim",
             "binding",
             "publish",
             "--key-file",
@@ -178,7 +178,7 @@ fn publish_is_create_only_idempotent_and_verifies_under_trust_policy() {
     let untrusted = atomic(
         &root,
         &home,
-        &["git", "bridge", "binding", "verify", &id_hex],
+        &["git", "shim", "binding", "verify", &id_hex],
     );
     assert!(
         !untrusted.status.success(),
@@ -211,7 +211,7 @@ fn publish_is_create_only_idempotent_and_verifies_under_trust_policy() {
     let trusted = atomic(
         &root,
         &home,
-        &["git", "bridge", "binding", "verify", &id_hex],
+        &["git", "shim", "binding", "verify", &id_hex],
     );
     assert_success(&trusted, "verify under trust policy");
     let trusted_text = String::from_utf8_lossy(&trusted.stdout).to_string();
@@ -231,7 +231,7 @@ fn packed_git_objects_contain_no_private_sentinels() {
 
     // Seed distinctive private sentinels into the Atomic side: a full private
     // prompt inside recorded provenance, and an attestation whose notes carry
-    // private session material. If any bridge path ever copied private
+    // private session material. If any shim path ever copied private
     // sidecars into Git, these bytes would appear in packed objects.
     const PROMPT_SENTINEL: &str = "PROMPT-SENTINEL-CB6A-do-not-leak-7f3a";
     const ATTESTATION_SENTINEL: &str = "ATTESTATION-NOTES-SENTINEL-CB6A-51de";
@@ -266,7 +266,7 @@ fn packed_git_objects_contain_no_private_sentinels() {
         &home,
         &[
             "git",
-            "bridge",
+            "shim",
             "binding",
             "publish",
             "--key-file",
@@ -313,7 +313,7 @@ fn packed_git_objects_contain_no_private_sentinels() {
     let verify = atomic(
         &root,
         &home,
-        &["git", "bridge", "binding", "verify", &id_hex],
+        &["git", "shim", "binding", "verify", &id_hex],
     );
     // Verify intentionally fails the gate (unknown signer) but must have
     // recomputed the content first: provenance UNTRUSTED, not content.

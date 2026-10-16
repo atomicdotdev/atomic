@@ -12,7 +12,7 @@ mod attribute_tests;
 mod binding_fetch_tests;
 mod binding_store_tests;
 mod binding_verify_tests;
-mod bridge_git_journal_tests;
+mod shim_git_journal_tests;
 mod capability_tests;
 mod change_tests;
 mod conflict_restore_tests;

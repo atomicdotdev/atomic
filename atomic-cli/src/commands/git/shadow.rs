@@ -1,6 +1,6 @@
 //! The shadow-publication pipeline and its CB-4B equivalence capability.
 //!
-//! `atomic git push`, native push with an active bridge, and shadow projection
+//! `atomic git push`, native push with an active shim, and shadow projection
 //! build an Atomic `ProjectTree`, observe Git index/worktree state read-only,
 //! and require an equivalent report before any publication mutation. The
 //! already-equivalent index supplies the tree; this module never stages an
@@ -251,8 +251,8 @@ fn verify_git_publication_with_project(
     )
 }
 
-/// Whether native publication must run the Git bridge gate.
-pub(crate) fn bridge_publication_required(repo_root: &Path) -> bool {
+/// Whether native publication must run the Git shim gate.
+pub(crate) fn shim_publication_required(repo_root: &Path) -> bool {
     GitRepository::discover(repo_root)
         .map(|repository| shadow_sync_active(&repository))
         .unwrap_or(false)
@@ -260,7 +260,7 @@ pub(crate) fn bridge_publication_required(repo_root: &Path) -> bool {
 
 /// Native Atomic publication is unchanged without an active Git shadow. Once
 /// the shadow marker exists, however, publication is gated fail-closed.
-pub(crate) fn verify_bridge_publication(
+pub(crate) fn verify_shim_publication(
     repo: &Repository,
     repo_root: &Path,
     view: &str,
@@ -464,7 +464,7 @@ impl ShadowSwitchSync {
     }
 
     /// Restore the Git evidence captured before synchronization. This is used
-    /// when the final bridge checkpoint cannot be refreshed after Git itself
+    /// when the final shim checkpoint cannot be refreshed after Git itself
     /// was aligned successfully.
     pub(crate) fn rollback(self, repo_root: &Path) -> CliResult<()> {
         let Self::Synchronized(receipt) = self else {
@@ -577,7 +577,7 @@ pub(crate) fn sync_git_head_to_view(
     // colocated-but-unenrolled repositories keep native view switches with
     // no Git projection and no checkpoint requirement.
     if !repo
-        .bridge_workspace_active()
+        .shim_workspace_active()
         .map_err(CliError::Repository)?
     {
         return Ok(ShadowSwitchSync::SkippedInactive);
@@ -635,7 +635,7 @@ pub(crate) fn sync_git_head_to_view(
 /// edits. This narrower transition is valid only for identical closures.
 ///
 /// Unenrolled working copies are native: a `.git` directory (or a retained
-/// shadow exclude line) is not bridge consent (RFC §2 / CB-13C), so they skip
+/// shadow exclude line) is not shim consent (RFC §2 / CB-13C), so they skip
 /// the Git-side coordination entirely instead of demanding a checkpoint.
 pub(crate) fn sync_inherited_agent_view(root: &Path, view: &str) -> CliResult<()> {
     let git = match GitRepository::open(root) {
@@ -649,9 +649,9 @@ pub(crate) fn sync_inherited_agent_view(root: &Path, view: &str) -> CliResult<()
     .map_err(CliError::Repository)?;
     // Enrollment is checkpoint-or-explicit-opt-in (the same predicate every
     // workspace boundary uses). The retained exclude marker alone must never
-    // make a native agent session require a bridge checkpoint.
+    // make a native agent session require a shim checkpoint.
     if !repo
-        .bridge_workspace_active()
+        .shim_workspace_active()
         .map_err(CliError::Repository)?
     {
         return Ok(());
@@ -659,12 +659,12 @@ pub(crate) fn sync_inherited_agent_view(root: &Path, view: &str) -> CliResult<()
     let Some(before) = super::checkpoint::read_checkpoint(root).map_err(checkpoint_error_of)?
     else {
         // Enrolled but not anchored. Selecting the view would move Git
-        // HEAD/refs — a bridge-specific destructive operation — so it fails
+        // HEAD/refs — a shim-specific destructive operation — so it fails
         // closed with the shared anchor-or-disable remediation rather than a
         // bare internal error.
         return Err(CliError::StaleBaseline {
             report: format!(
-                "agent view selection on an enrolled but unanchored Git bridge: {}",
+                "agent view selection on an enrolled but unanchored Git shim: {}",
                 atomic_repository::UnanchoredWorkspace::MissingCheckpoint
                     .remediation()
                     .unwrap_or_default()
@@ -755,7 +755,7 @@ pub(crate) fn sync_inherited_agent_view(root: &Path, view: &str) -> CliResult<()
 
 /// Refresh the verified workspace checkpoint from the live repository
 /// handle (CB-8A). redb admits only one writable handle per process, so the
-/// bridge verifier's own writable open cannot run while a repository handle
+/// shim verifier's own writable open cannot run while a repository handle
 /// is pinned; this re-observes the git HEAD/view state and writes the
 /// version-2 checkpoint directly.
 pub(crate) fn refresh_checkpoint_from_live_handle(
@@ -818,17 +818,17 @@ pub(crate) fn sync_git_projection_after_record(
     let repo = Repository::open(repo_root).map_err(CliError::Repository)?;
     // A retained shadow exclude line is not enrollment (RFC §2 / CB-13C):
     // a colocated-but-unenrolled repository never projects its records into
-    // Git and never anchors a bridge implicitly. Native records stand alone.
+    // Git and never anchors a shim implicitly. Native records stand alone.
     if !repo
-        .bridge_workspace_active()
+        .shim_workspace_active()
         .map_err(CliError::Repository)?
     {
         return Ok(());
     }
     // An enrolled workspace without a verified checkpoint is unanchored. The
     // record projection would move Git HEAD and write the first checkpoint,
-    // anchoring the bridge as a side effect of an agent record. Anchoring is
-    // explicit (`atomic git bridge reconcile`); the destructive Git mutation
+    // anchoring the shim as a side effect of an agent record. Anchoring is
+    // explicit (`atomic git shim reconcile`); the destructive Git mutation
     // fails closed here while the already-durable Atomic record stands.
     if super::checkpoint::read_checkpoint(repo_root)
         .map_err(checkpoint_error_of)?
@@ -838,14 +838,14 @@ pub(crate) fn sync_git_projection_after_record(
             repo_root,
             "record-projection:unanchored",
             view,
-            "enrolled bridge has no verified checkpoint; projection skipped \
-             (run `atomic git bridge reconcile` to anchor, or `atomic git bridge disable`)",
+            "enrolled shim has no verified checkpoint; projection skipped \
+             (run `atomic git shim reconcile` to anchor, or `atomic git shim disable`)",
         );
         if std::io::stderr().is_terminal() {
             print_warning(
-                "Recorded on an enrolled but unanchored Git bridge; the record projection \
-                 was skipped. Anchor the workspace (`atomic git bridge reconcile`) or disable \
-                 the bridge (`atomic git bridge disable`).",
+                "Recorded on an enrolled but unanchored Git shim; the record projection \
+                 was skipped. Anchor the workspace (`atomic git shim reconcile`) or disable \
+                 the shim (`atomic git shim disable`).",
             );
         }
         return Ok(());
@@ -884,7 +884,7 @@ pub(crate) fn sync_git_projection_after_record(
         return Ok(());
     }
 
-    // An Atomic-origin record is a bridge transition (RFC §7.6): the
+    // An Atomic-origin record is a shim transition (RFC §7.6): the
     // recorded durable state is the worktree's content, so the projection
     // re-stages the primary index manifest to the projected tree — the same
     // semantics as `git commit -a` — and commits. Staged-but-unrecorded
@@ -936,7 +936,7 @@ pub(crate) fn sync_git_projection_after_record(
     drop(repo);
     // The projection moved Git HEAD; refresh the verified checkpoint so the
     // next workspace entry sees the post-transition baseline (RFC §7.2).
-    crate::commands::git::bridge::refresh_checkpoint_if_aligned(repo_root)?;
+    crate::commands::git::shim::refresh_checkpoint_if_aligned(repo_root)?;
     Ok(())
 }
 
@@ -1886,9 +1886,9 @@ fn git_error(message: impl Into<String>) -> CliError {
 /// Whether git shadow sync is established for this repo (the `.git/info/exclude`
 /// carries Atomic's shadow patterns, written by import/push). Used to gate the
 /// view-switch git-follow so we never touch HEAD in a plain (non-shadow) repo.
-/// NOTE: this marker is *retained* by `git bridge disable` and by plain
+/// NOTE: this marker is *retained* by `git shim disable` and by plain
 /// `atomic init` inside an existing Git checkout — it is not enrollment. Use
-/// [`bridge_workspace_enrolled`] wherever the question is bridge participation.
+/// [`shim_workspace_enrolled`] wherever the question is shim participation.
 fn shadow_sync_active(git_repo: &GitRepository) -> bool {
     let exclude = git_repo.path().join("info").join("exclude");
     std::fs::read_to_string(exclude)
@@ -1897,13 +1897,13 @@ fn shadow_sync_active(git_repo: &GitRepository) -> bool {
 }
 
 /// Whether the working copy at `root` participates in the colocated Git
-/// bridge: a verified checkpoint (written by an explicit bridge command) or
-/// the explicit `[git.bridge] enabled` opt-in (RFC §2 / CB-13C). A `.git`
+/// shim: a verified checkpoint (written by an explicit shim command) or
+/// the explicit `[git.shim] enabled` opt-in (RFC §2 / CB-13C). A `.git`
 /// directory next to `.atomic` — with or without a retained shadow exclude
 /// line — is not consent.
-pub(crate) fn bridge_workspace_enrolled(root: &Path) -> CliResult<bool> {
+pub(crate) fn shim_workspace_enrolled(root: &Path) -> CliResult<bool> {
     let repo = Repository::open_readonly(root).map_err(CliError::Repository)?;
-    repo.bridge_workspace_active().map_err(CliError::Repository)
+    repo.shim_workspace_active().map_err(CliError::Repository)
 }
 
 /// Acquire the repo-scoped shadow-commit lock, or return `None` (a no-op skip)
@@ -2153,11 +2153,11 @@ mod tests {
         assert!(!forbidden("my.vault/keep.txt"));
     }
 
-    // ── Agent bridge gating (RFC §2 / CB-13C) ─────────────────────────────
+    // ── Agent shim gating (RFC §2 / CB-13C) ─────────────────────────────
     //
     // The retained `.git/info/exclude` marker is not enrollment: only a
-    // verified checkpoint or the explicit `[git.bridge] enabled` opt-in
-    // participates in the Git bridge.
+    // verified checkpoint or the explicit `[git.shim] enabled` opt-in
+    // participates in the Git shim.
 
     use git2::Oid;
 
@@ -2199,7 +2199,7 @@ mod tests {
     }
 
     /// Atomic + colocated Git with the retained shadow exclude marker, no
-    /// bridge checkpoint and no bridge opt-in: a native, unenrolled repo.
+    /// shim checkpoint and no shim opt-in: a native, unenrolled repo.
     fn native_colocated_with_retained_marker(root: &Path) -> GitRepository {
         atomic_repository::Repository::init(root).unwrap();
         let git = GitRepository::init(root).unwrap();
@@ -2216,7 +2216,7 @@ mod tests {
     fn enroll_via_config(root: &Path) {
         let config = root.join(".atomic").join("config.toml");
         let mut content = std::fs::read_to_string(&config).unwrap_or_default();
-        content.push_str("\n[git.bridge]\nenabled = true\n");
+        content.push_str("\n[git.shim]\nenabled = true\n");
         std::fs::write(&config, content).unwrap();
     }
 
@@ -2243,7 +2243,7 @@ mod tests {
     }
 
     #[test]
-    fn agent_view_selection_is_native_without_bridge_enrollment() {
+    fn agent_view_selection_is_native_without_shim_enrollment() {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path();
         let git = native_colocated_with_retained_marker(root);
@@ -2264,8 +2264,8 @@ mod tests {
         let error = sync_inherited_agent_view(root, &current_view(root)).unwrap_err();
         match error {
             CliError::StaleBaseline { report } => {
-                assert!(report.contains("atomic git bridge reconcile"), "{report}");
-                assert!(report.contains("atomic git bridge disable"), "{report}");
+                assert!(report.contains("atomic git shim reconcile"), "{report}");
+                assert!(report.contains("atomic git shim disable"), "{report}");
             }
             other => panic!("expected StaleBaseline, got: {other:?}"),
         }
@@ -2294,7 +2294,7 @@ mod tests {
     }
 
     #[test]
-    fn record_projection_is_native_without_bridge_enrollment() {
+    fn record_projection_is_native_without_shim_enrollment() {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path();
         let git = native_colocated_with_retained_marker(root);
@@ -2322,7 +2322,7 @@ mod tests {
     }
 
     #[test]
-    fn view_switch_git_follow_is_native_without_bridge_enrollment() {
+    fn view_switch_git_follow_is_native_without_shim_enrollment() {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path();
         let git = native_colocated_with_retained_marker(root);
@@ -2347,11 +2347,11 @@ mod tests {
         let root = directory.path();
         let git = native_colocated_with_retained_marker(root);
         // Unenrolled: marker alone is not consent.
-        assert!(!bridge_workspace_enrolled(root).unwrap());
+        assert!(!shim_workspace_enrolled(root).unwrap());
         write_aligned_checkpoint(root, &git);
-        // A checkpoint (explicit bridge command evidence) enrolls, even when
+        // A checkpoint (explicit shim command evidence) enrolls, even when
         // configuration says disabled.
-        assert!(bridge_workspace_enrolled(root).unwrap());
+        assert!(shim_workspace_enrolled(root).unwrap());
         drop(git);
 
         let directory = tempfile::tempdir().unwrap();
@@ -2360,7 +2360,7 @@ mod tests {
         drop(git);
         enroll_via_config(root);
         // Explicit opt-in enrolls without a checkpoint.
-        assert!(bridge_workspace_enrolled(root).unwrap());
+        assert!(shim_workspace_enrolled(root).unwrap());
     }
 
     fn git_ref_count(root: &Path, pattern: &str) -> usize {

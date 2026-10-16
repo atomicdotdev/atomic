@@ -1,4 +1,4 @@
-// Temporary Unix-only Git bridge support to unblock Windows native CI.
+// Temporary Unix-only Git shim support to unblock Windows native CI.
 // Revisit after Windows support is defined; see the RFC temporary platform policy.
 #![cfg(unix)]
 
@@ -229,13 +229,13 @@ fn all_import_never_supersedes_sibling_legs_of_the_target_closure() {
         );
     }
 
-    // Both CLIs agree the workspace is clean, and the bridge verifies.
+    // Both CLIs agree the workspace is clean, and the shim verifies.
     let status = atomic_ok(root, home, &["status"]);
     assert!(
         status.contains("nothing to record"),
         "atomic status must be clean after import, got: {status}"
     );
-    atomic_ok(root, home, &["git", "bridge", "verify"]);
+    atomic_ok(root, home, &["git", "shim", "verify"]);
 
     // Incremental re-import is idempotent — the retained sibling legs are
     // already-imported markers, not new history to re-derive.
@@ -254,5 +254,5 @@ fn all_import_never_supersedes_sibling_legs_of_the_target_closure() {
         before_count, after_count,
         "incremental import must not change the view membership"
     );
-    atomic_ok(root, home, &["git", "bridge", "verify"]);
+    atomic_ok(root, home, &["git", "shim", "verify"]);
 }

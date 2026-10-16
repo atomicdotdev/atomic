@@ -1,4 +1,4 @@
-// Temporary Unix-only Git bridge support to unblock Windows native CI.
+// Temporary Unix-only Git shim support to unblock Windows native CI.
 // Revisit after Windows support is defined; see the RFC temporary platform policy.
 #![cfg(unix)]
 
@@ -17,7 +17,7 @@
 //!   hashed tagged OIDs, ordered parents, tree OID, raw author/committer
 //!   identity+times, and `Derivation::EmptyCommit`,
 //! - unbound squashes without trailers synthesize one `Derivation::Squash`
-//!   interpretation, `atomic git bridge review` surfaces candidates with
+//!   interpretation, `atomic git shim review` surfaces candidates with
 //!   their evidence and identity limits, and a captured post-rewrite event
 //!   with a locally known predecessor produces only a reviewable
 //!   RewriteCandidate link.
@@ -401,7 +401,7 @@ fn merge_imports_every_parent_closure_and_resolves_with_verified_frontier() {
     );
     assert_eq!(
         git_meta.get("sequencing").and_then(|v| v.as_str()),
-        Some("bridge")
+        Some("shim")
     );
 
     // Content equality: the resolution resolved the union conflict.
@@ -614,7 +614,7 @@ fn concurrent_change_conflicts_after_reload_and_resolution_never_replays() {
 
     // Re-anchor the workspace checkpoint to the imported merge before the
     // view switch (the stale-baseline guard refuses across a moved HEAD).
-    atomic_ok(&root, &home, &["git", "bridge", "reconcile"]);
+    atomic_ok(&root, &home, &["git", "shim", "reconcile"]);
 
     // Insert the concurrent change into main: the GitResolution is present
     // in `main` and knows every imported ancestor, but the concurrent
@@ -790,7 +790,7 @@ fn git_env(root: &Path, env: &[(&str, &str)], args: &[&str]) {
 }
 
 /// Unbound squashes without trailers synthesize one `Derivation::Squash`
-/// interpretation; `atomic git bridge review` surfaces candidates with the
+/// interpretation; `atomic git shim review` surfaces candidates with the
 /// identity limits, and a reference-transaction event journaled through the
 /// real Git wire protocol (state as argv[1], `<old> <new> <ref>` on stdin)
 /// is reported as ref-movement evidence only.
@@ -847,7 +847,7 @@ fn unbound_squash_synthesizes_one_squash_derivation_and_review_surfaces_limits()
     drop(repo);
 
     // The review command surfaces the candidate with its identity limits.
-    let review = atomic_ok(&root, &home, &["git", "bridge", "review", "--view", "main"]);
+    let review = atomic_ok(&root, &home, &["git", "shim", "review", "--view", "main"]);
     assert!(review.contains("squash/rewrite candidates: 1"), "{review}");
     assert!(
         review.contains("identity requires a verified predecessor binding or explicit review"),
@@ -861,7 +861,7 @@ fn unbound_squash_synthesizes_one_squash_derivation_and_review_surfaces_limits()
     let hook_out = atomic_stdin(
         &root,
         &home,
-        &["git", "bridge", "hook-reference-transaction", "committed"],
+        &["git", "shim", "hook-reference-transaction", "committed"],
         format!("{main_oid} {squash} refs/heads/main\n").as_bytes(),
     );
     assert!(
@@ -898,7 +898,7 @@ fn unbound_squash_synthesizes_one_squash_derivation_and_review_surfaces_limits()
         Some(squash.as_str())
     );
 
-    let review = atomic_ok(&root, &home, &["git", "bridge", "review", "--view", "main"]);
+    let review = atomic_ok(&root, &home, &["git", "shim", "review", "--view", "main"]);
     assert!(
         review.contains("1 reference-transaction record(s)"),
         "{review}"
@@ -947,7 +947,7 @@ fn post_rewrite_event_creates_reviewable_candidate_link() {
     // from stdin.
     let pairs = format!("{original} {rewritten}\n");
     let mut child = Command::new(ATOMIC_BIN)
-        .args(["git", "bridge", "hook-post-rewrite"])
+        .args(["git", "shim", "hook-post-rewrite"])
         .current_dir(&root)
         .env("HOME", &home)
         .env("ATOMIC_HOME", home.join(".atomic"))
@@ -1039,7 +1039,7 @@ fn post_rewrite_event_creates_reviewable_candidate_link() {
 
     // The review output states the exact evidence limits: unanchored hook
     // input is advisory-only, never operation linkage (review C2).
-    let review = atomic_ok(&root, &home, &["git", "bridge", "review", "--view", "main"]);
+    let review = atomic_ok(&root, &home, &["git", "shim", "review", "--view", "main"]);
     assert!(!review.contains("post-rewrite-event"), "{review}");
     assert!(review.contains("unauthenticated-evidence-only"), "{review}");
 }
@@ -1056,7 +1056,7 @@ fn atomic_env(root: &Path, home: &Path, args: &[&str], envs: &[(&str, &str)]) ->
         .expect("run atomic")
 }
 
-/// Commit with a controlled committer date (the first deterministic bridge
+/// Commit with a controlled committer date (the first deterministic shim
 /// tie-break), for ordering-sensitive fixtures.
 fn git_commit_at(root: &Path, date: &str, message: &str) -> String {
     git(root, &["add", "."]);
@@ -1244,7 +1244,7 @@ fn merge_legs_record_no_sibling_dependency_in_both_orders() {
 
         // Full-tree verification of the imported state against Git (review
         // blocker 2: complete tree comparison, not just the touched paths).
-        atomic_ok(root, home, &["git", "bridge", "verify"]);
+        atomic_ok(root, home, &["git", "shim", "verify"]);
     }
 }
 
@@ -1263,7 +1263,7 @@ fn installed_reference_transaction_hooks_record_real_git_transitions() {
     atomic_ok(&root, &home, &["git", "import", "--no-vault"]);
 
     // Install the owned dispatchers.
-    let _enable = atomic_ok(&root, &home, &["git", "bridge", "enable"]);
+    let _enable = atomic_ok(&root, &home, &["git", "shim", "enable"]);
     let hooks_dir = root.join(".git/hooks");
     let hook_script = fs::read_to_string(hooks_dir.join("reference-transaction")).unwrap();
     assert!(
@@ -1338,7 +1338,7 @@ fn installed_reference_transaction_hooks_record_real_git_transitions() {
     let atomic_sh = ATOMIC_BIN.to_string().replace('\'', "'\\''");
     fs::write(
         hooks_dir.join("reference-transaction"),
-        format!("#!/bin/sh\n'{atomic_sh}' git bridge hook-reference-transaction \"$1\" || true\nexit 1\n"),
+        format!("#!/bin/sh\n'{atomic_sh}' git shim hook-reference-transaction \"$1\" || true\nexit 1\n"),
     )
     .unwrap();
     let before_commits = {
@@ -1482,7 +1482,7 @@ fn forged_and_partial_events_never_become_candidate_linkage() {
     atomic_stdin(
         &root,
         &home,
-        &["git", "bridge", "hook-post-rewrite"],
+        &["git", "shim", "hook-post-rewrite"],
         format!("{original} {valid}").as_bytes(),
     );
 
@@ -1493,7 +1493,7 @@ fn forged_and_partial_events_never_become_candidate_linkage() {
     atomic_stdin(
         &root,
         &home,
-        &["git", "bridge", "hook-post-rewrite"],
+        &["git", "shim", "hook-post-rewrite"],
         format!("{} {forged}", "1".repeat(40)).as_bytes(),
     );
 
@@ -1566,7 +1566,7 @@ fn forged_and_partial_events_never_become_candidate_linkage() {
     // The review output states the exact evidence limits: every captured
     // record here is unauthenticated-evidence-only, and no operation
     // linkage is asserted for any candidate (review B3).
-    let review = atomic_ok(&root, &home, &["git", "bridge", "review", "--view", "main"]);
+    let review = atomic_ok(&root, &home, &["git", "shim", "review", "--view", "main"]);
     assert!(review.contains("unauthenticated-evidence-only"), "{review}");
     assert!(
         !review.contains("class=post-rewrite-event"),
@@ -1586,7 +1586,7 @@ fn binding_tree_match_creates_candidate_without_hooks() {
     git_commit(&root, "base");
     let base = git(&root, &["rev-parse", "HEAD"]);
     atomic_ok(&root, &home, &["git", "import", "--no-vault"]);
-    atomic_ok(&root, &home, &["git", "bridge", "reconcile"]);
+    atomic_ok(&root, &home, &["git", "shim", "reconcile"]);
 
     // Record v2 through Atomic so the bound projection tree carries v2.
     fs::write(root.join("code.rs"), b"fn v2() {}\n").unwrap();
@@ -1608,7 +1608,7 @@ fn binding_tree_match_creates_candidate_without_hooks() {
         &home,
         &[
             "git",
-            "bridge",
+            "shim",
             "binding",
             "publish",
             "--key-file",
@@ -1696,7 +1696,7 @@ fn binding_range_match_covers_known_intermediate_without_blob_or_message_similar
     git_commit(&root, "base");
     let base = git(&root, &["rev-parse", "HEAD"]);
     atomic_ok(&root, &home, &["git", "import", "--no-vault"]);
-    atomic_ok(&root, &home, &["git", "bridge", "reconcile"]);
+    atomic_ok(&root, &home, &["git", "shim", "reconcile"]);
 
     // Record v2 through Atomic so the bound projection tree carries v2.
     fs::write(root.join("code.rs"), b"fn v2() {}\n").unwrap();
@@ -1718,7 +1718,7 @@ fn binding_range_match_covers_known_intermediate_without_blob_or_message_similar
         &home,
         &[
             "git",
-            "bridge",
+            "shim",
             "binding",
             "publish",
             "--key-file",
@@ -1807,7 +1807,7 @@ fn binding_range_match_covers_known_intermediate_without_blob_or_message_similar
     drop(repo);
 
     // The review output names the known-range evidence and its identity limit.
-    let review = atomic_ok(&root, &home, &["git", "bridge", "review", "--view", "main"]);
+    let review = atomic_ok(&root, &home, &["git", "shim", "review", "--view", "main"]);
     assert!(review.contains("binding-range-match"), "{review}");
 }
 
@@ -2001,7 +2001,7 @@ fn explicit_insertion_reapplies_the_resolution_in_another_view() {
         &home,
         &["git", "import", "--incremental", "--no-vault"],
     );
-    atomic_ok(&root, &home, &["git", "bridge", "reconcile"]);
+    atomic_ok(&root, &home, &["git", "shim", "reconcile"]);
 
     let repo = open_repo(&root);
     let merge_hash = change_of(&repo, "main", &merge).hash().unwrap().to_base32();
@@ -2429,7 +2429,7 @@ fn ancestor_surviving_exclusion_refuses_before_publication() {
     // before the view switch is accepted.
     git(&root, &["checkout", "-q", "main"]);
     atomic_ok(&root, &home, &["view", "switch", "main", "--force"]);
-    atomic_ok(&root, &home, &["git", "bridge", "verify"]);
+    atomic_ok(&root, &home, &["git", "shim", "verify"]);
 }
 
 /// Review blocker 1 (empty-tip parents): a merge whose side parent's tip is
@@ -2554,7 +2554,7 @@ fn hooks_off_bound_range_squash_imports_to_the_git_boundary() {
         &home,
         &[
             "git",
-            "bridge",
+            "shim",
             "binding",
             "publish",
             "--key-file",
@@ -2601,13 +2601,13 @@ fn hooks_off_bound_range_squash_imports_to_the_git_boundary() {
 
     // The reviewable binding-range-match link exists, naming the bound
     // intermediate's full OID and the binding id — advisory, never identity.
-    let review = atomic_ok(&root, &home, &["git", "bridge", "review", "--view", "main"]);
+    let review = atomic_ok(&root, &home, &["git", "shim", "review", "--view", "main"]);
     assert!(review.contains("binding-range-match"), "{review}");
     assert!(review.contains(&intermediate), "{review}");
 
     // The published target's projection is exactly the Git HEAD tree, and a
     // successor after the rewrite imports without a failing boundary.
-    atomic_ok(&root, &home, &["git", "bridge", "verify"]);
+    atomic_ok(&root, &home, &["git", "shim", "verify"]);
     fs::write(root.join("g.txt"), b"successor\n").unwrap();
     git_commit(&root, "successor");
     atomic_ok(
@@ -2615,7 +2615,7 @@ fn hooks_off_bound_range_squash_imports_to_the_git_boundary() {
         &home,
         &["git", "import", "--incremental", "--no-vault"],
     );
-    atomic_ok(&root, &home, &["git", "bridge", "verify"]);
+    atomic_ok(&root, &home, &["git", "shim", "verify"]);
 }
 
 /// Review B4/C3: the canceled-intermediate range — the squash cancels the
@@ -2662,7 +2662,7 @@ fn hooks_off_canceled_intermediate_range_imports_cleanly() {
         &home,
         &[
             "git",
-            "bridge",
+            "shim",
             "binding",
             "publish",
             "--key-file",
@@ -2697,12 +2697,12 @@ fn hooks_off_canceled_intermediate_range_imports_cleanly() {
         "the canceled-intermediate range must import: {}",
         atomic_text(&imported)
     );
-    atomic_ok(&root, &home, &["git", "bridge", "verify"]);
+    atomic_ok(&root, &home, &["git", "shim", "verify"]);
 
     // Review C3: the canceled intermediate is still a known bound
     // intermediate of the rewritten range — the candidate exists without any
     // surviving path or blob intersection.
-    let review = atomic_ok(&root, &home, &["git", "bridge", "review", "--view", "main"]);
+    let review = atomic_ok(&root, &home, &["git", "shim", "review", "--view", "main"]);
     assert!(review.contains("binding-range-match"), "{review}");
     assert!(review.contains(&intermediate), "{review}");
 
@@ -2767,7 +2767,7 @@ fn known_range_candidates_cover_canceled_and_multiple_intermediates() {
         &home,
         &[
             "git",
-            "bridge",
+            "shim",
             "binding",
             "publish",
             "--key-file",
@@ -2788,7 +2788,7 @@ fn known_range_candidates_cover_canceled_and_multiple_intermediates() {
         &home,
         &[
             "git",
-            "bridge",
+            "shim",
             "binding",
             "publish",
             "--key-file",
@@ -2833,7 +2833,7 @@ fn known_range_candidates_cover_canceled_and_multiple_intermediates() {
         "the canceled multi-intermediate range must import: {}",
         atomic_text(&imported)
     );
-    atomic_ok(&root, &home, &["git", "bridge", "verify"]);
+    atomic_ok(&root, &home, &["git", "shim", "verify"]);
 
     let repo = open_repo(&root);
     let tags = repo.list_tags_for_view("main").unwrap();
@@ -2921,7 +2921,7 @@ fn hook_captured_pairs_without_an_active_operation_stay_unauthenticated() {
     atomic_stdin(
         &root,
         &home,
-        &["git", "bridge", "hook-post-rewrite"],
+        &["git", "shim", "hook-post-rewrite"],
         format!("{victim} {amended}\n").as_bytes(),
     );
     // Journal a fully known forged pair: both commits are locally
@@ -2930,7 +2930,7 @@ fn hook_captured_pairs_without_an_active_operation_stay_unauthenticated() {
     atomic_stdin(
         &root,
         &home,
-        &["git", "bridge", "hook-post-rewrite"],
+        &["git", "shim", "hook-post-rewrite"],
         format!("{original} {amended}\n").as_bytes(),
     );
 
@@ -2986,7 +2986,7 @@ fn hook_captured_pairs_without_an_active_operation_stay_unauthenticated() {
         );
     }
     drop(repo);
-    let review = atomic_ok(&root, &home, &["git", "bridge", "review", "--view", "main"]);
+    let review = atomic_ok(&root, &home, &["git", "shim", "review", "--view", "main"]);
     assert!(review.contains("unauthenticated-evidence-only"), "{review}");
 }
 
@@ -3026,7 +3026,7 @@ fn ordinary_sibling_pairs_submitted_directly_stay_unauthenticated() {
     atomic_stdin(
         &root,
         &home,
-        &["git", "bridge", "hook-post-rewrite"],
+        &["git", "shim", "hook-post-rewrite"],
         format!("{base} {right}\n").as_bytes(),
     );
 
@@ -3072,7 +3072,7 @@ fn ordinary_sibling_pairs_submitted_directly_stay_unauthenticated() {
     let review = atomic_ok(
         &root,
         &home,
-        &["git", "bridge", "review", "--view", "right"],
+        &["git", "shim", "review", "--view", "right"],
     );
     assert!(review.contains("unauthenticated-evidence-only"), "{review}");
     assert!(
@@ -3102,7 +3102,7 @@ fn many_one_line_files_import_without_placeholder_overflow() {
     // The semantic layer renders every file and the status is clean: branch
     // and leaf placeholders stay unique per entry (referential integrity).
     atomic_ok(&root, &home, &["status"]);
-    atomic_ok(&root, &home, &["git", "bridge", "verify"]);
+    atomic_ok(&root, &home, &["git", "shim", "verify"]);
     let repo = open_repo(&root);
     for (name, bytes) in &files {
         assert_eq!(
@@ -3147,7 +3147,7 @@ fn root_spanning_squash_names_the_locally_published_root_binding() {
         &home,
         &[
             "git",
-            "bridge",
+            "shim",
             "binding",
             "publish",
             "--key-file",
@@ -3187,7 +3187,7 @@ fn root_spanning_squash_names_the_locally_published_root_binding() {
     let review = atomic_ok(
         &root,
         &home,
-        &["git", "bridge", "review", "--view", "squashed"],
+        &["git", "shim", "review", "--view", "squashed"],
     );
     assert!(
         review.contains("binding-root-range-match"),
@@ -3304,7 +3304,7 @@ fn ordinary_ref_movement_is_not_rewrite_authority_e2e() {
     let repo = open_repo(&root);
     let wc = repo.require_working_copy_id().unwrap();
     let ordinary = repo
-        .prepare_bridge_git_ref_write(
+        .prepare_shim_git_ref_write(
             wc,
             "refs/heads/ref-only-review",
             Some(GitRefTarget::Direct(tagged(&old))),
@@ -3329,22 +3329,22 @@ fn ordinary_ref_movement_is_not_rewrite_authority_e2e() {
     }))
     .unwrap();
     let error = repo
-        .capture_bridge_event_anchored(&forged, ordinary.operation_id)
+        .capture_shim_event_anchored(&forged, ordinary.operation_id)
         .expect_err("a ref-only operation must not accept a rewrite anchor");
     assert!(
         error.to_string().contains("no minted capture context"),
         "the refusal must name the missing rewrite context: {error}"
     );
-    repo.record_bridge_git_ref_receipt(&ordinary, Some(GitRefTarget::Direct(tagged(&next))))
+    repo.record_shim_git_ref_receipt(&ordinary, Some(GitRefTarget::Direct(tagged(&next))))
         .unwrap();
     let ordinary_id = ordinary.operation_id;
-    repo.finalize_bridge_git_write(ordinary, Some(GitRefTarget::Direct(tagged(&next))))
+    repo.finalize_shim_git_write(ordinary, Some(GitRefTarget::Direct(tagged(&next))))
         .unwrap();
     assert!(repo.operation_has_verified_receipt(ordinary_id).unwrap());
 
     // ── Positive control: a genuine rewrite execution authenticates ───────
     let rewrite = repo
-        .prepare_bridge_git_rewrite(
+        .prepare_shim_git_rewrite(
             wc,
             "refs/heads/rewrite-review",
             Some(GitRefTarget::Direct(tagged(&old))),
@@ -3360,11 +3360,11 @@ fn ordinary_ref_movement_is_not_rewrite_authority_e2e() {
     // Journal the captured rewrite pair through the real hook wire format,
     // exporting the operation's minted capture token for the hook's duration.
     let mut child = Command::new(ATOMIC_BIN)
-        .args(["git", "bridge", "hook-post-rewrite"])
+        .args(["git", "shim", "hook-post-rewrite"])
         .current_dir(&root)
         .env("HOME", &home)
         .env("ATOMIC_HOME", home.join(".atomic"))
-        .env("ATOMIC_BRIDGE_CAPTURE_TOKEN", &token_hex)
+        .env("ATOMIC_SHIM_CAPTURE_TOKEN", &token_hex)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -3383,16 +3383,16 @@ fn ordinary_ref_movement_is_not_rewrite_authority_e2e() {
         .rfind(|line| !line.is_empty())
         .map(|line| line.as_bytes().to_vec())
         .expect("the rewrite capture is journaled");
-    repo.capture_bridge_event_anchored(&event_bytes, rewrite.operation_id)
+    repo.capture_shim_event_anchored(&event_bytes, rewrite.operation_id)
         .expect("the rewrite execution accepts its captured event");
-    repo.record_bridge_git_ref_receipt(&rewrite, Some(GitRefTarget::Direct(tagged(&next))))
+    repo.record_shim_git_ref_receipt(&rewrite, Some(GitRefTarget::Direct(tagged(&next))))
         .unwrap();
     let rewrite_id = rewrite.operation_id;
-    repo.finalize_bridge_git_write(rewrite, Some(GitRefTarget::Direct(tagged(&next))))
+    repo.finalize_shim_git_write(rewrite, Some(GitRefTarget::Direct(tagged(&next))))
         .unwrap();
     assert!(repo.operation_has_verified_receipt(rewrite_id).unwrap());
     assert!(
-        repo.bridge_anchor_binds_operation(&event_bytes, rewrite_id)
+        repo.shim_anchor_binds_operation(&event_bytes, rewrite_id)
             .unwrap(),
         "the rewrite-execution capture binds its operation"
     );
@@ -3408,7 +3408,7 @@ fn ordinary_ref_movement_is_not_rewrite_authority_e2e() {
     let review = atomic_ok(
         &root,
         &home,
-        &["git", "bridge", "review", "--view", "right"],
+        &["git", "shim", "review", "--view", "right"],
     );
     assert!(
         review.contains("class=post-rewrite-event"),
@@ -3429,7 +3429,7 @@ fn ordinary_ref_movement_is_not_rewrite_authority_e2e() {
 /// contract). A Rust workspace whose Git tree tracks `Cargo.lock` records
 /// EVERY tracked path — lockfile included — with exact bytes, and the
 /// prospective gate compares the projection against the Git tree minus ONLY
-/// the versioned bridge-private exclusions.
+/// the versioned shim-private exclusions.
 ///
 /// Failing-before (review ::26 R1 evidence): the import silently omitted
 /// `Cargo.lock` from atomic content and the gate was aligned to that loss.
@@ -3605,9 +3605,9 @@ fn incremental_import_after_a_fresh_process_preserves_tracked_paths() {
 
 /// Review ::26 R3: an all-excluded root folds to the CANONICAL empty tree of
 /// the object format (sha1 `4b825dc6...`), never a zero sentinel. A root
-/// commit whose only tracked entries are bridge-private (`.atomicignore`,
+/// commit whose only tracked entries are shim-private (`.atomicignore`,
 /// `.vault/`) imports: the projection of an empty state is the canonical
-/// empty tree, and the bridge-private files stay tracked-alive in the view.
+/// empty tree, and the shim-private files stay tracked-alive in the view.
 #[test]
 fn all_private_root_imports_with_the_canonical_empty_tree() {
     let root = tempfile::tempdir().unwrap().keep();
@@ -3616,7 +3616,7 @@ fn all_private_root_imports_with_the_canonical_empty_tree() {
     fs::write(root.join(".atomicignore"), b"target/\n").unwrap();
     fs::create_dir_all(root.join(".vault")).unwrap();
     fs::write(root.join(".vault/state.md"), b"private state\n").unwrap();
-    git_commit(&root, "only bridge-private entries");
+    git_commit(&root, "only shim-private entries");
     let report = atomic_ok(&root, &home, &["git", "import", "--no-vault"]);
     assert!(
         !report.contains("prospective import tree mismatch"),
@@ -3626,7 +3626,7 @@ fn all_private_root_imports_with_the_canonical_empty_tree() {
     let vault = repo
         .get_file_content_on_view(".vault/state.md", "main")
         .expect("the vault path reads cleanly")
-        .expect("the bridge-private file is tracked alive");
+        .expect("the shim-private file is tracked alive");
     assert_eq!(vault, b"private state\n".to_vec());
 }
 
@@ -3731,17 +3731,17 @@ fn lockfile_only_modification_renders_exact_bytes() {
     assert_eq!(graph_only, lock_v2.to_vec(), "graph-only exact bytes");
 }
 
-/// Review ::26 R1: `.vault/` files are versioned bridge-private policy
-/// (`ExclusionPolicy::BridgePrivate`) — tracked-alive in the view, absent
+/// Review ::26 R1: `.vault/` files are versioned shim-private policy
+/// (`ExclusionPolicy::ShimPrivate`) — tracked-alive in the view, absent
 /// from project manifests. The staged full-tree check must exempt the whole
-/// bridge-private set (`.atomic*` AND `.vault/`), which it does via
-/// `bridge_private_path`.
+/// shim-private set (`.atomic*` AND `.vault/`), which it does via
+/// `shim_private_path`.
 ///
 /// Failing-before: `staged path '.vault/seed.md' is present but the commit
 /// tree does not hold it`. Passing-after: the import succeeds and the
 /// recorded graph tracks the `.vault/` file with its exact committed bytes.
 #[test]
-fn tracked_vault_files_import_as_bridge_private_state() {
+fn tracked_vault_files_import_as_shim_private_state() {
     let root = tempfile::tempdir().unwrap().keep();
     let home = tempfile::tempdir().unwrap().keep();
     git(&root, &["init", "-q", "-b", "main"]);

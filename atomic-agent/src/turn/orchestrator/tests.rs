@@ -1886,7 +1886,7 @@ async fn test_session_end_fails_closed_when_attestation_write_fails() {
     }
 }
 
-/// CB-13D: a pending bridge-watch notice round-trips, is consumed on
+/// CB-13D: a pending shim-watch notice round-trips, is consumed on
 /// read, and refuses to be delivered to a different session.
 /// CB-13D ::24 R6 exactly-once replay: a notice claimed by a CRASHED
 /// consumer (its claim file remains, the writer pid is gone) is
@@ -2006,7 +2006,7 @@ async fn tool_boundary_surfaces_pending_watch_notice() {
     let result = orch.dispatch(event).await.unwrap();
     assert!(
         result.warnings.iter().any(|warning| {
-            warning.contains("bridge watch") && warning.contains("external-head-change")
+            warning.contains("shim watch") && warning.contains("external-head-change")
         }),
         "the notice must surface before the next tool call, got {:?}",
         result.warnings

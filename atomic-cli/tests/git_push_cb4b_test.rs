@@ -1,4 +1,4 @@
-// Temporary Unix-only Git bridge support to unblock Windows native CI.
+// Temporary Unix-only Git shim support to unblock Windows native CI.
 // Revisit after Windows support is defined; see the RFC temporary platform policy.
 #![cfg(unix)]
 #![cfg(feature = "remote")]
@@ -128,7 +128,7 @@ fn git_push_mismatch_preserves_refs_index_odb_worktree_and_operation_heads() {
 }
 
 #[test]
-fn native_push_bridge_mismatch_preserves_all_state_and_sends_no_request() {
+fn native_push_shim_mismatch_preserves_all_state_and_sends_no_request() {
     let repository = TempDir::new().expect("repository tempdir");
     let home = TempDir::new().expect("home tempdir");
     init_fixture(repository.path(), home.path());

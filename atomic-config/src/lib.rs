@@ -546,58 +546,58 @@ pub struct GitConfig {
     #[serde(default)]
     pub identity: GitIdentityConfig,
 
-    /// Bridge rollout gate (RFC-ATOMIC-GIT-CAUSAL-BRIDGE §13 Phase 13
-    /// task 4, CB-13C). Default-off: the bridge is never enabled by
+    /// Shim rollout gate (RFC-ATOMIC-GIT-CAUSAL-BRIDGE §13 Phase 13
+    /// task 4, CB-13C). Default-off: the shim is never enabled by
     /// configuration alone.
     #[serde(default)]
-    pub bridge: GitBridgeConfig,
+    pub shim: GitShimConfig,
 }
 
-/// Bridge rollout gate (RFC §13 Phase 13 task 4, CB-13C).
+/// Shim rollout gate (RFC §13 Phase 13 task 4, CB-13C).
 ///
 /// # Decision recorded for CB-13C
 ///
-/// The colocated bridge stays **opt-in only**. `enabled` defaults to
+/// The colocated shim stays **opt-in only**. `enabled` defaults to
 /// `false`, and no code path flips it: default enablement additionally
 /// requires every named rollout gate (recovery, parity, security,
 /// migration, performance) to be independently `Passed`, which per the
 /// RFC §21 evidence matrix in the tracker they are not (several are
 /// `Unknown`, and none carries owner approval). Until the owner approves
-/// measured thresholds, [`GitBridgeConfig::default_enablement`] refuses.
+/// measured thresholds, [`GitShimConfig::default_enablement`] refuses.
 ///
 /// ```toml
-/// [git.bridge]
+/// [git.shim]
 /// enabled = true   # explicit per-repository opt-in; default false
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
-pub struct GitBridgeConfig {
-    /// Explicit opt-in for bridge workflows on this repository. Defaults
-    /// to `false`; the bridge is never enabled by configuration alone.
+pub struct GitShimConfig {
+    /// Explicit opt-in for shim workflows on this repository. Defaults
+    /// to `false`; the shim is never enabled by configuration alone.
     #[serde(default)]
     pub enabled: bool,
 
-    /// The optional metadata-only bridge watch daemon (RFC §11.2, CB-13D).
-    /// Defaults to disabled; an absent `[git.bridge.watch]` section reads
+    /// The optional metadata-only shim watch daemon (RFC §11.2, CB-13D).
+    /// Defaults to disabled; an absent `[git.shim.watch]` section reads
     /// as fully disabled.
     #[serde(default)]
-    pub watch: BridgeWatchConfig,
+    pub watch: ShimWatchConfig,
 }
 
-/// Configuration for the optional metadata-only bridge watch daemon
+/// Configuration for the optional metadata-only shim watch daemon
 /// (RFC §11.2 rules 3–7).
 ///
 /// The daemon is a latency accelerator only: correctness always comes from
 /// command-boundary reconciliation, and a stopped or killed daemon must
 /// never change the next command's outcome. It is therefore disabled unless
-/// explicitly opted in per repository, over and above the bridge opt-in.
+/// explicitly opted in per repository, over and above the shim opt-in.
 ///
 /// ```toml
-/// [git.bridge.watch]
+/// [git.shim.watch]
 /// enabled = true  # explicit per-repository opt-in; default false
 /// quiet_ms = 250  # minimum silence before a reactive reconcile (>= 250)
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct BridgeWatchConfig {
+pub struct ShimWatchConfig {
     /// Explicit opt-in for the watch daemon on this repository. Defaults to
     /// `false`; the daemon is never started by configuration alone — not
     /// even in CI or containers, which simply receive the same disabled
@@ -606,14 +606,14 @@ pub struct BridgeWatchConfig {
     pub enabled: bool,
     /// Minimum silence window, in milliseconds, before a reactive
     /// reconcile may run (RFC §11.2 rule 3: at least 250 ms). Values below
-    /// the floor are clamped up to [`BridgeWatchConfig::MIN_QUIET_MS`] by
-    /// [`BridgeWatchConfig::effective_quiet_ms`]; the raw field is
+    /// the floor are clamped up to [`ShimWatchConfig::MIN_QUIET_MS`] by
+    /// [`ShimWatchConfig::effective_quiet_ms`]; the raw field is
     /// preserved for round-tripping.
-    #[serde(default = "BridgeWatchConfig::default_quiet_ms")]
+    #[serde(default = "ShimWatchConfig::default_quiet_ms")]
     pub quiet_ms: u64,
 }
 
-impl BridgeWatchConfig {
+impl ShimWatchConfig {
     /// The enforced lower bound for the reactive silence window
     /// (RFC §11.2 rule 3: at least 250 ms).
     pub const MIN_QUIET_MS: u64 = 250;
@@ -630,7 +630,7 @@ impl BridgeWatchConfig {
 
     /// Why the daemon must not start under the current configuration, if it
     /// must not. The daemon is opt-in only (RFC §11.2 rule 7): it is off
-    /// unless `[git.bridge.watch] enabled = true` is explicitly recorded,
+    /// unless `[git.shim.watch] enabled = true` is explicitly recorded,
     /// which is also how CI and containers stay off — they get the same
     /// disabled default as everywhere else, and only an explicit
     /// per-repository opt-in starts the daemon there.
@@ -639,13 +639,13 @@ impl BridgeWatchConfig {
             return None;
         }
         Some(
-            "the bridge watch daemon is disabled (set [git.bridge.watch] enabled = true to opt in; \
+            "the shim watch daemon is disabled (set [git.shim.watch] enabled = true to opt in; \
              command boundaries fully reconcile without it)",
         )
     }
 }
 
-impl Default for BridgeWatchConfig {
+impl Default for ShimWatchConfig {
     fn default() -> Self {
         Self {
             enabled: false,
@@ -708,7 +708,7 @@ pub const ROLLOUT_GATES: &[(&str, RolloutGateState)] = &[
 /// Why default enablement is refused.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum DefaultEnablementRefusal {
-    #[error("the bridge is opt-in only: set [git.bridge] enabled = true to opt in")]
+    #[error("the shim is opt-in only: set [git.shim] enabled = true to opt in")]
     NotOptedIn,
     #[error("rollout gate '{gate}' is unmeasured; default enablement is blocked until the RFC §21 matrix records measured evidence and owner approval")]
     UnmeasuredGate { gate: &'static str },
@@ -716,8 +716,8 @@ pub enum DefaultEnablementRefusal {
     FailedGate { gate: &'static str },
 }
 
-impl GitBridgeConfig {
-    /// Whether the bridge may be enabled *by default* (without an explicit
+impl GitShimConfig {
+    /// Whether the shim may be enabled *by default* (without an explicit
     /// user action naming this repository). Refuses while the repository has
     /// not opted in, or while any rollout gate is unmeasured or unpassed.
     pub fn default_enablement(&self) -> Result<(), DefaultEnablementRefusal> {
@@ -1138,33 +1138,33 @@ mod tests {
     /// window is floored at 250 ms; an absent section reads as fully
     /// disabled and round-trips losslessly.
     #[test]
-    fn bridge_watch_defaults_to_disabled_with_rfc_floor() {
+    fn shim_watch_defaults_to_disabled_with_rfc_floor() {
         let parsed: RepoConfig = toml::from_str("").unwrap();
-        assert!(!parsed.git.bridge.watch.enabled);
-        assert_eq!(parsed.git.bridge.watch.quiet_ms, 250);
-        assert_eq!(parsed.git.bridge.watch.effective_quiet_ms(), 250);
-        assert!(parsed.git.bridge.watch.startup_refusal().is_some());
+        assert!(!parsed.git.shim.watch.enabled);
+        assert_eq!(parsed.git.shim.watch.quiet_ms, 250);
+        assert_eq!(parsed.git.shim.watch.effective_quiet_ms(), 250);
+        assert!(parsed.git.shim.watch.startup_refusal().is_some());
 
         let parsed: RepoConfig =
-            toml::from_str("[git.bridge.watch]\nenabled = true\nquiet_ms = 40\n").unwrap();
-        assert!(parsed.git.bridge.watch.enabled);
+            toml::from_str("[git.shim.watch]\nenabled = true\nquiet_ms = 40\n").unwrap();
+        assert!(parsed.git.shim.watch.enabled);
         assert_eq!(
-            parsed.git.bridge.watch.effective_quiet_ms(),
+            parsed.git.shim.watch.effective_quiet_ms(),
             250,
             "the daemon never waits less than the RFC 250 ms silence floor"
         );
-        assert!(parsed.git.bridge.watch.startup_refusal().is_none());
+        assert!(parsed.git.shim.watch.startup_refusal().is_none());
 
         let parsed: RepoConfig =
-            toml::from_str("[git.bridge.watch]\nenabled = true\nquiet_ms = 900\n").unwrap();
-        assert_eq!(parsed.git.bridge.watch.effective_quiet_ms(), 900);
+            toml::from_str("[git.shim.watch]\nenabled = true\nquiet_ms = 900\n").unwrap();
+        assert_eq!(parsed.git.shim.watch.effective_quiet_ms(), 900);
 
         // Round-trip: a saved opt-in keeps its exact values.
         let config = RepoConfig {
             git: GitConfig {
-                bridge: GitBridgeConfig {
+                shim: GitShimConfig {
                     enabled: true,
-                    watch: BridgeWatchConfig {
+                    watch: ShimWatchConfig {
                         enabled: true,
                         quiet_ms: 500,
                     },
@@ -1175,7 +1175,7 @@ mod tests {
         };
         let encoded = toml::to_string_pretty(&config).unwrap();
         let decoded: RepoConfig = toml::from_str(&encoded).unwrap();
-        assert_eq!(decoded.git.bridge.watch, config.git.bridge.watch);
+        assert_eq!(decoded.git.shim.watch, config.git.shim.watch);
     }
 
     #[test]
@@ -1215,13 +1215,13 @@ mod tests {
         }
     }
 
-    /// CB-13C rollout gate: the bridge is opt-in only and default-off.
+    /// CB-13C rollout gate: the shim is opt-in only and default-off.
     #[test]
-    fn git_bridge_defaults_to_disabled() {
+    fn git_shim_defaults_to_disabled() {
         let config: RepoConfig = toml::from_str("").unwrap();
-        assert!(!config.git.bridge.enabled);
+        assert!(!config.git.shim.enabled);
         assert_eq!(
-            config.git.bridge.default_enablement(),
+            config.git.shim.default_enablement(),
             Err(DefaultEnablementRefusal::NotOptedIn)
         );
     }
@@ -1229,10 +1229,10 @@ mod tests {
     /// Explicit opt-in parses, and default enablement is still refused
     /// while any rollout gate is unmeasured (RFC §21 matrix).
     #[test]
-    fn git_bridge_opt_in_parses_but_default_enablement_stays_blocked_by_unmeasured_gates() {
-        let config: RepoConfig = toml::from_str("[git.bridge]\nenabled = true\n").unwrap();
-        assert!(config.git.bridge.enabled);
-        match config.git.bridge.default_enablement() {
+    fn git_shim_opt_in_parses_but_default_enablement_stays_blocked_by_unmeasured_gates() {
+        let config: RepoConfig = toml::from_str("[git.shim]\nenabled = true\n").unwrap();
+        assert!(config.git.shim.enabled);
+        match config.git.shim.default_enablement() {
             Err(DefaultEnablementRefusal::UnmeasuredGate { gate }) => {
                 assert_eq!(gate, "recovery", "the first unmeasured gate is named")
             }
@@ -1245,14 +1245,14 @@ mod tests {
     /// refuses with the FIRST gate and can never report `FailedGate` while
     /// the constants are fixed. The helper is consumed by the CLI enable
     /// command and the consent-gated telemetry sink (`for_repository`);
-    /// the live opt-in/rollback transition is covered by the CLI bridge
+    /// the live opt-in/rollback transition is covered by the CLI shim
     /// test `enable_records_opt_in_and_disable_rolls_back`, which drives
     /// the real config file. This test asserts the real recorded states,
     /// not constructed booleans.
     #[test]
     fn default_enablement_refuses_with_the_real_unmeasured_gate_surface() {
-        let config: RepoConfig = toml::from_str("[git.bridge]\nenabled = true\n").unwrap();
-        assert!(config.git.bridge.enabled);
+        let config: RepoConfig = toml::from_str("[git.shim]\nenabled = true\n").unwrap();
+        assert!(config.git.shim.enabled);
 
         // The recorded surface itself: every gate unmeasured and unpassed.
         for (gate, state) in ROLLOUT_GATES {
@@ -1264,7 +1264,7 @@ mod tests {
         }
         // Opting in does not approve default rollout: the first gate is
         // named as unmeasured.
-        match config.git.bridge.default_enablement() {
+        match config.git.shim.default_enablement() {
             Err(DefaultEnablementRefusal::UnmeasuredGate { gate }) => {
                 assert_eq!(gate, "recovery")
             }
@@ -1275,7 +1275,7 @@ mod tests {
         // NotOptedIn regardless of any gate state.
         let rolled_back: RepoConfig = toml::from_str("").unwrap();
         assert_eq!(
-            rolled_back.git.bridge.default_enablement(),
+            rolled_back.git.shim.default_enablement(),
             Err(DefaultEnablementRefusal::NotOptedIn)
         );
         // The FailedGate branch is unreachable while every gate is

@@ -1,4 +1,4 @@
-// Temporary Unix-only Git bridge support to unblock Windows native CI.
+// Temporary Unix-only Git shim support to unblock Windows native CI.
 // Revisit after Windows support is defined; see the RFC temporary platform policy.
 #![cfg(unix)]
 
@@ -159,7 +159,7 @@ impl Colocated {
         path
     }
 
-    /// Anchor the bridge (CB-7A) so git-side transitions adopt through the
+    /// Anchor the shim (CB-7A) so git-side transitions adopt through the
     /// post-checkout hook (needed for ephemeral-view adoption tests).
     fn anchor(&self) {
         atomic_ok(
@@ -167,7 +167,7 @@ impl Colocated {
             self.home(),
             &[
                 "git",
-                "bridge",
+                "shim",
                 "enable",
                 "--binding-key-file",
                 self.key().to_str().expect("utf8 key path"),

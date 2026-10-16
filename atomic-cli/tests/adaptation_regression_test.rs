@@ -44,7 +44,7 @@ fn commit_git_paths(root: &Path, message: &str, paths: &[&str]) {
         .unwrap();
 }
 
-// Git bridge integration currently requires Unix raw-byte path support.
+// Git shim integration currently requires Unix raw-byte path support.
 #[cfg(unix)]
 #[test]
 fn git_import_retires_empty_parent_directories_and_recreates_them() {
@@ -268,7 +268,7 @@ fn diff_and_restore_include_content_permissions_and_symlink_types() {
 
 #[cfg(unix)]
 #[test]
-fn remove_preview_does_not_capture_pending_bridge_edits() {
+fn remove_preview_does_not_capture_pending_shim_edits() {
     use std::collections::BTreeMap;
     fn snapshot(root: &Path) -> BTreeMap<std::path::PathBuf, Vec<u8>> {
         fn visit(path: &Path, files: &mut BTreeMap<std::path::PathBuf, Vec<u8>>) {
@@ -306,7 +306,7 @@ fn remove_preview_does_not_capture_pending_bridge_edits() {
     assert_eq!(
         snapshot(root.path()),
         before,
-        "preview must not mutate DB, changes, journal or bridge evidence"
+        "preview must not mutate DB, changes, journal or shim evidence"
     );
     assert_eq!(
         fs::read(root.path().join("file.txt")).unwrap(),

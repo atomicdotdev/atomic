@@ -1,4 +1,4 @@
-// Temporary Unix-only Git bridge support to unblock Windows native CI.
+// Temporary Unix-only Git shim support to unblock Windows native CI.
 // Revisit after Windows support is defined; see the RFC temporary platform policy.
 #![cfg(unix)]
 
@@ -196,7 +196,7 @@ fn managed_capture_commit_lands_and_atomic_finalization_is_durably_incomplete() 
     git(&root, &["commit", "-q", "--allow-empty", "-m", "git base"]);
 
     // Install the REAL pre-commit dispatcher (advisory) and anchor.
-    atomic_ok(&root, &home, &["git", "bridge", "enable"]);
+    atomic_ok(&root, &home, &["git", "shim", "enable"]);
     assert!(
         root.join(".git/hooks/pre-commit").exists(),
         "the pre-commit dispatcher is installed"
@@ -251,7 +251,7 @@ fn managed_capture_commit_lands_and_atomic_finalization_is_durably_incomplete() 
         "the commit-time capture is retained for the turn"
     );
 
-    // The commit moved Git HEAD past the bridge checkpoint — the workspace
+    // The commit moved Git HEAD past the shim checkpoint — the workspace
     // is unanchored at turn end. The turn-end guard refuses (nonzero) and
     // persists the WIP recovery evidence durably: the AC-9 oracle's
     // nonzero-finalization / no-exact-attribution / retained-recovery
@@ -352,7 +352,7 @@ fn bypassed_commit_lands_and_finalization_keeps_durable_unattributed_incomplete(
     );
 
     // Re-anchor the workspace at the landed commit before finalization.
-    atomic_ok(&root, &home, &["git", "bridge", "reconcile"]);
+    atomic_ok(&root, &home, &["git", "shim", "reconcile"]);
 
     // Atomic finalization: observed-operation-only + durable incomplete.
     let turn_end = atomic_with_stdin(

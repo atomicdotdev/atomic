@@ -57,7 +57,7 @@
 pub mod anchor;
 pub mod binding;
 pub(crate) mod bootstrap;
-pub mod bridge;
+pub mod shim;
 pub mod census;
 pub(crate) mod checkpoint;
 pub(crate) mod guard;
@@ -75,7 +75,7 @@ pub(crate) mod wip;
 
 use clap::Subcommand;
 
-pub use bridge::Bridge;
+pub use shim::Shim;
 pub use hooks::Hooks;
 pub use import::Import;
 pub use push::Push;
@@ -91,7 +91,7 @@ use crate::error::CliResult;
 #[derive(Subcommand, Debug)]
 pub enum GitCommands {
     /// Reconcile or verify a clean Git checkout with the current Atomic view.
-    Bridge(Bridge),
+    Shim(Shim),
 
     /// Import a Git repository into Atomic.
     ///
@@ -162,7 +162,7 @@ pub struct Git {
 impl Command for Git {
     fn run(&self) -> CliResult<()> {
         match &self.command {
-            GitCommands::Bridge(cmd) => cmd.run(),
+            GitCommands::Shim(cmd) => cmd.run(),
             GitCommands::Import(cmd) => cmd.run(),
             GitCommands::Push(cmd) => cmd.run(),
             GitCommands::Hooks(cmd) => cmd.run(),
@@ -178,15 +178,15 @@ mod tests {
     fn test_git_commands_variants() {
         fn check_variant(cmd: &GitCommands) -> &'static str {
             match cmd {
-                GitCommands::Bridge(_) => "bridge",
+                GitCommands::Shim(_) => "shim",
                 GitCommands::Import(_) => "import",
                 GitCommands::Push(_) => "push",
                 GitCommands::Hooks(_) => "hooks",
             }
         }
 
-        let bridge = Bridge::default();
-        assert_eq!(check_variant(&GitCommands::Bridge(bridge)), "bridge");
+        let shim = Shim::default();
+        assert_eq!(check_variant(&GitCommands::Shim(shim)), "shim");
 
         let import = Import::default();
         assert_eq!(check_variant(&GitCommands::Import(import)), "import");

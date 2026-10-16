@@ -138,7 +138,7 @@ pub use conflict_reconcile::{
     ConflictReconcileOutcome, StaleConflictDisposition, StaleConflictPath, StaleConflictReport,
 };
 pub use cutover::{
-    BridgeCutoverAudit, BridgeCutoverOutcome, BridgeCutoverPlan, CutoverAuditDisposition,
+    ShimCutoverAudit, ShimCutoverOutcome, ShimCutoverPlan, CutoverAuditDisposition,
     CutoverSchemaAudit,
 };
 pub use database::{
@@ -170,7 +170,7 @@ pub use ignore_mirror::{
 pub use locks::RepositoryCommonLockGuard;
 pub use operation::{
     OperationDetails, OperationHeadState, OperationLog, OperationLogEntry,
-    OperationVerificationState, PreparedBridgeGitWrite, PreparedRemoteOperation,
+    OperationVerificationState, PreparedShimGitWrite, PreparedRemoteOperation,
 };
 pub use project_tree::{
     escape_repo_path, unescape_repo_path, ConversionPolicy, ExclusionPolicy, ExclusionReason,
@@ -258,8 +258,8 @@ mod vault_names;
 mod vault_triples;
 mod verify;
 pub use anchor::{
-    conversion_policy_for_git, format_equivalence_report, read_head_map, BridgeAnchorError,
-    BridgeAnchorOutcome, BridgeAnchorRefusal, HeadMapEntry,
+    conversion_policy_for_git, format_equivalence_report, read_head_map, ShimAnchorError,
+    ShimAnchorOutcome, ShimAnchorRefusal, HeadMapEntry,
 };
 pub use binding_fetch::{
     BindingChangeSource, ClosureAcquisition, ClosureReadiness, IncompletenessReason,

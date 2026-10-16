@@ -507,22 +507,22 @@ impl Push {
 
     /// Async implementation of the push command.
     async fn run_async(&self) -> CliResult<()> {
-        // For an active Git bridge, run CB-4B through a read-only Atomic handle
+        // For an active Git shim, run CB-4B through a read-only Atomic handle
         // before writable open can recover/create an operation and before the
         // first HTTP `/code` negotiation POST. Plain Atomic repositories retain
         // their original writable-open/recovery behavior.
         let repo_root = find_repository_root()?;
-        let preflight = if crate::commands::git::shadow::bridge_publication_required(&repo_root) {
+        let preflight = if crate::commands::git::shadow::shim_publication_required(&repo_root) {
             let readonly_repo =
                 Repository::open_readonly(&repo_root).map_err(CliError::Repository)?;
             let local_view = self.get_local_view(&readonly_repo)?;
-            let publication = crate::commands::git::shadow::verify_bridge_publication(
+            let publication = crate::commands::git::shadow::verify_shim_publication(
                 &readonly_repo,
                 &repo_root,
                 &local_view,
             )?
             .ok_or_else(|| CliError::GitError {
-                message: "Git bridge publication marker disappeared during preflight".to_string(),
+                message: "Git shim publication marker disappeared during preflight".to_string(),
             })?;
             Some((local_view, publication))
         } else {

@@ -899,7 +899,7 @@ fn snapshot_retention_preserves_an_object_rooted_by_an_incomplete_session_record
 #[test]
 #[cfg_attr(
     not(unix),
-    ignore = "temporary Unix-only Git bridge (PR #207); see RFC temporary platform policy"
+    ignore = "temporary Unix-only Git shim (PR #207); see RFC temporary platform policy"
 )]
 fn snapshot_retention_respects_git_keep_refs_and_audit_wall() {
     let (directory, repo) = create_temp_repo();

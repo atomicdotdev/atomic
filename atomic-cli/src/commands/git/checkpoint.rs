@@ -1,4 +1,4 @@
-//! Versioned local checkpoint persistence for the colocated Git bridge.
+//! Versioned local checkpoint persistence for the colocated Git shim.
 
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -87,7 +87,7 @@ pub(crate) struct GitAdminIdentity {
     pub index_path: PathBuf,
 }
 
-/// Atomic side of one observed bridge checkpoint.
+/// Atomic side of one observed shim checkpoint.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct CheckpointAtomicState {
     pub view: String,
@@ -95,12 +95,12 @@ pub(crate) struct CheckpointAtomicState {
     pub manifest_root: Option<ManifestRootEvidence>,
 }
 
-/// Version-2 bridge checkpoint.
+/// Version-2 shim checkpoint.
 ///
-/// Fields remain flat so the experimental bridge can upgrade the version-1
+/// Fields remain flat so the experimental shim can upgrade the version-1
 /// JSON without changing its existing direction-classification call sites.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub(crate) struct BridgeCheckpoint {
+pub(crate) struct ShimCheckpoint {
     pub version: u32,
     pub view: String,
     pub atomic_state: String,
@@ -122,7 +122,7 @@ pub(crate) struct BridgeCheckpoint {
     pub git_admin: Option<GitAdminIdentity>,
 }
 
-impl BridgeCheckpoint {
+impl ShimCheckpoint {
     pub(crate) fn legacy_compatible(
         view: impl Into<String>,
         atomic_state: impl Into<String>,
@@ -148,7 +148,7 @@ impl BridgeCheckpoint {
     }
 }
 
-/// State already verified by the bridge before a checkpoint is published.
+/// State already verified by the shim before a checkpoint is published.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct VerifiedCheckpointInput<'a> {
     pub view: &'a str,
@@ -159,27 +159,27 @@ pub(crate) struct VerifiedCheckpointInput<'a> {
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum CheckpointError {
-    #[error("cannot read bridge checkpoint '{path}': {source}")]
+    #[error("cannot read shim checkpoint '{path}': {source}")]
     Read {
         path: PathBuf,
         #[source]
         source: std::io::Error,
     },
 
-    #[error("bridge checkpoint '{path}' is malformed: {source}")]
+    #[error("shim checkpoint '{path}' is malformed: {source}")]
     Malformed {
         path: PathBuf,
         #[source]
         source: serde_json::Error,
     },
 
-    #[error("unsupported bridge checkpoint version {version}")]
+    #[error("unsupported shim checkpoint version {version}")]
     UnsupportedVersion { version: u32 },
 
-    #[error("cannot write bridge checkpoint: {0}")]
+    #[error("cannot write shim checkpoint: {0}")]
     Write(#[source] std::io::Error),
 
-    #[error("cannot encode bridge checkpoint: {0}")]
+    #[error("cannot encode shim checkpoint: {0}")]
     Encode(#[source] serde_json::Error),
 
     #[error("cannot inspect Atomic checkpoint state: {0}")]
@@ -188,10 +188,10 @@ pub(crate) enum CheckpointError {
     #[error(transparent)]
     Observation(#[from] ObservationError),
 
-    #[error("a bridge checkpoint requires a Git working tree")]
+    #[error("a shim checkpoint requires a Git working tree")]
     NoGit,
 
-    #[error("a bridge checkpoint requires an attached Git HEAD")]
+    #[error("a shim checkpoint requires an attached Git HEAD")]
     UnsupportedHead,
 
     #[error(
@@ -210,7 +210,7 @@ struct VersionProbe {
 }
 
 #[derive(Deserialize)]
-struct BridgeCheckpointV1 {
+struct ShimCheckpointV1 {
     version: u32,
     view: String,
     atomic_state: String,
@@ -223,7 +223,7 @@ pub(crate) fn checkpoint_path(root: &Path) -> PathBuf {
 }
 
 /// Read and upgrade a local checkpoint without rewriting it.
-pub(crate) fn read_checkpoint(root: &Path) -> Result<Option<BridgeCheckpoint>, CheckpointError> {
+pub(crate) fn read_checkpoint(root: &Path) -> Result<Option<ShimCheckpoint>, CheckpointError> {
     let path = checkpoint_path(root);
     let bytes = match fs::read(&path) {
         Ok(bytes) => bytes,
@@ -233,7 +233,7 @@ pub(crate) fn read_checkpoint(root: &Path) -> Result<Option<BridgeCheckpoint>, C
     decode_checkpoint_at(&bytes, path).map(Some)
 }
 
-fn decode_checkpoint_at(bytes: &[u8], path: PathBuf) -> Result<BridgeCheckpoint, CheckpointError> {
+fn decode_checkpoint_at(bytes: &[u8], path: PathBuf) -> Result<ShimCheckpoint, CheckpointError> {
     let probe: VersionProbe =
         serde_json::from_slice(bytes).map_err(|source| CheckpointError::Malformed {
             path: path.clone(),
@@ -242,13 +242,13 @@ fn decode_checkpoint_at(bytes: &[u8], path: PathBuf) -> Result<BridgeCheckpoint,
 
     match probe.version {
         1 => {
-            let legacy: BridgeCheckpointV1 =
+            let legacy: ShimCheckpointV1 =
                 serde_json::from_slice(bytes).map_err(|source| CheckpointError::Malformed {
                     path: path.clone(),
                     source,
                 })?;
             debug_assert_eq!(legacy.version, 1);
-            Ok(BridgeCheckpoint::legacy_compatible(
+            Ok(ShimCheckpoint::legacy_compatible(
                 legacy.view,
                 legacy.atomic_state,
                 legacy.git_head,
@@ -264,7 +264,7 @@ fn decode_checkpoint_at(bytes: &[u8], path: PathBuf) -> Result<BridgeCheckpoint,
 /// Atomically write a version-2 checkpoint.
 pub(crate) fn write_checkpoint(
     root: &Path,
-    checkpoint: &BridgeCheckpoint,
+    checkpoint: &ShimCheckpoint,
 ) -> Result<(), CheckpointError> {
     let directory = root.join(".atomic/bridge");
     fs::create_dir_all(&directory).map_err(CheckpointError::Write)?;
@@ -375,11 +375,11 @@ fn observe_atomic_on_handle(
     })
 }
 
-/// Re-observe the verified bridge state and publish it as a version-2 checkpoint.
+/// Re-observe the verified shim state and publish it as a version-2 checkpoint.
 pub(crate) fn write_verified_checkpoint(
     root: &Path,
     input: VerifiedCheckpointInput<'_>,
-) -> Result<BridgeCheckpoint, CheckpointError> {
+) -> Result<ShimCheckpoint, CheckpointError> {
     let atomic = observe_atomic_view(root, input.view)?;
     if atomic.state.as_str() != input.atomic_state {
         return Err(CheckpointError::ObservedStateChanged {
@@ -421,7 +421,7 @@ pub(crate) fn write_verified_checkpoint(
         });
     }
 
-    let checkpoint = BridgeCheckpoint {
+    let checkpoint = ShimCheckpoint {
         version: CHECKPOINT_VERSION,
         view: atomic.view,
         atomic_state: input.atomic_state.to_string(),
@@ -482,7 +482,7 @@ mod tests {
     #[test]
     fn v2_checkpoint_roundtrips_all_evidence() {
         let root = tempfile::tempdir().expect("tempdir");
-        let checkpoint = BridgeCheckpoint {
+        let checkpoint = ShimCheckpoint {
             version: CHECKPOINT_VERSION,
             view: "agent/session-1".to_string(),
             atomic_state: "atomic-2".to_string(),

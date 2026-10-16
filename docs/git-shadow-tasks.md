@@ -2,7 +2,7 @@
 
 > **Status (CB-13C, 2026-09-14):** this document is the historical Shadow
 > POC design record. The colocated bridge is the forward path; see the
-> [bridge operating guide](bridge-operating-guide.md) for supported
+> [shim operating guide](shim-operating-guide.md) for supported
 > workflows. The Shadow→bridge **cutover is unsupported**: the transactional
 > cutover has no CLI caller and open review findings (fence-before-lock race
 > in the legacy writer's fence check, `.git`-existence-only readiness

@@ -1,7 +1,7 @@
-//! CB-13B: the transactional shadow → colocated-bridge cutover.
+//! CB-13B: the transactional shadow → colocated-shim cutover.
 //!
 //! The cutover is the ownership transfer that ends the two-writer window
-//! between the legacy Git shadow pipeline and the colocated bridge. It is
+//! between the legacy Git shadow pipeline and the colocated shim. It is
 //! planned from a read-only audit that inventories the durable schemas and
 //! refuses unsupported or unready states before any mutation, journaled as a
 //! repository-scoped [`OperationKind::Cutover`] metadata operation, and
@@ -40,7 +40,7 @@ use atomic_core::operation::{
 };
 use atomic_core::pristine::{
     CapabilityTxnT, FileIndexV2TxnT, GitShaIndexTxnT, RequiredRepositoryCapability, ViewTxnT,
-    WorkingCopyTxnT, BRIDGE_CUTOVER_CAPABILITY, SUPPORTED_REPOSITORY_CAPABILITIES,
+    WorkingCopyTxnT, SHIM_CUTOVER_CAPABILITY, SUPPORTED_REPOSITORY_CAPABILITIES,
 };
 use atomic_core::{Hash, OperationId, WorkingCopyId};
 
@@ -80,7 +80,7 @@ pub struct CutoverSchemaAudit {
 
 /// Read-only CB-13B cutover audit over the repository's durable state.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BridgeCutoverAudit {
+pub struct ShimCutoverAudit {
     /// Durable `git-bridge-cutover` requirement version, if any.
     pub cutover_requirement: Option<u32>,
     /// Capability rows this build cannot satisfy; cutover fails closed.
@@ -100,7 +100,7 @@ pub struct BridgeCutoverAudit {
     pub final_schema: Vec<CutoverSchemaAudit>,
 }
 
-impl BridgeCutoverAudit {
+impl ShimCutoverAudit {
     /// Stable evidence digest of the pre-fence audit state.
     pub fn evidence_digest(&self) -> Hash {
         let mut material = String::new();
@@ -146,9 +146,9 @@ impl BridgeCutoverAudit {
 
 /// A validated, not-yet-applied cutover plan (CB-13B).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BridgeCutoverPlan {
+pub struct ShimCutoverPlan {
     /// The audit snapshot the plan was derived from (rollback evidence).
-    pub audit: BridgeCutoverAudit,
+    pub audit: ShimCutoverAudit,
     /// The single fenced metadata transition the cutover applies.
     pub transition: MetadataTransition,
     /// The repository already durably requires the cutover capability.
@@ -157,7 +157,7 @@ pub struct BridgeCutoverPlan {
 
 /// Outcome of one cutover execution (CB-13B).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BridgeCutoverOutcome {
+pub struct ShimCutoverOutcome {
     /// The journaled `Cutover` operation, when one was prepared, or the
     /// owning operation that was resumed to its Verified receipt.
     pub operation: Option<OperationId>,
@@ -209,7 +209,7 @@ fn surface_inventory(
     let capability_detail = match (cutover_requirement, requirements) {
         (Some(version), _) => format!(
             "git-bridge-cutover version {version} is durably required; the colocated \
-             bridge owns writes"
+             shim owns writes"
         ),
         (None, []) => "no capability requirement is durable yet".to_string(),
         (None, rows) => format!(
@@ -271,14 +271,14 @@ fn surface_inventory(
 }
 
 impl Repository {
-    /// Audit the repository for the CB-13B shadow → bridge cutover.
+    /// Audit the repository for the CB-13B shadow → shim cutover.
     ///
     /// Read-only: inventories the durable capability rows, the PATH_CLAIMS
     /// schema marker, the colocated Git readiness and every readiness
     /// refusal, and classifies every schema surface as
     /// preserved-immutable, rebuildable, required or refused. The audit
     /// never mutates repository state.
-    pub fn audit_bridge_cutover(&self) -> Result<BridgeCutoverAudit, RepositoryError> {
+    pub fn audit_shim_cutover(&self) -> Result<ShimCutoverAudit, RepositoryError> {
         let requirements = self
             .pristine
             .required_repository_capabilities()
@@ -289,7 +289,7 @@ impl Repository {
             .map_err(|error| RepositoryError::Database(error.to_string()))?;
         let cutover_requirement = requirements
             .iter()
-            .find(|required| required.id == BRIDGE_CUTOVER_CAPABILITY.id())
+            .find(|required| required.id == SHIM_CUTOVER_CAPABILITY.id())
             .map(|required| required.minimum_version);
         let unsupported_requirements = unsupported_requirements(&requirements);
         let colocated_git = observe_colocated_git_readiness(&self.root);
@@ -304,7 +304,7 @@ impl Repository {
                 .chain(self.binding_census(&colocated_git)?)
                 .collect()
         };
-        Ok(BridgeCutoverAudit {
+        Ok(ShimCutoverAudit {
             cutover_requirement,
             unsupported_requirements,
             path_claim_schema_version,
@@ -401,7 +401,7 @@ impl Repository {
                 disposition: CutoverAuditDisposition::PreservedImmutable,
                 detail: format!(
                     "{conflicts} stored conflict row(s); durable ambiguity items are \
-                     preserved and re-rendered by the bridge, never resolved silently"
+                     preserved and re-rendered by the shim, never resolved silently"
                 ),
             },
             CutoverSchemaAudit {
@@ -499,7 +499,7 @@ impl Repository {
     }
 
     /// The four leased readiness observations (CB-13B R6): Git repository
-    /// open, bridge-enabled equivalence (verified checkpoint matching the
+    /// open, shim-enabled equivalence (verified checkpoint matching the
     /// live HEAD), candidate-binding proof (the view's stored mapping
     /// resolving in the colocated repository) and hook/remote readiness.
     ///
@@ -516,7 +516,7 @@ impl Repository {
         match readiness.form {
             ColocatedGitForm::Repository => {}
             ColocatedGitForm::Absent => refusals.push(format!(
-                "no colocated Git repository at '{}'; run `atomic git bridge enable` \
+                "no colocated Git repository at '{}'; run `atomic git shim enable` \
                  before cutting over",
                 self.root.join(".git").display()
             )),
@@ -536,13 +536,13 @@ impl Repository {
                     .to_string(),
             ),
         }
-        // 2. Bridge-enabled equivalence: a verified checkpoint for the
+        // 2. Shim-enabled equivalence: a verified checkpoint for the
         // current view whose git_head equals the live colocated HEAD.
         match read_workspace_checkpoint(&self.root)? {
             Some(checkpoint) if checkpoint.view == self.current_view => {
                 if readiness.head.as_deref() != Some(checkpoint.git_head.as_str()) {
                     refusals.push(format!(
-                        "the bridge checkpoint does not verify against the colocated HEAD \
+                        "the shim checkpoint does not verify against the colocated HEAD \
                          (checkpoint head '{}'; live head {:?}); re-project the view \
                          before cutting over",
                         checkpoint.git_head, readiness.head
@@ -550,12 +550,12 @@ impl Repository {
                 }
             }
             Some(checkpoint) => refusals.push(format!(
-                "the verified bridge checkpoint is for view '{}', not the current view \
+                "the verified shim checkpoint is for view '{}', not the current view \
                  '{}'; switch to the checkpointed view or re-project before cutting over",
                 checkpoint.view, self.current_view
             )),
             None => refusals.push(
-                "no verified bridge checkpoint; the shadow pipeline has not published a \
+                "no verified shim checkpoint; the shadow pipeline has not published a \
                  verified projection here — re-project before cutting over"
                     .to_string(),
             ),
@@ -667,12 +667,12 @@ impl Repository {
     /// refuses (CB-13B R6). `already_fenced` is informational row
     /// presence: execution decides through the verified-lifecycle proof
     /// under the operation locks (CB-13B R7), never through this flag.
-    pub fn plan_bridge_cutover(&self) -> Result<BridgeCutoverPlan, RepositoryError> {
-        let audit = self.audit_bridge_cutover()?;
+    pub fn plan_shim_cutover(&self) -> Result<ShimCutoverPlan, RepositoryError> {
+        let audit = self.audit_shim_cutover()?;
         if let Some(requirement) = audit.unsupported_requirements.first() {
             return Err(RepositoryError::InvalidOperation {
                 message: format!(
-                    "bridge cutover refused: repository requires unsupported capability \
+                    "shim cutover refused: repository requires unsupported capability \
                      '{}' version {} (this build supports through {:?}); preserve the \
                      repository and upgrade Atomic before migrating",
                     requirement.id,
@@ -686,7 +686,7 @@ impl Repository {
         }
         if audit.path_claim_schema_version.is_none() {
             return Err(RepositoryError::InvalidOperation {
-                message: "bridge cutover refused: the repository PATH_CLAIMS schema is not \
+                message: "shim cutover refused: the repository PATH_CLAIMS schema is not \
                           current; run the pending repository migration first"
                     .to_string(),
             });
@@ -698,7 +698,7 @@ impl Repository {
             if let Some(refusal) = audit.readiness_refusals.first() {
                 return Err(RepositoryError::InvalidOperation {
                     message: format!(
-                        "bridge cutover refused: {refusal} Preserve the repository and \
+                        "shim cutover refused: {refusal} Preserve the repository and \
                          resolve every readiness refusal before migrating."
                     ),
                 });
@@ -707,7 +707,7 @@ impl Repository {
         let already_fenced = audit.cutover_requirement.is_some();
         let transition = MetadataTransition {
             target: MetadataTarget::Capability {
-                id: BRIDGE_CUTOVER_CAPABILITY.id().to_string(),
+                id: SHIM_CUTOVER_CAPABILITY.id().to_string(),
             },
             expected_old: audit
                 .cutover_requirement
@@ -715,14 +715,14 @@ impl Repository {
                 .unwrap_or(MetadataValue::Absent),
             expected_new: MetadataValue::Sequence(u64::from(BRIDGE_CUTOVER_VERSION)),
         };
-        Ok(BridgeCutoverPlan {
+        Ok(ShimCutoverPlan {
             audit,
             transition,
             already_fenced,
         })
     }
 
-    /// Execute the journaled shadow → bridge cutover (CB-13B).
+    /// Execute the journaled shadow → shim cutover (CB-13B).
     ///
     /// Holds the canonical operation locks, re-observes the capability
     /// lease under them with its full verified-lifecycle proof (CB-13B R7:
@@ -732,8 +732,8 @@ impl Repository {
     /// only after the verified receipt. An already-fenced repository is a
     /// no-op only when that proof is complete; an interrupted fence whose
     /// receipt never landed is resumed in place; anything else refuses.
-    pub fn execute_bridge_cutover(&self) -> Result<BridgeCutoverOutcome, RepositoryError> {
-        let plan = self.plan_bridge_cutover()?;
+    pub fn execute_shim_cutover(&self) -> Result<ShimCutoverOutcome, RepositoryError> {
+        let plan = self.plan_shim_cutover()?;
         let working_copy = self.require_working_copy_id()?;
         // Canonical order: the common bridge lock is acquired first and the
         // working-copy operation lock nests inside it; every pristine write
@@ -743,7 +743,7 @@ impl Repository {
         // durable row alone is never resume proof.
         match self.already_fenced_proof(working_copy)? {
             CutoverFenceProof::Verified => {
-                return Ok(BridgeCutoverOutcome {
+                return Ok(ShimCutoverOutcome {
                     operation: None,
                     already_fenced: true,
                     resumed: false,
@@ -755,7 +755,7 @@ impl Repository {
                 // the lease against expected-new and appends the Verified
                 // receipt durably. Never a no-op success.
                 self.finalize_operation_verified(&operation_lock, operation)?;
-                return Ok(BridgeCutoverOutcome {
+                return Ok(ShimCutoverOutcome {
                     operation: Some(operation),
                     already_fenced: true,
                     resumed: true,
@@ -774,7 +774,7 @@ impl Repository {
         if !refusals.is_empty() {
             return Err(RepositoryError::InvalidOperation {
                 message: format!(
-                    "bridge cutover refused under the operation lease: {}; the fence \
+                    "shim cutover refused under the operation lease: {}; the fence \
                      was not written",
                     refusals.join("; ")
                 ),
@@ -826,7 +826,7 @@ impl Repository {
         // finalize re-observes the lease against expected-new before it
         // appends the operation-level Verified receipt durably.
         self.finalize_operation_verified(&operation_lock, operation.id())?;
-        Ok(BridgeCutoverOutcome {
+        Ok(ShimCutoverOutcome {
             operation: Some(operation.id()),
             already_fenced: false,
             resumed: false,
@@ -845,7 +845,7 @@ impl Repository {
     ) -> Result<CutoverFenceProof, RepositoryError> {
         let observed = {
             let txn = self.pristine.read_txn().map_err(pristine_error)?;
-            txn.required_capability_version(BRIDGE_CUTOVER_CAPABILITY.id())
+            txn.required_capability_version(SHIM_CUTOVER_CAPABILITY.id())
                 .map_err(pristine_error)?
         };
         let Some(version) = observed else {
@@ -857,7 +857,7 @@ impl Repository {
         if version != BRIDGE_CUTOVER_VERSION {
             return Ok(CutoverFenceProof::Refused {
                 reason: format!(
-                    "bridge cutover refused: the durable requirement version is {version}, \
+                    "shim cutover refused: the durable requirement version is {version}, \
                      not exactly this build's {BRIDGE_CUTOVER_VERSION}; a foreign fence \
                      version cannot be resumed or undone through this journal"
                 ),
@@ -880,7 +880,7 @@ impl Repository {
                 let carries = payload.delta.metadata.iter().any(|transition| {
                     matches!(
                         &transition.target,
-                        MetadataTarget::Capability { id } if id == BRIDGE_CUTOVER_CAPABILITY.id()
+                        MetadataTarget::Capability { id } if id == SHIM_CUTOVER_CAPABILITY.id()
                     )
                 });
                 if carries {
@@ -894,7 +894,7 @@ impl Repository {
         }
         let Some(operation) = owning else {
             return Ok(CutoverFenceProof::Refused {
-                reason: "bridge cutover refused: the requirement row is durable but no owning \
+                reason: "shim cutover refused: the requirement row is durable but no owning \
                      Cutover operation exists in the journal; a fence without its owning \
                      operation cannot be resumed through this journal"
                     .to_string(),
@@ -909,7 +909,7 @@ impl Repository {
             _ if !details.head_of.is_empty() => Ok(CutoverFenceProof::Resumable { operation }),
             _ => Ok(CutoverFenceProof::Refused {
                 reason: format!(
-                    "bridge cutover refused: the owning Cutover operation {operation} is \
+                    "shim cutover refused: the owning Cutover operation {operation} is \
                      not verified and is no longer an operation head; its lifecycle \
                      cannot be resolved under this lock"
                 ),
@@ -920,7 +920,7 @@ impl Repository {
     /// Roll the verified cutover back through the journal's typed inverse.
     ///
     /// The gate is the SHARED repository head, not the initiating
-    /// working-copy head (CB-13B R2): another worktree's later bridge
+    /// working-copy head (CB-13B R2): another worktree's later shim
     /// activity, or a generic op undo/restore, advances the shared head
     /// past the cutover and rollback must refuse instead of undoing out of
     /// order. The inverse deletes only the cutover requirement row — every
@@ -930,7 +930,7 @@ impl Repository {
     /// `git-bridge-cutover` capability transition), so a later operation —
     /// including the rollback's own undo child — can never be mistaken for
     /// the cutover.
-    pub fn rollback_bridge_cutover(&mut self) -> Result<OperationId, RepositoryError> {
+    pub fn rollback_shim_cutover(&mut self) -> Result<OperationId, RepositoryError> {
         let working_copy = self.require_working_copy_id()?;
         // CB-13B R2: the shared repository head is the rollback authority.
         let shared_head = self.sole_operation_head(OperationScope::Repository)?;
@@ -950,13 +950,13 @@ impl Repository {
                 .any(|transition| {
                     matches!(
                         &transition.target,
-                        MetadataTarget::Capability { id } if id == BRIDGE_CUTOVER_CAPABILITY.id()
+                        MetadataTarget::Capability { id } if id == SHIM_CUTOVER_CAPABILITY.id()
                     )
                 });
         if !is_cutover {
             return Err(RepositoryError::InvalidOperation {
                 message: format!(
-                    "bridge cutover rollback refused: the shared repository head {} is not \
+                    "shim cutover rollback refused: the shared repository head {} is not \
                      the cutover",
                     shared_head
                 ),
@@ -966,21 +966,21 @@ impl Repository {
     }
 
     /// Refuse while the repository durably requires the `git-bridge-cutover`
-    /// capability (CB-13B): the colocated bridge owns writes after cutover.
+    /// capability (CB-13B): the colocated shim owns writes after cutover.
     ///
     /// The legacy shadow commit lock consults this before taking its lock, so
     /// every legacy writer refuses before mutating any state.
     pub fn require_legacy_shadow_write_allowed(&self) -> Result<(), RepositoryError> {
         let txn = self.pristine.read_txn().map_err(pristine_error)?;
         let required = txn
-            .required_capability_version(BRIDGE_CUTOVER_CAPABILITY.id())
+            .required_capability_version(SHIM_CUTOVER_CAPABILITY.id())
             .map_err(pristine_error)?;
         drop(txn);
         match required {
             Some(version) => Err(RepositoryError::LegacyShadowWriterFenced {
                 capability: format!(
                     "{} (required version {version})",
-                    BRIDGE_CUTOVER_CAPABILITY.id()
+                    SHIM_CUTOVER_CAPABILITY.id()
                 ),
             }),
             None => Ok(()),

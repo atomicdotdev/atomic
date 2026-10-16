@@ -1,4 +1,4 @@
-//! CB-7A: `git bridge enable` anchoring phase (RFC §7, Phase 7 task 1).
+//! CB-7A: `git shim enable` anchoring phase (RFC §7, Phase 7 task 1).
 //!
 //! After the advisory hook integration is installed, enable proves complete
 //! repository/index/worktree equivalence under one conversion policy and only
@@ -10,14 +10,14 @@
 
 use std::path::Path;
 
-use atomic_repository::{BridgeAnchorError, BridgeAnchorRefusal, Repository};
+use atomic_repository::{ShimAnchorError, ShimAnchorRefusal, Repository};
 
 use super::binding::load_signing_key;
-use super::bridge::{current_heads, project_atomic_to_git};
+use super::shim::{current_heads, project_atomic_to_git};
 use crate::error::{CliError, CliResult};
 use crate::output::{print_info, print_success, print_warning};
 
-/// Options for the anchoring phase of `bridge enable`.
+/// Options for the anchoring phase of `shim enable`.
 #[derive(Debug, Default, Clone)]
 pub(crate) struct EnableAnchorOptions {
     /// Run the Atomic-origin projection remediation first (explicit consent).
@@ -44,17 +44,17 @@ pub(crate) enum EnableAnchorOutcome {
     },
     /// A typed, actionable refusal. Enable still reports success for its hook
     /// integration, but no Anchor or checkpoint was created.
-    NotAnchored { refusal: BridgeAnchorRefusal },
+    NotAnchored { refusal: ShimAnchorRefusal },
 }
 
 /// Typed refusal for explicitly requested, explicitly unavailable behavior.
 pub(crate) fn adopt_git_refusal() -> CliError {
     CliError::GitError {
-        message: BridgeAnchorRefusal::AdoptGitUnavailable.to_string(),
+        message: ShimAnchorRefusal::AdoptGitUnavailable.to_string(),
     }
 }
 
-/// Run the CB-7A anchoring phase for `bridge enable`.
+/// Run the CB-7A anchoring phase for `shim enable`.
 pub(crate) fn run_enable_anchor(root: &Path, options: &EnableAnchorOptions) -> CliResult<()> {
     if options.adopt_git {
         return Err(adopt_git_refusal());
@@ -79,7 +79,7 @@ pub(crate) fn run_enable_anchor(root: &Path, options: &EnableAnchorOptions) -> C
             Ok(())
         }
         Ok(EnableAnchorOutcome::NotAnchored { refusal }) => {
-            print_warning(&format!("bridge anchor not created: {refusal}"));
+            print_warning(&format!("shim anchor not created: {refusal}"));
             Ok(())
         }
         Err(error) => Err(error),
@@ -92,9 +92,9 @@ fn enable_anchor_inner(
 ) -> CliResult<EnableAnchorOutcome> {
     let Some(key_file) = options.binding_key_file.as_ref() else {
         return Ok(EnableAnchorOutcome::NotAnchored {
-            refusal: BridgeAnchorRefusal::DirtyState {
+            refusal: ShimAnchorRefusal::DirtyState {
                 detail: "no --binding-key-file was provided, so the Anchor cannot be signed; \
-                         bridge enable signs the Anchor with an explicitly supplied Ed25519 \
+                         shim enable signs the Anchor with an explicitly supplied Ed25519 \
                          key file only"
                     .to_string(),
             },
@@ -103,7 +103,7 @@ fn enable_anchor_inner(
     let signer = load_signing_key(key_file)?;
 
     let mut repo = Repository::open(root).map_err(CliError::from)?;
-    let git = super::bridge::open_git(root)?;
+    let git = super::shim::open_git(root)?;
 
     if options.adopt_atomic {
         // Explicit remediation: project the Atomic state onto Git through the
@@ -145,8 +145,8 @@ fn enable_anchor_inner(
     };
 
     let anchor_outcome = match changes_pack.as_deref() {
-        Some(pack) => repo.enable_bridge_anchor_with_changes_pack(&git, &signer, pack),
-        None => repo.enable_bridge_anchor(&git, &signer),
+        Some(pack) => repo.enable_shim_anchor_with_changes_pack(&git, &signer, pack),
+        None => repo.enable_shim_anchor(&git, &signer),
     };
     match anchor_outcome {
         Ok(outcome) => Ok(EnableAnchorOutcome::Anchored {
@@ -158,12 +158,12 @@ fn enable_anchor_inner(
                 atomic_repository::BindingPublication::Idempotent { .. }
             ),
         }),
-        Err(BridgeAnchorError::Refusal(refusal)) => {
+        Err(ShimAnchorError::Refusal(refusal)) => {
             Ok(EnableAnchorOutcome::NotAnchored { refusal })
         }
         Err(error) => Err(CliError::Repository(
             atomic_repository::RepositoryError::InvalidOperation {
-                message: format!("bridge anchoring failed: {error}"),
+                message: format!("shim anchoring failed: {error}"),
             },
         )),
     }

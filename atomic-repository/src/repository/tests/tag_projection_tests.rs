@@ -195,7 +195,7 @@ fn annotated_tag_round_trip_carries_the_binding_and_restores_the_bound_state() {
 fn lightweight_git_tag_imports_as_an_atomic_state_tag() {
     let fixture = tag_fixture(0x30, true);
     // Export the annotated binding carrier first so the fixture mirrors a
-    // real bridge; then add a *lightweight* Git tag on the bound commit.
+    // real shim; then add a *lightweight* Git tag on the bound commit.
     fixture
         .repo
         .export_tag_to_git("dev", "v1", &fixture.git)

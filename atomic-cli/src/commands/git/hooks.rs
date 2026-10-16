@@ -1,4 +1,4 @@
-//! Advisory Git hook integration for the colocated Atomic bridge.
+//! Advisory Git hook integration for the colocated Atomic shim.
 //!
 //! Atomic installs only an explicitly owned `post-checkout` dispatcher. The
 //! dispatcher appends immutable local evidence and schedules a read-only
@@ -35,7 +35,7 @@ const EVENT_JOURNAL_RELATIVE: &str = ".atomic/bridge/git-events.jsonl";
 const DEFERRED_DIRECTORY_RELATIVE: &str = ".atomic/bridge/deferred-observations";
 const DEFERRED_DELAY_MS: u64 = 300;
 
-/// Backward-compatible entry point for bridge hook management.
+/// Backward-compatible entry point for shim hook management.
 #[derive(Debug, Args)]
 pub struct Hooks {
     #[command(subcommand)]
@@ -44,11 +44,11 @@ pub struct Hooks {
 
 #[derive(Debug, Subcommand)]
 pub enum HookCommands {
-    /// Enable the advisory bridge `post-checkout` dispatcher.
+    /// Enable the advisory shim `post-checkout` dispatcher.
     Install,
-    /// Remove an Atomic-owned bridge dispatcher.
+    /// Remove an Atomic-owned shim dispatcher.
     Uninstall,
-    /// Show advisory bridge hook status.
+    /// Show advisory shim hook status.
     Status,
 }
 
@@ -56,8 +56,8 @@ impl Command for Hooks {
     fn run(&self) -> CliResult<()> {
         let root = find_repository_root()?;
         match &self.command {
-            HookCommands::Install => enable_bridge(&root, false),
-            HookCommands::Uninstall => uninstall_bridge(&root),
+            HookCommands::Install => enable_shim(&root, false),
+            HookCommands::Uninstall => uninstall_shim(&root),
             HookCommands::Status => show_status(&root),
         }
     }
@@ -76,12 +76,12 @@ enum DispatcherInstall {
     Unmanaged,
 }
 
-/// Enable the bridge's advisory `post-checkout` integration.
+/// Enable the shim's advisory `post-checkout` integration.
 ///
 /// Only a missing hook or an exact Atomic-owned dispatcher is written. A
 /// custom `core.hooksPath`, symlink, binary, or unmanaged hook is reported with
 /// an integration command and left byte-for-byte untouched.
-pub(crate) fn enable_bridge(root: &Path, mirror_ignores: bool) -> CliResult<()> {
+pub(crate) fn enable_shim(root: &Path, mirror_ignores: bool) -> CliResult<()> {
     let root = canonical_root(root)?;
     let binary = std::env::current_exe()
         .map_err(|error| git_error(format!("cannot resolve the Atomic binary path: {error}")))?;
@@ -202,7 +202,7 @@ pub(crate) fn enable_bridge(root: &Path, mirror_ignores: bool) -> CliResult<()> 
             )),
             DispatcherInstall::Unmanaged => {
                 let command = format!(
-                    "{} git bridge {subcommand} || true",
+                    "{} git shim {subcommand} || true",
                     shell_quote(&binary).map_err(|error| {
                         git_error(format!("cannot quote the binary path: {error}"))
                     })?
@@ -264,7 +264,7 @@ fn git_hook_context(root: &Path) -> CliResult<GitHookContext> {
     {
         GitObservation::NoGit { .. } => {
             return Err(git_error(
-                "cannot enable the bridge outside a Git repository",
+                "cannot enable the shim outside a Git repository",
             ));
         }
         GitObservation::Repository(observation) => {
@@ -302,11 +302,11 @@ fn dispatcher_script(binary: &Path, subcommand: &str) -> io::Result<String> {
     let binary = shell_quote(binary)?;
     Ok(format!(
         "#!/bin/sh\n{DISPATCHER_MARKER}\n\
-{binary} git bridge {subcommand} \"$@\" || true\n\
+{binary} git shim {subcommand} \"$@\" || true\n\
 if [ -d \"$0.d\" ]; then\n\
-  for atomic_bridge_hook in \"$0.d\"/*; do\n\
-    [ -f \"$atomic_bridge_hook\" ] && [ -x \"$atomic_bridge_hook\" ] || continue\n\
-    \"$atomic_bridge_hook\" \"$@\" || true\n\
+  for atomic_shim_hook in \"$0.d\"/*; do\n\
+    [ -f \"$atomic_shim_hook\" ] && [ -x \"$atomic_shim_hook\" ] || continue\n\
+    \"$atomic_shim_hook\" \"$@\" || true\n\
   done\n\
 fi\n\
 exit 0\n"
@@ -348,14 +348,14 @@ fn stdin_dispatcher_script_ext(
     };
     Ok(format!(
         "#!/bin/sh\n{DISPATCHER_MARKER}\n\
-{binary} git bridge {subcommand}{state_arg}{failure}\n\
+{binary} git shim {subcommand}{state_arg}{failure}\n\
 exit 0\n"
     ))
 }
 
 fn integration_command(binary: &Path) -> io::Result<String> {
     Ok(format!(
-        "{} git bridge hook-post-checkout \"$@\" || true",
+        "{} git shim hook-post-checkout \"$@\" || true",
         shell_quote(binary)?
     ))
 }
@@ -529,7 +529,7 @@ fn set_executable(_path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-fn uninstall_bridge(root: &Path) -> CliResult<()> {
+fn uninstall_shim(root: &Path) -> CliResult<()> {
     let root = canonical_root(root)?;
     let binary = std::env::current_exe()
         .map_err(|error| git_error(format!("cannot resolve the Atomic binary path: {error}")))?;
@@ -679,7 +679,7 @@ struct GitObservationEvidence {
 ///
 /// `capture_token` (review E2) is present only when the hook ran INSIDE a
 /// prepared operation's capture context (the executor exports
-/// `ATOMIC_BRIDGE_CAPTURE_TOKEN` for the duration of the operation). A
+/// `ATOMIC_SHIM_CAPTURE_TOKEN` for the duration of the operation). A
 /// capture without a token — the ordinary advisory hook path — can never be
 /// promoted onto a prepared operation: anchoring requires the captured bytes
 /// to carry the exact token minted for that operation at preparation time.
@@ -827,7 +827,7 @@ pub(crate) fn run_pre_push_verification_with_input(root: &Path, input: &str) -> 
         // CB-12B follow-up AC-4 exact-OID binding: the gate verifies THE
         // OBJECTS BEING PUSHED, not a mutable HEAD reread after the fact.
         // For each proposed OID, fold its tree under the conversion policy
-        // (raw tree MINUS declared bridge-private entries — the same
+        // (raw tree MINUS declared shim-private entries — the same
         // equivalence the import gate proves) and require it to equal the
         // verified manifest tree: native-publisher pushes and
         // imported-foreign-history pushes bind exactly; a proposed OID
@@ -883,7 +883,7 @@ pub(crate) fn run_pre_push_verification_with_input(root: &Path, input: &str) -> 
                 "pre-push (local, advisory): {current_view} passed local verification \
                  ({} change(s), {} managed). Local hooks are advisory to the guarantee: \
                  this push is only protected if the remote enforces provenance server-side \
-                 ('atomic git bridge verify-receive', an Atomic-controlled remote, or a \
+                 ('atomic git shim verify-receive', an Atomic-controlled remote, or a \
                  required CI status check).",
                 verdict.checked, verdict.managed_changes
             ));
@@ -1012,9 +1012,9 @@ pub(crate) fn record_pre_commit(root: &Path) -> CliResult<()> {
 /// predicate, and a real-looking amend pair submitted directly to the hook
 /// proves nothing about which operation captured it). Operation linkage
 /// requires an anchored capture written through
-/// `Repository::capture_bridge_event_anchored` during an active captured
+/// `Repository::capture_shim_event_anchored` during an active captured
 /// operation whose minted capture token the event bytes carry (review E2:
-/// the executor exports `ATOMIC_BRIDGE_CAPTURE_TOKEN` for the duration of
+/// the executor exports `ATOMIC_SHIM_CAPTURE_TOKEN` for the duration of
 /// the operation; a capture produced inside that context is the only one
 /// that can bind to the operation, and never to a later unrelated one).
 pub(crate) fn record_post_rewrite(root: &Path) -> CliResult<()> {
@@ -1057,12 +1057,12 @@ pub(crate) fn record_post_rewrite(root: &Path) -> CliResult<()> {
     // bytes can later bind to exactly that operation (and never to a later
     // unrelated one). An invalid or absent token keeps the capture advisory:
     // the hook must never break Git over evidence it cannot authenticate.
-    let capture_token = match std::env::var("ATOMIC_BRIDGE_CAPTURE_TOKEN") {
+    let capture_token = match std::env::var("ATOMIC_SHIM_CAPTURE_TOKEN") {
         Ok(raw) if !raw.trim().is_empty() => {
             let token = raw.trim().to_string();
             if token.len() != 64 || !token.bytes().all(|b| b.is_ascii_hexdigit()) {
                 print_warning(
-                    "ATOMIC_BRIDGE_CAPTURE_TOKEN is not a 64-hex-character capture token; \
+                    "ATOMIC_SHIM_CAPTURE_TOKEN is not a 64-hex-character capture token; \
                      the captured event stays advisory",
                 );
                 None
@@ -1104,8 +1104,8 @@ fn capture_event_bytes(root: &Path, event_bytes: &[u8]) -> CliResult<()> {
     if let Err(error) = (|| -> Result<(), CliError> {
         let repo = atomic_repository::Repository::open(root)
             .map_err(|error| git_error(format!("cannot open the Atomic repository: {error}")))?;
-        repo.capture_bridge_event(event_bytes)
-            .map_err(|error| git_error(format!("cannot capture bridge event: {error}")))?;
+        repo.capture_shim_event(event_bytes)
+            .map_err(|error| git_error(format!("cannot capture shim event: {error}")))?;
         Ok(())
     })() {
         print_warning(&format!(
@@ -1235,11 +1235,11 @@ pub(crate) const REF_INTERPRETATION_NOT_MOVED: &str =
 /// Compatibility alias for the committed-state interpretation.
 pub(crate) const REF_INTERPRETATION: &str = REF_INTERPRETATION_COMMITTED;
 
-/// CB-9B: `atomic git bridge review` — surface squash/rewrite candidates,
+/// CB-9B: `atomic git shim review` — surface squash/rewrite candidates,
 /// merge resolutions, and empty-commit interpretations with the evidence
 /// that links them to Git operations, stating each evidence class's exact
 /// identity limit (RFC §5.4).
-pub(crate) fn run_bridge_review(root: &Path, view: Option<&str>) -> CliResult<()> {
+pub(crate) fn run_shim_review(root: &Path, view: Option<&str>) -> CliResult<()> {
     let root = canonical_root(root)?;
     let repo = atomic_repository::Repository::open(&root)
         .map_err(|error| git_error(format!("cannot open the Atomic repository: {error}")))?;
@@ -1452,7 +1452,7 @@ pub(crate) fn run_bridge_review(root: &Path, view: Option<&str>) -> CliResult<()
         }
     }
 
-    println!("Bridge review for view '{view_name}':");
+    println!("Shim review for view '{view_name}':");
     println!("  imported changes: {}", entries.len());
     println!("  merge resolutions: {merges}");
     println!("  empty-commit interpretations: {empty_commits}");
@@ -1673,7 +1673,7 @@ fn spawn_deferred_observer(root: &Path, scheduled: &ScheduledObservation) -> Cli
         .map_err(|error| git_error(format!("cannot resolve the Atomic binary path: {error}")))?;
     ProcessCommand::new(binary)
         .arg("git")
-        .arg("bridge")
+        .arg("shim")
         .arg("observe-deferred")
         .arg("--root")
         .arg(root)
@@ -1904,7 +1904,7 @@ mod tests {
         let script =
             dispatcher_script(Path::new("/opt/Atomic Tools/atomic"), "hook-post-checkout").unwrap();
         assert!(script.starts_with("#!/bin/sh\n# atomic:git-bridge-dispatcher:v1"));
-        assert!(script.contains("'/opt/Atomic Tools/atomic' git bridge hook-post-checkout"));
+        assert!(script.contains("'/opt/Atomic Tools/atomic' git shim hook-post-checkout"));
         assert!(script.contains("\"$@\" || true"));
         assert!(script.contains("\"$0.d\"/*"));
         assert!(script.ends_with("exit 0\n"));
@@ -1914,7 +1914,7 @@ mod tests {
     fn pre_commit_dispatcher_is_advisory_and_uses_the_capture_subcommand() {
         let script = dispatcher_script(Path::new("/usr/bin/atomic"), "hook-pre-commit").unwrap();
         assert!(script.starts_with("#!/bin/sh\n# atomic:git-bridge-dispatcher:v1"));
-        assert!(script.contains("'/usr/bin/atomic' git bridge hook-pre-commit"));
+        assert!(script.contains("'/usr/bin/atomic' git shim hook-pre-commit"));
         assert!(
             script.contains("\"$@\" || true"),
             "capture evidence is advisory"
@@ -1927,7 +1927,7 @@ mod tests {
         let script =
             stdin_dispatcher_script_ext(Path::new("/usr/bin/atomic"), "hook-pre-push", false, true)
                 .unwrap();
-        assert!(script.contains("'/usr/bin/atomic' git bridge hook-pre-push"));
+        assert!(script.contains("'/usr/bin/atomic' git shim hook-pre-push"));
         assert!(
             script.contains(" || exit $?"),
             "a local refusal must fail THIS push: {script}"
@@ -2005,7 +2005,7 @@ mod tests {
         // Failing-before: the pre-fix validator rejected the symbolic
         // values with "old from post-checkout is not a hexadecimal Git
         // object ID", printing an error on every checkout of a
-        // bridge-enabled repository.
+        // shim-enabled repository.
         let symbolic = "refs/heads/feature refs/heads/main HEAD";
         let entries = reference_transaction_entries(symbolic).expect("symbolic updates skip");
         assert!(
@@ -2222,13 +2222,13 @@ mod tests {
     }
 
     #[test]
-    fn enable_bridge_installs_the_pre_commit_dispatcher() {
+    fn enable_shim_installs_the_pre_commit_dispatcher() {
         let root = TempDir::new().unwrap();
         let git = GitRepository::init(root.path()).unwrap();
         drop(git);
         let repo = atomic_repository::Repository::init(root.path()).unwrap();
         drop(repo);
-        enable_bridge(root.path(), false).unwrap();
+        enable_shim(root.path(), false).unwrap();
 
         let hooks_dir = root.path().join(".git").join("hooks");
         let script = fs::read_to_string(hooks_dir.join("pre-commit")).unwrap();
@@ -2236,7 +2236,7 @@ mod tests {
             script.contains("atomic:git-bridge-dispatcher:v1"),
             "pre-commit must be an Atomic-owned dispatcher"
         );
-        assert!(script.contains("git bridge hook-pre-commit"));
+        assert!(script.contains("git shim hook-pre-commit"));
         // Advisory: capture evidence never blocks a commit.
         assert!(script.contains("|| true"));
     }
@@ -2255,7 +2255,7 @@ mod pre_push_tests {
     #[test]
     #[cfg_attr(
         not(unix),
-        ignore = "the Git bridge projection requires lossless unix paths (ProjectTreeError::UnsupportedPlatformPath)"
+        ignore = "the Git shim projection requires lossless unix paths (ProjectTreeError::UnsupportedPlatformPath)"
     )]
     fn pre_push_refuses_managed_work_without_evidence() {
         let dir = TempDir::new().unwrap();
@@ -2362,7 +2362,7 @@ mod pre_push_tests {
     #[test]
     #[cfg_attr(
         not(unix),
-        ignore = "the Git bridge projection requires lossless unix paths (ProjectTreeError::UnsupportedPlatformPath)"
+        ignore = "the Git shim projection requires lossless unix paths (ProjectTreeError::UnsupportedPlatformPath)"
     )]
     fn pre_push_binds_to_the_exact_proposed_oid() {
         let dir = TempDir::new().unwrap();

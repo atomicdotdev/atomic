@@ -454,7 +454,7 @@ pub fn git_classification_metadata(
     classification.unhashed_git_facts(&mut git);
     git.insert(
         "sequencing".to_string(),
-        serde_json::Value::String("bridge".to_string()),
+        serde_json::Value::String("shim".to_string()),
     );
     if !boundaries.is_empty() {
         git.insert(
@@ -1508,7 +1508,7 @@ impl Repository {
     /// Returns the capture digest. The bytes are stored in the pristine
     /// database, which only the Atomic library writes; a JSONL journal line
     /// is operation-linkage evidence only when this capture exists.
-    pub fn capture_bridge_event(&self, event_bytes: &[u8]) -> Result<[u8; 32], RepositoryError> {
+    pub fn capture_shim_event(&self, event_bytes: &[u8]) -> Result<[u8; 32], RepositoryError> {
         use atomic_core::pristine::BridgeEventCaptureMutTxnT;
         let mut txn = self
             .pristine
@@ -1523,7 +1523,7 @@ impl Repository {
     }
 
     /// Whether the exact event bytes have an immutable capture (CB-9B R4).
-    pub fn bridge_event_captured(&self, event_bytes: &[u8]) -> Result<bool, RepositoryError> {
+    pub fn shim_event_captured(&self, event_bytes: &[u8]) -> Result<bool, RepositoryError> {
         use atomic_core::pristine::BridgeEventCaptureTxnT;
         let digest: [u8; 32] = blake3::hash(event_bytes).into();
         let txn = self
@@ -1544,9 +1544,9 @@ impl Repository {
     /// holds the active head of its scope, so an anchored capture is proof
     /// it was written while that operation was the live head. The advisory
     /// hook path (direct stdin, no active operation) must use
-    /// [`Repository::capture_bridge_event`] instead: its captures carry no
+    /// [`Repository::capture_shim_event`] instead: its captures carry no
     /// anchor and read as unauthenticated evidence downstream.
-    pub fn capture_bridge_event_anchored(
+    pub fn capture_shim_event_anchored(
         &self,
         event_bytes: &[u8],
         operation: atomic_core::types::OperationId,
@@ -1573,7 +1573,7 @@ impl Repository {
     /// without the operation's capture token fail here, so the
     /// authentication tier never trusts a bare anchor row and can never
     /// authenticate an advisory capture that predates the operation.
-    pub fn bridge_anchor_binds_operation(
+    pub fn shim_anchor_binds_operation(
         &self,
         event_bytes: &[u8],
         operation: atomic_core::types::OperationId,
@@ -1658,7 +1658,7 @@ impl Repository {
 
     /// The capture token minted for `operation`'s capture context, if any
     /// (review E2). An executor driving Git hooks inside the operation's
-    /// capture context exports this token as `ATOMIC_BRIDGE_CAPTURE_TOKEN`;
+    /// capture context exports this token as `ATOMIC_SHIM_CAPTURE_TOKEN`;
     /// only captured events carrying it can anchor to the operation.
     pub fn bridge_ref_capture_token(
         &self,
@@ -3580,7 +3580,7 @@ impl Repository {
             }
             if expected_tree.entries.contains_key(path)
                 || crate::repository::project_tree::atomic_private_path(path.as_bytes())
-                || crate::repository::project_tree::bridge_private_path(path.as_bytes())
+                || crate::repository::project_tree::shim_private_path(path.as_bytes())
                 || expected_tree
                     .verify_paths
                     .as_ref()

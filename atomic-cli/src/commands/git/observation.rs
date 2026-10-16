@@ -320,9 +320,9 @@ pub struct AtomicAnchorObservation {
     pub state: String,
 }
 
-/// Existing bridge checkpoint fields that CB-0A can compare without mutation.
+/// Existing shim checkpoint fields that CB-0A can compare without mutation.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct BridgeCheckpointObservation {
+pub struct ShimCheckpointObservation {
     pub view: String,
     pub atomic_state: String,
     pub git_head: String,
@@ -470,7 +470,7 @@ impl fmt::Display for Unanchored {
                 "Atomic view '{atomic_view}' does not match Git branch '{git_branch}'"
             ),
             Self::CheckpointDrift { fields } => {
-                write!(formatter, "bridge checkpoint drift: {}", fields.join(", "))
+                write!(formatter, "shim checkpoint drift: {}", fields.join(", "))
             }
             Self::ManifestMismatch { detail } => {
                 write!(formatter, "Atomic/Git manifests differ: {detail}")
@@ -529,7 +529,7 @@ pub fn observe_git(root: &Path) -> Result<GitObservation, ObservationError> {
         .map(GitObservation::Repository)
 }
 
-/// Observe an already-open repository. This helper is also used by the bridge
+/// Observe an already-open repository. This helper is also used by the shim
 /// to share HEAD interpretation without changing its mutating reconcile path.
 pub fn observe_open_repository(
     root: &Path,
@@ -642,7 +642,7 @@ pub fn observe_head(repository: &GitRepository) -> Result<HeadObservation, Obser
 pub fn classify_provisional_checkpoint(
     git: &GitObservation,
     atomic: &AtomicAnchorObservation,
-    checkpoint: Option<&BridgeCheckpointObservation>,
+    checkpoint: Option<&ShimCheckpointObservation>,
     manifest_equivalence: &ManifestEquivalence,
 ) -> ProvisionalCheckpointEligibility {
     let repository = match git {
@@ -1561,8 +1561,8 @@ mod tests {
     fn checkpoint_for(
         observation: &GitRepositoryObservation,
         atomic: &AtomicAnchorObservation,
-    ) -> BridgeCheckpointObservation {
-        BridgeCheckpointObservation {
+    ) -> ShimCheckpointObservation {
+        ShimCheckpointObservation {
             view: atomic.view.clone(),
             atomic_state: atomic.state.clone(),
             git_head: observation.head.oid().expect("head oid").to_string(),

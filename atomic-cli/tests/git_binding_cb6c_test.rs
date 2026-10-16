@@ -1,4 +1,4 @@
-// Temporary Unix-only Git bridge support to unblock Windows native CI.
+// Temporary Unix-only Git shim support to unblock Windows native CI.
 // Revisit after Windows support is defined; see the RFC temporary platform policy.
 #![cfg(unix)]
 
@@ -53,13 +53,13 @@ fn hex_of_oid(oid: &atomic_core::operation::GitObjectId) -> String {
         .collect()
 }
 
-/// A publisher: Git baseline, imported bridge baseline, three recorded changes,
+/// A publisher: Git baseline, imported shim baseline, three recorded changes,
 /// and a bound projection commit whose tree is the projected closure (built
-/// through the projection API — the same facts `git bridge reconcile` exports).
+/// through the projection API — the same facts `git shim reconcile` exports).
 fn setup_publisher(root: &Path, home: &Path) -> (git2::Oid, String) {
     // A native Atomic repository (no Git, no Git import): every closure member
     // is a hash-authoritative V3 change without unhashed sections, so the
-    // bounded pack can carry it (RFC §12.13), and no bridge baseline is needed.
+    // bounded pack can carry it (RFC §12.13), and no shim baseline is needed.
     assert_success(&atomic(root, home, &["init"]), "atomic init");
 
     for (name, message) in [("a.txt", "one"), ("b.txt", "two"), ("c.txt", "three")] {
@@ -130,7 +130,7 @@ fn changes_pack_for(
 
 /// Publish a signed binding for `commit` (tree `tree_hex`) over the view's
 /// effective closure with the pack attached — the repository-level contract of
-/// `git bridge binding publish`.
+/// `git shim binding publish`.
 fn publish_binding_for(root: &Path, home: &Path, commit: &git2::Oid, tree_hex: &str) -> String {
     let _ = home;
     let repo = atomic_repository::Repository::open(root).expect("open atomic");
@@ -316,7 +316,7 @@ fn fresh_clone_resurrects_the_exact_closure_through_the_published_binding() {
     transfer_to_client(&publisher, &remote_dir, &client);
 
     // The client initializes its Atomic repository, ties the published
-    // binding into its store (transport), and its bridge baseline import then
+    // binding into its store (transport), and its shim baseline import then
     // takes the resurrection path over synthesis.
     assert_success(&atomic(&client, &home, &["init"]), "client atomic init");
     {
@@ -356,7 +356,7 @@ fn fresh_clone_resurrects_the_exact_closure_through_the_published_binding() {
         "create target view",
     );
     assert_success(
-        &atomic(&client, &home, &["git", "bridge", "binding", "fetch", &id]),
+        &atomic(&client, &home, &["git", "shim", "binding", "fetch", &id]),
         "binding fetch",
     );
     let resurrect = atomic(
@@ -364,7 +364,7 @@ fn fresh_clone_resurrects_the_exact_closure_through_the_published_binding() {
         &home,
         &[
             "git",
-            "bridge",
+            "shim",
             "binding",
             "resurrect",
             &id,
@@ -444,7 +444,7 @@ fn a_tampered_published_binding_fails_resurrection_closed() {
         "create target view",
     );
     let members_before = view_members(&client, "fresh");
-    let fetch = atomic(&client, &home, &["git", "bridge", "binding", "fetch", &id]);
+    let fetch = atomic(&client, &home, &["git", "shim", "binding", "fetch", &id]);
     assert!(
         !fetch.status.success(),
         "a tampered binding must fail verification before any closure fetch: {}",
@@ -455,7 +455,7 @@ fn a_tampered_published_binding_fails_resurrection_closed() {
         &home,
         &[
             "git",
-            "bridge",
+            "shim",
             "binding",
             "resurrect",
             &id,

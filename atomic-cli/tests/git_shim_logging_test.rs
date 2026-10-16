@@ -1,4 +1,4 @@
-// Temporary Unix-only Git bridge support to unblock Windows native CI.
+// Temporary Unix-only Git shim support to unblock Windows native CI.
 // Revisit after Windows support is defined; see the RFC temporary platform policy.
 #![cfg(unix)]
 
@@ -120,19 +120,19 @@ fn line_with<'a>(log: &'a str, needles: &[&str]) -> &'a str {
         .unwrap_or_else(|| panic!("no line with {needles:?} in:\n{log}"))
 }
 
-/// A bridge-enabled repository on `main`, then a commit on `feature` made
+/// A shim-enabled repository on `main`, then a commit on `feature` made
 /// through Git so its hooks run, reconciled into Atomic.
-fn bridged_feature_commit() -> Sandbox {
+fn shim_feature_commit() -> Sandbox {
     let sandbox = Sandbox::new();
     sandbox.git(&["init", "-q", "-b", "main"]);
     sandbox.commit("a.txt", "a\n", "one");
     sandbox.atomic_ok(&["init"]);
     sandbox.atomic_ok(&["git", "import"]);
-    sandbox.atomic_ok(&["git", "bridge", "enable"]);
+    sandbox.atomic_ok(&["git", "shim", "enable"]);
 
     // With -v, whose `atomic=debug` would show an `info` line, so the copy
     // stays off the terminal only because its target is file-only.
-    let aligned = sandbox.atomic_ok(&["-v", "git", "bridge", "reconcile"]);
+    let aligned = sandbox.atomic_ok(&["-v", "git", "shim", "reconcile"]);
     let stdout = String::from_utf8_lossy(&aligned.stdout);
     let stderr = String::from_utf8_lossy(&aligned.stderr);
     assert_eq!(
@@ -148,22 +148,22 @@ fn bridged_feature_commit() -> Sandbox {
     sandbox.git(&["checkout", "-q", "-b", "feature"]);
     // post-checkout starts a detached observer; let it finish inside the
     // sandbox before going on.
-    sandbox.wait_for_log(&["cmd=git bridge observe-deferred", "command finished"]);
+    sandbox.wait_for_log(&["cmd=git shim observe-deferred", "command finished"]);
     sandbox.commit("b.txt", "b\n", "two");
-    sandbox.atomic_ok(&["git", "bridge", "reconcile"]);
+    sandbox.atomic_ok(&["git", "shim", "reconcile"]);
     sandbox
 }
 
 #[test]
 fn reconcile_logs_its_decision_and_outcome_inside_its_span() {
-    let sandbox = bridged_feature_commit();
+    let sandbox = shim_feature_commit();
     let log = sandbox.log();
 
     // The aligned run: the bridge event, and the message it printed.
     line_with(
         &log,
         &[
-            "cmd=git bridge reconcile",
+            "cmd=git shim reconcile",
             "reconcile{",
             "atomic::bridge::event",
             r#""event":"reconcile""#,
@@ -174,7 +174,7 @@ fn reconcile_logs_its_decision_and_outcome_inside_its_span() {
     line_with(
         &log,
         &[
-            "cmd=git bridge reconcile",
+            "cmd=git shim reconcile",
             "atomic::printed",
             "Git HEAD already matches the current Atomic view",
         ],
@@ -199,13 +199,13 @@ fn reconcile_logs_its_decision_and_outcome_inside_its_span() {
 
 #[test]
 fn git_hooks_log_the_evidence_they_journal() {
-    let sandbox = bridged_feature_commit();
+    let sandbox = shim_feature_commit();
     let log = sandbox.log();
 
     line_with(
         &log,
         &[
-            "cmd=git bridge hook-post-checkout",
+            "cmd=git shim hook-post-checkout",
             "atomic::git::hook",
             r#""record_type":"post-checkout""#,
             r#""checkout_kind":"branch""#,
@@ -214,7 +214,7 @@ fn git_hooks_log_the_evidence_they_journal() {
     line_with(
         &log,
         &[
-            "cmd=git bridge hook-reference-transaction",
+            "cmd=git shim hook-reference-transaction",
             "atomic::git::hook",
             r#""state":"committed""#,
             "refs/heads/feature",
@@ -224,7 +224,7 @@ fn git_hooks_log_the_evidence_they_journal() {
     line_with(
         &log,
         &[
-            "cmd=git bridge observe-deferred",
+            "cmd=git shim observe-deferred",
             "atomic::git::hook",
             r#""record_type":"deferred-observation""#,
             r#""head_kind":"attached""#,
@@ -237,16 +237,16 @@ fn git_hooks_log_the_evidence_they_journal() {
 }
 
 #[test]
-fn bridge_switch_logs_the_steps_it_reached() {
-    let sandbox = bridged_feature_commit();
+fn shim_switch_logs_the_steps_it_reached() {
+    let sandbox = shim_feature_commit();
     // Whatever the outcome, the log shows how far the switch got.
-    let switched = sandbox.atomic(&["git", "bridge", "switch", "main"]);
+    let switched = sandbox.atomic(&["git", "shim", "switch", "main"]);
     let log = sandbox.log();
 
     line_with(
         &log,
         &[
-            "cmd=git bridge switch",
+            "cmd=git shim switch",
             r#"switch{view="main"}"#,
             "checkpoint matches",
         ],
@@ -258,7 +258,7 @@ fn bridge_switch_logs_the_steps_it_reached() {
     };
     line_with(
         &log,
-        &["cmd=git bridge switch", "command finished", outcome],
+        &["cmd=git shim switch", "command finished", outcome],
     );
     line_with(&log, &[r#"switch{view="main"}"#, "close time.busy"]);
 }
