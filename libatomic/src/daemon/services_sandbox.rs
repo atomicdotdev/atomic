@@ -18,7 +18,9 @@ use std::sync::Arc;
 use crate::atomic::ErrorCode;
 use crate::atomic::*;
 use atomic_core::pristine::ViewTxnT;
-use atomic_repository::{Repository, RepositoryError, SealOptions, StageOptions, SubmitRejection, ViewEntryKind};
+use atomic_repository::{
+    Repository, RepositoryError, SealOptions, StageOptions, SubmitRejection, ViewEntryKind,
+};
 use tonic::{Request, Response, Status};
 
 use super::convert::{hash_proto, timestamp_proto};
@@ -76,10 +78,7 @@ fn materialize_prefix(path_prefix: Option<String>) -> Result<Option<String>, Sta
         let Component::Normal(name) = part else {
             return Err(refuse("not a plain relative path"));
         };
-        if name == ".atomic"
-            || name == ".atomic-sandbox"
-            || name == ".atomic-sandbox.d"
-        {
+        if name == ".atomic" || name == ".atomic-sandbox" || name == ".atomic-sandbox.d" {
             return Err(refuse("names the sandbox's own bookkeeping"));
         }
         parts.push(name.to_string_lossy().into_owned());
@@ -504,8 +503,8 @@ impl sandbox_service_server::SandboxService for SandboxImpl {
                 // are prefix-coherent with what was streamed.
                 if let Some(prefix) = &prefix {
                     let under = entry.path.starts_with(prefix.as_str());
-                    let ancestor = prefix.starts_with(&entry.path)
-                        && entry.kind == ViewEntryKind::Directory;
+                    let ancestor =
+                        prefix.starts_with(&entry.path) && entry.kind == ViewEntryKind::Directory;
                     if !under && !ancestor {
                         return Ok(());
                     }

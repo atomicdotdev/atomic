@@ -1142,14 +1142,29 @@ fn a_prefix_materializes_only_its_subtree_and_refuses_traversal() {
     let root = dir.path().join("empty");
     std::fs::create_dir_all(&root).unwrap();
     let root = root.canonicalize().unwrap();
-    let (_, _) = materialize_prefix_into(&host, &opened.token, &root, Some("nowhere"));
+    let (nowhere, _) = materialize_prefix_into(&host, &opened.token, &root, Some("nowhere"));
+    assert!(
+        nowhere < src,
+        "a matching-nothing prefix streams fewer entries than a matching one"
+    );
 
-    // A deep prefix streams the chain of directories that lead to it.
+    // A deep prefix streams only the ancestor entries the VIEW has (the
+    // leading directories of the chain that exist), not a synthesized
+    // chain — its missing members cost nothing until a file lands under
+    // them (the client-side writer creates parents on write).
     let dir = TempDir::new().unwrap();
     let root = dir.path().join("deep");
     std::fs::create_dir_all(&root).unwrap();
     let root = root.canonicalize().unwrap();
-    materialize_prefix_into(&host, &opened.token, &root, Some("src/deep/nested"));
+    let (deep, _) = materialize_prefix_into(&host, &opened.token, &root, Some("src/deep/nested"));
+    assert_eq!(
+        deep, 1,
+        "a deep prefix streams exactly the view's own leading directories"
+    );
+    assert!(
+        !root.join("src/lib.rs").is_file(),
+        "a src/deep/... prefix must stream nothing of src/"
+    );
 
     // Traversal and reserved prefixes are refused, never truncated.
     for bad in ["..", "../elsewhere", "/abs", ".atomic", "a/../b"] {
@@ -1157,21 +1172,28 @@ fn a_prefix_materializes_only_its_subtree_and_refuses_traversal() {
         let root = dir.path().join("bad");
         std::fs::create_dir_all(&root).unwrap();
         let root = root.canonicalize().unwrap();
-        let refused = host.rt.block_on(
-            host.service().materialize(with_token(
-                MaterializeRequest {
-                    repository: Some(host.repository.clone()),
-                    target: None,
-                    path_prefix: Some(bad.to_string()),
-                },
-                &opened.token,
-            )),
+        let refused = host.rt.block_on(host.service().materialize(with_token(
+            MaterializeRequest {
+                repository: Some(host.repository.clone()),
+                target: None,
+                path_prefix: Some(bad.to_string()),
+            },
+            &opened.token,
+        )));
+        // A refusal writes nothing: the destination stays empty.
+        assert!(
+            std::fs::read_dir(&root).unwrap().count() == 0,
+            "{bad:?} wrote into the destination despite being refused"
         );
         let code = match refused {
             Err(status) => status.code(),
             Ok(_) => panic!("{bad:?} must be refused"),
         };
-        assert_eq!(code, tonic::Code::InvalidArgument, "{bad:?} must be refused");
+        assert_eq!(
+            code,
+            tonic::Code::InvalidArgument,
+            "{bad:?} must be refused"
+        );
     }
 }
 
