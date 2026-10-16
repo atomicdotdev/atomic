@@ -314,7 +314,7 @@ dependencies = [
  "rand 0.8.7",
  "rayon",
  "redb 2.6.3",
- "redb 4.2.0",
+ "redb 4.4.0",
  "serde",
  "serde_json",
  "similar",
@@ -416,7 +416,7 @@ dependencies = [
  "postcard",
  "rand 0.8.7",
  "rayon",
- "redb 4.2.0",
+ "redb 4.4.0",
  "reflink-copy",
  "reqwest",
  "serde",
@@ -1939,7 +1939,7 @@ dependencies = [
  "prost-types",
  "protox",
  "rand 0.8.7",
- "redb 4.2.0",
+ "redb 4.4.0",
  "serde_json",
  "similar",
  "tempfile",
@@ -2759,9 +2759,9 @@ dependencies = [
 
 [[package]]
 name = "redb"
-version = "4.2.0"
+version = "4.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "de6c3b63e007e90ce536ec2ae4690826136a20ec8dbbbb400daef1bb999d2e36"
+checksum = "39178e0a867f9e3eaa6292a4ab1dd3613f2519c5b564341e1e7b29b270736cc4"
 dependencies = [
  "libc",
 ]
