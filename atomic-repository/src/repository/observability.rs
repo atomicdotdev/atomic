@@ -1037,7 +1037,7 @@ impl Repository {
             }
         })?;
         if let Some(expected) = expected_old {
-            if config.git.bridge.vault != expected {
+            if config.git.bridge.vault != Some(expected) {
                 return Err(RepositoryError::InvalidOperation {
                     message: format!(
                         "bridge vault policy lease diverged: expected {expected:?}, observed {:?}",
@@ -1046,11 +1046,11 @@ impl Repository {
                 });
             }
         }
-        if config.git.bridge.vault == vault {
+        if config.git.bridge.vault == Some(vault) {
             drop(common);
             return Ok(false);
         }
-        config.git.bridge.vault = vault;
+        config.git.bridge.vault = Some(vault);
         config
             .save(&config_path)
             .map_err(|error| RepositoryError::InvalidRepository {

@@ -579,11 +579,12 @@ pub struct GitBridgeConfig {
     /// Whether `.vault/` participates in the bridge's repository-manifest
     /// projection (RFC-ATOMIC-GIT-CAUSAL-BRIDGE §6.2 "Excluded paths":
     /// "`.vault/` is private by default but may be tracked under explicit
-    /// policy"). Defaults to `private`; `git import` records `tracked`
-    /// once, at first import, when the imported Git history already tracks
-    /// `.vault/`.
-    #[serde(default)]
-    pub vault: BridgeVaultPolicy,
+    /// policy"). An omitted value remains undecided: the bridge resolves it
+    /// from Git's tracked tree, using private vault behavior when Git does
+    /// not track `.vault/`. Saving unrelated configuration must not turn an
+    /// omitted policy into explicit consent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vault: Option<BridgeVaultPolicy>,
 
     /// The optional metadata-only bridge watch daemon (RFC §11.2, CB-13D).
     /// Defaults to disabled; an absent `[git.bridge.watch]` section reads
@@ -1231,7 +1232,7 @@ mod tests {
             git: GitConfig {
                 bridge: GitBridgeConfig {
                     enabled: true,
-                    vault: BridgeVaultPolicy::Tracked,
+                    vault: Some(BridgeVaultPolicy::Tracked),
                     watch: BridgeWatchConfig {
                         enabled: true,
                         quiet_ms: 500,
@@ -1244,7 +1245,7 @@ mod tests {
         let encoded = toml::to_string_pretty(&config).unwrap();
         let decoded: RepoConfig = toml::from_str(&encoded).unwrap();
         assert_eq!(decoded.git.bridge.watch, config.git.bridge.watch);
-        assert_eq!(decoded.git.bridge.vault, BridgeVaultPolicy::Tracked);
+        assert_eq!(decoded.git.bridge.vault, Some(BridgeVaultPolicy::Tracked));
     }
 
     #[test]
@@ -1295,21 +1296,21 @@ mod tests {
         );
     }
 
-    /// RFC §6.2: the vault projection policy defaults to `private`.
+    /// An omitted policy is undecided; bridge enablement is not a vault-policy choice.
     #[test]
     fn git_bridge_vault_defaults_to_private() {
         let config: RepoConfig = toml::from_str("").unwrap();
-        assert_eq!(config.git.bridge.vault, BridgeVaultPolicy::Private);
+        assert_eq!(config.git.bridge.vault, None);
         // The explicit opt-in must not silently flip the vault policy.
         let config: RepoConfig = toml::from_str("[git.bridge]\nenabled = true\n").unwrap();
-        assert_eq!(config.git.bridge.vault, BridgeVaultPolicy::Private);
+        assert_eq!(config.git.bridge.vault, None);
     }
 
     /// RFC §6.2: a colocated repository may record `tracked`.
     #[test]
     fn git_bridge_vault_parses_and_round_trips() {
         let config: RepoConfig = toml::from_str("[git.bridge]\nvault = \"tracked\"\n").unwrap();
-        assert_eq!(config.git.bridge.vault, BridgeVaultPolicy::Tracked);
+        assert_eq!(config.git.bridge.vault, Some(BridgeVaultPolicy::Tracked));
         assert!(
             !config.git.bridge.enabled,
             "other fields keep their defaults"
@@ -1317,7 +1318,7 @@ mod tests {
 
         let text = toml::to_string(&config).unwrap();
         let reloaded: RepoConfig = toml::from_str(&text).unwrap();
-        assert_eq!(reloaded.git.bridge.vault, BridgeVaultPolicy::Tracked);
+        assert_eq!(reloaded.git.bridge.vault, Some(BridgeVaultPolicy::Tracked));
     }
 
     /// An unknown vault policy value refuses instead of guessing.
@@ -1337,29 +1338,52 @@ mod tests {
         // Absent file: defaulted, not recorded.
         let (config, recorded) = RepoConfig::load_with_vault_recorded(&path).unwrap();
         assert!(!recorded);
-        assert_eq!(config.git.bridge.vault, BridgeVaultPolicy::Private);
+        assert_eq!(config.git.bridge.vault, None);
 
         // Omitted field (pre-policy configuration): not recorded.
         std::fs::write(&path, "[git.bridge]\nenabled = true\n").unwrap();
         let (config, recorded) = RepoConfig::load_with_vault_recorded(&path).unwrap();
         assert!(!recorded, "an omitted vault field is undecided");
-        assert_eq!(config.git.bridge.vault, BridgeVaultPolicy::Private);
+        assert_eq!(config.git.bridge.vault, None);
         assert!(config.git.bridge.enabled);
 
         // Explicit record: recorded, both directions.
         std::fs::write(&path, "[git.bridge]\nvault = \"tracked\"\n").unwrap();
         let (config, recorded) = RepoConfig::load_with_vault_recorded(&path).unwrap();
         assert!(recorded);
-        assert_eq!(config.git.bridge.vault, BridgeVaultPolicy::Tracked);
+        assert_eq!(config.git.bridge.vault, Some(BridgeVaultPolicy::Tracked));
 
         std::fs::write(&path, "[git.bridge]\nvault = \"private\"\n").unwrap();
         let (config, recorded) = RepoConfig::load_with_vault_recorded(&path).unwrap();
         assert!(recorded);
-        assert_eq!(config.git.bridge.vault, BridgeVaultPolicy::Private);
+        assert_eq!(config.git.bridge.vault, Some(BridgeVaultPolicy::Private));
 
         // A corrupt configuration fails closed instead of defaulting.
         std::fs::write(&path, "not [ valid toml").unwrap();
         assert!(RepoConfig::load_with_vault_recorded(&path).is_err());
+    }
+
+    #[test]
+    fn saving_bridge_settings_preserves_an_omitted_vault_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut config = RepoConfig::default();
+        config.git.bridge.enabled = true;
+        config.save(&path).unwrap();
+
+        let (loaded, recorded) = RepoConfig::load_with_vault_recorded(&path).unwrap();
+        assert!(loaded.git.bridge.enabled);
+        assert_eq!(loaded.git.bridge.vault, None);
+        assert!(
+            !recorded,
+            "saving unrelated settings must not invent an explicit vault policy"
+        );
+
+        config.git.bridge.vault = Some(BridgeVaultPolicy::Private);
+        config.save(&path).unwrap();
+        let (loaded, recorded) = RepoConfig::load_with_vault_recorded(&path).unwrap();
+        assert!(recorded);
+        assert_eq!(loaded.git.bridge.vault, Some(BridgeVaultPolicy::Private));
     }
 
     /// Explicit opt-in parses, and default enablement is still refused

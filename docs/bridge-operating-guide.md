@@ -260,8 +260,10 @@ require verified provenance.
 
 ## 13. Privacy and security rules
 
-The Git projection excludes `.atomic/` and `.vault/`. Files that users explicitly
-track are ordinary Git content.
+The Git projection excludes `.atomic/`. The vault is private when Git does not
+track it; a tracked `.vault/` joins the projection under the vault policy in
+[section 3](#3-vault-policy-private-by-default-tracked-under-explicit-record).
+Saving unrelated bridge settings does not create an explicit vault-policy record.
 
 Bridge event telemetry uses fixed event types, identifiers, and counts. It does
 not have a free-text field for prompts, transcripts, secrets, or environment

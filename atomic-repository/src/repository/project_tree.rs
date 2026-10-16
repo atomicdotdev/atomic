@@ -288,17 +288,15 @@ impl ExclusionPolicy {
             };
             let config_path = dot_dir.join("config.toml");
             if config_path.exists() {
-                let (config, recorded) = atomic_config::RepoConfig::load_with_vault_recorded(
-                    &config_path,
-                )
-                .map_err(|error| {
-                    ProjectTreeError::Repository(format!(
-                        "cannot load the repository configuration at {}: {error}",
-                        config_path.display()
-                    ))
-                })?;
-                if recorded {
-                    return Ok(match config.git.bridge.vault {
+                let (config, _) = atomic_config::RepoConfig::load_with_vault_recorded(&config_path)
+                    .map_err(|error| {
+                        ProjectTreeError::Repository(format!(
+                            "cannot load the repository configuration at {}: {error}",
+                            config_path.display()
+                        ))
+                    })?;
+                if let Some(vault) = config.git.bridge.vault {
+                    return Ok(match vault {
                         atomic_config::BridgeVaultPolicy::Tracked => Self::IncludeVault,
                         atomic_config::BridgeVaultPolicy::Private => Self::BridgePrivate,
                     });
@@ -1808,6 +1806,16 @@ mod tests {
             resolve(&git),
             ExclusionPolicy::IncludeVault,
             "an omitted vault field must not read as an explicit private record"
+        );
+
+        let config_path = root.path().join(".atomic/config.toml");
+        let mut config = atomic_config::RepoConfig::load(&config_path).unwrap();
+        config.git.bridge.watch.enabled = true;
+        config.save(&config_path).unwrap();
+        assert_eq!(
+            resolve(&git),
+            ExclusionPolicy::IncludeVault,
+            "saving unrelated bridge settings must preserve tracked-tree detection"
         );
 
         // An explicit private record wins over the tracked HEAD tree.

@@ -239,6 +239,46 @@ fn tracked_vault_no_vault_import_still_verifies_clean() {
     assert!(ok, "bridge verify must pass:\n{output}");
 }
 
+#[test]
+fn enabling_bridge_before_import_does_not_force_a_private_vault_policy() {
+    let (root, home) = fixture(true);
+    // Local Atomic metadata is not part of this fixture's Git history.
+    // Keep it ignored before native initialization, as import itself does
+    // when it initializes a new Atomic repository.
+    let exclude = root.path().join(".git/info/exclude");
+    std::fs::create_dir_all(exclude.parent().unwrap()).unwrap();
+    std::fs::write(exclude, "/.atomic/\n/.atomicignore\n/.vault/\n").unwrap();
+    for args in [
+        &["init", "--no-vault", "--view", "main"][..],
+        &["git", "bridge", "enable"][..],
+        &["git", "import", "--incremental"][..],
+    ] {
+        let (ok, output) = run_atomic(root.path(), home.path(), args);
+        assert!(ok, "atomic {args:?} failed:\n{output}");
+    }
+
+    for (path, content) in tracked_vault_files() {
+        assert_eq!(
+            std::fs::read(root.path().join(path)).unwrap(),
+            content.as_bytes()
+        );
+    }
+    let (ok, output) = run_atomic(root.path(), home.path(), &["git", "bridge", "verify"]);
+    assert!(
+        ok,
+        "tracked-vault import after enabling the bridge must verify:\n{output}"
+    );
+    let git = GitRepository::open(root.path()).unwrap();
+    let mut status_options = git2::StatusOptions::new();
+    status_options.include_ignored(false);
+    let statuses = git.statuses(Some(&mut status_options)).unwrap();
+    let changed: Vec<_> = statuses
+        .iter()
+        .map(|entry| (entry.path().map(str::to_owned), entry.status()))
+        .collect();
+    assert!(changed.is_empty(), "Git must remain clean: {changed:?}");
+}
+
 /// The fresh-vault experience is unchanged: a repository whose Git tree has
 /// no `.vault/` gets the default vault (private policy), a clean Git
 /// status, KG enrichment, a content index, and a green verifier — and a
