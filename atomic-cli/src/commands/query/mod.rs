@@ -4,6 +4,7 @@ use std::collections::{HashMap, HashSet};
 
 use clap::{Parser, Subcommand};
 
+use atomic_core::kg::ontology::{compact, Class};
 use atomic_core::pristine::vault::{KgEdge, KgNode};
 use atomic_core::types::{Base32, Hash};
 use atomic_repository::Repository;
@@ -11,10 +12,13 @@ use atomic_repository::Repository;
 use crate::commands::{find_repository_root, Command};
 use crate::error::{CliError, CliResult};
 use crate::output::{create_spinner, finish_error, finish_success};
+mod validate;
 
 /// Subcommands for vault knowledge graph queries.
 #[derive(Subcommand, Debug)]
 pub enum QueryCommands {
+    /// Evaluate builtin and local enterprise SHACL shapes over a workflow snapshot.
+    Validate(validate::Validate),
     /// Search the knowledge graph by keywords.
     ///
     /// Performs full-text search over KG node IDs, labels, and summaries,
@@ -205,6 +209,7 @@ pub struct Query {
 impl Command for Query {
     fn run(&self) -> CliResult<()> {
         match &self.command {
+            QueryCommands::Validate(cmd) => cmd.run(),
             QueryCommands::Search(cmd) => cmd.run(),
             QueryCommands::Neighbors(cmd) => cmd.run(),
             QueryCommands::Callers(cmd) => cmd.run(),
@@ -294,19 +299,18 @@ impl Command for QueryGraph {
         } else {
             self.kinds
                 .split(',')
-                .map(|s| s.trim().to_lowercase())
+                .map(|s| s.trim().to_owned())
                 .filter(|s| !s.is_empty())
                 .collect()
         };
-        let kind_allowed =
-            |kind: &str| -> bool { allow_all || allowed_kinds.contains(&kind.to_lowercase()) };
+        let kind_allowed = |kind: &str| -> bool { allow_all || allowed_kinds.contains(kind) };
 
         // 1. Seed: search the KG, filtered to allowed kinds
         let seed_nodes: Vec<KgNode> = repo
             .vault_kg_search(&self.query, self.limit * 3, None) // fetch extra, then filter
             .map_err(CliError::Repository)?
             .into_iter()
-            .filter(|n| kind_allowed(&n.kind))
+            .filter(|n| n.types.iter().any(|class| kind_allowed(class)))
             .take(self.limit)
             .collect();
 
@@ -340,11 +344,11 @@ impl Command for QueryGraph {
             let mut changes_for_seed: usize = 0;
 
             for node in subgraph.nodes {
-                if !kind_allowed(&node.kind) {
+                if !node.types.iter().any(|class| kind_allowed(class)) {
                     continue;
                 }
                 // Cap change nodes per seed
-                if node.kind == "change" && cap_changes {
+                if node.has_type(Class::Change) && cap_changes {
                     if node_map.contains_key(&node.id) {
                         continue; // already added by another seed, don't count
                     }
@@ -357,19 +361,17 @@ impl Command for QueryGraph {
             }
 
             for edge in subgraph.edges {
-                let from_kind_ok = allow_all || {
-                    let prefix = edge.from_id.split(':').next().unwrap_or("");
-                    kind_allowed(prefix)
-                };
-                let to_kind_ok = allow_all || {
-                    let prefix = edge.to_id.split(':').next().unwrap_or("");
-                    kind_allowed(prefix)
-                };
+                let from_kind_ok = node_map.contains_key(&edge.from_id);
+                let to_kind_ok = node_map.contains_key(&edge.to_id);
                 if from_kind_ok && to_kind_ok {
                     // Only add edge if both endpoints made it into node_map
                     // (respects the per-seed change cap)
                     if node_map.contains_key(&edge.from_id) || node_map.contains_key(&edge.to_id) {
-                        let key = (edge.from_id.clone(), edge.to_id.clone(), edge.kind.clone());
+                        let key = (
+                            edge.from_id.clone(),
+                            edge.to_id.clone(),
+                            edge.kind.to_string(),
+                        );
                         if edge_set.insert(key) {
                             all_edges.push(edge);
                         }
@@ -511,7 +513,7 @@ pub(crate) fn emit_dot(nodes: &[KgNode], edges: &[KgEdge]) -> String {
 
     // Nodes
     for node in nodes {
-        let (fillcolor, shape) = node_style(&node.kind);
+        let (fillcolor, shape) = node_style(node.primary_type());
         let label = node_label(node);
         out.push_str(&format!(
             "  \"{}\" [label=\"{}\", fillcolor=\"{}\", shape={}];\n",
@@ -530,7 +532,7 @@ pub(crate) fn emit_dot(nodes: &[KgNode], edges: &[KgEdge]) -> String {
             "  \"{}\" -> \"{}\" [label=\"{}\"];\n",
             dot_escape_id(&edge.from_id),
             dot_escape_id(&edge.to_id),
-            dot_escape_label(&edge.kind),
+            dot_escape_label(&compact(edge.kind.iri())),
         ));
     }
 
@@ -540,23 +542,25 @@ pub(crate) fn emit_dot(nodes: &[KgNode], edges: &[KgEdge]) -> String {
 
 /// Returns `(fillcolor, shape)` for a given node kind.
 fn node_style(kind: &str) -> (&'static str, &'static str) {
-    match kind.to_lowercase().as_str() {
-        "module" => ("#d4e6f1", "folder"),
-        "file" => ("#d5f5e3", "box"),
-        "entity" => ("#fdebd0", "ellipse"),
-        "change" => ("#fadbd8", "note"),
-        "view" => ("#e8daef", "pentagon"),
-        "identity" => ("#fef9e7", "box"),
-        "goal" => ("#d1f2eb", "hexagon"),
-        "intent" => ("#d1f2eb", "hexagon"),
-        "memory" => ("#fef9e7", "box"),
+    match Class::from_iri(kind) {
+        Some(Class::File) => ("#d5f5e3", "box"),
+        Some(Class::Change) => ("#fadbd8", "note"),
+        Some(Class::View) => ("#e8daef", "pentagon"),
+        Some(
+            Class::Goal
+            | Class::WorkIntent
+            | Class::FeatureIntent
+            | Class::BugIntent
+            | Class::ReviewIntent,
+        ) => ("#d1f2eb", "hexagon"),
+        Some(Class::Memory | Class::Identity) => ("#fef9e7", "box"),
         _ => ("#f2f3f4", "box"),
     }
 }
 
 /// Build a human-readable label for a node in DOT output.
 fn node_label(node: &KgNode) -> String {
-    let kind = node.kind.to_lowercase();
+    let kind = compact(node.primary_type());
     match kind.as_str() {
         "module" => {
             // Last path component + trailing slash
@@ -567,7 +571,7 @@ fn node_label(node: &KgNode) -> String {
                 .unwrap_or(&node.label);
             format!("{}/", last)
         }
-        "file" => {
+        "atomic:File" => {
             // Filename, optionally with match count
             let filename = node.label.rsplit('/').next().unwrap_or(&node.label);
             if let Some(ref meta) = node.metadata {
@@ -594,7 +598,7 @@ fn node_label(node: &KgNode) -> String {
             }
             label
         }
-        "change" => {
+        "atomic:Change" => {
             // Short hash + optional summary excerpt
             let mut label = node.label.clone();
             if let Some(ref summary) = node.summary {
@@ -656,7 +660,8 @@ pub(crate) fn emit_html(query: &str, nodes: &[KgNode], edges: &[KgEdge]) -> Stri
                 .unwrap_or(0);
             serde_json::json!({
                 "id": n.id,
-                "kind": n.kind,
+                "kind": n.primary_type(),
+                "types": n.types,
                 "label": n.label,
                 "summary": n.summary.as_deref().unwrap_or(""),
                 "content_matches": content_matches,
@@ -735,33 +740,26 @@ pub(crate) fn emit_html(query: &str, nodes: &[KgNode], edges: &[KgEdge]) -> Stri
   var graphData = {data_json};
 
   var COLORS = {{
-    module:   '#3498db',
-    file:     '#2ecc71',
-    entity:   '#e67e22',
-    change:   '#e74c3c',
-    view:     '#9b59b6',
-    identity: '#f1c40f',
-    goal:     '#1abc9c',
-    intent:   '#1abc9c',
-    memory:   '#f39c12',
+    'https://atomic.dev/ns/workflow#File': '#2ecc71',
+    'https://atomic.dev/ns/workflow#Change': '#e74c3c',
+    'https://atomic.dev/ns/workflow#View': '#9b59b6',
+    'https://atomic.dev/ns/workflow#Identity': '#f1c40f',
+    'https://atomic.dev/ns/workflow#Goal': '#1abc9c',
+    'https://atomic.dev/ns/workflow#WorkIntent': '#1abc9c',
+    'https://atomic.dev/ns/workflow#Memory': '#f39c12',
   }};
   var EDGE_COLORS = {{
-    DEFINES:     '#e67e22',
-    MODIFIES:    '#e74c3c',
-    PART_OF:     '#3498db',
-    INCLUDES:    '#2ecc71',
-    AUTHORED_BY: '#f1c40f',
-    DEPENDS_ON:  '#e74c3c',
-    ON_VIEW:     '#9b59b6',
-    REFERENCES:  '#95a5a6',
+    'https://atomic.dev/ns/workflow#modifiesFile': '#e74c3c',
+    'https://atomic.dev/ns/workflow#authoredBy': '#f1c40f',
+    'https://atomic.dev/ns/workflow#directlyDependsOnChange': '#e74c3c',
+    'https://atomic.dev/ns/workflow#directlyOnView': '#9b59b6',
+    'https://atomic.dev/ns/workflow#references': '#95a5a6',
   }};
   var DEFAULT_COLOR = '#7f8c8d';
 
   function nodeRadius(d) {{
-    if (d.kind === 'module') return 14 + Math.min(d.content_matches, 50) * 0.3;
-    if (d.kind === 'file') return 5 + Math.min(d.content_matches, 100) * 0.12;
-    if (d.kind === 'entity') return 4;
-    if (d.kind === 'change') return 4;
+    if (d.kind === 'https://atomic.dev/ns/workflow#File') return 5 + Math.min(d.content_matches, 100) * 0.12;
+    if (d.kind === 'https://atomic.dev/ns/workflow#Change') return 4;
     return 5;
   }}
 
@@ -802,10 +800,10 @@ pub(crate) fn emit_html(query: &str, nodes: &[KgNode], edges: &[KgEdge]) -> Stri
   var kindsPresent = new Set(nodes.map(function(n) {{ return n.kind; }}));
   var legendEl = document.getElementById('legend');
   var legendHTML = '<div class="legend-title">Node Types</div>';
-  var kindOrder = ['module', 'file', 'entity', 'change', 'view', 'identity', 'goal', 'intent', 'memory'];
+  var kindOrder = Array.from(kindsPresent).sort();
   kindOrder.forEach(function(k) {{
     if (kindsPresent.has(k)) {{
-      legendHTML += '<div class="legend-item"><span class="legend-dot" style="background:' + (COLORS[k] || DEFAULT_COLOR) + '"></span>' + k + '</div>';
+      legendHTML += '<div class="legend-item"><span class="legend-dot" style="background:' + (COLORS[k] || DEFAULT_COLOR) + '"></span>' + k.replace('https://atomic.dev/ns/workflow#', 'atomic:') + '</div>';
     }}
   }});
   legendEl.innerHTML = legendHTML;
@@ -1105,10 +1103,10 @@ impl Command for QueryNodes {
             .map_err(CliError::Repository)?;
 
         let nodes: Vec<_> = if let Some(ref kind_filter) = self.kind {
-            let k = kind_filter.to_lowercase();
+            let k = kind_filter.to_owned();
             all_nodes
                 .into_iter()
-                .filter(|n| n.kind.to_lowercase() == k)
+                .filter(|n| n.types.contains(&k))
                 .take(self.limit)
                 .collect()
         } else {
@@ -1127,7 +1125,12 @@ impl Command for QueryNodes {
                 } else {
                     format!("  {}", truncate_display(summary, 60))
                 };
-                println!("  [{}] {}{}", node.kind, node.id, summary_display);
+                println!(
+                    "  [{}] {}{}",
+                    compact(node.primary_type()),
+                    node.id,
+                    summary_display
+                );
             }
             println!("\n{} result(s).", nodes.len());
         }
@@ -1177,7 +1180,12 @@ impl Command for QueryNeighbors {
                 } else {
                     format!("  {}", truncate_display(summary, 50))
                 };
-                println!("  [{}] {}{}", node.kind, node.id, summary_display);
+                println!(
+                    "  [{}] {}{}",
+                    compact(node.primary_type()),
+                    node.id,
+                    summary_display
+                );
             }
             println!("\nEdges ({}):", subgraph.edges.len());
             for edge in &subgraph.edges {
@@ -1199,10 +1207,7 @@ impl Command for QueryNeighbors {
 /// Find all functions that call a given entity node.
 #[derive(Parser, Debug)]
 pub struct QueryCallers {
-    /// Full entity node ID, e.g. `entity:src/auth.rs:verify:42`.
-    ///
-    /// Use `atomic vault query entities <file>` to list entity IDs for a file,
-    /// then pass one here.
+    /// Symbol selector: `<path>#<name>` or a bare symbol name.
     pub entity_id: String,
 
     /// Output as JSON.
@@ -1220,70 +1225,42 @@ impl Command for QueryCallers {
         let root = find_repository_root()?;
         let repo = Repository::open(&root).map_err(CliError::Repository)?;
 
-        let subgraph = repo
-            .vault_kg_neighbors(&self.entity_id, 1)
+        let callers = repo
+            .query_callers(&self.entity_id)
             .map_err(CliError::Repository)?;
-
-        // Incoming CALLS edges: from_id is the caller, to_id is our entity.
-        let caller_edges: Vec<&KgEdge> = subgraph
-            .edges
-            .iter()
-            .filter(|e| e.kind.to_uppercase() == "CALLS" && e.to_id == self.entity_id)
-            .collect();
-
-        if self.json {
-            let out: Vec<serde_json::Value> = caller_edges
-                .iter()
-                .map(|e| {
-                    let node = subgraph.nodes.iter().find(|n| n.id == e.from_id);
-                    serde_json::json!({
-                        "caller_id": e.from_id,
-                        "summary": node.and_then(|n| n.summary.as_deref()),
-                    })
-                })
-                .collect();
-            println!("{}", serde_json::to_string_pretty(&out).unwrap());
-            return Ok(());
-        }
-
-        if caller_edges.is_empty() {
-            println!("No callers found for '{}'.", self.entity_id);
-            // Distinguish "no callers" from "CALLS edges not yet enriched"
-            let has_any_calls = subgraph
-                .edges
-                .iter()
-                .any(|e| e.kind.to_uppercase() == "CALLS");
-            if !has_any_calls {
-                println!(
-                    "Hint: run `atomic vault query enrich` to populate CALLS edges, \
-                    then retry."
-                );
-            } else {
-                println!("This function is an entry point — nothing in the repo calls it.");
-            }
-        } else {
-            println!("{} caller(s) of {}:\n", caller_edges.len(), self.entity_id);
-            for edge in &caller_edges {
-                // Parse entity:{file}:{name}:{line} for a readable display
-                let display = if let Some(rest) = edge.from_id.strip_prefix("entity:") {
-                    let last = rest.rfind(':').unwrap_or(rest.len());
-                    let inner = &rest[..last]; // {file}:{name}
-                    let sig = subgraph
-                        .nodes
-                        .iter()
-                        .find(|n| n.id == edge.from_id)
-                        .and_then(|n| n.summary.as_deref())
-                        .map(|s| format!("  [{}]", s.lines().next().unwrap_or(s)));
-                    format!("  {}{}", inner, sig.unwrap_or_default())
-                } else {
-                    format!("  {}", edge.from_id)
-                };
-                println!("{display}");
-            }
-        }
-
-        Ok(())
+        render_callers(&self.entity_id, &callers, self.json)
     }
+}
+
+pub(crate) fn render_callers(
+    target: &str,
+    callers: &[atomic_repository::repository::Caller],
+    json: bool,
+) -> CliResult<()> {
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(callers).map_err(|e| CliError::Internal(e.into()))?
+        );
+    } else if callers.is_empty() {
+        println!("No callers found for '{target}'.");
+    } else {
+        println!("{} caller(s) of {target}:\n", callers.len());
+        for caller in callers {
+            println!(
+                "  {}#{}:{}{}",
+                caller.path,
+                caller.name,
+                caller.line,
+                caller
+                    .summary
+                    .as_ref()
+                    .map(|summary| format!("  [{summary}]"))
+                    .unwrap_or_default()
+            );
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1590,7 +1567,7 @@ mod enrich_tests {
             )
             .unwrap();
         let full_hash = outcome.hash().to_base32();
-        let node_id = format!("change:{}", &full_hash[..12]);
+        let node_id = atomic_core::kg::iri::mint_change(outcome.hash());
         assert!(repo.vault_kg_node(&node_id).unwrap().is_none());
         drop(repo);
 
@@ -1639,14 +1616,10 @@ impl Command for QueryEnrich {
             return Ok(());
         }
 
-        // Clean rebuild: drop stale VCS/AST-derived nodes so files that became
-        // ignored or were deleted don't linger. Vault/session nodes are kept.
+        // Shared file/view resources also carry vault/session relationships;
+        // regenerate the whole read model rather than cascade-delete those joins.
         if self.rebuild {
-            let spinner = create_spinner("Clearing stale KG entries...");
-            match repo.kg_clear_derived() {
-                Ok(n) => finish_success(&spinner, &format!("{} stale node(s) removed", n)),
-                Err(e) => finish_error(&spinner, &format!("clear failed: {}", e)),
-            }
+            repo.rebuild_kg(true).map_err(CliError::Repository)?;
         }
 
         let mut total = atomic_repository::KgEnrichStats::default();
@@ -1671,16 +1644,6 @@ impl Command for QueryEnrich {
             Err(e) => finish_error(&spinner, &format!("files failed: {}", e)),
         }
 
-        // Phase 3: Modules + PART_OF edges
-        let spinner = create_spinner("Enriching modules...");
-        match repo.kg_enrich_modules(working_copy) {
-            Ok(n) => {
-                total.modules = n;
-                finish_success(&spinner, &format!("{} module(s)", n));
-            }
-            Err(e) => finish_error(&spinner, &format!("modules failed: {}", e)),
-        }
-
         // Phase 4: Changes
         let spinner = create_spinner("Enriching changes...");
         match repo.kg_enrich_changes(working_copy) {
@@ -1689,36 +1652,6 @@ impl Command for QueryEnrich {
                 finish_success(&spinner, &format!("{} change(s)", n));
             }
             Err(e) => finish_error(&spinner, &format!("changes failed: {}", e)),
-        }
-
-        // Phase 5: AST entities
-        let spinner = create_spinner("Extracting entities (tree-sitter)...");
-        match repo.kg_enrich_entities(working_copy) {
-            Ok(n) => {
-                total.entities = n;
-                finish_success(&spinner, &format!("{} entit(ies)", n));
-            }
-            Err(e) => finish_error(&spinner, &format!("entities failed: {}", e)),
-        }
-
-        // Phase 6: INCLUDES edges
-        let spinner = create_spinner("Resolving includes...");
-        match repo.kg_enrich_includes(working_copy) {
-            Ok(n) => {
-                total.includes = n;
-                finish_success(&spinner, &format!("{} include(s)", n));
-            }
-            Err(e) => finish_error(&spinner, &format!("includes failed: {}", e)),
-        }
-
-        // Phase 7: CALLS edges (caller entity → callee entity)
-        let spinner = create_spinner("Resolving call sites...");
-        match repo.kg_enrich_calls(working_copy) {
-            Ok(n) => {
-                total.calls = n;
-                finish_success(&spinner, &format!("{} call(s)", n));
-            }
-            Err(e) => finish_error(&spinner, &format!("calls failed: {}", e)),
         }
 
         // Phase 8: Content search index (syntext)
@@ -1749,18 +1682,53 @@ impl Command for QueryEnrich {
 
 /// Rebuild the KG index from all vault entries.
 #[derive(Parser, Debug)]
-pub struct Reindex;
+pub struct Reindex {
+    /// Rebuild the complete workflow graph from canonical objects.
+    #[arg(long)]
+    pub full: bool,
+}
 
 impl Command for Reindex {
     fn run(&self) -> CliResult<()> {
+        let root = find_repository_root()?;
+        // Key discovery precedes both local and daemon reindex execution. A
+        // missing remote or authentication leaves attestations Unverifiable.
+        {
+            let repo = Repository::open(&root).map_err(CliError::Repository)?;
+            if let Ok((_, remote)) = repo.get_default_remote() {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|error| CliError::Internal(error.into()))?;
+                runtime.block_on(async {
+                    let config = crate::commands::auth::attach_identity(
+                        atomic_remote::HttpRemoteConfig::new(),
+                        &remote.url,
+                        None,
+                    )
+                    .await;
+                    if let Some(client) =
+                        libatomic::signer_refresh::client_for_remote(&remote.url, &config)
+                    {
+                        if let Err(error) = libatomic::signer_refresh::refresh(&repo, &client).await
+                        {
+                            log::warn!("signer refresh: {error}");
+                        }
+                    }
+                });
+            }
+        }
         // Route every form through the service layer (the handler runs
         // the same vault_reindex_kg domain call).
-        if crate::commands::rpc::query_reindex()? {
+        if crate::commands::rpc::query_reindex(self.full)? {
             return Ok(());
         }
         let root = find_repository_root()?;
         let repo = Repository::open(&root).map_err(CliError::Repository)?;
 
+        if self.full {
+            repo.rebuild_kg(true).map_err(CliError::Repository)?;
+        }
         let count = repo.vault_reindex_kg().map_err(CliError::Repository)?;
         println!("Indexed {} nodes + edges.", count);
 
@@ -1831,7 +1799,7 @@ impl Command for QueryEmbed {
 /// Use `--json` for machine-readable output.
 ///
 /// Example plan:
-/// {"steps":[{"type":"kg_search","query":"auth","limit":5,"bind":"results"}]}
+/// {"schema_version":1,"steps":[{"type":"kg_search","query":"auth","limit":5,"bind":"results"}]}
 #[derive(Parser, Debug)]
 pub struct PlanExec {
     /// Output as JSON.
@@ -1883,7 +1851,7 @@ impl Command for PlanExec {
             if !result.nodes.is_empty() {
                 println!("\nNodes ({}):", result.nodes.len());
                 for node in &result.nodes {
-                    print!("  [{}] {}", node.kind, node.label);
+                    print!("  [{}] {}", compact(node.primary_type()), node.label);
                     if let Some(ref s) = node.summary {
                         // Truncate safely for Unicode text.
                         let short: String = s.chars().take(60).collect();
@@ -1968,12 +1936,11 @@ Strategy:
 5. Answer concisely using what you found. Cite file paths and line numbers.
 
 The knowledge graph contains:
-- file nodes (file:path) — tracked files
-- entity nodes (entity:file:name:line) — functions, structs, classes from tree-sitter
-- change nodes (change:hash) — commit history with dates and messages
-- view nodes (view:name) — like branches
-- goal/intent/memory nodes — development sessions and work items
-- edges: MODIFIES, DEFINES, AUTHORED_BY, DEPENDS_ON, REFERENCES, ON_VIEW, etc.";
+- nodes with asserted class IRIs in https://atomic.dev/ns/workflow# (File, Change, View, WorkIntent, Goal, Memory)
+- project-qualified resource IRIs and global full-hash change IRIs; copy IDs from search results
+- predicates: atomic:modifiesFile, atomic:authoredBy, atomic:directlyDependsOnChange, atomic:references, atomic:directlyOnView, atomic:hasPlan, atomic:implements
+- views filter membership in one common graph; directlyOnView is own membership, not inherited visibility
+- source entities and callers are parsed live with list_entities/code_search, never stored in the workflow graph.";
 
 impl Command for QueryAsk {
     fn run(&self) -> CliResult<()> {

@@ -530,6 +530,7 @@ impl Pull {
         let config = self
             .build_remote_config(&remote_url, identity_hint.as_deref())
             .await;
+        let signer_client = libatomic::signer_refresh::client_for_remote(&remote_url, &config);
         let remote = HttpRemote::with_config(&remote_url, config).map_err(|e| {
             finish_error(&spinner, "Failed to connect");
             convert_remote_error(e, &remote_url)
@@ -767,6 +768,11 @@ impl Pull {
                     crate::commands::sidecars::report_sidecars(sidecar_stats);
                 }
             }
+            if let Some(client) = &signer_client {
+                if let Err(error) = libatomic::signer_refresh::refresh(&repo, client).await {
+                    log::warn!("signer key refresh after download failed: {error}");
+                }
+            }
             print_blank();
             print_success(&format!(
                 "Downloaded {} (not inserted - use 'atomic insert' to insert)",
@@ -960,16 +966,10 @@ impl Pull {
             }
         }
 
-        // Enrich the knowledge graph from pulled VCS data (views, files, changes).
-        // This runs for every pull that applies changes, not just vaulted repos.
-        if stats.changes_applied > 0 {
-            // Ensure KG tables exist (idempotent — no-op if already created)
-            if let Err(e) = repo.init_kg() {
-                log::warn!("KG table init failed: {}", e);
-            }
-            match repo.kg_enrich_from_vcs(working_copy) {
-                Ok(kg_stats) => log::info!("KG enriched after pull: {}", kg_stats),
-                Err(e) => log::warn!("KG enrichment after pull failed: {}", e),
+        // Ingestion/membership APIs project regardless of download/apply counts.
+        if let Some(client) = &signer_client {
+            if let Err(error) = libatomic::signer_refresh::refresh(&repo, client).await {
+                log::warn!("signer key refresh after pull failed: {error}");
             }
         }
 

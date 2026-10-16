@@ -34,3 +34,4 @@ pub mod atomic {
 pub use crate::atomic as proto;
 
 pub mod daemon;
+pub mod signer_refresh;

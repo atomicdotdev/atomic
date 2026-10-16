@@ -145,7 +145,7 @@ fn memory_sources(bundle: &EntryBundle) -> crate::commands::memory::bridge::Atte
 fn kg_node_domain(node: &pb::KgNode) -> atomic_core::pristine::vault::KgNode {
     atomic_core::pristine::vault::KgNode {
         id: node.id.clone(),
-        kind: node.node_type.clone(),
+        types: node.types.clone(),
         label: node.name.clone().unwrap_or_default(),
         summary: node
             .data
@@ -160,16 +160,21 @@ fn kg_node_domain(node: &pb::KgNode) -> atomic_core::pristine::vault::KgNode {
 }
 
 /// Wire KGEdge → the domain edge.
-fn kg_edge_domain(edge: &pb::KgEdge) -> atomic_core::pristine::vault::KgEdge {
-    atomic_core::pristine::vault::KgEdge {
+fn kg_edge_domain(edge: &pb::KgEdge) -> CliResult<atomic_core::pristine::vault::KgEdge> {
+    Ok(atomic_core::pristine::vault::KgEdge {
         from_id: edge.source.clone(),
         to_id: edge.target.clone(),
-        kind: edge.relation.clone(),
+        kind: atomic_core::kg::ontology::Predicate::from_iri(&edge.relation).ok_or_else(|| {
+            CliError::Internal(anyhow::anyhow!(
+                "unknown canonical predicate from service: {}",
+                edge.relation
+            ))
+        })?,
         metadata: edge
             .metadata
             .as_ref()
             .and_then(|metadata| serde_json::from_slice(metadata).ok()),
-    }
+    })
 }
 
 pub(crate) fn request_meta() -> Option<pb::RequestMeta> {
@@ -1223,7 +1228,12 @@ pub fn query_search(args: &super::query::QueryNodes) -> CliResult<bool> {
         } else {
             format!("  {}", super::query::truncate_display(summary, 60))
         };
-        println!("  [{}] {}{}", node.kind, node.id, summary_display);
+        println!(
+            "  [{}] {}{}",
+            atomic_core::kg::ontology::compact(node.primary_type()),
+            node.id,
+            summary_display
+        );
     }
     println!("\n{} result(s).", nodes.len());
     Ok(true)
@@ -2648,7 +2658,7 @@ pub fn query_neighbors(args: &super::query::QueryNeighbors) -> CliResult<bool> {
         .edges
         .iter()
         .map(kg_edge_domain)
-        .collect::<Vec<_>>();
+        .collect::<CliResult<Vec<_>>>()?;
     if args.json {
         let subgraph = atomic_core::pristine::vault::KgSubgraph { nodes, edges };
         println!("{}", serde_json::to_string_pretty(&subgraph).unwrap());
@@ -2666,7 +2676,12 @@ pub fn query_neighbors(args: &super::query::QueryNeighbors) -> CliResult<bool> {
         } else {
             format!("  {}", super::query::truncate_display(summary, 50))
         };
-        println!("  [{}] {}{}", node.kind, node.id, summary_display);
+        println!(
+            "  [{}] {}{}",
+            atomic_core::kg::ontology::compact(node.primary_type()),
+            node.id,
+            summary_display
+        );
     }
     println!("\nEdges ({}):", edges.len());
     for edge in &edges {
@@ -6101,7 +6116,7 @@ pub fn query_graph(args: &super::query::QueryGraph) -> CliResult<bool> {
         .edges
         .iter()
         .map(kg_edge_domain)
-        .collect::<Vec<_>>();
+        .collect::<CliResult<Vec<_>>>()?;
     if nodes.is_empty() {
         if args.json {
             println!("{{\"nodes\":[],\"edges\":[]}}");
@@ -6195,60 +6210,17 @@ pub fn query_callers(args: &super::query::QueryCallers) -> CliResult<bool> {
         view: None,
     };
     let response = session.query_graph(request)?;
-    let caller_nodes = response
-        .nodes
-        .iter()
-        .map(kg_node_domain)
-        .collect::<Vec<_>>();
-    let caller_edges = response
-        .edges
-        .iter()
-        .map(kg_edge_domain)
-        .collect::<Vec<_>>();
-
-    if args.json {
-        let out: Vec<serde_json::Value> = caller_edges
-            .iter()
-            .map(|edge| {
-                let node = caller_nodes.iter().find(|node| node.id == edge.from_id);
-                serde_json::json!({
-                    "caller_id": edge.from_id,
-                    "summary": node.and_then(|node| node.summary.as_deref()),
-                })
-            })
-            .collect();
-        println!("{}", serde_json::to_string_pretty(&out).unwrap());
-        return Ok(true);
-    }
-
-    if caller_edges.is_empty() {
-        println!("No callers found for '{}'.", args.entity_id);
-        if !response.calls_present {
-            println!(
-                "Hint: run `atomic vault query enrich` to populate CALLS edges, \
-                then retry."
-            );
-        } else {
-            println!("This function is an entry point — nothing in the repo calls it.");
-        }
-    } else {
-        println!("{} caller(s) of {}:\n", caller_edges.len(), args.entity_id);
-        for edge in &caller_edges {
-            let display = if let Some(rest) = edge.from_id.strip_prefix("entity:") {
-                let last = rest.rfind(':').unwrap_or(rest.len());
-                let inner = &rest[..last];
-                let sig = caller_nodes
-                    .iter()
-                    .find(|node| node.id == edge.from_id)
-                    .and_then(|node| node.summary.as_deref())
-                    .map(|summary| format!("  [{}]", summary));
-                format!("  {}{}", inner, sig.unwrap_or_default())
-            } else {
-                format!("  {}", edge.from_id)
-            };
-            println!("{display}");
-        }
-    }
+    let callers: Vec<_> = response
+        .callers
+        .into_iter()
+        .map(|caller| atomic_repository::repository::Caller {
+            path: caller.path,
+            name: caller.name,
+            line: caller.line,
+            summary: caller.summary,
+        })
+        .collect();
+    super::query::render_callers(&args.entity_id, &callers, args.json)?;
     Ok(true)
 }
 
@@ -6303,7 +6275,11 @@ pub fn query_plan(args: &super::query::PlanExec) -> CliResult<bool> {
         if !result.nodes.is_empty() {
             println!("\nNodes ({}):", result.nodes.len());
             for node in &result.nodes {
-                print!("  [{}] {}", node.kind, node.label);
+                print!(
+                    "  [{}] {}",
+                    atomic_core::kg::ontology::compact(node.primary_type()),
+                    node.label
+                );
                 if let Some(summary) = &node.summary {
                     let short: String = summary.chars().take(60).collect();
                     print!(": {}", short);
@@ -6437,7 +6413,7 @@ pub fn query_embed(args: &super::query::QueryEmbed) -> CliResult<bool> {
 
 /// `atomic query reindex` over MaintainKnowledgeGraph (REINDEX) — the
 /// handler runs vault_reindex_kg; the CLI prints the local report.
-pub fn query_reindex() -> CliResult<bool> {
+pub fn query_reindex(full: bool) -> CliResult<bool> {
     let Some(session) = Service::open()? else {
         return Ok(false);
     };
@@ -6445,7 +6421,7 @@ pub fn query_reindex() -> CliResult<bool> {
         repository: Some(session.reference.clone()),
         meta: request_meta(),
         action: pb::KnowledgeMaintainAction::Reindex as i32,
-        scope: None,
+        scope: full.then(|| "full".to_owned()),
         changes: Vec::new(),
     };
     let response = session.maintain_knowledge_graph(request)?;

@@ -734,7 +734,7 @@ impl<'a> ToolExecutor for RepoToolExecutor<'a> {
                     "properties": {
                         "node_id": {
                             "type": "string",
-                            "description": "Node ID (e.g. \"file:src/main.rs\", \"change:abc123\")"
+                            "description": "Canonical resource IRI copied from a search result; files are project-qualified and changes use their full content hash"
                         },
                         "depth": {
                             "type": "integer",

@@ -160,6 +160,7 @@ impl Repository {
         content: Vec<u8>,
         frontmatter_json: String,
     ) -> Result<Hash, RepositoryError> {
+        self.ensure_project_identity(atomic_core::kg::project_id::MintReason::Upgrade)?;
         let now = chrono::Utc::now().to_rfc3339();
         let entry = VaultEntry::new(entry_type, content, frontmatter_json, now.clone());
         let content_hash = Hash::from_bytes(entry.content_hash);
@@ -179,18 +180,14 @@ impl Repository {
             }
             _ => Vec::new(),
         };
-        if let Some(previous_entry_type) = previous_entry
+        if let Some(_previous_entry_type) = previous_entry
             .as_ref()
             .map(|previous| previous.entry_type)
             .filter(|previous| *previous != entry_type)
         {
             txn.init_kg()
                 .map_err(|e| RepositoryError::Database(e.to_string()))?;
-            txn.del_kg_node(&super::vault_triples::entry_subject(
-                path,
-                previous_entry_type,
-            ))
-            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+            super::vault_triples::delete_vault_projection(&mut txn, path)?;
         }
 
         txn.put_vault_entry(path, &entry)
@@ -233,6 +230,7 @@ impl Repository {
         path: &str,
         entry: &VaultEntry,
     ) -> Result<Hash, RepositoryError> {
+        self.ensure_project_identity(atomic_core::kg::project_id::MintReason::Upgrade)?;
         let content_hash = Hash::from_bytes(entry.content_hash);
         let now = chrono::Utc::now().to_rfc3339();
 
@@ -251,18 +249,14 @@ impl Repository {
             }
             _ => Vec::new(),
         };
-        if let Some(previous_entry_type) = previous_entry
+        if let Some(_previous_entry_type) = previous_entry
             .as_ref()
             .map(|previous| previous.entry_type)
             .filter(|previous| *previous != entry.entry_type)
         {
             txn.init_kg()
                 .map_err(|e| RepositoryError::Database(e.to_string()))?;
-            txn.del_kg_node(&super::vault_triples::entry_subject(
-                path,
-                previous_entry_type,
-            ))
-            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+            super::vault_triples::delete_vault_projection(&mut txn, path)?;
         }
 
         txn.put_vault_entry(path, entry)
@@ -299,17 +293,16 @@ impl Repository {
     /// Called as a side effect of `vault_store` and `vault_store_entry`.
     /// Best-effort — logs on failure but never fails the parent operation.
     fn vault_auto_index(&self, path: &str) {
-        // Signed attestation blobs must not pollute semantic search, and they
-        // contribute no KG triples (vault_extract_kg early-returns empty for
-        // Attestation). Skip embedding entirely for them.
+        // Signed documents contribute typed workflow links, but their serialized
+        // JSON/proof bytes do not belong in semantic content embeddings.
         let is_attestation = matches!(
             self.vault_retrieve(path),
             Ok(Some(e)) if e.entry_type == VaultEntryType::Attestation
         );
 
-        // KG indexing — safe: extract_kg returns empty for Attestation, so
-        // vault_store_kg deletes any stale rows and stores nothing.
-        if let Err(e) = self.vault_index_kg(path) {
+        // Re-resolve references as a set: adding/removing a target can repair
+        // another entry's historical gap without changing that source entry.
+        if let Err(e) = self.vault_reindex_kg() {
             log::debug!("Auto KG index for {}: {}", path, e);
         }
 
@@ -366,6 +359,7 @@ impl Repository {
 
     /// Delete a vault entry by path. Also updates the manifest.
     pub fn vault_delete(&self, path: &str) -> Result<bool, RepositoryError> {
+        self.ensure_project_identity(atomic_core::kg::project_id::MintReason::Upgrade)?;
         let mut txn = self
             .pristine
             .write_txn()
@@ -381,10 +375,6 @@ impl Repository {
         } else {
             Vec::new()
         };
-        let entry_type = previous_entry
-            .as_ref()
-            .map(|entry| entry.entry_type)
-            .unwrap_or_else(|| infer_entry_type(path));
 
         txn.init_kg()
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
@@ -395,13 +385,10 @@ impl Repository {
 
         // KG and embeddings are derived from the Vault entry. Clean both even
         // if the source entry is already missing so a retry repairs stale data.
-        let node_id = super::vault_triples::entry_subject(path, entry_type);
         // Remove projected child nodes (tasks, acceptance criteria, scope,
         // constraints) before the subject so an intent deletion does not orphan
         // them or their SATISFIES/TOUCHES edges. No-op for non-intent subjects.
-        super::vault_triples::delete_intent_child_nodes(&mut txn, &node_id)?;
-        txn.del_kg_node(&node_id)
-            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        super::vault_triples::delete_vault_projection(&mut txn, path)?;
         txn.del_embeddings(path)
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
@@ -417,6 +404,7 @@ impl Repository {
 
         txn.commit()
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        self.vault_reindex_kg()?;
         for update in cascade_updates {
             self.vault_auto_index(&update.path);
             if let Err(error) = self.vault_materialize(&update.path) {

@@ -1,0 +1,63 @@
+@prefix atomic: <https://atomic.dev/ns/workflow#> .
+@prefix shape: <https://atomic.dev/ns/shapes/projection/1.0.0#> .
+@prefix sh: <http://www.w3.org/ns/shacl#> .
+@prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+@prefix prov: <http://www.w3.org/ns/prov#> .
+
+shape:GeneratedChange a sh:NodeShape ;
+  sh:targetObjectsOf atomic:generatedChange ;
+  sh:class atomic:Change ;
+  sh:and (
+    [ sh:or (
+      [ sh:property [ sh:path atomic:implements ; sh:minCount 1 ] ]
+      [ sh:property [ sh:path ( [ sh:inversePath atomic:aboutResource ] atomic:findingCode ) ; sh:hasValue "MissingPlanId" ] ]
+    ) ]
+    [ sh:or (
+      [ sh:property [ sh:path atomic:changeExplainedBy ; sh:minCount 1 ] ]
+      [ sh:property [ sh:path ( [ sh:inversePath atomic:aboutResource ] atomic:findingCode ) ; sh:hasValue "MissingProvenance" ] ]
+    ) ]
+    [ sh:or (
+      [ sh:property [ sh:path atomic:attestedBy ; sh:minCount 1 ] ]
+      [ sh:property [ sh:path ( [ sh:inversePath atomic:aboutResource ] atomic:findingCode ) ; sh:hasValue "MissingAttestation" ] ]
+    ) ]
+  ) ;
+  sh:sparql [
+    sh:message "Change shortcuts must equal the authoritative turn/attestation paths." ;
+    sh:select """
+      PREFIX atomic: <https://atomic.dev/ns/workflow#>
+      SELECT $this WHERE {
+        { $this atomic:implements ?intent . FILTER NOT EXISTS { ?turn atomic:generatedChange $this ; atomic:hasPlan ?intent } }
+        UNION { ?turn atomic:generatedChange $this ; atomic:hasPlan ?intent . FILTER NOT EXISTS { $this atomic:implements ?intent } }
+        UNION { $this atomic:changeExplainedBy ?graph . FILTER NOT EXISTS { ?turn atomic:generatedChange $this ; atomic:turnExplainedBy ?graph } }
+        UNION { ?turn atomic:generatedChange $this ; atomic:turnExplainedBy ?graph . FILTER NOT EXISTS { $this atomic:changeExplainedBy ?graph } }
+        UNION { $this atomic:attestedBy ?attestation . FILTER NOT EXISTS { ?attestation atomic:coversChange $this } }
+        UNION { ?attestation atomic:coversChange $this . FILTER NOT EXISTS { $this atomic:attestedBy ?attestation } }
+      }
+    """
+  ] .
+
+shape:ReferencedResource a sh:NodeShape ;
+  sh:targetObjectsOf atomic:hasTurn, atomic:hasPlan, atomic:generatedChange,
+    atomic:informedBy, atomic:turnExplainedBy, atomic:changeExplainedBy,
+    atomic:hasTodo, atomic:blocks, atomic:blockedBy, atomic:assignedTo,
+    atomic:linkedIntent, atomic:linkedGoal, atomic:references, atomic:hasLabel,
+    atomic:hasTask, atomic:hasAcceptanceCriterion, atomic:hasScopeIn,
+    atomic:hasScopeOut, atomic:hasConstraint, atomic:satisfies, atomic:touches,
+    atomic:scopeOutFile, atomic:remediates, atomic:reviews,
+    atomic:directlyDependsOnChange, atomic:dependsOnIntent, atomic:modifiesFile,
+    atomic:directlyOnView, atomic:sessionViewContext, atomic:childViewOf,
+    atomic:authoredBy, atomic:coversChange, atomic:attests, atomic:attestsSession,
+    atomic:signedBy, atomic:previousAttestation, atomic:implements,
+    atomic:attestedBy, atomic:aboutResource, atomic:verificationResult,
+    atomic:hasIdentity, atomic:issuer, atomic:explainedBy, atomic:dependsOn,
+    atomic:modifies, atomic:hasScopeItem, atomic:ancestorView,
+    atomic:turnOfSession, atomic:governsTurn, atomic:generatedBy, atomic:reviewedBy,
+    prov:wasDerivedFrom, prov:used, prov:wasInformedBy, prov:generated, prov:wasAttributedTo ;
+  sh:nodeKind sh:IRI ;
+  sh:property [ sh:path rdf:type ; sh:minCount 1 ; sh:message "Every referenced canonical resource must exist with an asserted type." ] .
+
+shape:FullHashIdentity a sh:NodeShape ;
+  sh:targetClass atomic:Change, atomic:ProvenanceGraph, atomic:Attestation, atomic:ProjectIdentity ;
+  sh:nodeKind sh:IRI ;
+  sh:pattern "^urn:atomic:(change|provenance|attestation|project-identity):blake3-256:[A-Z2-7]{51}[AQ]$" ;
+  sh:message "Durable content identities require the full canonical Blake3 hash." .

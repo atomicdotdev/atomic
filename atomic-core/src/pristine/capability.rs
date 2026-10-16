@@ -18,9 +18,14 @@ pub const CHANGE_FORMAT_VNEXT_CAPABILITY: RepositoryCapability =
 pub const BRIDGE_CUTOVER_CAPABILITY: RepositoryCapability =
     RepositoryCapability::new("git-bridge-cutover", 1);
 
+pub const KG_SEMWEB_CAPABILITY: RepositoryCapability = RepositoryCapability::new("kg-semweb-v1", 1);
+
 /// Capabilities supported by this Atomic build.
-pub const SUPPORTED_REPOSITORY_CAPABILITIES: &[RepositoryCapability] =
-    &[CHANGE_FORMAT_VNEXT_CAPABILITY, BRIDGE_CUTOVER_CAPABILITY];
+pub const SUPPORTED_REPOSITORY_CAPABILITIES: &[RepositoryCapability] = &[
+    CHANGE_FORMAT_VNEXT_CAPABILITY,
+    BRIDGE_CUTOVER_CAPABILITY,
+    KG_SEMWEB_CAPABILITY,
+];
 
 /// A repository capability and the minimum version required to use it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

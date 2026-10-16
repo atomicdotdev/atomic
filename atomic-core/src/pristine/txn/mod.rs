@@ -9,6 +9,7 @@
 //! - `helpers` - Serialization and utility functions
 
 mod helpers;
+mod kg_identity;
 mod pristine;
 mod read;
 mod write;

@@ -94,6 +94,7 @@ use commands::{
     Record,
     Remote,
     Remove,
+    Repo,
     Restore,
     Revise,
     Sandbox,
@@ -659,6 +660,9 @@ enum Commands {
     /// ```
     Project(ProjectCmd),
 
+    /// Inspect local repository identity and metadata.
+    Repo(Repo),
+
     /// Manage organizations and members.
     ///
     /// Organizations group teams, workspaces, and projects. Each user has
@@ -1061,6 +1065,7 @@ fn main() {
         Commands::Workspace(workspace) => workspace.run(),
 
         Commands::Project(project) => project.run(),
+        Commands::Repo(repo) => repo.run(),
 
         #[cfg(feature = "teams")]
         Commands::Org(org) => org.run(),

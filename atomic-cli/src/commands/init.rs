@@ -543,6 +543,8 @@ impl Command for Init {
             }
             other => CliError::Repository(other),
         })?;
+        repo.ensure_project_identity(atomic_core::kg::project_id::MintReason::Created)
+            .map_err(CliError::Repository)?;
         let working_copy = repo
             .require_working_copy_id()
             .map_err(CliError::Repository)?;

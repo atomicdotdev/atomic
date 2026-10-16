@@ -115,6 +115,7 @@ impl Repository {
         parent_name: Option<&str>,
         seed_from: Option<&str>,
     ) -> Result<(), RepositoryError> {
+        self.ensure_project_identity(atomic_core::kg::project_id::MintReason::Upgrade)?;
         // The overlay chain is anchored on the nearest Shared ancestor of the
         // current view unless a parent is given. Using the nearest SHARED
         // ancestor (instead of the current view directly) prevents sibling
@@ -195,6 +196,10 @@ impl Repository {
         txn.update_view(&new_view)
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
+        if txn.kg_writes_enabled()? {
+            self.project_view_kg(&mut txn)?;
+        }
+
         txn.commit()
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
@@ -210,6 +215,7 @@ impl Repository {
     ///
     /// Returns `ViewAlreadyExists` if the view already exists.
     pub fn create_shared_view(&mut self, name: &str) -> Result<(), RepositoryError> {
+        self.ensure_project_identity(atomic_core::kg::project_id::MintReason::Upgrade)?;
         ensure_workspace_dir(&self.dot_dir, name)?;
 
         let mut txn = self
@@ -230,6 +236,10 @@ impl Repository {
         txn.create_view(name, ViewScope::Shared, None)
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
+        if txn.kg_writes_enabled()? {
+            self.project_view_kg(&mut txn)?;
+        }
+
         txn.commit()
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
@@ -241,6 +251,7 @@ impl Repository {
     /// This is useful after `git import` which creates Draft views by
     /// default.
     pub fn set_view_scope(&self, name: &str, scope: ViewScope) -> Result<(), RepositoryError> {
+        self.ensure_project_identity(atomic_core::kg::project_id::MintReason::Upgrade)?;
         let mut txn = self
             .pristine
             .write_txn()
@@ -264,6 +275,10 @@ impl Repository {
 
         txn.update_view(&view)
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+        if txn.kg_writes_enabled()? {
+            self.project_view_kg(&mut txn)?;
+        }
 
         txn.commit()
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
@@ -289,6 +304,7 @@ impl Repository {
         scope: ViewScope,
         parent_name: Option<&str>,
     ) -> Result<(), RepositoryError> {
+        self.ensure_project_identity(atomic_core::kg::project_id::MintReason::Upgrade)?;
         let mut txn = self
             .pristine
             .write_txn()
@@ -322,6 +338,10 @@ impl Repository {
 
         txn.update_view(&view)
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+        if txn.kg_writes_enabled()? {
+            self.project_view_kg(&mut txn)?;
+        }
 
         txn.commit()
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
@@ -491,6 +511,7 @@ impl Repository {
     /// - The view is the current view (cannot delete current view)
     /// - The database operation fails
     pub fn delete_view(&mut self, name: &str) -> Result<(), RepositoryError> {
+        self.ensure_project_identity(atomic_core::kg::project_id::MintReason::Upgrade)?;
         // Cannot delete the current view
         if name == self.current_view {
             return Err(RepositoryError::CannotDeleteCurrentView {
@@ -542,6 +563,8 @@ impl Repository {
 
         txn.commit()
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+        self.kg_enrich_views()?;
 
         // Only clean up legacy shelved artifacts after deletion is durable.
         // A refused deletion or failed commit must preserve the user's files.
@@ -681,6 +704,7 @@ impl Repository {
         scope: ViewScope,
         parent_name: Option<&str>,
     ) -> Result<(), RepositoryError> {
+        self.ensure_project_identity(atomic_core::kg::project_id::MintReason::Upgrade)?;
         ensure_workspace_dir(&self.dot_dir, name)?;
 
         let mut txn = self
@@ -712,6 +736,10 @@ impl Repository {
 
         txn.create_view(name, scope, parent_id)
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+        if txn.kg_writes_enabled()? {
+            self.project_view_kg(&mut txn)?;
+        }
 
         txn.commit()
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
