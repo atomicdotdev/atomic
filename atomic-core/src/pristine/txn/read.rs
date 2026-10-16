@@ -51,6 +51,7 @@ use super::helpers::{
 /// can be active simultaneously.
 pub struct ReadTxn {
     pub(crate) txn: ReadTransaction,
+    pub(crate) legacy_applied_changes: std::sync::OnceLock<std::collections::HashSet<u64>>,
 }
 
 fn operation_serialization_error(error: impl std::fmt::Display) -> PristineError {
@@ -109,7 +110,10 @@ fn decode_working_copy_row(
 impl ReadTxn {
     /// Create a new read transaction
     pub(crate) fn new(txn: ReadTransaction) -> Self {
-        Self { txn }
+        Self {
+            txn,
+            legacy_applied_changes: std::sync::OnceLock::new(),
+        }
     }
 
     /// Open the INODE_GRAPH table for shared use across multiple operations.

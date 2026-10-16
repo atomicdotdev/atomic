@@ -474,6 +474,11 @@ fn apply_change_hunks_locked(
         log::debug!("write_change_to_graph: no FileOps to apply");
     }
 
+    // Vertex ownership cannot prove application of edge-only deletions,
+    // attribute-only changes or empty commits. Publish completion with the
+    // complete effects in this transaction, independently of view membership.
+    txn.mark_change_applied(change_id)
+        .map_err(|error| InsertError::Database(error.to_string()))?;
     Ok(())
 }
 

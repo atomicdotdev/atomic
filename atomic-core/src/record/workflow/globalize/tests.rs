@@ -354,6 +354,11 @@ mod tests {
             .unwrap();
             txn.put_graph(name, SerializedGraphEdge::new(alive, loser, name_change))
                 .unwrap();
+            txn.put_graph(
+                name,
+                SerializedGraphEdge::new(alive | EdgeFlags::PARENT, source.end_pos(), name_change),
+            )
+            .unwrap();
             for (inode, introduced_by) in [(winner, winner_change), (loser, loser_change)] {
                 txn.put_graph(
                     GraphNode::new(inode.change, inode.pos, inode.pos),
@@ -403,6 +408,24 @@ mod tests {
             solve_ctx.dependencies(),
             &HashSet::from([winner_hash, loser_hash, parent_hash, name_hash])
         );
+
+        // The RecordedFile pipeline must emit the same valid, non-empty
+        // operation, keeping the winner rather than the losing inode.
+        let mut recorded = crate::record::workflow::RecordedFile::new("src/conflict.txt");
+        recorded.set_inode(Inode::new(2));
+        recorded.set_position(loser);
+        recorded.set_name_conflict_resolution(winner, vec![name]);
+        let mut recorded_ctx = GlobalizeContext::new(&txn);
+        let globalized =
+            globalize_recorded_file(&mut recorded_ctx, &recorded, &GlobalizeOptions::new())
+                .unwrap();
+        assert_eq!(globalized.hunks().len(), 1);
+        let GraphOp::SolveNameConflict { name: update, .. } = &globalized.hunks()[0] else {
+            panic!("recorded name resolution must produce SolveNameConflict");
+        };
+        assert_eq!(update.inode, solve_update.inode);
+        assert_eq!(update.edges, solve_update.edges);
+        assert_eq!(recorded_ctx.dependencies(), solve_ctx.dependencies());
 
         let mut unsolve_ctx = GlobalizeContext::new(&txn);
         let unsolve = globalize_unsolve_name_conflict(

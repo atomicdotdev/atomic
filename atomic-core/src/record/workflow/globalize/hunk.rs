@@ -130,6 +130,37 @@ where
 
     match built.kind {
         BuiltHunkKind::Insert => {
+            // ::26 R1 fourth follow-up (2026-10-13): the positional line→vertex
+            // mapping in `classify_insert` is only provable when the alive graph
+            // holds exactly one content vertex per old-file line. Histories with
+            // many accumulated in-place edits leave extra alive vertices (diamond
+            // remnants the walk-through-dead re-attaches), so an insertion anchors
+            // at silent wrong vertices and the staged render loses content
+            // (atomicdotdev/atomic commit b110aa70: rendered 68,762 of 74,206
+            // bytes after 71 in-place edits). When the counts diverge, escalate
+            // to the whole-file replace — every alive vertex is deleted and the
+            // full content inserted fresh per line, which renders byte-exactly
+            // regardless of the diamond structure.
+            if let Some(expected) = old_line_count {
+                let sorted = collect_sorted_content_vertices_cached(ctx, inode, inode_pos)?;
+                if sorted.len() != expected {
+                    log::warn!(
+                        "globalize_hunk: vertex/line divergence on {} ({} vertices for {} lines); \
+                         escalating to whole-file replace",
+                        local.path,
+                        sorted.len(),
+                        expected
+                    );
+                    return globalize_replace_whole_file(
+                        ctx,
+                        inode,
+                        inode_pos,
+                        full_content,
+                        local,
+                        encoding,
+                    );
+                }
+            }
             match globalize_insert(
                 ctx,
                 built,
@@ -192,6 +223,7 @@ where
     T: GraphTxnT + TreeTxnT + InodeGraphOps,
 {
     let vertices = collect_sorted_content_vertices_cached(ctx, inode, inode_pos)?;
+
     let position = classify_insert(&vertices, inode_pos, built.old_start, old_line_count)?;
 
     let (predecessors, successors) = match position {
@@ -514,7 +546,10 @@ where
     // change, including zero-byte files whose deletion has no content edges.
     ctx.add_dependency_by_id(inode_pos.change)?;
 
-    if should_use_opaque_generated_vertices(&local.path) {
+    // An empty range denotes deletion of the file itself. Generated-file
+    // content optimizations must not turn that lifecycle operation into an
+    // Edit: it needs the same canonical FileDel as every other file.
+    if should_use_opaque_generated_vertices(&local.path) && !built.deleted_lines.is_empty() {
         let content_vertices = find_content_vertices(ctx.txn(), inode, inode_pos)?;
         let deletion_edges = build_deletion_edges(ctx, &content_vertices)?;
         let deletion = EdgeUpdate {

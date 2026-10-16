@@ -1122,6 +1122,18 @@ impl Repository {
                 && !absent.directory
                 && !alive_inodes.contains(&absent.inode)
                 && !alive_paths.contains(&absent.path)
+                // A name resolution deliberately retains the losing inode's
+                // content as history. Those bytes cannot resurrect a removed
+                // name (including its pre-rename path). Require a live name
+                // in this exact graph closure before content-based recovery.
+                && !super::materialize::live_names_for_path(
+                    txn,
+                    &self.change_store,
+                    absent.position,
+                    &absent.path,
+                    &visibility.iter_dependency_first().copied().collect(),
+                )?
+                .is_empty()
             {
                 let check_start = std::time::Instant::now();
                 let alive = self.inode_renders_alive_content(

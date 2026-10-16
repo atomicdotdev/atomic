@@ -33,6 +33,7 @@ impl Fault {
 
 #[derive(Default)]
 struct FaultGraphTxn {
+    forward_calls: std::cell::Cell<usize>,
     edges: HashMap<GraphNode<NodeId>, Vec<SerializedGraphEdge>>,
     blocks: HashMap<Position<NodeId>, GraphNode<NodeId>>,
     block_ends: HashMap<Position<NodeId>, GraphNode<NodeId>>,
@@ -92,6 +93,9 @@ impl GraphTxnT for FaultGraphTxn {
         min_flag: EdgeFlags,
         max_flag: EdgeFlags,
     ) -> Result<Self::Adj, PristineError> {
+        if !min_flag.contains(EdgeFlags::PARENT) {
+            self.forward_calls.set(self.forward_calls.get() + 1);
+        }
         let item_fault = if min_flag.contains(EdgeFlags::PARENT) {
             self.parent_item_faults.get(&node)
         } else {
@@ -957,4 +961,303 @@ fn test_retrieve_result_fields() {
     assert!(result.truncated);
     assert_eq!(result.positions_visited, 100);
     assert_eq!(result.edges_traversed, 500);
+}
+
+// A deleted intermediate node must be contracted at its actual predecessor.
+// In Hyperfine commit 65 the direct child is downstream of the bypass child;
+// deferring the bypass to that direct child creates a cycle that is absent
+// from the canonical graph.
+fn bypass_fixture(
+    ordered: bool,
+    reverse_edges: bool,
+) -> (
+    FaultGraphTxn,
+    Position<NodeId>,
+    GraphNode<NodeId>,
+    GraphNode<NodeId>,
+) {
+    let mut txn = FaultGraphTxn::default();
+    let start = test_pos(1, 0);
+    let root = start.inode_node();
+    let dead = test_node(2, 0, 10);
+    let bypass = test_node(3, 0, 10);
+    let direct = test_node(4, 0, 10);
+    for node in [root, dead, bypass, direct] {
+        txn.resolve_block(node.start_pos(), node);
+        txn.resolve_block_end(node.end_pos(), node);
+    }
+    for (from, to, flags) in [
+        (root, dead, EdgeFlags::BLOCK | EdgeFlags::DELETED),
+        (root, direct, EdgeFlags::BLOCK),
+        (dead, bypass, EdgeFlags::BLOCK),
+    ] {
+        txn.add_edge(from, flags, to.start_pos());
+        txn.add_edge(to, flags | EdgeFlags::PARENT, from.end_pos());
+    }
+    if ordered {
+        txn.add_edge(bypass, EdgeFlags::BLOCK, direct.start_pos());
+        txn.add_edge(
+            direct,
+            EdgeFlags::PARENT | EdgeFlags::BLOCK,
+            bypass.end_pos(),
+        );
+    }
+    if reverse_edges {
+        for edges in txn.edges.values_mut() {
+            edges.reverse();
+        }
+    }
+    (txn, start, bypass, direct)
+}
+
+#[test]
+fn bypass_does_not_reverse_canonical_order() {
+    for reverse in [false, true] {
+        let (txn, start, bypass, direct) = bypass_fixture(true, reverse);
+        let result = retrieve_graph(
+            &txn,
+            start,
+            RetrieveOptions::new()
+                .with_graph_visibility(visibility([1, 2, 3, 4, 99].map(NodeId::new))),
+        )
+        .unwrap();
+        let find = |node| {
+            result
+                .graph
+                .iter_vertices()
+                .find(|(_, v)| v.node == node)
+                .unwrap()
+                .0
+        };
+        let a = find(bypass);
+        let b = find(direct);
+        assert!(super::alive_graph_reaches(&result.graph, a, b));
+        assert!(
+            !super::alive_graph_reaches(&result.graph, b, a),
+            "bypass created a reverse edge"
+        );
+        assert!(super::alive_graph_reaches(
+            &result.graph,
+            VertexId::new(1),
+            a
+        ));
+    }
+}
+
+#[test]
+fn bypass_preserves_unordered_successors() {
+    for reverse in [false, true] {
+        let (txn, start, bypass, direct) = bypass_fixture(false, reverse);
+        let result = retrieve_graph(
+            &txn,
+            start,
+            RetrieveOptions::new()
+                .with_graph_visibility(visibility([1, 2, 3, 4, 99].map(NodeId::new))),
+        )
+        .unwrap();
+        let find = |node| {
+            result
+                .graph
+                .iter_vertices()
+                .find(|(_, v)| v.node == node)
+                .unwrap()
+                .0
+        };
+        let a = find(bypass);
+        let b = find(direct);
+        assert!(super::alive_graph_reaches(
+            &result.graph,
+            VertexId::new(1),
+            a
+        ));
+        assert!(super::alive_graph_reaches(
+            &result.graph,
+            VertexId::new(1),
+            b
+        ));
+        assert!(!super::alive_graph_reaches(&result.graph, a, b));
+        assert!(
+            !super::alive_graph_reaches(&result.graph, b, a),
+            "bypass serialized independent successors"
+        );
+    }
+}
+
+#[test]
+fn adjacent_replacement_contexts_follow_visible_graph_witnesses() {
+    for reverse_edges in [false, true] {
+        let mut txn = FaultGraphTxn::default();
+        let root = test_node(1, 0, 0);
+        let old_a = test_node(1, 10, 20);
+        let old_b = test_node(1, 20, 30);
+        let tail = test_node(1, 30, 40);
+        let new_a = test_node(2, 0, 10);
+        let new_b = test_node(3, 0, 10);
+        for node in [root, old_a, old_b, tail, new_a, new_b] {
+            txn.resolve_block(node.start_pos(), node);
+            txn.resolve_block_end(node.end_pos(), node);
+        }
+        for (from, to, deleted, change) in [
+            (root, old_a, false, 1),
+            (old_a, old_b, false, 1),
+            (old_b, tail, false, 1),
+            (root, old_a, true, 2),
+            (root, new_a, false, 2),
+            (new_a, old_b, false, 2),
+            (old_a, old_b, true, 3),
+            (old_a, new_b, false, 3),
+            (new_b, tail, false, 3),
+        ] {
+            let flags = if deleted {
+                EdgeFlags::BLOCK | EdgeFlags::DELETED
+            } else {
+                EdgeFlags::BLOCK
+            };
+            txn.edges
+                .entry(from)
+                .or_default()
+                .push(SerializedGraphEdge::new(
+                    flags,
+                    to.start_pos(),
+                    NodeId::new(change),
+                ));
+            txn.edges
+                .entry(to)
+                .or_default()
+                .push(SerializedGraphEdge::new(
+                    flags | EdgeFlags::PARENT,
+                    from.end_pos(),
+                    NodeId::new(change),
+                ));
+        }
+        if reverse_edges {
+            for edges in txn.edges.values_mut() {
+                edges.reverse();
+            }
+        }
+        for (changes, first, second) in [
+            (vec![1, 2, 3], new_a, new_b),
+            (vec![1, 3, 2], new_a, new_b),
+            (vec![1, 2], new_a, old_b),
+            (vec![1, 3], old_a, new_b),
+            (vec![1], old_a, old_b),
+        ] {
+            let result = retrieve_graph(
+                &txn,
+                root.start_pos(),
+                RetrieveOptions::new()
+                    .with_graph_visibility(visibility(changes.into_iter().map(NodeId::new))),
+            )
+            .unwrap();
+            let find = |node| {
+                result
+                    .graph
+                    .iter_vertices()
+                    .find(|(_, v)| v.node == node)
+                    .unwrap()
+                    .0
+            };
+            assert!(super::alive_graph_reaches(
+                &result.graph,
+                find(first),
+                find(second)
+            ));
+            assert!(!super::alive_graph_reaches(
+                &result.graph,
+                find(second),
+                find(first)
+            ));
+            assert!(super::alive_graph_reaches(
+                &result.graph,
+                find(second),
+                find(tail)
+            ));
+        }
+    }
+}
+
+#[test]
+fn liveness_checks_scan_shared_dead_history_once() {
+    // Whole-file replacements leave many root edges into overlapping dead
+    // chains. The boolean query must visit their union, not each suffix again.
+    let mut txn = FaultGraphTxn::default();
+    let root = test_node(1, 0, 0);
+    let count = 80;
+    for i in 0..count {
+        let node = test_node(2, i * 10, i * 10 + 10);
+        txn.resolve_block(node.start_pos(), node);
+        txn.resolve_block_end(node.end_pos(), node);
+        txn.add_edge(
+            root,
+            EdgeFlags::BLOCK | EdgeFlags::DELETED,
+            node.start_pos(),
+        );
+        txn.add_edge(
+            node,
+            EdgeFlags::PARENT | EdgeFlags::BLOCK | EdgeFlags::DELETED,
+            root.end_pos(),
+        );
+        if i + 1 < count {
+            txn.add_edge(
+                node,
+                EdgeFlags::BLOCK | EdgeFlags::DELETED,
+                test_pos(2, (i + 1) * 10),
+            );
+        }
+    }
+    txn.resolve_block_end(root.end_pos(), root);
+    let opts = RetrieveOptions::new()
+        .with_graph_visibility(visibility([
+            NodeId::new(1),
+            NodeId::new(2),
+            NodeId::new(99),
+        ]))
+        .stop_at_first_content(true);
+    // Ordinary rendering must also avoid re-scanning wholly dead suffixes.
+    let full = retrieve_graph(
+        &txn,
+        root.start_pos(),
+        opts.clone().stop_at_first_content(false),
+    )
+    .unwrap();
+    assert_eq!(full.graph.total_bytes(), 0);
+    assert!(
+        txn.forward_calls.get() <= count as usize * 3 + 1,
+        "full rendering re-scanned dead suffixes: {} reads",
+        txn.forward_calls.get()
+    );
+    txn.forward_calls.set(0);
+    let result = retrieve_graph(&txn, root.start_pos(), opts).unwrap();
+    assert_eq!(result.graph.total_bytes(), 0);
+    assert!(
+        txn.forward_calls.get() <= count as usize + 1,
+        "dead suffixes were traversed repeatedly: {} reads",
+        txn.forward_calls.get()
+    );
+}
+
+#[test]
+fn liveness_checks_stop_inside_dead_walk_after_finding_content() {
+    let mut txn = FaultGraphTxn::default();
+    let (start, dead, dead_end) = add_dead_walk_prefix(&mut txn);
+    let live = test_node(3, 0, 10);
+    txn.add_edge(dead, EdgeFlags::BLOCK, live.start_pos());
+    txn.resolve_block(live.start_pos(), live);
+    txn.add_edge(live, EdgeFlags::PARENT | EdgeFlags::BLOCK, dead_end);
+    txn.resolve_block_end(dead_end, dead);
+    // A later sibling is irrelevant once live bytes have been proven.
+    txn.add_edge(dead, EdgeFlags::BLOCK, test_pos(4, 0));
+    txn.fail_find_block(test_pos(4, 0), Fault::Inconsistent("unneeded tail"));
+    let result = retrieve_graph(
+        &txn,
+        start,
+        RetrieveOptions::new().stop_at_first_content(true),
+    )
+    .unwrap();
+    assert_eq!(result.graph.total_bytes(), 10);
+    // Ordinary reconstruction still walks and validates the complete graph.
+    assert_inconsistent(
+        retrieve_graph(&txn, start, RetrieveOptions::new()),
+        "unneeded tail",
+    );
 }

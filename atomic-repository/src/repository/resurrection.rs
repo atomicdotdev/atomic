@@ -1237,7 +1237,7 @@ impl Repository {
                 },
             )?;
             let change = self.load_change(hash)?;
-            let already_applied = txn.has_change_in_graph(change_id).map_err(pristine_map)?;
+            let already_applied = txn.was_change_applied(change_id).map_err(pristine_map)?;
             let tree_projection =
                 self.plan_tree_projection(&mut txn, change_id, *hash, &change, &[], false)?;
             tree_projection.apply_prerequisites(&mut *txn)?;

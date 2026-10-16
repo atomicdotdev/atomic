@@ -239,11 +239,30 @@ impl Command for Hooks {
                     }
                 }
             }
-            None => find_repository_root().map_err(|e| {
-                // Log to stderr — the agent should continue even if Atomic can't find a repo
-                eprintln!("[atomic] Warning: {}", e);
-                e
-            })?,
+            None => match find_repository_root() {
+                Ok(root) => root,
+                Err(error @ CliError::RepositoryNotFound { .. }) => {
+                    // Same state as the hints path: the hook ran outside an
+                    // Atomic repository (or the repository disappeared since
+                    // the caller's probe). Nothing to record — exit quietly
+                    // instead of failing the hook (and, through the agent
+                    // bridge plugins' strict tool propagation, the tool call).
+                    log::warn!(
+                        "hooks: no Atomic repository for {} {}: {}",
+                        self.agent_name,
+                        self.verb,
+                        error
+                    );
+                    if let Some(response) = agent.stdout_response(hook_type) {
+                        println!("{}", response);
+                    }
+                    return Ok(());
+                }
+                // Only the genuine not-an-Atomic-repository state is quiet.
+                // Any other discovery failure (I/O and friends) stays fatal:
+                // swallowing it would hide real breakage behind exit 0.
+                Err(error) => return Err(error),
+            },
         };
 
         // Hooks are never suppressed under a managed run: sessions adopt its

@@ -95,6 +95,7 @@ pub(crate) fn visit_tables(visitor: &mut impl TableVisitor) -> PristineResult<()
     visitor.multimap(CHANGE_DEPS)?;
     visitor.multimap(REV_CHANGE_DEPS)?;
     visitor.table(CHANGE_DEPS_INDEXED)?;
+    visitor.table(APPLIED_CHANGES)?;
 
     // State and tags
     visitor.table(STATES)?;

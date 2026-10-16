@@ -876,6 +876,8 @@ impl Command for Import {
             let branches = self.get_all_branches(&git_repo)?;
 
             let mut total_imported = 0;
+            let checked_out_branch = current_git_branch(&git_repo);
+            let mut checked_out_verification = None;
             for branch_name in branches {
                 let preserve_branch_working_copy =
                     preserve_current_view && original_view != branch_name;
@@ -885,6 +887,13 @@ impl Command for Import {
                             "missing prevalidated import plan for '{branch_name}'"
                         ))
                     })?;
+                if checked_out_branch.as_deref() == Some(branch_name.as_str()) {
+                    if let (Some(expected), Some(raw)) =
+                        (plan.expected_git_tree(), plan.raw_git_tree())
+                    {
+                        checked_out_verification = Some((branch_name.clone(), expected, raw));
+                    }
+                }
 
                 // Ensure the view exists
                 if !repo
@@ -951,8 +960,17 @@ impl Command for Import {
                 print_info(
                     "Working copy materialization deferred to the explicit command boundary (metadata-only reactive budget).",
                 );
+            } else if let Some(checked_out) = current_git_branch(&git_repo) {
+                // Importing every branch must finish on the checked-out branch,
+                // not whichever ref happened to sort last. Its complete target
+                // tree has passed the same preflight and publication checks as
+                // single-branch import, so adopt Git's existing materialization.
+                repo.align_to_view(working_copy, &checked_out)
+                    .map_err(|e| CliError::Internal(e.into()))?;
+                print_info("Using Git working copy as imported materialization.");
+                reindex_working_copy(&repo, working_copy);
             } else {
-                // Materialize the working copy from the graph
+                // Detached imports have no checked-out branch to adopt.
                 print_info("Materializing working copy...");
                 match repo.materialize(working_copy) {
                     Ok(result) => {
@@ -989,6 +1007,22 @@ impl Command for Import {
                 "Imported {} total changes across all branches",
                 total_imported
             ));
+            if !self.skip_checkpoint_refresh {
+                if let Some((view, expected, raw)) = checked_out_verification {
+                    // Use the same canonical tree proof as single-branch import.
+                    // The generic native-status fallback interprets escaped Git
+                    // names as disk names and is not an import equivalence proof.
+                    super::bridge::refresh_checkpoint_after_verified_import(
+                        &repo,
+                        working_copy,
+                        &git_repo,
+                        &view,
+                        &expected,
+                        &raw,
+                    )?;
+                    checkpoint_refreshed = true;
+                }
+            }
         } else {
             // Import single branch
             let branch_name = self.branch.clone().unwrap_or(default_branch);
@@ -1253,7 +1287,8 @@ fn reindex_working_copy(repo: &Repository, working_copy: WorkingCopyId) {
     let mut entries: Vec<(String, i64, u32, u64, Hash)> = Vec::new();
 
     for file in &tracked {
-        let abs = repo_root.join(&file.path);
+        let path = file.path.to_string_lossy();
+        let abs = repo_root.join(super::parallel::canonical_tree_path(&path));
         if let Ok(metadata) = std::fs::metadata(&abs) {
             let mtime = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
             let duration = mtime
@@ -1261,7 +1296,7 @@ fn reindex_working_copy(repo: &Repository, working_copy: WorkingCopyId) {
                 .unwrap_or_default();
             if let Ok(bytes) = std::fs::read(&abs) {
                 entries.push((
-                    file.path.to_string_lossy().replace('\\', "/"),
+                    path.into_owned(),
                     duration.as_secs() as i64,
                     duration.subsec_nanos(),
                     metadata.len(),

@@ -128,6 +128,15 @@ pub fn retrieve_graph<T: GraphTxnT>(
     let mut chain_memo: HashMap<(GraphNode<NodeId>, GraphNode<NodeId>), bool> = HashMap::new();
     // Shared causal-dominance memo across every aliveness check in this walk.
     let mut dep_memo: HashMap<(NodeId, NodeId), bool> = HashMap::new();
+    let mut dead_contexts = std::collections::HashSet::new();
+    // A liveness query needs only reachability to any live bytes, independent
+    // of the owner-specific ordering of bypass edges. Share dead visits across
+    // root edges so overlapping deleted histories are scanned once.
+    let mut liveness_dead_seen = std::collections::HashSet::new();
+    // Negative reachability proofs are independent of the bypass owner.
+    // Reuse only fully explored subgraphs with no live successor at all;
+    // positive walks retain their owner-specific ordering and attachment.
+    let mut empty_dead_subgraphs = std::collections::HashSet::new();
 
     // Add dummy span at index 0
     result.graph.push_vertex(AliveVertex::DUMMY);
@@ -159,14 +168,6 @@ pub fn retrieve_graph<T: GraphTxnT>(
     // When a change filter is active we need to see deleted edges so we can
     // decide whether the deletion "has happened" from our view's perspective.
     let include_deleted = options.include_deleted_edges();
-
-    // Deferred bypass attachments: when a vertex has both direct alive
-    // children AND bypass children (live successors discovered through a
-    // dead chain), we attach the bypass children to the LAST direct
-    // child rather than to this vertex.  Since that direct child is
-    // still on the stack and hasn't been processed yet, we record the
-    // attachment here and apply it when the direct child pops.
-    let mut pending_bypass: HashMap<VertexId, Vec<VertexId>> = HashMap::new();
 
     while let Some(vid) = stack.pop() {
         // Liveness fast path (review E4): the moment the traversal holds
@@ -205,24 +206,13 @@ pub fn retrieve_graph<T: GraphTxnT>(
         // bypass children (live successors discovered by walking through
         // adjacent dead vertices) separately.
         //
-        // The byte-graph alone does not encode whether a bypass-child
-        // (e.g. a replacement of a later line in the dead chain) is
-        // concurrent with a direct child (e.g. a replacement of an
-        // earlier line).  In practice, when both exist, the bypass child
-        // sits *after* the direct child in the linearised output — the
-        // direct child is the FIRST replacement off this vertex, and the
-        // bypass surfaces a deeper replacement reachable through the
-        // dead chain that the direct child also leads into.
-        //
-        // After processing all edges we either:
-        //   * attach bypass children directly when there is no direct
-        //     alive child, or
-        //   * attach them to the last direct alive child so they appear
-        //     downstream rather than as a concurrent fork.
         let mut children_to_add: Vec<(Option<SerializedGraphEdge>, VertexId)> = Vec::new();
         let mut bypass_children: Vec<VertexId> = Vec::new();
 
         for edge in forward_edges {
+            if options.stop_at_first_content && result.graph.total_bytes() > 0 {
+                break;
+            }
             result.edges_traversed += 1;
 
             let dest_pos = edge.dest;
@@ -261,6 +251,7 @@ pub fn retrieve_graph<T: GraphTxnT>(
                 )?;
 
                 if !dest_alive {
+                    dead_contexts.insert((vid, resolved_vertex));
                     let successors = walk_through_dead(
                         txn,
                         &options,
@@ -271,6 +262,8 @@ pub fn retrieve_graph<T: GraphTxnT>(
                         &mut alive_memo,
                         &mut chain_memo,
                         &mut dep_memo,
+                        &mut liveness_dead_seen,
+                        &mut empty_dead_subgraphs,
                         &mut result,
                     )?;
                     // Collect bypass children; placement decided after
@@ -308,6 +301,7 @@ pub fn retrieve_graph<T: GraphTxnT>(
                         // emitting it, but walk THROUGH it to find live
                         // successors so we don't lose unrelated downstream
                         // content (no pseudo-edges in the additive model).
+                        dead_contexts.insert((vid, resolved_vertex));
                         let successors = walk_through_dead(
                             txn,
                             &options,
@@ -318,6 +312,8 @@ pub fn retrieve_graph<T: GraphTxnT>(
                             &mut alive_memo,
                             &mut chain_memo,
                             &mut dep_memo,
+                            &mut liveness_dead_seen,
+                            &mut empty_dead_subgraphs,
                             &mut result,
                         )?;
                         for succ_vid in successors {
@@ -333,6 +329,7 @@ pub fn retrieve_graph<T: GraphTxnT>(
                 } else {
                     // Span is not alive, skip — but still walk through
                     // to find live successors.
+                    dead_contexts.insert((vid, resolved_vertex));
                     let successors = walk_through_dead(
                         txn,
                         &options,
@@ -343,6 +340,8 @@ pub fn retrieve_graph<T: GraphTxnT>(
                         &mut alive_memo,
                         &mut chain_memo,
                         &mut dep_memo,
+                        &mut liveness_dead_seen,
+                        &mut empty_dead_subgraphs,
                         &mut result,
                     )?;
                     for succ_vid in successors {
@@ -379,47 +378,15 @@ pub fn retrieve_graph<T: GraphTxnT>(
             }
         }
 
-        // Place bypass children.
-        //
-        // If this vertex has at least one direct alive child, defer the
-        // bypass children so they attach to the LAST direct child when
-        // it's processed — they sit downstream of it in the linearised
-        // output, not as concurrent siblings. If there is no direct
-        // alive child, attach them directly so they appear after this
-        // vertex.
-        if !bypass_children.is_empty() {
-            // In the insert-path graph, bypass successors reached through
-            // dead chains belong after the downstream surviving child, not
-            // alongside the first direct child. Attaching them to the
-            // last direct child preserves linear file order when a change
-            // both replaces an earlier line and carries through to later
-            // descendants in the same chain.
-            let direct_child =
-                children_to_add
-                    .iter()
-                    .rev()
-                    .find_map(|(_, v)| if !v.is_dummy() { Some(*v) } else { None });
-
-            if let Some(direct) = direct_child {
-                pending_bypass
-                    .entry(direct)
-                    .or_default()
-                    .extend(bypass_children.iter().copied());
-            } else {
-                for succ_vid in &bypass_children {
-                    if !children_to_add.iter().any(|(_, v)| v == succ_vid) {
-                        children_to_add.push((None, *succ_vid));
-                    }
-                }
-            }
-        }
-
-        // Apply any deferred bypass attachments for THIS vertex.
-        if let Some(deferred) = pending_bypass.remove(&vid) {
-            for succ_vid in deferred {
-                if !children_to_add.iter().any(|(_, v)| *v == succ_vid) {
-                    children_to_add.push((None, succ_vid));
-                }
+        // Contract a dead chain at the predecessor from which it was reached.
+        // A bypass successor may precede a direct child, or be concurrent with
+        // it. Attaching it to an arbitrary direct child invents an ordering
+        // edge (and can create a cycle). It can also lose the attachment if
+        // that child has already been processed. Keep the canonical reachability
+        // relation here; the output graph handles redundant paths and forks.
+        for successor in bypass_children {
+            if !children_to_add.iter().any(|(_, child)| *child == successor) {
+                children_to_add.push((None, successor));
             }
         }
 
@@ -439,7 +406,106 @@ pub fn retrieve_graph<T: GraphTxnT>(
         }
     }
 
+    // The opt-in boolean query does not need to reconstruct line ordering.
+    if options.stop_at_first_content {
+        return Ok(result);
+    }
+
+    // Adjacent independent replacements leave each new span anchored to
+    // deleted old context. For old A -> B, replacing A with X and B with Y
+    // records X -> old B and old A -> Y. Contracting old spans alone loses
+    // X -> Y. Recover that ordering only with both replacement witnesses:
+    // Y was inserted where B was deleted, and X descends from the replacement
+    // of B's old predecessor A. Unrelated same-anchor inserts remain forks.
+    // Resolve after traversal so discovery/edge order cannot hide a claimant.
+    let mut replacement_cache = HashMap::new();
+    for (owner_vid, dead) in dead_contexts {
+        let owner = result.graph.get_vertex(owner_vid).node;
+        for (predecessor, replacement) in
+            replacement_roots(txn, &options, dead, &mut replacement_cache)?
+        {
+            if memo_vertex_alive(&options, txn, predecessor, &mut alive_memo, &mut dep_memo)? {
+                continue;
+            }
+            let Some(&replacement_vid) = cache.get(&replacement) else {
+                continue;
+            };
+            if owner == replacement
+                || memo_visible_chain_reaches(txn, &options, replacement, owner, &mut chain_memo)?
+            {
+                continue;
+            }
+            let mut replaces_predecessor = false;
+            for (_, predecessor_replacement) in
+                replacement_roots(txn, &options, predecessor, &mut replacement_cache)?
+            {
+                if memo_visible_chain_reaches(
+                    txn,
+                    &options,
+                    predecessor_replacement,
+                    owner,
+                    &mut chain_memo,
+                )? {
+                    replaces_predecessor = true;
+                    break;
+                }
+            }
+            if replaces_predecessor
+                && !result
+                    .graph
+                    .children(owner_vid)
+                    .any(|(_, child)| *child == replacement_vid)
+            {
+                result
+                    .graph
+                    .get_vertex_mut(owner_vid)
+                    .unwrap()
+                    .extra
+                    .push((None, replacement_vid));
+            }
+        }
+    }
     Ok(result)
+}
+
+/// Pair a deleted incoming binding with new content inserted by the same
+/// change at that exact predecessor. These are canonical graph witnesses,
+/// independent of path indexes, local insertion order, and Git metadata.
+type ReplacementRoot = (GraphNode<NodeId>, GraphNode<NodeId>);
+type ReplacementRootsMemo = HashMap<GraphNode<NodeId>, Vec<ReplacementRoot>>;
+
+fn replacement_roots<T: GraphTxnT>(
+    txn: &T,
+    options: &RetrieveOptions,
+    dead: GraphNode<NodeId>,
+    memo: &mut ReplacementRootsMemo,
+) -> Result<Vec<ReplacementRoot>, PristineError> {
+    if let Some(roots) = memo.get(&dead) {
+        return Ok(roots.clone());
+    }
+    let mut roots = Vec::new();
+    for parent in txn.iter_parents(dead, true)? {
+        if parent.kind != crate::types::ParentEdgeKind::BlockDeleted
+            || !options.passes_filter(parent.introduced_by)
+        {
+            continue;
+        }
+        let predecessor = txn.find_block_end(parent.dest)?;
+        if !options.passes_filter(predecessor.change) {
+            continue;
+        }
+        for edge in txn.iter_forward(predecessor, false)? {
+            if edge.introduced_by != parent.introduced_by || !options.is_edge_alive(&edge) {
+                continue;
+            }
+            let replacement = txn.find_block(edge.dest)?;
+            if replacement.change == parent.introduced_by && replacement != dead {
+                roots.push((predecessor, replacement));
+            }
+        }
+    }
+    memo.insert(dead, roots.clone());
+    Ok(roots)
 }
 
 /// Walk through a dead vertex's forward edges to find live successors.
@@ -484,10 +550,17 @@ fn walk_through_dead<T: GraphTxnT>(
     alive_memo: &mut std::collections::HashMap<GraphNode<NodeId>, bool>,
     chain_memo: &mut std::collections::HashMap<(GraphNode<NodeId>, GraphNode<NodeId>), bool>,
     dep_memo: &mut std::collections::HashMap<(NodeId, NodeId), bool>,
+    liveness_dead_seen: &mut std::collections::HashSet<GraphNode<NodeId>>,
+    empty_dead_subgraphs: &mut std::collections::HashSet<GraphNode<NodeId>>,
     result: &mut RetrieveResult,
 ) -> Result<Vec<VertexId>, PristineError> {
     use std::collections::HashSet;
     let mut live_successors: Vec<VertexId> = Vec::new();
+    if empty_dead_subgraphs.contains(&dead_vertex)
+        || (options.stop_at_first_content && !liveness_dead_seen.insert(dead_vertex))
+    {
+        return Ok(live_successors);
+    }
 
     // BFS through dead vertices, recording live ones we encounter.
     //
@@ -506,6 +579,7 @@ fn walk_through_dead<T: GraphTxnT>(
     let mut queue: Vec<GraphNode<NodeId>> = vec![dead_vertex];
     seen.insert(dead_vertex);
     dead_visited.insert(dead_vertex);
+    let mut saw_live_successor = false;
 
     while let Some(current) = queue.pop() {
         // Walk current's forward edges (include deleted so we can chain
@@ -516,7 +590,10 @@ fn walk_through_dead<T: GraphTxnT>(
             let next_pos = edge.dest;
             let next_vertex = txn.find_block(next_pos)?;
 
-            if seen.contains(&next_vertex) {
+            if seen.contains(&next_vertex)
+                || empty_dead_subgraphs.contains(&next_vertex)
+                || (options.stop_at_first_content && liveness_dead_seen.contains(&next_vertex))
+            {
                 continue;
             }
             seen.insert(next_vertex);
@@ -530,6 +607,7 @@ fn walk_through_dead<T: GraphTxnT>(
             let alive = memo_vertex_alive(options, txn, next_vertex, alive_memo, dep_memo)?;
 
             if alive {
+                saw_live_successor = true;
                 // Live successor. Only surface it as a bypass child when
                 // there is no OTHER alive parent outside the dead chain.
                 // Ancestors of `owner_parent` in the already-built alive
@@ -586,6 +664,10 @@ fn walk_through_dead<T: GraphTxnT>(
                     new_id
                 };
 
+                if options.stop_at_first_content && result.graph.total_bytes() > 0 {
+                    return Ok(vec![vid]);
+                }
+
                 if !has_alive_alt_parent && !live_successors.contains(&vid) {
                     let mut shadowed_by_existing = false;
                     for existing_vid in live_successors.iter().copied() {
@@ -631,11 +713,19 @@ fn walk_through_dead<T: GraphTxnT>(
                 // CRDT conflicts).
                 // Still dead — keep walking through it.
                 dead_visited.insert(next_vertex);
+                if options.stop_at_first_content {
+                    liveness_dead_seen.insert(next_vertex);
+                }
                 queue.push(next_vertex);
             }
         }
     }
 
+    if !options.stop_at_first_content && !saw_live_successor {
+        // Every outgoing route was exhausted under the same immutable
+        // transaction/filter. This says nothing about positive bypass paths.
+        empty_dead_subgraphs.extend(dead_visited);
+    }
     Ok(live_successors)
 }
 
@@ -678,7 +768,7 @@ fn visible_chain_reaches<T: GraphTxnT>(
         }
 
         for edge in txn.iter_forward(current, true)? {
-            if edge.kind.is_pseudo() {
+            if edge.kind.is_pseudo() || !options.passes_filter(edge.introduced_by) {
                 continue;
             }
 

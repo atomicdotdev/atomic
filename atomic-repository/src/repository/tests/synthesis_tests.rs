@@ -256,7 +256,7 @@ fn git_deletion_preserves_native_empty_directories_inside_imported_parents() {
         &single_file_expectation("sub/inner/file.txt", b"file\n"),
         None,
         &[],
-        false,
+        &[],
     )
     .unwrap();
     repo.materialize(wc).unwrap();
@@ -299,7 +299,7 @@ fn git_deletion_preserves_native_empty_directories_inside_imported_parents() {
         &full_tree_expectation(&[], &[]),
         None,
         &[],
-        false,
+        &[],
     )
     .unwrap();
     repo.materialize(wc).unwrap();
@@ -357,7 +357,7 @@ fn synthesized_multi_file_root_change_reconstructs_every_path() {
         &expectation,
         None,
         &[],
-        false,
+        &[],
     )
     .expect("synthesize multi-file root change");
 
@@ -402,7 +402,7 @@ fn synthesized_root_change_carries_hashed_origin_tagged_oids_and_bridge_sequenci
             &single_file_expectation("src/domain/model.rs", b"pub struct Model;\n"),
             None,
             &[],
-            false,
+            &[],
         )
         .expect("synthesize root change");
 
@@ -522,7 +522,7 @@ fn synthesized_first_parent_dependencies_come_from_graph_context_after_reopen() 
             &single_file_expectation("src/domain/model.rs", b"pub struct Model;\n"),
             None,
             &[],
-            false,
+            &[],
         )
         .unwrap();
 
@@ -560,7 +560,7 @@ fn synthesized_first_parent_dependencies_come_from_graph_context_after_reopen() 
             ),
             None,
             &[],
-            false,
+            &[],
         )
         .unwrap();
 
@@ -625,7 +625,7 @@ fn deletion_synthesis_uses_repository_state_and_canonical_filedel() {
         &single_file_expectation("plain.txt", b"payload\n"),
         None,
         &[],
-        false,
+        &[],
     )
     .unwrap();
 
@@ -657,7 +657,7 @@ fn deletion_synthesis_uses_repository_state_and_canonical_filedel() {
             },
             None,
             &[],
-            false,
+            &[],
         )
         .unwrap();
     assert_eq!(
@@ -731,7 +731,7 @@ fn legacy_changes_are_never_rewritten_and_repeated_synthesis_is_idempotent() {
             ),
             None,
             &[],
-            false,
+            &[],
         )
         .unwrap();
     assert_ne!(first.write.hash, legacy_outcome.hash);
@@ -777,7 +777,7 @@ fn legacy_changes_are_never_rewritten_and_repeated_synthesis_is_idempotent() {
             ),
             None,
             &[],
-            false,
+            &[],
         )
         .unwrap();
     assert!(again.already_in_view);
@@ -826,7 +826,7 @@ fn synthesis_failure_aborts_the_prepared_operation_without_view_advance() {
             &single_file_expectation("doomed.txt", b"doomed\n"),
             None,
             &[],
-            false,
+            &[],
         )
         .expect_err("the injected mutation-stage fault must fail the synthesis");
     super::super::synthesis::SYNTHESIS_APPLY_FAULT.with(|cell| cell.set(false));
@@ -917,7 +917,7 @@ fn synthesis_under_workspace_transaction_journals_synthesize_git_and_verifies() 
             &[],
             &single_file_expectation("bridge.txt", b"bridged\n"),
             &[],
-            false,
+            &[],
         )
         .expect("workspace-backed synthesis");
     assert!(outcome.operation.is_some());
@@ -1194,7 +1194,7 @@ fn reference_registered_change_verifies_the_effective_projection_before_publicat
         &expectation,
         None,
         &[],
-        false,
+        &[],
     )
     .expect("publish the change");
 
@@ -1221,7 +1221,7 @@ fn reference_registered_change_verifies_the_effective_projection_before_publicat
         &expectation,
         None,
         &[],
-        true,
+        &[],
     )
     .expect("the reference path verifies and publishes into the new view");
 
@@ -1249,7 +1249,7 @@ fn reference_registered_change_verifies_the_effective_projection_before_publicat
             &wrong_bytes,
             None,
             &[],
-            true,
+            &[],
         )
         .expect_err(
             "the reference path must verify the effective projection and refuse a \
@@ -1281,7 +1281,7 @@ fn rejected_synthesis_journal_does_not_poison_a_different_retry() {
             &single_file_expectation("doc.txt", b"different expected bytes\n"),
             None,
             &[],
-            false,
+            &[],
         )
         .unwrap_err();
     assert!(
@@ -1312,7 +1312,7 @@ fn rejected_synthesis_journal_does_not_poison_a_different_retry() {
         &single_file_expectation("doc.txt", b"accepted bytes\n"),
         None,
         &[],
-        false,
+        &[],
     )
     .unwrap();
     assert_eq!(
@@ -1368,7 +1368,7 @@ fn edited_lines_render_exact_alive_tokens_after_reload() {
         &base_expectation,
         None,
         &[],
-        false,
+        &[],
     )
     .expect("publish base");
 
@@ -1402,7 +1402,7 @@ fn edited_lines_render_exact_alive_tokens_after_reload() {
         &edit_expectation,
         None,
         &[],
-        true,
+        &[],
     )
     .expect("publish the edit");
 
@@ -1513,7 +1513,7 @@ fn reference_registered_change_with_target_local_removal_prepares_exact_leases()
             &single_file_expectation("doc.txt", b"referenced content\n"),
             None,
             &[],
-            false,
+            &[],
         )
         .expect("publish A into the default view")
         .write
@@ -1543,7 +1543,7 @@ fn reference_registered_change_with_target_local_removal_prepares_exact_leases()
             &single_file_expectation("other.txt", b"superseded\n"),
             None,
             &[],
-            false,
+            &[],
         )
         .expect("publish B")
         .write
@@ -1568,7 +1568,7 @@ fn reference_registered_change_with_target_local_removal_prepares_exact_leases()
             ),
             None,
             &[],
-            false,
+            &[],
         )
         .expect("publish C")
         .write
@@ -1580,6 +1580,8 @@ fn reference_registered_change_with_target_local_removal_prepares_exact_leases()
     // historical defect prepared the pre-removal lease, committed
     // membership [C, A], then rejected its own lease after the commit —
     // leaving a Prepared head that blocked ordinary reopen (review D1).
+    // B is the genuinely replaced history this rewrite supersedes, so it is
+    // named in the supersede list (and stays assembly-excluded).
     let outcome = repo
         .synthesize_git_change(
             fixed_header("import doc"),
@@ -1601,7 +1603,7 @@ fn reference_registered_change_with_target_local_removal_prepares_exact_leases()
             ),
             None,
             &[],
-            true,
+            &[hash_b],
         )
         .expect("the reference with removal must prepare exact leases and publish");
 
@@ -1652,7 +1654,7 @@ fn already_in_view_refuses_a_diverged_expectation() {
         &correct,
         None,
         &[],
-        false,
+        &[],
     )
     .expect("publish the change");
 
@@ -1675,7 +1677,7 @@ fn already_in_view_refuses_a_diverged_expectation() {
             &wrong,
             None,
             &[],
-            true,
+            &[],
         )
         .expect_err("a wrong already-present expectation must be refused");
     assert!(
@@ -1701,7 +1703,7 @@ fn already_in_view_refuses_a_diverged_expectation() {
             &correct,
             None,
             &[],
-            true,
+            &[],
         )
         .expect("the matching expectation is a clean no-op");
     assert!(outcome.already_in_view, "the retry reads already-in-view");
@@ -1732,7 +1734,7 @@ fn reference_path_verification_failure_aborts_cleanly_and_retries() {
         &single_file_expectation("doc.txt", b"referenced content\n"),
         None,
         &[],
-        false,
+        &[],
     )
     .expect("publish A");
     repo.create_shared_view("retry-target")
@@ -1762,7 +1764,7 @@ fn reference_path_verification_failure_aborts_cleanly_and_retries() {
             &wrong,
             None,
             &[],
-            true,
+            &[],
         )
         .expect_err("the diverged expectation must refuse before publication");
     assert!(
@@ -1797,7 +1799,7 @@ fn reference_path_verification_failure_aborts_cleanly_and_retries() {
         &correct,
         None,
         &[],
-        true,
+        &[],
     )
     .expect("the clean retry publishes");
     assert_eq!(view_members(&repo, "retry-target").len(), 1);
@@ -1850,7 +1852,7 @@ impl CorruptedBase {
             &expectation,
             None,
             &[],
-            false,
+            &[],
         )
         .expect("publish the base");
         Self { directory, repo }
@@ -1881,7 +1883,7 @@ impl CorruptedBase {
                 &expectation,
                 None,
                 &[],
-                true,
+                &[],
             )
             .expect_err("the corrupted ambient semantic state must refuse the successor");
         let message = error.to_string();
@@ -1916,6 +1918,22 @@ fn first_branch(
 /// after-chain with no BRANCH_VERTEX is refused — the historical silent
 /// skip let the consumer walker fail with OrphanBranch while the graph
 /// output stayed intact.
+#[test]
+fn staged_verification_refuses_an_unattributed_after_reference() {
+    use atomic_core::crdt::{tables::encode_branch_id, BranchId};
+    use atomic_core::pristine::MutTxnT;
+    let mut base = CorruptedBase::new(false);
+    let (key, _, _) = first_branch(&base.repo, "f.txt");
+    let mut txn = base.repo.pristine().write_txn().unwrap();
+    txn.put_crdt_branch_after(
+        &key,
+        &encode_branch_id(&BranchId::new(NodeId::new(9999), 0)),
+    )
+    .unwrap();
+    txn.commit().unwrap();
+    base.finish_refusal(b"inherited text\n", "no applied canonical writer recorded");
+}
+
 #[test]
 fn staged_verification_refuses_an_unexpected_chain_branch() {
     use atomic_core::crdt::tables::{
@@ -2094,7 +2112,7 @@ fn out_of_closure_tombstone_attribution_requires_an_applied_writer() {
     let branch_attributed = super::super::synthesis::out_of_closure_writer_deleted_branch(
         &loader,
         &txn,
-        "f.txt",
+        trunk,
         branch,
         &visibility,
     )
@@ -2106,12 +2124,116 @@ fn out_of_closure_tombstone_attribution_requires_an_applied_writer() {
     let trunk_attributed = super::super::synthesis::out_of_closure_writer_deleted_trunk(
         &loader,
         &txn,
-        "f.txt",
+        trunk,
         &visibility,
     )
     .unwrap();
     assert!(
         !trunk_attributed,
         "a registered-but-unapplied change must not attribute a trunk tombstone"
+    );
+
+    // Once ingestion is proven, attribution uses stable identity. A different
+    // incarnation at the same spelling must not borrow this writer's delete.
+    txn.mark_change_applied(id).unwrap();
+    assert!(
+        super::super::synthesis::out_of_closure_writer_deleted_branch(
+            &loader,
+            &txn,
+            trunk,
+            branch,
+            &visibility,
+        )
+        .unwrap()
+    );
+    assert!(
+        super::super::synthesis::out_of_closure_writer_deleted_trunk(
+            &loader,
+            &txn,
+            trunk,
+            &visibility,
+        )
+        .unwrap()
+    );
+    let other_trunk = TrunkId::new(NodeId::new(8), 0);
+    assert!(
+        !super::super::synthesis::out_of_closure_writer_deleted_branch(
+            &loader,
+            &txn,
+            other_trunk,
+            branch,
+            &visibility,
+        )
+        .unwrap()
+    );
+    assert!(
+        !super::super::synthesis::out_of_closure_writer_deleted_trunk(
+            &loader,
+            &txn,
+            other_trunk,
+            &visibility,
+        )
+        .unwrap()
+    );
+}
+
+#[test]
+fn deletion_evidence_loads_each_applied_writer_once_for_all_its_lines() {
+    use super::super::synthesis::SemanticDeletionEvidence;
+    use atomic_core::change::{Change, ChangeHeader, FileOps, LineOps};
+    use atomic_core::crdt::{BranchId, TrunkId};
+    use atomic_core::pristine::{GraphVisibilityClosure, MutTxnT, ViewMembershipSet};
+    use atomic_core::types::{Hash, NodeId};
+
+    let (_temp, repo) = create_temp_repo();
+    let trunk = TrunkId::new(NodeId::new(7), 0);
+    let mut ops = FileOps::edit(trunk, "same-path.txt".into());
+    for index in 0..80 {
+        ops.add_line_op(LineOps::delete_empty(BranchId::new(NodeId::ROOT, index)));
+    }
+    let change = Change::with_file_ops(
+        ChangeHeader::builder()
+            .message("many semantic deletions")
+            .build(),
+        Vec::new(),
+        vec![ops],
+        Vec::new(),
+        Vec::new(),
+    );
+    let hash = change.serialize(&mut Vec::new()).unwrap();
+    let calls = std::cell::Cell::new(0);
+    let loader = |candidate: &Hash| -> Result<Change, String> {
+        if *candidate != hash {
+            return Err("not this writer".into());
+        }
+        calls.set(calls.get() + 1);
+        Ok(change.clone())
+    };
+    let mut txn = repo.pristine().write_txn().unwrap();
+    let id = txn.register_change(&hash).unwrap();
+    txn.put_change_deps(id, &[]).unwrap();
+    txn.mark_change_applied(id).unwrap();
+    let empty = GraphVisibilityClosure::empty();
+    let evidence = SemanticDeletionEvidence::load(&loader, &txn, trunk, &empty).unwrap();
+    for index in 0..80 {
+        let branch = BranchId::new(id, index);
+        assert!(evidence.applied.contains(&branch));
+        assert!(evidence.outside.contains(&branch));
+    }
+    assert_eq!(calls.get(), 1, "one canonical load covers all 80 lines");
+    let visible = GraphVisibilityClosure::try_from_membership(
+        &txn,
+        &ViewMembershipSet::from_ordered(vec![id]),
+    )
+    .unwrap();
+    let in_closure = SemanticDeletionEvidence::load(&loader, &txn, trunk, &visible).unwrap();
+    assert_eq!(in_closure.applied.len(), 80);
+    assert!(in_closure.outside.is_empty());
+    let other =
+        SemanticDeletionEvidence::load(&loader, &txn, TrunkId::new(NodeId::new(8), 0), &empty)
+            .unwrap();
+    assert!(
+        other.applied.is_empty(),
+        "same spelling cannot borrow another trunk's proof"
     );
 }

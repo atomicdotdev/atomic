@@ -1070,6 +1070,31 @@ where
             _ => FileDiff::modified(file_path),
         };
 
+        // A whole-file rewrite's tombstones carry identities, not old text.
+        // Render its textual delta using recorded before-content, even when
+        // context is disabled or only statistics were requested.
+        if let Some((before_content, after_content)) =
+            atomic_repository::diff_engine::whole_file_replacement_text(
+                ops,
+                &change.contents,
+                || before(file_path),
+            )
+        {
+            let result = diff_text(&before_content, &after_content, Algorithm::Myers);
+            let old_lines: Vec<_> = before_content.split(|&b| b == b'\n').collect();
+            let new_lines: Vec<_> = after_content.split(|&b| b == b'\n').collect();
+            for mut hunk in
+                build_hunks_from_diff(&result, &old_lines, &new_lines, config.context_lines)
+            {
+                hunk.lines = Diff::repair_diff_lines(hunk.lines);
+                file_diff.add_hunk(hunk);
+            }
+            file_diff.compute_stats();
+            stats.add_file(file_diff.stats.clone());
+            file_diffs.push(file_diff);
+            continue;
+        }
+
         // Pass 1: flatten line operations into numbered changed lines.
         let mut insertions = 0usize;
         let mut deletions = 0usize;
