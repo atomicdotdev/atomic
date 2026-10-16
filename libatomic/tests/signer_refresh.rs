@@ -10,7 +10,10 @@ use std::{
     net::TcpListener,
 };
 
-fn serve_key(did: String, public_key: String) -> (StorageClient, std::thread::JoinHandle<()>) {
+fn serve_key(
+    did: String,
+    public_key: String,
+) -> (String, StorageClient, std::thread::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
     let server = std::thread::spawn(move || {
@@ -37,8 +40,9 @@ fn serve_key(did: String, public_key: String) -> (StorageClient, std::thread::Jo
         .to_string();
         write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
     });
-    let client = StorageClient::new(&format!("http://{address}"), "", "fixture-token").unwrap();
-    (client, server)
+    let url = format!("http://{address}");
+    let client = StorageClient::new(&url, "", "fixture-token").unwrap();
+    (url, client, server)
 }
 
 #[tokio::test]
@@ -67,7 +71,7 @@ async fn fetched_keys_are_did_checked_before_cache_and_offline_verification() {
     };
     assert!(status().ends_with("#Unverifiable"));
 
-    let (client, server) = serve_key(did.clone(), KeyPair::generate().public.to_base32());
+    let (_, client, server) = serve_key(did.clone(), KeyPair::generate().public.to_base32());
     assert_eq!(
         libatomic::signer_refresh::refresh(&repo, &client)
             .await
@@ -84,7 +88,7 @@ async fn fetched_keys_are_did_checked_before_cache_and_offline_verification() {
         .is_none());
     assert!(status().ends_with("#Unverifiable"));
 
-    let (client, server) = serve_key(did.clone(), key.public.to_base32());
+    let (_, client, server) = serve_key(did.clone(), key.public.to_base32());
     assert_eq!(
         libatomic::signer_refresh::refresh(&repo, &client)
             .await
@@ -109,4 +113,68 @@ fn anonymous_remotes_do_not_start_signer_discovery() {
         &HttpRemoteConfig::new()
     )
     .is_none());
+}
+
+#[tokio::test]
+async fn reindex_rpc_refreshes_signers_with_url_bound_client_credentials() {
+    use libatomic::atomic::{
+        knowledge_service_server::KnowledgeService, GetWorkflowSnapshotRequest,
+        KnowledgeMaintainAction, MaintainKnowledgeGraphRequest,
+    };
+    use libatomic::daemon::{services_agent::KnowledgeImpl, state::DaemonState};
+    use std::sync::Arc;
+    use tonic::Request;
+
+    let directory = tempfile::tempdir().unwrap();
+    let repo = Repository::init(directory.path()).unwrap();
+    let key = KeyPair::generate();
+    let did = atomic_canonical::did::did_for_public_key(&key.public);
+    let mut attestation =
+        Attestation::builder("rpc-session", AttestAgent::new("agent", "Agent", "1"))
+            .add_change(Hash::of(b"rpc covered change"))
+            .build();
+    attestation.sign_with_did(&did, key.secret.as_bytes());
+    let hash = repo.save_attestation(&attestation).unwrap();
+    let (url, _, server) = serve_key(did, key.public.to_base32());
+    repo.add_remote_default("origin", &url).unwrap();
+    drop(repo);
+
+    let state = Arc::new(DaemonState::new());
+    let reference = state
+        .register(directory.path().to_path_buf())
+        .repository_ref();
+    let service = KnowledgeImpl { state };
+    let request = MaintainKnowledgeGraphRequest {
+        repository: Some(reference.clone()),
+        action: KnowledgeMaintainAction::Reindex as i32,
+        scope: Some("full".into()),
+        signer_remote_url: Some("http://wrong.example".into()),
+        signer_auth_headers: [("Authorization".into(), "Bearer fixture-token".into())].into(),
+        ..Default::default()
+    };
+    let error = service
+        .maintain_knowledge_graph(Request::new(request.clone()))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+    service
+        .maintain_knowledge_graph(Request::new(MaintainKnowledgeGraphRequest {
+            signer_remote_url: Some(url),
+            ..request
+        }))
+        .await
+        .unwrap();
+    server.join().unwrap();
+    let snapshot = service
+        .get_workflow_snapshot(Request::new(GetWorkflowSnapshotRequest {
+            repository: Some(reference),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(snapshot.edges.iter().any(|edge| {
+        edge.source == atomic_core::kg::iri::mint_attestation(&hash)
+            && edge.relation == atomic_core::kg::ontology::Predicate::VerificationResult.iri()
+            && edge.target.ends_with("#Verified")
+    }));
 }

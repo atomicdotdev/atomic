@@ -1319,6 +1319,7 @@ pub fn query_enrich(args: &super::query::QueryEnrich) -> CliResult<bool> {
         action: pb::KnowledgeMaintainAction::Enrich as i32,
         scope: args.rebuild.then(|| "rebuild".to_string()),
         changes,
+        ..Default::default()
     };
     let response = session.maintain_knowledge_graph(request)?;
     if !args.changes.is_empty() {
@@ -6393,6 +6394,7 @@ pub fn query_embed(args: &super::query::QueryEmbed) -> CliResult<bool> {
         action: pb::KnowledgeMaintainAction::Embed as i32,
         scope: args.path.clone(),
         changes: Vec::new(),
+        ..Default::default()
     };
     let response = session.maintain_knowledge_graph(request)?;
     println!(
@@ -6415,20 +6417,64 @@ pub fn query_embed(args: &super::query::QueryEmbed) -> CliResult<bool> {
 
 /// `atomic query reindex` over MaintainKnowledgeGraph (REINDEX) — the
 /// handler runs vault_reindex_kg; the CLI prints the local report.
-pub fn query_reindex(full: bool) -> CliResult<bool> {
-    let Some(session) = Service::open()? else {
-        return Ok(false);
+pub fn query_reindex(full: bool) -> CliResult<()> {
+    let root = super::find_repository_root()?;
+    let session = Service::open_root(&root)?.ok_or_else(|| CliError::InvalidArgument {
+        message: "knowledge graph reindex requires a local repository service".into(),
+    })?;
+    let remote = match sync_resolve_remote(&session, &None) {
+        Ok((_, url)) => Some(url),
+        Err(CliError::RemoteNotFound { .. }) => None,
+        Err(error) => return Err(error),
     };
+    let signer_auth_headers = remote
+        .as_deref()
+        .map(|url| sync_auth_headers(url, None))
+        .unwrap_or_default();
     let request = pb::MaintainKnowledgeGraphRequest {
         repository: Some(session.reference.clone()),
         meta: request_meta(),
         action: pb::KnowledgeMaintainAction::Reindex as i32,
         scope: full.then(|| "full".to_owned()),
         changes: Vec::new(),
+        signer_auth_headers,
+        signer_remote_url: remote,
     };
     let response = session.maintain_knowledge_graph(request)?;
     println!("Indexed {} nodes + edges.", response.processed);
-    Ok(true)
+    Ok(())
+}
+
+/// Fetch the asserted graph through the same service for local and reactor
+/// modes. The CLI adapts this immutable snapshot to RDF without opening redb.
+pub(crate) fn workflow_snapshot(
+    root: &Path,
+) -> CliResult<atomic_repository::repository::WorkflowSnapshot> {
+    let session = Service::open_root(root)?.ok_or_else(|| CliError::InvalidArgument {
+        message: "workflow validation requires a local repository service".into(),
+    })?;
+    let response = session.get_workflow_snapshot(pb::GetWorkflowSnapshotRequest {
+        repository: Some(session.reference.clone()),
+    })?;
+    if response.api_version != 1
+        || response.generation != atomic_core::kg::KG_GENERATION
+        || response.ontology_version != atomic_core::kg::ontology::VERSION_IRI
+    {
+        return Err(CliError::Internal(anyhow::anyhow!(
+            "unsupported workflow snapshot API/generation/ontology"
+        )));
+    }
+    Ok(atomic_repository::repository::WorkflowSnapshot {
+        generation: response.generation,
+        ontology_version: atomic_core::kg::ontology::VERSION_IRI,
+        identity: response.identity,
+        nodes: response.nodes.iter().map(kg_node_domain).collect(),
+        edges: response
+            .edges
+            .iter()
+            .map(kg_edge_domain)
+            .collect::<CliResult<_>>()?,
+    })
 }
 
 // ---------------------------------------------------------------------------

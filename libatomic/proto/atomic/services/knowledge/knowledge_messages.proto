@@ -1,11 +1,12 @@
 // atomic-protocol — KnowledgeService: knowledge-graph queries and
 // maintenance.
 //
-// DRAFT — add-only. The CLI's eleven `query` verbs collapse into TWO RPCs
-// (the headline combine of this draft):
+// DRAFT — add-only. Interactive graph queries and maintenance use:
 //  * QueryGraph — every read: content/code search, kg search, entity,
 //    neighbors, callers, graph slice, plan execution, RAG ask;
 //  * MaintainKnowledgeGraph — embed/enrich/reindex (the write/rebuild side).
+// GetProjectIdentity and GetWorkflowSnapshot provide read-only, repository-wide
+// workflow inspection for `repo identity show` and client-side SHACL validation.
 // Local file-index construction (`query index`) remains client-side. QueryGraph
 // reads a view-scoped indexed snapshot; it must never build/refresh an index.
 
@@ -15,6 +16,29 @@ package atomic;
 
 import "atomic/common/common.proto";
 
+message GetProjectIdentityRequest {
+  RepositoryRef repository = 1;
+}
+message GetProjectIdentityResponse {
+  string project = 1;
+  string urn = 2;
+  string created = 3;
+  string minted = 4;
+  optional string signed_by = 5;
+  string hash = 6;
+}
+message GetWorkflowSnapshotRequest {
+  RepositoryRef repository = 1;
+}
+// One consistent, repository-wide asserted snapshot. SHACL runs client-side.
+message GetWorkflowSnapshotResponse {
+  uint32 api_version = 1;
+  uint32 generation = 2;
+  string ontology_version = 3;
+  string identity = 4;
+  repeated KGNode nodes = 5;
+  repeated KGEdge edges = 6;
+}
 
 
 message QueryGraphRequest {
@@ -154,6 +178,11 @@ message MaintainKnowledgeGraphRequest {
   KnowledgeMaintainAction action = 3;
   optional string scope = 4;      // e.g. entity-type filter
   repeated Hash changes = 5;     // ENRICH: limit to these changes' nodes
+  // Client-resolved credentials for optional signer discovery on reindex.
+  // The handler verifies that the configured remote still matches this URL
+  // before using these headers. No client-side repository open is required.
+  map<string, string> signer_auth_headers = 6;
+  optional string signer_remote_url = 7;
 }
 message MaintainKnowledgeGraphResponse {
   uint64 processed = 1;

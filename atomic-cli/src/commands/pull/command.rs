@@ -530,7 +530,6 @@ impl Pull {
         let config = self
             .build_remote_config(&remote_url, identity_hint.as_deref())
             .await;
-        let signer_client = libatomic::signer_refresh::client_for_remote(&remote_url, &config);
         let remote = HttpRemote::with_config(&remote_url, config).map_err(|e| {
             finish_error(&spinner, "Failed to connect");
             convert_remote_error(e, &remote_url)
@@ -768,11 +767,6 @@ impl Pull {
                     crate::commands::sidecars::report_sidecars(sidecar_stats);
                 }
             }
-            if let Some(client) = &signer_client {
-                if let Err(error) = libatomic::signer_refresh::refresh(&repo, client).await {
-                    log::warn!("signer key refresh after download failed: {error}");
-                }
-            }
             print_blank();
             print_success(&format!(
                 "Downloaded {} (not inserted - use 'atomic insert' to insert)",
@@ -963,13 +957,6 @@ impl Pull {
                     Ok(()) => print_success("Vault initialized from pulled content"),
                     Err(e) => print_warning(&format!("Failed to bootstrap vault: {}", e)),
                 }
-            }
-        }
-
-        // Ingestion/membership APIs project regardless of download/apply counts.
-        if let Some(client) = &signer_client {
-            if let Err(error) = libatomic::signer_refresh::refresh(&repo, client).await {
-                log::warn!("signer key refresh after pull failed: {error}");
             }
         }
 
