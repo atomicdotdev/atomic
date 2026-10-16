@@ -576,10 +576,7 @@ pub(crate) fn sync_git_head_to_view(
     // A retained shadow exclude line is not enrollment (RFC §2 / CB-13C):
     // colocated-but-unenrolled repositories keep native view switches with
     // no Git projection and no checkpoint requirement.
-    if !repo
-        .shim_workspace_active()
-        .map_err(CliError::Repository)?
-    {
+    if !repo.shim_workspace_active().map_err(CliError::Repository)? {
         return Ok(ShadowSwitchSync::SkippedInactive);
     }
     let working_copy = repo
@@ -650,10 +647,7 @@ pub(crate) fn sync_inherited_agent_view(root: &Path, view: &str) -> CliResult<()
     // Enrollment is checkpoint-or-explicit-opt-in (the same predicate every
     // workspace boundary uses). The retained exclude marker alone must never
     // make a native agent session require a shim checkpoint.
-    if !repo
-        .shim_workspace_active()
-        .map_err(CliError::Repository)?
-    {
+    if !repo.shim_workspace_active().map_err(CliError::Repository)? {
         return Ok(());
     }
     let Some(before) = super::checkpoint::read_checkpoint(root).map_err(checkpoint_error_of)?
@@ -819,10 +813,7 @@ pub(crate) fn sync_git_projection_after_record(
     // A retained shadow exclude line is not enrollment (RFC §2 / CB-13C):
     // a colocated-but-unenrolled repository never projects its records into
     // Git and never anchors a shim implicitly. Native records stand alone.
-    if !repo
-        .shim_workspace_active()
-        .map_err(CliError::Repository)?
-    {
+    if !repo.shim_workspace_active().map_err(CliError::Repository)? {
         return Ok(());
     }
     // An enrolled workspace without a verified checkpoint is unanchored. The

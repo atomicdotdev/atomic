@@ -519,9 +519,7 @@ impl Command for Add {
         if !self.dry_run
             && total_stats.total_added() > 0
             && repo_root.join(".git").exists()
-            && repo
-                .shim_workspace_active()
-                .map_err(CliError::Repository)?
+            && repo.shim_workspace_active().map_err(CliError::Repository)?
         {
             if let Err(error) = create_intent_to_add_entries(&repo_root, &files_to_add) {
                 print_warning(&format!(
@@ -565,10 +563,7 @@ pub(crate) fn finish_service_add(repo_root: &Path, requested: &[PathBuf]) -> Cli
     }
     let repo = Repository::open_readonly_wait(repo_root, atomic_repository::database_lock_wait())
         .map_err(CliError::Repository)?;
-    if repo
-        .shim_workspace_active()
-        .map_err(CliError::Repository)?
-    {
+    if repo.shim_workspace_active().map_err(CliError::Repository)? {
         create_intent_to_add_entries(repo_root, requested)?;
     }
     Ok(())

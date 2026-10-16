@@ -263,9 +263,7 @@ fn git_hook_context(root: &Path) -> CliResult<GitHookContext> {
         .map_err(|error| git_error(format!("cannot resolve Git administrative paths: {error}")))?
     {
         GitObservation::NoGit { .. } => {
-            return Err(git_error(
-                "cannot enable the shim outside a Git repository",
-            ));
+            return Err(git_error("cannot enable the shim outside a Git repository"));
         }
         GitObservation::Repository(observation) => {
             if observation.paths.worktree_root.is_none() {

@@ -431,9 +431,7 @@ pub(crate) fn apply_git_informed_overlays(
     // Git-informed overlays are colocated shim behavior (RFC §9); native
     // status of a working copy that never enrolled stays Git-independent.
     if !repo_root.join(".git").exists()
-        || !repo
-            .shim_workspace_active()
-            .map_err(CliError::Repository)?
+        || !repo.shim_workspace_active().map_err(CliError::Repository)?
     {
         return Ok(());
     }

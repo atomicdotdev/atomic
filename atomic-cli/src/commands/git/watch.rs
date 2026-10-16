@@ -35,10 +35,8 @@ use clap::Parser;
 use atomic_agent::turn::session::SessionStore;
 use atomic_repository::repository::{observe_git_metadata, GitQuiescence, ReconcileEffectBudget};
 
-use super::shim::{
-    shim_config, reconcile_transaction_budgeted, WatchNoticeKind, WatchNoticeSink,
-};
 use super::observation::{observe_git, GitObservation, HeadObservation};
+use super::shim::{reconcile_transaction_budgeted, shim_config, WatchNoticeKind, WatchNoticeSink};
 use crate::commands::Command;
 use crate::error::{CliError, CliResult};
 use crate::output::{print_info, print_warning};
@@ -555,8 +553,7 @@ pub(crate) fn run_watch(root: &Path, once: bool, poll_ms: u64) -> CliResult<()> 
         // (command boundaries remain the correctness guarantee).
         match shim_config(root) {
             Ok(config)
-                if config.git.shim.enabled
-                    && config.git.watch != atomic_config::GitWatch::Off => {}
+                if config.git.shim.enabled && config.git.watch != atomic_config::GitWatch::Off => {}
             _ => {
                 print_info(
                     "shim watch: consent withdrawn while running; the daemon exits                      (command boundaries remain the correctness guarantee)",

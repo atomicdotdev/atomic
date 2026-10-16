@@ -101,10 +101,7 @@ pub(crate) fn prepare_service_query(allow_git_operation: bool) -> CliResult<bool
     };
     let repo = Repository::open_readonly_wait(&root, atomic_repository::database_lock_wait())
         .map_err(CliError::Repository)?;
-    if !repo
-        .shim_workspace_active()
-        .map_err(CliError::Repository)?
-    {
+    if !repo.shim_workspace_active().map_err(CliError::Repository)? {
         return Ok(true);
     }
     drop(repo);

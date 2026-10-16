@@ -1731,19 +1731,13 @@ pub(crate) fn read_workspace_checkpoint(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => {
             return Err(RepositoryError::InvalidRepository {
-                reason: format!(
-                    "cannot read shim checkpoint '{}': {error}",
-                    path.display()
-                ),
+                reason: format!("cannot read shim checkpoint '{}': {error}", path.display()),
             })
         }
     };
     let wire: CheckpointWire =
         serde_json::from_slice(&bytes).map_err(|error| RepositoryError::InvalidRepository {
-            reason: format!(
-                "shim checkpoint '{}' is malformed: {error}",
-                path.display()
-            ),
+            reason: format!("shim checkpoint '{}' is malformed: {error}", path.display()),
         })?;
     if wire.version != 1 && wire.version != 2 {
         return Err(RepositoryError::InvalidRepository {
@@ -1840,10 +1834,7 @@ pub(crate) fn write_workspace_checkpoint(
         let _ = fs::remove_file(&temporary);
     }
     result.map_err(|error| RepositoryError::InvalidRepository {
-        reason: format!(
-            "cannot write shim checkpoint '{}': {error}",
-            path.display()
-        ),
+        reason: format!("cannot write shim checkpoint '{}': {error}", path.display()),
     })
 }
 

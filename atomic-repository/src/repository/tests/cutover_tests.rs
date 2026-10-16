@@ -7,7 +7,7 @@ use atomic_core::operation::{
 };
 use atomic_core::pristine::{
     CapabilityMutTxnT, CapabilityTxnT, RefMapping, RefSyncStatus, RequiredRepositoryCapability,
-    SHIM_CUTOVER_CAPABILITY, CHANGE_FORMAT_VNEXT_CAPABILITY, REF_MAPPING_VERSION,
+    CHANGE_FORMAT_VNEXT_CAPABILITY, REF_MAPPING_VERSION, SHIM_CUTOVER_CAPABILITY,
     SUPPORTED_REPOSITORY_CAPABILITIES,
 };
 use atomic_core::OperationId;

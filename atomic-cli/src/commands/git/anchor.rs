@@ -10,7 +10,7 @@
 
 use std::path::Path;
 
-use atomic_repository::{ShimAnchorError, ShimAnchorRefusal, Repository};
+use atomic_repository::{Repository, ShimAnchorError, ShimAnchorRefusal};
 
 use super::binding::load_signing_key;
 use super::shim::{current_heads, project_atomic_to_git};
@@ -158,9 +158,7 @@ fn enable_anchor_inner(
                 atomic_repository::BindingPublication::Idempotent { .. }
             ),
         }),
-        Err(ShimAnchorError::Refusal(refusal)) => {
-            Ok(EnableAnchorOutcome::NotAnchored { refusal })
-        }
+        Err(ShimAnchorError::Refusal(refusal)) => Ok(EnableAnchorOutcome::NotAnchored { refusal }),
         Err(error) => Err(CliError::Repository(
             atomic_repository::RepositoryError::InvalidOperation {
                 message: format!("shim anchoring failed: {error}"),

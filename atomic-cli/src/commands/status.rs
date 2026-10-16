@@ -104,12 +104,12 @@ use atomic_repository::{
     Repository, SnapshotStatus, WorkspaceRemediation, WorkspaceTxnMode, WorkspaceTxnStart,
 };
 
-use crate::commands::git::shim::read_checkpoint_observation;
 use crate::commands::git::observation::{
     classify_provisional_checkpoint, display_git_bytes, observe_git, AtomicAnchorObservation,
     GitObservation, IndexHeadEquivalence, ManifestEquivalence, ProvisionalCheckpointEligibility,
     RefTargetObservation,
 };
+use crate::commands::git::shim::read_checkpoint_observation;
 use crate::commands::workspace_txn::{enter_workspace, observe_workspace};
 use crate::commands::{find_repository_root, Command, DEFAULT_HASH_LENGTH};
 use crate::error::{CliError, CliResult};
@@ -294,10 +294,7 @@ impl Status {
             .map_err(CliError::Repository)?;
         crate::commands::status_git::apply_git_informed_overlays(&repo, &root, &mut status)?;
         crate::commands::git::ref_mapping::print_divergence_notices(&repo)?;
-        if repo
-            .shim_workspace_active()
-            .map_err(CliError::Repository)?
-        {
+        if repo.shim_workspace_active().map_err(CliError::Repository)? {
             if let Ok(git) = git2::Repository::discover(&root) {
                 if git.state() != git2::RepositoryState::Clean {
                     status.add_notice(format!("Git operation in progress ({:?})", git.state()));

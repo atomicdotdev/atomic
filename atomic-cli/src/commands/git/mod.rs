@@ -57,7 +57,6 @@
 pub mod anchor;
 pub mod binding;
 pub(crate) mod bootstrap;
-pub mod shim;
 pub mod census;
 pub(crate) mod checkpoint;
 pub(crate) mod guard;
@@ -68,6 +67,7 @@ pub mod parallel;
 pub(crate) mod push;
 pub(crate) mod ref_mapping;
 pub(crate) mod shadow;
+pub mod shim;
 pub(crate) mod transport;
 pub(crate) mod verify_receive;
 pub(crate) mod watch;
@@ -75,10 +75,10 @@ pub(crate) mod wip;
 
 use clap::Subcommand;
 
-pub use shim::Shim;
 pub use hooks::Hooks;
 pub use import::Import;
 pub use push::Push;
+pub use shim::Shim;
 pub use wip::{
     capture_or_reuse_tracked_wip, capture_tracked_wip, is_publishable_git_ref, is_wip_ref,
     WipCapture, WipCaptureError, WipCaptureRequest, WIP_REF_PREFIX,

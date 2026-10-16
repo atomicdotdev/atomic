@@ -6,8 +6,8 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use super::checkpoint::{
-    self, ShimCheckpoint, CheckpointAtomicState, CheckpointError, GitAdminIdentity,
-    ManifestRootEvidence,
+    self, CheckpointAtomicState, CheckpointError, GitAdminIdentity, ManifestRootEvidence,
+    ShimCheckpoint,
 };
 use super::observation::{
     display_git_bytes, observe_git, GitObservation, HeadObservation, ObservationError,
@@ -968,7 +968,7 @@ mod tests {
     use std::fs;
     use std::process::Command;
 
-    use super::super::checkpoint::{ShimCheckpoint, GitAdminIdentity, CHECKPOINT_VERSION};
+    use super::super::checkpoint::{GitAdminIdentity, ShimCheckpoint, CHECKPOINT_VERSION};
     use super::*;
 
     fn root(value: &str) -> ManifestRootEvidence {

@@ -175,11 +175,7 @@ fn publish_is_create_only_idempotent_and_verifies_under_trust_policy() {
 
     // Unknown signer: content recomputes, provenance is UNTRUSTED and the
     // command fails closed.
-    let untrusted = atomic(
-        &root,
-        &home,
-        &["git", "shim", "binding", "verify", &id_hex],
-    );
+    let untrusted = atomic(&root, &home, &["git", "shim", "binding", "verify", &id_hex]);
     assert!(
         !untrusted.status.success(),
         "an unknown signer must fail the gate"
@@ -208,11 +204,7 @@ fn publish_is_create_only_idempotent_and_verifies_under_trust_policy() {
     )
     .unwrap();
 
-    let trusted = atomic(
-        &root,
-        &home,
-        &["git", "shim", "binding", "verify", &id_hex],
-    );
+    let trusted = atomic(&root, &home, &["git", "shim", "binding", "verify", &id_hex]);
     assert_success(&trusted, "verify under trust policy");
     let trusted_text = String::from_utf8_lossy(&trusted.stdout).to_string();
     assert!(trusted_text.contains("trusted"), "{trusted_text}");
@@ -310,11 +302,7 @@ fn packed_git_objects_contain_no_private_sentinels() {
         assert!(!ids.is_empty(), "binding stored");
         ids[0].to_hex()
     };
-    let verify = atomic(
-        &root,
-        &home,
-        &["git", "shim", "binding", "verify", &id_hex],
-    );
+    let verify = atomic(&root, &home, &["git", "shim", "binding", "verify", &id_hex]);
     // Verify intentionally fails the gate (unknown signer) but must have
     // recomputed the content first: provenance UNTRUSTED, not content.
     let verify_text = format!(

@@ -1338,7 +1338,9 @@ fn installed_reference_transaction_hooks_record_real_git_transitions() {
     let atomic_sh = ATOMIC_BIN.to_string().replace('\'', "'\\''");
     fs::write(
         hooks_dir.join("reference-transaction"),
-        format!("#!/bin/sh\n'{atomic_sh}' git shim hook-reference-transaction \"$1\" || true\nexit 1\n"),
+        format!(
+            "#!/bin/sh\n'{atomic_sh}' git shim hook-reference-transaction \"$1\" || true\nexit 1\n"
+        ),
     )
     .unwrap();
     let before_commits = {
@@ -3069,11 +3071,7 @@ fn ordinary_sibling_pairs_submitted_directly_stay_unauthenticated() {
         "the unauthenticated tier never names the sibling as a predecessor: {entries:?}"
     );
     drop(repo);
-    let review = atomic_ok(
-        &root,
-        &home,
-        &["git", "shim", "review", "--view", "right"],
-    );
+    let review = atomic_ok(&root, &home, &["git", "shim", "review", "--view", "right"]);
     assert!(review.contains("unauthenticated-evidence-only"), "{review}");
     assert!(
         !review.contains("post-rewrite-event"),
@@ -3405,11 +3403,7 @@ fn ordinary_ref_movement_is_not_rewrite_authority_e2e() {
         &home,
         &["git", "import", "--incremental", "--no-vault"],
     );
-    let review = atomic_ok(
-        &root,
-        &home,
-        &["git", "shim", "review", "--view", "right"],
-    );
+    let review = atomic_ok(&root, &home, &["git", "shim", "review", "--view", "right"]);
     assert!(
         review.contains("class=post-rewrite-event"),
         "the genuine rewrite execution must authenticate its captured event: {review}"

@@ -407,12 +407,10 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), RepositoryError> {
 
 /// The deterministic conversion policy for one live Git repository
 /// (RFC §6.1–6.2): object format, platform capabilities, exclusion rules.
-pub fn conversion_policy_for_git(
-    git: &GitRepository,
-) -> Result<ConversionPolicy, ShimAnchorError> {
-    let config = git.config().map_err(|error| {
-        ShimAnchorError::Git(format!("cannot read Git configuration: {error}"))
-    })?;
+pub fn conversion_policy_for_git(git: &GitRepository) -> Result<ConversionPolicy, ShimAnchorError> {
+    let config = git
+        .config()
+        .map_err(|error| ShimAnchorError::Git(format!("cannot read Git configuration: {error}")))?;
     let object_format = match config.get_string("extensions.objectFormat") {
         Ok(value) if value.eq_ignore_ascii_case("sha1") => GitHashAlgorithm::Sha1,
         Ok(value) if value.eq_ignore_ascii_case("sha256") => GitHashAlgorithm::Sha256,
@@ -669,9 +667,7 @@ impl Repository {
             .odb()
             .map_err(|error| ShimAnchorError::Git(format!("cannot open Git odb: {error}")))?
             .read(head)
-            .map_err(|error| {
-                ShimAnchorError::Git(format!("cannot read raw HEAD commit: {error}"))
-            })?
+            .map_err(|error| ShimAnchorError::Git(format!("cannot read raw HEAD commit: {error}")))?
             .data()
             .to_vec();
 

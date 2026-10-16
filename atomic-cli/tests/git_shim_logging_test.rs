@@ -256,9 +256,6 @@ fn shim_switch_logs_the_steps_it_reached() {
     } else {
         "outcome=error"
     };
-    line_with(
-        &log,
-        &["cmd=git shim switch", "command finished", outcome],
-    );
+    line_with(&log, &["cmd=git shim switch", "command finished", outcome]);
     line_with(&log, &[r#"switch{view="main"}"#, "close time.busy"]);
 }

@@ -24,8 +24,8 @@ use git2::{
 
 use super::checkpoint::{self, ShimCheckpoint, VerifiedCheckpointInput};
 use super::observation::{
-    observe_git, observe_head, ShimCheckpointObservation, GitObservation, HeadObservation,
-    ObservationError,
+    observe_git, observe_head, GitObservation, HeadObservation, ObservationError,
+    ShimCheckpointObservation,
 };
 use super::parallel::{
     conversion_policy, equivalence_error, git_object_id, verify_complete_equivalence,
@@ -586,9 +586,7 @@ impl Command for Shim {
             }
             ShimCommand::Switch { view } => switch(view),
             ShimCommand::Status => super::ref_mapping::run_status(),
-            ShimCommand::Publish { view, branch } => {
-                super::ref_mapping::run_publish(view, branch)
-            }
+            ShimCommand::Publish { view, branch } => super::ref_mapping::run_publish(view, branch),
             ShimCommand::Enable {
                 mirror_ignores,
                 adopt_atomic,
@@ -1370,8 +1368,11 @@ fn switch(target: &str) -> CliResult<()> {
 
 #[tracing::instrument(name = "switch", skip_all, fields(view = target))]
 fn switch_transaction(root: &Path, target: &str) -> CliResult<()> {
-    let checkpoint = read_workspace_metadata(root)?
-        .ok_or_else(|| git_error("shim switch requires an existing checkpoint; run 'atomic git shim reconcile' first"))?;
+    let checkpoint = read_workspace_metadata(root)?.ok_or_else(|| {
+        git_error(
+            "shim switch requires an existing checkpoint; run 'atomic git shim reconcile' first",
+        )
+    })?;
     let mut repo = Repository::open(root).map_err(CliError::from)?;
 
     // Shared workspace transaction: switch is a mutating boundary that owns
@@ -2789,10 +2790,7 @@ pub(crate) fn project_atomic_to_git(
         .map_err(|error| git_error(format!("cannot observe Git worktree: {error}")))?;
     let report = compare_project_to_worktree(&project, &worktree, &policy);
     if !report.is_equivalent() {
-        return Err(equivalence_error(
-            "Atomic-to-Git shim projection",
-            &report,
-        ));
+        return Err(equivalence_error("Atomic-to-Git shim projection", &report));
     }
     let tree_oid = write_project_tree(git, &project)?;
     let tree = git
