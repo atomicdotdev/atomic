@@ -5,8 +5,9 @@
 //!
 //! # What It Does
 //!
-//! 1. Finds the repository root if there is one (falls back to the current
-//!    directory when outside a repository — hooks install anywhere)
+//! 1. Finds the repository root if there is one (falls back to a global
+//!    install in the home directory when outside a repository — hooks
+//!    install anywhere)
 //! 2. Detects which agent is present (or uses `--agent` flag)
 //! 3. Calls `AgentHook::install()` to write hooks into the agent's config
 //! 4. Creates `.atomic/sessions/` directory for session state persistence
@@ -193,32 +194,42 @@ impl Command for Enable {
 
         // Find the repository root if there is one. Hooks install relative
         // to a base directory: the repo root inside a repository, or the
-        // current directory outside one. Hooks only record turns in
-        // projects that have a `.atomic/` directory, so enabling outside
-        // a repository is safe — the hooks stay dormant.
-        let repo_root = match find_repository_root() {
-            Ok(root) => root,
+        // home directory outside one (the same target as --global — a
+        // project-level `.claude/` in an arbitrary directory would never
+        // be read). Hooks only record turns in projects that have a
+        // `.atomic/` directory, so enabling outside a repository is safe —
+        // the hooks stay dormant.
+        let (install_base, in_repo) = match find_repository_root() {
+            Ok(root) => (root, true),
             Err(_) => {
                 print_warning(
-                    "No Atomic repository found — installing hooks relative to the current directory.",
+                    "No Atomic repository found — installing hooks globally to the home directory.",
                 );
                 print_warning(
                     "Turns are only recorded in projects that have a .atomic/ directory.",
                 );
-                std::env::current_dir().map_err(crate::error::CliError::Io)?
+                let home = dirs::home_dir().ok_or_else(|| {
+                    crate::error::CliError::Io(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        "Could not determine the home directory",
+                    ))
+                })?;
+                (home, false)
             }
         };
 
         // Ensure .atomic/sessions directory exists — inside repositories
-        // only, so running outside a repo never creates a stray .atomic/.
-        let sessions_dir = repo_root.join(".atomic").join("sessions");
-        if repo_root.join(".atomic").is_dir() && !sessions_dir.exists() {
-            std::fs::create_dir_all(&sessions_dir).map_err(|e| {
-                crate::error::CliError::Io(std::io::Error::new(
-                    e.kind(),
-                    format!("Failed to create sessions directory: {}", e),
-                ))
-            })?;
+        // only, so running outside a repo never touches the home .atomic/.
+        if in_repo {
+            let sessions_dir = install_base.join(".atomic").join("sessions");
+            if !sessions_dir.exists() {
+                std::fs::create_dir_all(&sessions_dir).map_err(|e| {
+                    crate::error::CliError::Io(std::io::Error::new(
+                        e.kind(),
+                        format!("Failed to create sessions directory: {}", e),
+                    ))
+                })?;
+            }
         }
 
         let registry = AgentRegistry::with_defaults();
@@ -226,7 +237,7 @@ impl Command for Enable {
         // Determine which agents to install for
         let agents_to_install: Vec<&str> = if self.all {
             // Install for all detected agents
-            let detected = registry.detect(&repo_root);
+            let detected = registry.detect(&install_base);
             if detected.is_empty() {
                 // Do not install hooks when no agent is detected.
                 print_error(
@@ -250,7 +261,7 @@ impl Command for Enable {
             vec![name.as_str()]
         } else {
             // Auto-detect
-            let detected = registry.detect(&repo_root);
+            let detected = registry.detect(&install_base);
             if detected.is_empty() {
                 // No agent detected — try to install for all, with a hint
                 let available = registry.list();
@@ -380,7 +391,7 @@ impl Command for Enable {
             }
 
             // Check if already installed (and not forcing)
-            if !self.force && agent.is_installed(&repo_root) {
+            if !self.force && agent.is_installed(&install_base) {
                 println!(
                     "  ✓ hooks already installed for {}. Use --force to reinstall.",
                     agent.display_name(),
@@ -389,8 +400,8 @@ impl Command for Enable {
             }
 
             // If forcing, uninstall first
-            if self.force && agent.is_installed(&repo_root) {
-                if let Err(e) = agent.uninstall(&repo_root) {
+            if self.force && agent.is_installed(&install_base) {
+                if let Err(e) = agent.uninstall(&install_base) {
                     print_warning(&format!(
                         "Failed to remove existing hooks for {}: {}",
                         agent.display_name(),
@@ -400,7 +411,7 @@ impl Command for Enable {
             }
 
             // Install
-            match agent.install(&repo_root) {
+            match agent.install(&install_base) {
                 Ok(count) => {
                     if count > 0 {
                         print_success(&format!(
