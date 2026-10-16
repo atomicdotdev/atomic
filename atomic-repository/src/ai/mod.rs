@@ -445,18 +445,18 @@ pub fn build_context_string(nodes: &[KgNode], edges: &[KgEdge], query: &str) -> 
     let mut groups: std::collections::BTreeMap<&str, Vec<&KgNode>> =
         std::collections::BTreeMap::new();
     for node in nodes {
-        groups.entry(node.kind.as_str()).or_default().push(node);
+        groups.entry(node.primary_type()).or_default().push(node);
     }
 
     for (kind, group_nodes) in &groups {
-        buf.push_str(&format!("{}:\n", capitalize(kind)));
+        buf.push_str(&format!("{}:\n", atomic_core::kg::ontology::compact(kind)));
         for node in group_nodes {
             buf.push_str(&format!("- {}", node.label));
             if let Some(ref summary) = node.summary {
                 buf.push_str(&format!(": {}", summary));
             }
             // Render metadata for change nodes (timestamp, author, sequence)
-            if node.kind == "change" {
+            if node.has_type(atomic_core::kg::ontology::Class::Change) {
                 if let Some(ref meta) = node.metadata {
                     let mut details = Vec::new();
                     if let Some(ts) = meta.get("timestamp").and_then(|v| v.as_str()) {
@@ -471,7 +471,7 @@ pub fn build_context_string(nodes: &[KgNode], edges: &[KgEdge], query: &str) -> 
                 }
             }
             // Render metadata for entity nodes (kind, file, line range)
-            if node.kind == "entity" {
+            if node.has_type(atomic_core::kg::ontology::Class::File) {
                 if let Some(ref meta) = node.metadata {
                     let mut details = Vec::new();
                     if let Some(k) = meta.get("kind").and_then(|v| v.as_str()) {
@@ -505,7 +505,9 @@ pub fn build_context_string(nodes: &[KgNode], edges: &[KgEdge], query: &str) -> 
         for edge in edges {
             buf.push_str(&format!(
                 "- {} -[{}]-> {}\n",
-                edge.from_id, edge.kind, edge.to_id
+                edge.from_id,
+                edge.kind.curie(),
+                edge.to_id
             ));
             if buf.len() >= MAX_CHARS {
                 break;
@@ -517,6 +519,7 @@ pub fn build_context_string(nodes: &[KgNode], edges: &[KgEdge], query: &str) -> 
     buf
 }
 
+#[cfg(test)]
 fn capitalize(s: &str) -> String {
     let mut c = s.chars();
     match c.next() {
@@ -601,15 +604,30 @@ mod tests {
     #[test]
     fn test_build_context_string() {
         let nodes = vec![
-            KgNode::new("change:abc", "change", "abc123", "graph").with_summary("Fix auth bug"),
-            KgNode::new("file:src/auth.rs", "file", "src/auth.rs", "graph"),
+            KgNode::new(
+                "change:abc",
+                atomic_core::kg::ontology::Class::Change,
+                "abc123",
+                "graph",
+            )
+            .with_summary("Fix auth bug"),
+            KgNode::new(
+                "file:src/auth.rs",
+                atomic_core::kg::ontology::Class::File,
+                "src/auth.rs",
+                "graph",
+            ),
         ];
-        let edges = vec![KgEdge::new("change:abc", "file:src/auth.rs", "MODIFIES")];
+        let edges = vec![KgEdge::new(
+            "change:abc",
+            "file:src/auth.rs",
+            atomic_core::kg::ontology::Predicate::ModifiesFile,
+        )];
 
         let context = build_context_string(&nodes, &edges, "who fixed auth?");
         assert!(context.contains("abc123"));
         assert!(context.contains("Fix auth bug"));
-        assert!(context.contains("MODIFIES"));
+        assert!(context.contains("atomic:modifiesFile"));
         assert!(context.contains("who fixed auth?"));
     }
 
@@ -626,7 +644,7 @@ mod tests {
             .map(|i| {
                 KgNode::new(
                     format!("entity:{}", i),
-                    "entity",
+                    atomic_core::kg::ontology::Class::File,
                     format!("entity-{}", i),
                     "graph",
                 )
@@ -640,14 +658,33 @@ mod tests {
     #[test]
     fn test_build_context_string_groups_by_kind() {
         let nodes = vec![
-            KgNode::new("file:a.rs", "file", "a.rs", "graph"),
-            KgNode::new("change:x", "change", "x", "graph"),
-            KgNode::new("file:b.rs", "file", "b.rs", "graph"),
+            KgNode::new(
+                "file:a.rs",
+                atomic_core::kg::ontology::Class::File,
+                "a.rs",
+                "graph",
+            ),
+            KgNode::new(
+                "change:x",
+                atomic_core::kg::ontology::Class::Change,
+                "x",
+                "graph",
+            ),
+            KgNode::new(
+                "file:b.rs",
+                atomic_core::kg::ontology::Class::File,
+                "b.rs",
+                "graph",
+            ),
         ];
         let context = build_context_string(&nodes, &[], "test");
         // BTreeMap orders keys: "change" < "file"
-        let change_pos = context.find("Change:").expect("should contain Change:");
-        let file_pos = context.find("File:").expect("should contain File:");
+        let change_pos = context
+            .find("atomic:Change:")
+            .expect("should contain atomic:Change:");
+        let file_pos = context
+            .find("atomic:File:")
+            .expect("should contain atomic:File:");
         assert!(
             change_pos < file_pos,
             "Change group should appear before File group (BTreeMap order)"

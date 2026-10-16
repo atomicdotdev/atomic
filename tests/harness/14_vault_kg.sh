@@ -214,7 +214,8 @@ run_cmd atomic vault query search "auth" --json
 assert_ran "KG search finds 'auth' content" "auth"
 
 # Query neighbors of a view node — returns a node/edge graph
-run_cmd atomic vault query neighbors "view:dev" --json
+project_urn="$(atomic repo identity show --json | python3 -c 'import json,sys; print(json.load(sys.stdin)["urn"])')"
+run_cmd atomic vault query neighbors "${project_urn}:view:dev" --json
 assert_ran "KG neighbors query for view node" '"nodes"'
 
 # Reindex
@@ -294,7 +295,8 @@ else
         assert_ran "KG search finds imported content" "uuid"
 
         # Neighbors query for the imported default view
-        run_cmd atomic vault query neighbors "view:main" --json
+        project_urn="$(atomic repo identity show --json | python3 -c 'import json,sys; print(json.load(sys.stdin)["urn"])')"
+        run_cmd atomic vault query neighbors "${project_urn}:view:main" --json
         assert_ran "KG neighbors query after import" '"nodes"'
 
         # Reindex vault entries

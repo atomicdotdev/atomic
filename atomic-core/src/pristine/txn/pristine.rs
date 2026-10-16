@@ -376,6 +376,18 @@ impl Pristine {
             write_txn.open_table(SESSION_PROVENANCE)?;
             write_txn.open_table(SESSION_MANIFESTS)?;
             write_txn.open_table(SESSION_HEADS)?;
+            write_txn.open_table(PROJECT_IDENTITY)?;
+            write_txn.open_table(SIGNER_KEYS)?;
+            write_txn.open_multimap_table(KG_TYPES)?;
+            write_txn.open_multimap_table(KG_TYPES_REV)?;
+            if is_new_database {
+                write_txn
+                    .open_table(KG_INDEX_META)?
+                    .insert("kg_generation", crate::kg::KG_GENERATION)?;
+                write_txn
+                    .open_table(PRISTINE_META)?
+                    .insert("required-capability/kg-semweb-v1", 1)?;
+            }
 
             stamp_schema_version(&write_txn)?;
         }
@@ -783,20 +795,32 @@ mod tests {
             .unwrap();
         assert_eq!(
             pristine.required_repository_capabilities().unwrap(),
-            vec![RequiredRepositoryCapability {
-                id: CHANGE_FORMAT_VNEXT_CAPABILITY.id().to_string(),
-                minimum_version: CHANGE_FORMAT_VNEXT_CAPABILITY.minimum_version(),
-            }]
+            vec![
+                RequiredRepositoryCapability {
+                    id: CHANGE_FORMAT_VNEXT_CAPABILITY.id().to_string(),
+                    minimum_version: CHANGE_FORMAT_VNEXT_CAPABILITY.minimum_version(),
+                },
+                RequiredRepositoryCapability {
+                    id: "kg-semweb-v1".into(),
+                    minimum_version: 1
+                }
+            ]
         );
         drop(pristine);
 
         let reopened = Pristine::open_readonly(&db_path).unwrap();
         assert_eq!(
             reopened.required_repository_capabilities().unwrap(),
-            vec![RequiredRepositoryCapability {
-                id: "change-format-vnext".to_string(),
-                minimum_version: 1,
-            }]
+            vec![
+                RequiredRepositoryCapability {
+                    id: "change-format-vnext".to_string(),
+                    minimum_version: 1,
+                },
+                RequiredRepositoryCapability {
+                    id: "kg-semweb-v1".into(),
+                    minimum_version: 1
+                }
+            ]
         );
     }
 
@@ -819,10 +843,16 @@ mod tests {
             .unwrap();
         assert_eq!(
             pristine.required_repository_capabilities().unwrap(),
-            vec![RequiredRepositoryCapability {
-                id: "change-format-vnext".to_string(),
-                minimum_version: 1,
-            }]
+            vec![
+                RequiredRepositoryCapability {
+                    id: "change-format-vnext".to_string(),
+                    minimum_version: 1,
+                },
+                RequiredRepositoryCapability {
+                    id: "kg-semweb-v1".into(),
+                    minimum_version: 1
+                }
+            ]
         );
     }
 

@@ -14,7 +14,7 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-rust-version.workspace = true
+rust-version = "1.98"
 description = "A mathematically sound distributed version control system"
 readme = "README.md"
 keywords = ["vcs", "version-control", "distributed", "patch-theory"]
@@ -39,6 +39,7 @@ atomic-client = { workspace = true }
 tonic = { workspace = true }
 prost-types = { workspace = true }
 atomic-semantic = { workspace = true }
+atomic-shacl = { workspace = true }
 atomic-teams = { workspace = true, optional = true }
 
 # CLI

@@ -12,6 +12,7 @@ members = [
     "atomic-remote",
     "atomic-repository",
     "atomic-semantic",
+    "atomic-shacl",
     "atomic-teams",
     "atomic-wasm",
     "libatomic",
@@ -38,6 +39,7 @@ atomic-objects = { path = "atomic-objects" }
 atomic-remote = { path = "atomic-remote" }
 atomic-repository = { path = "atomic-repository" }
 atomic-semantic = { path = "atomic-semantic" }
+atomic-shacl = { path = "atomic-shacl" }
 atomic-teams = { path = "atomic-teams" }
 libatomic = { path = "libatomic" }
 

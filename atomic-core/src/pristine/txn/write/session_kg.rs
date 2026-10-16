@@ -1,468 +1,453 @@
-//! Session-ledger taxonomy — the single place where session-ledger rows are
-//! arranged into the knowledge graph.
-//!
-//! Model (ATOM-16): the ontology (TBox, [`crate::pristine::ontology`]) types
-//! the ledger's columns; this module is the ABox organization — the node-ID
-//! minting, `rdf:type` assertions, and containment/derivation chains that
-//! arrange session-ledger instances into the KG. The VCS graph stays
-//! canonical and untouched: these triples classify over it, never alter it.
-//!
-//! Taxonomy rules (all of them, nowhere else):
-//!
-//! - Node IDs: `session:{id}`, `session:{id}/turn:{n}`, `provenance:{hash}`,
-//!   `change:{12-char-truncated}` — the last joins the enrichment convention;
-//!   the full hash rides in edge metadata for precision.
-//! - Every relation uses an ontology predicate — no ad-hoc edge kinds.
-//! - `rdf:type` is asserted in node metadata (`rdf_type` key, full URI);
-//!   `KgNode.kind` stays a short searchable category like the rest of the KG.
-//! - Emission is idempotent (upsert semantics) and rides the caller's write
-//!   transaction; it never opens a second one.
-
-use crate::change::session::{SessionRecord, SessionTurn};
-use crate::pristine::error::PristineResult;
-use crate::pristine::ontology::{edge_kind, entity_type, predicate};
-use crate::pristine::traits::{KgMutTxnT, KgTxnT};
-use crate::pristine::vault::{KgEdge, KgNode};
-use crate::types::{Base32, Hash};
+//! Offline projection of authoritative session-ledger rows. Class assertions
+//! live outside neighborhood edges; view context never asserts membership.
 
 use super::WriteTxn;
-
-/// Node id for a session ledger.
-pub(crate) fn session_node_id(session_id: &str) -> String {
-    format!("session:{}", session_id)
-}
-
-/// Node id for one turn row in a session ledger.
-pub(crate) fn turn_node_id(session_id: &str, turn_number: u32) -> String {
-    format!("session:{}/turn:{}", session_id, turn_number)
-}
-
-/// Node id for a provenance graph.
-pub(crate) fn provenance_node_id(hash: &Hash) -> String {
-    format!("provenance:{}", hash.to_base32())
-}
-
-/// Node id for a change, using the enrichment convention (12-char truncated).
-pub(crate) fn change_node_id(hash: &Hash) -> String {
-    let b32 = hash.to_base32();
-    format!("change:{}", &b32[..12.min(b32.len())])
-}
-
-/// Node id for a todo. Agent-provided IDs are only stable within their
-/// session, so qualify them with that session. Generated turn-local IDs are
-/// already fully qualified and pass through unchanged.
-pub(crate) fn todo_node_id(session_id: &str, todo_id: &str) -> String {
-    if todo_id.starts_with(&format!("session:{session_id}/")) {
-        todo_id.to_string()
-    } else {
-        format!("session:{session_id}/todo:{todo_id}")
-    }
-}
-
-fn legacy_todo_node_id(todo_id: &str) -> String {
-    if todo_id.starts_with("session:") {
-        todo_id.to_string()
-    } else {
-        format!("todo:{todo_id}")
-    }
-}
-
-fn is_session_owned_turn_edge(edge: &KgEdge, turn: &SessionTurn) -> bool {
-    let turn_id = turn_node_id(&turn.session_id, turn.turn_number);
-    let session_turn_prefix = format!("session:{}/turn:", turn.session_id);
-    if edge.from_id == turn_id {
-        return (edge.kind == predicate::EXPLAINED_BY
-            && edge.to_id == provenance_node_id(&turn.provenance_hash))
-            || (edge.kind == predicate::HAD_PLAN
-                && turn.plan_id.as_ref().is_some_and(|plan_id| {
-                    edge.to_id == format!("intent:{}", plan_id.to_uppercase())
-                }))
-            || (edge.kind == predicate::HAS_TODO
-                && turn.todos.iter().any(|todo| {
-                    edge.to_id == todo_node_id(&turn.session_id, &todo.id)
-                        || edge.to_id == legacy_todo_node_id(&todo.id)
-                }))
-            || (edge.kind == predicate::GENERATED
-                && turn
-                    .change_hashes
-                    .iter()
-                    .any(|hash| edge.to_id == change_node_id(hash)))
-            || (edge.kind == predicate::WAS_INFORMED_BY
-                && edge.to_id.starts_with(&session_turn_prefix));
-    }
-
-    edge.to_id == turn_id
-        && ((edge.kind == predicate::HAD_MEMBER
-            && edge.from_id == session_node_id(&turn.session_id))
-            || (edge.kind == predicate::WAS_INFORMED_BY
-                && edge.from_id.starts_with(&session_turn_prefix)))
-}
+use crate::change::session::{SessionRecord, SessionTurn};
+use crate::kg::{
+    iri,
+    ontology::{Class, Predicate},
+    project_id::ProjectId,
+};
+use crate::pristine::vault::{KgEdge, KgNode};
+use crate::pristine::{
+    GraphTxnT, KgMutTxnT, KgTxnT, PristineError, PristineResult, VaultTxnT, ViewTxnT,
+};
+use crate::types::{Base32, Hash};
+use redb::ReadableTable;
 
 impl WriteTxn<'_> {
-    /// Remove derived turn/todo KG state before a session ledger is
-    /// re-numbered. Edges not owned by the session index are returned with
-    /// their turn endpoints remapped so callers can restore them afterward.
+    pub fn kg_project(&self) -> PristineResult<ProjectId> {
+        self.project_identity()?
+            .ok_or(PristineError::MissingProjectIdentity)?
+            .project_id()
+            .map_err(|e| PristineError::Serialization {
+                message: e.to_string(),
+            })
+    }
+
+    /// Resolve a plan through authoritative manifest identity; a raw label is
+    /// insufficient evidence to invent a canonical intent resource.
+    pub fn kg_intent_id(&self, raw: &str) -> PristineResult<Option<String>> {
+        let raw = raw.strip_prefix("urn:atomic:intent:").unwrap_or(raw);
+        let manifest = self.get_vault_manifest()?;
+        let summary = manifest.intents.iter().find(|(key, summary)| {
+            key.eq_ignore_ascii_case(raw) || summary.uid.eq_ignore_ascii_case(raw)
+        });
+        Ok(summary.and_then(|(_, summary)| {
+            iri::mint_intent(&self.kg_project().ok()?, &summary.uid.to_uppercase()).ok()
+        }))
+    }
+
+    pub fn kg_finding(&mut self, code: &str, subject: &str, message: &str) -> PristineResult<()> {
+        let id = iri::mint_finding(&self.kg_project()?, code, subject);
+        self.upsert_kg_node(
+            &KgNode::new(&id, Class::Finding, code, "findings")
+                .with_summary(message)
+                .with_metadata(serde_json::json!({"finding_code": code})),
+        )?;
+        self.upsert_kg_edge(&KgEdge::new(id, subject, Predicate::AboutResource))
+    }
+
+    pub fn kg_clear_finding(&mut self, code: &str, subject: &str) -> PristineResult<()> {
+        self.del_kg_node(&iri::mint_finding(&self.kg_project()?, code, subject))?;
+        Ok(())
+    }
+
     pub(crate) fn clear_session_turn_kg(
         &mut self,
-        old_turns: &[SessionTurn],
-        new_turns: &[SessionTurn],
+        old: &[SessionTurn],
+        new: &[SessionTurn],
     ) -> PristineResult<Vec<KgEdge>> {
-        let mut todo_ids = std::collections::BTreeSet::new();
-        let old_turn_ids: std::collections::BTreeSet<String> = old_turns
-            .iter()
-            .map(|turn| turn_node_id(&turn.session_id, turn.turn_number))
-            .collect();
-        let new_turn_ids: std::collections::HashMap<Hash, String> = new_turns
+        if !self.kg_writes_enabled()? {
+            return Ok(Vec::new());
+        }
+        let project = self.kg_project()?;
+        let replacements: std::collections::HashMap<Hash, String> = new
             .iter()
             .map(|turn| {
                 (
                     turn.provenance_hash,
-                    turn_node_id(&turn.session_id, turn.turn_number),
+                    iri::mint_turn(&project, &turn.session_id, turn.turn_number),
                 )
             })
             .collect();
-        let mut remapped_turn_ids = std::collections::HashMap::new();
+        let mut remap = std::collections::HashMap::new();
         let mut preserved = std::collections::BTreeMap::new();
-
-        for turn in old_turns {
-            let old_turn_id = turn_node_id(&turn.session_id, turn.turn_number);
-            if let Some(new_turn_id) = new_turn_ids.get(&turn.provenance_hash) {
-                remapped_turn_ids.insert(old_turn_id.clone(), new_turn_id.clone());
+        for turn in old {
+            let id = iri::mint_turn(&project, &turn.session_id, turn.turn_number);
+            if let Some(new_id) = replacements.get(&turn.provenance_hash) {
+                remap.insert(id.clone(), new_id.clone());
             }
-            for todo in &turn.todos {
-                // Current namespaced form.
-                todo_ids.insert(todo_node_id(&turn.session_id, &todo.id));
-                // Pre-fix global form, for safe migration during a rewrite.
-                todo_ids.insert(legacy_todo_node_id(&todo.id));
-            }
-
-            let edges = self
-                .get_kg_edges_from(&old_turn_id)?
+            for edge in self
+                .get_kg_edges_from(&id)?
                 .into_iter()
-                .chain(self.get_kg_edges_to(&old_turn_id)?);
-            for edge in edges {
-                if !is_session_owned_turn_edge(&edge, turn) {
-                    preserved.insert(
-                        (edge.from_id.clone(), edge.to_id.clone(), edge.kind.clone()),
-                        edge,
-                    );
+                .chain(self.get_kg_edges_to(&id)?)
+            {
+                if edge
+                    .metadata
+                    .as_ref()
+                    .and_then(|m| m.get("projector"))
+                    .and_then(|m| m.as_str())
+                    != Some("session_ledger")
+                {
+                    preserved.insert((edge.from_id.clone(), edge.to_id.clone(), edge.kind), edge);
+                }
+            }
+            self.del_kg_node(&id)?;
+            for hash in &turn.change_hashes {
+                let change = iri::mint_change(hash);
+                for edge in self.get_kg_edges_from(&change)? {
+                    if edge
+                        .metadata
+                        .as_ref()
+                        .and_then(|m| m.get("turn_provenance"))
+                        .and_then(|m| m.as_str())
+                        == Some(turn.provenance_hash.to_base32().as_str())
+                    {
+                        self.del_kg_edge(&edge.from_id, &edge.to_id, &edge.kind)?;
+                    }
                 }
             }
         }
-
-        for turn_id in &old_turn_ids {
-            self.del_kg_node(turn_id)?;
-        }
-
-        for todo_id in todo_ids {
-            let is_session_todo = self
-                .get_kg_node(&todo_id)?
-                .is_some_and(|node| node.kind == "todo" && node.source == "session_ledger");
-            if is_session_todo
-                && self.get_kg_edges_from(&todo_id)?.is_empty()
-                && self.get_kg_edges_to(&todo_id)?.is_empty()
-            {
-                self.del_kg_node(&todo_id)?;
-            }
-        }
-
         Ok(preserved
             .into_values()
             .map(|mut edge| {
-                if let Some(new_id) = remapped_turn_ids.get(&edge.from_id) {
-                    edge.from_id = new_id.clone();
+                if let Some(id) = remap.get(&edge.from_id) {
+                    edge.from_id = id.clone();
                 }
-                if let Some(new_id) = remapped_turn_ids.get(&edge.to_id) {
-                    edge.to_id = new_id.clone();
+                if let Some(id) = remap.get(&edge.to_id) {
+                    edge.to_id = id.clone();
                 }
                 edge
             })
             .collect())
     }
 
-    /// Check the derived nodes and edges covered by the session-ledger schema
-    /// marker before an idempotent rebuild skips a full rewrite.
     pub(crate) fn session_turn_kg_is_current(
         &self,
-        session_id: &str,
+        session: &str,
         turns: &[SessionTurn],
     ) -> PristineResult<bool> {
-        let session_node = session_node_id(session_id);
-        let is_current_session = self
-            .get_kg_node(&session_node)?
-            .is_some_and(|node| node.kind == "session" && node.source == "session_ledger");
-        if !is_current_session {
+        if !self.kg_writes_enabled()? {
+            return Ok(true);
+        }
+        let project = self.kg_project()?;
+        if self
+            .get_kg_node(&iri::mint_session(&project, session))?
+            .is_none()
+        {
             return Ok(false);
         }
-
-        let session_edges = self.get_kg_edges_from(&session_node)?;
-        let turn_numbers: std::collections::HashMap<Hash, u32> = turns
-            .iter()
-            .map(|turn| (turn.provenance_hash, turn.turn_number))
-            .collect();
-        let turn_prefix = format!("session:{session_id}/turn:");
-
         for turn in turns {
-            if turn.session_id != session_id {
+            let id = iri::mint_turn(&project, session, turn.turn_number);
+            let Some(node) = self.get_kg_node(&id)? else {
                 return Ok(false);
-            }
-
-            let turn_id = turn_node_id(&turn.session_id, turn.turn_number);
-            let is_current_turn = self
-                .get_kg_node(&turn_id)?
-                .is_some_and(|node| node.kind == "session_turn" && node.source == "session_ledger");
-            if !is_current_turn
-                || !session_edges
-                    .iter()
-                    .any(|edge| edge.kind == predicate::HAD_MEMBER && edge.to_id == turn_id)
+            };
+            if !node.has_type(Class::SessionTurn)
+                || node.has_type(Class::ManagedTurn) != turn.plan_id.is_some()
             {
                 return Ok(false);
             }
-
-            let turn_edges = self.get_kg_edges_from(&turn_id)?;
-            if !turn_edges.iter().any(|edge| {
-                edge.kind == predicate::EXPLAINED_BY
-                    && edge.to_id == provenance_node_id(&turn.provenance_hash)
-            }) {
-                return Ok(false);
-            }
-
-            let expected_previous = turn.previous_provenance.and_then(|hash| {
-                turn_numbers
-                    .get(&hash)
-                    .map(|number| turn_node_id(session_id, *number))
-            });
-            let actual_previous: Vec<&str> = turn_edges
-                .iter()
-                .filter(|edge| {
-                    edge.kind == predicate::WAS_INFORMED_BY && edge.to_id.starts_with(&turn_prefix)
-                })
-                .map(|edge| edge.to_id.as_str())
-                .collect();
-            match expected_previous {
-                Some(expected)
-                    if actual_previous.len() == 1 && actual_previous[0] == expected.as_str() => {}
-                None if actual_previous.is_empty() => {}
-                _ => return Ok(false),
-            }
-
-            if let Some(plan_id) = &turn.plan_id {
-                let intent_id = format!("intent:{}", plan_id.to_uppercase());
-                if !turn_edges
-                    .iter()
-                    .any(|edge| edge.kind == predicate::HAD_PLAN && edge.to_id == intent_id)
-                    || !session_edges
-                        .iter()
-                        .any(|edge| edge.kind == predicate::HAD_PLAN && edge.to_id == intent_id)
-                {
-                    return Ok(false);
-                }
-            }
-
+            let edges = self.get_kg_edges_from(&id)?;
             for todo in &turn.todos {
-                let current_id = todo_node_id(&turn.session_id, &todo.id);
-                let is_current_todo = self
-                    .get_kg_node(&current_id)?
-                    .is_some_and(|node| node.kind == "todo" && node.source == "session_ledger");
-                if !is_current_todo
-                    || !turn_edges
+                let todo = iri::mint_todo(&project, session, &todo.id);
+                if self.get_kg_node(&todo)?.is_none()
+                    || !edges
                         .iter()
-                        .any(|edge| edge.kind == predicate::HAS_TODO && edge.to_id == current_id)
-                {
-                    return Ok(false);
-                }
-
-                let legacy_id = legacy_todo_node_id(&todo.id);
-                if legacy_id != current_id
-                    && self
-                        .get_kg_node(&legacy_id)?
-                        .is_some_and(|node| node.kind == "todo" && node.source == "session_ledger")
+                        .any(|edge| edge.kind == Predicate::HasTodo && edge.to_id == todo)
                 {
                     return Ok(false);
                 }
             }
-
-            for change_hash in &turn.change_hashes {
-                let change_id = change_node_id(change_hash);
-                if !turn_edges
+            if let Some(previous) = turn.previous_provenance.and_then(|hash| {
+                turns
                     .iter()
-                    .any(|edge| edge.kind == predicate::GENERATED && edge.to_id == change_id)
+                    .find(|candidate| candidate.provenance_hash == hash)
+            }) {
+                let previous = iri::mint_turn(&project, session, previous.turn_number);
+                if !edges
+                    .iter()
+                    .any(|edge| edge.kind == Predicate::ProvWasInformedBy && edge.to_id == previous)
                 {
+                    return Ok(false);
+                }
+            }
+            for hash in &turn.change_hashes {
+                if !edges.iter().any(|e| {
+                    e.kind == Predicate::GeneratedChange && e.to_id == iri::mint_change(hash)
+                }) {
                     return Ok(false);
                 }
             }
         }
-
         Ok(true)
     }
 
-    /// Upsert the session node with its current lifecycle metadata.
     pub(crate) fn emit_session_node(&mut self, record: &SessionRecord) -> PristineResult<()> {
-        let node = KgNode::new(
-            session_node_id(&record.session_id),
-            "session",
-            &record.session_id,
-            "session_ledger",
-        )
-        .with_metadata(serde_json::json!({
-            "rdf_type": entity_type::SESSION,
-            "view": record.view_name,
-            "parent_view": record.parent_view,
-            "status": record.status.label(),
-            "incomplete": record.status.incomplete(),
-            "turn_count": record.turn_count,
-            "json_path": record.json_path,
-        }));
-        self.upsert_kg_node(&node)?;
-
-        // session ON_VIEW view — shares the enrichment's view vocabulary so
-        // `neighbors view:X` surfaces sessions alongside changes and files.
+        if !self.kg_writes_enabled()? {
+            return Ok(());
+        }
+        let project = self.kg_project()?;
+        let id = iri::mint_session(&project, &record.session_id);
+        self.upsert_kg_node(&KgNode::new(&id, Class::Session, &record.session_id, "session_ledger")
+            .with_metadata(serde_json::json!({"view": record.view_name, "parent_view": record.parent_view,
+                "status": record.status.label(), "incomplete": record.status.incomplete(), "turn_count": record.turn_count,
+                "json_path": record.json_path})))?;
+        for edge in self.get_kg_edges_from(&id)? {
+            if edge.kind == Predicate::SessionViewContext {
+                self.del_kg_edge(&edge.from_id, &edge.to_id, &edge.kind)?;
+            }
+        }
         if let Some(view) = &record.view_name {
-            self.upsert_kg_edge(&KgEdge::new(
-                session_node_id(&record.session_id),
-                format!("view:{}", view),
-                edge_kind::ON_VIEW,
-            ))?;
+            let view_id = iri::mint_view(&project, view);
+            if self.get_view(view)?.is_some() {
+                if self.get_kg_node(&view_id)?.is_none() {
+                    self.upsert_kg_node(&KgNode::new(&view_id, Class::View, view, "vcs"))?;
+                }
+                self.upsert_kg_edge(&KgEdge::new(&id, view_id, Predicate::SessionViewContext))?;
+            }
         }
         Ok(())
     }
 
-    /// Emit one turn row's nodes and edges.
-    ///
-    /// Triples (all in the caller's transaction):
-    /// - `session:{id}` (upserted with latest lifecycle metadata)
-    /// - `provenance:{hash}` typed `vault:ProvenanceGraph`
-    /// - `session:{id}/turn:{n}` typed `vault:SessionTurn`
-    /// - session `prov:hadMember` turn
-    /// - turn `vault:explainedBy` provenance
-    /// - turn `prov:generated` change (per explained change; full hash in edge metadata)
-    /// - turn `prov:wasInformedBy` the turn named by `previous_provenance`
     pub(crate) fn emit_turn_kg(
         &mut self,
         record: &SessionRecord,
         turn: &SessionTurn,
-        previous_turn_number: Option<u32>,
+        previous: Option<u32>,
     ) -> PristineResult<()> {
+        if !self.kg_writes_enabled()? {
+            return Ok(());
+        }
+        let project = self.kg_project()?;
         self.emit_session_node(record)?;
-
-        let prov_id = provenance_node_id(&turn.provenance_hash);
-        let prov_node = KgNode::new(
-            &prov_id,
-            "provenance",
-            &turn.provenance_hash.to_base32()[..12],
-            "session_ledger",
-        )
-        .with_metadata(serde_json::json!({
-            "rdf_type": entity_type::PROVENANCE,
-            "session_id": turn.session_id,
-            "timestamp": turn.timestamp,
-        }));
-        self.upsert_kg_node(&prov_node)?;
-
-        let turn_id = turn_node_id(&turn.session_id, turn.turn_number);
-        let turn_node = KgNode::new(
-            &turn_id,
-            "session_turn",
-            format!("turn {}", turn.turn_number),
-            "session_ledger",
-        )
-        .with_metadata(serde_json::json!({
-            "rdf_type": entity_type::SESSION_TURN,
-            "turn_number": turn.turn_number,
-            "timestamp": turn.timestamp,
-            "goal": turn.goal,
-        }));
-        let turn_node = match &turn.goal {
-            Some(goal) => turn_node.with_summary(goal),
-            None => turn_node,
+        let id = iri::mint_turn(&project, &turn.session_id, turn.turn_number);
+        // Replace only this projector's facts. Independent workflow references
+        // survive replay, while removed plans/todos/shortcuts cannot linger.
+        for old in self.get_kg_edges_from(&id)? {
+            if old
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("projector"))
+                .and_then(|value| value.as_str())
+                == Some("session_ledger")
+            {
+                self.del_kg_edge(&old.from_id, &old.to_id, &old.kind)?;
+            }
+        }
+        for hash in &turn.change_hashes {
+            for old in self.get_kg_edges_from(&iri::mint_change(hash))? {
+                if old
+                    .metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.get("turn_provenance"))
+                    .and_then(|value| value.as_str())
+                    == Some(turn.provenance_hash.to_base32().as_str())
+                {
+                    self.del_kg_edge(&old.from_id, &old.to_id, &old.kind)?;
+                }
+            }
+        }
+        self.kg_clear_finding("UnresolvedReference", &id)?;
+        let created_at = chrono::DateTime::from_timestamp(turn.timestamp, 0)
+            .ok_or_else(|| PristineError::Serialization {
+                message: "session turn timestamp is outside the RDF dateTime range".into(),
+            })?
+            .to_rfc3339();
+        let mut node = KgNode::new(&id, Class::SessionTurn, format!("turn {}", turn.turn_number), "session_ledger")
+            .with_metadata(serde_json::json!({"turn_number": turn.turn_number, "created_at": created_at, "goal": turn.goal,
+                "plan_id": turn.plan_id, "outcome": turn.outcome, "boundary_start": turn.boundary_start, "boundary_end": turn.boundary_end}));
+        if turn.plan_id.is_some() {
+            node = node.with_type(Class::ManagedTurn);
+        }
+        if let Some(goal) = &turn.goal {
+            node = node.with_summary(goal);
+        }
+        self.upsert_kg_node(&node)?;
+        let edge = |from: &str, to: &str, predicate| {
+            KgEdge::new(from, to, predicate)
+            .with_metadata(serde_json::json!({"projector": "session_ledger", "turn_provenance": turn.provenance_hash.to_base32()}))
         };
-        self.upsert_kg_node(&turn_node)?;
-
-        self.upsert_kg_edge(&KgEdge::new(
-            session_node_id(&turn.session_id),
-            &turn_id,
-            predicate::HAD_MEMBER,
+        self.upsert_kg_edge(&edge(
+            &iri::mint_session(&project, &turn.session_id),
+            &id,
+            Predicate::HasTurn,
         ))?;
-
-        self.upsert_kg_edge(&KgEdge::new(&turn_id, &prov_id, predicate::EXPLAINED_BY))?;
-
-        if let Some(plan_id) = &turn.plan_id {
-            let intent_id = format!("intent:{}", plan_id.to_uppercase());
-            // The managed plan governs both the session and this concrete turn.
-            self.upsert_kg_edge(&KgEdge::new(
-                session_node_id(&turn.session_id),
-                &intent_id,
-                predicate::HAD_PLAN,
+        let provenance = iri::mint_provenance(&turn.provenance_hash);
+        let has_provenance = self.get_internal(&turn.provenance_hash)?.is_some();
+        if has_provenance {
+            self.upsert_kg_node(&KgNode::new(
+                &provenance,
+                Class::ProvenanceGraph,
+                &turn.provenance_hash.to_base32()[..12],
+                "session_ledger",
             ))?;
-            self.upsert_kg_edge(&KgEdge::new(&turn_id, &intent_id, predicate::HAD_PLAN))?;
+            self.upsert_kg_edge(&edge(&id, &provenance, Predicate::TurnExplainedBy))?;
         }
-
+        let plan = match turn.plan_id.as_deref() {
+            Some(raw) => self.kg_intent_id(raw)?,
+            None => None,
+        };
+        if let Some(plan) = &plan {
+            if self.get_kg_node(plan)?.is_some() {
+                self.upsert_kg_edge(&edge(&id, plan, Predicate::HasPlan))?;
+            } else {
+                self.kg_finding(
+                    "UnresolvedReference",
+                    &id,
+                    "The governing intent is not projected locally",
+                )?;
+            }
+        } else if turn.plan_id.is_some() {
+            self.kg_finding(
+                "UnresolvedReference",
+                &id,
+                "The governing intent could not be resolved through the vault manifest",
+            )?;
+        }
         for todo in &turn.todos {
-            let todo_id = todo_node_id(&turn.session_id, &todo.id);
-            let todo_node = KgNode::new(&todo_id, "todo", &todo.content, "session_ledger")
-                .with_summary(&todo.content)
-                .with_metadata(serde_json::json!({
-                    "rdf_type": entity_type::TODO,
-                    "todo_id": todo.id,
-                    "status": todo.status,
-                    "priority": todo.priority,
-                    "session_id": turn.session_id,
-                    "turn_number": turn.turn_number,
-                }));
-            self.upsert_kg_node(&todo_node)?;
-            self.upsert_kg_edge(
-                &KgEdge::new(&turn_id, &todo_id, predicate::HAS_TODO).with_metadata(
-                    serde_json::json!({
-                        "status": todo.status,
-                        "priority": todo.priority,
-                    }),
-                ),
-            )?;
+            let todo_id = iri::mint_todo(&project, &turn.session_id, &todo.id);
+            self.upsert_kg_node(&KgNode::new(&todo_id, Class::Todo, &todo.content, "session_ledger")
+                .with_summary(&todo.content).with_metadata(serde_json::json!({"todo_id": todo.id, "status": todo.status,
+                    "priority": todo.priority, "session_id": turn.session_id, "turn_number": turn.turn_number})))?;
+            self.upsert_kg_edge(&edge(&id, &todo_id, Predicate::HasTodo))?;
         }
-
-        for change_hash in &turn.change_hashes {
-            self.upsert_kg_edge(
-                &KgEdge::new(&turn_id, change_node_id(change_hash), predicate::GENERATED)
-                    .with_metadata(serde_json::json!({
-                        "change_hash": change_hash.to_base32(),
-                    })),
-            )?;
+        for hash in &turn.change_hashes {
+            let change = iri::mint_change(hash);
+            if self.get_kg_node(&change)?.is_none() {
+                self.upsert_kg_node(
+                    &KgNode::new(
+                        &change,
+                        Class::Change,
+                        &hash.to_base32()[..12],
+                        "session_ledger",
+                    )
+                    .with_metadata(serde_json::json!({"hash": hash.to_base32()})),
+                )?;
+            }
+            self.upsert_kg_edge(&edge(&id, &change, Predicate::GeneratedChange))?;
+            self.kg_clear_finding("MissingPlanId", &change)?;
+            if let Some(plan) = plan
+                .as_ref()
+                .filter(|plan| self.get_kg_node(plan).ok().flatten().is_some())
+            {
+                self.upsert_kg_edge(&edge(&change, plan, Predicate::Implements))?;
+            } else {
+                self.kg_finding(
+                    "MissingPlanId",
+                    &change,
+                    "The generating turn has no locally resolved governing intent",
+                )?;
+            }
+            self.kg_clear_finding("MissingProvenance", &change)?;
+            if has_provenance {
+                self.upsert_kg_edge(&edge(&change, &provenance, Predicate::ChangeExplainedBy))?;
+            } else {
+                self.kg_finding(
+                    "MissingProvenance",
+                    &change,
+                    "The generating turn's provenance sidecar is absent",
+                )?;
+            }
+            if !self
+                .get_kg_edges_from(&change)?
+                .iter()
+                .any(|edge| edge.kind == Predicate::AttestedBy)
+            {
+                self.kg_finding(
+                    "MissingAttestation",
+                    &change,
+                    "No covering attestation is registered locally",
+                )?;
+            }
         }
-
-        if let Some(previous_turn_number) = previous_turn_number {
-            self.upsert_kg_edge(&KgEdge::new(
-                &turn_id,
-                turn_node_id(&turn.session_id, previous_turn_number),
-                predicate::WAS_INFORMED_BY,
-            ))?;
+        if let Some(previous) = previous {
+            let previous = iri::mint_turn(&project, &turn.session_id, previous);
+            if self.get_kg_node(&previous)?.is_some() {
+                self.upsert_kg_edge(&edge(&id, &previous, Predicate::ProvWasInformedBy))?;
+            }
         }
-
         Ok(())
     }
 
-    /// Emit the fork-derivation triple: child session `prov:wasDerivedFrom`
-    /// parent session, with the fork boundary in edge metadata.
-    ///
-    /// Public because the fork boundary is decided at the repository layer
-    /// (`Repository::fork_session`); the turn/session emission stays internal
-    /// to the index paths.
+    pub fn project_session_kg(
+        &mut self,
+        record: &SessionRecord,
+        turns: &[SessionTurn],
+    ) -> PristineResult<()> {
+        if !self.kg_writes_enabled()? {
+            return Ok(());
+        }
+        self.emit_session_node(record)?;
+        let numbers: std::collections::HashMap<Hash, u32> = turns
+            .iter()
+            .map(|turn| (turn.provenance_hash, turn.turn_number))
+            .collect();
+        for turn in turns {
+            self.emit_turn_kg(
+                record,
+                turn,
+                turn.previous_provenance
+                    .and_then(|hash| numbers.get(&hash).copied()),
+            )?;
+        }
+        let lineage = {
+            use crate::change::session::SessionManifest;
+            use crate::pristine::tables::{SESSION_HEADS, SESSION_MANIFESTS};
+            let heads = self.txn.open_table(SESSION_HEADS)?;
+            let manifests = self.txn.open_table(SESSION_MANIFESTS)?;
+            let decode = |bytes: &[u8]| {
+                SessionManifest::from_bytes(bytes).map_err(|error| PristineError::Serialization {
+                    message: error.to_string(),
+                })
+            };
+            let mut lineage = None;
+            if let Some(head) = heads.get(record.session_id.as_str())? {
+                if let Some(bytes) = manifests.get(head.value())? {
+                    let manifest = decode(bytes.value())?;
+                    if let (Some(parent), Some(turn)) =
+                        (manifest.parent_session, manifest.fork_turn)
+                    {
+                        if let Some(bytes) = manifests.get(parent.as_bytes())? {
+                            lineage = Some((decode(bytes.value())?.session_id, turn, parent));
+                        }
+                    }
+                }
+            }
+            lineage
+        };
+        if let Some((parent, turn, manifest)) = lineage {
+            let parent_id = iri::mint_session(&self.kg_project()?, &parent);
+            if self.get_kg_node(&parent_id)?.is_none() {
+                self.upsert_kg_node(&KgNode::new(
+                    parent_id,
+                    Class::Session,
+                    &parent,
+                    "session_ledger",
+                ))?;
+            }
+            self.emit_session_fork_kg(&record.session_id, &parent, turn, &manifest)?;
+        }
+        Ok(())
+    }
+
     pub fn emit_session_fork_kg(
         &mut self,
-        child_session_id: &str,
-        parent_session_id: &str,
+        child: &str,
+        parent: &str,
         fork_turn: u32,
         parent_manifest: &Hash,
     ) -> PristineResult<()> {
-        self.upsert_kg_edge(
-            &KgEdge::new(
-                session_node_id(child_session_id),
-                session_node_id(parent_session_id),
-                predicate::WAS_DERIVED_FROM,
-            )
-            .with_metadata(serde_json::json!({
-                "fork_turn": fork_turn,
-                "parent_manifest": parent_manifest.to_base32(),
-            })),
-        )
+        if !self.kg_writes_enabled()? {
+            return Ok(());
+        }
+        let project = self.kg_project()?;
+        let child_id = iri::mint_session(&project, child);
+        let parent_id = iri::mint_session(&project, parent);
+        if self.get_kg_node(&child_id)?.is_some() && self.get_kg_node(&parent_id)?.is_some() {
+            self.upsert_kg_edge(&KgEdge::new(child_id, parent_id, Predicate::ProvWasDerivedFrom)
+                .with_metadata(serde_json::json!({"fork_turn": fork_turn, "parent_manifest": parent_manifest.to_base32()})))?;
+        }
+        Ok(())
     }
 }

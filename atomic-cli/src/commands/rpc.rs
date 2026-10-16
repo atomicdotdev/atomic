@@ -145,7 +145,7 @@ fn memory_sources(bundle: &EntryBundle) -> crate::commands::memory::bridge::Atte
 fn kg_node_domain(node: &pb::KgNode) -> atomic_core::pristine::vault::KgNode {
     atomic_core::pristine::vault::KgNode {
         id: node.id.clone(),
-        kind: node.node_type.clone(),
+        types: node.types.clone(),
         label: node.name.clone().unwrap_or_default(),
         summary: node
             .data
@@ -160,16 +160,21 @@ fn kg_node_domain(node: &pb::KgNode) -> atomic_core::pristine::vault::KgNode {
 }
 
 /// Wire KGEdge → the domain edge.
-fn kg_edge_domain(edge: &pb::KgEdge) -> atomic_core::pristine::vault::KgEdge {
-    atomic_core::pristine::vault::KgEdge {
+fn kg_edge_domain(edge: &pb::KgEdge) -> CliResult<atomic_core::pristine::vault::KgEdge> {
+    Ok(atomic_core::pristine::vault::KgEdge {
         from_id: edge.source.clone(),
         to_id: edge.target.clone(),
-        kind: edge.relation.clone(),
+        kind: atomic_core::kg::ontology::Predicate::from_iri(&edge.relation).ok_or_else(|| {
+            CliError::Internal(anyhow::anyhow!(
+                "unknown canonical predicate from service: {}",
+                edge.relation
+            ))
+        })?,
         metadata: edge
             .metadata
             .as_ref()
             .and_then(|metadata| serde_json::from_slice(metadata).ok()),
-    }
+    })
 }
 
 pub(crate) fn request_meta() -> Option<pb::RequestMeta> {
@@ -1223,7 +1228,12 @@ pub fn query_search(args: &super::query::QueryNodes) -> CliResult<bool> {
         } else {
             format!("  {}", super::query::truncate_display(summary, 60))
         };
-        println!("  [{}] {}{}", node.kind, node.id, summary_display);
+        println!(
+            "  [{}] {}{}",
+            atomic_core::kg::ontology::compact(node.primary_type()),
+            node.id,
+            summary_display
+        );
     }
     println!("\n{} result(s).", nodes.len());
     Ok(true)
@@ -1307,6 +1317,7 @@ pub fn query_enrich(args: &super::query::QueryEnrich) -> CliResult<bool> {
         action: pb::KnowledgeMaintainAction::Enrich as i32,
         scope: args.rebuild.then(|| "rebuild".to_string()),
         changes,
+        ..Default::default()
     };
     let response = session.maintain_knowledge_graph(request)?;
     if !args.changes.is_empty() {
@@ -2648,7 +2659,7 @@ pub fn query_neighbors(args: &super::query::QueryNeighbors) -> CliResult<bool> {
         .edges
         .iter()
         .map(kg_edge_domain)
-        .collect::<Vec<_>>();
+        .collect::<CliResult<Vec<_>>>()?;
     if args.json {
         let subgraph = atomic_core::pristine::vault::KgSubgraph { nodes, edges };
         println!("{}", serde_json::to_string_pretty(&subgraph).unwrap());
@@ -2666,7 +2677,12 @@ pub fn query_neighbors(args: &super::query::QueryNeighbors) -> CliResult<bool> {
         } else {
             format!("  {}", super::query::truncate_display(summary, 50))
         };
-        println!("  [{}] {}{}", node.kind, node.id, summary_display);
+        println!(
+            "  [{}] {}{}",
+            atomic_core::kg::ontology::compact(node.primary_type()),
+            node.id,
+            summary_display
+        );
     }
     println!("\nEdges ({}):", edges.len());
     for edge in &edges {
@@ -2681,6 +2697,39 @@ pub fn query_neighbors(args: &super::query::QueryNeighbors) -> CliResult<bool> {
 // ---------------------------------------------------------------------------
 // doctor (MaintenanceService)
 // ---------------------------------------------------------------------------
+
+/// Native repair refuses unrepairable authority in a read-only handler preflight.
+pub fn doctor_repair_native_indexes() -> CliResult<()> {
+    let root = super::find_repository_root()?;
+    let session = Service::open_root(&root)?.ok_or_else(|| CliError::InvalidArgument {
+        message: "native-index repair requires a local repository service".into(),
+    })?;
+    print_info("Rebuilding native derived indexes from graph authority...");
+    let outcome = session.repair(pb::RepairRequest {
+        repository: Some(session.reference.clone()),
+        meta: request_meta(),
+        action: pb::RepairAction::RebuildNativeIndexes as i32,
+        force: false,
+        view: String::new(),
+    })?;
+    if outcome.native_already_healthy {
+        print_success(&format!(
+            "Native derived indexes are already consistent ({} rows).",
+            outcome.native_rows_written
+        ));
+    } else {
+        print_success(&format!(
+            "Repaired {} native derived-index problem(s); wrote {} rows atomically{}.",
+            outcome.native_problems_repaired,
+            outcome.native_rows_written,
+            outcome
+                .native_operation
+                .map(|operation| format!("; journaled as operation {operation}"))
+                .unwrap_or_default()
+        ));
+    }
+    Ok(())
+}
 
 /// `atomic doctor check` over CheckRepository — the read-only consistency
 /// check. Rendered to mirror the in-process path exactly (non-zero exit
@@ -6101,7 +6150,7 @@ pub fn query_graph(args: &super::query::QueryGraph) -> CliResult<bool> {
         .edges
         .iter()
         .map(kg_edge_domain)
-        .collect::<Vec<_>>();
+        .collect::<CliResult<Vec<_>>>()?;
     if nodes.is_empty() {
         if args.json {
             println!("{{\"nodes\":[],\"edges\":[]}}");
@@ -6195,60 +6244,17 @@ pub fn query_callers(args: &super::query::QueryCallers) -> CliResult<bool> {
         view: None,
     };
     let response = session.query_graph(request)?;
-    let caller_nodes = response
-        .nodes
-        .iter()
-        .map(kg_node_domain)
-        .collect::<Vec<_>>();
-    let caller_edges = response
-        .edges
-        .iter()
-        .map(kg_edge_domain)
-        .collect::<Vec<_>>();
-
-    if args.json {
-        let out: Vec<serde_json::Value> = caller_edges
-            .iter()
-            .map(|edge| {
-                let node = caller_nodes.iter().find(|node| node.id == edge.from_id);
-                serde_json::json!({
-                    "caller_id": edge.from_id,
-                    "summary": node.and_then(|node| node.summary.as_deref()),
-                })
-            })
-            .collect();
-        println!("{}", serde_json::to_string_pretty(&out).unwrap());
-        return Ok(true);
-    }
-
-    if caller_edges.is_empty() {
-        println!("No callers found for '{}'.", args.entity_id);
-        if !response.calls_present {
-            println!(
-                "Hint: run `atomic vault query enrich` to populate CALLS edges, \
-                then retry."
-            );
-        } else {
-            println!("This function is an entry point — nothing in the repo calls it.");
-        }
-    } else {
-        println!("{} caller(s) of {}:\n", caller_edges.len(), args.entity_id);
-        for edge in &caller_edges {
-            let display = if let Some(rest) = edge.from_id.strip_prefix("entity:") {
-                let last = rest.rfind(':').unwrap_or(rest.len());
-                let inner = &rest[..last];
-                let sig = caller_nodes
-                    .iter()
-                    .find(|node| node.id == edge.from_id)
-                    .and_then(|node| node.summary.as_deref())
-                    .map(|summary| format!("  [{}]", summary));
-                format!("  {}{}", inner, sig.unwrap_or_default())
-            } else {
-                format!("  {}", edge.from_id)
-            };
-            println!("{display}");
-        }
-    }
+    let callers: Vec<_> = response
+        .callers
+        .into_iter()
+        .map(|caller| atomic_repository::repository::Caller {
+            path: caller.path,
+            name: caller.name,
+            line: caller.line,
+            summary: caller.summary,
+        })
+        .collect();
+    super::query::render_callers(&args.entity_id, &callers, args.json)?;
     Ok(true)
 }
 
@@ -6303,7 +6309,11 @@ pub fn query_plan(args: &super::query::PlanExec) -> CliResult<bool> {
         if !result.nodes.is_empty() {
             println!("\nNodes ({}):", result.nodes.len());
             for node in &result.nodes {
-                print!("  [{}] {}", node.kind, node.label);
+                print!(
+                    "  [{}] {}",
+                    atomic_core::kg::ontology::compact(node.primary_type()),
+                    node.label
+                );
                 if let Some(summary) = &node.summary {
                     let short: String = summary.chars().take(60).collect();
                     print!(": {}", short);
@@ -6415,6 +6425,7 @@ pub fn query_embed(args: &super::query::QueryEmbed) -> CliResult<bool> {
         action: pb::KnowledgeMaintainAction::Embed as i32,
         scope: args.path.clone(),
         changes: Vec::new(),
+        ..Default::default()
     };
     let response = session.maintain_knowledge_graph(request)?;
     println!(
@@ -6437,20 +6448,64 @@ pub fn query_embed(args: &super::query::QueryEmbed) -> CliResult<bool> {
 
 /// `atomic query reindex` over MaintainKnowledgeGraph (REINDEX) — the
 /// handler runs vault_reindex_kg; the CLI prints the local report.
-pub fn query_reindex() -> CliResult<bool> {
-    let Some(session) = Service::open()? else {
-        return Ok(false);
+pub fn query_reindex(full: bool) -> CliResult<()> {
+    let root = super::find_repository_root()?;
+    let session = Service::open_root(&root)?.ok_or_else(|| CliError::InvalidArgument {
+        message: "knowledge graph reindex requires a local repository service".into(),
+    })?;
+    let remote = match sync_resolve_remote(&session, &None) {
+        Ok((_, url)) => Some(url),
+        Err(CliError::RemoteNotFound { .. }) => None,
+        Err(error) => return Err(error),
     };
+    let signer_auth_headers = remote
+        .as_deref()
+        .map(|url| sync_auth_headers(url, None))
+        .unwrap_or_default();
     let request = pb::MaintainKnowledgeGraphRequest {
         repository: Some(session.reference.clone()),
         meta: request_meta(),
         action: pb::KnowledgeMaintainAction::Reindex as i32,
-        scope: None,
+        scope: full.then(|| "full".to_owned()),
         changes: Vec::new(),
+        signer_auth_headers,
+        signer_remote_url: remote,
     };
     let response = session.maintain_knowledge_graph(request)?;
     println!("Indexed {} nodes + edges.", response.processed);
-    Ok(true)
+    Ok(())
+}
+
+/// Fetch the asserted graph through the same service for local and reactor
+/// modes. The CLI adapts this immutable snapshot to RDF without opening redb.
+pub(crate) fn workflow_snapshot(
+    root: &Path,
+) -> CliResult<atomic_repository::repository::WorkflowSnapshot> {
+    let session = Service::open_root(root)?.ok_or_else(|| CliError::InvalidArgument {
+        message: "workflow validation requires a local repository service".into(),
+    })?;
+    let response = session.get_workflow_snapshot(pb::GetWorkflowSnapshotRequest {
+        repository: Some(session.reference.clone()),
+    })?;
+    if response.api_version != 1
+        || response.generation != atomic_core::kg::KG_GENERATION
+        || response.ontology_version != atomic_core::kg::ontology::VERSION_IRI
+    {
+        return Err(CliError::Internal(anyhow::anyhow!(
+            "unsupported workflow snapshot API/generation/ontology"
+        )));
+    }
+    Ok(atomic_repository::repository::WorkflowSnapshot {
+        generation: response.generation,
+        ontology_version: atomic_core::kg::ontology::VERSION_IRI,
+        identity: response.identity,
+        nodes: response.nodes.iter().map(kg_node_domain).collect(),
+        edges: response
+            .edges
+            .iter()
+            .map(kg_edge_domain)
+            .collect::<CliResult<_>>()?,
+    })
 }
 
 // ---------------------------------------------------------------------------

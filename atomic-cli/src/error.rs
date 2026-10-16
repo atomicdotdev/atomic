@@ -55,6 +55,10 @@ pub type CliResult<T> = Result<T, CliError>;
 /// - **Internal errors**: Unexpected failures (bugs)
 #[derive(Debug, Error)]
 pub enum CliError {
+    #[error("SHACL validation found {count} result(s) that prevent conformance")]
+    ShaclViolation { count: usize },
+    #[error("SHACL validation error: {0}")]
+    ShaclError(String),
     // Repository Errors
     /// No Atomic repository found in the current directory or any parent.
     ///
@@ -680,6 +684,8 @@ impl CliError {
     /// The exit code to use when terminating due to this error.
     pub fn exit_code(&self) -> i32 {
         match self {
+            Self::ShaclViolation { .. } => 1,
+            Self::ShaclError(_) => 3,
             // User-fixable, general errors
             Self::NothingToRecord
             | Self::Cancelled

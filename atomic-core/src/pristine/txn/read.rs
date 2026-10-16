@@ -1371,6 +1371,7 @@ impl VaultTxnT for ReadTxn {
 
 impl KgTxnT for ReadTxn {
     fn get_kg_node(&self, id: &str) -> PristineResult<Option<KgNode>> {
+        self.require_current_kg()?;
         let table = match self.txn.open_table(KG_NODES) {
             Ok(t) => t,
             Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
@@ -1390,6 +1391,7 @@ impl KgTxnT for ReadTxn {
     }
 
     fn get_kg_edges_from(&self, node_id: &str) -> PristineResult<Vec<KgEdge>> {
+        self.require_current_kg()?;
         let from_table = match self.txn.open_multimap_table(KG_EDGES_FROM) {
             Ok(t) => t,
             Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
@@ -1419,6 +1421,7 @@ impl KgTxnT for ReadTxn {
     }
 
     fn get_kg_edges_to(&self, node_id: &str) -> PristineResult<Vec<KgEdge>> {
+        self.require_current_kg()?;
         let to_table = match self.txn.open_multimap_table(KG_EDGES_TO) {
             Ok(t) => t,
             Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
@@ -1448,6 +1451,7 @@ impl KgTxnT for ReadTxn {
     }
 
     fn kg_fts_search(&self, query: &str, limit: usize) -> PristineResult<Vec<KgNode>> {
+        self.require_current_kg()?;
         let fts_table = match self.txn.open_multimap_table(KG_FTS) {
             Ok(t) => t,
             Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
@@ -1474,40 +1478,11 @@ impl KgTxnT for ReadTxn {
             }
         }
 
-        // Sort by relevance: boost entity nodes (3x) and file nodes (2x)
-        // over change nodes (1x). Entities and files are more useful for
-        // code exploration than individual change records.
-        let mut ranked: Vec<(String, usize)> = hit_counts.into_iter().collect();
-        ranked.sort_by(|a, b| {
-            let boost_a = if a.0.starts_with("entity:") {
-                a.1 * 3
-            } else if a.0.starts_with("file:") {
-                a.1 * 2
-            } else {
-                a.1
-            };
-            let boost_b = if b.0.starts_with("entity:") {
-                b.1 * 3
-            } else if b.0.starts_with("file:") {
-                b.1 * 2
-            } else {
-                b.1
-            };
-            boost_b.cmp(&boost_a)
-        });
-        ranked.truncate(limit);
-
-        // Fetch full nodes
-        let mut nodes = Vec::new();
-        for (id, _) in &ranked {
-            if let Some(node) = self.get_kg_node(id)? {
-                nodes.push(node);
-            }
-        }
-        Ok(nodes)
+        crate::pristine::vault::rank_kg_hits(self, hit_counts, limit)
     }
 
     fn kg_fts_match_ids(&self, query: &str) -> PristineResult<Vec<(String, usize)>> {
+        self.require_current_kg()?;
         let fts_table = match self.txn.open_multimap_table(KG_FTS) {
             Ok(t) => t,
             Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
@@ -1537,6 +1512,7 @@ impl KgTxnT for ReadTxn {
     }
 
     fn count_kg_nodes(&self) -> PristineResult<usize> {
+        self.require_current_kg()?;
         let table = match self.txn.open_table(KG_NODES) {
             Ok(t) => t,
             Err(redb::TableError::TableDoesNotExist(_)) => return Ok(0),
@@ -1546,6 +1522,7 @@ impl KgTxnT for ReadTxn {
     }
 
     fn kg_node_ids_by_source(&self, sources: &[&str]) -> PristineResult<Vec<String>> {
+        self.require_current_kg()?;
         let table = match self.txn.open_table(KG_NODES) {
             Ok(t) => t,
             Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
@@ -1564,6 +1541,7 @@ impl KgTxnT for ReadTxn {
     }
 
     fn count_kg_edges(&self) -> PristineResult<usize> {
+        self.require_current_kg()?;
         let table = match self.txn.open_table(KG_EDGES) {
             Ok(t) => t,
             Err(redb::TableError::TableDoesNotExist(_)) => return Ok(0),
