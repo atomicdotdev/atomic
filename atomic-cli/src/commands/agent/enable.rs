@@ -6,13 +6,17 @@
 //! # What It Does
 //!
 //! 1. Finds the repository root if there is one (falls back to a global
-//!    install in the home directory when outside a repository — hooks
-//!    install anywhere)
+//!    install in the home directory when outside a repository)
 //! 2. Detects which agent is present (or uses `--agent` flag)
-//! 3. Calls `AgentHook::install()` to write hooks into the agent's config
-//! 4. Creates `.atomic/sessions/` directory for session state persistence
-//!    (inside repositories only)
-//! 5. Prints a success message with the number of hooks installed
+//! 3. Installs the agent's integration package per its manifest — every
+//!    hook, skill, and prompt lands in the home directory (e.g.
+//!    `~/.claude/settings.json`, `~/.config/opencode/opencode.json`),
+//!    never in the repo; the repo root is used only for agent
+//!    auto-detection, `.atomic/sessions/`, and `--agents-md`
+//!    `[[repo-file]]` entries
+//! 4. Falls back to built-in hook installation (repo-relative inside a
+//!    repository, home directory outside one) only if the package
+//!    cannot be fetched
 //!
 //! Hooks only record turns in projects that have a `.atomic/` directory,
 //! so running `enable` outside a repository is safe — the hooks stay
@@ -192,13 +196,15 @@ impl Command for Enable {
             return self.run_global();
         }
 
-        // Find the repository root if there is one. Hooks install relative
-        // to a base directory: the repo root inside a repository, or the
-        // home directory outside one (the same target as --global — a
-        // project-level `.claude/` in an arbitrary directory would never
-        // be read). Hooks only record turns in projects that have a
-        // `.atomic/` directory, so enabling outside a repository is safe —
-        // the hooks stay dormant.
+        // Find the repository root if there is one. Packaged integrations
+        // (the normal path — every registry agent resolves to one) install
+        // entirely into the home directory per their manifest; the repo
+        // root is used only for agent auto-detection, `.atomic/sessions`,
+        // and `--agents-md` `[[repo-file]]` entries. The built-in hook
+        // install below is a fallback for when the package cannot be
+        // fetched — inside a repository it installs repo-relative, and
+        // outside one it targets the home directory, matching where the
+        // packages install.
         let (install_base, in_repo) = match find_repository_root() {
             Ok(root) => (root, true),
             Err(_) => {
