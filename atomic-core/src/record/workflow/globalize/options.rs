@@ -18,6 +18,27 @@ use super::*;
 /// assert!(!options.include_empty_files());
 /// assert!(options.validate_positions());
 /// ```
+/// A path identity binding resolved through the assembly view's graph
+/// closure by the repository layer.
+///
+/// Globalization resolves parent-directory anchors through these bindings
+/// before consulting the ambient TREE/INODES/DIRECTORIES indexes: a
+/// preserved incremental import (another view owns the working copy) holds
+/// TREE updates only in the deferred lifecycle journal, so the ambient
+/// tables either do not bind the path at all or bind it to another view's
+/// inode. The closure projection is the identity authority (RFC §3.12:
+/// the ambient graph + view closure is the source of truth; TREE and
+/// friends are transactional projections).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectedPathBinding {
+    /// Stable inode the closure binds to the path.
+    pub inode: Inode,
+    /// Graph position of the inode anchor.
+    pub position: Position<NodeId>,
+    /// Whether the closure binds the path as a directory.
+    pub directory: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct GlobalizeOptions {
     /// Whether to include empty files in the output.
@@ -25,6 +46,14 @@ pub struct GlobalizeOptions {
     /// If false, files with no content hunks are skipped.
     /// Default: false
     include_empty_files: bool,
+
+    /// Closure-projected path identity bindings, keyed by path.
+    ///
+    /// Seeded by the repository layer for the ancestor directories of the
+    /// records being assembled. Empty by default: native recording aligns
+    /// the ambient TREE with the current view, so the ambient lookups are
+    /// authoritative there.
+    projected_paths: std::collections::HashMap<String, ProjectedPathBinding>,
 
     /// Whether to validate that positions exist in the graph.
     ///
@@ -78,6 +107,26 @@ impl GlobalizeOptions {
     pub fn with_include_empty_files(mut self, include: bool) -> Self {
         self.include_empty_files = include;
         self
+    }
+
+    /// Seed closure-projected path identity bindings.
+    ///
+    /// See [`ProjectedPathBinding`]: globalization consumes these before the
+    /// ambient TREE so parent-directory anchoring works under a preserved
+    /// (deferred-TREE) incremental import.
+    #[must_use]
+    pub fn with_projected_paths(
+        mut self,
+        paths: std::collections::HashMap<String, ProjectedPathBinding>,
+    ) -> Self {
+        self.projected_paths = paths;
+        self
+    }
+
+    /// The closure-projected path identity bindings.
+    #[must_use]
+    pub fn projected_paths(&self) -> &std::collections::HashMap<String, ProjectedPathBinding> {
+        &self.projected_paths
     }
 
     /// Set whether to validate positions.
@@ -173,6 +222,7 @@ impl Default for GlobalizeOptions {
             validate_positions: true,
             max_hunk_size: 0,
             default_encoding: Encoding::Utf8,
+            projected_paths: std::collections::HashMap::new(),
         }
     }
 }

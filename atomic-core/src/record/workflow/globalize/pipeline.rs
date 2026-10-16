@@ -974,6 +974,59 @@ where
         return Ok(anchor);
     }
 
+    // Closure-projected binding first (preserved-import identity contract):
+    // the ambient TREE/DIRECTORIES may hold the path only in the deferred
+    // lifecycle journal — or bind it to another view's inode — while this
+    // binding was reduced from the assembly view's path claims. The same
+    // visibility, kind, and vertex checks as the ambient path apply, and a
+    // binding the change being assembled itself vacates (file→directory
+    // transitions) is skipped so the in-change DirAdd anchor wins.
+    if let Some(binding) = ctx
+        .projected_paths
+        .get(directory_path)
+        .cloned()
+        .filter(|binding| {
+            !ctx.vacated_bindings
+                .get(directory_path)
+                .is_some_and(|inodes| inodes.contains(&binding.inode))
+        })
+    {
+        if binding.directory {
+            let hash = ctx.txn().get_external(binding.position.change)?.ok_or(
+                GlobalizeError::MissingExternalHash {
+                    node_id: binding.position.change,
+                },
+            )?;
+            if ctx.txn().is_change_visible(binding.position.change) {
+                let inode_node = GraphNode::new(
+                    binding.position.change,
+                    binding.position.pos,
+                    binding.position.pos,
+                );
+                if !ctx.txn().has_vertex(inode_node)? {
+                    return Err(GlobalizeError::InvalidParentMetadata {
+                        path: child_path.to_string(),
+                        parent: directory_path.to_string(),
+                        reason: "projected directory inode anchor is missing from the graph",
+                    });
+                }
+
+                let anchor = Position {
+                    change: Some(hash),
+                    pos: binding.position.pos,
+                };
+                ctx.add_dependency(hash);
+                ctx.register_directory_anchor(directory_path, anchor);
+                return Ok(anchor);
+            }
+        } else {
+            return Err(GlobalizeError::ParentNotDirectory {
+                path: child_path.to_string(),
+                parent: directory_path.to_string(),
+            });
+        }
+    }
+
     if let Some(inode) = ctx.txn().get_inode(directory_path)?.filter(|inode| {
         !ctx.vacated_bindings
             .get(directory_path)

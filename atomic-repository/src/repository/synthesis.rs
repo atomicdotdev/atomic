@@ -2021,6 +2021,56 @@ impl Repository {
         )
     }
 
+    /// Ancestor-directory identity bindings for one assembly: every parent
+    /// directory of the records being assembled (record paths, move old
+    /// paths, and deleted paths), resolved through the assembly view's graph
+    /// closure. Globalization seeds these bindings so structural parent
+    /// anchoring never depends on the ambient TREE (preserved imports hold
+    /// TREE updates in the deferred lifecycle journal; the ambient binding
+    /// may also belong to another view's inode). Directories absent from
+    /// the closure stay unseeded — globalization emits their DirAdd anchors
+    /// inside the change being assembled, exactly as before.
+    fn assembly_projected_paths<T>(
+        &self,
+        txn: &T,
+        visibility: &atomic_core::pristine::GraphVisibilityClosure,
+        recorded_files: &[atomic_core::record::workflow::RecordedFile],
+        deleted_paths: &[String],
+    ) -> Result<
+        std::collections::HashMap<String, atomic_core::record::workflow::ProjectedPathBinding>,
+        RepositoryError,
+    >
+    where
+        T: atomic_core::pristine::GraphTxnT
+            + atomic_core::pristine::TreeTxnT
+            + atomic_core::pristine::PathClaimTxnT
+            + atomic_core::pristine::InodeGraphOps<InodeError = atomic_core::pristine::PristineError>,
+    {
+        use atomic_core::record::workflow::ancestor_directories;
+        use std::collections::{BTreeSet, HashMap};
+
+        let mut wanted: BTreeSet<String> = BTreeSet::new();
+        for file in recorded_files {
+            wanted.extend(ancestor_directories(file.path()));
+            if let Some(old_path) = file.old_path() {
+                wanted.extend(ancestor_directories(old_path));
+            }
+        }
+        for path in deleted_paths {
+            wanted.extend(ancestor_directories(path));
+        }
+
+        let mut bindings = HashMap::with_capacity(wanted.len());
+        for directory in wanted {
+            if let Some(binding) =
+                self.projected_path_binding_for_visibility(txn, visibility, &directory)?
+            {
+                bindings.insert(directory, binding);
+            }
+        }
+        Ok(bindings)
+    }
+
     /// Git directories are implicit: deleting their last descendant also
     /// retires their canonical path claims. Native directory identities stay
     /// explicit, including empty directories nested below an imported parent.
@@ -2163,6 +2213,21 @@ impl Repository {
                     recorded_files,
                     deleted_paths,
                 )?;
+                // Parent-directory anchors resolved through the assembly
+                // closure: under a preserved incremental import the ambient
+                // TREE/DIRECTORIES hold the bindings only in the deferred
+                // lifecycle journal (or bind them to another view's inode),
+                // so globalization's `ensure_directory_anchor` /
+                // `resolve_path_to_inode` must consult these projected
+                // bindings before the ambient indexes — otherwise nested
+                // adds emit duplicate DirAdd claims and directory deletions
+                // fail to resolve their parents.
+                let projected_paths = self.assembly_projected_paths(
+                    &txn,
+                    &visibility,
+                    &recorded_files,
+                    deleted_paths,
+                )?;
                 let view_graph = atomic_core::pristine::ViewGraph::new(&txn, visibility);
                 // CB-9C: imported trees legitimately contain empty tracked
                 // files (`.gitkeep`, lockfile placeholders). Their FileAdd
@@ -2187,7 +2252,8 @@ impl Repository {
                     header.clone(),
                     &AssemblyOptions::new()
                         .max_content_size(content_budget)
-                        .include_empty_files(true),
+                        .include_empty_files(true)
+                        .projected_paths(projected_paths),
                 ) {
                     Ok(result) => {
                         let change = result.into_change();
