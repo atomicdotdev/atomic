@@ -5,11 +5,17 @@
 //!
 //! # What It Does
 //!
-//! 1. Finds the repository root (`.atomic/` must exist)
+//! 1. Finds the repository root if there is one (falls back to the current
+//!    directory when outside a repository — hooks install anywhere)
 //! 2. Detects which agent is present (or uses `--agent` flag)
 //! 3. Calls `AgentHook::install()` to write hooks into the agent's config
 //! 4. Creates `.atomic/sessions/` directory for session state persistence
+//!    (inside repositories only)
 //! 5. Prints a success message with the number of hooks installed
+//!
+//! Hooks only record turns in projects that have a `.atomic/` directory,
+//! so running `enable` outside a repository is safe — the hooks stay
+//! dormant until they fire inside an Atomic repository.
 //!
 //! # Examples
 //!
@@ -185,12 +191,28 @@ impl Command for Enable {
             return self.run_global();
         }
 
-        // Find the repository root
-        let repo_root = find_repository_root()?;
+        // Find the repository root if there is one. Hooks install relative
+        // to a base directory: the repo root inside a repository, or the
+        // current directory outside one. Hooks only record turns in
+        // projects that have a `.atomic/` directory, so enabling outside
+        // a repository is safe — the hooks stay dormant.
+        let repo_root = match find_repository_root() {
+            Ok(root) => root,
+            Err(_) => {
+                print_warning(
+                    "No Atomic repository found — installing hooks relative to the current directory.",
+                );
+                print_warning(
+                    "Turns are only recorded in projects that have a .atomic/ directory.",
+                );
+                std::env::current_dir().map_err(crate::error::CliError::Io)?
+            }
+        };
 
-        // Ensure .atomic/sessions directory exists
+        // Ensure .atomic/sessions directory exists — inside repositories
+        // only, so running outside a repo never creates a stray .atomic/.
         let sessions_dir = repo_root.join(".atomic").join("sessions");
-        if !sessions_dir.exists() {
+        if repo_root.join(".atomic").is_dir() && !sessions_dir.exists() {
             std::fs::create_dir_all(&sessions_dir).map_err(|e| {
                 crate::error::CliError::Io(std::io::Error::new(
                     e.kind(),
@@ -572,9 +594,19 @@ impl Enable {
 
         // Determine repo_root from the --agents-md / --no-agents-md flags
         // or the interactive prompt. Only relevant when the manifest has
-        // [[repo-file]] entries.
+        // [[repo-file]] entries. Outside a repository the entries are
+        // skipped with a warning rather than failing the whole install —
+        // `enable` does not require a repository.
         let repo_root = if !manifest.repo_files.is_empty() && self.agents_md {
-            Some(find_repository_root()?)
+            match find_repository_root() {
+                Ok(root) => Some(root),
+                Err(_) => {
+                    print_warning(
+                        "--agents-md requires an Atomic repository — skipping [[repo-file]] entries.",
+                    );
+                    None
+                }
+            }
         } else {
             None
         };
