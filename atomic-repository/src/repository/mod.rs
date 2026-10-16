@@ -128,7 +128,9 @@ mod split;
 mod staging;
 mod stash;
 mod switch;
+mod syntax_index;
 mod synthesis;
+pub use syntax_index::{Caller, SyntaxIndex};
 mod tag_projection;
 mod views;
 mod working_copy;
@@ -243,8 +245,14 @@ mod changes;
 mod content;
 mod history;
 mod insert;
+mod kg_attestation;
+mod kg_rebuild;
+mod project_identity;
 pub mod provenance_gate;
 mod provenance_summary;
+pub use project_identity::{
+    build_project_identity, project_identity_hash, verify_project_identity,
+};
 mod record;
 mod remotes;
 mod status;
@@ -253,6 +261,8 @@ mod tracking;
 mod triage;
 mod vault;
 mod vault_defaults;
+mod vault_projection;
+pub use vault_triples::WorkflowSnapshot;
 mod vault_embeddings;
 mod vault_goal;
 mod vault_identity;
@@ -611,6 +621,10 @@ default = "{}"
             is_sandbox: false,
         };
         repository.fence_recovery_for_budget(working_copy_id, budget)?;
+        if !budget.is_metadata_only() {
+            repository.ensure_project_identity(atomic_core::kg::project_id::MintReason::Upgrade)?;
+            repository.rebuild_kg(false)?;
+        }
 
         // Deferred TREE or operation recovery may rewrite the compatibility
         // pointer. Reassert the persistent record as the sole authority.

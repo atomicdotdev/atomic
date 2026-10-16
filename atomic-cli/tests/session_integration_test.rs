@@ -16,7 +16,10 @@ use std::process::{Command, Output};
 use atomic_core::change::provenance_graph::{ProvenanceNode, ProvenanceNodeKind};
 use atomic_core::change::session::SessionTodo;
 use atomic_core::change::ProvenanceGraph;
-use atomic_core::pristine::ontology::{edge_kind, entity_type, predicate};
+use atomic_core::kg::{
+    iri,
+    ontology::{Class as C, Predicate as P},
+};
 use atomic_core::pristine::vault::{KgEdge, KgNode};
 use atomic_core::pristine::{KgMutTxnT, KgTxnT};
 use atomic_core::types::{Base32, Hash};
@@ -138,35 +141,22 @@ fn session_order_and_manifest_do_not_depend_on_ingestion_order() {
     repo_a.save_provenance_graph(&child).unwrap();
 
     let repo_b = Repository::open(b_tmp.path()).unwrap();
+    let project = repo_b.project_id().unwrap();
+    let incoming = iri::mint_memory(&project, "incoming-link");
+    let outgoing = iri::mint_memory(&project, "outgoing-link");
+    let turn0 = iri::mint_turn(&project, "ordered-session", 0);
+    let turn1 = iri::mint_turn(&project, "ordered-session", 1);
     repo_b.save_provenance_graph(&child).unwrap();
     {
         let mut txn = repo_b.pristine().write_txn().unwrap();
-        txn.upsert_kg_node(&KgNode::new(
-            "memory:incoming-link",
-            "memory",
-            "incoming",
-            "vault",
-        ))
-        .unwrap();
-        txn.upsert_kg_node(&KgNode::new(
-            "memory:outgoing-link",
-            "memory",
-            "outgoing",
-            "vault",
-        ))
-        .unwrap();
-        txn.upsert_kg_edge(&KgEdge::new(
-            "memory:incoming-link",
-            "session:ordered-session/turn:0",
-            "extension:references",
-        ))
-        .unwrap();
-        txn.upsert_kg_edge(&KgEdge::new(
-            "session:ordered-session/turn:0",
-            "memory:outgoing-link",
-            "extension:produced",
-        ))
-        .unwrap();
+        txn.upsert_kg_node(&KgNode::new(&incoming, C::Memory, "incoming", "vault"))
+            .unwrap();
+        txn.upsert_kg_node(&KgNode::new(&outgoing, C::Memory, "outgoing", "vault"))
+            .unwrap();
+        txn.upsert_kg_edge(&KgEdge::new(&incoming, &turn0, P::References))
+            .unwrap();
+        txn.upsert_kg_edge(&KgEdge::new(&turn0, &outgoing, P::References))
+            .unwrap();
         txn.commit().unwrap();
     }
     repo_b.save_provenance_graph(&parent).unwrap();
@@ -183,30 +173,22 @@ fn session_order_and_manifest_do_not_depend_on_ingestion_order() {
     assert_eq!(turns_b[1].provenance_hash, child_hash);
 
     let txn = repo_b.pristine().read_txn().unwrap();
-    let child_edges = txn
-        .get_kg_edges_from("session:ordered-session/turn:1")
-        .unwrap();
-    assert!(child_edges.iter().any(|edge| {
-        edge.kind == predicate::WAS_INFORMED_BY && edge.to_id == "session:ordered-session/turn:0"
-    }));
-    let parent_edges = txn
-        .get_kg_edges_from("session:ordered-session/turn:0")
-        .unwrap();
-    assert!(!parent_edges
-        .iter()
-        .any(|edge| edge.kind == predicate::WAS_INFORMED_BY));
+    let child_edges = txn.get_kg_edges_from(&turn1).unwrap();
     assert!(child_edges
         .iter()
-        .any(|edge| { edge.kind == "extension:produced" && edge.to_id == "memory:outgoing-link" }));
-    let child_incoming = txn
-        .get_kg_edges_to("session:ordered-session/turn:1")
-        .unwrap();
-    assert!(child_incoming.iter().any(|edge| {
-        edge.kind == "extension:references" && edge.from_id == "memory:incoming-link"
-    }));
+        .any(|edge| { edge.kind == P::ProvWasInformedBy && edge.to_id == turn0 }));
+    let parent_edges = txn.get_kg_edges_from(&turn0).unwrap();
     assert!(!parent_edges
         .iter()
-        .any(|edge| edge.kind.starts_with("extension:")));
+        .any(|edge| edge.kind == P::ProvWasInformedBy));
+    assert!(child_edges
+        .iter()
+        .any(|edge| { edge.kind == P::References && edge.to_id == outgoing }));
+    let child_incoming = txn.get_kg_edges_to(&turn1).unwrap();
+    assert!(child_incoming
+        .iter()
+        .any(|edge| { edge.kind == P::References && edge.from_id == incoming }));
+    assert!(!parent_edges.iter().any(|edge| edge.kind == P::References));
 }
 
 #[test]
@@ -298,24 +280,21 @@ fn session_rebuild_is_idempotent_and_tolerates_corruption() {
         assert_eq!(turns.len(), 2, "rebuild must not duplicate turns");
 
         let mut txn = repo.pristine().write_txn().unwrap();
-        txn.del_kg_edge(
-            "session:rebuild/turn:1",
-            "session:rebuild/turn:0",
-            predicate::WAS_INFORMED_BY,
-        )
-        .unwrap();
+        let project = repo.project_id().unwrap();
+        let turn0 = iri::mint_turn(&project, "rebuild", 0);
+        let turn1 = iri::mint_turn(&project, "rebuild", 1);
+        txn.del_kg_edge(&turn1, &turn0, P::ProvWasInformedBy.iri())
+            .unwrap();
         txn.commit().unwrap();
 
         let (indexed, skipped, corrupt) = repo.rebuild_session_index().expect("repair rebuild");
         assert_eq!((indexed, skipped, corrupt), (0, 2, 0));
         let txn = repo.pristine().read_txn().unwrap();
         assert!(txn
-            .get_kg_edges_from("session:rebuild/turn:1")
+            .get_kg_edges_from(&turn1)
             .unwrap()
             .iter()
-            .any(|edge| {
-                edge.kind == predicate::WAS_INFORMED_BY && edge.to_id == "session:rebuild/turn:0"
-            }));
+            .any(|edge| { edge.kind == P::ProvWasInformedBy && edge.to_id == turn0 }));
     }
 
     // A corrupt provenance file is reported, not fatal.
@@ -495,7 +474,13 @@ fn session_rebuild_restores_a_fork_from_its_manifest() {
     assert_eq!(empty_record.turn_count, 0);
     assert!(empty_turns.is_empty());
     let txn = repo_b.pristine().read_txn().unwrap();
-    assert!(txn.get_kg_node("session:empty-child").unwrap().is_some());
+    assert!(txn
+        .get_kg_node(&iri::mint_session(
+            &repo_b.project_id().unwrap(),
+            "empty-child"
+        ))
+        .unwrap()
+        .is_some());
     drop(txn);
     let empty_head = repo_b.get_session_head("empty-child").unwrap().unwrap();
     let empty_rebuilt = repo_b.get_session_manifest(&empty_head).unwrap().unwrap();
@@ -604,7 +589,14 @@ fn session_ledger_emits_rdf_taxonomy() {
     let home_dir = home_tmp.path();
     init_repo(repo_dir, home_dir);
 
-    let repo = Repository::open(repo_dir).expect("open repo");
+    let mut repo = Repository::open(repo_dir).expect("open repo");
+    let parent = repo.current_view().to_owned();
+    repo.create_draft_view("agent-kg-session", &parent).unwrap();
+    let project = repo.project_id().unwrap();
+    let session_id = iri::mint_session(&project, "kg-session");
+    let turn0_id = iri::mint_turn(&project, "kg-session", 0);
+    let turn1_id = iri::mint_turn(&project, "kg-session", 1);
+    let todo_id = iri::mint_todo(&project, "kg-session", "todo-rdf");
     let change0 = Hash::of(&[1u8]);
     let p0 = repo
         .save_provenance_graph(
@@ -631,7 +623,7 @@ fn session_ledger_emits_rdf_taxonomy() {
         .expect("save contextual provenance");
     let _p1 = save_turn_graph(&repo, "kg-session", "kg turn one", 2, Some(p0));
 
-    // Lifecycle: view metadata + status ride the session node, ON_VIEW edge.
+    // Session view context is distinct from change membership.
     repo.upsert_session_lifecycle(
         "kg-session",
         Some("agent-kg-session".into()),
@@ -644,69 +636,64 @@ fn session_ledger_emits_rdf_taxonomy() {
 
     // Session node: typed, lifecycle metadata.
     let session = txn
-        .get_kg_node("session:kg-session")
+        .get_kg_node(&session_id)
         .expect("kg read")
         .expect("session node");
     let meta = session.metadata.as_ref().expect("session metadata");
-    assert_eq!(meta["rdf_type"], entity_type::SESSION);
+    assert!(session.has_type(C::Session));
+    assert!(meta.get("rdf_type").is_none());
     assert_eq!(meta["view"], "agent-kg-session");
     assert_eq!(meta["status"], "active");
 
     // Turn + provenance nodes typed; the taxonomy chains present.
     let turn1 = txn
-        .get_kg_node("session:kg-session/turn:1")
+        .get_kg_node(&turn1_id)
         .expect("kg read")
         .expect("turn node");
-    assert_eq!(
-        turn1.metadata.as_ref().unwrap()["rdf_type"],
-        entity_type::SESSION_TURN
-    );
+    assert!(turn1.has_type(C::SessionTurn));
 
-    let session_edges = txn
-        .get_kg_edges_from("session:kg-session")
-        .expect("kg read");
+    let session_edges = txn.get_kg_edges_from(&session_id).expect("kg read");
     assert!(session_edges
         .iter()
-        .any(|e| e.kind == predicate::HAD_MEMBER && e.to_id == "session:kg-session/turn:0"));
-    assert!(session_edges
+        .any(|e| e.kind == P::HasTurn && e.to_id == turn0_id));
+    assert!(session_edges.iter().any(|e| e.kind == P::SessionViewContext
+        && e.to_id == iri::mint_view(&project, "agent-kg-session")));
+    assert!(!session_edges
         .iter()
-        .any(|e| e.kind == edge_kind::ON_VIEW && e.to_id == "view:agent-kg-session"));
-    assert!(session_edges
-        .iter()
-        .any(|e| e.kind == predicate::HAD_PLAN && e.to_id == "intent:ATOM-20"));
+        .any(|e| matches!(e.kind, P::HasPlan | P::DirectlyOnView)));
 
-    let turn0_edges = txn
-        .get_kg_edges_from("session:kg-session/turn:0")
-        .expect("kg read");
-    assert!(turn0_edges.iter().any(|e| e.kind == predicate::EXPLAINED_BY
-        && e.to_id == format!("provenance:{}", p0.to_base32())));
-    let change0_short = &change0.to_base32()[..12];
+    let turn0_edges = txn.get_kg_edges_from(&turn0_id).expect("kg read");
     assert!(turn0_edges
         .iter()
-        .any(|e| e.kind == predicate::GENERATED && e.to_id == format!("change:{}", change0_short)));
+        .any(|e| e.kind == P::TurnExplainedBy && e.to_id == iri::mint_provenance(&p0)));
     assert!(turn0_edges
         .iter()
-        .any(|e| e.kind == predicate::HAD_PLAN && e.to_id == "intent:ATOM-20"));
-    assert!(turn0_edges.iter().any(|e| {
-        e.kind == predicate::HAS_TODO && e.to_id == "session:kg-session/todo:todo-rdf"
-    }));
+        .any(|e| e.kind == P::GeneratedChange && e.to_id == iri::mint_change(&change0)));
+    // An unresolvable historical plan is a gap, never a guessed intent IRI.
+    assert!(!turn0_edges.iter().any(|e| e.kind == P::HasPlan));
+    assert!(txn
+        .get_kg_node(&iri::mint_finding(
+            &project,
+            "UnresolvedReference",
+            &turn0_id
+        ))
+        .unwrap()
+        .is_some());
+    assert!(turn0_edges
+        .iter()
+        .any(|e| { e.kind == P::HasTodo && e.to_id == todo_id }));
     let todo = txn
-        .get_kg_node("session:kg-session/todo:todo-rdf")
+        .get_kg_node(&todo_id)
         .expect("kg read")
         .expect("todo node");
-    assert_eq!(
-        todo.metadata.as_ref().unwrap()["rdf_type"],
-        entity_type::TODO
-    );
+    assert!(todo.has_type(C::Todo));
     assert_eq!(todo.metadata.as_ref().unwrap()["status"], "completed");
 
     // Turn 1 informed by turn 0.
-    let turn1_edges = txn
-        .get_kg_edges_from("session:kg-session/turn:1")
-        .expect("kg read");
+    let turn1_edges = txn.get_kg_edges_from(&turn1_id).expect("kg read");
     assert!(turn1_edges
         .iter()
-        .any(|e| e.kind == predicate::WAS_INFORMED_BY && e.to_id == "session:kg-session/turn:0"));
+        .any(|e| e.kind == P::ProvWasInformedBy && e.to_id == turn0_id));
 
     drop(txn);
 
@@ -715,10 +702,12 @@ fn session_ledger_emits_rdf_taxonomy() {
         .fork_session("kg-session", 1, "kg-child")
         .expect("fork");
     let txn = repo.pristine().read_txn().expect("read txn");
-    let child_edges = txn.get_kg_edges_from("session:kg-child").expect("kg read");
+    let child_edges = txn
+        .get_kg_edges_from(&iri::mint_session(&project, "kg-child"))
+        .expect("kg read");
     let fork_edge = child_edges
         .iter()
-        .find(|e| e.kind == predicate::WAS_DERIVED_FROM && e.to_id == "session:kg-session")
+        .find(|e| e.kind == P::ProvWasDerivedFrom && e.to_id == session_id)
         .expect("fork edge");
     let fork_meta = fork_edge.metadata.as_ref().expect("fork metadata");
     assert_eq!(fork_meta["fork_turn"], 1);
@@ -729,30 +718,20 @@ fn session_ledger_emits_rdf_taxonomy() {
 
     // Inherited prefix emits under the child session too.
     assert!(txn
-        .get_kg_node("session:kg-child/turn:1")
+        .get_kg_node(&iri::mint_turn(&project, "kg-child", 1))
         .expect("kg read")
         .is_some());
     drop(txn);
 
-    // Simulate the old global todo representation on an inherited-only child.
+    // Repair a missing derived todo on an inherited-only child, preserving
+    // an unrelated resource owned by a different producer.
     let mut txn = repo.pristine().write_txn().expect("write txn");
-    txn.del_kg_node("session:kg-child/todo:todo-rdf").unwrap();
+    txn.del_kg_node(&iri::mint_todo(&project, "kg-child", "todo-rdf"))
+        .unwrap();
+    let unrelated_id = iri::mint_todo(&project, "external-session", "external-collision");
     txn.upsert_kg_node(&KgNode::new(
-        "todo:todo-rdf",
-        "todo",
-        "Emit RDF plan and todo links",
-        "session_ledger",
-    ))
-    .unwrap();
-    txn.upsert_kg_edge(&KgEdge::new(
-        "session:kg-child/turn:0",
-        "todo:todo-rdf",
-        predicate::HAS_TODO,
-    ))
-    .unwrap();
-    txn.upsert_kg_node(&KgNode::new(
-        "todo:external-collision",
-        "todo",
+        &unrelated_id,
+        C::Todo,
         "Owned by another index",
         "external_index",
     ))
@@ -761,13 +740,12 @@ fn session_ledger_emits_rdf_taxonomy() {
 
     repo.rebuild_session_index().expect("rebuild");
     let txn = repo.pristine().read_txn().expect("read txn");
-    assert!(txn.get_kg_node("todo:todo-rdf").unwrap().is_none());
     assert!(txn
-        .get_kg_node("session:kg-child/todo:todo-rdf")
+        .get_kg_node(&iri::mint_todo(&project, "kg-child", "todo-rdf"))
         .unwrap()
         .is_some());
     let unrelated = txn
-        .get_kg_node("todo:external-collision")
+        .get_kg_node(&unrelated_id)
         .unwrap()
         .expect("unrelated colliding node must survive");
     assert_eq!(unrelated.source, "external_index");
@@ -801,12 +779,13 @@ fn todo_ids_are_scoped_to_their_session() {
     }
 
     let txn = repo.pristine().read_txn().unwrap();
+    let project = repo.project_id().unwrap();
     let first = txn
-        .get_kg_node("session:todo-a/todo:t-1")
+        .get_kg_node(&iri::mint_todo(&project, "todo-a", "t-1"))
         .unwrap()
         .expect("first session todo");
     let second = txn
-        .get_kg_node("session:todo-b/todo:t-1")
+        .get_kg_node(&iri::mint_todo(&project, "todo-b", "t-1"))
         .unwrap()
         .expect("second session todo");
     assert_eq!(first.label, "First session");

@@ -327,10 +327,11 @@ pub enum Class { WorkIntent, FeatureIntent, ... }
 pub enum Predicate { HasTurn, HasPlan, ..., ProvWasInformedBy, ProvUsed, ... }
 
 // A class's parent may be an atomic class or an external one (owl:Thing, skos:Concept).
-pub enum ClassRef { Atomic(Class), External(&'static str) }
+pub enum ExternalClass { OwlThing, SkosConcept }
+pub enum ClassRef { Atomic(Class), External(ExternalClass) }
 
 // A property's range: an atomic class, an external class IRI, or an XSD datatype.
-pub enum Range { Class(Class), External(&'static str), Datatype(&'static str) }
+pub enum Range { Class(ClassRef), Datatype(Datatype) }
 
 impl Class {
     pub fn iri(&self) -> &'static str;
@@ -342,7 +343,7 @@ impl Predicate {
     pub fn iri(&self) -> &'static str;
     pub fn curie(&self) -> &'static str;
     pub fn is_external(&self) -> bool;
-    pub fn domain(&self) -> Option<Class>;
+    pub fn domain(&self) -> Option<ClassRef>;
     pub fn range(&self) -> Option<Range>;
     pub fn inverse(&self) -> Option<Predicate>;
     pub fn super_predicate(&self) -> Option<Predicate>;
@@ -469,8 +470,11 @@ pristine table outside the view system.
 > **Phase 1 implementation boundary.** `atomic clone` is HTTP-only (plus a Git bootstrap
 > path that never contacts storage), so identity transport over clone, pull and push all
 > depends on server support in `atomic-storage`, which is owned by another effort. In
-> Phase 1, implement only the local pieces: minting, the `PROJECT_IDENTITY` table, and the
-> CLI. **Do not change push, pull, clone, `atomic-remote`, or the daemon's sync code.** The
+> Phase 1, implement the local pieces: minting, the `PROJECT_IDENTITY` table, and the
+> CLI. Repository-level KG projection during existing object ingestion and actual
+> view-membership mutations, plus signer-key cache refresh through existing identity
+> APIs, are in scope for CLI and daemon paths. ProjectIdentity transfer, adoption,
+> remote binding, and sync wire-contract changes remain deferred. The
 > rules below record the target behavior for the later transport work.
 
 - **Clone:** the remote supplies its identity object as a repository-level object (not a
@@ -1035,8 +1039,9 @@ defined in the ontology, not `kg_nodes` rows.
 - Minting: `atomic init` and `atomic git import` at creation; every other repository
   without an identity on first writable open
 - **Not in Phase 1:** clone/pull/push identity transport. It waits for `atomic-storage`
-  (see the boundary note in §1.3); leave push, pull, clone, `atomic-remote`, and the daemon's
-  sync code unchanged
+  (see the boundary note in §1.3). Existing repository ingestion and membership
+  APIs maintain the offline projection; CLI/daemon orchestration refreshes
+  signer keys outside pristine writes without changing the sync wire contract.
 - CLI: `atomic repo identity show` (`--json`)
 - Property tests: round-trip, percent-encoding, strict base32 parsing
 

@@ -35,6 +35,7 @@ pub use crate::atomic as proto;
 
 pub mod daemon;
 pub mod local;
+pub mod signer_refresh;
 
 #[cfg(feature = "node")]
 mod node;

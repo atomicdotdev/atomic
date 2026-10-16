@@ -140,6 +140,9 @@ secrets/
 # Atomic repository data (for testing)
 .atomic/
 
+# Local vault state (existing tracked project content remains tracked)
+/.vault/
+
 # Benchmark results
 criterion/
 benches/target/

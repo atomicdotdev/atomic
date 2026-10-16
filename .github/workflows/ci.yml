@@ -153,5 +153,10 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-msrv-
 
-      - name: cargo check (MSRV)
-        run: cargo check --workspace
+      - name: cargo check (shared library MSRV)
+        run: cargo check --workspace --exclude atomic-cli --exclude atomic-shacl --locked
+
+      - uses: dtolnay/rust-toolchain@1.98
+
+      - name: cargo check (CLI and SHACL MSRV)
+        run: cargo check -p atomic-cli -p atomic-shacl --locked

@@ -834,6 +834,15 @@ pub const KG_FTS_BY_NODE: MultimapTableDefinition<&str, &str> =
 /// KG index metadata used for transactional index migrations.
 pub const KG_INDEX_META: TableDefinition<&str, u32> = TableDefinition::new("kg_index_meta");
 
+/// View-independent project identity singleton (key 0).
+pub const PROJECT_IDENTITY: TableDefinition<u8, &[u8]> = TableDefinition::new("project_identity");
+/// DID-bound Ed25519 public keys, used by offline attestation projection.
+pub const SIGNER_KEYS: TableDefinition<&str, &str> = TableDefinition::new("signer_keys");
+/// Asserted class membership; excluded from kind-blind neighborhoods.
+pub const KG_TYPES: MultimapTableDefinition<&str, &str> = MultimapTableDefinition::new("kg_types");
+pub const KG_TYPES_REV: MultimapTableDefinition<&str, &str> =
+    MultimapTableDefinition::new("kg_types_rev");
+
 // Embedding Tables (vector similarity search)
 
 /// Vector embeddings: vault_path → EmbeddingRecord (serialized)
@@ -1349,11 +1358,15 @@ mod tests {
 
     #[test]
     fn test_edge_key_roundtrip() {
-        let key = encode_edge_key("change:abc", "file:auth.rs", "MODIFIES");
+        let key = encode_edge_key(
+            "change:abc",
+            "file:auth.rs",
+            crate::kg::ontology::Predicate::ModifiesFile.iri(),
+        );
         let (from, to, kind) = decode_edge_key(&key).unwrap();
         assert_eq!(from, "change:abc");
         assert_eq!(to, "file:auth.rs");
-        assert_eq!(kind, "MODIFIES");
+        assert_eq!(kind, crate::kg::ontology::Predicate::ModifiesFile.iri());
     }
 
     #[test]

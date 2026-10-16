@@ -151,6 +151,10 @@ pub(crate) fn visit_tables(visitor: &mut impl TableVisitor) -> PristineResult<()
     visitor.multimap(KG_FTS)?;
     visitor.multimap(KG_FTS_BY_NODE)?;
     visitor.table(KG_INDEX_META)?;
+    visitor.table(PROJECT_IDENTITY)?;
+    visitor.table(SIGNER_KEYS)?;
+    visitor.multimap(KG_TYPES)?;
+    visitor.multimap(KG_TYPES_REV)?;
     visitor.table(EMBEDDINGS)?;
 
     // Semantic CRDT

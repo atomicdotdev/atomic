@@ -1173,18 +1173,18 @@ Strategy:
    code_search first to find the exact line range you need, then read just that range.
 5. Answer concisely using what you found. Cite file paths and line numbers.
 
-The knowledge graph contains:
-- file nodes (file:path) — tracked files
-- entity nodes (entity:file:name:line) — functions, structs, classes from tree-sitter
-- change nodes (change:hash) — commit history with dates and messages
-- view nodes (view:name) — like branches
-- goal/intent/memory nodes — development sessions and work items
-- edges: MODIFIES, DEFINES, AUTHORED_BY, DEPENDS_ON, REFERENCES, ON_VIEW, etc.";
+The knowledge graph contains canonical Atomic workflow resources with absolute IRIs
+and asserted class types. Views filter membership over one common causal graph.
+Workflow predicates include atomic:modifiesFile, atomic:authoredBy,
+atomic:directlyDependsOnChange, atomic:directlyOnView, atomic:hasPlan,
+atomic:generatedChange, atomic:implements, atomic:attestedBy, and atomic:references.
+The atomic namespace is https://atomic.dev/ns/workflow#.
+Use live tree-sitter entity/reference queries for code structure.";
 
 pub(crate) fn kg_node_proto(node: atomic_core::pristine::vault::KgNode) -> KgNode {
     KgNode {
         id: node.id,
-        node_type: node.kind,
+        types: node.types,
         name: Some(node.label),
         data: node.summary.clone().map(String::into_bytes),
         score: None,
@@ -1200,7 +1200,7 @@ pub(crate) fn kg_edge_proto(edge: atomic_core::pristine::vault::KgEdge) -> KgEdg
     KgEdge {
         source: edge.from_id,
         target: edge.to_id,
-        relation: edge.kind,
+        relation: edge.kind.to_string(),
         metadata: edge
             .metadata
             .and_then(|metadata| serde_json::to_vec(&metadata).ok()),
