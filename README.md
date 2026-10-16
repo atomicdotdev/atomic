@@ -282,6 +282,14 @@ The vault stores five kinds of content:
 
 Everything is content-addressed and version-controlled. When an agent starts a session, it reads the vault for context. When it finishes, its learnings go back into the vault for the next session — human or machine.
 
+**Colocated repositories that track `.vault/` in Git:** `atomic git import` preserves
+your tracked vault files byte-for-byte (it hydrates the vault database from them;
+default templates are only created for a repository that has no `.vault/` at all).
+The first import records the vault's bridge policy — `[git.bridge] vault = "tracked"`
+in `.atomic/config.toml` — so the vault participates in Git equivalence and
+publication checks exactly like any other tracked path. A repository whose Git tree
+does not track `.vault/` keeps the vault private and ignored by Git.
+
 ### Knowledge Graph — Code Intelligence at Scale
 
 Atomic builds a **knowledge graph** from your entire codebase — source code content, file structure, tree-sitter entities (functions, classes, types), module hierarchy, change history, and their relationships. Search it, traverse it, visualize it, or let an LLM explore it with tools.

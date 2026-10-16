@@ -83,10 +83,10 @@ use atomic_core::types::{
 use atomic_repository::{
     compare_project_state, git_resolution_metadata, git_synthesis_metadata,
     graph_visibility_closure, observe_git_index, observe_worktree, verify_prospective_equivalence,
-    ContentFilter, ConversionPolicy, EquivalenceClaims, EquivalenceReport, GitAttributesFilter,
-    GitResolutionOrigin, GitSynthesisOrigin, LossNote, ManifestDisposition, MoveBasis,
-    MoveEvidence, PlatformCapabilities, ProbableMove, ProjectTree, RenameCandidate, RepoPath,
-    Repository, RepositoryEntry, RepositoryManifest, VerifiedProspectiveEquivalence,
+    ContentFilter, ConversionPolicy, EquivalenceClaims, EquivalenceReport, ExclusionPolicy,
+    GitAttributesFilter, GitResolutionOrigin, GitSynthesisOrigin, LossNote, ManifestDisposition,
+    MoveBasis, MoveEvidence, PlatformCapabilities, ProbableMove, ProjectTree, RenameCandidate,
+    RepoPath, Repository, RepositoryEntry, RepositoryManifest, VerifiedProspectiveEquivalence,
 };
 
 use crate::error::{CliError, CliResult};
@@ -1591,7 +1591,35 @@ pub(crate) fn conversion_policy(git: &GitRepository) -> CliResult<ConversionPoli
         case_sensitive: !config.get_bool("core.ignorecase").unwrap_or(false),
         unicode_normalizing: config.get_bool("core.precomposeunicode").unwrap_or(false),
     };
+    // RFC §6.2: `.vault/` is private by default but may be tracked under
+    // explicit policy. Resolve the vault half from the recorded repository
+    // configuration, then the tracked Git HEAD tree, so every command that
+    // builds this policy agrees with the import that synthesized the
+    // projection. Fails closed on a corrupt configuration.
+    policy.exclusions = ExclusionPolicy::resolve_for_git(git)
+        .map_err(|error| git_error(format!("cannot resolve the bridge vault policy: {error}")))?;
     Ok(policy)
+}
+
+/// Record the vault projection policy (RFC §6.2) for a freshly imported
+/// repository.
+///
+/// `tracked` is the policy resolved BEFORE the repository (and its default
+/// configuration) was created — the same unambiguous HEAD-tree detection
+/// the import plan above just used. `git import` is the first command that
+/// needs the decision, so it persists the detected value once, here, and
+/// every later command reconstructs this exact conversion policy from the
+/// record instead of re-detecting against a moving HEAD.
+pub(crate) fn record_imported_vault_policy(repo: &Repository, tracked: bool) -> CliResult<()> {
+    if tracked {
+        repo.set_bridge_vault_policy(atomic_config::BridgeVaultPolicy::Tracked, None)
+            .map_err(CliError::from)?;
+        print_info(
+            "Git tracks .vault/: recorded bridge vault policy 'tracked' — the vault joins \
+             the manifest projection exactly like any other tracked path.",
+        );
+    }
+    Ok(())
 }
 
 pub(crate) fn git_object_id(algorithm: GitHashAlgorithm, oid: Oid) -> CliResult<GitObjectId> {

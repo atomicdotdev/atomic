@@ -255,7 +255,7 @@ are preserved. Section 7 includes tests for database locks and interrupted
 migration.
 
 Database migration is separate from `git bridge cutover`. See
-[operating guide section 14](bridge-operating-guide.md#14-bridge-cutover-and-database-migration)
+[operating guide section 15](bridge-operating-guide.md#15-bridge-cutover-and-database-migration)
 for cutover limits.
 
 ## 9. Known failure: new Git branch after Atomic records

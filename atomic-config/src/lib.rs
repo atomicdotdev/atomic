@@ -576,11 +576,48 @@ pub struct GitBridgeConfig {
     #[serde(default)]
     pub enabled: bool,
 
+    /// Whether `.vault/` participates in the bridge's repository-manifest
+    /// projection (RFC-ATOMIC-GIT-CAUSAL-BRIDGE §6.2 "Excluded paths":
+    /// "`.vault/` is private by default but may be tracked under explicit
+    /// policy"). Defaults to `private`; `git import` records `tracked`
+    /// once, at first import, when the imported Git history already tracks
+    /// `.vault/`.
+    #[serde(default)]
+    pub vault: BridgeVaultPolicy,
+
     /// The optional metadata-only bridge watch daemon (RFC §11.2, CB-13D).
     /// Defaults to disabled; an absent `[git.bridge.watch]` section reads
     /// as fully disabled.
     #[serde(default)]
     pub watch: BridgeWatchConfig,
+}
+
+/// Whether the colocated bridge projects `.vault/` into the repository
+/// manifest.
+///
+/// `private` (default): `.vault/` is bridge-private state, excluded from
+/// the manifest projection — the vault is Atomic-owned and never enters
+/// Git equivalence proofs or publications. This is the policy for a
+/// repository whose Git tree does not track `.vault/`.
+///
+/// `tracked`: Git tracks `.vault/` in this repository, so the vault joins
+/// the manifest projection and every equivalence, checkpoint, and
+/// publication comparison covers it exactly like any other tracked path.
+/// A projection that silently lacked a Git-tracked `.vault/` could never
+/// verify against the raw Git tree, and publishing it would delete the
+/// vault from Git.
+///
+/// ```toml
+/// [git.bridge]
+/// vault = "tracked"
+/// ```
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub enum BridgeVaultPolicy {
+    #[default]
+    #[serde(rename = "private")]
+    Private,
+    #[serde(rename = "tracked")]
+    Tracked,
 }
 
 /// Configuration for the optional metadata-only bridge watch daemon
@@ -1080,6 +1117,36 @@ impl RepoConfig {
         Ok(toml::from_str(&content)?)
     }
 
+    /// Load the repository configuration and report whether the bridge
+    /// vault policy (`[git.bridge] vault`) was explicitly recorded, as
+    /// opposed to defaulted by omission in a configuration written before
+    /// the field existed.
+    ///
+    /// The distinction matters: an explicit record is a decision (the
+    /// importer's first-import record, or a user's override) and wins; an
+    /// omitted field is "undecided" and callers fall back to detection.
+    /// Read and parse failures propagate — a corrupt configuration must
+    /// fail closed, never silently change the resolved policy.
+    pub fn load_with_vault_recorded(path: &std::path::Path) -> Result<(Self, bool), ConfigError> {
+        if !path.exists() {
+            return Ok((Self::default(), false));
+        }
+
+        let content = std::fs::read_to_string(path).map_err(|e| ConfigError::ReadError {
+            path: path.to_path_buf(),
+            source: e,
+        })?;
+
+        let value: toml::Value = toml::from_str(&content)?;
+        let recorded = value
+            .get("git")
+            .and_then(|git| git.get("bridge"))
+            .and_then(|bridge| bridge.get("vault"))
+            .is_some();
+        let config: Self = toml::from_str(&content)?;
+        Ok((config, recorded))
+    }
+
     /// Save repository configuration to a specific path.
     ///
     /// Atomic replacement (write a same-directory temporary, fsync, rename
@@ -1164,6 +1231,7 @@ mod tests {
             git: GitConfig {
                 bridge: GitBridgeConfig {
                     enabled: true,
+                    vault: BridgeVaultPolicy::Tracked,
                     watch: BridgeWatchConfig {
                         enabled: true,
                         quiet_ms: 500,
@@ -1176,6 +1244,7 @@ mod tests {
         let encoded = toml::to_string_pretty(&config).unwrap();
         let decoded: RepoConfig = toml::from_str(&encoded).unwrap();
         assert_eq!(decoded.git.bridge.watch, config.git.bridge.watch);
+        assert_eq!(decoded.git.bridge.vault, BridgeVaultPolicy::Tracked);
     }
 
     #[test]
@@ -1224,6 +1293,73 @@ mod tests {
             config.git.bridge.default_enablement(),
             Err(DefaultEnablementRefusal::NotOptedIn)
         );
+    }
+
+    /// RFC §6.2: the vault projection policy defaults to `private`.
+    #[test]
+    fn git_bridge_vault_defaults_to_private() {
+        let config: RepoConfig = toml::from_str("").unwrap();
+        assert_eq!(config.git.bridge.vault, BridgeVaultPolicy::Private);
+        // The explicit opt-in must not silently flip the vault policy.
+        let config: RepoConfig = toml::from_str("[git.bridge]\nenabled = true\n").unwrap();
+        assert_eq!(config.git.bridge.vault, BridgeVaultPolicy::Private);
+    }
+
+    /// RFC §6.2: a colocated repository may record `tracked`.
+    #[test]
+    fn git_bridge_vault_parses_and_round_trips() {
+        let config: RepoConfig = toml::from_str("[git.bridge]\nvault = \"tracked\"\n").unwrap();
+        assert_eq!(config.git.bridge.vault, BridgeVaultPolicy::Tracked);
+        assert!(
+            !config.git.bridge.enabled,
+            "other fields keep their defaults"
+        );
+
+        let text = toml::to_string(&config).unwrap();
+        let reloaded: RepoConfig = toml::from_str(&text).unwrap();
+        assert_eq!(reloaded.git.bridge.vault, BridgeVaultPolicy::Tracked);
+    }
+
+    /// An unknown vault policy value refuses instead of guessing.
+    #[test]
+    fn git_bridge_vault_rejects_unknown_values() {
+        let result: Result<RepoConfig, _> = toml::from_str("[git.bridge]\nvault = \"maybe\"\n");
+        assert!(result.is_err());
+    }
+
+    /// `load_with_vault_recorded` distinguishes an explicit record from a
+    /// configuration written before the field existed.
+    #[test]
+    fn load_with_vault_recorded_reports_presence() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+
+        // Absent file: defaulted, not recorded.
+        let (config, recorded) = RepoConfig::load_with_vault_recorded(&path).unwrap();
+        assert!(!recorded);
+        assert_eq!(config.git.bridge.vault, BridgeVaultPolicy::Private);
+
+        // Omitted field (pre-policy configuration): not recorded.
+        std::fs::write(&path, "[git.bridge]\nenabled = true\n").unwrap();
+        let (config, recorded) = RepoConfig::load_with_vault_recorded(&path).unwrap();
+        assert!(!recorded, "an omitted vault field is undecided");
+        assert_eq!(config.git.bridge.vault, BridgeVaultPolicy::Private);
+        assert!(config.git.bridge.enabled);
+
+        // Explicit record: recorded, both directions.
+        std::fs::write(&path, "[git.bridge]\nvault = \"tracked\"\n").unwrap();
+        let (config, recorded) = RepoConfig::load_with_vault_recorded(&path).unwrap();
+        assert!(recorded);
+        assert_eq!(config.git.bridge.vault, BridgeVaultPolicy::Tracked);
+
+        std::fs::write(&path, "[git.bridge]\nvault = \"private\"\n").unwrap();
+        let (config, recorded) = RepoConfig::load_with_vault_recorded(&path).unwrap();
+        assert!(recorded);
+        assert_eq!(config.git.bridge.vault, BridgeVaultPolicy::Private);
+
+        // A corrupt configuration fails closed instead of defaulting.
+        std::fs::write(&path, "not [ valid toml").unwrap();
+        assert!(RepoConfig::load_with_vault_recorded(&path).is_err());
     }
 
     /// Explicit opt-in parses, and default enablement is still refused

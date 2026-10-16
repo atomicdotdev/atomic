@@ -444,6 +444,13 @@ fn current_conversion_policy(
             )
         })
         .collect();
+    // RFC §6.2: resolve the vault half of the exclusion policy from the
+    // recorded repository configuration (already loaded above), then the
+    // tracked Git HEAD tree — the same decision every other policy factory
+    // makes, so publication equivalence agrees with import and verify.
+    // Fails closed on a corrupt configuration.
+    policy.exclusions = atomic_repository::ExclusionPolicy::resolve_for_git(git_repo)
+        .map_err(|error| git_error(format!("cannot resolve the bridge vault policy: {error}")))?;
     Ok((policy, repo_config.filters))
 }
 

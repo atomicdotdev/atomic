@@ -31,6 +31,14 @@ impl Repository {
     /// `.vault/` directory structure on disk. This is idempotent —
     /// calling it on an already-initialized vault is a no-op.
     ///
+    /// When a `.vault/` working copy already exists on disk (a colocated
+    /// repository that tracks `.vault/` in Git, or a `.vault/` restored
+    /// from elsewhere), its bytes are user work and authoritative: the
+    /// tables are hydrated from disk before any default content is
+    /// considered, and `vault_install_defaults` never overwrites an
+    /// existing file. Re-initializing an existing vault therefore never
+    /// resets templates or memories.
+    ///
     /// # Directory structure created:
     /// ```text
     /// .vault/
@@ -77,7 +85,24 @@ impl Repository {
         // Initialize embeddings table
         self.init_embeddings()?;
 
-        // Install default vault content (skills, memory index, system prompt)
+        // Hydrate the tables from an existing on-disk working copy BEFORE
+        // installing defaults: a `.vault/` that arrived with a colocated
+        // Git checkout (or any other source) is user work, and its bytes
+        // are authoritative. The pull/clone path has
+        // `bootstrap_vault_from_working_copy` for this; init on a
+        // pre-existing directory has the same shape.
+        if vault_dir.exists() {
+            let updated = self.vault_record_working_copy()?;
+            if !updated.is_empty() {
+                log::info!(
+                    "Hydrated {} vault entries from the existing .vault/ working copy",
+                    updated.len()
+                );
+            }
+        }
+
+        // Install default vault content (skills, memory index, system
+        // prompt) — only for paths absent from both the database and disk.
         self.vault_install_defaults()?;
 
         // NOTE: The vault files are NOT added+recorded here. The CLI init
@@ -1244,7 +1269,7 @@ fn remove_manifest_summary_for_entry(manifest: &mut VaultManifest, path: &str, e
 ///
 /// The system fields are always included to enable round-trip (deflation
 /// can reconstruct the VaultEntry from the file).
-fn render_entry_to_markdown(entry: &VaultEntry) -> String {
+pub(crate) fn render_entry_to_markdown(entry: &VaultEntry) -> String {
     let mut output = String::new();
     output.push_str("---\n");
 

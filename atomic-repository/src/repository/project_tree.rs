@@ -245,6 +245,85 @@ impl ExclusionPolicy {
             None
         }
     }
+
+    /// Resolve the vault half of the policy for one live colocated Git
+    /// repository (RFC §6.2: "`.vault/` is private by default but may be
+    /// tracked under explicit policy").
+    ///
+    /// An explicit `[git.bridge] vault` record in the repository
+    /// configuration wins in both directions — the first import records
+    /// the detected value, and a user override is honored. A configuration
+    /// that predates the field omits it: that is "undecided", and the Git
+    /// HEAD tree decides (a repository whose HEAD tree tracks a `.vault`
+    /// entry runs [`Self::IncludeVault`]).
+    ///
+    /// A repository whose Git tree tracks `.vault/` must run with the
+    /// vault included in the manifest projection: the alternative — a
+    /// projection that silently lacks a Git-tracked `.vault/` — can never
+    /// verify against the raw Git tree, and a publication built from it
+    /// would delete the vault from Git.
+    ///
+    /// Fail-closed: an unreadable or corrupt repository configuration, or
+    /// an unresolvable Atomic layout in a checkout that has one, is a real
+    /// fault — it propagates instead of silently changing the resolved
+    /// policy.
+    pub fn resolve_for_git(git: &git2::Repository) -> Result<Self, ProjectTreeError> {
+        if let Some(workdir) = git.workdir() {
+            let repository_present = workdir.join(".atomic").exists();
+            let dot_dir = if repository_present {
+                Repository::canonical_dot_dir(workdir).map_err(|error| {
+                    ProjectTreeError::Repository(format!(
+                        "cannot resolve the Atomic directory for the checkout at {}: {error}",
+                        workdir.display()
+                    ))
+                })?
+            } else {
+                // No local `.atomic`: nothing is recorded yet (a fresh
+                // checkout before its first import, or a plain Git
+                // repository) — the HEAD tree decides.
+                match Repository::canonical_dot_dir(workdir) {
+                    Ok(dot_dir) => dot_dir,
+                    Err(_) => return Ok(Self::from_git_head(git)),
+                }
+            };
+            let config_path = dot_dir.join("config.toml");
+            if config_path.exists() {
+                let (config, recorded) = atomic_config::RepoConfig::load_with_vault_recorded(
+                    &config_path,
+                )
+                .map_err(|error| {
+                    ProjectTreeError::Repository(format!(
+                        "cannot load the repository configuration at {}: {error}",
+                        config_path.display()
+                    ))
+                })?;
+                if recorded {
+                    return Ok(match config.git.bridge.vault {
+                        atomic_config::BridgeVaultPolicy::Tracked => Self::IncludeVault,
+                        atomic_config::BridgeVaultPolicy::Private => Self::BridgePrivate,
+                    });
+                }
+            }
+        }
+        Ok(Self::from_git_head(git))
+    }
+
+    /// Auto-detect from the Git HEAD tree: does the tracked root tree hold
+    /// a `.vault` entry? An unborn or detached-without-commit HEAD reads
+    /// as untracked.
+    fn from_git_head(git: &git2::Repository) -> Self {
+        let tracks_vault = git
+            .head()
+            .ok()
+            .and_then(|head| head.peel_to_commit().ok())
+            .and_then(|commit| commit.tree().ok())
+            .is_some_and(|tree| tree.get_name(".vault").is_some());
+        if tracks_vault {
+            Self::IncludeVault
+        } else {
+            Self::BridgePrivate
+        }
+    }
 }
 
 /// Whether `path` is Atomic-private bridge state (`.atomic*`): tracked alive
@@ -1639,6 +1718,113 @@ mod tests {
         let mut changed = policy.clone();
         changed.object_format = GitHashAlgorithm::Sha256;
         assert_ne!(policy.root(), changed.root());
+    }
+
+    /// RFC §6.2: the vault exclusion policy follows an explicit config
+    /// record; an omitted field (a pre-policy config) and no config at all
+    /// fall back to the tracked HEAD tree; corrupt config fails closed.
+    #[test]
+    fn resolve_for_git_follows_config_then_head_tree() {
+        let root = tempfile::tempdir().unwrap();
+        let git = git2::Repository::init(root.path()).unwrap();
+        let signature = git2::Signature::now("policy", "policy@example.com").unwrap();
+
+        fn commit_tree(
+            git: &git2::Repository,
+            signature: &git2::Signature,
+            paths: &[(&str, &[u8])],
+        ) {
+            fn build(git: &git2::Repository, files: &[(&str, &[u8])]) -> git2::Oid {
+                let mut builder = git.treebuilder(None).unwrap();
+                let mut directories = std::collections::BTreeMap::<&str, Vec<(&str, &[u8])>>::new();
+                for &(path, bytes) in files {
+                    if let Some((directory, rest)) = path.split_once('/') {
+                        directories
+                            .entry(directory)
+                            .or_default()
+                            .push((rest, bytes));
+                    } else {
+                        builder
+                            .insert(path, git.blob(bytes).unwrap(), 0o100644)
+                            .unwrap();
+                    }
+                }
+                for (directory, children) in directories {
+                    builder
+                        .insert(directory, build(git, &children), 0o040000)
+                        .unwrap();
+                }
+                builder.write().unwrap()
+            }
+            let tree = git.find_tree(build(git, paths)).unwrap();
+            let parents: Vec<_> = git
+                .find_reference("refs/heads/main")
+                .ok()
+                .and_then(|reference| reference.peel_to_commit().ok())
+                .into_iter()
+                .collect();
+            git.commit(
+                Some("refs/heads/main"),
+                signature,
+                signature,
+                "fixture",
+                &tree,
+                &parents.iter().collect::<Vec<_>>(),
+            )
+            .unwrap();
+            git.set_head("refs/heads/main").unwrap();
+        }
+
+        fn write_config(root: &Path, text: &str) {
+            std::fs::create_dir_all(root.join(".atomic")).unwrap();
+            std::fs::write(root.join(".atomic/config.toml"), text).unwrap();
+        }
+
+        let resolve = |git: &git2::Repository| {
+            ExclusionPolicy::resolve_for_git(git).expect("resolution must not fail")
+        };
+
+        // No commits and no config: untracked, so the vault stays private.
+        assert_eq!(resolve(&git), ExclusionPolicy::BridgePrivate);
+
+        // A tree WITHOUT .vault: still private.
+        commit_tree(&git, &signature, &[("README.md", b"readme\n")]);
+        assert_eq!(resolve(&git), ExclusionPolicy::BridgePrivate);
+
+        // A tree WITH a tracked .vault/: the vault joins the projection.
+        commit_tree(
+            &git,
+            &signature,
+            &[
+                ("README.md", b"readme\n"),
+                (".vault/memory/MEMORY.md", b"# user work\n"),
+            ],
+        );
+        assert_eq!(resolve(&git), ExclusionPolicy::IncludeVault);
+
+        // An omitted field (pre-policy config) is undecided: HEAD decides.
+        write_config(root.path(), "[git.bridge]\nenabled = true\n");
+        assert_eq!(
+            resolve(&git),
+            ExclusionPolicy::IncludeVault,
+            "an omitted vault field must not read as an explicit private record"
+        );
+
+        // An explicit private record wins over the tracked HEAD tree.
+        write_config(root.path(), "[git.bridge]\nvault = \"private\"\n");
+        assert_eq!(resolve(&git), ExclusionPolicy::BridgePrivate);
+
+        // An explicit tracked record wins over an untracked HEAD tree.
+        commit_tree(&git, &signature, &[("README.md", b"readme\n")]);
+        write_config(root.path(), "[git.bridge]\nvault = \"tracked\"\n");
+        assert_eq!(resolve(&git), ExclusionPolicy::IncludeVault);
+
+        // A corrupt configuration fails closed instead of defaulting.
+        write_config(root.path(), "not [ valid toml");
+        assert!(
+            ExclusionPolicy::resolve_for_git(&git).is_err(),
+            "a corrupt config must propagate, not silently pick a policy"
+        );
     }
 
     #[test]

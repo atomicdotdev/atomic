@@ -1016,6 +1016,49 @@ impl Repository {
         drop(common);
         Ok(true)
     }
+
+    /// Record the bridge vault projection policy (RFC §6.2) in the
+    /// repository configuration under `[git.bridge] vault`.
+    ///
+    /// Serialized, expected-old-leased, and idempotent like
+    /// [`set_bridge_consent`]: performed under the common operation lock
+    /// with an atomic same-directory replacement; a diverged `expected_old`
+    /// refuses instead of overwriting. Returns whether the file changed.
+    pub fn set_bridge_vault_policy(
+        &self,
+        vault: atomic_config::BridgeVaultPolicy,
+        expected_old: Option<atomic_config::BridgeVaultPolicy>,
+    ) -> Result<bool, RepositoryError> {
+        let common = self.try_lock_common_operation()?;
+        let config_path = self.dot_dir().join("config.toml");
+        let mut config = atomic_config::RepoConfig::load(&config_path).map_err(|error| {
+            RepositoryError::InvalidRepository {
+                reason: format!("cannot load the repository configuration: {error}"),
+            }
+        })?;
+        if let Some(expected) = expected_old {
+            if config.git.bridge.vault != expected {
+                return Err(RepositoryError::InvalidOperation {
+                    message: format!(
+                        "bridge vault policy lease diverged: expected {expected:?}, observed {:?}",
+                        config.git.bridge.vault
+                    ),
+                });
+            }
+        }
+        if config.git.bridge.vault == vault {
+            drop(common);
+            return Ok(false);
+        }
+        config.git.bridge.vault = vault;
+        config
+            .save(&config_path)
+            .map_err(|error| RepositoryError::InvalidRepository {
+                reason: format!("cannot save the repository configuration: {error}"),
+            })?;
+        drop(common);
+        Ok(true)
+    }
 }
 
 fn position_to_len(position: usize) -> u64 {

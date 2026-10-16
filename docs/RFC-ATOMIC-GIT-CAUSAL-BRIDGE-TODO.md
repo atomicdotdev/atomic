@@ -1132,7 +1132,7 @@ precedent as the earlier session).
   per-import synthesis aggregation (`import_synthesis`) is wired from the
   real `ImportStats` counters with an end-to-end test and a shipping-CLI
   journal exercise.
-- **R6 (medium, fixed):** guide §9 documents the actual
+- **R6 (medium, fixed):** guide §10 documents the actual
   `binding queue --degraded-head-fallback` path
   (`refs/heads/atomic/bindings/*`, explicit, never automatic,
   non-equivalent); §2 documents the disable rollback; §12 privacy claim

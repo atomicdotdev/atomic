@@ -73,14 +73,66 @@ never anchored returns to native behavior.
 hook. The other installed hooks need separate removal when decommissioning
 that integration.
 
-## 3. Working copies
+## 3. Vault policy: private by default, tracked under explicit record
+
+The vault (`.vault/`) participates in the bridge projection according to RFC §6.2:
+it is **private by default** — excluded from the repository manifest projection,
+invisible to Git equivalence checks and publication — **but may be tracked** when
+the colocated Git repository itself tracks `.vault/` in its tree.
+
+The policy is recorded in `.atomic/config.toml`:
+
+```toml
+[git.bridge]
+vault = "tracked"   # or "private" (the default)
+```
+
+Resolution order:
+
+1. An explicit `vault` record wins, in both directions. `atomic git import`
+   writes `tracked` once, at first import, when it detects a `.vault` entry in
+   the imported Git HEAD tree, and prints a notice — that first-import record
+   is the "explicit policy" consent.
+2. A configuration that predates the field omits it: "undecided". The Git HEAD
+   tree then decides — a tracked `.vault/` entry resolves to `tracked`.
+3. A corrupt or unreadable configuration fails closed: the policy refuses
+   rather than silently changing.
+
+Why a Git-tracked vault must join the projection: the manifest is what
+equivalence, checkpoints, and publication compare against the raw Git tree. A
+projection that silently lacked a Git-tracked `.vault/` could never verify
+against that tree, and a Git commit published from it would delete the vault
+from the branch. Under `tracked`, the vault is compared byte-for-byte like any
+other tracked path; under `private` (no `.vault/` in Git), the vault is
+Atomic-owned state that Git ignores via the managed exclude block.
+
+Consequences of the record being explicit and durable:
+
+- The conversion policy — and therefore the manifest root and every
+  checkpoint's projection evidence — is frozen once recorded. Changing the
+  record later invalidates prior projections; the verifier reports the
+  divergence fail-closed instead of silently re-basing.
+- Bindings published under one vault policy verify against that policy; a
+  policy change requires re-publication.
+- To force `private` on a repository that tracks `.vault/` in Git, record
+  `vault = "private"` in `.atomic/config.toml` before importing; the verifier
+  will then honestly report the tracked `.vault/` as a manifest divergence.
+
+`atomic git import` on a repository that already tracks `.vault/` preserves the
+tracked vault byte-for-byte: it hydrates the vault database from the working
+copy and never installs templates over existing files (defaults are only
+created for a repository with no `.vault/` at all). An unreadable file at a
+default path — bad permissions, invalid UTF-8 — fails the import closed with an
+actionable refusal rather than overwriting the bytes.
+
+## 4. Working copies
 
 Each physical directory has a working-copy ID in `.atomic/working_copy_id`.
 Linked Git worktrees and agent sandboxes have separate IDs, shelves, and caches.
 Some operation history is shared across the repository. An unfinished shared
 operation can block work in another linked worktree until it is recovered.
 
-## 4. Draft views, detached HEAD, and explicit publish
+## 5. Draft views, detached HEAD, and explicit publish
 
 A Draft view can leave Git at a detached HEAD. That is expected when HEAD points
 to the view's projection commit.
@@ -96,7 +148,7 @@ the named Git branch; the Atomic view remains a Draft and HEAD stays detached.
 `atomic git bridge switch <view>` switches to an existing mapped branch; it does
 not create a missing branch.
 
-## 5. Staging and status parity limits
+## 6. Staging and status parity limits
 
 ```sh
 atomic status --git
@@ -111,7 +163,7 @@ Draft conflicts can be represented by conflict snapshot commits on Draft refs.
 Shared export has additional conflict checks; do not assume a Git commit means
 all Atomic conflicts are resolved.
 
-## 6. Trust, untrusted provenance, and signed boundaries
+## 7. Trust, untrusted provenance, and signed boundaries
 
 Content checks and trust checks are separate. A valid signature does not make
 an unknown signer trusted. Repository trust settings live under `[git.trust]`:
@@ -126,7 +178,7 @@ has limits recorded in the RFC tracker.
 remote. A local pre-push hook can block this machine's push, but another client
 or `git push --no-verify` can bypass it. The remote must enforce its own checks.
 
-## 7. Safe recovery
+## 8. Safe recovery
 
 Operations that use the journal store their planned changes and outcomes.
 Writable open recovers interrupted operations before accepting new work.
@@ -138,7 +190,7 @@ still allows the operation.
 Do not delete `.atomic`, `.vault`, shelves, or Git objects to repair a failure.
 They can contain the only remaining copy of pending work or recovery data.
 
-## 8. WIP retention and incomplete sessions
+## 9. WIP retention and incomplete sessions
 
 If an agent turn leaves unexplained edits, Atomic retains WIP evidence and marks
 the session incomplete. It must not silently discard those edits or claim that
@@ -148,7 +200,7 @@ another change explains them.
 Incomplete sessions and their retained snapshots are not discarded just because
 they are old.
 
-## 9. Namespace fallback
+## 10. Namespace fallback
 
 Bindings and view refs use `refs/atomic/bindings/*` and `refs/atomic/views/*`.
 Enablement configures fetch rules for the selected remote unless
@@ -161,7 +213,7 @@ branches and can be affected by ordinary branch tools. This fallback is not
 equivalent to the normal namespace and is never selected automatically. Check
 published refs with `git ls-remote`.
 
-## 10. Hooks and watchers are optional — never the guarantee
+## 11. Hooks and watchers are optional — never the guarantee
 
 Git's filesystem monitor or Watchman can speed up candidate-file discovery.
 The setting is `[git] watch = "off" | "auto" | "fsmonitor" | "watchman"` in
@@ -200,13 +252,13 @@ The foreground loop reports the problem and retries.
 Disabling the bridge or setting `git.watch = "off"` stops the loop. Ordinary
 commands still check repository state when the watcher is off.
 
-## 11. Arbitrary Git push outside the protection guarantee
+## 12. Arbitrary Git push outside the protection guarantee
 
 Local hooks do not protect a remote that accepts unchecked pushes. Use a
 receiving-side verifier or a required server-side check when publication must
 require verified provenance.
 
-## 12. Privacy and security rules
+## 13. Privacy and security rules
 
 The Git projection excludes `.atomic/` and `.vault/`. Files that users explicitly
 track are ordinary Git content.
@@ -216,7 +268,7 @@ not have a free-text field for prompts, transcripts, secrets, or environment
 values. Git hook evidence records ref and operation events; it does not prove
 that two rewritten commits have the same identity.
 
-## 13. Observability: the structured event journal
+## 14. Observability: the structured event journal
 
 Bridge events are stored in `.atomic/bridge/events.jsonl`. The file is capped at
 4 MiB. New events can be dropped at the limit or when another writer holds the
@@ -232,7 +284,7 @@ Imports can fetch and verify binding data. Fetch loss is reported per fetch;
 import correlation IDs connect related events. Event counts are diagnostic
 information, not proof that every operation or event was captured.
 
-## 14. Bridge cutover and database migration
+## 15. Bridge cutover and database migration
 
 ### Legacy Shadow → colocated bridge
 

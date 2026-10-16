@@ -815,6 +815,26 @@ impl Command for Import {
             print_info("Configured Git to ignore Atomic local state.");
         }
 
+        // RFC §6.2 vault policy: resolve the tracked-vault decision BEFORE
+        // the Atomic repository (and its default configuration) is created
+        // below, while `.atomic/` does not exist yet — the resolution is
+        // then the unambiguous Git HEAD-tree detection, the exact one the
+        // preflight plan above used. The value is persisted immediately
+        // after init so every later command reads the recorded policy.
+        let fresh_vault_tracked = if repo_exists {
+            None
+        } else {
+            Some(
+                atomic_repository::ExclusionPolicy::resolve_for_git(&git_repo).map_err(
+                    |error| {
+                        CliError::Internal(anyhow::anyhow!(
+                            "cannot resolve the bridge vault policy: {error}"
+                        ))
+                    },
+                )? == atomic_repository::ExclusionPolicy::IncludeVault,
+            )
+        };
+
         // Check if Atomic repository exists in THIS directory (not parent dirs).
         // Don't use find_repository_root() — it walks up and might find
         // ~/.atomic/ (global config dir) which isn't a repo.
@@ -832,6 +852,14 @@ impl Command for Import {
             Repository::init_with_view(workdir, &default_branch)
                 .map_err(|e| CliError::Internal(e.into()))?
         };
+
+        // Record the detected vault policy for a freshly created repository
+        // (RFC §6.2): explicit and durable, so the conversion policy is
+        // frozen for every later command instead of re-detected against a
+        // moving HEAD.
+        if let Some(tracked) = fresh_vault_tracked {
+            super::parallel::record_imported_vault_policy(&repo, tracked)?;
+        }
 
         // Enter the shared workspace boundary. Import is also the bootstrap
         // remediation path for a Git checkout that has no bridge checkpoint
@@ -996,7 +1024,13 @@ impl Command for Import {
                 print_info("Enriching knowledge graph...");
                 match repo.kg_enrich_from_vcs(working_copy) {
                     Ok(stats) => print_info(&format!("KG enriched: {}", stats)),
-                    Err(e) => log::warn!("KG enrichment failed: {}", e),
+                    // Actionable, not silent: the import's Git equivalence is
+                    // unaffected, but the derived knowledge graph is stale
+                    // until this is addressed.
+                    Err(e) => print_warning(&format!(
+                        "KG enrichment failed (the import itself is unaffected; re-run \
+                         'atomic git import' or inspect the vault state): {e}"
+                    )),
                 }
             }
 
@@ -1147,7 +1181,13 @@ impl Command for Import {
                 print_info("Enriching knowledge graph...");
                 match repo.kg_enrich_from_vcs(working_copy) {
                     Ok(stats) => print_info(&format!("KG enriched: {}", stats)),
-                    Err(e) => log::warn!("KG enrichment failed: {}", e),
+                    // Actionable, not silent: the import's Git equivalence is
+                    // unaffected, but the derived knowledge graph is stale
+                    // until this is addressed.
+                    Err(e) => print_warning(&format!(
+                        "KG enrichment failed (the import itself is unaffected; re-run \
+                         'atomic git import' or inspect the vault state): {e}"
+                    )),
                 }
             }
 
@@ -1171,7 +1211,10 @@ impl Command for Import {
                 // missing or the Git HEAD moved.
                 match atomic_repository::refresh_content_index(workdir) {
                     Ok(()) => print_info("Content index built."),
-                    Err(e) => log::warn!("Content index build failed: {}", e),
+                    Err(e) => print_warning(&format!(
+                        "Content index build failed (search will use the stale index until \
+                         fixed): {e}"
+                    )),
                 }
             }
 
@@ -1369,9 +1412,26 @@ fn init_atomicignore_and_vault(
         return Ok(());
     }
 
-    match repo.init_vault() {
+    // A pre-existing `.vault/` working copy is user work — in a colocated
+    // repository it arrived with the Git checkout. Hydrate the vault
+    // tables from disk and install NOTHING: the on-disk file set is
+    // authoritative. (Creating missing default files here would add
+    // untracked paths that diverge the manifest projection from the Git
+    // HEAD tree under the tracked-vault policy; a fresh repository
+    // without `.vault/` still gets the full default vault below.)
+    let existing_vault = repo.vault_dir().exists();
+    let init_result = if existing_vault {
+        print_info("Existing .vault/ detected: hydrating the vault from the working copy.");
+        repo.bootstrap_vault_from_working_copy()
+    } else {
+        repo.init_vault()
+    };
+
+    match init_result {
         Ok(()) => {
-            print_info("Initialized vault at .vault/");
+            if !existing_vault {
+                print_info("Initialized vault at .vault/");
+            }
 
             // Add all vault files
             fn add_dir_recursive(
@@ -1407,7 +1467,7 @@ fn init_atomicignore_and_vault(
                 .add_path(".vault")
                 .detect_raw_renames(false);
             match repo.record(working_copy, header, options) {
-                Ok(_) => print_info("Recorded vault defaults"),
+                Ok(_) => print_info("Recorded vault files"),
                 Err(atomic_repository::RecordError::NothingToRecord) => {}
                 Err(e) => log::warn!("Failed to record vault files: {}", e),
             }

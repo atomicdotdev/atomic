@@ -3605,17 +3605,17 @@ fn incremental_import_after_a_fresh_process_preserves_tracked_paths() {
 
 /// Review ::26 R3: an all-excluded root folds to the CANONICAL empty tree of
 /// the object format (sha1 `4b825dc6...`), never a zero sentinel. A root
-/// commit whose only tracked entries are bridge-private (`.atomicignore`,
-/// `.vault/`) imports: the projection of an empty state is the canonical
-/// empty tree, and the bridge-private files stay tracked-alive in the view.
+/// commit whose only tracked entries are bridge-private (`.atomicignore`)
+/// imports: the projection of an empty state is the canonical empty tree,
+/// and the bridge-private files stay tracked-alive in the view. (A root
+/// that also tracks `.vault/` resolves the tracked-vault policy instead —
+/// see `tracked_vault_files_import_under_the_recorded_policy`.)
 #[test]
 fn all_private_root_imports_with_the_canonical_empty_tree() {
     let root = tempfile::tempdir().unwrap().keep();
     let home = tempfile::tempdir().unwrap().keep();
     git(&root, &["init", "-q", "-b", "main"]);
     fs::write(root.join(".atomicignore"), b"target/\n").unwrap();
-    fs::create_dir_all(root.join(".vault")).unwrap();
-    fs::write(root.join(".vault/state.md"), b"private state\n").unwrap();
     git_commit(&root, "only bridge-private entries");
     let report = atomic_ok(&root, &home, &["git", "import", "--no-vault"]);
     assert!(
@@ -3623,11 +3623,11 @@ fn all_private_root_imports_with_the_canonical_empty_tree() {
         "the all-private root must fold to the canonical empty tree: {report}"
     );
     let repo = open_repo(&root);
-    let vault = repo
-        .get_file_content_on_view(".vault/state.md", "main")
-        .expect("the vault path reads cleanly")
+    let ignore = repo
+        .get_file_content_on_view(".atomicignore", "main")
+        .expect("the .atomicignore path reads cleanly")
         .expect("the bridge-private file is tracked alive");
-    assert_eq!(vault, b"private state\n".to_vec());
+    assert_eq!(ignore, b"target/\n".to_vec());
 }
 
 /// Review ::26 R3: deleting the LAST tracked file folds to the canonical
@@ -3731,17 +3731,18 @@ fn lockfile_only_modification_renders_exact_bytes() {
     assert_eq!(graph_only, lock_v2.to_vec(), "graph-only exact bytes");
 }
 
-/// Review ::26 R1: `.vault/` files are versioned bridge-private policy
-/// (`ExclusionPolicy::BridgePrivate`) — tracked-alive in the view, absent
-/// from project manifests. The staged full-tree check must exempt the whole
-/// bridge-private set (`.atomic*` AND `.vault/`), which it does via
-/// `bridge_private_path`.
+/// Review ::26 R1 + RFC §6.2: a repository whose Git tree tracks `.vault/`
+/// resolves the tracked vault policy (recorded by the first import), so
+/// the vault files are manifest-included content — tracked-alive in the
+/// view with their exact committed bytes, byte-for-byte covered by every
+/// equivalence and publication comparison like any other tracked path.
 ///
-/// Failing-before: `staged path '.vault/seed.md' is present but the commit
-/// tree does not hold it`. Passing-after: the import succeeds and the
-/// recorded graph tracks the `.vault/` file with its exact committed bytes.
+/// Failing-before (pre-policy): tracked `.vault/` stayed bridge-private —
+/// absent from project manifests — so the staged full-tree check had to
+/// exempt `bridge_private_path`, and the standing verifier could never
+/// compare the projection against the raw Git tree.
 #[test]
-fn tracked_vault_files_import_as_bridge_private_state() {
+fn tracked_vault_files_import_under_the_recorded_policy() {
     let root = tempfile::tempdir().unwrap().keep();
     let home = tempfile::tempdir().unwrap().keep();
     git(&root, &["init", "-q", "-b", "main"]);

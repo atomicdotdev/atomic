@@ -436,6 +436,14 @@ pub fn conversion_policy_for_git(
         case_sensitive: !config.get_bool("core.ignorecase").unwrap_or(false),
         unicode_normalizing: config.get_bool("core.precomposeunicode").unwrap_or(false),
     };
+    // RFC §6.2: `.vault/` is private by default but may be tracked under
+    // explicit policy. Anchoring must prove equivalence under the same
+    // policy the import and the verifier resolved, so a colocated
+    // repository that tracks `.vault/` anchors with the vault included in
+    // the manifest projection. Fails closed on a corrupt configuration.
+    policy.exclusions = crate::ExclusionPolicy::resolve_for_git(git).map_err(|error| {
+        BridgeAnchorError::Git(format!("cannot resolve the bridge vault policy: {error}"))
+    })?;
     Ok(policy)
 }
 
