@@ -11,13 +11,17 @@ use tonic::{Request, Status};
 
 use crate::atomic::{
     attestation_service_server::AttestationService, daemon_service_server::DaemonService,
+    repository_mutation_service_server::RepositoryMutationService,
     repository_query_service_server::RepositoryQueryService, vault_service_server::VaultService,
-    GetVaultContextRequest, GetVaultEntryRequest, ListVaultEntriesRequest,
-    ResolveRepositoryRequest, StatusRequest, VerifyAttestationRequest,
+    view_service_server::ViewService, AddFilesRequest, CreateViewRequest, DeleteViewRequest,
+    GetChangeRequest, GetVaultContextRequest, GetVaultEntryRequest, ListVaultEntriesRequest,
+    ListViewsRequest, LogRequest, PreviewRestoreRequest, RecordRequest, ResolveRepositoryRequest,
+    StatusRequest, SwitchViewRequest, VerifyAttestationRequest,
 };
 use crate::daemon::{
-    services::{DaemonImpl, QueryImpl},
+    services::{DaemonImpl, MutationImpl, QueryImpl},
     services_agent::{AttestationImpl, VaultImpl},
+    services_query::ViewImpl,
     state::DaemonState,
 };
 
@@ -27,9 +31,11 @@ use crate::daemon::{
 /// handles. Keep one instance per application and reuse it across calls.
 /// This is not a replacement for remote authentication middleware.
 ///
-/// Supports repository resolution/status and read-only vault get/list/context
-/// and attestation verification. Mutations and view-scoped vault reads are not
-/// supported; unsupported methods fail explicitly with `Unimplemented`.
+/// Supports repository resolution, basic working-copy/change/view operations,
+/// read-only restore previews (including recorded file bytes),
+/// read-only vault get/list/context, and attestation verification. View-scoped
+/// vault reads are not supported; unsupported methods fail explicitly with
+/// `Unimplemented`.
 #[derive(Clone)]
 pub struct LocalService {
     state: Arc<DaemonState>,
@@ -104,6 +110,96 @@ impl LocalService {
                     state: self.state.clone(),
                 }
                 .status(Request::new(request))
+                .await?;
+                Ok(response.into_inner().encode_to_vec())
+            }
+            "/atomic.RepositoryMutationService/AddFiles" => {
+                let request = decode::<AddFilesRequest>(request)?;
+                require_repository(&request.repository)?;
+                let response = MutationImpl {
+                    state: self.state.clone(),
+                }
+                .add_files(Request::new(request))
+                .await?;
+                Ok(response.into_inner().encode_to_vec())
+            }
+            "/atomic.RepositoryMutationService/Record" => {
+                let request = decode::<RecordRequest>(request)?;
+                require_repository(&request.repository)?;
+                let response = MutationImpl {
+                    state: self.state.clone(),
+                }
+                .record(Request::new(request))
+                .await?;
+                Ok(response.into_inner().encode_to_vec())
+            }
+            "/atomic.RepositoryQueryService/Log" => {
+                let request = decode::<LogRequest>(request)?;
+                require_repository(&request.repository)?;
+                let response = QueryImpl {
+                    state: self.state.clone(),
+                }
+                .log(Request::new(request))
+                .await?;
+                Ok(response.into_inner().encode_to_vec())
+            }
+            "/atomic.RepositoryQueryService/GetChange" => {
+                let request = decode::<GetChangeRequest>(request)?;
+                require_repository(&request.repository)?;
+                let response = QueryImpl {
+                    state: self.state.clone(),
+                }
+                .get_change(Request::new(request))
+                .await?;
+                Ok(response.into_inner().encode_to_vec())
+            }
+            "/atomic.RepositoryQueryService/PreviewRestore" => {
+                let request = decode::<PreviewRestoreRequest>(request)?;
+                require_repository(&request.repository)?;
+                let response = QueryImpl {
+                    state: self.state.clone(),
+                }
+                .preview_restore(Request::new(request))
+                .await?;
+                Ok(response.into_inner().encode_to_vec())
+            }
+            "/atomic.ViewService/ListViews" => {
+                let request = decode::<ListViewsRequest>(request)?;
+                require_repository(&request.repository)?;
+                let response = ViewImpl {
+                    state: self.state.clone(),
+                }
+                .list_views(Request::new(request))
+                .await?;
+                Ok(response.into_inner().encode_to_vec())
+            }
+            "/atomic.ViewService/CreateView" => {
+                let request = decode::<CreateViewRequest>(request)?;
+                require_repository(&request.repository)?;
+                let response = ViewImpl {
+                    state: self.state.clone(),
+                }
+                .create_view(Request::new(request))
+                .await?;
+                Ok(response.into_inner().encode_to_vec())
+            }
+            "/atomic.ViewService/SwitchView" => {
+                let request = decode::<SwitchViewRequest>(request)?;
+                require_repository(&request.repository)?;
+                let response = ViewImpl {
+                    state: self.state.clone(),
+                }
+                .switch_view(Request::new(request))
+                .await?;
+                Ok(response.into_inner().encode_to_vec())
+            }
+            "/atomic.ViewService/DeleteView" => {
+                let request = decode::<DeleteViewRequest>(request)?;
+                require_repository(&request.repository)?;
+                let response = ViewImpl {
+                    state: self.state.clone(),
+                }
+                .delete_view(Request::new(request))
                 .await?;
                 Ok(response.into_inner().encode_to_vec())
             }

@@ -84,6 +84,10 @@ mod adoption;
 mod anchor;
 mod binding_fetch;
 mod binding_store;
+mod change_intents;
+pub use change_intents::{
+    ChangeIntentAssociation, ChangeIntentContext, ChangeIntentIdentity, ChangePlanBinding,
+};
 mod conflict_object;
 mod conflict_reconcile;
 mod cutover;

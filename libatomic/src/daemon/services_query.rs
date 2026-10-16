@@ -221,6 +221,90 @@ fn diff_status_string(status: DomainFileStatus) -> String {
 // GetChange — `atomic change <HASH|#N>`
 // ---------------------------------------------------------------------------
 
+/// Privacy-limited metadata from the change already decoded by atomic-core.
+/// Values are recorded attribution, not verified billing or authorship.
+fn change_metadata_projection(
+    change: &atomic_core::change::Change,
+    hash: &atomic_core::types::Hash,
+) -> ChangeMetadata {
+    let mut warnings = Vec::new();
+    let usage = change
+        .hashed
+        .provenance
+        .iter()
+        .enumerate()
+        .map(|(index, record)| {
+            let cost = &record.cost;
+            let cost_micro_usd = if cost.usd.is_finite() && cost.usd >= 0.0 {
+                if cost.micro_usd > 0 || cost.usd == 0.0 {
+                    Some(cost.micro_usd)
+                } else if cost.usd * 1_000_000.0 < u64::MAX as f64 {
+                    Some(atomic_core::change::Cost::from_usd(cost.usd).micro_usd)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            if cost_micro_usd.is_none() {
+                warnings.push(format!(
+                    "Usage record {index} has an invalid/out-of-range recorded cost"
+                ));
+            }
+            ChangeAiUsage {
+                record_index: index as u32,
+                vendor: record.vendor.to_string(),
+                model: record.model.clone(),
+                model_version: record.model_version.clone(),
+                tool: record.tool.to_string(),
+                request_id: record.request_id.clone(),
+                session_id: record.session_id.clone(),
+                session_slug: record.session_slug.clone(),
+                step_count: record.step_count,
+                tokens: Some(ChangeTokenUsage {
+                    input_tokens: record.tokens.input_tokens,
+                    output_tokens: record.tokens.output_tokens,
+                    total_tokens: record.tokens.total_tokens,
+                    cache_read_tokens: record.tokens.cache_read_tokens,
+                    cache_write_tokens: record.tokens.cache_write_tokens,
+                    reasoning_tokens: record.tokens.reasoning_tokens,
+                }),
+                cost_micro_usd,
+            }
+        })
+        .collect();
+    let mut affected_paths = atomic_repository::get_files_in_change(change);
+    affected_paths.extend(change.file_ops().iter().map(|ops| ops.path().to_string()));
+    affected_paths.sort();
+    affected_paths.dedup();
+    ChangeMetadata {
+        schema_version: 1,
+        change_hash: Some(hash_proto(hash)),
+        usage,
+        affected_paths,
+        warnings,
+        graph_summary: Some(change_graph_summary(change)),
+    }
+}
+
+fn change_graph_summary(change: &atomic_core::change::Change) -> ChangeGraphSummary {
+    let (vertices, edges) = atomic_repository::triage::count_hunk_atoms(change.hunks());
+    ChangeGraphSummary {
+        vertices_added: vertices as u64,
+        edges_changed: edges as u64,
+        content_bytes: change.contents.len() as u64,
+        files_changed: atomic_repository::get_files_in_change(change).len() as u64,
+        files: atomic_repository::triage::hunk_display_summaries(change.hunks())
+            .into_iter()
+            .map(|summary| ChangeFileSummary {
+                symbol: summary.symbol.to_string(),
+                path: summary.path,
+                info: summary.info,
+            })
+            .collect(),
+    }
+}
+
 pub async fn get_change_impl(
     state: &Arc<DaemonState>,
     request: Request<GetChangeRequest>,
@@ -242,6 +326,7 @@ pub async fn get_change_impl(
     let handle_for_task = handle.clone();
     let wants_bundle = request.includes.as_ref().is_some_and(|i| i.metadata);
     let wants_file_contents = request.include_file_contents;
+    let wants_blast_radius = request.includes.as_ref().is_some_and(|i| i.blast_radius);
     let change = tokio::task::spawn_blocking(move || {
         // A query: read-only open with the read-concurrency wait.
         let repo = handle_for_task.repository_readonly()?;
@@ -328,9 +413,13 @@ pub async fn get_change_impl(
         } else {
             None
         };
-        let ledger = repo
+        let graphs = repo
             .find_provenance_for_change(&hash)
-            .map_err(|error| domain_status(ErrorCode::Repository, error.to_string()))?
+            .map_err(|error| domain_status(ErrorCode::Repository, error.to_string()))?;
+        let intent_context = wants_bundle.then(|| {
+            change_intent_projection(&hash, repo.change_intent_context(&hash, &change, &graphs))
+        });
+        let ledger = graphs
             .into_iter()
             .map(|(graph_hash, graph)| {
                 let payload = serde_json::to_vec(&graph)
@@ -358,32 +447,61 @@ pub async fn get_change_impl(
             paths
                 .into_iter()
                 .map(|path| {
-                    let before = repo
-                        .get_file_content_before_change(&path, &hash)
-                        .ok()
-                        .flatten();
-                    let after = repo
-                        .get_file_content_after_change(&path, &hash)
-                        .ok()
-                        .flatten();
+                    let before_result = repo.get_file_content_before_change(&path, &hash);
+                    let after_result = repo.get_file_content_after_change(&path, &hash);
+                    let before_exists =
+                        before_result.as_ref().ok().map(|content| content.is_some());
+                    let after_exists = after_result.as_ref().ok().map(|content| content.is_some());
+                    let before = before_result.ok().flatten();
+                    let after = after_result.ok().flatten();
+                    let is_directory = change.hunks().iter().any(|op| {
+                        matches!(op,
+                        atomic_core::change::GraphOp::DirAdd { path: dir, .. }
+                        | atomic_core::change::GraphOp::DirDel { path: dir, .. }
+                        | atomic_core::change::GraphOp::DirUndel { path: dir, .. } if dir == &path)
+                    });
                     ChangeFileContent {
                         path,
                         before,
                         after,
+                        before_exists,
+                        after_exists,
+                        is_directory,
                     }
                 })
                 .collect::<Vec<_>>()
         } else {
             Vec::new()
         };
-        Ok::<_, Status>((change, hash, sequence, bundle, ledger, file_contents))
+        let blast_radius =
+            wants_blast_radius.then(|| super::change_impact::project(&repo, &change, &hash));
+        Ok::<_, Status>((
+            change,
+            hash,
+            sequence,
+            bundle,
+            ledger,
+            file_contents,
+            blast_radius,
+            intent_context,
+        ))
     })
     .await
     .map_err(|error| Status::internal(error.to_string()))??;
 
-    let (change, hash, sequence, change_bundle, provenance_ledger, file_contents) = change;
+    let (
+        change,
+        hash,
+        sequence,
+        change_bundle,
+        provenance_ledger,
+        file_contents,
+        blast_radius,
+        intent_context,
+    ) = change;
     let (provenance_ledger_hashes, provenance_ledger) = provenance_ledger.into_iter().unzip();
     let header = &change.hashed.header;
+    let metadata = wants_bundle.then(|| change_metadata_projection(&change, &hash));
     Ok(Response::new(GetChangeResponse {
         change: Some(ChangeInfo {
             hash: Some(hash_proto(&hash)),
@@ -418,7 +536,256 @@ pub async fn get_change_impl(
         provenance_ledger_hashes,
         sequence,
         file_contents,
+        metadata,
+        blast_radius,
+        intent_context,
     }))
+}
+
+fn change_intent_projection(
+    hash: &atomic_core::types::Hash,
+    context: atomic_repository::ChangeIntentContext,
+) -> ChangeIntentContext {
+    let identity = |value: atomic_repository::ChangeIntentIdentity| ChangeIntentIdentity {
+        id: value.id,
+        uid: value.uid,
+        title: value.title,
+        path: value.path,
+    };
+    ChangeIntentContext {
+        schema_version: 1, change_hash: Some(hash_proto(hash)), plan_id: context.plan_id, status: context.status,
+        plans: context.plans.into_iter().map(|plan| ChangePlanBinding { plan_id: plan.plan_id, source: plan.source,
+            session_id: plan.session_id, provenance_hash: Some(hash_proto(&plan.provenance_hash)), turn_number: plan.turn_number,
+            intent: plan.intent.map(identity) }).collect(),
+        associated_intents: context.associated_intents.into_iter().map(|item| ChangeIntentAssociation {
+            path: item.path, intent: item.intent.map(identity), commitment_node_ids: item.commitment_node_ids,
+            patch_node_ids: item.patch_node_ids, provenance_hashes: item.provenance_hashes.iter().map(hash_proto).collect() }).collect(),
+        warnings: context.warnings, validation_status: "not_checked".into(),
+        context: "Recorded plan_id declarations and change-local edit evidence; identity/title/path lookup uses the current vault. No historical intent snapshot, SHACL validation, signature check or repository-wide 1:1 proof is implied.".into(),
+    }
+}
+
+#[cfg(test)]
+mod change_metadata_tests {
+    use super::*;
+    use atomic_core::change::{
+        AITool, AIVendor, Change, ChangeHeader, Cost, Provenance, TokenUsage,
+    };
+
+    #[test]
+    fn metadata_uses_canonical_decode_and_preserves_exact_usage_without_private_text() {
+        let mut change = Change::empty(ChangeHeader::new("AI work"));
+        let mut record = Provenance::new(AIVendor::OpenAI, "test-model", AITool::cli("OpenCode"));
+        record.tokens = TokenUsage::full(u64::MAX - 10, 2, 3, 4, 5);
+        record.cost = Cost::from_micro_usd(123_456);
+        record.request_id = Some("request-1".into());
+        record.session_id = Some("session-1".into());
+        record.reasoning_text = Some("PRIVATE_REASONING".into());
+        record.prompt = atomic_core::change::PromptContent::full("PRIVATE_PROMPT");
+        change.hashed.provenance.push(record);
+        let mut bytes = Vec::new();
+        change.serialize(&mut bytes).unwrap();
+        let (decoded, hash) = Change::deserialize(&mut bytes.as_slice()).unwrap();
+        let metadata = change_metadata_projection(&decoded, &hash);
+        let usage = &metadata.usage[0];
+        assert_eq!(metadata.schema_version, 1);
+        assert_eq!(metadata.change_hash, Some(hash_proto(&hash)));
+        assert_eq!(usage.tokens.as_ref().unwrap().input_tokens, u64::MAX - 10);
+        assert_eq!(usage.tokens.as_ref().unwrap().cache_read_tokens, 4);
+        assert_eq!(usage.tokens.as_ref().unwrap().reasoning_tokens, 3);
+        assert_eq!(usage.cost_micro_usd, Some(123_456));
+        assert_eq!(usage.request_id.as_deref(), Some("request-1"));
+        let debug = format!("{metadata:?}");
+        assert!(!debug.contains("PRIVATE_REASONING"));
+        assert!(!debug.contains("PRIVATE_PROMPT"));
+    }
+
+    #[test]
+    fn metadata_distinguishes_no_records_zero_cost_and_invalid_cost() {
+        let mut change = Change::empty(ChangeHeader::new("work"));
+        let hash = change.hash().unwrap();
+        assert!(change_metadata_projection(&change, &hash).usage.is_empty());
+        let mut record = Provenance::new(AIVendor::OpenAI, "model", AITool::Api);
+        change.hashed.provenance.push(record.clone());
+        assert_eq!(
+            change_metadata_projection(&change, &hash).usage[0].cost_micro_usd,
+            Some(0)
+        );
+        record.cost = Cost {
+            usd: 0.25,
+            micro_usd: 0,
+        };
+        change.hashed.provenance = vec![record.clone()];
+        assert_eq!(
+            change_metadata_projection(&change, &hash).usage[0].cost_micro_usd,
+            Some(250_000)
+        );
+        record.cost.usd = f64::NAN;
+        change.hashed.provenance = vec![record];
+        let metadata = change_metadata_projection(&change, &hash);
+        assert_eq!(metadata.usage[0].cost_micro_usd, None);
+        assert_eq!(metadata.warnings.len(), 1);
+    }
+
+    #[test]
+    fn graph_summary_matches_native_hunk_aggregation_after_canonical_decode() {
+        use atomic_core::change::{Atom, EdgeUpdate, GraphOp, Insertion, Local};
+        use atomic_core::{ChangePosition, EdgeFlags, GraphNode, Hash, Position};
+        let inode = Position::new(Some(Hash::of(b"inode")), ChangePosition::new(0));
+        let span = Insertion {
+            predecessors: vec![],
+            successors: vec![],
+            flag: EdgeFlags::BLOCK,
+            start: ChangePosition::new(0),
+            end: ChangePosition::new(1),
+            inode,
+        };
+        let edges = EdgeUpdate {
+            edges: vec![],
+            inode,
+        };
+        let claim = (
+            inode,
+            GraphNode::new(inode.change, ChangePosition::new(0), ChangePosition::new(1)),
+            inode.change,
+        );
+        let hunks = vec![
+            GraphOp::DirAdd {
+                add_name: span.clone(),
+                add_inode: span.clone(),
+                path: "src".into(),
+            },
+            GraphOp::FileAdd {
+                add_name: span.clone(),
+                add_inode: span.clone(),
+                contents: Some(span.clone()),
+                path: "src/a.ts".into(),
+                encoding: None,
+            },
+            GraphOp::Edit {
+                change: Atom::Insertion(span.clone()),
+                local: Local::new("src/a.ts", 1),
+                encoding: None,
+            },
+            GraphOp::Replacement {
+                change: edges.clone(),
+                replacement: span.clone(),
+                local: Local::new("src/a.ts", 1),
+                encoding: None,
+            },
+            GraphOp::FileMove {
+                del: edges.clone(),
+                add: span.clone(),
+                path: "moved.ts".into(),
+            },
+            GraphOp::FileDel {
+                del: edges.clone(),
+                contents: Some(edges.clone()),
+                path: "deleted.ts".into(),
+                encoding: None,
+            },
+            GraphOp::FileUndel {
+                undel: edges.clone(),
+                contents: None,
+                path: "restored.ts".into(),
+                encoding: None,
+            },
+            GraphOp::DirDel {
+                del: edges.clone(),
+                path: "old-dir".into(),
+            },
+            GraphOp::DirUndel {
+                undel: edges.clone(),
+                path: "restored-dir".into(),
+            },
+            GraphOp::solve_name_conflict("name.ts", inode, [claim]).unwrap(),
+            GraphOp::unsolve_name_conflict("name.ts", inode, [claim]).unwrap(),
+            GraphOp::SolveOrderConflict {
+                change: edges.clone(),
+                local: Local::new("order.ts", 1),
+            },
+            GraphOp::UnsolveOrderConflict {
+                change: edges.clone(),
+                local: Local::new("order.ts", 1),
+            },
+            GraphOp::ResurrectZombies {
+                change: edges.clone(),
+                local: Local::new("zombie.ts", 1),
+                encoding: None,
+            },
+            GraphOp::AddRoot {
+                name: span.clone(),
+                inode: span,
+            },
+            GraphOp::DelRoot {
+                name: edges.clone(),
+                inode: edges,
+            },
+            GraphOp::SetAttr {
+                inode,
+                path: "src/a.ts".into(),
+                value: atomic_core::change::InodeAttr::Mode(420),
+            },
+        ];
+        let change = Change::new(
+            ChangeHeader::new("graph summaries"),
+            hunks,
+            b"hello\n".to_vec(),
+            vec![],
+        );
+        let mut bytes = Vec::new();
+        change.serialize(&mut bytes).unwrap();
+        let (decoded, hash) = Change::deserialize(&mut bytes.as_slice()).unwrap();
+        let summary = change_metadata_projection(&decoded, &hash)
+            .graph_summary
+            .unwrap();
+        assert_eq!((summary.vertices_added, summary.edges_changed), (9, 13));
+        assert_eq!(summary.content_bytes, 6);
+        assert_eq!(summary.files_changed, 10);
+        assert_eq!(summary.files.len(), 11); // root row is not a file
+        let file = summary
+            .files
+            .iter()
+            .find(|row| row.path == "src/a.ts")
+            .unwrap();
+        assert_eq!(file.symbol, "±");
+        assert!(file.info.starts_with("(4 hunks:"));
+        assert!(file.info.contains("attribute: Mode(420)"));
+        assert_eq!(
+            summary
+                .files
+                .iter()
+                .find(|row| row.path == "src")
+                .unwrap()
+                .symbol,
+            "📁+"
+        );
+        let expected = atomic_repository::triage::hunk_display_summaries(decoded.hunks());
+        assert_eq!(
+            summary
+                .files
+                .iter()
+                .map(|row| (&*row.symbol, &*row.path, &*row.info))
+                .collect::<Vec<_>>(),
+            expected
+                .iter()
+                .map(|row| (row.symbol, &*row.path, &*row.info))
+                .collect::<Vec<_>>()
+        );
+        let empty = change_metadata_projection(&Change::empty(ChangeHeader::new("empty")), &hash)
+            .graph_summary
+            .unwrap();
+        assert_eq!(
+            (
+                empty.vertices_added,
+                empty.edges_changed,
+                empty.content_bytes,
+                empty.files_changed
+            ),
+            (0, 0, 0, 0)
+        );
+        assert!(empty.files.is_empty());
+    }
 }
 
 // ---------------------------------------------------------------------------

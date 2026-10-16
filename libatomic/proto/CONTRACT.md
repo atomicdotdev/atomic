@@ -197,7 +197,96 @@ supplied StoredProvenanceTurn. Derive state, counters and checkpoint attempts
 server-side. Lifecycle stop/resume/abandon also require expected_generation.
 Keep prepare/bind/acknowledge separate for crash-injection parity.
 
+## Decoded change metadata
+
+`RepositoryQueryService.GetChange` with `includes.metadata = true` returns the
+existing `atomic.change.v3` bundle and an additive `ChangeMetadata` projection
+(response field 11, projection schema version 1). Both derive from the same
+atomic-core-loaded change; clients do not need a second binary decoder.
+
+The projection binds to `change_hash` and carries recorded AI vendor/model/tool,
+request/session identity, all six token counters, exact micro-USD cost and actual
+hunk/file-op paths. It excludes prompt/reasoning text, reasoning signatures and
+arbitrary provider metadata. The separately requested full bundle remains the
+complete change and is not a privacy-redacted replacement.
+
+`ChangeMetadata.graph_summary` (field 6, additive within schema version 1)
+exposes the native `atomic change` report: `vertices_added`, `edges_changed`,
+uncompressed `content_bytes`, unique graph-op `files_changed`, and canonical
+per-path `files` rows (`symbol`, `path`, `info`). Both the CLI and service use
+`atomic_repository::triage::{count_hunk_atoms,hunk_display_summaries}`. Counts
+follow the CLI's operation/span/edge-map conventions, not individual graph edges
+or provenance DAG nodes; semantic file_ops do not inflate graph-op counts. Root
+ops can have a `(root)` display row but do not count as a changed file. Preserve
+uint64 precision and render strings as text. A present all-zero summary is an
+empty graph change; absent summary means an older producer, not zero.
+
+`GetChange.includes.blast_radius` opts into the additive `blast_radius` response
+(field 12). It binds directly changed paths to the selected hash and observes
+incoming `CALLS`/`INCLUDES` from the current repository KG. Public API changes
+are found by parsing the recorded before/after sources and matching changed
+line ranges in both versions, including deletions. Entity IDs come from indexed
+DEFINES edges, not historical-line guesses. No working-copy source reads, KG
+enrichment, co-change traversal or write-open occurs. The response is not a
+historical/view-isolated dependency snapshot and says so explicitly. Missing
+parsers/content/definitions, ambiguity and analysis/display limits yield partial
+coverage, never a private-change assertion. Results deduplicate file paths and
+preserve hop 1 when a direct file also appears as a caller. No random impact or
+confidence percentages are generated. Analysis is bounded to 100 direct paths
+(2 MiB of combined before/after source each), 2000 displayed paths and 4000 file edges; common callable
+names with more than 30 incoming callers are skipped with a coverage warning.
+
+These are recorded attribution values, not billing/signature verification.
+Preserve uint64 precision. A usage row with recorded zero remains zero; no row
+or no metadata is not zero. Invalid costs are absent with a warning; legacy
+recorded USD uses atomic-core's unit conversion, not model-price estimation.
+Record indices are change-local occurrences, not cross-change identities.
+Consumers aggregating across changes must deduplicate repeated request records,
+surface conflicts and avoid guessing identities from a session ID alone.
+
+## Change-local plan and intent context
+
+`GetChange` with `includes.metadata` returns `intent_context` (field 13, schema
+version 1), computed by `Repository::change_intent_context`. It binds to the
+selected hash and preserves each actual `plan_id` declaration from covering
+provenance graphs and matched indexed turns. Both provenance identity and
+change membership must match a turn; a plan from another turn in the same
+session cannot leak into the result. Current vault metadata resolves stable UID
+and human-key aliases without turning aliases into false ambiguity. Unresolved
+identity metadata does not erase a recorded plan ID. Multiple different
+governors are returned as ambiguous rather than arbitrarily choosing one.
+
+Changed intent documents and direct `committed_via` edit→selected-patch evidence
+are returned separately as `associated_intents`, never promoted into a missing
+governing `plan_id`. In particular, the vault manifest's session/turn at intent
+creation records creation provenance, not governance. The lookup never
+backfills old graphs, reparents sessions or signs anything. Identity/title/path
+metadata comes from the current vault, not a historical or view-isolated intent
+snapshot. `validation_status=not_checked` explicitly means no SHACL, signature
+or repository-wide one-to-one validation ran. Missing metadata is not failure.
+The read is bounded to 32 covering graphs, 128 plan bindings, 128 associated
+documents and 256 causal references per document, with partial-coverage notes.
+
 ## Snapshot and effect semantics
+
+### Read-only editor file revisions
+
+LocalService dispatches `RepositoryQueryService/PreviewRestore` through the
+existing query handler. `content_path` returns the recorded graph bytes in
+`pristine_content` plus the observed working-copy `view` (response field 7).
+This is a read-only preview, never a restore/untrack mutation; opening an editor
+diff must not write the database or working files. Repository-relative content
+paths are validated before lookup. A missing payload is not an empty file.
+
+`ChangeFileContent` includes additive optional `before_exists`/`after_exists`
+(fields 4/5): `Ok(Some(bytes))` is present, `Ok(None)` is absent, and failed
+reconstruction leaves existence unknown. Known absence can be shown as an
+empty diff side; unknown content cannot. `is_directory` (field 6) identifies
+directory operations so consumers do not offer them as regular file diffs.
+These flags do not assert UTF-8 or change signature validity. Older producers'
+present byte payloads remain valid without flags, including empty buffers.
+
+### Snapshot leases
 
 ViewSnapshot is a server-derived canonical digest covering repository/stable target ID,
 scope, contributing ancestor IDs/states, visible dependency closure and effective

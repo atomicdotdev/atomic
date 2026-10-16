@@ -1167,6 +1167,39 @@ fn load_provenance_compact(repo: &Repository, hash_b32: &str) -> Option<serde_js
 // ── The change-view hunk summaries (moved from the CLI's `atomic change`)
 // ──────────────────────────────────────────────────────────────────────────
 
+/// The `atomic change` graph summary: added vertex spans and changed edge maps.
+/// These are the CLI's operation-level counts, not graph traversal statistics or
+/// counts of individual edges within each map. Root operations retain the CLI's
+/// single-operation convention; attributes contribute no graph atoms.
+pub fn count_hunk_atoms<H>(hunks: &[GraphOp<H>]) -> (usize, usize) {
+    let mut vertices = 0;
+    let mut edges = 0;
+    for graph_op in hunks {
+        match graph_op {
+            GraphOp::FileAdd { contents, .. } => vertices += 2 + usize::from(contents.is_some()),
+            GraphOp::FileDel { contents, .. } | GraphOp::FileUndel { contents, .. } => {
+                edges += 1 + usize::from(contents.is_some());
+            }
+            GraphOp::FileMove { .. } | GraphOp::Replacement { .. } => {
+                vertices += 1;
+                edges += 1;
+            }
+            GraphOp::DirAdd { .. } => vertices += 2,
+            GraphOp::Edit { .. } | GraphOp::AddRoot { .. } => vertices += 1,
+            GraphOp::DirDel { .. }
+            | GraphOp::DirUndel { .. }
+            | GraphOp::SolveNameConflict { .. }
+            | GraphOp::UnsolveNameConflict { .. }
+            | GraphOp::SolveOrderConflict { .. }
+            | GraphOp::UnsolveOrderConflict { .. }
+            | GraphOp::ResurrectZombies { .. }
+            | GraphOp::DelRoot { .. } => edges += 1,
+            GraphOp::SetAttr { .. } => {}
+        }
+    }
+    (vertices, edges)
+}
+
 /// One changed file's summary in a change: a change-type symbol (`+`/`-`/
 /// `~`/`±`), the path, and a per-file hunk summary — the same view
 /// `atomic change` prints, embedded in the report's `changes[].files`.

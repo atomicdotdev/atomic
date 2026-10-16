@@ -614,6 +614,7 @@ impl repository_query_service_server::RepositoryQueryService for QueryImpl {
                             snapshot: None,
                             untracked: Vec::new(),
                             pristine_content: None,
+                            view: None,
                         })
                     }
                     Some(preview_mutation_request::Operation::Unrecord(preview)) => {
@@ -725,6 +726,7 @@ impl repository_query_service_server::RepositoryQueryService for QueryImpl {
                             snapshot: None,
                             untracked: Vec::new(),
                             pristine_content: None,
+                            view: None,
                         })
                     }
                     None => Err(domain_status(
@@ -743,6 +745,22 @@ impl repository_query_service_server::RepositoryQueryService for QueryImpl {
         request: Request<PreviewRestoreRequest>,
     ) -> Result<Response<PreviewMutationResponse>, Status> {
         let request = request.into_inner();
+        if let Some(path) = &request.content_path {
+            use std::path::Component;
+            if path.is_empty()
+                || std::path::Path::new(path).components().any(|component| {
+                    matches!(
+                        component,
+                        Component::ParentDir | Component::RootDir | Component::Prefix(_)
+                    )
+                })
+            {
+                return Err(domain_status(
+                    ErrorCode::InvalidArgument,
+                    "content_path must be repository-relative",
+                ));
+            }
+        }
         let handle = self
             .state
             .resolve(request.repository.as_ref().unwrap_or(&default_ref()))?;
@@ -811,6 +829,7 @@ impl repository_query_service_server::RepositoryQueryService for QueryImpl {
                     snapshot: None,
                     untracked,
                     pristine_content,
+                    view: Some(workspace.view().name.clone()),
                 })
             })
             .await
