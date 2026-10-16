@@ -18,7 +18,7 @@ use std::sync::Arc;
 use crate::atomic::ErrorCode;
 use crate::atomic::*;
 use atomic_core::pristine::ViewTxnT;
-use atomic_repository::{Repository, RepositoryError, SealOptions, StageOptions, SubmitRejection};
+use atomic_repository::{Repository, RepositoryError, SealOptions, StageOptions, SubmitRejection, ViewEntryKind};
 use tonic::{Request, Response, Status};
 
 use super::convert::{hash_proto, timestamp_proto};
@@ -52,6 +52,42 @@ fn repository_ref(repository: &Option<RepositoryRef>) -> Result<RepositoryRef, S
 
 fn joined(error: tokio::task::JoinError) -> Status {
     Status::internal(error.to_string())
+}
+
+/// Validate a Materialize path prefix: plain relative components only (the
+/// same lexical rules as the entries it filters — no `..`, no `.`, no root,
+/// no empty components, no reserved bookkeeping names), normalized to
+/// `component/component` form. Empty or unset means the whole view.
+fn materialize_prefix(path_prefix: Option<String>) -> Result<Option<String>, Status> {
+    use std::path::{Component, Path};
+    let Some(prefix) = path_prefix else {
+        return Ok(None);
+    };
+    if prefix.is_empty() {
+        return Ok(None);
+    }
+    let refuse = |why: &str| invalid(format!("refusing materialize prefix {prefix:?}: {why}"));
+    let relative = Path::new(&prefix);
+    if !relative.is_relative() {
+        return Err(refuse("not a relative path"));
+    }
+    let mut parts = Vec::new();
+    for part in relative.components() {
+        let Component::Normal(name) = part else {
+            return Err(refuse("not a plain relative path"));
+        };
+        if name == ".atomic"
+            || name == ".atomic-sandbox"
+            || name == ".atomic-sandbox.d"
+        {
+            return Err(refuse("names the sandbox's own bookkeeping"));
+        }
+        parts.push(name.to_string_lossy().into_owned());
+    }
+    if parts.is_empty() {
+        return Err(refuse("empty path"));
+    }
+    Ok(Some(parts.join("/")))
 }
 
 fn invalid(message: impl Into<String>) -> Status {
@@ -445,6 +481,7 @@ impl sandbox_service_server::SandboxService for SandboxImpl {
             request.target.as_ref(),
             "sandbox.read",
         )?;
+        let prefix = materialize_prefix(request.path_prefix)?;
         let gate_handle = handle.clone();
         let _gate = gate_handle.exclusive().await;
         if let Some(caller) = &caller {
@@ -461,6 +498,18 @@ impl sandbox_service_server::SandboxService for SandboxImpl {
             let mut frames = Vec::new();
             let mut live = BTreeMap::new();
             repo.materialize_view_entries::<()>(&view, |entry| {
+                // A prefix materializes only its subtree: the entries at or
+                // under it, plus the plain directories that lead there. The
+                // live map follows the same filter so the skeleton's rows
+                // are prefix-coherent with what was streamed.
+                if let Some(prefix) = &prefix {
+                    let under = entry.path.starts_with(prefix.as_str());
+                    let ancestor = prefix.starts_with(&entry.path)
+                        && entry.kind == ViewEntryKind::Directory;
+                    if !under && !ancestor {
+                        return Ok(());
+                    }
+                }
                 live.insert(entry.inode, entry.path.clone());
                 frames.push(MaterializeFrame {
                     frame: Some(materialize_frame::Frame::Entry(wire::tree_entry_proto(
