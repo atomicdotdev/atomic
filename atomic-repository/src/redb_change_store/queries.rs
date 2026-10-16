@@ -315,7 +315,7 @@ impl RedbChangeStore {
 
     /// Delete a change from the store.
     ///
-    /// Removes all entries for this change from CHANGE_META, CHANGE_GRAPH,
+    /// Removes all entries for this change from CHANGE_META, CHANGE_PROVENANCE, CHANGE_GRAPH,
     /// CHANGE_SEMANTIC, CHANGE_CHUNKS, and CHANGE_UNHASHED.
     ///
     /// **Note**: Content chunks in CONTENT_CHUNKS are NOT deleted because
@@ -331,6 +331,8 @@ impl RedbChangeStore {
         {
             let mut meta_table = txn.open_table(tables::CHANGE_META)?;
             meta_table.remove(hash)?;
+
+            txn.open_table(tables::CHANGE_PROVENANCE)?.remove(hash)?;
 
             let mut graph_table = txn.open_table(tables::CHANGE_GRAPH)?;
             for idx in 0..meta.graph_section_count {
@@ -419,10 +421,27 @@ impl RedbChangeStore {
         // Write DEPS section
         writer.write_dependencies(&meta.dependency_indices)?;
 
+        // Inline provenance is part of the hashed metadata and precedes the
+        // signature. Older stores discarded it; do not emit an unreadable file
+        // or silently replace the lost evidence with an empty section.
+        let txn = self.db().begin_read()?;
+        if meta.has_provenance {
+            let table = txn.open_table(tables::CHANGE_PROVENANCE)?;
+            let value = table.get(hash)?.ok_or_else(|| {
+                RedbStoreError::Corrupt(
+                    "missing inline PROVENANCE payload; reimport the original change file to recover it"
+                        .to_string(),
+                )
+            })?;
+            let payload = zstd::decode_all(value.value()).map_err(|error| {
+                RedbStoreError::Corrupt(format!("provenance decompression failed: {error}"))
+            })?;
+            writer.write_provenance_payload(&payload)?;
+        }
+
         // Write SIGNATURE section (metadata phase — before GRAPH). The
         // payload is the stored postcard ChangeSignature; decompress from
         // CHANGE_SIGNATURES and write as the SIGNATURE section.
-        let txn = self.db().begin_read()?;
         {
             let sig_table = txn.open_table(tables::CHANGE_SIGNATURES)?;
             if let Some(value) = sig_table.get(hash)? {

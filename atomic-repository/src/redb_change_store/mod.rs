@@ -234,6 +234,7 @@ pub struct StoredChangeMeta {
 /// | Table | Key | Value | Purpose |
 /// |-------|-----|-------|---------|
 /// | `CHANGE_META` | `[u8; 32]` (hash) | compressed meta blob | Header + deps + hash table |
+/// | `CHANGE_PROVENANCE` | `[u8; 32]` (hash) | compressed original section | Inline hashed provenance |
 /// | `CHANGE_GRAPH` | `[u8; 36]` (hash + idx) | compressed graph ops | Per-file graph sections |
 /// | `CHANGE_SEMANTIC` | `[u8; 36]` (hash + idx) | compressed semantic ops | Per-file semantic sections |
 /// | `CONTENT_CHUNKS` | `[u8; 32]` (chunk hash) | compressed content | Deduped content chunks |
@@ -311,6 +312,7 @@ impl RedbChangeStore {
             let txn = db.begin_write()?;
             {
                 let _ = txn.open_table(tables::CHANGE_META)?;
+                let _ = txn.open_table(tables::CHANGE_PROVENANCE)?;
                 let _ = txn.open_table(tables::CHANGE_GRAPH)?;
                 let _ = txn.open_table(tables::CHANGE_SEMANTIC)?;
                 let _ = txn.open_table(tables::CONTENT_CHUNKS)?;
@@ -455,6 +457,15 @@ impl RedbChangeStore {
             // CHANGE_META
             let mut meta_table = txn.open_table(tables::CHANGE_META)?;
             meta_table.insert(&content_hash, meta_compressed.as_slice())?;
+
+            // Preserve the original hashed section in the same transaction as
+            // its metadata flag. The journal/sidecar tables store other objects.
+            if let Some(payload) = &provenance_payload {
+                let compressed = zstd::encode_all(payload.as_slice(), 3)
+                    .map_err(|e| RedbStoreError::Serialization(e.to_string()))?;
+                txn.open_table(tables::CHANGE_PROVENANCE)?
+                    .insert(&content_hash, compressed.as_slice())?;
+            }
 
             // CHANGE_GRAPH
             let mut graph_table = txn.open_table(tables::CHANGE_GRAPH)?;
