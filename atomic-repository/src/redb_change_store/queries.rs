@@ -226,6 +226,11 @@ impl RedbChangeStore {
     /// Returns `None` if no unhashed data is stored.
     pub fn load_unhashed(&self, hash: &[u8; 32]) -> RedbStoreResult<Option<serde_json::Value>> {
         let txn = self.db().begin_read()?;
+        match self.load_meta_in_txn(&txn, hash) {
+            Ok(meta) if meta.has_unhashed => {}
+            Ok(_) | Err(RedbStoreError::NotFound { .. }) => return Ok(None),
+            Err(error) => return Err(error),
+        }
         let table = txn.open_table(tables::CHANGE_UNHASHED)?;
 
         match table.get(hash)? {
@@ -237,7 +242,7 @@ impl RedbChangeStore {
                 let json: serde_json::Value = serde_json::from_slice(&decompressed)?;
                 Ok(Some(json))
             }
-            None => Ok(None),
+            None => Err(RedbStoreError::Corrupt("missing UNHASHED payload".into())),
         }
     }
 
@@ -316,7 +321,7 @@ impl RedbChangeStore {
     /// Delete a change from the store.
     ///
     /// Removes all entries for this change from CHANGE_META, CHANGE_GRAPH,
-    /// CHANGE_SEMANTIC, CHANGE_CHUNKS, and CHANGE_UNHASHED.
+    /// CHANGE_SEMANTIC, CHANGE_CHUNKS, CHANGE_UNHASHED, and CHANGE_SIGNATURES.
     ///
     /// **Note**: Content chunks in CONTENT_CHUNKS are NOT deleted because
     /// they may be shared with other changes.
@@ -352,6 +357,8 @@ impl RedbChangeStore {
 
             let mut unhashed_table = txn.open_table(tables::CHANGE_UNHASHED)?;
             unhashed_table.remove(hash)?;
+            let mut sig_table = txn.open_table(tables::CHANGE_SIGNATURES)?;
+            sig_table.remove(hash)?;
         }
         txn.commit()?;
 
@@ -376,7 +383,18 @@ impl RedbChangeStore {
     /// This is the core export method used by both file export and
     /// network transfer.
     pub fn export_v3_bytes(&self, hash: &[u8; 32]) -> RedbStoreResult<Vec<u8>> {
-        let meta = self.load_meta(hash)?;
+        let txn = self.db().begin_read()?;
+        self.export_v3_bytes_in_txn(&txn, hash)
+    }
+
+    // Keep metadata flags and all section payloads on the same snapshot even
+    // when another writer replaces attachments under the same logical hash.
+    pub(super) fn export_v3_bytes_in_txn(
+        &self,
+        txn: &redb::ReadTransaction,
+        hash: &[u8; 32],
+    ) -> RedbStoreResult<Vec<u8>> {
+        let meta = self.load_meta_in_txn(txn, hash)?;
 
         // Reconstruct the hash dedup table
         let hash_table = if meta.hash_table.is_empty() {
@@ -422,8 +440,7 @@ impl RedbChangeStore {
         // Write SIGNATURE section (metadata phase — before GRAPH). The
         // payload is the stored postcard ChangeSignature; decompress from
         // CHANGE_SIGNATURES and write as the SIGNATURE section.
-        let txn = self.db().begin_read()?;
-        {
+        if meta.has_signature {
             let sig_table = txn.open_table(tables::CHANGE_SIGNATURES)?;
             if let Some(value) = sig_table.get(hash)? {
                 let compressed = value.value();
@@ -434,6 +451,8 @@ impl RedbChangeStore {
                     RedbStoreError::Corrupt(format!("signature deserialization failed: {}", e))
                 })?;
                 writer.write_signature(&signature)?;
+            } else {
+                return Err(RedbStoreError::Corrupt("missing SIGNATURE payload".into()));
             }
         }
 
@@ -497,7 +516,7 @@ impl RedbChangeStore {
         }
 
         // Write UNHASHED section
-        {
+        if meta.has_unhashed {
             let unhashed_table = txn.open_table(tables::CHANGE_UNHASHED)?;
             if let Some(value) = unhashed_table.get(hash)? {
                 let compressed = value.value();
@@ -505,10 +524,10 @@ impl RedbChangeStore {
                     RedbStoreError::Corrupt(format!("unhashed decompression failed: {}", e))
                 })?;
                 writer.write_unhashed(&decompressed)?;
+            } else {
+                return Err(RedbStoreError::Corrupt("missing UNHASHED payload".into()));
             }
         }
-
-        drop(txn);
 
         writer.finalize()?;
 
