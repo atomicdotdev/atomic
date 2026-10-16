@@ -395,7 +395,7 @@ impl Command for Hooks {
                 .map_err(|e| CliError::Internal(anyhow!("Failed to dispatch hook event: {}", e)))?;
 
             // Agent recording uses the repository directly, so finish the same
-            // bridge projection as an ordinary CLI/service record. Keep all
+            // shim projection as an ordinary CLI/service record. Keep all
             // provenance/refusal checks ahead of this publication.
             drop(orchestrator);
             if dispatch_result.incomplete.is_none() {
@@ -1200,7 +1200,7 @@ mod tests {
             .unwrap();
         drop(repository);
 
-        // The routed view switch keeps the bridge checkpoint aligned with the
+        // The routed view switch keeps the shim checkpoint aligned with the
         // working-copy record; refresh it exactly as the routed path would.
         let atomic = atomic_repository::Repository::open_readonly(root).unwrap();
         let view_info = atomic.get_view_info("agent-view").unwrap();

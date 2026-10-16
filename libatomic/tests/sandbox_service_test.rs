@@ -426,12 +426,24 @@ fn materialize(host: &Host, opened: &SandboxOpened) -> Vm {
 }
 
 fn materialize_into(host: &Host, token: &[u8], root: &Path) -> (u64, SandboxSkeleton) {
+    materialize_prefix_into(host, token, root, None)
+}
+
+/// Materialize with an optional path prefix, as a sandbox does: every entry
+/// through the kernel's path-checked writer, then the cache's skeleton.
+fn materialize_prefix_into(
+    host: &Host,
+    token: &[u8],
+    root: &Path,
+    path_prefix: Option<&str>,
+) -> (u64, SandboxSkeleton) {
     let frames: Vec<MaterializeFrame> = host.rt.block_on(async {
         host.service()
             .materialize(with_token(
                 MaterializeRequest {
                     repository: Some(host.repository.clone()),
                     target: None,
+                    path_prefix: path_prefix.map(str::to_string),
                 },
                 token,
             ))
@@ -443,6 +455,7 @@ fn materialize_into(host: &Host, token: &[u8], root: &Path) -> (u64, SandboxSkel
             .await
     });
     let mut written = 0;
+    let mut paths = Vec::new();
     for frame in frames {
         match frame.frame.unwrap() {
             materialize_frame::Frame::Entry(entry) => {
@@ -455,6 +468,7 @@ fn materialize_into(host: &Host, token: &[u8], root: &Path) -> (u64, SandboxSkel
                 )
                 .unwrap();
                 written += 1;
+                paths.push(entry.path);
             }
             materialize_frame::Frame::Done(done) => {
                 assert_eq!(done.entries, written, "every entry arrived");
@@ -464,6 +478,17 @@ fn materialize_into(host: &Host, token: &[u8], root: &Path) -> (u64, SandboxSkel
                     done.snapshot,
                     "one coherent state"
                 );
+                if let Some(prefix) = path_prefix {
+                    // A prefix streams only its subtree plus the directories
+                    // that lead to it — and the skeleton's live rows follow
+                    // the same filter.
+                    for path in &paths {
+                        assert!(
+                            path.starts_with(prefix) || prefix.starts_with(path.as_str()),
+                            "{path:?} escaped the {prefix:?} materialize"
+                        );
+                    }
+                }
                 return (written, wire::skeleton_from_proto(&skeleton).unwrap());
             }
         }
@@ -723,6 +748,7 @@ fn a_token_reaches_its_view_and_nothing_else() {
             MaterializeRequest {
                 repository: Some(host.repository.clone()),
                 target,
+                path_prefix: None,
             },
             token,
         )))
@@ -755,6 +781,7 @@ fn a_token_reaches_its_view_and_nothing_else() {
             MaterializeRequest {
                 repository: Some(workspace),
                 target: None,
+                path_prefix: None,
             },
             &opened.token,
         ))),
@@ -832,6 +859,7 @@ fn a_token_reaches_its_view_and_nothing_else() {
     let mut request = Request::new(MaterializeRequest {
         repository: Some(host.repository.clone()),
         target: None,
+        path_prefix: None,
     });
     request.extensions_mut().insert(SandboxGrant {
         repository_id: elsewhere.repository.repository_id.clone(),
@@ -850,6 +878,7 @@ fn a_token_reaches_its_view_and_nothing_else() {
     let mut request = Request::new(MaterializeRequest {
         repository: Some(host.repository.clone()),
         target: None,
+        path_prefix: None,
     });
     request.extensions_mut().insert(SandboxGrant {
         repository_id: host.repository.repository_id.clone(),
@@ -878,6 +907,7 @@ fn renew_keeps_the_token_close_ends_it_and_reopening_replaces_it() {
             MaterializeRequest {
                 repository: Some(host.repository.clone()),
                 target: None,
+                path_prefix: None,
             },
             token,
         )))
@@ -965,6 +995,7 @@ fn a_view_deleted_and_recreated_does_not_revive_its_grant() {
             MaterializeRequest {
                 repository: Some(host.repository.clone()),
                 target: None,
+                path_prefix: None,
             },
             &opened.token,
         ))),
@@ -1073,6 +1104,97 @@ fn a_sandbox_on_the_checked_out_view_lands_in_the_working_copy() {
             .all(|e| e.status() != atomic_repository::status::FileStatus::Deleted),
         "the host offers to delete the sandbox's file"
     );
+}
+
+/// A prefix materializes only its subtree (plus the directories that lead to
+/// it), the skeleton's live rows follow the same filter, and a traversal or
+/// reserved prefix is refused outright. A monorepo folder in, a monorepo
+/// folder out — the sandbox cache stays prefix-coherent.
+#[test]
+fn a_prefix_materializes_only_its_subtree_and_refuses_traversal() {
+    let host = host();
+    let opened = host.open("dev", ALL);
+
+    // The whole view: README.md and src/lib.rs.
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().join("full");
+    std::fs::create_dir_all(&root).unwrap();
+    let root = root.canonicalize().unwrap();
+    let (full, _) = materialize_prefix_into(&host, &opened.token, &root, None);
+    assert!(root.join("README.md").is_file());
+    assert!(root.join("src/lib.rs").is_file());
+
+    // Only src: the subtree plus its leading directory — no README.
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().join("src-only");
+    std::fs::create_dir_all(&root).unwrap();
+    let root = root.canonicalize().unwrap();
+    let (src, _) = materialize_prefix_into(&host, &opened.token, &root, Some("src"));
+    assert!(src < full, "a prefix streams fewer entries than the view");
+    assert!(root.join("src/lib.rs").is_file());
+    assert!(
+        !root.join("README.md").exists(),
+        "a src materialize leaked README.md"
+    );
+
+    // A prefix that matches nothing streams only its leading directories.
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().join("empty");
+    std::fs::create_dir_all(&root).unwrap();
+    let root = root.canonicalize().unwrap();
+    let (nowhere, _) = materialize_prefix_into(&host, &opened.token, &root, Some("nowhere"));
+    assert!(
+        nowhere < src,
+        "a matching-nothing prefix streams fewer entries than a matching one"
+    );
+
+    // A deep prefix streams only the ancestor entries the VIEW has (the
+    // leading directories of the chain that exist), not a synthesized
+    // chain — its missing members cost nothing until a file lands under
+    // them (the client-side writer creates parents on write).
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().join("deep");
+    std::fs::create_dir_all(&root).unwrap();
+    let root = root.canonicalize().unwrap();
+    let (deep, _) = materialize_prefix_into(&host, &opened.token, &root, Some("src/deep/nested"));
+    assert_eq!(
+        deep, 1,
+        "a deep prefix streams exactly the view's own leading directories"
+    );
+    assert!(
+        !root.join("src/lib.rs").is_file(),
+        "a src/deep/... prefix must stream nothing of src/"
+    );
+
+    // Traversal and reserved prefixes are refused, never truncated.
+    for bad in ["..", "../elsewhere", "/abs", ".atomic", "a/../b"] {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().join("bad");
+        std::fs::create_dir_all(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        let refused = host.rt.block_on(host.service().materialize(with_token(
+            MaterializeRequest {
+                repository: Some(host.repository.clone()),
+                target: None,
+                path_prefix: Some(bad.to_string()),
+            },
+            &opened.token,
+        )));
+        // A refusal writes nothing: the destination stays empty.
+        assert!(
+            std::fs::read_dir(&root).unwrap().count() == 0,
+            "{bad:?} wrote into the destination despite being refused"
+        );
+        let code = match refused {
+            Err(status) => status.code(),
+            Ok(_) => panic!("{bad:?} must be refused"),
+        };
+        assert_eq!(
+            code,
+            tonic::Code::InvalidArgument,
+            "{bad:?} must be refused"
+        );
+    }
 }
 
 fn reserve(

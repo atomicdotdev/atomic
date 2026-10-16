@@ -1,4 +1,4 @@
-//! CB-5C bridge-owned Git write journaling: operation before visibility.
+//! CB-5C shim-owned Git write journaling: operation before visibility.
 
 use atomic_core::operation::{
     EffectTarget, EffectValue, GitHashAlgorithm, GitRefTarget, OperationKind,
@@ -37,24 +37,24 @@ fn sole_head(
 }
 
 #[test]
-fn bridge_git_ref_write_journals_operation_before_visibility_and_records_receipt() {
+fn shim_git_ref_write_journals_operation_before_visibility_and_records_receipt() {
     let (_directory, repository) = create_temp_repo();
     let working_copy = repository.working_copy();
     let old_oid = "1111111111111111111111111111111111111111";
     let new_oid = "2222222222222222222222222222222222222222";
 
-    // The bridge observed the old target and intends the new one. The journal
+    // The shim observed the old target and intends the new one. The journal
     // entry must exist with its operation ID and intended effect BEFORE the
     // caller performs the Git write (here modeled by the returned value).
     let prepared = repository
-        .prepare_bridge_git_ref_write(
+        .prepare_shim_git_ref_write(
             working_copy,
             "refs/heads/main",
             Some(sha1(old_oid)),
             sha1(new_oid),
-            Hash::of(b"bridge write evidence"),
+            Hash::of(b"shim write evidence"),
         )
-        .expect("journal the bridge write");
+        .expect("journal the shim write");
     let (head, kind) = sole_head(&repository, working_copy);
     assert_eq!(head, prepared.operation_id);
     assert_eq!(kind, OperationKind::ExportGitRefs);
@@ -74,7 +74,7 @@ fn bridge_git_ref_write_journals_operation_before_visibility_and_records_receipt
 
     // The write happens here in the caller; the receipt is leased afterwards.
     let receipt = repository
-        .record_bridge_git_ref_receipt(&prepared, Some(sha1(new_oid)))
+        .record_shim_git_ref_receipt(&prepared, Some(sha1(new_oid)))
         .expect("record the applied receipt");
     assert_eq!(
         receipt.payload().kind,
@@ -82,33 +82,33 @@ fn bridge_git_ref_write_journals_operation_before_visibility_and_records_receipt
     );
     let operation_id = prepared.operation_id;
     repository
-        .finalize_bridge_git_write(prepared, Some(sha1(new_oid)))
+        .finalize_shim_git_write(prepared, Some(sha1(new_oid)))
         .expect("verify the completed write");
     let details = repository.operation_details(operation_id).expect("details");
     assert_eq!(details.verification, OperationVerificationState::Verified);
 }
 
 #[test]
-fn bridge_git_write_with_unexpected_ref_target_fails_and_does_not_verify() {
+fn shim_git_write_with_unexpected_ref_target_fails_and_does_not_verify() {
     let (_directory, repository) = create_temp_repo();
     let working_copy = repository.working_copy();
     let old_oid = "1111111111111111111111111111111111111111";
     let new_oid = "2222222222222222222222222222222222222222";
 
     let prepared = repository
-        .prepare_bridge_git_ref_write(
+        .prepare_shim_git_ref_write(
             working_copy,
             "refs/heads/main",
             Some(sha1(old_oid)),
             sha1(new_oid),
             Hash::of(b"divergence evidence"),
         )
-        .expect("journal the bridge write");
+        .expect("journal the shim write");
 
     // The caller observes a third value: someone else moved the ref between
     // observation and mutation. The receipt must be a durable rejection and
     // the operation must not verify.
-    let observed = repository.record_bridge_git_ref_receipt(
+    let observed = repository.record_shim_git_ref_receipt(
         &prepared,
         Some(sha1("3333333333333333333333333333333333333333")),
     );
@@ -165,7 +165,7 @@ fn anchored_capture_authenticates_only_through_a_verified_active_operation() {
     let unknown = atomic_core::types::OperationId::from_bytes([0x5Au8; 32]);
     assert!(
         repository
-            .capture_bridge_event_anchored(b"unanchored attempt", unknown)
+            .capture_shim_event_anchored(b"unanchored attempt", unknown)
             .is_err(),
         "an unknown operation must not accept an anchor"
     );
@@ -183,7 +183,7 @@ fn anchored_capture_authenticates_only_through_a_verified_active_operation() {
     // token (review E2), and the operation then completes with a verified
     // receipt. Only that sequence authenticates.
     let prepared = repository
-        .prepare_bridge_git_rewrite(
+        .prepare_shim_git_rewrite(
             working_copy,
             "refs/heads/main",
             Some(sha1(old_oid)),
@@ -196,7 +196,7 @@ fn anchored_capture_authenticates_only_through_a_verified_active_operation() {
     let minted = repository
         .bridge_ref_capture_token(prepared.operation_id)
         .expect("read the minted capture context")
-        .expect("a prepared bridge write carries a minted capture token");
+        .expect("a prepared shim write carries a minted capture token");
     let event_bytes = token_event_json(
         old_oid,
         new_oid,
@@ -205,7 +205,7 @@ fn anchored_capture_authenticates_only_through_a_verified_active_operation() {
     );
 
     let _anchored = repository
-        .capture_bridge_event_anchored(&event_bytes, prepared.operation_id)
+        .capture_shim_event_anchored(&event_bytes, prepared.operation_id)
         .expect("anchor the capture to the active operation");
     assert_eq!(
         repository
@@ -228,7 +228,7 @@ fn anchored_capture_authenticates_only_through_a_verified_active_operation() {
     // An unrelated event captured by the plain advisory path stays
     // unanchored forever.
     repository
-        .capture_bridge_event(b"direct hook stdin, no operation")
+        .capture_shim_event(b"direct hook stdin, no operation")
         .expect("advisory capture");
     assert_eq!(
         repository
@@ -241,12 +241,12 @@ fn anchored_capture_authenticates_only_through_a_verified_active_operation() {
     // The operation completes and verifies; the anchored capture then
     // authenticates through the verified receipt.
     let receipt = repository
-        .record_bridge_git_ref_receipt(&prepared, Some(sha1(new_oid)))
+        .record_shim_git_ref_receipt(&prepared, Some(sha1(new_oid)))
         .expect("record the applied receipt");
     let _ = receipt;
     let operation_id = prepared.operation_id;
     repository
-        .finalize_bridge_git_write(prepared, Some(sha1(new_oid)))
+        .finalize_shim_git_write(prepared, Some(sha1(new_oid)))
         .expect("verify the completed write");
     assert!(
         repository
@@ -259,7 +259,7 @@ fn anchored_capture_authenticates_only_through_a_verified_active_operation() {
     // be written AFTER the active window, not during it.
     assert!(
         repository
-            .capture_bridge_event_anchored(b"late capture", operation_id)
+            .capture_shim_event_anchored(b"late capture", operation_id)
             .is_err(),
         "an already-verified operation can no longer anchor captures"
     );
@@ -274,7 +274,7 @@ fn anchored_capture_refuses_an_operation_that_is_not_the_active_head() {
     // the superseded operation no longer holds the active head, so it cannot
     // anchor captures even before finalization.
     let prepared = repository
-        .prepare_bridge_git_rewrite(
+        .prepare_shim_git_rewrite(
             working_copy,
             "refs/heads/main",
             Some(sha1("1111111111111111111111111111111111111111")),
@@ -285,18 +285,18 @@ fn anchored_capture_refuses_an_operation_that_is_not_the_active_head() {
     // Finalize it so the head moves on (the finalization CAS advances the
     // scope past the prepared operation).
     let operation_id = prepared.operation_id;
-    let _ = repository.record_bridge_git_ref_receipt(
+    let _ = repository.record_shim_git_ref_receipt(
         &prepared,
         Some(sha1("2222222222222222222222222222222222222222")),
     );
-    let _ = repository.finalize_bridge_git_write(
+    let _ = repository.finalize_shim_git_write(
         prepared,
         Some(sha1("2222222222222222222222222222222222222222")),
     );
 
     assert!(
         repository
-            .capture_bridge_event_anchored(b"stale capture", operation_id)
+            .capture_shim_event_anchored(b"stale capture", operation_id)
             .is_err(),
         "a non-head operation must not accept capture anchors"
     );
@@ -316,7 +316,7 @@ fn anchored_capture_refuses_conflicting_reanchoring() {
 
     // A first prepared operation whose leases describe exactly this rewrite.
     let prepared = repository
-        .prepare_bridge_git_rewrite(
+        .prepare_shim_git_rewrite(
             working_copy,
             "refs/heads/main",
             Some(sha1(old_oid)),
@@ -329,7 +329,7 @@ fn anchored_capture_refuses_conflicting_reanchoring() {
     let minted = repository
         .bridge_ref_capture_token(prepared.operation_id)
         .expect("read the minted capture context")
-        .expect("a prepared bridge write carries a minted capture token");
+        .expect("a prepared shim write carries a minted capture token");
     let event = token_event_json(
         old_oid,
         new_oid,
@@ -337,13 +337,13 @@ fn anchored_capture_refuses_conflicting_reanchoring() {
         Some(&token_hex(&minted)),
     );
     let anchored = repository
-        .capture_bridge_event_anchored(&event, prepared.operation_id)
+        .capture_shim_event_anchored(&event, prepared.operation_id)
         .expect("the matching operation accepts the anchor");
 
     // Idempotent: the SAME bytes anchored to the SAME operation succeed and
     // keep the anchor.
     let repeat = repository
-        .capture_bridge_event_anchored(&event, prepared.operation_id)
+        .capture_shim_event_anchored(&event, prepared.operation_id)
         .expect("re-anchoring to the same operation is idempotent");
     assert_eq!(repeat, anchored, "the anchor is unchanged");
     assert_eq!(
@@ -362,13 +362,13 @@ fn anchored_capture_refuses_conflicting_reanchoring() {
     // digest to refs/heads/UNRELATED operations).
     let first_operation_id = prepared.operation_id;
     repository
-        .record_bridge_git_ref_receipt(&prepared, Some(sha1(new_oid)))
+        .record_shim_git_ref_receipt(&prepared, Some(sha1(new_oid)))
         .expect("record the applied receipt");
     repository
-        .finalize_bridge_git_write(prepared, Some(sha1(new_oid)))
+        .finalize_shim_git_write(prepared, Some(sha1(new_oid)))
         .expect("verify the completed write");
     let second = repository
-        .prepare_bridge_git_rewrite(
+        .prepare_shim_git_rewrite(
             working_copy,
             "refs/heads/next",
             Some(sha1(old_oid)),
@@ -377,7 +377,7 @@ fn anchored_capture_refuses_conflicting_reanchoring() {
         )
         .expect("journal the second operation");
     let error = repository
-        .capture_bridge_event_anchored(&event, second.operation_id)
+        .capture_shim_event_anchored(&event, second.operation_id)
         .expect_err("an anchor must never be re-anchored to another operation");
     assert!(
         error.to_string().contains("cannot be re-anchored"),
@@ -395,13 +395,13 @@ fn anchored_capture_refuses_conflicting_reanchoring() {
     // the first operation, not the second.
     assert!(
         repository
-            .bridge_anchor_binds_operation(&event, first_operation_id)
+            .shim_anchor_binds_operation(&event, first_operation_id)
             .expect("read binding"),
         "the anchor genuinely binds the matching operation"
     );
     assert!(
         !repository
-            .bridge_anchor_binds_operation(&event, second.operation_id)
+            .shim_anchor_binds_operation(&event, second.operation_id)
             .expect("read binding"),
         "an unrelated operation never binds the event"
     );
@@ -414,7 +414,7 @@ fn anchored_capture_refuses_events_the_operation_does_not_describe() {
 
     // An active ExportGitRefs operation whose leases name 3333 -> 4444.
     let prepared = repository
-        .prepare_bridge_git_rewrite(
+        .prepare_shim_git_rewrite(
             working_copy,
             "refs/heads/UNRELATED",
             Some(sha1("3333333333333333333333333333333333333333")),
@@ -433,10 +433,10 @@ fn anchored_capture_refuses_events_the_operation_does_not_describe() {
         "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
     );
     repository
-        .capture_bridge_event(sibling_event.as_bytes())
+        .capture_shim_event(sibling_event.as_bytes())
         .expect("capture the advisory event");
     let error = repository
-        .capture_bridge_event_anchored(sibling_event.as_bytes(), prepared.operation_id)
+        .capture_shim_event_anchored(sibling_event.as_bytes(), prepared.operation_id)
         .expect_err("an unrelated active ref-write must not adopt a foreign event");
     assert!(
         error
@@ -461,7 +461,7 @@ fn anchored_capture_refuses_events_the_operation_does_not_describe() {
     let minted = repository
         .bridge_ref_capture_token(prepared.operation_id)
         .expect("read the minted capture context")
-        .expect("a prepared bridge write carries a minted capture token");
+        .expect("a prepared shim write carries a minted capture token");
     let bytes = token_event_json(
         old_oid,
         new_oid,
@@ -469,11 +469,11 @@ fn anchored_capture_refuses_events_the_operation_does_not_describe() {
         Some(&token_hex(&minted)),
     );
     repository
-        .capture_bridge_event_anchored(&bytes, prepared.operation_id)
+        .capture_shim_event_anchored(&bytes, prepared.operation_id)
         .expect("the durable JSON evidence shape binds through the capture token");
     assert!(
         repository
-            .bridge_anchor_binds_operation(&bytes, prepared.operation_id)
+            .shim_anchor_binds_operation(&bytes, prepared.operation_id)
             .expect("read binding"),
         "the JSON-record anchor binds its operation"
     );
@@ -489,7 +489,7 @@ fn anchored_capture_refuses_events_the_operation_does_not_describe() {
         None,
     );
     let error = repository
-        .capture_bridge_event_anchored(&tokenless, prepared.operation_id)
+        .capture_shim_event_anchored(&tokenless, prepared.operation_id)
         .expect_err("a matching-OID capture with no capture token must refuse");
     assert!(
         error
@@ -506,7 +506,7 @@ fn anchored_capture_refuses_events_the_operation_does_not_describe() {
         Some(&token_hex(&[0x11u8; 32])),
     );
     let error = repository
-        .capture_bridge_event_anchored(&foreign, prepared.operation_id)
+        .capture_shim_event_anchored(&foreign, prepared.operation_id)
         .expect_err("a foreign capture token must refuse");
     assert!(
         error
@@ -536,7 +536,7 @@ fn anchored_capture_refuses_an_advisory_capture_that_predates_the_operation() {
         None,
     );
     repository
-        .capture_bridge_event(&advisory)
+        .capture_shim_event(&advisory)
         .expect("capture the advisory event");
     assert_eq!(
         repository
@@ -549,7 +549,7 @@ fn anchored_capture_refuses_an_advisory_capture_that_predates_the_operation() {
     // Step 2: only afterwards the public API prepares a ref-only write whose
     // leases match those exact OIDs — the E2 forgery shape.
     let prepared = repository
-        .prepare_bridge_git_rewrite(
+        .prepare_shim_git_rewrite(
             working_copy,
             "refs/heads/ref-only-review",
             Some(sha1(old_oid)),
@@ -562,7 +562,7 @@ fn anchored_capture_refuses_an_advisory_capture_that_predates_the_operation() {
     // operation and carries no capture token, so matching OIDs authenticate
     // nothing.
     let error = repository
-        .capture_bridge_event_anchored(&advisory, prepared.operation_id)
+        .capture_shim_event_anchored(&advisory, prepared.operation_id)
         .expect_err("a pre-operation advisory capture must never anchor");
     assert!(
         error
@@ -579,12 +579,12 @@ fn anchored_capture_refuses_an_advisory_capture_that_predates_the_operation() {
     );
 
     // The same event captured INSIDE the operation's capture context (the
-    // hook ran with ATOMIC_BRIDGE_CAPTURE_TOKEN exported) binds and, after a
+    // hook ran with ATOMIC_SHIM_CAPTURE_TOKEN exported) binds and, after a
     // verified receipt, authenticates end to end.
     let minted = repository
         .bridge_ref_capture_token(prepared.operation_id)
         .expect("read the minted capture context")
-        .expect("a prepared bridge write carries a minted capture token");
+        .expect("a prepared shim write carries a minted capture token");
     let in_context = token_event_json(
         old_oid,
         new_oid,
@@ -592,24 +592,24 @@ fn anchored_capture_refuses_an_advisory_capture_that_predates_the_operation() {
         Some(&token_hex(&minted)),
     );
     repository
-        .capture_bridge_event_anchored(&in_context, prepared.operation_id)
+        .capture_shim_event_anchored(&in_context, prepared.operation_id)
         .expect("an in-context capture binds to its operation");
     repository
-        .record_bridge_git_ref_receipt(&prepared, Some(sha1(new_oid)))
+        .record_shim_git_ref_receipt(&prepared, Some(sha1(new_oid)))
         .expect("record the applied receipt");
     let operation_id = prepared.operation_id;
     repository
-        .finalize_bridge_git_write(prepared, Some(sha1(new_oid)))
+        .finalize_shim_git_write(prepared, Some(sha1(new_oid)))
         .expect("verify the completed write");
     assert!(
         repository
-            .bridge_anchor_binds_operation(&in_context, operation_id)
+            .shim_anchor_binds_operation(&in_context, operation_id)
             .expect("read binding"),
         "the in-context capture authenticates through the verified operation"
     );
     assert!(
         !repository
-            .bridge_anchor_binds_operation(&advisory, operation_id)
+            .shim_anchor_binds_operation(&advisory, operation_id)
             .expect("read binding"),
         "the advisory capture never authenticates"
     );
@@ -629,7 +629,7 @@ fn ordinary_ref_movement_is_not_rewrite_authority() {
     let new_oid = "2222222222222222222222222222222222222222";
 
     let prepared = repository
-        .prepare_bridge_git_ref_write(
+        .prepare_shim_git_ref_write(
             working_copy,
             "refs/heads/ordinary-review",
             Some(sha1(old_oid)),
@@ -656,7 +656,7 @@ fn ordinary_ref_movement_is_not_rewrite_authority() {
         Some(&token_hex(&[0x11u8; 32])),
     );
     let error = repository
-        .capture_bridge_event_anchored(&forged, prepared.operation_id)
+        .capture_shim_event_anchored(&forged, prepared.operation_id)
         .expect_err("a ref-only operation must not accept a rewrite anchor");
     assert!(
         error.to_string().contains("no minted capture context"),
@@ -665,11 +665,11 @@ fn ordinary_ref_movement_is_not_rewrite_authority() {
 
     // The ordinary movement still verifies as a ref movement.
     repository
-        .record_bridge_git_ref_receipt(&prepared, Some(sha1(new_oid)))
+        .record_shim_git_ref_receipt(&prepared, Some(sha1(new_oid)))
         .expect("record the applied receipt");
     let operation_id = prepared.operation_id;
     repository
-        .finalize_bridge_git_write(prepared, Some(sha1(new_oid)))
+        .finalize_shim_git_write(prepared, Some(sha1(new_oid)))
         .expect("verify the completed ref movement");
     assert!(
         repository
@@ -679,7 +679,7 @@ fn ordinary_ref_movement_is_not_rewrite_authority() {
     );
     assert!(
         !repository
-            .bridge_anchor_binds_operation(&forged, operation_id)
+            .shim_anchor_binds_operation(&forged, operation_id)
             .expect("read binding"),
         "a token-bearing ordinary ref movement is never rewrite authority"
     );

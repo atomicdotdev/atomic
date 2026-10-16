@@ -83,7 +83,7 @@ pub enum OperationKind {
     /// mutation itself is redb-internal (no external effect), journaled with
     /// before/after evidence digests and a same-transaction verified receipt.
     Repair,
-    /// CB-13B: the transactional shadow → bridge cutover. Repository-scoped:
+    /// CB-13B: the transactional shadow → shim cutover. Repository-scoped:
     /// fences legacy shadow writers by requiring the `git-bridge-cutover`
     /// repository capability, journaled with a same-transaction verified
     /// receipt. Follow-up filesystem effects (legacy hook removal) are

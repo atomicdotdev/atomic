@@ -115,7 +115,7 @@ impl Colocated {
             RecordOptions::new().add_path("f.txt"),
         )
         .unwrap();
-        // Build the policy the way the bridge does for a live repository so
+        // Build the policy the way the shim does for a live repository so
         // its platform facts match what the observer detects (macOS Git sets
         // core.ignorecase and core.precomposeunicode).
         let git = git2::Repository::open(&root).unwrap();

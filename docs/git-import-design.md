@@ -4,7 +4,7 @@
 > Git→Atomic reconciliation engine inside the colocated bridge (RFC §7, CB-5C
 > through CB-12). Supported workflows, limits, and the honest unsupported list
 > (CLI cutover, `--adopt-git`, exact managed reassembly) live in the
-> [bridge operating guide](bridge-operating-guide.md). Reconciliation counts
+> [shim operating guide](shim-operating-guide.md). Reconciliation counts
 > and refusal classes are observable in `.atomic/bridge/events.jsonl`.
 
 ## Overview

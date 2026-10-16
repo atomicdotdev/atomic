@@ -1,96 +1,123 @@
-//! Is the pristine's file lock exclusive across processes, or only within one?
-//!
-//! The database owner re-opens the repository on every request and retries while
-//! it is busy, which works either way. Whether it may instead hold one handle for
-//! its lifetime depends on the answer: a cross-process lock would stop local
-//! `atomic status` / `record` from opening the repository at all while an owner
-//! is running.
-//!
-//! One test binary, two roles. The parent holds a `Repository` open and re-runs
-//! itself as the child; the child tries to open the same repository and reports
-//! what happened.
+//! Repository and provenance handles must agree on database exclusion, both
+//! within one process and across processes. All probes use disposable repos.
 
-use std::process::Command;
+use std::path::Path;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
+use atomic_repository::redb_change_store::{RedbChangeStore, RedbStoreError};
 use atomic_repository::{Repository, RepositoryError};
 
 const CHILD_ROOT: &str = "ATOMIC_DATABASE_LOCK_ROOT";
 const CHILD_REPORT: &str = "ATOMIC_DATABASE_LOCK_REPORT";
-const CHILD_TEST: &str = "a_second_process_can_open_a_repository_another_one_holds";
+const CHILD_TEST: &str = "database_handles_exclude_incompatible_opens_across_processes";
 
-/// What the child managed to do, one line, on stdout.
-fn probe(root: &std::path::Path) -> String {
-    // Read-only first: the gentlest thing a local command does.
-    let readonly = match Repository::open_readonly(root) {
+fn probe(root: &Path) -> String {
+    let readonly = match Repository::open_readonly_wait(root, Duration::ZERO) {
         Ok(_) => "readonly-ok".to_string(),
         Err(RepositoryError::DatabaseBusy) => "readonly-busy".to_string(),
         Err(e) => format!("readonly-other: {e}"),
     };
-    // Then read-write, which is what `record` needs.
-    let readwrite = match Repository::open_existing(root) {
+    let readwrite = match Repository::open_existing_wait(root, Duration::ZERO) {
         Ok(_) => "readwrite-ok".to_string(),
         Err(RepositoryError::DatabaseBusy) => "readwrite-busy".to_string(),
         Err(e) => format!("readwrite-other: {e}"),
     };
-    format!("{readonly} {readwrite}")
+    // The journal opens native redb against the same database the repository
+    // opens through SnapshotBackend. Neither may bypass the other's lock.
+    let journal = match RedbChangeStore::open_existing(root.join(".atomic/atomic.redb")) {
+        Ok(_) => "journal-ok".to_string(),
+        Err(RedbStoreError::Database(e))
+            if matches!(*e, redb::DatabaseError::DatabaseAlreadyOpen) =>
+        {
+            "journal-busy".to_string()
+        }
+        Err(e) => format!("journal-other: {e}"),
+    };
+    format!("{readonly} {readwrite} {journal}")
+}
+
+fn child_probe(root: &Path, report_path: &Path) -> String {
+    let mut child = Command::new(std::env::current_exe().expect("test binary path"))
+        .args(["--exact", CHILD_TEST, "--test-threads=1"])
+        .env(CHILD_ROOT, root)
+        .env(CHILD_REPORT, report_path)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("run the child probe");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while child.try_wait().expect("poll child").is_none() {
+        if Instant::now() >= deadline {
+            child.kill().expect("stop hung probe");
+            child.wait().expect("reap hung probe");
+            panic!("database open blocked instead of returning a contention error");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let output = child.wait_with_output().expect("collect child output");
+    assert!(
+        output.status.success(),
+        "child failed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    std::fs::read_to_string(report_path).expect("child wrote a report")
+}
+
+fn check_exclusion(cross_process: bool) {
+    for holder in ["repository", "journal", "reader"] {
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = temp.path().join("repo");
+        drop(Repository::init(&root).expect("init"));
+        let path = root.join(".atomic/atomic.redb");
+        // Keep the chosen handle alive throughout every refused-open probe.
+        let held: Box<dyn std::any::Any> = match holder {
+            "repository" => Box::new(Repository::open_existing(&root).unwrap()),
+            "journal" => Box::new(RedbChangeStore::open_existing(&path).unwrap()),
+            "reader" => Box::new(redb::ReadOnlyDatabase::open(&path).unwrap()),
+            _ => unreachable!(),
+        };
+        let expected = if holder == "reader" {
+            "readonly-ok readwrite-busy journal-busy"
+        } else {
+            "readonly-busy readwrite-busy journal-busy"
+        };
+        // A failed open must not release the live holder's lock. Probe again
+        // after all the first probe's failed handles have been cleaned up.
+        for attempt in 0..2 {
+            let report = if cross_process {
+                child_probe(&root, &temp.path().join(format!("report-{attempt}")))
+            } else {
+                probe(&root)
+            };
+            assert_eq!(report, expected, "holder={holder}, attempt={attempt}");
+        }
+        drop(held);
+        let report = if cross_process {
+            child_probe(&root, &temp.path().join("released"))
+        } else {
+            probe(&root)
+        };
+        assert_eq!(
+            report, "readonly-ok readwrite-ok journal-ok",
+            "dropping {holder} must release exclusion"
+        );
+    }
 }
 
 #[test]
-fn a_second_process_can_open_a_repository_another_one_holds() {
-    let temp = tempfile::TempDir::new().unwrap();
-    let root = temp.path().join("repo");
+fn database_handles_exclude_incompatible_opens_in_one_process() {
+    check_exclusion(false);
+}
 
-    if let Ok(child_root) = std::env::var(CHILD_ROOT) {
-        // The child: report on the repository the parent named and get out. The
-        // report goes to a file, not stdout — libtest's capture decides whether
-        // a child's `println!` reaches its parent, and this must not depend on
-        // whether the parent was run with `--nocapture`.
-        let report = probe(std::path::Path::new(&child_root));
-        let path = std::env::var(CHILD_REPORT).expect("CHILD_REPORT");
-        std::fs::write(path, report).expect("write the child report");
+#[test]
+fn database_handles_exclude_incompatible_opens_across_processes() {
+    if let Ok(root) = std::env::var(CHILD_ROOT) {
+        let report = probe(Path::new(&root));
+        std::fs::write(std::env::var(CHILD_REPORT).expect("CHILD_REPORT"), report)
+            .expect("write child report");
         return;
     }
-
-    // Held for the whole child run: this is the thing being tested.
-    let held = Repository::init(&root).expect("init");
-    assert_eq!(held.current_view(), "dev", "the parent's handle is open");
-
-    let report_path = temp.path().join("child-report.txt");
-    let output = Command::new(std::env::current_exe().expect("test binary path"))
-        .args(["--exact", CHILD_TEST, "--test-threads=1"])
-        .env(CHILD_ROOT, &root)
-        .env(CHILD_REPORT, &report_path)
-        .output()
-        .expect("run the child probe");
-
-    let report = std::fs::read_to_string(&report_path).unwrap_or_else(|e| {
-        panic!(
-            "the child reported nothing ({e})\n--- stdout ---\n{}\n--- stderr ---\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        )
-    });
-
-    println!("while one process holds the repository, a second sees: {report}");
-
-    // The answer, asserted. Exclusive across processes, and for a read-only
-    // open as much as a read-write one — so the database owner cannot hold the
-    // pristine for its lifetime without locking local `atomic status` and
-    // `record` out of the repository. That is why it opens per request and
-    // retries, and why an idle release is required of any handle it does keep.
-    assert_eq!(
-        report, "readonly-busy readwrite-busy",
-        "the pristine's lock is no longer exclusive across processes; the owner \
-         may be able to hold it open, and its open-per-request retry is \
-         redundant"
-    );
-
-    // And the corollary, which is the one that bites: dropping the parent's
-    // handle must let the very next open succeed, or an idle release would
-    // never actually free the file.
-    drop(held);
-    match Repository::open_readonly(&root) {
-        Ok(_) => {}
-        Err(e) => panic!("releasing the handle did not free the file: {e}"),
-    }
+    check_exclusion(true);
 }

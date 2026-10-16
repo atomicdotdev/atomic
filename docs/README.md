@@ -8,7 +8,7 @@ Welcome to the Atomic VCS documentation. This directory contains comprehensive d
 |----------|-------------|----------|
 | [CLI Reference](../atomic-cli/README.md) | Complete command reference for the `atomic` CLI | Users, Everyone |
 | [Hook Health and Session Logs](./hook-health.md) | Diagnose hook failures and inspect per-session health | Users, Integration developers |
-| [Bridge Operating Guide](./bridge-operating-guide.md) | Git bridge enable/disable, vault projection policy, trust, recovery, privacy, and observability (CB-13C; exercised against the shipping CLI) | Users, Agents |
+| [Shim Operating Guide](./shim-operating-guide.md) | Git shim enable/disable, vault projection policy, trust, recovery, privacy, and observability (CB-13C; exercised against the shipping CLI) | Users, Agents |
 | [Stack Walkthrough](./walkthrough-stacks.md) | Hands-on tutorial for stacks, apply, and stash | Users, Contributors |
 | [Attestation Design](./attestation-design.md) | Graph-level audit nodes for AI cost, tokens, and compliance | Developers, Contributors |
 | [Intent Identity](./intent-identity.md) | ULID + `PROJECT::author::seq` intent identity and reference resolution | Users, Contributors |

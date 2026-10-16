@@ -1,6 +1,6 @@
 //! CB-0C end-to-end coverage for the shared stale-baseline guard.
 
-// Temporary Unix-only Git bridge support to unblock Windows native CI.
+// Temporary Unix-only Git shim support to unblock Windows native CI.
 // Revisit after Windows support is defined; see the RFC temporary platform policy.
 #![cfg(unix)]
 use std::collections::BTreeMap;
@@ -13,7 +13,7 @@ use serde_json::Value;
 use tempfile::TempDir;
 
 const ATOMIC_BIN: &str = env!("CARGO_BIN_EXE_atomic");
-const EXACT_STALE_REMEDIATION: &str = "Remediation: Reconcile the observed Git baseline before retrying the refused operation.\n  atomic status --no-reconcile\n  atomic git bridge reconcile\n";
+const EXACT_STALE_REMEDIATION: &str = "Remediation: Reconcile the observed Git baseline before retrying the refused operation.\n  atomic status --no-reconcile\n  atomic git shim reconcile\n";
 
 struct Fixture {
     repository: TempDir,
@@ -41,13 +41,13 @@ impl Fixture {
         fixture.git_ok(&["add", "tracked.txt"]);
         fixture.git_ok(&["commit", "--no-gpg-sign", "-q", "-m", "checkpoint"]);
         fixture.atomic_ok(&["git", "import", "--no-vault"]);
-        fixture.atomic_ok(&["git", "bridge", "reconcile"]);
+        fixture.atomic_ok(&["git", "shim", "reconcile"]);
         assert!(
             fixture
                 .root()
                 .join(".atomic/bridge/workspace.json")
                 .is_file(),
-            "Git reconciliation must establish a valid bridge checkpoint"
+            "Git reconciliation must establish a valid shim checkpoint"
         );
         fixture
     }
@@ -263,7 +263,7 @@ fn collect_snapshot(base: &Path, path: &Path, snapshot: &mut BTreeMap<String, Ve
         // every clean close, so the file's bytes differ between opens even
         // when no state changed. That internal marker is not a mutation of
         // repository state; record its size so growth is still caught and
-        // rely on the change store, bridge journal, and op-log snapshots
+        // rely on the change store, shim journal, and op-log snapshots
         // for semantic tamper evidence.
         if relative.ends_with("atomic.redb") {
             snapshot.insert(
@@ -351,7 +351,7 @@ fn assert_guard_refusal(fixture: &Fixture, operation: &str, args: &[&str]) {
     }
     for expected in [
         format!("Unsafe operation: {operation}"),
-        "Refusal: Git moved away from the bridge checkpoint".to_string(),
+        "Refusal: Git moved away from the shim checkpoint".to_string(),
         "Old checkpoint Atomic view: main".to_string(),
         "Old checkpoint Atomic state:".to_string(),
         "Old checkpoint Atomic manifest root: atomic-visible-regular-files-blake3-v1:".to_string(),
@@ -495,7 +495,7 @@ fn stale_git_branch_and_head_refuse_every_guarded_process_before_output_or_mutat
     let historical_before =
         fixture.atomic_ok(&["diff", "--change", &change, "--name-only", "--no-color"]);
 
-    fixture.atomic_ok(&["git", "bridge", "enable"]);
+    fixture.atomic_ok(&["git", "shim", "enable"]);
     let hook_path = fixture.git_text(&["rev-parse", "--git-path", "hooks/post-checkout"]);
     fs::remove_file(fixture.root().join(hook_path)).expect("remove advisory post-checkout hook");
     // CB-9B also installs the advisory reference-transaction dispatcher; a
@@ -543,7 +543,7 @@ fn stale_git_branch_and_head_refuse_every_guarded_process_before_output_or_mutat
     let forensic = fixture.atomic_ok(&["status", "--no-reconcile"]);
     let forensic_text = String::from_utf8_lossy(&forensic.stdout);
     assert!(forensic_text.contains("Forensic status (read-only; reconciliation disabled)"));
-    assert!(forensic_text.contains("Bridge checkpoint: present"));
+    assert!(forensic_text.contains("Shim checkpoint: present"));
     assert!(forensic_text.contains("refs/heads/raw-drift"));
     let after_forensic = RepositorySnapshot::capture(&fixture);
     assert_snapshot_unchanged(
@@ -585,7 +585,7 @@ fn ordinary_edits_and_atomic_only_advancement_pass_the_shared_guard() {
         .find_map(|line| line.strip_prefix("Atomic state: "))
         .expect("current Atomic state");
     assert_ne!(current_state, checkpoint_state);
-    // CB-8A: an Atomic-origin record is a bridge transition — the recorded
+    // CB-8A: an Atomic-origin record is a shim transition — the recorded
     // state projects immediately, so Git HEAD advances via the operation-
     // specific projection commit and both statuses stay clean (RFC §8.2,
     // Phase 8 acceptance). The checkpoint tracks the projected HEAD.

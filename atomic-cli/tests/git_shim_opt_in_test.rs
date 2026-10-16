@@ -1,12 +1,12 @@
-//! The colocated Git bridge is explicit per-repository opt-in (RFC §2,
-//! CB-13C `[git.bridge] enabled`, default false). A `.git` directory next to
+//! The colocated Git shim is explicit per-repository opt-in (RFC §2,
+//! CB-13C `[git.shim] enabled`, default false). A `.git` directory next to
 //! `.atomic` is not consent: without the opt-in and without a checkpoint
-//! written by an explicit bridge command, ordinary Atomic commands keep their
+//! written by an explicit shim command, ordinary Atomic commands keep their
 //! native behavior and never refuse for a missing Git anchor, never write the
 //! Git index, and never create Git refs. Once the user opts in, an unanchored
 //! workspace refuses with the exact commands that resolve it.
 
-// Temporary Unix-only Git bridge support to unblock Windows native CI.
+// Temporary Unix-only Git shim support to unblock Windows native CI.
 // Revisit after Windows support is defined; see the RFC temporary platform policy.
 #![cfg(unix)]
 use std::fs;
@@ -149,8 +149,8 @@ impl Fixture {
         child.wait_with_output().expect("wait for agent hook")
     }
 
-    /// A retained shadow exclude marker without bridge enrollment: written by
-    /// import/push, kept on disk by `git bridge disable`, and never removed by
+    /// A retained shadow exclude marker without shim enrollment: written by
+    /// import/push, kept on disk by `git shim disable`, and never removed by
     /// plain `atomic init` inside an existing Git checkout.
     fn retain_shadow_marker(&self) {
         fs::create_dir_all(self.root().join(".git/info")).unwrap();
@@ -201,12 +201,12 @@ fn assert_native_workflow(fixture: &Fixture, git_index_before: &str) {
     assert_eq!(
         fixture.git_text(&["ls-files", "--stage"]),
         git_index_before,
-        "ordinary Atomic commands must not write the Git index without the bridge opt-in"
+        "ordinary Atomic commands must not write the Git index without the shim opt-in"
     );
     assert_eq!(
         fixture.git_text(&["tag", "--list"]),
         "",
-        "`atomic tag create` must not export Git tags without the bridge opt-in"
+        "`atomic tag create` must not export Git tags without the shim opt-in"
     );
     assert!(
         fixture.hooks_installed().is_empty(),
@@ -220,20 +220,20 @@ fn assert_native_workflow(fixture: &Fixture, git_index_before: &str) {
 }
 
 #[test]
-fn fresh_git_init_without_bridge_keeps_native_commands_working() {
+fn fresh_git_init_without_shim_keeps_native_commands_working() {
     let fixture = Fixture::fresh_git_init();
     assert_native_workflow(&fixture, "");
 }
 
 #[test]
-fn existing_git_history_without_bridge_keeps_native_commands_working() {
+fn existing_git_history_without_shim_keeps_native_commands_working() {
     let fixture = Fixture::existing_git_history();
     let index_before = fixture.git_text(&["ls-files", "--stage"]);
     assert_native_workflow(&fixture, &index_before);
 }
 
 #[test]
-fn status_does_not_mix_git_index_state_without_bridge_opt_in() {
+fn status_does_not_mix_git_index_state_without_shim_opt_in() {
     let fixture = Fixture::existing_git_history();
     fs::write(fixture.root().join("git-only.txt"), b"staged in git\n").unwrap();
     fixture.git_ok(&["add", "git-only.txt"]);
@@ -249,54 +249,54 @@ fn status_does_not_mix_git_index_state_without_bridge_opt_in() {
 #[test]
 fn opted_in_workspace_without_anchor_refuses_with_actionable_remediation() {
     let fixture = Fixture::existing_git_history();
-    fixture.atomic_ok(&["git", "bridge", "enable"]);
+    fixture.atomic_ok(&["git", "shim", "enable"]);
 
     let refused = fixture.atomic(&["status"]);
     assert!(
         !refused.status.success(),
-        "unanchored bridge workspace must refuse"
+        "unanchored shim workspace must refuse"
     );
     let text = output_text(&refused);
     assert!(text.contains("MissingCheckpoint"), "{text}");
-    assert!(text.contains("atomic git bridge reconcile"), "{text}");
-    assert!(text.contains("atomic git bridge disable"), "{text}");
+    assert!(text.contains("atomic git shim reconcile"), "{text}");
+    assert!(text.contains("atomic git shim disable"), "{text}");
 
-    fixture.atomic_ok(&["git", "bridge", "reconcile"]);
+    fixture.atomic_ok(&["git", "shim", "reconcile"]);
     fixture.atomic_ok(&["status"]);
 }
 
 #[test]
 fn opted_in_unborn_head_names_the_first_commit_remediation() {
     let fixture = Fixture::fresh_git_init();
-    fixture.atomic_ok(&["git", "bridge", "enable"]);
+    fixture.atomic_ok(&["git", "shim", "enable"]);
     fs::write(fixture.root().join("f.txt"), b"hello\n").unwrap();
 
     let refused = fixture.atomic(&["add", "f.txt"]);
     assert!(
         !refused.status.success(),
-        "unborn bridge workspace must refuse"
+        "unborn shim workspace must refuse"
     );
     let text = output_text(&refused);
     assert!(text.contains("UnbornHead"), "{text}");
     assert!(text.contains("first Git commit"), "{text}");
-    assert!(text.contains("atomic git bridge reconcile"), "{text}");
+    assert!(text.contains("atomic git shim reconcile"), "{text}");
 }
 
 #[test]
-fn disabling_an_unanchored_bridge_restores_native_behavior() {
+fn disabling_an_unanchored_shim_restores_native_behavior() {
     let fixture = Fixture::fresh_git_init();
-    fixture.atomic_ok(&["git", "bridge", "enable"]);
+    fixture.atomic_ok(&["git", "shim", "enable"]);
     assert!(!fixture.atomic(&["status"]).status.success());
 
-    fixture.atomic_ok(&["git", "bridge", "disable"]);
+    fixture.atomic_ok(&["git", "shim", "disable"]);
     fixture.atomic_ok(&["status"]);
 }
 
 /// The OpenCode agent bridge dispatches `atomic agent hooks opencode <verb>`
 /// on every tool call. In a colocated-but-unenrolled repository with a
 /// retained shadow exclude marker, dispatch must stay native: it may never
-/// demand a bridge checkpoint (the reported every-tool-call exit 128) and
-/// never bootstrap bridge state.
+/// demand a shim checkpoint (the reported every-tool-call exit 128) and
+/// never bootstrap shim state.
 #[test]
 fn agent_hooks_stay_native_with_a_retained_shadow_marker() {
     let fixture = Fixture::existing_git_history();
@@ -313,12 +313,12 @@ fn agent_hooks_stay_native_with_a_retained_shadow_marker() {
             .root()
             .join(".atomic/bridge/workspace.json")
             .exists(),
-        "agent hooks must not bootstrap the bridge checkpoint"
+        "agent hooks must not bootstrap the shim checkpoint"
     );
     assert_eq!(
         fixture.git_text(&["ls-files", "--stage"]),
         index_before,
-        "agent hooks must not write the Git index without the bridge opt-in"
+        "agent hooks must not write the Git index without the shim opt-in"
     );
     assert_eq!(
         fixture.git_text(&["for-each-ref", "--format=%(refname)", "refs/atomic"]),
@@ -389,22 +389,22 @@ fn agent_hooks_exit_quietly_outside_a_repository() {
 #[test]
 fn agent_hooks_refuse_with_remediation_when_enrolled_unanchored() {
     let fixture = Fixture::existing_git_history();
-    fixture.atomic_ok(&["git", "bridge", "enable"]);
+    fixture.atomic_ok(&["git", "shim", "enable"]);
 
     let refused = fixture.agent_hook("session-start", "ses-enrolled");
     assert!(
         !refused.status.success(),
-        "enrolled but unanchored bridge must refuse the agent boundary"
+        "enrolled but unanchored shim must refuse the agent boundary"
     );
     let text = output_text(&refused);
     assert!(text.contains("MissingCheckpoint"), "{text}");
-    assert!(text.contains("atomic git bridge reconcile"), "{text}");
-    assert!(text.contains("atomic git bridge disable"), "{text}");
+    assert!(text.contains("atomic git shim reconcile"), "{text}");
+    assert!(text.contains("atomic git shim disable"), "{text}");
     assert!(
         !fixture
             .root()
             .join(".atomic/bridge/workspace.json")
             .exists(),
-        "the refusal must not anchor the bridge"
+        "the refusal must not anchor the shim"
     );
 }

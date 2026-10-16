@@ -1,4 +1,4 @@
-// Temporary Unix-only Git bridge support to unblock Windows native CI.
+// Temporary Unix-only Git shim support to unblock Windows native CI.
 // Revisit after Windows support is defined; see the RFC temporary platform policy.
 #![cfg(unix)]
 
@@ -134,13 +134,13 @@ fn import_of_prepend_insert_delete_history_renders_every_state_byte_exact() {
         "blank separator line must survive the deletion import"
     );
 
-    // Both CLIs agree the workspace is clean, and the bridge layers verify.
+    // Both CLIs agree the workspace is clean, and the shim layers verify.
     let status = atomic_ok(&root, &home, &["status"]);
     assert!(
         status.contains("nothing to record"),
         "atomic status must be clean after import, got: {status}"
     );
-    atomic_ok(&root, &home, &["git", "bridge", "verify"]);
+    atomic_ok(&root, &home, &["git", "shim", "verify"]);
 
     // Incremental re-import is idempotent (no new changes, still verified).
     let again = atomic_ok(

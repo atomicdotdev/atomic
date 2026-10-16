@@ -1,4 +1,4 @@
-//! CB-13D (RFC §11.2 rules 3–7): the optional metadata-only bridge watch
+//! CB-13D (RFC §11.2 rules 3–7): the optional metadata-only shim watch
 //! daemon.
 //!
 //! The daemon is a latency accelerator, never the guarantee: correctness
@@ -16,11 +16,11 @@
 //! Self-event suppression (RFC §11.2 rule 5) is journal/state evidence,
 //! not a blind time window: the daemon re-observes the metadata truth
 //! after each of its own passes and records that as the baseline, so its
-//! own writes are never re-reported as external transitions; a bridge
+//! own writes are never re-reported as external transitions; a shim
 //! operation still in flight (durable but not yet verified in the
 //! operation journal) defers the next reactive pass. The Watchman path is
 //! additionally bracketed with the balanced `atomic-bridge` state
-//! enter/leave shared with every bridge transaction.
+//! enter/leave shared with every shim transaction.
 //!
 //! Daemon death (kill, disconnect, sleep/resume) leaves only recoverable
 //! metadata operations behind: incomplete operation heads are gated and
@@ -35,10 +35,8 @@ use clap::Parser;
 use atomic_agent::turn::session::SessionStore;
 use atomic_repository::repository::{observe_git_metadata, GitQuiescence, ReconcileEffectBudget};
 
-use super::bridge::{
-    bridge_config, reconcile_transaction_budgeted, WatchNoticeKind, WatchNoticeSink,
-};
 use super::observation::{observe_git, GitObservation, HeadObservation};
+use super::shim::{reconcile_transaction_budgeted, shim_config, WatchNoticeKind, WatchNoticeSink};
 use crate::commands::Command;
 use crate::error::{CliError, CliResult};
 use crate::output::{print_info, print_warning};
@@ -52,10 +50,10 @@ pub(crate) const DEFAULT_POLL_INTERVAL_MS: u64 = 500;
 /// and only burns the quiescence window.
 pub(crate) const MIN_POLL_INTERVAL_MS: u64 = 100;
 
-/// Run the optional metadata-only bridge watch daemon (CB-13D, RFC §11.2).
+/// Run the optional metadata-only shim watch daemon (CB-13D, RFC §11.2).
 ///
-/// The daemon is opt-in only: `[git.bridge] enabled = true` **and**
-/// `[git.bridge.watch] enabled = true` must both be recorded in the
+/// The daemon is opt-in only: `[git.shim] enabled = true` **and**
+/// `[git.shim.watch] enabled = true` must both be recorded in the
 /// repository configuration. Without the daemon, command boundaries fully
 /// reconcile — nothing else changes.
 #[derive(Parser, Debug, Default)]
@@ -68,7 +66,7 @@ pub struct Watch {
     pub once: bool,
     /// Metadata re-observation interval in milliseconds. Values are
     /// clamped up to the enforced minimum; the reactive silence window
-    /// comes from `[git.bridge.watch] quiet_ms` and is floored at the
+    /// comes from `[git.shim.watch] quiet_ms` and is floored at the
     /// RFC's 250 ms.
     #[arg(long, default_value_t = DEFAULT_POLL_INTERVAL_MS)]
     pub poll_ms: u64,
@@ -108,7 +106,7 @@ impl MetadataHint {
     /// still fire.
     pub(crate) fn verified_baseline(root: &Path) -> CliResult<Self> {
         let fresh = Self::observe(root)?;
-        let verified = super::bridge::read_workspace_metadata(root).ok().flatten();
+        let verified = super::shim::read_workspace_metadata(root).ok().flatten();
         Ok(match verified {
             Some(checkpoint) => Self {
                 head_oid: Some(checkpoint.git_head.clone()),
@@ -125,7 +123,7 @@ impl MetadataHint {
     /// Observe the current Git metadata truth through Git's own APIs.
     pub(crate) fn observe(root: &Path) -> CliResult<Self> {
         let observation = observe_git(root).map_err(|error| CliError::StaleBaseline {
-            report: format!("bridge watch cannot observe Git metadata truth: {error}"),
+            report: format!("shim watch cannot observe Git metadata truth: {error}"),
         })?;
         let base = match observation {
             GitObservation::NoGit { .. } => return Ok(Self::default()),
@@ -142,10 +140,10 @@ impl MetadataHint {
             },
         };
         // The Git-owned transaction state is truth the digests cannot see:
-        // a lock or marker file's presence changes what the bridge may do
+        // a lock or marker file's presence changes what the shim may do
         // even when every digest is unchanged (review R6).
         let metadata = observe_git_metadata(root).map_err(|error| CliError::StaleBaseline {
-            report: format!("bridge watch cannot observe Git state for the hint: {error}"),
+            report: format!("shim watch cannot observe Git state for the hint: {error}"),
         })?;
         Ok(Self {
             busy_signature: match GitQuiescence::evaluate(&metadata) {
@@ -171,7 +169,7 @@ impl Command for Watch {
     }
 }
 
-/// Whether a bridge operation is still in flight in the operation journal
+/// Whether a shim operation is still in flight in the operation journal
 /// (durable but not yet verified). RFC §11.2 rule 5: events attributable to
 /// an in-flight operation are suppressed — the native path uses this
 /// journal evidence instead of a time window. The daemon defers reacting
@@ -233,7 +231,7 @@ pub(crate) fn wait_for_quiescence(
         if let Some(deadline) = deadline {
             if Instant::now() >= deadline {
                 return Err(CliError::StaleBaseline {
-                    report: "bridge watch: quiescence deadline reached while a Git-owned \
+                    report: "shim watch: quiescence deadline reached while a Git-owned \
                              transaction was still in flight; deferring to the next command \
                              boundary"
                         .to_string(),
@@ -241,12 +239,12 @@ pub(crate) fn wait_for_quiescence(
             }
         }
         let observation = observe_git_metadata(root).map_err(|error| CliError::StaleBaseline {
-            report: format!("bridge watch cannot observe Git state for quiescence: {error}"),
+            report: format!("shim watch cannot observe Git state for quiescence: {error}"),
         })?;
         match GitQuiescence::evaluate(&observation) {
             GitQuiescence::Quiescent { .. } => {}
             GitQuiescence::Busy { reason, detail } => {
-                log::warn!("bridge watch: not quiescent ({reason}): {detail}; waiting");
+                log::warn!("shim watch: not quiescent ({reason}): {detail}; waiting");
                 last_change = Instant::now();
                 std::thread::sleep(poll);
                 stable = MetadataHint::observe(root)?;
@@ -279,7 +277,7 @@ pub(crate) enum PassOutcome {
     /// No external hint: nothing to do.
     NoChange,
     /// An external hint fired but the pass deferred (unsafe state, pending
-    /// recovery, or an in-flight bridge operation); the notice was surfaced
+    /// recovery, or an in-flight shim operation); the notice was surfaced
     /// instead.
     Deferred,
 }
@@ -315,7 +313,7 @@ fn reactive_pass(
     // an evaluation that is not quiescent right now becomes a notice and
     // the daemon waits instead of repairing.
     let observation = observe_git_metadata(root).map_err(|error| CliError::StaleBaseline {
-        report: format!("bridge watch cannot observe Git state: {error}"),
+        report: format!("shim watch cannot observe Git state: {error}"),
     })?;
     if let GitQuiescence::Busy { reason, detail } = GitQuiescence::evaluate(&observation) {
         let should_notice = notice_baseline.is_none_or(|noticed| current.differs_from(noticed));
@@ -325,7 +323,7 @@ fn reactive_pass(
                 root,
                 WatchNoticeKind::UnsafeState,
                 &format!("Git-owned state in flight ({reason}): {detail}"),
-                "wait for Git to finish, then run 'atomic git bridge reconcile' if needed",
+                "wait for Git to finish, then run 'atomic git shim reconcile' if needed",
             );
         }
         return Ok(PassOutcome::Deferred);
@@ -333,7 +331,7 @@ fn reactive_pass(
     wait_for_quiescence(root, quiet, poll, None)?;
     // The prior-operation journal evidence AND the pending-recovery gate
     // (review R1): the budgeted open refuses before any recovery runs, and
-    // a bridge operation still in flight defers this pass entirely; its own
+    // a shim operation still in flight defers this pass entirely; its own
     // completion will be part of the re-baselined truth.
     let repo = match atomic_repository::Repository::open_with_budget(
         root,
@@ -348,7 +346,7 @@ fn reactive_pass(
                     root,
                     WatchNoticeKind::UnsafeState,
                     &format!("reactive reconcile deferred: {detail}"),
-                    "run 'atomic git bridge reconcile' explicitly to complete the pending work",
+                    "run 'atomic git shim reconcile' explicitly to complete the pending work",
                 );
             }
             return Ok(PassOutcome::Deferred);
@@ -364,7 +362,7 @@ fn reactive_pass(
                 root,
                 WatchNoticeKind::UnsafeState,
                 &format!(
-                    "bridge operation {operation} is still in flight; reactive reconcile deferred"
+                    "shim operation {operation} is still in flight; reactive reconcile deferred"
                 ),
                 "run 'atomic op log' to inspect the operation",
             );
@@ -374,7 +372,7 @@ fn reactive_pass(
     drop(repo);
     // The shared transaction path with a metadata-only budget, bracketed
     // with the balanced atomic-bridge state enter/leave (Watchman) so the
-    // bridge's own writes are suppressed from watchers.
+    // the shim's own writes are suppressed from watchers.
     let sessions_for_notice =
         SessionStore::for_repo(root).map_err(|error| CliError::InvalidRepository {
             reason: format!("cannot open the session store: {error}"),
@@ -387,10 +385,10 @@ fn reactive_pass(
                 // required" — an unsafe state DEFERS to an explicit
                 // reconcile and a follow-up UnsafeState notice names the
                 // remediation.
-                "the workspace reconciles automatically when safe; an unsafe state                  defers to an explicit 'atomic git bridge reconcile'"
+                "the workspace reconciles automatically when safe; an unsafe state                  defers to an explicit 'atomic git shim reconcile'"
             }
-            WatchNoticeKind::UnsafeState => "run 'atomic git bridge reconcile' once Git is idle",
-            WatchNoticeKind::ExportSuppressed => "run 'atomic git bridge reconcile' explicitly",
+            WatchNoticeKind::UnsafeState => "run 'atomic git shim reconcile' once Git is idle",
+            WatchNoticeKind::ExportSuppressed => "run 'atomic git shim reconcile' explicitly",
         };
         notify_active_sessions(&sessions_for_notice, root, kind, detail, remediation);
     };
@@ -415,7 +413,7 @@ fn reactive_pass(
 /// watcher bracket.
 fn bracket_pass(root: &Path, sink: &(dyn Fn(WatchNoticeKind, &str) + '_)) -> CliResult<()> {
     let sink_ref: &WatchNoticeSink<'_> = sink;
-    let operation = format!("bridge-watch:{}", std::process::id());
+    let operation = format!("shim-watch:{}", std::process::id());
     let root_owned = root.to_path_buf();
     atomic_agent::watcher::bridge::bracket_bridge_transaction(
         atomic_agent::watcher::bridge::watcher_config(root),
@@ -449,13 +447,13 @@ fn notify_active_sessions(
     let active = match sessions.active_sessions() {
         Ok(active) => active,
         Err(error) => {
-            log::warn!("bridge watch: cannot list active sessions for notices: {error}");
+            log::warn!("shim watch: cannot list active sessions for notices: {error}");
             return;
         }
     };
     if active.is_empty() {
         print_warning(&format!(
-            "bridge watch: {kind_code}: {detail} ({remediation})"
+            "shim watch: {kind_code}: {detail} ({remediation})"
         ));
         return;
     }
@@ -465,38 +463,38 @@ fn notify_active_sessions(
             sessions.write_watch_notice(&session.session_id, kind_code, detail, remediation)
         {
             log::warn!(
-                "bridge watch: could not write the watch notice for session {}: {error}",
+                "shim watch: could not write the watch notice for session {}: {error}",
                 session.session_id
             );
         }
     }
     print_info(&format!(
-        "bridge watch: {kind_code} notice delivered to {delivered} active session(s)"
+        "shim watch: {kind_code} notice delivered to {delivered} active session(s)"
     ));
 }
 
 /// The daemon entry point: consent, then the hint loop (or a single pass).
 pub(crate) fn run_watch(root: &Path, once: bool, poll_ms: u64) -> CliResult<()> {
-    let config = bridge_config(root)?;
-    if !config.git.bridge.enabled {
+    let config = shim_config(root)?;
+    if !config.git.shim.enabled {
         return Err(CliError::InvalidRepository {
-            reason: "the bridge is not enabled for this repository (set [git.bridge] \
+            reason: "the shim is not enabled for this repository (set [git.shim] \
                      enabled = true); the watch daemon is an optional accelerator on top of \
                      command-boundary reconciliation"
                 .to_string(),
         });
     }
-    if let Some(refusal) = config.git.bridge.watch.startup_refusal() {
+    if let Some(refusal) = config.git.shim.watch.startup_refusal() {
         return Err(CliError::InvalidRepository {
             reason: refusal.to_string(),
         });
     }
     // RFC §11.2 tier precedence (review R4): an explicit `git.watch = "off"`
-    // overrides the bridge-watch consent. The daemon is a tier accelerator,
+    // overrides the shim-watch consent. The daemon is a tier accelerator,
     // not an independent consent surface — the explicit off wins.
     if config.git.watch == atomic_config::GitWatch::Off {
         return Err(CliError::InvalidRepository {
-            reason: "the bridge watch daemon is disabled by [git] watch = \"off\"; \
+            reason: "the shim watch daemon is disabled by [git] watch = \"off\"; \
                      command-boundary reconciliation remains the correctness guarantee"
                 .to_string(),
         });
@@ -507,11 +505,11 @@ pub(crate) fn run_watch(root: &Path, once: bool, poll_ms: u64) -> CliResult<()> 
     let environment = atomic_config::Environment::detect();
     if environment != atomic_config::Environment::Desktop {
         log::warn!(
-            "bridge watch: explicitly opted in while running in a {environment:?} environment; \
+            "shim watch: explicitly opted in while running in a {environment:?} environment; \
              the RFC default-off rule is satisfied by the disabled default, not by refusal"
         );
     }
-    let quiet = Duration::from_millis(config.git.bridge.watch.effective_quiet_ms());
+    let quiet = Duration::from_millis(config.git.shim.watch.effective_quiet_ms());
     let poll = Duration::from_millis(poll_ms.max(MIN_POLL_INTERVAL_MS));
     let sessions = SessionStore::for_repo(root).map_err(|error| CliError::InvalidRepository {
         reason: format!("cannot open the session store: {error}"),
@@ -533,16 +531,16 @@ pub(crate) fn run_watch(root: &Path, once: bool, poll_ms: u64) -> CliResult<()> 
             PassOutcome::Attempted { .. } | PassOutcome::NoChange => return Ok(()),
             PassOutcome::Deferred => {
                 return Err(CliError::StaleBaseline {
-                    report: "bridge watch: the external transition was noticed but the \
+                    report: "shim watch: the external transition was noticed but the \
                              reconcile was deferred (unsafe state, pending recovery, or \
-                             in-flight bridge operation); the notice names the remediation"
+                             in-flight shim operation); the notice names the remediation"
                         .to_string(),
                 });
             }
         }
     }
     print_info(&format!(
-        "bridge watch: watching Git metadata (poll {} ms, quiet {} ms); Ctrl-C to stop; \
+        "shim watch: watching Git metadata (poll {} ms, quiet {} ms); Ctrl-C to stop; \
          command boundaries remain the correctness guarantee",
         poll.as_millis(),
         quiet.as_millis()
@@ -553,13 +551,12 @@ pub(crate) fn run_watch(root: &Path, once: bool, poll_ms: u64) -> CliResult<()> 
         // sampled once; a consent withdrawn while the daemon runs is
         // consumed at the next poll and the daemon exits cleanly
         // (command boundaries remain the correctness guarantee).
-        match bridge_config(root) {
+        match shim_config(root) {
             Ok(config)
-                if config.git.bridge.enabled
-                    && config.git.watch != atomic_config::GitWatch::Off => {}
+                if config.git.shim.enabled && config.git.watch != atomic_config::GitWatch::Off => {}
             _ => {
                 print_info(
-                    "bridge watch: consent withdrawn while running; the daemon exits                      (command boundaries remain the correctness guarantee)",
+                    "shim watch: consent withdrawn while running; the daemon exits                      (command boundaries remain the correctness guarantee)",
                 );
                 return Ok(());
             }
@@ -570,7 +567,7 @@ pub(crate) fn run_watch(root: &Path, once: bool, poll_ms: u64) -> CliResult<()> 
                 // Degraded observation (disconnect, sleep/resume): degrade
                 // to command-boundary observation; the next successful
                 // observation re-baselines.
-                log::warn!("bridge watch: observation failed, degrading: {error}");
+                log::warn!("shim watch: observation failed, degrading: {error}");
                 baseline = MetadataHint::default();
                 continue;
             }
@@ -618,7 +615,7 @@ pub(crate) fn run_watch(root: &Path, once: bool, poll_ms: u64) -> CliResult<()> 
                     &error,
                     CliError::Repository(repository_error) if repository_error.is_lock_contended()
                 );
-                log::warn!("bridge watch: reactive reconcile failed: {error}");
+                log::warn!("shim watch: reactive reconcile failed: {error}");
                 notice_gate = Some(current.clone());
                 if !retryable {
                     baseline = current;
@@ -681,7 +678,7 @@ mod tests {
                 .as_nanos();
             let sequence = TEST_DIRECTORY_SEQUENCE.fetch_add(1, Ordering::Relaxed);
             let path = std::env::temp_dir().join(format!(
-                "atomic-bridge-watch-{}-{unique}-{sequence}",
+                "atomic-shim-watch-{}-{unique}-{sequence}",
                 std::process::id()
             ));
             fs::create_dir(&path).unwrap();

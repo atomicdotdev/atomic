@@ -1,14 +1,14 @@
-// Temporary Unix-only Git bridge support to unblock Windows native CI.
+// Temporary Unix-only Git shim support to unblock Windows native CI.
 // Revisit after Windows support is defined; see the RFC temporary platform policy.
 #![cfg(unix)]
 
-//! CB-13D integration coverage: the optional metadata-only bridge watch
+//! CB-13D integration coverage: the optional metadata-only shim watch
 //! daemon (RFC §11.2).
 //!
 //! Every fixture drives a fresh `atomic` binary against a colocated Git
-//! repository, mirroring the bridge contract end to end:
+//! repository, mirroring the shim contract end to end:
 //!
-//! - **metadata-only reactive reconcile (AC1):** `git bridge watch --once`
+//! - **metadata-only reactive reconcile (AC1):** `git shim watch --once`
 //!   imports an external Git commit through the shared workspace
 //!   transaction path without moving a Git ref and without writing any
 //!   working-copy byte;
@@ -16,12 +16,12 @@
 //!   typed refusal and a notice — no ref moves reactively; the explicit
 //!   command still exports under its expected-old lease;
 //! - **watcher-off equivalence (AC2):** from identical fixtures, the
-//!   watch-daemon path and the plain `bridge reconcile` path reach
+//!   watch-daemon path and the plain `shim reconcile` path reach
 //!   identical views, checkpoints, refs and verified states;
 //! - **fault corpus (AC2):** duplicated passes are no-ops, a Git-owned
 //!   merge marker yields an unsafe-state notice and no repair, and a
 //!   `kill -9`'d daemon leaves the next command outcome unchanged;
-//! - **opt-in only (AC3):** without `[git.bridge.watch] enabled = true`
+//! - **opt-in only (AC3):** without `[git.shim.watch] enabled = true`
 //!   the daemon refuses to start.
 
 use std::fs;
@@ -144,23 +144,23 @@ fn key_file(home: &Path) -> PathBuf {
     path
 }
 
-/// Opt the repository into the optional watch daemon (the bridge opt-in
-/// itself is recorded by `git bridge enable`). The serialized
-/// configuration always carries a `[git.bridge.watch]` table (the
+/// Opt the repository into the optional watch daemon (the shim opt-in
+/// itself is recorded by `git shim enable`). The serialized
+/// configuration always carries a `[git.shim.watch]` table (the
 /// disabled default), so the flip edits that table in place.
 fn enable_watch(root: &Path) {
     let config = root.join(".atomic/config.toml");
     let content = fs::read_to_string(&config).expect("read repo config");
     assert!(
-        content.contains("[git.bridge]"),
-        "bridge enable must have recorded the consent table first"
+        content.contains("[git.shim]"),
+        "shim enable must have recorded the consent table first"
     );
     let mut in_watch = false;
     let mut flipped = false;
     let rewritten: String = content
         .lines()
         .map(|line| {
-            if line.trim() == "[git.bridge.watch]" {
+            if line.trim() == "[git.shim.watch]" {
                 in_watch = true;
                 return line.to_string();
             }
@@ -184,7 +184,7 @@ fn enable_watch(root: &Path) {
     fs::write(config, rewritten).expect("write repo config");
 }
 
-/// Remove the watch consent while keeping the bridge consent.
+/// Remove the watch consent while keeping the shim consent.
 fn disable_watch(root: &Path) {
     let config = root.join(".atomic/config.toml");
     let content = fs::read_to_string(&config).expect("read repo config");
@@ -192,7 +192,7 @@ fn disable_watch(root: &Path) {
     let rewritten: String = content
         .lines()
         .map(|line| {
-            if line.trim() == "[git.bridge.watch]" {
+            if line.trim() == "[git.shim.watch]" {
                 in_watch = true;
                 return line.to_string();
             }
@@ -210,7 +210,7 @@ fn disable_watch(root: &Path) {
     fs::write(config, rewritten).expect("write repo config");
 }
 
-/// A colocated Git + Atomic repository with the bridge enabled and the
+/// A colocated Git + Atomic repository with the shim enabled and the
 /// watch daemon opted in.
 struct WatchFixture {
     root: TempDir,
@@ -237,13 +237,13 @@ impl WatchFixture {
             home.path(),
             &[
                 "git",
-                "bridge",
+                "shim",
                 "enable",
                 "--binding-key-file",
                 key_file(home.path()).to_str().expect("utf8 key path"),
             ],
         );
-        atomic_ok(root.path(), home.path(), &["git", "bridge", "reconcile"]);
+        atomic_ok(root.path(), home.path(), &["git", "shim", "reconcile"]);
         enable_watch(root.path());
         let _ = name;
         Self { root, home }
@@ -315,7 +315,7 @@ impl WatchFixture {
         atomic(
             self.root(),
             self.home(),
-            &["git", "bridge", "watch", "--once"],
+            &["git", "shim", "watch", "--once"],
         )
     }
 
@@ -415,7 +415,7 @@ impl WatchFixture {
         ));
         // Normalize base32 state hashes out of the verify output: they are
         // per-repository change identities, not state shapes.
-        let verify = self.atomic(&["git", "bridge", "verify"]);
+        let verify = self.atomic(&["git", "shim", "verify"]);
         let verify = normalize_base32(&verify);
         identity.push_str(&format!(
             "worktree:\n{}\nverify:\n{}",
@@ -506,7 +506,7 @@ fn crash_during_effect_recovers_without_partial_bytes() {
         // unstage it so the export's clean-index gate passes.
         fixture.git(&["reset", "-q"]);
         let output = Command::new(ATOMIC_BIN)
-            .args(["git", "bridge", "reconcile"])
+            .args(["git", "shim", "reconcile"])
             .current_dir(fixture.root())
             .env("HOME", fixture.home())
             .env("ATOMIC_HOME", fixture.home().join(".atomic"))
@@ -543,7 +543,7 @@ fn crash_during_effect_recovers_without_partial_bytes() {
         recovery = atomic_text(&atomic(
             fixture.root().to_path_buf().as_path(),
             fixture.home().to_path_buf().as_path(),
-            &["git", "bridge", "reconcile"],
+            &["git", "shim", "reconcile"],
         ));
         if recovery.contains("matches") || recovery.contains("Reconciled") {
             break;
@@ -592,7 +592,7 @@ fn linked_worktree_tiers_reach_identical_state() {
     let reconcile = atomic_text(&atomic(
         linked.root(),
         linked.home.path(),
-        &["git", "bridge", "reconcile"],
+        &["git", "shim", "reconcile"],
     ));
     assert!(
         reconcile.contains("matches") || reconcile.contains("Reconciled"),
@@ -636,7 +636,7 @@ fn external_git_commit_reconciles_without_moving_refs_or_writing_bytes() {
     );
 
     // The workspace reconciled to Git's truth...
-    let verify = fixture.atomic(&["git", "bridge", "verify"]);
+    let verify = fixture.atomic(&["git", "shim", "verify"]);
     assert!(
         verify.contains("matches"),
         "the reactive pass must reach the verified aligned state:\n{verify}"
@@ -718,10 +718,10 @@ fn atomic_ahead_state_is_never_exported_reactively() {
     );
 
     // The explicit command boundary still exports (Command budget).
-    fixture.atomic(&["git", "bridge", "reconcile"]);
+    fixture.atomic(&["git", "shim", "reconcile"]);
     let exported = fixture.tip("refs/heads/main").expect("exported tip");
     assert_ne!(exported, aligned_tip, "the command boundary exports");
-    fixture.atomic(&["git", "bridge", "verify"]);
+    fixture.atomic(&["git", "shim", "verify"]);
 }
 
 /// AC2: the watch-daemon path and the watcher-off path reach identical
@@ -739,7 +739,7 @@ fn watcher_on_reaches_the_same_state_as_watcher_off() {
     }
 
     // Repo A: command-boundary observation only (watcher-off equivalent).
-    watcher_off.atomic(&["git", "bridge", "reconcile"]);
+    watcher_off.atomic(&["git", "shim", "reconcile"]);
     // Repo B: the reactive daemon pass.
     let output = watched.watch_once();
     assert!(output.status.success(), "watch --once failed");
@@ -823,7 +823,7 @@ fn session_notice_written_and_killed_daemon_leaves_commands_unchanged() {
 
     // Start the real daemon in the background.
     let mut daemon = Command::new(ATOMIC_BIN)
-        .args(["git", "bridge", "watch", "--poll-ms", "100"])
+        .args(["git", "shim", "watch", "--poll-ms", "100"])
         .current_dir(fixture.root())
         .env("HOME", fixture.home())
         .env("ATOMIC_HOME", fixture.home().join(".atomic"))
@@ -886,8 +886,8 @@ fn session_notice_written_and_killed_daemon_leaves_commands_unchanged() {
     // the external commit and the checkpoint references that head.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     let head_contains_external = loop {
-        fixture.atomic(&["git", "bridge", "reconcile"]);
-        fixture.atomic(&["git", "bridge", "verify"]);
+        fixture.atomic(&["git", "shim", "reconcile"]);
+        fixture.atomic(&["git", "shim", "verify"]);
         let head = fixture.tip("refs/heads/main").expect("head after recovery");
         if head == external_tip {
             break true;
@@ -928,11 +928,11 @@ fn session_notice_written_and_killed_daemon_leaves_commands_unchanged() {
     );
 }
 
-/// Review R4: an explicit `git.watch = "off"` overrides the bridge-watch
+/// Review R4: an explicit `git.watch = "off"` overrides the shim-watch
 /// consent — the daemon is a tier accelerator, never an independent
 /// consent surface.
 #[test]
-fn git_watch_off_overrides_bridge_watch_consent() {
+fn git_watch_off_overrides_shim_watch_consent() {
     let fixture = WatchFixture::new("watch-off");
     let config = fixture.root().join(".atomic/config.toml");
     let content = fs::read_to_string(&config).expect("read repo config");
@@ -949,7 +949,7 @@ fn git_watch_off_overrides_bridge_watch_consent() {
     let output = fixture.watch_once();
     assert!(
         !output.status.success(),
-        "the daemon must refuse under git.watch=off even with bridge-watch consent:\n{}",
+        "the daemon must refuse under git.watch=off even with shim-watch consent:\n{}",
         atomic_text(&output)
     );
     assert!(
@@ -960,14 +960,14 @@ fn git_watch_off_overrides_bridge_watch_consent() {
     );
 
     // The explicit command boundary is unaffected: reconcile still works.
-    fixture.atomic(&["git", "bridge", "reconcile"]);
+    fixture.atomic(&["git", "shim", "reconcile"]);
 }
 
-/// AC3: the daemon is opt-in only, over and above the bridge opt-in.
+/// AC3: the daemon is opt-in only, over and above the shim opt-in.
 #[test]
 fn watch_daemon_requires_explicit_opt_in() {
     let fixture = WatchFixture::new("optin");
-    // Remove the watch consent, keep the bridge consent.
+    // Remove the watch consent, keep the shim consent.
     disable_watch(fixture.root());
 
     let output = fixture.watch_once();
@@ -999,7 +999,7 @@ fn watch_once_never_shelves_ignored_artifacts_on_cross_view_head_adoption() {
     fixture.git(&["add", "-A"]);
     fixture.git(&["commit", "-qm", "orphan side"]);
     fixture.git(&["checkout", "--detach"]);
-    fixture.atomic(&["git", "bridge", "reconcile"]);
+    fixture.atomic(&["git", "shim", "reconcile"]);
 
     // The ignored user artifact.
     let exclude = fixture.root().join(".git/info/exclude");
@@ -1177,7 +1177,7 @@ fn corpus_identity(fixture: &WatchFixture) -> String {
         fs::read_to_string(fixture.root().join(".atomic/current_view")).unwrap_or_default();
     identity.push_str(&format!("current_view: {}\n", current_view.trim()));
     // Verified layers (base32-normalized) + physical bytes + change count.
-    let verify = fixture.atomic(&["git", "bridge", "verify"]);
+    let verify = fixture.atomic(&["git", "shim", "verify"]);
     identity.push_str(&format!("verify:\n{}\n", normalize_base32(&verify)));
     identity.push_str(&format!("worktree:\n{}\n", fixture.worktree_snapshot()));
     let changes = fs::read_dir(fixture.root().join(".atomic/changes"))
@@ -1216,7 +1216,7 @@ fn assert_corpus_scenario(name: &str, scenario: impl Fn(&WatchFixture)) {
     };
     // Watcher-OFF: the command-boundary path for the same transitions.
     let off_identity = {
-        off.atomic(&["git", "bridge", "reconcile"]);
+        off.atomic(&["git", "shim", "reconcile"]);
         corpus_identity(&off)
     };
     assert_eq!(
@@ -1337,8 +1337,8 @@ fn dropped_hint_degrades_to_command_boundary_observation() {
     off.git(&["commit", "-qm", "dropped hint commit"]);
 
     // The next command boundary on the watched fixture reconciles.
-    watched.atomic(&["git", "bridge", "reconcile"]);
-    off.atomic(&["git", "bridge", "reconcile"]);
+    watched.atomic(&["git", "shim", "reconcile"]);
+    off.atomic(&["git", "shim", "reconcile"]);
 
     assert_eq!(
         corpus_identity(&watched),
@@ -1375,7 +1375,7 @@ fn event_burst_overflow_degrades_to_one_truth_pass() {
         "burst pass failed:\n{}",
         atomic_text(&output)
     );
-    off.atomic(&["git", "bridge", "reconcile"]);
+    off.atomic(&["git", "shim", "reconcile"]);
 
     assert_eq!(
         corpus_identity(&watched),
@@ -1411,11 +1411,11 @@ fn sleep_resume_gap_rebaselines_and_imports_gap_truth_once() {
     fs::write(off.root().join("tracked.txt"), b"pre-sleep edit\n").expect("edit");
     off.git(&["add", "-A"]);
     off.git(&["commit", "-qm", "pre-sleep"]);
-    off.atomic(&["git", "bridge", "reconcile"]);
+    off.atomic(&["git", "shim", "reconcile"]);
     fs::write(off.root().join("tracked.txt"), b"resumed edit\n").expect("gap edit");
     off.git(&["add", "-A"]);
     off.git(&["commit", "-qm", "gap commit"]);
-    off.atomic(&["git", "bridge", "reconcile"]);
+    off.atomic(&["git", "shim", "reconcile"]);
 
     assert_eq!(
         corpus_identity(&watched),
@@ -1455,8 +1455,8 @@ fn invalid_tokens_fall_back_to_scan_without_changing_the_outcome() {
     fs::write(token_dir.join("fsmonitor.token"), b"corrupt-not-a-token").expect("token");
     fs::write(token_dir.join("watchman.token"), b"corrupt-not-a-token").expect("token");
 
-    watched.atomic(&["git", "bridge", "reconcile"]);
-    off.atomic(&["git", "bridge", "reconcile"]);
+    watched.atomic(&["git", "shim", "reconcile"]);
+    off.atomic(&["git", "shim", "reconcile"]);
 
     assert_eq!(
         corpus_identity(&watched),

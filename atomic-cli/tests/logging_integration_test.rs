@@ -248,7 +248,7 @@ fn stderr_has_debug(output: &Output) -> bool {
 #[test]
 #[cfg_attr(
     not(unix),
-    ignore = "temporary Unix-only Git bridge (PR #207); see RFC temporary platform policy"
+    ignore = "temporary Unix-only Git shim (PR #207); see RFC temporary platform policy"
 )]
 fn git_import_logs_each_commit_inside_its_span() {
     let root = tempfile::tempdir().unwrap();

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Regression contract for interruption-safe bridge switching.
+# Regression contract for interruption-safe shim switching.
 #
 # The assertions are the original expected-red CB-1B contract, now promoted
 # unchanged into the numbered integration harness.
@@ -9,7 +9,7 @@ source "$HARNESS_DIR/helpers.sh"
 
 echo ""
 echo "${BOLD}══════════════════════════════════════════════════════════════${RESET}"
-echo "${BOLD}  Bridge switch recovers after partial tracked removal${RESET}"
+echo "${BOLD}  shim switch recovers after partial tracked removal${RESET}"
 echo "${BOLD}══════════════════════════════════════════════════════════════${RESET}"
 
 begin_section "Prerequisites"
@@ -96,11 +96,11 @@ create_file "source-only/01-first.txt" "first source-only tracked file\n"
 create_file "source-only/02-second.txt" "second source-only tracked file\n"
 git add -A
 git commit --quiet -m "Feature projection with two source-only files"
-assert_success "project feature through the experimental bridge" atomic git bridge reconcile
+assert_success "project feature through the experimental shim" atomic git shim reconcile
 assert_success "imported deletion passes native index verification" atomic doctor check
 assert_success "native index repair reconstructs the imported deletion" atomic doctor repair-native-indexes
 assert_clean_statuses "source projection before interrupted switch"
-assert_success "source projection verifies" atomic git bridge verify
+assert_success "source projection verifies" atomic git shim verify
 
 SOURCE_HEAD="$(git_head_sha_full)"
 SOURCE_BRANCH="$(git_current_branch)"
@@ -113,13 +113,13 @@ snapshot_complete_state "$SOURCE_STATE"
 
 begin_section "Interrupt after the first sorted tracked removal"
 set +e
-FAIL_OUTPUT="$(ATOMIC_FAIL_SWITCH_AFTER_FIRST_TRACKED_REMOVAL=1 atomic git bridge switch "$MAIN" 2>&1)"
+FAIL_OUTPUT="$(ATOMIC_FAIL_SWITCH_AFTER_FIRST_TRACKED_REMOVAL=1 atomic git shim switch "$MAIN" 2>&1)"
 FAIL_RC=$?
 set -e
 if [[ "$FAIL_RC" -ne 0 ]]; then
-    _pass "failpoint makes bridge switch fail"
+    _pass "failpoint makes shim switch fail"
 else
-    _fail "failpoint makes bridge switch fail" "command unexpectedly succeeded: $FAIL_OUTPUT"
+    _fail "failpoint makes shim switch fail" "command unexpectedly succeeded: $FAIL_OUTPUT"
 fi
 
 ACTUAL_HEAD="$(git_head_sha_full)"
@@ -134,7 +134,7 @@ begin_section "Rollback contract"
 assert_equal "source Git HEAD is restored" "$SOURCE_HEAD" "$ACTUAL_HEAD"
 assert_equal "source Git branch is restored" "$SOURCE_BRANCH" "$ACTUAL_BRANCH"
 assert_equal "source Atomic view is restored" "$SOURCE_VIEW" "$ACTUAL_VIEW"
-assert_equal "bridge checkpoint is unchanged" "$SOURCE_CHECKPOINT" "$ACTUAL_CHECKPOINT"
+assert_equal "shim checkpoint is unchanged" "$SOURCE_CHECKPOINT" "$ACTUAL_CHECKPOINT"
 if cmp -s "$SOURCE_STATE" "$AFTER_FAILURE_STATE"; then
     _pass "all source paths, types, and contents are restored with no target-only files"
 else
@@ -144,7 +144,7 @@ fi
 
 begin_section "Automatic recovery on ordinary retry"
 set +e
-RETRY_OUTPUT="$(atomic git bridge switch "$MAIN" 2>&1)"
+RETRY_OUTPUT="$(atomic git shim switch "$MAIN" 2>&1)"
 RETRY_RC=$?
 set -e
 if [[ "$RETRY_RC" -eq 0 ]]; then
@@ -155,7 +155,7 @@ fi
 assert_equal "retry aligns Git branch to target" "$MAIN" "$(git_current_branch)"
 assert_equal "retry aligns Atomic view to target" "$MAIN" "$(atomic_current_view)"
 assert_clean_statuses "target projection after retry"
-assert_success "bridge verify succeeds after retry" atomic git bridge verify
+assert_success "shim verify succeeds after retry" atomic git shim verify
 
 begin_section "CB-8B: journaled projection publication recovers at its crash points"
 # The record-path projection journals its ref/HEAD publication before
@@ -231,7 +231,7 @@ for FAILPOINT_NAME in ATOMIC_FAIL_PROJECTION_BEFORE_REF ATOMIC_FAIL_PROJECTION_A
         set +e
         atomic record -m "projection crash $FAILPOINT_NAME" >/dev/null 2>&1
         RECORD_RC=$?
-        atomic git bridge reconcile >/dev/null 2>&1
+        atomic git shim reconcile >/dev/null 2>&1
         RECONCILE_RC=$?
         set -e
         if [[ "$RECONCILE_RC" -eq 0 ]]; then
@@ -244,7 +244,7 @@ for FAILPOINT_NAME in ATOMIC_FAIL_PROJECTION_BEFORE_REF ATOMIC_FAIL_PROJECTION_A
         set -e
         if [[ "$SWITCH_RC" -eq 0 ]]; then
             set +e
-            atomic git bridge reconcile >/dev/null 2>&1
+            atomic git shim reconcile >/dev/null 2>&1
             RECONCILE_RC=$?
             set -e
             if [[ "$RECONCILE_RC" -eq 0 ]]; then
@@ -269,7 +269,7 @@ done
 
 if [[ "$TESTS_FAILED" -gt 0 ]]; then
     echo ""
-    echo "${BOLD}${RED}RECOVERY FAILURE:${RESET} bridge switch did not satisfy the interruption-safe contract."
+    echo "${BOLD}${RED}RECOVERY FAILURE:${RESET} shim switch did not satisfy the interruption-safe contract."
     echo "${RED}  Actual state immediately after failpoint:${RESET}"
     echo "    Git:    branch=${ACTUAL_BRANCH:-<detached>} head=$ACTUAL_HEAD"
     echo "    Atomic: view=${ACTUAL_VIEW:-<unknown>}"

@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# 41_git_bridge_hooks.sh — CB-0D advisory post-checkout bridge contract.
+# 41_git_shim_hooks.sh — CB-0D advisory post-checkout shim contract.
 
 HARNESS_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$HARNESS_DIR/helpers.sh"
 
 printf '\n%s\n' "${BOLD}══════════════════════════════════════════════════════════════${RESET}"
-printf '%s\n' "${BOLD}  Suite: 41_git_bridge_hooks${RESET}"
+printf '%s\n' "${BOLD}  Suite: 41_git_shim_hooks${RESET}"
 printf '%s\n' "${BOLD}══════════════════════════════════════════════════════════════${RESET}"
 
 begin_section "Prerequisites"
@@ -38,7 +38,7 @@ wait_for_receipt() {
 }
 
 begin_section "Owned common-dir dispatcher and advisory evidence"
-make_temp_repo "git-bridge-hooks"
+make_temp_repo "git-shim-hooks"
 init_git_repo
 create_file "tracked.txt" "main\n"
 git add tracked.txt
@@ -52,31 +52,31 @@ git commit --quiet -m "feature"
 FEATURE_HEAD="$(git_head_sha_full)"
 git switch --quiet "$MAIN"
 
-assert_success "initialize Atomic for bridge hooks" atomic init --view "$MAIN"
-assert_success "enable advisory bridge" atomic git bridge enable
+assert_success "initialize Atomic for shim hooks" atomic init --view "$MAIN"
+assert_success "enable advisory shim" atomic git shim enable
 HOOK_PATH="$(git rev-parse --git-path hooks/post-checkout)"
-if [[ -x "$HOOK_PATH" ]] && grep -q '^# atomic:git-bridge-dispatcher:v1$' "$HOOK_PATH"; then
-    _pass "bridge enable installs an owned executable dispatcher"
+if [[ -x "$HOOK_PATH" ]] && grep -q '^# atomic:git-shim-dispatcher:v1$' "$HOOK_PATH"; then
+    _pass "shim enable installs an owned executable dispatcher"
 else
-    _fail "bridge enable installs an owned executable dispatcher" "$HOOK_PATH missing or unowned"
+    _fail "shim enable installs an owned executable dispatcher" "$HOOK_PATH missing or unowned"
 fi
 if grep -q "${ATOMIC_BIN}" "$HOOK_PATH"; then
     _pass "dispatcher embeds the absolute Atomic binary"
 else
     _fail "dispatcher embeds the absolute Atomic binary" "$(cat "$HOOK_PATH")"
 fi
-if grep -q 'atomic git import\|bridge reconcile' "$HOOK_PATH"; then
+if grep -q 'atomic git import\|shim reconcile' "$HOOK_PATH"; then
     _fail "dispatcher contains no synchronous reconciliation" "$(cat "$HOOK_PATH")"
 else
     _pass "dispatcher contains no synchronous reconciliation"
 fi
 
 ORIGINAL_DISPATCHER="$(cat "$HOOK_PATH")"
-assert_success "refresh owned dispatcher" atomic git bridge enable
+assert_success "refresh owned dispatcher" atomic git shim enable
 if [[ "$(cat "$HOOK_PATH")" == "$ORIGINAL_DISPATCHER" ]]; then
-    _pass "bridge enable refresh is idempotent"
+    _pass "shim enable refresh is idempotent"
 else
-    _fail "bridge enable refresh is idempotent" "dispatcher content changed"
+    _fail "shim enable refresh is idempotent" "dispatcher content changed"
 fi
 
 assert_success "raw Git switch fires advisory hook" git switch feature
@@ -125,7 +125,7 @@ mkdir -p .githooks
 printf '#!/bin/sh\necho custom-hook\n' > .githooks/post-checkout
 CUSTOM_BEFORE="$(shasum -a 256 .githooks/post-checkout | awk '{ print $1 }')"
 set +e
-CUSTOM_OUT="$(atomic git bridge enable 2>&1)"
+CUSTOM_OUT="$(atomic git shim enable 2>&1)"
 CUSTOM_RC=$?
 set -e
 CUSTOM_AFTER="$(shasum -a 256 .githooks/post-checkout | awk '{ print $1 }')"

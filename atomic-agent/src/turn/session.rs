@@ -996,9 +996,9 @@ impl SessionStore {
         &self.sessions_dir
     }
 
-    /// Write one pending bridge-watch notice for a session (CB-13D).
+    /// Write one pending shim-watch notice for a session (CB-13D).
     ///
-    /// The optional metadata-only bridge watch daemon (RFC §11.2 rule 6)
+    /// The optional metadata-only shim watch daemon (RFC §11.2 rule 6)
     /// calls this when it detects an external Git transition or an unsafe
     /// state while a managed session is active. The notice is a separate
     /// pending file — it never mutates the session state file the
@@ -1043,7 +1043,7 @@ impl SessionStore {
         Ok(())
     }
 
-    /// Take the pending bridge-watch notice for a session, if any (CB-13D).
+    /// Take the pending shim-watch notice for a session, if any (CB-13D).
     ///
     /// Consuming claims the notice atomically first (review R6): the pending
     /// file is renamed to a per-consumer claim name before it is read, so a
@@ -1196,13 +1196,13 @@ impl SessionStore {
 const WATCH_NOTICES_DIRECTORY: &str = "notices";
 /// Process-local sequence for unique notice temp/claim file names.
 static WATCH_NOTICE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
-/// Current bridge-watch notice payload version.
+/// Current shim-watch notice payload version.
 pub const WATCH_NOTICE_VERSION: u32 = 1;
-/// Expected `record_type` of a bridge-watch notice payload.
+/// Expected `record_type` of a shim-watch notice payload.
 pub const WATCH_NOTICE_RECORD_TYPE: &str = "bridge-watch-notice";
 
 /// One pending external-transition or unsafe-state notice written by the
-/// optional bridge watch daemon (RFC §11.2 rule 6) for an active managed
+/// optional shim watch daemon (RFC §11.2 rule 6) for an active managed
 /// session. Purely advisory: without the daemon the next agent boundary
 /// still fully reconciles, and the notice never changes command outcomes.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]

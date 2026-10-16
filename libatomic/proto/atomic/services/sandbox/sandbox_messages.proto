@@ -213,6 +213,13 @@ message MaterializeRequest {
   RepositoryRef repository = 1;
   reserved 2, 3; // credentials moved to middleware; mutable view names removed
   optional ViewRef target = 4; // sandbox: inferred from grant; others: required
+  // Partial materialization (a monorepo folder): stream only entries at or
+  // under this path, plus the ancestor directories that lead to them, and
+  // filter the terminal skeleton's live rows the same way so the sandbox
+  // cache is prefix-coherent. Plain relative components only — the same
+  // path-safety rules as TreeEntry.path (no "..", no ".", no root, no
+  // empty components); unset or empty materializes the whole view.
+  optional string path_prefix = 5;
 }
 message MaterializeFrame {
   oneof frame {

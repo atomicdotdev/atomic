@@ -1,4 +1,4 @@
-// Temporary Unix-only Git bridge support to unblock Windows native CI.
+// Temporary Unix-only Git shim support to unblock Windows native CI.
 // Revisit after Windows support is defined; see the RFC temporary platform policy.
 #![cfg(unix)]
 
@@ -61,7 +61,7 @@ fn write_key_file(root: &Path, name: &str, seed: u8) -> std::path::PathBuf {
     path
 }
 
-/// A publisher: Git repo, imported bridge baseline, three recorded changes.
+/// A publisher: Git repo, imported shim baseline, three recorded changes.
 fn setup_publisher(root: &Path, home: &Path) {
     {
         let git = git2::Repository::init(root).expect("init git");
@@ -81,8 +81,8 @@ fn setup_publisher(root: &Path, home: &Path) {
         "git import",
     );
     assert_success(
-        &atomic(root, home, &["git", "bridge", "reconcile"]),
-        "bridge reconcile",
+        &atomic(root, home, &["git", "shim", "reconcile"]),
+        "shim reconcile",
     );
 
     for (name, message) in [("a.txt", "one"), ("b.txt", "two"), ("c.txt", "three")] {
@@ -218,7 +218,7 @@ fn imported_history_refuses_private_packs_and_fresh_clone_fetch_is_explicitly_in
         &home,
         &[
             "git",
-            "bridge",
+            "shim",
             "binding",
             "publish",
             "--key-file",
@@ -257,7 +257,7 @@ fn imported_history_refuses_private_packs_and_fresh_clone_fetch_is_explicitly_in
         &home,
         &[
             "git",
-            "bridge",
+            "shim",
             "binding",
             "publish",
             "--key-file",
@@ -272,7 +272,7 @@ fn imported_history_refuses_private_packs_and_fresh_clone_fetch_is_explicitly_in
         &home,
         &[
             "git",
-            "bridge",
+            "shim",
             "binding",
             "publish",
             "--key-file",
@@ -298,7 +298,7 @@ fn imported_history_refuses_private_packs_and_fresh_clone_fetch_is_explicitly_in
     let client = temp.path().join("client");
     transfer_to_client(&publisher, &remote_dir, &client);
     assert_no_wip_refs_on_remote(&remote_dir);
-    // The client bootstraps its bridge baseline: git import anchors the
+    // The client bootstraps its shim baseline: git import anchors the
     // workspace and imports the Git history. The imported root change is
     // hash-identical to the publisher's (unhashed content does not affect
     // change identity), so it is a legitimate local "have".
@@ -316,7 +316,7 @@ fn imported_history_refuses_private_packs_and_fresh_clone_fetch_is_explicitly_in
             .expect("client log")
             .len()
     };
-    let fetch = atomic(&client, &home, &["git", "bridge", "binding", "fetch", &id]);
+    let fetch = atomic(&client, &home, &["git", "shim", "binding", "fetch", &id]);
     assert!(
         !fetch.status.success(),
         "fetch without any available source must fail: {}",
@@ -432,7 +432,7 @@ fn private_sidecars_never_enter_a_pack_and_sentinels_stay_out_of_git() {
         &home,
         &[
             "git",
-            "bridge",
+            "shim",
             "binding",
             "publish",
             "--key-file",
@@ -472,7 +472,7 @@ fn private_sidecars_never_enter_a_pack_and_sentinels_stay_out_of_git() {
         &home,
         &[
             "git",
-            "bridge",
+            "shim",
             "binding",
             "publish",
             "--key-file",

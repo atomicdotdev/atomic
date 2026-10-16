@@ -4,7 +4,7 @@
 //! Before the fix, the import's default vault initialization overwrote the
 //! Git-tracked user files with template bytes (data loss, dirty `git
 //! status`), recorded the templates as an Atomic change, and the standing
-//! `git bridge verify` failed the manifest/index layers by construction:
+//! `git shim verify` failed the manifest/index layers by construction:
 //! the projection excluded `.vault/` while the Git HEAD tree tracked it.
 //!
 //! The conforming contract (RFC-ATOMIC-GIT-CAUSAL-BRIDGE §6.2):
@@ -146,7 +146,7 @@ fn fixture(with_vault: bool) -> (tempfile::TempDir, tempfile::TempDir) {
 
 /// Import must preserve the tracked vault byte-for-byte, keep `git status`
 /// clean, hydrate the vault database with the user's content, and leave
-/// `git bridge verify` green — with the default import (vault enabled).
+/// `git shim verify` green — with the default import (vault enabled).
 #[test]
 fn tracked_vault_default_import_preserves_user_content() {
     let (root, home) = fixture(true);
@@ -213,7 +213,7 @@ fn tracked_vault_default_import_preserves_user_content() {
     assert!(ok, "atomic status failed:\n{output}");
 
     // The standing verifier is green: manifest, index, worktree, census.
-    let (ok, output) = run_atomic(root.path(), home.path(), &["git", "bridge", "verify"]);
+    let (ok, output) = run_atomic(root.path(), home.path(), &["git", "shim", "verify"]);
     assert!(
         ok,
         "bridge verify must pass after a tracked-vault import:\n{output}"
@@ -235,7 +235,7 @@ fn tracked_vault_no_vault_import_still_verifies_clean() {
         assert_eq!(disk, content.as_bytes(), "{path} must be untouched");
     }
 
-    let (ok, output) = run_atomic(root.path(), home.path(), &["git", "bridge", "verify"]);
+    let (ok, output) = run_atomic(root.path(), home.path(), &["git", "shim", "verify"]);
     assert!(ok, "bridge verify must pass:\n{output}");
 }
 
@@ -250,7 +250,7 @@ fn enabling_bridge_before_import_does_not_force_a_private_vault_policy() {
     std::fs::write(exclude, "/.atomic/\n/.atomicignore\n/.vault/\n").unwrap();
     for args in [
         &["init", "--no-vault", "--view", "main"][..],
-        &["git", "bridge", "enable"][..],
+        &["git", "shim", "enable"][..],
         &["git", "import", "--incremental"][..],
     ] {
         let (ok, output) = run_atomic(root.path(), home.path(), args);
@@ -263,7 +263,7 @@ fn enabling_bridge_before_import_does_not_force_a_private_vault_policy() {
             content.as_bytes()
         );
     }
-    let (ok, output) = run_atomic(root.path(), home.path(), &["git", "bridge", "verify"]);
+    let (ok, output) = run_atomic(root.path(), home.path(), &["git", "shim", "verify"]);
     assert!(
         ok,
         "tracked-vault import after enabling the bridge must verify:\n{output}"
@@ -325,7 +325,7 @@ fn fresh_repository_default_import_creates_private_vault() {
         "git status must stay clean"
     );
 
-    let (ok, output) = run_atomic(root.path(), home.path(), &["git", "bridge", "verify"]);
+    let (ok, output) = run_atomic(root.path(), home.path(), &["git", "shim", "verify"]);
     assert!(ok, "bridge verify must pass:\n{output}");
 
     // Re-running vault init on the initialized vault resets nothing.

@@ -1,4 +1,4 @@
-// Temporary Unix-only Git bridge support to unblock Windows native CI.
+// Temporary Unix-only Git shim support to unblock Windows native CI.
 // Revisit after Windows support is defined; see the RFC temporary platform policy.
 #![cfg(unix)]
 
@@ -6,7 +6,7 @@
 //! bootstrap through the real CLI (RFC §5, §7.3, §8.5, §8.6, §12; task 4).
 //!
 //! Offline local-remote fixtures prove:
-//! - `bridge enable` configures the explicit RFC §8.6 fetch refspecs for
+//! - `shim enable` configures the explicit RFC §8.6 fetch refspecs for
 //!   `refs/atomic/bindings/*` and `refs/atomic/views/*`, idempotently,
 //! - the bounded create-only publication queue republishes missing binding
 //!   refs, retries idempotently, refuses a conflicting remote target without
@@ -166,14 +166,14 @@ fn setup_native_publisher(root: &Path, home: &Path, key: &Path) {
             home,
             &[
                 "git",
-                "bridge",
+                "shim",
                 "enable",
                 "--binding-key-file",
                 key.to_str().unwrap(),
                 "--with-changes-pack",
             ],
         ),
-        "bridge enable",
+        "shim enable",
     );
 }
 
@@ -211,13 +211,13 @@ fn enable_configures_both_refspecs_idempotently() {
             &home,
             &[
                 "git",
-                "bridge",
+                "shim",
                 "enable",
                 "--binding-key-file",
                 key.to_str().unwrap(),
             ],
         ),
-        "bridge enable with remote",
+        "shim enable with remote",
     );
 
     let refspecs = git_text(&publisher, &["config", "--get-all", "remote.origin.fetch"]);
@@ -239,13 +239,13 @@ fn enable_configures_both_refspecs_idempotently() {
             &home,
             &[
                 "git",
-                "bridge",
+                "shim",
                 "enable",
                 "--binding-key-file",
                 key.to_str().unwrap(),
             ],
         ),
-        "repeat bridge enable",
+        "repeat shim enable",
     );
     let refspecs = git_text(&publisher, &["config", "--get-all", "remote.origin.fetch"]);
     assert_eq!(
@@ -263,7 +263,7 @@ fn enable_configures_both_refspecs_idempotently() {
         &home,
         &[
             "git",
-            "bridge",
+            "shim",
             "enable",
             "--remote",
             "nowhere",
@@ -300,7 +300,7 @@ fn queue_republishes_missing_refs_idempotently_and_refuses_conflicting_targets()
             &home,
             &[
                 "git",
-                "bridge",
+                "shim",
                 "binding",
                 "publish",
                 "--key-file",
@@ -333,7 +333,7 @@ fn queue_republishes_missing_refs_idempotently_and_refuses_conflicting_targets()
     );
 
     // The queue republishes the missing ref through the journaled CAS path.
-    let queue = atomic(&publisher, &home, &["git", "bridge", "binding", "queue"]);
+    let queue = atomic(&publisher, &home, &["git", "shim", "binding", "queue"]);
     assert_success(&queue, "binding queue");
     assert!(
         output_text(&queue).contains("published"),
@@ -345,7 +345,7 @@ fn queue_republishes_missing_refs_idempotently_and_refuses_conflicting_targets()
         .is_empty());
 
     // Retry is idempotent: nothing new is published.
-    let retry = atomic(&publisher, &home, &["git", "bridge", "binding", "queue"]);
+    let retry = atomic(&publisher, &home, &["git", "shim", "binding", "queue"]);
     assert_success(&retry, "binding queue retry");
     assert!(
         output_text(&retry).contains("0 published"),
@@ -375,7 +375,7 @@ fn queue_republishes_missing_refs_idempotently_and_refuses_conflicting_targets()
     let refused = atomic(
         &publisher,
         &home,
-        &["git", "bridge", "binding", "queue", "--max", "1"],
+        &["git", "shim", "binding", "queue", "--max", "1"],
     );
     assert!(
         !refused.status.success(),
@@ -410,7 +410,7 @@ fn queue_remote_transfer_is_create_only_and_verified_before_publication_report()
             &home,
             &[
                 "git",
-                "bridge",
+                "shim",
                 "binding",
                 "publish",
                 "--key-file",
@@ -427,7 +427,7 @@ fn queue_remote_transfer_is_create_only_and_verified_before_publication_report()
     let queue = atomic(
         &publisher,
         &home,
-        &["git", "bridge", "binding", "queue", "--remote", "origin"],
+        &["git", "shim", "binding", "queue", "--remote", "origin"],
     );
     assert_success(&queue, "queue --remote");
     assert!(
@@ -481,7 +481,7 @@ fn queue_remote_transfer_is_create_only_and_verified_before_publication_report()
     let queue = atomic(
         &publisher,
         &home,
-        &["git", "bridge", "binding", "queue", "--remote", "origin"],
+        &["git", "shim", "binding", "queue", "--remote", "origin"],
     );
     assert!(
         !queue.status.success(),
@@ -995,7 +995,7 @@ fn namespace_rejection_is_explicit_and_degraded_fallback_needs_opt_in() {
             &home,
             &[
                 "git",
-                "bridge",
+                "shim",
                 "binding",
                 "publish",
                 "--key-file",
@@ -1033,7 +1033,7 @@ fn namespace_rejection_is_explicit_and_degraded_fallback_needs_opt_in() {
     let refused = atomic(
         &publisher,
         &home,
-        &["git", "bridge", "binding", "queue", "--remote", "origin"],
+        &["git", "shim", "binding", "queue", "--remote", "origin"],
     );
     assert!(
         !refused.status.success(),
@@ -1058,7 +1058,7 @@ fn namespace_rejection_is_explicit_and_degraded_fallback_needs_opt_in() {
         &home,
         &[
             "git",
-            "bridge",
+            "shim",
             "binding",
             "queue",
             "--remote",
@@ -1143,7 +1143,7 @@ fn hostile_carrier_with_private_wip_parent_never_transfers() {
             &home,
             &[
                 "git",
-                "bridge",
+                "shim",
                 "binding",
                 "publish",
                 "--key-file",
@@ -1159,7 +1159,7 @@ fn hostile_carrier_with_private_wip_parent_never_transfers() {
     let control = atomic(
         &publisher,
         &home,
-        &["git", "bridge", "binding", "queue", "--remote", "origin"],
+        &["git", "shim", "binding", "queue", "--remote", "origin"],
     );
     assert_success(&control, "unchanged-carrier control queue --remote origin");
     assert!(
@@ -1260,7 +1260,7 @@ fn hostile_carrier_with_private_wip_parent_never_transfers() {
     let refused = atomic(
         &publisher,
         &home,
-        &["git", "bridge", "binding", "queue", "--remote", "leak"],
+        &["git", "shim", "binding", "queue", "--remote", "leak"],
     );
     assert!(
         !refused.status.success(),
@@ -1291,7 +1291,7 @@ fn hostile_carrier_with_private_wip_parent_never_transfers() {
     let retry = atomic(
         &publisher,
         &home,
-        &["git", "bridge", "binding", "queue", "--remote", "origin"],
+        &["git", "shim", "binding", "queue", "--remote", "origin"],
     );
     assert!(
         !retry.status.success(),
@@ -1322,7 +1322,7 @@ fn unregistered_binding_ref_is_never_transferred() {
             &home,
             &[
                 "git",
-                "bridge",
+                "shim",
                 "binding",
                 "publish",
                 "--key-file",
@@ -1368,7 +1368,7 @@ fn unregistered_binding_ref_is_never_transferred() {
     let refused = atomic(
         &publisher,
         &home,
-        &["git", "bridge", "binding", "queue", "--remote", "origin"],
+        &["git", "shim", "binding", "queue", "--remote", "origin"],
     );
     assert!(
         !refused.status.success(),

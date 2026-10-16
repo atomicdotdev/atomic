@@ -104,12 +104,12 @@ use atomic_repository::{
     Repository, SnapshotStatus, WorkspaceRemediation, WorkspaceTxnMode, WorkspaceTxnStart,
 };
 
-use crate::commands::git::bridge::read_checkpoint_observation;
 use crate::commands::git::observation::{
     classify_provisional_checkpoint, display_git_bytes, observe_git, AtomicAnchorObservation,
     GitObservation, IndexHeadEquivalence, ManifestEquivalence, ProvisionalCheckpointEligibility,
     RefTargetObservation,
 };
+use crate::commands::git::shim::read_checkpoint_observation;
 use crate::commands::workspace_txn::{enter_workspace, observe_workspace};
 use crate::commands::{find_repository_root, Command, DEFAULT_HASH_LENGTH};
 use crate::error::{CliError, CliResult};
@@ -208,7 +208,7 @@ pub struct Status {
     /// Print read-only Git/Atomic checkpoint evidence without reconciliation.
     ///
     /// This forensic mode does not run ordinary file status, reindex, import,
-    /// materialization, or any bridge reconciliation path.
+    /// materialization, or any shim reconciliation path.
     #[arg(long = "no-reconcile", conflicts_with = "reindex")]
     pub no_reconcile: bool,
 
@@ -294,10 +294,7 @@ impl Status {
             .map_err(CliError::Repository)?;
         crate::commands::status_git::apply_git_informed_overlays(&repo, &root, &mut status)?;
         crate::commands::git::ref_mapping::print_divergence_notices(&repo)?;
-        if repo
-            .bridge_workspace_active()
-            .map_err(CliError::Repository)?
-        {
+        if repo.shim_workspace_active().map_err(CliError::Repository)? {
             if let Ok(git) = git2::Repository::discover(&root) {
                 if git.state() != git2::RepositoryState::Clean {
                     status.add_notice(format!("Git operation in progress ({:?})", git.state()));
@@ -891,7 +888,7 @@ fn forensic_manifest_root(repo_root: &Path, repo: &Repository, view: &str) -> Op
 /// observations. No stale-baseline classification is made: index movement is
 /// legitimate Git work between boundaries (CB-11A).
 fn forensic_drift(
-    checkpoint: Option<&crate::commands::git::observation::BridgeCheckpointObservation>,
+    checkpoint: Option<&crate::commands::git::observation::ShimCheckpointObservation>,
     atomic: &AtomicAnchorObservation,
     git: &GitObservation,
 ) -> Vec<String> {
@@ -944,7 +941,7 @@ fn forensic_drift(
 fn build_forensic_report(
     repo_root: &Path,
     atomic: &AtomicAnchorObservation,
-    checkpoint: Option<&crate::commands::git::observation::BridgeCheckpointObservation>,
+    checkpoint: Option<&crate::commands::git::observation::ShimCheckpointObservation>,
     git: &GitObservation,
     eligibility: &ProvisionalCheckpointEligibility,
     manifest_root: Option<&str>,
@@ -975,14 +972,14 @@ fn build_forensic_report(
 
     match checkpoint {
         Some(checkpoint) => {
-            let _ = writeln!(report, "Bridge checkpoint: present");
+            let _ = writeln!(report, "Shim checkpoint: present");
             let _ = writeln!(report, "  view: {}", checkpoint.view);
             let _ = writeln!(report, "  atomic state: {}", checkpoint.atomic_state);
             let _ = writeln!(report, "  Git HEAD: {}", checkpoint.git_head);
             let _ = writeln!(report, "  Git tree: {}", checkpoint.git_tree);
         }
         None => {
-            let _ = writeln!(report, "Bridge checkpoint: absent");
+            let _ = writeln!(report, "Shim checkpoint: absent");
         }
     }
 

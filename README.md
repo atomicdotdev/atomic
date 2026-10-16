@@ -2,11 +2,11 @@
 
 A Semantic Change Graph (SCG) to track memory, intent, provenance, and change as a single unit of work.  This is the evolution of source code management in the era of agents and agentic coding.
 
-The Git causal bridge is temporarily supported on **Unix only (Linux and macOS)**.
-Windows bridge support is deferred while its platform contract is defined; native
+The Git causal shim is temporarily supported on **Unix only (Linux and macOS)**.
+Windows shim support is deferred while its platform contract is defined; native
 Atomic functionality continues to be tested on Windows. See the
 [temporary platform policy](docs/RFC-ATOMIC-GIT-CAUSAL-BRIDGE.md#temporary-platform-support-pr-207)
-for the CI scope and requirements for re-enabling Windows bridge tests.
+for the CI scope and requirements for re-enabling Windows shim tests.
 
 ## Why Atomic?
 
@@ -285,7 +285,7 @@ Everything is content-addressed and version-controlled. When an agent starts a s
 **Colocated repositories that track `.vault/` in Git:** `atomic git import` preserves
 your tracked vault files byte-for-byte (it hydrates the vault database from them;
 default templates are only created for a repository that has no `.vault/` at all).
-The first import records the vault's bridge policy — `[git.bridge] vault = "tracked"`
+The first import records the vault's shim policy — `[git.shim] vault = "tracked"`
 in `.atomic/config.toml` — so the vault participates in Git equivalence and
 publication checks exactly like any other tracked path. A repository whose Git tree
 does not track `.vault/` keeps the vault private and ignored by Git.

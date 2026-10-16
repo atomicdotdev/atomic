@@ -143,7 +143,7 @@ impl Repository {
         &self,
     ) -> Result<Option<RepositoryCommonLockGuard>, RepositoryError> {
         // CB-13B: once the `git-bridge-cutover` requirement is durable, the
-        // colocated bridge owns writes. The legacy shadow writer refuses
+        // colocated shim owns writes. The legacy shadow writer refuses
         // before taking its lock or touching any state (fast path).
         self.require_legacy_shadow_write_allowed()?;
         #[cfg(test)]

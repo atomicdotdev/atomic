@@ -229,7 +229,7 @@ pub enum ExclusionReason {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ExclusionPolicy {
-    BridgePrivate,
+    ShimPrivate,
     IncludeVault,
 }
 
@@ -238,7 +238,7 @@ impl ExclusionPolicy {
         if atomic_private_path(path.as_bytes()) {
             Some(ExclusionReason::AtomicPrivate)
         } else if path.components().next().unwrap_or_default() == b".vault"
-            && self == Self::BridgePrivate
+            && self == Self::ShimPrivate
         {
             Some(ExclusionReason::VaultPrivate)
         } else {
@@ -250,7 +250,7 @@ impl ExclusionPolicy {
     /// repository (RFC §6.2: "`.vault/` is private by default but may be
     /// tracked under explicit policy").
     ///
-    /// An explicit `[git.bridge] vault` record in the repository
+    /// An explicit `[git.shim] vault` record in the repository
     /// configuration wins in both directions — the first import records
     /// the detected value, and a user override is honored. A configuration
     /// that predates the field omits it: that is "undecided", and the Git
@@ -295,10 +295,10 @@ impl ExclusionPolicy {
                             config_path.display()
                         ))
                     })?;
-                if let Some(vault) = config.git.bridge.vault {
+                if let Some(vault) = config.git.shim.vault {
                     return Ok(match vault {
-                        atomic_config::BridgeVaultPolicy::Tracked => Self::IncludeVault,
-                        atomic_config::BridgeVaultPolicy::Private => Self::BridgePrivate,
+                        atomic_config::ShimVaultPolicy::Tracked => Self::IncludeVault,
+                        atomic_config::ShimVaultPolicy::Private => Self::ShimPrivate,
                     });
                 }
             }
@@ -319,12 +319,12 @@ impl ExclusionPolicy {
         if tracks_vault {
             Self::IncludeVault
         } else {
-            Self::BridgePrivate
+            Self::ShimPrivate
         }
     }
 }
 
-/// Whether `path` is Atomic-private bridge state (`.atomic*`): tracked alive
+/// Whether `path` is Atomic-private shim state (`.atomic*`): tracked alive
 /// in the worktree's Atomic view but deliberately absent from project
 /// manifests and from Git. Staged whole-tree verification (review R3) exempts
 /// these paths from the extra-path refusal exactly as the conversion policy
@@ -337,16 +337,16 @@ pub fn atomic_private_path(path_bytes: &[u8]) -> bool {
     first == b".atomic" || path_bytes == b".atomicignore"
 }
 
-/// Whether `path` is bridge-private state under
-/// [`ExclusionPolicy::BridgePrivate`] — deliberately absent from project
+/// Whether `path` is shim-private state under
+/// [`ExclusionPolicy::ShimPrivate`] — deliberately absent from project
 /// manifests while tracked alive in the Atomic view. This is exactly the
-/// path set [`ExclusionPolicy::BridgePrivate::exclusion`] rejects: Atomic
+/// path set [`ExclusionPolicy::ShimPrivate::exclusion`] rejects: Atomic
 /// private state (`.atomic*`) plus the vault (`.vault/`), whose files a
 /// colocated repository legitimately tracks in both Git and the graph.
 /// Staged verification must exempt the whole set, not only the `.atomic*`
 /// half, or importing a repository that tracks `.vault/` files refuses with
 /// "staged path ... is present but the commit tree does not hold it".
-pub fn bridge_private_path(path_bytes: &[u8]) -> bool {
+pub fn shim_private_path(path_bytes: &[u8]) -> bool {
     let first = path_bytes
         .split(|byte| *byte == b'/')
         .next()
@@ -539,7 +539,7 @@ impl ConversionPolicy {
                 unicode_normalizing: false,
             },
             object_format,
-            exclusions: ExclusionPolicy::BridgePrivate,
+            exclusions: ExclusionPolicy::ShimPrivate,
             losses: LossPolicy::Refuse,
         }
     }
@@ -563,7 +563,7 @@ impl ConversionPolicy {
         encoder.u8(self.platform.unicode_normalizing as u8);
         encoder.u8(algorithm_tag(self.object_format));
         encoder.u8(match self.exclusions {
-            ExclusionPolicy::BridgePrivate => 0,
+            ExclusionPolicy::ShimPrivate => 0,
             ExclusionPolicy::IncludeVault => 1,
         });
         encoder.u8(match self.losses {
@@ -1783,11 +1783,11 @@ mod tests {
         };
 
         // No commits and no config: untracked, so the vault stays private.
-        assert_eq!(resolve(&git), ExclusionPolicy::BridgePrivate);
+        assert_eq!(resolve(&git), ExclusionPolicy::ShimPrivate);
 
         // A tree WITHOUT .vault: still private.
         commit_tree(&git, &signature, &[("README.md", b"readme\n")]);
-        assert_eq!(resolve(&git), ExclusionPolicy::BridgePrivate);
+        assert_eq!(resolve(&git), ExclusionPolicy::ShimPrivate);
 
         // A tree WITH a tracked .vault/: the vault joins the projection.
         commit_tree(
@@ -1801,7 +1801,7 @@ mod tests {
         assert_eq!(resolve(&git), ExclusionPolicy::IncludeVault);
 
         // An omitted field (pre-policy config) is undecided: HEAD decides.
-        write_config(root.path(), "[git.bridge]\nenabled = true\n");
+        write_config(root.path(), "[git.shim]\nenabled = true\n");
         assert_eq!(
             resolve(&git),
             ExclusionPolicy::IncludeVault,
@@ -1810,21 +1810,21 @@ mod tests {
 
         let config_path = root.path().join(".atomic/config.toml");
         let mut config = atomic_config::RepoConfig::load(&config_path).unwrap();
-        config.git.bridge.watch.enabled = true;
+        config.git.shim.watch.enabled = true;
         config.save(&config_path).unwrap();
         assert_eq!(
             resolve(&git),
             ExclusionPolicy::IncludeVault,
-            "saving unrelated bridge settings must preserve tracked-tree detection"
+            "saving unrelated shim settings must preserve tracked-tree detection"
         );
 
         // An explicit private record wins over the tracked HEAD tree.
-        write_config(root.path(), "[git.bridge]\nvault = \"private\"\n");
-        assert_eq!(resolve(&git), ExclusionPolicy::BridgePrivate);
+        write_config(root.path(), "[git.shim]\nvault = \"private\"\n");
+        assert_eq!(resolve(&git), ExclusionPolicy::ShimPrivate);
 
         // An explicit tracked record wins over an untracked HEAD tree.
         commit_tree(&git, &signature, &[("README.md", b"readme\n")]);
-        write_config(root.path(), "[git.bridge]\nvault = \"tracked\"\n");
+        write_config(root.path(), "[git.shim]\nvault = \"tracked\"\n");
         assert_eq!(resolve(&git), ExclusionPolicy::IncludeVault);
 
         // A corrupt configuration fails closed instead of defaulting.

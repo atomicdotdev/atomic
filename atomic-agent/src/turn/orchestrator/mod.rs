@@ -445,7 +445,7 @@ pub struct TurnOrchestrator {
     pub(crate) publication_lock_held: bool,
 
     /// Embedding CLI coordinates a newly selected session view with its Git
-    /// bridge before any turn-start baseline can be observed.
+    /// shim before any turn-start baseline can be observed.
     session_view_coordinator: Option<SessionViewCoordinator>,
 }
 
@@ -559,7 +559,7 @@ impl TurnOrchestrator {
         self.journal_sink = Some(sink);
     }
 
-    /// Coordinate bridge state after selecting a session view, before tools
+    /// Coordinate shim state after selecting a session view, before tools
     /// or turn-start observation. Native library callers need no coordinator.
     pub fn set_session_view_coordinator(&mut self, coordinate: SessionViewCoordinator) {
         self.session_view_coordinator = Some(coordinate);

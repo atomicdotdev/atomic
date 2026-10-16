@@ -3,11 +3,12 @@
 
 use std::fs::OpenOptions;
 use std::io::{self, Write};
+use std::ops::Bound;
 use std::path::Path;
 use std::sync::Arc;
 
 use redb::backends::FileBackend;
-use redb::{DatabaseError, StorageBackend};
+use redb::{BackendError, DatabaseError, StorageBackend};
 
 use super::{Pristine, PristineDatabase, PristineResult};
 
@@ -38,6 +39,37 @@ impl SnapshotBackend {
 }
 
 impl StorageBackend for SnapshotBackend {
+    // Since redb 4.3, FileBackend::new does not acquire the database lock.
+    // Forward the complete locking contract: the trait defaults report
+    // Unsupported and allow an exclusive-writer database to open unlocked.
+    fn try_lock_range(&self, start: Bound<u64>, end: Bound<u64>) -> Result<bool, BackendError> {
+        self.0.try_lock_range(start, end)
+    }
+
+    fn try_lock_shared_range(
+        &self,
+        start: Bound<u64>,
+        end: Bound<u64>,
+    ) -> Result<bool, BackendError> {
+        self.0.try_lock_shared_range(start, end)
+    }
+
+    fn lock_range(&self, start: Bound<u64>, end: Bound<u64>) -> Result<(), BackendError> {
+        self.0.lock_range(start, end)
+    }
+
+    fn lock_shared_range(&self, start: Bound<u64>, end: Bound<u64>) -> Result<(), BackendError> {
+        self.0.lock_shared_range(start, end)
+    }
+
+    fn unlock_range(&self, start: Bound<u64>, end: Bound<u64>) -> Result<(), BackendError> {
+        self.0.unlock_range(start, end)
+    }
+
+    fn query_lock_range(&self, start: Bound<u64>, end: Bound<u64>) -> Result<bool, BackendError> {
+        self.0.query_lock_range(start, end)
+    }
+
     fn len(&self) -> io::Result<u64> {
         self.0.len()
     }
@@ -108,6 +140,91 @@ mod tests {
 
     const VALUES: TableDefinition<&str, u64> = TableDefinition::new("snapshot_values");
     const LINKS: MultimapTableDefinition<u64, u64> = MultimapTableDefinition::new("snapshot_links");
+
+    #[test]
+    fn backend_clones_do_not_release_the_database_lock() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("source.redb");
+        let source = Pristine::open(&path).unwrap();
+        let PristineDatabase::Writable(_, backend) = &source.db else {
+            unreachable!();
+        };
+        let retained = backend.clone();
+        drop(backend.clone());
+        assert!(matches!(
+            Database::open(&path),
+            Err(DatabaseError::DatabaseAlreadyOpen)
+        ));
+
+        // redb owns close: a snapshot's retained Arc must neither release the
+        // live database's lock early nor keep it locked after the database ends.
+        drop(source);
+        let reopened = Database::open(&path).unwrap();
+        drop(retained);
+        assert!(matches!(
+            Database::open(&path),
+            Err(DatabaseError::DatabaseAlreadyOpen)
+        ));
+        drop(reopened);
+        Pristine::open_existing(&path).unwrap();
+    }
+
+    #[test]
+    fn failed_database_open_releases_its_lock_with_a_retained_backend() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("invalid.redb");
+        std::fs::write(&path, b"not a redb database").unwrap();
+        let backend = SnapshotBackend::open(&path, false).unwrap();
+        assert!(Database::builder()
+            .create_with_backend(backend.clone())
+            .is_err());
+
+        // The failed Database must call close even though the snapshot side
+        // still retains the underlying file. A fresh owner can acquire it.
+        let peer = SnapshotBackend::open(&path, false).unwrap();
+        assert!(peer
+            .try_lock_range(Bound::Unbounded, Bound::Unbounded)
+            .unwrap());
+        peer.close().unwrap();
+        drop(backend);
+    }
+
+    #[test]
+    fn serialized_wrapped_and_native_writes_survive_reopen() {
+        use redb::ReadableDatabase;
+
+        const PAYLOADS: TableDefinition<u64, &[u8]> = TableDefinition::new("payloads");
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("source.redb");
+        drop(Pristine::open(&path).unwrap());
+        for round in 0..8u64 {
+            let db = if round % 2 == 0 {
+                Database::builder()
+                    .create_with_backend(SnapshotBackend::open(&path, false).unwrap())
+                    .unwrap()
+            } else {
+                Database::open(&path).unwrap()
+            };
+            let payload = vec![round as u8; 4096 + round as usize * 2048];
+            let write = db.begin_write().unwrap();
+            write
+                .open_table(PAYLOADS)
+                .unwrap()
+                .insert(round, payload.as_slice())
+                .unwrap();
+            write.commit().unwrap();
+        }
+        let db = Database::open(&path).unwrap();
+        let read = db.begin_read().unwrap();
+        let table = read.open_table(PAYLOADS).unwrap();
+        for round in 0..8u64 {
+            assert_eq!(
+                table.get(round).unwrap().unwrap().value(),
+                vec![round as u8; 4096 + round as usize * 2048],
+                "acknowledged write {round} must survive subsequent writers"
+            );
+        }
+    }
 
     #[test]
     fn snapshot_waits_for_a_writer_and_captures_its_commit() {

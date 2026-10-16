@@ -177,7 +177,7 @@ pub use attribute::{
 pub use bindings::{BindingMutTxnT, BindingStoreOutcome, BindingTxnT};
 pub use capability::{
     RepositoryCapability, RequiredRepositoryCapability, UnsupportedRepositoryCapability,
-    BRIDGE_CUTOVER_CAPABILITY, CHANGE_FORMAT_VNEXT_CAPABILITY, REQUIRED_CAPABILITY_PREFIX,
+    CHANGE_FORMAT_VNEXT_CAPABILITY, REQUIRED_CAPABILITY_PREFIX, SHIM_CUTOVER_CAPABILITY,
     SUPPORTED_REPOSITORY_CAPABILITIES,
 };
 pub use error::{PristineError, PristineResult};

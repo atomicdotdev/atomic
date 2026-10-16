@@ -294,8 +294,7 @@ mod tests {
         // The install path itself refuses closed with an actionable message.
         let error = repo
             .vault_install_defaults()
-            .err()
-            .expect("vault_install_defaults must fail closed");
+            .expect_err("vault_install_defaults must fail closed");
         assert!(
             error.to_string().contains("refusing to"),
             "the refusal must be actionable, got: {error}"

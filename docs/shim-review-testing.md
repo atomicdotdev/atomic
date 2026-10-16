@@ -1,9 +1,9 @@
 # PR #207: review and testing walkthrough
 
-Companion to the [bridge operating guide](bridge-operating-guide.md).
+Companion to the [shim operating guide](shim-operating-guide.md).
 Updated 2026-10-13 for source `27d06ffb664400f6788b6fae0c4bee91e9a92c61`
 (`atomic 0.19.1`). Record the actual commit and `atomic --version` with results.
-Use Linux or macOS for bridge/RPC tests. Windows bridge support has not been
+Use Linux or macOS for shim/RPC tests. Windows shim support has not been
 validated.
 
 **Known bug:** the new-Git-branch steps in section 9 fail after Atomic records,
@@ -25,7 +25,7 @@ export ATOMIC_REVIEW_SOURCE="$PWD"
 git rev-parse HEAD
 cargo build --locked -p atomic-cli --bin atomic
 export ATOMIC_REVIEW_BIN="$ATOMIC_REVIEW_SOURCE/target/debug/atomic"
-export ATOMIC_REVIEW_ROOT="$(mktemp -d /tmp/atomic-bridge-review.XXXXXX)"
+export ATOMIC_REVIEW_ROOT="$(mktemp -d /tmp/atomic-shim-review.XXXXXX)"
 export ATOMIC_CONFIG_DIR="$ATOMIC_REVIEW_ROOT/config"
 export ATOMIC_SERVICE=local
 export ATOMIC_NONINTERACTIVE=1
@@ -73,13 +73,13 @@ Expected: rename records without an inode error. Switching views shows `base`
 on `main` and `child` on `child`. After recording, `status --short` is empty.
 No `.git` directory is created.
 
-## 3. Existing Git history → explicit bridge
+## 3. Existing Git history → explicit shim
 
 ```sh
-mkdir "$ATOMIC_REVIEW_ROOT/bridge"
-cd "$ATOMIC_REVIEW_ROOT/bridge"
+mkdir "$ATOMIC_REVIEW_ROOT/shim"
+cd "$ATOMIC_REVIEW_ROOT/shim"
 git init -q -b main
-git config user.name 'Bridge Test'
+git config user.name 'Shim Test'
 git config user.email 'test@example.invalid'
 printf 'base\n' > tracked.txt
 git add tracked.txt
@@ -87,10 +87,10 @@ git commit -qm 'review: Git baseline'
 
 atomic git import --no-vault
 python3 -c 'import os,secrets; p=os.path.join(os.environ["ATOMIC_REVIEW_ROOT"],"binding.key"); fd=os.open(p,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600); os.write(fd,secrets.token_hex(32).encode()); os.close(fd)'
-atomic git bridge enable --no-refspecs \
+atomic git shim enable --no-refspecs \
   --binding-key-file "$ATOMIC_REVIEW_ROOT/binding.key"
-atomic git bridge reconcile
-atomic git bridge verify
+atomic git shim reconcile
+atomic git shim verify
 atomic git hooks status
 test -z "$(atomic status --short)"
 test -z "$(git status --porcelain)"
@@ -101,7 +101,7 @@ passes. The test key stays outside the repository. `--no-refspecs` skips remote
 setup. A notice that automatic rollout is blocked is expected.
 
 There is no `atomic git shim` command. Use normal Git commands after installing
-the hooks. Having both `.git` and `.atomic` alone does not enable the bridge;
+the hooks. Having both `.git` and `.atomic` alone does not enable the shim;
 the opt-in tests in section 7 cover that case.
 
 ## 4. Atomic changes projected to Git
@@ -114,10 +114,10 @@ atomic diff
 atomic record -am 'review: Atomic edit'
 test "$(git show HEAD:tracked.txt)" = 'atomic edit'
 mv tracked.txt renamed.txt
-atomic record -am 'review: bridge rename'
+atomic record -am 'review: shim rename'
 test "$(git show HEAD:renamed.txt)" = 'atomic edit'
 test ! -e tracked.txt
-atomic git bridge verify
+atomic git shim verify
 test -z "$(atomic status --short)"
 test -z "$(git status --porcelain)"
 ```
@@ -135,14 +135,14 @@ from pathlib import Path
 import re
 p = Path('.atomic/config.toml')
 s = p.read_text()
-s, n = re.subn(r'(\[git\.bridge\.watch\]\s*\nenabled\s*=\s*)false',
+s, n = re.subn(r'(\[git\.shim\.watch\]\s*\nenabled\s*=\s*)false',
                r'\g<1>true', s, count=1)
 assert n == 1, 'inspect the existing watcher configuration before editing'
 p.write_text(s)
 PY
-atomic git bridge watch --once
-atomic git bridge verify
-atomic git bridge disable
+atomic git shim watch --once
+atomic git shim verify
+atomic git shim disable
 atomic git hooks status
 ```
 
@@ -152,8 +152,8 @@ still check for a stale baseline. `atomic git hooks uninstall` removes only
 Atomic's post-checkout hook.
 
 The watcher tests in section 7 cover Git changes and blocked operations. To
-run the watcher continuously, re-enable the bridge and run
-`atomic git bridge watch`. Stop it with Ctrl-C.
+run the watcher continuously, re-enable the shim and run
+`atomic git shim watch`. Stop it with Ctrl-C.
 
 ## 6. OpenCode: real agent work
 
@@ -163,10 +163,10 @@ outside the repository. Add the built binary's directory to that profile's
 PATH and check `command -v atomic`. The shell function above is not enough for
 the agent to find the binary.
 
-In the bridge test repo, re-enable the bridge and install the integration:
+In the shim test repo, re-enable the shim and install the integration:
 
 ```sh
-atomic git bridge enable --no-refspecs \
+atomic git shim enable --no-refspecs \
   --binding-key-file "$ATOMIC_REVIEW_ROOT/binding.key"
 atomic agent enable --agent opencode
 atomic agent status --json
@@ -186,7 +186,7 @@ atomic agent status --json
 atomic log --short
 atomic status --short
 git status --porcelain
-atomic git bridge verify
+atomic git shim verify
 ```
 
 Expected: tests pass, the turn is recorded, and both statuses are clean after
@@ -206,8 +206,8 @@ Check failures and skipped tests in the output.
 cd "$ATOMIC_REVIEW_SOURCE"
 cargo test --locked -p atomic-cli \
   --test adaptation_regression_test \
-  --test git_bridge_opt_in_test \
-  --test git_bridge_workspace_test \
+  --test git_shim_opt_in_test \
+  --test git_shim_workspace_test \
   --test bridge_agent_workflow_regression_test \
   --test git_shim_logging_test
 
@@ -218,11 +218,11 @@ cargo test --locked -p libatomic \
   --test record_service_test --test status_service_test --test sandbox_service_test
 
 cargo test --locked -p atomic-repository \
-  --test database_consolidation_bridge_test --test migration_recovery_test
+  --test database_consolidation_shim_test --test migration_recovery_test
 
 cargo test --locked -p atomic-cli \
   --features adoption-test-injection \
-  --test git_bridge_cb13d_test --test git_cutover_cb13b_test
+  --test git_shim_cb13d_test --test git_cutover_cb13b_test
 ```
 
 `working_copy_service_adaptation_test` starts a real RPC server using this
@@ -254,21 +254,21 @@ Then rename and record a file, switch views and back, reopen, and run
 are preserved. Section 7 includes tests for database locks and interrupted
 migration.
 
-Database migration is separate from `git bridge cutover`. See
-[operating guide section 15](bridge-operating-guide.md#15-bridge-cutover-and-database-migration)
+Database migration is separate from `git shim cutover`. See
+[operating guide section 15](shim-operating-guide.md#15-shim-cutover-and-database-migration)
 for cutover limits.
 
 ## 9. Known failure: new Git branch after Atomic records
 
 Run this in a **fresh test repo immediately after sections 1–4**, before
-disabling the bridge or running the agent test:
+disabling the shim or running the agent test:
 
 ```sh
 git switch -c foreign-edit
 printf 'Git edit\n' > renamed.txt
 git add renamed.txt
 git commit -qm 'review: foreign Git edit'
-atomic git bridge reconcile
+atomic git shim reconcile
 ```
 
 Expected: reconcile imports the commit and verify passes. Switching between
@@ -284,10 +284,10 @@ repository projection failed: view 'foreign-edit' not found
 
 `reconcile` exits 4. This fails both with Atomic hooks installed and with a
 custom hook path that prevents installation. Earlier steps pass. The existing
-`git_bridge_workspace_test` suite passes but does not catch this sequence.
+`git_shim_workspace_test` suite passes but does not catch this sequence.
 
 Keep the failed repo for debugging. The cause and comparison against `dev`
-have not been confirmed. This bug needs a fix before these basic bridge
+have not been confirmed. This bug needs a fix before these basic shim
 workflows can be marked ready to merge.
 
 ## 10. Evidence and reporting
@@ -298,9 +298,9 @@ documentation-only edits; the binary reports a `-dirty` suffix):
 | Check | Result |
 | --- | --- |
 | Default-build commands extracted from sections 1–5, in fresh repos | PASS |
-| `git_bridge_workspace_test` | 4 passed |
+| `git_shim_workspace_test` | 4 passed |
 | `working_copy_service_adaptation_test` (real RPC socket) | 1 passed |
-| `git_bridge_cb13d_test` (injection build) | 21 passed |
+| `git_shim_cb13d_test` (injection build) | 21 passed |
 | `git_cutover_cb13b_test` (injection build) | 4 passed |
 | Database consolidation + migration recovery suites listed in §7 | 4 passed |
 | Section 9 combined new-branch reproduction | FAIL, exit 4, with and without installed hooks |
@@ -322,4 +322,4 @@ For each review result report:
   fixture details. Share no signing keys, credentials, or private transcripts.
 
 Keep failed test repos. Check file contents and history as well as status
-and bridge verification.
+and shim verification.

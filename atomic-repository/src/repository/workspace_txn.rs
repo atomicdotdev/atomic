@@ -35,14 +35,14 @@ pub enum WorkspaceTxnMode {
 
 /// The enforced RFC floor for the reactive-reconcile silence window
 /// (RFC §11.2 rule 3: at least 250 ms). Single source of truth is the
-/// bridge watch configuration; this alias keeps the transaction-side
+/// shim watch configuration; this alias keeps the transaction-side
 /// precondition readable without a magic number.
-pub const MIN_REACTIVE_QUIESCENCE_MS: u64 = atomic_config::BridgeWatchConfig::MIN_QUIET_MS;
+pub const MIN_REACTIVE_QUIESCENCE_MS: u64 = atomic_config::ShimWatchConfig::MIN_QUIET_MS;
 
 /// Effect budget a workspace-transaction caller granted itself (CB-13D,
 /// RFC §11.2 rule 4).
 ///
-/// The optional bridge watch daemon reuses the shared workspace transaction
+/// The optional shim watch daemon reuses the shared workspace transaction
 /// path but carries a metadata-only budget: it may create
 /// `ImportGitHead`/`ImportGitRefs` operations and adopt bookkeeping, but it
 /// must never materialize working-copy files and must never move Git refs.
@@ -54,7 +54,7 @@ pub enum ReconcileEffectBudget {
     /// transaction mode and its leases allow.
     #[default]
     Command,
-    /// Metadata-only budget (the bridge watch daemon). Export-classified
+    /// Metadata-only budget (the shim watch daemon). Export-classified
     /// reconciliation surfaces a notice/remediation instead of executing.
     MetadataOnly,
 }
@@ -792,22 +792,22 @@ pub enum UnanchoredWorkspace {
 impl UnanchoredWorkspace {
     /// Commands that resolve this state when a single safe path exists.
     ///
-    /// Ordinary boundaries only observe Git for bridge workspaces
-    /// ([`Repository::bridge_workspace_active`]), so these states are reached
+    /// Ordinary boundaries only observe Git for shim workspaces
+    /// ([`Repository::shim_workspace_active`]), so these states are reached
     /// after an explicit opt-in or anchoring.
     pub fn remediation(&self) -> Option<String> {
-        const DISABLE: &str = "To use Atomic without the Git bridge in a workspace that was never \
-anchored:\n  atomic git bridge disable";
+        const DISABLE: &str = "To use Atomic without the Git shim in a workspace that was never \
+anchored:\n  atomic git shim disable";
         match self {
             Self::MissingCheckpoint => Some(format!(
-                "The Git bridge is enabled for this repository, but this workspace has no \
+                "The Git shim is enabled for this repository, but this workspace has no \
 verified Git baseline yet. Anchor it to the current Git HEAD (imports the Git \
-history into the current view):\n  atomic git bridge reconcile\n{DISABLE}"
+history into the current view):\n  atomic git shim reconcile\n{DISABLE}"
             )),
             Self::UnbornHead { symref } => Some(format!(
                 "{symref} has no commits yet, so there is no Git baseline to anchor to. \
 Create the first Git commit (or switch to a branch that has commits), then \
-anchor the workspace:\n  git add <paths> && git commit\n  atomic git bridge reconcile\n{DISABLE}"
+anchor the workspace:\n  git add <paths> && git commit\n  atomic git shim reconcile\n{DISABLE}"
             )),
             _ => None,
         }
@@ -866,7 +866,7 @@ impl Repository {
         // not interpreted, so ordinary commands keep native behavior instead
         // of refusing for a Git anchor the user never asked for.
         let observe: fn(&Path) -> Result<WorkspaceGitObservation, super::ObservationError> =
-            if self.bridge_workspace_active()? {
+            if self.shim_workspace_active()? {
                 observe_git_metadata
             } else {
                 observe_native_workspace
@@ -874,23 +874,23 @@ impl Repository {
         self.begin_workspace_txn_with_opt(mode, observe, false, budget)
     }
 
-    /// Whether this working copy participates in the colocated Git bridge.
+    /// Whether this working copy participates in the colocated Git shim.
     ///
     /// The bridge is explicit per-repository opt-in (RFC §2; CB-13C
-    /// `[git.bridge] enabled`, default `false`): a `.git` directory next to
+    /// `[git.shim] enabled`, default `false`): a `.git` directory next to
     /// `.atomic` is not consent. A working copy participates once the user
-    /// recorded the opt-in (`atomic git bridge enable`) or an explicit bridge
-    /// command (`git bridge reconcile`, `git import`, anchoring, clone
+    /// recorded the opt-in (`atomic git shim enable`) or an explicit bridge
+    /// command (`git shim reconcile`, `git import`, anchoring, clone
     /// bootstrap / `--adopt-git`) wrote the verified checkpoint that the
     /// stale-baseline guard protects. The explicit repair boundary
     /// ([`Self::begin_remediation_txn`]) always observes Git.
-    pub fn bridge_workspace_active(&self) -> Result<bool, RepositoryError> {
+    pub fn shim_workspace_active(&self) -> Result<bool, RepositoryError> {
         if read_workspace_checkpoint(self.root())?.is_some() {
             return Ok(true);
         }
         // Sandboxes share the canonical config but have their own working-
         // copy identity. Provisioning copies files (including .git), not the
-        // host's bridge enrollment. Only a local verified checkpoint enrolls
+        // host's shim enrollment. Only a local verified checkpoint enrolls
         // a sandbox; inheriting the host flag would require a missing anchor.
         if self.is_sandbox() {
             return Ok(false);
@@ -900,10 +900,10 @@ impl Repository {
                 reason: format!("cannot load the repository configuration: {error}"),
             },
         )?;
-        Ok(config.git.bridge.enabled)
+        Ok(config.git.shim.enabled)
     }
 
-    /// Enter the explicit repair boundary used by the bridge remediation path.
+    /// Enter the explicit repair boundary used by the shim remediation path.
     ///
     /// This is the only entry that may proceed while the workspace is
     /// unanchored (missing/stale checkpoint, moved HEAD/index) — repairing that
@@ -1246,11 +1246,11 @@ impl Repository {
                 ));
             }
 
-            // RFC §7.1 step 6: a verified bridge workspace with pending edits
+            // RFC §7.1 step 6: a verified shim workspace with pending edits
             // captures a baseline-relative snapshot plus pre-transition
             // evidence at the boundary, so any later bound HEAD adoption can
             // prove the carried edit (CB-7B). Capture failure refuses the
-            // boundary (fail closed); non-bridge workspaces are unaffected.
+            // boundary (fail closed); non-shim workspaces are unaffected.
             if mode != WorkspaceTxnMode::Observe {
                 self.capture_pending_workspace_evidence(working_copy)?;
             }
@@ -1391,8 +1391,8 @@ impl Repository {
     ) -> Result<HeadAdoptionAttempt, RepositoryError> {
         if budget.is_metadata_only() {
             log::info!(
-                "bridge watch: metadata-only budget refuses bound HEAD adoption; \
-                 the workspace change needs an explicit 'atomic git bridge reconcile'"
+                "shim watch: metadata-only budget refuses bound HEAD adoption; \
+                 the workspace change needs an explicit 'atomic git shim reconcile'"
             );
             return Ok(HeadAdoptionAttempt::Refused);
         }
@@ -1646,7 +1646,7 @@ fn classify_git_state(
     // the durable graph this workspace interprets is unchanged (HEAD, HEAD
     // tree, view, and state all matched above). The recorded index digest
     // stays advisory evidence for the forensic report and
-    // `atomic bridge verify`.
+    // `atomic shim verify`.
     //
     // `UnanchoredWorkspace::IndexTreeChanged` remains a public variant and
     // stays tolerated by the repair boundary, but it is no longer produced
@@ -1660,7 +1660,7 @@ fn classify_git_state(
 /// every mode.
 ///
 /// A detached HEAD is tolerated here because the two remediation commands
-/// that enter this boundary (`git bridge reconcile`, `git import`) are exactly
+/// that enter this boundary (`git shim reconcile`, `git import`) are exactly
 /// the §7.3/§7.5 paths that may resolve a detached commit: a verified binding
 /// adopts through the CB-7A entry adoption; an unbound commit routes through
 /// the §7.5 ephemeral mapping and the CB-9A importer. Ordinary command
@@ -1731,23 +1731,17 @@ pub(crate) fn read_workspace_checkpoint(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => {
             return Err(RepositoryError::InvalidRepository {
-                reason: format!(
-                    "cannot read bridge checkpoint '{}': {error}",
-                    path.display()
-                ),
+                reason: format!("cannot read shim checkpoint '{}': {error}", path.display()),
             })
         }
     };
     let wire: CheckpointWire =
         serde_json::from_slice(&bytes).map_err(|error| RepositoryError::InvalidRepository {
-            reason: format!(
-                "bridge checkpoint '{}' is malformed: {error}",
-                path.display()
-            ),
+            reason: format!("shim checkpoint '{}' is malformed: {error}", path.display()),
         })?;
     if wire.version != 1 && wire.version != 2 {
         return Err(RepositoryError::InvalidRepository {
-            reason: format!("unsupported bridge checkpoint version {}", wire.version),
+            reason: format!("unsupported shim checkpoint version {}", wire.version),
         });
     }
     let git_head_symref = wire
@@ -1775,11 +1769,11 @@ pub(crate) fn workspace_checkpoint_from_bytes(
 ) -> Result<WorkspaceCheckpoint, RepositoryError> {
     let wire: CheckpointWire =
         serde_json::from_slice(bytes).map_err(|error| RepositoryError::InvalidRepository {
-            reason: format!("bridge checkpoint bytes are malformed: {error}"),
+            reason: format!("shim checkpoint bytes are malformed: {error}"),
         })?;
     if wire.version != 1 && wire.version != 2 {
         return Err(RepositoryError::InvalidRepository {
-            reason: format!("unsupported bridge checkpoint version {}", wire.version),
+            reason: format!("unsupported shim checkpoint version {}", wire.version),
         });
     }
     let git_head_symref = wire
@@ -1813,11 +1807,11 @@ pub(crate) fn write_workspace_checkpoint(
     let parent = path
         .parent()
         .ok_or_else(|| RepositoryError::InvalidRepository {
-            reason: "bridge checkpoint path has no parent directory".to_string(),
+            reason: "shim checkpoint path has no parent directory".to_string(),
         })?;
     fs::create_dir_all(parent).map_err(|error| RepositoryError::InvalidRepository {
         reason: format!(
-            "cannot create bridge checkpoint directory '{}': {error}",
+            "cannot create shim checkpoint directory '{}': {error}",
             parent.display()
         ),
     })?;
@@ -1840,10 +1834,7 @@ pub(crate) fn write_workspace_checkpoint(
         let _ = fs::remove_file(&temporary);
     }
     result.map_err(|error| RepositoryError::InvalidRepository {
-        reason: format!(
-            "cannot write bridge checkpoint '{}': {error}",
-            path.display()
-        ),
+        reason: format!("cannot write shim checkpoint '{}': {error}", path.display()),
     })
 }
 
@@ -2303,13 +2294,13 @@ mod tests {
     }
 
     /// CB-13D (RFC §11.2 rule 3): the reactive silence floor is the RFC
-    /// 250 ms minimum, sourced from the bridge watch configuration.
+    /// 250 ms minimum, sourced from the shim watch configuration.
     #[test]
     fn reactive_quiescence_floor_is_the_rfc_250ms_minimum() {
         assert_eq!(MIN_REACTIVE_QUIESCENCE_MS, 250);
         assert_eq!(
             MIN_REACTIVE_QUIESCENCE_MS,
-            atomic_config::BridgeWatchConfig::MIN_QUIET_MS
+            atomic_config::ShimWatchConfig::MIN_QUIET_MS
         );
     }
 

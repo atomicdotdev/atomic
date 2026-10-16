@@ -1,4 +1,4 @@
-//! Bridge entry through the native workspace lifecycle, with default files retained.
+//! Shim entry through the native workspace lifecycle, with default files retained.
 #![cfg(unix)]
 
 use std::fs;
@@ -24,9 +24,9 @@ impl Fixture {
             .env("ATOMIC_NONINTERACTIVE", "1")
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env("GIT_AUTHOR_NAME", "Bridge workspace test")
+            .env("GIT_AUTHOR_NAME", "Shim workspace test")
             .env("GIT_AUTHOR_EMAIL", "bridge@example.invalid")
-            .env("GIT_COMMITTER_NAME", "Bridge workspace test")
+            .env("GIT_COMMITTER_NAME", "Shim workspace test")
             .env("GIT_COMMITTER_EMAIL", "bridge@example.invalid")
             .output()
             .unwrap()
@@ -75,12 +75,12 @@ impl Fixture {
         fs::write(&key, "42".repeat(32)).unwrap();
         fixture.atomic(&[
             "git",
-            "bridge",
+            "shim",
             "enable",
             "--binding-key-file",
             key.to_str().unwrap(),
         ]);
-        fixture.atomic(&["git", "bridge", "reconcile"]);
+        fixture.atomic(&["git", "shim", "reconcile"]);
         fixture
     }
 
@@ -111,7 +111,7 @@ fn preinit_record(native: bool) {
     assert_eq!(f.git(&["show", "HEAD:tracked.txt"]), "edit\n");
     assert!(f.atomic(&["status", "--short"]).trim().is_empty());
     assert!(f.git(&["status", "--porcelain"]).trim().is_empty());
-    f.atomic(&["git", "bridge", "reconcile"]);
+    f.atomic(&["git", "shim", "reconcile"]);
     f.assert_content("main", "tracked.txt", b"edit\n");
 }
 
@@ -141,18 +141,18 @@ fn signed_parent_then_foreign_branch_edit_preserves_file_identity() {
     f.git(&["add", "tracked.txt"]);
     f.git(&["commit", "-qm", "feature edit"]);
     let head = f.git(&["rev-parse", "HEAD"]);
-    f.atomic(&["git", "bridge", "reconcile"]);
+    f.atomic(&["git", "shim", "reconcile"]);
     f.assert_content("feature", "tracked.txt", b"feature edit\n");
     assert_eq!(identity(f.root.path()), before);
     assert_eq!(f.git(&["rev-parse", "HEAD"]), head);
     assert!(f.atomic(&["status", "--short"]).trim().is_empty());
-    f.atomic(&["git", "bridge", "reconcile"]);
+    f.atomic(&["git", "shim", "reconcile"]);
     f.assert_content("feature", "tracked.txt", b"feature edit\n");
     f.assert_content("main", "tracked.txt", b"base\n");
 
     f.git(&["mv", "tracked.txt", "renamed.txt"]);
     f.git(&["commit", "-qm", "rename"]);
-    f.atomic(&["git", "bridge", "reconcile"]);
+    f.atomic(&["git", "shim", "reconcile"]);
     f.assert_content("feature", "renamed.txt", b"feature edit\n");
     {
         let repo = atomic_repository::Repository::open(f.root.path()).unwrap();
@@ -166,17 +166,17 @@ fn signed_parent_then_foreign_branch_edit_preserves_file_identity() {
             .is_none());
     }
     f.git(&["switch", "main"]);
-    f.atomic(&["git", "bridge", "reconcile"]);
+    f.atomic(&["git", "shim", "reconcile"]);
     assert_eq!(
         fs::read(f.root.path().join("tracked.txt")).unwrap(),
         b"base\n"
     );
     f.git(&["switch", "feature"]);
-    f.atomic(&["git", "bridge", "reconcile"]);
+    f.atomic(&["git", "shim", "reconcile"]);
     f.assert_content("feature", "renamed.txt", b"feature edit\n");
     f.git(&["rm", "renamed.txt"]);
     f.git(&["commit", "-qm", "delete"]);
-    f.atomic(&["git", "bridge", "reconcile"]);
+    f.atomic(&["git", "shim", "reconcile"]);
     let repo = atomic_repository::Repository::open(f.root.path()).unwrap();
     assert!(repo
         .get_file_content_on_view("renamed.txt", "feature")
@@ -198,7 +198,7 @@ fn signed_sibling_branches_import_in_either_order() {
             fs::write(f.root.path().join("tracked.txt"), &bytes).unwrap();
             f.git(&["add", "tracked.txt"]);
             f.git(&["commit", "-qm", branch]);
-            f.atomic(&["git", "bridge", "reconcile"]);
+            f.atomic(&["git", "shim", "reconcile"]);
             f.assert_content(branch, "tracked.txt", bytes.as_bytes());
         }
         // Both closures must still reconstruct independently after the other

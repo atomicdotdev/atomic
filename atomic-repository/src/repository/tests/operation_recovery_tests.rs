@@ -455,14 +455,14 @@ fn recovery_between_chained_effects_reverses_only_the_reached_stage() {
     );
 }
 
-/// CB-13C observability: an executed recovery is recorded in the bridge
+/// CB-13C observability: an executed recovery is recorded in the shim
 /// event journal with the original/recovery operation IDs and whether a
 /// new `Recover` operation was created. The automatic sink is
 /// consent-gated (review R1/R4), so the fixture opts in first.
 #[test]
 fn executed_recovery_is_recorded_in_the_event_journal() {
     let (temp, mut repo) = create_temp_repo();
-    opt_in_bridge_telemetry(temp.path());
+    opt_in_shim_telemetry(temp.path());
     let (_prepared, initial, intermediate, _) = prepare_working_copy_chain(&repo);
     let lock = repo.try_lock_operation(repo.working_copy()).unwrap();
     repo.apply_working_copy_state_locked(&lock, &intermediate)
@@ -505,16 +505,16 @@ fn executed_recovery_is_recorded_in_the_event_journal() {
     );
 }
 
-/// Append the explicit bridge opt-in to the repository config: the
+/// Append the explicit shim opt-in to the repository config: the
 /// automatic recovery journal sink is consent-gated (review R1/R4).
-fn opt_in_bridge_telemetry(root: &std::path::Path) {
+fn opt_in_shim_telemetry(root: &std::path::Path) {
     use std::io::Write as _;
     let config = root.join(super::super::DOT_DIR).join("config.toml");
     let mut file = std::fs::OpenOptions::new()
         .append(true)
         .open(&config)
         .unwrap();
-    writeln!(file, "\n[git.bridge]\nenabled = true\n").unwrap();
+    writeln!(file, "\n[git.shim]\nenabled = true\n").unwrap();
 }
 
 /// Review R5: a recovery that fails closed — here a replay lease
@@ -525,7 +525,7 @@ fn opt_in_bridge_telemetry(root: &std::path::Path) {
 #[test]
 fn failed_recovery_records_a_failure_event() {
     let (temp, repo) = create_temp_repo();
-    opt_in_bridge_telemetry(temp.path());
+    opt_in_shim_telemetry(temp.path());
     let path = "tracked.txt";
     let old_bytes = b"old contents\n";
     let target_bytes = b"target contents\n";

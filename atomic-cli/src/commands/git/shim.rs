@@ -1,4 +1,4 @@
-//! Minimal experimental bridge between a clean Git checkout and an Atomic view.
+//! Minimal experimental shim between a clean Git checkout and an Atomic view.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -22,10 +22,10 @@ use git2::{
     ObjectType, Oid, Repository as GitRepository, Status, StatusOptions as GitStatusOptions,
 };
 
-use super::checkpoint::{self, BridgeCheckpoint, VerifiedCheckpointInput};
+use super::checkpoint::{self, ShimCheckpoint, VerifiedCheckpointInput};
 use super::observation::{
-    observe_git, observe_head, BridgeCheckpointObservation, GitObservation, HeadObservation,
-    ObservationError,
+    observe_git, observe_head, GitObservation, HeadObservation, ObservationError,
+    ShimCheckpointObservation,
 };
 use super::parallel::{
     conversion_policy, equivalence_error, git_object_id, verify_complete_equivalence,
@@ -41,7 +41,7 @@ use crate::output::{print_info, print_success, print_warning};
 use atomic_agent::watcher::bridge::{bracket_bridge_transaction, watcher_config};
 use atomic_repository::repository::ReconcileEffectBudget;
 
-/// Journal one bridge-owned Git ref move before it becomes visible, perform
+/// Journal one shim-owned Git ref move before it becomes visible, perform
 /// the move, then record its leased receipt and verify the operation.
 ///
 /// Journal failure returns an error before the write is performed; an
@@ -75,7 +75,7 @@ pub(crate) fn journal_and_move_branch(
     // Journal-before-visibility: the operation (ID + intended effect) is
     // durable before the ref write. Any failure here prevents the write.
     let prepared = repo
-        .prepare_bridge_git_ref_write(
+        .prepare_shim_git_ref_write(
             working_copy,
             target_ref,
             observed_old.clone(),
@@ -145,7 +145,7 @@ pub(crate) fn journal_and_move_branch(
         .ok()
         .and_then(|reference| reference.target())
         .and_then(canonical_ref_target);
-    repo.record_bridge_git_ref_receipt(&prepared, observed_after.clone())
+    repo.record_shim_git_ref_receipt(&prepared, observed_after.clone())
         .map_err(|error| git_error(error.to_string()))?;
     // CB-13D ::24 AC-5 crash-during-effect failpoint: the effect has
     // LANDED (the ref move + its leased receipt are durable) but the
@@ -158,7 +158,7 @@ pub(crate) fn journal_and_move_branch(
             "debug failpoint: ATOMIC_FAIL_RECONCILE_EXPORT_MID_EFFECT",
         ));
     }
-    repo.finalize_bridge_git_write(prepared, observed_after)
+    repo.finalize_shim_git_write(prepared, observed_after)
         .map_err(|error| git_error(error.to_string()))?;
     Ok(())
 }
@@ -211,7 +211,7 @@ pub(crate) fn journal_and_create_branch_cas(
     // Journal-before-visibility: the operation (ID + intended effect) is
     // durable before the ref write. Any failure here prevents the write.
     let prepared = repo
-        .prepare_bridge_git_ref_write(working_copy, target_ref, None, intended_new, evidence)
+        .prepare_shim_git_ref_write(working_copy, target_ref, None, intended_new, evidence)
         .map_err(|error| {
             git_error(format!(
                 "cannot journal '{target_ref}' before writing: {error}"
@@ -262,9 +262,9 @@ pub(crate) fn journal_and_create_branch_cas(
         .ok()
         .and_then(|reference| reference.target())
         .and_then(canonical_ref_target);
-    repo.record_bridge_git_ref_receipt(&prepared, observed_after.clone())
+    repo.record_shim_git_ref_receipt(&prepared, observed_after.clone())
         .map_err(|error| git_error(error.to_string()))?;
-    repo.finalize_bridge_git_write(prepared, observed_after)
+    repo.finalize_shim_git_write(prepared, observed_after)
         .map_err(|error| git_error(error.to_string()))?;
     Ok(())
 }
@@ -304,7 +304,7 @@ pub(crate) fn journal_and_create_branch_cas_with_mapping(
         format!("atomic:bridge-ref-create:v1\0{target_ref}\0{commit}").as_bytes(),
     );
     let prepared = repo
-        .prepare_bridge_git_ref_write_with_metadata(
+        .prepare_shim_git_ref_write_with_metadata(
             working_copy,
             target_ref,
             None,
@@ -355,24 +355,24 @@ pub(crate) fn journal_and_create_branch_cas_with_mapping(
         .ok()
         .and_then(|reference| reference.target())
         .and_then(canonical_ref_target);
-    repo.record_bridge_git_ref_receipt(&prepared, observed_after.clone())
+    repo.record_shim_git_ref_receipt(&prepared, observed_after.clone())
         .map_err(|error| git_error(error.to_string()))?;
-    repo.complete_bridge_git_write_with_metadata(prepared, observed_after)
+    repo.complete_shim_git_write_with_metadata(prepared, observed_after)
         .map_err(|error| git_error(error.to_string()))?;
     Ok(())
 }
 
 /// Reconcile and verify a clean, attached Git checkout against Atomic.
 #[derive(Parser, Debug, Default)]
-#[command(name = "bridge")]
-pub struct Bridge {
+#[command(name = "shim")]
+pub struct Shim {
     #[command(subcommand)]
-    pub command: BridgeCommand,
+    pub command: ShimCommand,
 }
 
 #[derive(Subcommand, Debug, Default)]
-pub enum BridgeCommand {
-    /// Incrementally import Git HEAD, verify it, and record bridge metadata.
+pub enum ShimCommand {
+    /// Incrementally import Git HEAD, verify it, and record shim metadata.
     #[default]
     Reconcile,
     /// Read-only comparison of Git HEAD and the current Atomic view.
@@ -399,7 +399,7 @@ pub enum BridgeCommand {
         #[arg(long)]
         branch: String,
     },
-    /// Enable the advisory Git checkout event bridge and anchor bridge state.
+    /// Enable the advisory Git checkout event shim and anchor shim state.
     ///
     /// With `--mirror-ignores`, `.atomicignore` patterns that are not already
     /// represented in Git ignore sources are mirrored into a managed
@@ -451,13 +451,13 @@ pub enum BridgeCommand {
     /// Mirror .atomicignore into the managed .git/info/exclude block
     /// (explicit consent).
     MirrorIgnores,
-    /// Roll the bridge back: record `[git.bridge] enabled = false` in the
+    /// Roll the shim back: record `[git.shim] enabled = false` in the
     /// repository configuration (review R4: the tested rollback path).
     ///
     /// The advisory dispatchers installed by `enable` remain on disk —
     /// they are advisory evidence hooks, not the guarantee (RFC §10.3) —
     /// and the automatic telemetry sink stops writing once consent is
-    /// withdrawn. Run `atomic git bridge enable` again to re-record the
+    /// withdrawn. Run `atomic git shim enable` again to re-record the
     /// opt-in.
     Disable,
     /// Sign, publish, and verify immutable Git state bindings.
@@ -538,14 +538,14 @@ pub enum BridgeCommand {
     },
     /// Watch Git metadata and reconcile reactively (CB-13D, optional).
     ///
-    /// The metadata-only bridge watch daemon: an accelerator, never the
+    /// The metadata-only shim watch daemon: an accelerator, never the
     /// guarantee. It treats Git metadata differences as wake-up hints,
     /// waits for at least 250 ms of silence with no Git index/ref locks
     /// and no sequence operations, then runs the shared workspace
     /// transaction path under a metadata-only budget — it never
     /// materializes files and never moves Git refs; export-classified
     /// runs are refused with a notice instead. Opt-in only via
-    /// `[git.bridge] enabled = true` plus `[git.bridge.watch] enabled`.
+    /// `[git.shim] enabled = true` plus `[git.shim.watch] enabled`.
     Watch {
         /// Run exactly one reactive pass and exit (test/equivalence mode).
         #[arg(long)]
@@ -554,14 +554,14 @@ pub enum BridgeCommand {
         #[arg(long, default_value_t = super::watch::DEFAULT_POLL_INTERVAL_MS)]
         poll_ms: u64,
     },
-    /// Cut the repository over to the colocated bridge (CB-13B).
+    /// Cut the repository over to the colocated shim (CB-13B).
     ///
     /// The cutover is the exclusive enablement-state transition that ends
     /// the two-writer window: it journals a `Cutover` metadata operation
     /// and moves the `required-capability/git-bridge-cutover` row from
     /// absent to the fenced version, after which the legacy shadow writer
-    /// refuses and the colocated bridge owns writes. Requires the explicit
-    /// opt-in (`atomic git bridge enable`) and full migration readiness;
+    /// refuses and the colocated shim owns writes. Requires the explicit
+    /// opt-in (`atomic git shim enable`) and full migration readiness;
     /// hook, remote and unsupported surfaces are reported and refuse —
     /// nothing is migrated partially.
     ///
@@ -575,21 +575,19 @@ pub enum BridgeCommand {
     },
 }
 
-impl Command for Bridge {
+impl Command for Shim {
     fn run(&self) -> CliResult<()> {
         match &self.command {
-            BridgeCommand::Reconcile => reconcile(),
-            BridgeCommand::Verify => {
+            ShimCommand::Reconcile => reconcile(),
+            ShimCommand::Verify => {
                 verify()?;
                 print_success("Git HEAD matches the current Atomic view");
                 Ok(())
             }
-            BridgeCommand::Switch { view } => switch(view),
-            BridgeCommand::Status => super::ref_mapping::run_status(),
-            BridgeCommand::Publish { view, branch } => {
-                super::ref_mapping::run_publish(view, branch)
-            }
-            BridgeCommand::Enable {
+            ShimCommand::Switch { view } => switch(view),
+            ShimCommand::Status => super::ref_mapping::run_status(),
+            ShimCommand::Publish { view, branch } => super::ref_mapping::run_publish(view, branch),
+            ShimCommand::Enable {
                 mirror_ignores,
                 adopt_atomic,
                 adopt_git,
@@ -603,20 +601,20 @@ impl Command for Bridge {
                 if *adopt_git {
                     return Err(anchor::adopt_git_refusal());
                 }
-                hooks::enable_bridge(&root, *mirror_ignores)?;
+                hooks::enable_shim(&root, *mirror_ignores)?;
                 // Review R4: the explicit CLI enable IS the consent, so it
                 // is recorded where it is consumed. The repository
-                // configuration now records `[git.bridge] enabled = true`;
-                // `git bridge disable` rolls it back.
-                if record_bridge_opt_in(&root, true)? {
+                // configuration now records `[git.shim] enabled = true`;
+                // `git shim disable` rolls it back.
+                if record_shim_opt_in(&root, true)? {
                     print_info(
-                        "Recorded explicit bridge opt-in in the repository configuration ([git.bridge] enabled = true).",
+                        "Recorded explicit shim opt-in in the repository configuration ([git.shim] enabled = true).",
                     );
                 }
                 // Report the default-enablement gate honestly (review R4:
                 // the helper gains a real consumer). Explicit opt-in is
                 // experimental consent, never default-rollout approval.
-                match bridge_config(&root)?.git.bridge.default_enablement() {
+                match shim_config(&root)?.git.shim.default_enablement() {
                     Ok(()) => print_info(
                         "All rollout gates are measured and passed; default (automatic) enablement still requires recorded owner approval of the thresholds.",
                     ),
@@ -641,7 +639,7 @@ impl Command for Bridge {
                         )),
                         Err(error) => print_warning(&format!(
                             "fetch refspecs not configured: {error}; binding refs will not \
-                             transfer with fetch until 'atomic git bridge enable --remote <name>' \
+                             transfer with fetch until 'atomic git shim enable --remote <name>' \
                              succeeds"
                         )),
                     }
@@ -656,28 +654,28 @@ impl Command for Bridge {
                     },
                 )
             }
-            BridgeCommand::MirrorIgnores => {
+            ShimCommand::MirrorIgnores => {
                 let root = find_repository_root()?;
                 hooks::mirror_ignores_with_consent(&root)
             }
-            BridgeCommand::Disable => {
+            ShimCommand::Disable => {
                 let root = find_repository_root()?;
-                if record_bridge_opt_in(&root, false)? {
+                if record_shim_opt_in(&root, false)? {
                     print_success(
-                        "Recorded bridge rollback in the repository configuration ([git.bridge] enabled = false). The automatic telemetry sink stops writing without consent; advisory dispatchers remain on disk.",
+                        "Recorded shim rollback in the repository configuration ([git.shim] enabled = false). The automatic telemetry sink stops writing without consent; advisory dispatchers remain on disk.",
                     );
                 } else {
-                    print_info("Bridge was already disabled in the repository configuration.");
+                    print_info("Shim was already disabled in the repository configuration.");
                 }
                 Ok(())
             }
-            BridgeCommand::Cutover { rollback } => run_cutover(*rollback),
-            BridgeCommand::Binding { command } => command.clone().run(),
-            BridgeCommand::Review { view } => {
+            ShimCommand::Cutover { rollback } => run_cutover(*rollback),
+            ShimCommand::Binding { command } => command.clone().run(),
+            ShimCommand::Review { view } => {
                 let root = find_repository_root()?;
-                super::hooks::run_bridge_review(&root, view.as_deref())
+                super::hooks::run_shim_review(&root, view.as_deref())
             }
-            BridgeCommand::HookPostCheckout {
+            ShimCommand::HookPostCheckout {
                 old_head,
                 new_head,
                 checkout_flag,
@@ -685,30 +683,30 @@ impl Command for Bridge {
                 let root = find_repository_root()?;
                 hooks::record_post_checkout(&root, old_head, new_head, checkout_flag)
             }
-            BridgeCommand::HookPostRewrite => {
+            ShimCommand::HookPostRewrite => {
                 let root = find_repository_root()?;
                 hooks::record_post_rewrite(&root)
             }
-            BridgeCommand::HookPreCommit => {
+            ShimCommand::HookPreCommit => {
                 let root = find_repository_root()?;
                 hooks::record_pre_commit(&root)
             }
-            BridgeCommand::HookReferenceTransaction { state } => {
+            ShimCommand::HookReferenceTransaction { state } => {
                 let root = find_repository_root()?;
                 hooks::record_reference_transaction(&root, state)
             }
-            BridgeCommand::HookPrePush => {
+            ShimCommand::HookPrePush => {
                 let root = find_repository_root()?;
                 hooks::run_pre_push_verification(&root)
             }
-            BridgeCommand::VerifyReceive { unprotected } => {
+            ShimCommand::VerifyReceive { unprotected } => {
                 let root = find_repository_root()?;
                 super::verify_receive::run_verify_receive(&root, unprotected)
             }
-            BridgeCommand::ObserveDeferred { root, request } => {
+            ShimCommand::ObserveDeferred { root, request } => {
                 hooks::run_deferred_observation(root, request)
             }
-            BridgeCommand::Watch { once, poll_ms } => {
+            ShimCommand::Watch { once, poll_ms } => {
                 let root = find_repository_root()?;
                 super::watch::run_watch(&root, *once, *poll_ms)
             }
@@ -717,7 +715,7 @@ impl Command for Bridge {
 }
 
 #[derive(Debug)]
-pub(crate) struct BridgeSnapshot {
+pub(crate) struct ShimSnapshot {
     pub(crate) view: String,
     pub(crate) atomic_state: String,
     pub(crate) git_head: String,
@@ -753,16 +751,16 @@ fn classify_direction(
 fn reconcile() -> CliResult<()> {
     let root = find_repository_root()?;
     // The transaction brackets the FileWatcher with atomic-bridge enter/leave,
-    // including failure cleanup; bridge-originated writes inside the span are
+    // including failure cleanup; shim-originated writes inside the span are
     // self-suppressed so they never feed back into reconciliation.
-    bracket_bridge_transaction(watcher_config(&root), "bridge-reconcile", || {
+    bracket_bridge_transaction(watcher_config(&root), "shim-reconcile", || {
         reconcile_transaction_budgeted(&root, ReconcileEffectBudget::Command, None)
     })
 }
 
-/// Load the repository configuration for `root` (review R4: the bridge
+/// Load the repository configuration for `root` (review R4: the shim
 /// consent surface is read where it is acted on, not only in tests).
-pub(crate) fn bridge_config(root: &Path) -> CliResult<atomic_config::RepoConfig> {
+pub(crate) fn shim_config(root: &Path) -> CliResult<atomic_config::RepoConfig> {
     let config_path = Repository::canonical_dot_dir(root)
         .map_err(CliError::from)?
         .join("config.toml");
@@ -770,7 +768,7 @@ pub(crate) fn bridge_config(root: &Path) -> CliResult<atomic_config::RepoConfig>
         .map_err(|error| git_error(format!("cannot load the repository configuration: {error}")))
 }
 
-/// Record the explicit bridge consent in the repository configuration.
+/// Record the explicit shim consent in the repository configuration.
 /// Returns whether the file changed. Review R4: the CLI enable/disable
 /// action and the flag become one reachable consent/activation path.
 ///
@@ -778,10 +776,10 @@ pub(crate) fn bridge_config(root: &Path) -> CliResult<atomic_config::RepoConfig>
 /// lock with an expected-old lease and an atomic file replacement — the
 /// caller's observed consent state is the lease, so a concurrent consent
 /// change refuses instead of being overwritten.
-fn record_bridge_opt_in(root: &Path, enabled: bool) -> CliResult<bool> {
-    let observed = bridge_config(root)?.git.bridge.enabled;
+fn record_shim_opt_in(root: &Path, enabled: bool) -> CliResult<bool> {
+    let observed = shim_config(root)?.git.shim.enabled;
     let repo = Repository::open(root).map_err(CliError::from)?;
-    repo.set_bridge_consent(enabled, Some(observed))
+    repo.set_shim_consent(enabled, Some(observed))
         .map_err(CliError::from)
 }
 
@@ -794,22 +792,22 @@ fn run_cutover(rollback: bool) -> CliResult<()> {
     let root = find_repository_root()?;
     if rollback {
         let mut repo = Repository::open(&root).map_err(CliError::from)?;
-        let undone = repo.rollback_bridge_cutover().map_err(CliError::from)?;
+        let undone = repo.rollback_shim_cutover().map_err(CliError::from)?;
         print_success(&format!(
             "Cutover {undone} rolled back through the journal's typed inverse; \
              the legacy shadow writer fence is lifted and newer format fences are kept."
         ));
         return Ok(());
     }
-    let config = bridge_config(&root)?;
-    if !config.git.bridge.enabled {
+    let config = shim_config(&root)?;
+    if !config.git.shim.enabled {
         return Err(git_error(
-            "bridge cutover requires the explicit opt-in consent; run \
-             `atomic git bridge enable` first (the cutover never enables implicitly)",
+            "shim cutover requires the explicit opt-in consent; run \
+             `atomic git shim enable` first (the cutover never enables implicitly)",
         ));
     }
     let repo = Repository::open(&root).map_err(CliError::from)?;
-    let outcome = repo.execute_bridge_cutover().map_err(CliError::from)?;
+    let outcome = repo.execute_shim_cutover().map_err(CliError::from)?;
     if outcome.resumed {
         print_success(&format!(
             "Resumed the interrupted cutover {}: the fence was already durable and the \
@@ -820,10 +818,10 @@ fn run_cutover(rollback: bool) -> CliResult<()> {
                 .unwrap_or_default()
         ));
     } else if outcome.already_fenced {
-        print_info("The repository is already cut over to the colocated bridge; nothing to do.");
+        print_info("The repository is already cut over to the colocated shim; nothing to do.");
     } else {
         print_success(&format!(
-            "Cutover {} journaled and verified: the colocated bridge now owns writes and \
+            "Cutover {} journaled and verified: the colocated shim now owns writes and \
              the legacy shadow writer is fenced.",
             outcome
                 .operation
@@ -834,7 +832,7 @@ fn run_cutover(rollback: bool) -> CliResult<()> {
     Ok(())
 }
 
-/// Record one change-source degradation from an explicit bridge command
+/// Record one change-source degradation from an explicit shim command
 /// boundary (review R1: status returns its metrics without writing; only
 /// an authorized boundary decides to record them). Consent-gated
 /// (`for_repository`) and lossy.
@@ -863,28 +861,28 @@ pub(crate) enum WatchNoticeKind {
     /// A Git-owned transaction or divergence prevents reconciling now.
     UnsafeState,
     /// Atomic moved ahead of Git; reactive export is suppressed and an
-    /// explicit `atomic git bridge reconcile` is required.
+    /// explicit `atomic git shim reconcile` is required.
     ExportSuppressed,
 }
 
 /// Callback receiving one watch notice; `String` is the human detail.
 pub(crate) type WatchNoticeSink<'s> = dyn Fn(WatchNoticeKind, &str) + 's;
 
-/// One `atomic git bridge reconcile` run under an explicit effect budget.
+/// One `atomic git shim reconcile` run under an explicit effect budget.
 ///
 /// `Command` (the CLI command) may project Atomic→Git under its
-/// expected-old lease. `MetadataOnly` (the optional bridge watch daemon,
+/// expected-old lease. `MetadataOnly` (the optional shim watch daemon,
 /// CB-13D) runs the identical shared transaction path — the same entry
 /// boundary, observation, classification, and import code — but never
 /// exports and never materializes: an export-classified run is refused
 /// with a journal event and a session notice instead of moving refs.
 /// CB-13D ::24 R4: the suppression attribution marker — the JOURNAL
-/// OperationId of the just-completed bridge operation and the working-copy
+/// OperationId of the just-completed shim operation and the working-copy
 /// heads it advanced, so watcher self-event matching binds observed changes
 /// to the operation that caused them (never an invocation or pid label).
 /// Best-effort: suppression attribution is advisory, and a failure to
 /// record it never fails the reconciled pass.
-pub(crate) fn record_last_bridge_operation(root: &Path) {
+pub(crate) fn record_last_shim_operation(root: &Path) {
     let record = (|| -> CliResult<()> {
         let repo = Repository::open_readonly(root).map_err(CliError::from)?;
         let working_copy = repo.require_working_copy_id().map_err(CliError::from)?;
@@ -917,7 +915,7 @@ pub(crate) fn record_last_bridge_operation(root: &Path) {
         Ok(())
     })();
     if let Err(error) = record {
-        log::warn!("bridge watch: could not record the suppression attribution: {error}");
+        log::warn!("shim watch: could not record the suppression attribution: {error}");
     }
 }
 
@@ -935,7 +933,7 @@ pub(crate) fn reconcile_transaction_budgeted(
     // CB-13C observability: one journal per reconcile run; every terminal
     // outcome below records a stable `reconcile` event (review R5: including
     // the entry/observation failures that previously bypassed the sink).
-    // Emission is lossy; reconcile is an explicit bridge command boundary.
+    // Emission is lossy; reconcile is an explicit shim command boundary.
     let journal = BridgeEventJournal::new(
         &Repository::canonical_dot_dir(root).map_err(CliError::from)?,
         None,
@@ -975,8 +973,8 @@ pub(crate) fn reconcile_transaction_budgeted(
                 &format!("reactive reconcile deferred: {detail}"),
             );
             return Err(git_error(format!(
-                "the bridge watch daemon defers: {detail}; \
-                 run 'atomic git bridge reconcile' explicitly"
+                "the shim watch daemon defers: {detail}; \
+                 run 'atomic git shim reconcile' explicitly"
             )));
         }
         Err(error) => {
@@ -1109,7 +1107,7 @@ pub(crate) fn reconcile_transaction_budgeted(
             return Err(git_error(format!(
                 "Git and Atomic both advanced beyond the last mutually observed mapping for view '{}'; \
                  neither side was moved. Resolve with 'atomic view insert' from the other side or \
-                 'git merge', then re-run 'atomic git bridge reconcile'",
+                 'git merge', then re-run 'atomic git shim reconcile'",
                 current.view
             )));
         }
@@ -1142,7 +1140,7 @@ pub(crate) fn reconcile_transaction_budgeted(
                         "the mapped ref '{}' for view '{}' advanced beyond the last observed \
                          mapping independently of Git HEAD; no automatic import was performed. \
                          Reconcile the mapped ref explicitly (resolve it with 'git update-ref' or \
-                         re-publish), then re-run 'atomic git bridge reconcile'",
+                         re-publish), then re-run 'atomic git shim reconcile'",
                         mapping.local_ref.as_deref().unwrap_or("<none>"),
                         current.view
                     )));
@@ -1287,11 +1285,11 @@ pub(crate) fn reconcile_transaction_budgeted(
                 emit_notice(
                     WatchNoticeKind::ExportSuppressed,
                     "the Atomic view advanced beyond Git HEAD; reactive export is suppressed — \
-                     run 'atomic git bridge reconcile' explicitly",
+                     run 'atomic git shim reconcile' explicitly",
                 );
                 return Err(git_error(
-                    "the bridge watch daemon reconciles metadata only and never exports \
-                     Atomic→Git; run 'atomic git bridge reconcile' explicitly to project",
+                    "the shim watch daemon reconciles metadata only and never exports \
+                     Atomic→Git; run 'atomic git shim reconcile' explicitly to project",
                 ));
             }
             let projected = (|| -> CliResult<()> {
@@ -1346,11 +1344,11 @@ pub(crate) fn reconcile_transaction_budgeted(
             });
             emit_notice(
                 WatchNoticeKind::UnsafeState,
-                "Git HEAD and Atomic state both changed since the bridge checkpoint; \
+                "Git HEAD and Atomic state both changed since the shim checkpoint; \
                  resolve the divergence explicitly",
             );
             Err(git_error(
-                "Git HEAD and Atomic state both changed since the bridge checkpoint; reconcile the divergence explicitly",
+                "Git HEAD and Atomic state both changed since the shim checkpoint; reconcile the divergence explicitly",
             ))
         }
     }
@@ -1359,19 +1357,22 @@ pub(crate) fn reconcile_transaction_budgeted(
 fn switch(target: &str) -> CliResult<()> {
     let root = find_repository_root()?;
     // The transaction brackets the FileWatcher with atomic-bridge enter/leave,
-    // including failure cleanup; bridge-originated writes inside the span are
+    // including failure cleanup; shim-originated writes inside the span are
     // self-suppressed so they never feed back into reconciliation.
     bracket_bridge_transaction(
         watcher_config(&root),
-        &format!("bridge-switch:{target}"),
+        &format!("shim-switch:{target}"),
         || switch_transaction(&root, target),
     )
 }
 
 #[tracing::instrument(name = "switch", skip_all, fields(view = target))]
 fn switch_transaction(root: &Path, target: &str) -> CliResult<()> {
-    let checkpoint = read_workspace_metadata(root)?
-        .ok_or_else(|| git_error("bridge switch requires an existing checkpoint; run 'atomic git bridge reconcile' first"))?;
+    let checkpoint = read_workspace_metadata(root)?.ok_or_else(|| {
+        git_error(
+            "shim switch requires an existing checkpoint; run 'atomic git shim reconcile' first",
+        )
+    })?;
     let mut repo = Repository::open(root).map_err(CliError::from)?;
 
     // Shared workspace transaction: switch is a mutating boundary that owns
@@ -1388,7 +1389,7 @@ fn switch_transaction(root: &Path, target: &str) -> CliResult<()> {
     let aligned_view = workspace_head_aligned(&repo, working_copy, &git)?.0;
     if aligned_view != current.view || !checkpoint_matches_snapshot(&checkpoint, &current) {
         return Err(git_error(
-            "current Git and Atomic state does not match the bridge checkpoint; reconcile before switching",
+            "current Git and Atomic state does not match the shim checkpoint; reconcile before switching",
         ));
     }
     tracing::info!(
@@ -1426,9 +1427,9 @@ fn switch_transaction(root: &Path, target: &str) -> CliResult<()> {
         verify_with(&repo, working_copy, &git)?;
     }
 
-    if std::env::var("ATOMIC_TEST_BRIDGE_FAIL_BEFORE_MATERIALIZE").as_deref() == Ok("1") {
+    if std::env::var("ATOMIC_TEST_SHIM_FAIL_BEFORE_MATERIALIZE").as_deref() == Ok("1") {
         return Err(git_error(
-            "bridge switch stopped before Atomic materialization by ATOMIC_TEST_BRIDGE_FAIL_BEFORE_MATERIALIZE",
+            "shim switch stopped before Atomic materialization by ATOMIC_TEST_SHIM_FAIL_BEFORE_MATERIALIZE",
         ));
     }
 
@@ -1536,7 +1537,7 @@ fn git_branch_paths(git: &GitRepository, branch: &str) -> CliResult<BTreeSet<Str
         .map_err(|error| {
             if error.code() == git2::ErrorCode::NotFound {
                 git_error(format!(
-                    "target Git branch '{branch}' does not exist; bridge switch requires an existing target branch"
+                    "target Git branch '{branch}' does not exist; shim switch requires an existing target branch"
                 ))
             } else {
                 git_error(format!("cannot read target Git branch '{branch}': {error}"))
@@ -1596,7 +1597,7 @@ fn plan_switch_collisions(
     Ok(())
 }
 
-fn checkpoint_matches_snapshot(checkpoint: &BridgeCheckpoint, snapshot: &BridgeSnapshot) -> bool {
+fn checkpoint_matches_snapshot(checkpoint: &ShimCheckpoint, snapshot: &ShimSnapshot) -> bool {
     checkpoint.view == snapshot.view
         && checkpoint.atomic_state == snapshot.atomic_state
         && checkpoint.git_head == snapshot.git_head
@@ -1641,7 +1642,7 @@ fn find_or_create_target_commit(
         .map_err(|error| git_error(format!("cannot read target Git tree: {error}")))?;
     let signature = projection_signature(git)?;
     let message = format!(
-        "Atomic bridge switch projection\n\nAtomic-View: {target}\nAtomic-State: {atomic_state}\n"
+        "Atomic shim switch projection\n\nAtomic-View: {target}\nAtomic-State: {atomic_state}\n"
     );
     git.commit(None, &signature, &signature, &message, &tree, &[&parent])
         .map_err(|error| {
@@ -1664,7 +1665,7 @@ fn update_target_branch(
         git,
         target_ref,
         commit,
-        "atomic bridge switch",
+        "atomic shim switch",
     )
 }
 
@@ -1714,7 +1715,7 @@ fn import_git_to_atomic_budgeted(root: &Path, budget: ReconcileEffectBudget) -> 
                     return Err(CliError::Repository(
                         atomic_repository::RepositoryError::ReactiveDeferred {
                             detail: format!(
-                                "detached Git HEAD '{oid_hex}' would create ephemeral view                                  '{view}'; that metadata-changing import step is deferred to                                  an explicit 'atomic git bridge reconcile'"
+                                "detached Git HEAD '{oid_hex}' would create ephemeral view                                  '{view}'; that metadata-changing import step is deferred to                                  an explicit 'atomic git shim reconcile'"
                             ),
                         },
                     ));
@@ -1787,7 +1788,7 @@ fn import_git_to_atomic_budgeted(root: &Path, budget: ReconcileEffectBudget) -> 
                     .to_string();
                 if source_state != checkpoint.atomic_state {
                     return Err(git_error(format!(
-                    "bridge checkpoint claims Atomic state {} for view '{}', but the actual state is {}",
+                    "shim checkpoint claims Atomic state {} for view '{}', but the actual state is {}",
                     checkpoint.atomic_state, checkpoint.view, source_state
                 )));
                 }
@@ -1797,7 +1798,7 @@ fn import_git_to_atomic_budgeted(root: &Path, budget: ReconcileEffectBudget) -> 
                     &checkpoint.view,
                     root,
                     &git,
-                    "branch-only bridge adoption",
+                    "branch-only shim adoption",
                 )?;
                 drop(git);
 
@@ -1899,7 +1900,7 @@ fn import_git_to_atomic_budgeted(root: &Path, budget: ReconcileEffectBudget) -> 
     // CB-10A: the import moved the workspace view; record the fresh
     // Synchronized observation under a journaled RefMapping operation.
     refresh_import_mapping_budgeted(root, &snapshot, budget)?;
-    record_last_bridge_operation(root);
+    record_last_shim_operation(root);
     print_success("Reconciled Git HEAD with the current Atomic view");
     Ok(())
 }
@@ -1908,7 +1909,7 @@ fn import_git_to_atomic_budgeted(root: &Path, budget: ReconcileEffectBudget) -> 
 /// import observed Git's new tip and imported it into the view). No verified
 /// export happened: the previous export binding is preserved (CB-10A review
 /// R4 — only a verified export transition binds the export state).
-fn refresh_import_mapping(root: &Path, snapshot: &BridgeSnapshot) -> CliResult<()> {
+fn refresh_import_mapping(root: &Path, snapshot: &ShimSnapshot) -> CliResult<()> {
     refresh_import_mapping_budgeted(root, snapshot, ReconcileEffectBudget::Command)
 }
 
@@ -1916,7 +1917,7 @@ fn refresh_import_mapping(root: &Path, snapshot: &BridgeSnapshot) -> CliResult<(
 /// daemon defers instead of running recovery inside the writable open.
 fn refresh_import_mapping_budgeted(
     root: &Path,
-    snapshot: &BridgeSnapshot,
+    snapshot: &ShimSnapshot,
     budget: ReconcileEffectBudget,
 ) -> CliResult<()> {
     let repo = Repository::open_with_budget(root, budget).map_err(CliError::from)?;
@@ -1940,11 +1941,11 @@ pub(crate) enum CheckpointRefresh {
     SkippedViewMismatch,
 }
 
-/// Refresh the local v2 checkpoint only when the existing bridge verifier can
+/// Refresh the local v2 checkpoint only when the existing shim verifier can
 /// prove that Git and the persisted Atomic working-copy view are fully aligned.
 ///
 /// No-Git repositories and intentional branch/view mismatches are no-ops. The
-/// latter is required by bridge incremental raw-switch adoption: `Import::run`
+/// latter is required by shim incremental raw-switch adoption: `Import::run`
 /// preserves the old Atomic pointer until `import_git_to_atomic` aligns it.
 pub(crate) fn refresh_checkpoint_after_verified_import(
     repo: &Repository,
@@ -1975,7 +1976,7 @@ pub(crate) fn refresh_checkpoint_after_verified_import(
         .map_err(|error| git_error(format!("cannot read Git HEAD tree: {error}")))?;
     // HEAD-stability anchors on the commit's RAW tree; the projection
     // equivalence compares against the same tree MINUS the declared
-    // exclusions (bridge-private paths and import-ignore patterns), which is
+    // exclusions (shim-private paths and import-ignore patterns), which is
     // what `expected_tree` carries.
     if tree.id().as_bytes() != git_tree.as_bytes() {
         return Err(git_error(
@@ -2003,7 +2004,7 @@ pub(crate) fn refresh_checkpoint_after_verified_import(
         .map_err(CliError::from)?
         .state
         .to_string();
-    let checkpoint = BridgeCheckpoint {
+    let checkpoint = ShimCheckpoint {
         version: checkpoint::CHECKPOINT_VERSION,
         view: view.to_string(),
         atomic_state,
@@ -2096,9 +2097,9 @@ fn refresh_detached_checkpoint(
     if project.git.root.as_bytes() != commit.tree_id().as_bytes() {
         return Ok(CheckpointRefresh::SkippedViewMismatch);
     }
-    verify_complete_equivalence(&repo, &view, root, &git, "Git bridge verification")?;
+    verify_complete_equivalence(&repo, &view, root, &git, "Git shim verification")?;
     drop(repo);
-    let snapshot = BridgeSnapshot {
+    let snapshot = ShimSnapshot {
         view,
         atomic_state: view_state,
         git_head: oid.to_string(),
@@ -2108,7 +2109,7 @@ fn refresh_detached_checkpoint(
     Ok(CheckpointRefresh::Refreshed)
 }
 
-/// CB-13A R2: the operations-head layer of `bridge verify`, collected
+/// CB-13A R2: the operations-head layer of `shim verify`, collected
 /// read-only through the public operation log.
 ///
 /// A repository-scope or working-copy-scope head that is diverged, or whose
@@ -2208,7 +2209,7 @@ fn operation_layer_verdict(
 }
 
 #[tracing::instrument(name = "verify", skip_all)]
-fn verify() -> CliResult<BridgeSnapshot> {
+fn verify() -> CliResult<ShimSnapshot> {
     let root = find_repository_root()?;
     // CB-13A R2: diagnosis is a read-only observation boundary. Opening for
     // operation inspection performs no migration, no deferred-tree alignment,
@@ -2220,7 +2221,7 @@ fn verify() -> CliResult<BridgeSnapshot> {
     let policy = conversion_policy(&git)?;
     let filter = GitAttributesFilter::for_repository(&root);
 
-    // CB-11A: `atomic bridge verify` proves all five layers, or reports
+    // CB-11A: `atomic shim verify` proves all five layers, or reports
     // structured divergence. Every check is read-only.
     let mut verdicts: Vec<(&'static str, bool, String)> = Vec::new();
 
@@ -2398,7 +2399,7 @@ fn verify() -> CliResult<BridgeSnapshot> {
     }
     if !failed.is_empty() {
         return Err(git_error(format!(
-            "bridge verification found {} diverged layer(s): {}",
+            "shim verification found {} diverged layer(s): {}",
             failed.len(),
             failed
                 .iter()
@@ -2412,14 +2413,14 @@ fn verify() -> CliResult<BridgeSnapshot> {
     // aligns with the desired view's projection.
     let (branch, head, tree) = workspace_head_aligned(&repo, working_copy, &git)?;
     require_clean_git_worktree(&git)?;
-    verify_complete_equivalence(&repo, &branch, &root, &git, "Git bridge verification")?;
+    verify_complete_equivalence(&repo, &branch, &root, &git, "Git shim verification")?;
     let atomic_state = repo
         .get_view_info(&branch)
         .map_err(CliError::from)?
         .state
         .to_string();
 
-    Ok(BridgeSnapshot {
+    Ok(ShimSnapshot {
         view: branch,
         atomic_state,
         git_head: head.to_string(),
@@ -2428,7 +2429,7 @@ fn verify() -> CliResult<BridgeSnapshot> {
 }
 
 #[tracing::instrument(name = "verify", skip_all)]
-fn verify_at(root: &Path) -> CliResult<BridgeSnapshot> {
+fn verify_at(root: &Path) -> CliResult<ShimSnapshot> {
     // CB-13A R2: the same read-only diagnostic boundary as `verify` — the
     // repository is observed for operation inspection without recovery.
     let repo = Repository::open_readonly_for_operation_inspection(root).map_err(CliError::from)?;
@@ -2449,7 +2450,7 @@ fn verify_at(root: &Path) -> CliResult<BridgeSnapshot> {
         .status(working_copy, StatusOptions::default())
         .map_err(CliError::from)?;
     // CB-13C review R1: status itself never writes telemetry. This helper
-    // runs only inside explicit bridge command flows (reconcile/switch/
+    // runs only inside explicit shim command flows (reconcile/switch/
     // import/publish), so it is the authorized sink boundary that records
     // the degradation the status metrics just returned — consent-gated via
     // `for_repository`.
@@ -2466,14 +2467,14 @@ fn verify_at(root: &Path) -> CliResult<BridgeSnapshot> {
     if !atomic_status.is_clean() {
         return Err(git_error("Atomic working copy is not clean"));
     }
-    verify_complete_equivalence(&repo, &branch, root, &git, "Git bridge verification")?;
+    verify_complete_equivalence(&repo, &branch, root, &git, "Git shim verification")?;
     let atomic_state = repo
         .get_view_info(&branch)
         .map_err(CliError::from)?
         .state
         .to_string();
 
-    Ok(BridgeSnapshot {
+    Ok(ShimSnapshot {
         view: branch,
         atomic_state,
         git_head: head.to_string(),
@@ -2484,7 +2485,7 @@ fn verify_at(root: &Path) -> CliResult<BridgeSnapshot> {
 /// Verify a workspace whose HEAD may be detached (RFC §7.5, CB-8A Draft
 /// policy): an attached HEAD follows the branch rule; a detached HEAD aligns
 /// when its commit tree exactly equals the desired view's projection.
-pub(crate) fn verify_at_detached_ok(root: &Path) -> CliResult<BridgeSnapshot> {
+pub(crate) fn verify_at_detached_ok(root: &Path) -> CliResult<ShimSnapshot> {
     verify_at(root)
 }
 
@@ -2495,7 +2496,7 @@ pub(crate) fn verify_with(
     repo: &Repository,
     working_copy: WorkingCopyId,
     git: &GitRepository,
-) -> CliResult<BridgeSnapshot> {
+) -> CliResult<ShimSnapshot> {
     let (branch, head, tree) = workspace_head_aligned(repo, working_copy, git)?;
     require_clean_git_worktree(git)?;
     let atomic_status = repo
@@ -2504,14 +2505,14 @@ pub(crate) fn verify_with(
     if !atomic_status.is_clean() {
         return Err(git_error("Atomic working copy is not clean"));
     }
-    verify_complete_equivalence(repo, &branch, repo.root(), git, "Git bridge verification")?;
+    verify_complete_equivalence(repo, &branch, repo.root(), git, "Git shim verification")?;
     let atomic_state = repo
         .get_view_info(&branch)
         .map_err(CliError::from)?
         .state
         .to_string();
 
-    Ok(BridgeSnapshot {
+    Ok(ShimSnapshot {
         view: branch,
         atomic_state,
         git_head: head.to_string(),
@@ -2590,7 +2591,7 @@ pub(crate) fn current_heads(
     repo: &Repository,
     working_copy: WorkingCopyId,
     git: &GitRepository,
-) -> CliResult<BridgeSnapshot> {
+) -> CliResult<ShimSnapshot> {
     let head = git
         .head()
         .map_err(|error| git_error(format!("Git HEAD is unavailable: {error}")))?;
@@ -2609,7 +2610,7 @@ pub(crate) fn current_heads(
         .map_err(CliError::from)?
         .state
         .to_string();
-    Ok(BridgeSnapshot {
+    Ok(ShimSnapshot {
         view,
         atomic_state,
         git_head: oid.to_string(),
@@ -2619,9 +2620,9 @@ pub(crate) fn current_heads(
 
 pub(crate) fn read_checkpoint_observation(
     root: &Path,
-) -> CliResult<Option<BridgeCheckpointObservation>> {
+) -> CliResult<Option<ShimCheckpointObservation>> {
     read_workspace_metadata(root).map(|checkpoint| {
-        checkpoint.map(|checkpoint| BridgeCheckpointObservation {
+        checkpoint.map(|checkpoint| ShimCheckpointObservation {
             view: checkpoint.view,
             atomic_state: checkpoint.atomic_state,
             git_head: checkpoint.git_head,
@@ -2630,7 +2631,7 @@ pub(crate) fn read_checkpoint_observation(
     })
 }
 
-pub(crate) fn read_workspace_metadata(root: &Path) -> CliResult<Option<BridgeCheckpoint>> {
+pub(crate) fn read_workspace_metadata(root: &Path) -> CliResult<Option<ShimCheckpoint>> {
     checkpoint::read_checkpoint(root).map_err(checkpoint_error)
 }
 
@@ -2746,7 +2747,7 @@ pub(crate) fn project_atomic_to_git(
     repo: &Repository,
     working_copy: WorkingCopyId,
     git: &GitRepository,
-    current: &BridgeSnapshot,
+    current: &ShimSnapshot,
 ) -> CliResult<()> {
     let head = git
         .head()
@@ -2789,10 +2790,7 @@ pub(crate) fn project_atomic_to_git(
         .map_err(|error| git_error(format!("cannot observe Git worktree: {error}")))?;
     let report = compare_project_to_worktree(&project, &worktree, &policy);
     if !report.is_equivalent() {
-        return Err(equivalence_error(
-            "Atomic-to-Git bridge projection",
-            &report,
-        ));
+        return Err(equivalence_error("Atomic-to-Git shim projection", &report));
     }
     let tree_oid = write_project_tree(git, &project)?;
     let tree = git
@@ -2803,7 +2801,7 @@ pub(crate) fn project_atomic_to_git(
         .map_err(|error| git_error(format!("cannot read Git HEAD commit: {error}")))?;
     let signature = projection_signature(git)?;
     let message = format!(
-        "Atomic bridge projection\n\nAtomic-View: {}\nAtomic-State: {}\n",
+        "Atomic shim projection\n\nAtomic-View: {}\nAtomic-State: {}\n",
         current.view, current.atomic_state
     );
     // Create the commit object without moving any ref first; the ref move is
@@ -2830,7 +2828,7 @@ pub(crate) fn project_atomic_to_git(
         git,
         &branch_ref,
         commit_oid,
-        "atomic bridge projection",
+        "atomic shim projection",
     )?;
 
     Ok(())
@@ -3143,7 +3141,7 @@ fn format_paths<T: AsRef<str>>(paths: &[&T]) -> String {
     }
 }
 
-fn write_workspace_metadata(root: &Path, snapshot: &BridgeSnapshot) -> CliResult<()> {
+fn write_workspace_metadata(root: &Path, snapshot: &ShimSnapshot) -> CliResult<()> {
     checkpoint::write_verified_checkpoint(
         root,
         VerifiedCheckpointInput {
@@ -3174,10 +3172,10 @@ fn git_error(message: impl Into<String>) -> CliError {
 #[cfg(test)]
 mod tests {
     #[cfg(test)]
-    fn record_last_bridge_operation_probe(root: &std::path::Path) -> CliResult<()> {
+    fn record_last_shim_operation_probe(root: &std::path::Path) -> CliResult<()> {
         // The marker writer is best-effort (returns ()). For the regression we
         // verify the WRITE against a real repository: the marker must appear.
-        record_last_bridge_operation(root);
+        record_last_shim_operation(root);
         let marker = Repository::canonical_dot_dir(root)
             .map_err(CliError::from)?
             .join("bridge/suppressed-operation.json");
@@ -3225,7 +3223,7 @@ mod tests {
         )
         .unwrap();
         drop(repo);
-        assert!(record_last_bridge_operation_probe(&root).is_ok());
+        assert!(record_last_shim_operation_probe(&root).is_ok());
 
         let marker = root.join(".atomic/bridge/suppressed-operation.json");
         let bytes = std::fs::read_to_string(&marker).expect("the attribution marker exists");
@@ -3257,7 +3255,7 @@ mod tests {
                 .as_nanos();
             let sequence = TEST_DIRECTORY_SEQUENCE.fetch_add(1, Ordering::Relaxed);
             let path = std::env::temp_dir().join(format!(
-                "atomic-bridge-collision-{}-{unique}-{sequence}",
+                "atomic-shim-collision-{}-{unique}-{sequence}",
                 std::process::id()
             ));
             fs::create_dir(&path).unwrap();
@@ -3312,27 +3310,27 @@ mod tests {
         init_git_with_commit(&root, "main");
 
         // Default: un-opted; default (automatic) enablement refuses.
-        let config = bridge_config(&root).unwrap();
-        assert!(!config.git.bridge.enabled);
-        assert!(config.git.bridge.default_enablement().is_err());
+        let config = shim_config(&root).unwrap();
+        assert!(!config.git.shim.enabled);
+        assert!(config.git.shim.default_enablement().is_err());
 
         // The enable action records the explicit opt-in.
-        assert!(record_bridge_opt_in(&root, true).unwrap());
-        let config = bridge_config(&root).unwrap();
-        assert!(config.git.bridge.enabled, "explicit enable records consent");
+        assert!(record_shim_opt_in(&root, true).unwrap());
+        let config = shim_config(&root).unwrap();
+        assert!(config.git.shim.enabled, "explicit enable records consent");
         // Explicit opt-in is NOT default-rollout approval: the gate still
         // refuses while rollout gates are unmeasured.
-        assert!(config.git.bridge.default_enablement().is_err());
+        assert!(config.git.shim.default_enablement().is_err());
 
         // Idempotent re-enable changes nothing.
-        assert!(!record_bridge_opt_in(&root, true).unwrap());
+        assert!(!record_shim_opt_in(&root, true).unwrap());
 
         // The disable action rolls the consent back.
-        assert!(record_bridge_opt_in(&root, false).unwrap());
-        let config = bridge_config(&root).unwrap();
-        assert!(!config.git.bridge.enabled, "disable rolls the consent back");
+        assert!(record_shim_opt_in(&root, false).unwrap());
+        let config = shim_config(&root).unwrap();
+        assert!(!config.git.shim.enabled, "disable rolls the consent back");
         assert_eq!(
-            config.git.bridge.default_enablement(),
+            config.git.shim.default_enablement(),
             Err(atomic_config::DefaultEnablementRefusal::NotOptedIn)
         );
     }
@@ -3393,8 +3391,8 @@ mod tests {
 
     #[test]
     fn checkpoint_match_requires_every_recorded_head() {
-        let checkpoint = BridgeCheckpoint::legacy_compatible("main", "atomic-1", "git-1", "tree-1");
-        let mut snapshot = BridgeSnapshot {
+        let checkpoint = ShimCheckpoint::legacy_compatible("main", "atomic-1", "git-1", "tree-1");
+        let mut snapshot = ShimSnapshot {
             view: "main".to_string(),
             atomic_state: "atomic-1".to_string(),
             git_head: "git-1".to_string(),
@@ -3491,7 +3489,7 @@ mod tests {
     }
 
     #[test]
-    fn bridge_exclusions_are_exact_or_recursive() {
+    fn shim_exclusions_are_exact_or_recursive() {
         assert!(excluded_path(".atomicignore"));
         assert!(excluded_path(".atomic/data"));
         assert!(excluded_path(".vault/intents/x"));
@@ -3503,7 +3501,7 @@ mod tests {
     /// under `.atomic/`, which the Git projection excludes — telemetry is
     /// never exported into Git metadata or objects.
     #[test]
-    fn bridge_telemetry_is_excluded_from_git_projection() {
+    fn shim_telemetry_is_excluded_from_git_projection() {
         assert!(excluded_path(".atomic/bridge/events.jsonl"));
         assert!(!excluded_path("bridge/events.jsonl"));
     }

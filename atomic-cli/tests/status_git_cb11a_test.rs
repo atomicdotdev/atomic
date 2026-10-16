@@ -1,6 +1,6 @@
 //! CB-11A end-to-end: RFC §9.2 golden parity rows, versioned machine-readable
 //! status, stage/unstage, `diff --git` layers, forensic Observe, reconcile
-//! refusal, bridge verify layers, and consent-based ignore mirroring.
+//! refusal, shim verify layers, and consent-based ignore mirroring.
 //!
 //! Every §9.2 row asserts the three columns of the table against the real
 //! binary and the real `git status --short`:
@@ -10,7 +10,7 @@
 //! The native codes (`M`/`A`/`D`/`P`/`T`/`C`) deliberately differ from the
 //! `--git` XY subset; each row asserts its native column too.
 
-// Temporary Unix-only Git bridge support to unblock Windows native CI.
+// Temporary Unix-only Git shim support to unblock Windows native CI.
 // Revisit after Windows support is defined; see the RFC temporary platform policy.
 #![cfg(unix)]
 use std::collections::BTreeMap;
@@ -42,13 +42,13 @@ impl Fixture {
         fixture.git_ok(&["add", "tracked.txt"]);
         fixture.git_ok(&["commit", "--no-gpg-sign", "-q", "-m", "base"]);
         fixture.atomic_ok(&["git", "import", "--no-vault"]);
-        fixture.atomic_ok(&["git", "bridge", "reconcile"]);
+        fixture.atomic_ok(&["git", "shim", "reconcile"]);
         assert!(
             fixture
                 .root()
                 .join(".atomic/bridge/workspace.json")
                 .is_file(),
-            "Git reconciliation must establish a valid bridge checkpoint"
+            "Git reconciliation must establish a valid shim checkpoint"
         );
         fixture
     }
@@ -380,7 +380,7 @@ fn row_bound_switch_is_clean_after_reconcile() {
     fixture.atomic_ok(&["view", "create", "feature"]);
     fixture.atomic_ok(&["view", "switch", "feature"]);
     fixture.atomic_ok(&["view", "switch", "main"]);
-    fixture.atomic_ok(&["git", "bridge", "reconcile"]);
+    fixture.atomic_ok(&["git", "shim", "reconcile"]);
     assert_eq!(fixture.git_short(), "");
     assert_eq!(git_status_rows(&fixture), Vec::<String>::new());
     assert!(fixture
@@ -496,30 +496,30 @@ fn row_committed_conflict_snapshot_is_clean_git_with_notice_and_native_conflict(
 
     // Re-anchor and confirm the restored conflict metadata stays native C.
     fixture.atomic_ok(&["git", "import", "--no-vault"]);
-    fixture.atomic_ok(&["git", "bridge", "reconcile"]);
+    fixture.atomic_ok(&["git", "shim", "reconcile"]);
     assert_eq!(fixture.git_short(), "");
     assert!(native_rows(&fixture).contains(&"C  tracked.txt".to_string()));
 }
 
-// ── Machine-readable output (bridge state/origin, layers, version) ──────
+// ── Machine-readable output (shim state/origin, layers, version) ──────
 
 #[test]
-fn machine_readable_status_git_carries_bridge_state_origin_and_version() {
+fn machine_readable_status_git_carries_shim_state_origin_and_version() {
     let fixture = Fixture::colocated();
 
     // A clean repository first: baseline tree and index tree agree.
     let clean = fixture.atomic_json(&["status", "--git", "--json"]);
     assert_eq!(clean["format"], "atomic-status-git");
     assert_eq!(clean["version"], 1);
-    assert_eq!(clean["bridge"]["state"], "aligned");
+    assert_eq!(clean["shim"]["state"], "aligned");
     assert!(
-        clean["bridge"]["origin"] == "checkpoint" || clean["bridge"]["origin"] == "observed",
-        "origin names the bridge source: {}",
-        clean["bridge"]["origin"]
+        clean["shim"]["origin"] == "checkpoint" || clean["shim"]["origin"] == "observed",
+        "origin names the shim source: {}",
+        clean["shim"]["origin"]
     );
-    assert_eq!(clean["bridge"]["view"], "main");
-    assert!(clean["bridge"]["git_head"].is_string());
-    assert!(clean["bridge"]["git_tree"].is_string());
+    assert_eq!(clean["shim"]["view"], "main");
+    assert!(clean["shim"]["git_head"].is_string());
+    assert!(clean["shim"]["git_tree"].is_string());
     assert_eq!(
         clean["layers"]["baseline_tree"],
         clean["layers"]["index_tree"]
@@ -547,15 +547,15 @@ fn machine_readable_status_git_carries_bridge_state_origin_and_version() {
 }
 
 #[test]
-fn machine_readable_reports_remediation_bridge_state() {
+fn machine_readable_reports_remediation_shim_state() {
     let fixture = Fixture::colocated();
     // Advance Git HEAD behind Atomic's back: the checkpoint is stale.
     fixture.write("tracked.txt", "l1\nRAW-GIT\nl3\n");
     fixture.git_ok(&["commit", "-aqm", "raw git commit"]);
 
     let document = fixture.atomic_json(&["status", "--git", "--json"]);
-    assert_eq!(document["bridge"]["state"], "remediation");
-    assert_eq!(document["bridge"]["origin"], "observed");
+    assert_eq!(document["shim"]["state"], "remediation");
+    assert_eq!(document["shim"]["origin"], "observed");
     assert!(document["notices"]
         .as_array()
         .unwrap()
@@ -807,7 +807,7 @@ fn forensic_observe_reports_layers_without_mutation() {
     assert!(text.contains("Atomic view"), "{text}");
     assert!(text.contains("Atomic state"), "{text}");
     assert!(text.contains("Durable manifest root"), "{text}");
-    assert!(text.contains("Bridge checkpoint"), "{text}");
+    assert!(text.contains("Shim checkpoint"), "{text}");
     assert!(text.contains("Git HEAD"), "{text}");
     assert!(text.contains("Drift"), "{text}");
 
@@ -845,12 +845,12 @@ fn reconcile_status_refuses_and_never_materializes() {
     assert_eq!(fixture.read("tracked.txt"), b"l1\nRAW\nl3\n");
 }
 
-// ── Bridge verify proves the five layers ────────────────────────────────
+// ── Shim verify proves the five layers ────────────────────────────────
 
 #[test]
-fn bridge_verify_proves_all_five_layers_and_reports_divergence() {
+fn shim_verify_proves_all_five_layers_and_reports_divergence() {
     let fixture = Fixture::colocated();
-    let verified = fixture.atomic_ok(&["git", "bridge", "verify"]);
+    let verified = fixture.atomic_ok(&["git", "shim", "verify"]);
     let text = output_text(&verified);
     assert!(text.contains("layer durable"), "{text}");
     assert!(text.contains("layer manifest"), "{text}");
@@ -860,7 +860,7 @@ fn bridge_verify_proves_all_five_layers_and_reports_divergence() {
 
     // Structured divergence names the layer.
     fixture.write("tracked.txt", "l1\nDRIFT\nl3\n");
-    let diverged = fixture.atomic(&["git", "bridge", "verify"]);
+    let diverged = fixture.atomic(&["git", "shim", "verify"]);
     assert!(
         !diverged.status.success(),
         "verify must fail on worktree drift"
@@ -874,7 +874,7 @@ fn bridge_verify_proves_all_five_layers_and_reports_divergence() {
 
 /// Atomic-directory manifest: every relative path with its exact bytes.
 ///
-/// CB-13A R2 uses this to prove bridge verify is a read-only diagnostic —
+/// CB-13A R2 uses this to prove shim verify is a read-only diagnostic —
 /// the manifest must be byte-identical across a verify invocation, even on
 /// a repository whose operation head is still incomplete.
 fn atomic_manifest(root: &Path) -> BTreeMap<String, Vec<u8>> {
@@ -897,14 +897,14 @@ fn atomic_manifest(root: &Path) -> BTreeMap<String, Vec<u8>> {
     out
 }
 
-/// CB-13A R2: bridge verify is a read-only diagnostic. Around a switch that
+/// CB-13A R2: shim verify is a read-only diagnostic. Around a switch that
 /// was interrupted mid-effect (the switch's own error path synchronously
 /// recovered its journal), verify must observe the state WITHOUT any further
 /// mutation: the Atomic-directory manifest must stay byte-identical across a
 /// passing verify, and a failing verify must neither repair nor journal. The
 /// operations-head layer is part of every verdict.
 #[test]
-fn bridge_verify_is_read_only_around_an_interrupted_switch() {
+fn shim_verify_is_read_only_around_an_interrupted_switch() {
     let fixture = Fixture::colocated();
 
     // A draft feature projection whose switch back to main removes a tracked
@@ -925,7 +925,7 @@ fn bridge_verify_is_read_only_around_an_interrupted_switch() {
     .expect("write second");
     fixture.git_ok(&["add", "-A"]);
     fixture.git_ok(&["commit", "--no-gpg-sign", "-q", "-m", "feature projection"]);
-    fixture.atomic_ok(&["git", "bridge", "reconcile"]);
+    fixture.atomic_ok(&["git", "shim", "reconcile"]);
 
     // Interrupt the switch after its first tracked removal.
     let crashed = {
@@ -954,7 +954,7 @@ fn bridge_verify_is_read_only_around_an_interrupted_switch() {
     // Read-only diagnosis on the just-crashed repository: the switch's own
     // error path synchronously recovered its journal, and verify must now
     // observe the complete state WITHOUT any further mutation.
-    let diagnosed = fixture.atomic_ok(&["git", "bridge", "verify"]);
+    let diagnosed = fixture.atomic_ok(&["git", "shim", "verify"]);
     let text = output_text(&diagnosed);
     assert!(
         text.contains("layer operations"),
@@ -963,13 +963,13 @@ fn bridge_verify_is_read_only_around_an_interrupted_switch() {
     let after_verify = atomic_manifest(fixture.root());
     assert_eq!(
         after_crash, after_verify,
-        "bridge verify must not recover, migrate, or align before inspection"
+        "shim verify must not recover, migrate, or align before inspection"
     );
 
     // Drift must be reported without any repair: verify fails and the
     // manifest stays byte-identical.
     fs::write(fixture.root().join("drift.txt"), b"drift\n").expect("write drift file");
-    let diverged = fixture.atomic(&["git", "bridge", "verify"]);
+    let diverged = fixture.atomic(&["git", "shim", "verify"]);
     assert!(
         !diverged.status.success(),
         "verify must fail on untracked-worktree drift against the projection"
@@ -1010,7 +1010,7 @@ fn ignore_divergence_reported_until_consented_mirroring() {
     );
 
     // Explicit consent mirrors into the managed block.
-    let enabled = fixture.atomic_ok(&["git", "bridge", "enable", "--mirror-ignores"]);
+    let enabled = fixture.atomic_ok(&["git", "shim", "enable", "--mirror-ignores"]);
     let text = output_text(&enabled);
     assert!(text.contains("newly mirrored"), "{text}");
     let exclude =
