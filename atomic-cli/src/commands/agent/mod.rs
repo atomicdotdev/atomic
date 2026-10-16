@@ -100,13 +100,16 @@ pub struct Agent {
 pub enum AgentCommands {
     /// Install agent hooks for turn-level recording.
     ///
-    /// Writes hooks into the agent's configuration file (e.g.,
-    /// `.claude/settings.json`) that call back to `atomic agent hooks`
-    /// on each lifecycle event. Also creates the `.atomic/sessions/`
-    /// directory for session state persistence when run inside a
-    /// repository. Works outside a repository too — hooks install
-    /// globally to the home directory and only record turns in projects
-    /// that have a `.atomic/` directory.
+    /// Installs the agent's integration package per its manifest: every
+    /// hook, skill, and prompt lands in the home directory (e.g.,
+    /// `~/.claude/settings.json`, `~/.config/opencode/opencode.json`),
+    /// never in the repo. The repo root is used only for agent
+    /// auto-detection, the `.atomic/sessions/` directory, and — with
+    /// `--agents-md` — `[[repo-file]]` entries such as `AGENTS.md`.
+    ///
+    /// Works outside an Atomic repository: hooks install globally to the
+    /// home directory and only record turns in projects that have a
+    /// `.atomic/` directory.
     ///
     /// # Examples
     ///
