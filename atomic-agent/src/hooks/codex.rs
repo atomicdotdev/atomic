@@ -141,15 +141,6 @@ impl CodexHook {
         dirs::home_dir().map(|home| home.join(CODEX_DIR).join(HOOKS_FILE))
     }
 
-    pub fn install_global(&self, force: bool) -> AgentResult<usize> {
-        let path = Self::global_hooks_path().ok_or_else(|| AgentError::ConfigError {
-            operation: "resolve".to_string(),
-            path: PathBuf::from("~/.codex/hooks.json"),
-            reason: "Could not determine home directory for Codex hooks".to_string(),
-        })?;
-        self.install_at(&path, force)
-    }
-
     /// Install or migrate Atomic hooks at an explicit Codex hooks file.
     ///
     /// Integration receipts record the exact settings target they manage.
@@ -157,13 +148,6 @@ impl CodexHook {
     /// repository-local hook file while leaving stale global hooks active.
     pub fn install_at(&self, path: &Path, force: bool) -> AgentResult<usize> {
         install_hooks_at(path, force)
-    }
-
-    pub fn uninstall_global(&self) -> AgentResult<()> {
-        if let Some(path) = Self::global_hooks_path() {
-            uninstall_hooks_at(&path)?;
-        }
-        Ok(())
     }
 
     pub fn is_installed_global(&self) -> bool {

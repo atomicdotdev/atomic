@@ -75,22 +75,14 @@ pub struct Enable {
     #[arg(long)]
     all: bool,
 
-    /// Install hooks globally (~/.claude/settings.json).
-    ///
-    /// Global hooks fire for every Claude Code session regardless of
-    /// project. This is the recommended way to enable Atomic tracking —
-    /// install once, works everywhere that has a `.atomic/` directory.
-    #[arg(short, long)]
-    global: bool,
-
     /// Install hooks from an integration-supplied manifest file.
     ///
     /// The manifest (shipped by an integration package such as atomic-codex)
     /// names its own target settings file and the hook commands to register,
     /// and is merged in idempotently — preserving non-Atomic hooks. Because the
     /// definitions live in the integration repo, updating an agent's hook
-    /// wiring never requires rebuilding `atomic`. When set, `--agent`/`--global`
-    /// are not needed; the manifest is self-describing.
+    /// wiring never requires rebuilding `atomic`. When set, `--agent` is not
+    /// needed; the manifest is self-describing.
     #[arg(long, value_name = "FILE")]
     hooks: Option<std::path::PathBuf>,
 
@@ -132,7 +124,6 @@ impl Enable {
             agent: None,
             force: false,
             all: false,
-            global: false,
             hooks: None,
             from: None,
             from_skills: None,
@@ -189,11 +180,6 @@ impl Command for Enable {
         // Data-driven install — definitions come from the integration's manifest.
         if let Some(ref manifest) = self.hooks {
             return self.run_manifest(manifest);
-        }
-
-        // Global install — writes to ~/.claude/settings.json
-        if self.global {
-            return self.run_global();
         }
 
         // Find the repository root if there is one. Packaged integrations
@@ -676,157 +662,6 @@ impl Enable {
         }
         Ok(())
     }
-
-    /// Install hooks globally to the agent's user-level settings.
-    ///
-    /// Supports:
-    /// - `claude-code` → `~/.claude/settings.json`
-    /// - `gemini-cli` → `~/.gemini/settings.json`
-    /// - `codex` → `~/.codex/hooks.json`
-    ///
-    /// agy is intentionally absent: its plugin is inherently global and is
-    /// installed by the integrations engine via the standard `enable` path.
-    fn run_global(&self) -> CliResult<()> {
-        use atomic_agent::hooks::claude_code::ClaudeCodeHook;
-        use atomic_agent::hooks::codex::CodexHook;
-        use atomic_agent::hooks::gemini_cli::GeminiCliHook;
-
-        let agent_name = self.agent.as_deref().unwrap_or("claude-code");
-
-        match agent_name {
-            "claude-code" => {
-                let hook = ClaudeCodeHook::new();
-
-                if !self.force && hook.is_installed_global() {
-                    print_success("Global hooks already installed in ~/.claude/settings.json.");
-                    println!("  Use --force to reinstall.");
-                    return Ok(());
-                }
-
-                match hook.install_global(self.force) {
-                    Ok(count) if count > 0 => {
-                        print_success(&format!(
-                            "Installed {} global hook{} for Claude Code",
-                            count,
-                            if count == 1 { "" } else { "s" },
-                        ));
-                        println!();
-                        println!("Hooks written to: ~/.claude/settings.json");
-                        println!();
-                        println!("Every Claude Code session in a project with .atomic/ will now:");
-                        println!("  • Record each turn as an Atomic change with full provenance");
-                        println!("  • Track session metadata (turn number, timing, files)");
-                        println!("  • Create attestations at session end");
-                    }
-                    Ok(_) => {
-                        print_success("Global hooks already up to date.");
-                    }
-                    Err(e) => {
-                        print_error(&format!("Failed to install global hooks: {}", e));
-                    }
-                }
-            }
-
-            "gemini-cli" => {
-                let hook = GeminiCliHook::new();
-
-                if !self.force && hook.is_installed_global() {
-                    print_success("Global hooks already installed in ~/.gemini/settings.json.");
-                    println!("  Use --force to reinstall.");
-                    return Ok(());
-                }
-
-                match hook.install_global(self.force) {
-                    Ok(count) if count > 0 => {
-                        print_success(&format!(
-                            "Installed {} global hook{} for Gemini CLI",
-                            count,
-                            if count == 1 { "" } else { "s" },
-                        ));
-                        println!();
-                        println!("Hooks written to: ~/.gemini/settings.json");
-                        println!();
-                        println!("Every Gemini CLI session in a project with .atomic/ will now:");
-                        println!("  • Record each turn as an Atomic change with full provenance");
-                        println!("  • Track session metadata (turn number, timing, files)");
-                        println!("  • Create attestations at session end");
-                    }
-                    Ok(_) => {
-                        print_success("Global hooks already up to date.");
-                    }
-                    Err(e) => {
-                        print_error(&format!("Failed to install global hooks: {}", e));
-                    }
-                }
-            }
-
-            "agy" => {
-                // agy's plugin is inherently global — the integration package
-                // install (the standard repo-scoped `enable` path) *is* the
-                // global install.
-                println!("The agy plugin is global by nature — install it with:");
-                println!("  atomic agent enable --agent agy");
-                println!();
-                println!("(No --global needed; the integrations engine stages the plugin");
-                println!(" at ~/.gemini/config/plugins/atomic/ from the atomic-agy package.)");
-            }
-
-            "codex" => {
-                let hook = CodexHook::new();
-
-                if !self.force && hook.is_installed_global() {
-                    print_success("Global hooks already installed in ~/.codex/hooks.json.");
-                    println!("  Use --force to reinstall.");
-                    return Ok(());
-                }
-
-                match hook.install_global(self.force) {
-                    Ok(count) if count > 0 => {
-                        print_success(&format!(
-                            "Installed {} global hook{} for Codex",
-                            count,
-                            if count == 1 { "" } else { "s" },
-                        ));
-                        println!();
-                        println!("Hooks written to: ~/.codex/hooks.json");
-                        println!();
-                        println!("Every Codex session in a project with .atomic/ will now:");
-                        println!(
-                            "  \u{2022} Record each turn as an Atomic change with full provenance"
-                        );
-                        println!("  \u{2022} Track session metadata (turn number, timing, files)");
-                        println!("  \u{2022} Capture tool calls through pre/post tool hooks");
-                    }
-                    Ok(_) => {
-                        print_success("Global hooks already up to date.");
-                    }
-                    Err(e) => {
-                        print_error(&format!("Failed to install global hooks: {}", e));
-                    }
-                }
-            }
-
-            "kiro" => {
-                print_success("Kiro hooks are configured through the IDE panel.");
-                println!();
-                println!("Install the atomic-kiro integration (skills, steering, hook scripts):");
-                println!("  atomic agent enable --agent kiro");
-                println!();
-                println!(
-                    "Then configure hooks in Kiro IDE \u{2192} Agent Steering & Skills panel."
-                );
-            }
-
-            other => {
-                print_warning(&format!(
-                    "Global install is not supported for '{}'. Supported agents: claude-code, gemini-cli, codex, kiro (agy via plain enable)",
-                    other
-                ));
-            }
-        }
-
-        Ok(())
-    }
 }
 
 // Tests
@@ -909,7 +744,6 @@ mod tests {
             agent: Some("claude-code".to_string()),
             force: false,
             all: false,
-            global: false,
             hooks: None,
             from: None,
             from_skills: None,
@@ -923,7 +757,6 @@ mod tests {
             agent: Some("claude-code".to_string()),
             force: true,
             all: false,
-            global: false,
             hooks: None,
             from: None,
             from_skills: None,
@@ -939,7 +772,6 @@ mod tests {
             agent: None,
             force: false,
             all: true,
-            global: false,
             hooks: None,
             from: None,
             from_skills: None,
@@ -947,22 +779,6 @@ mod tests {
         };
         assert!(cmd.all);
         assert!(cmd.agent.is_none());
-    }
-
-    #[test]
-    fn test_enable_with_global_flag() {
-        let cmd = Enable {
-            agent: Some("claude-code".to_string()),
-            force: false,
-            all: false,
-            global: true,
-            hooks: None,
-            from: None,
-            from_skills: None,
-            agents_md: false,
-        };
-        assert!(cmd.global);
-        assert_eq!(cmd.agent.as_deref(), Some("claude-code"));
     }
 
     #[test]

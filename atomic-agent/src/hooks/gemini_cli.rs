@@ -302,11 +302,6 @@ impl GeminiCliHook {
         repo_root.join(GEMINI_DIR).join(SETTINGS_FILE)
     }
 
-    /// Returns the path to the global `~/.gemini/settings.json`.
-    pub fn global_settings_path() -> Option<PathBuf> {
-        dirs::home_dir().map(|home| home.join(GEMINI_DIR).join(SETTINGS_FILE))
-    }
-
     /// Read and parse the existing `.gemini/settings.json`, if it exists.
     ///
     /// Returns `(raw_settings, hooks)` where `raw_settings` preserves unknown
@@ -488,38 +483,6 @@ impl GeminiCliHook {
                     || has_any_atomic_hook(&hooks.after_tool)
             }
             Err(_) => false,
-        }
-    }
-
-    // Global install/uninstall (same pattern as Claude Code)
-
-    /// Install hooks globally to `~/.gemini/settings.json`.
-    pub fn install_global(&self, force: bool) -> AgentResult<usize> {
-        let settings_path =
-            Self::global_settings_path().ok_or_else(|| AgentError::ConfigError {
-                operation: "resolve home".to_string(),
-                path: PathBuf::from("~/.gemini/settings.json"),
-                reason: "Could not determine home directory".to_string(),
-            })?;
-
-        Self::install_to(&settings_path, force)
-    }
-
-    /// Remove hooks from the global `~/.gemini/settings.json`.
-    pub fn uninstall_global(&self) -> AgentResult<()> {
-        let settings_path = match Self::global_settings_path() {
-            Some(p) => p,
-            None => return Ok(()),
-        };
-
-        Self::uninstall_from(&settings_path)
-    }
-
-    /// Check if hooks are installed globally in `~/.gemini/settings.json`.
-    pub fn is_installed_global(&self) -> bool {
-        match Self::global_settings_path() {
-            Some(p) => Self::is_installed_in(&p),
-            None => false,
         }
     }
 }
