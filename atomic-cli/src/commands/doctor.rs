@@ -436,45 +436,7 @@ fn print_diagnosis(diagnosis: &atomic_repository::WorkingCopyRegistrationDiagnos
 
 impl Command for RepairNativeIndexes {
     fn run(&self) -> CliResult<()> {
-        let repo = match require_repository_for_native_repair(None) {
-            Ok(repo) => repo,
-            Err(error) => {
-                print_warning(&format!(
-                    "Native derived indexes are unrepairable because repository authority cannot be opened: {}",
-                    error
-                ));
-                return Err(error);
-            }
-        };
-        print_info("Rebuilding native derived indexes from graph authority...");
-        let outcome = match repo.repair_native_derived_indexes() {
-            Ok(outcome) => outcome,
-            Err(error) => {
-                print_warning(&format!(
-                    "Native derived indexes are unrepairable from available authority: {}",
-                    error
-                ));
-                print_hint("No repair transaction was committed. Restore missing/corrupt change or graph authority and retry.");
-                return Err(crate::error::CliError::Repository(error));
-            }
-        };
-        if outcome.already_healthy {
-            print_success(&format!(
-                "Native derived indexes are already consistent ({} rows).",
-                outcome.rows_written
-            ));
-        } else {
-            print_success(&format!(
-                "Repaired {} native derived-index problem(s); wrote {} rows atomically{}.",
-                outcome.problems_repaired,
-                outcome.rows_written,
-                outcome
-                    .operation
-                    .map(|operation| format!("; journaled as operation {operation}"))
-                    .unwrap_or_default()
-            ));
-        }
-        Ok(())
+        crate::commands::rpc::doctor_repair_native_indexes()
     }
 }
 

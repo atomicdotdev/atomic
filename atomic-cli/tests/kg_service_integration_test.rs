@@ -103,11 +103,13 @@ fn identity_inspection_does_not_silently_mint_a_missing_identity() {
 async fn reactor_workflow_commands_use_served_handlers_without_local_fallback() {
     use libatomic::atomic::{
         daemon_service_server::DaemonServiceServer,
-        knowledge_service_server::KnowledgeServiceServer, sync_service_server::SyncServiceServer,
+        knowledge_service_server::KnowledgeServiceServer,
+        maintenance_service_server::MaintenanceServiceServer,
+        sync_service_server::SyncServiceServer,
     };
     use libatomic::daemon::{
-        services::DaemonImpl, services_agent::KnowledgeImpl, services_sync::SyncImpl,
-        state::DaemonState,
+        services::DaemonImpl, services_agent::KnowledgeImpl, services_maintenance::MaintenanceImpl,
+        services_sync::SyncImpl, state::DaemonState,
     };
     use std::sync::Arc;
 
@@ -140,6 +142,9 @@ async fn reactor_workflow_commands_use_served_handlers_without_local_fallback() 
             .add_service(KnowledgeServiceServer::new(KnowledgeImpl {
                 state: state.clone(),
             }))
+            .add_service(MaintenanceServiceServer::new(MaintenanceImpl {
+                state: state.clone(),
+            }))
             .add_service(SyncServiceServer::new(SyncImpl { state }))
             .serve_with_incoming_shutdown(
                 tokio_stream::wrappers::UnixListenerStream::new(listener),
@@ -158,6 +163,7 @@ async fn reactor_workflow_commands_use_served_handlers_without_local_fallback() 
             Some(local_report),
         ),
         (vec!["query", "reindex", "--full"], None),
+        (vec!["doctor", "repair-native-indexes"], None),
     ] {
         let mut cli = command(&root, &args);
         cli.env("ATOMIC_SERVICE", "reactor")
@@ -181,6 +187,7 @@ async fn reactor_workflow_commands_use_served_handlers_without_local_fallback() 
         vec!["repo", "identity", "show", "--json"],
         vec!["query", "validate", "--format", "json"],
         vec!["query", "reindex", "--full"],
+        vec!["doctor", "repair-native-indexes"],
     ] {
         let mut cli = command(&root, &args);
         cli.env("ATOMIC_SERVICE", "reactor")

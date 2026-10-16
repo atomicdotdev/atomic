@@ -2700,6 +2700,39 @@ pub fn query_neighbors(args: &super::query::QueryNeighbors) -> CliResult<bool> {
 // doctor (MaintenanceService)
 // ---------------------------------------------------------------------------
 
+/// Native repair refuses unrepairable authority in a read-only handler preflight.
+pub fn doctor_repair_native_indexes() -> CliResult<()> {
+    let root = super::find_repository_root()?;
+    let session = Service::open_root(&root)?.ok_or_else(|| CliError::InvalidArgument {
+        message: "native-index repair requires a local repository service".into(),
+    })?;
+    print_info("Rebuilding native derived indexes from graph authority...");
+    let outcome = session.repair(pb::RepairRequest {
+        repository: Some(session.reference.clone()),
+        meta: request_meta(),
+        action: pb::RepairAction::RebuildNativeIndexes as i32,
+        force: false,
+        view: String::new(),
+    })?;
+    if outcome.native_already_healthy {
+        print_success(&format!(
+            "Native derived indexes are already consistent ({} rows).",
+            outcome.native_rows_written
+        ));
+    } else {
+        print_success(&format!(
+            "Repaired {} native derived-index problem(s); wrote {} rows atomically{}.",
+            outcome.native_problems_repaired,
+            outcome.native_rows_written,
+            outcome
+                .native_operation
+                .map(|operation| format!("; journaled as operation {operation}"))
+                .unwrap_or_default()
+        ));
+    }
+    Ok(())
+}
+
 /// `atomic doctor check` over CheckRepository — the read-only consistency
 /// check. Rendered to mirror the in-process path exactly (non-zero exit
 /// when problems are found).
