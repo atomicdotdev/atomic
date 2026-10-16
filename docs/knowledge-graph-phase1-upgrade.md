@@ -33,6 +33,13 @@ atomic query validate --profile publication --format json
 atomic query validate --shape <shape-iri> --node <resource-iri>
 ```
 
+Identity inspection and validation fetch their data through the shared RPC
+handlers in both local and reactor modes, using the central repository connection
+opener. They are read-only: missing identity/generation state requires an explicit
+`atomic query reindex --full`. Reindex also performs signer discovery handler-side;
+the CLI resolves credentials without opening a repository database. PurRDF still
+runs client-side on the returned immutable snapshot.
+
 Projection validation accepts a missing workflow shortcut only with its matching
 per-change finding. Publication validation additionally checks managed plans,
 provenance, session coverage, and explicit successful DID signature verification.

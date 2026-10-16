@@ -3246,6 +3246,92 @@ pub struct KnowledgeImpl {
 
 #[tonic::async_trait]
 impl knowledge_service_server::KnowledgeService for KnowledgeImpl {
+    async fn get_project_identity(
+        &self,
+        request: Request<GetProjectIdentityRequest>,
+    ) -> Result<Response<GetProjectIdentityResponse>, Status> {
+        let request = request.into_inner();
+        let reference = request
+            .repository
+            .as_ref()
+            .ok_or_else(|| Status::invalid_argument("repository required"))?;
+        let handle = self.state.resolve(reference)?;
+        self.state.log_rpc("GetProjectIdentity", Some(&handle));
+        let gate = handle.exclusive_owned().await;
+        let response = tokio::task::spawn_blocking(move || {
+            let _gate = gate;
+            let repo = handle.repository_readonly()?;
+            let record = repo
+                .project_identity()
+                .map_err(repository_error)?
+                .ok_or_else(|| {
+                    Status::failed_precondition(
+                        "MissingProjectIdentity; run atomic query reindex --full",
+                    )
+                })?;
+            let project = record
+                .project_id()
+                .map_err(|e| Status::internal(e.to_string()))?;
+            let object: serde_json::Value = serde_json::from_slice(&record.object)
+                .map_err(|e| Status::internal(e.to_string()))?;
+            let minted = serde_json::to_value(record.mint_reason)
+                .map_err(|e| Status::internal(e.to_string()))?;
+            Ok::<_, Status>(GetProjectIdentityResponse {
+                project: project.to_base32(),
+                urn: project.to_urn(),
+                created: record.created_at,
+                minted: minted.as_str().unwrap_or_default().to_owned(),
+                signed_by: object
+                    .get("atomic:issuer")
+                    .and_then(|v| v.get("@id"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_owned),
+                hash: record.hash.to_base32(),
+            })
+        })
+        .await
+        .map_err(|e| Status::internal(e.to_string()))??;
+        Ok(Response::new(response))
+    }
+
+    async fn get_workflow_snapshot(
+        &self,
+        request: Request<GetWorkflowSnapshotRequest>,
+    ) -> Result<Response<GetWorkflowSnapshotResponse>, Status> {
+        let request = request.into_inner();
+        let reference = request
+            .repository
+            .as_ref()
+            .ok_or_else(|| Status::invalid_argument("repository required"))?;
+        let handle = self.state.resolve(reference)?;
+        self.state.log_rpc("GetWorkflowSnapshot", Some(&handle));
+        let gate = handle.exclusive_owned().await;
+        let response = tokio::task::spawn_blocking(move || {
+            let _gate = gate;
+            let repo = handle.repository_readonly()?;
+            let snapshot = repo.workflow_snapshot().map_err(repository_error)?;
+            Ok::<_, Status>(GetWorkflowSnapshotResponse {
+                api_version: 1,
+                generation: snapshot.generation,
+                ontology_version: snapshot.ontology_version.to_owned(),
+                identity: snapshot.identity,
+                nodes: snapshot
+                    .nodes
+                    .into_iter()
+                    .map(super::services_query::kg_node_proto)
+                    .collect(),
+                edges: snapshot
+                    .edges
+                    .into_iter()
+                    .map(super::services_query::kg_edge_proto)
+                    .collect(),
+            })
+        })
+        .await
+        .map_err(|e| Status::internal(e.to_string()))??;
+        Ok(Response::new(response))
+    }
+
     async fn query_graph(
         &self,
         request: Request<QueryGraphRequest>,
@@ -3641,44 +3727,33 @@ impl knowledge_service_server::KnowledgeService for KnowledgeImpl {
         &self,
         request: Request<MaintainKnowledgeGraphRequest>,
     ) -> Result<Response<MaintainKnowledgeGraphResponse>, Status> {
-        let authorization = request
-            .metadata()
-            .get("authorization")
-            .and_then(|value| value.to_str().ok())
-            .map(str::to_owned);
-        let delegation = request
-            .metadata()
-            .get("atomic-delegation")
-            .and_then(|value| value.to_str().ok())
-            .map(str::to_owned);
         let request = request.into_inner();
         let action = KnowledgeMaintainAction::try_from(request.action)
             .unwrap_or(KnowledgeMaintainAction::Unspecified);
         let handle = self.state.resolve(request.repository.as_ref().unwrap())?;
         self.state.log_rpc("MaintainKnowledgeGraph", Some(&handle));
-        let gate_handle = handle.clone();
-        let _gate = gate_handle.exclusive().await;
-        if action == KnowledgeMaintainAction::Reindex {
-            if let Some(authorization) = authorization {
-                let repo = handle.repository()?;
-                if let Ok((_, remote)) = repo.get_default_remote() {
-                    let mut config = atomic_remote::HttpRemoteConfig::new()
-                        .with_header("Authorization", authorization);
-                    if let Some(delegation) = delegation {
-                        config = config.with_header("Atomic-Delegation", delegation);
-                    }
-                    if let Some(client) =
-                        crate::signer_refresh::client_for_remote(&remote.url, &config)
-                    {
-                        crate::signer_refresh::refresh(&repo, &client)
-                            .await
-                            .map_err(repository_error)?;
-                    }
-                }
+        let gate = handle.exclusive_owned().await;
+        if action == KnowledgeMaintainAction::Reindex && !request.signer_auth_headers.is_empty() {
+            let repo = handle.repository()?;
+            let (_, remote) = repo.get_default_remote().map_err(repository_error)?;
+            if request.signer_remote_url.as_deref() != Some(remote.url.as_str()) {
+                return Err(Status::failed_precondition(
+                    "signer discovery remote changed; retry reindex with fresh credentials",
+                ));
+            }
+            let mut config = atomic_remote::HttpRemoteConfig::new();
+            for (name, value) in &request.signer_auth_headers {
+                config = config.with_header(name, value);
+            }
+            if let Some(client) = crate::signer_refresh::client_for_remote(&remote.url, &config) {
+                crate::signer_refresh::refresh(&repo, &client)
+                    .await
+                    .map_err(repository_error)?;
             }
         }
         let meta = request.meta.clone();
         let response = tokio::task::spawn_blocking(move || {
+            let _gate = gate;
             let (repo, workspace) =
                 handle.workspace_repository(atomic_repository::WorkspaceTxnMode::Reconcile)?;
             let working_copy = workspace.working_copy();

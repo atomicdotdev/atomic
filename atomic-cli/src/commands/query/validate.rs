@@ -30,8 +30,9 @@ impl Command for Validate {
     fn run(&self) -> CliResult<()> {
         // Validation deliberately runs in the CLI process so neither the
         // daemon nor shared libraries acquire the SHACL engine's MSRV.
-        let repo = Repository::open(find_repository_root()?).map_err(CliError::Repository)?;
-        let snapshot = repo.workflow_snapshot().map_err(CliError::Repository)?;
+        let root = find_repository_root()?;
+        let snapshot = crate::commands::rpc::workflow_snapshot(&root)?;
+        let dot_dir = Repository::canonical_dot_dir(&root).map_err(CliError::Repository)?;
         let error = |error: atomic_shacl::ValidationError| CliError::ShaclError(error.to_string());
         let data =
             atomic_shacl::snapshot_ntriples(&snapshot.nodes, &snapshot.edges).map_err(error)?;
@@ -42,8 +43,7 @@ impl Command for Validate {
             },
             shape: self.shape.clone(),
             node: self.node.clone(),
-            custom: atomic_shacl::load_custom_shapes(&repo.dot_dir().join("shapes"))
-                .map_err(error)?,
+            custom: atomic_shacl::load_custom_shapes(&dot_dir.join("shapes")).map_err(error)?,
         };
         let report =
             atomic_shacl::validate_ntriples(&data, &snapshot.identity, &request).map_err(error)?;

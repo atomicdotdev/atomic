@@ -1690,49 +1690,7 @@ pub struct Reindex {
 
 impl Command for Reindex {
     fn run(&self) -> CliResult<()> {
-        let root = find_repository_root()?;
-        // Key discovery precedes both local and daemon reindex execution. A
-        // missing remote or authentication leaves attestations Unverifiable.
-        {
-            let repo = Repository::open(&root).map_err(CliError::Repository)?;
-            if let Ok((_, remote)) = repo.get_default_remote() {
-                let runtime = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .map_err(|error| CliError::Internal(error.into()))?;
-                runtime.block_on(async {
-                    let config = crate::commands::auth::attach_identity(
-                        atomic_remote::HttpRemoteConfig::new(),
-                        &remote.url,
-                        None,
-                    )
-                    .await;
-                    if let Some(client) =
-                        libatomic::signer_refresh::client_for_remote(&remote.url, &config)
-                    {
-                        if let Err(error) = libatomic::signer_refresh::refresh(&repo, &client).await
-                        {
-                            log::warn!("signer refresh: {error}");
-                        }
-                    }
-                });
-            }
-        }
-        // Route every form through the service layer (the handler runs
-        // the same vault_reindex_kg domain call).
-        if crate::commands::rpc::query_reindex(self.full)? {
-            return Ok(());
-        }
-        let root = find_repository_root()?;
-        let repo = Repository::open(&root).map_err(CliError::Repository)?;
-
-        if self.full {
-            repo.rebuild_kg(true).map_err(CliError::Repository)?;
-        }
-        let count = repo.vault_reindex_kg().map_err(CliError::Repository)?;
-        println!("Indexed {} nodes + edges.", count);
-
-        Ok(())
+        crate::commands::rpc::query_reindex(self.full)
     }
 }
 

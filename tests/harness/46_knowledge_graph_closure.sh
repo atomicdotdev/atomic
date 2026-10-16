@@ -10,3 +10,4 @@ cargo test --manifest-path "$HARNESS_DIR/../../Cargo.toml" -p atomic-core --test
 cargo test --manifest-path "$HARNESS_DIR/../../Cargo.toml" -p atomic-repository --test project_identity --test kg_projection --quiet
 cargo test --manifest-path "$HARNESS_DIR/../../Cargo.toml" -p atomic-shacl --quiet
 cargo test --manifest-path "$HARNESS_DIR/../../Cargo.toml" -p libatomic --test signer_refresh --quiet
+cargo test --manifest-path "$HARNESS_DIR/../../Cargo.toml" -p atomic-cli --test kg_service_integration_test --quiet
