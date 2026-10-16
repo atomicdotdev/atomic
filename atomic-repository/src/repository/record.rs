@@ -3391,7 +3391,8 @@ impl Repository {
     ///
     /// # Errors
     ///
-    /// Fails closed on projection errors and unresolved name conflicts.
+    /// Propagates projection errors. Conflicted paths return no seed and
+    /// remain input to the canonical name-conflict resolution machinery.
     pub fn projected_path_binding_for_visibility<T>(
         &self,
         txn: &T,

@@ -2,22 +2,6 @@ use super::*;
 
 // CONFIGURATION
 
-/// Configuration options for globalization.
-///
-/// Controls how local hunks are converted to graph operations.
-///
-/// # Example
-///
-/// ```rust
-/// use atomic_core::record::workflow::globalize::GlobalizeOptions;
-///
-/// let options = GlobalizeOptions::new()
-///     .with_include_empty_files(false)
-///     .with_validate_positions(true);
-///
-/// assert!(!options.include_empty_files());
-/// assert!(options.validate_positions());
-/// ```
 /// A path identity binding resolved through the assembly view's graph
 /// closure by the repository layer.
 ///
@@ -39,6 +23,22 @@ pub struct ProjectedPathBinding {
     pub directory: bool,
 }
 
+/// Configuration options for globalization.
+///
+/// Controls how local hunks are converted to graph operations.
+///
+/// # Example
+///
+/// ```rust
+/// use atomic_core::record::workflow::globalize::GlobalizeOptions;
+///
+/// let options = GlobalizeOptions::new()
+///     .with_include_empty_files(false)
+///     .with_validate_positions(true);
+///
+/// assert!(!options.include_empty_files());
+/// assert!(options.validate_positions());
+/// ```
 #[derive(Debug, Clone)]
 pub struct GlobalizeOptions {
     /// Whether to include empty files in the output.
