@@ -91,7 +91,7 @@ fn git_commit(root: &Path, message: &str) -> String {
 
 /// One colocated Git+Atomic fixture whose active Atomic view (`aged-rain`)
 /// is unrelated to the checked-out Git branch `main`, with no verified
-/// bridge checkpoint: `atomic git bridge reconcile` must import `main`
+/// bridge checkpoint: `atomic git shim reconcile` must import `main`
 /// through the preserved (deferred-TREE) path.
 ///
 /// Atomic is initialized *after* the Git history exists, mirroring a real
@@ -153,7 +153,7 @@ impl Preserved {
     }
 
     fn reconcile(&self) -> String {
-        self.atomic(&["git", "bridge", "reconcile"])
+        self.atomic(&["git", "shim", "reconcile"])
     }
 
     fn git(&self, args: &[&str]) -> String {
@@ -198,10 +198,10 @@ impl Preserved {
     }
 
     fn assert_bridge_verified(&self) {
-        let output = self.atomic_output(&["git", "bridge", "verify"]);
+        let output = self.atomic_output(&["git", "shim", "verify"]);
         assert!(
             output.status.success(),
-            "atomic git bridge verify failed:\n{}",
+            "atomic git shim verify failed:\n{}",
             atomic_text(&output)
         );
     }
