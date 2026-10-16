@@ -103,7 +103,10 @@ pub enum AgentCommands {
     /// Writes hooks into the agent's configuration file (e.g.,
     /// `.claude/settings.json`) that call back to `atomic agent hooks`
     /// on each lifecycle event. Also creates the `.atomic/sessions/`
-    /// directory for session state persistence.
+    /// directory for session state persistence when run inside a
+    /// repository. Works outside a repository too — hooks install
+    /// relative to the current directory and only record turns in
+    /// projects that have a `.atomic/` directory.
     ///
     /// # Examples
     ///
