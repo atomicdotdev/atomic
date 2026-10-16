@@ -646,7 +646,7 @@ impl Command for Init {
         // The scaffold view was created above; the binding-first bootstrap
         // installs the fetched bindings (fail-closed), resurrects a verified
         // binding for HEAD exactly into the scaffold view, and — with the
-        // explicit key — anchors the bridge. An unbound history is a typed
+        // explicit key — anchors the shim. An unbound history is a typed
         // refusal naming the explicit import path; init itself stays
         // successful (the repository exists), the adoption does not run.
         if self.adopt_git {

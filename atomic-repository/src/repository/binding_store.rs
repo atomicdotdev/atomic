@@ -290,8 +290,8 @@ impl Repository {
 
         let observed_after = read_ref_target(git, &ref_name)?;
         let observed_after_ref = observed_after.clone().map(GitRefTarget::Direct);
-        self.record_bridge_git_ref_receipt(&prepared, observed_after_ref.clone())?;
-        self.finalize_bridge_git_write(prepared, observed_after_ref)?;
+        self.record_shim_git_ref_receipt(&prepared, observed_after_ref.clone())?;
+        self.finalize_shim_git_write(prepared, observed_after_ref)?;
 
         Ok(BindingPublication::Published {
             operation,
@@ -828,8 +828,8 @@ impl Repository {
         observed_old: Option<GitObjectId>,
         intended_new: GitObjectId,
         evidence: Hash,
-    ) -> Result<super::operation::PreparedBridgeGitWrite, RepositoryError> {
-        self.prepare_bridge_git_ref_write(
+    ) -> Result<super::operation::PreparedShimGitWrite, RepositoryError> {
+        self.prepare_shim_git_ref_write(
             working_copy,
             ref_name,
             observed_old.map(GitRefTarget::Direct),

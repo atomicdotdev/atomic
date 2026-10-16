@@ -256,7 +256,7 @@ fn journal_failure_cannot_expose_a_valid_looking_publication() {
     // A competing writer holds the ordered operation lock. Publication must
     // fail with the typed contention error before any journal or ref write.
     let _held = repository
-        .prepare_bridge_git_ref_write(
+        .prepare_shim_git_ref_write(
             working_copy,
             "refs/heads/main",
             None,
@@ -299,7 +299,7 @@ fn crash_between_journal_and_ref_write_gates_the_repository_with_the_ref_absent(
     // process dies.
     repository.store_binding(&binding).expect("store");
     let prepared = repository
-        .prepare_bridge_git_ref_write(
+        .prepare_shim_git_ref_write(
             working_copy,
             &ref_name,
             None,

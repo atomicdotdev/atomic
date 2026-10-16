@@ -60,13 +60,13 @@ impl Fixture {
         let key = root_key(f.root());
         f.atomic(&[
             "git",
-            "bridge",
+            "shim",
             "enable",
             "--no-refspecs",
             "--binding-key-file",
             key.to_str().unwrap(),
         ]);
-        f.atomic(&["git", "bridge", "reconcile"]);
+        f.atomic(&["git", "shim", "reconcile"]);
         f
     }
     fn root(&self) -> &Path {
@@ -109,7 +109,7 @@ impl Fixture {
         self.hook_output_in(verb, self.root())
     }
     fn hook_output_in(&self, verb: &str, root: &Path) -> std::process::Output {
-        let payload = serde_json::json!({"session_id": "bridge-agent", "cwd": root,
+        let payload = serde_json::json!({"session_id": "shim-agent", "cwd": root,
             "prompt": "Edit tracked file", "model": "test", "provider": "test",
             "response": "Edited tracked file", "turn_duration_ms": 10});
         let mut child = self
@@ -169,8 +169,8 @@ fn rename_status_restore_does_not_poison_foreign_import() {
             git.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
                 .unwrap();
         }
-        f.atomic(&["git", "bridge", "reconcile"]);
-        f.atomic(&["git", "bridge", "verify"]);
+        f.atomic(&["git", "shim", "reconcile"]);
+        f.atomic(&["git", "shim", "verify"]);
         assert_eq!(
             fs::read(f.root().join("tracked.txt")).unwrap(),
             b"feature edit\n"
@@ -183,23 +183,23 @@ fn rename_status_restore_does_not_poison_foreign_import() {
             b"feature edit\n"
         );
         assert!(!f.root().join("renamed.txt").exists());
-        f.atomic(&["git", "bridge", "verify"]);
+        f.atomic(&["git", "shim", "verify"]);
     }
 }
 
 #[test]
-fn actual_agent_start_and_stop_keep_bridge_aligned() {
+fn actual_agent_start_and_stop_keep_shim_aligned() {
     let f = Fixture::new();
     f.hook("session-start");
     assert!(f.atomic(&["status", "--short"]).trim().is_empty());
-    f.atomic(&["git", "bridge", "verify"]);
+    f.atomic(&["git", "shim", "verify"]);
     f.hook("user-prompt");
     fs::write(f.root().join("tracked.txt"), b"agent edit\n").unwrap();
     f.hook("stop");
     assert!(f.atomic(&["status", "--short"]).trim().is_empty());
-    f.atomic(&["git", "bridge", "verify"]);
+    f.atomic(&["git", "shim", "verify"]);
     let ledger: serde_json::Value =
-        serde_json::from_str(&f.atomic(&["session", "show", "bridge-agent", "--json"])).unwrap();
+        serde_json::from_str(&f.atomic(&["session", "show", "shim-agent", "--json"])).unwrap();
     assert_eq!(ledger[1].as_array().unwrap().len(), 1);
     assert!(!ledger.to_string().contains("UnattributedGitOperation"));
     let git = git2::Repository::open(f.root()).unwrap();
@@ -261,7 +261,7 @@ fn agent_start_preserves_git_owned_state_and_refuses_before_fork() {
 }
 
 #[test]
-fn fallback_agent_start_with_pending_work_keeps_bytes_and_bridge_baseline() {
+fn fallback_agent_start_with_pending_work_keeps_bytes_and_shim_baseline() {
     let f = Fixture::new();
     fs::write(
         f.root().join("tracked.txt"),
@@ -275,7 +275,7 @@ fn fallback_agent_start_with_pending_work_keeps_bytes_and_bridge_baseline() {
     );
     assert!(f.atomic(&["status", "--short"]).contains("tracked.txt"));
     f.hook("stop");
-    f.atomic(&["git", "bridge", "verify"]);
+    f.atomic(&["git", "shim", "verify"]);
 }
 
 #[test]
@@ -292,7 +292,7 @@ fn atomic_record_inside_agent_turn_is_a_verified_repository_operation() {
         "Bridge Test <bridge@example.invalid>",
     ]);
     f.hook("stop");
-    f.atomic(&["git", "bridge", "verify"]);
+    f.atomic(&["git", "shim", "verify"]);
     f.hook("user-prompt");
     fs::write(f.root().join("tracked.txt"), b"second explicit edit\n").unwrap();
     f.atomic(&[
@@ -308,7 +308,7 @@ fn atomic_record_inside_agent_turn_is_a_verified_repository_operation() {
     )
     .unwrap();
     f.hook("stop");
-    f.atomic(&["git", "bridge", "verify"]);
+    f.atomic(&["git", "shim", "verify"]);
 }
 
 #[test]
@@ -345,7 +345,7 @@ fn agent_start_preserves_partial_staging_and_existing_snapshot() {
         "Bridge Test <bridge@example.invalid>",
     ]);
     f.hook("stop");
-    f.atomic(&["git", "bridge", "verify"]);
+    f.atomic(&["git", "shim", "verify"]);
 }
 
 #[test]
@@ -421,5 +421,5 @@ fn agent_in_nested_sandbox_does_not_project_to_the_hosts_git() {
         view
     );
     assert_eq!(fs::read(f.root().join("tracked.txt")).unwrap(), b"base\n");
-    f.atomic(&["git", "bridge", "verify"]);
+    f.atomic(&["git", "shim", "verify"]);
 }

@@ -251,7 +251,7 @@ pub(super) fn aligned_git_index_lease(
     super::git_observation::observe_index_lease(algorithm, &index).map_err(git_map)
 }
 
-/// Facts digest of the parsed bridge checkpoint, `Ok(None)` when absent
+/// Facts digest of the parsed shim checkpoint, `Ok(None)` when absent
 /// (CB-8B ac-3: prepare and execute derive the Checkpoint lease identically
 /// from the canonical checkpoint FACTS — never from file bytes — and a
 /// missing checkpoint is a real first-publication lease value, not an error).

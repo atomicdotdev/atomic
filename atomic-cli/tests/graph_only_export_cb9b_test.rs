@@ -1,4 +1,4 @@
-// Temporary Unix-only Git bridge support to unblock Windows native CI.
+// Temporary Unix-only Git shim support to unblock Windows native CI.
 // Revisit after Windows support is defined; see the RFC temporary platform policy.
 #![cfg(unix)]
 
@@ -177,7 +177,7 @@ const SCALAR_FILES: [&str; 13] = [
     "atomic-repository/src/repository/projection_effects.rs",
     "atomic-repository/src/repository/conflict_object.rs",
     "atomic-repository/src/repository/tests/synthesis_tests.rs",
-    "atomic-repository/src/repository/tests/bridge_git_journal_tests.rs",
+    "atomic-repository/src/repository/tests/shim_git_journal_tests.rs",
     "atomic-repository/src/repository/tests/conflict_restore_tests.rs",
 ];
 

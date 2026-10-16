@@ -151,10 +151,10 @@ pub enum RepositoryError {
     /// The legacy Git shadow pipeline refused to write (CB-13B).
     ///
     /// The repository durably requires the `git-bridge-cutover` capability,
-    /// so the colocated bridge owns writes. Nothing was written: the legacy
+    /// so the colocated shim owns writes. Nothing was written: the legacy
     /// writer refuses before taking its lock or mutating any state.
     #[error(
-        "repository has cut over to the colocated Git bridge: legacy shadow writes are \
+        "repository has cut over to the colocated Git shim: legacy shadow writes are \
          fenced by required capability '{capability}'"
     )]
     LegacyShadowWriterFenced { capability: String },

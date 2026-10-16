@@ -374,7 +374,7 @@ fn synthesized_multi_file_root_change_reconstructs_every_path() {
 }
 
 #[test]
-fn synthesized_root_change_carries_hashed_origin_tagged_oids_and_bridge_sequencing() {
+fn synthesized_root_change_carries_hashed_origin_tagged_oids_and_shim_sequencing() {
     let directory = TempDir::new().unwrap();
     let repo = Repository::init(directory.path()).unwrap();
 
@@ -433,7 +433,7 @@ fn synthesized_root_change_carries_hashed_origin_tagged_oids_and_bridge_sequenci
         .iter()
         .any(|dep| dep.as_bytes() == oid20(0x11).as_bytes()));
 
-    // Tagged commit/tree OIDs, derivation, boundaries, and the bridge
+    // Tagged commit/tree OIDs, derivation, boundaries, and the shim
     // sequencing label travel in unhashed provenance.
     let git_meta = change
         .unhashed
@@ -473,7 +473,7 @@ fn synthesized_root_change_carries_hashed_origin_tagged_oids_and_bridge_sequenci
     );
     assert_eq!(
         git_meta.get("sequencing").and_then(|v| v.as_str()),
-        Some("bridge")
+        Some("shim")
     );
     assert_eq!(
         git_meta

@@ -292,7 +292,7 @@ impl New {
                 result.files_written,
             ));
             let repo_root = find_repository_root()?;
-            if crate::commands::git::shadow::bridge_publication_required(&repo_root) {
+            if crate::commands::git::shadow::shim_publication_required(&repo_root) {
                 let shadow_sync =
                     crate::commands::git::shadow::sync_git_head_to_view(repo, &repo_root, name)?;
                 drop(shadow_sync);

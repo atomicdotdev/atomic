@@ -46,9 +46,9 @@ pub(crate) fn observe_workspace(
     }
 }
 
-/// Enter the explicit repair boundary for the bridge remediation path.
+/// Enter the explicit repair boundary for the shim remediation path.
 ///
-/// The bridge remediation command is what reconciles unanchored workspaces, so
+/// The shim remediation command is what reconciles unanchored workspaces, so
 /// it cannot require an anchored baseline; it still refuses Git-owned
 /// operations, index locks, and diverged operation heads through the typed
 /// remediation value.
@@ -101,10 +101,7 @@ pub(crate) fn prepare_service_query(allow_git_operation: bool) -> CliResult<bool
     };
     let repo = Repository::open_readonly_wait(&root, atomic_repository::database_lock_wait())
         .map_err(CliError::Repository)?;
-    if !repo
-        .bridge_workspace_active()
-        .map_err(CliError::Repository)?
-    {
+    if !repo.shim_workspace_active().map_err(CliError::Repository)? {
         return Ok(true);
     }
     drop(repo);

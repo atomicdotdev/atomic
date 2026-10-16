@@ -1028,7 +1028,7 @@ mod tests {
     #[test]
     fn test_stale_baseline_is_typed_user_fixable_refusal() {
         let error = CliError::StaleBaseline {
-            report: "Unsafe operation: record\nRemediation: atomic git bridge reconcile".into(),
+            report: "Unsafe operation: record\nRemediation: atomic git shim reconcile".into(),
         };
         assert_eq!(error.exit_code(), 1);
         assert!(error.is_user_fixable());

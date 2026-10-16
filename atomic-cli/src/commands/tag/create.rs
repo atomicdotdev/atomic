@@ -263,9 +263,9 @@ fn project_tag_to_git_if_colocated(
     view: &str,
     name: &str,
 ) {
-    // RFC §2/§8.4: tag projection is bridge behavior; a working copy that
+    // RFC §2/§8.4: tag projection is shim behavior; a working copy that
     // never enrolled keeps its tags Atomic-only.
-    match repo.bridge_workspace_active() {
+    match repo.shim_workspace_active() {
         Ok(true) => {}
         Ok(false) => return,
         Err(error) => {

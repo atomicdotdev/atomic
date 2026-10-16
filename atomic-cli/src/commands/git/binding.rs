@@ -1,6 +1,6 @@
 //! Signed Git state binding commands (CB-6A, RFC §5.1/5.2/5.6/8.6).
 //!
-//! `atomic git bridge binding publish` binds the current Git HEAD to the
+//! `atomic git shim binding publish` binds the current Git HEAD to the
 //! current Atomic view state and publishes the signed object to a
 //! create-only `refs/atomic/bindings/<shard>/<id>` ref through the journaled
 //! operation machinery.
@@ -870,7 +870,7 @@ fn fetch(id: &str, remote: Option<String>, timeout: u64, insecure: bool) -> CliR
 
 use atomic_repository::OperationHeadState;
 
-use super::bridge::open_git;
+use super::shim::open_git;
 
 /// Build the preferred Atomic-remote closure source, when one is configured.
 fn build_remote_source(
@@ -901,7 +901,7 @@ fn build_remote_source(
     }
 }
 
-/// `atomic git bridge binding resurrect` (CB-6C): exact restoration of a
+/// `atomic git shim binding resurrect` (CB-6C): exact restoration of a
 /// verified binding's closure into a view.
 fn resurrect(
     id: &str,

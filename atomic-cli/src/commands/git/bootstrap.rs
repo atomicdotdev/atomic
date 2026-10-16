@@ -4,7 +4,7 @@
 //! `git clone` + `atomic init --adopt-git` — route through this one
 //! binding-first bootstrap:
 //!
-//! 1. install the advisory hook integration (`bridge enable` machinery);
+//! 1. install the advisory hook integration (`shim enable` machinery);
 //! 2. configure the RFC §8.6 explicit fetch refspecs on `origin` and fetch
 //!    the binding/view namespaces;
 //! 3. **install verified fetched bindings** into the immutable local store:
@@ -41,7 +41,7 @@ use crate::error::{CliError, CliResult};
 use crate::output::{print_hint, print_info, print_success, print_warning};
 
 use super::binding::load_signing_key;
-use super::bridge::open_git;
+use super::shim::open_git;
 
 /// The outcome of a bound bootstrap attempt.
 pub(crate) enum BootstrapOutcome {
@@ -339,7 +339,7 @@ fn load_binding_at_ref(
 
 /// The shared bound bootstrap for an existing Git checkout (RFC §7.3 via the
 /// CB-7A anchor machinery). `key_file` signs the Anchor when supplied; the
-/// bridge otherwise stays unanchored with the resurrection still journaled.
+/// the shim otherwise stays unanchored with the resurrection still journaled.
 ///
 /// Refuses active Git sequences (merge/rebase in progress) and dirty
 /// bootstraps rather than silently merging: the worktree must be clean
@@ -410,8 +410,8 @@ pub(crate) fn adopt_git_checkout(
         }
     }
 
-    // 1. Hook integration (bridge enable machinery), refspecs, binding fetch.
-    super::hooks::enable_bridge(root, false)?;
+    // 1. Hook integration (shim enable machinery), refspecs, binding fetch.
+    super::hooks::enable_shim(root, false)?;
     let _ = super::transport::configure_fetch_refspecs(&git, remote_name);
     fetch_binding_refs(&git, remote_name, include_degraded)?;
 
@@ -528,11 +528,11 @@ pub(crate) fn adopt_git_checkout(
 
     // 5. Anchoring (CB-7A): with an explicit key, prove complete equivalence
     //    and create the signed Anchor + verified checkpoint. Without a key
-    //    the bound state is restored but the bridge stays unanchored.
+    //    the bound state is restored but the shim stays unanchored.
     let anchored = match key_file {
         Some(key_file) => {
             let signer = load_signing_key(key_file)?;
-            match repo.enable_bridge_anchor(&git, &signer) {
+            match repo.enable_shim_anchor(&git, &signer) {
                 Ok(outcome) => {
                     print_success(&format!(
                         "Anchor binding {} created for view '{}' at Git HEAD {}",
@@ -542,19 +542,19 @@ pub(crate) fn adopt_git_checkout(
                     ));
                     Some(outcome.binding.id().to_hex())
                 }
-                Err(atomic_repository::BridgeAnchorError::Refusal(refusal)) => {
-                    print_warning(&format!("bridge anchor not created: {refusal}"));
+                Err(atomic_repository::ShimAnchorError::Refusal(refusal)) => {
+                    print_warning(&format!("shim anchor not created: {refusal}"));
                     None
                 }
                 Err(error) => {
                     return Err(CliError::GitError {
-                        message: format!("bridge anchoring failed: {error}"),
+                        message: format!("shim anchoring failed: {error}"),
                     })
                 }
             }
         }
         None => {
-            print_hint("no --binding-key-file given; the bound state is restored but the bridge is not anchored");
+            print_hint("no --binding-key-file given; the bound state is restored but the shim is not anchored");
             None
         }
     };

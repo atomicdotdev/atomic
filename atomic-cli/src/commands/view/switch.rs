@@ -111,15 +111,15 @@ fn checkpoint_shadow_switch(
 ) -> CliResult<()> {
     let shadow_was_synchronized = shadow_sync.is_synchronized();
     // A native (unenrolled) colocated repository must neither fail its view
-    // switch on Git observation errors nor bootstrap the first bridge
-    // checkpoint: `.git` beside `.atomic` is not bridge consent. Only an
+    // switch on Git observation errors nor bootstrap the first shim
+    // checkpoint: `.git` beside `.atomic` is not shim consent. Only an
     // enrolled workspace refreshes; import anchors explicitly.
     if !shadow_was_synchronized
-        && !crate::commands::git::shadow::bridge_workspace_enrolled(repo_root)?
+        && !crate::commands::git::shadow::shim_workspace_enrolled(repo_root)?
     {
         return Ok(());
     }
-    let checkpoint = match crate::commands::git::bridge::refresh_checkpoint_if_aligned(repo_root) {
+    let checkpoint = match crate::commands::git::shim::refresh_checkpoint_if_aligned(repo_root) {
         Ok(outcome) => outcome,
         Err(error) => {
             return match shadow_sync.rollback(repo_root) {
@@ -131,11 +131,11 @@ fn checkpoint_shadow_switch(
         }
     };
     if shadow_was_synchronized
-        && checkpoint != crate::commands::git::bridge::CheckpointRefresh::Refreshed
+        && checkpoint != crate::commands::git::shim::CheckpointRefresh::Refreshed
     {
         let error = CliError::GitError {
             message: format!(
-                "Git shadow synchronization for view '{view}' completed, but the bridge verifier did not refresh its checkpoint ({checkpoint:?}); run `atomic git bridge verify` for details"
+                "Git shadow synchronization for view '{view}' completed, but the shim verifier did not refresh its checkpoint ({checkpoint:?}); run `atomic git shim verify` for details"
             ),
         };
         return match shadow_sync.rollback(repo_root) {
@@ -298,7 +298,7 @@ impl Command for Switch {
             ));
         }
 
-        // Release the original redb handle before the full bridge verifier
+        // Release the original redb handle before the full shim verifier
         // reopens the repository. A synchronized shadow switch must produce a
         // fresh checkpoint; no-Git and non-shadow switches preserve their
         // existing no-op behavior.
@@ -372,7 +372,7 @@ mod tests {
     }
 
     // -------------------------------------------------------------------------
-    // Bridge enrollment gating (RFC §2 / CB-13C)
+    // Shim enrollment gating (RFC §2 / CB-13C)
     // -------------------------------------------------------------------------
 
     #[test]
@@ -381,9 +381,9 @@ mod tests {
         let root = directory.path();
         atomic_repository::Repository::init(root).unwrap();
         let git = git2::Repository::init(root).unwrap();
-        // A retained exclude marker without bridge enrollment must neither
+        // A retained exclude marker without shim enrollment must neither
         // fail the view switch on Git observation errors nor bootstrap the
-        // first bridge checkpoint.
+        // first shim checkpoint.
         std::fs::create_dir_all(root.join(".git").join("info")).unwrap();
         std::fs::write(
             root.join(".git").join("info").join("exclude"),
@@ -461,7 +461,7 @@ mod tests {
         assert!(result.is_ok());
         assert!(
             !repo_path.join(".atomic/bridge/workspace.json").exists(),
-            "a no-Git switch must not create bridge metadata"
+            "a no-Git switch must not create shim metadata"
         );
 
         // Verify we switched
@@ -473,7 +473,7 @@ mod tests {
     #[serial]
     #[cfg_attr(
         not(unix),
-        ignore = "the Git bridge projection requires lossless unix paths (ProjectTreeError::UnsupportedPlatformPath)"
+        ignore = "the Git shim projection requires lossless unix paths (ProjectTreeError::UnsupportedPlatformPath)"
     )]
     fn native_colocated_switch_projects_parent_advance_into_child_shadow() {
         let _guard = DirGuard::new();
@@ -593,7 +593,7 @@ mod tests {
     #[serial]
     #[cfg_attr(
         not(unix),
-        ignore = "the Git bridge projection requires lossless unix paths (ProjectTreeError::UnsupportedPlatformPath)"
+        ignore = "the Git shim projection requires lossless unix paths (ProjectTreeError::UnsupportedPlatformPath)"
     )]
     fn conflicted_shadow_projection_fails_and_restores_git_evidence() {
         let _guard = DirGuard::new();

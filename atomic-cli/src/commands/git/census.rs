@@ -1,4 +1,4 @@
-//! CB-13A R2: the deterministic diagnostic census for the read-only bridge
+//! CB-13A R2: the deterministic diagnostic census for the read-only shim
 //! verify paths.
 //!
 //! The five layers prove the CURRENT working copy's alignment; the census
@@ -340,7 +340,7 @@ fn ref_mapping_census_class(repo: &Repository, root: &Path, view_name: &str) -> 
                 clean: false,
                 detail: format!(
                     "the mapped ref tip {tip} diverges from the branch tip {branch_tip}; \
-                     run 'atomic git bridge status' for the reconciliation state"
+                     run 'atomic git shim status' for the reconciliation state"
                 ),
             }),
             None => Ok(CensusClass {

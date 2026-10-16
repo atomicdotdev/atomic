@@ -865,7 +865,7 @@ Exact independent bounded commands/results (all zero failures/ignored):
 
 | Command | Passed | Filtered |
 | --- | --- | --- |
-| `cargo test -p atomic-cli --test git_bridge_cb13d_test` | 10 | 0 |
+| `cargo test -p atomic-cli --test git_shim_cb13d_test` | 10 | 0 |
 | `cargo test -p atomic-repository --lib repository::workspace_txn::tests` | 17 | 1295 |
 | `cargo test -p atomic-repository --lib metadata_only_open_refuses_pending_recovery_instead_of_replaying --quiet` | 1 | 1311 |
 | `cargo test -p atomic-agent --lib watch_notice` | 3 | 1307 |
@@ -1015,7 +1015,7 @@ open). FINAL review pending.
   metadata-only adoption refusal surfaces as an unsafe-state notice with
   the typed remediation.
 
-Checks run (fresh binary, targeted): `git_bridge_cb13d_test` 10/10;
+Checks run (fresh binary, targeted): `git_shim_cb13d_test` 10/10;
 `atomic-repository` workspace_txn unit 17/17 + operation_recovery_tests
 22/22; `atomic-cli` git command units 152/152 (incl. watch 7/7);
 `atomic-agent` lib 1310/1310; `atomic-config` bridge_watch 1/1; harness 45
@@ -1110,8 +1110,8 @@ precedent as the earlier session).
   64-char lowercase hex). Adversarial test rejects prompt/transcript/
   secret sentinels, no-space tokens, wrong-length and wrong-alphabet
   values at the type boundary.
-- **R4 (medium, fixed):** `atomic git bridge enable` records the explicit
-  consent (`[git.bridge] enabled = true`) and a new `git bridge disable`
+- **R4 (medium, fixed):** `atomic git shim enable` records the explicit
+  consent (`[git.shim] enabled = true`) and a new `git shim disable`
   rolls it back — exercised live through the real config file
   (`enable_records_opt_in_and_disable_rolls_back`); `default_enablement()`
   gains real consumers (honest enable-time report + the consent gate); the
@@ -1237,7 +1237,7 @@ prompts/transcripts/decision graphs/secrets cannot be serialized into
 telemetry by construction; a field-allowlist + leaf-string test pins the
 schema (`every_event_variant_has_stable_fields_and_safe_leaf_strings`).
 Emission wired through existing entrypoints: reconcile direction/outcome at
-every terminal of `atomic git bridge reconcile` (`bridge.rs`), publication
+every terminal of `atomic git shim reconcile` (`bridge.rs`), publication
 refusals in `verify_receive.rs` and the local pre-push gate (`hooks.rs`),
 recovery outcomes in `recover_incomplete_operation`, binding-closure loss in
 `fetch_binding_closure`, and change-source degradation in `status.rs`
@@ -1269,7 +1269,7 @@ CB-13D-absent watcher.
 **Task 3 — rollout gates (AC-3 MET on its letter: matrix published, budgets
 measured on real filesystems, gates enforced; explicit owner approval of
 default enablement remains an open owner decision and default stays refused).**
-`atomic-config`: `[git.bridge] enabled` (default **false**; no code path
+`atomic-config`: `[git.shim] enabled` (default **false**; no code path
 flips it) plus the recorded `ROLLOUT_GATES` surface (recovery, parity,
 security, migration, performance — all `unmeasured`), `default_enablement()`
 refusing NotOptedIn/UnmeasuredGate/FailedGate; tests pin default-off, opt-in
@@ -1346,18 +1346,18 @@ blockers and every unmeasured gate remain in force.
 
 Each RFC §21 success criterion, its actual artifacts, and its truthful state.
 "Unknown or failing gates prevent default enablement" is implemented by
-`GitBridgeConfig::default_enablement()`; per-gate states below are the
+`GitShimConfig::default_enablement()`; per-gate states below are the
 recorded decision surface in `atomic-config/src/lib.rs` (`ROLLOUT_GATES`).
 
 | §21 | Criterion | Artifacts | State |
 |---|---|---|---|
-| 1 | `git switch feature && git status && atomic status` coherent for a bound state | `39_git_bridge_mvp.sh`; CLI bridge tests (switch/collision/classifier); exercised reconcile/verify in this session's disposable repo | Linux-only evidence; measured on synthetic fixtures — not certified across platforms |
+| 1 | `git switch feature && git status && atomic status` coherent for a bound state | `39_git_shim_mvp.sh`; CLI bridge tests (switch/collision/classifier); exercised reconcile/verify in this session's disposable repo | Linux-only evidence; measured on synthetic fixtures — not certified across platforms |
 | 2 | `atomic view switch` + `atomic status` + `git status --short` coherent | `status_git_cb11a_test` (28 golden rows, Linux); `atomic status --git` exercised | Parity subset (§9.2); macOS/Windows unmeasured |
-| 3 | Fresh clone + `--adopt-git` exact restoration | CB-6C resurrection tests; `atomic git bridge enable --adopt-git` refuses (typed) | **Blocked**: adopt-git explicitly unavailable until Phase 9 |
+| 3 | Fresh clone + `--adopt-git` exact restoration | CB-6C resurrection tests; `atomic git shim enable --adopt-git` refuses (typed) | **Blocked**: adopt-git explicitly unavailable until Phase 9 |
 | 4 | Foreign history imported as ChangeOrigin-verified graph | `git_import_cb9a_test`, `git_import_cb9c_test` | **Blocked**: CB-9C open findings (R7, sibling import, unbuildable target pieces) |
 | 5 | Concurrent ref movements → `Diverged`, never last-writer-wins | `ref_mapping_tests`; reconcile Diverged refusal (exercised mapping-diverged path in code review only) | Typed Diverged present; no true multi-process race fixture |
 | 6 | Agent ends with signed exact/synthesized-incomplete outcome | `atomic-core` session/attestation tests; CB-12A capture evidence | **Blocked**: exact reassembly unimplemented; MAC not agent-DID signatures (Q2/Q4 open) |
-| 7 | Crash at any operation state recovers without data loss | `43_git_bridge_operation_recovery.sh` (21/21); `44_operation_commands.sh` (31/31); recovery journal events | Recovery outcomes observable; full fault-class matrix (CB-13A) open |
+| 7 | Crash at any operation state recovers without data loss | `43_git_shim_operation_recovery.sh` (21/21); `44_operation_commands.sh` (31/31); recovery journal events | Recovery outcomes observable; full fault-class matrix (CB-13A) open |
 | 8 | Legacy Shadow and colocated bridge cannot both be active | `cutover_tests` 33/33 (fence under lock, readiness, resume proof, hook-decommission leases + effect-bearing rollback/recovery); CLI `git_cutover_cb13b_test` 4/4 | Fence verified including the read-to-lock interleaving (R5), real readiness gates (R6), lifecycle resume proof (R7), CLI entry + journaled hook decommission with byte-for-byte leased rollback (R2), census/goldens/matrix (R4); the cross-stream matrix remains owned by ::25 |
 | 9 | Every §9.2 parity row passes on Linux/macOS/Windows | `status_git_cb11a_test` | **Blocked for the criterion**: Linux only; macOS/Windows unmeasured |
 
@@ -1522,10 +1522,10 @@ The historical negatives above are preserved verbatim.
   at the incomplete-head gate (`cutover_refuses_to_prepare_over_an_interrupted_
   fence_before_the_landing`). Fails before (presence-only no-op success),
   passes after.
-- **R2 closed** (ownership, second pass #331): `atomic git bridge cutover [--rollback]`
+- **R2 closed** (ownership, second pass #331): `atomic git shim cutover [--rollback]`
   (bridge.rs `run_cutover`) is the reachable CLI entry invoking the journaled
   executor and its typed inverse; the explicit opt-in consent
-  (`[git.bridge] enabled`) is a precondition — the cutover never enables
+  (`[git.shim] enabled`) is a precondition — the cutover never enables
   implicitly, and the observed consent file's digest travels in the cutover
   operation's evidence. The Atomic-owned advisory dispatchers (marker
   `# atomic:git-bridge-dispatcher:v1`, shared constant) decommission through
@@ -1715,7 +1715,7 @@ no deletion, not an error, and does not prove wall-clock or unified retention.
 - **R3/P2:** `repair.rs:362-501,509-550` writes repair directly in redb, without
   immutable remediation payload/receipts/fresh inverse leases. Database atomicity
   and truthful insert-only refusal are not the full AC2 recovery contract.
-- **R4/P1:** harness `43_git_bridge_operation_recovery.sh:163-187` reports pass
+- **R4/P1:** harness `43_git_shim_operation_recovery.sh:163-187` reports pass
   when add refuses or a failpoint does not trigger, so existing results cannot
   establish the per-effect crash matrix. Require proven seam entry and explicit
   limitations, preserve historical assertions, then cover recovery interruption,
@@ -1848,7 +1848,7 @@ intent `::16` carries the author's evidence; review ::8 below records failures):
   working copies (needs operation-ancestry filtering); ref-target equality
   beyond HEAD/index covered only via the journal on the moved-HEAD path.
 - **Authenticated capture evidence (AC2 partial).** `pre-commit` dispatcher
-  installed by `atomic git bridge enable`; `atomic git bridge hook-pre-commit`
+  installed by `atomic git shim enable`; `atomic git shim hook-pre-commit`
   writes one MAC-bound `ManagedCommitCapture` per active managed session
   (keyed Blake3; key stored beside the evidence — evidence quality, not
   content correctness). The turn-end consumer verifies MAC, session, turn,
@@ -3116,7 +3116,7 @@ configured `[git.trust]`, unexplained-commit check); typed
 `PublicationGateRefused`; gates before mutation at shared-view
 `insert_change`/`insert_change_rec` (full closure)/`insert_from_view`
 ("triage promotion"), Atomic push (`to_store` delta), and `atomic git push`
-(view closure) with an honest unenforced-remote warning; `atomic git bridge
+(view closure) with an honest unenforced-remote warning; `atomic git shim
 verify-receive` (stdin pre-receive/update contract, projection-trailer →
 Merkle → STATES seq, refuses ahead-of-ingestion and unverifiable evidence,
 `--unprotected` explicit exemptions); advisory local `pre-push` dispatcher
@@ -3150,7 +3150,7 @@ User-authorized follow-up remediating work ::13 against review ::5 (final
 R1-R7). Every fix landed with an automated regression that fails before and
 passes after; the six findings and the full-contract sweep:
 
-- **R1 export-authority verification** — `git bridge publish` trusted the
+- **R1 export-authority verification** — `git shim publish` trusted the
   live tip of the draft's private ref (which the verified-workspace
   invariant does not cover). Now the publication commit must be the VERIFIED
   projection commit the checkpoint names; the stale-source probe (external
@@ -3211,7 +3211,7 @@ passes after; the six findings and the full-contract sweep:
 - **R5 preserved**: the refused-Shared-delete control stays green
   (`refused_shared_view_delete_keeps_its_mapping`), untouched.
 
-Verification: `cargo test -p atomic-cli --test git_bridge_cb10a_test` 26/26,
+Verification: `cargo test -p atomic-cli --test git_shim_cb10a_test` 26/26,
 `cargo test -p atomic-repository --lib` 1356/1356, `cargo test -p
 atomic-core --lib` 3648/3648, atomic-cli full suite (injection feature)
 2261/2261. Two-process stale-plan/ref races are covered through the lease
@@ -3338,12 +3338,12 @@ operations, suppresses self-events, emits managed-session notices, and can be ki
 without changing the next command outcome.
 
 **Execution status (2026-09-14, author-met, not acceptance):** the metadata-only
-daemon (`atomic git bridge watch`), the shared-transaction metadata-only effect
+daemon (`atomic git shim watch`), the shared-transaction metadata-only effect
 budget, the ≥250 ms quiescence gate over Git-resolved lock/sequence state,
 journal/state self-event suppression, session notices, and the opt-in-only
 consent surface landed. Evidence: repository unit tests (quiescence/budget),
-daemon unit tests, `atomic-cli/tests/git_bridge_cb13d_test.rs` (7),
-`tests/harness/45_git_bridge_watch_daemon.sh` (16), and regression runs of
+daemon unit tests, `atomic-cli/tests/git_shim_cb13d_test.rs` (7),
+`tests/harness/45_git_shim_watch_daemon.sh` (16), and regression runs of
 CB-10A (20), hooks (16), CB-0D (6), harness 43 (21 pass / 2 skipped crash
 seams). **Unmet part of AC2:** the fsmonitor/Watchman tier equivalence corpus
 was not executed against real tier daemons (none available; none faked), and
@@ -3393,7 +3393,7 @@ entries are owned by ::25's shared matrix.
 |---|---|---|
 | ::15 / ::3 (CB-9B) | synthesis/merge-rate acceptance | closed-in-follow-up: ::16 (CB-9C) + the CB-9B blocker remains RFC-tracked; review ::3's file recovery → AC-3 below |
 | ::16 / ::4 (CB-9C) | import budget + sibling findings | closed-in-follow-up: ::16 fix round (recorded); residual R7 → tracked |
-| ::17 / ::5 (CB-10A) | mapping/publication findings R1-R7 | closed-in-follow-up: ::17 (six fixes, 26/26 `git_bridge_cb10a_test`) |
+| ::17 / ::5 (CB-10A) | mapping/publication findings R1-R7 | closed-in-follow-up: ::17 (six fixes, 26/26 `git_shim_cb10a_test`) |
 | ::18 / ::7 (CB-10B) | transport/bootstrap R2-R12 | closed-in-follow-up: ::18 (ten fixes, 17/17 `git_transport_cb10b_test`) |
 | ::19 / ::8 (CB-12A) | capture/DID/attestation | closed-in-follow-up: ::19 (Attestation V4, DID signing, e2e oracles) |
 | ::20 / ::9 (CB-12B) | split splitting + interrupted investigation | closed-in-follow-up: ::20 (the interrupted ::9 investigation finished first per the recorded exception); fix-round labels re-verified by ::23 |

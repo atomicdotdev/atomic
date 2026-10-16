@@ -1,6 +1,6 @@
 //! Authenticated managed commit-time capture (CB-12A, RFC §10.3 / §11.1).
 //!
-//! A `pre-commit` hook installed by `atomic git bridge enable` writes one
+//! A `pre-commit` hook installed by `atomic git shim enable` writes one
 //! capture per active managed agent session while the commit is forming. The
 //! capture proves, at commit time: exact HEAD, the primary index tree/digest,
 //! the working-copy identity, the session and turn, and the conversion policy

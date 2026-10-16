@@ -6,7 +6,7 @@
 //! classify the three-way matrix, and expose the status/publish lifecycle
 //! surfaces.
 
-use crate::commands::git::bridge::{
+use crate::commands::git::shim::{
     journal_and_create_branch_cas_with_mapping, journal_and_move_branch,
 };
 use crate::commands::workspace_txn::enter_workspace;
@@ -375,17 +375,17 @@ pub(crate) fn persist_diverged_status(
 pub(crate) fn remediation_for(status: RefSyncStatus) -> &'static str {
     match status {
         RefSyncStatus::Diverged => {
-            "resolve with 'atomic view insert' from the other side or 'git merge', then re-run 'atomic git bridge reconcile'"
+            "resolve with 'atomic view insert' from the other side or 'git merge', then re-run 'atomic git shim reconcile'"
         }
         RefSyncStatus::GitAhead => {
-            "run 'atomic git bridge reconcile' to import the Git movement"
+            "run 'atomic git shim reconcile' to import the Git movement"
         }
         RefSyncStatus::AtomicAhead => {
-            "run 'atomic git bridge reconcile' to export the Atomic projection"
+            "run 'atomic git shim reconcile' to export the Atomic projection"
         }
         RefSyncStatus::Synchronized => "no action needed",
         RefSyncStatus::Unrepresentable => {
-            "the view no longer maps to a Git ref; republish via 'atomic git bridge publish' or 'git switch -c'"
+            "the view no longer maps to a Git ref; republish via 'atomic git shim publish' or 'git switch -c'"
         }
     }
 }
@@ -422,7 +422,7 @@ pub(crate) fn print_divergence_notices(repo: &Repository) -> CliResult<()> {
     Ok(())
 }
 
-/// `atomic git bridge status`: read-only per-view ref-mapping reconciliation
+/// `atomic git shim status`: read-only per-view ref-mapping reconciliation
 /// report (CB-10A AC-2). Never materializes; never moves a ref.
 pub(crate) fn run_status() -> CliResult<()> {
     let root = crate::commands::find_repository_root()?;
@@ -447,7 +447,7 @@ pub(crate) fn run_status() -> CliResult<()> {
     }
 
     if rows.is_empty() {
-        println!("no ref mappings (run 'atomic git bridge reconcile' to establish one)");
+        println!("no ref mappings (run 'atomic git shim reconcile' to establish one)");
         return Ok(());
     }
     let git = GitRepository::open(&root).map_err(|error| CliError::GitError {
@@ -460,7 +460,7 @@ pub(crate) fn run_status() -> CliResult<()> {
         let (display_status, remediation) = if !view_exists {
             (
                 RefSyncStatus::Unrepresentable,
-                "view no longer exists; its Git ref was left untouched. republish via 'git switch -c' or 'atomic git bridge publish'",
+                "view no longer exists; its Git ref was left untouched. republish via 'git switch -c' or 'atomic git shim publish'",
             )
         } else {
             let decision = classify_mapping_direction(&repo, &git, &mapping.view_name, &mapping)?;
@@ -541,7 +541,7 @@ fn unpersisted_mapping(repo: &Repository, view: &str) -> CliResult<RefMapping> {
     })
 }
 
-/// `atomic git bridge publish <view> --branch <name>`: explicit Draft
+/// `atomic git shim publish <view> --branch <name>`: explicit Draft
 /// publication (RFC §8.1, CB-10A AC-2).
 ///
 /// Publication is create-only and guarded (CB-10A review R3): the shared
@@ -579,7 +579,7 @@ pub(crate) fn run_publish(view: &str, branch: &str) -> CliResult<()> {
     let git = GitRepository::open(&root).map_err(|error| CliError::GitError {
         message: format!("cannot open Git repository: {error}"),
     })?;
-    crate::commands::git::bridge::require_clean_git_worktree(&git)?;
+    crate::commands::git::shim::require_clean_git_worktree(&git)?;
 
     let target_ref = format!("refs/heads/{branch}");
     // Review R3: publication is create-only. An occupied target is never a
@@ -613,7 +613,7 @@ pub(crate) fn run_publish(view: &str, branch: &str) -> CliResult<()> {
         })
         .ok_or_else(|| CliError::GitError {
             message: format!(
-                "view '{view}' has no projection commit to publish; run 'atomic git bridge reconcile' or record first"
+                "view '{view}' has no projection commit to publish; run 'atomic git shim reconcile' or record first"
             ),
         })?;
 
@@ -626,17 +626,17 @@ pub(crate) fn run_publish(view: &str, branch: &str) -> CliResult<()> {
     // live ref tip would export unverified history and then claim
     // `Synchronized` for it. The stale-source probe — external
     // `git update-ref refs/atomic/views/topic refs/heads/main`, then
-    // `git bridge publish topic --branch …` — refuses here instead.
-    let checkpoint = crate::commands::git::bridge::read_workspace_metadata(&root)?;
+    // `git shim publish topic --branch …` — refuses here instead.
+    let checkpoint = crate::commands::git::shim::read_workspace_metadata(&root)?;
     let checkpoint = checkpoint.ok_or_else(|| {
         git_error(format!(
-            "refusing to publish view '{view}': there is no verified bridge checkpoint; \
-         run 'atomic git bridge reconcile' to verify the workspace first"
+            "refusing to publish view '{view}': there is no verified shim checkpoint; \
+         run 'atomic git shim reconcile' to verify the workspace first"
         ))
     })?;
     if checkpoint.view != view {
         return Err(git_error(format!(
-            "refusing to publish view '{view}': the verified bridge checkpoint names view '{}' \
+            "refusing to publish view '{view}': the verified shim checkpoint names view '{}' \
              (the workspace must be reconciled and checked out on '{view}' first)",
             checkpoint.view
         )));
@@ -645,7 +645,7 @@ pub(crate) fn run_publish(view: &str, branch: &str) -> CliResult<()> {
         return Err(git_error(format!(
             "refusing to publish view '{view}': the candidate publication commit {} is not the \
              verified projection commit {} of the current workspace state. The draft's mapped ref \
-             moved outside a verified transition; run 'atomic git bridge reconcile' and re-verify \
+             moved outside a verified transition; run 'atomic git shim reconcile' and re-verify \
              before publishing",
             commit, checkpoint.git_head
         )));

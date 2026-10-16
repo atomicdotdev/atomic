@@ -10,12 +10,12 @@ pub const CHANGE_FORMAT_VNEXT_CAPABILITY: RepositoryCapability =
     RepositoryCapability::new("change-format-vnext", 1);
 
 /// CB-13B: capability a repository requires once the transactional shadow
-/// migration has cut over to the colocated bridge.
+/// migration has cut over to the colocated shim.
 ///
 /// The requirement lives in `PRISTINE_META` under `required-capability/`,
 /// so builds that predate this capability fail closed on open instead of
 /// writing through a legacy shadow pipeline the repository no longer owns.
-pub const BRIDGE_CUTOVER_CAPABILITY: RepositoryCapability =
+pub const SHIM_CUTOVER_CAPABILITY: RepositoryCapability =
     RepositoryCapability::new("git-bridge-cutover", 1);
 
 pub const KG_SEMWEB_CAPABILITY: RepositoryCapability = RepositoryCapability::new("kg-semweb-v1", 1);
@@ -23,7 +23,7 @@ pub const KG_SEMWEB_CAPABILITY: RepositoryCapability = RepositoryCapability::new
 /// Capabilities supported by this Atomic build.
 pub const SUPPORTED_REPOSITORY_CAPABILITIES: &[RepositoryCapability] = &[
     CHANGE_FORMAT_VNEXT_CAPABILITY,
-    BRIDGE_CUTOVER_CAPABILITY,
+    SHIM_CUTOVER_CAPABILITY,
     KG_SEMWEB_CAPABILITY,
 ];
 

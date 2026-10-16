@@ -5,7 +5,7 @@
 //! layer (index → worktree) with two-column codes, decorates Git-informed
 //! notices, reports shelves under a separate heading, and never claims full
 //! Git porcelain compatibility. Machine-readable output carries the format
-//! version, bridge state, and origin.
+//! version, shim state, and origin.
 //!
 //! The command is observation-only: it enters the workspace boundary in
 //! Observe mode, so it never journals reconcile operations, never
@@ -45,12 +45,12 @@ pub fn run_git_status(repo_root: &Path, json: bool) -> CliResult<()> {
     let git_repo = open_git(repo_root)?;
     let policy = conversion_policy(&git_repo)?;
 
-    let (staging, bridge, remediation_notice) = match boundary {
+    let (staging, shim, remediation_notice) = match boundary {
         WorkspaceTxnStart::Ready(workspace) => {
             let working_copy = workspace.working_copy();
             let staging = observe_staging_state(&repo, working_copy, &policy)
                 .map_err(|error| CliError::Internal(error.into()))?;
-            let bridge = BridgeSummary {
+            let shim = ShimSummary {
                 state: "aligned".to_string(),
                 origin: if workspace.checkpoint().is_some() {
                     "checkpoint".to_string()
@@ -66,7 +66,7 @@ pub fn run_git_status(repo_root: &Path, json: bool) -> CliResult<()> {
                     .checkpoint()
                     .map(|checkpoint| checkpoint.git_tree.clone()),
             };
-            (staging, bridge, None)
+            (staging, shim, None)
         }
         WorkspaceTxnStart::Remediation(remediation) => {
             let mut staging = observe_git_staging_state(repo_root, &policy)
@@ -81,7 +81,7 @@ pub fn run_git_status(repo_root: &Path, json: bool) -> CliResult<()> {
                 .require_working_copy_id()
                 .ok()
                 .and_then(|working_copy| repo.desired_view_name(working_copy).ok());
-            let bridge = BridgeSummary {
+            let shim = ShimSummary {
                 state: "remediation".to_string(),
                 origin: "observed".to_string(),
                 view: view.unwrap_or_default(),
@@ -109,19 +109,19 @@ pub fn run_git_status(repo_root: &Path, json: bool) -> CliResult<()> {
                     describe_remediation(other)
                 )),
             };
-            (staging, bridge, notice)
+            (staging, shim, notice)
         }
     };
 
     let ignore = check_ignore_policy(repo_root).map_err(|error| CliError::GitError {
         message: error.to_string(),
     })?;
-    let shelved = collect_shelved_artifacts(repo_root, &bridge.view);
+    let shelved = collect_shelved_artifacts(repo_root, &shim.view);
 
     if json {
         let document = git_status_json(
             &staging,
-            &bridge,
+            &shim,
             &ignore,
             &shelved,
             remediation_notice.as_deref(),
@@ -179,7 +179,7 @@ pub fn run_git_status(repo_root: &Path, json: bool) -> CliResult<()> {
     Ok(())
 }
 
-struct BridgeSummary {
+struct ShimSummary {
     state: String,
     origin: String,
     view: String,
@@ -342,7 +342,7 @@ fn entry_json(entry: &StagingEntry) -> serde_json::Value {
 
 fn git_status_json(
     staging: &StagingState,
-    bridge: &BridgeSummary,
+    shim: &ShimSummary,
     ignore: &atomic_repository::IgnorePolicyReport,
     shelved: &[String],
     remediation_notice: Option<&str>,
@@ -379,13 +379,13 @@ fn git_status_json(
         "format": "atomic-status-git",
         "version": GIT_STATUS_JSON_VERSION,
         "clean": staging.is_clean(),
-        "bridge": {
-            "state": bridge.state,
-            "origin": bridge.origin,
-            "view": bridge.view,
-            "atomic_state": bridge.atomic_state,
-            "git_head": bridge.git_head,
-            "git_tree": bridge.git_tree,
+        "shim": {
+            "state": shim.state,
+            "origin": shim.origin,
+            "view": shim.view,
+            "atomic_state": shim.atomic_state,
+            "git_head": shim.git_head,
+            "git_tree": shim.git_tree,
         },
         "layers": {
             "baseline_tree": staging.baseline_tree.as_ref().map(git_object_id_hex),
@@ -428,12 +428,10 @@ pub(crate) fn apply_git_informed_overlays(
     repo_root: &Path,
     status: &mut atomic_repository::RepositoryStatus,
 ) -> CliResult<()> {
-    // Git-informed overlays are colocated bridge behavior (RFC §9); native
+    // Git-informed overlays are colocated shim behavior (RFC §9); native
     // status of a working copy that never enrolled stays Git-independent.
     if !repo_root.join(".git").exists()
-        || !repo
-            .bridge_workspace_active()
-            .map_err(CliError::Repository)?
+        || !repo.shim_workspace_active().map_err(CliError::Repository)?
     {
         return Ok(());
     }

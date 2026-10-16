@@ -564,7 +564,7 @@ impl Repository {
     /// edit to the file's existing CRDT trunk and alive branches (CB-9B
     /// review F4).
     ///
-    /// The bridge importer drives this for foreign deltas: the baseline is
+    /// The shim importer drives this for foreign deltas: the baseline is
     /// the commit's own context (Git parent-tree bytes in leg mode), never
     /// silently re-read from the view. The semantic state resolution is the
     /// same as [`Self::record_resolution_modified_file`]: the file's current
@@ -3380,6 +3380,48 @@ impl Repository {
             .present
             .get(path)
             .map(|item| (item.inode, item.position)))
+    }
+
+    /// Closure-projected identity binding for one path under an explicit
+    /// assembly visibility: the `(inode, position, directory)` triple
+    /// reduced from the view's path claims. Globalization consumes these as
+    /// the parent-directory anchor authority when the ambient TREE is
+    /// preserved for another view (deferred lifecycle journal) or binds the
+    /// path to a foreign inode.
+    ///
+    /// # Errors
+    ///
+    /// Propagates projection errors. Conflicted paths return no seed and
+    /// remain input to the canonical name-conflict resolution machinery.
+    pub fn projected_path_binding_for_visibility<T>(
+        &self,
+        txn: &T,
+        visibility: &atomic_core::pristine::GraphVisibilityClosure,
+        path: &str,
+    ) -> Result<Option<atomic_core::record::workflow::ProjectedPathBinding>, RepositoryError>
+    where
+        T: atomic_core::pristine::GraphTxnT
+            + atomic_core::pristine::TreeTxnT
+            + atomic_core::pristine::PathClaimTxnT
+            + atomic_core::pristine::InodeGraphOps<InodeError = atomic_core::pristine::PristineError>,
+    {
+        let projection = self.project_tree_for_visibility_scoped(txn, visibility, Some(path))?;
+        // A path with unresolved competing claims in this closure has no
+        // unambiguous binding to seed — a merge resolution is exactly the
+        // change assembled to resolve it. Leave it unseeded: globalization's
+        // name-conflict machinery (SolveNameConflict) owns those paths, and
+        // the ambient anchor path proceeds exactly as before this seeding
+        // existed.
+        if projection.name_conflicts.contains_key(path) {
+            return Ok(None);
+        }
+        Ok(projection.present_metadata.get(path).map(|side| {
+            atomic_core::record::workflow::ProjectedPathBinding {
+                inode: side.inode,
+                position: side.position,
+                directory: side.kind == atomic_core::pristine::PathClaimKind::Directory,
+            }
+        }))
     }
 
     /// Record all changes with a message.
