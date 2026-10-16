@@ -121,14 +121,7 @@ impl Repository {
                 continue;
             }
             if let Some(plan) = &graph.plan_id {
-                self.push_change_plan(
-                    &mut plans,
-                    &mut warnings,
-                    plan,
-                    graph,
-                    graph_hash,
-                    None,
-                );
+                self.push_change_plan(&mut plans, &mut warnings, plan, graph, graph_hash, None);
             }
             if !graph.session_id.is_empty() {
                 if !sessions.contains_key(&graph.session_id) {
@@ -251,8 +244,13 @@ impl Repository {
                 ));
             }
         }
-        plans.sort_by(|a, b| (a.source != "provenance_graph").cmp(&(b.source != "provenance_graph"))
-            .then(a.provenance_hash.0.cmp(&b.provenance_hash.0)).then(a.turn_number.cmp(&b.turn_number)).then(a.plan_id.cmp(&b.plan_id)));
+        plans.sort_by(|a, b| {
+            (a.source != "provenance_graph")
+                .cmp(&(b.source != "provenance_graph"))
+                .then(a.provenance_hash.0.cmp(&b.provenance_hash.0))
+                .then(a.turn_number.cmp(&b.turn_number))
+                .then(a.plan_id.cmp(&b.plan_id))
+        });
         plans.dedup();
         let keys: BTreeSet<_> = plans
             .iter()
@@ -333,7 +331,12 @@ impl Repository {
         }
         plans.push(ChangePlanBinding {
             plan_id: plan.into(),
-            source: if turn.is_some() { "session_turn" } else { "provenance_graph" }.into(),
+            source: if turn.is_some() {
+                "session_turn"
+            } else {
+                "provenance_graph"
+            }
+            .into(),
             session_id: graph.session_id.clone(),
             provenance_hash: *graph_hash,
             turn_number: turn,

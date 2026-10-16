@@ -74,7 +74,7 @@ pub fn repository(root: &Path, fixture: &Fixture) -> Result<Value> {
         let ids =
             atomic_repository::repository::collect_visible_change_ids_with_deps(&txn, &state)?;
         filters.insert(view, json!({"id":state.id,"kind":format!("{:?}",state.kind),"parent":state.parent,"own_change_count":state.change_count,
-            "effective_change_ids":ids.iter().map(|id|id.get()).collect::<Vec<_>>()}));
+            "effective_change_ids":ids.iter_dependency_first().map(|id|id.get()).collect::<Vec<_>>()}));
         drop(txn);
         let mut files = BTreeMap::new();
         for path in &paths {

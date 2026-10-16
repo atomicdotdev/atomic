@@ -311,12 +311,20 @@ async fn another_turn_in_same_session_is_not_a_governing_link_for_an_unbound_cha
 
 #[tokio::test]
 async fn unresolved_current_vault_metadata_does_not_hide_an_actual_recorded_plan_id() {
-    let (dir, repo) = fixture(); let hash = save(&repo, "unresolved intent metadata");
-    repo.save_provenance_graph(&ProvenanceGraph::builder("recorded-session", "pi").plan_id("MISSING::author::999").add_change_explained(hash).build()).unwrap();
+    let (dir, repo) = fixture();
+    let hash = save(&repo, "unresolved intent metadata");
+    repo.save_provenance_graph(
+        &ProvenanceGraph::builder("recorded-session", "pi")
+            .plan_id("MISSING::author::999")
+            .add_change_explained(hash)
+            .build(),
+    )
+    .unwrap();
     drop(repo);
     let context = get(dir.path(), hash, true).await.intent_context.unwrap();
     assert_eq!(context.plan_id.as_deref(), Some("MISSING::author::999"));
-    assert_eq!(context.status, "partial"); assert!(!context.warnings.is_empty());
+    assert_eq!(context.status, "partial");
+    assert!(!context.warnings.is_empty());
     assert!(context.plans.iter().all(|plan| plan.intent.is_none()));
     assert_eq!(context.validation_status, "not_checked");
 }
