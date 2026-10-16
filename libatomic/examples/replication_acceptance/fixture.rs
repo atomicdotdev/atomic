@@ -39,10 +39,12 @@ fn source_hash(fm: &Map<String, Value>, body: &str) -> String {
 }
 pub fn create(binary: &Path, root: &Path, config: &Path) -> Result<Fixture> {
     let mut repo = Repository::init(root)?;
+    let working_copy = repo.require_working_copy_id()?;
     repo.init_vault()?;
     write(root, "base.txt", b"shared base\n")?;
-    repo.add("base.txt", TrackingOptions::default())?;
+    repo.add(working_copy, "base.txt", TrackingOptions::default())?;
     repo.record(
+        working_copy,
         ChangeHeader::new("base"),
         RecordOptions::new()
             .with_all(false)
@@ -54,6 +56,7 @@ pub fn create(binary: &Path, root: &Path, config: &Path) -> Result<Fixture> {
     drop(repo);
     cli(binary, root, config, &["view", "switch", "feature"])?;
     let repo = Repository::open_existing(root)?;
+    let working_copy = repo.require_working_copy_id()?;
     let made = repo.vault_intent_create(IntentCreateOptions {
         title: "Replicated intent".into(),
         priority: None,
@@ -115,7 +118,7 @@ pub fn create(binary: &Path, root: &Path, config: &Path) -> Result<Fixture> {
         ".vault/goals/acceptance/_goal.md".into(),
     ];
     for path in &paths {
-        repo.add(path, TrackingOptions::default())?;
+        repo.add(working_copy, path, TrackingOptions::default())?;
     }
     let provenance = Provenance::builder()
         .vendor(AIVendor::OpenAI)
@@ -124,6 +127,7 @@ pub fn create(binary: &Path, root: &Path, config: &Path) -> Result<Fixture> {
         .session_id("acceptance-session")
         .build();
     let out = repo.record(
+        working_copy,
         ChangeHeader::new("recorded code and vault"),
         RecordOptions::new()
             .with_all(false)
@@ -241,6 +245,7 @@ pub fn orphan(binary: &Path, root: &Path, config: &Path) -> Result<Hash> {
     drop(repo);
     cli(binary, root, config, &["view", "switch", "orphan"])?;
     let repo = Repository::open_existing(root)?;
+    let working_copy = repo.require_working_copy_id()?;
     write(root, "orphan.txt", b"unpromoted code\n")?;
     let memory = "---\nentry_type: memory\nid: orphan-memory\n---\nOnly on orphan\n";
     write(root, ".vault/memory/orphan.md", memory.as_bytes())?;
@@ -252,9 +257,10 @@ pub fn orphan(binary: &Path, root: &Path, config: &Path) -> Result<Hash> {
     )?;
     let paths: Vec<String> = vec!["orphan.txt".into(), ".vault/memory/orphan.md".into()];
     for path in &paths {
-        repo.add(path, TrackingOptions::default())?;
+        repo.add(working_copy, path, TrackingOptions::default())?;
     }
     let out = repo.record(
+        working_copy,
         ChangeHeader::new("unpromoted work"),
         RecordOptions::new()
             .with_all(false)
