@@ -1,4 +1,4 @@
-// Temporary Unix-only Git bridge support to unblock Windows native CI.
+// Temporary Unix-only Git shim support to unblock Windows native CI.
 // Revisit after Windows support is defined; see the RFC temporary platform policy.
 #![cfg(unix)]
 
@@ -76,7 +76,7 @@ fn git_ok(root: &Path, args: &[&str]) {
 /// MEASURED HONEST FAILURE (2026-09-20, recorded in the RFC §22.5):
 /// libgit2 (the shipped build) cannot open `--object-format=sha256`
 /// repositories — `Repository::open` fails at the import boundary before
-/// any bridge logic runs. The git CLI works; the bridge's git2 layer does
+/// any shim logic runs. The git CLI works; the shim's git2 layer does
 /// not. A skipped-as-pass is never counted; this cell stays an explicit
 /// ignored run until the git2 layer gains SHA-256 support.
 #[test]
@@ -105,7 +105,7 @@ fn sha256_colocated_e2e_import_record_project_verify() {
     atomic_ok(root.path(), home.path(), &["record", "-m", "sha256 second"]);
 
     // The projection is verified against the SHA-256 tree.
-    let verify = atomic_ok(root.path(), home.path(), &["git", "bridge", "verify"]);
+    let verify = atomic_ok(root.path(), home.path(), &["git", "shim", "verify"]);
     assert!(
         verify.contains("matches") || !verify.contains("✗"),
         "sha256 verify: {verify}"
@@ -127,8 +127,8 @@ fn sha256_colocated_e2e_import_record_project_verify() {
 /// reftable support.
 /// MEASURED HONEST FAILURE (2026-09-20, recorded in the RFC §22.5):
 /// libgit2 (the shipped build) cannot open reftable-backed repositories —
-/// the import boundary fails before any bridge logic runs. The git CLI
-/// works; the bridge's git2 layer does not.
+/// the import boundary fails before any shim logic runs. The git CLI
+/// works; the shim's git2 layer does not.
 #[test]
 #[ignore = "measured honest failure: libgit2 cannot open reftable repositories (import boundary)"]
 fn reftable_backend_colocated_reconcile_verifies() {
@@ -150,7 +150,7 @@ fn reftable_backend_colocated_reconcile_verifies() {
     atomic_ok(root.path(), home.path(), &["init", "--no-vault"]);
     let _ = fs::remove_file(root.path().join(".atomicignore"));
     atomic_ok(root.path(), home.path(), &["git", "import", "--no-vault"]);
-    let verify = atomic_ok(root.path(), home.path(), &["git", "bridge", "verify"]);
+    let verify = atomic_ok(root.path(), home.path(), &["git", "shim", "verify"]);
     assert!(
         !verify.contains("✗"),
         "the reftable verify must pass: {verify}"
@@ -160,7 +160,7 @@ fn reftable_backend_colocated_reconcile_verifies() {
     fs::write(root.path().join("second.txt"), b"reftable second\n").unwrap();
     git_ok(root.path(), &["add", "second.txt"]);
     git_ok(root.path(), &["commit", "-qm", "reftable second"]);
-    atomic_ok(root.path(), home.path(), &["git", "bridge", "reconcile"]);
+    atomic_ok(root.path(), home.path(), &["git", "shim", "reconcile"]);
 }
 
 /// The pack-format matrix dimension: after the baseline, `git gc` packs
@@ -185,8 +185,8 @@ fn packed_objects_reconcile_identically() {
     fs::write(root.path().join("second.txt"), b"pack second\n").unwrap();
     git_ok(root.path(), &["add", "second.txt"]);
     git_ok(root.path(), &["commit", "-qm", "pack second"]);
-    atomic_ok(root.path(), home.path(), &["git", "bridge", "reconcile"]);
-    let verify = atomic_ok(root.path(), home.path(), &["git", "bridge", "verify"]);
+    atomic_ok(root.path(), home.path(), &["git", "shim", "reconcile"]);
+    let verify = atomic_ok(root.path(), home.path(), &["git", "shim", "verify"]);
     assert!(!verify.contains("✗"), "pack verify: {verify}");
 }
 
@@ -197,7 +197,7 @@ fn packed_objects_reconcile_identically() {
 /// libgit2's status does not honor git's skip-worktree flag — out-of-cone
 /// tracked files report as unstaged deletions, so the clean-worktree gate
 /// refuses the reconcile. The git CLI shows a clean tree (skip-worktree
-/// honored); the bridge's git2 layer does not.
+/// honored); the shim's git2 layer does not.
 #[test]
 #[ignore = "measured honest failure: libgit2 statuses ignore skip-worktree (clean gate refuses)"]
 fn sparse_checkout_reconcile_stays_in_cone() {
@@ -234,7 +234,7 @@ fn sparse_checkout_reconcile_stays_in_cone() {
     // for the commit via the explicit pathspec).
     git_ok(root.path(), &["add", "kept"]);
     git_ok(root.path(), &["commit", "-qm", "sparse second"]);
-    atomic_ok(root.path(), home.path(), &["git", "bridge", "reconcile"]);
+    atomic_ok(root.path(), home.path(), &["git", "shim", "reconcile"]);
     assert!(root.path().join("kept/kept2.txt").exists());
     assert!(
         !root.path().join("skipped/skipped2.txt").exists(),
@@ -261,7 +261,7 @@ fn watch_consent_revocation_while_running_exits_cleanly() {
         home.path(),
         &[
             "git",
-            "bridge",
+            "shim",
             "enable",
             "--binding-key-file",
             {
@@ -277,9 +277,9 @@ fn watch_consent_revocation_while_running_exits_cleanly() {
             .as_str(),
         ],
     );
-    atomic_ok(root.path(), home.path(), &["git", "bridge", "reconcile"]);
+    atomic_ok(root.path(), home.path(), &["git", "shim", "reconcile"]);
 
-    // Revoke: `[git.bridge] enabled = false`.
+    // Revoke: `[git.shim] enabled = false`.
     let config = root.path().join(".atomic/config.toml");
     let content = fs::read_to_string(&config).unwrap();
     let revoked = content
@@ -300,7 +300,7 @@ fn watch_consent_revocation_while_running_exits_cleanly() {
     let once = atomic(
         root.path(),
         home.path(),
-        &["git", "bridge", "watch", "--once"],
+        &["git", "shim", "watch", "--once"],
     );
     let once_text = atomic_text(&once);
     assert!(
@@ -310,5 +310,5 @@ fn watch_consent_revocation_while_running_exits_cleanly() {
         "the revoked daemon must report the withdrawal honestly: {once_text}"
     );
     // Commands remain the guarantee.
-    atomic_ok(root.path(), home.path(), &["git", "bridge", "reconcile"]);
+    atomic_ok(root.path(), home.path(), &["git", "shim", "reconcile"]);
 }

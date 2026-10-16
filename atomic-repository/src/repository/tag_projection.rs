@@ -75,7 +75,7 @@ impl Repository {
             .ok_or_else(|| RepositoryError::InvalidOperation {
                 message: format!(
                     "tag '{name}' targets state {}, which has no verified Git state \
-                     binding; run `atomic git bridge enable` to bind it first",
+                     binding; run `atomic git shim enable` to bind it first",
                     Base32::to_base32(&tag.state)
                 ),
             })?;

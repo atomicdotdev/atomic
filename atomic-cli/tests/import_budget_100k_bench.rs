@@ -19,7 +19,7 @@
 //! recorded calibration: budgets are asserted against the published
 //! scan-tier thresholds (with the documented environment), and the
 //! equivalence run asserts byte-level identity between the watcher-off
-//! command-boundary path and the watcher-on (`bridge watch --once`, scan
+//! command-boundary path and the watcher-on (`shim watch --once`, scan
 //! tier) path.
 //!
 //! Environment facts the matrix records (from the measured run):
@@ -309,7 +309,7 @@ const COLD_FILES_TOTAL: usize = COLD_DIRS * FILES_PER_DIR;
 const EQUIV_DIRS: usize = 10;
 const EQUIV_FILES_PER_DIR: usize = 50;
 
-/// A single colocated repo with the bridge enabled and an initial import
+/// A single colocated repo with the shim enabled and an initial import
 /// of the deterministic corpus.
 struct EquivFixture {
     root: tempfile::TempDir,
@@ -337,13 +337,13 @@ impl EquivFixture {
             home.path(),
             &[
                 "git",
-                "bridge",
+                "shim",
                 "enable",
                 "--binding-key-file",
                 key_file(home.path()).to_str().expect("utf8 key path"),
             ],
         );
-        atomic_ok(root.path(), home.path(), &["git", "bridge", "reconcile"]);
+        atomic_ok(root.path(), home.path(), &["git", "shim", "reconcile"]);
         if watch_enabled {
             enable_watch(root.path());
         }
@@ -427,7 +427,7 @@ impl EquivFixture {
                 identity.push('\n');
             }
         }
-        let verify = self.atomic_ok(&["git", "bridge", "verify"]);
+        let verify = self.atomic_ok(&["git", "shim", "verify"]);
         identity.push_str(&format!("verify:\n{}\n", normalize_base32(&verify)));
         identity.push_str(&format!(
             "worktree-bytes: {:?}\n",
@@ -442,15 +442,15 @@ fn enable_watch(root: &Path) {
     let config = root.join(".atomic/config.toml");
     let content = fs::read_to_string(&config).expect("read repo config");
     assert!(
-        content.contains("[git.bridge]"),
-        "bridge enable must have recorded the consent table first"
+        content.contains("[git.shim]"),
+        "shim enable must have recorded the consent table first"
     );
     let mut in_watch = false;
     let mut flipped = false;
     let rewritten: String = content
         .lines()
         .map(|line| {
-            if line.trim() == "[git.bridge.watch]" {
+            if line.trim() == "[git.shim.watch]" {
                 in_watch = true;
                 return line.to_string();
             }
@@ -536,8 +536,8 @@ fn normalize_base32(text: &str) -> String {
 /// AC-3 measurement: watcher-off equivalence through the real CLI.
 ///
 /// From two identical fixtures, the watcher-OFF command-boundary path
-/// (`git bridge reconcile`) and the watcher-ON daemon path
-/// (`git bridge watch --once`, scan tier) must reach identical views,
+/// (`git shim reconcile`) and the watcher-ON daemon path
+/// (`git shim watch --once`, scan tier) must reach identical views,
 /// checkpoints, refs, verified states, worktree bytes and change counts —
 /// and both must pass the typed equivalence verifier.
 #[test]
@@ -553,7 +553,7 @@ fn measured_watcher_off_equivalence_real_cli() {
     on.external_commit();
 
     // Path A: watcher off — the next command boundary reconciles.
-    let (off_s, off_out) = timed_atomic(off.root(), off.home(), &["git", "bridge", "reconcile"]);
+    let (off_s, off_out) = timed_atomic(off.root(), off.home(), &["git", "shim", "reconcile"]);
     assert!(
         off_out.status.success(),
         "watcher-off reconcile failed:\n{off_out:?}"
@@ -561,7 +561,7 @@ fn measured_watcher_off_equivalence_real_cli() {
     println!("WATCH_OFF_RECONCILE_S {off_s:.3}");
 
     // Path B: watcher on (scan tier) — one reactive daemon pass.
-    let (on_s, on_out) = timed_atomic(on.root(), on.home(), &["git", "bridge", "watch", "--once"]);
+    let (on_s, on_out) = timed_atomic(on.root(), on.home(), &["git", "shim", "watch", "--once"]);
     assert!(on_out.status.success(), "watch-on pass failed:\n{on_out:?}");
     println!("WATCH_ON_ONCE_S {on_s:.3}");
 

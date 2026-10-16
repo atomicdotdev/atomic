@@ -74,7 +74,7 @@ fn run_git(root: &Path, args: &[&str]) -> String {
 }
 
 /// Colocated fixture: an Atomic repository over a Git repository with one
-/// commit on `master` and a verified bridge checkpoint naming that state.
+/// commit on `master` and a verified shim checkpoint naming that state.
 fn colocated() -> (TempDir, Repository, git2::Repository) {
     let directory = TempDir::new().unwrap();
     let repo = Repository::init_with_view(directory.path(), "master").unwrap();

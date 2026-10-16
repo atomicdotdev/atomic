@@ -699,8 +699,12 @@ pub(crate) fn build_crdt_ops_for_whole_file_replace(
         }
     }
 
-    // 2. Insert every new line fresh, chained from the start of the file,
-    //    with token-level LeafOps.
+    // 2. Insert every new line fresh, chained from the start of the file
+    //    (`after: None` anchors the fresh chain at the file-start sentinel —
+    //    the fork with the tombstoned original chain is the sanctioned
+    //    multi-render shape: the graph emits both alive chains as a
+    //    conflict, and the after-chain walk emits them in deterministic
+    //    order), with token-level LeafOps.
     let mut prev_branch: Option<BranchId> = None;
     for (new_line_idx, line) in new_lines.iter().enumerate() {
         let branch_id = alloc_branch();

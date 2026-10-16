@@ -118,26 +118,26 @@ pub struct Import {
     #[arg(long = "with-crdt")]
     pub with_crdt: bool,
 
-    /// Internal bridge imports align and checkpoint in their outer operation.
+    /// Internal shim imports align and checkpoint in their outer operation.
     #[arg(skip)]
     pub(crate) skip_checkpoint_refresh: bool,
 
     /// Internal: verify the whole tree at every imported commit. A plain
     /// `git import` verifies only the paths each commit touches, and the
-    /// whole tree at its last commit and at merges; bridge reconcile keeps
+    /// whole tree at its last commit and at merges; shim reconcile keeps
     /// the full check.
     #[arg(skip)]
     pub(crate) full_tree_verification: bool,
 
     /// Internal §7.5 detached-HEAD import tip: the commits behind this commit
     /// import into `branch`'s view even though no local branch carries it.
-    /// Never set from the command line; only the bridge reconcile path uses it
+    /// Never set from the command line; only the shim reconcile path uses it
     /// after resolving the §7.5 view mapping, and it never invents Git refs.
     #[arg(skip)]
     pub(crate) detached_tip: Option<String>,
 
     /// Internal effect budget (CB-13D review R1): set only by the
-    /// metadata-only bridge watch reconcile path. Under
+    /// metadata-only shim watch reconcile path. Under
     /// [`ReconcileEffectBudget::MetadataOnly`] the import refuses every
     /// command-boundary effect — repository bootstrap, Git exclude writes,
     /// and working-copy materialization — and runs metadata-only work only.
@@ -731,7 +731,7 @@ impl Command for Import {
             .is_some_and(|budget| budget.is_metadata_only());
         if metadata_only && !repo_exists {
             return Err(CliError::GitError {
-                message: "the bridge watch daemon imports metadata only and never bootstraps \
+                message: "the shim watch daemon imports metadata only and never bootstraps \
                           an Atomic repository; run 'atomic git import' explicitly"
                     .to_string(),
             });
@@ -805,9 +805,9 @@ impl Command for Import {
         if metadata_only {
             if ensure_git_shadow_excludes_needed(git_repo.path())? {
                 return Err(CliError::GitError {
-                    message: "the bridge watch daemon never edits Git administrative files; \
+                    message: "the shim watch daemon never edits Git administrative files; \
                               the Git shadow exclude line is missing — run 'atomic git import' \
-                              or 'atomic git bridge reconcile' explicitly once"
+                              or 'atomic git shim reconcile' explicitly once"
                         .to_string(),
                 });
             }
@@ -834,7 +834,7 @@ impl Command for Import {
         };
 
         // Enter the shared workspace boundary. Import is also the bootstrap
-        // remediation path for a Git checkout that has no bridge checkpoint
+        // remediation path for a Git checkout that has no shim checkpoint
         // yet, so it uses the explicit repair entry: it still refuses Git-owned
         // operations, index locks, and diverged operation heads, but tolerates
         // the unanchored baseline it exists to establish. The metadata-only
@@ -873,6 +873,8 @@ impl Command for Import {
             let branches = self.get_all_branches(&git_repo)?;
 
             let mut total_imported = 0;
+            let checked_out_branch = current_git_branch(&git_repo);
+            let mut checked_out_verification = None;
             for branch_name in branches {
                 let preserve_branch_working_copy =
                     preserve_current_view && original_view != branch_name;
@@ -882,6 +884,13 @@ impl Command for Import {
                             "missing prevalidated import plan for '{branch_name}'"
                         ))
                     })?;
+                if checked_out_branch.as_deref() == Some(branch_name.as_str()) {
+                    if let (Some(expected), Some(raw)) =
+                        (plan.expected_git_tree(), plan.raw_git_tree())
+                    {
+                        checked_out_verification = Some((branch_name.clone(), expected, raw));
+                    }
+                }
 
                 // Ensure the view exists
                 if !repo
@@ -948,8 +957,17 @@ impl Command for Import {
                 print_info(
                     "Working copy materialization deferred to the explicit command boundary (metadata-only reactive budget).",
                 );
+            } else if let Some(checked_out) = current_git_branch(&git_repo) {
+                // Importing every branch must finish on the checked-out branch,
+                // not whichever ref happened to sort last. Its complete target
+                // tree has passed the same preflight and publication checks as
+                // single-branch import, so adopt Git's existing materialization.
+                repo.align_to_view(working_copy, &checked_out)
+                    .map_err(|e| CliError::Internal(e.into()))?;
+                print_info("Using Git working copy as imported materialization.");
+                reindex_working_copy(&repo, working_copy);
             } else {
-                // Materialize the working copy from the graph
+                // Detached imports have no checked-out branch to adopt.
                 print_info("Materializing working copy...");
                 match repo.materialize(working_copy) {
                     Ok(result) => {
@@ -986,6 +1004,22 @@ impl Command for Import {
                 "Imported {} total changes across all branches",
                 total_imported
             ));
+            if !self.skip_checkpoint_refresh {
+                if let Some((view, expected, raw)) = checked_out_verification {
+                    // Use the same canonical tree proof as single-branch import.
+                    // The generic native-status fallback interprets escaped Git
+                    // names as disk names and is not an import equivalence proof.
+                    super::shim::refresh_checkpoint_after_verified_import(
+                        &repo,
+                        working_copy,
+                        &git_repo,
+                        &view,
+                        &expected,
+                        &raw,
+                    )?;
+                    checkpoint_refreshed = true;
+                }
+            }
         } else {
             // Import single branch
             let branch_name = self.branch.clone().unwrap_or(default_branch);
@@ -1080,7 +1114,7 @@ impl Command for Import {
                 // command-boundary filesystem effect.
                 if metadata_only {
                     return Err(CliError::GitError {
-                        message: "the bridge watch daemon reconciles metadata only and never \
+                        message: "the shim watch daemon reconciles metadata only and never \
                                   materializes a non-checked-out target; run 'atomic git import' \
                                   explicitly to materialize"
                             .to_string(),
@@ -1155,7 +1189,7 @@ impl Command for Import {
                 if let (Some(expected_tree), Some(git_tree)) =
                     (expected_git_tree.as_ref(), raw_git_tree.as_ref())
                 {
-                    super::bridge::refresh_checkpoint_after_verified_import(
+                    super::shim::refresh_checkpoint_after_verified_import(
                         &repo,
                         working_copy,
                         &git_repo,
@@ -1168,9 +1202,9 @@ impl Command for Import {
             }
         }
 
-        // Standalone imports establish or refresh the bridge checkpoint only
+        // Standalone imports establish or refresh the shim checkpoint only
         // when Git and the persisted Atomic working-copy view are fully
-        // aligned. During bridge raw-switch adoption the incremental import
+        // aligned. During shim raw-switch adoption the incremental import
         // deliberately preserves the old Atomic view, so this returns the
         // intentional mismatch no-op; `import_git_to_atomic` aligns and
         // checkpoints afterward.
@@ -1182,7 +1216,7 @@ impl Command for Import {
             drop(workspace);
             drop(repo);
             drop(git_repo);
-            let _ = super::bridge::refresh_checkpoint_if_aligned(&checkpoint_root)?;
+            let _ = super::shim::refresh_checkpoint_if_aligned(&checkpoint_root)?;
         }
 
         Ok(())
@@ -1250,7 +1284,8 @@ fn reindex_working_copy(repo: &Repository, working_copy: WorkingCopyId) {
     let mut entries: Vec<(String, i64, u32, u64, Hash)> = Vec::new();
 
     for file in &tracked {
-        let abs = repo_root.join(&file.path);
+        let path = file.path.to_string_lossy();
+        let abs = repo_root.join(super::parallel::canonical_tree_path(&path));
         if let Ok(metadata) = std::fs::metadata(&abs) {
             let mtime = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
             let duration = mtime
@@ -1258,7 +1293,7 @@ fn reindex_working_copy(repo: &Repository, working_copy: WorkingCopyId) {
                 .unwrap_or_default();
             if let Ok(bytes) = std::fs::read(&abs) {
                 entries.push((
-                    file.path.to_string_lossy().replace('\\', "/"),
+                    path.into_owned(),
                     duration.as_secs() as i64,
                     duration.subsec_nanos(),
                     metadata.len(),
@@ -1596,7 +1631,7 @@ mod tests {
     #[serial]
     #[cfg_attr(
         not(unix),
-        ignore = "the Git bridge projection requires lossless unix paths (ProjectTreeError::UnsupportedPlatformPath)"
+        ignore = "the Git shim projection requires lossless unix paths (ProjectTreeError::UnsupportedPlatformPath)"
     )]
     fn import_records_a_per_import_synthesis_aggregation() {
         // Review R5: the per-import synthesis aggregation is wired from
@@ -1624,7 +1659,7 @@ mod tests {
             "an un-opted repository must not record import synthesis"
         );
 
-        // Opt in exactly as `atomic git bridge enable` records the consent,
+        // Opt in exactly as `atomic git shim enable` records the consent,
         // then import a second commit.
         let config = root.path().join(".atomic/config.toml");
         {
@@ -1633,7 +1668,7 @@ mod tests {
                 .append(true)
                 .open(&config)
                 .unwrap();
-            writeln!(file, "\n[git.bridge]\nenabled = true\n").unwrap();
+            writeln!(file, "\n[git.shim]\nenabled = true\n").unwrap();
         }
         fs::write(root.path().join("tracked.txt"), b"second\n").unwrap();
         git_ok(root.path(), &["add", "tracked.txt"]);
@@ -1674,7 +1709,7 @@ mod tests {
     #[serial]
     #[cfg_attr(
         not(unix),
-        ignore = "the Git bridge projection requires lossless unix paths (ProjectTreeError::UnsupportedPlatformPath)"
+        ignore = "the Git shim projection requires lossless unix paths (ProjectTreeError::UnsupportedPlatformPath)"
     )]
     fn standalone_import_refreshes_v2_checkpoint_before_status() {
         let _dir_guard = DirGuard::new();
@@ -1713,7 +1748,7 @@ mod tests {
     #[serial]
     #[cfg_attr(
         not(unix),
-        ignore = "the Git bridge projection requires lossless unix paths (ProjectTreeError::UnsupportedPlatformPath)"
+        ignore = "the Git shim projection requires lossless unix paths (ProjectTreeError::UnsupportedPlatformPath)"
     )]
     fn one_line_incremental_import_finishes_within_debug_budget() {
         let _dir_guard = DirGuard::new();
@@ -1758,7 +1793,7 @@ mod tests {
     #[serial]
     #[cfg_attr(
         not(unix),
-        ignore = "the Git bridge projection requires lossless unix paths (ProjectTreeError::UnsupportedPlatformPath)"
+        ignore = "the Git shim projection requires lossless unix paths (ProjectTreeError::UnsupportedPlatformPath)"
     )]
     fn mismatched_incremental_import_does_not_publish_checkpoint_before_alignment() {
         let _dir_guard = DirGuard::new();

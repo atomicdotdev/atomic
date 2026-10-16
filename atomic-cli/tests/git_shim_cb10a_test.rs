@@ -1,4 +1,4 @@
-// Temporary Unix-only Git bridge support to unblock Windows native CI.
+// Temporary Unix-only Git shim support to unblock Windows native CI.
 // Revisit after Windows support is defined; see the RFC temporary platform policy.
 #![cfg(unix)]
 
@@ -6,7 +6,7 @@
 //! reconciliation (RFC §8.1/§8.5).
 //!
 //! Every fixture drives a fresh `atomic` binary against a colocated Git
-//! repository, mirroring the bridge contract end to end:
+//! repository, mirroring the shim contract end to end:
 //!
 //! - the three-way matrix: neither moved (no-op), Git-only (import),
 //!   Atomic-only (export under the expected-old lease), both moved
@@ -94,7 +94,7 @@ impl Colocated {
             home.path(),
             &[
                 "git",
-                "bridge",
+                "shim",
                 "enable",
                 "--binding-key-file",
                 key_file(home.path()).to_str().expect("utf8 key path"),
@@ -102,7 +102,7 @@ impl Colocated {
         );
         // CB-10A: establish the Synchronized baseline mapping for the main
         // view. The reconcile also proves the whole five-layer state.
-        atomic_ok(root.path(), home.path(), &["git", "bridge", "reconcile"]);
+        atomic_ok(root.path(), home.path(), &["git", "shim", "reconcile"]);
         let _ = name;
         Self { root, home }
     }
@@ -150,7 +150,7 @@ impl Colocated {
 
     #[allow(dead_code)]
     fn status_text(&self) -> String {
-        self.atomic(&["git", "bridge", "status"])
+        self.atomic(&["git", "shim", "status"])
     }
 }
 
@@ -243,12 +243,12 @@ fn neither_moved_is_a_persisted_noop_mapping() {
 
     // The baseline reconcile in the fixture created the mapping; a second
     // reconcile must be a verified no-op that moves nothing.
-    fixture.atomic(&["git", "bridge", "reconcile"]);
+    fixture.atomic(&["git", "shim", "reconcile"]);
     assert_eq!(fixture.tip("refs/heads/main"), Some(main_tip));
 
     // The mapping is durable bookkeeping in the shared pristine: a fresh
-    // process (`git bridge status`) reports it as Synchronized.
-    let status = fixture.atomic(&["git", "bridge", "status"]);
+    // process (`git shim status`) reports it as Synchronized.
+    let status = fixture.atomic(&["git", "shim", "status"]);
     assert!(status.contains("main"), "{status}");
     assert!(status.contains("synchronized"), "{status}");
     assert!(status.contains("refs/heads/main"), "{status}");
@@ -274,7 +274,7 @@ fn git_only_movement_imports_and_refreshes_the_mapping() {
     drop(repository);
 
     // Reconcile imports the Git movement.
-    let output = fixture.atomic_output(&["git", "bridge", "reconcile"]);
+    let output = fixture.atomic_output(&["git", "shim", "reconcile"]);
     assert!(
         output.status.success(),
         "reconcile failed:\n{}",
@@ -284,7 +284,7 @@ fn git_only_movement_imports_and_refreshes_the_mapping() {
     // The mapped ref did not move (import is Git→Atomic), and the mapping now
     // observes the imported tip as Synchronized.
     assert_eq!(fixture.tip("refs/heads/main"), Some(moved));
-    let status = fixture.atomic(&["git", "bridge", "status"]);
+    let status = fixture.atomic(&["git", "shim", "status"]);
     assert!(status.contains("synchronized"), "{status}");
     assert!(
         status.contains(&moved.to_string()),
@@ -307,7 +307,7 @@ fn atomic_only_movement_exports_under_the_expected_old_lease() {
     fixture.atomic(&["record", "-m", "atomic-side change"]);
 
     let baseline = fixture.tip("refs/heads/main").expect("main tip");
-    let output = fixture.atomic_output(&["git", "bridge", "reconcile"]);
+    let output = fixture.atomic_output(&["git", "shim", "reconcile"]);
     assert!(
         output.status.success(),
         "reconcile failed:\n{}",
@@ -329,14 +329,14 @@ fn atomic_only_movement_exports_under_the_expected_old_lease() {
             commit
                 .message()
                 .expect("message")
-                .contains("Atomic bridge projection"),
+                .contains("Atomic shim projection"),
             "export commit must be an Atomic projection: {:?}",
             commit.message()
         );
     }
 
     // The mapping records the exported tip and reports Synchronized.
-    let status = fixture.atomic(&["git", "bridge", "status"]);
+    let status = fixture.atomic(&["git", "shim", "status"]);
     assert!(status.contains("synchronized"), "{status}");
     assert!(
         status.contains(&exported.to_string()),
@@ -368,7 +368,7 @@ fn incompatible_both_moved_persists_diverged_and_moves_neither_side() {
 
     // Reconcile must refuse: both sides moved beyond the last mutually
     // observed mapping and no closure proof selects a side.
-    let failure = fixture.atomic_fails(&["git", "bridge", "reconcile"]);
+    let failure = fixture.atomic_fails(&["git", "shim", "reconcile"]);
     assert!(
         failure.contains("both advanced beyond the last mutually observed mapping"),
         "{failure}"
@@ -380,7 +380,7 @@ fn incompatible_both_moved_persists_diverged_and_moves_neither_side() {
     assert_eq!(view_merkle(&fixture), atomic_state_before);
 
     // The mapping persisted the Diverged status with explicit remediation.
-    let status = fixture.atomic(&["git", "bridge", "status"]);
+    let status = fixture.atomic(&["git", "shim", "status"]);
     assert!(status.contains("diverged"), "{status}");
     assert!(
         status.contains("atomic view insert"),
@@ -415,7 +415,7 @@ fn equal_trees_with_different_closures_still_reconcile_as_diverged() {
     );
     drop(repository);
 
-    let failure = fixture.atomic_fails(&["git", "bridge", "reconcile"]);
+    let failure = fixture.atomic_fails(&["git", "shim", "reconcile"]);
     assert!(
         failure.contains("both advanced beyond the last mutually observed mapping"),
         "equal trees must not prove identity: {failure}"
@@ -433,7 +433,7 @@ fn mapping_persists_across_reopen_and_processes() {
     // Every atomic invocation is a fresh process with a fresh repository
     // handle: the mapping written by the fixture's reconcile is still there.
     for _ in 0..3 {
-        let status = fixture.atomic(&["git", "bridge", "status"]);
+        let status = fixture.atomic(&["git", "shim", "status"]);
         assert!(status.contains("synchronized"), "{status}");
         assert!(status.contains("refs/heads/main"), "{status}");
     }
@@ -461,7 +461,7 @@ fn draft_publication_is_explicit_and_routes_through_the_mapping() {
     // Explicit publication creates the branch at the projection commit.
     fixture.atomic(&[
         "git",
-        "bridge",
+        "shim",
         "publish",
         "feature-auth",
         "--branch",
@@ -474,7 +474,7 @@ fn draft_publication_is_explicit_and_routes_through_the_mapping() {
     );
 
     // The mapping records the branch-backed ref as Synchronized.
-    let status = fixture.atomic(&["git", "bridge", "status"]);
+    let status = fixture.atomic(&["git", "shim", "status"]);
     assert!(status.contains("refs/heads/published"), "{status}");
     assert!(
         status.contains(&draft_ref.to_string()),
@@ -491,7 +491,7 @@ fn draft_publication_is_explicit_and_routes_through_the_mapping() {
         advanced, draft_ref,
         "published branch must track draft work"
     );
-    let status = fixture.atomic(&["git", "bridge", "status"]);
+    let status = fixture.atomic(&["git", "shim", "status"]);
     assert!(status.contains("synchronized"), "{status}");
     assert!(
         status.contains(&advanced.to_string()),
@@ -506,14 +506,14 @@ fn draft_delete_removes_its_mapping_row() {
     fixture.atomic(&["view", "switch", "to-delete"]);
     // The current-view reconcile materializes the draft's baseline mapping
     // without recording (no snapshot child views).
-    fixture.atomic(&["git", "bridge", "reconcile"]);
-    let status = fixture.atomic(&["git", "bridge", "status"]);
+    fixture.atomic(&["git", "shim", "reconcile"]);
+    let status = fixture.atomic(&["git", "shim", "status"]);
     assert!(status.contains("to-delete"), "{status}");
 
     fixture.atomic(&["view", "switch", "main"]);
     fixture.atomic(&["view", "delete", "to-delete", "--force"]);
 
-    let status = fixture.atomic(&["git", "bridge", "status"]);
+    let status = fixture.atomic(&["git", "shim", "status"]);
     assert!(
         !status.contains("to-delete"),
         "deleted draft mapping must be removed:\n{status}"
@@ -531,10 +531,10 @@ fn status_and_observe_never_materialize_or_move_refs() {
     fixture.atomic(&["record", "-m", "not exported yet"]);
     let before = fixture.tip("refs/heads/main");
 
-    let _ = fixture.atomic(&["git", "bridge", "status"]);
+    let _ = fixture.atomic(&["git", "shim", "status"]);
     let _ = fixture.atomic(&["status", "--no-reconcile"]);
-    // `git bridge verify` reports the divergence (fails) but moves nothing.
-    let _ = fixture.atomic_output(&["git", "bridge", "verify"]);
+    // `git shim verify` reports the divergence (fails) but moves nothing.
+    let _ = fixture.atomic_output(&["git", "shim", "verify"]);
 
     assert_eq!(
         fixture.tip("refs/heads/main"),
@@ -543,10 +543,10 @@ fn status_and_observe_never_materialize_or_move_refs() {
     );
 
     // The status reports the pending export explicitly.
-    let status = fixture.atomic(&["git", "bridge", "status"]);
+    let status = fixture.atomic(&["git", "shim", "status"]);
     assert!(status.contains("atomic-ahead"), "{status}");
     assert!(
-        status.contains("atomic git bridge reconcile"),
+        status.contains("atomic git shim reconcile"),
         "status must give actionable remediation:\n{status}"
     );
 }
@@ -631,13 +631,13 @@ fn detached_draft_head_reconciles_through_the_mapping() {
     }
 
     // The reconcile is a no-op for the mapped pair and stays synchronized.
-    let output = fixture.atomic_output(&["git", "bridge", "reconcile"]);
+    let output = fixture.atomic_output(&["git", "shim", "reconcile"]);
     assert!(
         output.status.success(),
         "detached reconcile failed:\n{}",
         atomic_text(&output)
     );
-    let status = fixture.atomic(&["git", "bridge", "status"]);
+    let status = fixture.atomic(&["git", "shim", "status"]);
     assert!(status.contains("synchronized"), "{status}");
     assert!(
         status.contains("refs/atomic/views/feature-detached"),
@@ -676,7 +676,7 @@ fn the_mapping_lives_in_the_shared_pristine_not_working_copy_storage() {
         Some("fedcba9876543210fedcba9876543210fedcba98")
     );
     drop(reopened);
-    let _ = fixture.atomic(&["git", "bridge", "status"]);
+    let _ = fixture.atomic(&["git", "shim", "status"]);
 }
 
 #[test]
@@ -696,7 +696,7 @@ fn both_moved_incompatible_after_import_and_record_persists_diverged() {
         "to be imported",
     );
     drop(repository);
-    fixture.atomic(&["git", "bridge", "reconcile"]);
+    fixture.atomic(&["git", "shim", "reconcile"]);
 
     // Atomic moves without projecting (shadow disabled AFTER the import so
     // the managed exclude line is not restored by the reconcile).
@@ -715,14 +715,14 @@ fn both_moved_incompatible_after_import_and_record_persists_diverged() {
     );
     drop(repository);
 
-    let failure = fixture.atomic_fails(&["git", "bridge", "reconcile"]);
+    let failure = fixture.atomic_fails(&["git", "shim", "reconcile"]);
     assert!(
         failure.contains("both advanced beyond the last mutually observed mapping"),
         "{failure}"
     );
     // Neither side moved.
     assert_eq!(fixture.tip("refs/heads/main"), Some(git_moved));
-    let status = fixture.atomic(&["git", "bridge", "status"]);
+    let status = fixture.atomic(&["git", "shim", "status"]);
     assert!(status.contains("diverged"), "{status}");
 }
 
@@ -741,7 +741,7 @@ fn diverged_reconcile_emits_failed_not_refused_after_persisting_status() {
         "to be imported",
     );
     drop(repository);
-    fixture.atomic(&["git", "bridge", "reconcile"]);
+    fixture.atomic(&["git", "shim", "reconcile"]);
 
     disable_shadow_sync(fixture.root());
     fs::write(fixture.root().join("atomic-only.txt"), b"atomic diverged\n").expect("write");
@@ -757,7 +757,7 @@ fn diverged_reconcile_emits_failed_not_refused_after_persisting_status() {
     );
     drop(repository);
 
-    let failure = fixture.atomic_fails(&["git", "bridge", "reconcile"]);
+    let failure = fixture.atomic_fails(&["git", "shim", "reconcile"]);
     assert!(
         failure.contains("both advanced beyond the last mutually observed mapping"),
         "{failure}"
@@ -819,7 +819,7 @@ fn stale_bookkeeping_heals_but_an_unreachable_baseline_fails_closed() {
     }
     drop(repo);
 
-    let output = fixture.atomic_output(&["git", "bridge", "reconcile"]);
+    let output = fixture.atomic_output(&["git", "shim", "reconcile"]);
     assert!(
         output.status.success(),
         "stale-mapping reconcile failed:\n{}",
@@ -830,7 +830,7 @@ fn stale_bookkeeping_heals_but_an_unreachable_baseline_fails_closed() {
         "an aligned pair must reconcile as a no-op: {}",
         atomic_text(&output)
     );
-    let status = fixture.atomic(&["git", "bridge", "status"]);
+    let status = fixture.atomic(&["git", "shim", "status"]);
     assert!(status.contains("synchronized"), "{status}");
 
     // (2) An unreachable baseline (a row claiming an impossible observed tip)
@@ -859,7 +859,7 @@ fn stale_bookkeeping_heals_but_an_unreachable_baseline_fails_closed() {
     }
     drop(repo);
 
-    let failure = fixture.atomic_fails(&["git", "bridge", "reconcile"]);
+    let failure = fixture.atomic_fails(&["git", "shim", "reconcile"]);
     assert!(
         failure.contains("both advanced beyond the last mutually observed mapping"),
         "an unprovable baseline must fail closed: {failure}"
@@ -916,7 +916,7 @@ fn forged_atomic_state_header_cannot_authorize_import() {
     assert_ne!(foreign, baseline, "the foreign commit moved the ref");
 
     // The forged header must not authorize the import.
-    let failure = fixture.atomic_fails(&["git", "bridge", "reconcile"]);
+    let failure = fixture.atomic_fails(&["git", "shim", "reconcile"]);
     assert!(
         failure.contains("both advanced beyond the last mutually observed mapping"),
         "a forged header must not select a side: {failure}"
@@ -925,7 +925,7 @@ fn forged_atomic_state_header_cannot_authorize_import() {
     assert_eq!(view_merkle(&fixture), atomic_state, "atomic must not move");
 
     // The mapping persists the refusal as Diverged with remediation.
-    let status = fixture.atomic(&["git", "bridge", "status"]);
+    let status = fixture.atomic(&["git", "shim", "status"]);
     assert!(status.contains("diverged"), "{status}");
 }
 
@@ -939,7 +939,7 @@ fn stale_export_binding_cannot_select_a_side() {
     // Atomic moves and exports: the mapping binds the export to that state.
     fs::write(fixture.root().join("tracked.txt"), b"first\n").expect("write");
     fixture.atomic(&["record", "-m", "exported change"]);
-    fixture.atomic(&["git", "bridge", "reconcile"]);
+    fixture.atomic(&["git", "shim", "reconcile"]);
     let exported = fixture.tip("refs/heads/main").expect("exported tip");
 
     // Atomic moves again (never exported) and a foreign Git commit lands:
@@ -951,7 +951,7 @@ fn stale_export_binding_cannot_select_a_side() {
     let foreign = commit_file(&repository, "extra.txt", b"foreign\n", "foreign commit");
     drop(repository);
 
-    let failure = fixture.atomic_fails(&["git", "bridge", "reconcile"]);
+    let failure = fixture.atomic_fails(&["git", "shim", "reconcile"]);
     assert!(
         failure.contains("both advanced beyond the last mutually observed mapping"),
         "an obsolete export must not select a side: {failure}"
@@ -981,7 +981,7 @@ fn publish_refuses_an_occupied_target_branch() {
 
     let failure = fixture.atomic_fails(&[
         "git",
-        "bridge",
+        "shim",
         "publish",
         "feature-occupied",
         "--branch",
@@ -997,7 +997,7 @@ fn publish_refuses_an_occupied_target_branch() {
         "the occupied branch must be unmoved"
     );
     // The draft's mapping is untouched: it still maps the private ref.
-    let status = fixture.atomic(&["git", "bridge", "status"]);
+    let status = fixture.atomic(&["git", "shim", "status"]);
     assert!(
         status.contains("refs/atomic/views/feature-occupied"),
         "the draft mapping must stay on its private ref:\n{status}"
@@ -1029,7 +1029,7 @@ fn publish_refuses_during_a_git_sequence_operation_then_succeeds_clean() {
     .expect("write MERGE_HEAD");
     let failure = fixture.atomic_fails(&[
         "git",
-        "bridge",
+        "shim",
         "publish",
         "feature-seq",
         "--branch",
@@ -1048,7 +1048,7 @@ fn publish_refuses_during_a_git_sequence_operation_then_succeeds_clean() {
     // With the marker cleared, publication proceeds create-only.
     fixture.atomic(&[
         "git",
-        "bridge",
+        "shim",
         "publish",
         "feature-seq",
         "--branch",
@@ -1073,7 +1073,7 @@ fn detached_mapped_ref_movement_is_not_falsely_synchronized() {
     let projection = fixture
         .tip("refs/atomic/views/topic")
         .expect("draft projection");
-    fixture.atomic(&["git", "bridge", "publish", "topic", "--branch", "published"]);
+    fixture.atomic(&["git", "shim", "publish", "topic", "--branch", "published"]);
     assert_eq!(fixture.tip("refs/heads/published"), Some(projection));
 
     // An unbound empty commit advances the mapped branch: equal tree,
@@ -1091,13 +1091,13 @@ fn detached_mapped_ref_movement_is_not_falsely_synchronized() {
     assert_ne!(fixture.tip("refs/heads/published"), Some(projection));
 
     // Status reports the Git-side movement; it never synchronizes by itself.
-    let status = fixture.atomic(&["git", "bridge", "status"]);
+    let status = fixture.atomic(&["git", "shim", "status"]);
     assert!(status.contains("git-ahead"), "{status}");
 
     // The reconcile refuses: the movement is independent of Git HEAD.
     let head_before = fixture.git(&["rev-parse", "HEAD"]);
     let atomic_state = view_merkle(&fixture);
-    let failure = fixture.atomic_fails(&["git", "bridge", "reconcile"]);
+    let failure = fixture.atomic_fails(&["git", "shim", "reconcile"]);
     assert!(
         failure.contains("independently of Git HEAD"),
         "the mapped-ref movement must be refused, not imported: {failure}"
@@ -1111,7 +1111,7 @@ fn detached_mapped_ref_movement_is_not_falsely_synchronized() {
 
     // The stored mapping was never re-pointed at the foreign commit: the
     // observation and the export binding still name the published tip.
-    let status = fixture.atomic(&["git", "bridge", "status"]);
+    let status = fixture.atomic(&["git", "shim", "status"]);
     assert!(status.contains("git-ahead"), "{status}");
     assert!(
         status.contains(&projection.to_string()),
@@ -1138,7 +1138,7 @@ fn refused_shared_view_delete_keeps_its_mapping() {
         "the shared-permanence refusal must survive: {failure}"
     );
 
-    let status = fixture.atomic(&["git", "bridge", "status"]);
+    let status = fixture.atomic(&["git", "shim", "status"]);
     assert!(status.contains("main"), "{status}");
     assert!(
         status.contains("synchronized"),
@@ -1169,7 +1169,7 @@ fn stale_draft_ref_source_is_refused_by_publish() {
     fixture.atomic(&["add", "topic.txt"]);
     fixture.atomic(&["record", "-m", "draft change"]);
     // Establish the verified checkpoint for the draft workspace.
-    fixture.atomic(&["git", "bridge", "reconcile"]);
+    fixture.atomic(&["git", "shim", "reconcile"]);
 
     let draft_tip = fixture.tip("refs/atomic/views/topic").expect("draft ref");
     let main_tip = fixture.tip("refs/heads/main").expect("main ref");
@@ -1191,7 +1191,7 @@ fn stale_draft_ref_source_is_refused_by_publish() {
     // projection commit, and NOTHING is written.
     let output = fixture.atomic_output(&[
         "git",
-        "bridge",
+        "shim",
         "publish",
         "topic",
         "--branch",
@@ -1222,7 +1222,7 @@ fn stale_draft_ref_source_is_refused_by_publish() {
         )
         .expect("update-ref back");
     }
-    fixture.atomic(&["git", "bridge", "publish", "topic", "--branch", "published"]);
+    fixture.atomic(&["git", "shim", "publish", "topic", "--branch", "published"]);
     assert_eq!(fixture.tip("refs/heads/published"), Some(draft_tip));
 }
 
@@ -1351,7 +1351,7 @@ fn crash_before_the_ref_write_leaves_no_branch_and_a_recoverable_intent() {
             expected_new: MetadataValue::Bytes(intended.encode().expect("encode intent")),
         };
         let _prepared = repo
-            .prepare_bridge_git_ref_write_with_metadata(
+            .prepare_shim_git_ref_write_with_metadata(
                 working_copy,
                 "refs/heads/never-created",
                 None,
@@ -1437,7 +1437,7 @@ fn both_moved_proven_export_reconciles_through_the_mapped_pair() {
     // 3. The reconcile must NOT refuse with Diverged: the proofs resolve the
     //    both-moved case to Export, and the export runs (a no-op projection:
     //    the branch already sits at the view's verified projection).
-    let output = fixture.atomic_output(&["git", "bridge", "reconcile"]);
+    let output = fixture.atomic_output(&["git", "shim", "reconcile"]);
     assert!(
         output.status.success(),
         "a proven both-moved Export must reconcile through the mapped pair:\n{}",
@@ -1445,7 +1445,7 @@ fn both_moved_proven_export_reconciles_through_the_mapped_pair() {
     );
 
     // 4. The workspace verifies and the mapping is Synchronized again.
-    let status = fixture.atomic(&["git", "bridge", "verify"]);
+    let status = fixture.atomic(&["git", "shim", "verify"]);
     assert!(status.contains("✓"), "the workspace must verify:\n{status}");
 }
 
@@ -1460,7 +1460,7 @@ fn renamed_mapped_ref_refuses_with_explicit_remediation() {
     fixture.git(&["branch", "-m", "main", "elsewhere"]);
     assert!(fixture.tip("refs/heads/main").is_none());
 
-    let output = fixture.atomic_output(&["git", "bridge", "reconcile"]);
+    let output = fixture.atomic_output(&["git", "shim", "reconcile"]);
     assert!(
         !output.status.success(),
         "the renamed mapped ref must refuse (no silent re-binding)"

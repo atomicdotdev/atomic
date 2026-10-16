@@ -1,12 +1,12 @@
-//! The colocated Git bridge is explicit per-repository opt-in (RFC §2,
-//! CB-13C `[git.bridge] enabled`, default false). A `.git` directory next to
+//! The colocated Git shim is explicit per-repository opt-in (RFC §2,
+//! CB-13C `[git.shim] enabled`, default false). A `.git` directory next to
 //! `.atomic` is not consent: without the opt-in and without a checkpoint
-//! written by an explicit bridge command, ordinary Atomic commands keep their
+//! written by an explicit shim command, ordinary Atomic commands keep their
 //! native behavior and never refuse for a missing Git anchor, never write the
 //! Git index, and never create Git refs. Once the user opts in, an unanchored
 //! workspace refuses with the exact commands that resolve it.
 
-// Temporary Unix-only Git bridge support to unblock Windows native CI.
+// Temporary Unix-only Git shim support to unblock Windows native CI.
 // Revisit after Windows support is defined; see the RFC temporary platform policy.
 #![cfg(unix)]
 use std::fs;
@@ -117,6 +117,45 @@ impl Fixture {
         hooks.sort();
         hooks
     }
+
+    /// Run one OpenCode agent hook dispatch the way the atomic-opencode
+    /// plugin does: JSON on stdin, foreground, from the repository root.
+    fn agent_hook(&self, verb: &str, session_id: &str) -> Output {
+        use std::io::Write;
+        let payload = format!(
+            "{{\"session_id\":\"{session_id}\",\"cwd\":\"{}\",\"timestamp\":\"2026-10-14T10:30:00Z\"}}",
+            self.root().display()
+        );
+        let mut child = Command::new(ATOMIC_BIN)
+            .args(["agent", "hooks", "opencode", verb, "--foreground"])
+            .current_dir(self.root())
+            .env("HOME", self.home.path())
+            .env("ATOMIC_HOME", self.home.path().join(".atomic"))
+            .env("ATOMIC_NONINTERACTIVE", "1")
+            .env("NO_COLOR", "1")
+            .env("CLICOLOR", "0")
+            .env("TERM", "dumb")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .stdin(Stdio::piped())
+            .spawn()
+            .expect("spawn atomic agent hooks");
+        child
+            .stdin
+            .as_mut()
+            .expect("hook stdin")
+            .write_all(payload.as_bytes())
+            .expect("write hook stdin");
+        child.wait_with_output().expect("wait for agent hook")
+    }
+
+    /// A retained shadow exclude marker without shim enrollment: written by
+    /// import/push, kept on disk by `git shim disable`, and never removed by
+    /// plain `atomic init` inside an existing Git checkout.
+    fn retain_shadow_marker(&self) {
+        fs::create_dir_all(self.root().join(".git/info")).unwrap();
+        fs::write(self.root().join(".git/info/exclude"), b"/.atomic/\n").unwrap();
+    }
 }
 
 fn assert_success(output: &Output, what: &str) {
@@ -162,12 +201,12 @@ fn assert_native_workflow(fixture: &Fixture, git_index_before: &str) {
     assert_eq!(
         fixture.git_text(&["ls-files", "--stage"]),
         git_index_before,
-        "ordinary Atomic commands must not write the Git index without the bridge opt-in"
+        "ordinary Atomic commands must not write the Git index without the shim opt-in"
     );
     assert_eq!(
         fixture.git_text(&["tag", "--list"]),
         "",
-        "`atomic tag create` must not export Git tags without the bridge opt-in"
+        "`atomic tag create` must not export Git tags without the shim opt-in"
     );
     assert!(
         fixture.hooks_installed().is_empty(),
@@ -181,20 +220,20 @@ fn assert_native_workflow(fixture: &Fixture, git_index_before: &str) {
 }
 
 #[test]
-fn fresh_git_init_without_bridge_keeps_native_commands_working() {
+fn fresh_git_init_without_shim_keeps_native_commands_working() {
     let fixture = Fixture::fresh_git_init();
     assert_native_workflow(&fixture, "");
 }
 
 #[test]
-fn existing_git_history_without_bridge_keeps_native_commands_working() {
+fn existing_git_history_without_shim_keeps_native_commands_working() {
     let fixture = Fixture::existing_git_history();
     let index_before = fixture.git_text(&["ls-files", "--stage"]);
     assert_native_workflow(&fixture, &index_before);
 }
 
 #[test]
-fn status_does_not_mix_git_index_state_without_bridge_opt_in() {
+fn status_does_not_mix_git_index_state_without_shim_opt_in() {
     let fixture = Fixture::existing_git_history();
     fs::write(fixture.root().join("git-only.txt"), b"staged in git\n").unwrap();
     fixture.git_ok(&["add", "git-only.txt"]);
@@ -210,45 +249,162 @@ fn status_does_not_mix_git_index_state_without_bridge_opt_in() {
 #[test]
 fn opted_in_workspace_without_anchor_refuses_with_actionable_remediation() {
     let fixture = Fixture::existing_git_history();
-    fixture.atomic_ok(&["git", "bridge", "enable"]);
+    fixture.atomic_ok(&["git", "shim", "enable"]);
 
     let refused = fixture.atomic(&["status"]);
     assert!(
         !refused.status.success(),
-        "unanchored bridge workspace must refuse"
+        "unanchored shim workspace must refuse"
     );
     let text = output_text(&refused);
     assert!(text.contains("MissingCheckpoint"), "{text}");
-    assert!(text.contains("atomic git bridge reconcile"), "{text}");
-    assert!(text.contains("atomic git bridge disable"), "{text}");
+    assert!(text.contains("atomic git shim reconcile"), "{text}");
+    assert!(text.contains("atomic git shim disable"), "{text}");
 
-    fixture.atomic_ok(&["git", "bridge", "reconcile"]);
+    fixture.atomic_ok(&["git", "shim", "reconcile"]);
     fixture.atomic_ok(&["status"]);
 }
 
 #[test]
 fn opted_in_unborn_head_names_the_first_commit_remediation() {
     let fixture = Fixture::fresh_git_init();
-    fixture.atomic_ok(&["git", "bridge", "enable"]);
+    fixture.atomic_ok(&["git", "shim", "enable"]);
     fs::write(fixture.root().join("f.txt"), b"hello\n").unwrap();
 
     let refused = fixture.atomic(&["add", "f.txt"]);
     assert!(
         !refused.status.success(),
-        "unborn bridge workspace must refuse"
+        "unborn shim workspace must refuse"
     );
     let text = output_text(&refused);
     assert!(text.contains("UnbornHead"), "{text}");
     assert!(text.contains("first Git commit"), "{text}");
-    assert!(text.contains("atomic git bridge reconcile"), "{text}");
+    assert!(text.contains("atomic git shim reconcile"), "{text}");
 }
 
 #[test]
-fn disabling_an_unanchored_bridge_restores_native_behavior() {
+fn disabling_an_unanchored_shim_restores_native_behavior() {
     let fixture = Fixture::fresh_git_init();
-    fixture.atomic_ok(&["git", "bridge", "enable"]);
+    fixture.atomic_ok(&["git", "shim", "enable"]);
     assert!(!fixture.atomic(&["status"]).status.success());
 
-    fixture.atomic_ok(&["git", "bridge", "disable"]);
+    fixture.atomic_ok(&["git", "shim", "disable"]);
     fixture.atomic_ok(&["status"]);
+}
+
+/// The OpenCode agent bridge dispatches `atomic agent hooks opencode <verb>`
+/// on every tool call. In a colocated-but-unenrolled repository with a
+/// retained shadow exclude marker, dispatch must stay native: it may never
+/// demand a shim checkpoint (the reported every-tool-call exit 128) and
+/// never bootstrap shim state.
+#[test]
+fn agent_hooks_stay_native_with_a_retained_shadow_marker() {
+    let fixture = Fixture::existing_git_history();
+    fixture.retain_shadow_marker();
+    let index_before = fixture.git_text(&["ls-files", "--stage"]);
+
+    for verb in ["session-start", "user-prompt", "before-tool", "after-tool"] {
+        let output = fixture.agent_hook(verb, "ses-gate");
+        assert_success(&output, &format!("agent hooks opencode {verb}"));
+    }
+
+    assert!(
+        !fixture
+            .root()
+            .join(".atomic/bridge/workspace.json")
+            .exists(),
+        "agent hooks must not bootstrap the shim checkpoint"
+    );
+    assert_eq!(
+        fixture.git_text(&["ls-files", "--stage"]),
+        index_before,
+        "agent hooks must not write the Git index without the shim opt-in"
+    );
+    assert_eq!(
+        fixture.git_text(&["for-each-ref", "--format=%(refname)", "refs/atomic"]),
+        "",
+        "agent hooks must not create Atomic Git refs without the opt-in"
+    );
+}
+
+/// Hook dispatch outside an Atomic repository exits quietly: the plugin's
+/// per-dispatch gating normally prevents the call entirely, and a repository
+/// that disappears between probe and dispatch must not surface as a hook
+/// failure (which the bridge plugins' strict tool propagation would turn
+/// into a blocked tool call).
+#[test]
+fn agent_hooks_exit_quietly_outside_a_repository() {
+    for with_git in [false, true] {
+        let directory = TempDir::new().expect("tempdir");
+        let home = TempDir::new().expect("home tempdir");
+        let root = directory.path();
+        if with_git {
+            let output = Command::new("git")
+                .args(["init", "-q", "-b", "main"])
+                .current_dir(root)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .output()
+                .expect("git init");
+            assert_success(&output, "git init");
+        }
+        let payload = format!(
+            "{{\"session_id\":\"ses-none\",\"cwd\":\"{}\",\"timestamp\":\"2026-10-14T10:30:00Z\"}}",
+            root.display()
+        );
+        use std::io::Write;
+        let mut child = Command::new(ATOMIC_BIN)
+            .args([
+                "agent",
+                "hooks",
+                "opencode",
+                "session-start",
+                "--foreground",
+            ])
+            .current_dir(root)
+            .env("HOME", home.path())
+            .env("ATOMIC_NONINTERACTIVE", "1")
+            .env("NO_COLOR", "1")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .stdin(Stdio::piped())
+            .spawn()
+            .expect("spawn atomic agent hooks");
+        child
+            .stdin
+            .as_mut()
+            .expect("hook stdin")
+            .write_all(payload.as_bytes())
+            .expect("write hook stdin");
+        let output = child.wait_with_output().expect("wait for agent hook");
+        assert_success(&output, "agent hooks opencode session-start");
+        assert!(
+            !root.join(".atomic").exists(),
+            "hook dispatch must never create a repository"
+        );
+    }
+}
+
+/// An enrolled-but-unanchored workspace keeps its fail-closed refusal with
+/// the anchor-or-disable remediation at the agent boundary too.
+#[test]
+fn agent_hooks_refuse_with_remediation_when_enrolled_unanchored() {
+    let fixture = Fixture::existing_git_history();
+    fixture.atomic_ok(&["git", "shim", "enable"]);
+
+    let refused = fixture.agent_hook("session-start", "ses-enrolled");
+    assert!(
+        !refused.status.success(),
+        "enrolled but unanchored shim must refuse the agent boundary"
+    );
+    let text = output_text(&refused);
+    assert!(text.contains("MissingCheckpoint"), "{text}");
+    assert!(text.contains("atomic git shim reconcile"), "{text}");
+    assert!(text.contains("atomic git shim disable"), "{text}");
+    assert!(
+        !fixture
+            .root()
+            .join(".atomic/bridge/workspace.json")
+            .exists(),
+        "the refusal must not anchor the shim"
+    );
 }

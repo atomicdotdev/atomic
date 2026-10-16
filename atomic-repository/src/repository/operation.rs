@@ -110,12 +110,12 @@ impl PreparedRemoteOperation {
     }
 }
 
-/// A journaled bridge-owned Git ref write awaiting its leased effect receipt.
+/// A journaled shim-owned Git ref write awaiting its leased effect receipt.
 ///
 /// The operation (and therefore its operation ID and intended effect) is
 /// durable before the caller performs the Git mutation; retaining this value
 /// keeps the ordered operation locks held until the receipt is recorded.
-pub struct PreparedBridgeGitWrite {
+pub struct PreparedShimGitWrite {
     /// Immutable operation identity journaled before the Git write.
     pub operation_id: OperationId,
     /// Git ref the mutation targets (for example `refs/heads/main`).
@@ -127,7 +127,7 @@ pub struct PreparedBridgeGitWrite {
     /// The capture token minted for this write's capture context (review
     /// E2), or `None` for an ordinary ref movement that is not a rewrite
     /// execution (CB-9B F2). An executor driving Git hooks inside this
-    /// write's capture context exports it as `ATOMIC_BRIDGE_CAPTURE_TOKEN`;
+    /// write's capture context exports it as `ATOMIC_SHIM_CAPTURE_TOKEN`;
     /// only captured events carrying this exact token can later anchor to
     /// the operation.
     pub capture_token: Option<[u8; 32]>,
@@ -200,14 +200,14 @@ enum ResolvedRecoveryTarget {
         recursive_directory: bool,
     },
     WorkingCopy(WorkingCopyId),
-    /// A Git reference observed/rolled back through the lease-safe bridge
+    /// A Git reference observed/rolled back through the lease-safe shim
     /// reader (R3: the adoption completion's WIP-ref drop; CB-8B: projection
     /// refs and shared branches).
     GitRef(String),
     /// The working copy's Git HEAD, observed/rolled back through the
-    /// lease-safe bridge reader (CB-8B projection publication).
+    /// lease-safe shim reader (CB-8B projection publication).
     GitHead(WorkingCopyId),
-    /// The derived bridge checkpoint file, addressed by content digest
+    /// The derived shim checkpoint file, addressed by content digest
     /// (R3: the adoption completion's verified checkpoint publish).
     Checkpoint {
         working_copy: WorkingCopyId,
@@ -468,27 +468,27 @@ impl Repository {
         Ok(operation_id)
     }
 
-    /// Journal one bridge-owned Git ref mutation before it becomes visible.
+    /// Journal one shim-owned Git ref mutation before it becomes visible.
     ///
     /// The returned value carries the immutable operation ID and the exact
     /// intended effect. Journal failure returns an error and the caller must
     /// not perform the Git write. The lease observes `observed_old` as
-    /// provided by the caller (the bridge owns Git observation through its
+    /// provided by the caller (the shim owns Git observation through its
     /// own handle); a later receipt classifies the outcome against the lease.
     ///
     /// This is an ORDINARY ref movement, not a rewrite execution: it does NOT
     /// mint a capture token, so a post-rewrite hook event can never anchor to
     /// it (CB-9B F2). A caller that is actually executing a Git rewrite must
-    /// use [`Self::prepare_bridge_git_rewrite`].
-    pub fn prepare_bridge_git_ref_write(
+    /// use [`Self::prepare_shim_git_rewrite`].
+    pub fn prepare_shim_git_ref_write(
         &self,
         working_copy: WorkingCopyId,
         ref_name: &str,
         observed_old: Option<GitRefTarget>,
         intended_new: GitRefTarget,
         evidence: Hash,
-    ) -> Result<PreparedBridgeGitWrite, RepositoryError> {
-        self.prepare_bridge_git_write_impl(
+    ) -> Result<PreparedShimGitWrite, RepositoryError> {
+        self.prepare_shim_git_write_impl(
             false,
             working_copy,
             ref_name,
@@ -499,16 +499,16 @@ impl Repository {
         )
     }
 
-    /// [`Self::prepare_bridge_git_ref_write`] with a companion durable
+    /// [`Self::prepare_shim_git_ref_write`] with a companion durable
     /// metadata intent (CB-10A review R3): the SAME journaled operation
     /// carries the ref effect lease AND the metadata transitions, so a ref
     /// movement is never visible without its recoverable mapping intent —
     /// the mapping intent is durable before the ref write and is applied
     /// only after the ref effect's receipt (see
-    /// [`Self::complete_bridge_git_write_with_metadata`]). The metadata
+    /// [`Self::complete_shim_git_write_with_metadata`]). The metadata
     /// leases are validated at prepare time: a mapping that moved between
     /// the caller's observation and this preparation refuses closed.
-    pub fn prepare_bridge_git_ref_write_with_metadata(
+    pub fn prepare_shim_git_ref_write_with_metadata(
         &self,
         working_copy: WorkingCopyId,
         ref_name: &str,
@@ -516,8 +516,8 @@ impl Repository {
         intended_new: GitRefTarget,
         evidence: Hash,
         metadata: Vec<atomic_core::operation::MetadataTransition>,
-    ) -> Result<PreparedBridgeGitWrite, RepositoryError> {
-        self.prepare_bridge_git_write_impl(
+    ) -> Result<PreparedShimGitWrite, RepositoryError> {
+        self.prepare_shim_git_write_impl(
             false,
             working_copy,
             ref_name,
@@ -528,21 +528,21 @@ impl Repository {
         )
     }
 
-    /// [`Self::finalize_bridge_git_write`] for a write prepared with
+    /// [`Self::finalize_shim_git_write`] for a write prepared with
     /// companion metadata (CB-10A review R3): the metadata transitions are
     /// applied under the held operation lock BEFORE the operation-level
     /// Verified receipt, so the mapping intent lands exactly once — after
     /// the ref effect it accompanies.
-    pub fn complete_bridge_git_write_with_metadata(
+    pub fn complete_shim_git_write_with_metadata(
         &self,
-        prepared: PreparedBridgeGitWrite,
+        prepared: PreparedShimGitWrite,
         observed_ref: Option<GitRefTarget>,
     ) -> Result<OperationId, RepositoryError> {
         self.apply_operation_metadata_locked(&prepared._operation_lock, prepared.operation_id)?;
-        self.finalize_bridge_git_write(prepared, observed_ref)
+        self.finalize_shim_git_write(prepared, observed_ref)
     }
 
-    /// Journal a bridge-owned Git REWRITE execution before it becomes
+    /// Journal a shim-owned Git REWRITE execution before it becomes
     /// visible, minting the operation's immutable capture context.
     ///
     /// Only a genuine rewrite executor (one that actually ran the Git rewrite
@@ -550,17 +550,17 @@ impl Repository {
     /// token is the unforgeable binding between a hook capture produced during
     /// this operation's execution and the operation itself (CB-9B F2): an
     /// ordinary ref movement prepared through
-    /// [`Self::prepare_bridge_git_ref_write`] carries no capture context and
+    /// [`Self::prepare_shim_git_ref_write`] carries no capture context and
     /// can never be promoted into rewrite authority.
-    pub fn prepare_bridge_git_rewrite(
+    pub fn prepare_shim_git_rewrite(
         &self,
         working_copy: WorkingCopyId,
         ref_name: &str,
         observed_old: Option<GitRefTarget>,
         intended_new: GitRefTarget,
         evidence: Hash,
-    ) -> Result<PreparedBridgeGitWrite, RepositoryError> {
-        self.prepare_bridge_git_write_impl(
+    ) -> Result<PreparedShimGitWrite, RepositoryError> {
+        self.prepare_shim_git_write_impl(
             true,
             working_copy,
             ref_name,
@@ -572,7 +572,7 @@ impl Repository {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn prepare_bridge_git_write_impl(
+    fn prepare_shim_git_write_impl(
         &self,
         mint_capture: bool,
         working_copy: WorkingCopyId,
@@ -581,7 +581,7 @@ impl Repository {
         intended_new: GitRefTarget,
         evidence: Hash,
         metadata: Vec<atomic_core::operation::MetadataTransition>,
-    ) -> Result<PreparedBridgeGitWrite, RepositoryError> {
+    ) -> Result<PreparedShimGitWrite, RepositoryError> {
         let operation_lock = self.try_lock_operation(working_copy)?;
         if let OperationHeadState::Diverged(heads) =
             self.consolidate_operation_heads_locked(&operation_lock)?
@@ -643,7 +643,7 @@ impl Repository {
         } else {
             None
         };
-        Ok(PreparedBridgeGitWrite {
+        Ok(PreparedShimGitWrite {
             operation_id: operation.operation.id(),
             _operation_lock: operation_lock,
             ref_name: ref_name.to_string(),
@@ -653,14 +653,14 @@ impl Repository {
         })
     }
 
-    /// Append the leased effect receipt after a journaled bridge Git write.
+    /// Append the leased effect receipt after a journaled shim Git write.
     ///
     /// `observed_after` is what Git now shows for the ref. Values matching the
     /// intended target append an Applied (or idempotent Recovered) receipt;
     /// any third value appends a durable rejection receipt and fails closed.
-    pub fn record_bridge_git_ref_receipt(
+    pub fn record_shim_git_ref_receipt(
         &self,
-        prepared: &PreparedBridgeGitWrite,
+        prepared: &PreparedShimGitWrite,
         observed_after: Option<GitRefTarget>,
     ) -> Result<EffectReceipt, RepositoryError> {
         let observed_after = observed_after
@@ -680,15 +680,15 @@ impl Repository {
         )
     }
 
-    /// Append the operation-level Verified receipt for a completed bridge write.
+    /// Append the operation-level Verified receipt for a completed shim write.
     ///
     /// The GitRef effect lease is verified against `observed_ref`, which the
-    /// bridge reads back from Git after the mutation (the lease-safe executor
+    /// shim reads back from Git after the mutation (the lease-safe executor
     /// the recovery layer requires). Any third value fails closed without a
     /// Verified receipt.
-    pub fn finalize_bridge_git_write(
+    pub fn finalize_shim_git_write(
         &self,
-        prepared: PreparedBridgeGitWrite,
+        prepared: PreparedShimGitWrite,
         observed_ref: Option<GitRefTarget>,
     ) -> Result<OperationId, RepositoryError> {
         let operation_id = prepared.operation_id;
@@ -2482,9 +2482,9 @@ impl Repository {
         }
     }
 
-    /// Raw bytes of the derived bridge checkpoint file, empty when absent
+    /// Raw bytes of the derived shim checkpoint file, empty when absent
     /// (R3: the Checkpoint lease observes the file's content digest).
-    /// Facts digest of the derived bridge checkpoint (R3): the parsed
+    /// Facts digest of the derived shim checkpoint (R3): the parsed
     /// checkpoint's canonical serialization, so the lease is format-agnostic
     /// (the CLI's richer v2 writer and the simple writer carry the same
     /// facts) and a fact-preserving rewrite is idempotent.
@@ -2497,12 +2497,12 @@ impl Repository {
     ) -> Result<atomic_core::Hash, RepositoryError> {
         let bytes = std::fs::read(self.dot_dir.join("bridge/workspace.json")).map_err(|error| {
             RepositoryError::InvalidRepository {
-                reason: format!("cannot read the bridge checkpoint for a lease: {error}"),
+                reason: format!("cannot read the shim checkpoint for a lease: {error}"),
             }
         })?;
         let checkpoint = read_workspace_checkpoint(&self.root)?.ok_or_else(|| {
             RepositoryError::InvalidRepository {
-                reason: "the bridge checkpoint disappeared during adoption completion".to_string(),
+                reason: "the shim checkpoint disappeared during adoption completion".to_string(),
             }
         })?;
         let _ = bytes;
@@ -2554,7 +2554,7 @@ impl Repository {
         }
     }
 
-    /// Re-derive the pre-completion bridge checkpoint from the original
+    /// Re-derive the pre-completion shim checkpoint from the original
     /// completion operation's recorded before-state (R3): the view name and
     /// state come from `before.view`, and the Git facts (symref, HEAD OID,
     /// index digest/tree) come from `before.git`, so the rollback is exact
@@ -3322,7 +3322,7 @@ impl Repository {
                     }
                 }
             }
-            // R3: the derived bridge checkpoint is restored to its
+            // R3: the derived shim checkpoint is restored to its
             // pre-completion content, re-derived from the original
             // operation's recorded before-state (view + Git facts). The
             // caller re-observes the digest and rejects any third value.

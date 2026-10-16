@@ -1,8 +1,8 @@
-// Temporary Unix-only Git bridge support to unblock Windows native CI.
+// Temporary Unix-only Git shim support to unblock Windows native CI.
 // Revisit after Windows support is defined; see the RFC temporary platform policy.
 #![cfg(unix)]
 
-//! CB-13A R2: the deterministic diagnostic census. `git bridge verify`
+//! CB-13A R2: the deterministic diagnostic census. `git shim verify`
 //! enumerates the durable classes a recovery would need to face — missing
 //! changes, invalid bindings, stale/broken working-copy records, orphaned
 //! WIP refs, divergent ref mappings — READ-ONLY: injected corruption
@@ -125,7 +125,7 @@ fn census_reports_classes_read_only_and_clean_state_passes() {
     atomic_ok(&root, &home, &["git", "import", "--no-vault"]);
 
     // A clean repository's census is all-green and named.
-    let verify = atomic_ok(&root, &home, &["git", "bridge", "verify"]);
+    let verify = atomic_ok(&root, &home, &["git", "shim", "verify"]);
     for class in [
         "census/changes",
         "census/bindings",
@@ -171,7 +171,7 @@ fn census_reports_classes_read_only_and_clean_state_passes() {
     // Snapshot AFTER the corruption edit: any verify-side write is a
     // difference; the corruption edit itself is not.
     let before = snapshot(&root);
-    let corrupted = atomic(&root, &home, &["git", "bridge", "verify"]);
+    let corrupted = atomic(&root, &home, &["git", "shim", "verify"]);
     let text = format!(
         "{}{}",
         String::from_utf8_lossy(&corrupted.stdout),
@@ -319,7 +319,7 @@ fn census_reports_incomplete_heads_in_other_working_copy_scopes() {
         txn.commit().unwrap();
     }
     let before = snapshot(&root);
-    let verify = atomic(&root, &home, &["git", "bridge", "verify"]);
+    let verify = atomic(&root, &home, &["git", "shim", "verify"]);
     let after = snapshot(&root);
     let text = format!(
         "{}{}",

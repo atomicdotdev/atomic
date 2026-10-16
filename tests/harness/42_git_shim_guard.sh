@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# 42_git_bridge_guard.sh — CB-0C shared stale-baseline guard evidence.
+# 42_git_shim_guard.sh — CB-0C shared stale-baseline guard evidence.
 
 HARNESS_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$HARNESS_DIR/helpers.sh"
 
 printf '\n%s\n' "${BOLD}══════════════════════════════════════════════════════════════${RESET}"
-printf '%s\n' "${BOLD}  Suite: 42_git_bridge_guard${RESET}"
+printf '%s\n' "${BOLD}  Suite: 42_git_shim_guard${RESET}"
 printf '%s\n' "${BOLD}══════════════════════════════════════════════════════════════${RESET}"
 
 begin_section "Prerequisites"
@@ -51,11 +51,11 @@ start_colocated_repo() {
     git add tracked.txt
     git commit --no-gpg-sign --quiet -m "checkpoint"
     atomic git import --no-vault >/dev/null
-    atomic git bridge reconcile >/dev/null
+    atomic git shim reconcile >/dev/null
     if [[ -s .atomic/bridge/workspace.json ]]; then
-        _pass "$label: valid bridge checkpoint established"
+        _pass "$label: valid shim checkpoint established"
     else
-        _fail "$label: valid bridge checkpoint established" ".atomic/bridge/workspace.json missing"
+        _fail "$label: valid shim checkpoint established" ".atomic/bridge/workspace.json missing"
     fi
 }
 
@@ -113,7 +113,7 @@ assert_guard_refusal() {
     local evidence_ok=1
     for expected in \
         "Unsafe operation: $operation" \
-        "Refusal: Git moved away from the bridge checkpoint" \
+        "Refusal: Git moved away from the shim checkpoint" \
         "Old checkpoint Atomic view: main" \
         "Old checkpoint Atomic state:" \
         "Old checkpoint Atomic manifest root: atomic-visible-regular-files-blake3-v1:" \
@@ -138,7 +138,7 @@ assert_guard_refusal() {
         "Current Git manifest root: git-tree-oid:" \
         "Remediation: Reconcile the observed Git baseline before retrying the refused operation." \
         "  atomic status --no-reconcile" \
-        "  atomic git bridge reconcile"
+        "  atomic git shim reconcile"
     do
         if ! printf '%s\n' "$output" | grep -qF -- "$expected"; then
             evidence_ok=0
@@ -167,12 +167,12 @@ assert_guard_refusal() {
 }
 
 begin_section "Every working-copy boundary shares one early refusal"
-start_colocated_repo "git-bridge-guard-matrix"
+start_colocated_repo "git-shim-guard-matrix"
 atomic view create feature --draft --parent main >/dev/null
 CHANGE="$(atomic log -f oneline --full-hash | awk 'NR == 1 { print $1 }')"
 HISTORY_BEFORE="$(atomic diff --change "$CHANGE" --name-only --no-color)"
 
-atomic git bridge enable >/dev/null
+atomic git shim enable >/dev/null
 HOOK_PATH="$(git rev-parse --git-path hooks/post-checkout)"
 rm -f "$HOOK_PATH"
 raw_git_drift raw-drift
@@ -216,7 +216,7 @@ else
 fi
 
 begin_section "Ordinary edits and Atomic-only advancement remain allowed"
-start_colocated_repo "git-bridge-guard-atomic-advance"
+start_colocated_repo "git-shim-guard-atomic-advance"
 GIT_HEAD_BEFORE="$(git rev-parse HEAD)"
 overwrite_file tracked.txt "ordinary edit\n"
 if STATUS_OUT="$(atomic status --short 2>&1)" && printf '%s\n' "$STATUS_OUT" | grep -qF tracked.txt; then
@@ -241,7 +241,7 @@ assert_success "add passes after Atomic-only advancement" atomic add atomic-only
 assert_success "record passes after further Atomic-only advancement" atomic record -m "Further Atomic-only advancement"
 
 begin_section "No-Git repositories retain normal behavior"
-make_temp_repo "git-bridge-guard-no-git"
+make_temp_repo "git-shim-guard-no-git"
 use_isolated_home
 assert_success "initialize no-Git Atomic repository" atomic init --view main
 create_file tracked.txt "initial\n"
@@ -333,13 +333,13 @@ assert_agent_incomplete() {
 }
 
 begin_section "Unmanaged turn/session endings are durable and unattributed"
-start_colocated_repo "git-bridge-guard-unmanaged-agent"
+start_colocated_repo "git-shim-guard-unmanaged-agent"
 raw_git_drift unmanaged-drift
 printf 'unattributed agent bytes\n' > tracked.txt
 assert_agent_incomplete "unmanaged agent" "unmanaged-session" stop session-end "agent turn-end"
 
 begin_section "Managed session/turn endings are durable and unattributed"
-start_colocated_repo "git-bridge-guard-managed-agent"
+start_colocated_repo "git-shim-guard-managed-agent"
 CANONICAL_ROOT="$(pwd -P)"
 set +e
 LIFECYCLE_JSON="$(atomic agent lifecycle begin \

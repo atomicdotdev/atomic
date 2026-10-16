@@ -53,8 +53,12 @@ pub fn normalize_path_with_root(path: &Path, repo_root: Option<&Path>) -> String
                 // that Unix-style paths work correctly on Windows in tests and
                 // cross-platform scenarios.
                 let root_str = root.to_string_lossy();
+                #[cfg(windows)]
                 let root_str = root_str.replace('\\', "/");
+                #[cfg(windows)]
                 let path_str = path_str_raw.replace('\\', "/");
+                #[cfg(not(windows))]
+                let path_str = path_str_raw.clone();
                 let root_with_sep = if root_str.ends_with('/') {
                     root_str.to_string()
                 } else {
@@ -71,11 +75,10 @@ pub fn normalize_path_with_root(path: &Path, repo_root: Option<&Path>) -> String
 
     let path_str = path_to_normalize.to_string_lossy();
 
-    // Convert to forward slashes and remove trailing slash
-    let normalized = path_str
-        .replace('\\', "/")
-        .trim_end_matches('/')
-        .to_string();
+    // Backslash is a filename byte on Unix, and a separator on Windows.
+    #[cfg(windows)]
+    let path_str = path_str.replace('\\', "/");
+    let normalized = path_str.trim_end_matches('/').to_string();
 
     // Handle empty path (current directory)
     if normalized.is_empty() {

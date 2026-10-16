@@ -1939,3 +1939,37 @@ fn test_crdt_walker_hyperfine_sequence_offline_fixture() {
         );
     }
 }
+
+/// A later edit deletes an old line and reinserts its bytes after an existing
+/// insertion. The reader must not disconnect the surviving inserted chain.
+#[test]
+fn test_bypass_relocated_line_roundtrip() {
+    let (repo, _temp, path) = create_test_repo();
+    let versions = [
+        "head\nanchor\ntail\n",
+        "head\nanchor\nlibc\ntail\n",
+        "head\nanchor\nlibc\natty\ntail\n",
+        "head\nanchor\natty\ntarget\nlibc\ntail\n",
+    ];
+    let mut hashes = Vec::new();
+    for (index, content) in versions.iter().enumerate() {
+        write_file(&path, "file.txt", content);
+        if index == 0 {
+            repo.add(working_copy(&repo), "file.txt", Default::default())
+                .unwrap();
+        }
+        hashes.push(record_change(&repo, &format!("state {index}")));
+        assert_content_matches(&repo, "file.txt", content);
+    }
+    drop(repo);
+    let repo = Repository::open(&path).unwrap();
+    assert_content_matches(&repo, "file.txt", versions[3]);
+    for (hash, content) in hashes.iter().zip(versions) {
+        assert_content_after_change(&repo, "file.txt", hash, content);
+    }
+    repo.materialize(working_copy(&repo)).unwrap();
+    assert_eq!(
+        fs::read_to_string(path.join("file.txt")).unwrap(),
+        versions[3]
+    );
+}

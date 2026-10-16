@@ -249,6 +249,22 @@ impl AssemblyOptions {
         self
     }
 
+    /// Seed closure-projected path identity bindings for globalization.
+    ///
+    /// See [`crate::record::workflow::ProjectedPathBinding`]: the repository
+    /// layer resolves these through the assembly view's graph closure so
+    /// parent-directory anchoring never depends on the ambient TREE (a
+    /// preserved incremental import holds TREE updates only in the deferred
+    /// lifecycle journal).
+    #[must_use]
+    pub fn projected_paths(
+        mut self,
+        paths: std::collections::HashMap<String, crate::record::workflow::ProjectedPathBinding>,
+    ) -> Self {
+        self.globalize_options = self.globalize_options.with_projected_paths(paths);
+        self
+    }
+
     /// Set whether to validate dependencies.
     ///
     /// # Arguments

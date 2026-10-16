@@ -33,7 +33,7 @@ enum TurnEndLock {
     Unavailable,
 }
 
-/// Drain a pending bridge-watch notice (CB-13D, RFC §11.2 rule 6) for a
+/// Drain a pending shim-watch notice (CB-13D, RFC §11.2 rule 6) for a
 /// managed session, if one is pending.
 ///
 /// The optional metadata-only watch daemon writes a pending notice when it
@@ -46,13 +46,13 @@ enum TurnEndLock {
 fn drain_watch_notice(orchestrator: &TurnOrchestrator, session_id: &str) -> Option<String> {
     match orchestrator.session_store.take_watch_notice(session_id) {
         Ok(Some(notice)) => Some(format!(
-            "bridge watch ({}): {}; remediation: {}",
+            "shim watch ({}): {}; remediation: {}",
             notice.kind, notice.detail, notice.remediation
         )),
         Ok(None) => None,
         Err(error) => {
             log::warn!(
-                "Failed to drain bridge-watch notice for session {}: {}",
+                "Failed to drain shim-watch notice for session {}: {}",
                 session_id,
                 error
             );
@@ -172,7 +172,7 @@ impl TurnOrchestrator {
             }
         }
 
-        // CB-13D: surface a pending bridge-watch notice (external Git
+        // CB-13D: surface a pending shim-watch notice (external Git
         // transition or unsafe state observed by the optional daemon)
         // before the turn proceeds.
         if let Some(warning) = drain_watch_notice(self, session_id) {
@@ -783,7 +783,7 @@ impl TurnOrchestrator {
 
         self.session_store.save(&session)?;
 
-        // CB-13D: surface a pending bridge-watch notice before the agent's
+        // CB-13D: surface a pending shim-watch notice before the agent's
         // next tool call executes (RFC §11.2 rule 6).
         if let Some(warning) = drain_watch_notice(self, session_id) {
             dispatch = dispatch.with_warning(warning);
@@ -816,7 +816,7 @@ impl TurnOrchestrator {
             );
         }
 
-        // CB-13D: surface a pending bridge-watch notice before the agent's
+        // CB-13D: surface a pending shim-watch notice before the agent's
         // next tool call executes (RFC §11.2 rule 6).
         let mut dispatch = DispatchResult::new(session_id, session.phase);
         if let Some(warning) = drain_watch_notice(self, session_id) {

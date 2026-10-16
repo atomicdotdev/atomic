@@ -14,7 +14,10 @@ fn test_normalize_path_trailing_slash() {
 
 #[test]
 fn test_normalize_path_backslashes() {
+    #[cfg(windows)]
     assert_eq!(normalize_path(Path::new("src\\main.rs")), "src/main.rs");
+    #[cfg(unix)]
+    assert_eq!(normalize_path(Path::new("src\\main.rs")), "src\\main.rs");
 }
 
 #[test]

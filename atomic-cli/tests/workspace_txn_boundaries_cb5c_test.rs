@@ -2,7 +2,7 @@
 //! bootstrap, dry-run Observe mutation-freedom, no-Git behavior, and managed
 //! turn boundaries under Git-owned partial operations.
 
-// Temporary Unix-only Git bridge support to unblock Windows native CI.
+// Temporary Unix-only Git shim support to unblock Windows native CI.
 // Revisit after Windows support is defined; see the RFC temporary platform policy.
 #![cfg(unix)]
 use std::collections::BTreeMap;
@@ -34,13 +34,13 @@ impl Fixture {
         fixture.git_ok(&["add", "tracked.txt"]);
         fixture.git_ok(&["commit", "--no-gpg-sign", "-q", "-m", "checkpoint"]);
         fixture.atomic_ok(&["git", "import", "--no-vault"]);
-        fixture.atomic_ok(&["git", "bridge", "reconcile"]);
+        fixture.atomic_ok(&["git", "shim", "reconcile"]);
         assert!(
             fixture
                 .root()
                 .join(".atomic/bridge/workspace.json")
                 .is_file(),
-            "Git reconciliation must establish a valid bridge checkpoint"
+            "Git reconciliation must establish a valid shim checkpoint"
         );
         fixture
     }
@@ -328,7 +328,7 @@ const SEQUENCE_MARKERS: &[&str] = &[
 fn every_git_sequence_marker_is_informative_under_observe_and_refused_for_mutation() {
     for marker in SEQUENCE_MARKERS {
         let fixture = Fixture::colocated();
-        fixture.atomic_ok(&["git", "bridge", "enable"]);
+        fixture.atomic_ok(&["git", "shim", "enable"]);
         inject_marker(&fixture, marker);
         let before = RepositorySnapshot::capture(&fixture);
 
@@ -403,7 +403,7 @@ fn every_git_sequence_marker_is_informative_under_observe_and_refused_for_mutati
 #[test]
 fn index_lock_refuses_mutating_boundaries_without_running_the_command_body() {
     let fixture = Fixture::colocated();
-    fixture.atomic_ok(&["git", "bridge", "enable"]);
+    fixture.atomic_ok(&["git", "shim", "enable"]);
     inject_marker(&fixture, "index.lock");
     let before = RepositorySnapshot::capture(&fixture);
 
@@ -479,7 +479,7 @@ fn clone_transport_failure_cleans_up_and_never_fabricates_a_working_copy() {
 #[test]
 fn agent_turn_end_under_a_git_owned_partial_operation_persists_evidence_only() {
     let fixture = Fixture::colocated();
-    fixture.atomic_ok(&["git", "bridge", "enable"]);
+    fixture.atomic_ok(&["git", "shim", "enable"]);
     inject_marker(&fixture, "MERGE_HEAD");
     fs::write(
         fixture.root().join("tracked.txt"),
@@ -538,19 +538,14 @@ fn agent_turn_end_under_a_git_owned_partial_operation_persists_evidence_only() {
 #[test]
 fn preservation_failure_persists_a_durable_incomplete_reason_and_returns_nonzero() {
     let fixture = Fixture::colocated();
-    // Make the Git object database unwritable so WIP capture cannot persist.
-    // Loose objects are written as temp files inside `.git/objects` before
-    // being renamed into their fan-out directory, so removing the owner write
-    // bit from the object database root fails every object write (commit-tree,
-    // write-tree) without disturbing refs or reflogs of already-created objects.
-    let objects_dir = fixture.root().join(".git/objects");
-    use std::os::unix::fs::PermissionsExt as _;
-    let original_mode = fs::metadata(&objects_dir)
-        .expect("git objects metadata")
-        .permissions()
-        .mode();
-    let readonly = fs::Permissions::from_mode(original_mode & !0o200);
-    fs::set_permissions(&objects_dir, readonly).expect("read-only git objects");
+    let pending = b"pending tracked work must survive failed preservation\n";
+    fs::write(fixture.root().join("tracked.txt"), pending).expect("write pending work");
+    // A valid ref at this namespace root deterministically prevents creating
+    // any recovery ref beneath it, while keeping Git readable and the shim
+    // checkpoint valid. Making only `.git/objects` read-only is insufficient:
+    // writes can still succeed in existing writable fan-out directories,
+    // depending on the newly generated object's hash and host permissions.
+    fixture.git_ok(&["update-ref", "refs/atomic/wip", "HEAD"]);
 
     let output = fixture.atomic_with_stdin(
         &["agent", "hooks", "claude-code", "session-end", "--json"],
@@ -560,10 +555,6 @@ fn preservation_failure_persists_a_durable_incomplete_reason_and_returns_nonzero
         !output.status.success(),
         "turn-end unexpectedly reported success when preservation failed"
     );
-
-    // Restore permissions before reading the durable session record.
-    let restore = fs::Permissions::from_mode(original_mode);
-    fs::set_permissions(&objects_dir, restore).expect("restore git permissions");
 
     let session_path = fixture
         .root()
@@ -579,12 +570,17 @@ fn preservation_failure_persists_a_durable_incomplete_reason_and_returns_nonzero
     );
     assert_eq!(session["turn_count"], 0);
     assert_eq!(session["recorded_change_hashes"], serde_json::json!([]));
+    assert_eq!(
+        fs::read(fixture.root().join("tracked.txt")).unwrap(),
+        pending,
+        "failed preservation must not discard pending tracked bytes"
+    );
 }
 
 #[test]
 fn dropping_and_reordering_hook_events_keeps_the_safe_logical_outcome() {
     let fixture = Fixture::colocated();
-    fixture.atomic_ok(&["git", "bridge", "enable"]);
+    fixture.atomic_ok(&["git", "shim", "enable"]);
     let journal = fixture.root().join(".atomic/bridge/git-events.jsonl");
     let baseline_lines = || -> usize {
         fs::read_to_string(&journal)

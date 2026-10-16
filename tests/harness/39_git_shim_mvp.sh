@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 39_git_bridge_mvp.sh — Offline contract test for `atomic git bridge reconcile`.
+# 39_git_shim_mvp.sh — Offline contract test for `atomic git shim reconcile`.
 #
 # The MVP imports the checked-out Git branch, aligns it with an Atomic view,
 # reconciles later Git commits without disturbing either working tree, is
@@ -10,7 +10,7 @@ source "$HARNESS_DIR/helpers.sh"
 
 echo ""
 echo "${BOLD}══════════════════════════════════════════════════════════════${RESET}"
-echo "${BOLD}  Suite: 39_git_bridge_mvp${RESET}"
+echo "${BOLD}  Suite: 39_git_shim_mvp${RESET}"
 echo "${BOLD}══════════════════════════════════════════════════════════════${RESET}"
 
 begin_section "Prerequisites"
@@ -40,8 +40,8 @@ assert_clean_statuses() {
 assert_complete_paths_match() {
     local label="$1"
     local git_paths disk_paths
-    git_paths="$(mktemp "${TMPDIR:-/tmp}/atomic-bridge-git-paths-XXXXXX")"
-    disk_paths="$(mktemp "${TMPDIR:-/tmp}/atomic-bridge-disk-paths-XXXXXX")"
+    git_paths="$(mktemp "${TMPDIR:-/tmp}/atomic-shim-git-paths-XXXXXX")"
+    disk_paths="$(mktemp "${TMPDIR:-/tmp}/atomic-shim-disk-paths-XXXXXX")"
     _HARNESS_TMPDIRS+=("$git_paths" "$disk_paths")
     git ls-tree -r --name-only HEAD | LC_ALL=C sort > "$git_paths"
     find . -type f \
@@ -58,9 +58,9 @@ assert_complete_paths_match() {
 }
 
 begin_section "Initial import and feature reconciliation"
-make_temp_repo "git-bridge-mvp"
+make_temp_repo "git-shim-mvp"
 init_git_repo
-create_file "README.md" "bridge mvp\n"
+create_file "README.md" "shim mvp\n"
 create_file "src/nested/base.txt" "base\n"
 : > "tracked-empty.txt"
 git add README.md src/nested/base.txt tracked-empty.txt
@@ -82,19 +82,19 @@ else
 fi
 create_file "src/nested/feature.txt" "feature\n"
 : > feature-empty.txt
-overwrite_file "README.md" "bridge mvp\nfeature\n"
+overwrite_file "README.md" "shim mvp\nfeature\n"
 git add README.md src/nested/feature.txt feature-empty.txt
 git commit --quiet -m "Feature commit"
 FEATURE_HEAD="$(git_head_sha_full)"
 
 set +e
-RECONCILE_OUT="$(atomic git bridge reconcile 2>&1)"
+RECONCILE_OUT="$(atomic git shim reconcile 2>&1)"
 RECONCILE_RC=$?
 set -e
 if [[ "$RECONCILE_RC" -eq 0 ]]; then
-    _pass "bridge reconcile imports the feature commit"
+    _pass "shim reconcile imports the feature commit"
 else
-    _fail "bridge reconcile imports the feature commit" "exit $RECONCILE_RC: $RECONCILE_OUT"
+    _fail "shim reconcile imports the feature commit" "exit $RECONCILE_RC: $RECONCILE_OUT"
 fi
 
 assert_view_exists "feature branch has matching Atomic view" "feature"
@@ -118,7 +118,7 @@ else
         "feature-empty.txt missing or non-empty"
 fi
 assert_complete_paths_match "all Git HEAD paths exactly match working-tree paths"
-assert_success "explicit bridge verify proves Git/Atomic equality" atomic git bridge verify
+assert_success "explicit shim verify proves Git/Atomic equality" atomic git shim verify
 if [[ -s .atomic/bridge/workspace.json ]]; then
     _pass "reconcile writes a non-empty local workspace checkpoint"
 else
@@ -130,14 +130,14 @@ if [[ -f tracked-empty.txt && ! -s tracked-empty.txt ]]; then
     _pass "tracked zero-byte file exists and remains empty"
 else
     _fail "tracked zero-byte file exists and remains empty" \
-        "known bridge/import empty-file fidelity bug: missing or non-empty tracked-empty.txt"
+        "known shim/import empty-file fidelity bug: missing or non-empty tracked-empty.txt"
 fi
 
 begin_section "Idempotence"
 BEFORE_SECOND_HEAD="$(git_head_sha_full)"
 BEFORE_SECOND_COUNT="$(git_commit_count)"
 set +e
-SECOND_OUT="$(atomic git bridge reconcile 2>&1)"
+SECOND_OUT="$(atomic git shim reconcile 2>&1)"
 SECOND_RC=$?
 set -e
 if [[ "$SECOND_RC" -eq 0 ]]; then
@@ -153,10 +153,10 @@ fi
 assert_clean_statuses "after second reconcile"
 
 begin_section "Atomic-origin reconciliation"
-overwrite_file "README.md" "bridge mvp\nfeature\natomic origin\n"
+overwrite_file "README.md" "shim mvp\nfeature\natomic origin\n"
 create_file "src/nested/atomic-origin.txt" "recorded by Atomic\n"
 assert_success "add Atomic-origin file" atomic add src/nested/atomic-origin.txt
-assert_success "record Atomic-origin changes" atomic record -m "Atomic-origin bridge change"
+assert_success "record Atomic-origin changes" atomic record -m "Atomic-origin shim change"
 
 if [[ -z "$(atomic status --short 2>/dev/null || true)" ]]; then
     _pass "Atomic-origin record leaves Atomic clean"
@@ -170,7 +170,7 @@ else
 fi
 
 ATOMIC_ORIGIN_OLD_HEAD="$(git_head_sha_full)"
-assert_success "reconcile exports Atomic-origin record to Git" atomic git bridge reconcile
+assert_success "reconcile exports Atomic-origin record to Git" atomic git shim reconcile
 ATOMIC_ORIGIN_NEW_HEAD="$(git_head_sha_full)"
 if [[ "$ATOMIC_ORIGIN_NEW_HEAD" != "$ATOMIC_ORIGIN_OLD_HEAD" ]]; then
     _pass "Atomic-origin reconcile advances Git HEAD"
@@ -178,7 +178,7 @@ else
     _fail "Atomic-origin reconcile advances Git HEAD" "Git HEAD remained $ATOMIC_ORIGIN_OLD_HEAD"
 fi
 assert_clean_statuses "after Atomic-origin reconcile"
-assert_success "bridge verify succeeds after Atomic-origin reconcile" atomic git bridge verify
+assert_success "shim verify succeeds after Atomic-origin reconcile" atomic git shim verify
 ATOMIC_ORIGIN_BLOB="$(mktemp "${TMPDIR:-/tmp}/atomic-origin-blob-XXXXXX")"
 _HARNESS_TMPDIRS+=("$ATOMIC_ORIGIN_BLOB")
 git show HEAD:src/nested/atomic-origin.txt > "$ATOMIC_ORIGIN_BLOB"
@@ -191,7 +191,7 @@ fi
 
 ATOMIC_ORIGIN_SECOND_HEAD="$(git_head_sha_full)"
 ATOMIC_ORIGIN_SECOND_COUNT="$(git_commit_count)"
-assert_success "second Atomic-origin reconcile succeeds" atomic git bridge reconcile
+assert_success "second Atomic-origin reconcile succeeds" atomic git shim reconcile
 if [[ "$(git_head_sha_full)" == "$ATOMIC_ORIGIN_SECOND_HEAD" && \
       "$(git_commit_count)" == "$ATOMIC_ORIGIN_SECOND_COUNT" ]]; then
     _pass "second Atomic-origin reconcile creates no Git commit"
@@ -217,7 +217,7 @@ else
 fi
 
 set +e
-DIRTY_OUT="$(atomic git bridge reconcile 2>&1)"
+DIRTY_OUT="$(atomic git shim reconcile 2>&1)"
 DIRTY_RC=$?
 set -e
 if [[ "$DIRTY_RC" -ne 0 ]]; then
@@ -244,7 +244,7 @@ fi
 git checkout -- README.md
 assert_clean_statuses "after restoring dirty-refusal edit"
 
-begin_section "Bridge switch materializes exact Atomic view state"
+begin_section "shim switch materializes exact Atomic view state"
 
 snapshot_materialized_state() {
     local paths_file="$1"
@@ -278,12 +278,12 @@ snapshot_git_rendered_state() {
     done < "$paths_file"
 }
 
-FEATURE_PATHS="$(mktemp "${TMPDIR:-/tmp}/atomic-bridge-feature-paths-XXXXXX")"
-FEATURE_HASHES="$(mktemp "${TMPDIR:-/tmp}/atomic-bridge-feature-hashes-XXXXXX")"
-MAIN_PATHS="$(mktemp "${TMPDIR:-/tmp}/atomic-bridge-main-paths-XXXXXX")"
-MAIN_HASHES="$(mktemp "${TMPDIR:-/tmp}/atomic-bridge-main-hashes-XXXXXX")"
-CURRENT_PATHS="$(mktemp "${TMPDIR:-/tmp}/atomic-bridge-current-paths-XXXXXX")"
-CURRENT_HASHES="$(mktemp "${TMPDIR:-/tmp}/atomic-bridge-current-hashes-XXXXXX")"
+FEATURE_PATHS="$(mktemp "${TMPDIR:-/tmp}/atomic-shim-feature-paths-XXXXXX")"
+FEATURE_HASHES="$(mktemp "${TMPDIR:-/tmp}/atomic-shim-feature-hashes-XXXXXX")"
+MAIN_PATHS="$(mktemp "${TMPDIR:-/tmp}/atomic-shim-main-paths-XXXXXX")"
+MAIN_HASHES="$(mktemp "${TMPDIR:-/tmp}/atomic-shim-main-hashes-XXXXXX")"
+CURRENT_PATHS="$(mktemp "${TMPDIR:-/tmp}/atomic-shim-current-paths-XXXXXX")"
+CURRENT_HASHES="$(mktemp "${TMPDIR:-/tmp}/atomic-shim-current-hashes-XXXXXX")"
 _HARNESS_TMPDIRS+=(
     "$FEATURE_PATHS" "$FEATURE_HASHES" "$MAIN_PATHS"
     "$MAIN_HASHES" "$CURRENT_PATHS" "$CURRENT_HASHES"
@@ -293,7 +293,7 @@ rm src/nested/base.txt
 assert_success "record feature deletion for materialization coverage" \
     atomic record -m "Delete base file on feature"
 set +e
-FEATURE_DELETE_OUT="$(atomic git bridge reconcile 2>&1)"
+FEATURE_DELETE_OUT="$(atomic git shim reconcile 2>&1)"
 FEATURE_DELETE_RC=$?
 set -e
 if [[ "$FEATURE_DELETE_RC" -eq 0 ]]; then
@@ -301,9 +301,9 @@ if [[ "$FEATURE_DELETE_RC" -eq 0 ]]; then
 else
     _fail "project feature deletion to Git" "exit $FEATURE_DELETE_RC: $FEATURE_DELETE_OUT"
 fi
-assert_clean_statuses "before bridge switch materialization checks"
+assert_clean_statuses "before shim switch materialization checks"
 
-SENTINEL_CONTENT="untracked bridge switch sentinel"
+SENTINEL_CONTENT="untracked shim switch sentinel"
 printf '%s\n' "$SENTINEL_CONTENT" > .atomic/bridge/sentinel.txt
 snapshot_materialized_state "$FEATURE_PATHS" "$FEATURE_HASHES"
 
@@ -313,13 +313,13 @@ DIRTY_SWITCH_VIEW="$(atomic_current_view)"
 DIRTY_SWITCH_README="$(cat README.md)"
 DIRTY_SWITCH_PATHS="$(cat "$FEATURE_PATHS")"
 set +e
-DIRTY_SWITCH_OUT="$(atomic git bridge switch "$MAIN" 2>&1)"
+DIRTY_SWITCH_OUT="$(atomic git shim switch "$MAIN" 2>&1)"
 DIRTY_SWITCH_RC=$?
 set -e
 if [[ "$DIRTY_SWITCH_RC" -ne 0 ]]; then
-    _pass "bridge switch refuses a dirty tracked edit"
+    _pass "shim switch refuses a dirty tracked edit"
 else
-    _fail "bridge switch refuses a dirty tracked edit" "command unexpectedly succeeded"
+    _fail "shim switch refuses a dirty tracked edit" "command unexpectedly succeeded"
 fi
 if [[ "$(git_head_sha_full)" == "$DIRTY_SWITCH_HEAD" && \
       "$(atomic_current_view)" == "$DIRTY_SWITCH_VIEW" ]]; then
@@ -337,16 +337,16 @@ else
     _fail "dirty switch refusal preserves files and untracked sentinel" "$DIRTY_SWITCH_OUT"
 fi
 git checkout -- README.md
-assert_clean_statuses "after restoring dirty bridge-switch edit"
+assert_clean_statuses "after restoring dirty shim-switch edit"
 
-assert_success "bridge switch feature to main" atomic git bridge switch "$MAIN"
+assert_success "shim switch feature to main" atomic git shim switch "$MAIN"
 if [[ "$(git_current_branch)" == "$MAIN" && "$(atomic_current_view)" == "$MAIN" ]]; then
     _pass "main Git branch and Atomic view are aligned"
 else
     _fail "main Git branch and Atomic view are aligned" \
         "got $(git_current_branch)/$(atomic_current_view)"
 fi
-assert_file_content "main README content is exact" README.md "bridge mvp\n"
+assert_file_content "main README content is exact" README.md "shim mvp\n"
 assert_file_content "main nested base file is restored" src/nested/base.txt "base\n"
 assert_file_exists "main zero-byte path is present" tracked-empty.txt
 if [[ ! -s tracked-empty.txt ]]; then
@@ -358,11 +358,11 @@ assert_file_not_exists "feature-added path is absent on main" src/nested/feature
 assert_file_not_exists "feature-local zero-byte path is absent on main" feature-empty.txt
 assert_file_not_exists "Atomic-origin path is absent on main" src/nested/atomic-origin.txt
 assert_complete_paths_match "main materialization has exact projected path list"
-assert_clean_statuses "after bridge switch to main"
-assert_success "bridge verify succeeds on main materialization" atomic git bridge verify
+assert_clean_statuses "after shim switch to main"
+assert_success "shim verify succeeds on main materialization" atomic git shim verify
 snapshot_materialized_state "$MAIN_PATHS" "$MAIN_HASHES"
 
-assert_success "bridge switch main to feature" atomic git bridge switch feature
+assert_success "shim switch main to feature" atomic git shim switch feature
 if [[ "$(git_current_branch)" == "feature" && "$(atomic_current_view)" == "feature" ]]; then
     _pass "feature Git branch and Atomic view are aligned"
 else
@@ -370,7 +370,7 @@ else
         "got $(git_current_branch)/$(atomic_current_view)"
 fi
 assert_file_content "feature README content is exact" README.md \
-    "bridge mvp\nfeature\natomic origin\n"
+    "shim mvp\nfeature\natomic origin\n"
 assert_file_content "feature added file content is exact" src/nested/feature.txt "feature\n"
 assert_file_content "feature nested Atomic-origin content is exact" \
     src/nested/atomic-origin.txt "recorded by Atomic\n"
@@ -394,17 +394,17 @@ else
         "$(diff -u "$FEATURE_PATHS" "$CURRENT_PATHS" || true)"
 fi
 assert_complete_paths_match "feature materialization has exact projected path list"
-assert_clean_statuses "after first bridge switch to feature"
-assert_success "bridge verify succeeds on feature materialization" atomic git bridge verify
+assert_clean_statuses "after first shim switch to feature"
+assert_success "shim verify succeeds on feature materialization" atomic git shim verify
 
 set +e
-SECOND_MAIN_OUT="$(atomic git bridge switch "$MAIN" 2>&1)"
+SECOND_MAIN_OUT="$(atomic git shim switch "$MAIN" 2>&1)"
 SECOND_MAIN_RC=$?
 set -e
 if [[ "$SECOND_MAIN_RC" -eq 0 ]]; then
-    _pass "bridge switch feature back to main"
+    _pass "shim switch feature back to main"
 else
-    _fail "bridge switch feature back to main" "exit $SECOND_MAIN_RC: $SECOND_MAIN_OUT"
+    _fail "shim switch feature back to main" "exit $SECOND_MAIN_RC: $SECOND_MAIN_OUT"
 fi
 snapshot_materialized_state "$CURRENT_PATHS" "$CURRENT_HASHES"
 if cmp -s "$MAIN_PATHS" "$CURRENT_PATHS" && cmp -s "$MAIN_HASHES" "$CURRENT_HASHES"; then
@@ -413,10 +413,10 @@ else
     _fail "main path list and content hashes survive second switch" \
         "$(diff -u "$MAIN_PATHS" "$CURRENT_PATHS" || true)"
 fi
-assert_clean_statuses "after second bridge switch to main"
-assert_success "bridge verify succeeds after second main materialization" atomic git bridge verify
+assert_clean_statuses "after second shim switch to main"
+assert_success "shim verify succeeds after second main materialization" atomic git shim verify
 
-assert_success "bridge switch main back to feature" atomic git bridge switch feature
+assert_success "shim switch main back to feature" atomic git shim switch feature
 snapshot_materialized_state "$CURRENT_PATHS" "$CURRENT_HASHES"
 if cmp -s "$FEATURE_PATHS" "$CURRENT_PATHS" && cmp -s "$FEATURE_HASHES" "$CURRENT_HASHES"; then
     _pass "feature path list and content hashes survive second round trip"
@@ -425,9 +425,9 @@ else
         "$(diff -u "$FEATURE_PATHS" "$CURRENT_PATHS" || true)"
 fi
 if [[ "$(cat .atomic/bridge/sentinel.txt)" == "$SENTINEL_CONTENT" ]]; then
-    _pass "untracked sentinel survives every bridge switch"
+    _pass "untracked sentinel survives every shim switch"
 else
-    _fail "untracked sentinel survives every bridge switch" ".atomic/bridge/sentinel.txt changed"
+    _fail "untracked sentinel survives every shim switch" ".atomic/bridge/sentinel.txt changed"
 fi
 if [[ "$(git_current_branch)" == "feature" && "$(atomic_current_view)" == "feature" ]]; then
     _pass "final Git branch and Atomic view are aligned on feature"
@@ -435,17 +435,17 @@ else
     _fail "final Git branch and Atomic view are aligned on feature" \
         "got $(git_current_branch)/$(atomic_current_view)"
 fi
-assert_clean_statuses "after repeated bridge switching"
-assert_success "bridge verify succeeds after repeated switching" atomic git bridge verify
+assert_clean_statuses "after repeated shim switching"
+assert_success "shim verify succeeds after repeated switching" atomic git shim verify
 
 begin_section "Raw Git switch adoption does not rematerialize"
 
-ADOPTION_PATHS_BEFORE="$(mktemp "${TMPDIR:-/tmp}/atomic-bridge-adoption-paths-before-XXXXXX")"
-ADOPTION_HASHES_BEFORE="$(mktemp "${TMPDIR:-/tmp}/atomic-bridge-adoption-hashes-before-XXXXXX")"
-ADOPTION_METADATA_BEFORE="$(mktemp "${TMPDIR:-/tmp}/atomic-bridge-adoption-metadata-before-XXXXXX")"
-ADOPTION_PATHS_AFTER="$(mktemp "${TMPDIR:-/tmp}/atomic-bridge-adoption-paths-after-XXXXXX")"
-ADOPTION_HASHES_AFTER="$(mktemp "${TMPDIR:-/tmp}/atomic-bridge-adoption-hashes-after-XXXXXX")"
-ADOPTION_METADATA_AFTER="$(mktemp "${TMPDIR:-/tmp}/atomic-bridge-adoption-metadata-after-XXXXXX")"
+ADOPTION_PATHS_BEFORE="$(mktemp "${TMPDIR:-/tmp}/atomic-shim-adoption-paths-before-XXXXXX")"
+ADOPTION_HASHES_BEFORE="$(mktemp "${TMPDIR:-/tmp}/atomic-shim-adoption-hashes-before-XXXXXX")"
+ADOPTION_METADATA_BEFORE="$(mktemp "${TMPDIR:-/tmp}/atomic-shim-adoption-metadata-before-XXXXXX")"
+ADOPTION_PATHS_AFTER="$(mktemp "${TMPDIR:-/tmp}/atomic-shim-adoption-paths-after-XXXXXX")"
+ADOPTION_HASHES_AFTER="$(mktemp "${TMPDIR:-/tmp}/atomic-shim-adoption-hashes-after-XXXXXX")"
+ADOPTION_METADATA_AFTER="$(mktemp "${TMPDIR:-/tmp}/atomic-shim-adoption-metadata-after-XXXXXX")"
 _HARNESS_TMPDIRS+=(
     "$ADOPTION_PATHS_BEFORE" "$ADOPTION_HASHES_BEFORE" "$ADOPTION_METADATA_BEFORE"
     "$ADOPTION_PATHS_AFTER" "$ADOPTION_HASHES_AFTER" "$ADOPTION_METADATA_AFTER"
@@ -473,7 +473,7 @@ else
         "$(diff -u "$MAIN_PATHS" "$ADOPTION_PATHS_BEFORE" || true)"
 fi
 sleep 1
-assert_success "reconcile adopts raw Git switch to main" atomic git bridge reconcile
+assert_success "reconcile adopts raw Git switch to main" atomic git shim reconcile
 snapshot_git_rendered_state \
     "$ADOPTION_PATHS_AFTER" "$ADOPTION_HASHES_AFTER" "$ADOPTION_METADATA_AFTER"
 if [[ "$(atomic_current_view)" == "$MAIN" ]]; then
@@ -482,7 +482,7 @@ else
     _fail "reconcile adopts main as the current Atomic view" "got $(atomic_current_view)"
 fi
 assert_clean_statuses "after adopting raw Git switch to main"
-assert_success "bridge verify succeeds after adopting main" atomic git bridge verify
+assert_success "shim verify succeeds after adopting main" atomic git shim verify
 assert_complete_paths_match "adopted main has the complete expected path list"
 if cmp -s "$MAIN_PATHS" "$ADOPTION_PATHS_AFTER" && \
    cmp -s "$MAIN_HASHES" "$ADOPTION_HASHES_AFTER"; then
@@ -522,7 +522,7 @@ else
         "$(diff -u "$FEATURE_PATHS" "$ADOPTION_PATHS_BEFORE" || true)"
 fi
 sleep 1
-assert_success "reconcile adopts raw Git switch to feature" atomic git bridge reconcile
+assert_success "reconcile adopts raw Git switch to feature" atomic git shim reconcile
 snapshot_git_rendered_state \
     "$ADOPTION_PATHS_AFTER" "$ADOPTION_HASHES_AFTER" "$ADOPTION_METADATA_AFTER"
 if [[ "$(atomic_current_view)" == "feature" ]]; then
@@ -531,7 +531,7 @@ else
     _fail "reconcile adopts feature as the current Atomic view" "got $(atomic_current_view)"
 fi
 assert_clean_statuses "after adopting raw Git switch to feature"
-assert_success "bridge verify succeeds after adopting feature" atomic git bridge verify
+assert_success "shim verify succeeds after adopting feature" atomic git shim verify
 assert_complete_paths_match "adopted feature has the complete expected path list"
 if cmp -s "$FEATURE_PATHS" "$ADOPTION_PATHS_AFTER" && \
    cmp -s "$FEATURE_HASHES" "$ADOPTION_HASHES_AFTER"; then
@@ -551,83 +551,83 @@ fi
 
 begin_section "Raw Git branch creation adoption"
 
-TOPIC_PATHS_BEFORE="$(mktemp "${TMPDIR:-/tmp}/atomic-bridge-topic-paths-before-XXXXXX")"
-TOPIC_HASHES_BEFORE="$(mktemp "${TMPDIR:-/tmp}/atomic-bridge-topic-hashes-before-XXXXXX")"
-TOPIC_METADATA_BEFORE="$(mktemp "${TMPDIR:-/tmp}/atomic-bridge-topic-metadata-before-XXXXXX")"
-TOPIC_PATHS_AFTER="$(mktemp "${TMPDIR:-/tmp}/atomic-bridge-topic-paths-after-XXXXXX")"
-TOPIC_HASHES_AFTER="$(mktemp "${TMPDIR:-/tmp}/atomic-bridge-topic-hashes-after-XXXXXX")"
-TOPIC_METADATA_AFTER="$(mktemp "${TMPDIR:-/tmp}/atomic-bridge-topic-metadata-after-XXXXXX")"
+TOPIC_PATHS_BEFORE="$(mktemp "${TMPDIR:-/tmp}/atomic-shim-topic-paths-before-XXXXXX")"
+TOPIC_HASHES_BEFORE="$(mktemp "${TMPDIR:-/tmp}/atomic-shim-topic-hashes-before-XXXXXX")"
+TOPIC_METADATA_BEFORE="$(mktemp "${TMPDIR:-/tmp}/atomic-shim-topic-metadata-before-XXXXXX")"
+TOPIC_PATHS_AFTER="$(mktemp "${TMPDIR:-/tmp}/atomic-shim-topic-paths-after-XXXXXX")"
+TOPIC_HASHES_AFTER="$(mktemp "${TMPDIR:-/tmp}/atomic-shim-topic-hashes-after-XXXXXX")"
+TOPIC_METADATA_AFTER="$(mktemp "${TMPDIR:-/tmp}/atomic-shim-topic-metadata-after-XXXXXX")"
 _HARNESS_TMPDIRS+=(
     "$TOPIC_PATHS_BEFORE" "$TOPIC_HASHES_BEFORE" "$TOPIC_METADATA_BEFORE"
     "$TOPIC_PATHS_AFTER" "$TOPIC_HASHES_AFTER" "$TOPIC_METADATA_AFTER"
 )
 
 TOPIC_BASE_HEAD="$(git_head_sha_full)"
-assert_success "raw Git creates bridge-topic from aligned feature" git checkout -b bridge-topic
-if [[ "$(git_current_branch)" == "bridge-topic" && "$(git_head_sha_full)" == "$TOPIC_BASE_HEAD" ]]; then
+assert_success "raw Git creates shim-topic from aligned feature" git checkout -b shim-topic
+if [[ "$(git_current_branch)" == "shim-topic" && "$(git_head_sha_full)" == "$TOPIC_BASE_HEAD" ]]; then
     _pass "raw Git branch creation changes only the checked-out branch"
 else
     _fail "raw Git branch creation changes only the checked-out branch" \
-        "got $(git_current_branch) at $(git_head_sha_full), expected bridge-topic at $TOPIC_BASE_HEAD"
+        "got $(git_current_branch) at $(git_head_sha_full), expected shim-topic at $TOPIC_BASE_HEAD"
 fi
 if [[ "$(atomic_current_view)" == "feature" ]]; then
-    _pass "Atomic view remains feature before adopting bridge-topic"
+    _pass "Atomic view remains feature before adopting shim-topic"
 else
-    _fail "Atomic view remains feature before adopting bridge-topic" \
+    _fail "Atomic view remains feature before adopting shim-topic" \
         "got $(atomic_current_view)"
 fi
 snapshot_git_rendered_state \
     "$TOPIC_PATHS_BEFORE" "$TOPIC_HASHES_BEFORE" "$TOPIC_METADATA_BEFORE"
 sleep 1
 set +e
-TOPIC_ADOPT_OUT="$(atomic git bridge reconcile 2>&1)"
+TOPIC_ADOPT_OUT="$(atomic git shim reconcile 2>&1)"
 TOPIC_ADOPT_RC=$?
 set -e
 if [[ "$TOPIC_ADOPT_RC" -eq 0 ]]; then
-    _pass "reconcile adopts newly created bridge-topic branch"
+    _pass "reconcile adopts newly created shim-topic branch"
 else
-    _fail "reconcile adopts newly created bridge-topic branch" "exit $TOPIC_ADOPT_RC: $TOPIC_ADOPT_OUT"
+    _fail "reconcile adopts newly created shim-topic branch" "exit $TOPIC_ADOPT_RC: $TOPIC_ADOPT_OUT"
 fi
 snapshot_git_rendered_state \
     "$TOPIC_PATHS_AFTER" "$TOPIC_HASHES_AFTER" "$TOPIC_METADATA_AFTER"
-assert_view_exists "new bridge-topic branch has a matching Atomic view" bridge-topic
-if [[ "$(atomic_current_view)" == "bridge-topic" ]]; then
-    _pass "new bridge-topic view is current after reconcile"
+assert_view_exists "new shim-topic branch has a matching Atomic view" shim-topic
+if [[ "$(atomic_current_view)" == "shim-topic" ]]; then
+    _pass "new shim-topic view is current after reconcile"
 else
-    _fail "new bridge-topic view is current after reconcile" "got $(atomic_current_view)"
+    _fail "new shim-topic view is current after reconcile" "got $(atomic_current_view)"
 fi
-assert_clean_statuses "after adopting newly created bridge-topic"
-assert_success "bridge verify succeeds after adopting bridge-topic" atomic git bridge verify
+assert_clean_statuses "after adopting newly created shim-topic"
+assert_success "shim verify succeeds after adopting shim-topic" atomic git shim verify
 if cmp -s "$TOPIC_PATHS_BEFORE" "$TOPIC_PATHS_AFTER" && \
    cmp -s "$TOPIC_HASHES_BEFORE" "$TOPIC_HASHES_AFTER" && \
    cmp -s "$TOPIC_METADATA_BEFORE" "$TOPIC_METADATA_AFTER"; then
-    _pass "bridge-topic reconcile adopts files without rewriting them"
+    _pass "shim-topic reconcile adopts files without rewriting them"
 else
-    _fail "bridge-topic reconcile adopts files without rewriting them" \
+    _fail "shim-topic reconcile adopts files without rewriting them" \
         "content paths, hashes, mtimes, or inodes changed"
 fi
 
 
-assert_success "raw Git switch bridge-topic to feature" git switch feature
-if [[ "$(atomic_current_view)" == "bridge-topic" ]]; then
-    _pass "Atomic view remains bridge-topic before readopting feature"
+assert_success "raw Git switch shim-topic to feature" git switch feature
+if [[ "$(atomic_current_view)" == "shim-topic" ]]; then
+    _pass "Atomic view remains shim-topic before readopting feature"
 else
-    _fail "Atomic view remains bridge-topic before readopting feature" \
+    _fail "Atomic view remains shim-topic before readopting feature" \
         "got $(atomic_current_view)"
 fi
-assert_success "reconcile readopts feature after raw Git switch" atomic git bridge reconcile
+assert_success "reconcile readopts feature after raw Git switch" atomic git shim reconcile
 if [[ "$(git_current_branch)" == "feature" && "$(atomic_current_view)" == "feature" ]]; then
     _pass "Git branch and Atomic view are realigned on feature"
 else
     _fail "Git branch and Atomic view are realigned on feature" \
         "got $(git_current_branch)/$(atomic_current_view)"
 fi
-assert_clean_statuses "after returning from bridge-topic to feature"
-assert_success "bridge verify succeeds after returning to feature" atomic git bridge verify
+assert_clean_statuses "after returning from shim-topic to feature"
+assert_success "shim verify succeeds after returning to feature" atomic git shim verify
 
 begin_section "Two-sided divergence refusal is non-destructive"
 
-overwrite_file "README.md" "bridge mvp\nfeature\natomic origin\ntwo-sided divergence\n"
+overwrite_file "README.md" "shim mvp\nfeature\natomic origin\ntwo-sided divergence\n"
 create_file "src/nested/two-sided.txt" "advanced independently\n"
 assert_success "add two-sided Atomic file" atomic add src/nested/two-sided.txt
 assert_success "record Atomic side of divergence" atomic record -m "Atomic side of divergence"
@@ -643,7 +643,7 @@ DIVERGED_ATOMIC_LOG="$(atomic log 2>&1)"
 DIVERGED_README="$(cat README.md)"
 DIVERGED_FILE="$(cat src/nested/two-sided.txt)"
 set +e
-DIVERGED_OUT="$(atomic git bridge reconcile 2>&1)"
+DIVERGED_OUT="$(atomic git shim reconcile 2>&1)"
 DIVERGED_RC=$?
 set -e
 if [[ "$DIVERGED_RC" -ne 0 ]]; then

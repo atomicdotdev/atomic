@@ -573,8 +573,24 @@ where
 
     log::debug!("assemble_change: {} files", files.len(),);
 
-    // Create globalization context
+    // Create globalization context. Closure-projected path bindings (see
+    // `ProjectedPathBinding`) are seeded first so parent-directory
+    // anchoring consults the assembly view's identity before the ambient
+    // TREE — required under a preserved (deferred-TREE) incremental import.
     let mut glob_ctx = GlobalizeContext::new(txn);
+    glob_ctx.seed_projected_paths(options.get_globalize_options().projected_paths().clone());
+    for file in files {
+        if let Some(inode) = file.inode() {
+            if let Some(old_path) = file.old_path() {
+                glob_ctx.vacate_binding(old_path, inode);
+            } else if matches!(
+                file.kind(),
+                Some(crate::record::workflow::DetectionKind::Deleted)
+            ) {
+                glob_ctx.vacate_binding(file.path(), inode);
+            }
+        }
+    }
     let mut ctx = AssemblyContext::new(header);
     let mut stats = AssemblyStats::new();
     let mut globalized_files = Vec::new();

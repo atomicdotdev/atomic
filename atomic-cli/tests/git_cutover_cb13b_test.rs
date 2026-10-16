@@ -1,4 +1,4 @@
-// Temporary Unix-only Git bridge support to unblock Windows native CI.
+// Temporary Unix-only Git shim support to unblock Windows native CI.
 // Revisit after Windows support is defined; see the RFC temporary platform policy.
 #![cfg(unix)]
 
@@ -96,7 +96,7 @@ fn git(root: &Path, args: &[&str]) {
 }
 
 /// A colocated Git + Atomic repository with an active shadow sync and the
-/// recorded explicit opt-in — the state `atomic git bridge cutover`
+/// recorded explicit opt-in — the state `atomic git shim cutover`
 /// consumes.
 struct Colocated {
     root: TempDir,
@@ -119,13 +119,13 @@ impl Colocated {
             home.path(),
             &[
                 "git",
-                "bridge",
+                "shim",
                 "enable",
                 "--binding-key-file",
                 key_file(home.path()).to_str().expect("utf8 key path"),
             ],
         );
-        atomic_ok(root.path(), home.path(), &["git", "bridge", "reconcile"]);
+        atomic_ok(root.path(), home.path(), &["git", "shim", "reconcile"]);
         Self { root, home }
     }
 
@@ -173,7 +173,7 @@ fn cutover_requires_the_explicit_opt_in_consent() {
     assert!(git_ok(&root, &["commit", "-qm", "anchor base"]));
     atomic_ok(root.path(), home.path(), &["init", "--no-vault"]);
 
-    let output = atomic_fail(root.path(), home.path(), &["git", "bridge", "cutover"]);
+    let output = atomic_fail(root.path(), home.path(), &["git", "shim", "cutover"]);
     assert!(
         output.contains("explicit opt-in consent"),
         "the consent precondition must refuse: {output}"
@@ -195,7 +195,7 @@ fn cutover_refuses_foreign_hook_surfaces_through_the_cli() {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
-    let output = colocated.atomic_fails(&["git", "bridge", "cutover"]);
+    let output = colocated.atomic_fails(&["git", "shim", "cutover"]);
     assert!(
         output.contains("hook"),
         "the foreign hook readiness refusal must reach the CLI: {output}"
@@ -208,13 +208,13 @@ fn cutover_cli_entry_is_reachable_end_to_end() {
     let dispatcher = colocated.root().join(".git/hooks/post-checkout");
     assert!(
         dispatcher.exists(),
-        "the fixture's bridge enable installs the advisory dispatcher"
+        "the fixture's shim enable installs the advisory dispatcher"
     );
 
     // The cutover lands: journaled, verified, fenced — and it
     // decommissions the Atomic-owned advisory dispatchers through its
     // journaled migration-effect leases (no manual decommission step).
-    let output = colocated.atomic(&["git", "bridge", "cutover"]);
+    let output = colocated.atomic(&["git", "shim", "cutover"]);
     assert!(
         output.contains("journaled and verified"),
         "cutover must report the journaled outcome: {output}"
@@ -227,7 +227,7 @@ fn cutover_cli_entry_is_reachable_end_to_end() {
     // The fence is real through the CLI: a recorded change's shadow
     // projection takes the legacy writer lock and refuses with the typed
     // fenced error. The record itself is durable; only the projection
-    // refuses (the colocated bridge owns writes now).
+    // refuses (the colocated shim owns writes now).
     fs::write(colocated.root().join("tracked.txt"), b"after cutover\n").unwrap();
     colocated.atomic(&["add", "tracked.txt"]);
     let output = colocated.atomic_fails(&["record", "-m", "post cutover"]);
@@ -237,7 +237,7 @@ fn cutover_cli_entry_is_reachable_end_to_end() {
     );
 
     // Re-execution is an idempotent already-fenced no-op.
-    let output = colocated.atomic(&["git", "bridge", "cutover"]);
+    let output = colocated.atomic(&["git", "shim", "cutover"]);
     assert!(
         output.contains("already cut over"),
         "re-execution must be a no-op: {output}"
@@ -246,7 +246,7 @@ fn cutover_cli_entry_is_reachable_end_to_end() {
     // Rollback after later activity refuses: the shared repository head
     // moved past the cutover (the durable record advanced it), and the
     // typed inverse never undoes out of order.
-    let output = colocated.atomic_fails(&["git", "bridge", "cutover", "--rollback"]);
+    let output = colocated.atomic_fails(&["git", "shim", "cutover", "--rollback"]);
     assert!(
         output.contains("not the cutover"),
         "rollback must refuse a moved shared head: {output}"
@@ -258,7 +258,7 @@ fn cutover_rollback_lifts_the_fence_and_restores_the_legacy_writer() {
     let colocated = Colocated::new();
     let dispatcher = colocated.root().join(".git/hooks/post-checkout");
     let original = fs::read(&dispatcher).expect("the fixture installed the dispatcher");
-    colocated.atomic(&["git", "bridge", "cutover"]);
+    colocated.atomic(&["git", "shim", "cutover"]);
     assert!(
         !dispatcher.exists(),
         "the cutover decommissioned the dispatcher"
@@ -267,7 +267,7 @@ fn cutover_rollback_lifts_the_fence_and_restores_the_legacy_writer() {
     // Immediately after the cutover (no later operation), the rollback
     // runs: the shared head still denotes the cutover, and the leased
     // hook decommission restores the dispatcher byte-for-byte.
-    let output = colocated.atomic(&["git", "bridge", "cutover", "--rollback"]);
+    let output = colocated.atomic(&["git", "shim", "cutover", "--rollback"]);
     assert!(
         output.contains("rolled back"),
         "rollback must report the inverse: {output}"

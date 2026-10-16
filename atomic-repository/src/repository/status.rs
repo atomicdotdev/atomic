@@ -418,7 +418,7 @@ impl Repository {
         // boundary and never writes telemetry — including from read-only
         // opens, non-Git repositories or un-opted configurations. The
         // degradation metrics are returned to the caller here (see
-        // `change_source_metrics`); only explicit bridge command boundaries
+        // `change_source_metrics`); only explicit shim command boundaries
         // decide whether an authorized journal records them.
         let verified_by_path: HashMap<PathBuf, _> = verified_scan
             .candidates
@@ -1360,9 +1360,9 @@ mod change_source_convergence_tests {
         }
     }
 
-    /// Review R1: status is observational and must not write bridge
+    /// Review R1: status is observational and must not write shim
     /// telemetry — not from a read-only open, a non-Git repository, or a
-    /// configuration with the bridge un-opted. A degrading change source
+    /// configuration with the shim un-opted. A degrading change source
     /// still surfaces its metrics to the caller, but no event file may be
     /// created (this failed before: the fallback emitted into
     /// `.atomic/bridge/events.jsonl` unconditionally).
@@ -1407,7 +1407,7 @@ mod change_source_convergence_tests {
             .join("bridge/events.jsonl");
         assert!(
             !journal_path.exists(),
-            "observational status must never write bridge telemetry"
+            "observational status must never write shim telemetry"
         );
     }
 }

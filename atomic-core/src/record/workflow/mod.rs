@@ -142,6 +142,7 @@ pub use globalize::{
     extract_parent, globalize_hunk, globalize_recorded_file, resolve_file_position,
     resolve_inode_to_position, resolve_parent_inode, resolve_path_to_inode, CacheStats,
     GlobalizeContext, GlobalizeError, GlobalizeOptions, GlobalizeResult, GlobalizedFile,
+    ProjectedPathBinding,
 };
 pub use graph_op::{
     BuiltHunk, BuiltHunkKind, HunkBuildOptions, HunkBuildResult, HunkBuilder, PendingChange,

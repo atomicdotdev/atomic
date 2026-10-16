@@ -882,7 +882,7 @@ impl Repository {
     }
 
     /// Whether sessions, WIP/shelf workspaces, recovery backups, or the
-    /// bridge workspace metadata still reference the object (CB-13A R1).
+    /// shim workspace metadata still reference the object (CB-13A R1).
     ///
     /// The base32 hash may appear as text (session JSON, WIP manifests) or as
     /// a path component (recovery backups mirror the change-store layout), so

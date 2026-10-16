@@ -1,4 +1,4 @@
-// Temporary Unix-only Git bridge support to unblock Windows native CI.
+// Temporary Unix-only Git shim support to unblock Windows native CI.
 // Revisit after Windows support is defined; see the RFC temporary platform policy.
 #![cfg(unix)]
 
@@ -164,7 +164,7 @@ fn make_executable(path: &Path) {
 }
 
 #[test]
-fn bridge_enable_records_checkout_and_direct_observation_does_not_need_the_hook() {
+fn shim_enable_records_checkout_and_direct_observation_does_not_need_the_hook() {
     let repository = TempDir::new().expect("repository tempdir");
     let home = TempDir::new().expect("home tempdir");
     let (main, feature) = init_git_with_feature(repository.path());
@@ -178,8 +178,8 @@ fn bridge_enable_records_checkout_and_direct_observation_does_not_need_the_hook(
     )
     .expect("legacy Atomic hook");
 
-    let enabled = atomic(repository.path(), home.path(), &["git", "bridge", "enable"]);
-    assert_success(&enabled, "bridge enable");
+    let enabled = atomic(repository.path(), home.path(), &["git", "shim", "enable"]);
+    assert_success(&enabled, "shim enable");
 
     let hook = repository.path().join(".git/hooks/post-checkout");
     let script = fs::read_to_string(&hook).expect("installed dispatcher");
@@ -194,8 +194,8 @@ fn bridge_enable_records_checkout_and_direct_observation_does_not_need_the_hook(
     assert!(!script.contains("reconcile"));
     assert!(!legacy_post_commit.exists());
 
-    let refreshed = atomic(repository.path(), home.path(), &["git", "bridge", "enable"]);
-    assert_success(&refreshed, "bridge enable refresh");
+    let refreshed = atomic(repository.path(), home.path(), &["git", "shim", "enable"]);
+    assert_success(&refreshed, "shim enable refresh");
     assert_eq!(
         script,
         fs::read_to_string(&hook).expect("refreshed dispatcher")
@@ -302,8 +302,8 @@ fn custom_hooks_path_is_reported_and_left_untouched() {
     let original = b"#!/bin/sh\necho custom-manager\n";
     fs::write(&custom_hook, original).expect("custom hook");
 
-    let output = atomic(repository.path(), home.path(), &["git", "bridge", "enable"]);
-    assert_success(&output, "bridge enable with custom hooks path");
+    let output = atomic(repository.path(), home.path(), &["git", "shim", "enable"]);
+    assert_success(&output, "shim enable with custom hooks path");
     assert_eq!(
         fs::read(&custom_hook).expect("custom hook after enable"),
         original
@@ -332,8 +332,8 @@ fn unmanaged_binary_hook_is_left_byte_for_byte_untouched() {
     let original = b"\x7fELF\x00\xff\xfeunmanaged";
     fs::write(&hook, original).expect("binary hook");
 
-    let output = atomic(repository.path(), home.path(), &["git", "bridge", "enable"]);
-    assert_success(&output, "bridge enable with binary hook");
+    let output = atomic(repository.path(), home.path(), &["git", "shim", "enable"]);
+    assert_success(&output, "shim enable with binary hook");
     assert_eq!(fs::read(&hook).expect("binary hook after enable"), original);
     let combined = format!(
         "{}{}",
@@ -362,8 +362,8 @@ fn unmanaged_symlink_hook_and_target_are_left_untouched() {
     fs::write(&target, original).expect("symlink target");
     symlink(&target, &hook).expect("hook symlink");
 
-    let output = atomic(repository.path(), home.path(), &["git", "bridge", "enable"]);
-    assert_success(&output, "bridge enable with symlink hook");
+    let output = atomic(repository.path(), home.path(), &["git", "shim", "enable"]);
+    assert_success(&output, "shim enable with symlink hook");
     assert!(fs::symlink_metadata(&hook)
         .expect("hook metadata")
         .file_type()
@@ -396,7 +396,7 @@ fn linked_worktree_uses_the_shared_common_hooks_directory() {
     assert_success(&output, "git worktree add");
     init_atomic(&linked, home.path(), "linked");
 
-    let enabled = atomic(&linked, home.path(), &["git", "bridge", "enable"]);
+    let enabled = atomic(&linked, home.path(), &["git", "shim", "enable"]);
     assert_success(&enabled, "enable from linked worktree");
 
     assert!(linked.join(".git").is_file());
@@ -412,8 +412,8 @@ fn dispatcher_reaches_absolute_atomic_binary_with_empty_path() {
     let home = TempDir::new().expect("home tempdir");
     let (main, _) = init_git_with_feature(repository.path());
     init_atomic(repository.path(), home.path(), "main");
-    let enabled = atomic(repository.path(), home.path(), &["git", "bridge", "enable"]);
-    assert_success(&enabled, "bridge enable");
+    let enabled = atomic(repository.path(), home.path(), &["git", "shim", "enable"]);
+    assert_success(&enabled, "shim enable");
 
     let hook = repository.path().join(".git/hooks/post-checkout");
     let output = Command::new(&hook)

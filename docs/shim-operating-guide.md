@@ -1,28 +1,28 @@
-# Atomic Git Bridge — Operating Guide
+# Atomic Git Shim — Operating Guide
 
 Updated 2026-10-13 for PR #207, source `27d06ff` (`atomic 0.19.1`).
-The bridge must be enabled for each repository. It is not enabled by default.
-Use Linux or macOS; Windows bridge support has not been validated.
+The shim must be enabled for each repository. It is not enabled by default.
+Use Linux or macOS; Windows shim support has not been validated.
 
-Start with the [testing walkthrough](bridge-review-testing.md) for setup,
+Start with the [testing walkthrough](shim-review-testing.md) for setup,
 commands, and expected results. The [RFC](RFC-ATOMIC-GIT-CAUSAL-BRIDGE.md)
 contains the full design. The [task tracker](RFC-ATOMIC-GIT-CAUSAL-BRIDGE-TODO.md)
 contains implementation and review history.
 
 ## 1. Current behavior and scope
 
-The bridge imports Git history, projects Atomic records into Git, checks that
+The shim imports Git history, projects Atomic records into Git, checks that
 both sides agree, and helps switch between views and branches. Git hooks and
 an optional watcher notice changes; commands still check the current state.
 
 **Known bug:** after recording an edit and rename with Atomic, creating a new
 Git branch and committing there can make `reconcile` fail with
-`view '<branch>' not found`. See the [reproduction](bridge-review-testing.md#9-known-failure-new-git-branch-after-atomic-records).
+`view '<branch>' not found`. See the [reproduction](shim-review-testing.md#9-known-failure-new-git-branch-after-atomic-records).
 This remains unfixed in the tested revision.
 
 Other limits:
 
-- `atomic git bridge enable --adopt-git` is still unavailable.
+- `atomic git shim enable --adopt-git` is still unavailable.
 - `atomic init --adopt-git` and Git-transport clones use verified bindings to
   restore Atomic history. For Git history without a binding, use
   `atomic git import`. Import cannot recover agent information that Git never
@@ -32,23 +32,23 @@ Other limits:
 
 ## 2. Enable and disable
 
-Having both `.git` and `.atomic` does not enable the bridge. Ordinary Atomic
-commands stay native until explicit bridge setup, import, or a verified bridge
+Having both `.git` and `.atomic` does not enable the shim. Ordinary Atomic
+commands stay native until explicit shim setup, import, or a verified shim
 checkpoint enrolls the repository.
 
 For a local repository with imported Git history:
 
 ```sh
-atomic git bridge enable --no-refspecs --binding-key-file /path/to/binding.key
-atomic git bridge reconcile
-atomic git bridge verify
+atomic git shim enable --no-refspecs --binding-key-file /path/to/binding.key
+atomic git shim reconcile
+atomic git shim verify
 ```
 
 The key file contains a hex-encoded 32-byte Ed25519 secret key. Keep it outside
 tracked files. It signs the Anchor binding. A checkpoint from `reconcile` alone
 is not proof of a signed Anchor.
 
-`enable` installs Atomic's Git hooks and sets `[git.bridge] enabled = true` in
+`enable` installs Atomic's Git hooks and sets `[git.shim] enabled = true` in
 `.atomic/config.toml`. A notice that automatic rollout is blocked is expected.
 For a remote, omit `--no-refspecs` and use `--remote <name>` (default `origin`).
 A missing remote produces a warning and leaves binding transfer unconfigured.
@@ -61,10 +61,10 @@ Atomic leaves custom `core.hooksPath` setups, existing hook binaries, and
 symlinks untouched and prints integration instructions instead.
 
 ```sh
-atomic git bridge disable
+atomic git shim disable
 ```
 
-Disable sets bridge consent to false and stops automatic bridge telemetry.
+Disable sets shim consent to false and stops automatic shim telemetry.
 It leaves installed hooks and existing checkpoints in place. A previously
 anchored workspace still checks for a stale baseline. A workspace that was
 never anchored returns to native behavior.
@@ -87,13 +87,13 @@ to the view's projection commit.
 
 ```sh
 atomic view switch feature
-atomic git bridge reconcile
-atomic git bridge publish feature --branch feature
+atomic git shim reconcile
+atomic git shim publish feature --branch feature
 ```
 
 Publish requires a projection commit, so record or reconcile first. It creates
 the named Git branch; the Atomic view remains a Draft and HEAD stays detached.
-`atomic git bridge switch <view>` switches to an existing mapped branch; it does
+`atomic git shim switch <view>` switches to an existing mapped branch; it does
 not create a missing branch.
 
 ## 5. Staging and status parity limits
@@ -122,7 +122,7 @@ Signed Anchor bindings use the supplied Ed25519 key. Managed-session capture
 currently uses a session MAC, not an agent-DID signature; its signature coverage
 has limits recorded in the RFC tracker.
 
-`atomic git bridge verify-receive` is the receiving-side check for a controlled
+`atomic git shim verify-receive` is the receiving-side check for a controlled
 remote. A local pre-push hook can block this machine's push, but another client
 or `git push --no-verify` can bypass it. The remote must enforce its own checks.
 
@@ -155,7 +155,7 @@ Enablement configures fetch rules for the selected remote unless
 `--no-refspecs` is used. Fetch rules cannot make a server accept a namespace it
 rejects on push.
 
-For those servers, `atomic git bridge binding queue --degraded-head-fallback`
+For those servers, `atomic git shim binding queue --degraded-head-fallback`
 explicitly uses `refs/heads/atomic/bindings/*`. These refs look like ordinary
 branches and can be affected by ordinary branch tools. This fallback is not
 equivalent to the normal namespace and is never selected automatically. Check
@@ -168,27 +168,27 @@ The setting is `[git] watch = "off" | "auto" | "fsmonitor" | "watchman"` in
 `.atomic/config.toml`. The default is `auto`; `off` is supported. Atomic checks
 the candidates and falls back to a scan when needed.
 
-The separate bridge watcher is disabled by default. After bridge enablement,
+The separate shim watcher is disabled by default. After shim enablement,
 edit the existing config tables; do not append duplicate tables:
 
 ```toml
 [git]
 watch = "auto"
 
-[git.bridge]
+[git.shim]
 enabled = true
 
-[git.bridge.watch]
+[git.shim.watch]
 enabled = true
 ```
 
 ```sh
-atomic git bridge watch --once
-atomic git bridge watch
+atomic git shim watch --once
+atomic git shim watch
 ```
 
 The first command runs one pass. The second runs in the foreground until Ctrl-C.
-Startup requires both bridge and watcher consent. `git.watch = "off"` overrides
+Startup requires both shim and watcher consent. `git.watch = "off"` overrides
 watcher consent.
 
 The watcher waits for quiet Git metadata, then reconciles metadata only. It
@@ -197,7 +197,7 @@ pending recovery, or work that needs file changes can delay reconciliation.
 `--once` returns nonzero when it cannot complete the pass and prints the reason.
 The foreground loop reports the problem and retries.
 
-Disabling the bridge or setting `git.watch = "off"` stops the loop. Ordinary
+Disabling the shim or setting `git.watch = "off"` stops the loop. Ordinary
 commands still check repository state when the watcher is off.
 
 ## 11. Arbitrary Git push outside the protection guarantee
@@ -224,25 +224,25 @@ lock. The journal is not fsynced and must not be used as recovery history.
 Durable operations and receipts are stored separately.
 
 Events include reconciliation, recovery, publication refusals, binding fetches,
-import results, and scan fallbacks. Automatic writes require bridge consent;
-explicit bridge commands provide their own consent. Observational status calls
+import results, and scan fallbacks. Automatic writes require shim consent;
+explicit shim commands provide their own consent. Observational status calls
 do not write this telemetry.
 
 Imports can fetch and verify binding data. Fetch loss is reported per fetch;
 import correlation IDs connect related events. Event counts are diagnostic
 information, not proof that every operation or event was captured.
 
-## 14. Bridge cutover and database migration
+## 14. Shim cutover and database migration
 
-### Legacy Shadow → colocated bridge
+### Legacy Shadow → colocated shim
 
 ```sh
-atomic git bridge cutover
-atomic git bridge cutover --rollback
+atomic git shim cutover
+atomic git shim cutover --rollback
 ```
 
 These are migration commands, not normal fresh-repository setup. Cutover requires
-bridge consent and passing readiness checks. It blocks the legacy shadow writer
+shim consent and passing readiness checks. It blocks the legacy shadow writer
 and removes Atomic-owned hooks through the operation journal. Foreign hooks or
 unsupported repository state can cause a refusal. Running a completed cutover
 again does nothing.
@@ -260,7 +260,7 @@ format fences. Later operations can prevent rollback.
 
 The current database is `.atomic/atomic.redb`. Writable open can combine legacy
 split databases and keep the old files under `.atomic/legacy/`. This migration
-does not require bridge enablement or `git bridge cutover`.
+does not require shim enablement or `git shim cutover`.
 
 Test a backup copy made with all source writers stopped. Compare history hashes,
 files, views, provenance, and unrecorded work before and after migration. Then
@@ -268,5 +268,5 @@ reopen and record another change.
 
 A held legacy database lock or new legacy writes after an interrupted migration
 must cause a refusal rather than hide history. Keep both database copies if that
-happens. The [testing walkthrough](bridge-review-testing.md#8-database-migration)
+happens. The [testing walkthrough](shim-review-testing.md#8-database-migration)
 lists the migration checks.

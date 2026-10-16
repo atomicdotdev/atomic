@@ -179,7 +179,7 @@ pub struct Clone {
     pub git: bool,
 
     /// Explicit Ed25519 key file for the clone bootstrap's Anchor binding
-    /// (Git-transport path only; the bridge stays unanchored without it).
+    /// (Git-transport path only; the shim stays unanchored without it).
     #[arg(long, requires = "git")]
     pub binding_key_file: Option<PathBuf>,
 

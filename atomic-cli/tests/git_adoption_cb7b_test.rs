@@ -1,4 +1,4 @@
-// Temporary Unix-only Git bridge support to unblock Windows native CI.
+// Temporary Unix-only Git shim support to unblock Windows native CI.
 // Revisit after Windows support is defined; see the RFC temporary platform policy.
 #![cfg(unix)]
 
@@ -129,7 +129,7 @@ impl Fixture {
             home.path(),
             &[
                 "git",
-                "bridge",
+                "shim",
                 "enable",
                 "--binding-key-file",
                 key.to_str().unwrap(),
@@ -138,13 +138,13 @@ impl Fixture {
         // C1: a second bound commit that leaves tracked.txt unchanged.
         fs::write(root.path().join("other.txt"), b"v1\n").expect("write");
         git_ok(root.path(), &["commit", "-qam", "C1 other file"]);
-        atomic_ok(root.path(), home.path(), &["git", "bridge", "reconcile"]);
+        atomic_ok(root.path(), home.path(), &["git", "shim", "reconcile"]);
         atomic_ok(
             root.path(),
             home.path(),
             &[
                 "git",
-                "bridge",
+                "shim",
                 "binding",
                 "publish",
                 "--key-file",
@@ -377,14 +377,14 @@ fn adjacent_intra_file_edits_merge_and_overlaps_refuse_structurally() {
     atomic_ok(
         fixture.root(),
         fixture.home(),
-        &["git", "bridge", "reconcile"],
+        &["git", "shim", "reconcile"],
     );
     atomic_ok(
         fixture.root(),
         fixture.home(),
         &[
             "git",
-            "bridge",
+            "shim",
             "binding",
             "publish",
             "--key-file",
@@ -468,14 +468,14 @@ fn intra_file_overlap_refuses_and_preserves_everything() {
     atomic_ok(
         fixture.root(),
         fixture.home(),
-        &["git", "bridge", "reconcile"],
+        &["git", "shim", "reconcile"],
     );
     atomic_ok(
         fixture.root(),
         fixture.home(),
         &[
             "git",
-            "bridge",
+            "shim",
             "binding",
             "publish",
             "--key-file",
@@ -650,7 +650,7 @@ fn git_stages_one_to_three_refuse_adoption_even_under_repair() {
     let repair = atomic(
         fixture.root(),
         fixture.home(),
-        &["git", "bridge", "reconcile"],
+        &["git", "shim", "reconcile"],
     );
     assert!(
         !repair.status.success(),
@@ -1022,14 +1022,14 @@ fn carried_deletion_converges_when_the_new_baseline_also_deleted_the_path() {
     atomic_ok(
         fixture.root(),
         fixture.home(),
-        &["git", "bridge", "reconcile"],
+        &["git", "shim", "reconcile"],
     );
     atomic_ok(
         fixture.root(),
         fixture.home(),
         &[
             "git",
-            "bridge",
+            "shim",
             "binding",
             "publish",
             "--key-file",
@@ -1882,14 +1882,14 @@ fn known_edit_adoption_with_destination_shelf_restores_and_keeps_attribution() {
     atomic_ok(
         fixture.root(),
         fixture.home(),
-        &["git", "bridge", "reconcile"],
+        &["git", "shim", "reconcile"],
     );
     atomic_ok(
         fixture.root(),
         fixture.home(),
         &[
             "git",
-            "bridge",
+            "shim",
             "binding",
             "publish",
             "--key-file",
@@ -2478,14 +2478,14 @@ fn shelf_ordinal_fixture(name: &str) -> (Fixture, String, String) {
     atomic_ok(
         fixture.root(),
         fixture.home(),
-        &["git", "bridge", "reconcile"],
+        &["git", "shim", "reconcile"],
     );
     atomic_ok(
         fixture.root(),
         fixture.home(),
         &[
             "git",
-            "bridge",
+            "shim",
             "binding",
             "publish",
             "--key-file",

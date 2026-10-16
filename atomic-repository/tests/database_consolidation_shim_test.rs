@@ -1,4 +1,4 @@
-//! Database consolidation must retain the bridge's capability and preflight
+//! Database consolidation must retain the shim capability and preflight
 //! fences, and snapshots must share the consolidated journal's handle safely.
 
 use atomic_repository::redb_change_store::RedbChangeStore;
@@ -13,7 +13,7 @@ fn legacy_repository() -> tempfile::TempDir {
 }
 
 #[test]
-fn unsupported_bridge_capability_refuses_before_legacy_files_are_moved() {
+fn unsupported_shim_capability_refuses_before_legacy_files_are_moved() {
     use atomic_core::pristine::tables::PRISTINE_META;
     use atomic_core::pristine::REQUIRED_CAPABILITY_PREFIX;
 

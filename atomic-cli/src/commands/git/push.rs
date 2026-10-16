@@ -903,7 +903,7 @@ impl Push {
         print_warning(&format!(
             "Local provenance verification is advisory: this push is only protected if '{}' \
              enforces managed provenance server-side (Atomic-controlled remote, a \
-             pre-receive/update hook running 'atomic git bridge verify-receive', or a required \
+             pre-receive/update hook running 'atomic git shim verify-receive', or a required \
              CI status check). Pushing to a remote without such enforcement is NOT blocked by \
              Atomic; the push will proceed regardless of what this client verified.",
             self.remote

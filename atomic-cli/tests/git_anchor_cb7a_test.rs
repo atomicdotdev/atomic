@@ -1,14 +1,14 @@
-// Temporary Unix-only Git bridge support to unblock Windows native CI.
+// Temporary Unix-only Git shim support to unblock Windows native CI.
 // Revisit after Windows support is defined; see the RFC temporary platform policy.
 #![cfg(unix)]
 
-//! CB-7A end-to-end: bridge anchoring and bound Git HEAD adoption.
+//! CB-7A end-to-end: shim anchoring and bound Git HEAD adoption.
 //!
 //! Normative source: RFC-ATOMIC-GIT-CAUSAL-BRIDGE §5.1–5.2, §7.1–7.5, §8.1,
 //! §12.1–12.7, Phase 7 (tracker CB-7A).
 //!
 //! Proven through the real binary and real Git:
-//! - `git bridge enable` proves full repository/index/worktree equivalence and
+//! - `git shim enable` proves full repository/index/worktree equivalence and
 //!   only then creates a signed Anchor binding plus the verified checkpoint;
 //!   mismatched layers, pending work, unborn HEADs, and `--adopt-git` are
 //!   typed refusals; repeat enable is idempotent (AC-1);
@@ -129,7 +129,7 @@ impl Colocated {
             self.home.path(),
             &[
                 "git",
-                "bridge",
+                "shim",
                 "enable",
                 "--binding-key-file",
                 self.key().to_str().expect("utf8 key path"),
@@ -212,7 +212,7 @@ fn verify_signature_and_content(fixture: &Colocated, id: &str) {
     let output = atomic(
         fixture.root.path(),
         fixture.home.path(),
-        &["git", "bridge", "binding", "verify", id],
+        &["git", "shim", "binding", "verify", id],
     );
     let text = atomic_text(&output);
     assert!(text.contains("signature valid: true"), "{text}");
@@ -248,7 +248,7 @@ fn enable_refuses_dirty_state_and_preserves_pending_work() {
         fixture.home.path(),
         &[
             "git",
-            "bridge",
+            "shim",
             "enable",
             "--binding-key-file",
             fixture.key().to_str().unwrap(),
@@ -302,7 +302,7 @@ fn enable_mismatch_offers_adopt_atomic_and_executes_the_projection() {
         fixture.home.path(),
         &[
             "git",
-            "bridge",
+            "shim",
             "enable",
             "--binding-key-file",
             fixture.key().to_str().unwrap(),
@@ -328,7 +328,7 @@ fn enable_mismatch_offers_adopt_atomic_and_executes_the_projection() {
         fixture.home.path(),
         &[
             "git",
-            "bridge",
+            "shim",
             "enable",
             "--adopt-atomic",
             "--binding-key-file",
@@ -345,7 +345,7 @@ fn enable_mismatch_offers_adopt_atomic_and_executes_the_projection() {
     atomic_ok(
         fixture.root.path(),
         fixture.home.path(),
-        &["git", "bridge", "verify"],
+        &["git", "shim", "verify"],
     );
 }
 
@@ -355,7 +355,7 @@ fn adopt_git_flag_is_explicitly_unavailable() {
     let output = atomic(
         fixture.root.path(),
         fixture.home.path(),
-        &["git", "bridge", "enable", "--adopt-git"],
+        &["git", "shim", "enable", "--adopt-git"],
     );
     assert!(!output.status.success(), "--adopt-git must fail closed");
     let text = atomic_text(&output);
@@ -370,11 +370,11 @@ fn enable_without_signing_key_reports_an_actionable_refusal() {
     let output = atomic(
         fixture.root.path(),
         fixture.home.path(),
-        &["git", "bridge", "enable"],
+        &["git", "shim", "enable"],
     );
     assert!(output.status.success(), "hook integration still succeeds");
     let text = atomic_text(&output);
-    assert!(text.contains("bridge anchor not created"), "{text}");
+    assert!(text.contains("shim anchor not created"), "{text}");
     assert!(text.contains("--binding-key-file"), "{text}");
     assert!(
         fixture.binding_refs().is_empty(),
@@ -393,7 +393,7 @@ fn enable_on_unborn_head_is_typed() {
     let output = atomic(
         root.path(),
         home.path(),
-        &["git", "bridge", "enable", "--binding-key-file", key],
+        &["git", "shim", "enable", "--binding-key-file", key],
     );
     let text = atomic_text(&output);
     assert!(
@@ -457,7 +457,7 @@ fn reset_to_bound_head_adopts_with_zero_tracked_rewrites() {
     atomic_ok(
         fixture.root.path(),
         fixture.home.path(),
-        &["git", "bridge", "verify"],
+        &["git", "shim", "verify"],
     );
 }
 
@@ -876,6 +876,6 @@ fn two_linked_worktrees_share_bindings_but_keep_their_own_checkpoints() {
     atomic_ok(
         fixture.root.path(),
         fixture.home.path(),
-        &["git", "bridge", "verify"],
+        &["git", "shim", "verify"],
     );
 }

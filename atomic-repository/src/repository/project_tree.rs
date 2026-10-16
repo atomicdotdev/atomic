@@ -229,7 +229,7 @@ pub enum ExclusionReason {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ExclusionPolicy {
-    BridgePrivate,
+    ShimPrivate,
     IncludeVault,
 }
 
@@ -238,7 +238,7 @@ impl ExclusionPolicy {
         if atomic_private_path(path.as_bytes()) {
             Some(ExclusionReason::AtomicPrivate)
         } else if path.components().next().unwrap_or_default() == b".vault"
-            && self == Self::BridgePrivate
+            && self == Self::ShimPrivate
         {
             Some(ExclusionReason::VaultPrivate)
         } else {
@@ -260,16 +260,16 @@ pub fn atomic_private_path(path_bytes: &[u8]) -> bool {
     first == b".atomic" || path_bytes == b".atomicignore"
 }
 
-/// Whether `path` is bridge-private state under
-/// [`ExclusionPolicy::BridgePrivate`] — deliberately absent from project
+/// Whether `path` is shim-private state under
+/// [`ExclusionPolicy::ShimPrivate`] — deliberately absent from project
 /// manifests while tracked alive in the Atomic view. This is exactly the
-/// path set [`ExclusionPolicy::BridgePrivate::exclusion`] rejects: Atomic
+/// path set [`ExclusionPolicy::ShimPrivate::exclusion`] rejects: Atomic
 /// private state (`.atomic*`) plus the vault (`.vault/`), whose files a
 /// colocated repository legitimately tracks in both Git and the graph.
 /// Staged verification must exempt the whole set, not only the `.atomic*`
 /// half, or importing a repository that tracks `.vault/` files refuses with
 /// "staged path ... is present but the commit tree does not hold it".
-pub fn bridge_private_path(path_bytes: &[u8]) -> bool {
+pub fn shim_private_path(path_bytes: &[u8]) -> bool {
     let first = path_bytes
         .split(|byte| *byte == b'/')
         .next()
@@ -462,7 +462,7 @@ impl ConversionPolicy {
                 unicode_normalizing: false,
             },
             object_format,
-            exclusions: ExclusionPolicy::BridgePrivate,
+            exclusions: ExclusionPolicy::ShimPrivate,
             losses: LossPolicy::Refuse,
         }
     }
@@ -486,7 +486,7 @@ impl ConversionPolicy {
         encoder.u8(self.platform.unicode_normalizing as u8);
         encoder.u8(algorithm_tag(self.object_format));
         encoder.u8(match self.exclusions {
-            ExclusionPolicy::BridgePrivate => 0,
+            ExclusionPolicy::ShimPrivate => 0,
             ExclusionPolicy::IncludeVault => 1,
         });
         encoder.u8(match self.losses {

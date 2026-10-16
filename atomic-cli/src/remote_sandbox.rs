@@ -339,7 +339,7 @@ pub fn install_link() {
 /// Every entry goes through the kernel's path-checked writer (no climbing
 /// out, no writing the pointer or the cache). A fresh cache also clears a
 /// sandbox that had fallen behind.
-pub fn materialize(root: &Path) -> CliResult<(u64, String)> {
+pub fn materialize(root: &Path, prefix: Option<&str>) -> CliResult<(u64, String)> {
     use tokio_stream::StreamExt;
 
     let internal = |e: String| CliError::Internal(anyhow::anyhow!(e));
@@ -350,6 +350,7 @@ pub fn materialize(root: &Path) -> CliResult<(u64, String)> {
         ))
     })?;
     let root_for_thread = root.to_path_buf();
+    let prefix = prefix.map(|p| p.to_string());
     let (entries, skeleton) = std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -362,6 +363,7 @@ pub fn materialize(root: &Path) -> CliResult<(u64, String)> {
                 .materialize(pb::MaterializeRequest {
                     repository: Some(repository),
                     target: Some(target(&pointer)),
+                    path_prefix: prefix,
                 })
                 .await
                 .map_err(refused)?

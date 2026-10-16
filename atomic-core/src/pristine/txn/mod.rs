@@ -8,7 +8,7 @@
 //! - `write` - Read-write transaction implementation
 //! - `helpers` - Serialization and utility functions
 
-mod helpers;
+pub(super) mod helpers;
 mod pristine;
 mod read;
 mod write;

@@ -1,10 +1,10 @@
-// Temporary Unix-only Git bridge support to unblock Windows native CI.
+// Temporary Unix-only Git shim support to unblock Windows native CI.
 // Revisit after Windows support is defined; see the RFC temporary platform policy.
 #![cfg(unix)]
 
 //! CB-9A end-to-end: `atomic git import` synthesizes foreign Git history
 //! through normal recorded-file assembly with hashed Git origin, tagged
-//! commit/tree OIDs, graph-context dependencies, bridge sequencing, and an
+//! commit/tree OIDs, graph-context dependencies, shim sequencing, and an
 //! explicit `SynthesizeGit` operation — and repeated incremental imports
 //! stay idempotent.
 //!
@@ -232,7 +232,7 @@ fn git_import_synthesizes_normal_assembly_with_hashed_origin_and_stays_idempoten
     assert!(root_change.has_file_ops());
     assert!(head_change.has_file_ops());
 
-    // Tagged commit/tree OIDs and the bridge sequencing label travel in the
+    // Tagged commit/tree OIDs and the shim sequencing label travel in the
     // unhashed provenance.
     for (change, sha, tree) in [
         (&root_change, &fixture.parent, &fixture.parent_tree),
@@ -268,7 +268,7 @@ fn git_import_synthesizes_normal_assembly_with_hashed_origin_and_stays_idempoten
         );
         assert_eq!(
             git_meta.get("sequencing").and_then(|v| v.as_str()),
-            Some("bridge")
+            Some("shim")
         );
     }
 
@@ -349,7 +349,7 @@ fn git_import_preserves_the_foreign_object_database() {
 
 /// A shallow clone imports with an explicit boundary label; deepening the
 /// clone afterwards refuses instead of silently reinterpreting the prior
-/// bridge sequencing.
+/// shim sequencing.
 #[test]
 fn shallow_import_labels_the_boundary_and_deepening_is_refused() {
     // Source repository: three commits.
