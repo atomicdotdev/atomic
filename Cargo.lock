@@ -369,6 +369,7 @@ dependencies = [
  "anyhow",
  "atomic-canonical",
  "atomic-core",
+ "atomic-identity",
  "atomic-objects",
  "bytes",
  "chrono",
