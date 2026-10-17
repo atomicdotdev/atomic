@@ -63,7 +63,12 @@ pub struct IntentUpdate {
 }
 
 impl IntentUpdate {
-    fn resolve_body(&self) -> CliResult<Option<String>> {
+    /// Resolve the body override: inline `--body` or `--body-stdin`.
+    ///
+    /// Shared by the local body and the service-layer hook — reading the
+    /// client's stdin is client-side by design, so the routed path resolves
+    /// the body with this SAME code and sends it on the wire.
+    pub(crate) fn resolve_body(&self) -> CliResult<Option<String>> {
         if let Some(ref body) = self.body {
             return Ok(Some(body.clone()));
         }
@@ -81,6 +86,10 @@ impl IntentUpdate {
 
 impl Command for IntentUpdate {
     fn run(&self) -> CliResult<()> {
+        if crate::commands::rpc::intent_update(self)? {
+            return Ok(());
+        }
+
         let root = find_repository_root()?;
         let repo = Repository::open(&root).map_err(CliError::Repository)?;
 

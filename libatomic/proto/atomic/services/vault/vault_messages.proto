@@ -1,0 +1,392 @@
+// atomic-protocol — VaultService: the `.vault/` knowledge store — intents,
+// memories, goals, vault sync, context.
+//
+// DRAFT — add-only. This is the agent-facing product surface (the
+// intent→change workflow with triage + knowledge graph), so the combine
+// discipline matters most here: intents/memories/goals are one entity model
+// with a kind enum, not three parallel RPC families. `vault intent`/
+// `vault memory` shims in the CLI print redirects — they map onto the same
+// methods below.
+//
+// Combine decisions (see COVERAGE.md):
+//  * goal start/stop/resume → UpdateVaultEntity(kind=GOAL, action);
+//  * goal list/show → GetVaultEntry/ListVaultEntries(kind filter);
+//  * intent new / memory new → CreateVaultEntity;
+//  * intent update / memory write → UpdateVaultEntity;
+//  * vault list/summaries → ListVaultEntries modes;
+//  * attest verbs → AttestationService (intent/memory are just targets).
+
+syntax = "proto3";
+
+package atomic;
+
+// VIEW ISOLATION: every request names its view (field 20), including reads.
+// A sandbox target must equal its grant's stable view ID. Reads see that view's
+// effective vault. Edits to inherited entities create target-local versions;
+// deletion creates a target-local tombstone; links refer only to visible
+// entities. No repository mutation overwrites sibling/ancestor state or writes
+// host files. ExportVault is the separate local filesystem operation.
+// Changes to the view's vault revision participate in ViewSnapshot fencing.
+// Remote sandboxes may write through these RPCs or submit recorded .vault edits;
+// both paths have identical view-local indexing/authorization semantics.
+
+import "google/protobuf/timestamp.proto";
+import "atomic/common/common.proto";
+import "atomic/common/pagination.proto";
+
+enum VaultEntityKind {
+  VAULT_ENTITY_KIND_UNSPECIFIED = 0;
+  VAULT_ENTITY_KIND_INTENT = 1;
+  VAULT_ENTITY_KIND_MEMORY = 2;
+  VAULT_ENTITY_KIND_GOAL = 3;
+}
+
+enum VaultEntityStatus {
+  VAULT_ENTITY_STATUS_UNSPECIFIED = 0;
+  VAULT_ENTITY_STATUS_BACKLOG = 1;
+  VAULT_ENTITY_STATUS_IN_PROGRESS = 2;
+  VAULT_ENTITY_STATUS_NEEDS_REVIEW = 3;
+  VAULT_ENTITY_STATUS_PLANNED = 4;
+  VAULT_ENTITY_STATUS_DONE = 5;
+  VAULT_ENTITY_STATUS_ACTIVE = 6;
+  VAULT_ENTITY_STATUS_SUSPENDED = 7;
+  VAULT_ENTITY_STATUS_COMPLETED = 8;
+  VAULT_ENTITY_STATUS_SUPERSEDED = 9;
+  VAULT_ENTITY_STATUS_RETRACTED = 10;
+  // Validate per-kind transitions: intent lifecycle vs goal/memory lifecycle.
+}
+
+
+
+message InitVaultRequest {
+  RepositoryRef repository = 1;
+  RequestMeta meta = 2;
+  ViewRef view = 20;
+  ViewSnapshot expected_snapshot = 21;
+}
+message InitVaultResponse {
+  ResponseMeta meta = 100;
+  // The init report (add-only): whether the vault already existed, the
+  // initialized vault directory, and whether the defaults recorded.
+  bool already_initialized = 1;
+  optional string vault_dir = 2;
+  bool recorded = 3;
+}
+
+message SyncVaultRequest {
+  RepositoryRef repository = 1;
+  RequestMeta meta = 2;
+  ViewRef view = 20;
+  ViewSnapshot expected_snapshot = 21;
+}
+message SyncVaultResponse {
+  uint32 entities_synced = 1;
+  ResponseMeta meta = 100;
+}
+
+message GetVaultEntryRequest {
+  RepositoryRef repository = 1;
+  VaultEntityKind kind = 2;
+  string id = 3;
+  // Resolve by vault-relative path first (add-only): `vault show PATH`
+  // names entries by path (any entry type), not by kind+id.
+  optional string path = 4;
+  // Request the versioned-opaque entry bundle (add-only): the stored
+  // entry's full domain serialization plus the RAW attestation sources
+  // (the tracked attestation entry and the legacy sidecar text), so the
+  // client runs its existing lift/classification code over wire-carried
+  // inputs (the canonical --json projections).
+  bool include_bundle = 5;
+  ViewRef view = 20;
+}
+message GetVaultEntryResponse {
+  VaultEntry entry = 1;
+  ViewSnapshot snapshot = 20;
+  // The stored entry + raw attestation sources (add-only; schema
+  // "atomic.vault.entry.bundle.v1"): JSON {"entry": `<atomic_core
+  // VaultEntry>`, "attestation": null | {"tracked": null | {"path": string,
+  // "frontmatter_json": string, "content": [bytes]}, "sidecar": null |
+  // {"path": string, "text": string}}}. The client deserializes the
+  // domain entry and classifies the attestation with the same bridge code
+  // the local body uses.
+  optional VersionedBytes entry_bundle = 21;
+}
+
+message ListVaultEntriesRequest {
+  RepositoryRef repository = 1;
+  optional VaultEntityKind kind = 2;
+  optional VaultEntityStatus status = 3;
+  bool summaries_only = 4;      // `vault summaries`
+  optional PageCursor cursor = 5;
+  optional PageBudget budget = 6;
+  optional string identity = 7;   // filter by the entry's author identity
+  // `vault list --prefix` (add-only): filter to paths under this prefix.
+  optional string path_prefix = 8;
+  // `vault list --type` (add-only): the vault entry-type string
+  // (session|tool_result|memory|intent|skill|scratch|attestation).
+  optional string entry_type = 9;
+  // Raw status filter (add-only): the goal listing's free-form status
+  // string ("active"/"completed"/"suspended"/"all"), applied verbatim.
+  optional string status_filter = 10;
+  // `atomic vault summaries` (add-only): ToolResult entries under
+  // path_prefix, with each entry's id set to the filename stem and its
+  // body set to the first-200-char content preview.
+  bool tool_result_previews = 11;
+  ViewRef view = 20;
+}
+message ListVaultEntriesResponse {
+  repeated VaultEntry entries = 1;   // summaries_only → title lines only
+  optional PageCursor next_cursor = 2;
+  ViewSnapshot snapshot = 20; // continuation cursors bind to this perspective
+}
+
+message GetVaultContextRequest {
+  RepositoryRef repository = 1;
+  optional uint32 max_entries = 2;
+  repeated VaultEntityKind kinds = 3;
+  // The retrieval seeds from `atomic vault context` (add-only): free-text
+  // query terms, an intent to seed from, and file paths whose neighbors are
+  // candidates. Absent seeds fall back to the most recently updated
+  // memories — the command's documented bare form.
+  repeated string query = 4;         // free-text seed terms
+  optional string intent = 5;       // --intent seed (id)
+  repeated string files = 6;        // --files seeds (working-copy paths)
+  optional uint32 budget_chars = 7; // total body budget across items
+  optional bool include_body = 8;  // false → candidate metadata only
+  ViewRef view = 20;
+}
+message GetVaultContextResponse {
+  repeated VaultEntry entries = 1;
+  // The ranked, budgeted memory context (add-only) — the gather+rank
+  // domain computation `atomic vault context` performs, served as one
+  // ranked list (schema: atomic.context.item.v1, mirroring the CLI's
+  // ranked MemoryItem).
+  repeated ContextItem context = 2;
+  ViewSnapshot snapshot = 20;
+  // SHAPE-CONFIRM: context-pack composition from vault/context.rs.
+}
+// One ranked memory returned by GetVaultContext — the fields of the CLI's
+// MemoryItem (atomic-cli/src/commands/vault/context.rs), add-only.
+message ContextItem {
+  string memory_id = 1;      // canonical urn:atomic:memory:… identity
+  string kg_node_id = 2;     // the KG's node identity
+  string revision_hash = 3;  // entry type + frontmatter + body revision
+  string content_hash = 4;   // body-only hash
+  string path = 5;           // vault-relative path, e.g. memory/`<name>`.md
+  string name = 6;
+  string kind = 7;           // memoryKind (constraint/lesson/…)
+  string status = 8;
+  double score = 9;          // final ranking score
+  string why_matched = 10;   // the ranking signals that matched
+  optional string body = 11;     // present when include_body
+  optional string preview = 12;  // first line of the body (with body)
+  string updated_at = 13;
+  uint64 introduced_by = 14; // introducing change sequence (0 = unrecorded)
+  bool recorded = 15;       // introduced_by != 0
+  bool truncated = 16;      // body clipped to the budget
+}
+
+message ExportVaultRequest {
+  RepositoryRef repository = 1;
+  RequestMeta meta = 2;
+  repeated VaultEntityKind kinds = 3;
+  optional string destination = 4;   // local path (LOCAL scope)
+  // `atomic vault materialize` (add-only): with a path, materialize only
+  // that entry; without, materialize every vault entry.
+  optional string path = 5;
+  ViewRef view = 20;
+}
+message ExportVaultResponse {
+  uint32 exported = 1;
+  ResponseMeta meta = 100;
+  // The materialized path (add-only): the entry's vault-relative path in
+  // the single-entry form, so the client prints the local report.
+  optional string materialized_path = 2;
+}
+
+message CreateVaultEntityRequest {
+  RepositoryRef repository = 1;
+  RequestMeta meta = 2;
+  VaultEntityKind kind = 3;
+  string title = 4;
+  optional string body = 5;         // initial directive/content text
+  // Memory-specific metadata (kind INTENT ignores these):
+  // constraint|preference|lesson|context|decision (add-only).
+  optional string memory_kind = 6;
+  // urn:atomic:... the memory derives from (add-only).
+  repeated string derived_from = 7;
+  // One-line summaries for goals (add-only).
+  repeated string about = 8;
+  // `vault goal start` metadata (add-only, kind GOAL): the developer, the
+  // linked intent, and the AI model — GoalStartOptions' fields.
+  optional string developer = 9;
+  optional string intent = 10;
+  optional string model = 11;
+  ViewRef view = 20;
+  ViewSnapshot expected_snapshot = 21;
+}
+message CreateVaultEntityResponse {
+  VaultEntry entry = 1;
+  ResponseMeta meta = 100;
+}
+
+message UpdateVaultEntityRequest {
+  RepositoryRef repository = 1;
+  RequestMeta meta = 2;
+  VaultEntityKind kind = 3;
+  string id = 4;
+  oneof update {
+    string body = 5;                 // rewrite content (memory write)
+    VaultEntityStatus status = 6;   // status transition (intent lifecycle,
+                                     // goal start/stop/resume)
+    // The fully composed update (add-only): every intent-update field in
+    // ONE request — the handler applies them atomically through the same
+    // domain update the CLI's multi-flag form performs.
+    IntentUpdateFields fields = 8;
+    // The freeform memory write (add-only): `atomic memory write` — raw
+    // stdin content stored (create-or-replace) at the given vault path
+    // with simple frontmatter, then materialized to the working copy.
+    MemoryWriteAction memory_write = 9;
+    // The goal lifecycle (add-only): `vault goal stop` (promote/discard)
+    // and `vault goal resume` — the domain calls the local bodies make.
+    GoalStopAction goal_stop = 10;
+    GoalResumeAction goal_resume = 11;
+  }
+  optional ExpectedState expected = 7;
+  ViewRef view = 20; // expected.kind must be view_snapshot matching this view
+}
+
+// The freeform memory write (add-only).
+message MemoryWriteAction {
+  string path = 1;                // the vault-relative path (`memory/<name>.md`)
+  bytes content = 2;              // the raw stdin content
+  string frontmatter_json = 3;    // the simple {name, type} frontmatter
+}
+
+// `vault goal stop` (add-only): the goal to stop (empty = the most recent
+// active goal) + the promote/discard options.
+message GoalStopAction {
+  optional string goal = 1;
+  bool promote = 2;
+  bool discard = 3;
+}
+
+// `vault goal resume` (add-only).
+message GoalResumeAction {
+  string goal = 1;
+}
+// One composed intent update (`intent update`'s multi-flag form, add-only).
+// Status stays the raw lifecycle string the domain update consumes
+// ("backlog"/"in_progress"/"needs-review"/"done"/"planned"/"icebox").
+message IntentUpdateFields {
+  optional string status = 1;
+  optional string assignee = 2;
+  optional string priority = 3;
+  optional string title = 4;
+  optional string reason = 5;
+  repeated string informed_by = 6;
+  optional string body = 7;
+  bool force = 8;
+}
+message UpdateVaultEntityResponse {
+  VaultEntry entry = 1;
+  // The memory-write report (add-only): the stored path + content hash, so
+  // the client prints the local write report.
+  optional string write_path = 2;
+  optional Hash write_hash = 3;
+  // The goal-stop report (add-only): the stopped goal's outcome status and
+  // the removed file count.
+  optional string stop_status = 4;
+  optional uint32 paths_removed = 5;
+  ResponseMeta meta = 100;
+}
+
+message DeleteVaultEntityRequest {
+  RepositoryRef repository = 1;
+  RequestMeta meta = 2;
+  VaultEntityKind kind = 3;
+  string id = 4;
+  ViewRef view = 20;
+  ViewSnapshot expected_snapshot = 21;
+}
+message DeleteVaultEntityResponse {
+  // The delete report (add-only): the normalized id + the removed file's
+  // vault path, so the client prints the local delete report.
+  string id = 1;
+  string vault_path = 2;
+  ResponseMeta meta = 100;
+}
+
+message ValidateVaultEntityRequest {
+  RepositoryRef repository = 1;
+  VaultEntityKind kind = 2;
+  oneof subject {
+    string id = 3;            // validate stored entity
+    bytes document = 4;      // validate candidate bytes (path-arg form)
+  }
+  optional Hash content_hash = 5;
+  ViewRef view = 20;
+}
+message ValidateVaultEntityResponse {
+  bool valid = 1;
+  repeated string issues = 2;
+}
+
+message LinkVaultEntitiesRequest {
+  RepositoryRef repository = 1;
+  RequestMeta meta = 2;
+  VaultEntityRef source = 3;
+  VaultEntityRef target = 4;
+  ViewRef view = 20;
+  ViewSnapshot expected_snapshot = 21;
+}
+message LinkVaultEntitiesResponse { ResponseMeta meta = 100; }
+
+message VaultEntityRef {
+  VaultEntityKind kind = 1;
+  string id = 2;
+}
+
+message VaultEntry {
+  VaultEntityKind kind = 1;
+  string id = 2;
+  string title = 3;
+  optional VaultEntityStatus status = 4;
+  optional string body = 5;   // present unless summaries_only
+  optional google.protobuf.Timestamp created_at = 6;
+  optional google.protobuf.Timestamp updated_at = 7;
+  repeated string linked = 8; // linked entity ids
+  // Local-surface render helpers (add-only): the vault file path and the
+  // intent/memory priority label.
+  optional string vault_path = 9;
+  optional string priority = 10;
+  // Listing-surface columns (add-only): the per-entry classification the
+  // attestation-aware listings render. The handler computes these with the
+  // same domain logic the local bodies use (manifest kind, the tracked
+  // attestation's fresh/stale state, the DID-match-then-verify rule).
+  optional string manifest_kind = 11;  // intent classification ("feature"/"review"/…)
+  optional string attested = 12;       // "fresh" | "stale" | "none"
+  optional string verifies = 13;       // "yes" | "no" | "na"
+  optional string memory_kind = 14;    // memory listing's kind column
+  optional string memory_status = 15;  // memory listing's status column
+  optional uint32 about_count = 16;    // memory listing's about-input count
+  // Whole-vault listing columns (add-only): `vault list`'s per-entry
+  // type/size/date table.
+  optional uint64 content_size = 17;   // stored content size in bytes
+  optional string updated_at_label = 18; // RFC 3339, as stored
+  optional string entry_type = 19;      // "memory"/"intent"/"session"/…
+  // Goal listing columns (add-only): `vault goal list --json`.
+  optional string started_at = 20;
+  optional uint32 turns = 21;
+  // Intent update report columns (add-only): the post-update assignee and
+  // the raw status label as stored (the frontmatter's own string).
+  optional string assignee = 22;
+  optional string status_label = 23;
+  // Goal report columns (add-only): `vault goal start`'s created goal
+  // directory + file, and the goal's developer.
+  optional string developer = 24;
+  optional string goal_dir = 25;
+  optional string goal_file = 26;
+  // SHAPE-CONFIRM: attestation/verification state surfacing (attestations
+  // live in AttestationService; entries reference their latest attestation).
+}

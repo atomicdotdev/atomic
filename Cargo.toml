@@ -4,6 +4,7 @@ members = [
     "atomic-agent",
     "atomic-canonical",
     "atomic-cli",
+    "atomic-client",
     "atomic-core",
     "atomic-config",
     "atomic-identity",
@@ -12,10 +13,12 @@ members = [
     "atomic-repository",
     "atomic-semantic",
     "atomic-teams",
+    "atomic-wasm",
+    "libatomic",
 ]
 
 [workspace.package]
-version = "0.19.1"
+version = "0.20.0"
 edition = "2021"
 authors = ["Atomic Contributors"]
 license = "Apache-2.0"
@@ -27,6 +30,7 @@ rust-version = "1.90"
 # Core
 atomic-agent = { path = "atomic-agent" }
 atomic-canonical = { path = "atomic-canonical" }
+atomic-client = { path = "atomic-client" }
 atomic-core = { path = "atomic-core" }
 atomic-config = { path = "atomic-config" }
 atomic-identity = { path = "atomic-identity" }
@@ -35,6 +39,18 @@ atomic-remote = { path = "atomic-remote" }
 atomic-repository = { path = "atomic-repository" }
 atomic-semantic = { path = "atomic-semantic" }
 atomic-teams = { path = "atomic-teams" }
+libatomic = { path = "libatomic" }
+
+# gRPC (one contract, many transports)
+tonic = "0.12"
+prost = "0.13"
+prost-types = "0.13"
+tonic-build = "0.12"
+protox = "0.7"
+tokio-stream = "0.1"
+tower = "0.4"
+libc = "0.2"
+hyper-util = { version = "0.1", features = ["tokio"] }
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
@@ -65,7 +81,8 @@ rand = "0.8"
 zstd = "0.13"
 
 # Database
-redb = "4.2.0"
+# SnapshotBackend forwards the locking API introduced after redb 4.2.
+redb = "4.4.0"
 redb_2_6 = { package = "redb", version = "=2.6.3" }
 # Read-only access to OpenCode's session store (transcript recovery);
 # bundled so no system SQLite is required.
@@ -106,6 +123,10 @@ tempfile = "3.10"
 parking_lot = "0.12"
 log = "0.4"
 env_logger = "0.11"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["std", "fmt", "env-filter", "registry", "tracing-log"] }
+tracing-appender = "0.2"
+tracing-log = "0.2"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 
 # Diff algorithms

@@ -22,6 +22,7 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  ATOMIC_BUILD_CHANNEL: release
   BINARY_NAME: atomic
   # Linux release binaries must run on all supported LTS distributions,
   # including RHEL 9. Keep this explicit so runner upgrades cannot silently
@@ -42,6 +43,7 @@ jobs:
     outputs:
       version: ${{ steps.version.outputs.version }}
       tag: ${{ steps.version.outputs.tag }}
+      revision: ${{ steps.version.outputs.revision }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -53,6 +55,7 @@ jobs:
           VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
           echo "tag=v${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "revision=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
           echo "Detected version: ${VERSION}"
 
   # ---------------------------------------------------------------------------
@@ -74,6 +77,7 @@ jobs:
             artifact: atomic-x86_64-unknown-linux-gnu.tar.gz
             build_mode: zig
             verify_glibc: true
+            node_runtime: true
 
           # Linux x86_64 (musl — statically linked, works on any Linux)
           - os: ubuntu-latest
@@ -111,6 +115,7 @@ jobs:
             artifact: atomic-aarch64-apple-darwin.tar.gz
             build_mode: native
             verify_glibc: false
+            node_runtime: true
 
           # Windows x86_64
           - os: windows-latest
@@ -118,11 +123,24 @@ jobs:
             artifact: atomic-x86_64-pc-windows-msvc.zip
             build_mode: native
             verify_glibc: false
+            node_runtime: true
 
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          # Pin every CLI/runtime pair to the version job's actual checkout,
+          # even when a branch moves while this workflow is running.
+          ref: ${{ needs.version.outputs.revision }}
+
+      - name: Install Node for native runtime packaging and smoke tests
+        if: matrix.node_runtime
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Test runtime packaging
+        if: matrix.node_runtime
+        run: node --test libatomic/scripts/package-runtime.test.mjs
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@1.90
@@ -158,40 +176,65 @@ jobs:
 
       - name: Build release binary
         if: matrix.build_mode == 'native'
-        run: cargo build --release --target ${{ matrix.target }} -p atomic-cli
+        run: cargo build --locked --release --target ${{ matrix.target }} -p atomic-cli
 
       - name: Build Linux release binary with glibc floor
         if: matrix.build_mode == 'zig' && !matrix.musl
-        run: cargo zigbuild --release --target "${{ matrix.target }}.${GLIBC_MIN}" -p atomic-cli
+        run: cargo zigbuild --locked --release --target "${{ matrix.target }}.${GLIBC_MIN}" -p atomic-cli
 
       - name: Build statically linked Linux release binary
         if: matrix.musl
-        run: cargo zigbuild --release --target ${{ matrix.target }} -p atomic-cli
+        run: cargo zigbuild --locked --release --target ${{ matrix.target }} -p atomic-cli
+
+      # Build separately: the CLI remains an ordinary Rust consumer and does
+      # not acquire unresolved Node-API imports through feature unification.
+      - name: Build Node-enabled libatomic
+        if: matrix.node_runtime && matrix.build_mode == 'native'
+        run: cargo build --locked --release --target ${{ matrix.target }} -p libatomic --features node
+
+      - name: Build Node-enabled libatomic with glibc floor
+        if: matrix.node_runtime && matrix.build_mode == 'zig'
+        run: cargo zigbuild --locked --release --target "${{ matrix.target }}.${GLIBC_MIN}" -p libatomic --features node
 
       - name: Verify Linux glibc floor
         if: matrix.verify_glibc
         shell: bash
         run: |
-          BINARY="target/${{ matrix.target }}/release/${BINARY_NAME}"
-          MAX_GLIBC=$(
-            readelf -W --version-info "$BINARY" \
-              | sed -n 's/.*Name: GLIBC_\([0-9][0-9.]*\).*/\1/p' \
-              | sort -V \
-              | tail -1
-          )
-
-          if [[ -z "$MAX_GLIBC" ]]; then
-            echo "::error::Could not determine the minimum glibc version for $BINARY"
-            exit 1
+          BINARIES=("target/${{ matrix.target }}/release/${BINARY_NAME}")
+          if [[ "${{ matrix.node_runtime }}" == "true" ]]; then
+            BINARIES+=("target/${{ matrix.target }}/release/liblibatomic.so")
           fi
 
-          HIGHEST=$(printf '%s\n%s\n' "$GLIBC_MIN" "$MAX_GLIBC" | sort -V | tail -1)
-          if [[ "$HIGHEST" != "$GLIBC_MIN" ]]; then
-            echo "::error::$BINARY requires glibc $MAX_GLIBC, above the supported floor $GLIBC_MIN"
-            exit 1
-          fi
+          for BINARY in "${BINARIES[@]}"; do
+            MAX_GLIBC=$(
+              readelf -W --version-info "$BINARY" \
+                | sed -n 's/.*Name: GLIBC_\([0-9][0-9.]*\).*/\1/p' \
+                | sort -V \
+                | tail -1
+            )
 
-          echo "$BINARY requires glibc $MAX_GLIBC (supported floor: $GLIBC_MIN)"
+            if [[ -z "$MAX_GLIBC" ]]; then
+              echo "::error::Could not determine the minimum glibc version for $BINARY"
+              exit 1
+            fi
+
+            HIGHEST=$(printf '%s\n%s\n' "$GLIBC_MIN" "$MAX_GLIBC" | sort -V | tail -1)
+            if [[ "$HIGHEST" != "$GLIBC_MIN" ]]; then
+              echo "::error::$BINARY requires glibc $MAX_GLIBC, above the supported floor $GLIBC_MIN"
+              exit 1
+            fi
+
+            echo "$BINARY requires glibc $MAX_GLIBC (supported floor: $GLIBC_MIN)"
+          done
+
+      - name: Stage normalized library and verify Node-API exports
+        if: matrix.node_runtime
+        run: >-
+          node libatomic/scripts/package-runtime.mjs
+          --target ${{ matrix.target }}
+          --build-dir target/${{ matrix.target }}/release
+          --output-dir staging
+          --expected-version ${{ needs.version.outputs.version }}
 
       # Package: Unix (tar.gz)
       - name: Package binary (Unix)
@@ -230,7 +273,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ needs.version.outputs.revision }}
           # Full history so generate-notes can diff against the previous tag
           fetch-depth: 0
 
@@ -286,12 +329,24 @@ jobs:
           INSTALL=$(cat <<'INSTALL_EOF'
           ## Installation
 
-          Download the binary for your platform below, extract it, and add it to your `PATH`.
+          Download the archive for your platform below and extract it into a versioned Atomic installation directory.
+          Add that directory to your `PATH`.
+
+          macOS ARM64, Linux x86_64 glibc, and Windows x86_64 archives include the matching
+          Node-enabled library (`libatomic.dylib`, `libatomic.so`, or `libatomic.dll`) and
+          `libatomic-runtime.json` alongside the CLI. Keep these files together; moving only
+          the executable does not install the native runtime. The manifest records the
+          release version, source revision, target, Node-API version, and binary/descriptor
+          checksums. Other archives are CLI-only. Node/Electron compatibility beyond the
+          Node load smoke still needs consumer testing.
 
           ### macOS (Apple Silicon)
           ```bash
+          INSTALL_DIR="$HOME/.local/share/atomic/${{ needs.version.outputs.tag }}"
+          mkdir -p "$INSTALL_DIR"
+          cd "$INSTALL_DIR"
           curl -L https://github.com/${{ github.repository }}/releases/download/${{ needs.version.outputs.tag }}/atomic-aarch64-apple-darwin.tar.gz | tar xz
-          sudo mv atomic /usr/local/bin/
+          export PATH="$INSTALL_DIR:$PATH"
           ```
 
           ### macOS (Intel)
@@ -308,8 +363,11 @@ jobs:
 
           ### Linux (x86_64, glibc — requires glibc 2.28+)
           ```bash
+          INSTALL_DIR="$HOME/.local/share/atomic/${{ needs.version.outputs.tag }}"
+          mkdir -p "$INSTALL_DIR"
+          cd "$INSTALL_DIR"
           curl -L https://github.com/${{ github.repository }}/releases/download/${{ needs.version.outputs.tag }}/atomic-x86_64-unknown-linux-gnu.tar.gz | tar xz
-          sudo mv atomic /usr/local/bin/
+          export PATH="$INSTALL_DIR:$PATH"
           ```
 
           ### Linux (aarch64, statically linked — works on any Linux)
@@ -325,7 +383,13 @@ jobs:
           ```
 
           ### Windows (x86_64)
-          Download `atomic-x86_64-pc-windows-msvc.zip`, extract, and add to your `PATH`.
+          Download `atomic-x86_64-pc-windows-msvc.zip`, extract all files into a versioned
+          installation directory, and add that directory to your `PATH`. Keep
+          `atomic.exe`, `libatomic.dll`, and `libatomic-runtime.json` together.
+
+          Persist the PATH change in your shell profile or Windows environment settings.
+          Install updates into a new versioned directory rather than overwriting a library
+          already loaded by an editor. CLI self-update does not yet update the library.
 
           ### Verify
           ```bash

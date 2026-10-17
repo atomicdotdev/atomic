@@ -156,9 +156,11 @@ pub use types::{RecordedFile, RecordingResult, RecordingStats};
 
 use crate::change::{Encoding, FileOps, Local};
 use crate::crdt::{BranchId, TrunkId};
+use crate::diff::DiffOp;
 use crate::diff::Line;
 use crate::output::WorkingCopyRead;
-use crate::types::NodeId;
+use crate::pristine::PathClaimId;
+use crate::types::{Hash, Inode, NodeId, Position};
 
 use super::compare::{compare_content, detect_encoding};
 use super::crdt::CrdtBuildStats;
@@ -273,6 +275,93 @@ where
     Ok(recorded)
 }
 
+/// Record a deleted file that has reappeared with its original identity.
+///
+/// Exact restoration emits only an undelete. When bytes changed while the
+/// path was deleted, normal modification hunks are attached to the same
+/// record so graph and CRDT state advance atomically with the undelete.
+#[allow(clippy::too_many_arguments)]
+pub fn record_undeleted_file<W>(
+    working_copy: &W,
+    detected: &DetectedFile,
+    deleted_by: &[Hash],
+    old_content: &[u8],
+    crdt_old_content: Option<&[u8]>,
+    options: &RecordingOptions,
+    existing_trunk_id: TrunkId,
+    existing_branches: Option<&[BranchId]>,
+) -> Result<RecordedFile, String>
+where
+    W: WorkingCopyRead,
+{
+    let inode = detected
+        .inode
+        .ok_or_else(|| format!("Undelete {} is missing its inode", detected.path))?;
+    let position = detected
+        .position
+        .ok_or_else(|| format!("Undelete {} is missing its graph position", detected.path))?;
+    if deleted_by.is_empty() {
+        return Err(format!(
+            "Undelete {} has no causally maximal deletion",
+            detected.path
+        ));
+    }
+
+    let mut current_content = Vec::new();
+    working_copy
+        .read_file(&detected.path, &mut current_content)
+        .map_err(|error| format!("Failed to read file {}: {}", detected.path, error))?;
+    if options.exceeds_max_size(current_content.len()) {
+        return Err(format!(
+            "File {} exceeds maximum size ({} bytes)",
+            detected.path,
+            current_content.len()
+        ));
+    }
+    let encoding = detect_encoding(&current_content);
+    if encoding == Encoding::Binary && options.get_skip_binary() {
+        return Err(format!("Skipping binary file {}", detected.path));
+    }
+
+    let mut recorded = if current_content == old_content {
+        let mut recorded = RecordedFile::new(&detected.path);
+        recorded.set_kind(DetectionKind::Modified);
+        recorded.set_content(current_content);
+        recorded.set_encoding(encoding);
+        recorded
+    } else {
+        let mut modified = detected.clone();
+        modified.kind = DetectionKind::Modified;
+        record_modified_file(
+            working_copy,
+            &modified,
+            old_content,
+            crdt_old_content,
+            options,
+            Some(existing_trunk_id),
+            existing_branches,
+        )?
+    };
+
+    recorded.set_inode(inode);
+    recorded.set_position(position);
+    recorded.set_undelete_changes(deleted_by.to_vec());
+
+    let edit_ops = recorded.crdt_ops().cloned();
+    let mut undelete_ops = FileOps::undelete(existing_trunk_id, detected.path.clone());
+    if let Some(edit_ops) = edit_ops {
+        undelete_ops
+            .line_ops_mut()
+            .extend(edit_ops.line_ops().iter().cloned());
+    }
+    recorded.set_crdt_ops(undelete_ops);
+    let mut stats = recorded.crdt_stats().cloned().unwrap_or_default();
+    stats.files_undeleted += 1;
+    recorded.set_crdt_stats(stats);
+
+    Ok(recorded)
+}
+
 /// Record a single deleted file.
 ///
 /// Creates a deletion graph_op for a file that no longer exists in the working copy.
@@ -381,7 +470,13 @@ where
     recorded.set_kind(DetectionKind::Modified);
 
     // Count lines in old content for precise insertion point detection
-    let old_line_count = old_content.iter().filter(|&&b| b == b'\n').count();
+    // Count LINES — newline-split segments including a no-trailing-newline
+    // remainder — matching the graph's per-line vertex split, the CRDT
+    // branch-per-line model, and the diff's line numbering. A raw `\n` count
+    // under-reports files that don't end with a newline (346 for a 347-line
+    // file), which desyncs every positional hunk index from the branch and
+    // vertex domains downstream.
+    let old_line_count = Line::from_bytes(old_content).len();
     recorded.set_old_line_count(old_line_count);
 
     // Copy inode and position if available
@@ -419,7 +514,20 @@ where
     // Fast path: machine-generated files (lockfiles, bundled output) skip
     // both the expensive diff computation AND CRDT tokenization.  We treat
     // them as a whole-file replace — one vertex in, one vertex out.
-    if super::globalize::should_use_opaque_generated_vertices(&detected.path) {
+    //
+    // Review ::26 R1 follow-up (2026-09-16): this fast path is ONLY safe
+    // when the file has NO existing per-line semantic state. On a MODIFY of
+    // recorded content the emitted hunk (`deleted_lines` empty,
+    // `inserted_lines` 1) made the assembly materialize ONLY the first
+    // line of the new content (a lockfile-only modification rendered 12 of
+    // 67 bytes — a real data-loss defect) and dropped the semantic ops
+    // entirely. With existing branches bound, fall through to the normal
+    // per-line record: the diff produces Modify ops bound to the existing
+    // branches (the proven shape every plain-file modify uses), and the
+    // final content fidelity is identical.
+    if super::globalize::should_use_opaque_generated_vertices(&detected.path)
+        && existing_branches.is_none_or(|branches| branches.is_empty())
+    {
         let mut replace_hunk = BuiltHunk::new_replace_with_lines(
             Local::new(&detected.path, 1),
             Some(encoding),
@@ -436,6 +544,68 @@ where
         return Ok(recorded);
     }
 
+    // ::26 R1 second follow-up (2026-10-13): the per-line fall-through above
+    // is only safe when the existing branches carry the newline-split shape.
+    // A generated file this module itself added holds ONE whole-content
+    // branch (the fast path above), so a per-line diff binds its Modify ops
+    // to line numbers that have no vertices and corrupts the staged render:
+    // `atomic git import` of a repository whose lockfile changed after its
+    // initial commit rendered Cargo.lock at 3,050 of 89,750 bytes and failed
+    // the staged synthesis verification. Route the opaque-shape modify through
+    // the same sentinel replace as an explicit force below: it deletes every
+    // alive vertex, inserts the full content fresh, and its CRDT ops
+    // tombstone the bound branches, so the recorded shape is one the graph
+    // can render exactly.
+    //
+    // The diff is computed before the force decision so the multi-line
+    // deletion check below can inspect its ops.
+    let comparison = compare_content(old_content, &new_content, options.get_algorithm());
+
+    // ::26 R1 third follow-up (2026-10-13): a contiguous multi-line deletion
+    // region recorded against a graph whose vertices span an earlier
+    // insertion commit leaves the additive graph in a state the alive walk
+    // classifies as a cyclic conflict — the staged render emits conflict
+    // markers and `atomic status` reports the file modified immediately after
+    // a clean record. Reproduced natively (record an insertion commit, then a
+    // commit deleting a 38-line contiguous region: the render keeps the
+    // deleted lines and adds markers) and through `atomic git import`, whose
+    // staged verification refused the change ("staged path ... renders 27472
+    // byte(s) but the commit tree expects 23819 byte(s)"). Single-line
+    // deletions are unaffected. Route the modify through the sentinel
+    // whole-file replace below — the same fail-safe shape used for binary
+    // content: every alive vertex is deleted and the full content inserted
+    // fresh, which renders byte-exact regardless of the graph's diamond
+    // structure.
+    let has_multi_line_deletion = comparison.diff_ops.iter().any(|op| match op {
+        DiffOp::Delete { len, .. } => *len > 1,
+        DiffOp::Replace { old_len, .. } => *old_len > 1,
+        _ => false,
+    });
+    // ::26 R1 fifth follow-up (2026-10-13): count LINES — newline-split
+    // segments including a no-trailing-newline remainder — matching the
+    // graph's per-line vertex split, the CRDT branch-per-line model, and the
+    // diff's line numbering. A raw `\n` count under-reports files that don't
+    // end with a newline (346 for a 347-line file), which desyncs every
+    // positional hunk index from the branch and vertex domains downstream.
+    let old_line_count = Line::from_bytes(old_content).len();
+    recorded.set_old_line_count(old_line_count);
+
+    // ::26 R1 sixth follow-up (2026-10-14): an edit at the EOF boundary of a
+    // file without a trailing newline — replacing or extending the final
+    // no-newline line, or adding one — loses or shifts the final byte in the
+    // per-line hunk slicing (observed: a +1-byte trailing-newline commit
+    // rendered 1,934 of 1,935 bytes). Either side lacking the final newline
+    // puts the edit boundary at EOF, where partial-hunk slicing is
+    // fragile; route through the sentinel whole-file replace, which
+    // rewrites the file byte-exactly.
+    let eof_boundary_edit = old_content.last().is_some_and(|&b| b != b'\n')
+        || new_content.last().is_some_and(|&b| b != b'\n');
+    let force_whole_file = options.get_force_whole_file_replace()
+        || (super::globalize::should_use_opaque_generated_vertices(&detected.path)
+            && existing_branches.is_some_and(|branches| !branches.is_empty()))
+        || has_multi_line_deletion
+        || eof_boundary_edit;
+
     // Whole-file-replace safety fallback: if the caller's `old_content` came
     // from resolving a fork or cyclic conflict (see
     // `retrieve_content_with_filter_and_fork_info`), it isn't guaranteed to
@@ -450,7 +620,7 @@ where
     // targeted per-vertex diff that would trust old_content's mismatched
     // shape. This mirrors the delete+add workaround that was used manually to
     // recover a corrupted file before this fix existed.
-    if options.get_force_whole_file_replace() {
+    if force_whole_file {
         let mut replace_hunk = BuiltHunk::new_replace_with_lines(
             Local::new(&detected.path, 1),
             Some(encoding),
@@ -462,13 +632,28 @@ where
         replace_hunk.content_start = Some(0);
         replace_hunk.content_end = Some(new_content.len() as u64);
         recorded.add_hunk(replace_hunk);
+
+        // CB-9B (review blocker 3 / F4): a forced whole-file replace must still
+        // regenerate semantic FileOps, and the CRDT side must mirror the
+        // graph's shape — the graph deletes every alive vertex and inserts
+        // the full content fresh, so the semantic layer tombstones every
+        // bound branch and inserts every line fresh. A positional diff here
+        // kept unchanged lines bound to graph-deleted vertices, leaving the
+        // CRDT layer unable to reconstruct the file.
+        let (crdt_ops, crdt_stats) = crdt::build_crdt_ops_for_whole_file_replace(
+            &detected.path,
+            &new_content,
+            encoding,
+            existing_trunk_id,
+            existing_branches,
+        );
+        recorded.set_crdt_ops(crdt_ops);
+        recorded.set_crdt_stats(crdt_stats);
+
         recorded.set_content(new_content);
 
         return Ok(recorded);
     }
-
-    // Compare content and build hunks
-    let comparison = compare_content(old_content, &new_content, options.get_algorithm());
 
     // Handle binary files: compare_content returns is_binary=true with zero
     // diff_ops when either old or new content contains null bytes.  Since we
@@ -500,6 +685,23 @@ where
         replace_hunk.content_start = Some(0);
         replace_hunk.content_end = Some(new_content.len() as u64);
         recorded.add_hunk(replace_hunk);
+
+        // CB-9B (review blocker 3): binary replaces keep the same semantic
+        // contract as forced replaces — regenerate FileOps from the byte
+        // diff instead of returning without a semantic layer.
+        let recipe_ctx = RecipeContext {
+            path: &detected.path,
+            old_content: crdt_old_content.unwrap_or(old_content),
+            new_content: &new_content,
+            existing_branches,
+            existing_trunk_id,
+            encoding,
+            algorithm: options.get_algorithm(),
+        };
+        let (crdt_ops, crdt_stats) = Recipe::detect(&recipe_ctx).build_ops(&recipe_ctx);
+        recorded.set_crdt_ops(crdt_ops);
+        recorded.set_crdt_stats(crdt_stats);
+
         recorded.set_content(new_content);
 
         return Ok(recorded);
@@ -590,6 +792,77 @@ where
 
     // Store the new content
     recorded.set_content(new_content);
+
+    Ok(recorded)
+}
+
+/// Record an identity-preserving file move, including destination content edits.
+///
+/// The destination bytes are recorded through [`record_modified_file`], so move
+/// recording uses the same graph hunk and CRDT line/token generation as an
+/// ordinary edit. The resulting record keeps the supplied stable inode,
+/// position, and exact source claim, and replaces the generated semantic trunk
+/// operation with one [`crate::crdt::TrunkOp::Move`] on `existing_trunk_id`.
+/// Generated line and token operations are retained beneath that move.
+#[allow(clippy::too_many_arguments)]
+pub fn record_moved_file<W>(
+    working_copy: &W,
+    detected: &DetectedFile,
+    old_content: &[u8],
+    crdt_old_content: Option<&[u8]>,
+    options: &RecordingOptions,
+    existing_inode: Inode,
+    existing_position: Position<NodeId>,
+    exact_source_claim: PathClaimId,
+    existing_trunk_id: TrunkId,
+    existing_branches: Option<&[BranchId]>,
+) -> Result<RecordedFile, String>
+where
+    W: WorkingCopyRead,
+{
+    let old_path = detected
+        .old_path
+        .clone()
+        .ok_or_else(|| format!("Move {} is missing its old path", detected.path))?;
+
+    // Reuse the normal edit pipeline for destination content, while forcing it
+    // to target the authoritative existing file identity supplied by the
+    // caller rather than any incidental identity on `detected`.
+    let mut modified = detected.clone();
+    modified.kind = DetectionKind::Modified;
+    modified.inode = Some(existing_inode);
+    modified.position = Some(existing_position);
+    let mut recorded = record_modified_file(
+        working_copy,
+        &modified,
+        old_content,
+        crdt_old_content,
+        options,
+        Some(existing_trunk_id),
+        existing_branches,
+    )?;
+
+    recorded.set_kind(DetectionKind::Moved);
+    recorded.set_old_path(old_path.clone());
+    recorded.set_inode(existing_inode);
+    recorded.set_position(existing_position);
+    recorded.set_exact_source_claim(exact_source_claim);
+
+    // A pure move may produce no edit FileOps, while opaque/binary replacement
+    // paths intentionally skip semantic tokenization. Always emit the semantic
+    // move, then retain any line/token operations generated by the edit path.
+    let generated_ops = recorded.crdt_ops().cloned();
+    let mut move_ops = FileOps::move_file(existing_trunk_id, old_path, detected.path.clone());
+    if let Some(generated_ops) = generated_ops {
+        move_ops
+            .line_ops_mut()
+            .extend(generated_ops.line_ops().iter().cloned());
+    }
+    recorded.set_crdt_ops(move_ops);
+
+    let mut stats = recorded.crdt_stats().cloned().unwrap_or_default();
+    stats.files_moved += 1;
+    recorded.set_crdt_stats(stats);
 
     Ok(recorded)
 }

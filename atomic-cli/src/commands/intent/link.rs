@@ -28,6 +28,12 @@ pub struct IntentLink {
 
 impl Command for IntentLink {
     fn run(&self) -> CliResult<()> {
+        // Route every form through the service layer (the handler runs the
+        // same vault_intent_link domain call).
+        if crate::commands::rpc::intent_link(self)? {
+            return Ok(());
+        }
+
         let root = find_repository_root()?;
         let repo = Repository::open(&root).map_err(CliError::Repository)?;
 

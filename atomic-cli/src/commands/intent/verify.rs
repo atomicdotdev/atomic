@@ -63,6 +63,10 @@ pub struct IntentVerify {
 
 impl Command for IntentVerify {
     fn run(&self) -> CliResult<()> {
+        if crate::commands::rpc::intent_verify(self)? {
+            return Ok(());
+        }
+
         // Remote resolution (identities/resolve) needs async. Build a
         // one-shot runtime rather than depending on the caller being inside
         // tokio, exactly like `identity register`.

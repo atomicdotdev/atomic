@@ -197,20 +197,42 @@ fn test_inode_edge_iterator() {
         let mut txn = pristine.write_txn().unwrap();
         let change_id = txn.register_change(&hash).unwrap();
 
-        let node = GraphNode::new(change_id, ChangePosition::new(0), ChangePosition::new(100));
-        let dest = Position::new(change_id, ChangePosition::new(50));
+        let first = GraphNode::new(change_id, ChangePosition::new(0), ChangePosition::new(100));
+        let second = GraphNode::new(
+            change_id,
+            ChangePosition::new(100),
+            ChangePosition::new(200),
+        );
 
-        // Add edges with different flags
+        // Add edges with different flags across multiple vertices.
         txn.put_inode_graph(
             inode,
-            node,
-            SerializedGraphEdge::new(EdgeFlags::BLOCK, dest, change_id),
+            first,
+            SerializedGraphEdge::new(
+                EdgeFlags::BLOCK,
+                Position::new(change_id, ChangePosition::new(50)),
+                change_id,
+            ),
         )
         .unwrap();
         txn.put_inode_graph(
             inode,
-            node,
-            SerializedGraphEdge::new(EdgeFlags::FOLDER, dest, change_id),
+            first,
+            SerializedGraphEdge::new(
+                EdgeFlags::FOLDER,
+                Position::new(change_id, ChangePosition::new(75)),
+                change_id,
+            ),
+        )
+        .unwrap();
+        txn.put_inode_graph(
+            inode,
+            second,
+            SerializedGraphEdge::new(
+                EdgeFlags::BLOCK | EdgeFlags::PSEUDO,
+                Position::new(change_id, ChangePosition::new(150)),
+                change_id,
+            ),
         )
         .unwrap();
         txn.commit().unwrap();
@@ -219,17 +241,28 @@ fn test_inode_edge_iterator() {
     {
         let txn = pristine.read_txn().unwrap();
 
-        // Iterate with iter_inode_edges
-        let iter = txn
+        let edges = txn
             .iter_inode_edges(inode, EdgeFlags::empty(), EdgeFlags::all())
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
             .unwrap();
+        assert_eq!(edges.len(), 3);
 
-        let edges: Vec<_> = iter.collect();
-        // Note: iter_inode_edges requires the caller to initialize with a span
-        // Since it's a trait-provided method that creates InodeEdgeIter without
-        // a starting span, it won't iterate automatically.
-        // The current implementation starts with current_adj = None.
-        assert_eq!(edges.len(), 0);
+        // Storage order is stable across independent iterators.
+        let repeated = txn
+            .iter_inode_edges(inode, EdgeFlags::empty(), EdgeFlags::all())
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(repeated, edges);
+
+        let block_only = txn
+            .iter_inode_edges(inode, EdgeFlags::BLOCK, EdgeFlags::BLOCK)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(block_only.len(), 1);
+        assert_eq!(block_only[0].flag(), EdgeFlags::BLOCK);
     }
 }
 

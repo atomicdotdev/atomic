@@ -101,7 +101,14 @@ pub enum LocalApplyError {
         hash: Hash,
     },
 
-    /// The change has already been applied to this view.
+    /// A causal frontier could not be proven from the complete local dependency index.
+    #[error("Causal frontier is incomplete or invalid: {reason}")]
+    CausalFrontierInvalid {
+        /// Why the frontier could not be accepted as causal proof.
+        reason: String,
+    },
+
+    /// The change has already been applied to a view.
     ///
     /// Applying the same change twice is not allowed and would corrupt
     /// the graph state.

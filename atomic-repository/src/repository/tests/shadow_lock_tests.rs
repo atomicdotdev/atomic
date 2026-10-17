@@ -13,6 +13,18 @@ fn shadow_commit_lock_is_exclusive_and_non_blocking() {
         .expect("lock op should not error");
     assert!(first.is_some(), "first acquire should succeed");
 
+    let operation_error = match repo.try_lock_operation(repo.working_copy()) {
+        Ok(_) => panic!("working-copy operation unexpectedly bypassed the common shadow lock"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        operation_error,
+        RepositoryError::LockContended {
+            lock: crate::RepositoryLockKind::Common,
+            ..
+        }
+    ));
+
     // A second attempt while the first guard is held must report contention,
     // not block or double-acquire.
     let second = repo

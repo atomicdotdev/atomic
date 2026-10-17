@@ -226,8 +226,7 @@ pub enum AgentError {
         reason: String,
     },
 
-    /// The turn had no file changes — nothing to record.
-    ///
+    /// A scoped turn declared no files or the turn produced no changes.
     /// This is informational, not a fatal error. The orchestrator
     /// silently skips empty turns.
     #[error("Turn {turn_number} for session '{session_id}' had no file changes")]
@@ -236,6 +235,27 @@ pub enum AgentError {
         session_id: String,
         /// The turn number.
         turn_number: u32,
+    },
+
+    /// A stored commit-time capture exists but does not authenticate
+    /// (tampered MAC, replayed/stale turn binding, or session/working-copy/
+    /// HEAD mismatch). Evidence quality failure: the turn is classified
+    /// without attributing the commit.
+    #[error("Commit-time capture failed authentication: {reason}")]
+    CaptureInvalid {
+        /// What failed and why.
+        reason: String,
+    },
+
+    /// Session attestation could not be created, signed, or persisted
+    /// (review ATOM::aaron::8 R3/R6). The session end fails closed with a
+    /// durable refusal instead of reporting success with unattested work.
+    #[error("Failed to attest session '{session_id}': {reason}")]
+    AttestationFailed {
+        /// The session ID.
+        session_id: String,
+        /// What went wrong.
+        reason: String,
     },
 
     /// Failed to create or access the agent's Atomic view.
@@ -339,7 +359,7 @@ impl AgentError {
             AgentError::WatchmanNotRunning
                 | AgentError::WatchmanConnectionFailed { .. }
                 | AgentError::WatchmanQueryFailed { .. }
-                | AgentError::EmptyTurn { .. }
+                | AgentError::CaptureInvalid { .. }
                 | AgentError::TurnAlreadyActive { .. }
         )
     }
@@ -399,7 +419,7 @@ impl AgentError {
 
             // Operational errors (retryable)
             AgentError::WatchmanNotRunning => 0, // Not fatal — fallback used
-            AgentError::EmptyTurn { .. } => 0,   // Not fatal — no-op turn
+            AgentError::CaptureInvalid { .. } => 0, // Not fatal — classified turn
 
             // Infrastructure errors
             AgentError::WatchmanConnectionFailed { .. } => 2,
@@ -544,9 +564,8 @@ mod tests {
             reason: "stale".to_string()
         }
         .is_recoverable());
-        assert!(AgentError::EmptyTurn {
-            session_id: "s".to_string(),
-            turn_number: 1,
+        assert!(AgentError::CaptureInvalid {
+            reason: "tampered".to_string(),
         }
         .is_recoverable());
         assert!(AgentError::TurnAlreadyActive {
@@ -657,9 +676,8 @@ mod tests {
     fn test_exit_code_non_fatal() {
         assert_eq!(AgentError::WatchmanNotRunning.exit_code(), 0);
         assert_eq!(
-            AgentError::EmptyTurn {
-                session_id: "s".to_string(),
-                turn_number: 1,
+            AgentError::CaptureInvalid {
+                reason: "tampered".to_string(),
             }
             .exit_code(),
             0

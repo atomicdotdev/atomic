@@ -47,6 +47,14 @@ pub struct Show {
 
 impl Command for Show {
     fn run(&self) -> CliResult<()> {
+        // Every form routes: the wire resolves by path and carries the
+        // stored entry's full domain bytes, so the revision hash, the
+        // JSON projection, and the --revision guard all run client-side
+        // over wire-carried data.
+        if crate::commands::rpc::vault_show(self)? {
+            return Ok(());
+        }
+
         let root = find_repository_root()?;
         let repo =
             crate::commands::open_readonly_repository(&root).map_err(CliError::Repository)?;
@@ -82,7 +90,7 @@ impl Command for Show {
     }
 }
 
-fn require_revision(path: &str, expected: Option<&str>, actual: &str) -> CliResult<()> {
+pub(crate) fn require_revision(path: &str, expected: Option<&str>, actual: &str) -> CliResult<()> {
     match expected {
         Some(expected) if !expected.eq_ignore_ascii_case(actual) => {
             return Err(CliError::InvalidArgument {
@@ -96,7 +104,7 @@ fn require_revision(path: &str, expected: Option<&str>, actual: &str) -> CliResu
     Ok(())
 }
 
-fn entry_json(path: &str, entry: &VaultEntry, revision_hash: &str) -> serde_json::Value {
+pub(crate) fn entry_json(path: &str, entry: &VaultEntry, revision_hash: &str) -> serde_json::Value {
     serde_json::json!({
         "schema_version": 1,
         "mode": "vault_entry_body",

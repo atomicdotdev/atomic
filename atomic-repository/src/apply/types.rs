@@ -143,6 +143,15 @@ pub struct InsertOptions {
     /// that is already in the view log (same NodeId, new hunks).
     /// Default: `false`
     pub skip_validation: bool,
+
+    /// Skip the trusted provenance publication gate (CB-12B).
+    ///
+    /// Internal escape hatch for callers that have ALREADY gated the complete
+    /// reachable closure once (e.g. `insert_change_rec` gates the closure
+    /// before looping). This never bypasses the gate for external callers:
+    /// the default is `false`, and every closure entry point re-gates.
+    /// Default: `false`
+    pub(crate) skip_publication_gate: bool,
 }
 
 impl Default for InsertOptions {
@@ -154,6 +163,7 @@ impl Default for InsertOptions {
             max_depth: 100,
             track_conflicts: true,
             skip_validation: false,
+            skip_publication_gate: false,
         }
     }
 }
@@ -229,6 +239,10 @@ pub struct InsertStats {
     /// Hashes of changes that were inserted.
     pub applied_hashes: Vec<Hash>,
 
+    /// Paths affected by graph content or by the target closure's path claims.
+    /// Includes both names of a move, even when the old name still has a claimant.
+    pub affected_paths: std::collections::HashSet<String>,
+
     /// Conflict summary if any conflicts were detected.
     pub conflict_summary: Option<ConflictSummary>,
 }
@@ -256,6 +270,7 @@ impl InsertStats {
         self.conflicts_detected += other.conflicts_detected;
         self.dependencies_applied += other.dependencies_applied;
         self.applied_hashes.extend(other.applied_hashes);
+        self.affected_paths.extend(other.affected_paths);
         if other.conflict_summary.is_some() {
             self.conflict_summary = other.conflict_summary;
         }

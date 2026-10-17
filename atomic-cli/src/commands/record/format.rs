@@ -2,11 +2,19 @@ use super::*;
 
 impl Record {
     /// Format the outcome for display.
-    pub(super) fn format_outcome(&self, repo: &Repository, outcome: &RecordOutcome) -> String {
+    pub(super) fn format_outcome(&self, view_name: &str, outcome: &RecordOutcome) -> String {
         let mut output = String::new();
 
-        // Get the actual current view name from the repository
-        let view_name = repo.current_view();
+        // A scoped stale-conflict cleanup records no content change; report it
+        // as such instead of a zero-file change summary.
+        if let Some(cleanup) = outcome.conflict_cleanup() {
+            return format_conflict_cleanup(
+                &cleanup.view,
+                &cleanup.paths,
+                cleanup.rows_cleared,
+                cleanup.operation,
+            );
+        }
 
         // Get hash (shortened)
         let hash_short = &outcome.hash().to_base32()[..DEFAULT_HASH_LENGTH.min(8)];
@@ -67,6 +75,59 @@ impl Record {
             }
         }
 
+        if let Ok(Some(evidence)) = outcome.move_evidence() {
+            for moved in evidence.authoritative_moves {
+                let authority = match moved.authority {
+                    atomic_repository::MoveAuthority::ExplicitAtomicMove => "explicit atomic move",
+                    atomic_repository::MoveAuthority::StableInodeProjection => {
+                        "stable inode projection"
+                    }
+                };
+                output.push_str(&format!(
+                    " move: {} → {} ({})\n",
+                    moved.old_path, moved.new_path, authority
+                ));
+            }
+            for moved in evidence.probable_moves {
+                let basis = match moved.basis {
+                    atomic_repository::MoveBasis::ByteIdentity => "byte identity",
+                    atomic_repository::MoveBasis::ContentSimilarity => "content similarity",
+                };
+                output.push_str(&format!(
+                    " probable move: {} → {} ({}.{:02}%, {})\n",
+                    moved.old_path,
+                    moved.new_path,
+                    moved.score / 100,
+                    moved.score % 100,
+                    basis
+                ));
+            }
+            for loss in evidence.loss_notes {
+                match loss {
+                    atomic_repository::LossNote::RenameUnresolved { candidates } => {
+                        output.push_str(
+                            " warning: rename identity unresolved; retained delete + add\n",
+                        );
+                        for candidate in candidates {
+                            output.push_str(&format!(
+                                "   candidate: {} → {} ({}.{:02}%)\n",
+                                candidate.source_path,
+                                candidate.destination_path,
+                                candidate.score / 100,
+                                candidate.score % 100
+                            ));
+                        }
+                    }
+                    atomic_repository::LossNote::EmptyDirectory { path } => {
+                        output.push_str(&format!(
+                            " warning: empty directory '{}' is omitted from Git tree projection\n",
+                            path
+                        ));
+                    }
+                }
+            }
+        }
+
         // File list
         for path in outcome.recorded_files() {
             output.push_str(&format!(" {}\n", path));
@@ -76,54 +137,86 @@ impl Record {
     }
 
     /// Display dry run preview.
-    pub(super) fn display_dry_run(&self, repo: &Repository) -> CliResult<()> {
+    pub(super) fn display_dry_run(
+        &self,
+        repo: &Repository,
+        working_copy: atomic_core::types::WorkingCopyId,
+    ) -> CliResult<()> {
         let status = repo
-            .status(StatusOptions::default())
+            .status(working_copy, StatusOptions::default())
             .map_err(CliError::Repository)?;
 
-        let mut has_changes = false;
-
-        println!("Would record:");
-
-        for entry in status.entries() {
-            // Skip untracked unless --all
-            if matches!(entry.status(), FileStatus::Untracked) && !self.all {
-                continue;
-            }
-
-            // Skip clean files
-            if matches!(entry.status(), FileStatus::Clean) {
-                continue;
-            }
-
-            // Filter by specified files if any
-            if !self.files.is_empty() {
-                let path_str = entry.path().to_string_lossy();
-                if !self.files.iter().any(|f| path_str.contains(f)) {
-                    continue;
+        let entries = status
+            .entries()
+            .iter()
+            .map(|entry| (entry.status(), entry.path().to_string_lossy().into_owned()))
+            .collect::<Vec<_>>();
+        render_dry_run(&entries, self.all, &self.files);
+        // Scoped stale-conflict cleanup is a metadata mutation that records no
+        // content change; surface exactly what an apply would clear.
+        if self.allow_conflict_markers && !self.all && !self.files.is_empty() {
+            if let Ok(report) = repo.inspect_stale_conflicts(working_copy, &self.files) {
+                let stale = report.stale_paths();
+                if !stale.is_empty() {
+                    println!();
+                    println!("Would clear stale conflict metadata (no content change):");
+                    for path in &stale {
+                        println!("  stale conflict:  {}", path);
+                    }
+                    println!(
+                        "  {} row(s) across {} path(s)",
+                        report.stale_row_count(),
+                        stale.len()
+                    );
                 }
             }
-
-            has_changes = true;
-            let status_desc = match entry.status() {
-                FileStatus::Added => "new file:",
-                FileStatus::Modified => "modified:",
-                FileStatus::Deleted => "deleted: ",
-                FileStatus::Untracked => "new file:",
-                FileStatus::TypeChanged => "typechange:",
-                FileStatus::PermissionsChanged => "permissions:",
-                FileStatus::Conflicted => "conflicted:",
-                FileStatus::Clean => continue,
-            };
-
-            println!("  {}  {}", status_desc, entry.path().to_string_lossy());
-        }
-
-        if !has_changes {
-            println!("  (no changes to record)");
         }
 
         Ok(())
+    }
+}
+
+/// The dry-run preview, pure over its inputs — the same lines the local
+/// body prints, shared with the routed path (the wire's Status entries
+/// drive it; the status vocabulary maps to the local descriptions).
+pub(crate) fn render_dry_run(entries: &[(FileStatus, String)], all: bool, files: &[String]) {
+    let mut has_changes = false;
+
+    println!("Would record:");
+
+    for (status, path) in entries {
+        // Skip untracked unless --all
+        if matches!(status, FileStatus::Untracked) && !all {
+            continue;
+        }
+
+        // Skip clean files
+        if matches!(status, FileStatus::Clean) {
+            continue;
+        }
+
+        // Filter by specified files if any
+        if !files.is_empty() && !files.iter().any(|f| path.contains(f)) {
+            continue;
+        }
+
+        has_changes = true;
+        let status_desc = match status {
+            FileStatus::Added => "new file:",
+            FileStatus::Modified => "modified:",
+            FileStatus::Deleted => "deleted: ",
+            FileStatus::Untracked => "new file:",
+            FileStatus::TypeChanged => "typechange:",
+            FileStatus::PermissionsChanged => "permissions:",
+            FileStatus::Conflicted => "conflicted:",
+            FileStatus::Clean => continue,
+        };
+
+        println!("  {}  {}", status_desc, path);
+    }
+
+    if !has_changes {
+        println!("  (no changes to record)");
     }
 }
 
@@ -131,4 +224,30 @@ impl Default for Record {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Render the scoped stale-conflict cleanup result.
+///
+/// Shared by the ordinary record outcome path and the metadata-only narrow
+/// route so both report the same actual operation identity and cleared scope.
+pub(super) fn format_conflict_cleanup(
+    view: &str,
+    paths: &[String],
+    rows_cleared: usize,
+    operation: Option<atomic_core::OperationId>,
+) -> String {
+    let operation = operation
+        .map(|id| id.to_string())
+        .unwrap_or_else(|| "none".to_string());
+    let mut output = format!(
+        "Cleared stale conflict metadata on view '{}': {} row(s) across {} path(s)\n",
+        view,
+        rows_cleared,
+        paths.len()
+    );
+    for path in paths {
+        output.push_str(&format!("  cleared: {}\n", path));
+    }
+    output.push_str(&format!("  operation: {}\n", operation));
+    output
 }

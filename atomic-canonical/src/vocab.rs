@@ -97,6 +97,7 @@ pub const FINDING_CODE: &[&str] = &[
     "STALE_TRIAGE",
     "OPEN_REMEDIATION",
     "UNREVIEWED_CHANGE",
+    "PUBLICATION_GATE",
 ];
 
 /// Directive names recognized by the parser + lift (closed set).
@@ -336,8 +337,10 @@ mod tests {
             assert!(is_known_finding_code(c), "code {c} should be known");
         }
         assert!(!is_known_finding_code("WAT"));
-        // The review-coverage gate's code is the newest member (appended last).
-        assert_eq!(FINDING_CODE.last(), Some(&"UNREVIEWED_CHANGE"));
+        // The publication gate's code is the newest member (appended last,
+        // CB-12B); the review-coverage gate's code precedes it.
+        assert_eq!(FINDING_CODE.last(), Some(&"PUBLICATION_GATE"));
+        assert_eq!(FINDING_CODE[FINDING_CODE.len() - 2], "UNREVIEWED_CHANGE");
 
         // The new edge and directive names joined their closed registries.
         assert!(is_known_edge("remediates"));

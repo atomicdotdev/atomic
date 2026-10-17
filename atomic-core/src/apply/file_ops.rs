@@ -65,7 +65,8 @@ use crate::crdt::{
     BranchId, BranchOp, BranchState, LeafId, LeafOp, LeafState, TrunkId, TrunkOp, TrunkState,
 };
 use crate::pristine::{MutTxnT, PristineError, PristineResult, TreeTxnT, WriteTxn};
-use crate::types::{GraphNode, NodeId};
+use crate::types::{GraphNode, Inode, NodeId};
+use std::collections::HashMap;
 
 // Statistics
 
@@ -168,10 +169,55 @@ pub fn apply_file_ops<T: MutTxnT>(
     change_id: NodeId,
     file_ops: &[FileOps],
 ) -> PristineResult<ApplyFileOpsStats> {
+    apply_file_ops_with_inodes(txn, change_id, file_ops, &HashMap::new())
+}
+
+fn apply_file_ops_with_inodes<T: MutTxnT>(
+    txn: &mut T,
+    change_id: NodeId,
+    file_ops: &[FileOps],
+    created_inodes: &HashMap<String, Inode>,
+) -> PristineResult<ApplyFileOpsStats> {
+    let trace_crdt = std::env::var_os("ATOMIC_TRACE_APPLY_CRDT").is_some();
+    let crdt_start = std::time::Instant::now();
     let mut stats = ApplyFileOpsStats::new();
     let mut next_leaf_idx = 0u32;
-    for ops in file_ops {
-        apply_single_file_ops(txn, change_id, ops, &mut stats, &mut next_leaf_idx)?;
+    for (ops_index, ops) in file_ops.iter().enumerate() {
+        if trace_crdt {
+            eprintln!(
+                "[apply-crdt] ops {ops_index}/{} path={:?} line_ops={} encoding_of_trunk={:?} elapsed_before={:?}",
+                file_ops.len(),
+                ops.path(),
+                ops.line_ops().len(),
+                ops.trunk_op().map(|op| match op {
+                    crate::crdt::TrunkOp::Create { encoding, .. } => {
+                        encoding.as_ref().map(ToString::to_string)
+                    }
+                    _ => None,
+                }),
+                crdt_start.elapsed()
+            );
+        }
+        apply_single_file_ops(
+            txn,
+            change_id,
+            ops,
+            &mut stats,
+            &mut next_leaf_idx,
+            created_inodes,
+        )?;
+        if trace_crdt {
+            eprintln!(
+                "[apply-crdt] ops {ops_index} complete elapsed={:?}",
+                crdt_start.elapsed()
+            );
+        }
+    }
+    if trace_crdt {
+        eprintln!(
+            "[apply-crdt] all ops complete total={:?}",
+            crdt_start.elapsed()
+        );
     }
     Ok(stats)
 }
@@ -186,8 +232,21 @@ pub fn apply_file_ops_batched(
     change_id: NodeId,
     file_ops: &[FileOps],
 ) -> PristineResult<ApplyFileOpsStats> {
+    apply_file_ops_batched_with_inodes(txn, change_id, file_ops, &HashMap::new())
+}
+
+/// Apply semantic operations using the graph identities allocated for this
+/// change's FileAdd operations. The map pairs paths within this change with
+/// their position-derived inodes; it must not come from the ambient TREE.
+/// Semantic-only creates without a FileAdd retain the legacy lookup behavior.
+pub fn apply_file_ops_batched_with_inodes(
+    txn: &mut WriteTxn<'_>,
+    change_id: NodeId,
+    file_ops: &[FileOps],
+    created_inodes: &HashMap<String, Inode>,
+) -> PristineResult<ApplyFileOpsStats> {
     if !can_batch_apply_file_ops(file_ops) {
-        return apply_file_ops(txn, change_id, file_ops);
+        return apply_file_ops_with_inodes(txn, change_id, file_ops, created_inodes);
     }
 
     let mut stats = ApplyFileOpsStats::new();
@@ -196,10 +255,7 @@ pub fn apply_file_ops_batched(
     for ops in file_ops {
         let trunk_create = match ops.trunk_op() {
             Some(TrunkOp::Create { encoding, .. }) => {
-                let inode = match txn.get_inode(ops.path())? {
-                    Some(i) => i,
-                    None => txn.alloc_inode()?,
-                };
+                let inode = resolve_created_inode(txn, ops.path(), created_inodes)?;
                 Some(SerializedTrunk {
                     inode,
                     state: TrunkState::Alive,
@@ -289,7 +345,12 @@ pub fn apply_file_ops_batched(
                     unreachable!("batched apply only runs for insert-only leaf ops");
                 };
 
-                let leaf_id = LeafId::new(branch_id.change_id(), next_leaf_idx);
+                // Leaf rows are keyed by the APPLYING change (review C1): the
+                // applier's NodeId plus the per-apply counter is globally
+                // unique, so a later apply can never re-key another branch's
+                // rows. Insert-created branches are applier-owned, so this
+                // matches the historical keying exactly on this path.
+                let leaf_id = LeafId::new(change_id, next_leaf_idx);
                 next_leaf_idx += 1;
                 let leaf_key = encode_leaf_id(&leaf_id);
                 let leaf_value = encode_leaf_value(&SerializedLeaf {
@@ -442,7 +503,9 @@ pub fn apply_file_ops_batched_groups(
                         unreachable!("batched apply only runs for insert-only leaf ops");
                     };
 
-                    let leaf_id = LeafId::new(branch_id.change_id(), next_leaf_idx);
+                    // Leaf rows are keyed by the APPLYING change (review C1):
+                    // same contract as `apply_file_ops_batched`.
+                    let leaf_id = LeafId::new(*change_id, next_leaf_idx);
                     next_leaf_idx += 1;
                     let leaf_key = encode_leaf_id(&leaf_id);
                     let leaf_value = encode_leaf_value(&SerializedLeaf {
@@ -464,18 +527,71 @@ pub fn apply_file_ops_batched_groups(
 }
 
 fn can_batch_apply_file_ops(file_ops: &[FileOps]) -> bool {
-    file_ops.iter().all(|ops| {
-        matches!(ops.trunk_op(), None | Some(TrunkOp::Create { .. }))
-            && ops.line_ops().iter().all(|line_ops| {
-                matches!(
-                    line_ops.operation(),
-                    BranchOp::Insert { content, .. }
-                        if content
-                            .iter()
-                            .all(|leaf_op| matches!(leaf_op, LeafOp::Insert { .. }))
-                )
-            })
-    })
+    let trace_crdt = std::env::var_os("ATOMIC_TRACE_APPLY_CRDT").is_some();
+    let outcome = file_ops.iter().all(|ops| {
+        // Attribute trunk ops (SetMode/SetKind) carry semantic facts only —
+        // GraphOp::SetAttr owns their persistence — so they batch like a
+        // no-op instead of forcing the whole file through the generic
+        // per-op table-reopening path (the 1 MB binary add took 36s there).
+        matches!(
+            ops.trunk_op(),
+            None | Some(TrunkOp::Create { .. })
+                | Some(TrunkOp::SetMode { .. })
+                | Some(TrunkOp::SetKind { .. })
+        ) && ops.line_ops().iter().all(|line_ops| {
+            matches!(
+                line_ops.operation(),
+                BranchOp::Insert { content, .. }
+                    if content
+                        .iter()
+                        .all(|leaf_op| matches!(leaf_op, LeafOp::Insert { .. }))
+            )
+        })
+    });
+    if trace_crdt && !outcome {
+        for (ops_index, ops) in file_ops.iter().enumerate() {
+            let trunk_ok = matches!(
+                ops.trunk_op(),
+                None | Some(TrunkOp::Create { .. })
+                    | Some(TrunkOp::SetMode { .. })
+                    | Some(TrunkOp::SetKind { .. })
+            );
+            if !trunk_ok {
+                eprintln!(
+                    "[apply-crdt] batch refused: ops {ops_index} trunk_op is not Create/None"
+                );
+            }
+            for (line_index, line_ops) in ops.line_ops().iter().enumerate() {
+                let is_insert = matches!(line_ops.operation(), BranchOp::Insert { .. });
+                if !is_insert {
+                    eprintln!(
+                        "[apply-crdt] batch refused: ops {ops_index} line {line_index} is not Insert"
+                    );
+                }
+                if let BranchOp::Insert { content, .. } = line_ops.operation() {
+                    for (leaf_index, leaf_op) in content.iter().enumerate() {
+                        if !matches!(leaf_op, LeafOp::Insert { .. }) {
+                            eprintln!(
+                                "[apply-crdt] batch refused: ops {ops_index} line {line_index} leaf {leaf_index} is {:?}",
+                                leaf_op_discriminant(leaf_op)
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+    outcome
+}
+
+/// Debug label for a leaf op's variant (batch-refusal tracing).
+fn leaf_op_discriminant(leaf_op: &LeafOp) -> &'static str {
+    match leaf_op {
+        LeafOp::Insert { .. } => "Insert",
+        LeafOp::Delete { .. } => "Delete",
+        LeafOp::Replace { .. } => "Replace",
+        LeafOp::Restore { .. } => "Restore",
+    }
 }
 
 /// Apply FileOps for a single file.
@@ -485,6 +601,7 @@ fn apply_single_file_ops<T: MutTxnT>(
     ops: &FileOps,
     stats: &mut ApplyFileOpsStats,
     next_leaf_idx: &mut u32,
+    created_inodes: &HashMap<String, Inode>,
 ) -> PristineResult<()> {
     // Resolve the TrunkId placeholder.  The recorder stores TrunkIds
     // with `change_id = NodeId::ROOT` as a placeholder meaning "this
@@ -504,7 +621,7 @@ fn apply_single_file_ops<T: MutTxnT>(
 
     // Apply trunk operation if present
     if let Some(trunk_op) = ops.trunk_op() {
-        apply_trunk_op(txn, change_id, trunk_id, path, trunk_op, stats)?;
+        apply_trunk_op(txn, trunk_id, path, trunk_op, stats, created_inodes)?;
     }
 
     // Apply line operations
@@ -518,30 +635,15 @@ fn apply_single_file_ops<T: MutTxnT>(
 /// Apply a TrunkOp (file-level operation).
 fn apply_trunk_op<T: MutTxnT>(
     txn: &mut T,
-    _change_id: NodeId,
     trunk_id: TrunkId,
     path: &str,
     trunk_op: &TrunkOp,
     stats: &mut ApplyFileOpsStats,
+    created_inodes: &HashMap<String, Inode>,
 ) -> PristineResult<()> {
     match trunk_op {
         TrunkOp::Create { encoding, .. } => {
-            // Use the inode the tree layer has already allocated for this
-            // path during `write_recorded`'s FileAdd pre-pass.  Allocating
-            // a fresh one here would create a parallel inode for the same
-            // file: the tree layer would index `path → tree_inode → pos`
-            // while the CRDT layer would index `crdt_inode → trunk`, and
-            // a caller asking "what's the CRDT trunk for the inode the
-            // tree returned for this path" would get nothing — even
-            // though both rows exist.
-            //
-            // Falling back to `alloc_inode` only when the tree has no
-            // entry preserves the original behaviour for CRDT-only
-            // callers (no FileAdd hunk).
-            let inode = match txn.get_inode(path)? {
-                Some(i) => i,
-                None => txn.alloc_inode()?,
-            };
+            let inode = resolve_created_inode(txn, path, created_inodes)?;
 
             // Create the serialized trunk record
             let serialized = SerializedTrunk {
@@ -574,6 +676,9 @@ fn apply_trunk_op<T: MutTxnT>(
             // Count as created for stats purposes
             stats.trunks_created += 1;
         }
+
+        // GraphOp::SetAttr owns persistence; FileOps carries the semantic fact.
+        TrunkOp::SetMode { .. } | TrunkOp::SetKind { .. } => {}
     }
 
     Ok(())
@@ -668,7 +773,13 @@ fn apply_line_ops_with_position<T: MutTxnT>(
 
             // Apply leaf operations for this line's tokens
             for leaf_op in content {
-                let leaf_id = LeafId::new(branch_id.change_id(), *next_leaf_idx);
+                // Leaf rows are keyed by the APPLYING change (review C1): the
+                // applier's NodeId plus the per-apply counter is globally
+                // unique, so no later apply can re-key this branch's rows or
+                // collide with a sibling branch's rows of a shared owner.
+                // For Insert-created branches the applier IS the branch's
+                // creator, so existing keying is preserved exactly here.
+                let leaf_id = LeafId::new(change_id, *next_leaf_idx);
                 *next_leaf_idx += 1;
                 apply_leaf_op(txn, branch_id, leaf_id, leaf_op, stats)?;
             }
@@ -745,9 +856,35 @@ fn apply_line_ops_with_position<T: MutTxnT>(
                 }
             }
 
+            // Tombstone the branch's previous alive tokens before inserting
+            // the replacement tokens (review C1): a Modify is semantically a
+            // delete-then-insert of the line's content, so the old tokens
+            // must not stay alive-linked to the reused branch id — otherwise
+            // the branch renders both the stale and the replacement tokens.
+            // With applier-keyed leaf ids the stale rows belong to the
+            // earlier applier's namespace and can be tombstoned without
+            // touching any other branch's rows.
+            {
+                let branch_key = encode_branch_id(&branch_id);
+                let stale: Vec<[u8; 12]> = txn
+                    .iter_branch_leaves(&branch_key)?
+                    .collect::<PristineResult<Vec<_>>>()?;
+                for leaf_key in stale {
+                    if let Some(mut row) = txn.get_crdt_leaf(&leaf_key)? {
+                        if row.state == LeafState::Alive {
+                            row.state = LeafState::Deleted;
+                            txn.put_crdt_leaf(&leaf_key, &encode_leaf_value(&row))?;
+                            stats.leaves_deleted += 1;
+                        }
+                    }
+                }
+            }
+
             // Apply leaf operations for the new content
             for leaf_op in new_content {
-                let leaf_id = LeafId::new(branch_id.change_id(), *next_leaf_idx);
+                // Applier-keyed leaf id (review C1): the modifying change owns
+                // the replacement tokens it records.
+                let leaf_id = LeafId::new(change_id, *next_leaf_idx);
                 *next_leaf_idx += 1;
                 apply_leaf_op(txn, branch_id, leaf_id, leaf_op, stats)?;
             }
@@ -840,6 +977,20 @@ fn encoding_to_u8(encoding: Option<&Encoding>) -> u8 {
 
 // Low-Level Table Operations
 
+fn resolve_created_inode<T: MutTxnT>(
+    txn: &mut T,
+    path: &str,
+    created_inodes: &HashMap<String, Inode>,
+) -> PristineResult<Inode> {
+    if let Some(inode) = created_inodes.get(path) {
+        return Ok(*inode);
+    }
+    match txn.get_inode(path)? {
+        Some(inode) => Ok(inode),
+        None => txn.alloc_inode(),
+    }
+}
+
 /// Store a trunk in the CRDT tables.
 fn put_trunk<T: MutTxnT>(
     txn: &mut T,
@@ -891,8 +1042,11 @@ fn update_trunk_path<T: MutTxnT>(
 
     // Get existing trunk
     if let Some(mut serialized) = txn.get_crdt_trunk(&key)? {
-        // Remove old path index
-        txn.del_crdt_path_trunk(&serialized.path)?;
+        // Another identity may now occupy the old path in the ambient index.
+        // Moving this trunk must not remove that other candidate's binding.
+        if txn.get_trunk_by_path(&serialized.path)? == Some(trunk_id) {
+            txn.del_crdt_path_trunk(&serialized.path)?;
+        }
 
         // Update path
         serialized.path = new_path.to_string();
@@ -1014,6 +1168,84 @@ fn update_leaf_content<T: MutTxnT>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn moving_old_identity_preserves_another_paths_index_binding() {
+        use crate::pristine::{CrdtTxnT, Pristine};
+        let temp = tempfile::tempdir().unwrap();
+        let pristine = Pristine::open(temp.path().join("move.redb")).unwrap();
+        let mut txn = pristine.write_txn().unwrap();
+        for change in [NodeId::new(1), NodeId::new(2)] {
+            let inode = txn.alloc_inode().unwrap();
+            apply_file_ops_batched_with_inodes(
+                &mut txn,
+                change,
+                &[FileOps::create(
+                    TrunkId::new(NodeId::ROOT, 0),
+                    "same".into(),
+                    None,
+                )],
+                &HashMap::from([("same".to_string(), inode)]),
+            )
+            .unwrap();
+        }
+        update_trunk_path(&mut txn, TrunkId::new(NodeId::new(1), 0), "moved").unwrap();
+        assert_eq!(
+            txn.get_trunk_by_path("same").unwrap(),
+            Some(TrunkId::new(NodeId::new(2), 0))
+        );
+        assert_eq!(
+            txn.get_trunk_by_path("moved").unwrap(),
+            Some(TrunkId::new(NodeId::new(1), 0))
+        );
+    }
+
+    #[test]
+    fn explicit_create_inodes_survive_opposite_orders_and_ambient_paths() {
+        use crate::pristine::{CrdtTxnT, Pristine};
+
+        for reverse in [false, true] {
+            for generic in [false, true] {
+                let temp = tempfile::tempdir().unwrap();
+                let pristine = Pristine::open(temp.path().join("identities.redb")).unwrap();
+                let mut txn = pristine.write_txn().unwrap();
+                let ambient = txn.alloc_inode().unwrap();
+                let first = txn.alloc_inode().unwrap();
+                let second = txn.alloc_inode().unwrap();
+                txn.put_tree("same.txt", ambient).unwrap();
+                let mut changes = [(NodeId::new(1), first), (NodeId::new(2), second)];
+                if reverse {
+                    changes.reverse();
+                }
+                for (change, inode) in changes {
+                    let trunk = TrunkId::new(NodeId::ROOT, 0);
+                    let mut ops = vec![FileOps::create(trunk, "same.txt".into(), None)];
+                    if generic {
+                        ops.push(FileOps::set_mode(trunk, "same.txt".into(), 0o644).unwrap());
+                    }
+                    apply_file_ops_batched_with_inodes(
+                        &mut txn,
+                        change,
+                        &ops,
+                        &HashMap::from([("same.txt".into(), inode)]),
+                    )
+                    .unwrap();
+                }
+                txn.commit().unwrap();
+                drop(pristine);
+
+                let pristine = Pristine::open(temp.path().join("identities.redb")).unwrap();
+                let txn = pristine.read_txn().unwrap();
+                assert_eq!(txn.get_inode("same.txt").unwrap(), Some(ambient));
+                assert!(txn.get_crdt_inode_trunk(ambient.get()).unwrap().is_none());
+                for (change, inode) in changes {
+                    let key = encode_trunk_id(&TrunkId::new(change, 0));
+                    assert_eq!(txn.get_crdt_inode_trunk(inode.get()).unwrap(), Some(key));
+                    assert_eq!(txn.get_crdt_trunk(&key).unwrap().unwrap().inode, inode);
+                }
+            }
+        }
+    }
 
     #[test]
     fn test_stats_new() {

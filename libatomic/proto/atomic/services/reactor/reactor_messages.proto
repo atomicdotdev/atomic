@@ -1,0 +1,72 @@
+// atomic-protocol — ReactorService: durable cross-project event ingestion.
+//
+// DRAFT — add-only. CONTRACT DRAFT ONLY: the server lands in Phase 3 with
+// atomicd; the contract is drafted now because the Reactor is its own first
+// consumer and the repository-outbox events (RFC D8) must rhyme with this
+// envelope (event.proto).
+//
+// Durability semantics (RFC D9) that the contract names explicitly:
+//  * append-before-acknowledgement (an acked event is durable);
+//  * globally unique event_id — duplicate ingestion is deduped, not failed;
+//  * daemon ingestion_sequence = replay order; repo/session sequences are
+//    per-stream ordering only — no semantically meaningful total order
+//    across unrelated repositories;
+//  * causation_id/correlation_id preserved across daemon proxying;
+//  * durable consumer checkpoints; at-least-once delivery — consumers are
+//    idempotent or land in dead-letter state.
+//
+// The Reactor prototype in this repo (durable inbox: append-before-ack,
+// dedup, accepted≠published, per-session ordering, replay) is the design
+// spec for the server that implements this service.
+
+syntax = "proto3";
+
+package atomic;
+
+import "google/protobuf/timestamp.proto";
+import "atomic/common/common.proto";
+import "atomic/common/event.proto";
+import "atomic/common/pagination.proto";
+
+
+
+message PublishEventRequest {
+  optional RepositoryRef repository = 1;  // repository-scoped publishes carry
+                                          // their ref; cross-project events
+                                          // omit it
+  EventEnvelope event = 2;
+}
+message PublishEventResponse {
+  uint64 ingestion_sequence = 1;    // assigned at durable append
+  optional google.protobuf.Timestamp ingested_at = 2;
+}
+
+message PublishStreamResponse {
+  uint64 accepted = 1;
+  uint64 duplicates = 2;           // deduped event_ids, not failures
+  optional uint64 last_ingestion_sequence = 3;
+}
+
+message SubscribeRequest {
+  string consumer_id = 1; // owned by authenticated principal; never ambient global ID
+  repeated string families = 2;     // type_url prefixes; empty = all authorized
+  optional bytes repository_id = 3;
+  optional string session_id = 4;
+}
+message ReplayRequest {
+  string consumer_id = 1; // same ownership and event-family/repository filtering
+  oneof from {
+    uint64 ingestion_sequence = 2;  // daemon replay order
+    PageCursor checkpoint = 3;      // last delivered checkpoint
+  }
+  optional uint64 limit = 4;
+  repeated string families = 5;
+}
+
+message CheckpointConsumerRequest {
+  string consumer_id = 1; // owner only; monotonic, no advancing beyond delivered state
+  uint64 ingestion_sequence = 2;
+  optional uint64 session_sequence = 3;
+  RequestMeta meta = 4;
+}
+message CheckpointConsumerResponse { ResponseMeta meta = 100; }

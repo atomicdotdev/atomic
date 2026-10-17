@@ -194,24 +194,84 @@ pub enum Attestation {
     Stale(Box<MemoryNode>),
 }
 
+/// The RAW attestation sources the dual-read consults — the tracked vault
+/// entry's bytes plus the legacy sidecar's text. The wire carries exactly
+/// these (the GetVaultEntry bundle), so the classification below runs in
+/// ONE place over identical inputs whether they were read in-process or
+/// fetched over the service layer.
+pub struct AttestationSources {
+    /// The tracked `attestations/memory/<id>/attested.md` entry, with its
+    /// vault path (the malformed-entry warning names it).
+    pub tracked: Option<TrackedAttestation>,
+    /// The legacy sidecar candidate's path and text.
+    pub sidecar: Option<SidecarArtifact>,
+}
+
+/// The tracked attestation entry's raw bytes.
+pub struct TrackedAttestation {
+    pub vault_path: String,
+    pub frontmatter_json: String,
+    pub content: Vec<u8>,
+}
+
+/// The legacy sidecar candidate's raw text, with its path (the
+/// unreadable-sidecar warnings name it).
+pub struct SidecarArtifact {
+    pub path: String,
+    pub text: String,
+}
+
 /// Load a memory's attestation and classify it against the current source
 /// (`inputs`). Prefers the tracked vault entry, falling back to the legacy
-/// sidecar. A missing attestation is `None`; a corrupt/malformed one is treated
-/// as `None`/skipped with a warning (fail-open, so a read still works on the
-/// raw node). Same mechanism as the intent bridge.
+/// sidecar. A missing attestation is `None`; a corrupt/malformed one is
+/// treated as `None`/skipped with a warning (fail-open, so a read still
+/// works on the raw node). Same mechanism as the intent bridge.
 pub fn load_attestation(
     repo: &Repository,
     id_or_path: &str,
     inputs: &MemLiftInputs,
 ) -> CliResult<Attestation> {
-    // 1) Tracked vault entry (authoritative). The body is the pretty JSON-LD
-    //    node (+ trailing '\n'); parse it straight to a MemoryNode.
+    // 1) Tracked vault entry (authoritative). The body is the pretty
+    //    JSON-LD node (+ trailing '\n'); the classification parses it
+    //    straight to a MemoryNode.
     let vpath = attestation_vault_path(id_or_path);
-    if let Some(entry) = repo.vault_retrieve(&vpath).map_err(CliError::Repository)? {
-        let raw = String::from_utf8_lossy(&entry.content_bytes);
+    let tracked = repo
+        .vault_retrieve(&vpath)
+        .map_err(CliError::Repository)?
+        .map(|entry| TrackedAttestation {
+            vault_path: vpath.clone(),
+            frontmatter_json: entry.frontmatter_json,
+            content: entry.content_bytes,
+        });
+    // 2) Legacy sidecar fallback (pre-upgrade attestations). Memory has
+    //    no PREFIX-N ambiguity, so there is exactly ONE candidate path.
+    let sidecar_path = attested_sidecar_path(repo, id_or_path);
+    let sidecar = if sidecar_path.exists() {
+        std::fs::read_to_string(&sidecar_path)
+            .ok()
+            .map(|text| SidecarArtifact {
+                path: sidecar_path.display().to_string(),
+                text,
+            })
+    } else {
+        None
+    };
+    Ok(classify_attestation(
+        AttestationSources { tracked, sidecar },
+        inputs,
+    ))
+}
+
+/// The dual-read classification, pure over its inputs — the same code the
+/// intent bridge runs, over the memory node shape. Both the local body
+/// (repo-read sources) and the routed path (wire-carried sources) run
+/// this SAME function.
+pub fn classify_attestation(sources: AttestationSources, inputs: &MemLiftInputs) -> Attestation {
+    if let Some(tracked) = sources.tracked {
+        let raw = String::from_utf8_lossy(&tracked.content);
         match serde_json::from_str::<MemoryNode>(raw.trim_end()) {
             Ok(node) => {
-                let recorded = serde_json::from_str::<Value>(&entry.frontmatter_json)
+                let recorded = serde_json::from_str::<Value>(&tracked.frontmatter_json)
                     .ok()
                     .and_then(|v| {
                         v.get("sourceContentHash")
@@ -219,33 +279,31 @@ pub fn load_attestation(
                             .map(str::to_owned)
                     });
                 let current = source_content_hash(inputs);
-                return Ok(match recorded {
+                return match recorded {
                     Some(h) if h == current => Attestation::Fresh(Box::new(node)),
                     _ => Attestation::Stale(Box::new(node)),
-                });
+                };
             }
             Err(e) => {
-                eprintln!("warning: ignoring malformed tracked attestation {vpath}: {e}");
+                eprintln!(
+                    "warning: ignoring malformed tracked attestation {}: {e}",
+                    tracked.vault_path
+                );
                 // fall through to the legacy sidecar
             }
         }
     }
-
-    // 2) Legacy sidecar fallback (pre-upgrade attestations). Memory has no
-    //    PREFIX-N ambiguity, so there is exactly ONE candidate path.
-    let path = attested_sidecar_path(repo, id_or_path);
-    if !path.exists() {
-        return Ok(Attestation::None);
-    }
-    let raw = std::fs::read_to_string(&path).map_err(CliError::Io)?;
-    let artifact: Value = match serde_json::from_str(&raw) {
+    let Some(sidecar) = sources.sidecar else {
+        return Attestation::None;
+    };
+    let artifact: Value = match serde_json::from_str(&sidecar.text) {
         Ok(v) => v,
         Err(e) => {
             eprintln!(
                 "warning: ignoring unreadable attestation sidecar {}: {e}",
-                path.display()
+                sidecar.path
             );
-            return Ok(Attestation::None);
+            return Attestation::None;
         }
     };
     let node_val = match artifact.get("node") {
@@ -253,9 +311,9 @@ pub fn load_attestation(
         None => {
             eprintln!(
                 "warning: attestation sidecar {} has no 'node' — ignoring",
-                path.display()
+                sidecar.path
             );
-            return Ok(Attestation::None);
+            return Attestation::None;
         }
     };
     let node: MemoryNode = match serde_json::from_value(node_val) {
@@ -263,9 +321,9 @@ pub fn load_attestation(
         Err(e) => {
             eprintln!(
                 "warning: ignoring malformed attestation node in {}: {e}",
-                path.display()
+                sidecar.path
             );
-            return Ok(Attestation::None);
+            return Attestation::None;
         }
     };
     let recorded = artifact
@@ -274,8 +332,8 @@ pub fn load_attestation(
         .and_then(Value::as_str);
     let current = source_content_hash(inputs);
     match recorded {
-        Some(h) if h == current => Ok(Attestation::Fresh(Box::new(node))),
-        _ => Ok(Attestation::Stale(Box::new(node))),
+        Some(h) if h == current => Attestation::Fresh(Box::new(node)),
+        _ => Attestation::Stale(Box::new(node)),
     }
 }
 

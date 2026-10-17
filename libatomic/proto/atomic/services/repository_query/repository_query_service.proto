@@ -1,0 +1,80 @@
+// atomic-protocol — RepositoryQueryService definition (the RPC contract).
+// DRAFT — add-only. Messages for this service live in
+// atomic/services/repository_query/repository_query_messages.proto · shared primitives in atomic/common/.
+
+syntax = "proto3";
+
+package atomic;
+
+import "atomic/common/options.proto";
+import "atomic/services/repository_query/repository_query_messages.proto";
+
+service RepositoryQueryService {
+  // Working-copy status is strictly read-only. --reindex is an explicit
+  // MaintenanceService.ReindexWorkspace followed by this read.
+  rpc Status(StatusRequest) returns (StatusResponse) {
+    option (atomic.execution_scope) = EXECUTION_SCOPE_LOCAL;
+    option (atomic.required_capability) = "repository.read";
+    option (atomic.required_capability) = "working-copy.read";
+    option (atomic.allowed_caller) = CALLER_CLASS_LOCAL;
+    option (atomic.effect) = RPC_EFFECT_REPOSITORY_READ;
+    option (atomic.effect) = RPC_EFFECT_WORKSPACE_READ;
+  }
+  // `atomic log [--all]` — paged change history.
+  rpc Log(LogRequest) returns (LogResponse) {
+    option (atomic.execution_scope) = EXECUTION_SCOPE_BOTH;
+    option (atomic.required_capability) = "repository.read";
+    option (atomic.allowed_caller) = CALLER_CLASS_LOCAL;
+    option (atomic.allowed_caller) = CALLER_CLASS_REMOTE_IDENTITY;
+    option (atomic.effect) = RPC_EFFECT_REPOSITORY_READ;
+  }
+  // `atomic change <HASH|#N>` — one change, sections requested by includes
+  // (one RPC instead of per-section verbs).
+  rpc GetChange(GetChangeRequest) returns (GetChangeResponse) {
+    option (atomic.execution_scope) = EXECUTION_SCOPE_BOTH;
+    option (atomic.required_capability) = "repository.read";
+    option (atomic.allowed_caller) = CALLER_CLASS_LOCAL;
+    option (atomic.allowed_caller) = CALLER_CLASS_REMOTE_IDENTITY;
+    option (atomic.effect) = RPC_EFFECT_REPOSITORY_READ;
+  }
+  // Repository-level ref-pair diff. No server filesystem access.
+  rpc Diff(DiffRequest) returns (stream DiffChunk) {
+    option (atomic.execution_scope) = EXECUTION_SCOPE_BOTH;
+    option (atomic.required_capability) = "repository.read";
+    option (atomic.allowed_caller) = CALLER_CLASS_LOCAL;
+    option (atomic.allowed_caller) = CALLER_CLASS_REMOTE_IDENTITY;
+    option (atomic.effect) = RPC_EFFECT_REPOSITORY_READ;
+  }
+  rpc DiffWorkingCopy(DiffWorkingCopyRequest) returns (stream DiffChunk) {
+    option (atomic.execution_scope) = EXECUTION_SCOPE_LOCAL;
+    option (atomic.required_capability) = "repository.read";
+    option (atomic.required_capability) = "working-copy.read";
+    option (atomic.allowed_caller) = CALLER_CLASS_LOCAL;
+    option (atomic.effect) = RPC_EFFECT_REPOSITORY_READ;
+    option (atomic.effect) = RPC_EFFECT_WORKSPACE_READ;
+  }
+  // One planning surface, no apply flag and no RequestMeta/replay writes.
+  rpc PreviewMutation(PreviewMutationRequest) returns (PreviewMutationResponse) {
+    option (atomic.execution_scope) = EXECUTION_SCOPE_BOTH;
+    option (atomic.required_capability) = "repository.read";
+    option (atomic.allowed_caller) = CALLER_CLASS_LOCAL;
+    option (atomic.allowed_caller) = CALLER_CLASS_REMOTE_IDENTITY;
+    option (atomic.effect) = RPC_EFFECT_REPOSITORY_READ;
+  }
+  rpc PreviewRestore(PreviewRestoreRequest) returns (PreviewMutationResponse) {
+    option (atomic.execution_scope) = EXECUTION_SCOPE_LOCAL;
+    option (atomic.required_capability) = "repository.read";
+    option (atomic.required_capability) = "working-copy.read";
+    option (atomic.allowed_caller) = CALLER_CLASS_LOCAL;
+    option (atomic.effect) = RPC_EFFECT_REPOSITORY_READ;
+    option (atomic.effect) = RPC_EFFECT_WORKSPACE_READ;
+  }
+  // `atomic conflicts` — files carrying conflict markers.
+  rpc ListConflicts(ListConflictsRequest) returns (ListConflictsResponse) {
+    option (atomic.execution_scope) = EXECUTION_SCOPE_LOCAL;
+    option (atomic.required_capability) = "working-copy.read";
+    option (atomic.allowed_caller) = CALLER_CLASS_LOCAL;
+    option (atomic.effect) = RPC_EFFECT_REPOSITORY_READ;
+    option (atomic.effect) = RPC_EFFECT_WORKSPACE_READ;
+  }
+}

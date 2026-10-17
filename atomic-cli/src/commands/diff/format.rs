@@ -8,19 +8,19 @@ use super::*;
 
 impl Diff {
     /// Print the diff in unified format.
-    pub(super) fn print_unified(
+    pub(crate) fn print_unified(
         &self,
         file_diffs: &[FileDiff],
         config: &DiffOutputConfig,
     ) -> CliResult<()> {
         for file_diff in file_diffs {
-            // Print file header
-            let old_path = if config.show_path_prefix {
+            // Print file header (/dev/null sides keep their bare form)
+            let old_path = if config.show_path_prefix && file_diff.old_path != "/dev/null" {
                 format!("a/{}", file_diff.old_path)
             } else {
                 file_diff.old_path.clone()
             };
-            let new_path = if config.show_path_prefix {
+            let new_path = if config.show_path_prefix && file_diff.new_path != "/dev/null" {
                 format!("b/{}", file_diff.new_path)
             } else {
                 file_diff.new_path.clone()
@@ -364,7 +364,7 @@ impl Diff {
     }
 
     /// Print the diff in stat format.
-    pub(super) fn print_stat(&self, stats: &DiffStats, config: &DiffOutputConfig) -> CliResult<()> {
+    pub(crate) fn print_stat(&self, stats: &DiffStats, config: &DiffOutputConfig) -> CliResult<()> {
         if !stats.has_changes() {
             return Ok(());
         }
@@ -441,7 +441,7 @@ impl Diff {
     }
 
     /// Print file names only.
-    pub(super) fn print_name_only(&self, file_diffs: &[FileDiff]) -> CliResult<()> {
+    pub(crate) fn print_name_only(&self, file_diffs: &[FileDiff]) -> CliResult<()> {
         for file_diff in file_diffs {
             println!("{}", file_diff.display_path());
         }
@@ -449,7 +449,7 @@ impl Diff {
     }
 
     /// Print file names with status.
-    pub(super) fn print_name_status(
+    pub(crate) fn print_name_status(
         &self,
         file_diffs: &[FileDiff],
         config: &DiffOutputConfig,

@@ -17,9 +17,10 @@ use std::time::Duration;
 /// Budget for opening the repository database when another process may hold
 /// the writer lock (session starts, ledger reads, checkpoint publication).
 ///
-/// Override with `ATOMIC_DB_LOCK_WAIT_MS`.
+/// The shared database-open budget — the daemon's opens wait on the same
+/// knob. Override with `ATOMIC_DB_LOCK_WAIT_MS`.
 pub fn database_wait() -> Duration {
-    env_millis("ATOMIC_DB_LOCK_WAIT_MS", 30_000)
+    atomic_repository::database_lock_wait()
 }
 
 /// Budget a Stop waits for another session's Stop to finish publishing its

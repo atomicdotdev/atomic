@@ -1,0 +1,21 @@
+[package]
+name = "atomic-client"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Transport-independent Atomic client: connect over the local daemon socket"
+
+[dependencies]
+libatomic = { workspace = true }
+tonic = { workspace = true }
+tokio = { workspace = true }
+libc = { workspace = true }
+tower = { workspace = true }
+hyper-util = { workspace = true }
+
+[dev-dependencies]
+atomic-repository = { workspace = true }
+tokio = { workspace = true }

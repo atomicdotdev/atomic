@@ -27,12 +27,13 @@ use crate::output::{print_error, print_success, print_warning};
 
 // Disable Command
 
-/// Remove agent hooks from the repository.
+/// Remove agent hooks.
 ///
 /// Removes Atomic hooks from the agent's configuration file while
-/// preserving any non-Atomic hooks. Session state files in
-/// `.atomic/sessions/` are not deleted — use `atomic agent sessions clean`
-/// for that.
+/// preserving any non-Atomic hooks — from the repository's config, the
+/// home config, and any installed integration package. Session state
+/// files in `.atomic/sessions/` are not deleted — use
+/// `atomic agent sessions clean` for that.
 #[derive(Debug, Args)]
 pub struct Disable {
     /// Which agent to remove hooks for.
@@ -48,13 +49,6 @@ pub struct Disable {
     /// currently installed.
     #[arg(long)]
     all: bool,
-
-    /// Remove hooks from global ~/.claude/settings.json.
-    ///
-    /// Removes the globally installed hooks that were added with
-    /// `atomic agent enable --global`.
-    #[arg(short, long)]
-    global: bool,
 
     /// Remove hooks described by an integration-supplied manifest file.
     ///
@@ -72,20 +66,31 @@ impl Disable {
         Self {
             agent: None,
             all: false,
-            global: false,
             hooks: None,
         }
     }
 }
 
 /// Agents with anything to uninstall: adapter-reported installs (hooks in
-/// agent config) plus agents with an integration receipt (package files).
-fn agents_with_installs(registry: &AgentRegistry, repo_root: &std::path::Path) -> Vec<String> {
+/// agent config, at the uninstall base or in the home config) plus agents
+/// with an integration receipt (package files).
+fn agents_with_installs(registry: &AgentRegistry, install_base: &std::path::Path) -> Vec<String> {
     let mut names: Vec<String> = registry
-        .installed(repo_root)
+        .installed(install_base)
         .iter()
         .map(|s| s.to_string())
         .collect();
+
+    // Hooks also live in the home config: the integration packages target
+    // it directly, and the pre-package global installs put them there too.
+    if let Some(home) = dirs::home_dir() {
+        for name in registry.installed(&home) {
+            if !names.iter().any(|n| n == name) {
+                names.push(name.to_string());
+            }
+        }
+    }
+
     for name in atomic_agent::integrations::registered_integrations() {
         if names.iter().any(|n| n == &name) {
             continue;
@@ -104,18 +109,30 @@ impl Command for Disable {
             return self.run_manifest(manifest);
         }
 
-        // Global uninstall — removes from ~/.claude/settings.json
-        if self.global {
-            return self.run_global();
-        }
-
-        let repo_root = find_repository_root()?;
+        // Uninstall base: the repo root inside a repository, or the home
+        // directory outside one — mirroring `enable`. Hooks may also live
+        // in the home config regardless (integration packages target it
+        // directly), so the loop below always cleans both scopes.
+        let install_base = match find_repository_root() {
+            Ok(root) => root,
+            Err(_) => {
+                print_warning(
+                    "No Atomic repository found — removing hooks from the home directory.",
+                );
+                dirs::home_dir().ok_or_else(|| {
+                    crate::error::CliError::Io(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        "Could not determine the home directory",
+                    ))
+                })?
+            }
+        };
         let registry = AgentRegistry::with_defaults();
 
         // Determine which agents to uninstall
         let agents_to_disable: Vec<String> = if self.all {
             // Uninstall from all agents that have hooks installed
-            let installed = agents_with_installs(&registry, &repo_root);
+            let installed = agents_with_installs(&registry, &install_base);
             if installed.is_empty() {
                 println!("No agent hooks are currently installed.");
                 return Ok(());
@@ -131,7 +148,7 @@ impl Command for Disable {
             vec![name.clone()]
         } else {
             // Auto: uninstall from all agents that have hooks installed
-            let installed = agents_with_installs(&registry, &repo_root);
+            let installed = agents_with_installs(&registry, &install_base);
             if installed.is_empty() {
                 println!("No agent hooks are currently installed.");
                 println!("Use 'atomic agent enable' to install hooks first.");
@@ -188,18 +205,36 @@ impl Command for Disable {
                 }
             }
 
-            if agent.is_installed(&repo_root) {
-                match agent.uninstall(&repo_root) {
-                    Ok(()) => {
-                        print_success(&format!("Removed hooks for {}", agent.display_name(),));
-                        removed_any = true;
-                    }
-                    Err(e) => {
-                        print_error(&format!(
-                            "Failed to remove hooks for {}: {}",
-                            agent.display_name(),
-                            e,
-                        ));
+            // Built-in hooks live relative to a base directory: the repo
+            // root inside a repository, or the home directory outside one.
+            // The home config is also always checked — the integration
+            // packages and the pre-package global installs put hooks
+            // there — so one `disable` cleans every scope Atomic wrote.
+            let mut bases: Vec<std::path::PathBuf> = vec![install_base.clone()];
+            if let Some(home) = dirs::home_dir() {
+                if !bases.iter().any(|b| b == &home) {
+                    bases.push(home);
+                }
+            }
+            for base in &bases {
+                if agent.is_installed(base) {
+                    match agent.uninstall(base) {
+                        Ok(()) => {
+                            print_success(&format!(
+                                "Removed hooks for {} ({})",
+                                agent.display_name(),
+                                base.display(),
+                            ));
+                            removed_any = true;
+                        }
+                        Err(e) => {
+                            print_error(&format!(
+                                "Failed to remove hooks for {} ({}): {}",
+                                agent.display_name(),
+                                base.display(),
+                                e,
+                            ));
+                        }
                     }
                 }
             }
@@ -257,148 +292,6 @@ impl Disable {
         }
         Ok(())
     }
-
-    /// Remove hooks from global agent settings.
-    ///
-    /// Supports:
-    /// - `claude-code` → `~/.claude/settings.json`
-    /// - `gemini-cli` → `~/.gemini/settings.json`
-    /// - `agy` → `~/.gemini/config/plugins/atomic/` (plugin)
-    /// - `codex` → `~/.codex/hooks.json`
-    /// - No `--agent` flag → removes from all agents that have global hooks
-    fn run_global(&self) -> CliResult<()> {
-        use atomic_agent::hooks::claude_code::ClaudeCodeHook;
-        use atomic_agent::hooks::codex::CodexHook;
-        use atomic_agent::hooks::gemini_cli::GeminiCliHook;
-
-        let agents: Vec<&str> = if let Some(ref name) = self.agent {
-            vec![name.as_str()]
-        } else {
-            // No agent specified — check all supported agents
-            let mut found = Vec::new();
-            if ClaudeCodeHook::new().is_installed_global() {
-                found.push("claude-code");
-            }
-            if GeminiCliHook::new().is_installed_global() {
-                found.push("gemini-cli");
-            }
-            // agy's global plugin is integration-installed; check its receipt.
-            if atomic_agent::integrations::Receipt::load("agy")
-                .map(|r| r.is_some())
-                .unwrap_or(false)
-            {
-                found.push("agy");
-            }
-            if CodexHook::new().is_installed_global() {
-                found.push("codex");
-            }
-            found
-        };
-
-        if agents.is_empty() {
-            println!("No global hooks installed.");
-            return Ok(());
-        }
-
-        let mut total_removed = 0;
-
-        for agent_name in &agents {
-            match *agent_name {
-                "claude-code" => {
-                    let hook = ClaudeCodeHook::new();
-                    if !hook.is_installed_global() {
-                        continue;
-                    }
-                    match hook.uninstall_global() {
-                        Ok(()) => {
-                            print_success("Removed global hooks from ~/.claude/settings.json");
-                            total_removed += 1;
-                        }
-                        Err(e) => {
-                            print_error(&format!(
-                                "Failed to remove Claude Code global hooks: {}",
-                                e
-                            ));
-                        }
-                    }
-                }
-                "gemini-cli" => {
-                    let hook = GeminiCliHook::new();
-                    if !hook.is_installed_global() {
-                        continue;
-                    }
-                    match hook.uninstall_global() {
-                        Ok(()) => {
-                            print_success("Removed global hooks from ~/.gemini/settings.json");
-                            total_removed += 1;
-                        }
-                        Err(e) => {
-                            print_error(&format!(
-                                "Failed to remove Gemini CLI global hooks: {}",
-                                e
-                            ));
-                        }
-                    }
-                }
-                "agy" => {
-                    // The agy plugin is integration-installed — remove it
-                    // per its receipt (plugin files, skills, registration).
-                    match atomic_agent::integrations::uninstall("agy") {
-                        Ok(outcome) => {
-                            print_success(&format!(
-                                "Removed the atomic plugin from ~/.gemini/config/plugins/ ({} files)",
-                                outcome.removed.len(),
-                            ));
-                            total_removed += 1;
-                        }
-                        Err(e) => {
-                            print_error(&format!("Failed to remove Antigravity CLI plugin: {}", e));
-                        }
-                    }
-                }
-                "codex" => {
-                    let hook = CodexHook::new();
-                    if !hook.is_installed_global() {
-                        continue;
-                    }
-                    match hook.uninstall_global() {
-                        Ok(()) => {
-                            print_success("Removed global hooks from ~/.codex/hooks.json");
-                            total_removed += 1;
-                        }
-                        Err(e) => {
-                            print_error(&format!("Failed to remove Codex global hooks: {}", e));
-                        }
-                    }
-                }
-                "kiro" => {
-                    print_success("Kiro hooks are configured through the IDE panel.");
-                    println!(
-                        "  Remove hooks manually in Kiro IDE \u{2192} Agent Steering & Skills."
-                    );
-                    println!("  Uninstall the integration: atomic agent disable --agent kiro");
-                }
-                "kilo" => {
-                    print_success("Kilo Code hooks are configured through kilo.jsonc.");
-                    println!("  Uninstall the integration: atomic agent disable --agent kilo");
-                }
-                other => {
-                    print_warning(&format!(
-                        "Global disable is not supported for '{}'. Supported agents: claude-code, gemini-cli, agy, codex, kilo, kiro",
-                        other
-                    ));
-                }
-            }
-        }
-
-        if total_removed > 0 {
-            println!();
-            println!("Agent turns will no longer be recorded automatically.");
-            println!("Use 'atomic agent enable --global' to re-enable.");
-        }
-
-        Ok(())
-    }
 }
 
 // Tests
@@ -412,7 +305,6 @@ mod tests {
         let cmd = Disable::default_for_test();
         assert!(cmd.agent.is_none());
         assert!(!cmd.all);
-        assert!(!cmd.global);
     }
 
     #[test]
@@ -420,7 +312,6 @@ mod tests {
         let cmd = Disable {
             agent: Some("claude-code".to_string()),
             all: false,
-            global: false,
             hooks: None,
         };
         assert_eq!(cmd.agent.as_deref(), Some("claude-code"));
@@ -431,21 +322,9 @@ mod tests {
         let cmd = Disable {
             agent: None,
             all: true,
-            global: false,
             hooks: None,
         };
         assert!(cmd.all);
-    }
-
-    #[test]
-    fn test_disable_with_global() {
-        let cmd = Disable {
-            agent: None,
-            all: false,
-            global: true,
-            hooks: None,
-        };
-        assert!(cmd.global);
     }
 
     #[test]

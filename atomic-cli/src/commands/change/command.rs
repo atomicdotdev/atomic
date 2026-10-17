@@ -75,6 +75,26 @@ pub struct ChangeCmd {
     pub full_hash: bool,
 }
 
+/// Everything the change renders need beyond the change itself: the causal
+/// decision graph(s) and (for `--show-deps`) dependency messages. The local
+/// path fetches these from the repository; the routed path gets them from
+/// the wire (GetChange's bundle + provenance ledger). One render either way.
+pub(crate) struct ChangeRenderData {
+    pub ledger_graphs: Vec<(Hash, ProvenanceGraph)>,
+    pub dep_messages: std::collections::HashMap<Hash, String>,
+}
+
+impl ChangeRenderData {
+    /// The local repository path. Dependency messages (for `--show-deps`)
+    /// are filled by the caller once the change's dependency list is known.
+    pub(crate) fn from_repo(repo: &Repository, hash: &Hash) -> Self {
+        Self {
+            ledger_graphs: repo.find_provenance_for_change(hash).unwrap_or_default(),
+            dep_messages: std::collections::HashMap::new(),
+        }
+    }
+}
+
 impl ChangeCmd {
     /// Create a new ChangeCmd with default settings.
     pub fn new() -> Self {
@@ -291,7 +311,7 @@ impl ChangeCmd {
         change: &Change,
         hash: &Hash,
         sequence: Option<u64>,
-        repo: &Repository,
+        data: &ChangeRenderData,
     ) -> String {
         let mut output = String::new();
         let hash_len = self.get_hash_length();
@@ -343,17 +363,9 @@ impl ChangeCmd {
             for dep_hash in &change.hashed.dependencies {
                 let dep_hash_str = format_hash_with_length(dep_hash, 12);
                 let dep_msg = if self.show_deps {
-                    repo.load_change(dep_hash)
-                        .ok()
-                        .map(|c| {
-                            c.hashed
-                                .header
-                                .message
-                                .lines()
-                                .next()
-                                .unwrap_or("")
-                                .to_string()
-                        })
+                    data.dep_messages
+                        .get(dep_hash)
+                        .cloned()
                         .unwrap_or_else(|| "[unable to load]".to_string())
                 } else {
                     String::new()
@@ -391,6 +403,57 @@ impl ChangeCmd {
                     .unwrap_or(false)
                 {
                     output.push_str(&format!("  {}\n", hint("(merge commit)")));
+                }
+            }
+        }
+
+        if let Ok(Some(evidence)) = extract_move_evidence(change) {
+            output.push('\n');
+            output.push_str("Move evidence:\n");
+            for moved in evidence.authoritative_moves {
+                let authority = match moved.authority {
+                    MoveAuthority::ExplicitAtomicMove => "explicit atomic move",
+                    MoveAuthority::StableInodeProjection => "stable inode projection",
+                };
+                output.push_str(&format!(
+                    "  authoritative: {} → {} ({})\n",
+                    moved.old_path, moved.new_path, authority
+                ));
+            }
+            for moved in evidence.probable_moves {
+                let basis = match moved.basis {
+                    MoveBasis::ByteIdentity => "byte identity",
+                    MoveBasis::ContentSimilarity => "content similarity",
+                };
+                output.push_str(&format!(
+                    "  probable: {} → {} ({}.{:02}%, {})\n",
+                    moved.old_path,
+                    moved.new_path,
+                    moved.score / 100,
+                    moved.score % 100,
+                    basis
+                ));
+            }
+            for loss in evidence.loss_notes {
+                match loss {
+                    LossNote::RenameUnresolved { candidates } => {
+                        output.push_str("  loss: rename unresolved; retained delete + add\n");
+                        for candidate in candidates {
+                            output.push_str(&format!(
+                                "    candidate: {} → {} ({}.{:02}%)\n",
+                                candidate.source_path,
+                                candidate.destination_path,
+                                candidate.score / 100,
+                                candidate.score % 100
+                            ));
+                        }
+                    }
+                    LossNote::EmptyDirectory { path } => {
+                        output.push_str(&format!(
+                            "  loss: empty directory '{}' omitted from Git tree projection\n",
+                            path
+                        ));
+                    }
                 }
             }
         }
@@ -433,7 +496,7 @@ impl ChangeCmd {
         }
 
         // Change ledger (causal decision DAG from .provenance file)
-        output.push_str(&self.format_change_ledger(hash, repo));
+        output.push_str(&self.format_change_ledger(&data.ledger_graphs));
 
         output
     }
@@ -564,29 +627,20 @@ impl ChangeCmd {
     ///
     /// Displays the structured provenance graph stored in the `.provenance`
     /// file: goals, tool executions, explorations, commitments, and patch
-    /// proposals that led to this change.
-    fn format_change_ledger(&self, change_hash: &Hash, repo: &Repository) -> String {
+    /// proposals that led to this change. The graphs arrive from the render
+    /// data (repository or wire — one render either way).
+    fn format_change_ledger(&self, graphs: &[(Hash, ProvenanceGraph)]) -> String {
         let mut output = String::new();
 
-        let graphs = match repo.find_provenance_for_change(change_hash) {
-            Ok(g) if !g.is_empty() => g,
-            Ok(_) => {
-                output.push_str(&format!(
-                    "{}\n",
-                    hint("No provenance graph found for this change.")
-                ));
-                return output;
-            }
-            Err(e) => {
-                output.push_str(&format!(
-                    "{}\n",
-                    hint(&format!("Failed to load provenance: {}", e))
-                ));
-                return output;
-            }
-        };
+        if graphs.is_empty() {
+            output.push_str(&format!(
+                "{}\n",
+                hint("No provenance graph found for this change.")
+            ));
+            return output;
+        }
 
-        for (_graph_hash, graph) in &graphs {
+        for (_graph_hash, graph) in graphs {
             output.push_str(&format!("{}\n", emphasis("=== Change Ledger ===")));
             output.push_str(&format!("  Session: {}\n", info(&graph.session_id)));
             output.push_str(&format!(
@@ -659,21 +713,26 @@ impl ChangeCmd {
     /// `.provenance` file — for JSON output. Mirrors the `=== Change Ledger ===`
     /// section of the default text format. Missing/corrupt provenance is
     /// non-fatal: the ledger simply stays empty (and is omitted from the JSON).
-    fn load_json_ledger(&self, hash: &Hash, repo: &Repository) -> Vec<JsonChangeLedger> {
-        repo.find_provenance_for_change(hash)
-            .unwrap_or_default()
+    fn load_json_ledger(&self, graphs: &[(Hash, ProvenanceGraph)]) -> Vec<JsonChangeLedger> {
+        graphs
             .iter()
             .map(|(graph_hash, graph)| JsonChangeLedger::from_graph(graph_hash, graph))
             .collect()
     }
 
     /// Print the change in the configured format.
-    fn print_change(&self, change: &Change, hash: &Hash, sequence: Option<u64>, repo: &Repository) {
+    pub(crate) fn print_change(
+        &self,
+        change: &Change,
+        hash: &Hash,
+        sequence: Option<u64>,
+        data: &ChangeRenderData,
+    ) {
         let output = match self.format {
-            ChangeFormat::Default => self.format_default(change, hash, sequence, repo),
+            ChangeFormat::Default => self.format_default(change, hash, sequence, data),
             ChangeFormat::Short => self.format_short(change, hash, sequence),
             ChangeFormat::Json => {
-                let ledger = self.load_json_ledger(hash, repo);
+                let ledger = self.load_json_ledger(&data.ledger_graphs);
                 self.format_json(change, hash, sequence, ledger)
             }
         };
@@ -738,6 +797,10 @@ impl Command for ChangeCmd {
     /// - The change is not found
     /// - The hash prefix is ambiguous
     fn run(&self) -> CliResult<()> {
+        if crate::commands::rpc::change(self)? {
+            return Ok(());
+        }
+
         // Find and open repository
         let repo_root = find_repository_root()?;
         let repo = crate::commands::open_readonly_repository(&repo_root).map_err(|e| match e {
@@ -761,8 +824,22 @@ impl Command for ChangeCmd {
             other => CliError::Internal(anyhow::anyhow!("{}", other)),
         })?;
 
+        // The render data from the repository (dep messages for --show-deps)
+        let mut data = ChangeRenderData::from_repo(&repo, &hash);
+        if self.show_deps {
+            for dep_hash in &change.hashed.dependencies {
+                let message = repo
+                    .load_change(dep_hash)
+                    .ok()
+                    .and_then(|c| c.hashed.header.message.lines().next().map(str::to_string));
+                if let Some(message) = message {
+                    data.dep_messages.insert(*dep_hash, message);
+                }
+            }
+        }
+
         // Print the change
-        self.print_change(&change, &hash, sequence, &repo);
+        self.print_change(&change, &hash, sequence, &data);
 
         Ok(())
     }
@@ -822,108 +899,6 @@ fn get_hunk_path<H>(graph_op: &GraphOp<H>) -> Option<String> {
         GraphOp::ResurrectZombies { local, .. } => Some(local.path.clone()),
         GraphOp::AddRoot { .. } => None,
         GraphOp::DelRoot { .. } => None,
+        GraphOp::SetAttr { path, .. } => Some(path.clone()),
     }
-}
-
-/// Get symbol and path for a graph_op (for display).
-fn hunk_symbol_and_path<H>(graph_op: &GraphOp<H>) -> (&'static str, String) {
-    match graph_op {
-        GraphOp::FileAdd { path, .. } => ("+", path.clone()),
-        GraphOp::FileDel { path, .. } => ("-", path.clone()),
-        GraphOp::FileMove { path, .. } => ("→", path.clone()),
-        GraphOp::FileUndel { path, .. } => ("↑", path.clone()),
-        GraphOp::DirAdd { path, .. } => ("📁+", path.clone()),
-        GraphOp::DirDel { path, .. } => ("📁-", path.clone()),
-        GraphOp::DirUndel { path, .. } => ("📁↑", path.clone()),
-        GraphOp::Edit { local, .. } => ("~", local.path.clone()),
-        GraphOp::Replacement { local, .. } => ("±", local.path.clone()),
-        GraphOp::SolveNameConflict { path, .. } => ("✓", path.clone()),
-        GraphOp::UnsolveNameConflict { path, .. } => ("!", path.clone()),
-        GraphOp::SolveOrderConflict { local, .. } => ("✓", local.path.clone()),
-        GraphOp::UnsolveOrderConflict { local, .. } => ("!", local.path.clone()),
-        GraphOp::ResurrectZombies { local, .. } => ("↑", local.path.clone()),
-        GraphOp::AddRoot { .. } => ("◉", "(root)".to_string()),
-        GraphOp::DelRoot { .. } => ("⊘", "(root)".to_string()),
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct HunkDisplaySummary {
-    pub symbol: &'static str,
-    pub path: String,
-    pub info: String,
-}
-
-#[derive(Debug, Clone)]
-struct HunkDisplayAggregate {
-    symbol: &'static str,
-    total: usize,
-    infos: std::collections::BTreeMap<String, usize>,
-}
-
-pub(crate) fn hunk_display_summaries<H>(hunks: &[GraphOp<H>]) -> Vec<HunkDisplaySummary> {
-    let mut by_path: std::collections::BTreeMap<String, HunkDisplayAggregate> =
-        std::collections::BTreeMap::new();
-
-    for graph_op in hunks {
-        let (symbol, path) = hunk_symbol_and_path(graph_op);
-        let info = hunk_atom_info(graph_op);
-        let aggregate = by_path.entry(path).or_insert_with(|| HunkDisplayAggregate {
-            symbol,
-            total: 0,
-            infos: std::collections::BTreeMap::new(),
-        });
-        aggregate.symbol = merge_hunk_symbols(aggregate.symbol, symbol);
-        aggregate.total += 1;
-        *aggregate.infos.entry(info).or_insert(0) += 1;
-    }
-
-    by_path
-        .into_iter()
-        .map(|(path, aggregate)| HunkDisplaySummary {
-            symbol: aggregate.symbol,
-            path,
-            info: format_hunk_aggregate_info(aggregate.total, &aggregate.infos),
-        })
-        .collect()
-}
-
-fn merge_hunk_symbols(current: &'static str, next: &'static str) -> &'static str {
-    if current == next {
-        return current;
-    }
-    if current == "±" || next == "±" {
-        return "±";
-    }
-    match (current, next) {
-        ("+", "~") | ("~", "+") | ("+", "-") | ("-", "+") | ("~", "-") | ("-", "~") => "±",
-        ("📁+", "📁-") | ("📁-", "📁+") => "±",
-        _ => current,
-    }
-}
-
-fn format_hunk_aggregate_info(
-    total: usize,
-    infos: &std::collections::BTreeMap<String, usize>,
-) -> String {
-    if total == 1 {
-        return infos
-            .keys()
-            .next()
-            .cloned()
-            .unwrap_or_else(|| "(1 hunk)".to_string());
-    }
-
-    let details = infos
-        .iter()
-        .map(|(info, count)| format!("{}x {}", count, trim_hunk_info(info)))
-        .collect::<Vec<_>>()
-        .join("; ");
-    format!("({} hunks: {})", total, details)
-}
-
-fn trim_hunk_info(info: &str) -> &str {
-    info.strip_prefix('(')
-        .and_then(|s| s.strip_suffix(')'))
-        .unwrap_or(info)
 }

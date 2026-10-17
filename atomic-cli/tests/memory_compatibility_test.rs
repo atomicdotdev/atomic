@@ -1,6 +1,5 @@
 //! Compatibility coverage for freeform memories.
 #![cfg(not(windows))]
-
 use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Output, Stdio};

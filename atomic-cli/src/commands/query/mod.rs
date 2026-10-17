@@ -276,6 +276,12 @@ const MAX_GRAPH_NODES_HTML: usize = 5000;
 
 impl Command for QueryGraph {
     fn run(&self) -> CliResult<()> {
+        // Route every form through the service layer: the seed/expand/
+        // filter/cap build runs handler-side; the DOT/HTML/JSON renders
+        // stay client-side over the wire-carried subgraph.
+        if crate::commands::rpc::query_graph(self)? {
+            return Ok(());
+        }
         let root = find_repository_root()?;
         let repo = Repository::open(&root).map_err(CliError::Repository)?;
 
@@ -493,7 +499,7 @@ impl Command for QueryGraph {
 }
 
 /// Generate a DOT (Graphviz) representation of a subgraph.
-fn emit_dot(nodes: &[KgNode], edges: &[KgEdge]) -> String {
+pub(crate) fn emit_dot(nodes: &[KgNode], edges: &[KgEdge]) -> String {
     let mut out = String::new();
     out.push_str("digraph query {\n");
     out.push_str("  rankdir=LR;\n");
@@ -619,7 +625,7 @@ fn dot_escape_label(s: &str) -> String {
 }
 
 /// Generate a self-contained HTML page with a D3.js force-directed graph.
-fn emit_html(query: &str, nodes: &[KgNode], edges: &[KgEdge]) -> String {
+pub(crate) fn emit_html(query: &str, nodes: &[KgNode], edges: &[KgEdge]) -> String {
     // Build JSON data for embedding
     let graph_nodes: Vec<serde_json::Value> = nodes
         .iter()
@@ -1028,7 +1034,7 @@ fn emit_html(query: &str, nodes: &[KgNode], edges: &[KgEdge]) -> String {
 }
 
 /// Truncate display text on character boundaries and append `...`.
-fn truncate_display(s: &str, max_chars: usize) -> String {
+pub(crate) fn truncate_display(s: &str, max_chars: usize) -> String {
     if s.chars().count() <= max_chars {
         s.to_string()
     } else {
@@ -1070,6 +1076,10 @@ pub struct QueryNodes {
 
 impl Command for QueryNodes {
     fn run(&self) -> CliResult<()> {
+        if crate::commands::rpc::query_search(self)? {
+            return Ok(());
+        }
+
         let root = find_repository_root()?;
         let repo = Repository::open(&root).map_err(CliError::Repository)?;
 
@@ -1143,6 +1153,10 @@ pub struct QueryNeighbors {
 
 impl Command for QueryNeighbors {
     fn run(&self) -> CliResult<()> {
+        if crate::commands::rpc::query_neighbors(self)? {
+            return Ok(());
+        }
+
         let root = find_repository_root()?;
         let repo = Repository::open(&root).map_err(CliError::Repository)?;
 
@@ -1198,6 +1212,11 @@ pub struct QueryCallers {
 
 impl Command for QueryCallers {
     fn run(&self) -> CliResult<()> {
+        // Route every form through the service layer (the handler filters
+        // the subgraph to CALLS edges at the entity).
+        if crate::commands::rpc::query_callers(self)? {
+            return Ok(());
+        }
         let root = find_repository_root()?;
         let repo = Repository::open(&root).map_err(CliError::Repository)?;
 
@@ -1285,7 +1304,6 @@ pub struct QueryEntities {
 impl Command for QueryEntities {
     fn run(&self) -> CliResult<()> {
         let root = find_repository_root()?;
-        let _repo = Repository::open(&root).map_err(CliError::Repository)?;
 
         if !atomic_semantic::is_supported(&self.path) {
             println!("Unsupported file type: {}", self.path);
@@ -1375,7 +1393,8 @@ impl Command for QueryCode {
             Err(atomic_repository::ContentSearchError::IndexNotFound) => {
                 println!(
                     "Content index not found.\n\n  \
-                         Run `atomic vault query enrich` to build it, then retry."
+                         Run `atomic vault query index` to build it, then retry.\n  \
+                         (`atomic vault query enrich` also builds it as part of full enrichment.)"
                 );
                 return Ok(());
             }
@@ -1558,9 +1577,12 @@ mod enrich_tests {
         repo.init_kg().unwrap();
 
         std::fs::write(temp.path().join("lesson.txt"), "durable fact\n").unwrap();
-        repo.add("lesson.txt", Default::default()).unwrap();
+        let working_copy = repo.require_working_copy_id().unwrap();
+        repo.add(working_copy, "lesson.txt", Default::default())
+            .unwrap();
         let outcome = repo
             .record(
+                working_copy,
                 ChangeHeader::builder()
                     .message("Agent-authored change")
                     .build(),
@@ -1587,8 +1609,15 @@ mod enrich_tests {
 
 impl Command for QueryEnrich {
     fn run(&self) -> CliResult<()> {
+        if crate::commands::rpc::query_enrich(self)? {
+            return Ok(());
+        }
+
         let root = find_repository_root()?;
         let repo = Repository::open(&root).map_err(CliError::Repository)?;
+        let working_copy = repo
+            .require_working_copy_id()
+            .map_err(CliError::Repository)?;
 
         // Agent stop hooks intentionally record with KG enrichment disabled to
         // keep their latency low. Consumers that need immediate RDF lineage can
@@ -1602,7 +1631,8 @@ impl Command for QueryEnrich {
                 .collect::<CliResult<Vec<_>>>()?;
 
             for hash in &hashes {
-                repo.enrich_change(hash).map_err(CliError::Repository)?;
+                repo.enrich_change(working_copy, hash)
+                    .map_err(CliError::Repository)?;
             }
 
             println!("Enriched {} change(s).", hashes.len());
@@ -1633,7 +1663,7 @@ impl Command for QueryEnrich {
 
         // Phase 2: Files
         let spinner = create_spinner("Enriching files...");
-        match repo.kg_enrich_files() {
+        match repo.kg_enrich_files(working_copy) {
             Ok(n) => {
                 total.files = n;
                 finish_success(&spinner, &format!("{} file(s)", n));
@@ -1643,7 +1673,7 @@ impl Command for QueryEnrich {
 
         // Phase 3: Modules + PART_OF edges
         let spinner = create_spinner("Enriching modules...");
-        match repo.kg_enrich_modules() {
+        match repo.kg_enrich_modules(working_copy) {
             Ok(n) => {
                 total.modules = n;
                 finish_success(&spinner, &format!("{} module(s)", n));
@@ -1653,7 +1683,7 @@ impl Command for QueryEnrich {
 
         // Phase 4: Changes
         let spinner = create_spinner("Enriching changes...");
-        match repo.kg_enrich_changes() {
+        match repo.kg_enrich_changes(working_copy) {
             Ok(n) => {
                 total.changes = n;
                 finish_success(&spinner, &format!("{} change(s)", n));
@@ -1663,7 +1693,7 @@ impl Command for QueryEnrich {
 
         // Phase 5: AST entities
         let spinner = create_spinner("Extracting entities (tree-sitter)...");
-        match repo.kg_enrich_entities() {
+        match repo.kg_enrich_entities(working_copy) {
             Ok(n) => {
                 total.entities = n;
                 finish_success(&spinner, &format!("{} entit(ies)", n));
@@ -1673,7 +1703,7 @@ impl Command for QueryEnrich {
 
         // Phase 6: INCLUDES edges
         let spinner = create_spinner("Resolving includes...");
-        match repo.kg_enrich_includes() {
+        match repo.kg_enrich_includes(working_copy) {
             Ok(n) => {
                 total.includes = n;
                 finish_success(&spinner, &format!("{} include(s)", n));
@@ -1683,7 +1713,7 @@ impl Command for QueryEnrich {
 
         // Phase 7: CALLS edges (caller entity → callee entity)
         let spinner = create_spinner("Resolving call sites...");
-        match repo.kg_enrich_calls() {
+        match repo.kg_enrich_calls(working_copy) {
             Ok(n) => {
                 total.calls = n;
                 finish_success(&spinner, &format!("{} call(s)", n));
@@ -1723,6 +1753,11 @@ pub struct Reindex;
 
 impl Command for Reindex {
     fn run(&self) -> CliResult<()> {
+        // Route every form through the service layer (the handler runs
+        // the same vault_reindex_kg domain call).
+        if crate::commands::rpc::query_reindex()? {
+            return Ok(());
+        }
         let root = find_repository_root()?;
         let repo = Repository::open(&root).map_err(CliError::Repository)?;
 
@@ -1743,6 +1778,12 @@ pub struct QueryEmbed {
 
 impl Command for QueryEmbed {
     fn run(&self) -> CliResult<()> {
+        // Route every form through the service layer: the provider
+        // resolves handler-side from the same environment/config; the CLI
+        // prints the local report from the wire-carried outcome.
+        if crate::commands::rpc::query_embed(self)? {
+            return Ok(());
+        }
         let root = find_repository_root()?;
         let repo = Repository::open(&root).map_err(CliError::Repository)?;
 
@@ -1800,6 +1841,11 @@ pub struct PlanExec {
 
 impl Command for PlanExec {
     fn run(&self) -> CliResult<()> {
+        // Route every form through the service layer (stdin stays
+        // client-side; the plan executes handler-side against the repo).
+        if crate::commands::rpc::query_plan(self)? {
+            return Ok(());
+        }
         let root = find_repository_root()?;
         let repo = Repository::open(&root).map_err(CliError::Repository)?;
 
@@ -1931,6 +1977,13 @@ The knowledge graph contains:
 
 impl Command for QueryAsk {
     fn run(&self) -> CliResult<()> {
+        // Route every form through the service layer: the agentic tool
+        // loop runs handler-side over the repository. --verbose's live
+        // tool-call trace is the unary-RPC limit: the trace rides the
+        // result (rendered in --json), not streamed live.
+        if crate::commands::rpc::query_ask(self)? {
+            return Ok(());
+        }
         let root = find_repository_root()?;
         let repo = Repository::open(&root).map_err(CliError::Repository)?;
 

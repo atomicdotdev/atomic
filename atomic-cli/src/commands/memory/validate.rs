@@ -29,6 +29,10 @@ pub struct MemoryValidate {
 
 impl Command for MemoryValidate {
     fn run(&self) -> CliResult<()> {
+        if crate::commands::rpc::memory_validate(self)? {
+            return Ok(());
+        }
+
         // A path-shaped argument (ends in `.md` or contains a separator) is
         // loaded as a file; a missing file is reported as FileNotFound rather
         // than misreported as a bad id. Otherwise it is a memory id read

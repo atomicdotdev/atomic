@@ -58,6 +58,8 @@
 
 use std::path::{Path, PathBuf};
 
+use dirs::home_dir;
+
 use atomic_core::types::{Base32, Hash};
 use atomic_repository::{Repository, SANDBOX_POINTER};
 use chrono::{DateTime, Local, Utc};
@@ -69,6 +71,7 @@ use crate::error::{CliError, CliResult};
 // Phase 2: Core Local Commands
 pub mod add;
 pub mod change;
+pub mod compact;
 pub mod complete;
 pub mod completions;
 pub mod conflicts;
@@ -80,16 +83,20 @@ pub mod intent;
 pub mod log;
 pub mod memory;
 pub mod mv;
+pub mod op;
 pub mod provenance;
 pub mod record;
 pub mod remove;
 pub mod restore;
 pub mod revise;
+pub(crate) mod rpc;
 pub mod sandbox;
 pub mod session;
 pub mod split;
+pub mod stage;
 pub mod stash;
 pub mod status;
+pub mod status_git;
 pub mod tag;
 pub mod triage;
 pub mod unrecord;
@@ -102,6 +109,7 @@ pub mod agent;
 
 // Phase 3: Remote Commands
 pub mod auth;
+pub mod blame;
 pub mod clone;
 pub mod pull;
 pub mod push;
@@ -124,6 +132,7 @@ pub mod delegation;
 pub mod project;
 pub mod token;
 pub mod workspace;
+pub(crate) mod workspace_txn;
 
 // Team collaboration commands (feature-gated)
 #[cfg(feature = "teams")]
@@ -134,8 +143,10 @@ pub mod team;
 // Re-export command structs for convenience
 pub use add::Add;
 pub use agent::Agent;
+pub use blame::Blame;
 pub use change::ChangeCmd;
 pub use clone::Clone;
+pub use compact::Compact;
 pub use completions::Completions;
 pub use conflicts::Conflicts;
 pub use diff::Diff;
@@ -148,6 +159,7 @@ pub use intent::Intent;
 pub use log::Log;
 pub use memory::Memory;
 pub use mv::Move;
+pub use op::Op;
 pub use project::ProjectCmd;
 pub use provenance::Provenance;
 pub use pull::Pull;
@@ -162,6 +174,7 @@ pub use sandbox::Sandbox;
 pub use server::ServerCmd;
 pub use session::Session;
 pub use split::Split;
+pub use stage::{Stage, Unstage};
 pub use stash::Stash;
 pub use status::Status;
 pub use tag::Tag;
@@ -238,8 +251,8 @@ pub const DOT_DIR: &str = ".atomic";
 /// Find the repository root by searching upward from the current directory.
 ///
 /// This function starts at the current working directory and walks up
-/// the directory tree looking for `.atomic/pristine.redb` or a sandbox
-/// pointer. This allows commands to work from any subdirectory within a
+/// the directory tree looking for `.atomic/atomic.redb`, legacy `pristine.redb`,
+/// or a sandbox pointer. This allows commands to work from any subdirectory within a
 /// repository without mistaking global configuration for a repository.
 ///
 /// # Returns
@@ -292,11 +305,18 @@ pub fn find_repository_root_from(start_path: &Path) -> CliResult<PathBuf> {
         current = canonical;
     }
 
+    // Never walk above $HOME: ~/.atomic holds global configuration (identity,
+    // config.toml, logs) but no repository database, so treating it as a
+    // search boundary prevents `atomic status`/`record`/etc. from silently
+    // failing when run in the home directory, and keeps home from being
+    // mistaken for a repo root.
+    let home = home_dir();
+
     loop {
         let dot_dir = current.join(DOT_DIR);
         // A bare `.atomic/` may hold global configuration (e.g. ~/.atomic),
         // not a repository. Require the repository's graph database too.
-        if dot_dir.is_dir() && dot_dir.join("pristine.redb").is_file() {
+        if dot_dir.is_dir() && atomic_repository::has_database(&dot_dir) {
             return Ok(current);
         }
 
@@ -305,6 +325,23 @@ pub fn find_repository_root_from(start_path: &Path) -> CliResult<PathBuf> {
         // repository root; `Repository::open*` resolves the pointer.
         if current.join(SANDBOX_POINTER).is_file() {
             return Ok(current);
+        }
+
+        // CB-13D ::24 R1/R5: a LINKED worktree also has no local `.atomic/`
+        // — its `.git` pointer resolves to the common repository's `.atomic`.
+        // The repository layer's layout detection is authoritative here; a
+        // plain `git worktree` used to fall through to "not a repository".
+        if current.join(".git").is_file() {
+            if let Ok(Some(root)) = atomic_repository::detect_repository_root(&current) {
+                return Ok(root);
+            }
+        }
+
+        // Stop at $HOME rather than walking into / — home is not a repo.
+        if home.as_ref().is_some_and(|h| current == *h) {
+            return Err(CliError::RepositoryNotFound {
+                searched_path: start_path.to_path_buf(),
+            });
         }
 
         // Move to parent directory
@@ -353,6 +390,16 @@ pub fn open_repository(path: Option<&Path>) -> CliResult<Repository> {
     Repository::open(&repo_path).map_err(CliError::from)
 }
 
+/// Open a repository without migration, recovery, or table-initialization writes.
+pub fn open_repository_readonly(path: Option<&Path>) -> CliResult<Repository> {
+    let repo_path = match path {
+        Some(path) if path.join(DOT_DIR).is_dir() => path.to_path_buf(),
+        Some(path) => find_repository_root_from(path)?,
+        None => find_repository_root()?,
+    };
+    Repository::open_readonly(&repo_path).map_err(CliError::from)
+}
+
 /// Acquire a read-only repository for a CLI query, allowing short-lived writers
 /// (such as Stop checkpoint publication) to finish first. Only typed database
 /// contention is retried, for at most ten seconds; all other errors propagate
@@ -385,6 +432,31 @@ pub(crate) fn open_readonly_repository(
 /// cannot be found or opened.
 pub fn require_repository(path: Option<&Path>) -> CliResult<Repository> {
     open_repository(path)
+}
+
+/// Open a repository strictly read-only or return a user-friendly error.
+pub fn require_repository_readonly(path: Option<&Path>) -> CliResult<Repository> {
+    open_repository_readonly(path)
+}
+
+/// Open a repository for native-index checking without implicit migration.
+pub fn require_repository_for_native_check(path: Option<&Path>) -> CliResult<Repository> {
+    let repo_path = match path {
+        Some(path) if path.join(DOT_DIR).is_dir() => path.to_path_buf(),
+        Some(path) => find_repository_root_from(path)?,
+        None => find_repository_root()?,
+    };
+    Repository::open_readonly_for_native_repair(repo_path).map_err(CliError::from)
+}
+
+/// Open a repository for explicit native-index repair without implicit migration.
+pub fn require_repository_for_native_repair(path: Option<&Path>) -> CliResult<Repository> {
+    let repo_path = match path {
+        Some(path) if path.join(DOT_DIR).is_dir() => path.to_path_buf(),
+        Some(path) => find_repository_root_from(path)?,
+        None => find_repository_root()?,
+    };
+    Repository::open_for_native_repair(repo_path).map_err(CliError::from)
 }
 
 // Formatting Utilities
@@ -639,7 +711,7 @@ mod tests {
             let mut check = temp.path().to_path_buf();
             let mut found = false;
             loop {
-                if check.join(DOT_DIR).join("pristine.redb").is_file()
+                if atomic_repository::has_database(&check.join(DOT_DIR))
                     || check.join(SANDBOX_POINTER).is_file()
                 {
                     found = true;

@@ -37,6 +37,13 @@ pub struct MemoryWrite {
 
 impl Command for MemoryWrite {
     fn run(&self) -> CliResult<()> {
+        // Route every form through the service layer: stdin + frontmatter
+        // stay client-side (interactive/file-only); the store + materialize
+        // run handler-side with the hash riding the response.
+        if crate::commands::rpc::memory_write(self)? {
+            return Ok(());
+        }
+
         let root = find_repository_root()?;
         let repo = Repository::open(&root).map_err(CliError::Repository)?;
 

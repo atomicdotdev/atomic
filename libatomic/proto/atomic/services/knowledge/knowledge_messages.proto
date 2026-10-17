@@ -1,0 +1,158 @@
+// atomic-protocol — KnowledgeService: knowledge-graph queries and
+// maintenance.
+//
+// DRAFT — add-only. The CLI's eleven `query` verbs collapse into TWO RPCs
+// (the headline combine of this draft):
+//  * QueryGraph — every read: content/code search, kg search, entity,
+//    neighbors, callers, graph slice, plan execution, RAG ask;
+//  * MaintainKnowledgeGraph — embed/enrich/reindex (the write/rebuild side).
+// Local file-index construction (`query index`) remains client-side. QueryGraph
+// reads a view-scoped indexed snapshot; it must never build/refresh an index.
+
+syntax = "proto3";
+
+package atomic;
+
+import "atomic/common/common.proto";
+
+
+
+message QueryGraphRequest {
+  RepositoryRef repository = 1;
+  uint32 limit = 2;             // default 10-20 per kind today
+  oneof query {
+    ContentSearchQuery content_search = 3;   // `query code` (syntext index)
+    KgSearchQuery kg_search = 4;             // `query search`
+    EntityQuery entity = 5;                  // `query entities`
+    NeighborsQuery neighbors = 6;            // `query neighbors`
+    CallersQuery callers = 7;               // `query callers`
+    GraphSliceQuery graph_slice = 8;         // `query graph`
+    PlanExecutionQuery plan = 9;            // `query plan` (JSON plan steps)
+    RagAskQuery rag_ask = 10;               // `query ask` (KG + LLM answer)
+  }
+  ViewRef view = 11; // required; sandbox must match grant
+  // All nodes, edges, snippets, opaque payloads and every plan step are filtered
+  // BEFORE evaluation/provider calls by this effective perspective. Plans are
+  // read-only; no embed/enrich/reindex or arbitrary filesystem/provider action.
+}
+
+message ContentSearchQuery {
+  string query = 1;
+  repeated string paths = 2;
+  // SHAPE-CONFIRM: filters from query/mod.rs content search.
+}
+message KgSearchQuery {
+  string query = 1;
+  // `query search --kind` (add-only): keep only nodes of this kind
+  // (case-insensitive), applied over the candidate pool before the limit.
+  optional string kind = 2;
+  // The candidate pool size (add-only): how many candidates to score
+  // before selecting the top results (the CLI's --pool, default 5000).
+  optional uint32 pool = 3;
+}
+message EntityQuery {
+  string node_id = 1;
+}
+message NeighborsQuery {
+  string node_id = 1;
+  optional bool incoming = 2;
+  // Traversal depth (add-only): `query neighbors -d` (1 or 2; default 1).
+  optional uint32 depth = 3;
+}
+message CallersQuery {
+  string node_id = 1;
+}
+message GraphSliceQuery {
+  repeated string node_ids = 1;
+  optional int32 max_depth = 2;
+  // The search-seeded graph build (add-only): `query graph`'s full knob
+  // surface — the seed query, the seed limit, the neighbor depth, the
+  // comma-separated kinds filter, the per-seed change cap, and the node
+  // ceiling (0 = the format default: 200 DOT / 5000 HTML).
+  optional string query = 3;
+  optional uint32 seed_limit = 4;
+  optional uint32 depth = 5;
+  optional string kinds = 6;
+  optional uint32 changes_per_seed = 7;
+  optional uint32 max_nodes = 8;
+}
+message PlanExecutionQuery {
+  bytes plan_json = 1;         // structured multi-step plan (parse_plan shape)
+}
+message RagAskQuery {
+  string question = 1;
+  uint32 top_k = 2;
+  // The agentic loop knobs (add-only): the turn budget and the verbose
+  // tool-call trace (rendered client-side after the fact over the wire —
+  // the unary RPC cannot stream them live).
+  optional uint32 max_turns = 3;
+  optional bool verbose = 4;
+}
+
+message QueryGraphResponse {
+  repeated KGNode nodes = 1;
+  repeated KGEdge edges = 2;
+  repeated ContentHit hits = 3;      // content/code search results
+  optional string answer = 4;        // rag_ask
+  optional bytes plan_result = 5;    // plan step outputs (JSON)
+  ViewSnapshot snapshot = 6;
+  // The pre-cap node count (add-only): the `query graph` cap note's "N
+  // nodes collected" figure.
+  optional uint32 graph_collected = 7;
+  // Whether the neighbors subgraph holds ANY calls edge (add-only): the
+  // `query callers` hint's entry-point distinction.
+  bool calls_present = 8;
+  // The full agentic ask result (add-only; schema "atomic.query.ask.v1" =
+  // the domain AgentResult JSON) plus its elapsed time.
+  optional VersionedBytes ask_result = 9;
+  optional uint64 ask_elapsed_ms = 10;
+}
+
+message KGNode {
+  string id = 1;
+  string node_type = 2;
+  optional string name = 3;
+  optional bytes data = 4;          // node payload (SHAPE-CONFIRM)
+  optional double score = 5;        // search ranking when applicable
+  // Full KG-node fields (add-only) for the `--json` projections: the
+  // domain node's source and metadata ride the wire so the client
+  // serializes the same shape the local body emits.
+  optional string source = 6;
+  optional bytes metadata = 7;      // JSON-encoded metadata value
+}
+message KGEdge {
+  string source = 1;
+  string target = 2;
+  string relation = 3;
+  // Full KG-edge field (add-only): the domain edge's metadata (JSON).
+  optional bytes metadata = 4;
+}
+message ContentHit {
+  string path = 1;
+  string snippet = 2;
+  optional uint64 line = 3;
+  optional double score = 4;
+}
+
+enum KnowledgeMaintainAction {
+  KNOWLEDGE_MAINTAIN_ACTION_UNSPECIFIED = 0;
+  KNOWLEDGE_MAINTAIN_ACTION_EMBED = 1;    // `query embed`
+  KNOWLEDGE_MAINTAIN_ACTION_ENRICH = 2;   // `query enrich` (index build)
+  KNOWLEDGE_MAINTAIN_ACTION_REINDEX = 3;  // `query reindex`
+}
+message MaintainKnowledgeGraphRequest {
+  RepositoryRef repository = 1;
+  RequestMeta meta = 2;
+  KnowledgeMaintainAction action = 3;
+  optional string scope = 4;      // e.g. entity-type filter
+  repeated Hash changes = 5;     // ENRICH: limit to these changes' nodes
+}
+message MaintainKnowledgeGraphResponse {
+  uint64 processed = 1;
+  ResponseMeta meta = 100;
+  // The embed report (add-only): the resolved provider + dimensions and,
+  // in the targeted form, the path (processed == 0 = content unchanged).
+  optional string provider = 2;
+  optional uint32 dimensions = 3;
+  optional string path = 4;
+}

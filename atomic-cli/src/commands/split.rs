@@ -58,7 +58,7 @@ const INVALID_CHARS: &[char] = &['/', '\\', '\0', ':', '*', '?', '"', '<', '>', 
 // View Name Validation
 
 /// Validate a view name.
-fn validate_view_name(name: &str) -> Result<(), String> {
+pub(crate) fn validate_view_name(name: &str) -> Result<(), String> {
     if name.is_empty() {
         return Err("View name cannot be empty".to_string());
     }
@@ -154,6 +154,14 @@ impl Split {
 
 impl Command for Split {
     fn run(&self) -> CliResult<()> {
+        // Route every form through the service layer: the wrapper composes
+        // the same CreateView(FromView) wire `view create --from` uses (plus
+        // SwitchView when --switch), and this render prints the split
+        // body's report from the wire-carried counts.
+        if crate::commands::rpc::split(self)? {
+            return Ok(());
+        }
+
         // Validate the new view name
         validate_view_name(&self.name).map_err(|msg| CliError::InvalidArgument { message: msg })?;
 
@@ -165,12 +173,15 @@ impl Command for Split {
             },
             other => CliError::Repository(other),
         })?;
+        let working_copy = repo
+            .require_working_copy_id()
+            .map_err(CliError::Repository)?;
+        let desired_view = repo
+            .desired_view_name(working_copy)
+            .map_err(CliError::Repository)?;
 
-        // Determine source view (default to current)
-        let source = self
-            .source
-            .clone()
-            .unwrap_or_else(|| repo.current_view().to_string());
+        // Determine source view (default to the working copy's desired view)
+        let source = self.source.clone().unwrap_or(desired_view);
 
         // Verify source view exists
         if !repo.view_exists(&source).map_err(CliError::Repository)? {
@@ -214,7 +225,9 @@ impl Command for Split {
 
         // Optionally switch to the new view
         if self.switch {
-            let result = repo.switch_view(&self.name).map_err(CliError::Repository)?;
+            let result = repo
+                .switch_view(working_copy, &self.name)
+                .map_err(CliError::Repository)?;
             print_success(&format!(
                 "Switched to view: {} ({} files updated)",
                 style_view(&self.name),

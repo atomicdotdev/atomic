@@ -58,9 +58,12 @@
 use std::path::{Path, PathBuf};
 
 use atomic_repository::tracking::TrackingOptions;
-use atomic_repository::{FileStatus, Repository, RepositoryStatus, StatusOptions};
+use atomic_repository::{
+    FileStatus, Repository, RepositoryStatus, StatusOptions, WorkspaceTxnMode,
+};
 use clap::Parser;
 
+use crate::commands::workspace_txn::enter_workspace;
 use crate::commands::{find_repository_root, Command};
 use crate::error::{CliError, CliResult};
 use crate::output::{print_hint, print_success, print_warning};
@@ -203,7 +206,11 @@ impl Restore {
         for entry in status.entries() {
             let file_status = entry.status();
             match file_status {
-                FileStatus::Modified | FileStatus::Deleted | FileStatus::Added => {
+                FileStatus::Modified
+                | FileStatus::Deleted
+                | FileStatus::Added
+                | FileStatus::TypeChanged
+                | FileStatus::PermissionsChanged => {
                     let path_str = entry.path().to_string_lossy();
                     if self.matches_filter(&path_str) {
                         out.push((entry.path().to_path_buf(), file_status));
@@ -217,11 +224,13 @@ impl Restore {
     }
 
     /// Execute dry-run for a single file - output pristine content to stdout.
-    fn dry_run_single_file(&self, repo: &Repository, path: &str) -> CliResult<()> {
+    fn dry_run_single_file(&self, repo: &Repository, view: &str, path: &str) -> CliResult<()> {
         // Get file content from pristine
-        let content = repo.get_file_content(Path::new(path)).map_err(|e| {
-            CliError::Internal(anyhow::anyhow!("Failed to get file content: {}", e))
-        })?;
+        let content = repo
+            .get_file_content_on_view(Path::new(path), view)
+            .map_err(|e| {
+                CliError::Internal(anyhow::anyhow!("Failed to get file content: {}", e))
+            })?;
 
         match content {
             Some(bytes) => {
@@ -251,39 +260,35 @@ impl Restore {
     fn restore_file(
         &self,
         repo: &Repository,
-        repo_root: &Path,
+        working_copy: atomic_core::WorkingCopyId,
+        view: &str,
+        _repo_root: &Path,
         path: &Path,
         status: FileStatus,
     ) -> CliResult<RestoreOutcome> {
         if status == FileStatus::Added {
             // Undo the `add`: stop tracking, but keep the file on disk.
-            repo.remove(path, TrackingOptions::default().with_recursive(false))
-                .map_err(CliError::Repository)?;
+            repo.remove(
+                working_copy,
+                path,
+                TrackingOptions::default().with_recursive(false),
+            )
+            .map_err(CliError::Repository)?;
             return Ok(RestoreOutcome::Untracked);
         }
 
         // Restore content from pristine.
-        let content = repo.get_file_content(path).map_err(|e| {
+        let content = repo.get_file_content_on_view(path, view).map_err(|e| {
             CliError::Internal(anyhow::anyhow!("Failed to get file content: {}", e))
         })?;
 
-        let full_path = repo_root.join(path);
-
         match content {
-            Some(bytes) => {
-                // Ensure parent directory exists (a Deleted file may have had
-                // its directory removed too).
-                if let Some(parent) = full_path.parent() {
-                    std::fs::create_dir_all(parent).map_err(|e| {
-                        CliError::Internal(anyhow::anyhow!("Failed to create directory: {}", e))
-                    })?;
-                }
-
-                // Write content
-                std::fs::write(&full_path, bytes).map_err(|e| {
-                    CliError::Internal(anyhow::anyhow!("Failed to write file: {}", e))
-                })?;
-
+            Some(_) => {
+                repo.materialize_paths(
+                    working_copy,
+                    std::collections::HashSet::from([path.to_string_lossy().into_owned()]),
+                )
+                .map_err(CliError::Repository)?;
                 Ok(RestoreOutcome::Restored)
             }
             None => {
@@ -329,15 +334,61 @@ impl Command for Restore {
     /// 4. If `--dry-run`, preview changes
     /// 5. Otherwise, restore files to pristine state
     fn run(&self) -> CliResult<()> {
+        // Route every form through the daemon when reachable — the
+        // non-dry-run forms over Restore; the dry-run previews over
+        // PreviewRestore (the listing form, and the single-file
+        // pristine-bytes dump through the content arm). The single-file
+        // shape check stats the working copy only — never a redb open.
+        if crate::commands::rpc::restore(self)? {
+            return Ok(());
+        }
+        if self.dry_run {
+            // The single-file dump applies only when the argument is
+            // exactly one concrete file (the local body's rule: a
+            // directory or trailing-slash filter has no pristine bytes
+            // of its own and previews as a listing).
+            let single_file_arg = self.files.len() == 1
+                && !self.files[0].ends_with('/')
+                && find_repository_root()
+                    .map(|root| !root.join(&self.files[0]).is_dir())
+                    .unwrap_or(true);
+            if single_file_arg && crate::commands::rpc::restore_single_dry_run(&self.files[0])? {
+                return Ok(());
+            }
+            if crate::commands::rpc::restore_preview(self.files.clone())? {
+                return Ok(());
+            }
+        }
+
+        // The NOT-A-REPOSITORY FALLBACK (and the unreachable-daemon
+        // fallback): the root lookup below reports the same refusal
+        // without opening redb when no repository surrounds the cwd.
         // Find repository
         let repo_root = find_repository_root()?;
-        let repo = Repository::open(&repo_root).map_err(CliError::Repository)?;
+        let mode = if self.dry_run {
+            WorkspaceTxnMode::Observe
+        } else {
+            WorkspaceTxnMode::Reconcile
+        };
+        let mut repo = match mode {
+            WorkspaceTxnMode::Observe => Repository::open_readonly(&repo_root),
+            WorkspaceTxnMode::Reconcile => Repository::open_for_workspace_transaction(&repo_root),
+            WorkspaceTxnMode::Force => unreachable!("restore never forces workspace entry"),
+        }
+        .map_err(CliError::Repository)?;
+        if !self.dry_run {
+            repo.hydrate_remote_sandbox()
+                .map_err(CliError::Repository)?;
+        }
+        let workspace = enter_workspace(&mut repo, mode)?;
+        let working_copy = workspace.working_copy();
+        let workspace_view = workspace.view().name.clone();
 
         // Compute status once. Restore only touches tracked files, so we skip
         // the untracked scan, and we reuse this single status for both the
         // safety guard and the file list (no second tree walk).
         let status = repo
-            .status(Self::status_options())
+            .status(working_copy, Self::status_options())
             .map_err(CliError::Repository)?;
 
         let has_changes = !status.is_clean();
@@ -368,7 +419,7 @@ impl Command for Restore {
             && !self.files[0].ends_with('/')
             && !repo_root.join(&self.files[0]).is_dir();
         if self.dry_run && single_file_arg && !single_added {
-            return self.dry_run_single_file(&repo, &self.files[0]);
+            return self.dry_run_single_file(&repo, &workspace_view, &self.files[0]);
         }
 
         // Dry run mode - just show what would happen
@@ -407,7 +458,14 @@ impl Command for Restore {
         for (path, file_status) in &files_to_restore {
             let path_display = path.display();
 
-            match self.restore_file(&repo, &repo_root, path, *file_status) {
+            match self.restore_file(
+                &repo,
+                working_copy,
+                &workspace_view,
+                &repo_root,
+                path,
+                *file_status,
+            ) {
                 Ok(RestoreOutcome::Restored) => {
                     println!("  Restored: {}", path_display);
                     restored_count += 1;
@@ -447,7 +505,7 @@ impl Command for Restore {
 }
 
 /// Format a count with singular/plural word.
-fn format_count(count: usize, word: &str) -> String {
+pub(crate) fn format_count(count: usize, word: &str) -> String {
     if count == 1 {
         format!("{} {}", count, word)
     } else {
@@ -663,18 +721,28 @@ mod tests {
 
     #[test]
     fn test_restore_modified_restores_pristine_content() {
-        let (_dir, repo, root) = test_repo();
+        let (_dir, mut repo, root) = test_repo();
+        let working_copy = repo.require_working_copy_id().unwrap();
         let path = Path::new("file.txt");
         fs::write(root.join(path), b"recorded\n").unwrap();
-        repo.add(path, TrackingOptions::default()).unwrap();
-        repo.record_all("init").unwrap();
+        repo.add(working_copy, path, TrackingOptions::default())
+            .unwrap();
+        repo.record_all(working_copy, "init").unwrap();
 
         // Local edit that we want to discard.
         fs::write(root.join(path), b"local edit\n").unwrap();
 
         let cmd = Restore::new();
+        let workspace = enter_workspace(&mut repo, WorkspaceTxnMode::Reconcile).unwrap();
         let outcome = cmd
-            .restore_file(&repo, &root, path, FileStatus::Modified)
+            .restore_file(
+                &repo,
+                workspace.working_copy(),
+                &workspace.view().name,
+                &root,
+                path,
+                FileStatus::Modified,
+            )
             .unwrap();
 
         assert_eq!(outcome, RestoreOutcome::Restored);
@@ -683,19 +751,29 @@ mod tests {
 
     #[test]
     fn test_restore_deleted_restores_file_from_pristine() {
-        let (_dir, repo, root) = test_repo();
+        let (_dir, mut repo, root) = test_repo();
+        let working_copy = repo.require_working_copy_id().unwrap();
         let path = Path::new("file.txt");
         fs::write(root.join(path), b"recorded\n").unwrap();
-        repo.add(path, TrackingOptions::default()).unwrap();
-        repo.record_all("init").unwrap();
+        repo.add(working_copy, path, TrackingOptions::default())
+            .unwrap();
+        repo.record_all(working_copy, "init").unwrap();
 
         // Delete it on disk; restore should bring it back.
         fs::remove_file(root.join(path)).unwrap();
         assert!(!root.join(path).exists());
 
         let cmd = Restore::new();
+        let workspace = enter_workspace(&mut repo, WorkspaceTxnMode::Reconcile).unwrap();
         let outcome = cmd
-            .restore_file(&repo, &root, path, FileStatus::Deleted)
+            .restore_file(
+                &repo,
+                workspace.working_copy(),
+                &workspace.view().name,
+                &root,
+                path,
+                FileStatus::Deleted,
+            )
             .unwrap();
 
         assert_eq!(outcome, RestoreOutcome::Restored);
@@ -705,23 +783,35 @@ mod tests {
 
     #[test]
     fn test_restore_added_untracks_but_keeps_file_on_disk() {
-        let (_dir, repo, root) = test_repo();
+        let (_dir, mut repo, root) = test_repo();
+        let working_copy = repo.require_working_copy_id().unwrap();
         let path = Path::new("new.txt");
         fs::write(root.join(path), b"brand new\n").unwrap();
-        repo.add(path, TrackingOptions::default()).unwrap();
+        repo.add(working_copy, path, TrackingOptions::default())
+            .unwrap();
         // Deliberately NOT recorded → status is `Added`.
 
         let cmd = Restore::new().with_files(vec!["new.txt".to_string()]);
 
         // Before: status reports it as a pending Added change.
-        let before = repo.status(Restore::status_options()).unwrap();
+        let before = repo
+            .status(working_copy, Restore::status_options())
+            .unwrap();
         let listed = cmd.files_to_restore(&before);
         assert!(listed
             .iter()
             .any(|(p, s)| p.as_path() == path && *s == FileStatus::Added));
 
+        let workspace = enter_workspace(&mut repo, WorkspaceTxnMode::Reconcile).unwrap();
         let outcome = cmd
-            .restore_file(&repo, &root, path, FileStatus::Added)
+            .restore_file(
+                &repo,
+                workspace.working_copy(),
+                &workspace.view().name,
+                &root,
+                path,
+                FileStatus::Added,
+            )
             .unwrap();
         assert_eq!(outcome, RestoreOutcome::Untracked);
 
@@ -731,7 +821,9 @@ mod tests {
 
         // ...and status no longer reports a pending change for it, so the
         // status hint is no longer lying.
-        let after = repo.status(Restore::status_options()).unwrap();
+        let after = repo
+            .status(working_copy, Restore::status_options())
+            .unwrap();
         let still_listed = cmd.files_to_restore(&after);
         assert!(!still_listed.iter().any(|(p, _)| p.as_path() == path));
     }

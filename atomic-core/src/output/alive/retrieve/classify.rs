@@ -6,7 +6,7 @@
 
 use super::super::vertex::{AliveVertex, VertexFlags};
 use crate::pristine::{GraphTxnT, PristineError};
-use crate::types::{GraphNode, NodeId, ParentEdgeKind, Position};
+use crate::types::{GraphNode, NodeId, ParentEdgeKind};
 
 /// Create an AliveVertex from an already-resolved span, if it's alive.
 ///
@@ -42,32 +42,6 @@ pub(super) fn create_alive_vertex<T: GraphTxnT>(
     }
 
     Ok(Some(alive))
-}
-
-/// Create a new AliveVertex for a position, if it's alive.
-///
-/// This function:
-/// 1. Finds the block (span) containing the position
-/// 2. Checks if the span is alive (has non-deleted edges)
-/// 3. Checks if it's a zombie (deleted but has live connections)
-///
-/// # Returns
-///
-/// - `Ok(Some(span))` if the position maps to an alive or zombie span
-/// - `Ok(None)` if the span is not alive and not a zombie
-/// - `Err(_)` on database error
-#[allow(dead_code)]
-pub(super) fn new_vertex_at_position<T: GraphTxnT>(
-    txn: &T,
-    pos: Position<NodeId>,
-) -> Result<Option<AliveVertex>, PristineError> {
-    // Find the block containing this position
-    let node = match txn.find_block(pos) {
-        Ok(v) => v,
-        Err(_) => return Ok(None),
-    };
-
-    create_alive_vertex(txn, node)
 }
 
 /// Check if a node is alive (not fully deleted).

@@ -60,6 +60,12 @@ pub struct Summaries {
 
 impl Command for Summaries {
     fn run(&self) -> CliResult<()> {
+        // Route every form through the service layer (the previews arm
+        // computes the same enumeration + 200-char previews).
+        if crate::commands::rpc::vault_summaries(self)? {
+            return Ok(());
+        }
+
         let root = find_repository_root()?;
         let repo = Repository::open(&root).map_err(CliError::Repository)?;
 

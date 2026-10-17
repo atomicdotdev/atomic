@@ -1,0 +1,45 @@
+// atomic-protocol — TagService definition (the RPC contract).
+// DRAFT — add-only. Messages for this service live in
+// atomic/services/tag/tag_messages.proto · shared primitives in atomic/common/.
+
+syntax = "proto3";
+
+package atomic;
+
+import "atomic/common/options.proto";
+import "atomic/services/tag/tag_messages.proto";
+
+service TagService {
+  // `atomic tag create <NAME>`
+  rpc CreateTag(CreateTagRequest) returns (CreateTagResponse) {
+    option (atomic.execution_scope) = EXECUTION_SCOPE_BOTH;
+    option (atomic.required_capability) = "repository.write";
+    option (atomic.allowed_caller) = CALLER_CLASS_LOCAL;
+    option (atomic.allowed_caller) = CALLER_CLASS_REMOTE_IDENTITY;
+    option (atomic.effect) = RPC_EFFECT_REPOSITORY_WRITE;
+  }
+  // `atomic tag delete <NAME>`
+  rpc DeleteTag(DeleteTagRequest) returns (DeleteTagResponse) {
+    option (atomic.execution_scope) = EXECUTION_SCOPE_BOTH;
+    option (atomic.required_capability) = "repository.write";
+    option (atomic.allowed_caller) = CALLER_CLASS_LOCAL;
+    option (atomic.allowed_caller) = CALLER_CLASS_REMOTE_IDENTITY;
+    option (atomic.effect) = RPC_EFFECT_REPOSITORY_WRITE;
+  }
+  // `atomic tag list`
+  rpc ListTags(ListTagsRequest) returns (ListTagsResponse) {
+    option (atomic.execution_scope) = EXECUTION_SCOPE_BOTH;
+    option (atomic.required_capability) = "repository.read";
+    option (atomic.allowed_caller) = CALLER_CLASS_LOCAL;
+    option (atomic.allowed_caller) = CALLER_CLASS_REMOTE_IDENTITY;
+    option (atomic.effect) = RPC_EFFECT_REPOSITORY_READ;
+  }
+  // `atomic tag show <NAME>` (list-with-detail covers `-v`)
+  rpc GetTag(GetTagRequest) returns (GetTagResponse) {
+    option (atomic.execution_scope) = EXECUTION_SCOPE_BOTH;
+    option (atomic.required_capability) = "repository.read";
+    option (atomic.allowed_caller) = CALLER_CLASS_LOCAL;
+    option (atomic.allowed_caller) = CALLER_CLASS_REMOTE_IDENTITY;
+    option (atomic.effect) = RPC_EFFECT_REPOSITORY_READ;
+  }
+}

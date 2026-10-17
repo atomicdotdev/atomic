@@ -1,0 +1,174 @@
+// atomic-protocol — shared primitives.
+//
+// DRAFT — add-only. Field numbers are never reused or renumbered.
+// Conventions carried from the parked Slice 0 draft (REAC::aaron::2):
+// package `atomic`, RepositoryRef numbering per the RFC.
+//
+// CONTRACT RULES (descriptor gate now; runtime conformance tests at implementation):
+//  * Idempotency: every mutation carries RequestMeta.request_id (UUID v4).
+//    The server echoes it in response metadata and detects replays — a
+//    replay returns the original outcome; different contents for the same key
+//    fail with IDEMPOTENCY_MISMATCH. This is the legacy journal protocol's
+//    request-ID discipline carried into the unified contract. Idempotency
+//    state is scoped by authority, repository, authenticated principal/grant,
+//    method and request_id, with a canonical request fingerprint. Authorize
+//    before opening storage or consulting replay state. The same key in another
+//    repository is a fresh request (one daemon serves many redb files —
+//    replay tables must not cross repository boundaries).
+//  * Caller-supplied time: RequestMeta.observed_at arrives on the wire;
+//    the server MUST NOT substitute its own clock for observation times
+//    (matters for replay; matters more when the caller is a sandbox whose
+//    clock is not trusted). Observation time NEVER controls token expiry,
+//    authorization, deadlines, or leases; those use the server's trusted clock.
+//  * Addressing: remote clients NEVER send filesystem paths — persistent
+//    repository IDs only (RepositoryRef). Local path discovery resolves to
+//    a persistent ID before forming the request (RFC "unified repository
+//    addressing"). Local-scoped ops may reference working-copy paths.
+//  * No REDB tables, raw keys, or transaction handles over RPC. There is no
+//    BeginTransaction. Each method defines its own server-side transaction
+//    boundary (RFC D5).
+//  * Reads run as independent concurrent read transactions; writes queue in
+//    a bounded per-repository FIFO queue — the contract never assumes a
+//    global write lock (RFC concurrency model).
+//  * No direct-storage fallback (RFC D4): a client that cannot reach the
+//    service fails with a stable error; it never opens storage itself.
+
+syntax = "proto3";
+
+package atomic;
+
+import "google/protobuf/timestamp.proto";
+
+// Shared generated constant for GetCapabilities and x-atomic-contract-version.
+// Revision 1's draft behavior is retired, not wire-compatible with these fences.
+enum ContractVersion {
+  CONTRACT_VERSION_UNSPECIFIED = 0;
+  reserved 1;
+  CONTRACT_VERSION_2 = 2;
+}
+
+// Globally qualified repository reference. Field numbering matches the RFC.
+// authority = the local daemon or a configured hosted authority; routing is
+// explicit and preserved in diagnostics, provenance, and correlation.
+//
+// MULTI-REPOSITORY ROUTING: one daemon multiplexes MANY repository
+// databases (RFC D3) — every repo-scoped request names exactly ONE
+// repository here, and the daemon resolves repository_id to its
+// lazily-opened, idle-evicted repository handle. IDs are persistent:
+// assigned at init (or explicit DaemonService.RegisterRepository for
+// repositories that predate them) and also recorded in the working copy's
+// .atomic so local clients can read them without a round trip. Remote
+// clients use registered IDs only.
+message RepositoryRef {
+  string authority = 1;          // e.g. "local", or a configured hosted authority
+  bytes repository_id = 2;      // persistent repository ID (never a path)
+  optional string workspace_id = 3; // required for working-copy operations
+}
+
+// Stable, opaque domain identity, not a redb key. A name is a display hint:
+// authorization uses view_id, and deleting/recreating a name never revives a
+// grant. Domain handlers must verify any supplied name agrees with the ID.
+message ViewRef {
+  bytes view_id = 1;
+  optional string name = 2;
+}
+
+// A coherent effective perspective, not merely the view's own ordered log.
+// effective_state covers repository/target identity and scope, contributing ancestor
+// identities/states, visible dependency closure, and view-scoped vault revision.
+// Servers derive a canonical BLAKE3 digest; callers echo it, never construct it.
+// It is not a transaction handle. Validate again inside publication's write txn.
+message ViewSnapshot {
+  ViewRef view = 1;
+  Hash effective_state = 2;
+  optional Hash own_merkle = 3; // diagnostic; insufficient as an effective fence
+}
+
+enum HashAlgorithm {
+  HASH_ALGORITHM_UNSPECIFIED = 0;
+  HASH_ALGORITHM_BLAKE3 = 1;    // atomic's content hash (32-byte digest)
+}
+
+// A content or state hash. Today always blake3-32; the algorithm field keeps
+// the wire honest if that ever changes.
+message Hash {
+  bytes value = 1;
+  HashAlgorithm algorithm = 2;
+}
+
+// A verified identity (atomic uses DIDs).
+message Identity {
+  string did = 1;
+  optional string display_name = 2;
+}
+
+// Common mutation header: idempotency key + caller-supplied observation time.
+message RequestMeta {
+  string request_id = 1;                        // UUID v4; echoed by the server
+  optional google.protobuf.Timestamp observed_at = 2; // caller-supplied "now"
+}
+
+// Present on every successful ordinary mutation response (field 100). Errors
+// echo via ErrorInfo. Event ingestion instead uses event_id deduplication.
+message ResponseMeta {
+  string request_id = 1;
+  bool replayed = 2;
+  optional ViewSnapshot snapshot = 3;
+}
+
+// A (session, turn) pair — used by provenance and agent integration.
+message SessionTurn {
+  string session_id = 1;
+  uint32 turn_number = 2;
+}
+
+// Schema-tagged opaque bytes — the interchange pattern for payloads whose
+// internal encoding is owned elsewhere (V3 change files, provenance graph
+// exports, knowledge-graph slices). SubmitChange/Changes carry V3 change
+// bytes as versioned-opaque with this schema field, like the event envelope's
+// type URL (HANDOFF §10.3 recommendation).
+message VersionedBytes {
+  string schema = 1;   // e.g. "atomic.change.v3", "atomic.prov.graph.v1"
+  bytes payload = 2;
+}
+
+// Expected-state precondition on a mutation (RFC D5/D7 + HANDOFF §6: fencing
+// on EVERY mutation, not just provenance). A mismatch fails with
+// PRECONDITION_FAILED (or GENERATION_CONFLICT for the provenance fencing
+// flavor) instead of silently racing.
+message ExpectedState {
+  oneof kind {
+    uint64 generation = 1;   // provenance/attempt generation fencing
+    Hash merkle_root = 2;    // view state as the caller last saw it
+    uint64 sequence = 3;     // sequence-number fencing
+    ViewSnapshot view_snapshot = 4; // required for effective-view mutations
+  }
+}
+
+// How a command names a change: by hash or by log sequence ("#N" — the
+// change's position in the current view's log, as the CLI accepts).
+message ChangeRef {
+  oneof kind {
+    Hash hash = 1;
+    uint64 sequence = 2;
+    // Case-insensitive unique-prefix resolution against the whole change
+    // store; the target operation's own membership/guard errors speak.
+    string prefix = 3;
+  }
+}
+
+// A versioned change bundle — the wire form of a change interchange object
+// (today: V3 change-file bytes; .change files remain import/export
+// interchange per the RFC's non-goals).
+message ChangeBundle {
+  Hash hash = 1;
+  string schema = 2;   // e.g. "atomic.change.v3"
+  bytes payload = 3;
+}
+
+// A signature over some attested target, by an identity.
+message ChangeSignature {
+  string identity_did = 1;
+  bytes signature = 2;
+  optional google.protobuf.Timestamp signed_at = 3;
+}

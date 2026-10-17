@@ -60,7 +60,7 @@ pub enum CliError {
     ///
     /// This error occurs when a command that requires a repository is run
     /// outside of any Atomic repository.
-    #[error("Not in an Atomic repository: '{searched_path}' (no repository found in this directory or its parents)")]
+    #[error("Not in an Atomic repository: '{searched_path}' (no repository found in this directory or its parents). Run 'atomic init' here, or cd into an Atomic repository.")]
     RepositoryNotFound {
         /// The path where the search started
         searched_path: PathBuf,
@@ -352,6 +352,11 @@ pub enum CliError {
         message: String,
     },
 
+    /// A working-copy command was refused because Git no longer denotes the
+    /// checkpointed filesystem baseline.
+    #[error("{report}")]
+    StaleBaseline { report: String },
+
     // User Input Errors
     /// The user cancelled the operation.
     #[error("Operation cancelled by user")]
@@ -373,6 +378,26 @@ pub enum CliError {
     RequiresForce {
         /// The operation that was blocked, e.g. "reset".
         operation: String,
+    },
+
+    /// A domain refusal surfaced by the service layer — the contract's
+    /// stable error vocabulary (the message carries the code and the
+    /// reason, e.g. `atomic:PRECONDITION_FAILED: ...`).
+    ///
+    /// This is an expected, user-fixable condition (not a bug): the domain
+    /// refused the operation and the message says what to do about it.
+    #[error("{message}")]
+    ServiceRefusal {
+        /// The domain's refusal, with its stable code prefix.
+        message: String,
+    },
+
+    /// A managed agent run stopped after preserving tracked work under a local
+    /// recovery ref. This is an expected refusal, not an internal failure.
+    #[error("Managed agent session '{session_id}' is incomplete: {outcome}")]
+    ManagedAgentIncomplete {
+        session_id: String,
+        outcome: atomic_core::change::session::IncompleteSession,
     },
 
     // Internal Errors
@@ -525,6 +550,8 @@ impl CliError {
                 | Self::AuthenticationFailed { .. }
                 | Self::InvalidArgument { .. }
                 | Self::RequiresForce { .. }
+                | Self::ManagedAgentIncomplete { .. }
+                | Self::StaleBaseline { .. }
                 | Self::InvalidRepository { .. }
                 | Self::InvalidPath { .. }
         )
@@ -605,6 +632,9 @@ impl CliError {
             Self::GitError { .. } => {
                 Some("A Git operation failed. Ensure you are in a valid Git repository, the referenced branch or commit exists, and you have the necessary permissions. Run 'git status' and 'git branch' to investigate.")
             }
+            Self::StaleBaseline { .. } => Some(
+                "Follow the exact remediation commands in the stale-baseline report before retrying the refused operation.",
+            ),
             Self::IdentityNotFound(_) => {
                 Some("Run 'atomic identity list' to see available identities, or 'atomic identity new <name>' to create one.")
             }
@@ -623,6 +653,9 @@ impl CliError {
             }
             Self::RequiresForce { .. } => Some(
                 "Restore specific files with 'atomic restore <file>...', or use 'atomic restore --force' to discard everything.",
+            ),
+            Self::ManagedAgentIncomplete { .. } => Some(
+                "Inspect the affected paths and recover or compare the preserved bytes using the reported refs/atomic/wip/... ref before resuming the managed run.",
             ),
             Self::Internal(_) => {
                 Some("This appears to be a bug. Please report it at: https://github.com/atomicdotdev/atomic/issues")
@@ -652,6 +685,9 @@ impl CliError {
             | Self::Cancelled
             | Self::FileAlreadyTracked { .. }
             | Self::RequiresForce { .. }
+            | Self::ServiceRefusal { .. }
+            | Self::ManagedAgentIncomplete { .. }
+            | Self::StaleBaseline { .. }
             | Self::ViewAlreadyExists { .. } => 1,
 
             // Command-line usage errors
@@ -981,7 +1017,38 @@ mod tests {
     #[test]
     fn test_exit_code_user_fixable() {
         assert_eq!(CliError::NothingToRecord.exit_code(), 1);
-        assert_eq!(CliError::Cancelled.exit_code(), 1);
+    }
+
+    #[test]
+    fn test_stale_baseline_is_typed_user_fixable_refusal() {
+        let error = CliError::StaleBaseline {
+            report: "Unsafe operation: record\nRemediation: atomic git shim reconcile".into(),
+        };
+        assert_eq!(error.exit_code(), 1);
+        assert!(error.is_user_fixable());
+        assert!(error.to_string().contains("Unsafe operation: record"));
+        assert!(error
+            .suggestion()
+            .is_some_and(|suggestion| suggestion.contains("exact remediation")));
+    }
+
+    #[test]
+    fn test_managed_agent_incomplete_is_typed_nonzero() {
+        let outcome = atomic_core::change::session::IncompleteSession::new(
+            "checkout drift",
+            vec!["src/lib.rs".into()],
+            "refs/atomic/wip/run-1",
+            atomic_core::change::session::SessionIncompleteOrigin::UnknownPostCheckout,
+        );
+        let error = CliError::ManagedAgentIncomplete {
+            session_id: "sess-1".into(),
+            outcome,
+        };
+
+        assert_eq!(error.exit_code(), 1);
+        assert!(error.is_user_fixable());
+        assert!(error.to_string().contains("refs/atomic/wip/run-1"));
+        assert!(error.to_string().contains("unknown post-checkout origin"));
     }
 
     #[test]

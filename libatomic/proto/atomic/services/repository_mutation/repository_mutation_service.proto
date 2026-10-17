@@ -1,0 +1,122 @@
+// atomic-protocol — RepositoryMutationService definition (the RPC contract).
+// DRAFT — add-only. Messages for this service live in
+// atomic/services/repository_mutation/repository_mutation_messages.proto · shared primitives in atomic/common/.
+
+syntax = "proto3";
+
+package atomic;
+
+import "atomic/common/options.proto";
+import "atomic/services/repository_mutation/repository_mutation_messages.proto";
+
+service RepositoryMutationService {
+  // `atomic add <PATH>...` — track files in the internal tree.
+  rpc AddFiles(AddFilesRequest) returns (AddFilesResponse) {
+    option (atomic.execution_scope) = EXECUTION_SCOPE_LOCAL;
+    option (atomic.required_capability) = "working-copy.write";
+    option (atomic.allowed_caller) = CALLER_CLASS_LOCAL;
+    option (atomic.effect) = RPC_EFFECT_REPOSITORY_WRITE;
+    option (atomic.effect) = RPC_EFFECT_WORKSPACE_READ;
+    option (atomic.effect) = RPC_EFFECT_WORKSPACE_WRITE; // mutable tracking state/lease
+  }
+  // `atomic remove [--keep]`
+  rpc RemoveFiles(RemoveFilesRequest) returns (RemoveFilesResponse) {
+    option (atomic.execution_scope) = EXECUTION_SCOPE_LOCAL;
+    option (atomic.required_capability) = "working-copy.write";
+    option (atomic.allowed_caller) = CALLER_CLASS_LOCAL;
+    option (atomic.effect) = RPC_EFFECT_REPOSITORY_WRITE;
+    option (atomic.effect) = RPC_EFFECT_WORKSPACE_WRITE;
+  }
+  // `atomic move <src> <dst>`
+  rpc MoveFile(MoveFileRequest) returns (MoveFileResponse) {
+    option (atomic.execution_scope) = EXECUTION_SCOPE_LOCAL;
+    option (atomic.required_capability) = "working-copy.write";
+    option (atomic.allowed_caller) = CALLER_CLASS_LOCAL;
+    option (atomic.effect) = RPC_EFFECT_REPOSITORY_WRITE;
+    option (atomic.effect) = RPC_EFFECT_WORKSPACE_WRITE;
+  }
+  // `atomic restore [--force]` (alias `reset`) — reset the
+  // working copy toward pristine state.
+  rpc Restore(RestoreRequest) returns (RestoreResponse) {
+    option (atomic.execution_scope) = EXECUTION_SCOPE_LOCAL;
+    option (atomic.required_capability) = "working-copy.write";
+    option (atomic.allowed_caller) = CALLER_CLASS_LOCAL;
+    option (atomic.effect) = RPC_EFFECT_REPOSITORY_READ;
+    option (atomic.effect) = RPC_EFFECT_WORKSPACE_WRITE;
+    option (atomic.effect) = RPC_EFFECT_DAEMON_WRITE; // replay/outcome ledger
+  }
+
+  // `atomic record -m ...` — change publication from tracked files; the
+  // store+apply+view-advance+outbox event commit in ONE write transaction
+  // (RFC 1.3). Expensive preparation happens before the writer is acquired;
+  // state is revalidated before commit.
+  rpc Record(RecordRequest) returns (RecordResponse) {
+    option (atomic.execution_scope) = EXECUTION_SCOPE_LOCAL;
+    option (atomic.required_capability) = "repository.write";
+    option (atomic.required_capability) = "working-copy.write";
+    option (atomic.allowed_caller) = CALLER_CLASS_LOCAL;
+    option (atomic.effect) = RPC_EFFECT_REPOSITORY_WRITE;
+    option (atomic.effect) = RPC_EFFECT_WORKSPACE_WRITE;
+  }
+  // `atomic revise [--reword]` — replace a recorded patch with a new hash;
+  // never mutate an immutable content-addressed change in place.
+  rpc Revise(ReviseRequest) returns (ReviseResponse) {
+    option (atomic.execution_scope) = EXECUTION_SCOPE_LOCAL;
+    option (atomic.required_capability) = "repository.write";
+    option (atomic.required_capability) = "working-copy.read";
+    option (atomic.allowed_caller) = CALLER_CLASS_LOCAL;
+    option (atomic.effect) = RPC_EFFECT_REPOSITORY_WRITE;
+    option (atomic.effect) = RPC_EFFECT_WORKSPACE_READ;
+  }
+  // Insert refs + dependency closure into an explicit target. Bare CLI promotion
+  // resolves its source/parent first. No working-copy materialization or preview.
+  rpc InsertChanges(InsertChangesRequest) returns (InsertChangesResponse) {
+    option (atomic.execution_scope) = EXECUTION_SCOPE_BOTH;
+    option (atomic.required_capability) = "repository.write";
+    option (atomic.allowed_caller) = CALLER_CLASS_LOCAL;
+    option (atomic.allowed_caller) = CALLER_CLASS_REMOTE_IDENTITY;
+    option (atomic.effect) = RPC_EFFECT_REPOSITORY_WRITE;
+  }
+  // Remove a reference from an explicit view; do not delete shared graph data
+  // or touch host files. The client separately restores its workspace if needed.
+  rpc Unrecord(UnrecordRequest) returns (UnrecordResponse) {
+    option (atomic.execution_scope) = EXECUTION_SCOPE_BOTH;
+    option (atomic.required_capability) = "repository.write";
+    option (atomic.allowed_caller) = CALLER_CLASS_LOCAL;
+    option (atomic.allowed_caller) = CALLER_CLASS_REMOTE_IDENTITY;
+    option (atomic.effect) = RPC_EFFECT_REPOSITORY_WRITE;
+  }
+
+  // `atomic stash push|pop|apply|list|show|drop|clear` → 4 RPCs (combine).
+  rpc CreateStash(CreateStashRequest) returns (CreateStashResponse) {
+    option (atomic.execution_scope) = EXECUTION_SCOPE_LOCAL;
+    option (atomic.required_capability) = "repository.write";
+    option (atomic.required_capability) = "working-copy.write";
+    option (atomic.allowed_caller) = CALLER_CLASS_LOCAL;
+    option (atomic.effect) = RPC_EFFECT_REPOSITORY_WRITE;
+    option (atomic.effect) = RPC_EFFECT_WORKSPACE_WRITE;
+  }
+  rpc ApplyStash(ApplyStashRequest) returns (ApplyStashResponse) {
+    option (atomic.execution_scope) = EXECUTION_SCOPE_LOCAL;
+    option (atomic.required_capability) = "working-copy.write";
+    option (atomic.allowed_caller) = CALLER_CLASS_LOCAL;
+    option (atomic.effect) = RPC_EFFECT_REPOSITORY_READ;
+    option (atomic.effect) = RPC_EFFECT_WORKSPACE_WRITE;
+    option (atomic.effect) = RPC_EFFECT_DAEMON_WRITE;
+  }
+  rpc ListStashes(ListStashesRequest) returns (ListStashesResponse) {
+    option (atomic.execution_scope) = EXECUTION_SCOPE_LOCAL;
+    option (atomic.required_capability) = "repository.read";
+    option (atomic.allowed_caller) = CALLER_CLASS_LOCAL;
+    option (atomic.effect) = RPC_EFFECT_REPOSITORY_READ;
+    option (atomic.effect) = RPC_EFFECT_WORKSPACE_READ;
+  }
+  rpc DropStash(DropStashRequest) returns (DropStashResponse) {
+    option (atomic.execution_scope) = EXECUTION_SCOPE_LOCAL;
+    option (atomic.required_capability) = "repository.write";
+    option (atomic.required_capability) = "working-copy.write";
+    option (atomic.allowed_caller) = CALLER_CLASS_LOCAL;
+    option (atomic.effect) = RPC_EFFECT_REPOSITORY_WRITE;
+    option (atomic.effect) = RPC_EFFECT_WORKSPACE_WRITE;
+  }
+}

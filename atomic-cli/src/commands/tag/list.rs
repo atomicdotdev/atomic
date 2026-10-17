@@ -38,8 +38,9 @@
 use clap::Parser;
 
 use atomic_core::types::Base32;
-use atomic_repository::Repository;
+use atomic_repository::{Repository, WorkspaceTxnMode};
 
+use crate::commands::workspace_txn::enter_workspace;
 use crate::commands::{find_repository_root, Command};
 use crate::error::{CliError, CliResult};
 use crate::output::{emphasis, hint};
@@ -121,21 +122,31 @@ impl List {
 
 impl Command for List {
     fn run(&self) -> CliResult<()> {
+        // Route every form through the service layer: the view/pattern/
+        // annotated-only filters ride the request and the handler applies
+        // the same semantics over the domain listing.
+        if crate::commands::rpc::tag_list(self)? {
+            return Ok(());
+        }
+
         // Find the repository
         let repo_root = find_repository_root()?;
-        let repo = Repository::open(&repo_root).map_err(|e| match e {
+        let mut repo = Repository::open_readonly(&repo_root).map_err(|e| match e {
             atomic_repository::RepositoryError::NotFound { path } => CliError::RepositoryNotFound {
                 searched_path: path.into(),
             },
             other => CliError::Repository(other),
         })?;
 
+        let workspace = enter_workspace(&mut repo, WorkspaceTxnMode::Observe)?;
+
         // Get tags — filter by view or list all
         let mut tags = if let Some(view) = &self.view {
             repo.list_tags_for_view(view)
                 .map_err(CliError::Repository)?
         } else {
-            repo.list_all_tags().map_err(CliError::Repository)?
+            repo.list_tags_for_view(&workspace.view().name)
+                .map_err(CliError::Repository)?
         };
 
         // Apply name pattern filter (glob-style)

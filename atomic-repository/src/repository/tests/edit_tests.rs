@@ -59,13 +59,15 @@ fn test_modified_file_creates_edit_hunks() {
         initial_change.hunks()[0].type_name()
     );
     // For a 3-line file, expect 1 FileAdd (first line) + 2 Edit (lines 2,3).
-    for op in &initial_change.hunks()[1..] {
-        assert_eq!(
-            op.type_name(),
-            "Edit",
-            "Per-line vertices should be emitted as Edit ops after FileAdd"
-        );
-    }
+    // Attribute operations may accompany the content operations.
+    let edit_count = initial_change.hunks()[1..]
+        .iter()
+        .filter(|operation| operation.type_name() == "Edit")
+        .count();
+    assert_eq!(edit_count, 2, "expected one Edit for each remaining line");
+    assert!(initial_change.hunks()[1..]
+        .iter()
+        .all(|operation| { matches!(operation.type_name(), "Edit" | "SetAttr") }));
 
     // Step 2: Modify the file (change middle line)
     std::fs::write(&file_path, b"line1\nmodified_line2\nline3\n").unwrap();

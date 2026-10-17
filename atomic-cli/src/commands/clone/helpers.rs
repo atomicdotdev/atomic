@@ -21,12 +21,10 @@
 //! This module provides the helper functions that support these operations.
 
 use std::collections::HashSet;
-use std::io::Cursor;
 use std::path::{Path, PathBuf};
 
 use bytes::Bytes;
 
-use atomic_core::change::Change;
 use atomic_core::types::{Base32, Hash};
 use atomic_remote::RemoteError;
 use atomic_repository::{Repository, ViewManifest};
@@ -304,6 +302,43 @@ impl Drop for CleanupGuard {
     }
 }
 
+/// Explicit bootstrap boundary for the clone transport phase.
+///
+/// A clone's transport runs before any persistent working copy exists, so it
+/// has no working-copy authority to hold: this marker names the boundary
+/// instead of fabricating a working-copy ID. Repository-local phases (view
+/// alignment, materialization) enter a workspace transaction only after
+/// `Repository::init` has created the working copy.
+#[derive(Debug)]
+pub struct CloneBootstrapBoundary {
+    /// The transport URL.
+    url: String,
+    /// Directory receiving the clone; no working copy exists during transport.
+    target_path: PathBuf,
+}
+
+impl CloneBootstrapBoundary {
+    /// Open the pre-repository transport boundary. No working-copy ID exists
+    /// or is fabricated here; Git-checkout adoption (`--into-existing`) stays
+    /// a CB-10A bootstrap and is refused for Atomic materialization.
+    pub fn begin(target_path: PathBuf) -> Self {
+        Self {
+            url: String::new(),
+            target_path,
+        }
+    }
+
+    /// The transport phase has no working-copy authority by construction.
+    pub fn working_copy(&self) -> Option<atomic_core::WorkingCopyId> {
+        None
+    }
+
+    /// The directory the transport writes into.
+    pub fn target_path(&self) -> &Path {
+        &self.target_path
+    }
+}
+
 // Change Operations
 
 /// Save a downloaded change to the repository's change store.
@@ -333,25 +368,9 @@ impl Drop for CleanupGuard {
 /// save_downloaded_change(&repo, &expected_hash, data)?;
 /// ```
 pub fn save_downloaded_change(repo: &Repository, hash: &Hash, data: Bytes) -> CliResult<()> {
-    // Deserialize the change from bytes
-    let mut cursor = Cursor::new(&data[..]);
-    let (change, computed_hash) = Change::deserialize(&mut cursor)
-        .map_err(|e| CliError::Internal(anyhow::anyhow!("Failed to deserialize change: {}", e)))?;
-
-    // Verify the hash matches what we expected
-    if computed_hash != *hash {
-        return Err(CliError::Internal(anyhow::anyhow!(
-            "Hash mismatch: expected {}, got {}",
-            hash.to_base32(),
-            computed_hash.to_base32()
-        )));
-    }
-
-    // Save to the change store
-    repo.save_change(&change)
-        .map_err(|e| CliError::Internal(anyhow::anyhow!("Failed to save change: {}", e)))?;
-
-    Ok(())
+    repo.import_change_bytes(hash, &data)
+        .map(|_| ())
+        .map_err(|e| CliError::Internal(anyhow::anyhow!("Failed to save change: {}", e)))
 }
 
 // View Manifests

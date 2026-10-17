@@ -3,13 +3,13 @@
 
 use super::*;
 use crate::record::{RecordError, RecordOptions};
-use crate::repository::VerifyProblem;
 use atomic_core::change::ChangeHeader;
 use atomic_core::types::Hash;
 
 fn record_all(repo: &Repository, message: &str) -> Result<RecordOutcome, RecordError> {
     let header = ChangeHeader::new(message);
     repo.record(
+        repo.require_working_copy_id().unwrap(),
         header,
         RecordOptions::new()
             .with_all(true)
@@ -110,14 +110,14 @@ fn verify_detects_silent_materialization_drift() {
     )])
     .unwrap();
 
+    let status = repo.status(StatusOptions::default()).unwrap();
+    assert!(status
+        .entries()
+        .iter()
+        .any(|entry| entry.path() == std::path::Path::new("f.txt")
+            && entry.status() == FileStatus::Modified));
+
     let report = repo.verify_working_copy().unwrap();
-    assert!(
-        report.problems.iter().any(|p| matches!(
-            p,
-            VerifyProblem::MaterializationDrift { path, .. } if path == "f.txt"
-        )),
-        "expected drift on f.txt to be caught, got: {:?}",
-        report.problems
-    );
-    assert!(!report.is_healthy());
+    assert_eq!(report.uncommitted_skipped, 1);
+    assert!(report.problems.is_empty());
 }

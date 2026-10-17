@@ -8,13 +8,15 @@
 //! - `write` - Read-write transaction implementation
 //! - `helpers` - Serialization and utility functions
 
-mod helpers;
+pub(super) mod helpers;
 mod pristine;
 mod read;
 mod write;
 
 pub use helpers::AdjIterator;
+pub(crate) use helpers::{deserialize_view_state, serialize_view_state};
 pub use pristine::Pristine;
+pub(crate) use pristine::{open_database, require_supported_repository_capabilities};
 pub use read::CachedGraphTxn;
 pub use read::InodePreloadTxn;
 pub use read::ReadTxn;

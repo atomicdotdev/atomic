@@ -3,7 +3,7 @@
 //! `MutTxnT` extends all read traits with write operations for modifying
 //! the repository graph, file tree, views, and CRDT tables.
 
-use crate::types::{GraphNode, Hash, Inode, NodeId, Position, SerializedGraphEdge};
+use crate::types::{GraphNode, Hash, Inode, NodeId, Position, SerializedGraphEdge, WorkingCopyId};
 
 use crate::pristine::error::PristineError;
 
@@ -32,7 +32,14 @@ use super::view::{StoredConflict, ViewScope, ViewState, ViewTxnT};
 ///
 /// All operations within a transaction are atomic—either all succeed and
 /// are committed, or none take effect.
-pub trait MutTxnT: ViewTxnT + TreeTxnT + super::CrdtTxnT {
+pub trait MutTxnT:
+    ViewTxnT
+    + TreeTxnT
+    + super::CrdtTxnT
+    + super::OperationMutTxnT
+    + super::PathClaimMutTxnT
+    + super::WorkingCopyMutTxnT
+{
     // ── Change Registration ─────────────────────────────────────
 
     /// Register a new internal ID for an external hash.
@@ -202,6 +209,18 @@ pub trait MutTxnT: ViewTxnT + TreeTxnT + super::CrdtTxnT {
     /// Remove a file from the tree (removes path↔inode mappings).
     fn del_tree(&mut self, path: &str) -> Result<Option<Inode>, PristineError>;
 
+    /// Rebuild REV_TREE as the exact inverse of TREE.
+    ///
+    /// History (0.17.x tree writes) could re-bind a path to a new inode
+    /// without cleaning the previous inode's REV_TREE row, leaving stale
+    /// reverse rows that fail the TREE/REV_TREE bijection validation every
+    /// later tree write runs. This repair removes every reverse row whose
+    /// path is not TREE-bound back to the same inode and inserts the missing
+    /// inverse for every forward row. TREE is authoritative for the binding;
+    /// the repair never touches forward rows. Returns
+    /// `(removed_stale, inserted_missing)`.
+    fn repair_rev_tree_bijection(&mut self) -> Result<(usize, usize), PristineError>;
+
     /// Remove one inode's path binding without deleting a different inode that
     /// currently occupies the same single-valued forward path entry.
     fn del_tree_binding(&mut self, path: &str, inode: Inode) -> Result<(), PristineError>;
@@ -222,6 +241,37 @@ pub trait MutTxnT: ViewTxnT + TreeTxnT + super::CrdtTxnT {
 
     /// Remove cached file index entry.
     fn del_file_index(&mut self, path: &str) -> Result<(), PristineError>;
+
+    /// Store filesystem metadata in the namespace of one working copy.
+    fn put_working_copy_file_index(
+        &mut self,
+        working_copy: WorkingCopyId,
+        path: &str,
+        mtime_secs: i64,
+        mtime_nanos: u32,
+        file_size: u64,
+        content_hash: &Hash,
+    ) -> Result<(), PristineError> {
+        self.put_file_index(
+            &super::tree::working_copy_file_index_key(working_copy, path),
+            mtime_secs,
+            mtime_nanos,
+            file_size,
+            content_hash,
+        )
+    }
+
+    /// Remove filesystem metadata from one working copy's namespace.
+    fn del_working_copy_file_index(
+        &mut self,
+        working_copy: WorkingCopyId,
+        path: &str,
+    ) -> Result<(), PristineError> {
+        self.del_file_index(&super::tree::working_copy_file_index_key(
+            working_copy,
+            path,
+        ))
+    }
 
     /// Map an inode to a graph position (creates inode↔position mappings).
     fn put_inode(&mut self, inode: Inode, pos: Position<NodeId>) -> Result<(), PristineError>;

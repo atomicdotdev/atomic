@@ -299,6 +299,22 @@ and never breaks the agent if something fails:
 test -d .atomic || test -f .atomic-sandbox && atomic agent hooks <agent> <verb> || true
 ```
 
+### Correlation and hook diagnostics
+
+Give each session a stable ID and preserve `parent_session_id` in the event's
+`raw_json` when the agent exposes parent/child relationships. Bridges can also
+pass `ATOMIC_SESSION_ID` and `ATOMIC_PARENT_SESSION_ID` in the hook process's
+environment. The typed `agent receive` entry point resolves the caller's parent
+ID and carries it explicitly on the service request.
+
+Native hooks and typed dispatch already emit shared operational diagnostics;
+adapters use this reporting path automatically. Check `atomic agent status`
+and `atomic agent status --json` after wiring an integration. Validate both
+successful dispatch and malformed input, and check that concurrent children
+keep their own session IDs and parent linkage. See
+[Hook Health and Session Logs](./hook-health.md) for the report fields and
+outage behavior.
+
 ---
 
 ## Why each agent must be added explicitly

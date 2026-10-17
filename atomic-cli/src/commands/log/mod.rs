@@ -124,8 +124,8 @@ use crate::output::{
 
 // Output Format
 
-mod command;
-mod types;
+pub(crate) mod command;
+pub(crate) mod types;
 
 pub use command::*;
 pub use types::*;

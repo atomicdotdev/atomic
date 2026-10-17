@@ -771,6 +771,27 @@ mod tests {
         assert!(result.is_err());
     }
 
+    #[test]
+    fn test_reachable_july_2026_change_when_present() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join(".atomic/changes/Y2/Y2MEJPZ5GEWH6EQ44JKUGFYCF4WN5W6EPAK4L4O2NESS3HJJOBZA.change");
+        if !path.exists() {
+            return;
+        }
+
+        let mut file = std::fs::File::open(path).unwrap();
+        let (change, _) = crate::change::Change::deserialize(&mut file).unwrap();
+        assert_eq!(change.hashed.hunks.len(), 22_453);
+        assert_eq!(change.hashed.provenance.len(), 1);
+        assert_eq!(change.hashed.provenance[0].model, "moonshotai");
+        assert_eq!(
+            change.hashed.provenance[0].model_version.as_deref(),
+            Some("kimi-k3")
+        );
+    }
+
     // ── SemanticSectionPayload ─────────────────────────────────────
 
     #[test]

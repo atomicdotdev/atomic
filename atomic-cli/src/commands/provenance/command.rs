@@ -76,16 +76,35 @@ pub struct ProvenanceShow {
 
 impl Command for ProvenanceTrace {
     fn run(&self) -> CliResult<()> {
-        let root = find_repository_root()?;
-        let repo = Repository::open(&root).map_err(CliError::Repository)?;
-        let change_hash = resolve_change_target(&repo, &self.target)?;
-        let graphs = load_graphs(&repo, &change_hash)?;
-
+        // Route every form through the service layer: the handler resolves
+        // the target, loads the explaining graphs, maps the projection
+        // inputs, and pre-walks the prior-turn chain. Identity resolution
+        // stays CLIENT-SIDE (the identity store is a config read, not
+        // redb); the projection/signing runs over wire-carried inputs with
+        // the SAME canonical functions.
         if self.json {
-            // Emit the JSON-LD, exactly like `show` (unsigned by default; `--sign`
-            // for the signable artifact).
             let (identity, keypair) = resolve_person(self.identity.as_deref())?;
             let person_did = did_for_public_key(&identity.public_key);
+            if let Some((change_hash, graphs)) =
+                crate::commands::rpc::provenance_export(&self.target, &person_did)?
+            {
+                let values = graphs
+                    .iter()
+                    .map(|wire| {
+                        if self.sign {
+                            attest_prov(&wire.input, &identity, &keypair)
+                        } else {
+                            project(&wire.input)
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                print_value(&values, self.sign);
+                return Ok(());
+            }
+            let root = find_repository_root()?;
+            let repo = Repository::open(&root).map_err(CliError::Repository)?;
+            let change_hash = resolve_change_target(&repo, &self.target)?;
+            let graphs = load_graphs(&repo, &change_hash)?;
             let values = graphs
                 .iter()
                 .map(|(_, g)| {
@@ -110,20 +129,50 @@ impl Command for ProvenanceTrace {
             .map(|(id, _)| did_for_public_key(&id.public_key))
             .unwrap_or_else(|| "(no signing identity)".to_string());
 
-        print_trace(&repo, &graphs, &change_hash, &person_did);
+        if let Some((change_hash, graphs)) =
+            crate::commands::rpc::provenance_export(&self.target, &person_did)?
+        {
+            print_trace(&graphs, &change_hash, &person_did);
+            return Ok(());
+        }
+
+        let root = find_repository_root()?;
+        let repo = Repository::open(&root).map_err(CliError::Repository)?;
+        let change_hash = resolve_change_target(&repo, &self.target)?;
+        let graphs = load_graphs(&repo, &change_hash)?;
+        print_trace_local(&repo, &graphs, &change_hash, &person_did);
         Ok(())
     }
 }
 
 impl Command for ProvenanceShow {
     fn run(&self) -> CliResult<()> {
+        // Route every form through the service layer (same wire as trace;
+        // show always needs the signing identity, resolved client-side).
+        let (identity, keypair) = resolve_person(self.identity.as_deref())?;
+        let person_did = did_for_public_key(&identity.public_key);
+
+        if let Some((change_hash, graphs)) =
+            crate::commands::rpc::provenance_export(&self.target, &person_did)?
+        {
+            let values = graphs
+                .iter()
+                .map(|wire| {
+                    if self.sign {
+                        attest_prov(&wire.input, &identity, &keypair)
+                    } else {
+                        project(&wire.input)
+                    }
+                })
+                .collect::<Vec<_>>();
+            print_value(&values, self.sign);
+            return Ok(());
+        }
+
         let root = find_repository_root()?;
         let repo = Repository::open(&root).map_err(CliError::Repository)?;
         let change_hash = resolve_change_target(&repo, &self.target)?;
         let graphs = load_graphs(&repo, &change_hash)?;
-
-        let (identity, keypair) = resolve_person(self.identity.as_deref())?;
-        let person_did = did_for_public_key(&identity.public_key);
 
         let values = graphs
             .iter()
@@ -264,9 +313,34 @@ fn print_value(values: &[serde_json::Value], signed: bool) {
     }
 }
 
-/// Print the human-readable flywheel chain: change -> activity -> generated ->
-/// agent -> person -> turnParent -> ... (walking `previous`).
+/// Print the human-readable flywheel chain — the routed render: change ->
+/// activity -> generated -> agent -> person -> turnParent -> ... (the
+/// prior-turn chain arrives pre-walked on the wire).
 fn print_trace(
+    graphs: &[crate::commands::rpc::ProvenanceWireGraph],
+    change_hash: &Hash,
+    person_did: &str,
+) {
+    println!(
+        "{} {}",
+        emphasis("Provenance for change"),
+        info(&change_hash.to_base32())
+    );
+    for (i, wire) in graphs.iter().enumerate() {
+        if graphs.len() > 1 {
+            println!(
+                "{}",
+                hint(&format!("  [graph {} of {}]", i + 1, graphs.len()))
+            );
+        }
+        print_activity_chain(&wire.input, &wire.prior_activities, wire.chain_truncated);
+    }
+    let _ = person_did;
+}
+
+/// The local fallback render (outside a routed repository): the same
+/// chain with the graphs walked live from the repository handle.
+fn print_trace_local(
     repo: &Repository,
     graphs: &[(Hash, ProvenanceGraph)],
     change_hash: &Hash,
@@ -285,12 +359,14 @@ fn print_trace(
             );
         }
         let input = map_graph_to_input(repo, graph, change_hash, person_did);
-        print_activity_chain(repo, &input, graph);
+        print_activity_chain_local(repo, &input, graph);
     }
 }
 
-/// Print one activity and walk its `turnParent` chain via `previous`.
-fn print_activity_chain(repo: &Repository, input: &ProvActivityInput, graph: &ProvenanceGraph) {
+/// Print one activity and its prior-turn chain — the routed render: the
+/// activity block projects from the wire-carried input, and the chain
+/// renders the handler's pre-walked activity URNs.
+fn print_activity_chain(input: &ProvActivityInput, priors: &[String], truncated: bool) {
     // The projected (unsigned) value is the source of truth for the shape.
     let value = project(input);
     let activity = value
@@ -349,28 +425,45 @@ fn print_activity_chain(repo: &Repository, input: &ProvActivityInput, graph: &Pr
         }
     }
 
-    // Walk `previous` to render the prior turn (one level; recursion via loop).
+    for prior in priors {
+        if prior.is_empty() {
+            println!("{indent}  {}", hint("↑ prior turn (graph unavailable)"));
+        } else {
+            println!("{indent}  {} activity {}", hint("↑ prior turn"), prior);
+        }
+    }
+    if truncated {
+        println!("{indent}  {}", hint("(chain truncated)"));
+    }
+}
+
+/// The local fallback's live chain walk (the same lines the pre-walked
+/// render prints).
+fn print_activity_chain_local(
+    repo: &Repository,
+    input: &ProvActivityInput,
+    graph: &ProvenanceGraph,
+) {
+    let mut priors = Vec::new();
+    let mut truncated = false;
     let mut cursor = graph.previous;
     let mut depth = 0usize;
     while let Some(prev_hash) = cursor {
         depth += 1;
         if depth > 64 {
-            println!("{indent}  {}", hint("(chain truncated)"));
+            truncated = true;
             break;
         }
         match repo.load_provenance_graph(&prev_hash) {
             Ok(prev) => {
-                println!(
-                    "{indent}  {} activity {}",
-                    hint("↑ prior turn"),
-                    activity_urn(&activity_id_for(&prev)),
-                );
+                priors.push(activity_urn(&activity_id_for(&prev)));
                 cursor = prev.previous;
             }
             Err(_) => {
-                println!("{indent}  {}", hint("↑ prior turn (graph unavailable)"));
+                priors.push(String::new());
                 break;
             }
         }
     }
+    print_activity_chain(input, &priors, truncated);
 }

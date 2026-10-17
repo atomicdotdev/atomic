@@ -1,0 +1,74 @@
+// atomic-protocol — DaemonService definition (the RPC contract).
+// DRAFT — add-only. Messages for this service live in
+// atomic/services/daemon/daemon_messages.proto · shared primitives in atomic/common/.
+
+syntax = "proto3";
+
+package atomic;
+
+import "atomic/common/options.proto";
+import "atomic/services/daemon/daemon_messages.proto";
+
+service DaemonService {
+  // Liveness + quick-gate feature tokens. Zero required capabilities
+  // (negotiation pair — see options.proto) and BOTH scope: health is served
+  // by local daemon and hosted server alike.
+  rpc Health(HealthRequest) returns (HealthResponse) {
+    option (atomic.execution_scope) = EXECUTION_SCOPE_BOTH;
+    option (atomic.allowed_caller) = CALLER_CLASS_LOCAL;
+    option (atomic.allowed_caller) = CALLER_CLASS_REMOTE_IDENTITY;
+    option (atomic.allowed_caller) = CALLER_CLASS_SANDBOX;
+    option (atomic.effect) = RPC_EFFECT_DAEMON_READ;
+  }
+
+  // The capability handshake (RFC D7): versions, endpoint kind, method
+  // matrix, limits, auth. Zero required capabilities (negotiation pair).
+  // Clients gate on this BEFORE invoking ops — the additive capability-flag
+  // pattern of the legacy surface, generalized to the full method matrix.
+  rpc GetCapabilities(GetCapabilitiesRequest) returns (GetCapabilitiesResponse) {
+    option (atomic.execution_scope) = EXECUTION_SCOPE_BOTH;
+    option (atomic.allowed_caller) = CALLER_CLASS_LOCAL;
+    option (atomic.allowed_caller) = CALLER_CLASS_REMOTE_IDENTITY;
+    option (atomic.allowed_caller) = CALLER_CLASS_SANDBOX;
+    option (atomic.effect) = RPC_EFFECT_DAEMON_READ;
+  }
+
+  // Local path discovery → persistent repository identity: the contract
+  // analog of find_repository_root. LOOKUP ONLY: resolve a registered
+  // repository/workspace, including the caller's subdirectory. Never register,
+  // initialize tables or recover a working tree on a read. Unregistered →
+  // REPOSITORY_NOT_FOUND; local clients explicitly RegisterRepository.
+  rpc ResolveRepository(ResolveRepositoryRequest) returns (ResolveRepositoryResponse) {
+    option (atomic.execution_scope) = EXECUTION_SCOPE_LOCAL;
+    option (atomic.required_capability) = "daemon.read";
+    option (atomic.allowed_caller) = CALLER_CLASS_LOCAL;
+    option (atomic.effect) = RPC_EFFECT_DAEMON_READ;
+    option (atomic.effect) = RPC_EFFECT_WORKSPACE_READ;
+  }
+
+  rpc RegisterRepository(RegisterRepositoryRequest) returns (RegisterRepositoryResponse) {
+    option (atomic.execution_scope) = EXECUTION_SCOPE_LOCAL;
+    option (atomic.required_capability) = "daemon.admin";
+    option (atomic.required_capability) = "working-copy.write";
+    option (atomic.allowed_caller) = CALLER_CLASS_LOCAL;
+    option (atomic.effect) = RPC_EFFECT_DAEMON_WRITE;
+    option (atomic.effect) = RPC_EFFECT_WORKSPACE_WRITE;
+  }
+
+  // Repositories this daemon can serve (with open/idle state).
+  rpc ListRepositories(ListRepositoriesRequest) returns (ListRepositoriesResponse) {
+    option (atomic.execution_scope) = EXECUTION_SCOPE_LOCAL;
+    option (atomic.required_capability) = "daemon.read";
+    option (atomic.allowed_caller) = CALLER_CLASS_LOCAL;
+    option (atomic.effect) = RPC_EFFECT_DAEMON_READ;
+  }
+
+  // Graceful shutdown (admin, local-only): drain active and queued work,
+  // close repository databases, release locks.
+  rpc Shutdown(ShutdownRequest) returns (ShutdownResponse) {
+    option (atomic.execution_scope) = EXECUTION_SCOPE_LOCAL;
+    option (atomic.required_capability) = "daemon.admin";
+    option (atomic.allowed_caller) = CALLER_CLASS_LOCAL;
+    option (atomic.effect) = RPC_EFFECT_DAEMON_WRITE;
+  }
+}

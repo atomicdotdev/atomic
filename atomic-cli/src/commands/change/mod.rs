@@ -128,11 +128,11 @@
 use clap::{Parser, ValueEnum};
 use serde::Serialize;
 
-use atomic_core::change::{Author, Change, GraphOp, Provenance};
+use atomic_core::change::{Author, Change, GraphOp, Provenance, ProvenanceGraph};
 use atomic_core::pristine::ViewTxnT;
 use atomic_core::types::{Base32, Hash};
 use atomic_repository::history::{find_change_sequence, get_change_at_sequence};
-use atomic_repository::Repository;
+use atomic_repository::{extract_move_evidence, LossNote, MoveAuthority, MoveBasis, Repository};
 
 use crate::commands::{
     find_repository_root, format_hash_with_length, format_timestamp, Command, DEFAULT_HASH_LENGTH,
@@ -146,11 +146,14 @@ use console::style;
 
 // Output Format
 
-mod command;
-mod types;
+pub(crate) mod command;
+pub(crate) mod types;
 
 pub use command::*;
 pub use types::*;
+// The per-file hunk summaries over a change's hunks live with the triage
+// projection in the repository layer now; the change command renders them.
+pub use atomic_repository::triage::{hunk_display_summaries, HunkDisplaySummary};
 
 #[cfg(test)]
 mod tests;

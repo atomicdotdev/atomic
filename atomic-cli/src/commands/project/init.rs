@@ -94,6 +94,16 @@ pub struct ProjectInit {
 
 impl Command for ProjectInit {
     fn run(&self) -> CliResult<()> {
+        // Route the repository mutation through the service layer: the
+        // server-side project creation stays client-side (the management
+        // StorageClient is built from the global config + the identity
+        // store — config/auth reads, not redb, per the push/pull ruling),
+        // and the ONE repository write (add_remote origin) rides
+        // ManageRemotes so this command never opens redb directly.
+        if crate::commands::rpc::project_init(self)? {
+            return Ok(());
+        }
+
         let rt = tokio::runtime::Runtime::new().map_err(|e| {
             CliError::Internal(anyhow::anyhow!("Failed to create async runtime: {}", e))
         })?;

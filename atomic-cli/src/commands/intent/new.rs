@@ -8,6 +8,7 @@ use atomic_repository::{IntentCreateOptions, IntentCreateResult, IntentUpdateOpt
 
 use crate::commands::{find_repository_root, Command};
 use crate::error::{CliError, CliResult};
+use atomic_repository::{FEATURE_SCAFFOLD, REVIEW_SCAFFOLD};
 
 /// The directive scaffold emitted for a new intent.
 ///
@@ -24,78 +25,6 @@ use crate::error::{CliError, CliResult};
 /// hard-requires a non-empty `why`), and because it emits a `:::scope-in` it
 /// must also emit a `:::scope-out` (the gate requires the out-of-scope boundary
 /// whenever scope is declared).
-const FEATURE_SCAFFOLD: &str = "\
-:::why
-<!-- Why does this intent exist? State the reason this work matters. The
-     content is never graded — but it must be present. Replace this stub. -->
-:::
-
-:::acceptance-criterion{#{id}-ac-1 status=unmet}
-<!-- A single, checkable outcome that means this intent is done. -->
-:::
-
-:::task{#{id}-1 status=open criteria={id}-ac-1}
-<!-- A concrete work item toward the criterion above. Name the file(s) it
-     touches with one or more ::file-ref leaves. -->
-::file-ref{path=path/to/file}
-:::
-
-:::scope-in
-<!-- What this intent will change. -->
-:::
-
-:::scope-out
-<!-- What this intent will deliberately NOT change (the boundaries the agent
-     must respect). -->
-:::
-
-:::constraint
-<!-- A rule the implementation must respect. -->
-:::
-";
-
-/// The directive scaffold emitted for a `--review <TARGET>` intent.
-///
-/// Identical in shape to [`FEATURE_SCAFFOLD`] but carries a
-/// `:::ref{to=<TARGET> edge=reviews}` leaf. The gate's `ReviewShape` couples the
-/// `review` kind to the `reviews` edge (kind==review ⟺ exactly-a-reviews-edge),
-/// so seeding the ref here makes a `--review` intent conform out of the box. The
-/// acceptance-criterion stub is phrased as a review verdict.
-///
-/// `{id}` is replaced with the intent's ULID (child-id namespacing) and
-/// `{target}` with the reviewed intent reference.
-const REVIEW_SCAFFOLD: &str = "\
-:::why
-<!-- Why does this review matter? State what makes reviewing the target work
-     worthwhile. The content is never graded — but it must be present. -->
-:::
-
-:::acceptance-criterion{#{id}-ac-1 status=unmet}
-<!-- Review verdict: the reviewed work is correct, tested, in scope, and its
-     own acceptance criteria are genuinely met. A single checkable outcome. -->
-:::
-
-:::task{#{id}-1 status=open criteria={id}-ac-1}
-<!-- Review the target intent's work and record the findings. -->
-::file-ref{path=path/to/file}
-:::
-
-:::ref{to={target} edge=reviews}
-:::
-
-:::scope-in
-<!-- What this review covers. -->
-:::
-
-:::scope-out
-<!-- What this review deliberately does NOT cover. -->
-:::
-
-:::constraint
-<!-- A rule this review must respect. -->
-:::
-";
-
 /// Scaffold a new directive-based intent into the vault.
 #[derive(Parser, Debug)]
 #[command(name = "new")]
@@ -212,6 +141,10 @@ fn create_intent(
 
 impl Command for IntentNew {
     fn run(&self) -> CliResult<()> {
+        if crate::commands::rpc::intent_new(self)? {
+            return Ok(());
+        }
+
         if self.template != "feature" {
             return Err(CliError::InvalidArgument {
                 message: format!(

@@ -2,6 +2,12 @@
 
 A Semantic Change Graph (SCG) to track memory, intent, provenance, and change as a single unit of work.  This is the evolution of source code management in the era of agents and agentic coding.
 
+The Git causal shim is temporarily supported on **Unix only (Linux and macOS)**.
+Windows shim support is deferred while its platform contract is defined; native
+Atomic functionality continues to be tested on Windows. See the
+[temporary platform policy](docs/RFC-ATOMIC-GIT-CAUSAL-BRIDGE.md#temporary-platform-support-pr-207)
+for the CI scope and requirements for re-enabling Windows shim tests.
+
 ## Why Atomic?
 
 Git was designed for humans writing code in text editors. It tracks lines in files. That worked for 20 years.
@@ -41,46 +47,121 @@ atomic agent enable
 #   - Provenance graph (why the agent made each decision)
 ```
 
-### Repository owner locks and connection recovery
+### Repository access through libatomic
 
-Agent hooks are short-lived processes, while redb permits only one writable process to open a database. Atomic therefore starts one long-lived **database owner per canonical repository**. Hooks send committed provenance requests to that owner instead of opening the repository's redb change store directly.
+CLI repository operations, including agent provenance recording, use the
+libatomic service handlers. The default mode (`ATOMIC_SERVICE=local`) runs
+those handlers inside the CLI process, without starting a background owner
+or creating a socket. Graph, views, sessions, vault, and the provenance journal
+share `.atomic/atomic.redb`.
 
-Each repository has an independent ownership namespace:
+With `ATOMIC_SERVICE=reactor`, the CLI calls the same handlers through the
+separate `atomicd` service over a Unix socket. Reactor mode still requires its
+socket and does not fall back to local execution if the service is unavailable.
+`ATOMIC_RPC=1` is the legacy alias for Reactor mode; an explicit
+`ATOMIC_SERVICE=local` or `reactor` takes precedence. Use the same mode for
+commands accessing a repository; do not mix local access with an active Reactor
+service accessing that repository.
 
-| Resource | Location | Purpose |
-|---|---|---|
-| redb change store | `.atomic/changes.redb` | Mutable provenance journal and checkpoint state |
-| owner election lock | `.atomic/changes-owner.lock` | OS-backed authority deciding which process may own that database |
-| Unix endpoint | `/tmp/atomic-owner-<repository-digest>.sock` | Local IPC transport on macOS and Linux |
-| Windows endpoint | `\\.\pipe\atomic-owner-<repository-digest>` | Local IPC transport on Windows |
+The old per-repository `atomic agent database-owner` command, its
+`changes-owner.lock` election, and its `/tmp/atomic-owner-*.sock` endpoints
+have been removed from the current CLI. Processes started by an older binary
+can still be running after an upgrade. Stop them using the steps below.
 
-These runtime resources do **not** require `sudo`. The owner process runs as the current user: it creates the repository lock and database under the user-writable `.atomic` directory and creates its Unix socket in `/tmp`, which is a shared, sticky-bit-protected runtime directory. Elevated privileges are only needed when installing or replacing the `atomic` executable in a system-owned prefix such as `/usr/local/bin`; they are unrelated to socket creation or owner election.
+### Upgrading from legacy database owners (0.19.1 and earlier)
 
-The endpoint digest is derived from the canonical `.atomic` path and uses 96 bits of BLAKE3 output. Different project paths therefore get different owners, locks, databases, and endpoints. Multiple agents working in one project intentionally share that project's owner; agents working in other projects use different owners and proceed independently. Agent sandboxes and symlinked paths resolve back to the canonical repository, so they share its owner rather than creating competing databases. A clone at a different path gets its own owner.
+Replacing the executable does not stop existing processes. Before upgrading,
+pause agent hooks and let active Atomic commands finish. Keep hooks paused
+through cleanup and installation. These macOS/Linux steps also work when you
+cannot locate the original repository, including test or workshop repositories
+created under `/tmp`.
 
-```text
-Agent A ─┐                         Agent C ─┐
-Agent B ─┴─> Project 1 owner       Agent D ─┴─> Project 2 owner
-                 │                                  │
-                 v                                  v
-       Project 1 changes.redb             Project 2 changes.redb
+List Atomic processes belonging to your user:
+
+```sh
+pgrep -u "$(id -u)" -x atomic
 ```
 
-The **lock is the authority; the socket or named pipe is only transport**. The lock file may remain on disk after normal operation, but an unlocked file does not block a new owner. If an owner crashes, the OS releases its lock automatically. Recovery then proceeds as follows:
+Once active work has finished, stop those processes with SIGTERM:
 
-1. A hook cannot reach the old endpoint and starts or reconnects to an owner.
-2. Owner candidates race for that repository's `changes-owner.lock`.
-3. Only the lock winner may open `changes.redb`.
-4. On Unix, the winner removes any stale socket left by the dead owner and binds a fresh endpoint.
-5. The hook retries with the same request/event ID, so a request committed before the crash is acknowledged once rather than applied twice.
+```sh
+pkill -TERM -u "$(id -u)" -x atomic
+```
 
-Within one repository, redb write transactions are serialized by design, while reads and independent repositories can proceed concurrently. Startup, reconnect, and retry loops are bounded so a broken owner fails instead of hanging hooks indefinitely. Checkpoint attempts, event cutoffs, and fencing generations let interrupted turns resume without rewriting completed session turns.
+This stops all processes named exactly `atomic` belonging to your user, across
+repositories and versions. It does not match `atomicd` or another user's
+processes. Coordinate with other users if their old processes are also running.
+If you know the repository and still have the old executable, you can instead
+request its owner's shutdown with that executable:
 
-Current operational considerations:
+```sh
+/path/to/old/atomic agent database-owner shutdown --repository /path/to/repo
+```
 
-- Owners remain alive until explicitly shut down; an idle timeout or user-level owner registry is a future resource-management improvement for machines that touch many repositories.
-- Unix endpoints use `/tmp` to stay below macOS Unix-socket path limits. A future hardening step should move them into a user-private runtime directory where available, enforce restrictive socket permissions, and validate peer credentials.
-- A 96-bit endpoint digest makes accidental cross-project collisions extraordinarily unlikely, but the repository-local lock remains the final ownership check.
+Check again and wait until no matching processes remain:
+
+```sh
+pgrep -u "$(id -u)" -x atomic
+```
+
+No output with exit status 1 means no matches; other errors need investigation.
+Do not continue while PIDs are still listed. `pkill` also returns 1 if there
+were no matching processes.
+
+After the old processes have exited, list leftover legacy sockets owned by
+your user:
+
+```sh
+find /tmp/ -maxdepth 1 -type s -user "$(id -un)" -name 'atomic-owner-*.sock' -print
+```
+
+Then remove those leftover sockets:
+
+```sh
+find /tmp/ -maxdepth 1 -type s -user "$(id -un)" -name 'atomic-owner-*.sock' -exec rm {} +
+```
+
+Socket removal does not stop a running owner or release its database lock.
+Leave `.atomic/changes-owner.lock` and database files in place; the OS releases
+process locks when the owner exits. These commands only remove legacy socket
+files, not Reactor's `atomicd.sock`. Run them as your normal user, without `sudo`.
+
+Now rerun your installer and check `atomic --version` before resuming hooks.
+For repositories using `.atomic/pristine.redb` and `.atomic/changes.redb`, the
+first open by the newer CLI merges them into `.atomic/atomic.redb`, verifies
+the copied tables, and archives the old files under `.atomic/legacy/<timestamp>/`.
+If you already replaced the binary, the process-stop and socket-cleanup steps
+still apply; the new CLI no longer has the old `database-owner shutdown` command.
+
+### Reclaiming unused database space
+
+Run explicit maintenance when the repository is quiet:
+
+```bash
+atomic compact
+atomic compact --repository /path/to/repo --json
+```
+
+The command compacts the existing `.atomic/atomic.redb` and reports its
+before/after sizes and reclaimed bytes. It preserves history, views,
+provenance, change files and unrecorded working files. It does not delete
+live data or deduplicate change objects; zero bytes reclaimed is a valid result.
+
+Compaction runs through libatomic, in-process by default. With
+`ATOMIC_SERVICE=reactor`, it uses the same handler through the configured
+Reactor service; that service must advertise `CompactDatabase`. An older or
+unavailable service produces an error, with no local fallback.
+
+Other database readers and writers must release their handles. Lock waiting
+uses `ATOMIC_DB_LOCK_WAIT_MS` (30 seconds by default); a busy database produces
+an error that can be retried. Once blocking maintenance starts, it finishes
+independently of the caller, including the bounded lock wait. Use a quiet period:
+other commands may time out while the database is being compacted. Persistent
+savepoints block compaction and are never deleted automatically.
+
+This is manual maintenance of an existing combined database, with no implicit
+initialization or migration. Hosted Storage's open-handle cache requires separate
+maintenance coordination before online compaction can be supported.
 
 ### Provenance Graphs
 
@@ -113,7 +194,7 @@ Total: $0.12 · 3 changes covered · 20.5k tokens
 
 ### Views, Not Branches
 
-Agents work on isolated views of the same underlying graph. No branch divergence, no merge commits, no orphaned history.
+Agents work on isolated views of the same underlying graph. No branch divergence or merge commits.
 
 ```bash
 # Agent session creates an isolated view automatically
@@ -122,9 +203,13 @@ Agents work on isolated views of the same underlying graph. No branch divergence
 # When done, insert changes into the parent view
 atomic insert @~1 --to dev
 
-# Delete the agent view — cascade-deletes its edges, zero orphans
+# Delete the agent view (prompts if any changes would be orphaned)
 atomic view delete agent-ses_3781fc7a6ffet5c6r1ILy1BEbv
 ```
+
+`atomic view split <name> --last N` moves changes out of the source into a new draft and asks you to acknowledge the risks. Use `--dry-run` to preview, or `--confirm` to acknowledge them non-interactively.
+
+Deleting a draft checks for changes that would lose their last local view reference, shows their hashes, and requires confirmation. Those changes become invisible in all views; they do not automatically return to the source. Insert them elsewhere before deleting to keep them referenced. `--force` skips the deletion prompt.
 
 ### Workspace Shelving
 
@@ -196,6 +281,14 @@ The vault stores five kinds of content:
 | **Scratch** | Temporary notes and working state |
 
 Everything is content-addressed and version-controlled. When an agent starts a session, it reads the vault for context. When it finishes, its learnings go back into the vault for the next session — human or machine.
+
+**Colocated repositories that track `.vault/` in Git:** `atomic git import` preserves
+your tracked vault files byte-for-byte (it hydrates the vault database from them;
+default templates are only created for a repository that has no `.vault/` at all).
+The first import records the vault's shim policy — `[git.shim] vault = "tracked"`
+in `.atomic/config.toml` — so the vault participates in Git equivalence and
+publication checks exactly like any other tracked path. A repository whose Git tree
+does not track `.vault/` keeps the vault private and ignored by Git.
 
 ### Knowledge Graph — Code Intelligence at Scale
 
@@ -330,7 +423,8 @@ Every change stores two parallel representations:
 | `atomic view create <name>` | Create a new view (`--draft` for isolated, `--parent` to set parent) |
 | `atomic view switch <name>` | Switch to a view |
 | `atomic view list` | List all views (`--verbose` for scope and parent) |
-| `atomic view delete <name>` | Delete a view |
+| `atomic view split <name>` | Move selected changes into a new draft (confirmation required; `--last N`, `--dry-run`, `--confirm`) |
+| `atomic view delete <name>` | Delete a draft; confirm if changes would be orphaned (`--force` skips the prompt) |
 | `atomic split <name>` | Create a new view from the current one |
 | `atomic stash` | Temporarily save uncommitted changes |
 
@@ -371,9 +465,14 @@ Every change stores two parallel representations:
 |---------|-------------|
 | `atomic agent enable` | Install agent hooks (auto-detect or `--agent claude-code`) |
 | `atomic agent disable` | Remove agent hooks |
-| `atomic agent status` | Show active sessions and hook status (`--json` for tooling) |
+| `atomic agent status` | Show sessions, hook liveness, and failures (`--json` for tooling) |
 | `atomic agent explain <id>` | Generate AI reasoning summary for a session |
 | `atomic agent attest` | List and inspect attestations |
+
+Hook health is computed from session-scoped logs, so concurrent agents retain
+their own outcomes and a child's success cannot hide a parent's failure. See
+[Hook Health and Session Logs](docs/hook-health.md) for diagnosis, JSON fields,
+and parent-session correlation.
 
 ### Vault Commands
 
@@ -413,6 +512,8 @@ Full documentation at **[docs.atomic.dev](https://docs.atomic.dev/)**.
 
 ## Building
 
+If replacing an older binary, first follow [the legacy upgrade steps](#upgrading-from-legacy-database-owners-0191-and-earlier).
+
 ```bash
 # Build all crates
 cargo build --release
@@ -427,6 +528,13 @@ cargo install --path atomic-cli
 atomic --version
 ```
 
+Local builds include their source commit in the version output, for example
+`atomic 0.19.1 (dev 4b143dfbcad2)`, with `-dirty` appended for tracked changes.
+The release workflow sets `ATOMIC_BUILD_CHANNEL=release` to report only the
+package version. Development builds distributed later retain their embedded
+commit; Git is not required to run them. When building from a source archive,
+set `ATOMIC_BUILD_COMMIT` to the source commit, or the output shows `dev unknown`.
+
 To install a locally built binary system-wide, the destination directory may require administrator privileges. On macOS, replacing the file rather than overwriting its existing inode also avoids retaining stale Gatekeeper provenance metadata:
 
 ```bash
@@ -437,7 +545,7 @@ sudo chmod 0755 /usr/local/bin/atomic
 /usr/local/bin/atomic --version
 ```
 
-Do not run normal Atomic commands or the database owner with `sudo`. Repository state, owner locks, and `/tmp/atomic-owner-*.sock` endpoints should remain owned by the user running Atomic.
+Do not run normal Atomic commands or legacy cleanup with `sudo`; repository state and runtime files should remain owned by the user running Atomic.
 
 ## Project Structure
 

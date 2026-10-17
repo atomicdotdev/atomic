@@ -166,6 +166,110 @@ fn test_delete_view_preserves_others() {
 }
 
 #[test]
+fn delete_view_refusal_preserves_shelved_files() {
+    use atomic_core::pristine::{MutTxnT, ViewScope, ViewTxnT, WorkingCopyMutTxnT};
+
+    for protected in ["shared", "parent", "in-use"] {
+        let (_dir, mut repo) = create_temp_repo();
+        let mut other_copy = repo.working_copy_record(repo.working_copy()).unwrap();
+        other_copy.id = WorkingCopyId::from_bytes([17; 16]);
+        other_copy.location_fingerprint = Hash::of(b"another working copy");
+        {
+            let mut txn = repo.pristine.write_txn().unwrap();
+            let dev = txn.get_view("dev").unwrap().unwrap();
+            let scope = if protected == "shared" {
+                ViewScope::Shared
+            } else {
+                ViewScope::Draft
+            };
+            let view = txn.create_view(protected, scope, Some(dev.id)).unwrap();
+            if protected == "parent" {
+                txn.create_view("child", ViewScope::Draft, Some(view.id))
+                    .unwrap();
+            }
+            if protected == "in-use" {
+                other_copy.desired_view = view.id;
+                other_copy.desired_state = view.state;
+                txn.put_working_copy(&other_copy).unwrap();
+            }
+            txn.commit().unwrap();
+        }
+        let shelves = [
+            super::super::switch::workspace_path(&repo.dot_dir, protected),
+            super::super::switch::working_copy_workspace_path(
+                &repo.dot_dir,
+                other_copy.id,
+                protected,
+            ),
+        ];
+        for shelf in &shelves {
+            std::fs::create_dir_all(shelf).unwrap();
+            std::fs::write(shelf.join("unrecorded.txt"), b"only copy of work\n").unwrap();
+        }
+
+        assert!(repo.delete_view(protected).is_err(), "{protected}");
+        assert!(repo.view_exists(protected).unwrap());
+        let root = repo.root().to_path_buf();
+        drop(repo);
+        let reopened = Repository::open(&root).unwrap();
+        assert!(reopened.view_exists(protected).unwrap());
+        for shelf in &shelves {
+            assert_eq!(
+                std::fs::read(shelf.join("unrecorded.txt")).unwrap(),
+                b"only copy of work\n",
+                "refused {protected} deletion must preserve shelf bytes"
+            );
+        }
+    }
+}
+
+#[test]
+fn delete_view_reopen_and_reinsert_preserves_shared_history() {
+    use atomic_core::pristine::{GraphTxnT, ViewTxnT};
+
+    let (dir, mut repo) = create_temp_repo();
+    repo.create_view("source").unwrap();
+    repo.switch_view("source").unwrap();
+    std::fs::write(dir.path().join("kept.txt"), b"shared graph content\n").unwrap();
+    repo.add("kept.txt", TrackingOptions::default()).unwrap();
+    let hash = *repo.record_all("source change").unwrap().hash();
+    repo.create_view_from("survivor", "source").unwrap();
+    repo.create_view_from("delete-me", "source").unwrap();
+    let deleted_id = {
+        let txn = repo.pristine.read_txn().unwrap();
+        txn.get_view("delete-me").unwrap().unwrap().id
+    };
+    repo.delete_view("delete-me").unwrap();
+    let root = repo.root().to_path_buf();
+    drop(repo);
+
+    let mut repo = Repository::open(&root).unwrap();
+    repo.create_view("replacement").unwrap();
+    {
+        let txn = repo.pristine().read_txn().unwrap();
+        let replacement = txn.get_view("replacement").unwrap().unwrap();
+        assert_eq!(replacement.id, deleted_id, "exercise ID reuse after reopen");
+        let change_id = txn.get_internal(&hash).unwrap().unwrap();
+        assert_eq!(txn.get_change_seq(&replacement, change_id).unwrap(), None);
+        let survivor = txn.get_view("survivor").unwrap().unwrap();
+        assert!(txn.get_change_seq(&survivor, change_id).unwrap().is_some());
+        assert!(txn.has_change_in_graph(change_id).unwrap());
+    }
+    repo.insert_change(&hash, InsertOptions::default().view("replacement"))
+        .unwrap();
+    drop(repo);
+    let repo = Repository::open(&root).unwrap();
+    assert_eq!(repo.load_change(&hash).unwrap().hash().unwrap(), hash);
+    for view in ["source", "survivor", "replacement"] {
+        assert_eq!(
+            repo.get_file_content_on_view("kept.txt", view).unwrap(),
+            Some(b"shared graph content\n".to_vec()),
+            "{view} must still render the original graph"
+        );
+    }
+}
+
+#[test]
 fn test_get_view_info() {
     let (_temp_dir, mut repo) = create_temp_repo();
 

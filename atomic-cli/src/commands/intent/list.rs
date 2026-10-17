@@ -70,7 +70,7 @@ pub struct IntentList {
 
 impl IntentList {
     /// The effective `kind` filter: `--review` is sugar for `--kind review`.
-    fn kind_filter(&self) -> Option<String> {
+    pub(crate) fn kind_filter(&self) -> Option<String> {
         if self.review {
             Some("review".to_string())
         } else {
@@ -81,7 +81,7 @@ impl IntentList {
 
 /// The classification of one intent's attestation, for a table/JSON row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Attested {
+pub(crate) enum Attested {
     Fresh,
     Stale,
     None,
@@ -109,7 +109,7 @@ impl Attested {
 
 /// The result of the DID-match-then-verify rule for one row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Verifies {
+pub(crate) enum Verifies {
     /// Same-signer, fresh attestation that cryptographically verified.
     Yes,
     /// Same-signer, fresh attestation whose hash/signature FAILED.
@@ -139,16 +139,16 @@ impl Verifies {
 }
 
 /// A fully-computed intent row.
-struct Row {
-    human_key: String,
+pub(crate) struct Row {
+    pub(crate) human_key: String,
     /// The intent's title, carried into `--json` so machine consumers can
     /// name an intent without a second lookup. The table stays id-only.
-    title: String,
-    status: String,
+    pub(crate) title: String,
+    pub(crate) status: String,
     /// Classification tag, read from the manifest `IntentSummary.kind` (no lift).
-    kind: String,
-    attested: Attested,
-    verifies: Verifies,
+    pub(crate) kind: String,
+    pub(crate) attested: Attested,
+    pub(crate) verifies: Verifies,
 }
 
 /// The verifying identity resolved ONCE for the whole list: its public key and
@@ -288,8 +288,112 @@ fn build_rows(
     Ok(rows)
 }
 
+impl IntentList {
+    /// The effective `kind` filter is validated and applied client-side
+    /// (an unknown kind is a clean argument error, not a silent empty
+    /// list); the classification itself rides the wire's VaultEntry.
+    pub(crate) fn render(rows: &[Row], json: bool) {
+        if json {
+            let json: Vec<serde_json::Value> = rows
+                .iter()
+                .map(|r| {
+                    serde_json::json!({
+                        "id": r.human_key,
+                        // Omitted entirely before, so every API consumer
+                        // reported an intent's title as null however well
+                        // the frontmatter named it.
+                        "title": r.title,
+                        "status": r.status,
+                        "kind": r.kind,
+                        "attested": r.attested.json(),
+                        "verifies": r.verifies.json(),
+                    })
+                })
+                .collect();
+            println!("{}", serde_json::to_string_pretty(&json).unwrap());
+            return;
+        }
+        if rows.is_empty() {
+            println!("No intents found.");
+            return;
+        }
+        // Fixed-width, left-aligned columns with a header row.
+        let key_w = rows
+            .iter()
+            .map(|r| r.human_key.chars().count())
+            .chain(std::iter::once("humanKey".chars().count()))
+            .max()
+            .unwrap_or(8);
+        let status_w = rows
+            .iter()
+            .map(|r| r.status.chars().count())
+            .chain(std::iter::once("status".chars().count()))
+            .max()
+            .unwrap_or(6);
+        // The kind column renders as a `[tag]`, so size on the bracketed width.
+        let kind_w = rows
+            .iter()
+            .map(|r| r.kind.chars().count() + 2)
+            .chain(std::iter::once("kind".chars().count()))
+            .max()
+            .unwrap_or(4);
+
+        println!(
+            "  {:<key_w$}  {:<status_w$}  {:<kind_w$}  {:<8}  verifies",
+            "humanKey", "status", "kind", "attested",
+        );
+        for r in rows {
+            println!(
+                "  {:<key_w$}  {:<status_w$}  {:<kind_w$}  {:<8}  {}",
+                r.human_key,
+                r.status,
+                format!("[{}]", r.kind),
+                r.attested.table(),
+                r.verifies.table(),
+            );
+        }
+    }
+}
+
+/// One row reconstructed from the wire's per-entry classification — the
+/// routed twin of [`compute_row`]: the handler computed the manifest kind
+/// and the attestation/verifies state with the same domain logic, so the
+/// row maps straight off the wire columns.
+pub(crate) fn wire_row(entry: &atomic_client::proto::VaultEntry) -> Row {
+    let attested = match entry.attested.as_deref() {
+        Some("fresh") => Attested::Fresh,
+        Some("stale") => Attested::Stale,
+        _ => Attested::None,
+    };
+    let verifies = match entry.verifies.as_deref() {
+        Some("yes") => Verifies::Yes,
+        Some("no") => Verifies::No,
+        _ => Verifies::Na,
+    };
+    Row {
+        human_key: entry.id.clone(),
+        title: entry.title.clone(),
+        status: entry
+            .status
+            .and_then(crate::commands::rpc::entry_status_label)
+            .unwrap_or_else(|| entry.status_label.clone().unwrap_or_default()),
+        kind: entry
+            .manifest_kind
+            .clone()
+            .unwrap_or_else(|| "feature".to_string()),
+        attested,
+        verifies,
+    }
+}
+
 impl Command for IntentList {
     fn run(&self) -> CliResult<()> {
+        // Every form routes (the --json columns ride the wire; the kind
+        // filter validates and applies client-side).
+        if crate::commands::rpc::intent_list(self)? {
+            return Ok(());
+        }
+
         let root = find_repository_root()?;
         let repo =
             crate::commands::open_readonly_repository(&root).map_err(CliError::Repository)?;

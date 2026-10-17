@@ -43,7 +43,7 @@
 //! potential zombie conflict. This is tracked in the workspace for later
 //! resolution during output.
 
-use crate::change::{Change, Insertion};
+use crate::change::{Change, Insertion, VerifiedCausalFrontier};
 use crate::pristine::GraphTxnT;
 #[allow(unused_imports)]
 use crate::types::{EdgeFlags, GraphNode, Hash, Inode, NodeId, Position, SerializedGraphEdge};
@@ -91,6 +91,32 @@ pub fn write_new_vertex(
     change: &Change,
     detect_conflicts: bool,
 ) -> Result<(), LocalApplyError> {
+    if !change.causal_frontier().is_empty() {
+        return Err(LocalApplyError::CausalFrontierInvalid {
+            reason: "frontier-bearing insertion requires a verified closure".to_string(),
+        });
+    }
+    write_new_vertex_with_frontier(
+        txn,
+        workspace,
+        change_id,
+        insertion,
+        change,
+        &VerifiedCausalFrontier::empty(),
+        detect_conflicts,
+    )
+}
+
+/// Write a new vertex using repository-verified causal knowledge.
+pub fn write_new_vertex_with_frontier(
+    txn: &mut CachedWriteGraphTxn<'_, '_>,
+    workspace: &mut Workspace,
+    change_id: NodeId,
+    insertion: &Insertion<Option<Hash>>,
+    change: &Change,
+    verified_frontier: &VerifiedCausalFrontier,
+    detect_conflicts: bool,
+) -> Result<(), LocalApplyError> {
     // Create the new span
     let node = GraphNode {
         change: change_id,
@@ -132,7 +158,7 @@ pub fn write_new_vertex(
 
         // Check if predecessors was deleted by an unknown change
         if detect_conflicts {
-            check_deleted_context(txn, workspace, change, up_vertex)?;
+            check_deleted_context(txn, workspace, change, verified_frontier, up_vertex)?;
         }
     }
 
@@ -179,7 +205,7 @@ pub fn write_new_vertex(
 
         // Check if successors was deleted by an unknown change
         if detect_conflicts {
-            check_deleted_context(txn, workspace, change, down_vertex)?;
+            check_deleted_context(txn, workspace, change, verified_frontier, down_vertex)?;
         }
     }
 
@@ -238,6 +264,7 @@ fn check_deleted_context<T: GraphTxnT>(
     txn: &T,
     workspace: &mut Workspace,
     change: &Change,
+    verified_frontier: &VerifiedCausalFrontier,
     node: GraphNode<NodeId>,
 ) -> Result<(), LocalApplyError> {
     // Skip ROOT span
@@ -268,7 +295,7 @@ fn check_deleted_context<T: GraphTxnT>(
                 // Look up the external hash
                 if let Ok(Some(hash)) = txn.get_external(introduced_by) {
                     // Check if this change knows about the deletion
-                    if !change.knows(&hash) {
+                    if !change.knows_with_frontier(&hash, verified_frontier) {
                         // Unknown deletion - mark as zombie
                         workspace.add_zombie_vertex(node);
                         break;

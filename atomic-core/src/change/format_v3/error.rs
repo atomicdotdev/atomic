@@ -41,12 +41,11 @@ use thiserror::Error;
 /// Any file not starting with these bytes is rejected immediately.
 pub const MAGIC: [u8; 4] = *b"ATOM";
 
-/// The only supported format version.
-///
-/// V3 is a clean break — there is no backward compatibility with V1/V2.
-/// The version field exists for future-proofing: if V4 is ever needed,
-/// readers can detect it immediately from the header.
-pub const FORMAT_VERSION: u32 = 1;
+/// Legacy ATOM streaming schema version accepted read-only.
+pub const LEGACY_FORMAT_VERSION: u32 = 1;
+
+/// Current ATOM streaming schema version emitted by writers.
+pub const FORMAT_VERSION: u32 = 2;
 
 /// Maximum number of unique hashes in the deduplication table.
 ///
@@ -100,6 +99,22 @@ pub enum FormatError {
     #[error("invalid header: {reason}")]
     InvalidHeader {
         /// Human-readable explanation of what's wrong.
+        reason: String,
+    },
+
+    /// Hashed change facts are malformed or noncanonical.
+    #[error("invalid change metadata: {reason}")]
+    InvalidChangeMetadata {
+        /// Failed invariant.
+        reason: String,
+    },
+
+    /// A graph operation violates a semantic contract required by V3 readers.
+    #[error("invalid {operation} graph operation: {reason}")]
+    InvalidGraphOp {
+        /// Graph operation variant being validated.
+        operation: &'static str,
+        /// Failed invariant.
         reason: String,
     },
 
@@ -268,6 +283,7 @@ impl FormatError {
             FormatError::InvalidMagic { .. }
                 | FormatError::UnsupportedVersion { .. }
                 | FormatError::InvalidHeader { .. }
+                | FormatError::InvalidChangeMetadata { .. }
                 | FormatError::InvalidSectionType { .. }
                 | FormatError::UnexpectedSection { .. }
                 | FormatError::SectionTruncated { .. }
@@ -315,7 +331,8 @@ mod tests {
 
     #[test]
     fn test_format_version() {
-        assert_eq!(FORMAT_VERSION, 1);
+        assert_eq!(LEGACY_FORMAT_VERSION, 1);
+        assert_eq!(FORMAT_VERSION, 2);
     }
 
     #[test]
@@ -345,7 +362,7 @@ mod tests {
         };
         let msg = err.to_string();
         assert!(msg.contains("unsupported format version"));
-        assert!(msg.contains("expected 1"));
+        assert!(msg.contains("expected 2"));
         assert!(msg.contains("got 99"));
     }
 

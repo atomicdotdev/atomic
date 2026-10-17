@@ -1,0 +1,52 @@
+// atomic-protocol — AttestationService definition (the RPC contract).
+// DRAFT — add-only. Messages for this service live in
+// atomic/services/attestation/attestation_messages.proto · shared primitives in atomic/common/.
+
+syntax = "proto3";
+
+package atomic;
+
+import "atomic/common/options.proto";
+import "atomic/services/attestation/attestation_messages.proto";
+
+service AttestationService {
+  // `--prepare`: returns the canonical document and the exact signing bytes.
+  // A remote signer can do this over the wire with only a public key.
+  // EXECUTION CLASS: read — prepare performs no mutation; the record (and
+  // the write) happens at RecordAttestation. No private keys are used here.
+  rpc PrepareAttestation(PrepareAttestationRequest) returns (PrepareAttestationResponse) {
+    option (atomic.execution_scope) = EXECUTION_SCOPE_BOTH;
+    option (atomic.required_capability) = "attestation.read";
+    option (atomic.allowed_caller) = CALLER_CLASS_LOCAL;
+    option (atomic.allowed_caller) = CALLER_CLASS_REMOTE_IDENTITY;
+    option (atomic.allowed_caller) = CALLER_CLASS_SANDBOX;
+    option (atomic.effect) = RPC_EFFECT_REPOSITORY_READ;
+  }
+  // `--signed` (or direct attest): verifies against the identity's key and
+  // the target as it is now; records the attestation.
+  rpc RecordAttestation(RecordAttestationRequest) returns (RecordAttestationResponse) {
+    option (atomic.execution_scope) = EXECUTION_SCOPE_BOTH;
+    option (atomic.required_capability) = "attestation.write";
+    option (atomic.allowed_caller) = CALLER_CLASS_LOCAL;
+    option (atomic.allowed_caller) = CALLER_CLASS_REMOTE_IDENTITY;
+    option (atomic.allowed_caller) = CALLER_CLASS_SANDBOX;
+    option (atomic.effect) = RPC_EFFECT_REPOSITORY_WRITE;
+  }
+  rpc VerifyAttestation(VerifyAttestationRequest) returns (VerifyAttestationResponse) {
+    option (atomic.execution_scope) = EXECUTION_SCOPE_BOTH;
+    option (atomic.required_capability) = "attestation.read";
+    option (atomic.allowed_caller) = CALLER_CLASS_LOCAL;
+    option (atomic.allowed_caller) = CALLER_CLASS_REMOTE_IDENTITY;
+    option (atomic.allowed_caller) = CALLER_CLASS_SANDBOX;
+    option (atomic.effect) = RPC_EFFECT_REPOSITORY_READ;
+  }
+  // List/inspect (`agent attest`, attestation listings).
+  rpc ListAttestations(ListAttestationsRequest) returns (ListAttestationsResponse) {
+    option (atomic.execution_scope) = EXECUTION_SCOPE_BOTH;
+    option (atomic.required_capability) = "attestation.read";
+    option (atomic.allowed_caller) = CALLER_CLASS_LOCAL;
+    option (atomic.allowed_caller) = CALLER_CLASS_REMOTE_IDENTITY;
+    option (atomic.allowed_caller) = CALLER_CLASS_SANDBOX;
+    option (atomic.effect) = RPC_EFFECT_REPOSITORY_READ;
+  }
+}

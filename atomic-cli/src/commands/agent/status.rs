@@ -107,6 +107,25 @@ struct StatusJson {
     /// broken session store into an indistinguishable "no sessions".
     #[serde(skip_serializing_if = "Option::is_none")]
     sessions_error: Option<String>,
+    /// Hook liveness, per agent, for the agents that have fired at least
+    /// once. Absent when nothing has fired — which is a real and important
+    /// answer for a repository whose hooks are installed but dead, and is
+    /// why the human output words that case explicitly rather than omitting
+    /// it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hook_health: Option<Vec<super::health::AgentHookSummary>>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    hook_sessions: Vec<super::health::SessionHookHealth>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hook_health_error: Option<String>,
+    /// A bounded, aggregated read of `.atomic/hook-errors.log`. Absent when
+    /// the file does not exist.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hook_errors: Option<super::health::HookErrors>,
+    /// Agents with hooks installed that have never recorded a successful
+    /// dispatch. This is the failure the installed-hooks check cannot see.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    silent_agents: Vec<String>,
 }
 
 /// The effective agent identity, as data.
@@ -166,6 +185,44 @@ impl AgentStatus {
             files_touched: sessions.iter().map(|s| s.files_touched.len()).sum(),
         };
 
+        let (health, hook_health_error) = match super::hook_log::read(repo_root) {
+            Ok(health) => (health, None),
+            Err(error) => (
+                super::hook_log::pending_health(repo_root),
+                Some(error.to_string()),
+            ),
+        };
+        let hook_sessions = health
+            .as_ref()
+            .map(|health| health.sessions.values().cloned().collect())
+            .unwrap_or_default();
+        let hook_health = health
+            .as_ref()
+            .map(super::health::summarize)
+            .filter(|v| !v.is_empty());
+        let hook_errors = super::health::read_errors(repo_root);
+
+        // An agent whose hooks are installed but which has never recorded a
+        // successful dispatch is silently losing every turn. Report it by
+        // name so a caller does not have to correlate the two lists.
+        //
+        // Only when observations exist at all: with no events there is no
+        // evidence either way, and calling a freshly-upgraded repository
+        // "never recorded" would be a false alarm on every machine.
+        let silent_agents: Vec<String> = if health.is_none() || hook_health_error.is_some() {
+            Vec::new()
+        } else {
+            installed
+                .iter()
+                .filter(|name| {
+                    !hook_health.as_ref().is_some_and(|rows| {
+                        rows.iter().any(|r| r.name == **name && r.last_ok.is_some())
+                    })
+                })
+                .map(|name| name.to_string())
+                .collect()
+        };
+
         StatusJson {
             agents,
             sessions: sessions
@@ -192,6 +249,11 @@ impl AgentStatus {
                 },
             ),
             sessions_error,
+            hook_health,
+            hook_sessions,
+            hook_health_error,
+            hook_errors,
+            silent_agents,
         }
     }
 }
@@ -274,6 +336,9 @@ impl Command for AgentStatus {
         }
 
         println!();
+
+        // Hook health and failures
+        print_hook_health(&repo_root, &installed, &registry);
 
         // Sessions
 
@@ -428,6 +493,102 @@ impl Command for AgentStatus {
 
         Ok(())
     }
+}
+
+/// Print hook liveness and aggregated failures.
+///
+/// The two facts are printed together because either alone misleads: a
+/// healthy log proves nothing about whether the recorder is running, and a
+/// live recorder proves nothing about what it failed to do earlier.
+fn print_hook_health(repo_root: &std::path::Path, installed: &[&str], registry: &AgentRegistry) {
+    let mut log_unavailable = false;
+    let health = super::hook_log::read(repo_root).unwrap_or_else(|error| {
+        log_unavailable = true;
+        eprintln!("  ⚠ Hook log unavailable: {error}");
+        super::hook_log::pending_health(repo_root)
+    });
+    let rows = health
+        .as_ref()
+        .map(super::health::summarize)
+        .unwrap_or_default();
+    let errors = super::health::read_errors(repo_root);
+
+    // With no observations there is no evidence either way, so stay
+    // quiet rather than accusing a freshly-upgraded repository of never
+    // having recorded.
+    let silent: Vec<&str> = if health.is_none() || log_unavailable {
+        Vec::new()
+    } else {
+        installed
+            .iter()
+            .copied()
+            .filter(|name| !rows.iter().any(|r| r.name == *name && r.last_ok.is_some()))
+            .collect()
+    };
+
+    if rows.is_empty() && errors.is_none() && silent.is_empty() {
+        return;
+    }
+
+    // Liveness, one line per agent that has ever fired.
+    for row in &rows {
+        let display = registry.get(&row.name).map_or_else(
+            || row.display_name.clone(),
+            |a| a.display_name().to_string(),
+        );
+        let marker = if row.last_ok.is_some() { "✓" } else { "⚠" };
+        let failing = if row.failing_verbs.is_empty() {
+            String::new()
+        } else {
+            format!("  ⚠ failing: {}", row.failing_verbs.join(", "))
+        };
+        println!("  {marker} {display} — {}", row.liveness());
+        if !failing.is_empty() {
+            println!("{failing}");
+        }
+    }
+
+    // Attribute outstanding failures to their sessions.
+    if let Some(health) = &health {
+        for session in health.sessions.values() {
+            let failing: Vec<_> = session
+                .health
+                .verbs
+                .iter()
+                .filter(|(_, verb)| verb.outcome == super::health::FireOutcome::Error)
+                .map(|(name, _)| name.as_str())
+                .collect();
+            if !failing.is_empty() {
+                println!(
+                    "    session {} (parent {}) — failing: {}",
+                    session.session_id.as_deref().unwrap_or("unattributed"),
+                    session.parent_session_id.as_deref().unwrap_or("—"),
+                    failing.join(", ")
+                );
+            }
+        }
+    }
+
+    // Hooks installed but never recorded — the failure an installed-hooks
+    // check cannot see, and the one that cost a demo.
+    for name in &silent {
+        let display = registry
+            .get(name)
+            .map_or_else(|| (*name).to_string(), |a| a.display_name().to_string());
+        println!("  ⚠ {display} — hooks installed; no successful dispatch recorded");
+    }
+
+    if let Some(errors) = &errors {
+        if errors.total > 0 {
+            println!();
+            println!("  Hook errors: {} ({})", errors.total, errors.window);
+            for class in errors.classes.iter().take(5) {
+                println!("    {:>5}  {}", class.count, class.example);
+            }
+        }
+    }
+
+    println!();
 }
 
 // Tests

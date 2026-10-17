@@ -76,7 +76,7 @@ use crate::error::CliResult;
 
 /// Identify the exact stored Vault revision, including entry type,
 /// frontmatter, and body rather than only the body content hash.
-fn vault_entry_revision_hash(entry: &VaultEntry) -> String {
+pub(crate) fn vault_entry_revision_hash(entry: &VaultEntry) -> String {
     let mut hasher = Hasher::new();
     hasher.update(b"atomic-vault-revision-v1");
     append_revision_field(&mut hasher, entry.entry_type.as_str().as_bytes());

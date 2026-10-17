@@ -93,12 +93,14 @@ pub struct Log {
     #[arg(long = "full-hash")]
     pub full_hash: bool,
 
-    /// Show full history including inherited changes.
+    /// Show the full history including changes inherited from ancestor
+    /// views.
     ///
-    /// Currently a no-op — all views show their complete history.
-    /// Reserved for future use when fork-point filtering is
-    /// re-implemented with a stable fork-point snapshot.
-    #[arg(long = "all", hide = true)]
+    /// Draft views list only their own changes by default — the work
+    /// this view added, not what it inherited from its parent chain —
+    /// so `--all` is how you see the complete change log a draft
+    /// view can reach (shared views always show their full chain).
+    #[arg(long = "all")]
     pub all: bool,
 
     /// Show compact output (shorthand for --format short).
@@ -497,8 +499,18 @@ impl Command for Log {
     /// - The specified view doesn't exist
     /// - Database errors occur
     fn run(&self) -> CliResult<()> {
+        if crate::commands::rpc::log(self)? {
+            return Ok(());
+        }
+
         // Find and open repository
         let repo_root = find_repository_root()?;
+        // A remote sandbox's cache fetches the change files it lacks first.
+        if atomic_repository::remote_cache_root(&repo_root).is_dir() {
+            let repo = Repository::open(&repo_root).map_err(CliError::Repository)?;
+            repo.fetch_remote_sandbox_changes()
+                .map_err(CliError::Repository)?;
+        }
         let repo = crate::commands::open_readonly_repository(&repo_root).map_err(|e| match e {
             atomic_repository::RepositoryError::NotFound { path } => CliError::RepositoryNotFound {
                 searched_path: path.into(),

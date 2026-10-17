@@ -72,7 +72,8 @@ impl FileSystem {
 
             if file_type.is_dir() {
                 self.walk_files_recursive(&path, files)?;
-            } else if file_type.is_file() {
+            } else if file_type.is_file() || file_type.is_symlink() {
+                // Symlinks, including dangling links, are first-class files.
                 // Convert to relative path
                 if let Ok(relative) = path.strip_prefix(self.root()) {
                     files.push(relative.to_string_lossy().to_string());
@@ -111,8 +112,12 @@ impl WorkingCopyRead for FileSystem {
     /// The buffer is **appended to**, not cleared.
     fn read_file(&self, path: &str, buffer: &mut Vec<u8>) -> Result<(), Self::Error> {
         let abs_path = self.resolve_path(path)?;
-        let mut file = File::open(&abs_path)?;
-        file.read_to_end(buffer)?;
+        if fs::symlink_metadata(&abs_path)?.file_type().is_symlink() {
+            buffer.extend_from_slice(fs::read_link(&abs_path)?.as_os_str().as_encoded_bytes());
+        } else {
+            let mut file = File::open(&abs_path)?;
+            file.read_to_end(buffer)?;
+        }
         Ok(())
     }
 
@@ -125,7 +130,9 @@ impl WorkingCopyRead for FileSystem {
 
     /// Check if a path exists.
     fn exists(&self, path: &str) -> bool {
-        self.resolve_path(path).map(|p| p.exists()).unwrap_or(false)
+        self.resolve_path(path)
+            .map(|path| fs::symlink_metadata(path).is_ok())
+            .unwrap_or(false)
     }
 
     /// Check if a path is a directory.

@@ -1,0 +1,46 @@
+// atomic-protocol — GitInteropService definition (the RPC contract).
+// DRAFT — add-only. Messages for this service live in
+// atomic/services/git_interop/git_interop_messages.proto · shared primitives in atomic/common/.
+
+syntax = "proto3";
+
+package atomic;
+
+import "atomic/common/options.proto";
+import "atomic/services/git_interop/git_interop_messages.proto";
+
+service GitInteropService {
+  // `atomic git import [--branch|--all|--incremental|--with-crdt]`
+  // — import git history as Atomic changes/views; bootstrap also registers the
+  // repository/workspace with the same ownership/identity checks as registration.
+  rpc ImportFromGit(ImportFromGitRequest) returns (ImportFromGitResponse) {
+    option (atomic.execution_scope) = EXECUTION_SCOPE_LOCAL;
+    option (atomic.required_capability) = "gitinterop.write";
+    option (atomic.required_capability) = "repository.write";
+    option (atomic.required_capability) = "working-copy.write";
+    option (atomic.allowed_caller) = CALLER_CLASS_LOCAL;
+    option (atomic.effect) = RPC_EFFECT_REPOSITORY_WRITE;
+    option (atomic.effect) = RPC_EFFECT_WORKSPACE_WRITE;
+  }
+  rpc PreviewGitImport(PreviewGitImportRequest) returns (PreviewGitImportResponse) {
+    option (atomic.execution_scope) = EXECUTION_SCOPE_LOCAL;
+    option (atomic.required_capability) = "gitinterop.read";
+    option (atomic.required_capability) = "working-copy.read";
+    option (atomic.allowed_caller) = CALLER_CLASS_LOCAL;
+    option (atomic.effect) = RPC_EFFECT_REPOSITORY_READ;
+    option (atomic.effect) = RPC_EFFECT_WORKSPACE_READ;
+  }
+  // `atomic git push [-m|--no-push|--branch]` — shadow-commit pipeline +
+  // validator, push Atomic state to git.
+  rpc PushToGit(PushToGitRequest) returns (PushToGitResponse) {
+    option (atomic.execution_scope) = EXECUTION_SCOPE_LOCAL;
+    option (atomic.required_capability) = "gitinterop.write";
+    option (atomic.required_capability) = "repository.read";
+    option (atomic.required_capability) = "working-copy.write";
+    option (atomic.allowed_caller) = CALLER_CLASS_LOCAL;
+    option (atomic.effect) = RPC_EFFECT_REPOSITORY_READ;
+    option (atomic.effect) = RPC_EFFECT_WORKSPACE_WRITE;
+    option (atomic.effect) = RPC_EFFECT_EXTERNAL_IO;
+    option (atomic.effect) = RPC_EFFECT_DAEMON_WRITE;
+  }
+}

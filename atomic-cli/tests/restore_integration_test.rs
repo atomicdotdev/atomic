@@ -92,8 +92,10 @@ fn whole_tree_restore_without_force_is_user_error_not_internal() {
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
+    // The routed guard is the domain's refusal: it names the unrecorded
+    // changes and the two ways out (paths or force).
     assert!(
-        combined.contains("Cannot restore"),
+        combined.contains("unrecorded changes"),
         "should explain the guard, got: {combined}"
     );
     assert!(

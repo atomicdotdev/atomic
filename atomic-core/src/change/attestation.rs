@@ -100,6 +100,7 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::io::{self, Read, Write};
 
+use super::session::decode_exact_shape;
 use crate::types::Hash;
 
 // Constants
@@ -108,10 +109,26 @@ use crate::types::Hash;
 const MAGIC: &[u8; 4] = b"ATST";
 
 /// Current attestation schema version.
-const SCHEMA_VERSION: u8 = 1;
+///
+/// V2 added `operations_covered` (CB-12A). V3 adds `signer` + `signature`
+/// (review ATOM::aaron::8 R6): the attestation is authenticated with the
+/// session MAC key over a canonical domain-separated payload. V4 (CB-12A
+/// AC3, ::19) adds the complete-payload evidence roots (`turn_outcomes_root`,
+/// `capture_root`, `provenance_root`) and Ed25519 DID signatures via
+/// [`Attestation::sign_with_did`]. V1/V2/V3 files decode through their
+/// explicit historical shapes; the payload version byte directs decoding,
+/// and every shape must consume its bytes exactly.
+const SCHEMA_VERSION: u8 = 4;
 
 /// File extension for attestation files.
 pub const ATTESTATION_EXTENSION: &str = "attest";
+
+/// Domain separator for Ed25519 DID signatures over the attestation payload
+/// (V4). Preceded byte-for-byte to the canonical unsigned payload in
+/// [`Attestation::did_signature_input`], so a signature made over another
+/// object kind (capture, intent, change) can never verify as attestation
+/// evidence.
+pub const DID_SIGNATURE_DOMAIN: &[u8] = b"atomic.attestation.did-signature.v4";
 
 // Attestation
 
@@ -177,6 +194,190 @@ pub struct Attestation {
     /// Optional free-form notes.
     #[serde(default)]
     pub notes: Option<String>,
+
+    /// Observed Git operations covered by this attestation (CB-12A).
+    ///
+    /// Observed-operation-only attribution (RFC §10.3.2): entries record that
+    /// a Git transition happened between the session's boundaries, never who
+    /// authored it. Empty for attestations that cover only durable changes.
+    #[serde(default)]
+    pub operations_covered: Vec<String>,
+
+    /// Who signed this attestation, e.g. `session-mac:<session_id>` (V3).
+    ///
+    /// `None` for historical V1/V2 files, which are authenticated only by
+    /// their content hash. Trust-policy decisions about which signer classes
+    /// to accept are NOT made here (RFC §19 Q4 is undecided).
+    #[serde(default)]
+    pub signer: Option<String>,
+
+    /// Domain-separated keyed-Blake3 MAC over the canonical payload with this
+    /// field cleared (V3). `None` for historical V1/V2 files.
+    #[serde(default)]
+    pub signature: Option<String>,
+
+    /// BLAKE3 root over the session ledger's classified turn outcomes — the
+    /// serialized `TurnOutcomeEntry` list (boundary pairs plus semantic
+    /// outcomes), in ledger order (V4, CB-12A AC3). Canonical construction:
+    /// `Hash::of(serde_json::to_vec(turn_outcomes))`. The DID signature
+    /// covers this root, so the attestation binds the boundary pair and the
+    /// outcome of every classified turn the ledger retained.
+    #[serde(default)]
+    pub turn_outcomes_root: Option<Hash>,
+
+    /// BLAKE3 root over the session's retained commit-time capture files
+    /// (V4, CB-12A AC3). Canonical construction: for every capture file in
+    /// the session's captures directory, take `(file name, blake3(file
+    /// bytes))` pairs sorted by name, concatenate
+    /// `name_bytes \0 hash_bytes` in that order, and `Hash::of` the result;
+    /// an empty capture set hashes to `Hash::of(&[])`. The DID signature
+    /// covers this root — the capture/binding evidence the session kept.
+    #[serde(default)]
+    pub capture_root: Option<Hash>,
+
+    /// BLAKE3 root over the provenance entries embedded in the covered
+    /// changes (V4, CB-12A AC3). Canonical construction: for each covered
+    /// change in `changes_covered` order, take `(change hash, blake3 of the
+    /// change's serialized provenance entries)`, concatenate
+    /// `change_hash \0 prov_hash` pairs, and `Hash::of` the result; no
+    /// provenance entries hash to `Hash::of(&[])`. The DID signature covers
+    /// this root, binding the model/token/cost evidence to the attestation.
+    #[serde(default)]
+    pub provenance_root: Option<Hash>,
+}
+
+/// Pre-signature attestation encoding (schema v2, CB-12A).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct AttestationV2 {
+    version: u8,
+    timestamp: i64,
+    agent: AttestAgent,
+    session_id: String,
+    cost_usd: f64,
+    duration_api_ms: u64,
+    duration_wall_ms: u64,
+    code_changes: CodeChangeStats,
+    models: Vec<ModelUsage>,
+    changes_covered: Vec<Hash>,
+    previous_attestation: Option<Hash>,
+    notes: Option<String>,
+    operations_covered: Vec<String>,
+}
+
+impl From<AttestationV2> for Attestation {
+    fn from(value: AttestationV2) -> Self {
+        Self {
+            version: value.version,
+            timestamp: value.timestamp,
+            agent: value.agent,
+            session_id: value.session_id,
+            cost_usd: value.cost_usd,
+            duration_api_ms: value.duration_api_ms,
+            duration_wall_ms: value.duration_wall_ms,
+            code_changes: value.code_changes,
+            models: value.models,
+            changes_covered: value.changes_covered,
+            previous_attestation: value.previous_attestation,
+            notes: value.notes,
+            operations_covered: value.operations_covered,
+            signer: None,
+            signature: None,
+            turn_outcomes_root: None,
+            capture_root: None,
+            provenance_root: None,
+        }
+    }
+}
+
+/// MAC-signed attestation encoding (schema v3, review ATOM::aaron::8 R6).
+///
+/// V3 carries `signer` + `signature` but none of the V4 evidence roots;
+/// decoding routes through this exact shape so a V3 payload is never
+/// silently reinterpreted as V4.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct AttestationV3 {
+    version: u8,
+    timestamp: i64,
+    agent: AttestAgent,
+    session_id: String,
+    cost_usd: f64,
+    duration_api_ms: u64,
+    duration_wall_ms: u64,
+    code_changes: CodeChangeStats,
+    models: Vec<ModelUsage>,
+    changes_covered: Vec<Hash>,
+    previous_attestation: Option<Hash>,
+    notes: Option<String>,
+    operations_covered: Vec<String>,
+    signer: Option<String>,
+    signature: Option<String>,
+}
+
+impl From<AttestationV3> for Attestation {
+    fn from(value: AttestationV3) -> Self {
+        Self {
+            version: value.version,
+            timestamp: value.timestamp,
+            agent: value.agent,
+            session_id: value.session_id,
+            cost_usd: value.cost_usd,
+            duration_api_ms: value.duration_api_ms,
+            duration_wall_ms: value.duration_wall_ms,
+            code_changes: value.code_changes,
+            models: value.models,
+            changes_covered: value.changes_covered,
+            previous_attestation: value.previous_attestation,
+            notes: value.notes,
+            operations_covered: value.operations_covered,
+            signer: value.signer,
+            signature: value.signature,
+            turn_outcomes_root: None,
+            capture_root: None,
+            provenance_root: None,
+        }
+    }
+}
+
+/// Pre-CB-12A attestation encoding (schema v1).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct AttestationV1 {
+    version: u8,
+    timestamp: i64,
+    agent: AttestAgent,
+    session_id: String,
+    cost_usd: f64,
+    duration_api_ms: u64,
+    duration_wall_ms: u64,
+    code_changes: CodeChangeStats,
+    models: Vec<ModelUsage>,
+    changes_covered: Vec<Hash>,
+    previous_attestation: Option<Hash>,
+    notes: Option<String>,
+}
+
+impl From<AttestationV1> for Attestation {
+    fn from(value: AttestationV1) -> Self {
+        Self {
+            version: value.version,
+            timestamp: value.timestamp,
+            agent: value.agent,
+            session_id: value.session_id,
+            cost_usd: value.cost_usd,
+            duration_api_ms: value.duration_api_ms,
+            duration_wall_ms: value.duration_wall_ms,
+            code_changes: value.code_changes,
+            models: value.models,
+            changes_covered: value.changes_covered,
+            previous_attestation: value.previous_attestation,
+            notes: value.notes,
+            operations_covered: Vec::new(),
+            signer: None,
+            signature: None,
+            turn_outcomes_root: None,
+            capture_root: None,
+            provenance_root: None,
+        }
+    }
 }
 
 impl Attestation {
@@ -204,6 +405,13 @@ impl Attestation {
     /// Deserialize an attestation from bytes, returning the attestation and its hash.
     ///
     /// The hash is computed over the input bytes (the entire serialized form).
+    ///
+    /// Decoding is version-directed: the first payload byte is the schema
+    /// version, and only the exact layout written for that version is
+    /// accepted — every shape must consume its bytes completely. A truncated
+    /// or misaligned payload is rejected instead of being reinterpreted as an
+    /// older shape that would silently drop covered fields (review
+    /// ATOM::aaron::8 R1).
     pub fn deserialize(data: &[u8]) -> Result<(Self, Hash), AttestationError> {
         if data.len() < MAGIC.len() + 1 {
             return Err(AttestationError::Codec {
@@ -221,17 +429,46 @@ impl Attestation {
             });
         }
 
-        let attestation: Self =
-            postcard::from_bytes(&data[4..]).map_err(|e| AttestationError::Codec {
-                reason: format!("postcard deserialize failed: {}", e),
-            })?;
-
-        if attestation.version > SCHEMA_VERSION {
+        let payload = &data[4..];
+        // postcard encodes a u8 field as exactly one leading byte.
+        let version = payload[0];
+        if version > SCHEMA_VERSION {
             return Err(AttestationError::UnsupportedVersion {
-                version: attestation.version,
+                version,
                 max_supported: SCHEMA_VERSION,
             });
         }
+        if version == 0 {
+            return Err(AttestationError::Codec {
+                reason: format!("invalid attestation schema version {version}"),
+            });
+        }
+
+        // Version-directed exact-shape decode. V1 and V2 carry their own
+        // historical structs; anything that fails its exact layout match is
+        // malformed and refused.
+        let attestation = match version {
+            1 => decode_exact_shape::<AttestationV1>(payload)
+                .map(Attestation::from)
+                .ok_or_else(|| AttestationError::Codec {
+                    reason: "malformed V1 attestation payload".to_string(),
+                })?,
+            2 => decode_exact_shape::<AttestationV2>(payload)
+                .map(Attestation::from)
+                .ok_or_else(|| AttestationError::Codec {
+                    reason: "malformed V2 attestation payload".to_string(),
+                })?,
+            3 => decode_exact_shape::<AttestationV3>(payload)
+                .map(Attestation::from)
+                .ok_or_else(|| AttestationError::Codec {
+                    reason: "malformed V3 attestation payload".to_string(),
+                })?,
+            _ => decode_exact_shape::<Attestation>(payload).ok_or_else(|| {
+                AttestationError::Codec {
+                    reason: "malformed V4 attestation payload".to_string(),
+                }
+            })?,
+        };
 
         let hash = Hash::of(data);
         Ok((attestation, hash))
@@ -259,6 +496,144 @@ impl Attestation {
     /// Fast check — only inspects the 4-byte magic prefix.
     pub fn is_attestation(data: &[u8]) -> bool {
         data.len() >= MAGIC.len() && &data[..4] == MAGIC
+    }
+
+    /// The canonical signature input: the attestation's JSON with `signature`
+    /// cleared. JSON with struct field order is deterministic for this type,
+    /// so the MAC binds exactly these bytes — every covered field, including
+    /// `operations_covered`, `changes_covered` and the chain link.
+    fn signature_input(&self) -> Vec<u8> {
+        let mut unsigned = self.clone();
+        unsigned.signature = None;
+        serde_json::to_vec(&unsigned).expect("attestation canonical JSON")
+    }
+
+    /// Sign this attestation in place with the session MAC key (64 hex chars).
+    ///
+    /// The key is domain-separated through `blake3::derive_key` so the same
+    /// session key signing commit-time captures cannot be transplanted into
+    /// an attestation signature or vice versa. The signer is recorded as
+    /// `session-mac:<session_id>`; this is evidence authentication, not a
+    /// trust-policy decision (RFC §19 Q4 stays undecided).
+    pub fn sign_with_mac(&mut self, key_hex: &str) {
+        self.signer = Some(format!("session-mac:{}", self.session_id));
+        let input = self.signature_input();
+        let key = blake3::derive_key("atomic-attestation v3 signature", key_hex.as_bytes());
+        self.signature = Some(
+            blake3::Hasher::new_keyed(&key)
+                .update(&input)
+                .finalize()
+                .to_hex()
+                .to_string(),
+        );
+    }
+
+    /// Verify the signature. Any edited covered field — operations, changes,
+    /// chain link, agent, counters — fails; so does a missing signature.
+    pub fn verify_mac(&self, key_hex: &str) -> bool {
+        let Some(signature) = &self.signature else {
+            return false;
+        };
+        let input = self.signature_input();
+        let key = blake3::derive_key("atomic-attestation v3 signature", key_hex.as_bytes());
+        blake3::Hasher::new_keyed(&key)
+            .update(&input)
+            .finalize()
+            .to_hex()
+            .as_str()
+            == signature.as_str()
+    }
+
+    /// Whether this attestation was signed by a session MAC key (V3 signer
+    /// class `session-mac:<session_id>`).
+    ///
+    /// MAC signatures are evidence authentication only: the key lives beside
+    /// the evidence, so they must never be accepted as *trusted* evidence
+    /// (CB-12A AC3 — [`TrustPolicy::verify`] refuses them outright).
+    pub fn is_session_mac_signed(&self) -> bool {
+        self.signer
+            .as_deref()
+            .is_some_and(|s| s.starts_with("session-mac:"))
+    }
+
+    /// The domain-separated DID signature input (V4).
+    ///
+    /// Ed25519 is deterministic, so domain separation comes from prefixing
+    /// the canonical unsigned payload with
+    /// [`DID_SIGNATURE_DOMAIN`]: the same bytes can never be valid evidence
+    /// of a different object kind, and a capture or intent signature cannot
+    /// be transplanted into an attestation.
+    pub fn did_signature_input(&self) -> Vec<u8> {
+        let mut unsigned = self.clone();
+        unsigned.signature = None;
+        let json = serde_json::to_vec(&unsigned).expect("attestation canonical JSON");
+        let mut input = Vec::with_capacity(DID_SIGNATURE_DOMAIN.len() + 1 + json.len());
+        input.extend_from_slice(DID_SIGNATURE_DOMAIN);
+        input.push(0);
+        input.extend_from_slice(&json);
+        input
+    }
+
+    /// Sign this attestation in place with an agent DID identity (V4,
+    /// CB-12A AC3).
+    ///
+    /// `did` is the signer's DID string (e.g. `did:atomic:<base32>` —
+    /// `atomic_canonical::did::did_for_public_key`); `secret_key_bytes` is
+    /// the Ed25519 seed (32 bytes, `atomic_identity::SecretKey::as_bytes`).
+    /// The signature is stored base32 (nopad), matching
+    /// `atomic_identity::Signature::to_base32`.
+    ///
+    /// Unlike [`Attestation::sign_with_mac`], this is asymmetric: anyone
+    /// holding the signer's public key can verify, and the private key never
+    /// has to live beside the evidence.
+    pub fn sign_with_did(&mut self, did: &str, secret_key_bytes: &[u8; 32]) {
+        use ed25519_dalek::Signer;
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(secret_key_bytes);
+        // The signer is part of the signed payload: set it BEFORE computing
+        // the signature input (mirrors sign_with_mac).
+        self.signer = Some(did.to_string());
+        let input = self.did_signature_input();
+        self.signature =
+            Some(data_encoding::BASE32_NOPAD.encode(&signing_key.sign(&input).to_bytes()));
+    }
+
+    /// Verify a V4 DID signature against the signer's Ed25519 public key.
+    ///
+    /// Any edited covered field — the covered changes and operations, the
+    /// chain link, the evidence roots, the agent metadata, the signer itself
+    /// — fails, as does a missing signature. `false` for MAC-signed or
+    /// unsigned attestations.
+    pub fn verify_with_did(&self, public_key_bytes: &[u8; 32]) -> bool {
+        use ed25519_dalek::Verifier;
+        let verifying_key = match ed25519_dalek::VerifyingKey::from_bytes(public_key_bytes) {
+            Ok(key) => key,
+            Err(_) => return false,
+        };
+        let Some(signature) = self.signature.as_deref() else {
+            return false;
+        };
+        let Ok(sig_bytes) = data_encoding::BASE32_NOPAD.decode(signature.as_bytes()) else {
+            return false;
+        };
+        let Ok(sig) = <[u8; 64]>::try_from(sig_bytes.as_slice()) else {
+            return false;
+        };
+        verifying_key
+            .verify(
+                &self.did_signature_input(),
+                &ed25519_dalek::Signature::from_bytes(&sig),
+            )
+            .is_ok()
+    }
+
+    /// The signer DID, when this attestation carries a non-MAC signer.
+    pub fn signer_did(&self) -> Option<&str> {
+        let signer = self.signer.as_deref()?;
+        if signer.starts_with("session-mac:") {
+            None
+        } else {
+            Some(signer)
+        }
     }
 
     /// Total tokens across all models (input + output + cache).
@@ -558,6 +933,10 @@ pub struct AttestationBuilder {
     previous_attestation: Option<Hash>,
     notes: Option<String>,
     timestamp: Option<i64>,
+    operations_covered: Vec<String>,
+    turn_outcomes_root: Option<Hash>,
+    capture_root: Option<Hash>,
+    provenance_root: Option<Hash>,
 }
 
 impl AttestationBuilder {
@@ -575,6 +954,10 @@ impl AttestationBuilder {
             previous_attestation: None,
             notes: None,
             timestamp: None,
+            operations_covered: Vec::new(),
+            turn_outcomes_root: None,
+            capture_root: None,
+            provenance_root: None,
         }
     }
 
@@ -632,9 +1015,36 @@ impl AttestationBuilder {
         self
     }
 
+    /// Set the observed Git operations covered by this attestation (CB-12A).
+    pub fn operations_covered(mut self, operations: Vec<String>) -> Self {
+        self.operations_covered = operations;
+        self
+    }
+
     /// Set optional notes.
     pub fn notes(mut self, notes: impl Into<String>) -> Self {
         self.notes = Some(notes.into());
+        self
+    }
+
+    /// Set the turn-outcomes evidence root (V4, CB-12A AC3). See
+    /// [`Attestation::turn_outcomes_root`] for the canonical construction.
+    pub fn turn_outcomes_root(mut self, root: Hash) -> Self {
+        self.turn_outcomes_root = Some(root);
+        self
+    }
+
+    /// Set the capture evidence root (V4, CB-12A AC3). See
+    /// [`Attestation::capture_root`] for the canonical construction.
+    pub fn capture_root(mut self, root: Hash) -> Self {
+        self.capture_root = Some(root);
+        self
+    }
+
+    /// Set the provenance evidence root (V4, CB-12A AC3). See
+    /// [`Attestation::provenance_root`] for the canonical construction.
+    pub fn provenance_root(mut self, root: Hash) -> Self {
+        self.provenance_root = Some(root);
         self
     }
 
@@ -666,7 +1076,89 @@ impl AttestationBuilder {
             changes_covered: self.changes_covered,
             previous_attestation: self.previous_attestation,
             notes: self.notes,
+            operations_covered: self.operations_covered,
+            signer: None,
+            signature: None,
+            turn_outcomes_root: self.turn_outcomes_root,
+            capture_root: self.capture_root,
+            provenance_root: self.provenance_root,
         }
+    }
+}
+
+// Trust Policy
+
+/// Explicitly configured trust for verifying attestation signatures
+/// (CB-12A AC3, RFC §19 Q4).
+///
+/// Trust is NEVER implicit: a [`TrustPolicy`] contains exactly the signer
+/// DIDs the operator or embedding tooling configured, mapped to their
+/// Ed25519 public keys. [`TrustPolicy::verify`] then refuses, in order:
+///
+/// 1. an unsigned attestation,
+/// 2. a `session-mac:*` signer — the session MAC key is symmetric evidence
+///    authentication and is **never** accepted as trusted evidence,
+/// 3. a signer DID outside the configured set,
+/// 4. an Ed25519 signature that does not verify against the configured key.
+///
+/// Nothing else is accepted — in particular a live capture MAC key or any
+/// other symmetric secret can never be promoted into trust.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct TrustPolicy {
+    trusted: std::collections::BTreeMap<String, [u8; 32]>,
+}
+
+impl TrustPolicy {
+    /// An empty trust policy: every attestation is refused.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Trust one signer DID with its Ed25519 public key.
+    pub fn trust(mut self, did: impl Into<String>, public_key: [u8; 32]) -> Self {
+        self.trusted.insert(did.into(), public_key);
+        self
+    }
+
+    /// Number of configured trust entries.
+    pub fn len(&self) -> usize {
+        self.trusted.len()
+    }
+
+    /// Whether the policy trusts no signers at all.
+    pub fn is_empty(&self) -> bool {
+        self.trusted.is_empty()
+    }
+
+    /// Verify an attestation under this policy, failing closed on every
+    /// refusal path (see the type docs).
+    pub fn verify(&self, attestation: &Attestation) -> Result<(), AttestationError> {
+        let Some(_signature) = &attestation.signature else {
+            return Err(AttestationError::Unsigned);
+        };
+        let Some(signer) = attestation.signer.as_deref() else {
+            return Err(AttestationError::Unsigned);
+        };
+
+        if signer.starts_with("session-mac:") {
+            return Err(AttestationError::SessionMacSignerNotTrusted {
+                signer: signer.to_string(),
+            });
+        }
+
+        let Some(public_key) = self.trusted.get(signer) else {
+            return Err(AttestationError::SignerNotTrusted {
+                signer: signer.to_string(),
+            });
+        };
+
+        if !attestation.verify_with_did(public_key) {
+            return Err(AttestationError::SignatureVerificationFailed {
+                signer: signer.to_string(),
+            });
+        }
+
+        Ok(())
     }
 }
 
@@ -694,6 +1186,35 @@ pub enum AttestationError {
     /// I/O error reading or writing the attestation.
     #[error("I/O error: {0}")]
     Io(#[from] io::Error),
+
+    /// The attestation carries no signature, so no trust decision is
+    /// possible (CB-12A AC3: fail closed).
+    #[error("attestation is unsigned")]
+    Unsigned,
+
+    /// The attestation was signed with the symmetric session MAC key, which
+    /// is evidence authentication only and is never accepted as trusted
+    /// evidence (CB-12A AC3).
+    #[error("session-MAC signer `{signer}` is never accepted as trusted evidence; configure an agent DID and sign with it")]
+    SessionMacSignerNotTrusted {
+        /// The rejected `session-mac:*` signer string.
+        signer: String,
+    },
+
+    /// The signer DID is not in the explicitly configured trust set.
+    #[error("signer `{signer}` is not in the configured trust set")]
+    SignerNotTrusted {
+        /// The signer DID that was not configured.
+        signer: String,
+    },
+
+    /// The Ed25519 signature did not verify against the configured public
+    /// key (tampered payload or wrong key).
+    #[error("DID signature verification failed for `{signer}`")]
+    SignatureVerificationFailed {
+        /// The signer DID whose signature failed.
+        signer: String,
+    },
 }
 
 // Formatting Helpers
@@ -1208,5 +1729,385 @@ mod tests {
         assert_eq!(format_duration_ms(2_354_000), "39m 14s");
         assert_eq!(format_duration_ms(3_600_000), "1h 0m");
         assert_eq!(format_duration_ms(3_661_000), "1h 1m 1s");
+    }
+
+    // CB-12A fix-session regressions (review ATOM::aaron::8 R1/R6).
+
+    /// A V2 payload truncated inside `operations_covered` must be REJECTED —
+    /// never reinterpreted as the older shape with the covered operations
+    /// silently dropped (the review's executed R1 counterexample).
+    #[test]
+    fn truncated_v2_payload_is_rejected() {
+        let attest = Attestation::builder("review", AttestAgent::new("a", "A", "v"))
+            .operations_covered(vec!["must not disappear".into()])
+            .build();
+        let mut bytes = attest.serialize().unwrap();
+        bytes.pop();
+        assert!(
+            Attestation::deserialize(&bytes).is_err(),
+            "truncated current-format payload must not decode as an older shape"
+        );
+    }
+
+    /// V1 and V2 files still decode through their historical layouts (hash
+    /// still over the exact original bytes), unsigned.
+    #[test]
+    fn historical_v1_and_v2_files_decode_unsigned() {
+        let key = "a".repeat(64);
+        let v3 = Attestation::builder("sess-hist", AttestAgent::new("a", "A", "v"))
+            .operations_covered(vec!["op".into()])
+            .build();
+
+        // V2: same fields, no signer/signature.
+        let v2 = AttestationV2 {
+            version: 2,
+            timestamp: 100,
+            agent: AttestAgent::new("a", "A", "v"),
+            session_id: "sess-hist".into(),
+            cost_usd: 0.0,
+            duration_api_ms: 0,
+            duration_wall_ms: 0,
+            code_changes: CodeChangeStats::default(),
+            models: Vec::new(),
+            changes_covered: vec![Hash::of(b"c")],
+            previous_attestation: None,
+            notes: None,
+            operations_covered: vec!["op".into()],
+        };
+        let mut bytes = b"ATST".to_vec();
+        bytes.extend(postcard::to_allocvec(&v2).unwrap());
+        let (loaded, hash) = Attestation::deserialize(&bytes).unwrap();
+        assert_eq!(loaded.version, 2);
+        assert_eq!(loaded.operations_covered, vec!["op".to_string()]);
+        assert_eq!(loaded.changes_covered, vec![Hash::of(b"c")]);
+        assert!(loaded.signer.is_none() && loaded.signature.is_none());
+        assert_eq!(hash, Hash::of(&bytes));
+
+        // V3 roundtrip keeps the signature; a V3 file written unsigned (no
+        // signer) still decodes — signature presence is optional at the codec
+        // layer and verified under the caller's key.
+        let mut unsigned_v3 = v3.clone();
+        unsigned_v3.sign_with_mac(&key);
+        assert!(unsigned_v3.verify_mac(&key));
+        let signed_bytes = unsigned_v3.serialize().unwrap();
+        let (loaded, _) = Attestation::deserialize(&signed_bytes).unwrap();
+        assert_eq!(loaded.signer.as_deref(), Some("session-mac:sess-hist"));
+        assert!(loaded.verify_mac(&key));
+        assert!(!loaded.verify_mac(&"b".repeat(64)));
+    }
+
+    /// The signature covers every field: tampering any one of them breaks
+    /// verification (review R6 — the audit object must actually be signed).
+    #[test]
+    fn signature_covers_every_field() {
+        let key = "c".repeat(64);
+        let mut attest = Attestation::builder("sess-signed", AttestAgent::new("a", "A", "v"))
+            .operations_covered(vec!["turn 1 HEAD a -> b".into()])
+            .add_change(Hash::of(b"change"))
+            .previous_attestation(Hash::of(b"prev"))
+            .build();
+        attest.sign_with_mac(&key);
+        assert!(attest.verify_mac(&key));
+
+        let tampered_ops = [
+            "version",
+            "timestamp",
+            "session",
+            "cost",
+            "duration_api",
+            "duration_wall",
+            "lines",
+            "models",
+            "changes",
+            "previous",
+            "notes",
+            "operations",
+            "signer",
+            "signature_cleared",
+            "agent_fields",
+        ];
+        let mut rejected = 0usize;
+        for field in tampered_ops {
+            let mut changed = attest.clone();
+            match field {
+                "version" => changed.version += 1,
+                "timestamp" => changed.timestamp += 1,
+                "session" => changed.session_id.push('x'),
+                "cost" => changed.cost_usd += 1.0,
+                "duration_api" => changed.duration_api_ms += 1,
+                "duration_wall" => changed.duration_wall_ms += 1,
+                "lines" => changed.code_changes.lines_added += 1,
+                "models" => changed.models.push(ModelUsage::new("m")),
+                "changes" => changed.changes_covered.push(Hash::of(b"extra")),
+                "previous" => changed.previous_attestation = Some(Hash::of(b"other")),
+                "notes" => changed.notes = Some("edited".into()),
+                "operations" => changed.operations_covered.push("forged op".into()),
+                "signer" => changed.signer = Some("session-mac:other".into()),
+                "signature_cleared" => changed.signature = None,
+                _ => changed.agent.display_name.push('x'),
+            }
+            if !changed.verify_mac(&key) {
+                rejected += 1;
+            }
+        }
+        assert_eq!(
+            rejected,
+            tampered_ops.len(),
+            "every covered field must be bound by the signature"
+        );
+        // A tampered signature string itself also fails.
+        let mut bad = attest.clone();
+        bad.signature = Some("0".repeat(64));
+        assert!(!bad.verify_mac(&key));
+    }
+
+    // -------------------------------------------------------------------------
+    // V4: DID signatures + evidence roots (CB-12A AC3)
+    // -------------------------------------------------------------------------
+
+    /// Deterministic Ed25519 seed for tests.
+    fn test_seed(byte: u8) -> [u8; 32] {
+        let mut seed = [byte; 32];
+        seed[0] = byte.wrapping_mul(7);
+        seed
+    }
+
+    fn did_attestation() -> Attestation {
+        Attestation::builder("sess-did", AttestAgent::new("a", "A", "v"))
+            .operations_covered(vec!["turn 2 HEAD a -> b".into()])
+            .add_change(Hash::of(b"change"))
+            .turn_outcomes_root(Hash::of(b"outcomes"))
+            .capture_root(Hash::of(b"captures"))
+            .provenance_root(Hash::of(b"provenance"))
+            .timestamp(1739290034)
+            .build()
+    }
+
+    fn sign_did(attest: &mut Attestation, seed: [u8; 32]) -> String {
+        let signing = ed25519_dalek::SigningKey::from_bytes(&seed);
+        let did = format!(
+            "did:atomic:{}",
+            data_encoding::BASE32_NOPAD
+                .encode(blake3::hash(signing.verifying_key().as_bytes()).as_bytes())
+        );
+        attest.sign_with_did(&did, &seed);
+        did
+    }
+
+    /// A V4 attestation with evidence roots signs with a DID, verifies,
+    /// roundtrips, and the roots survive the codec exactly.
+    #[test]
+    fn v4_did_signature_roundtrip_with_roots() {
+        let mut attest = did_attestation();
+        let did = sign_did(&mut attest, test_seed(3));
+        assert_eq!(attest.signer.as_deref(), Some(did.as_str()));
+        assert!(!attest.is_session_mac_signed());
+        assert_eq!(attest.signer_did(), Some(did.as_str()));
+
+        let signing = ed25519_dalek::SigningKey::from_bytes(&test_seed(3));
+        let public = signing.verifying_key().to_bytes();
+        assert!(attest.verify_with_did(&public));
+        assert!(!attest.verify_with_did(&test_seed(4)));
+
+        let bytes = attest.serialize().unwrap();
+        assert_eq!(attest.version, SCHEMA_VERSION);
+        assert_eq!(attest.version, 4);
+        let (loaded, _) = Attestation::deserialize(&bytes).unwrap();
+        assert_eq!(loaded.turn_outcomes_root, Some(Hash::of(b"outcomes")));
+        assert_eq!(loaded.capture_root, Some(Hash::of(b"captures")));
+        assert_eq!(loaded.provenance_root, Some(Hash::of(b"provenance")));
+        assert_eq!(loaded.signer.as_deref(), Some(did.as_str()));
+        assert!(loaded.verify_with_did(&public));
+    }
+
+    /// The DID signature covers every field including the three evidence
+    /// roots: tampering any one of them breaks verification.
+    #[test]
+    fn did_signature_covers_every_field_and_roots() {
+        let seed = test_seed(5);
+        let signing = ed25519_dalek::SigningKey::from_bytes(&seed);
+        let public = signing.verifying_key().to_bytes();
+        let mut attest = did_attestation();
+        attest.sign_with_did("did:atomic:test", &seed);
+        assert!(attest.verify_with_did(&public));
+
+        #[allow(clippy::type_complexity)] // tamper-mutation matrix
+        let tampered: Vec<(&str, Box<dyn Fn(&mut Attestation)>)> = vec![
+            ("version", Box::new(|a: &mut Attestation| a.version += 1)),
+            (
+                "timestamp",
+                Box::new(|a: &mut Attestation| a.timestamp += 1),
+            ),
+            (
+                "session",
+                Box::new(|a: &mut Attestation| a.session_id.push('x')),
+            ),
+            ("cost", Box::new(|a: &mut Attestation| a.cost_usd += 1.0)),
+            (
+                "duration_api",
+                Box::new(|a: &mut Attestation| a.duration_api_ms += 1),
+            ),
+            (
+                "duration_wall",
+                Box::new(|a: &mut Attestation| a.duration_wall_ms += 1),
+            ),
+            (
+                "lines",
+                Box::new(|a: &mut Attestation| a.code_changes.lines_added += 1),
+            ),
+            (
+                "models",
+                Box::new(|a: &mut Attestation| a.models.push(ModelUsage::new("m"))),
+            ),
+            (
+                "changes",
+                Box::new(|a: &mut Attestation| a.changes_covered.push(Hash::of(b"extra"))),
+            ),
+            (
+                "previous",
+                Box::new(|a: &mut Attestation| a.previous_attestation = Some(Hash::of(b"o"))),
+            ),
+            (
+                "notes",
+                Box::new(|a: &mut Attestation| a.notes = Some("edited".into())),
+            ),
+            (
+                "operations",
+                Box::new(|a: &mut Attestation| a.operations_covered.push("forged".into())),
+            ),
+            (
+                "turn_outcomes_root",
+                Box::new(|a: &mut Attestation| a.turn_outcomes_root = Some(Hash::of(b"forged"))),
+            ),
+            (
+                "capture_root",
+                Box::new(|a: &mut Attestation| a.capture_root = Some(Hash::of(b"forged"))),
+            ),
+            (
+                "provenance_root",
+                Box::new(|a: &mut Attestation| a.provenance_root = Some(Hash::of(b"forged"))),
+            ),
+            (
+                "signer",
+                Box::new(|a: &mut Attestation| a.signer = Some("did:atomic:other".into())),
+            ),
+            (
+                "signature_cleared",
+                Box::new(|a: &mut Attestation| a.signature = None),
+            ),
+        ];
+        for (field, mutate) in &tampered {
+            let mut changed = attest.clone();
+            mutate(&mut changed);
+            assert!(
+                !changed.verify_with_did(&public),
+                "tampered field `{field}` must break DID verification"
+            );
+        }
+        assert_eq!(tampered.len(), 17);
+    }
+
+    /// Trust verification fails closed on every refusal path: unsigned,
+    /// session-MAC signer, unconfigured signer, wrong key — and accepts the
+    /// one properly signed and configured case.
+    #[test]
+    fn trust_policy_refusal_matrix() {
+        let seed = test_seed(6);
+        let signing = ed25519_dalek::SigningKey::from_bytes(&seed);
+        let public = signing.verifying_key().to_bytes();
+        let did = format!(
+            "did:atomic:{}",
+            data_encoding::BASE32_NOPAD
+                .encode(blake3::hash(signing.verifying_key().as_bytes()).as_bytes())
+        );
+
+        // Unsigned → Unsigned.
+        let unsigned = did_attestation();
+        let err = TrustPolicy::new()
+            .trust(&did, public)
+            .verify(&unsigned)
+            .unwrap_err();
+        assert!(matches!(err, AttestationError::Unsigned));
+
+        // Session-MAC signer → never trusted evidence, even if configured.
+        let mut mac_signed = did_attestation();
+        mac_signed.sign_with_mac(&"a".repeat(64));
+        assert!(mac_signed.is_session_mac_signed());
+        let policy = TrustPolicy::new()
+            .trust(mac_signed.signer.clone().unwrap(), public)
+            .trust(&did, public);
+        let err = policy.verify(&mac_signed).unwrap_err();
+        assert!(matches!(
+            err,
+            AttestationError::SessionMacSignerNotTrusted { .. }
+        ));
+
+        // Unconfigured signer → SignerNotTrusted.
+        let mut signed = did_attestation();
+        signed.sign_with_did(&did, &seed);
+        let err = TrustPolicy::new().verify(&signed).unwrap_err();
+        assert!(matches!(err, AttestationError::SignerNotTrusted { .. }));
+
+        // Configured under the WRONG key → SignatureVerificationFailed.
+        let wrong_policy = TrustPolicy::new().trust(&did, test_seed(9));
+        let err = wrong_policy.verify(&signed).unwrap_err();
+        assert!(matches!(
+            err,
+            AttestationError::SignatureVerificationFailed { .. }
+        ));
+
+        // The one accepted path: configured DID + genuine signature.
+        let policy = TrustPolicy::new().trust(&did, public);
+        assert_eq!(policy.len(), 1);
+        policy
+            .verify(&signed)
+            .expect("genuine DID signature under configured trust");
+
+        // Tampered payload under the correct policy still fails.
+        let mut tampered = signed.clone();
+        tampered.changes_covered.push(Hash::of(b"extra"));
+        assert!(policy.verify(&tampered).is_err());
+    }
+
+    /// A V3 file still decodes after the V4 schema bump: signer/signature
+    /// preserved, roots absent, MAC verification intact.
+    #[test]
+    fn v3_file_still_decodes_after_v4_bump() {
+        let key = "d".repeat(64);
+        // A genuine V3 shape: no evidence roots, MAC signer/signature.
+        let mut v3 = AttestationV3 {
+            version: 3,
+            timestamp: 100,
+            agent: AttestAgent::new("a", "A", "v"),
+            session_id: "sess-v3".into(),
+            cost_usd: 0.0,
+            duration_api_ms: 0,
+            duration_wall_ms: 0,
+            code_changes: CodeChangeStats::default(),
+            models: Vec::new(),
+            changes_covered: vec![Hash::of(b"c")],
+            previous_attestation: None,
+            notes: None,
+            operations_covered: vec!["op".into()],
+            signer: None,
+            signature: None,
+        };
+        let mut attest: Attestation = v3.clone().into();
+        attest.sign_with_mac(&key);
+        v3.signer = attest.signer.clone();
+        v3.signature = attest.signature.clone();
+
+        let mut bytes = b"ATST".to_vec();
+        bytes.extend(postcard::to_allocvec(&v3).unwrap());
+        assert_eq!(bytes[4], 3, "payload version byte must say 3");
+        let (loaded, _) = Attestation::deserialize(&bytes).unwrap();
+        assert_eq!(loaded.version, 3);
+        assert_eq!(loaded.signer.as_deref(), Some("session-mac:sess-v3"));
+        assert!(loaded.verify_mac(&key));
+        assert!(loaded.turn_outcomes_root.is_none());
+        assert!(loaded.capture_root.is_none());
+        assert!(loaded.provenance_root.is_none());
+        assert!(loaded.is_session_mac_signed());
+        assert!(loaded.signer_did().is_none());
     }
 }

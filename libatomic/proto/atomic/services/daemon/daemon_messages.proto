@@ -1,0 +1,151 @@
+// atomic-protocol — DaemonService: daemon health, capability negotiation,
+// repository registry, lifecycle.
+//
+// DRAFT — add-only. Extends the parked Slice 0 draft (REAC::aaron::2).
+//
+// The legacy agent journal protocol is being fully dismantled (with the
+// `atomic agent database-owner` command that served it); liveness,
+// process lifecycle, and storage ownership become daemon concerns here:
+// Health carries status + quick-gate feature tokens; the additive
+// capability-flag pattern of the legacy surface (old clients ignore, old
+// servers omit, clients gate before using newer ops) carries into
+// GetCapabilities as the negotiated method matrix.
+//
+// Daemon lifecycle (RFC D3/D4): one user-level daemon; repository databases
+// are opened lazily and evicted when idle; a local client that cannot
+// reach the daemon may start/restart it and retry — it may NEVER open redb
+// directly.
+
+syntax = "proto3";
+
+package atomic;
+
+import "atomic/common/options.proto";   // ExecutionScope (MethodDescriptorInfo)
+import "atomic/common/common.proto";
+
+enum ServingStatus {
+  SERVING_STATUS_UNSPECIFIED = 0;
+  SERVING_STATUS_SERVING = 1;
+  SERVING_STATUS_NOT_SERVING = 2;
+}
+
+enum EndpointKind {
+  ENDPOINT_KIND_UNSPECIFIED = 0;
+  ENDPOINT_KIND_LOCAL_DAEMON = 1;
+  ENDPOINT_KIND_HOSTED_SERVER = 2;
+}
+
+// Negotiated limits. Seeded from the legacy journal transport's proven
+// defaults (64 MiB max message; 256 fragments per frozen page; 1 MiB frozen
+// pages; 4 MiB client-side append chunking). The daemon may lower these per
+// principal; never raise above what clients negotiate.
+message Limits {
+  uint64 max_message_bytes = 1;
+  uint32 max_frozen_page_fragments = 2;
+  uint64 frozen_page_bytes = 3;
+  uint64 append_chunk_budget_bytes = 4;
+  uint32 max_changes_per_request = 5;
+  uint32 max_inodes_per_request = 6;
+  uint32 max_write_queue_depth = 7;
+}
+
+// Auth requirements for remote principals: TLS + authenticated identity +
+// audience-bound JWTs (a token leaked from one server must not replay at
+// another — the `aud` claim carried from the sandbox extension's auth).
+message AuthRequirements {
+  bool tls_required = 1;
+  bool audience_binding = 2;
+  repeated string identity_schemes = 3;
+  repeated string credential_schemes = 4; // e.g. sandbox-token-bin, bearer-jwt
+  // TLS requirement refers to TCP; iroh provides its authenticated encrypted
+  // transport. Both apply the same caller/resource authorization policy.
+}
+
+message MethodDescriptorInfo {
+  string service = 1;
+  string method = 2;
+  ExecutionScope scope = 3;
+  repeated string required_capabilities = 4;
+  repeated CallerClass allowed_callers = 5;
+  repeated RpcEffect effects = 6;
+}
+
+
+
+message HealthRequest {}
+
+message HealthResponse {
+  ServingStatus status = 1;
+  uint32 pid = 2;
+  repeated string features = 3;   // quick-gate feature tokens; the full matrix
+                                  // lives in GetCapabilities
+}
+
+message GetCapabilitiesRequest {}
+
+message GetCapabilitiesResponse {
+  uint32 protocol_version = 1;    // contract version 2; mismatch fails hard
+                                  // BOTH directions (version discipline)
+  string implementation_version = 2;
+  EndpointKind endpoint_kind = 3;
+  repeated MethodDescriptorInfo methods = 4;  // the generated method matrix
+  repeated string features = 5;    // e.g. "harness_reflection" (HANDOFF §10.6:
+                                   // grpcurl + server reflection is the
+                                   // recommended harness flavor)
+  Limits limits = 6;
+  AuthRequirements auth = 7;
+}
+
+message ListRepositoriesRequest {}
+
+message ListRepositoriesResponse {
+  repeated RepositorySummary repositories = 1;
+}
+
+message ResolveRepositoryRequest {
+  string path = 1;                  // working-copy path (LOCAL endpoint only)
+}
+message ResolveRepositoryResponse {
+  RepositoryRef repository = 1;      // the persistent identity for that path
+  reserved 2; // registration is an explicit mutation
+  WorkspaceInfo workspace = 3;
+}
+
+// Returned only to local principals. CLI normalizes cwd-relative arguments to
+// root-relative paths before sending working-copy requests. Daemon cwd is never
+// consulted. workspace_id is bound to this repository/root and its current view.
+message WorkspaceInfo {
+  string workspace_id = 1;
+  string root_path = 2;
+  string relative_cwd = 3;
+  ViewRef current_view = 4;
+}
+
+// Bootstrap registration has no RepositoryRef yet. Validate filesystem ownership
+// and Atomic repository identity; aliases must refer to the same physical store.
+// Duplicate IDs at distinct stores are refused, never silently rebound. Assign
+// legacy IDs in the registry/.atomic ID record, without opening a repository
+// write transaction. Repository schema migration is separate administration.
+message RegisterRepositoryRequest {
+  string path = 1;
+  RequestMeta meta = 2;
+}
+message RegisterRepositoryResponse {
+  RepositoryRef repository = 1;
+  WorkspaceInfo workspace = 2;
+  ResponseMeta meta = 100;
+}
+
+message RepositorySummary {
+  RepositoryRef repository = 1;
+  bool open = 2;                    // repository database currently open
+  optional string local_path = 3;   // local daemon only; never sent to remote
+                                     // clients as addressing — informational
+}
+
+message ShutdownRequest { RequestMeta meta = 1; }
+
+message ShutdownResponse {
+  uint32 pid = 1;                   // ShuttingDown{pid}
+  ResponseMeta meta = 100;
+}

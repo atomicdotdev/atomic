@@ -76,6 +76,9 @@
 //!     ],
 //!     reasoning: Some(reasoning),
 //!     redacted: false,
+//!     input_tokens: None,
+//!     output_tokens: None,
+//!     step_count: None,
 //! };
 //!
 //! assert_eq!(data.turn_number, 3);

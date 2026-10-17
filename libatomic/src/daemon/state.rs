@@ -1,0 +1,428 @@
+//! Daemon state: the repository registry, RPC logging, error mapping.
+//!
+//! One daemon multiplexes many repositories (RFC D3): each resolved root is
+//! registered under its persistent ID and opened lazily, exactly once, and
+//! the handle is reused for every subsequent request. redb permits one
+//! writable process per database file — that process is this daemon.
+
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::Mutex;
+
+use crate::atomic::ErrorCode;
+use crate::atomic::{ErrorInfo, RepositoryRef};
+use atomic_repository::redb_change_store::RedbChangeStore;
+use atomic_repository::Repository;
+
+use super::sandbox_grants::{InMemorySandboxGrants, SandboxGrants};
+use tonic::{Code, Status};
+
+use prost::Message;
+
+/// Env-configured JSONL log of handled RPCs (the e2e harness audit pairs
+/// client invocations with served requests through it).
+pub const ENV_LOG_REQUESTS: &str = "ATOMIC_DAEMON_LOG_REQUESTS";
+
+/// The cross-process open grace: redb refuses any open while another
+/// process holds the database, so every daemon open — read or write,
+/// repository or change store — waits up to this budget for a short-lived
+/// writer (a recording agent turn in another process) to finish. The same
+/// budget the hook-side waits use; override with `ATOMIC_DB_LOCK_WAIT_MS`.
+pub fn database_open_wait() -> std::time::Duration {
+    atomic_repository::database_lock_wait()
+}
+
+/// One registered repository: canonical root + the per-repository
+/// serialization gate. redb permits ONE handle per database file even
+/// within a process, so the daemon never holds a repository handle across
+/// requests: each RPC acquires this gate, opens the database, runs, and
+/// drops the handle. (RFC D2's bounded per-repo queue, simplified to full
+/// serialization for this slice — the read/write split is future work.)
+pub struct RepoHandle {
+    pub root: PathBuf,
+    gate: std::sync::Arc<tokio::sync::Mutex<()>>,
+}
+
+impl RepoHandle {
+    pub fn new(root: PathBuf) -> Self {
+        Self {
+            root,
+            gate: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+        }
+    }
+
+    /// Serialize repository database access: at most one open handle at a
+    /// time for this repository. Acquire before any domain call.
+    pub async fn exclusive(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.gate.lock().await
+    }
+
+    /// Move maintenance exclusion into blocking work so cancelling its caller
+    /// cannot release the gate while that work is still using the database.
+    pub(super) async fn exclusive_owned(&self) -> tokio::sync::OwnedMutexGuard<()> {
+        self.gate.clone().lock_owned().await
+    }
+
+    /// The persistent repository ID for this daemon: a blake3 digest of the
+    /// canonical root. Slice limitation: RFC D3 wants IDs assigned at init
+    /// and recorded in `.atomic` so they survive daemon restarts and follow
+    /// the repository across daemons; a path digest is stable across
+    /// restarts of the same layout and unambiguous locally.
+    pub fn repository_id(&self) -> Vec<u8> {
+        blake3::hash(self.root.to_string_lossy().as_bytes())
+            .as_bytes()
+            .to_vec()
+    }
+
+    /// The current view, read from the `.atomic/current_view` marker WITHOUT
+    /// opening any database (ResolveRepository is a lookup, not a storage
+    /// open — CONTRACT "routing" section).
+    pub fn current_view(&self) -> String {
+        let path = self.root.join(".atomic").join("current_view");
+        std::fs::read_to_string(&path)
+            .map(|content| content.trim().to_string())
+            .unwrap_or_else(|_| "dev".to_string())
+    }
+
+    pub fn repository_ref(&self) -> RepositoryRef {
+        RepositoryRef {
+            authority: "local".to_string(),
+            repository_id: self.repository_id(),
+            workspace_id: None,
+        }
+    }
+
+    /// Open the repository database for this request. The caller drops the
+    /// handle when done; the gate guarantees exclusivity within this
+    /// process. `open_existing_wait` skips the table-init write transaction
+    /// (the repository exists — the daemon never bootstraps) and gives an
+    /// external short-lived writer the open grace before failing.
+    pub fn repository(&self) -> Result<Repository, Status> {
+        Repository::open_existing_wait(&self.root, database_open_wait()).map_err(|error| {
+            domain_status(
+                ErrorCode::Repository,
+                format!(
+                    "failed to open repository at {}: {error}",
+                    self.root.display()
+                ),
+            )
+        })
+    }
+
+    /// Enter an explicit working-copy boundary inside the blocking request.
+    /// The caller retains the returned transaction for the whole operation;
+    /// its ordered graph/workspace locks must not be dropped after reading ID.
+    pub fn workspace_repository(
+        &self,
+        mode: atomic_repository::WorkspaceTxnMode,
+    ) -> Result<(Repository, atomic_repository::WorkspaceTxn), Status> {
+        self.workspace_repository_for_switch(mode, None)
+    }
+
+    /// The only force recovery allowed here is retrying the exact view whose
+    /// native switch completed before its separate Git projection failed.
+    pub(super) fn workspace_repository_for_switch(
+        &self,
+        mode: atomic_repository::WorkspaceTxnMode,
+        target: Option<&str>,
+    ) -> Result<(Repository, atomic_repository::WorkspaceTxn), Status> {
+        use atomic_repository::{
+            RepositoryError, UnanchoredWorkspace, WorkspaceRemediation, WorkspaceTxnMode,
+            WorkspaceTxnStart,
+        };
+        if mode == WorkspaceTxnMode::Force {
+            return Err(domain_status(
+                ErrorCode::InvalidArgument,
+                "service workspace entry cannot force reconciliation",
+            ));
+        }
+        let deadline = std::time::Instant::now() + database_open_wait();
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            let mut repo = match mode {
+                WorkspaceTxnMode::Observe => Repository::open_readonly_wait(&self.root, remaining),
+                WorkspaceTxnMode::Reconcile => {
+                    Repository::open_for_workspace_transaction_wait(&self.root, remaining)
+                }
+                WorkspaceTxnMode::Force => unreachable!(),
+            }
+            .map_err(repository_error)?;
+            let start = repo
+                .begin_workspace_txn(mode)
+                .and_then(|start| match start {
+                    WorkspaceTxnStart::Remediation(WorkspaceRemediation::Unanchored {
+                        state:
+                            UnanchoredWorkspace::AtomicCheckpointDrift {
+                                ref desired_view, ..
+                            },
+                        ..
+                    }) if mode == WorkspaceTxnMode::Reconcile
+                        && target == Some(desired_view.as_str()) =>
+                    {
+                        repo.begin_workspace_txn(WorkspaceTxnMode::Force)
+                    }
+                    other => Ok(other),
+                });
+            match start {
+                Ok(WorkspaceTxnStart::Ready(workspace)) => return Ok((repo, workspace)),
+                Ok(WorkspaceTxnStart::Remediation(remediation)) => {
+                    return Err(domain_status(
+                        ErrorCode::PreconditionFailed,
+                        format!(
+                            "workspace reconciliation required: {}",
+                            remediation.describe()
+                        ),
+                    ))
+                }
+                Err(RepositoryError::LockContended { .. })
+                    if std::time::Instant::now() < deadline =>
+                {
+                    // Never keep a read handle while waiting: the lock owner
+                    // may need to open the database writable to finish.
+                    drop(repo);
+                    std::thread::sleep(
+                        std::time::Duration::from_millis(10)
+                            .min(deadline.saturating_duration_since(std::time::Instant::now())),
+                    );
+                }
+                Err(error) => return Err(repository_error(error)),
+            }
+        }
+    }
+
+    /// Open the repository database READ-ONLY for this query, with the
+    /// read-concurrency wait: redb refuses any open while a writable
+    /// handle exists (this or another process), so a short-lived writer —
+    /// a recording agent turn in another process, a gated mutation in this
+    /// one — is given [`database_open_wait`] to finish before the read fails.
+    /// Readers share the database across processes the same way the CLI's
+    /// query commands always have. The caller must hold no other handle.
+    pub fn repository_readonly(&self) -> Result<Repository, Status> {
+        Repository::open_readonly_wait(&self.root, database_open_wait()).map_err(|error| {
+            domain_status(
+                ErrorCode::Repository,
+                format!(
+                    "failed to open repository at {}: {error}",
+                    self.root.display()
+                ),
+            )
+        })
+    }
+
+    /// The redb-native change/provenance store (atomic.redb — the merged
+    /// database) for this request — opened by path WITHOUT opening the
+    /// repository handle. redb refuses a second concurrent handle on the
+    /// same file, so the journal-port handlers open, use, and drop this
+    /// sequentially under the gate (the same open/close-per-op discipline
+    /// #230's orchestrator applies).
+    pub fn change_store(&self) -> Result<RedbChangeStore, Status> {
+        let dot_dir = Repository::canonical_dot_dir(&self.root).map_err(repository_error)?;
+        let path = atomic_repository::ensure_database(&dot_dir)
+            .map_err(|error| domain_status(ErrorCode::Repository, error.to_string()))?;
+        RedbChangeStore::open_existing_wait(&path, database_open_wait()).map_err(|error| {
+            domain_status(
+                ErrorCode::ProvenanceStore,
+                format!("failed to open {}: {error}", path.display()),
+            )
+        })
+    }
+}
+
+/// Shared adapter for service paths that already own a repository handle.
+pub(super) fn enter_workspace(
+    repo: &mut Repository,
+    mode: atomic_repository::WorkspaceTxnMode,
+) -> Result<atomic_repository::WorkspaceTxn, Status> {
+    match repo.begin_workspace_txn(mode).map_err(repository_error)? {
+        atomic_repository::WorkspaceTxnStart::Ready(workspace) => Ok(workspace),
+        atomic_repository::WorkspaceTxnStart::Remediation(remediation) => Err(domain_status(
+            ErrorCode::PreconditionFailed,
+            format!(
+                "workspace reconciliation required: {}",
+                remediation.describe()
+            ),
+        )),
+    }
+}
+
+pub struct DaemonState {
+    repos: Mutex<HashMap<Vec<u8>, std::sync::Arc<RepoHandle>>>,
+    pub shutdown: tokio::sync::Notify,
+    log_path: Option<PathBuf>,
+    grants: std::sync::Arc<dyn SandboxGrants>,
+}
+
+impl DaemonState {
+    pub fn new() -> Self {
+        Self {
+            repos: Mutex::new(HashMap::new()),
+            shutdown: tokio::sync::Notify::new(),
+            log_path: std::env::var_os(ENV_LOG_REQUESTS).map(PathBuf::from),
+            grants: std::sync::Arc::new(InMemorySandboxGrants::new()),
+        }
+    }
+
+    /// Keep sandbox grants in `grants` instead — a host that persists them in
+    /// its own database, say. Install it before serving: grants issued by the
+    /// sandbox handlers resolve through here.
+    pub fn with_sandbox_grants(mut self, grants: std::sync::Arc<dyn SandboxGrants>) -> Self {
+        self.grants = grants;
+        self
+    }
+
+    /// Where this state's sandbox grants live.
+    pub fn sandbox_grants(&self) -> &std::sync::Arc<dyn SandboxGrants> {
+        &self.grants
+    }
+
+    /// Register (or return the already-registered) handle for a repository
+    /// root. The ID is derived from the canonical root, so re-resolution is
+    /// idempotent.
+    pub fn register(&self, root: PathBuf) -> std::sync::Arc<RepoHandle> {
+        let root = root.canonicalize().unwrap_or_else(|_| root.clone());
+        let id = blake3::hash(root.to_string_lossy().as_bytes())
+            .as_bytes()
+            .to_vec();
+        let mut repos = self.repos.lock().expect("repository registry");
+        repos
+            .entry(id)
+            .or_insert_with(|| std::sync::Arc::new(RepoHandle::new(root.clone())))
+            .clone()
+    }
+
+    /// Resolve a request's RepositoryRef to its handle. Unknown IDs fail
+    /// closed (REPOSITORY_NOT_FOUND) — never a filesystem fallback.
+    pub fn resolve(&self, reference: &RepositoryRef) -> Result<std::sync::Arc<RepoHandle>, Status> {
+        if reference.authority != "local" {
+            return Err(domain_status(
+                ErrorCode::InvalidArgument,
+                format!(
+                    "this daemon serves the local authority; '{}' is not served here",
+                    reference.authority
+                ),
+            ));
+        }
+        let repos = self.repos.lock().expect("repository registry");
+        repos.get(&reference.repository_id).cloned().ok_or_else(|| {
+            domain_status(
+                ErrorCode::RepositoryNotFound,
+                "repository is not registered with this daemon; resolve it by path first",
+            )
+        })
+    }
+
+    pub fn list(&self) -> Vec<std::sync::Arc<RepoHandle>> {
+        let repos = self.repos.lock().expect("repository registry");
+        let mut handles: Vec<_> = repos.values().cloned().collect();
+        handles.sort_by_key(|handle| handle.root.clone());
+        handles
+    }
+
+    /// Append one JSONL line to the env-configured RPC log. Logging must
+    /// never break a request.
+    pub fn log_rpc(&self, method: &str, handle: Option<&RepoHandle>) {
+        let Some(path) = &self.log_path else { return };
+        let record = serde_json::json!({
+            "ts": std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0),
+            "method": method,
+            "repository_id": handle.map(|h| data_encoding::HEXLOWER.encode(&h.repository_id()[..16])),
+            "root": handle.map(|h| h.root.display().to_string()),
+        });
+        use std::io::Write;
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
+            let _ = writeln!(file, "{record}");
+        }
+    }
+}
+
+impl Default for DaemonState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// A domain refusal as a gRPC status carrying the contract's stable
+/// machine-readable ErrorInfo detail.
+pub fn domain_status(code: ErrorCode, message: impl Into<String>) -> Status {
+    let message: String = message.into();
+    fn code_name(code: ErrorCode) -> &'static str {
+        match code {
+            ErrorCode::Unspecified => "ERROR_CODE_UNSPECIFIED",
+            ErrorCode::CapabilityUnavailable => "CAPABILITY_UNAVAILABLE",
+            ErrorCode::ProtocolVersionMismatch => "PROTOCOL_VERSION_MISMATCH",
+            ErrorCode::WorkspaceRequired => "WORKSPACE_REQUIRED",
+            ErrorCode::Unauthorized => "UNAUTHORIZED",
+            ErrorCode::Forbidden => "FORBIDDEN",
+            ErrorCode::SandboxToken => "SANDBOX_TOKEN",
+            ErrorCode::IdempotencyMismatch => "IDEMPOTENCY_MISMATCH",
+            ErrorCode::PreconditionFailed => "PRECONDITION_FAILED",
+            ErrorCode::GenerationConflict => "GENERATION_CONFLICT",
+            ErrorCode::InvalidArgument => "INVALID_ARGUMENT",
+            ErrorCode::NotFound => "NOT_FOUND",
+            ErrorCode::Repository => "REPOSITORY",
+            ErrorCode::RepositoryNotFound => "REPOSITORY_NOT_FOUND",
+            ErrorCode::ResourceExhausted => "RESOURCE_EXHAUSTED",
+            ErrorCode::RateLimited => "RATE_LIMITED",
+            ErrorCode::View => "VIEW",
+            ErrorCode::ViewStale => "VIEW_STALE",
+            ErrorCode::ChangeRejected => "CHANGE_REJECTED",
+            ErrorCode::ProvenanceStore => "PROVENANCE_STORE",
+            ErrorCode::ProvenanceCheckpoint => "PROVENANCE_CHECKPOINT",
+            ErrorCode::ProvenanceLifecycle => "PROVENANCE_LIFECYCLE",
+            ErrorCode::Provenance => "PROVENANCE",
+            ErrorCode::Changes => "CHANGES",
+            ErrorCode::FileStates => "FILE_STATES",
+            ErrorCode::Materialize => "MATERIALIZE",
+            ErrorCode::Remote => "REMOTE",
+            ErrorCode::Internal => "INTERNAL",
+        }
+    }
+    let info = ErrorInfo {
+        code: code as i32,
+        message: message.clone(),
+        context: HashMap::new(),
+        request_id: None,
+    };
+    let mut payload = Vec::new();
+    let _ = info.encode(&mut payload);
+    let _ = payload;
+    let grpc_code = match code {
+        ErrorCode::NotFound | ErrorCode::RepositoryNotFound => Code::NotFound,
+        ErrorCode::InvalidArgument => Code::InvalidArgument,
+        ErrorCode::PreconditionFailed
+        | ErrorCode::GenerationConflict
+        | ErrorCode::IdempotencyMismatch
+        | ErrorCode::ViewStale
+        | ErrorCode::ChangeRejected => Code::FailedPrecondition,
+        ErrorCode::ResourceExhausted | ErrorCode::RateLimited => Code::ResourceExhausted,
+        ErrorCode::Unauthorized => Code::Unauthenticated,
+        ErrorCode::Forbidden | ErrorCode::SandboxToken | ErrorCode::View => Code::PermissionDenied,
+        ErrorCode::ProtocolVersionMismatch => Code::Internal,
+        ErrorCode::Internal | ErrorCode::Repository => Code::Internal,
+        _ => Code::InvalidArgument,
+    };
+    // Slice note: rich grpc-status-details-bin attachments land with the
+    // compatibility suite; the stable code rides the message prefix until then.
+    Status::new(
+        grpc_code,
+        format!("atomic:{}: {}", code_name(code), message),
+    )
+}
+
+/// A domain result mapped to the contract's error vocabulary where the
+/// caller has no more specific mapping.
+pub fn repository_error(error: atomic_repository::RepositoryError) -> Status {
+    domain_status(ErrorCode::Repository, error.to_string())
+}
+
+/// A quick helper so handlers can echo hash bytes consistently.
+pub fn hash_bytes(hash: &atomic_core::types::Merkle) -> Vec<u8> {
+    hash.0.to_vec()
+}

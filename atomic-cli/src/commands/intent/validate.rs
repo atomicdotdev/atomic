@@ -29,6 +29,10 @@ pub struct IntentValidate {
 
 impl Command for IntentValidate {
     fn run(&self) -> CliResult<()> {
+        if crate::commands::rpc::intent_validate(self)? {
+            return Ok(());
+        }
+
         // Resolve the argument. A path-shaped argument (ends in `.md` or
         // contains a separator) is loaded as a file — and if it doesn't exist
         // we report FileNotFound rather than misreporting it as a bad ID.

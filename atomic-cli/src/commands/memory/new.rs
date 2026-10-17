@@ -75,6 +75,10 @@ pub struct MemoryNew {
 
 impl Command for MemoryNew {
     fn run(&self) -> CliResult<()> {
+        if crate::commands::rpc::memory_new(self)? {
+            return Ok(());
+        }
+
         // Reject a bad --kind EARLY (before touching the vault) so `new` never
         // writes a non-liftable / non-conforming spine.
         if !MEMORY_KIND.contains(&self.kind.as_str()) {

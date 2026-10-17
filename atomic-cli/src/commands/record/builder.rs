@@ -15,6 +15,7 @@ impl Record {
             dry_run: false,
             skip_binary: false,
             allow_conflict_markers: false,
+            resolve_name_conflicts: Vec::new(),
             max_size: None,
             ai_assisted: false,
             ai_provider: None,
@@ -44,7 +45,7 @@ impl Record {
     }
 
     /// Parse the author string into an Author struct.
-    pub(super) fn parse_author(&self) -> Option<Author> {
+    pub(crate) fn parse_author(&self) -> Option<Author> {
         self.author.as_ref().map(|s| {
             // Try to parse "Name <email>" format
             if let Some(bracket_start) = s.find('<') {
@@ -162,7 +163,11 @@ impl Record {
     }
 
     /// Get the commit message, potentially from editor.
-    pub(super) fn get_message(&self) -> CliResult<String> {
+    ///
+    /// Shared by the local body and the service-layer hook: the editor and
+    /// the interactive prompt are client-side by design, so the routed path
+    /// composes the message with this SAME code and sends it on the wire.
+    pub(crate) fn get_message(&self) -> CliResult<String> {
         // If message was provided, use it
         if let Some(ref msg) = self.message {
             return Ok(msg.clone());

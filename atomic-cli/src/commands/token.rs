@@ -11,7 +11,8 @@
 //! `base64url(header).base64url(claims).base64url(signature)`:
 //!
 //! - header: `{"alg":"EdDSA","typ":"JWT","kid":"<base32 Ed25519 public key>"}`
-//! - claims: `{ sub, iat, exp, jti }` (`sub` mirrors the `kid` public key)
+//! - claims: `{ sub, aud, iat, exp, jti }` (`sub` mirrors the `kid` public key;
+//!   `aud` is the server the token is for)
 //! - signature: `Ed25519_sign(private_key, "header.claims")`
 //!
 //! # Acting on behalf of someone (agent identities)
@@ -77,6 +78,12 @@ struct Claims {
     iat: i64,
     exp: i64,
     jti: String,
+
+    /// The server this token is for (RFC 7519 `aud`): the bare server URL,
+    /// without a trailing slash. A server that checks it refuses a token
+    /// minted for somewhere else, so a token leaked from one server can't
+    /// be replayed at another within its lifetime.
+    aud: String,
 
     /// RFC 8693 actor claim — present only when an agent is acting.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -160,6 +167,7 @@ fn mint_token(server: &str, identity: &Identity) -> CliResult<String> {
     let now = Utc::now();
     let claims = Claims {
         sub,
+        aud: audience(server),
         iat: now.timestamp(),
         exp: (now + TOKEN_TTL).timestamp(),
         jti: Uuid::new_v4().to_string(),
@@ -196,9 +204,35 @@ fn mint_token(server: &str, identity: &Identity) -> CliResult<String> {
     Ok(format!("{signing_input}.{sig_b64}"))
 }
 
+/// The `aud` for a server URL: scheme and host (and port), no trailing
+/// slash, lowercased — so `https://Atomic.Storage/` and
+/// `https://atomic.storage` are the same audience.
+pub fn audience(server: &str) -> String {
+    server.trim().trim_end_matches('/').to_ascii_lowercase()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_token_names_the_server_it_is_for() {
+        assert_eq!(
+            audience("https://Atomic.Storage/"),
+            "https://atomic.storage"
+        );
+        let claims = Claims {
+            sub: "S".into(),
+            aud: audience("https://atomic.storage"),
+            iat: 0,
+            exp: 1,
+            jti: "j".into(),
+            act: None,
+            dlg: None,
+        };
+        let v: serde_json::Value = serde_json::to_value(&claims).unwrap();
+        assert_eq!(v["aud"], "https://atomic.storage");
+    }
 
     #[test]
     fn header_is_eddsa_jwt_with_kid() {
@@ -218,6 +252,7 @@ mod tests {
     fn a_non_delegated_token_omits_the_actor_claims() {
         let claims = Claims {
             sub: "ABCDEF".to_string(),
+            aud: "https://a".to_string(),
             iat: 0,
             exp: 1,
             jti: "j".to_string(),
@@ -237,6 +272,7 @@ mod tests {
         let agent = "AGENTKEY";
         let claims = Claims {
             sub: human.to_string(),
+            aud: "https://a".to_string(),
             iat: 0,
             exp: 1,
             jti: "j".to_string(),
@@ -277,6 +313,7 @@ mod tests {
         let now = Utc::now();
         let claims = Claims {
             sub: public_key_b32.clone(),
+            aud: audience("https://atomic.storage"),
             iat: now.timestamp(),
             exp: (now + TOKEN_TTL).timestamp(),
             jti: Uuid::new_v4().to_string(),

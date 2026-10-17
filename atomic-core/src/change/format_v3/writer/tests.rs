@@ -5,7 +5,7 @@ use super::state_machine::ChangeWriter;
 use crate::change::format_v3::types::{
     FileHeader, SectionHeader, SectionType, Trailer, HASH_INDEX_NONE,
 };
-use crate::change::format_v3::HashDedupTable;
+use crate::change::format_v3::{HashDedupTable, LEGACY_FORMAT_VERSION};
 use crate::change::header::ChangeHeader;
 
 /// Helper: create a minimal writer with header + hash table already written.
@@ -163,6 +163,19 @@ fn test_write_file_header() {
 }
 
 #[test]
+fn test_writer_rejects_legacy_version_one() {
+    let mut buf = Vec::new();
+    let header = FileHeader {
+        version: LEGACY_FORMAT_VERSION,
+        ..FileHeader::default()
+    };
+    let mut writer = ChangeWriter::new(&mut buf, WriterOptions::default());
+
+    assert!(writer.write_file_header(&header).is_err());
+    assert!(buf.is_empty());
+}
+
+#[test]
 fn test_write_file_header_twice_fails() {
     let mut buf = Vec::new();
     let mut writer = ChangeWriter::new(&mut buf, WriterOptions::default());
@@ -264,17 +277,19 @@ fn test_write_dependencies_empty() {
 }
 
 #[test]
-fn test_write_dependencies_filters_none_sentinel() {
+fn test_write_dependencies_rejects_none_sentinel() {
     let mut buf = Vec::new();
     let mut writer = writer_with_preamble(&mut buf);
 
     writer
         .write_change_header(&ChangeHeader::new("Test"))
         .unwrap();
-    // Include HASH_INDEX_NONE — should be filtered out
-    writer.write_dependencies(&[1, HASH_INDEX_NONE, 2]).unwrap();
+    let result = writer.write_dependencies(&[1, HASH_INDEX_NONE, 2]);
 
-    assert_eq!(writer.stats().sections_written, 2);
+    assert!(matches!(
+        result,
+        Err(crate::change::format_v3::FormatError::InvalidChangeMetadata { .. })
+    ));
 }
 
 #[test]

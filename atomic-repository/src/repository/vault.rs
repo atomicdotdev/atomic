@@ -31,6 +31,14 @@ impl Repository {
     /// `.vault/` directory structure on disk. This is idempotent —
     /// calling it on an already-initialized vault is a no-op.
     ///
+    /// When a `.vault/` working copy already exists on disk (a colocated
+    /// repository that tracks `.vault/` in Git, or a `.vault/` restored
+    /// from elsewhere), its bytes are user work and authoritative: the
+    /// tables are hydrated from disk before any default content is
+    /// considered, and `vault_install_defaults` never overwrites an
+    /// existing file. Re-initializing an existing vault therefore never
+    /// resets templates or memories.
+    ///
     /// # Directory structure created:
     /// ```text
     /// .vault/
@@ -77,7 +85,24 @@ impl Repository {
         // Initialize embeddings table
         self.init_embeddings()?;
 
-        // Install default vault content (skills, memory index, system prompt)
+        // Hydrate the tables from an existing on-disk working copy BEFORE
+        // installing defaults: a `.vault/` that arrived with a colocated
+        // Git checkout (or any other source) is user work, and its bytes
+        // are authoritative. The pull/clone path has
+        // `bootstrap_vault_from_working_copy` for this; init on a
+        // pre-existing directory has the same shape.
+        if vault_dir.exists() {
+            let updated = self.vault_record_working_copy()?;
+            if !updated.is_empty() {
+                log::info!(
+                    "Hydrated {} vault entries from the existing .vault/ working copy",
+                    updated.len()
+                );
+            }
+        }
+
+        // Install default vault content (skills, memory index, system
+        // prompt) — only for paths absent from both the database and disk.
         self.vault_install_defaults()?;
 
         // NOTE: The vault files are NOT added+recorded here. The CLI init
@@ -594,35 +619,9 @@ impl Repository {
 
             // Read file content
             let file_content = std::fs::read_to_string(path)?;
-
-            // Parse into frontmatter + body
-            let (frontmatter_json, body) = parse_markdown_frontmatter(&file_content);
-
-            // Body hashes remain useful for content/embedding caches, but
-            // frontmatter is also knowledge: status, labels, identity, and
-            // descriptions affect retrieval and KG extraction.
-            let body_bytes = body.as_bytes();
-            let new_hash = Hash::of(body_bytes);
-
-            // Check if this is new or changed
-            let existing = self.vault_retrieve(&rel_path_str)?;
-            let change_type = match &existing {
-                Some(entry)
-                    if Hash::from_bytes(entry.content_hash) == new_hash
-                        && frontmatter_json_equal(&entry.frontmatter_json, &frontmatter_json) =>
-                {
-                    continue; // Unchanged, skip
-                }
-                Some(_) => VaultChangeType::Modified,
-                None => VaultChangeType::New,
-            };
-
-            changes.push(VaultFileChange {
-                path: rel_path_str,
-                change_type,
-                frontmatter_json,
-                content: body_bytes.to_vec(),
-            });
+            if let Some(change) = self.vault_file_change(rel_path_str, &file_content)? {
+                changes.push(change);
+            }
         }
 
         // Also check for deleted entries (in redb but not on disk)
@@ -642,6 +641,69 @@ impl Repository {
         Ok(changes)
     }
 
+    /// How one vault file (`rel_path`, vault-relative, with `file_content`)
+    /// differs from its stored entry — `None` when it doesn't.
+    fn vault_file_change(
+        &self,
+        rel_path_str: String,
+        file_content: &str,
+    ) -> Result<Option<VaultFileChange>, RepositoryError> {
+        {
+            // Parse into frontmatter + body
+            let (frontmatter_json, body) = parse_markdown_frontmatter(file_content);
+
+            // Body hashes remain useful for content/embedding caches, but
+            // frontmatter is also knowledge: status, labels, identity, and
+            // descriptions affect retrieval and KG extraction.
+            let body_bytes = body.as_bytes();
+            let new_hash = Hash::of(body_bytes);
+
+            // Check if this is new or changed
+            let existing = self.vault_retrieve(&rel_path_str)?;
+            let change_type = match &existing {
+                Some(entry)
+                    if Hash::from_bytes(entry.content_hash) == new_hash
+                        && frontmatter_json_equal(&entry.frontmatter_json, &frontmatter_json) =>
+                {
+                    return Ok(None); // Unchanged, skip
+                }
+                Some(_) => VaultChangeType::Modified,
+                None => VaultChangeType::New,
+            };
+
+            Ok(Some(VaultFileChange {
+                path: rel_path_str,
+                change_type,
+                frontmatter_json,
+                content: body_bytes.to_vec(),
+            }))
+        }
+    }
+
+    /// Deflate vault files that are not in this working copy — a view's,
+    /// say — into redb: each `(vault-relative path, content)`, `None` for a
+    /// file the view no longer has. What `vault_record_working_copy` does
+    /// for the files on disk.
+    pub fn vault_record_files(
+        &self,
+        files: &[(String, Option<String>)],
+    ) -> Result<Vec<String>, RepositoryError> {
+        let mut changes = Vec::new();
+        for (path, content) in files {
+            match content {
+                Some(content) => changes.extend(self.vault_file_change(path.clone(), content)?),
+                None if self.vault_retrieve(path)?.is_some() => changes.push(VaultFileChange {
+                    path: path.clone(),
+                    change_type: VaultChangeType::Deleted,
+                    frontmatter_json: String::new(),
+                    content: Vec::new(),
+                }),
+                None => {}
+            }
+        }
+        self.vault_apply_changes(&changes)
+    }
+
     /// Deflate changed vault files from disk into redb.
     ///
     /// Scans the vault working copy, detects changes, and updates the
@@ -653,10 +715,18 @@ impl Repository {
     /// - `vault_record_working_copy`: disk -> redb (after humans edit)
     pub fn vault_record_working_copy(&self) -> Result<Vec<String>, RepositoryError> {
         let changes = self.vault_scan_working_copy()?;
+        self.vault_apply_changes(&changes)
+    }
 
+    /// Store detected vault changes, then index any intents the manifest
+    /// is missing.
+    fn vault_apply_changes(
+        &self,
+        changes: &[VaultFileChange],
+    ) -> Result<Vec<String>, RepositoryError> {
         let mut updated_paths = Vec::new();
 
-        for change in &changes {
+        for change in changes {
             match change.change_type {
                 VaultChangeType::New | VaultChangeType::Modified => {
                     // Infer entry type from path
@@ -1199,7 +1269,7 @@ fn remove_manifest_summary_for_entry(manifest: &mut VaultManifest, path: &str, e
 ///
 /// The system fields are always included to enable round-trip (deflation
 /// can reconstruct the VaultEntry from the file).
-fn render_entry_to_markdown(entry: &VaultEntry) -> String {
+pub(crate) fn render_entry_to_markdown(entry: &VaultEntry) -> String {
     let mut output = String::new();
     output.push_str("---\n");
 
@@ -1247,15 +1317,10 @@ fn render_entry_to_markdown(entry: &VaultEntry) -> String {
 
     output.push_str("---\n");
 
-    // Content body
+    // Preserve the stored text exactly. Adding a newline changes its hash and
+    // makes an unchanged materialize/record cycle look like a content edit.
     let content = String::from_utf8_lossy(&entry.content_bytes);
-    if !content.is_empty() {
-        output.push_str(&content);
-        // Ensure file ends with a newline
-        if !content.ends_with('\n') {
-            output.push('\n');
-        }
-    }
+    output.push_str(&content);
 
     output
 }
@@ -2129,6 +2194,49 @@ mod tests {
 
         let result = repo.vault_materialize("nonexistent.md");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn vault_materialize_and_rebuild_preserve_body_bytes() {
+        let source_dir = tempdir().unwrap();
+        let receiver_dir = tempdir().unwrap();
+        let source = Repository::init(source_dir.path()).unwrap();
+        let receiver = Repository::init(receiver_dir.path()).unwrap();
+        source.init_vault().unwrap();
+        receiver.init_vault().unwrap();
+        for (index, body) in [
+            "",
+            "no final newline",
+            "one newline\n",
+            "two\n\n",
+            "中文\r\n",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let path = format!("memories/roundtrip-{index}.md");
+            source
+                .vault_store(
+                    &path,
+                    VaultEntryType::Memory,
+                    body.as_bytes().to_vec(),
+                    "{}".into(),
+                )
+                .unwrap();
+            let before = source.vault_retrieve(&path).unwrap().unwrap();
+            source.vault_materialize(&path).unwrap();
+            let file = std::fs::read_to_string(source.vault_dir().join(&path)).unwrap();
+            assert!(source
+                .vault_record_files(&[(path.clone(), Some(file.clone()))])
+                .unwrap()
+                .is_empty());
+            receiver
+                .vault_record_files(&[(path.clone(), Some(file))])
+                .unwrap();
+            let after = receiver.vault_retrieve(&path).unwrap().unwrap();
+            assert_eq!(after.content_bytes, before.content_bytes, "{path}");
+            assert_eq!(after.content_hash, before.content_hash, "{path}");
+        }
     }
 
     #[test]

@@ -33,6 +33,10 @@ pub struct MemoryAttest {
 
 impl Command for MemoryAttest {
     fn run(&self) -> CliResult<()> {
+        if crate::commands::rpc::memory_attest(self)? {
+            return Ok(());
+        }
+
         let root = find_repository_root()?;
         let repo = Repository::open(&root).map_err(CliError::Repository)?;
 

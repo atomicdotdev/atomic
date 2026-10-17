@@ -38,6 +38,10 @@ pub struct Sync;
 
 impl Command for Sync {
     fn run(&self) -> CliResult<()> {
+        if crate::commands::rpc::vault_sync()? {
+            return Ok(());
+        }
+
         let root = find_repository_root()?;
         let repo = Repository::open(&root).map_err(CliError::Repository)?;
 

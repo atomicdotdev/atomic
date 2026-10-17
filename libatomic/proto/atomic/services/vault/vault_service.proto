@@ -1,0 +1,122 @@
+// atomic-protocol — VaultService definition (the RPC contract).
+// DRAFT — add-only. Messages for this service live in
+// atomic/services/vault/vault_messages.proto · shared primitives in atomic/common/.
+
+syntax = "proto3";
+
+package atomic;
+
+import "atomic/common/options.proto";
+import "atomic/services/vault/vault_messages.proto";
+
+service VaultService {
+  // Initialize the authorized view's vault namespace, not host files.
+  rpc InitVault(InitVaultRequest) returns (InitVaultResponse) {
+    option (atomic.execution_scope) = EXECUTION_SCOPE_BOTH;
+    option (atomic.required_capability) = "vault.write";
+    option (atomic.allowed_caller) = CALLER_CLASS_LOCAL;
+    option (atomic.allowed_caller) = CALLER_CLASS_REMOTE_IDENTITY;
+    option (atomic.allowed_caller) = CALLER_CLASS_SANDBOX;
+    option (atomic.effect) = RPC_EFFECT_REPOSITORY_WRITE;
+  }
+  // `atomic vault sync` — deflate on-disk `.vault/` edits into the vault
+  // database (the file→db bridge; hooks handle the reverse direction).
+  rpc SyncVault(SyncVaultRequest) returns (SyncVaultResponse) {
+    option (atomic.execution_scope) = EXECUTION_SCOPE_LOCAL;
+    option (atomic.required_capability) = "vault.write";
+    option (atomic.required_capability) = "working-copy.read";
+    option (atomic.allowed_caller) = CALLER_CLASS_LOCAL;
+    option (atomic.effect) = RPC_EFFECT_REPOSITORY_WRITE;
+    option (atomic.effect) = RPC_EFFECT_WORKSPACE_READ;
+  }
+  // `atomic vault show <id>` / `intent show` / `memory show` / `goal show`
+  rpc GetVaultEntry(GetVaultEntryRequest) returns (GetVaultEntryResponse) {
+    option (atomic.execution_scope) = EXECUTION_SCOPE_BOTH;
+    option (atomic.required_capability) = "vault.read";
+    option (atomic.allowed_caller) = CALLER_CLASS_LOCAL;
+    option (atomic.allowed_caller) = CALLER_CLASS_REMOTE_IDENTITY;
+    option (atomic.allowed_caller) = CALLER_CLASS_SANDBOX;
+    option (atomic.effect) = RPC_EFFECT_REPOSITORY_READ;
+  }
+  // `atomic vault list|summaries` / `intent list` / `memory list` / `goal list`
+  rpc ListVaultEntries(ListVaultEntriesRequest) returns (ListVaultEntriesResponse) {
+    option (atomic.execution_scope) = EXECUTION_SCOPE_BOTH;
+    option (atomic.required_capability) = "vault.read";
+    option (atomic.allowed_caller) = CALLER_CLASS_LOCAL;
+    option (atomic.allowed_caller) = CALLER_CLASS_REMOTE_IDENTITY;
+    option (atomic.allowed_caller) = CALLER_CLASS_SANDBOX;
+    option (atomic.effect) = RPC_EFFECT_REPOSITORY_READ;
+  }
+  // `atomic vault context` — the context pack surfaced to agents.
+  rpc GetVaultContext(GetVaultContextRequest) returns (GetVaultContextResponse) {
+    option (atomic.execution_scope) = EXECUTION_SCOPE_BOTH;
+    option (atomic.required_capability) = "vault.read";
+    option (atomic.allowed_caller) = CALLER_CLASS_LOCAL;
+    option (atomic.allowed_caller) = CALLER_CLASS_REMOTE_IDENTITY;
+    option (atomic.allowed_caller) = CALLER_CLASS_SANDBOX;
+    option (atomic.effect) = RPC_EFFECT_REPOSITORY_READ;
+  }
+  // `atomic vault materialize` — export vault content to files (LOCAL).
+  // EXECUTION CLASS: redb-read — materialize only reads the vault
+  // repository database and writes workspace FILES under .vault/ (no repository
+  // DB writes; daemon recovery ledger is separate). working-copy.write gates
+  // that filesystem effect.
+  rpc ExportVault(ExportVaultRequest) returns (ExportVaultResponse) {
+    option (atomic.execution_scope) = EXECUTION_SCOPE_LOCAL;
+    option (atomic.required_capability) = "vault.read";
+    option (atomic.required_capability) = "working-copy.write";
+    option (atomic.allowed_caller) = CALLER_CLASS_LOCAL;
+    option (atomic.effect) = RPC_EFFECT_REPOSITORY_READ;
+    option (atomic.effect) = RPC_EFFECT_WORKSPACE_WRITE;
+    option (atomic.effect) = RPC_EFFECT_DAEMON_WRITE; // replay/outcome ledger
+  }
+  // `atomic intent new` / `memory new`
+  rpc CreateVaultEntity(CreateVaultEntityRequest) returns (CreateVaultEntityResponse) {
+    option (atomic.execution_scope) = EXECUTION_SCOPE_BOTH;
+    option (atomic.required_capability) = "vault.write";
+    option (atomic.allowed_caller) = CALLER_CLASS_LOCAL;
+    option (atomic.allowed_caller) = CALLER_CLASS_REMOTE_IDENTITY;
+    option (atomic.allowed_caller) = CALLER_CLASS_SANDBOX;
+    option (atomic.effect) = RPC_EFFECT_REPOSITORY_WRITE;
+  }
+  // `intent update` / `memory write` / goal transitions / status flips —
+  // one RPC, oneof update kind (the intent lifecycle's status vocabulary
+  // is honored by the status field).
+  rpc UpdateVaultEntity(UpdateVaultEntityRequest) returns (UpdateVaultEntityResponse) {
+    option (atomic.execution_scope) = EXECUTION_SCOPE_BOTH;
+    option (atomic.required_capability) = "vault.write";
+    option (atomic.allowed_caller) = CALLER_CLASS_LOCAL;
+    option (atomic.allowed_caller) = CALLER_CLASS_REMOTE_IDENTITY;
+    option (atomic.allowed_caller) = CALLER_CLASS_SANDBOX;
+    option (atomic.effect) = RPC_EFFECT_REPOSITORY_WRITE;
+  }
+  // `atomic intent delete`
+  rpc DeleteVaultEntity(DeleteVaultEntityRequest) returns (DeleteVaultEntityResponse) {
+    option (atomic.execution_scope) = EXECUTION_SCOPE_BOTH;
+    option (atomic.required_capability) = "vault.write";
+    option (atomic.allowed_caller) = CALLER_CLASS_LOCAL;
+    option (atomic.allowed_caller) = CALLER_CLASS_REMOTE_IDENTITY;
+    option (atomic.allowed_caller) = CALLER_CLASS_SANDBOX;
+    option (atomic.effect) = RPC_EFFECT_REPOSITORY_WRITE;
+  }
+  // `atomic intent validate [--hash]` / `memory validate` — id-arg form
+  // validates against the db; document-arg form validates the bytes alone
+  // (no db state required, still routed through the service for parity).
+  rpc ValidateVaultEntity(ValidateVaultEntityRequest) returns (ValidateVaultEntityResponse) {
+    option (atomic.execution_scope) = EXECUTION_SCOPE_BOTH;
+    option (atomic.required_capability) = "vault.read";
+    option (atomic.allowed_caller) = CALLER_CLASS_LOCAL;
+    option (atomic.allowed_caller) = CALLER_CLASS_REMOTE_IDENTITY;
+    option (atomic.allowed_caller) = CALLER_CLASS_SANDBOX;
+    option (atomic.effect) = RPC_EFFECT_REPOSITORY_READ;
+  }
+  // `atomic intent link` — link entities (e.g. intent ↔ intent provenance).
+  rpc LinkVaultEntities(LinkVaultEntitiesRequest) returns (LinkVaultEntitiesResponse) {
+    option (atomic.execution_scope) = EXECUTION_SCOPE_BOTH;
+    option (atomic.required_capability) = "vault.write";
+    option (atomic.allowed_caller) = CALLER_CLASS_LOCAL;
+    option (atomic.allowed_caller) = CALLER_CLASS_REMOTE_IDENTITY;
+    option (atomic.allowed_caller) = CALLER_CLASS_SANDBOX;
+    option (atomic.effect) = RPC_EFFECT_REPOSITORY_WRITE;
+  }
+}
