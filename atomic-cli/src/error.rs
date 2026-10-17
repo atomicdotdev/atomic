@@ -60,7 +60,7 @@ pub enum CliError {
     ///
     /// This error occurs when a command that requires a repository is run
     /// outside of any Atomic repository.
-    #[error("Not in an Atomic repository: '{searched_path}' (no repository found in this directory or its parents)")]
+    #[error("Not in an Atomic repository: '{searched_path}' (no repository found in this directory or its parents). Run 'atomic init' here, or cd into an Atomic repository.")]
     RepositoryNotFound {
         /// The path where the search started
         searched_path: PathBuf,
