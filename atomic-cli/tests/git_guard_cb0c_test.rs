@@ -36,6 +36,9 @@ impl Fixture {
         fixture.git_ok(&["config", "user.email", "atomic@example.com"]);
         fixture.git_ok(&["config", "core.autocrlf", "false"]);
         fixture.git_ok(&["config", "commit.gpgsign", "false"]);
+        // Snapshots below include all of .git. Automatic maintenance can
+        // outlive a commit and remove its lock while a snapshot walks it.
+        fixture.git_ok(&["config", "maintenance.auto", "false"]);
         fs::write(fixture.root().join("tracked.txt"), b"checkpoint\n")
             .expect("write initial tracked file");
         fixture.git_ok(&["add", "tracked.txt"]);
@@ -243,7 +246,8 @@ fn snapshot_path(path: &Path) -> BTreeMap<String, Vec<u8>> {
 }
 
 fn collect_snapshot(base: &Path, path: &Path, snapshot: &mut BTreeMap<String, Vec<u8>>) {
-    let metadata = fs::symlink_metadata(path).expect("snapshot metadata");
+    let metadata = fs::symlink_metadata(path)
+        .unwrap_or_else(|error| panic!("snapshot metadata for {}: {error}", path.display()));
     let relative = path
         .strip_prefix(base)
         .expect("snapshot relative path")
