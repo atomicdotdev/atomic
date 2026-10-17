@@ -648,6 +648,17 @@ pub struct VaultImpl {
     pub state: Arc<DaemonState>,
 }
 
+// Vault storage is currently repository-wide. Never silently pretend that a
+// requested view has been applied; scoped reads need the future vault overlay.
+fn reject_scoped_vault_read(view: &Option<ViewRef>) -> Result<(), Status> {
+    if view.is_some() {
+        return Err(Status::unimplemented(
+            "view-scoped vault reads are not available",
+        ));
+    }
+    Ok(())
+}
+
 fn parse_frontmatter(
     entry: &atomic_core::pristine::VaultEntry,
 ) -> Result<Map<String, Value>, Status> {
@@ -875,8 +886,10 @@ struct ListingVerifier {
 }
 
 fn resolve_listing_verifier(name: &Option<String>) -> Result<Option<ListingVerifier>, Status> {
-    let Ok(store) = IdentityStore::open_default() else {
-        return Ok(None);
+    let store = match IdentityStore::open_default_existing() {
+        Ok(store) => store,
+        Err(error) if name.is_some() => return Err(Status::not_found(error.to_string())),
+        Err(_) => return Ok(None),
     };
     let identity = match name {
         Some(name) => Some(store.load_by_name(name).map_err(|_| {
@@ -1565,9 +1578,14 @@ impl vault_service_server::VaultService for VaultImpl {
         request: Request<GetVaultEntryRequest>,
     ) -> Result<Response<GetVaultEntryResponse>, Status> {
         let request = request.into_inner();
+        reject_scoped_vault_read(&request.view)?;
         let kind = Kind::try_from(request.kind)
             .map_err(|_| domain_status(ErrorCode::InvalidArgument, "unknown vault entity kind"))?;
-        let handle = self.state.resolve(request.repository.as_ref().unwrap())?;
+        let reference = request
+            .repository
+            .as_ref()
+            .ok_or_else(|| Status::invalid_argument("repository required"))?;
+        let handle = self.state.resolve(reference)?;
         self.state.log_rpc("GetVaultEntry", Some(&handle));
         let gate_handle = handle.clone();
         let _gate = gate_handle.exclusive().await;
@@ -1730,10 +1748,35 @@ impl vault_service_server::VaultService for VaultImpl {
         request: Request<ListVaultEntriesRequest>,
     ) -> Result<Response<ListVaultEntriesResponse>, Status> {
         let request = request.into_inner();
-        // kind absent → the whole-vault listing (`vault list`: every entry
-        // with its type/size/date columns, prefix- and type-filtered).
-        let kind = request.kind.and_then(|k| Kind::try_from(k).ok());
-        let handle = self.state.resolve(request.repository.as_ref().unwrap())?;
+        reject_scoped_vault_read(&request.view)?;
+        if request.cursor.is_some() {
+            return Err(Status::unimplemented(
+                "vault continuation cursors are not available",
+            ));
+        }
+        // kind absent → the whole-vault listing.
+        let kind = request
+            .kind
+            .map(|k| {
+                Kind::try_from(k).map_err(|_| Status::invalid_argument("unknown vault entity kind"))
+            })
+            .transpose()?;
+        let requested_status = request
+            .status
+            .map(|s| {
+                VaultEntityStatus::try_from(s)
+                    .map_err(|_| Status::invalid_argument("unknown vault status"))
+            })
+            .transpose()?;
+        if let Some(raw) = &request.entry_type {
+            raw.parse::<VaultEntryType>()
+                .map_err(|_| Status::invalid_argument("unknown vault entry type"))?;
+        }
+        let reference = request
+            .repository
+            .as_ref()
+            .ok_or_else(|| Status::invalid_argument("repository required"))?;
+        let handle = self.state.resolve(reference)?;
         self.state.log_rpc("ListVaultEntries", Some(&handle));
         let gate_handle = handle.clone();
         let _gate = gate_handle.exclusive().await;
@@ -2068,6 +2111,15 @@ impl vault_service_server::VaultService for VaultImpl {
         })
         .await
         .map_err(|e| Status::internal(e.to_string()))??;
+        let mut response = response;
+        if let Some(status) = requested_status {
+            response
+                .entries
+                .retain(|entry| entry.status == Some(status as i32));
+        }
+        if let Some(limit) = limit {
+            response.entries.truncate(limit);
+        }
         Ok(Response::new(response))
     }
 
@@ -2263,7 +2315,16 @@ impl vault_service_server::VaultService for VaultImpl {
         request: Request<GetVaultContextRequest>,
     ) -> Result<Response<GetVaultContextResponse>, Status> {
         let request = request.into_inner();
-        let handle = self.state.resolve(request.repository.as_ref().unwrap())?;
+        reject_scoped_vault_read(&request.view)?;
+        for kind in &request.kinds {
+            Kind::try_from(*kind)
+                .map_err(|_| Status::invalid_argument("unknown vault entity kind"))?;
+        }
+        let reference = request
+            .repository
+            .as_ref()
+            .ok_or_else(|| Status::invalid_argument("repository required"))?;
+        let handle = self.state.resolve(reference)?;
         self.state.log_rpc("GetVaultContext", Some(&handle));
         let max = request.max_entries.unwrap_or(20).max(1) as usize;
         let kinds = request.kinds;
@@ -2558,6 +2619,33 @@ fn load_identity_public(name: &str) -> Result<Identity, Status> {
     store
         .load_by_name(name)
         .map_err(|error| domain_status(ErrorCode::NotFound, format!("identity '{name}': {error}")))
+}
+
+// Resolve verification material only. Never open/create an identity store or
+// load a secret key; the proof's DID, not the default identity, selects a signer.
+fn verification_public_key(
+    explicit: Option<&[u8]>,
+    name: Option<&str>,
+    signer: Option<&str>,
+) -> Result<atomic_identity::keypair::PublicKey, Status> {
+    if let Some(bytes) = explicit {
+        let bytes: &[u8; 32] = bytes
+            .try_into()
+            .map_err(|_| Status::invalid_argument("Ed25519 public key must be 32 bytes"))?;
+        return atomic_identity::keypair::PublicKey::from_bytes(bytes)
+            .map_err(|e| Status::invalid_argument(e.to_string()));
+    }
+    let store =
+        IdentityStore::open_default_existing().map_err(|e| Status::not_found(e.to_string()))?;
+    let identity = if let Some(name) = name {
+        store.load_by_name(name)
+    } else {
+        let id = atomic_identity::IdentityId::from_did(signer.unwrap_or(""))
+            .map_err(|e| Status::not_found(e.to_string()))?;
+        store.load(&id)
+    }
+    .map_err(|e| Status::not_found(e.to_string()))?;
+    Ok(identity.public_key)
 }
 
 /// The pre-attest gate the CLI's `attest` body applies: refuse violations
@@ -2919,7 +3007,26 @@ impl attestation_service_server::AttestationService for AttestationImpl {
         request: Request<VerifyAttestationRequest>,
     ) -> Result<Response<VerifyAttestationResponse>, Status> {
         let request = request.into_inner();
-        let handle = self.state.resolve(request.repository.as_ref().unwrap())?;
+        reject_scoped_vault_read(&request.view)?;
+        if request.public_key.is_some() && request.identity_name.is_some() {
+            return Err(Status::invalid_argument(
+                "use public_key or identity_name, not both",
+            ));
+        }
+        if request
+            .public_key
+            .as_ref()
+            .is_some_and(|key| key.len() != 32)
+        {
+            return Err(Status::invalid_argument(
+                "Ed25519 public_key must be 32 bytes",
+            ));
+        }
+        let reference = request
+            .repository
+            .as_ref()
+            .ok_or_else(|| Status::invalid_argument("repository required"))?;
+        let handle = self.state.resolve(reference)?;
         self.state.log_rpc("VerifyAttestation", Some(&handle));
         let gate_handle = handle.clone();
         let _gate = gate_handle.exclusive().await;
@@ -2927,134 +3034,126 @@ impl attestation_service_server::AttestationService for AttestationImpl {
             .target
             .ok_or_else(|| domain_status(ErrorCode::InvalidArgument, "verify target required"))?
         {
-            verify_attestation_request::Target::AttestationId(_id) => {
-                return Ok(Response::new(VerifyAttestationResponse {
-                    valid: false,
-                    reason: Some("attestation-id verification lands with its slice".to_string()),
-                }))
+            verify_attestation_request::Target::AttestationId(_) => {
+                return Err(Status::unimplemented(
+                    "attestation-id verification is not available",
+                ));
             }
-            verify_attestation_request::Target::Subject(subject) => {
-                subject.kind.ok_or_else(|| {
-                    domain_status(ErrorCode::InvalidArgument, "verify target kind required")
-                })?
-            }
+            verify_attestation_request::Target::Subject(subject) => subject
+                .kind
+                .ok_or_else(|| Status::invalid_argument("verify target kind required"))?,
         };
-        let identity_name = request.identity_name.clone();
-        let response = tokio::task::spawn_blocking(move || match target {
-            TargetKind::IntentId(intent_id) => {
-                let repo = handle.repository()?;
-                let entry = repo
-                    .vault_intent_show(&intent_id)
-                    .map_err(repository_error)?;
-                let frontmatter = parse_frontmatter(&entry)?;
-                let body = body_of(&entry);
-                let normalized = normalized_id(&repo, &intent_id);
-                let vault_path = format!("attestations/{}/attested.md", sanitize_id(&normalized));
-                let attested = repo
-                    .vault_retrieve(&vault_path)
-                    .map_err(repository_error)?
-                    .ok_or_else(|| {
-                        domain_status(
-                            ErrorCode::NotFound,
-                            "intent has no attestation; run `atomic intent attest`",
-                        )
-                    })?;
-                let node: CanonicalNode = serde_json::from_str(body_of(&attested).trim_end())
-                    .map_err(|e| {
-                        domain_status(
-                            ErrorCode::Internal,
-                            format!("attested node unreadable: {e}"),
-                        )
-                    })?;
-                let recorded_hash = serde_json::from_str::<Value>(&attested.frontmatter_json)
-                    .ok()
-                    .and_then(|v| {
-                        v.get("sourceContentHash")
-                            .and_then(Value::as_str)
-                            .map(str::to_string)
-                    });
-                if recorded_hash.as_deref() != Some(&source_content_hash(&frontmatter, &body)) {
-                    return Ok(VerifyAttestationResponse {
-                        valid: false,
-                        reason: Some(
-                            "attestation is stale: the intent changed since it was signed"
-                                .to_string(),
-                        ),
-                    });
+        let identity_name = request.identity_name;
+        let public_key = request.public_key;
+        let response = tokio::task::spawn_blocking(move || {
+            // Keep source and signed revision under the same read-only open.
+            let repo = handle.repository_readonly()?;
+            let (entry, path) = match &target {
+                TargetKind::IntentId(id) => (
+                    repo.vault_intent_show(id).map_err(repository_error)?,
+                    format!(
+                        "attestations/{}/attested.md",
+                        sanitize_id(&normalized_id(&repo, id))
+                    ),
+                ),
+                TargetKind::MemoryId(id) => (
+                    repo.vault_retrieve(&format!("memory/{id}.md"))
+                        .map_err(repository_error)?
+                        .ok_or_else(|| domain_status(ErrorCode::NotFound, "memory not found"))?,
+                    format!("attestations/memory/{}/attested.md", sanitize_id(id)),
+                ),
+                _ => {
+                    return Err(Status::unimplemented(
+                        "this attestation target is not supported",
+                    ))
                 }
-                let material = load_identity(identity_name.as_deref())?;
-                match verify(&node, &material.keypair.public) {
-                    Ok(()) => Ok(VerifyAttestationResponse {
-                        valid: true,
-                        reason: node.attributed_to.clone(),
-                    }),
-                    Err(error) => Ok(VerifyAttestationResponse {
-                        valid: false,
-                        reason: Some(error.to_string()),
-                    }),
+            };
+            let attested = repo
+                .vault_retrieve(&path)
+                .map_err(repository_error)?
+                .ok_or_else(|| {
+                    domain_status(ErrorCode::NotFound, "subject has no stored attestation")
+                })?;
+            let document = String::from_utf8(attested.content_bytes.clone())
+                .map_err(|_| Status::data_loss("signed document is not UTF-8"))?;
+            // Typed parsing fails closed on malformed or unexpected documents.
+            let value = match &target {
+                TargetKind::IntentId(_) => {
+                    serde_json::from_str::<CanonicalNode>(&document).map(|node| node.to_value())
+                }
+                TargetKind::MemoryId(_) => {
+                    serde_json::from_str::<MemoryNode>(&document).map(|node| node.to_value())
+                }
+                _ => unreachable!(),
+            }
+            .map_err(|e| Status::data_loss(format!("malformed signed document: {e}")))?;
+            if matches!(target, TargetKind::IntentId(_)) {
+                // Reuse the canonical lift's stable subject ID; do not accept
+                // another intent's valid signature copied into this path.
+                let expected = lift_intent(&parse_frontmatter(&entry)?, "").map_err(|e| {
+                    Status::data_loss(format!("cannot identify intent source: {e}"))
+                })?;
+                if value.get("@id").and_then(Value::as_str) != Some(expected.id.as_str()) {
+                    return Err(Status::data_loss(
+                        "signed document belongs to a different intent",
+                    ));
                 }
             }
-            TargetKind::MemoryId(memory_id) => {
-                let repo = handle.repository()?;
-                let vault_path = format!("memory/{memory_id}.md");
-                let entry = repo
-                    .vault_retrieve(&vault_path)
-                    .map_err(repository_error)?
-                    .ok_or_else(|| domain_status(ErrorCode::NotFound, "memory not found"))?;
-                let frontmatter = parse_frontmatter(&entry)?;
-                let body = body_of(&entry);
-                let attested_path = format!(
-                    "attestations/memory/{}/attested.md",
-                    sanitize_id(&memory_id)
+            let signer = value
+                .get("proof")
+                .and_then(|p| p.get("verificationMethod"))
+                .and_then(Value::as_str)
+                .map(atomic_canonical::did::did_from_verification_method)
+                .map(str::to_string);
+            let current_hash = source_content_hash(&parse_frontmatter(&entry)?, &body_of(&entry));
+            let recorded_hash = serde_json::from_str::<Value>(&attested.frontmatter_json)
+                .map_err(|e| Status::data_loss(format!("malformed attestation metadata: {e}")))?
+                .get("sourceContentHash")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let fresh = recorded_hash.as_ref().map(|hash| hash == &current_hash);
+            let key = verification_public_key(
+                public_key.as_deref(),
+                identity_name.as_deref(),
+                signer.as_deref(),
+            );
+            let (signature_valid, mut reason) = match key {
+                Ok(key) => match proof::verify_value(&value, &key) {
+                    Ok(()) => (Some(true), None),
+                    Err(error) => (Some(false), Some(error.to_string())),
+                },
+                Err(error) => (
+                    None,
+                    Some(format!(
+                        "verification public key unavailable: {}",
+                        error.message()
+                    )),
+                ),
+            };
+            if reason.is_none() && fresh != Some(true) {
+                reason = Some(
+                    if fresh == Some(false) {
+                        "attestation is stale: source changed since signing"
+                    } else {
+                        "signed source hash is unavailable"
+                    }
+                    .to_string(),
                 );
-                let attested = repo
-                    .vault_retrieve(&attested_path)
-                    .map_err(repository_error)?
-                    .ok_or_else(|| {
-                        domain_status(
-                            ErrorCode::NotFound,
-                            "memory has no attestation; run `atomic memory attest`",
-                        )
-                    })?;
-                let node: MemoryNode = serde_json::from_str(body_of(&attested).trim_end())
-                    .map_err(|e| {
-                        domain_status(
-                            ErrorCode::Internal,
-                            format!("attested node unreadable: {e}"),
-                        )
-                    })?;
-                let recorded_hash = serde_json::from_str::<Value>(&attested.frontmatter_json)
-                    .ok()
-                    .and_then(|v| {
-                        v.get("sourceContentHash")
-                            .and_then(Value::as_str)
-                            .map(str::to_string)
-                    });
-                if recorded_hash.as_deref() != Some(&source_content_hash(&frontmatter, &body)) {
-                    return Ok(VerifyAttestationResponse {
-                        valid: false,
-                        reason: Some(
-                            "attestation is stale: the memory changed since it was signed"
-                                .to_string(),
-                        ),
-                    });
-                }
-                let material = load_identity(identity_name.as_deref())?;
-                match verify_memory(&node, &material.keypair.public) {
-                    Ok(()) => Ok(VerifyAttestationResponse {
-                        valid: true,
-                        reason: node.attributed_to.clone(),
-                    }),
-                    Err(error) => Ok(VerifyAttestationResponse {
-                        valid: false,
-                        reason: Some(error.to_string()),
-                    }),
-                }
             }
-            other => Err(domain_status(
-                ErrorCode::InvalidArgument,
-                format!("attestation target {other:?} lands with its slice"),
-            )),
+            Ok::<_, Status>(VerifyAttestationResponse {
+                valid: signature_valid == Some(true) && fresh == Some(true),
+                reason,
+                signature_valid,
+                source_fresh: fresh,
+                signed_document: Some(document),
+                signer_did: signer,
+                current_source_hash: Some(current_hash),
+                signed_source_hash: recorded_hash,
+                signed_revision: Some(Hash {
+                    value: attested.content_hash.to_vec(),
+                    algorithm: HashAlgorithm::Blake3 as i32,
+                }),
+            })
         })
         .await
         .map_err(|e| Status::internal(e.to_string()))??;

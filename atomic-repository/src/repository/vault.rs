@@ -1317,15 +1317,10 @@ pub(crate) fn render_entry_to_markdown(entry: &VaultEntry) -> String {
 
     output.push_str("---\n");
 
-    // Content body
+    // Preserve the stored text exactly. Adding a newline changes its hash and
+    // makes an unchanged materialize/record cycle look like a content edit.
     let content = String::from_utf8_lossy(&entry.content_bytes);
-    if !content.is_empty() {
-        output.push_str(&content);
-        // Ensure file ends with a newline
-        if !content.ends_with('\n') {
-            output.push('\n');
-        }
-    }
+    output.push_str(&content);
 
     output
 }
@@ -2199,6 +2194,49 @@ mod tests {
 
         let result = repo.vault_materialize("nonexistent.md");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn vault_materialize_and_rebuild_preserve_body_bytes() {
+        let source_dir = tempdir().unwrap();
+        let receiver_dir = tempdir().unwrap();
+        let source = Repository::init(source_dir.path()).unwrap();
+        let receiver = Repository::init(receiver_dir.path()).unwrap();
+        source.init_vault().unwrap();
+        receiver.init_vault().unwrap();
+        for (index, body) in [
+            "",
+            "no final newline",
+            "one newline\n",
+            "two\n\n",
+            "中文\r\n",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let path = format!("memories/roundtrip-{index}.md");
+            source
+                .vault_store(
+                    &path,
+                    VaultEntryType::Memory,
+                    body.as_bytes().to_vec(),
+                    "{}".into(),
+                )
+                .unwrap();
+            let before = source.vault_retrieve(&path).unwrap().unwrap();
+            source.vault_materialize(&path).unwrap();
+            let file = std::fs::read_to_string(source.vault_dir().join(&path)).unwrap();
+            assert!(source
+                .vault_record_files(&[(path.clone(), Some(file.clone()))])
+                .unwrap()
+                .is_empty());
+            receiver
+                .vault_record_files(&[(path.clone(), Some(file))])
+                .unwrap();
+            let after = receiver.vault_retrieve(&path).unwrap().unwrap();
+            assert_eq!(after.content_bytes, before.content_bytes, "{path}");
+            assert_eq!(after.content_hash, before.content_hash, "{path}");
+        }
     }
 
     #[test]

@@ -8,7 +8,16 @@ repository.workspace = true
 rust-version.workspace = true
 description = "The one Atomic service-layer library: the protobuf contract (proto + codegen + the descriptor checker) and the handlers the atomicd transport serves and the CLI calls in-process"
 
+[lib]
+crate-type = ["rlib", "cdylib"]
+
+[features]
+# Optional in-process Node-API exports; ordinary Rust consumers don't enable it.
+node = ["dep:napi", "dep:napi-derive", "dep:napi-build"]
+
 [dependencies]
+napi = { version = "2", optional = true, default-features = false, features = ["napi8", "tokio_rt"] }
+napi-derive = { version = "2", optional = true }
 # Domain crates — the service layer executes on these.
 atomic-agent = { workspace = true }
 atomic-canonical = { workspace = true }
@@ -44,8 +53,12 @@ uuid = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+# Loopback protocol acceptance harness only; no production listener is added.
+axum = { version = "0.7", default-features = false, features = ["http1", "tokio"] }
 tempfile = { workspace = true }
 
 [build-dependencies]
+napi-build = { version = "2", optional = true }
+prost = { workspace = true }
 tonic-build = { workspace = true }
 protox = { workspace = true }

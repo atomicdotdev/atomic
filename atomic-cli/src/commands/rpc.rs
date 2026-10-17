@@ -896,6 +896,7 @@ pub fn intent_verify(args: &super::intent::verify::IntentVerify) -> CliResult<bo
         })),
         view: None,
         identity_name: args.identity.clone(),
+        public_key: None,
     };
     let response = session.verify_attestation(request)?;
     if !response.valid {
@@ -906,7 +907,7 @@ pub fn intent_verify(args: &super::intent::verify::IntentVerify) -> CliResult<bo
         });
     }
     println!("Verified intent: {}", args.id);
-    println!("  author: {}", response.reason.unwrap_or_default());
+    println!("  author: {}", response.signer_did.unwrap_or_default());
     Ok(true)
 }
 
@@ -1122,6 +1123,7 @@ pub fn memory_verify(args: &super::memory::verify::MemoryVerify) -> CliResult<bo
         })),
         view: None,
         identity_name: args.identity.clone(),
+        public_key: None,
     };
     let response = session.verify_attestation(request)?;
     if !response.valid {
@@ -1132,7 +1134,7 @@ pub fn memory_verify(args: &super::memory::verify::MemoryVerify) -> CliResult<bo
         });
     }
     println!("Verified memory: {}", args.id);
-    println!("  author: {}", response.reason.unwrap_or_default());
+    println!("  author: {}", response.signer_did.unwrap_or_default());
     Ok(true)
 }
 

@@ -183,12 +183,6 @@ pub(crate) fn add_hook_to_matcher(
     });
 }
 
-pub(crate) fn has_any_atomic_hook(matchers: &[ClaudeHookMatcher]) -> bool {
-    matchers
-        .iter()
-        .any(|m| m.hooks.iter().any(|h| is_atomic_hook(&h.command)))
-}
-
 pub(crate) fn is_atomic_hook(command: &str) -> bool {
     command.contains(ATOMIC_HOOK_PREFIX)
 }

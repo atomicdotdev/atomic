@@ -609,81 +609,8 @@ impl From<&Provenance> for JsonProvenance {
     }
 }
 
-/// Count the total atoms (vertices and edges) in hunks.
-pub(super) fn count_atoms<H>(hunks: &[GraphOp<H>]) -> (usize, usize) {
-    let mut vertices = 0;
-    let mut edges = 0;
-
-    for graph_op in hunks {
-        match graph_op {
-            GraphOp::FileAdd { contents, .. } => {
-                // FileAdd creates: name span, inode span, and optionally content span
-                vertices += 2;
-                if contents.is_some() {
-                    vertices += 1;
-                }
-            }
-            GraphOp::FileDel { contents, .. } => {
-                // FileDel creates edge maps to mark as deleted
-                edges += 1;
-                if contents.is_some() {
-                    edges += 1;
-                }
-            }
-            GraphOp::FileUndel { contents, .. } => {
-                // FileUndel creates edge maps to resurrect
-                edges += 1;
-                if contents.is_some() {
-                    edges += 1;
-                }
-            }
-            GraphOp::FileMove { .. } => {
-                // FileMove: delete old name edge, add new name span
-                vertices += 1;
-                edges += 1;
-            }
-            GraphOp::DirAdd { .. } => {
-                // DirAdd creates: name span, inode span (no content)
-                vertices += 2;
-            }
-            GraphOp::DirDel { .. } => {
-                // DirDel creates edge maps to mark as deleted
-                edges += 1;
-            }
-            GraphOp::DirUndel { .. } => {
-                // DirUndel creates edge maps to resurrect
-                edges += 1;
-            }
-            GraphOp::Edit { .. } => {
-                // Edit creates a new content span
-                vertices += 1;
-            }
-            GraphOp::Replacement { .. } => {
-                // Replacement: new span + edge map for deletion
-                vertices += 1;
-                edges += 1;
-            }
-            GraphOp::SolveNameConflict { .. } | GraphOp::UnsolveNameConflict { .. } => {
-                edges += 1;
-            }
-            GraphOp::SolveOrderConflict { .. } | GraphOp::UnsolveOrderConflict { .. } => {
-                edges += 1;
-            }
-            GraphOp::ResurrectZombies { .. } => {
-                edges += 1;
-            }
-            GraphOp::AddRoot { .. } => {
-                vertices += 1;
-            }
-            GraphOp::DelRoot { .. } => {
-                edges += 1;
-            }
-            GraphOp::SetAttr { .. } => {}
-        }
-    }
-
-    (vertices, edges)
-}
+// Keep CLI and native consumers on the same operation-counting implementation.
+pub(super) use atomic_repository::triage::count_hunk_atoms as count_atoms;
 
 /// Get a short description of the atoms in a graph_op.
 pub(super) fn hunk_atom_info<H>(graph_op: &GraphOp<H>) -> String {
