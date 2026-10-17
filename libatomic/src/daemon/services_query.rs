@@ -565,229 +565,6 @@ fn change_intent_projection(
     }
 }
 
-#[cfg(test)]
-mod change_metadata_tests {
-    use super::*;
-    use atomic_core::change::{
-        AITool, AIVendor, Change, ChangeHeader, Cost, Provenance, TokenUsage,
-    };
-
-    #[test]
-    fn metadata_uses_canonical_decode_and_preserves_exact_usage_without_private_text() {
-        let mut change = Change::empty(ChangeHeader::new("AI work"));
-        let mut record = Provenance::new(AIVendor::OpenAI, "test-model", AITool::cli("OpenCode"));
-        record.tokens = TokenUsage::full(u64::MAX - 10, 2, 3, 4, 5);
-        record.cost = Cost::from_micro_usd(123_456);
-        record.request_id = Some("request-1".into());
-        record.session_id = Some("session-1".into());
-        record.reasoning_text = Some("PRIVATE_REASONING".into());
-        record.prompt = atomic_core::change::PromptContent::full("PRIVATE_PROMPT");
-        change.hashed.provenance.push(record);
-        let mut bytes = Vec::new();
-        change.serialize(&mut bytes).unwrap();
-        let (decoded, hash) = Change::deserialize(&mut bytes.as_slice()).unwrap();
-        let metadata = change_metadata_projection(&decoded, &hash);
-        let usage = &metadata.usage[0];
-        assert_eq!(metadata.schema_version, 1);
-        assert_eq!(metadata.change_hash, Some(hash_proto(&hash)));
-        assert_eq!(usage.tokens.as_ref().unwrap().input_tokens, u64::MAX - 10);
-        assert_eq!(usage.tokens.as_ref().unwrap().cache_read_tokens, 4);
-        assert_eq!(usage.tokens.as_ref().unwrap().reasoning_tokens, 3);
-        assert_eq!(usage.cost_micro_usd, Some(123_456));
-        assert_eq!(usage.request_id.as_deref(), Some("request-1"));
-        let debug = format!("{metadata:?}");
-        assert!(!debug.contains("PRIVATE_REASONING"));
-        assert!(!debug.contains("PRIVATE_PROMPT"));
-    }
-
-    #[test]
-    fn metadata_distinguishes_no_records_zero_cost_and_invalid_cost() {
-        let mut change = Change::empty(ChangeHeader::new("work"));
-        let hash = change.hash().unwrap();
-        assert!(change_metadata_projection(&change, &hash).usage.is_empty());
-        let mut record = Provenance::new(AIVendor::OpenAI, "model", AITool::Api);
-        change.hashed.provenance.push(record.clone());
-        assert_eq!(
-            change_metadata_projection(&change, &hash).usage[0].cost_micro_usd,
-            Some(0)
-        );
-        record.cost = Cost {
-            usd: 0.25,
-            micro_usd: 0,
-        };
-        change.hashed.provenance = vec![record.clone()];
-        assert_eq!(
-            change_metadata_projection(&change, &hash).usage[0].cost_micro_usd,
-            Some(250_000)
-        );
-        record.cost.usd = f64::NAN;
-        change.hashed.provenance = vec![record];
-        let metadata = change_metadata_projection(&change, &hash);
-        assert_eq!(metadata.usage[0].cost_micro_usd, None);
-        assert_eq!(metadata.warnings.len(), 1);
-    }
-
-    #[test]
-    fn graph_summary_matches_native_hunk_aggregation_after_canonical_decode() {
-        use atomic_core::change::{Atom, EdgeUpdate, GraphOp, Insertion, Local};
-        use atomic_core::{ChangePosition, EdgeFlags, GraphNode, Hash, Position};
-        let inode = Position::new(Some(Hash::of(b"inode")), ChangePosition::new(0));
-        let span = Insertion {
-            predecessors: vec![],
-            successors: vec![],
-            flag: EdgeFlags::BLOCK,
-            start: ChangePosition::new(0),
-            end: ChangePosition::new(1),
-            inode,
-        };
-        let edges = EdgeUpdate {
-            edges: vec![],
-            inode,
-        };
-        let claim = (
-            inode,
-            GraphNode::new(inode.change, ChangePosition::new(0), ChangePosition::new(1)),
-            inode.change,
-        );
-        let hunks = vec![
-            GraphOp::DirAdd {
-                add_name: span.clone(),
-                add_inode: span.clone(),
-                path: "src".into(),
-            },
-            GraphOp::FileAdd {
-                add_name: span.clone(),
-                add_inode: span.clone(),
-                contents: Some(span.clone()),
-                path: "src/a.ts".into(),
-                encoding: None,
-            },
-            GraphOp::Edit {
-                change: Atom::Insertion(span.clone()),
-                local: Local::new("src/a.ts", 1),
-                encoding: None,
-            },
-            GraphOp::Replacement {
-                change: edges.clone(),
-                replacement: span.clone(),
-                local: Local::new("src/a.ts", 1),
-                encoding: None,
-            },
-            GraphOp::FileMove {
-                del: edges.clone(),
-                add: span.clone(),
-                path: "moved.ts".into(),
-            },
-            GraphOp::FileDel {
-                del: edges.clone(),
-                contents: Some(edges.clone()),
-                path: "deleted.ts".into(),
-                encoding: None,
-            },
-            GraphOp::FileUndel {
-                undel: edges.clone(),
-                contents: None,
-                path: "restored.ts".into(),
-                encoding: None,
-            },
-            GraphOp::DirDel {
-                del: edges.clone(),
-                path: "old-dir".into(),
-            },
-            GraphOp::DirUndel {
-                undel: edges.clone(),
-                path: "restored-dir".into(),
-            },
-            GraphOp::solve_name_conflict("name.ts", inode, [claim]).unwrap(),
-            GraphOp::unsolve_name_conflict("name.ts", inode, [claim]).unwrap(),
-            GraphOp::SolveOrderConflict {
-                change: edges.clone(),
-                local: Local::new("order.ts", 1),
-            },
-            GraphOp::UnsolveOrderConflict {
-                change: edges.clone(),
-                local: Local::new("order.ts", 1),
-            },
-            GraphOp::ResurrectZombies {
-                change: edges.clone(),
-                local: Local::new("zombie.ts", 1),
-                encoding: None,
-            },
-            GraphOp::AddRoot {
-                name: span.clone(),
-                inode: span,
-            },
-            GraphOp::DelRoot {
-                name: edges.clone(),
-                inode: edges,
-            },
-            GraphOp::SetAttr {
-                inode,
-                path: "src/a.ts".into(),
-                value: atomic_core::change::InodeAttr::Mode(420),
-            },
-        ];
-        let change = Change::new(
-            ChangeHeader::new("graph summaries"),
-            hunks,
-            b"hello\n".to_vec(),
-            vec![],
-        );
-        let mut bytes = Vec::new();
-        change.serialize(&mut bytes).unwrap();
-        let (decoded, hash) = Change::deserialize(&mut bytes.as_slice()).unwrap();
-        let summary = change_metadata_projection(&decoded, &hash)
-            .graph_summary
-            .unwrap();
-        assert_eq!((summary.vertices_added, summary.edges_changed), (9, 13));
-        assert_eq!(summary.content_bytes, 6);
-        assert_eq!(summary.files_changed, 10);
-        assert_eq!(summary.files.len(), 11); // root row is not a file
-        let file = summary
-            .files
-            .iter()
-            .find(|row| row.path == "src/a.ts")
-            .unwrap();
-        assert_eq!(file.symbol, "±");
-        assert!(file.info.starts_with("(4 hunks:"));
-        assert!(file.info.contains("attribute: Mode(420)"));
-        assert_eq!(
-            summary
-                .files
-                .iter()
-                .find(|row| row.path == "src")
-                .unwrap()
-                .symbol,
-            "📁+"
-        );
-        let expected = atomic_repository::triage::hunk_display_summaries(decoded.hunks());
-        assert_eq!(
-            summary
-                .files
-                .iter()
-                .map(|row| (&*row.symbol, &*row.path, &*row.info))
-                .collect::<Vec<_>>(),
-            expected
-                .iter()
-                .map(|row| (row.symbol, &*row.path, &*row.info))
-                .collect::<Vec<_>>()
-        );
-        let empty = change_metadata_projection(&Change::empty(ChangeHeader::new("empty")), &hash)
-            .graph_summary
-            .unwrap();
-        assert_eq!(
-            (
-                empty.vertices_added,
-                empty.edges_changed,
-                empty.content_bytes,
-                empty.files_changed
-            ),
-            (0, 0, 0, 0)
-        );
-        assert!(empty.files.is_empty());
-    }
-}
-
 // ---------------------------------------------------------------------------
 // GetSession — `atomic session show`
 // ---------------------------------------------------------------------------
@@ -1427,5 +1204,228 @@ pub(crate) fn kg_edge_proto(edge: atomic_core::pristine::vault::KgEdge) -> KgEdg
         metadata: edge
             .metadata
             .and_then(|metadata| serde_json::to_vec(&metadata).ok()),
+    }
+}
+
+#[cfg(test)]
+mod change_metadata_tests {
+    use super::*;
+    use atomic_core::change::{
+        AITool, AIVendor, Change, ChangeHeader, Cost, Provenance, TokenUsage,
+    };
+
+    #[test]
+    fn metadata_uses_canonical_decode_and_preserves_exact_usage_without_private_text() {
+        let mut change = Change::empty(ChangeHeader::new("AI work"));
+        let mut record = Provenance::new(AIVendor::OpenAI, "test-model", AITool::cli("OpenCode"));
+        record.tokens = TokenUsage::full(u64::MAX - 10, 2, 3, 4, 5);
+        record.cost = Cost::from_micro_usd(123_456);
+        record.request_id = Some("request-1".into());
+        record.session_id = Some("session-1".into());
+        record.reasoning_text = Some("PRIVATE_REASONING".into());
+        record.prompt = atomic_core::change::PromptContent::full("PRIVATE_PROMPT");
+        change.hashed.provenance.push(record);
+        let mut bytes = Vec::new();
+        change.serialize(&mut bytes).unwrap();
+        let (decoded, hash) = Change::deserialize(&mut bytes.as_slice()).unwrap();
+        let metadata = change_metadata_projection(&decoded, &hash);
+        let usage = &metadata.usage[0];
+        assert_eq!(metadata.schema_version, 1);
+        assert_eq!(metadata.change_hash, Some(hash_proto(&hash)));
+        assert_eq!(usage.tokens.as_ref().unwrap().input_tokens, u64::MAX - 10);
+        assert_eq!(usage.tokens.as_ref().unwrap().cache_read_tokens, 4);
+        assert_eq!(usage.tokens.as_ref().unwrap().reasoning_tokens, 3);
+        assert_eq!(usage.cost_micro_usd, Some(123_456));
+        assert_eq!(usage.request_id.as_deref(), Some("request-1"));
+        let debug = format!("{metadata:?}");
+        assert!(!debug.contains("PRIVATE_REASONING"));
+        assert!(!debug.contains("PRIVATE_PROMPT"));
+    }
+
+    #[test]
+    fn metadata_distinguishes_no_records_zero_cost_and_invalid_cost() {
+        let mut change = Change::empty(ChangeHeader::new("work"));
+        let hash = change.hash().unwrap();
+        assert!(change_metadata_projection(&change, &hash).usage.is_empty());
+        let mut record = Provenance::new(AIVendor::OpenAI, "model", AITool::Api);
+        change.hashed.provenance.push(record.clone());
+        assert_eq!(
+            change_metadata_projection(&change, &hash).usage[0].cost_micro_usd,
+            Some(0)
+        );
+        record.cost = Cost {
+            usd: 0.25,
+            micro_usd: 0,
+        };
+        change.hashed.provenance = vec![record.clone()];
+        assert_eq!(
+            change_metadata_projection(&change, &hash).usage[0].cost_micro_usd,
+            Some(250_000)
+        );
+        record.cost.usd = f64::NAN;
+        change.hashed.provenance = vec![record];
+        let metadata = change_metadata_projection(&change, &hash);
+        assert_eq!(metadata.usage[0].cost_micro_usd, None);
+        assert_eq!(metadata.warnings.len(), 1);
+    }
+
+    #[test]
+    fn graph_summary_matches_native_hunk_aggregation_after_canonical_decode() {
+        use atomic_core::change::{Atom, EdgeUpdate, GraphOp, Insertion, Local};
+        use atomic_core::{ChangePosition, EdgeFlags, GraphNode, Hash, Position};
+        let inode = Position::new(Some(Hash::of(b"inode")), ChangePosition::new(0));
+        let span = Insertion {
+            predecessors: vec![],
+            successors: vec![],
+            flag: EdgeFlags::BLOCK,
+            start: ChangePosition::new(0),
+            end: ChangePosition::new(1),
+            inode,
+        };
+        let edges = EdgeUpdate {
+            edges: vec![],
+            inode,
+        };
+        let claim = (
+            inode,
+            GraphNode::new(inode.change, ChangePosition::new(0), ChangePosition::new(1)),
+            inode.change,
+        );
+        let hunks = vec![
+            GraphOp::DirAdd {
+                add_name: span.clone(),
+                add_inode: span.clone(),
+                path: "src".into(),
+            },
+            GraphOp::FileAdd {
+                add_name: span.clone(),
+                add_inode: span.clone(),
+                contents: Some(span.clone()),
+                path: "src/a.ts".into(),
+                encoding: None,
+            },
+            GraphOp::Edit {
+                change: Atom::Insertion(span.clone()),
+                local: Local::new("src/a.ts", 1),
+                encoding: None,
+            },
+            GraphOp::Replacement {
+                change: edges.clone(),
+                replacement: span.clone(),
+                local: Local::new("src/a.ts", 1),
+                encoding: None,
+            },
+            GraphOp::FileMove {
+                del: edges.clone(),
+                add: span.clone(),
+                path: "moved.ts".into(),
+            },
+            GraphOp::FileDel {
+                del: edges.clone(),
+                contents: Some(edges.clone()),
+                path: "deleted.ts".into(),
+                encoding: None,
+            },
+            GraphOp::FileUndel {
+                undel: edges.clone(),
+                contents: None,
+                path: "restored.ts".into(),
+                encoding: None,
+            },
+            GraphOp::DirDel {
+                del: edges.clone(),
+                path: "old-dir".into(),
+            },
+            GraphOp::DirUndel {
+                undel: edges.clone(),
+                path: "restored-dir".into(),
+            },
+            GraphOp::solve_name_conflict("name.ts", inode, [claim]).unwrap(),
+            GraphOp::unsolve_name_conflict("name.ts", inode, [claim]).unwrap(),
+            GraphOp::SolveOrderConflict {
+                change: edges.clone(),
+                local: Local::new("order.ts", 1),
+            },
+            GraphOp::UnsolveOrderConflict {
+                change: edges.clone(),
+                local: Local::new("order.ts", 1),
+            },
+            GraphOp::ResurrectZombies {
+                change: edges.clone(),
+                local: Local::new("zombie.ts", 1),
+                encoding: None,
+            },
+            GraphOp::AddRoot {
+                name: span.clone(),
+                inode: span,
+            },
+            GraphOp::DelRoot {
+                name: edges.clone(),
+                inode: edges,
+            },
+            GraphOp::SetAttr {
+                inode,
+                path: "src/a.ts".into(),
+                value: atomic_core::change::InodeAttr::Mode(420),
+            },
+        ];
+        let change = Change::new(
+            ChangeHeader::new("graph summaries"),
+            hunks,
+            b"hello\n".to_vec(),
+            vec![],
+        );
+        let mut bytes = Vec::new();
+        change.serialize(&mut bytes).unwrap();
+        let (decoded, hash) = Change::deserialize(&mut bytes.as_slice()).unwrap();
+        let summary = change_metadata_projection(&decoded, &hash)
+            .graph_summary
+            .unwrap();
+        assert_eq!((summary.vertices_added, summary.edges_changed), (9, 13));
+        assert_eq!(summary.content_bytes, 6);
+        assert_eq!(summary.files_changed, 10);
+        assert_eq!(summary.files.len(), 11); // root row is not a file
+        let file = summary
+            .files
+            .iter()
+            .find(|row| row.path == "src/a.ts")
+            .unwrap();
+        assert_eq!(file.symbol, "±");
+        assert!(file.info.starts_with("(4 hunks:"));
+        assert!(file.info.contains("attribute: Mode(420)"));
+        assert_eq!(
+            summary
+                .files
+                .iter()
+                .find(|row| row.path == "src")
+                .unwrap()
+                .symbol,
+            "📁+"
+        );
+        let expected = atomic_repository::triage::hunk_display_summaries(decoded.hunks());
+        assert_eq!(
+            summary
+                .files
+                .iter()
+                .map(|row| (&*row.symbol, &*row.path, &*row.info))
+                .collect::<Vec<_>>(),
+            expected
+                .iter()
+                .map(|row| (row.symbol, &*row.path, &*row.info))
+                .collect::<Vec<_>>()
+        );
+        let empty = change_metadata_projection(&Change::empty(ChangeHeader::new("empty")), &hash)
+            .graph_summary
+            .unwrap();
+        assert_eq!(
+            (
+                empty.vertices_added,
+                empty.edges_changed,
+                empty.content_bytes,
+                empty.files_changed
+            ),
+            (0, 0, 0, 0)
+        );
+        assert!(empty.files.is_empty());
     }
 }
