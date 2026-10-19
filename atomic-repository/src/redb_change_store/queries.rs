@@ -376,7 +376,7 @@ impl RedbChangeStore {
     /// This is the core export method used by both file export and
     /// network transfer.
     pub fn export_v3_bytes(&self, hash: &[u8; 32]) -> RedbStoreResult<Vec<u8>> {
-        let meta = self.load_meta(hash)?;
+        let (meta, header_v2) = self.load_meta_with_header(hash)?;
 
         // Reconstruct the hash dedup table
         let hash_table = if meta.hash_table.is_empty() {
@@ -414,7 +414,14 @@ impl RedbChangeStore {
         writer.write_hash_table(&hash_table)?;
 
         // Write HEADER section
-        writer.write_change_header(&meta.header)?;
+        if let Some(payload) = header_v2 {
+            writer.write_change_header_v2_payload(&payload)?;
+        } else {
+            // Legacy rows stored only the basic header. Keep their existing
+            // read path; metadata already discarded by older imports cannot
+            // be reconstructed without reimporting the original change file.
+            writer.write_change_header(&meta.header)?;
+        }
 
         // Write DEPS section
         writer.write_dependencies(&meta.dependency_indices)?;
