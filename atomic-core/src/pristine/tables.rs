@@ -565,7 +565,8 @@ pub fn decode_file_index(value: &[u8; 52]) -> (i64, u32, u64, crate::types::Hash
 // as the primary storage format. The V3 section-based format maps naturally
 // to per-section redb values:
 //
-//   CHANGE_META:     Header + deps + provenance + hash table (one blob per change)
+//   CHANGE_META:     Header + deps + hash table (one blob per change)
+//   CHANGE_PROVENANCE: Inline provenance section (one blob per change)
 //   CHANGE_GRAPH:    Per-file graph ops (one blob per file per change)
 //   CHANGE_SEMANTIC: Per-file semantic ops (one blob per file per change)
 //   CONTENT_CHUNKS:  Content-addressed chunks (shared across changes via hash)
@@ -587,12 +588,21 @@ pub fn decode_file_index(value: &[u8; 52]) -> (i64, u32, u64, crate::types::Hash
 /// This is the first thing read when loading a change. It contains:
 /// - ChangeHeader (message, authors, timestamp)
 /// - Dependency hash indices
-/// - Provenance entries (AI attribution)
+/// - Whether an inline provenance section is present in CHANGE_PROVENANCE
 /// - The hash dedup table (for resolving HashIndex → full hash)
 ///
 /// Metadata is always loaded regardless of which layers are requested,
 /// because it's small and universally needed.
 pub const CHANGE_META: TableDefinition<&[u8; 32], &[u8]> = TableDefinition::new("change_meta");
+
+/// Inline provenance belonging to a change's hashed payload.
+///
+/// Key: change content hash (blake3, 32 bytes).
+/// Value: zstd-compressed, original PROVENANCE section payload. Retaining the
+/// encoded bytes preserves fields and their ordering when exporting a change.
+/// This is separate from independently stored provenance graphs and journals.
+pub const CHANGE_PROVENANCE: TableDefinition<&[u8; 32], &[u8]> =
+    TableDefinition::new("change_provenance");
 
 /// Per-file graph operations: (change_hash, file_index) → zstd(postcard(GraphSectionPayload))
 ///

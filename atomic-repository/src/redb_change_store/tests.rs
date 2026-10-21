@@ -42,6 +42,133 @@ fn make_change_with_hunk() -> Change {
     change
 }
 
+#[test]
+fn inline_provenance_survives_reopen_export_and_reimport() {
+    let (dir, store) = temp_store();
+    let mut change = make_change_with_hunk();
+    change.hashed.provenance = vec![atomic_core::change::Provenance {
+        model: "fixture-model".into(),
+        timestamp: Some(1_720_000_000),
+        session_id: Some("fixture-session".into()),
+        metadata: vec![("opaque".into(), "中文\r\n\0evidence".into())],
+        ..Default::default()
+    }];
+    change.unhashed = Some(serde_json::json!({"session": "fixture-session"}));
+    let key = atomic_identity::SecretKey::from_bytes(&[7; 32]);
+    change
+        .sign_with("did:atomic:fixture", key.as_bytes(), 1_720_000_000)
+        .unwrap();
+    let mut original = Vec::new();
+    let original_hash = change.serialize(&mut original).unwrap();
+    let hash = store.save_change(&change).unwrap();
+    assert_eq!(hash, *original_hash.as_bytes());
+    drop(store);
+
+    let store = RedbChangeStore::open_existing(dir.path().join("test_change_store.redb")).unwrap();
+    let exported = store.export_v3_bytes(&hash).unwrap();
+    let (loaded, exported_hash) = Change::deserialize(&mut Cursor::new(&exported)).unwrap();
+    assert_eq!(loaded.hashed, change.hashed);
+    assert_eq!(loaded.contents, change.contents);
+    assert_eq!(loaded.unhashed, change.unhashed);
+    assert_eq!(exported_hash, original_hash);
+    atomic_core::change::signing::verify_change_signature(
+        loaded.signature.as_ref().unwrap(),
+        key.public_key().as_bytes(),
+        &exported_hash,
+    )
+    .unwrap();
+    assert_eq!(exported, original);
+
+    let (_receiver_dir, receiver) = temp_store();
+    assert_eq!(receiver.import_v3_bytes(&exported).unwrap(), hash);
+    assert_eq!(receiver.export_v3_bytes(&hash).unwrap(), original);
+    assert_eq!(receiver.load_change(&hash).unwrap().hashed, change.hashed);
+}
+
+#[test]
+fn inline_provenance_missing_from_old_store_requires_reimport() {
+    let (dir, store) = temp_store();
+    let mut change = make_test_change("legacy lost provenance", b"body");
+    change.hashed.provenance = vec![Default::default()];
+    let mut original = Vec::new();
+    let hash = *change.serialize(&mut original).unwrap().as_bytes();
+    store.import_v3_bytes(&original).unwrap();
+    // Older stores recorded the presence flag but discarded the actual section.
+    let txn = store.db().begin_write().unwrap();
+    txn.delete_table(tables::CHANGE_PROVENANCE).unwrap();
+    txn.commit().unwrap();
+    drop(store);
+
+    let store = RedbChangeStore::open_existing(dir.path().join("test_change_store.redb")).unwrap();
+    let dest = dir.path().join("existing.change");
+    std::fs::write(&dest, b"keep existing export").unwrap();
+    let error = store.export_v3_file(&hash, &dest).unwrap_err();
+    assert!(matches!(error, RedbStoreError::Corrupt(_)));
+    assert!(error
+        .to_string()
+        .contains("reimport the original change file"));
+    assert_eq!(std::fs::read(&dest).unwrap(), b"keep existing export");
+    assert!(store.has_change(&hash).unwrap());
+
+    assert_eq!(store.import_v3_bytes(&original).unwrap(), hash);
+    assert_eq!(store.export_v3_bytes(&hash).unwrap(), original);
+}
+
+#[test]
+fn inline_provenance_table_is_optional_for_existing_plain_changes() {
+    let (dir, store) = temp_store();
+    let change = make_test_change("old plain row", b"body");
+    let hash = store.save_change(&change).unwrap();
+    let txn = store.db().begin_write().unwrap();
+    txn.delete_table(tables::CHANGE_PROVENANCE).unwrap();
+    txn.commit().unwrap();
+    drop(store);
+    let store = RedbChangeStore::open_existing(dir.path().join("test_change_store.redb")).unwrap();
+    assert_eq!(store.load_change(&hash).unwrap().hashed, change.hashed);
+}
+
+#[test]
+fn inline_provenance_is_removed_with_its_change() {
+    let (_dir, store) = temp_store();
+    let mut change = make_test_change("delete inline provenance", b"body");
+    change.hashed.provenance = vec![Default::default()];
+    let hash = store.save_change(&change).unwrap();
+    assert!(store.delete_change(&hash).unwrap());
+    let txn = store.db().begin_read().unwrap();
+    assert!(txn
+        .open_table(tables::CHANGE_PROVENANCE)
+        .unwrap()
+        .get(&hash)
+        .unwrap()
+        .is_none());
+    assert!(!store.has_change(&hash).unwrap());
+}
+
+#[test]
+fn inline_provenance_survives_database_consolidation() {
+    let dir = tempfile::tempdir().unwrap();
+    drop(crate::Repository::init(dir.path()).unwrap());
+    let dot = dir.path().join(".atomic");
+    std::fs::rename(
+        dot.join(crate::DATABASE_FILE),
+        dot.join(crate::LEGACY_PRISTINE_FILE),
+    )
+    .unwrap();
+    let store = RedbChangeStore::open(dot.join("changes.redb")).unwrap();
+    let mut change = make_test_change("migrate inline provenance", b"body");
+    change.hashed.provenance = vec![Default::default()];
+    let hash = store.save_change(&change).unwrap();
+    let expected = store.export_v3_bytes(&hash).unwrap();
+    drop(store);
+
+    let repo = crate::Repository::open(dir.path()).unwrap();
+    assert!(dot.join(crate::DATABASE_FILE).is_file());
+    assert!(!dot.join("changes.redb").exists());
+    let store = repo.redb_change_store().unwrap();
+    assert_eq!(store.export_v3_bytes(&hash).unwrap(), expected);
+    assert_eq!(store.load_change(&hash).unwrap().hashed, change.hashed);
+}
+
 // ── Basic Operations ───────────────────────────────────────────
 
 #[test]
