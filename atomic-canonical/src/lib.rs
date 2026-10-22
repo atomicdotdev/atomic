@@ -14,7 +14,9 @@
 //! Load-bearing principles enforced here: *presence is enforced, content is
 //! left honest* (the `why` is never schematized); *the vocabulary is closed*
 //! ([`vocab`]); *the fact is singular* (status lives only in the spine and is
-//! regenerated on render).
+//! regenerated on render). User-defined vault kinds ([`kind_spec`]) are the
+//! open-world extension beside that closed vocabulary: any repository may
+//! declare a kind, and each declared kind is then closed in turn.
 //!
 //! ## M0 scope
 //! This crate proves the Intent round trip **in isolation**. Wiring it into the
@@ -36,6 +38,7 @@ pub mod error;
 pub mod gate;
 pub mod hash;
 pub mod jcs;
+pub mod kind_spec;
 pub mod lift;
 pub mod memory;
 pub mod node;
@@ -47,6 +50,12 @@ pub mod vocab;
 
 pub use error::{CanonicalError, Result};
 pub use gate::{validate_intent, validate_memory, ValidationReport, Violation};
+pub use kind_spec::{
+    apply_defaults, has_conflict_markers, instance_kg_id, instance_urn, namespaced_edge,
+    parse_set_value, validate_instance, BaseType, BodySpec, FieldSpec, FieldType, InstanceReport,
+    KindSpec, KindSpecError, KindViolation, KindViolationCode, ParseValueError, RefResolver,
+    ResolvedRef, ShaclRow, RESERVED_FIELD_NAMES, RESERVED_KIND_NAMES,
+};
 pub use memory::MemoryNode;
 pub use node::{
     intent_substance_hash, AcceptanceCriterion, CanonicalNode, Constraint, Proof, Ref, ScopeItem,
