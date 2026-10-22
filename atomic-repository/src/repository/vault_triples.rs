@@ -861,6 +861,35 @@ impl Repository {
         Ok((nodes, edges))
     }
 
+    /// The vault paths that own (`derived_from_vault_path`) a KG edge into
+    /// any of `subjects`. Best-effort: a KG read error yields what was
+    /// collected so far.
+    pub(super) fn kg_incoming_edge_owners(
+        &self,
+        subjects: &std::collections::BTreeSet<String>,
+    ) -> std::collections::BTreeSet<String> {
+        let mut owners = std::collections::BTreeSet::new();
+        if subjects.is_empty() {
+            return owners;
+        }
+        let Ok(txn) = self.pristine.read_txn() else {
+            return owners;
+        };
+        for subject in subjects {
+            let Ok(edges) = txn.get_kg_edges_to(subject) else {
+                continue;
+            };
+            owners.extend(edges.iter().filter_map(|edge| {
+                edge.metadata
+                    .as_ref()?
+                    .get("derived_from_vault_path")?
+                    .as_str()
+                    .map(str::to_string)
+            }));
+        }
+        owners
+    }
+
     /// Re-index every vault entry under `kinds/<kind>/` — its definition and
     /// instances — into the KG, and re-apply the embedding policy to each.
     ///
@@ -1060,7 +1089,7 @@ fn path_to_subject(path: &str) -> String {
 /// An instance under a reserved kind name (`kinds/intent/<ULID>.md`) has no
 /// kind subject: `intent:<ULID>` would name — and a delete would remove — a
 /// real intent node. Such a kind never registers, so nothing is lost.
-fn kind_subject(path: &str) -> Option<String> {
+pub(super) fn kind_subject(path: &str) -> Option<String> {
     match KindPath::classify(path)? {
         KindPath::Definition { kind } => Some(format!("kind:{kind}")),
         KindPath::Instance { kind, uid } if !is_reserved_kind_name(&kind) => {
@@ -3541,6 +3570,115 @@ fields:
         kg_edges_from(repo, from)
             .iter()
             .any(|e| e.kind == kind && e.to_id == to)
+    }
+
+    #[test]
+    fn test_kind_cross_entry_edge_survives_target_spec_round_trip() {
+        let (_dir, repo) = kind_repo();
+        write_vault(&repo, "kinds/adr/_kind.md", ADR_SPEC);
+        write_vault(&repo, &format!("kinds/adr/{KUID}.md"), &adr(KUID, ""));
+        write_vault(&repo, "kinds/rfc/_kind.md", RFC_SPEC);
+        write_vault(
+            &repo,
+            &format!("kinds/rfc/{KUID3}.md"),
+            &rfc(KUID3, &format!("decidedBy: {KUID}\n")),
+        );
+        repo.vault_record_working_copy().unwrap();
+        let (rfc_id, adr_id) = (format!("rfc:{KUID3}"), format!("adr:{KUID}"));
+        assert!(has_edge(&repo, &rfc_id, "rfc.DECIDED_BY", &adr_id));
+        assert!(conforms(&repo, &rfc_id));
+
+        // The adr spec breaks: adr:A is gone, and rfc:R no longer resolves.
+        write_vault(
+            &repo,
+            "kinds/adr/_kind.md",
+            &ADR_SPEC.replace("specVersion: 1", "specVersion: 2"),
+        );
+        repo.vault_record_working_copy().unwrap();
+        assert!(kg_node(&repo, &adr_id).is_none());
+        assert!(!has_edge(&repo, &rfc_id, "rfc.DECIDED_BY", &adr_id));
+        assert!(!conforms(&repo, &rfc_id));
+        assert_eq!(
+            meta(&kg_node(&repo, &rfc_id).unwrap(), "violation_codes"),
+            &serde_json::json!(["UNRESOLVED_REF"])
+        );
+
+        // Fixing it brings the edge back without touching rfc:R.
+        write_vault(&repo, "kinds/adr/_kind.md", ADR_SPEC);
+        let updated = repo.vault_record_working_copy().unwrap();
+        assert_eq!(updated, ["kinds/adr/_kind.md"]);
+        assert!(has_edge(&repo, &rfc_id, "rfc.DECIDED_BY", &adr_id));
+        assert!(conforms(&repo, &rfc_id));
+    }
+
+    #[test]
+    fn test_kind_deleted_ref_target_makes_referrer_nonconforming() {
+        let (_dir, repo) = kind_repo();
+        write_vault(&repo, "kinds/adr/_kind.md", ADR_SPEC);
+        write_vault(&repo, &format!("kinds/adr/{KUID}.md"), &adr(KUID, ""));
+        write_vault(&repo, "kinds/rfc/_kind.md", RFC_SPEC);
+        write_vault(
+            &repo,
+            &format!("kinds/rfc/{KUID3}.md"),
+            &rfc(KUID3, &format!("decidedBy: {KUID}\n")),
+        );
+        repo.vault_record_working_copy().unwrap();
+        let rfc_id = format!("rfc:{KUID3}");
+        assert!(conforms(&repo, &rfc_id));
+
+        std::fs::remove_file(repo.vault_dir().join(format!("kinds/adr/{KUID}.md"))).unwrap();
+        repo.vault_record_working_copy().unwrap();
+        assert!(!conforms(&repo, &rfc_id), "the KG agrees with validate");
+        let report = repo
+            .kind_validate(&super::super::kinds::KindSource::WorkingCopy, Some("rfc"))
+            .unwrap();
+        assert!(!report.kinds[0].instances[0].conforms);
+
+        // Restoring the target restores conformance and the edge.
+        write_vault(&repo, &format!("kinds/adr/{KUID}.md"), &adr(KUID, ""));
+        repo.vault_record_working_copy().unwrap();
+        assert!(conforms(&repo, &rfc_id));
+        assert!(has_edge(
+            &repo,
+            &rfc_id,
+            "rfc.DECIDED_BY",
+            &format!("adr:{KUID}")
+        ));
+    }
+
+    #[test]
+    fn test_kind_intent_added_later_resolves_referrer() {
+        let (_dir, repo) = kind_repo();
+        // Make an intent, then take it out of the vault, keeping its file.
+        let created = intent(&repo);
+        let intent_disk = repo.vault_dir().join(&created.intent_file);
+        let intent_text = std::fs::read_to_string(&intent_disk).unwrap();
+        std::fs::remove_file(&intent_disk).unwrap();
+        repo.vault_record_working_copy().unwrap();
+        assert!(repo.vault_retrieve(&created.intent_file).unwrap().is_none());
+
+        write_vault(&repo, "kinds/rfc/_kind.md", RFC_SPEC);
+        write_vault(
+            &repo,
+            &format!("kinds/rfc/{KUID3}.md"),
+            &rfc(KUID3, &format!("intent: {}\n", created.uid)),
+        );
+        repo.vault_record_working_copy().unwrap();
+        let rfc_id = format!("rfc:{KUID3}");
+        assert!(!conforms(&repo, &rfc_id));
+
+        // The intent arrives in a later batch that does not touch rfc:R.
+        std::fs::write(&intent_disk, intent_text).unwrap();
+        let updated = repo.vault_record_working_copy().unwrap();
+        assert_eq!(updated, std::slice::from_ref(&created.intent_file));
+        let intent_subject = entry_subject(&created.intent_file, VaultEntryType::Intent);
+        assert!(conforms(&repo, &rfc_id));
+        assert!(has_edge(&repo, &rfc_id, "rfc.IMPLEMENTS", &intent_subject));
+
+        // And leaves again.
+        std::fs::remove_file(&intent_disk).unwrap();
+        repo.vault_record_working_copy().unwrap();
+        assert!(!conforms(&repo, &rfc_id));
     }
 
     #[test]

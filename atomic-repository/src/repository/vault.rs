@@ -752,6 +752,9 @@ impl Repository {
         changes: &[VaultFileChange],
     ) -> Result<Vec<String>, RepositoryError> {
         let mut updated_paths = Vec::new();
+        // Read before anything is stored or deleted: the KG edges this batch
+        // may remove, and the stored type of each entry it deletes.
+        let kind_batch = self.kind_batch_context(changes);
 
         for change in changes {
             match change.change_type {
@@ -810,20 +813,83 @@ impl Repository {
         // intents exist in redb but never show up in `intent list`.
         self.vault_reconcile_intent_manifest()?;
 
-        self.vault_reindex_changed_kinds(changes);
+        self.vault_reindex_changed_kinds(changes, kind_batch);
 
         Ok(updated_paths)
+    }
+
+    /// What [`Self::vault_reindex_changed_kinds`] needs to know about a
+    /// batch from *before* it is applied.
+    fn kind_batch_context(&self, changes: &[VaultFileChange]) -> KindBatchContext {
+        let mut context = KindBatchContext::default();
+        let mut subjects = std::collections::BTreeSet::new();
+        for change in changes {
+            let deleted = change.change_type == VaultChangeType::Deleted;
+            let entry_type = if deleted {
+                match self.vault_retrieve(&change.path) {
+                    Ok(Some(entry)) => entry.entry_type,
+                    _ => infer_entry_type(&change.path),
+                }
+            } else {
+                infer_entry_type(&change.path)
+            };
+            match KindPath::classify(&change.path) {
+                Some(KindPath::Definition { kind }) => {
+                    // Every instance may lose (or regain) its node.
+                    for meta in self
+                        .vault_list(&format!("{}/{kind}/", super::kinds::KINDS_DIR), None)
+                        .unwrap_or_default()
+                    {
+                        subjects.extend(super::vault_triples::kind_subject(&meta.path));
+                    }
+                    context.note_target(kind, true);
+                }
+                Some(KindPath::Instance { kind, .. }) => {
+                    subjects.extend(super::vault_triples::kind_subject(&change.path));
+                    if change.change_type != VaultChangeType::Modified {
+                        context.note_target(kind, deleted);
+                    }
+                }
+                Some(KindPath::Stray) => {}
+                None => {
+                    let target = match entry_type {
+                        VaultEntryType::Intent => "intent",
+                        VaultEntryType::Memory => "memory",
+                        _ => continue,
+                    };
+                    // Kind instances that refer to it are found through
+                    // their specs rather than their KG edges, which cover
+                    // only refs with an `edge`.
+                    if change.change_type != VaultChangeType::Modified {
+                        context.note_target(target.to_string(), deleted);
+                    }
+                }
+            }
+        }
+        context.owners = self.kg_incoming_edge_owners(&subjects);
+        context
     }
 
     /// Re-index kind files after a deflate batch.
     ///
     /// Each entry was indexed as it was stored, but in batch order: an
-    /// instance indexed before its sibling `_kind.md`, or before an intent it
-    /// refers to was stored (intent refs resolve through redb), was projected
-    /// against stale state. So every kind whose definition was added, changed
-    /// or deleted is re-indexed whole, and every other changed instance is
-    /// re-indexed once more.
-    fn vault_reindex_changed_kinds(&self, changes: &[VaultFileChange]) {
+    /// instance indexed before its sibling `_kind.md`, or before an entry it
+    /// refers to was stored, was projected against stale state; and a node
+    /// removed during the batch (a deleted instance, or every instance of a
+    /// kind whose spec became invalid) took the edges other entries own into
+    /// it with it. So, in order (steps 2 and 3 re-index each entry at most once):
+    ///
+    /// 1. every kind whose definition was added, changed or deleted is
+    ///    re-indexed whole, and every other changed instance once more;
+    /// 2. instances whose refs may have changed meaning are re-indexed: for
+    ///    each ref target kind (`intent`, `memory` or a custom kind) that
+    ///    gained or lost a node, the instances of every registered kind with
+    ///    a ref field targeting it — all of them when a target may have
+    ///    disappeared, else only those projected as non-conforming;
+    /// 3. every entry that owned a KG edge into a node the batch may have
+    ///    removed is re-indexed, restoring that edge when its target is
+    ///    back.
+    fn vault_reindex_changed_kinds(&self, changes: &[VaultFileChange], batch: KindBatchContext) {
         let mut respecced = std::collections::BTreeSet::new();
         let mut instances = Vec::new();
         for change in changes {
@@ -852,6 +918,89 @@ impl Repository {
                 log::debug!("KG re-index for {path}: {e}");
             }
         }
+        // Step 1 can remove nodes (and the edges into them) after an entry
+        // pointing at them was re-indexed, so steps 2 and 3 do not skip what
+        // it did; they only skip each other's work.
+        let mut done = std::collections::BTreeSet::new();
+        let mut reindex = |path: &str| {
+            if done.insert(path.to_string()) {
+                if let Err(e) = self.vault_index_kg(path) {
+                    log::debug!("KG re-index for {path}: {e}");
+                }
+            }
+        };
+        if !batch.targets.is_empty() {
+            for (path, all) in self.kind_instances_referring_to(&batch.targets) {
+                if all || self.kind_instance_nonconforming(&path) {
+                    reindex(&path);
+                }
+            }
+        }
+        for owner in &batch.owners {
+            if matches!(self.vault_retrieve(owner), Ok(Some(_))) {
+                reindex(owner);
+            }
+        }
+    }
+
+    /// Stored instances of every stored, registered kind with a ref field
+    /// targeting one of `targets`, each with whether it must be re-indexed
+    /// regardless of its current conformance (see
+    /// [`KindBatchContext::targets`]).
+    fn kind_instances_referring_to(
+        &self,
+        targets: &std::collections::BTreeMap<String, bool>,
+    ) -> Vec<(String, bool)> {
+        let kinds_prefix = format!("{}/", super::kinds::KINDS_DIR);
+        let entries = self.vault_list(&kinds_prefix, None).unwrap_or_default();
+        let mut referring = std::collections::BTreeMap::new();
+        for meta in &entries {
+            let Some(KindPath::Definition { kind }) = KindPath::classify(&meta.path) else {
+                continue;
+            };
+            let Ok(Some(definition)) = self.stored_kind_definition(&kind) else {
+                continue;
+            };
+            let Some(spec) = definition.spec() else {
+                continue;
+            };
+            let mut all = None;
+            for field in spec.fields.values() {
+                for target in &field.target {
+                    if let Some(&deleted) = targets.get(target) {
+                        all = Some(all.unwrap_or(false) || deleted);
+                    }
+                }
+            }
+            if let Some(all) = all {
+                referring.insert(kind, all);
+            }
+        }
+        entries
+            .into_iter()
+            .filter_map(|meta| match KindPath::classify(&meta.path) {
+                Some(KindPath::Instance { kind, .. }) => {
+                    referring.get(&kind).map(|&all| (meta.path, all))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Is the instance at `path` projected with `conforms: false`?
+    fn kind_instance_nonconforming(&self, path: &str) -> bool {
+        let Some(subject) = super::vault_triples::kind_subject(path) else {
+            return false;
+        };
+        matches!(
+            self.vault_kg_node(&subject),
+            Ok(Some(node)) if node
+                .metadata
+                .as_ref()
+                .and_then(|m| m.get("conforms"))
+                .and_then(serde_json::Value::as_bool)
+                == Some(false)
+        )
     }
 
     /// Record-time T5b grant-lapse for an intent deflated from disk (gap #2).
@@ -1401,6 +1550,25 @@ pub enum VaultChangeType {
     New,
     Modified,
     Deleted,
+}
+
+/// What a deflate batch can change for kind instances it does not store
+/// itself; see [`Repository::vault_reindex_changed_kinds`].
+#[derive(Default)]
+struct KindBatchContext {
+    /// Vault paths owning a KG edge into a node the batch may delete or
+    /// re-project.
+    owners: std::collections::BTreeSet<String>,
+    /// Ref target kinds whose set of nodes the batch changes, each `true`
+    /// when a node may have disappeared (a delete, or a custom kind whose
+    /// definition changed) and `false` when nodes were only added.
+    targets: std::collections::BTreeMap<String, bool>,
+}
+
+impl KindBatchContext {
+    fn note_target(&mut self, target: String, removed: bool) {
+        *self.targets.entry(target).or_insert(false) |= removed;
+    }
 }
 
 /// A detected change in the vault working copy.
