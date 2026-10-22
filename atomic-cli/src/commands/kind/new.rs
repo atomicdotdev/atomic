@@ -4,6 +4,7 @@
 //! values, required fields, refs that must resolve) before anything is
 //! written; on any violation nothing is written and the command exits 2.
 
+use std::cell::{Cell, RefCell};
 use std::collections::BTreeSet;
 use std::io::Read;
 use std::path::PathBuf;
@@ -18,7 +19,9 @@ use atomic_repository::{
 };
 
 use super::init::{ingest, write_new_file};
-use super::{display_path, kind_not_found, open_repository, record_hint, validation_failed};
+use super::{
+    display_path, display_text, kind_not_found, open_repository, record_hint, validation_failed,
+};
 use crate::commands::Command;
 use crate::error::{CliError, CliResult};
 use crate::output::{error, success, warning};
@@ -52,9 +55,25 @@ pub struct KindNew {
     #[arg(long)]
     pub body_stdin: bool,
 
-    /// Emit `{"uid","kind","file","kg_id"}` instead of the human summary.
+    /// Emit JSON instead of the human summary: on success
+    /// `{"written": true, "uid", "kind", "file", "kg_id"}`; on failure
+    /// `{"written": false, "kind", ...}` with either `violations` (the
+    /// instance does not conform) or `error` (anything else).
     #[arg(long)]
     pub json: bool,
+
+    #[arg(skip)]
+    progress: JsonProgress,
+}
+
+/// What `--json` output a run has produced so far, so that every failure is
+/// reported as exactly one JSON object.
+#[derive(Debug, Default)]
+struct JsonProgress {
+    /// A failure object has already been printed.
+    reported: Cell<bool>,
+    /// The file written before a later step failed.
+    written: RefCell<Option<String>>,
 }
 
 /// One reason the instance cannot be written.
@@ -88,6 +107,7 @@ impl KindNew {
     /// Print why nothing was written and return the exit-2 error.
     fn reject(&self, rejections: &[Rejection]) -> CliError {
         if self.json {
+            self.progress.reported.set(true);
             let out = serde_json::json!({
                 "kind": self.kind,
                 "written": false,
@@ -97,8 +117,13 @@ impl KindNew {
         } else {
             for r in rejections {
                 match &r.field {
-                    Some(field) => eprintln!("{} {field}: {}", error("✗"), r.message),
-                    None => eprintln!("{} {}", error("✗"), r.message),
+                    Some(field) => eprintln!(
+                        "{} {}: {}",
+                        error("✗"),
+                        display_text(field),
+                        display_text(&r.message)
+                    ),
+                    None => eprintln!("{} {}", error("✗"), display_text(&r.message)),
                 }
             }
             eprintln!("Nothing was written.");
@@ -113,6 +138,30 @@ impl KindNew {
 
 impl Command for KindNew {
     fn run(&self) -> CliResult<()> {
+        let result = self.create();
+        if let Err(e) = &result {
+            if self.json && !self.progress.reported.get() {
+                let written = self.progress.written.borrow();
+                let mut out = serde_json::json!({
+                    "kind": self.kind,
+                    "written": written.is_some(),
+                    "error": {
+                        "message": e.to_string(),
+                        "exit_code": e.exit_code(),
+                    },
+                });
+                if let Some(file) = written.as_deref() {
+                    out["file"] = Value::String(file.to_string());
+                }
+                println!("{out}");
+            }
+        }
+        result
+    }
+}
+
+impl KindNew {
+    fn create(&self) -> CliResult<()> {
         let repo = open_repository()?;
         let registry = repo
             .kind_registry(&KindSource::WorkingCopy)
@@ -124,13 +173,28 @@ impl Command for KindNew {
             KindStatus::Registered(spec) => spec,
             KindStatus::Invalid(problems) => {
                 let def = display_path(&entry.definition.def_path);
-                for p in problems {
-                    eprintln!("{} {def}: {p}", error("✗"));
-                }
-                return Err(validation_failed(format!(
+                let err = validation_failed(format!(
                     "kind '{}' is not registered until {def} is fixed; nothing was written",
                     self.kind
-                )));
+                ));
+                if self.json {
+                    self.progress.reported.set(true);
+                    let out = serde_json::json!({
+                        "kind": self.kind,
+                        "written": false,
+                        "error": {
+                            "message": err.to_string(),
+                            "exit_code": err.exit_code(),
+                            "problems": problems,
+                        },
+                    });
+                    println!("{out}");
+                } else {
+                    for p in problems {
+                        eprintln!("{} {def}: {}", error("✗"), display_text(p));
+                    }
+                }
+                return Err(err);
             }
         };
 
@@ -218,6 +282,7 @@ impl Command for KindNew {
         let rel = kind_instance_path(&self.kind, &uid);
         let path = repo.vault_dir().join(&rel);
         write_new_file(&path, &document)?;
+        *self.progress.written.borrow_mut() = Some(display_path(&rel));
         ingest(&repo, &rel, &document)?;
 
         warn_if_definition_unrecorded(&repo, &self.kind)?;
@@ -225,6 +290,7 @@ impl Command for KindNew {
         let kg_id = instance_kg_id(&self.kind, &uid);
         if self.json {
             let out = serde_json::json!({
+                "written": true,
                 "uid": uid,
                 "kind": self.kind,
                 "file": display_path(&rel),

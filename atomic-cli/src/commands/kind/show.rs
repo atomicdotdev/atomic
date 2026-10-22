@@ -7,7 +7,8 @@ use atomic_canonical::kind_spec::{FieldSpec, KindSpec};
 use atomic_repository::{KindEntry, KindSource, KindStatus};
 
 use super::{
-    display_path, kind_not_found, open_repository, status_label, status_problems, Guidance,
+    display_path, display_text, kind_not_found, open_repository, status_label, status_problems,
+    Guidance,
 };
 use crate::commands::Command;
 use crate::error::{CliError, CliResult};
@@ -56,7 +57,7 @@ impl KindShow {
             "status": status_label(def),
             "problems": status_problems(def),
             "def_path": display_path(&def.def_path),
-            "instances": entry.instances.len(),
+            "instance_count": entry.instances.len(),
             "spec": spec,
             "edges": spec.map(KindSpec::edges).unwrap_or_default(),
             "shacl": spec.map(KindSpec::summary_rows).unwrap_or_default(),
@@ -77,7 +78,7 @@ impl KindShow {
             .add("Kind", def.name.clone())
             .add("Status", status_label(def));
         if let Some(title) = entry.spec().and_then(|s| s.title.as_deref()) {
-            summary = summary.add("Title", title);
+            summary = summary.add("Title", display_text(title));
         }
         summary = summary
             .add("Definition", display_path(&def.def_path))
@@ -100,7 +101,7 @@ impl KindShow {
                 println!();
                 println!("{}", emphasis("Problems (the kind is not registered)"));
                 for p in problems {
-                    println!("  {} {p}", error("✗"));
+                    println!("  {} {}", error("✗"), display_text(p));
                 }
             }
             KindStatus::Registered(spec) => {
@@ -120,7 +121,11 @@ impl KindShow {
                     Column::new("SHACL"),
                 ]);
                 for row in spec.summary_rows() {
-                    shacl.add_row([row.subject, row.construct, row.shacl]);
+                    shacl.add_row([
+                        display_text(&row.subject),
+                        display_text(&row.construct),
+                        display_text(&row.shacl),
+                    ]);
                 }
                 println!("{shacl}");
             }
@@ -152,8 +157,8 @@ fn fields_table(spec: &KindSpec) -> Table {
             field
                 .default
                 .as_ref()
-                .map_or_else(|| "-".to_string(), compact),
-            values_or_target(field),
+                .map_or_else(|| "-".to_string(), |v| display_text(&compact(v))),
+            display_text(&values_or_target(field)),
             field
                 .edge
                 .as_deref()
@@ -161,7 +166,7 @@ fn fields_table(spec: &KindSpec) -> Table {
             field
                 .description
                 .as_deref()
-                .map_or_else(|| "-".to_string(), one_line),
+                .map_or_else(|| "-".to_string(), display_text),
         ]);
     }
     table
@@ -189,12 +194,4 @@ fn compact(value: &Value) -> String {
         Value::String(s) => s.clone(),
         other => other.to_string(),
     }
-}
-
-/// A description on one table line, without control characters.
-fn one_line(s: &str) -> String {
-    s.split_whitespace()
-        .map(|w| w.chars().filter(|c| !c.is_control()).collect::<String>())
-        .collect::<Vec<_>>()
-        .join(" ")
 }
