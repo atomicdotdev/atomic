@@ -5,7 +5,7 @@
 //! or a simple hash-based function for testing. This module handles
 //! chunking, storage, staleness detection, and search.
 
-use super::kinds::{KindPath, KindRegistry, KindSource};
+use super::kinds::KindPath;
 use super::*;
 use atomic_core::pristine::vault::{EmbeddingRecord, SearchResult, VaultEntryType};
 use atomic_core::pristine::{EmbeddingsMutTxnT, EmbeddingsTxnT, VaultTxnT};
@@ -190,15 +190,16 @@ impl Repository {
     /// The embedding policy for a `kinds/` path, or `None` for any other
     /// path (whose caller applies its own rule).
     ///
-    /// An instance is embedded iff its kind is registered in the working copy
+    /// An instance is embedded iff its kind's stored definition registers
     /// with `embed: true`. Definitions and stray files are never embedded.
     pub(super) fn kind_embed_policy(&self, path: &str) -> Option<bool> {
         let KindPath::Instance { kind, .. } = KindPath::classify(path)? else {
             return Some(false);
         };
+        // From the stored definition, like KG projection: the policy must
+        // follow the same spec the instance was projected against.
         let embed = self
-            .kind_files(&KindSource::WorkingCopy)
-            .and_then(|files| KindRegistry::load_kind(&files, &kind))
+            .stored_kind_definition(&kind)
             .map(|definition| definition.and_then(|d| d.spec().map(|spec| spec.embed)))
             .unwrap_or_else(|e| {
                 log::debug!("Kind embed policy for {path}: {e}");

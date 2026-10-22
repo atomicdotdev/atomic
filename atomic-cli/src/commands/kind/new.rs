@@ -245,6 +245,16 @@ impl KindNew {
         }
 
         apply_defaults(spec, &mut fm);
+        if let Err(violations) = repo.canonicalize_kind_refs(spec, &mut fm) {
+            let rejections: Vec<Rejection> = violations
+                .into_iter()
+                .map(|v| Rejection {
+                    field: v.field,
+                    message: v.message,
+                })
+                .collect();
+            return Err(self.reject(&rejections));
+        }
         let uid = mint_kind_uid();
         fm.insert("uid".into(), Value::String(uid.clone()));
         if let Some(title) = &self.title {
