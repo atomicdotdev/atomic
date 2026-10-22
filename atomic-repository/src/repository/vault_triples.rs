@@ -240,10 +240,46 @@ impl Repository {
         limit: usize,
         pool: Option<usize>,
     ) -> Result<Vec<KgNode>, RepositoryError> {
+        self.vault_kg_search_inner(query, limit, pool, None)
+    }
+
+    /// Search VCS nodes and source content through the requested view's
+    /// validated closure. Filtering precedes candidate ranking and truncation.
+    /// Vault-only nodes remain repository-wide.
+    pub fn vault_kg_search_on_view(
+        &self,
+        view_name: &str,
+        query: &str,
+        limit: usize,
+        pool: Option<usize>,
+    ) -> Result<Vec<KgNode>, RepositoryError> {
+        let scope = self.query_view(view_name)?;
+        self.vault_kg_search_inner(query, limit, pool, Some(&scope))
+    }
+
+    fn vault_kg_search_inner(
+        &self,
+        query: &str,
+        limit: usize,
+        pool: Option<usize>,
+        scope: Option<&super::query::QueryView>,
+    ) -> Result<Vec<KgNode>, RepositoryError> {
         let txn = self.pristine.read_txn()?;
         let mut rows = BTreeMap::new();
         let mut content = HashMap::<String, usize>::new();
-        if crate::content_search::has_content_index(self.root()) {
+        if let Some(scope) = scope {
+            if let Ok(result) = scope.search_content(
+                query,
+                crate::content_search::ContentSearchOptions {
+                    max_results: Some(2000),
+                    ..Default::default()
+                },
+            ) {
+                for result in result.matches {
+                    *content.entry(result.path).or_default() += 1;
+                }
+            }
+        } else if crate::content_search::has_content_index(self.root()) {
             if let Ok(result) = crate::content_search::search_content(
                 self.root(),
                 query,
@@ -259,9 +295,26 @@ impl Repository {
         }
         for (id, _) in txn.kg_fts_match_ids(query)? {
             if let Some(node) = txn.get_kg_node(&id)? {
+                let node = if let Some(scope) = scope {
+                    let Some(node) = scope.project_node(&txn, node)? else {
+                        continue;
+                    };
+                    node
+                } else {
+                    node
+                };
                 let hits = fts_hits(&node, query);
                 if hits > 0 {
                     rows.insert(id, (node, hits));
+                }
+            }
+        }
+        // A visible rename or new file need not already have a KG posting.
+        if let Some(scope) = scope {
+            for node in scope.nodes().values() {
+                let hits = fts_hits(node, query);
+                if hits > 0 {
+                    rows.insert(node.id.clone(), (node.clone(), hits));
                 }
             }
         }

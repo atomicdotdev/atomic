@@ -88,6 +88,7 @@ async fn rejects_invalid_requests_and_unknown_methods() {
         "/atomic.ViewService/CreateView",
         "/atomic.ViewService/SwitchView",
         "/atomic.ViewService/DeleteView",
+        "/atomic.KnowledgeService/QueryGraph",
     ] {
         let error = service.call(method, &[]).await.unwrap_err();
         assert_eq!(error.code(), tonic::Code::InvalidArgument, "{method}");

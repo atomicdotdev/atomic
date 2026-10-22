@@ -114,6 +114,7 @@ mod project_tree;
 mod projection;
 mod projection_commit;
 mod projection_effects;
+mod query;
 pub mod ref_mapping;
 mod remote_cache;
 mod repair;

@@ -3343,6 +3343,42 @@ pub struct KnowledgeImpl {
     pub state: Arc<DaemonState>,
 }
 
+fn query_view_name(
+    repo: &atomic_repository::Repository,
+    requested: Option<&ViewRef>,
+) -> Result<String, Status> {
+    let Some(requested) = requested else {
+        let working_copy = repo.require_working_copy_id().map_err(repository_error)?;
+        return repo
+            .desired_view_name(working_copy)
+            .map_err(repository_error);
+    };
+    let name = match requested.name.as_deref().filter(|name| !name.is_empty()) {
+        Some(name) => name.to_string(),
+        None if !requested.view_id.is_empty() => repo
+            .list_views()
+            .map_err(repository_error)?
+            .into_iter()
+            .find(|name| super::sandbox_grants::view_ref_id(name) == requested.view_id)
+            .ok_or_else(|| domain_status(ErrorCode::View, "unknown query view ID"))?,
+        None => {
+            return Err(domain_status(
+                ErrorCode::InvalidArgument,
+                "query view must name a view or ID",
+            ))
+        }
+    };
+    if !requested.view_id.is_empty()
+        && requested.view_id != super::sandbox_grants::view_ref_id(&name)
+    {
+        return Err(domain_status(
+            ErrorCode::InvalidArgument,
+            "query view name and ID disagree",
+        ));
+    }
+    Ok(name)
+}
+
 #[tonic::async_trait]
 impl knowledge_service_server::KnowledgeService for KnowledgeImpl {
     async fn get_project_identity(
@@ -3449,9 +3485,76 @@ impl knowledge_service_server::KnowledgeService for KnowledgeImpl {
             request.limit as usize
         };
         let root = handle.root.clone();
+        let requested_view = request.view;
+        let content_limit = if request.limit == 0 {
+            30
+        } else {
+            request.limit as usize
+        };
         let response = tokio::task::spawn_blocking(move || match query {
+            QueryOneof::ContentSearch(search) => {
+                let repo = handle.repository_readonly()?;
+                let view = query_view_name(&repo, requested_view.as_ref())?;
+                let result = repo
+                    .search_content_paths_on_view(
+                        &view,
+                        &search.query,
+                        atomic_repository::ContentSearchOptions {
+                            path_filter: search.path_filter,
+                            file_type: search.file_type,
+                            exclude_type: search.exclude_type,
+                            max_results: Some(
+                                search
+                                    .max_results
+                                    .map(|n| n as usize)
+                                    .unwrap_or(content_limit),
+                            ),
+                            case_insensitive: search.case_insensitive,
+                        },
+                        &search.paths,
+                    )
+                    .map_err(repository_error)?;
+                Ok(QueryGraphResponse {
+                    api_version: 1,
+                    hits: result
+                        .matches
+                        .iter()
+                        .map(|m| ContentHit {
+                            path: m.path.clone(),
+                            snippet: m.line_content.clone(),
+                            line: Some(m.line_number as u64),
+                            score: None,
+                        })
+                        .collect(),
+                    content_result: Some(ContentSearchResult {
+                        matches: result
+                            .matches
+                            .into_iter()
+                            .map(|m| ContentMatch {
+                                path: m.path,
+                                line_number: m.line_number,
+                                line_content: m.line_content,
+                                byte_offset: m.byte_offset,
+                                submatch_start: m.submatch_start as u64,
+                                submatch_end: m.submatch_end as u64,
+                            })
+                            .collect(),
+                        total_matches: result.total_matches as u64,
+                        dir_facets: result
+                            .dir_facets
+                            .into_iter()
+                            .map(|(path, count)| ContentDirectoryFacet {
+                                path,
+                                count: count as u64,
+                            })
+                            .collect(),
+                    }),
+                    ..Default::default()
+                })
+            }
             QueryOneof::KgSearch(search) => {
-                let repo = handle.repository()?;
+                let repo = handle.repository_readonly()?;
+                let view = query_view_name(&repo, requested_view.as_ref())?;
                 // The candidate pool the CLI's --pool names (default 5000)
                 // — the pool is what lets lower-scored kinds survive the
                 // diversity selection, so it rides the request.
@@ -3463,7 +3566,7 @@ impl knowledge_service_server::KnowledgeService for KnowledgeImpl {
                     // kind's nodes, take the limit AFTER filtering — the
                     // local post-filter order.
                     let kind = kind_filter;
-                    repo.vault_kg_search(&search.query, pool, Some(pool))
+                    repo.vault_kg_search_on_view(&view, &search.query, pool, Some(pool))
                         .map_err(repository_error)?
                         .into_iter()
                         .filter(|node| node.types.contains(&kind))
@@ -3471,7 +3574,7 @@ impl knowledge_service_server::KnowledgeService for KnowledgeImpl {
                         .map(|node| crate::daemon::services_query::kg_node_proto(node.clone()))
                         .collect::<Vec<_>>()
                 } else {
-                    repo.vault_kg_search(&search.query, limit, Some(pool))
+                    repo.vault_kg_search_on_view(&view, &search.query, limit, Some(pool))
                         .map_err(repository_error)?
                         .into_iter()
                         .map(|node| crate::daemon::services_query::kg_node_proto(node.clone()))
@@ -3490,6 +3593,7 @@ impl knowledge_service_server::KnowledgeService for KnowledgeImpl {
                     calls_present: false,
                     ask_result: None,
                     ask_elapsed_ms: None,
+                    content_result: None,
                 })
             }
             QueryOneof::Neighbors(neighbors) => {
@@ -3512,6 +3616,7 @@ impl knowledge_service_server::KnowledgeService for KnowledgeImpl {
                     calls_present: false,
                     ask_result: None,
                     ask_elapsed_ms: None,
+                    content_result: None,
                 })
             }
             QueryOneof::Entity(entity) => {
@@ -3551,12 +3656,14 @@ impl knowledge_service_server::KnowledgeService for KnowledgeImpl {
                     calls_present: false,
                     ask_result: None,
                     ask_elapsed_ms: None,
+                    content_result: None,
                 })
             }
             QueryOneof::Callers(callers) => {
                 let repo = handle.repository_readonly()?;
+                let view = query_view_name(&repo, requested_view.as_ref())?;
                 let callers = repo
-                    .query_callers(&callers.node_id)
+                    .query_callers_on_view(&view, &callers.node_id)
                     .map_err(repository_error)?
                     .into_iter()
                     .map(|caller| crate::atomic::CodeCaller {
@@ -3626,6 +3733,7 @@ impl knowledge_service_server::KnowledgeService for KnowledgeImpl {
                         calls_present: false,
                         ask_result: None,
                         ask_elapsed_ms: None,
+                        content_result: None,
                     });
                 }
                 // 2. Expand: per-seed neighbor subgraphs, kind-filtered,
@@ -3738,6 +3846,7 @@ impl knowledge_service_server::KnowledgeService for KnowledgeImpl {
                     calls_present: false,
                     ask_result: None,
                     ask_elapsed_ms: None,
+                    content_result: None,
                 })
             }
             QueryOneof::Plan(plan) => {
@@ -3765,6 +3874,7 @@ impl knowledge_service_server::KnowledgeService for KnowledgeImpl {
                     calls_present: false,
                     ask_result: None,
                     ask_elapsed_ms: None,
+                    content_result: None,
                 })
             }
             QueryOneof::RagAsk(ask) => {
@@ -3812,12 +3922,9 @@ impl knowledge_service_server::KnowledgeService for KnowledgeImpl {
                         payload,
                     }),
                     ask_elapsed_ms: Some(elapsed.as_millis() as u64),
+                    content_result: None,
                 })
             }
-            other => Err(domain_status(
-                ErrorCode::InvalidArgument,
-                format!("query kind {other:?} lands with its slice"),
-            )),
         })
         .await
         .map_err(|e| Status::internal(e.to_string()))??;

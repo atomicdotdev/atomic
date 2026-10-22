@@ -453,6 +453,7 @@ dependencies = [
  "rayon",
  "redb 4.4.0",
  "reflink-copy",
+ "regex",
  "reqwest",
  "serde",
  "serde_json",
