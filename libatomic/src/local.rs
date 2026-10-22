@@ -11,16 +11,17 @@ use tonic::{Request, Status};
 
 use crate::atomic::{
     attestation_service_server::AttestationService, daemon_service_server::DaemonService,
+    knowledge_service_server::KnowledgeService,
     repository_mutation_service_server::RepositoryMutationService,
     repository_query_service_server::RepositoryQueryService, vault_service_server::VaultService,
     view_service_server::ViewService, AddFilesRequest, CreateViewRequest, DeleteViewRequest,
     GetChangeRequest, GetVaultContextRequest, GetVaultEntryRequest, ListVaultEntriesRequest,
-    ListViewsRequest, LogRequest, PreviewRestoreRequest, RecordRequest, ResolveRepositoryRequest,
-    StatusRequest, SwitchViewRequest, VerifyAttestationRequest,
+    ListViewsRequest, LogRequest, PreviewRestoreRequest, QueryGraphRequest, RecordRequest,
+    ResolveRepositoryRequest, StatusRequest, SwitchViewRequest, VerifyAttestationRequest,
 };
 use crate::daemon::{
     services::{DaemonImpl, MutationImpl, QueryImpl},
-    services_agent::{AttestationImpl, VaultImpl},
+    services_agent::{AttestationImpl, KnowledgeImpl, VaultImpl},
     services_query::ViewImpl,
     state::DaemonState,
 };
@@ -33,7 +34,7 @@ use crate::daemon::{
 ///
 /// Supports repository resolution, basic working-copy/change/view operations,
 /// read-only restore previews (including recorded file bytes),
-/// read-only vault get/list/context, and attestation verification. View-scoped
+/// read-only knowledge queries, vault get/list/context, and attestation verification. View-scoped
 /// vault reads are not supported; unsupported methods fail explicitly with
 /// `Unimplemented`.
 #[derive(Clone)]
@@ -230,6 +231,16 @@ impl LocalService {
                     state: self.state.clone(),
                 }
                 .get_vault_context(Request::new(request))
+                .await?;
+                Ok(response.into_inner().encode_to_vec())
+            }
+            "/atomic.KnowledgeService/QueryGraph" => {
+                let request = decode::<QueryGraphRequest>(request)?;
+                require_repository(&request.repository)?;
+                let response = KnowledgeImpl {
+                    state: self.state.clone(),
+                }
+                .query_graph(Request::new(request))
                 .await?;
                 Ok(response.into_inner().encode_to_vec())
             }

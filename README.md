@@ -298,8 +298,11 @@ Atomic builds a **knowledge graph** from your entire codebase — source code co
 # Search the knowledge graph — unified structural + content search
 atomic query search "replication"
 
-# Search source code content (powered by syntext trigram index)
+# Search recorded source code in the current view
 atomic query code "replication" -t cpp -g src/mongo/db/repl/
+
+# Find callers in the current view's recorded source
+atomic query callers "entity:src/auth.rs:verify:42"
 
 # List tree-sitter entities in a file (functions, classes, types)
 atomic query entities src/mongo/db/repl/replication_coordinator_impl.cpp
@@ -325,9 +328,20 @@ module:src/mongo/db/repl          ← directory-level grouping
   └─ PART_OF → module:src/mongo/db  (parent module)
 ```
 
-Search is powered by two indexes that work together:
-- **KG FTS** — searches node labels, summaries, and metadata (structural search)
-- **syntext** — trigram-indexed content search across all source files, ~20x faster than grep
+`query search`, `query callers`, and `query code` use the **current view's effective
+graph filter**: the view's changes, all ancestor views, and transitive dependencies.
+They read recorded source bytes, not unrecorded working-copy edits or stale
+content from another view. Deletions and renames follow the canonical view
+projection. Vault-only search results (such as memories and intents) remain shared.
+
+Structural search uses **KG FTS** candidates, filters them before ranking, and
+re-derives entities from the selected view's bytes. Content matching uses
+**syntext's** path/type filters and line verifier over those bytes; callers use
+the same tree-sitter call resolver as enrichment. These read-only queries do not
+require a working-copy content index or rebuild one. This correctness-first path
+renders/scans the selected view per query rather than trusting the shared index.
+The RPC supports an explicit view; omitting it uses the working copy's registered
+desired view. Other query verbs retain their existing scope semantics.
 
 Results are ranked: `src/` files above tests, modules above flat files, content match counts as a signal. A bounded min-heap ensures the top N results surface from thousands of matches without sorting the full set.
 
@@ -407,7 +421,7 @@ Every change stores two parallel representations:
 | Command | Description |
 |---------|-------------|
 | `atomic query search <query>` | Search the knowledge graph (structural + content) |
-| `atomic query code <pattern>` | Search source code content (trigram-indexed, `-t` for file type, `-g` for path filter) |
+| `atomic query code <pattern>` | Search recorded source in the current view (`-t` for file type, `-g` for path filter) |
 | `atomic query entities <path>` | List tree-sitter entities in a file (functions, classes, types with line ranges) |
 | `atomic query neighbors <id>` | Explore the graph around a node (DEFINES, MODIFIES, PART_OF, INCLUDES edges) |
 | `atomic query graph <query>` | Visualize the knowledge graph as interactive HTML (D3 force-directed, `-k` seeds, `--depth`, `--kinds`) |

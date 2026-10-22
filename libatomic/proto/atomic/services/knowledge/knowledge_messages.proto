@@ -7,7 +7,8 @@
 //    neighbors, callers, graph slice, plan execution, RAG ask;
 //  * MaintainKnowledgeGraph — embed/enrich/reindex (the write/rebuild side).
 // Local file-index construction (`query index`) remains client-side. QueryGraph
-// reads a view-scoped indexed snapshot; it must never build/refresh an index.
+// reads are read-only; the view-scoped search/callers/content paths project
+// recorded graph bytes and must never build/refresh a persistent index.
 
 syntax = "proto3";
 
@@ -21,7 +22,7 @@ message QueryGraphRequest {
   RepositoryRef repository = 1;
   uint32 limit = 2;             // default 10-20 per kind today
   oneof query {
-    ContentSearchQuery content_search = 3;   // `query code` (syntext index)
+    ContentSearchQuery content_search = 3;   // `query code` (recorded view bytes)
     KgSearchQuery kg_search = 4;             // `query search`
     EntityQuery entity = 5;                  // `query entities`
     NeighborsQuery neighbors = 6;            // `query neighbors`
@@ -30,16 +31,27 @@ message QueryGraphRequest {
     PlanExecutionQuery plan = 9;            // `query plan` (JSON plan steps)
     RagAskQuery rag_ask = 10;               // `query ask` (KG + LLM answer)
   }
-  ViewRef view = 11; // required; sandbox must match grant
-  // All nodes, edges, snippets, opaque payloads and every plan step are filtered
-  // BEFORE evaluation/provider calls by this effective perspective. Plans are
-  // read-only; no embed/enrich/reindex or arbitrary filesystem/provider action.
+  // For kg_search, callers, and content_search: use this view's full ancestor
+  // and dependency closure. Local callers may omit it to use WORKING_COPIES'
+  // authoritative desired view, never the current_view compatibility file.
+  // An explicit name/id mismatch or unknown view is an error, not a fallback.
+  // VCS candidates are filtered BEFORE ranking/limits. Vault-only KG records
+  // remain repository-wide. These reads never refresh indexes or materialize.
+  // Other query kinds retain their existing scope semantics.
+  ViewRef view = 11;
 }
 
 message ContentSearchQuery {
   string query = 1;
+  // Optional union of repository-relative paths or directory prefixes.
   repeated string paths = 2;
-  // SHAPE-CONFIRM: filters from query/mod.rs content search.
+  optional string path_filter = 3; // same glob semantics as `query code -g`
+  optional string file_type = 4;
+  optional string exclude_type = 5;
+  bool case_insensitive = 6;
+  // Omitted: use QueryGraphRequest.limit (or 30 when it is zero).
+  // Explicit zero: no displayed matches; totals/facets are still returned.
+  optional uint32 max_results = 7;
 }
 message KgSearchQuery {
   string query = 1;
@@ -60,6 +72,9 @@ message NeighborsQuery {
   optional uint32 depth = 3;
 }
 message CallersQuery {
+  // Resolve calls from the selected view's recorded sources using the same
+  // name-based tree-sitter resolver as enrichment; no enriched CALLS index is
+  // required. Sibling-view edges and working-copy edits are excluded.
   string node_id = 1;
 }
 message GraphSliceQuery {
@@ -99,13 +114,36 @@ message QueryGraphResponse {
   // The pre-cap node count (add-only): the `query graph` cap note's "N
   // nodes collected" figure.
   optional uint32 graph_collected = 7;
-  // Whether the neighbors subgraph holds ANY calls edge (add-only): the
-  // `query callers` hint's entry-point distinction.
+  // Whether the target has any incoming or outgoing call in the selected
+  // view. Retained for compatibility; no enrichment is required by callers.
   bool calls_present = 8;
   // The full agentic ask result (add-only; schema "atomic.query.ask.v1" =
   // the domain AgentResult JSON) plus its elapsed time.
   optional VersionedBytes ask_result = 9;
   optional uint64 ask_elapsed_ms = 10;
+  // Complete typed `query code` result, including scoped totals, facets and
+  // offsets. `hits` also carries the displayed lines for generic clients.
+  ContentSearchResult content_result = 11;
+}
+
+message ContentSearchResult {
+  repeated ContentMatch matches = 1;
+  uint64 total_matches = 2;
+  repeated ContentDirectoryFacet dir_facets = 3;
+}
+
+message ContentMatch {
+  string path = 1;
+  uint32 line_number = 2;
+  string line_content = 3;
+  uint64 byte_offset = 4;
+  uint64 submatch_start = 5;
+  uint64 submatch_end = 6;
+}
+
+message ContentDirectoryFacet {
+  string path = 1;
+  uint64 count = 2;
 }
 
 message KGNode {

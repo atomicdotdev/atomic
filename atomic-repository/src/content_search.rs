@@ -225,6 +225,56 @@ pub fn search_content(
                 && !ignore_rules.is_ignored(&m.path, false)
         })
         .collect();
+    Ok(rank_content_matches(raw_matches, display_limit))
+}
+
+/// Search graph-rendered bytes without consulting the working-copy index.
+/// Path/type matching and line verification use the same syntext machinery as
+/// indexed search; filtering and ranking happen before the display limit.
+pub(crate) fn search_file_contents(
+    files: &std::collections::BTreeMap<String, Vec<u8>>,
+    pattern: &str,
+    opts: ContentSearchOptions,
+) -> Result<ContentSearchResult, ContentSearchError> {
+    let re = regex::bytes::RegexBuilder::new(pattern)
+        .case_insensitive(opts.case_insensitive)
+        .size_limit(10 * 1024 * 1024)
+        .dfa_size_limit(10 * 1024 * 1024)
+        .build()
+        .map_err(|error| ContentSearchError::InvalidPattern(error.to_string()))?;
+    let paths: Vec<_> = files.keys().map(std::path::PathBuf::from).collect();
+    let path_index = syntext::path::PathIndex::build(&paths);
+    let filter = syntext::path::filter::build_filter(
+        &path_index,
+        opts.file_type.as_deref(),
+        opts.exclude_type.as_deref(),
+        opts.path_filter.as_deref(),
+    );
+    let mut matches = Vec::new();
+    for (id, (path, content)) in files.iter().enumerate() {
+        if content.len() > 10 * 1024 * 1024
+            || filter
+                .as_ref()
+                .is_some_and(|filter| !filter.file_ids.contains(id as u32))
+        {
+            continue;
+        }
+        matches.extend(syntext::search::verifier::verify_regex(
+            &re,
+            Path::new(path),
+            content,
+        ));
+    }
+    Ok(rank_content_matches(
+        matches,
+        opts.max_results.unwrap_or(50),
+    ))
+}
+
+fn rank_content_matches(
+    raw_matches: Vec<syntext::SearchMatch>,
+    display_limit: usize,
+) -> ContentSearchResult {
     let total_matches = raw_matches.len();
 
     // Build per-directory match counts for the facets summary.
@@ -265,11 +315,11 @@ pub fn search_content(
         })
         .collect();
 
-    Ok(ContentSearchResult {
+    ContentSearchResult {
         matches,
         total_matches,
         dir_facets,
-    })
+    }
 }
 
 /// Assign a ranking tier to a file path.

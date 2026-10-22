@@ -45,6 +45,7 @@ ignore = { workspace = true }
 git2 = { workspace = true }
 
 syntext = { workspace = true }
+regex = "1"
 tempfile = { workspace = true }
 log = { workspace = true }
 chrono = { workspace = true }
