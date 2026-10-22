@@ -117,11 +117,16 @@ pub(crate) fn display_path(vault_relative: &str) -> String {
 }
 
 /// `registered`, `invalid`, or `conflicted` (invalid because the definition
-/// has unresolved merge-conflict markers).
+/// has unresolved merge-conflict markers, or, in a view, an unresolved name
+/// conflict).
 pub(crate) fn status_label(definition: &KindDefinition) -> &'static str {
     match &definition.status {
         KindStatus::Registered(_) => "registered",
-        KindStatus::Invalid(problems) if problems.iter().any(|p| p.contains("conflict marker")) => {
+        KindStatus::Invalid(problems)
+            if problems
+                .iter()
+                .any(|p| p.contains("conflict marker") || p.contains("name conflict")) =>
+        {
             "conflicted"
         }
         KindStatus::Invalid(_) => "invalid",
@@ -307,6 +312,12 @@ mod tests {
         d.status = KindStatus::Invalid(vec![
             "the file contains unresolved merge-conflict markers".into()
         ]);
+        assert_eq!(status_label(&d), "conflicted");
+        let conflict = atomic_repository::KindNameConflict {
+            claimants: 2,
+            directory: false,
+        };
+        d.status = KindStatus::Invalid(vec![conflict.describe()]);
         assert_eq!(status_label(&d), "conflicted");
         d.status = KindStatus::Invalid(vec!["fields.x: bad".into()]);
         assert_eq!(status_label(&d), "invalid");
