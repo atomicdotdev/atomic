@@ -113,7 +113,15 @@ const TOP_LEVEL_KEYS: &[&str] = &[
     "context",
 ];
 
-const FIELD_KEYS: &[&str] = &["type", "required", "values", "target", "edge", "default"];
+const FIELD_KEYS: &[&str] = &[
+    "type",
+    "required",
+    "values",
+    "target",
+    "edge",
+    "default",
+    "description",
+];
 
 const CROCKFORD: &[u8] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 
@@ -294,6 +302,9 @@ pub struct FieldSpec {
     /// validating, so a missing required field is still reported.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default: Option<Value>,
+    /// Free-text guidance for authors; never validated beyond being a string.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
 }
 
 /// The `body:` section of a definition.
@@ -453,6 +464,13 @@ impl KindSpec {
                     name,
                     format!("edge: {edge}"),
                     format!("sh:path {}", namespaced_edge(&self.name, edge)),
+                ));
+            }
+            if let Some(description) = &f.description {
+                rows.push(row(
+                    name,
+                    format!("description: {description}"),
+                    format!("sh:description {description:?}"),
                 ));
             }
             if let Some(default) = &f.default {
@@ -673,6 +691,15 @@ fn check_field(name: &str, spec: &Value, p: &mut Problems) {
             p.at(
                 &format!("{path}.required"),
                 format_args!("expected a boolean, got {}", type_name(v)),
+            );
+        }
+    }
+
+    if let Some(v) = spec.get("description") {
+        if !v.is_string() {
+            p.at(
+                &format!("{path}.description"),
+                format_args!("expected a string, got {}", type_name(v)),
             );
         }
     }
@@ -1165,23 +1192,32 @@ pub fn validate_instance(
     }
 }
 
-fn is_conflict_marker_line(line: &str) -> bool {
-    ["<<<<<<<", "=======", ">>>>>>>"].iter().any(|m| {
-        line.strip_prefix(m)
-            .is_some_and(|rest| rest.is_empty() || rest.starts_with(' '))
-    })
+fn starts_with_marker(line: &str, marker: &str) -> bool {
+    line.strip_prefix(marker)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with(' '))
 }
 
+fn is_open_close_marker(line: &str) -> bool {
+    starts_with_marker(line, "<<<<<<<") || starts_with_marker(line, ">>>>>>>")
+}
+
+/// The 1-based line of the first conflict marker. A `=======` separator only
+/// counts when the text also has an opening or closing marker, so a markdown
+/// setext heading underlined with exactly seven `=` is not a conflict.
 fn first_conflict_marker_line(text: &str) -> Option<usize> {
+    let separators_count = text.lines().any(is_open_close_marker);
     text.lines()
-        .position(is_conflict_marker_line)
+        .position(|l| {
+            is_open_close_marker(l) || (separators_count && starts_with_marker(l, "======="))
+        })
         .map(|i| i + 1)
 }
 
 /// Does `text` contain a merge-conflict marker line? A marker is seven `<`,
 /// `=` or `>` at the start of a line, alone or followed by a space. That
 /// covers Git's `<<<<<<< ours` / `=======` / `>>>>>>> theirs` and Atomic's
-/// own `>>>>>>> 1 [HASH]` / `======= 1` / `<<<<<<< 1`.
+/// own `>>>>>>> 1 [HASH]` / `======= 1` / `<<<<<<< 1`. A `=======` separator
+/// counts only alongside an opening or closing marker.
 pub fn has_conflict_markers(text: &str) -> bool {
     first_conflict_marker_line(text).is_some()
 }
@@ -1923,11 +1959,10 @@ mod tests {
     fn conflict_marker_detection() {
         for yes in [
             "<<<<<<< HEAD\n",
-            "x\n=======\ny",
-            "x\r\n=======\r\ny",
+            "x\n=======\ny\n>>>>>>> theirs",
+            "x\r\n=======\r\ny\r\n<<<<<<< 1",
             ">>>>>>> branch",
             ">>>>>>> 1 [ABCDEFGH]\n",
-            "a\n======= 1\nb",
             "<<<<<<< 1",
             "<<<<<<<",
         ] {
@@ -1939,12 +1974,52 @@ mod tests {
             " <<<<<<< indented",
             "a ======= b",
             "Title\n========\n",
+            "Title\n=======\n",
+            "x\n=======\ny",
+            "a\n======= 1\nb",
             "<<<<<<<< eight",
             ">>>>>>>x",
             "======-",
         ] {
             assert!(!has_conflict_markers(no), "{no:?}");
         }
+    }
+
+    #[test]
+    fn setext_heading_is_not_a_conflict_marker() {
+        let body = "Decision\n=======\n\nWe sign change headers.\n";
+        assert!(!has_conflict_markers(body));
+        assert!(validate(&instance(), body).conforms);
+
+        // With an opener or closer present, the separator counts too: the
+        // first marker reported is the separator on line 2.
+        let body = "x\n=======\ny\n>>>>>>> theirs\n";
+        assert_eq!(
+            only(&validate(&instance(), body)).message,
+            "unresolved conflict marker at body line 2"
+        );
+    }
+
+    #[test]
+    fn field_description() {
+        let spec =
+            one_field(json!({"type": "string", "description": "One-line summary."})).unwrap();
+        assert_eq!(
+            spec.field("f").unwrap().description.as_deref(),
+            Some("One-line summary.")
+        );
+        assert!(spec
+            .summary_rows()
+            .iter()
+            .any(|r| r.subject == "f" && r.shacl == r#"sh:description "One-line summary.""#));
+        assert_rejected_with(
+            one_field(json!({"type": "string", "description": 3})),
+            "fields.f.description: expected a string, got integer",
+        );
+        assert!(!adr()
+            .summary_rows()
+            .iter()
+            .any(|r| r.shacl.starts_with("sh:description")));
     }
 
     #[test]
