@@ -10,7 +10,8 @@ use atomic_repository::{
 };
 
 use super::{
-    display_path, kind_not_found, open_repository, status_label, status_problems, Guidance,
+    display_path, display_text, kind_not_found, open_repository, status_label, status_problems,
+    Guidance,
 };
 use crate::commands::Command;
 use crate::error::{CliError, CliResult};
@@ -66,7 +67,7 @@ impl KindList {
                         "name": def.name,
                         "status": status_label(def),
                         "def_path": display_path(&def.def_path),
-                        "instances": entry.instances.len(),
+                        "instance_count": entry.instances.len(),
                         "edges": entry.spec().map(KindSpec::edges).unwrap_or_default(),
                         "problems": status_problems(def),
                     });
@@ -216,7 +217,12 @@ impl KindList {
         }
 
         for p in status_problems(def) {
-            eprintln!("{} {}: {p}", warning("⚠"), display_path(&def.def_path));
+            eprintln!(
+                "{} {}: {}",
+                warning("⚠"),
+                display_path(&def.def_path),
+                display_text(p)
+            );
         }
         if rows.is_empty() {
             println!(
@@ -238,7 +244,9 @@ impl KindList {
             for row in &rows {
                 let mut cells = vec![
                     short_uid(&row.uid),
-                    row.title.clone().unwrap_or_else(|| "-".to_string()),
+                    row.title
+                        .as_deref()
+                        .map_or_else(|| "-".to_string(), display_text),
                 ];
                 cells.extend(columns.iter().map(|c| cell(row.fields.get(c))));
                 table.add_row(cells);
@@ -289,11 +297,12 @@ fn short_uid(uid: &str) -> String {
     }
 }
 
+/// A field value on one table line; see [`display_text`].
 fn cell(value: Option<&Value>) -> String {
     match value {
         None | Some(Value::Null) => "-".to_string(),
-        Some(Value::String(s)) => s.clone(),
-        Some(other) => other.to_string(),
+        Some(Value::String(s)) => display_text(s),
+        Some(other) => display_text(&other.to_string()),
     }
 }
 
