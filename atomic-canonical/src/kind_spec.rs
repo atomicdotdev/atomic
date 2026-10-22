@@ -42,7 +42,10 @@ use thiserror::Error;
 pub const SPEC_VERSION: u64 = 1;
 
 /// Kind names a definition may not claim: the built-in node types, the vault's
-/// own directories and entry types, and their plurals.
+/// own directories and entry types, and their plurals; every node-id prefix
+/// and node kind atomic writes to the knowledge graph; and the CURIE and URI
+/// prefixes those ids share the graph with. An instance's KG id is
+/// `<k>:<ULID>`, so any of these as `<k>` would land in a built-in namespace.
 pub const RESERVED_KIND_NAMES: &[&str] = &[
     "goal",
     "session",
@@ -83,6 +86,24 @@ pub const RESERVED_KIND_NAMES: &[&str] = &[
     "sessions",
     "kinds",
     "kind",
+    // Other KG node-id prefixes and node kinds: session ledger
+    // (`provenance:<hash>`, `session_turn`), read-content results
+    // (`content:<path>`), triage walkthrough layers (`layer:<dir>`), and agent
+    // reasoning journal events (`reasoning:<n>`).
+    "provenance",
+    "session_turn",
+    "content",
+    "layer",
+    "reasoning",
+    // Ontology CURIE prefixes (`pristine::ontology::ns`; `vault` is above) and
+    // the URI schemes used as node ids (`urn:atomic:…`, `did:atomic:…`).
+    "atom",
+    "prov",
+    "skos",
+    "dc",
+    "rdf",
+    "urn",
+    "did",
 ];
 
 /// Field names a definition may not declare. `uid` and `title` have fixed
@@ -2305,6 +2326,18 @@ mod tests {
         for t in BUILTIN_REF_TARGETS {
             assert!(is_reserved_kind_name(t) && is_ref_target_name(t));
         }
-        assert_eq!(RESERVED_KIND_NAMES.len(), 39);
+        // KG namespaces that once slipped through.
+        for k in [
+            "layer",
+            "provenance",
+            "reasoning",
+            "session_turn",
+            "content",
+        ] {
+            assert!(is_reserved_kind_name(k), "{k}");
+        }
+        let unique: BTreeSet<_> = RESERVED_KIND_NAMES.iter().collect();
+        assert_eq!(unique.len(), RESERVED_KIND_NAMES.len(), "duplicates");
+        assert_eq!(RESERVED_KIND_NAMES.len(), 51);
     }
 }

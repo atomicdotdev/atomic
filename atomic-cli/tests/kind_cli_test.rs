@@ -121,6 +121,8 @@ fn init_validate_and_reject_bad_definitions() {
     let reserved = f.fails(&["kind", "init", "intent"], 2);
     assert!(reserved.contains("reserved"), "{reserved}");
     assert!(!f.kind_dir("intent").exists());
+    let reserved = f.fails(&["kind", "init", "layer"], 2);
+    assert!(reserved.contains("reserved"), "{reserved}");
 
     let created = f.ok(&["kind", "init", "adr"]);
     assert!(
