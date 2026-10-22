@@ -126,7 +126,8 @@ fn print_report(report: &KindValidationReport) {
                         plural(n, "instance", "instances")
                     ),
                 };
-                println!("{mark_ok} {}: {edges}; {instances}", kind.name);
+                let fields = plural(kind.field_count, "field", "fields");
+                println!("{mark_ok} {}: {fields}, {edges}; {instances}", kind.name);
                 for instance in &kind.instances {
                     for v in &instance.violations {
                         let at = v
