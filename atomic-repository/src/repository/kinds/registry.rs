@@ -3,6 +3,8 @@
 use std::collections::BTreeMap;
 
 use atomic_canonical::kind_spec::{has_conflict_markers, is_valid_kind_name, KindSpec};
+use atomic_core::pristine::VaultEntry;
+use serde_json::{Map, Value};
 
 use super::{kind_definition_path, KindFiles, KindPath};
 use crate::repository::vault_frontmatter::{parse_frontmatter_strict, split_frontmatter};
@@ -89,6 +91,73 @@ impl KindDefinition {
     }
 }
 
+impl KindDefinition {
+    /// Parse the definition of kind `name` from its **stored** vault entry
+    /// (`kinds/<name>/_kind.md` as deflated into redb), the way KG
+    /// projection and the embedding policy read it.
+    ///
+    /// Fails closed like [`KindDefinition::parse`]: a merge-conflict marker
+    /// in the body or in any frontmatter string, or frontmatter stored as
+    /// `{}` (what deflate stores when a `kinds/` block is missing or does not
+    /// parse strictly) leaves the kind [`KindStatus::Invalid`].
+    pub fn from_stored(name: &str, entry: &VaultEntry) -> KindDefinition {
+        let def_path = kind_definition_path(name);
+        let invalid = |problems: Vec<String>, guidance: &str| KindDefinition {
+            name: name.to_string(),
+            def_path: def_path.clone(),
+            status: KindStatus::Invalid(problems),
+            guidance: guidance.to_string(),
+        };
+        let Ok(body) = std::str::from_utf8(&entry.content_bytes) else {
+            return invalid(vec!["the body is not valid UTF-8".into()], "");
+        };
+        let fm = match serde_json::from_str::<Map<String, Value>>(&entry.frontmatter_json) {
+            Ok(fm) => fm,
+            Err(e) => return invalid(vec![format!("stored frontmatter: {e}")], body),
+        };
+        if has_conflict_markers(body)
+            || fm
+                .iter()
+                .any(|(k, v)| has_conflict_markers(k) || value_has_conflict_markers(v))
+        {
+            return invalid(
+                vec!["the file contains unresolved merge-conflict markers".into()],
+                body,
+            );
+        }
+        if fm.is_empty() {
+            return invalid(
+                vec![
+                    "no frontmatter: the block is missing or did not parse when the file was \
+                     deflated"
+                        .into(),
+                ],
+                body,
+            );
+        }
+        match KindSpec::from_frontmatter(name, &fm) {
+            Ok(spec) => KindDefinition {
+                name: name.to_string(),
+                def_path,
+                status: KindStatus::Registered(spec),
+                guidance: body.to_string(),
+            },
+            Err(e) => invalid(e.problems, body),
+        }
+    }
+}
+
+fn value_has_conflict_markers(value: &Value) -> bool {
+    match value {
+        Value::String(s) => has_conflict_markers(s),
+        Value::Array(items) => items.iter().any(value_has_conflict_markers),
+        Value::Object(map) => map
+            .iter()
+            .any(|(k, v)| has_conflict_markers(k) || value_has_conflict_markers(v)),
+        _ => false,
+    }
+}
+
 /// A kind in a [`KindRegistry`]: its definition plus the instance files
 /// found beside it.
 #[derive(Debug, Clone, PartialEq)]
@@ -155,7 +224,7 @@ impl KindRegistry {
     /// file does not exist or `name` is not a valid kind name. A definition
     /// with an unresolved name conflict in a view is [`KindStatus::Invalid`].
     ///
-    /// This is the per-instance lookup for KG projection.
+    /// This is the per-target lookup of [`KindRefResolver`](super::KindRefResolver).
     pub fn load_kind(
         files: &KindFiles<'_>,
         name: &str,

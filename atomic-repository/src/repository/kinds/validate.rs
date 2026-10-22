@@ -2,53 +2,80 @@
 
 use atomic_canonical::kind_spec::{
     has_conflict_markers, instance_kg_id, is_valid_kind_name, is_valid_ulid, validate_instance,
-    InstanceReport, KindSpec, KindViolation, RefResolver,
+    BaseType, FieldSpec, InstanceReport, KindSpec, KindViolation, KindViolationCode, RefResolver,
+    BUILTIN_REF_TARGETS,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-use super::{kind_instance_path, KindFiles, KindPath, KindSource, KindStatus, KINDS_DIR};
+use std::cell::RefCell;
+use std::collections::HashMap;
+
+use super::{
+    kind_instance_path, KindFiles, KindPath, KindRegistry, KindSource, KindStatus, KINDS_DIR,
+};
 use crate::repository::vault_frontmatter::{parse_frontmatter_strict, split_frontmatter};
 use crate::repository::Repository;
 use crate::RepositoryError;
 
 /// Resolves kind ref values against one [`KindFiles`] source.
 ///
-/// - A custom kind `k`: `raw` must be a ULID and `kinds/k/<raw>.md` must
-///   exist in the source; resolves to `k:<raw>`.
+/// - A custom kind `k`: `raw` must be a ULID, `k` must be **registered** in
+///   the same source (its `_kind.md` parses into a valid spec), and
+///   `kinds/k/<raw>.md` must exist there; resolves to `k:<raw>`. An instance
+///   of an unregistered or invalid kind is not a node, so a ref to it does
+///   not resolve.
 /// - `memory`: `memory/<raw>.md` must exist in the source; resolves to that
 ///   vault path.
-/// - `intent`: resolved through [`Repository::vault_intent_path`], which
-///   accepts human keys (`PIMO-12`) and ULID prefixes; resolves to the
-///   intent's vault path.
+/// - `intent`: `raw` must be the intent's full ULID (any case) or its full
+///   human key exactly as stored in the manifest (`PIMO::alice::3`);
+///   resolves to the intent's vault path. Short forms that depend on the
+///   current identity (`3`, `alice::3`) or on uniqueness (a ULID prefix) do
+///   not resolve: [`Repository::canonicalize_kind_refs`] rewrites them
+///   before an instance is written.
 ///
 /// The resolved value is an opaque id: the gate only needs to know a ref
 /// resolves, and it is not a KG subject.
 ///
-/// Intent resolution reads the redb vault index, not the source's files,
-/// because intents are addressed by keys that only the manifest maps to
-/// paths. Against a view source an intent ref therefore resolves when the
-/// intent exists anywhere in the repository, even if the view does not
-/// track it.
+/// Intent resolution always reads the redb vault index, because intents are
+/// addressed by keys only the manifest maps to paths. Against a view source
+/// an intent ref therefore resolves when the intent exists anywhere in the
+/// repository, even if the view does not track it.
 pub struct KindRefResolver<'a, 'r> {
     files: &'a KindFiles<'r>,
+    /// Whether each custom target kind is registered, looked up once.
+    registered: RefCell<HashMap<String, bool>>,
 }
 
 impl<'a, 'r> KindRefResolver<'a, 'r> {
     pub fn new(files: &'a KindFiles<'r>) -> Self {
-        Self { files }
+        Self {
+            files,
+            registered: RefCell::default(),
+        }
+    }
+
+    fn is_registered(&self, kind: &str) -> bool {
+        if let Some(&known) = self.registered.borrow().get(kind) {
+            return known;
+        }
+        let registered = KindRegistry::load_kind(self.files, kind)
+            .unwrap_or_else(|e| {
+                log::debug!("kind ref target {kind}: {e}");
+                None
+            })
+            .is_some_and(|d| d.spec().is_some());
+        self.registered
+            .borrow_mut()
+            .insert(kind.to_string(), registered);
+        registered
     }
 }
 
 impl RefResolver for KindRefResolver<'_, '_> {
     fn resolve(&self, target_kind: &str, raw: &str) -> Option<String> {
         match target_kind {
-            "intent" => self
-                .files
-                .repository()
-                .vault_intent_path(raw)
-                .ok()
-                .flatten(),
+            "intent" => self.files.repository().intent_path_strict(raw),
             "memory" => {
                 let name_ok = !raw.is_empty()
                     && !raw.contains('\\')
@@ -58,10 +85,9 @@ impl RefResolver for KindRefResolver<'_, '_> {
                 let path = format!("memory/{raw}.md");
                 (name_ok && self.files.exists(&path)).then_some(path)
             }
-            kind if is_valid_kind_name(kind) && is_valid_ulid(raw) => self
-                .files
-                .exists(&kind_instance_path(kind, raw))
-                .then(|| instance_kg_id(kind, raw)),
+            kind if is_valid_kind_name(kind) && is_valid_ulid(raw) => (self.is_registered(kind)
+                && self.files.exists(&kind_instance_path(kind, raw)))
+            .then(|| instance_kg_id(kind, raw)),
             _ => None,
         }
     }
@@ -407,6 +433,107 @@ impl Repository {
             kinds,
             problems,
         })
+    }
+
+    /// Rewrite every user-typed intent reference in `fm` to the form a
+    /// stored instance must use (see [`KindRefResolver`]): the intent's
+    /// full human key when it has one, else its full ULID.
+    ///
+    /// Only values of `ref` fields that target `intent` are touched, and
+    /// only when the value does not already resolve as written (against the
+    /// working copy, trying the field's targets in order) — so a full key, a
+    /// full ULID, or a ref to another target kind stays as it is. A value is
+    /// looked up the way `atomic intent show` does: `3` and `alice::3` are
+    /// composed with the current project and identity, and a ULID prefix
+    /// must be unique. An `intent:`-qualified value keeps its qualifier.
+    ///
+    /// A value no intent matches is left alone for validation to report as
+    /// `UNRESOLVED_REF`.
+    ///
+    /// # Errors
+    ///
+    /// One `UNRESOLVED_REF` violation per value that is ambiguous (a ULID
+    /// prefix shared by several intents); `fm` is still updated for every
+    /// other value.
+    pub fn canonicalize_kind_refs(
+        &self,
+        spec: &KindSpec,
+        fm: &mut Map<String, Value>,
+    ) -> Result<(), Vec<KindViolation>> {
+        let files = self.kind_files(&KindSource::WorkingCopy).map_err(|e| {
+            vec![KindViolation {
+                code: KindViolationCode::UnresolvedRef,
+                field: None,
+                message: e.to_string(),
+            }]
+        })?;
+        let resolver = KindRefResolver::new(&files);
+        let mut violations = Vec::new();
+        for (name, field) in &spec.fields {
+            if field.field_type.base != BaseType::Ref || !field.target.iter().any(|t| t == "intent")
+            {
+                continue;
+            }
+            let Some(value) = fm.get_mut(name) else {
+                continue;
+            };
+            let items: Vec<&mut Value> = match value {
+                Value::Array(items) => items.iter_mut().collect(),
+                other => vec![other],
+            };
+            for item in items {
+                let Value::String(raw) = item else { continue };
+                match self.canonical_kind_intent_ref(field, raw.trim(), &resolver) {
+                    Ok(Some(canonical)) => *raw = canonical,
+                    Ok(None) => {}
+                    Err(message) => violations.push(KindViolation {
+                        code: KindViolationCode::UnresolvedRef,
+                        field: Some(name.clone()),
+                        message,
+                    }),
+                }
+            }
+        }
+        if violations.is_empty() {
+            Ok(())
+        } else {
+            Err(violations)
+        }
+    }
+
+    /// The canonical form of one ref value, or `None` to leave it as it is.
+    fn canonical_kind_intent_ref(
+        &self,
+        field: &FieldSpec,
+        raw: &str,
+        resolver: &KindRefResolver<'_, '_>,
+    ) -> Result<Option<String>, String> {
+        // `<kind>:<id>` with a single colon is qualified, as in validation;
+        // `alice::3` is an intent short form, not kind `alice`.
+        let qualified = raw.split_once(':').filter(|(k, id)| {
+            !id.starts_with(':') && (BUILTIN_REF_TARGETS.contains(k) || is_valid_kind_name(k))
+        });
+        let (prefix, id) = match qualified {
+            Some(("intent", id)) => ("intent:", id),
+            Some(_) => return Ok(None),
+            None => {
+                if field
+                    .target
+                    .iter()
+                    .any(|t| resolver.resolve(t, raw).is_some())
+                {
+                    return Ok(None);
+                }
+                ("", raw)
+            }
+        };
+        if resolver.resolve("intent", id).is_some() {
+            return Ok(None);
+        }
+        match self.canonical_intent_reference(id) {
+            Ok(found) => Ok(found.map(|canonical| format!("{prefix}{canonical}"))),
+            Err(e) => Err(format!("{raw:?}: {e}")),
+        }
     }
 
     fn validate_one(
