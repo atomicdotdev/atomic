@@ -100,8 +100,6 @@ fn kinds_classify_paths() {
 
 #[test]
 fn kinds_helpers() {
-    let (dir, repo) = vault_repo();
-    assert_eq!(repo.kinds_dir(), dir.path().join(".vault/kinds"));
     assert_eq!(kind_definition_path("adr"), "kinds/adr/_kind.md");
     assert_eq!(
         kind_instance_path("adr", UID),

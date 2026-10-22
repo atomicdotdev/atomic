@@ -358,11 +358,6 @@ fn walk_files(dir: &Path, rel: &str, out: &mut Vec<String>) -> Result<(), Reposi
 pub(crate) struct KindRegistryCache(Mutex<HashMap<Merkle, Arc<KindRegistry>>>);
 
 impl Repository {
-    /// The working copy's kinds directory, `.vault/kinds`.
-    pub fn kinds_dir(&self) -> PathBuf {
-        self.vault_dir().join(KINDS_DIR)
-    }
-
     /// Kind `kind`'s definition as **stored** in redb at exactly
     /// `kinds/<kind>/_kind.md`, or `None` when there is no such entry or
     /// `kind` is not a valid kind name. See [`KindDefinition::from_stored`].
