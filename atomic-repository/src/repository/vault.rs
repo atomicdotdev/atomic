@@ -6,7 +6,7 @@ use atomic_core::pristine::vault::{
 use atomic_core::types::{Hash, Merkle};
 
 pub(crate) use super::vault_frontmatter::parse_vault_frontmatter_at;
-use super::vault_frontmatter::parse_yaml_value;
+use super::vault_frontmatter::write_frontmatter_field;
 
 /// Directory name for the vault at the project root.
 const VAULT_DIR: &str = ".vault";
@@ -1327,53 +1327,6 @@ pub(crate) fn render_entry_to_markdown(entry: &VaultEntry) -> String {
     output.push_str(&content);
 
     output
-}
-
-/// Write a single frontmatter field in YAML format.
-fn write_frontmatter_field(output: &mut String, key: &str, value: &serde_json::Value) {
-    use std::fmt::Write;
-    match value {
-        serde_json::Value::String(s) => {
-            // Keep simple strings readable, but quote values that our parser
-            // would otherwise reinterpret as another scalar/container type.
-            // JSON string syntax is valid YAML and preserves escapes.
-            let parsed_unquoted = parse_yaml_value(s);
-            let has_edge_whitespace = s.chars().next().is_some_and(char::is_whitespace)
-                || s.chars().last().is_some_and(char::is_whitespace);
-            if parsed_unquoted != serde_json::Value::String(s.clone())
-                || s.contains(": ")
-                || s.contains('#')
-                || s.contains('\n')
-                || s.starts_with('{')
-                || s.starts_with('[')
-                || s.starts_with('"')
-                || s.starts_with('\'')
-                || has_edge_whitespace
-            {
-                let rendered = serde_json::to_string(s).unwrap_or_else(|_| "\"\"".to_string());
-                let _ = writeln!(output, "{}: {}", key, rendered);
-            } else {
-                let _ = writeln!(output, "{}: {}", key, s);
-            }
-        }
-        serde_json::Value::Number(n) => {
-            let _ = writeln!(output, "{}: {}", key, n);
-        }
-        serde_json::Value::Bool(b) => {
-            let _ = writeln!(output, "{}: {}", key, b);
-        }
-        serde_json::Value::Array(arr) => {
-            let rendered = serde_json::to_string(arr).unwrap_or_else(|_| "[]".to_string());
-            let _ = writeln!(output, "{}: {}", key, rendered);
-        }
-        serde_json::Value::Object(_) => {
-            // Inline JSON for nested objects
-            let _ = writeln!(output, "{}: {}", key, value);
-        }
-        serde_json::Value::Null => {
-            let _ = writeln!(output, "{}: null", key);
-        }
-    }
 }
 
 // ── Deflation helpers ───────────────────────────────────────────────────
