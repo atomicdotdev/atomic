@@ -4,9 +4,7 @@
 //! memory, skills, and user-defined kinds under `kinds/`) and stores them in
 //! the pristine KG tables.
 
-use super::kinds::{
-    KindDefinition, KindPath, KindRefResolver, KindRegistry, KindSource, KindStatus, KINDS_DIR,
-};
+use super::kinds::{KindDefinition, KindPath, KindRefResolver, KindStatus, KINDS_DIR};
 use super::*;
 use crate::content_search::{has_content_index, search_content, ContentSearchOptions};
 use atomic_canonical::kind_spec::{
@@ -789,10 +787,15 @@ impl Repository {
     /// KG data for a Scratch entry: a kind definition or instance under
     /// `kinds/`, or nothing.
     ///
-    /// Kind status is read from the working copy's `kinds/<k>/_kind.md`
-    /// (never from redb). An instance is validated from the stored entry —
-    /// its frontmatter and body as deflated — so the projection is a function
-    /// of the entry and its spec; a ref resolves against working-copy files.
+    /// Everything comes from redb's stored vault entries, never from the
+    /// working copy: the KG is a redb-derived projection in which the last
+    /// deflate wins, so an instance and its spec must come from the same
+    /// layer. The `kind:<k>` node is built from the definition entry being
+    /// extracted; an instance is validated from its stored frontmatter and
+    /// body against the stored `kinds/<k>/_kind.md` (see
+    /// [`Repository::stored_kind_definition`]), and its refs resolve against
+    /// stored entries ([`KindRefResolver::stored`]). The per-view gate
+    /// (`kind validate`, `kind new`) still resolves from files.
     fn vault_extract_kind_kg(
         &self,
         path: &str,
@@ -803,16 +806,14 @@ impl Repository {
         let Some(subject) = kind_subject(path) else {
             return Ok((nodes, edges));
         };
-        let files = self.kind_files(&KindSource::WorkingCopy)?;
         match KindPath::classify(path) {
             Some(KindPath::Definition { kind }) => {
-                let Some(definition) = KindRegistry::load_kind(&files, &kind)? else {
-                    return Ok((nodes, edges));
-                };
+                let definition = KindDefinition::from_stored(&kind, entry);
                 nodes.push(kind_definition_node(&subject, path, &definition));
             }
             Some(KindPath::Instance { kind, uid }) => {
-                let Some(spec) = KindRegistry::load_kind(&files, &kind)?
+                let Some(spec) = self
+                    .stored_kind_definition(&kind)?
                     .and_then(|definition| definition.spec().cloned())
                 else {
                     // Unregistered or invalid kind: the instance stays inert.
@@ -831,7 +832,7 @@ impl Repository {
                 if !fm.contains_key("uid") || has_conflict_markers(&body) {
                     return Ok((nodes, edges));
                 }
-                let resolver = KindRefResolver::new(&files);
+                let resolver = KindRefResolver::stored(self);
                 let report = validate_instance(&spec, &uid, &fm, &body, &resolver);
                 nodes.push(kind_instance_node(
                     &subject, path, &kind, &uid, &spec, &fm, &report,
@@ -3506,6 +3507,143 @@ Say what was decided and why.
         repo.vault_record_working_copy().unwrap();
         assert!(kg_node(&repo, &id).is_none());
         survives("instance deleted");
+    }
+
+    const KUID3: &str = "01JD8ZK3M6W2Q4V7X9B5N1C3TT";
+
+    const RFC_SPEC: &str = "\
+---
+name: rfc
+specVersion: 1
+fields:
+  decidedBy:
+    type: ref
+    target: [adr]
+    edge: DECIDED_BY
+  intent:
+    type: ref
+    target: [intent]
+    edge: IMPLEMENTS
+---
+";
+
+    fn rfc(uid: &str, extra: &str) -> String {
+        format!("---\nuid: {uid}\ntitle: Storage RFC\n{extra}---\nProposal.\n")
+    }
+
+    fn conforms(repo: &Repository, id: &str) -> bool {
+        meta(&kg_node(repo, id).expect(id), "conforms")
+            .as_bool()
+            .unwrap()
+    }
+
+    fn has_edge(repo: &Repository, from: &str, kind: &str, to: &str) -> bool {
+        kg_edges_from(repo, from)
+            .iter()
+            .any(|e| e.kind == kind && e.to_id == to)
+    }
+
+    #[test]
+    fn test_kind_projection_reads_the_stored_definition() {
+        let (_dir, repo) = kind_repo();
+        write_vault(&repo, "kinds/adr/_kind.md", ADR_SPEC);
+        let inst = format!("kinds/adr/{KUID}.md");
+        write_vault(&repo, &inst, &adr(KUID, ""));
+        repo.vault_record_working_copy().unwrap();
+        let id = format!("adr:{KUID}");
+        assert!(conforms(&repo, &id));
+
+        // An unrecorded edit to the working-copy definition is not what the
+        // stored instance was deflated against: projection ignores it,
+        // while the file-based gate sees it.
+        write_vault(
+            &repo,
+            "kinds/adr/_kind.md",
+            &ADR_SPEC.replace("[proposed, accepted, superseded]", "[proposed, superseded]"),
+        );
+        repo.vault_index_kg(&inst).unwrap();
+        assert!(conforms(&repo, &id));
+        assert_eq!(
+            meta(&kg_node(&repo, "kind:adr").unwrap(), "fields"),
+            &serde_json::json!(["intent", "priority", "status", "supersedes", "tags"])
+        );
+        let report = repo
+            .kind_validate(&super::super::kinds::KindSource::WorkingCopy, None)
+            .unwrap();
+        assert!(!report.kinds[0].instances[0].conforms);
+
+        // A case variant of `_kind.md` is a stray file, and never a spec.
+        std::fs::remove_file(repo.vault_dir().join("kinds/adr/_kind.md")).unwrap();
+        repo.vault_record_working_copy().unwrap();
+        assert!(kg_node(&repo, &id).is_none());
+        repo.vault_store(
+            "kinds/adr/_KIND.md",
+            VaultEntryType::Scratch,
+            Vec::new(),
+            serde_json::to_string(&serde_json::json!({"name": "adr", "specVersion": 1})).unwrap(),
+        )
+        .unwrap();
+        repo.vault_index_kg(&inst).unwrap();
+        assert!(kg_node(&repo, &id).is_none());
+    }
+
+    #[test]
+    fn test_kind_projection_of_files_not_on_disk() {
+        // A sandbox submit deflates a view's files, which need not be in the
+        // working copy at all.
+        let (_dir, repo) = kind_repo();
+        let inst = format!("kinds/rfc/{KUID3}.md");
+        let target = format!("kinds/adr/{KUID}.md");
+        repo.vault_record_files(&[
+            ("kinds/adr/_kind.md".into(), Some(ADR_SPEC.into())),
+            (target.clone(), Some(adr(KUID, ""))),
+            ("kinds/rfc/_kind.md".into(), Some(RFC_SPEC.into())),
+            (
+                inst.clone(),
+                Some(rfc(KUID3, &format!("decidedBy: {KUID}\n"))),
+            ),
+        ])
+        .unwrap();
+        assert!(!repo.vault_dir().join(&inst).exists());
+        let rfc_id = format!("rfc:{KUID3}");
+        assert!(conforms(&repo, &rfc_id));
+        assert!(has_edge(
+            &repo,
+            &rfc_id,
+            "rfc.DECIDED_BY",
+            &format!("adr:{KUID}")
+        ));
+    }
+
+    #[test]
+    fn test_stored_kind_definition_fails_closed() {
+        use super::super::kinds::KindDefinition;
+        let entry = |fm: serde_json::Value, body: &str| {
+            VaultEntry::new(
+                VaultEntryType::Scratch,
+                body.as_bytes().to_vec(),
+                fm.to_string(),
+                String::new(),
+            )
+        };
+        let ok = serde_json::json!({"name": "adr", "specVersion": 1});
+        assert!(
+            KindDefinition::from_stored("adr", &entry(ok.clone(), "guide\n"))
+                .spec()
+                .is_some()
+        );
+        let marker = "<<<<<<< ours\na\n=======\nb\n>>>>>>> theirs\n";
+        for (fm, body) in [
+            (serde_json::json!({}), "guide\n"),
+            (ok.clone(), marker),
+            (
+                serde_json::json!({"name": "adr", "specVersion": 1, "title": marker}),
+                "",
+            ),
+        ] {
+            let def = KindDefinition::from_stored("adr", &entry(fm.clone(), body));
+            assert!(def.spec().is_none(), "{fm} / {body:?}");
+        }
     }
 
     #[test]

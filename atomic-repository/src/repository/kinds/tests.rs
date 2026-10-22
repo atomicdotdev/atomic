@@ -458,6 +458,161 @@ fn kinds_resolve_refs_to_instances_memory_and_intents() {
     );
 }
 
+#[test]
+fn kinds_ref_to_unregistered_or_invalid_kind_does_not_resolve() {
+    let (dir, repo) = vault_repo();
+    let root = dir.path();
+    write(
+        root,
+        "kinds/rfc/_kind.md",
+        "---\nname: rfc\nspecVersion: 1\nfields:\n  decidedBy:\n    type: ref\n    target: [adr]\n    edge: DECIDED_BY\n---\n",
+    );
+    write(
+        root,
+        &format!("kinds/rfc/{UID}.md"),
+        &format!("---\nuid: {UID}\ndecidedBy: {UID2}\n---\nbody\n"),
+    );
+    // The target file exists, but its kind has no definition.
+    write(
+        root,
+        &format!("kinds/adr/{UID2}.md"),
+        &adr_instance(UID2, ""),
+    );
+    let rfc_conforms = || {
+        let report = repo
+            .kind_validate(&KindSource::WorkingCopy, Some("rfc"))
+            .unwrap();
+        let instance = &report.kinds[0].instances[0];
+        let codes: Vec<_> = instance.violations.iter().map(|v| v.code).collect();
+        (instance.conforms, codes)
+    };
+    assert_eq!(
+        rfc_conforms(),
+        (false, vec![KindViolationCode::UnresolvedRef]),
+        "unregistered kind"
+    );
+
+    write(
+        root,
+        "kinds/adr/_kind.md",
+        &ADR_DEF.replace("specVersion: 1", "specVersion: 2"),
+    );
+    assert_eq!(
+        rfc_conforms(),
+        (false, vec![KindViolationCode::UnresolvedRef]),
+        "invalid kind"
+    );
+
+    write(root, "kinds/adr/_kind.md", ADR_DEF);
+    assert_eq!(rfc_conforms(), (true, vec![]), "registered kind");
+}
+
+fn create_intent(repo: &Repository, title: &str) -> crate::IntentCreateResult {
+    repo.vault_intent_create(crate::IntentCreateOptions {
+        title: title.to_string(),
+        priority: None,
+        assignee: None,
+        labels: Vec::new(),
+        session_id: None,
+        turn_id: None,
+        kind: None,
+    })
+    .unwrap()
+}
+
+#[test]
+fn kinds_intent_refs_resolve_only_by_full_ulid_or_full_human_key() {
+    let (_dir, repo) = vault_repo();
+    let created = create_intent(&repo, "Adopt kinds");
+    let files = repo.kind_files(&KindSource::WorkingCopy).unwrap();
+    let subject = crate::repository::vault_triples::entry_subject(
+        &created.intent_file,
+        atomic_core::pristine::VaultEntryType::Intent,
+    );
+    for (resolver, layer) in [
+        (KindRefResolver::new(&files), "files"),
+        (KindRefResolver::stored(&repo), "stored"),
+    ] {
+        let resolve = |raw: &str| resolver.resolve("intent", raw);
+        assert_eq!(resolve(&created.uid), Some(subject.clone()), "{layer}");
+        assert_eq!(
+            resolve(&created.uid.to_lowercase()),
+            Some(subject.clone()),
+            "{layer}: a ULID matches in any case"
+        );
+        assert_eq!(resolve(&created.id), Some(subject.clone()), "{layer}");
+        // Forms whose meaning depends on who asks or on what else exists.
+        let seq = created.id.rsplit("::").next().unwrap();
+        let author_seq = created.id.split_once("::").unwrap().1;
+        for short in [
+            seq,
+            author_seq,
+            &created.uid[..6],
+            &created.id.to_lowercase(),
+        ] {
+            assert_eq!(resolve(short), None, "{layer}: {short}");
+        }
+    }
+}
+
+#[test]
+fn kinds_canonicalize_intent_refs() {
+    let (_dir, repo) = vault_repo();
+    let first = create_intent(&repo, "Adopt kinds");
+    let spec_def = "---\nname: plan\nspecVersion: 1\nfields:\n  intent:\n    type: ref\n    target: [intent]\n  related:\n    type: ref[]\n    target: [adr, intent]\n  note:\n    type: string\n---\n";
+    let spec = KindDefinition::parse("plan", spec_def.as_bytes())
+        .spec()
+        .cloned()
+        .unwrap();
+    let seq = first.id.rsplit("::").next().unwrap().to_string();
+
+    let mut fm = serde_json::Map::new();
+    fm.insert("intent".into(), serde_json::json!(seq));
+    fm.insert(
+        "related".into(),
+        serde_json::json!([
+            first.uid[..10].to_string(),
+            format!("intent:{seq}"),
+            first.uid.to_lowercase(),
+            UID,
+            "NOPE-404",
+        ]),
+    );
+    fm.insert("note".into(), serde_json::json!(seq));
+    repo.canonicalize_kind_refs(&spec, &mut fm).unwrap();
+    assert_eq!(fm["intent"], serde_json::json!(first.id));
+    assert_eq!(
+        fm["related"],
+        serde_json::json!([
+            first.id,
+            format!("intent:{}", first.id),
+            // Already resolves as written: kept.
+            first.uid.to_lowercase(),
+            // Neither is an intent: left for validation to report.
+            UID,
+            "NOPE-404",
+        ])
+    );
+    assert_eq!(fm["note"], serde_json::json!(seq), "not a ref field");
+
+    // A prefix two intents share is ambiguous.
+    let second = create_intent(&repo, "Adopt more kinds");
+    let shared = first
+        .uid
+        .chars()
+        .zip(second.uid.chars())
+        .take_while(|(a, b)| a == b)
+        .map(|(a, _)| a)
+        .collect::<String>();
+    assert!(!shared.is_empty(), "ULIDs minted together share a prefix");
+    let mut fm = serde_json::Map::new();
+    fm.insert("intent".into(), serde_json::json!(shared));
+    let violations = repo.canonicalize_kind_refs(&spec, &mut fm).unwrap_err();
+    assert_eq!(violations.len(), 1);
+    assert_eq!(violations[0].code, KindViolationCode::UnresolvedRef);
+    assert_eq!(violations[0].field.as_deref(), Some("intent"));
+}
+
 // ── view source ─────────────────────────────────────────────────────────
 
 #[test]
