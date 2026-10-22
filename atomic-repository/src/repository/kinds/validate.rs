@@ -236,6 +236,10 @@ pub enum KindProblemCode {
     /// holding both sides between markers, which is `CONFLICT_MARKER`. A
     /// name-conflicted *definition* makes its kind invalid (`KIND_INVALID`).
     NameConflict,
+    /// An instance path that could not be read as a regular file: a
+    /// symlink (never followed), something other than a file, a read error,
+    /// or a file removed while validating. Its fields were not validated.
+    Unreadable,
 }
 
 impl KindProblemCode {
@@ -247,6 +251,7 @@ impl KindProblemCode {
             KindProblemCode::FrontmatterInvalid => "FRONTMATTER_INVALID",
             KindProblemCode::ConflictMarker => "CONFLICT_MARKER",
             KindProblemCode::NameConflict => "NAME_CONFLICT",
+            KindProblemCode::Unreadable => "UNREADABLE",
         }
     }
 }
@@ -605,9 +610,27 @@ impl Repository {
             });
             return Ok(result);
         }
-        // The walk just listed it; a concurrent delete reads as absent.
-        let Some(bytes) = files.read(path)? else {
-            return Ok(result);
+        let read = match files.read(path) {
+            Ok(Some(bytes)) => Ok(bytes),
+            Ok(None) => Err(
+                "not a regular file (a symlink, which is never followed, or \
+                             something else), or removed while validating"
+                    .to_string(),
+            ),
+            Err(e) => Err(format!("could not be read: {e}")),
+        };
+        let bytes = match read {
+            Ok(bytes) => bytes,
+            Err(message) => {
+                result.problem = Some(KindProblemCode::Unreadable);
+                problems.push(KindProblem {
+                    code: KindProblemCode::Unreadable,
+                    path: path.to_string(),
+                    kind: Some(spec.name.clone()),
+                    message,
+                });
+                return Ok(result);
+            }
         };
         match check_instance(spec, &uid, &bytes, resolver) {
             InstanceCheck::Checked {

@@ -507,6 +507,34 @@ fn kinds_ref_to_unregistered_or_invalid_kind_does_not_resolve() {
     assert_eq!(rfc_conforms(), (true, vec![]), "registered kind");
 }
 
+#[cfg(unix)]
+#[test]
+fn kinds_unreadable_instance_is_a_problem() {
+    let (dir, repo) = vault_repo();
+    let root = dir.path();
+    write(root, "kinds/adr/_kind.md", ADR_DEF);
+    write(root, "memory/elsewhere.md", &adr_instance(UID, ""));
+    std::os::unix::fs::symlink(
+        root.join(".vault/memory/elsewhere.md"),
+        root.join(format!(".vault/kinds/adr/{UID}.md")),
+    )
+    .unwrap();
+
+    let report = repo.kind_validate(&KindSource::WorkingCopy, None).unwrap();
+    assert!(!report.ok);
+    let instance = &report.kinds[0].instances[0];
+    assert!(!instance.conforms);
+    assert_eq!(instance.problem, Some(KindProblemCode::Unreadable));
+    assert_eq!(
+        codes(&report),
+        [(KindProblemCode::Unreadable, format!("kinds/adr/{UID}.md"))]
+    );
+    assert_eq!(
+        serde_json::to_value(KindProblemCode::Unreadable).unwrap(),
+        "UNREADABLE"
+    );
+}
+
 fn create_intent(repo: &Repository, title: &str) -> crate::IntentCreateResult {
     repo.vault_intent_create(crate::IntentCreateOptions {
         title: title.to_string(),
