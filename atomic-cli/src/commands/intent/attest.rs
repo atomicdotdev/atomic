@@ -223,7 +223,7 @@ impl Command for IntentAttest {
         let content_bytes = body.into_bytes();
 
         // Frontmatter anchors — FLAT SCALAR strings only, so they survive
-        // yaml_frontmatter_to_json (which only round-trips `key: scalar/array`
+        // the legacy frontmatter parser (which only round-trips `key: scalar/array`
         // lines; a nested object would be mangled). sourceContentHash/vaultPath
         // contain ':' and '/' but no ": " (colon-space), so write_frontmatter_field
         // emits them bare and they round-trip cleanly.

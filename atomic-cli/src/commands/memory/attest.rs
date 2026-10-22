@@ -149,7 +149,7 @@ impl Command for MemoryAttest {
         let content_bytes = body.into_bytes();
 
         // Frontmatter anchors — FLAT SCALAR strings only, so they survive
-        // yaml_frontmatter_to_json. `sourceContentHash` contains ':' but no
+        // the legacy frontmatter parser. `sourceContentHash` contains ':' but no
         // ": " (colon-space), so it round-trips cleanly.
         let mut fm = serde_json::Map::new();
         fm.insert(

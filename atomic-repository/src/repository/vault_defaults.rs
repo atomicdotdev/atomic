@@ -10,7 +10,7 @@
 //!   - vault/skills/code-intelligence.md
 //!   - vault/memory/MEMORY.md
 
-use super::vault::{parse_vault_frontmatter, render_entry_to_markdown};
+use super::vault::{parse_vault_frontmatter_at, render_entry_to_markdown};
 use super::*;
 use atomic_core::pristine::VaultEntryType;
 
@@ -67,7 +67,8 @@ impl Repository {
             let disk_path = self.vault_dir().join(path);
             match std::fs::read_to_string(&disk_path) {
                 Ok(file_content) => {
-                    let (file_frontmatter, body) = parse_vault_frontmatter(&file_content);
+                    let (file_frontmatter, body) =
+                        parse_vault_frontmatter_at(Some(path), &file_content);
                     self.vault_store(
                         path,
                         *entry_type,
@@ -151,7 +152,8 @@ impl Repository {
                         ),
                     }
                 })?;
-                let (file_frontmatter, body) = parse_vault_frontmatter(&file_content);
+                let (file_frontmatter, body) =
+                    parse_vault_frontmatter_at(Some(path), &file_content);
                 self.vault_store(path, entry_type, body.as_bytes().to_vec(), file_frontmatter)?;
                 Ok(())
             }
