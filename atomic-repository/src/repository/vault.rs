@@ -508,9 +508,20 @@ impl Repository {
     /// # Errors
     ///
     /// Returns an error if:
+    /// - `path` is under `kinds/`: kind files are authoritative on disk and
+    ///   their redb rows only a projection, so they are never written back
+    ///   (as [`Self::vault_materialize_all`] skips them)
     /// - The entry doesn't exist in redb
     /// - The file can't be written (permissions, disk full, etc.)
     pub fn vault_materialize(&self, path: &str) -> Result<(), RepositoryError> {
+        if KindPath::classify(path).is_some() {
+            return Err(RepositoryError::InvalidOperation {
+                message: format!(
+                    "'{path}' is a kind file: the file in .vault/ is authoritative and is never \
+                     overwritten from the vault index"
+                ),
+            });
+        }
         let entry = self
             .vault_retrieve(path)?
             .ok_or_else(|| RepositoryError::FileNotFound {
@@ -2215,6 +2226,13 @@ mod tests {
         std::fs::write(&path, edited).unwrap();
         let others = repo.vault_list("", None).unwrap().len() - 1;
         assert_eq!(repo.vault_materialize_all().unwrap(), others);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), edited);
+
+        // Nor can a single kind file be materialized over the edit.
+        assert!(matches!(
+            repo.vault_materialize(rel),
+            Err(RepositoryError::InvalidOperation { .. })
+        ));
         assert_eq!(std::fs::read_to_string(&path).unwrap(), edited);
 
         // Deflate still sees kind files: the edit, then the deletion.

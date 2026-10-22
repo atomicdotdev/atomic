@@ -8,7 +8,7 @@ use super::kinds::{KindDefinition, KindPath, KindRefResolver, KindStatus, KINDS_
 use super::*;
 use crate::content_search::{has_content_index, search_content, ContentSearchOptions};
 use atomic_canonical::kind_spec::{
-    has_conflict_markers, instance_kg_id, is_reserved_kind_name, is_valid_kind_name,
+    has_conflict_markers, instance_kg_id, instance_urn, is_reserved_kind_name, is_valid_kind_name,
     validate_instance, BaseType, InstanceReport, KindSpec,
 };
 use atomic_canonical::lift::lift_intent;
@@ -946,7 +946,7 @@ fn kind_definition_node(subject: &str, path: &str, definition: &KindDefinition) 
 ///
 /// Metadata holds every declared non-ref field whose value is a scalar or a
 /// list of scalars, then the projection's own keys (`vault_path`, `uid`,
-/// `kind`, `conforms`, `violation_codes`), which win over a field of the same
+/// `urn`, `kind`, `conforms`, `violation_codes`), which win over a field of the same
 /// name.
 fn kind_instance_node(
     subject: &str,
@@ -995,6 +995,7 @@ fn kind_instance_node(
     }
     metadata.insert("vault_path".into(), serde_json::json!(path));
     metadata.insert("uid".into(), serde_json::json!(uid));
+    metadata.insert("urn".into(), serde_json::json!(instance_urn(kind, uid)));
     metadata.insert("kind".into(), serde_json::json!(kind));
     metadata.insert("conforms".into(), serde_json::json!(report.conforms));
     metadata.insert("violation_codes".into(), serde_json::json!(codes));
@@ -3690,6 +3691,10 @@ fields:
         repo.vault_record_working_copy().unwrap();
         let id = format!("adr:{KUID}");
         assert!(conforms(&repo, &id));
+        assert_eq!(
+            meta(&kg_node(&repo, &id).unwrap(), "urn"),
+            &format!("urn:atomic:adr:{KUID}")
+        );
 
         // An unrecorded edit to the working-copy definition is not what the
         // stored instance was deflated against: projection ignores it,
