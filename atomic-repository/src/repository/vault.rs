@@ -5,6 +5,7 @@ use atomic_core::pristine::vault::{
 };
 use atomic_core::types::{Hash, Merkle};
 
+use super::kinds::KindPath;
 pub(crate) use super::vault_frontmatter::parse_vault_frontmatter_at;
 use super::vault_frontmatter::write_frontmatter_field;
 
@@ -327,25 +328,41 @@ impl Repository {
     /// Called as a side effect of `vault_store` and `vault_store_entry`.
     /// Best-effort — logs on failure but never fails the parent operation.
     fn vault_auto_index(&self, path: &str) {
-        // Signed attestation blobs must not pollute semantic search, and they
-        // contribute no KG triples (vault_extract_kg early-returns empty for
-        // Attestation). Skip embedding entirely for them.
-        let is_attestation = matches!(
-            self.vault_retrieve(path),
-            Ok(Some(e)) if e.entry_type == VaultEntryType::Attestation
-        );
-
         // KG indexing — safe: extract_kg returns empty for Attestation, so
         // vault_store_kg deletes any stale rows and stores nothing.
         if let Err(e) = self.vault_index_kg(path) {
             log::debug!("Auto KG index for {}: {}", path, e);
         }
+        self.vault_auto_embed(path);
+    }
 
-        if is_attestation {
-            return; // do NOT embed
+    /// Embed one vault entry with the resolved provider, if the embedding
+    /// policy allows it. Best-effort, like [`Self::vault_auto_index`].
+    pub(super) fn vault_auto_embed(&self, path: &str) {
+        // `kinds/**` follows the kind's spec, here and in `vault_embed_all`
+        // alike. Only `kinds/` is reconciled: other Scratch entries are still
+        // embedded here and skipped by `vault_embed_all`.
+        match self.kind_embed_policy(path) {
+            Some(true) => {}
+            Some(false) => {
+                self.vault_drop_embeddings(path);
+                return;
+            }
+            None => {
+                // Signed attestation blobs must not pollute semantic search,
+                // and they contribute no KG triples (vault_extract_kg
+                // early-returns empty for Attestation). Skip embedding
+                // entirely for them.
+                let is_attestation = matches!(
+                    self.vault_retrieve(path),
+                    Ok(Some(e)) if e.entry_type == VaultEntryType::Attestation
+                );
+                if is_attestation {
+                    return; // do NOT embed
+                }
+            }
         }
 
-        // Embedding
         let provider = crate::ai::resolve_embedding_provider();
         let config = EmbedConfig {
             max_chunk_tokens: 512,
@@ -525,6 +542,12 @@ impl Repository {
         let mut count = 0;
 
         for meta in &entries {
+            // Kind files are authoritative on disk; their redb rows are only a
+            // projection, so writing them back could clobber an edit not yet
+            // deflated. Deflate still scans them (and notices deletions).
+            if KindPath::classify(&meta.path).is_some() {
+                continue;
+            }
             self.vault_materialize(&meta.path)?;
             count += 1;
         }
@@ -787,7 +810,48 @@ impl Repository {
         // intents exist in redb but never show up in `intent list`.
         self.vault_reconcile_intent_manifest()?;
 
+        self.vault_reindex_changed_kinds(changes);
+
         Ok(updated_paths)
+    }
+
+    /// Re-index kind files after a deflate batch.
+    ///
+    /// Each entry was indexed as it was stored, but in batch order: an
+    /// instance indexed before its sibling `_kind.md`, or before an intent it
+    /// refers to was stored (intent refs resolve through redb), was projected
+    /// against stale state. So every kind whose definition was added, changed
+    /// or deleted is re-indexed whole, and every other changed instance is
+    /// re-indexed once more.
+    fn vault_reindex_changed_kinds(&self, changes: &[VaultFileChange]) {
+        let mut respecced = std::collections::BTreeSet::new();
+        let mut instances = Vec::new();
+        for change in changes {
+            match KindPath::classify(&change.path) {
+                Some(KindPath::Definition { kind }) => {
+                    respecced.insert(kind);
+                }
+                Some(KindPath::Instance { kind, .. })
+                    if change.change_type != VaultChangeType::Deleted =>
+                {
+                    instances.push((kind, change.path.as_str()));
+                }
+                _ => {}
+            }
+        }
+        for kind in &respecced {
+            if let Err(e) = self.vault_reindex_kind(kind) {
+                log::warn!("Failed to re-index kind {kind}: {e}");
+            }
+        }
+        for (kind, path) in instances {
+            if respecced.contains(&kind) {
+                continue;
+            }
+            if let Err(e) = self.vault_index_kg(path) {
+                log::debug!("KG re-index for {path}: {e}");
+            }
+        }
     }
 
     /// Record-time T5b grant-lapse for an intent deflated from disk (gap #2).
@@ -1960,6 +2024,36 @@ mod tests {
             std::fs::read_to_string(repo.vault_dir().join("_manifest.json")).unwrap();
         let manifest: VaultManifest = serde_json::from_str(&manifest_content).unwrap();
         assert_eq!(manifest.version, 1);
+    }
+
+    #[test]
+    fn test_vault_materialize_all_skips_kind_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        repo.init_vault().unwrap();
+        let rel = "kinds/adr/01JD8ZK3M6W2Q4V7X9B5N1C3TR.md";
+        let path = repo.vault_dir().join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            "---\nuid: 01JD8ZK3M6W2Q4V7X9B5N1C3TR\nstatus: accepted\n---\nOriginal.\n",
+        )
+        .unwrap();
+        repo.vault_record_working_copy().unwrap();
+        assert!(repo.vault_retrieve(rel).unwrap().is_some());
+
+        // An edit not yet deflated survives a full materialization.
+        let edited = "---\nuid: 01JD8ZK3M6W2Q4V7X9B5N1C3TR\nstatus: proposed\n---\nEdited.\n";
+        std::fs::write(&path, edited).unwrap();
+        let others = repo.vault_list("", None).unwrap().len() - 1;
+        assert_eq!(repo.vault_materialize_all().unwrap(), others);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), edited);
+
+        // Deflate still sees kind files: the edit, then the deletion.
+        assert_eq!(repo.vault_record_working_copy().unwrap(), [rel]);
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(repo.vault_record_working_copy().unwrap(), [rel]);
+        assert!(repo.vault_retrieve(rel).unwrap().is_none());
     }
 
     #[test]
