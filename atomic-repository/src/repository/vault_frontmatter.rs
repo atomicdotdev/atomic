@@ -362,6 +362,130 @@ fn is_core_float(s: &str) -> bool {
     mantissa_ok && exponent_ok
 }
 
+// ── Writer ──────────────────────────────────────────────────────────────
+
+/// Render a complete `kinds/` file: frontmatter between `---` lines, then
+/// `body` verbatim.
+///
+/// Keys are written sorted; the system keys the materializer adds
+/// (`entry_type`, `content_hash`, `created_at`, `updated_at`) are left out.
+/// Strings are written bare when YAML reads them back unchanged and
+/// JSON-quoted otherwise; arrays and objects are written as flow-style
+/// JSON. The result always reads back through [`parse_frontmatter_strict`]
+/// as `fm`.
+///
+/// # Examples
+///
+/// ```
+/// use atomic_repository::{parse_frontmatter_strict, render_frontmatter_document};
+///
+/// let fm = serde_json::json!({"title": "Use redb", "status": "~", "refs": ["A"]});
+/// let doc = render_frontmatter_document(fm.as_object().unwrap(), "Body.\n");
+/// assert_eq!(doc, "---\nrefs: [\"A\"]\nstatus: \"~\"\ntitle: Use redb\n---\nBody.\n");
+/// ```
+pub fn render_frontmatter_document(fm: &Map<String, Value>, body: &str) -> String {
+    let mut output = String::from("---\n");
+    let mut keys: Vec<&String> = fm
+        .keys()
+        .filter(|k| !SYSTEM_KEYS.contains(&k.as_str()))
+        .collect();
+    keys.sort();
+    if keys.is_empty() {
+        // `---\n---\n` is not recognized as frontmatter; `{}` is an empty
+        // mapping to both parsers.
+        output.push_str("{}\n");
+    }
+    for key in keys {
+        let key_text = if reads_back_as_string_key(key) {
+            key.clone()
+        } else {
+            serde_json::to_string(key).unwrap_or_else(|_| "\"\"".to_string())
+        };
+        write_frontmatter_field(&mut output, &key_text, &fm[key.as_str()]);
+    }
+    output.push_str("---\n");
+    output.push_str(body);
+    output
+}
+
+/// Write a single frontmatter field in YAML format.
+///
+/// `key` is written as given. A string value is JSON-quoted (JSON string
+/// syntax is valid YAML and preserves escapes) whenever either parser would
+/// read the bare text as anything other than that same string.
+pub(super) fn write_frontmatter_field(output: &mut String, key: &str, value: &Value) {
+    use std::fmt::Write;
+    match value {
+        Value::String(s) => {
+            if needs_quotes(s) {
+                let rendered = serde_json::to_string(s).unwrap_or_else(|_| "\"\"".to_string());
+                let _ = writeln!(output, "{}: {}", key, rendered);
+            } else {
+                let _ = writeln!(output, "{}: {}", key, s);
+            }
+        }
+        Value::Number(n) => {
+            let _ = writeln!(output, "{}: {}", key, n);
+        }
+        Value::Bool(b) => {
+            let _ = writeln!(output, "{}: {}", key, b);
+        }
+        Value::Array(arr) => {
+            let rendered = serde_json::to_string(arr).unwrap_or_else(|_| "[]".to_string());
+            let _ = writeln!(output, "{}: {}", key, rendered);
+        }
+        Value::Object(_) => {
+            // Inline JSON for nested objects
+            let _ = writeln!(output, "{}: {}", key, value);
+        }
+        Value::Null => {
+            let _ = writeln!(output, "{}: null", key);
+        }
+    }
+}
+
+/// Whether `s`, written bare as a value, would read back as anything but
+/// `s` under either parser.
+fn needs_quotes(s: &str) -> bool {
+    let has_edge_whitespace = s.chars().next().is_some_and(char::is_whitespace)
+        || s.chars().last().is_some_and(char::is_whitespace);
+    if s.contains(": ")
+        || s.contains('#')
+        || s.contains('\n')
+        || s.contains('\r')
+        || s.starts_with('{')
+        || s.starts_with('[')
+        || s.starts_with('"')
+        || s.starts_with('\'')
+        || has_edge_whitespace
+        || parse_yaml_value(s) != Value::String(s.to_string())
+    {
+        return true;
+    }
+    // The YAML reading is the oracle: it covers the core-schema scalars
+    // (`~`, `Null`, `True`, `0x1F`, the empty string, ...) and indicators
+    // (`- x`, `*x`, `!x`, `|`, `x:`, ...) that the checks above miss.
+    let mut probe = String::with_capacity(s.len() + 4);
+    probe.push_str("v: ");
+    probe.push_str(s);
+    probe.push('\n');
+    !matches!(
+        parse_frontmatter_strict(&probe),
+        Ok(map) if map.len() == 1 && map.get("v").and_then(Value::as_str) == Some(s)
+    )
+}
+
+/// Whether `key`, written bare, reads back under the strict parser as the
+/// string key `key`.
+fn reads_back_as_string_key(key: &str) -> bool {
+    let probe = format!("{key}: 0\n");
+    !key.contains(['\n', '\r'])
+        && matches!(
+            parse_frontmatter_strict(&probe),
+            Ok(map) if map.len() == 1 && map.contains_key(key)
+        )
+}
+
 // ── Path-aware entry point ──────────────────────────────────────────────
 
 /// Split a vault markdown file into its frontmatter (as a JSON object
@@ -505,9 +629,9 @@ fn legacy_frontmatter_to_map(yaml: &str) -> Map<String, Value> {
 
 /// Parse one legacy frontmatter value string into a JSON value.
 ///
-/// The materializer also uses it to decide which strings need quoting.
+/// The writer also uses it to decide which strings need quoting.
 // TODO: remove one release after the YAML parser ships
-pub(super) fn parse_yaml_value(s: &str) -> Value {
+fn parse_yaml_value(s: &str) -> Value {
     // Quoted values remain strings even when their contents look like another
     // scalar type. Decode JSON-style double-quoted escapes losslessly.
     if s.len() >= 2 && s.starts_with('"') && s.ends_with('"') {
@@ -899,6 +1023,31 @@ mod tests {
             json!("continuouslee <lee@atomic.dev>"),
             json!("中文 ✓ émoji 🎉"),
             json!("bell\u{7}"),
+            // Bare, these read as something else under YAML 1.2.
+            json!(""),
+            json!("~"),
+            json!("Null"),
+            json!("NULL"),
+            json!("True"),
+            json!("FALSE"),
+            json!("0x1F"),
+            json!("0o17"),
+            json!("+1"),
+            json!(".5"),
+            json!("trailing:"),
+            json!("- item"),
+            json!("-"),
+            json!("*alias"),
+            json!("&anchor"),
+            json!("!tag"),
+            json!("|"),
+            json!(">"),
+            json!("%directive"),
+            json!("@at"),
+            json!("`tick"),
+            json!("? key"),
+            json!(".inf"),
+            json!("cr\ronly"),
             json!(0),
             json!(-42),
             json!(i64::MAX),
@@ -942,39 +1091,95 @@ mod tests {
         assert_eq!(legacy(&yaml), all);
     }
 
-    /// Strings the materializer writes bare although YAML reads them as
-    /// something else. The dual run keeps the legacy (correct) reading, so
-    /// nothing stored changes; a `kinds/` file must not be written this way.
+    /// Hand-written values that both parsers accept but read differently.
+    /// The writer never produces them (it quotes these strings), but files
+    /// written by hand still do; outside `kinds/` they keep the legacy
+    /// reading, with a warning.
     #[test]
-    fn writer_forms_yaml_reads_differently() {
-        for s in [
-            "",
-            "~",
-            "Null",
-            "True",
-            "FALSE",
-            "0x1F",
-            "0o17",
-            "trailing:",
-            "- item",
-        ] {
-            let frontmatter = json!({ "v": s });
-            let yaml = rendered_frontmatter(&frontmatter);
-            assert_eq!(legacy(&yaml), frontmatter, "{yaml:?}");
-            assert_ne!(
-                parse_frontmatter_strict(&yaml).map(Value::Object).ok(),
-                Some(frontmatter.clone()),
-                "{yaml:?} now agrees; move it to the round-trip test"
-            );
-            assert_eq!(stored(&yaml), frontmatter, "{yaml:?}");
+    fn hand_written_forms_yaml_reads_differently() {
+        let cases = [
+            ("v: \n", json!(""), json!(null)),
+            ("v: ~\n", json!("~"), json!(null)),
+            ("v: Null\n", json!("Null"), json!(null)),
+            ("v: True\n", json!("True"), json!(true)),
+            ("v: FALSE\n", json!("FALSE"), json!(false)),
+            ("v: 0x1F\n", json!("0x1F"), json!(31)),
+            ("v: 0o17\n", json!("0o17"), json!(15)),
+        ];
+        for (yaml, legacy_value, yaml_value) in cases {
+            assert_eq!(legacy(yaml), json!({ "v": legacy_value }), "{yaml:?}");
+            assert_eq!(strict(yaml), json!({ "v": yaml_value }), "{yaml:?}");
+            assert_eq!(stored(yaml), legacy(yaml), "{yaml:?}");
         }
+        for yaml in ["v: trailing:\n", "v: - item\n"] {
+            assert!(parse_frontmatter_strict(yaml).is_err(), "{yaml:?}");
+            assert_falls_back(yaml);
+        }
+    }
 
+    /// Numbers the writer emits that the two parsers read differently.
+    #[test]
+    fn writer_numbers_past_i64() {
         // An integer past `i64::MAX`: YAML keeps it exact, legacy rounds it
         // through f64. The dual run keeps that (pre-existing) rounding.
         let yaml = rendered_frontmatter(&json!({ "v": u64::MAX }));
         assert_eq!(strict(&yaml), json!({ "v": u64::MAX }));
         assert_eq!(legacy(&yaml), json!({ "v": u64::MAX as f64 }));
         assert_eq!(stored(&yaml), legacy(&yaml));
+    }
+
+    #[test]
+    fn rendered_documents_round_trip_strictly() {
+        let fm = json!({
+            "uid": "01J9ZQ3V7M4K2X8R6T5N0B1C2D",
+            "title": "Use redb: not sqlite",
+            "status": "~",
+            "empty": "",
+            "flag": "True",
+            "count": 3,
+            "ratio": 0.5,
+            "ok": false,
+            "none": null,
+            "supersedes": ["01J9ZQ3V7M4K2X8R6T5N0B1C2E", "- x", ""],
+            "meta": {"a": [1, {"b": "c: d"}], "e": null},
+            "key: with colon": "x",
+            "1": "numeric key",
+            "true": "bool key",
+            "- dash": "indicator key",
+            "#hash": "y",
+        });
+        let fm = fm.as_object().unwrap();
+        let doc = render_frontmatter_document(fm, "# Body\n\nText.\n");
+        let (yaml, body) = split_frontmatter(&doc).unwrap();
+        assert_eq!(body, "# Body\n\nText.\n");
+        assert_eq!(parse_frontmatter_strict(yaml).as_ref(), Ok(fm), "{yaml}");
+        assert_eq!(
+            parse_vault_frontmatter_at(Some("kinds/adr/01J9ZQ3V7M4K2X8R6T5N0B1C2D.md"), &doc),
+            (
+                serde_json::to_string(fm).unwrap(),
+                "# Body\n\nText.\n".to_string()
+            )
+        );
+
+        // Sorted keys, bare where safe.
+        let simple = json!({"b": "two", "a": 1});
+        assert_eq!(
+            render_frontmatter_document(simple.as_object().unwrap(), "x"),
+            "---\na: 1\nb: two\n---\nx"
+        );
+
+        // System keys are never written.
+        let with_system = json!({"title": "t", "entry_type": "memory", "created_at": "now"});
+        let doc = render_frontmatter_document(with_system.as_object().unwrap(), "");
+        assert_eq!(doc, "---\ntitle: t\n---\n");
+
+        // An empty map still produces a recognized (empty) frontmatter block.
+        let doc = render_frontmatter_document(&Map::new(), "body\n");
+        assert_eq!(
+            parse_vault_frontmatter_at(Some("kinds/adr/x.md"), &doc),
+            ("{}".to_string(), "body\n".to_string())
+        );
+        assert!(doc.starts_with("---\n"));
     }
 
     /// The vault files this repository ships and tracks read the same
