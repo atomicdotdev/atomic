@@ -6,11 +6,16 @@
 //! in [`atomic_canonical::kind_spec`]). Paths in this module are
 //! vault-relative, as redb stores them: `kinds/<k>/_kind.md`.
 //!
-//! Kind definitions are always resolved from **files**, never from redb's
-//! `VAULT_ENTRIES`: those rows are repository-global and are not refreshed by
-//! switch, insert or unrecord, so they cannot say which kinds a given view
-//! declares. A [`KindSource`] names the files to read — the working copy on
-//! disk, or the tracked content of a view — and [`KindFiles`] reads them.
+//! The per-view gate (`kind validate`, `kind new`, the registry) resolves
+//! kind definitions from **files**, never from redb's `VAULT_ENTRIES`: those
+//! rows are repository-global and are not refreshed by switch, insert or
+//! unrecord, so they cannot say which kinds a given view declares. A
+//! [`KindSource`] names the files to read — the working copy on disk, or the
+//! tracked content of a view — and [`KindFiles`] reads them.
+//!
+//! KG projection and the embedding policy are the exception: they are
+//! derived from redb, so they read the stored definition instead (see
+//! [`Repository::stored_kind_definition`]).
 
 mod registry;
 mod validate;
@@ -135,8 +140,8 @@ impl KindPath {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum KindSource {
-    /// The files on disk under [`Repository::vault_dir`]. Deflate and KG
-    /// projection read from here, and it is the CLI's default.
+    /// The files on disk under [`Repository::vault_dir`]. Deflate reads
+    /// from here, and it is the CLI's default.
     WorkingCopy,
     /// The tracked content of the named view, as recorded in the graph
     /// (including everything inherited through its parent chain).
@@ -356,6 +361,30 @@ impl Repository {
     /// The working copy's kinds directory, `.vault/kinds`.
     pub fn kinds_dir(&self) -> PathBuf {
         self.vault_dir().join(KINDS_DIR)
+    }
+
+    /// Kind `kind`'s definition as **stored** in redb at exactly
+    /// `kinds/<kind>/_kind.md`, or `None` when there is no such entry or
+    /// `kind` is not a valid kind name. See [`KindDefinition::from_stored`].
+    ///
+    /// The KG is a projection of redb's vault entries in which the last
+    /// deflate wins, so KG projection and the embedding policy take an
+    /// instance's spec from here: the instance and its spec must come from
+    /// the same layer, not from whatever the working copy holds (which a
+    /// sandbox deflating a view's files may not even have, and which a
+    /// case-insensitive filesystem would let `kinds/adr/_KIND.md` stand in
+    /// for). The per-view gate (`kind validate`, `kind new`) still reads
+    /// files through [`Repository::kind_files`].
+    pub fn stored_kind_definition(
+        &self,
+        kind: &str,
+    ) -> Result<Option<KindDefinition>, RepositoryError> {
+        if !is_valid_kind_name(kind) {
+            return Ok(None);
+        }
+        Ok(self
+            .vault_retrieve(&kind_definition_path(kind))?
+            .map(|entry| KindDefinition::from_stored(kind, &entry)))
     }
 
     /// Open a reader over `source`.
