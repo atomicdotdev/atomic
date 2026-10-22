@@ -541,7 +541,9 @@ fn resolve_frontmatter(path: Option<&str>, yaml: &str) -> Map<String, Value> {
     let file = path.unwrap_or("<vault file>");
     if path.is_some_and(|p| p.starts_with("kinds/")) {
         return parse_frontmatter_strict(yaml).unwrap_or_else(|error| {
-            log::warn!("vault: ignoring frontmatter of {file}: {error}");
+            if first_warning(file, yaml) {
+                log::warn!("vault: ignoring frontmatter of {file}: {error}");
+            }
             Map::new()
         });
     }
@@ -550,21 +552,43 @@ fn resolve_frontmatter(path: Option<&str>, yaml: &str) -> Map<String, Value> {
     match parse_frontmatter_strict(yaml) {
         Ok(strict) if strict == legacy => strict,
         Ok(strict) => {
-            let key = first_differing_key(&strict, &legacy).unwrap_or_default();
-            log::warn!(
-                "vault: YAML and legacy frontmatter parsers disagree on key `{key}` in {file}; \
-                 keeping the legacy reading"
-            );
+            if first_warning(file, yaml) {
+                let key = first_differing_key(&strict, &legacy).unwrap_or_default();
+                log::warn!(
+                    "vault: YAML and legacy frontmatter parsers disagree on key `{key}` in \
+                     {file}; keeping the legacy reading"
+                );
+            }
             legacy
         }
         Err(error) => {
-            log::warn!(
-                "vault: frontmatter of {file} is not valid YAML ({error}); \
-                 keeping the legacy reading"
-            );
+            if first_warning(file, yaml) {
+                log::warn!(
+                    "vault: frontmatter of {file} is not valid YAML ({error}); \
+                     keeping the legacy reading"
+                );
+            }
             legacy
         }
     }
+}
+
+/// True the first time this process warns about `file` with frontmatter
+/// `yaml`. Every scan re-parses every file, so without this an unchanged
+/// file would repeat its warning on each `status`, `record` or deflate.
+fn first_warning(file: &str, yaml: &str) -> bool {
+    use std::collections::HashSet;
+    use std::hash::{Hash, Hasher};
+    use std::sync::{Mutex, OnceLock};
+
+    static WARNED: OnceLock<Mutex<HashSet<(String, u64)>>> = OnceLock::new();
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    yaml.hash(&mut hasher);
+    WARNED
+        .get_or_init(Mutex::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert((file.to_string(), hasher.finish()))
 }
 
 fn first_differing_key<'a>(
@@ -715,6 +739,15 @@ mod tests {
             "{yaml:?}"
         );
         assert_eq!(stored(yaml), legacy, "{yaml:?}");
+    }
+
+    #[test]
+    fn warnings_are_once_per_file_and_content() {
+        let file = "memory/first-warning-test.md";
+        assert!(first_warning(file, "a: 1"));
+        assert!(!first_warning(file, "a: 1"));
+        assert!(first_warning(file, "a: 2"), "new content warns again");
+        assert!(first_warning("memory/other.md", "a: 1"));
     }
 
     #[test]
