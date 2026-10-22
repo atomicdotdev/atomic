@@ -7,7 +7,7 @@ use atomic_repository::{
     KindProblemCode, KindReportStatus, KindSource, KindValidationReport, RepositoryError,
 };
 
-use super::{display_path, kind_not_found, open_repository, validation_failed};
+use super::{display_path, display_text, kind_not_found, open_repository, validation_failed};
 use crate::commands::Command;
 use crate::error::{CliError, CliResult};
 use crate::output::{error, success};
@@ -46,7 +46,6 @@ impl Command for KindValidate {
                 (RepositoryError::ViewNotFound { name }, _) => CliError::ViewNotFound { name },
                 (e, _) => CliError::Repository(e),
             })?;
-        let registry = repo.kind_registry(&source).map_err(CliError::Repository)?;
 
         if self.json {
             println!(
@@ -54,9 +53,7 @@ impl Command for KindValidate {
                 serde_json::to_string_pretty(&report).expect("the report serializes")
             );
         } else {
-            print_report(&report, |kind| {
-                registry.spec(kind).map_or(0, |spec| spec.fields.len())
-            });
+            print_report(&report);
         }
 
         if report.ok {
@@ -104,7 +101,10 @@ fn plural(n: usize, one: &str, many: &str) -> String {
     format!("{n} {}", if n == 1 { one } else { many })
 }
 
-fn print_report(report: &KindValidationReport, field_count: impl Fn(&str) -> usize) {
+/// The report for people. Every path and message is passed through
+/// [`display_text`]: they come from repository files and can echo the
+/// values written there.
+fn print_report(report: &KindValidationReport) {
     let mark_ok = success("✓");
     let mark_bad = error("✗");
 
@@ -126,29 +126,29 @@ fn print_report(report: &KindValidationReport, field_count: impl Fn(&str) -> usi
                         plural(n, "instance", "instances")
                     ),
                 };
-                println!(
-                    "{mark_ok} {}: {}, {edges}; {instances}",
-                    kind.name,
-                    plural(field_count(&kind.name), "field", "fields"),
-                );
+                println!("{mark_ok} {}: {edges}; {instances}", kind.name);
                 for instance in &kind.instances {
                     for v in &instance.violations {
                         let at = v
                             .field
                             .as_deref()
-                            .map(|f| format!("{f}: "))
+                            .map(|f| format!("{}: ", display_text(f)))
                             .unwrap_or_default();
                         println!(
                             "{mark_bad} {}: {at}{}",
-                            display_path(&instance.path),
-                            v.message
+                            display_text(&display_path(&instance.path)),
+                            display_text(&v.message)
                         );
                     }
                 }
             }
             KindReportStatus::Invalid => {
                 for p in &kind.spec_problems {
-                    println!("{mark_bad} {}: {p}", display_path(&kind.def_path));
+                    println!(
+                        "{mark_bad} {}: {}",
+                        display_text(&display_path(&kind.def_path)),
+                        display_text(p)
+                    );
                 }
                 println!("  ({} stays unregistered until this is fixed)", kind.name);
             }
@@ -166,7 +166,11 @@ fn print_report(report: &KindValidationReport, field_count: impl Fn(&str) -> usi
         if p.code == KindProblemCode::KindInvalid && invalid_defs.contains(&p.path.as_str()) {
             continue;
         }
-        println!("{mark_bad} {}: {}", display_path(&p.path), p.message);
+        println!(
+            "{mark_bad} {}: {}",
+            display_text(&display_path(&p.path)),
+            display_text(&p.message)
+        );
     }
 
     let source = &report.source;

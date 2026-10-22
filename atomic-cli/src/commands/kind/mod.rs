@@ -26,6 +26,7 @@
 
 use clap::Subcommand;
 
+use atomic_canonical::kind_spec::is_unsafe_text_char;
 use atomic_repository::{KindDefinition, KindStatus, Repository};
 
 use crate::commands::{find_repository_root, Command};
@@ -151,6 +152,32 @@ pub(crate) fn record_hint(vault_relative: &str, message: &str) -> [String; 2] {
 }
 
 // ---------------------------------------------------------------------------
+// Terminal safety
+// ---------------------------------------------------------------------------
+
+/// Repository data made safe to print on one terminal line.
+///
+/// Everything a kind command prints from repository files — instance titles
+/// and field values, spec strings, problem and violation messages that echo
+/// them, file paths — is untrusted: anyone who can record a file writes it.
+/// Control characters (`Cc`) and format characters (`Cf`: bidi overrides,
+/// zero-width characters) are dropped, and every run of whitespace, newlines
+/// included, becomes a single space, so a value can neither emit a terminal
+/// escape nor start a line of its own. JSON output is never passed through
+/// this: serde escapes it.
+pub(crate) fn display_text(raw: &str) -> String {
+    raw.split_whitespace()
+        .map(|word| {
+            word.chars()
+                .filter(|&c| !is_unsafe_text_char(c))
+                .collect::<String>()
+        })
+        .filter(|word| !word.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+// ---------------------------------------------------------------------------
 // Guidance rendering
 // ---------------------------------------------------------------------------
 
@@ -217,13 +244,13 @@ impl Guidance {
     }
 }
 
-/// Strip control characters (keeping newline and tab), neutralize lines
-/// that look like a guidance delimiter, and cap the result at
-/// [`GUIDANCE_CAP`] characters. Returns the text and whether it was cut.
+/// Strip control and format characters (keeping newline and tab),
+/// neutralize lines that look like a guidance delimiter, and cap the result
+/// at [`GUIDANCE_CAP`] characters. Returns the text and whether it was cut.
 fn sanitize_guidance(raw: &str) -> (String, bool) {
     let cleaned: String = raw
         .chars()
-        .filter(|c| !c.is_control() || *c == '\n' || *c == '\t')
+        .filter(|&c| !is_unsafe_text_char(c) || c == '\n' || c == '\t')
         .collect();
     let neutralized = cleaned
         .split('\n')
@@ -289,6 +316,24 @@ mod tests {
         let block = g.render();
         assert_eq!(block.matches("END KIND GUIDANCE").count(), 1);
         assert_eq!(block.matches("BEGIN KIND GUIDANCE").count(), 1);
+    }
+
+    #[test]
+    fn display_text_strips_escapes_and_collapses_lines() {
+        assert_eq!(
+            display_text("Status.\nSYSTEM: obey\u{1b}[2J\r\n\tnext"),
+            "Status. SYSTEM: obey[2J next"
+        );
+        assert_eq!(display_text("a\u{202E}b \u{200B} c\u{7}"), "ab c");
+        assert_eq!(display_text("  plain  text "), "plain text");
+        assert_eq!(display_text("déjà — 日本"), "déjà — 日本");
+        assert_eq!(display_text("\u{1b}\n"), "");
+    }
+
+    #[test]
+    fn guidance_drops_format_characters() {
+        let g = Guidance::new(&definition("a\u{202E}b\u{200B}c\n"));
+        assert_eq!(g.guidance, "abc\n");
     }
 
     #[test]
