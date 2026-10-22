@@ -826,13 +826,44 @@ impl Repository {
     /// across all tracked files. Calls to external crates / stdlib are silently skipped.
     pub fn kg_enrich_calls(&self, working_copy: WorkingCopyId) -> Result<usize, RepositoryError> {
         let files = self.list_enrichable_files(working_copy)?;
+        let sources: Vec<_> = files
+            .iter()
+            .filter(|file| !file.is_directory)
+            .filter_map(|file| {
+                let path = file.path.to_string_lossy().to_string();
+                let source = std::fs::read_to_string(self.root().join(&file.path)).ok()?;
+                Some((path, source))
+            })
+            .collect();
+        let edges = Self::calls_from_sources(
+            sources
+                .iter()
+                .map(|(path, source)| (path.as_str(), source.as_str())),
+        );
+        let mut txn = self
+            .pristine
+            .write_txn()
+            .map_err(|error| RepositoryError::Database(error.to_string()))?;
+        for edge in &edges {
+            txn.upsert_kg_edge(edge)
+                .map_err(|error| RepositoryError::Database(error.to_string()))?;
+        }
+        txn.commit()
+            .map_err(|error| RepositoryError::Database(error.to_string()))?;
+        Ok(edges.len())
+    }
 
+    /// Shared name-based resolution for enrichment and read-only view queries.
+    /// The supplied sources define the perspective; this never reads disk.
+    pub(super) fn calls_from_sources<'a>(
+        sources: impl IntoIterator<Item = (&'a str, &'a str)>,
+    ) -> Vec<KgEdge> {
         let mut parser_registry = atomic_semantic::ParserRegistry::new();
 
         // ── Pass 1: Parse every file to build the name → entity-ID index.
-        struct FileData {
-            path: String,
-            source: String,
+        struct FileData<'a> {
+            path: &'a str,
+            source: &'a str,
             entities: Vec<atomic_semantic::Entity>,
         }
 
@@ -840,21 +871,12 @@ impl Repository {
         // function/method name → list of entity IDs (names can appear in multiple files)
         let mut name_to_entity_ids: HashMap<String, Vec<String>> = HashMap::new();
 
-        for file in &files {
-            if file.is_directory {
+        for (path, source) in sources {
+            if !atomic_semantic::is_supported(path) {
                 continue;
             }
-            let path_str = file.path.to_string_lossy().to_string();
-            if !atomic_semantic::is_supported(&path_str) {
-                continue;
-            }
-            let abs_path = self.root().join(&file.path);
-            let source = match std::fs::read_to_string(&abs_path) {
-                Ok(s) => s,
-                Err(_) => continue,
-            };
 
-            let entities = parser_registry.extract(&path_str, &source);
+            let entities = parser_registry.extract(path, source);
 
             for entity in &entities {
                 match entity.kind {
@@ -871,22 +893,18 @@ impl Repository {
             }
 
             all_file_data.push(FileData {
-                path: path_str,
+                path,
                 source,
                 entities,
             });
         }
 
         // ── Pass 2: Extract call sites and write CALLS edges.
-        let mut txn = self
-            .pristine
-            .write_txn()
-            .map_err(|e| RepositoryError::Database(e.to_string()))?;
-
-        let mut count = 0;
+        let mut edges = Vec::new();
+        let mut seen = HashSet::new();
 
         for file_data in &all_file_data {
-            let refs = parser_registry.extract_references(&file_data.path, &file_data.source);
+            let refs = parser_registry.extract_references(file_data.path, file_data.source);
             if refs.is_empty() {
                 continue;
             }
@@ -942,16 +960,15 @@ impl Repository {
                     if callee_id == caller_id {
                         continue; // skip direct recursion
                     }
-                    txn.upsert_kg_edge(&KgEdge::new(caller_id, callee_id, edge_kind::CALLS))
-                        .map_err(|e| RepositoryError::Database(e.to_string()))?;
-                    count += 1;
+                    if seen.insert((caller_id.to_string(), callee_id.clone())) {
+                        edges.push(KgEdge::new(caller_id, callee_id, edge_kind::CALLS));
+                    }
                 }
             }
         }
 
-        txn.commit()
-            .map_err(|e| RepositoryError::Database(e.to_string()))?;
-        Ok(count)
+        edges.sort_by(|a, b| (&a.from_id, &a.to_id).cmp(&(&b.from_id, &b.to_id)));
+        edges
     }
 
     /// Parses all supported source files in the working copy and creates

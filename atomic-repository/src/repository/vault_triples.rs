@@ -302,6 +302,30 @@ impl Repository {
         limit: usize,
         pool: Option<usize>,
     ) -> Result<Vec<KgNode>, RepositoryError> {
+        self.vault_kg_search_inner(query, limit, pool, None)
+    }
+
+    /// Search VCS nodes and source content through the requested view's
+    /// validated closure. Filtering precedes candidate ranking and truncation.
+    /// Vault-only nodes remain repository-wide.
+    pub fn vault_kg_search_on_view(
+        &self,
+        view_name: &str,
+        query: &str,
+        limit: usize,
+        pool: Option<usize>,
+    ) -> Result<Vec<KgNode>, RepositoryError> {
+        let scope = self.query_view(view_name)?;
+        self.vault_kg_search_inner(query, limit, pool, Some(&scope))
+    }
+
+    fn vault_kg_search_inner(
+        &self,
+        query: &str,
+        limit: usize,
+        pool: Option<usize>,
+        scope: Option<&super::query::QueryView>,
+    ) -> Result<Vec<KgNode>, RepositoryError> {
         use std::cmp::Reverse;
         use std::collections::{BinaryHeap, HashMap, HashSet};
 
@@ -332,15 +356,48 @@ impl Repository {
             else {
                 continue;
             };
+            let node = if let Some(scope) = scope {
+                let Some(node) = scope.project_node(&txn, node)? else {
+                    continue;
+                };
+                node
+            } else {
+                node
+            };
             let current_hits = kg_node_fts_hit_count(&node, &query_tokens);
             if current_hits > 0 {
                 kg_matches.insert(node_id, current_hits);
             }
         }
 
-        // Content search: file-level matches from syntext, grouped by path.
+        // Shared structural IDs are not versioned. Include matches from this
+        // projection even when an ambient FTS posting describes another view,
+        // or a newly renamed file has not yet been enriched.
+        if let Some(scope) = scope {
+            for node in scope.nodes().values() {
+                let hits = kg_node_fts_hit_count(node, &query_tokens);
+                if hits > 0 {
+                    kg_matches.insert(node.id.clone(), hits);
+                }
+            }
+        }
+
+        // Content search: scoped queries must verify projected bytes, not the
+        // working-copy index (which can contain sibling or unrecorded bytes).
         let mut content_counts: HashMap<String, usize> = HashMap::new();
-        if has_content_index(self.root()) {
+        if let Some(scope) = scope {
+            if let Ok(result) = scope.search_content(
+                query,
+                ContentSearchOptions {
+                    max_results: Some(2000),
+                    ..Default::default()
+                },
+            ) {
+                for m in result.matches {
+                    *content_counts.entry(m.path).or_insert(0) += 1;
+                }
+            }
+        } else if has_content_index(self.root()) {
             let opts = ContentSearchOptions {
                 max_results: Some(2000),
                 ..Default::default()
@@ -456,8 +513,24 @@ impl Repository {
 
         let mut results: Vec<KgNode> = Vec::with_capacity(ranked.len());
         for (_score, id, content_match_count) in &ranked {
-            let node = match txn.get_kg_node(id) {
-                Ok(Some(mut n)) => {
+            let projected = if let Some(scope) = scope {
+                if let Some(node) = scope.nodes().get(id) {
+                    Some(node.clone())
+                } else {
+                    match txn
+                        .get_kg_node(id)
+                        .map_err(|error| RepositoryError::Database(error.to_string()))?
+                    {
+                        Some(node) => scope.project_node(&txn, node)?,
+                        None => None,
+                    }
+                }
+            } else {
+                txn.get_kg_node(id)
+                    .map_err(|error| RepositoryError::Database(error.to_string()))?
+            };
+            let node = match projected {
+                Some(mut n) => {
                     if *content_match_count > 0 {
                         let md = n.metadata.get_or_insert_with(|| serde_json::json!({}));
                         if let Some(obj) = md.as_object_mut() {
@@ -469,7 +542,7 @@ impl Repository {
                     }
                     n
                 }
-                _ => {
+                None => {
                     // Node not in KG — create a stub (content-only file)
                     let label = id
                         .strip_prefix("file:")

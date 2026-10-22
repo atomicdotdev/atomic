@@ -6181,9 +6181,8 @@ pub fn query_graph(args: &super::query::QueryGraph) -> CliResult<bool> {
     Ok(true)
 }
 
-/// `atomic query callers` over QueryGraph (Callers) — the handler filters
-/// the 1-hop subgraph to CALLS edges at the entity; the CLI renders the
-/// local caller lines and hints.
+/// `atomic query callers` over QueryGraph (Callers) — the handler resolves
+/// calls from the selected view's recorded source; the CLI renders callers.
 pub fn query_callers(args: &super::query::QueryCallers) -> CliResult<bool> {
     let Some(session) = Service::open()? else {
         return Ok(false);
@@ -6225,14 +6224,6 @@ pub fn query_callers(args: &super::query::QueryCallers) -> CliResult<bool> {
 
     if caller_edges.is_empty() {
         println!("No callers found for '{}'.", args.entity_id);
-        if !response.calls_present {
-            println!(
-                "Hint: run `atomic vault query enrich` to populate CALLS edges, \
-                then retry."
-            );
-        } else {
-            println!("This function is an entry point — nothing in the repo calls it.");
-        }
     } else {
         println!("{} caller(s) of {}:\n", caller_edges.len(), args.entity_id);
         for edge in &caller_edges {
@@ -6251,6 +6242,58 @@ pub fn query_callers(args: &super::query::QueryCallers) -> CliResult<bool> {
             println!("{display}");
         }
     }
+    Ok(true)
+}
+
+/// `query code` uses the same graph-filtered read over both local-service and
+/// reactor transports. Preserve the complete domain JSON/human render.
+pub fn query_code(args: &super::query::QueryCode) -> CliResult<bool> {
+    let Some(session) = Service::open()? else {
+        return Ok(false);
+    };
+    let response = session.query_graph(pb::QueryGraphRequest {
+        repository: Some(session.reference.clone()),
+        query: Some(pb::query_graph_request::Query::ContentSearch(
+            pb::ContentSearchQuery {
+                query: args.pattern.clone(),
+                paths: Vec::new(),
+                path_filter: args.path_filter.clone(),
+                file_type: args.file_type.clone(),
+                exclude_type: None,
+                case_insensitive: args.case_insensitive,
+                max_results: Some(u32::try_from(args.max_results).map_err(|_| {
+                    CliError::Internal(anyhow::anyhow!("max-results exceeds the RPC limit"))
+                })?),
+            },
+        )),
+        ..Default::default()
+    })?;
+    let result = response.content_result.ok_or_else(|| {
+        CliError::Internal(anyhow::anyhow!(
+            "the service returned no content search result"
+        ))
+    })?;
+    let result = atomic_repository::ContentSearchResult {
+        matches: result
+            .matches
+            .into_iter()
+            .map(|m| atomic_repository::ContentMatch {
+                path: m.path,
+                line_number: m.line_number,
+                line_content: m.line_content,
+                byte_offset: m.byte_offset,
+                submatch_start: m.submatch_start as usize,
+                submatch_end: m.submatch_end as usize,
+            })
+            .collect(),
+        total_matches: result.total_matches as usize,
+        dir_facets: result
+            .dir_facets
+            .into_iter()
+            .map(|facet| (facet.path, facet.count as usize))
+            .collect(),
+    };
+    super::query::print_code_result(&result, args.json)?;
     Ok(true)
 }
 

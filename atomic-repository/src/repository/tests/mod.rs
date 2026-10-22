@@ -37,6 +37,7 @@ mod operation_routing_tests;
 mod operation_undo_tests;
 mod path_claim_migration_tests;
 mod projection_effects_tests;
+mod query_view_tests;
 mod record_duplication_tests;
 mod record_tests;
 mod ref_mapping_tests;
