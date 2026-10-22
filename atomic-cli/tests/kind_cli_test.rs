@@ -136,7 +136,10 @@ fn init_validate_and_reject_bad_definitions() {
     f.fails(&["kind", "init", "adr"], 2);
 
     let valid = f.ok(&["kind", "validate", "adr"]);
-    assert!(valid.contains("✓ adr: no edges; no instances"), "{valid}");
+    assert!(
+        valid.contains("✓ adr: 1 field, no edges; no instances"),
+        "{valid}"
+    );
 
     // The starter was ingested into the vault index.
     let listed = f.ok(&["vault", "list", "--json", "--prefix", "kinds/"]);

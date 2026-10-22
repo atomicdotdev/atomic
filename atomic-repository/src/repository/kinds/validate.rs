@@ -306,6 +306,8 @@ pub struct KindReport {
     pub status: KindReportStatus,
     /// Why the definition did not register; empty when it did.
     pub spec_problems: Vec<String>,
+    /// Declared fields; zero when the definition did not register.
+    pub field_count: usize,
     /// The namespaced edges (`<kind>.<EDGE>`) the kind can project.
     pub edges: Vec<String>,
     pub instance_count: usize,
@@ -373,12 +375,14 @@ impl Repository {
                 def_path: def.def_path.clone(),
                 status: KindReportStatus::Registered,
                 spec_problems: Vec::new(),
+                field_count: 0,
                 edges: Vec::new(),
                 instance_count: entry.instances.len(),
                 instances: Vec::new(),
             };
             match &def.status {
                 KindStatus::Registered(spec) => {
+                    report.field_count = spec.fields.len();
                     report.edges = spec.edges();
                     for path in &entry.instances {
                         let result =
