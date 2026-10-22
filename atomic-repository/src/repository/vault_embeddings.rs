@@ -5,6 +5,7 @@
 //! or a simple hash-based function for testing. This module handles
 //! chunking, storage, staleness detection, and search.
 
+use super::kinds::{KindPath, KindRegistry, KindSource};
 use super::*;
 use atomic_core::pristine::vault::{EmbeddingRecord, SearchResult, VaultEntryType};
 use atomic_core::pristine::{EmbeddingsMutTxnT, EmbeddingsTxnT, VaultTxnT};
@@ -154,6 +155,23 @@ impl Repository {
         let entries = self.vault_list("", None)?;
         let mut total = 0;
         for meta in &entries {
+            // `kinds/**` follows the kind's spec, as in `vault_auto_embed`.
+            // The two paths are reconciled only for `kinds/`: other Scratch
+            // entries are skipped here but embedded by `vault_auto_embed`.
+            match self.kind_embed_policy(&meta.path) {
+                Some(true) => {
+                    match self.vault_embed(&meta.path, embed_fn, config) {
+                        Ok(count) => total += count,
+                        Err(e) => log::warn!("Failed to embed {}: {}", meta.path, e),
+                    }
+                    continue;
+                }
+                Some(false) => {
+                    self.vault_drop_embeddings(&meta.path);
+                    continue;
+                }
+                None => {}
+            }
             // Only embed text content types
             match meta.entry_type {
                 VaultEntryType::Memory
@@ -167,6 +185,42 @@ impl Repository {
             }
         }
         Ok(total)
+    }
+
+    /// The embedding policy for a `kinds/` path, or `None` for any other
+    /// path (whose caller applies its own rule).
+    ///
+    /// An instance is embedded iff its kind is registered in the working copy
+    /// with `embed: true`. Definitions and stray files are never embedded.
+    pub(super) fn kind_embed_policy(&self, path: &str) -> Option<bool> {
+        let KindPath::Instance { kind, .. } = KindPath::classify(path)? else {
+            return Some(false);
+        };
+        let embed = self
+            .kind_files(&KindSource::WorkingCopy)
+            .and_then(|files| KindRegistry::load_kind(&files, &kind))
+            .map(|definition| definition.and_then(|d| d.spec().map(|spec| spec.embed)))
+            .unwrap_or_else(|e| {
+                log::debug!("Kind embed policy for {path}: {e}");
+                None
+            });
+        Some(embed.unwrap_or(false))
+    }
+
+    /// Remove an entry's embeddings, best-effort: one the policy no longer
+    /// allows must not linger in search results.
+    pub(super) fn vault_drop_embeddings(&self, path: &str) {
+        let result = self
+            .pristine
+            .write_txn()
+            .map_err(|e| e.to_string())
+            .and_then(|mut txn| {
+                txn.del_embeddings(path).map_err(|e| e.to_string())?;
+                txn.commit().map_err(|e| e.to_string())
+            });
+        if let Err(e) = result {
+            log::debug!("Failed to drop embeddings for {path}: {e}");
+        }
     }
 
     /// Search vault embeddings for similar content.
@@ -525,5 +579,91 @@ mod tests {
 
         // But embeddings do exist from auto-embed
         assert!(repo.vault_embedding_count().unwrap() >= 2);
+    }
+
+    const KUID: &str = "01JD8ZK3M6W2Q4V7X9B5N1C3TR";
+
+    fn kind_spec(embed: bool) -> String {
+        format!(
+            "---\nname: note\nspecVersion: 1\nfields:\n  topic:\n    type: string\nembed: {embed}\n---\nGuidance prose.\n"
+        )
+    }
+
+    fn write_vault(repo: &Repository, rel: &str, content: &str) {
+        let path = repo.vault_dir().join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, content).unwrap();
+    }
+
+    fn has_embedding(repo: &Repository, path: &str) -> bool {
+        let txn = repo.pristine.read_txn().unwrap();
+        txn.get_embedding(path, 0).unwrap().is_some()
+    }
+
+    fn drop_all(repo: &Repository, paths: &[&str]) {
+        for path in paths {
+            repo.vault_drop_embeddings(path);
+        }
+    }
+
+    #[test]
+    fn test_kind_embed_policy_in_both_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        repo.init_vault().unwrap();
+        repo.init_embeddings().unwrap();
+        let def = "kinds/note/_kind.md";
+        let inst = format!("kinds/note/{KUID}.md");
+        let stray = "kinds/note/readme.md";
+        let other = "scratch/idea.md";
+        write_vault(&repo, def, &kind_spec(true));
+        write_vault(
+            &repo,
+            &inst,
+            &format!("---\nuid: {KUID}\ntopic: storage\n---\n# Storage\n\nUse redb.\n"),
+        );
+        write_vault(&repo, stray, "# Stray\n\nNot a kind file.\n");
+        write_vault(&repo, other, "# Idea\n\nScratch outside kinds.\n");
+        repo.vault_record_working_copy().unwrap();
+        let config = EmbedConfig {
+            max_chunk_tokens: 512,
+            dimensions: 8,
+        };
+
+        // Auto path (deflate): only the instance of an `embed: true` kind,
+        // plus Scratch outside `kinds/` as before.
+        assert!(has_embedding(&repo, &inst));
+        assert!(!has_embedding(&repo, def));
+        assert!(!has_embedding(&repo, stray));
+        assert!(has_embedding(&repo, other));
+
+        // Bulk path: the same rule for `kinds/`; Scratch elsewhere is still
+        // skipped.
+        drop_all(&repo, &[def, &inst, stray, other]);
+        assert!(repo.vault_embed_all(&test_embed, &config).unwrap() > 0);
+        assert!(has_embedding(&repo, &inst));
+        assert!(!has_embedding(&repo, def));
+        assert!(!has_embedding(&repo, stray));
+        assert!(!has_embedding(&repo, other));
+
+        // `embed: false`: the spec change re-indexes the kind and drops the
+        // instance's embeddings; neither path embeds it again.
+        write_vault(&repo, def, &kind_spec(false));
+        repo.vault_record_working_copy().unwrap();
+        assert!(!has_embedding(&repo, &inst));
+        repo.vault_embed_all(&test_embed, &config).unwrap();
+        assert!(!has_embedding(&repo, &inst));
+        repo.vault_auto_embed(&inst);
+        assert!(!has_embedding(&repo, &inst));
+
+        // No spec at all: not embedded either.
+        write_vault(&repo, def, &kind_spec(true));
+        repo.vault_record_working_copy().unwrap();
+        assert!(has_embedding(&repo, &inst));
+        std::fs::remove_file(repo.vault_dir().join(def)).unwrap();
+        repo.vault_record_working_copy().unwrap();
+        assert!(!has_embedding(&repo, &inst));
+        repo.vault_embed_all(&test_embed, &config).unwrap();
+        assert!(!has_embedding(&repo, &inst));
     }
 }
