@@ -152,7 +152,8 @@ impl KindRegistry {
 
     /// Read and parse only `kinds/<name>/_kind.md`, without walking any
     /// other kind or listing instances. Returns `None` when the definition
-    /// file does not exist or `name` is not a valid kind name.
+    /// file does not exist or `name` is not a valid kind name. A definition
+    /// with an unresolved name conflict in a view is [`KindStatus::Invalid`].
     ///
     /// This is the per-instance lookup for KG projection.
     pub fn load_kind(
@@ -161,6 +162,16 @@ impl KindRegistry {
     ) -> Result<Option<KindDefinition>, RepositoryError> {
         if !is_valid_kind_name(name) {
             return Ok(None);
+        }
+        let def_path = kind_definition_path(name);
+        if let Some(conflict) = files.name_conflict(&def_path) {
+            // Neither side can be read, so nothing registers: fail closed.
+            return Ok(Some(KindDefinition {
+                name: name.to_string(),
+                def_path,
+                status: KindStatus::Invalid(vec![conflict.describe()]),
+                guidance: String::new(),
+            }));
         }
         Ok(files
             .read(&kind_definition_path(name))?

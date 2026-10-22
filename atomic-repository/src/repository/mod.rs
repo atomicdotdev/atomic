@@ -281,9 +281,9 @@ pub use insert::{
 };
 pub use kinds::{
     check_instance, kind_definition_path, kind_instance_path, mint_kind_uid, InstanceCheck,
-    InstanceResult, KindDefinition, KindEntry, KindFiles, KindPath, KindProblem, KindProblemCode,
-    KindRefResolver, KindRegistry, KindReport, KindReportStatus, KindSource, KindStatus,
-    KindValidationReport, KINDS_DIR, KIND_DEFINITION_FILE,
+    InstanceResult, KindDefinition, KindEntry, KindFiles, KindNameConflict, KindPath, KindProblem,
+    KindProblemCode, KindRefResolver, KindRegistry, KindReport, KindReportStatus, KindSource,
+    KindStatus, KindValidationReport, KINDS_DIR, KIND_DEFINITION_FILE,
 };
 pub use provenance_gate::{GateBlocker, GateVerdict, MacKeyProvider, PublicationGateConfig};
 pub use provenance_summary::ProvenanceSummary;
