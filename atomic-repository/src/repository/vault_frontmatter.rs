@@ -510,7 +510,7 @@ pub(crate) fn parse_vault_frontmatter_at(path: Option<&str>, content: &str) -> (
 
 /// `(frontmatter, body)` for a file that opens with a `---` line and has a
 /// closing one.
-fn split_frontmatter(content: &str) -> Option<(&str, &str)> {
+pub(crate) fn split_frontmatter(content: &str) -> Option<(&str, &str)> {
     let after_first = if content.starts_with("---\r\n") {
         5
     } else if content.starts_with("---\n") {
