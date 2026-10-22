@@ -161,6 +161,13 @@ pub enum KindProblemCode {
     FrontmatterInvalid,
     /// An instance with merge-conflict markers anywhere in the file.
     ConflictMarker,
+    /// A `kinds/**` instance or directory that two or more files or
+    /// directories claim in a view (an unresolved name conflict). The view
+    /// renders none of them, so the instance cannot be read. Reported only
+    /// for a view source: in the working copy the same conflict is a file
+    /// holding both sides between markers, which is `CONFLICT_MARKER`. A
+    /// name-conflicted *definition* makes its kind invalid (`KIND_INVALID`).
+    NameConflict,
 }
 
 impl KindProblemCode {
@@ -171,6 +178,7 @@ impl KindProblemCode {
             KindProblemCode::StrayFile => "STRAY_FILE",
             KindProblemCode::FrontmatterInvalid => "FRONTMATTER_INVALID",
             KindProblemCode::ConflictMarker => "CONFLICT_MARKER",
+            KindProblemCode::NameConflict => "NAME_CONFLICT",
         }
     }
 }
@@ -375,6 +383,23 @@ impl Repository {
             });
         }
 
+        // A conflicted directory can hide the files under it from the view,
+        // so it is a problem in its own right. (Conflicted files were listed
+        // by the walk and reported above.)
+        for (path, conflict) in files.name_conflicts().filter(|(_, c)| c.directory) {
+            // `kinds/<k>` itself names its kind too.
+            let kind = kind_dir(path).or_else(|| path.strip_prefix(&format!("{KINDS_DIR}/")));
+            if !wanted(kind) {
+                continue;
+            }
+            problems.push(KindProblem {
+                code: KindProblemCode::NameConflict,
+                path: path.to_string(),
+                kind: kind.map(str::to_string),
+                message: conflict.describe(),
+            });
+        }
+
         let ok = problems.is_empty() && kinds.iter().flat_map(|k| &k.instances).all(|i| i.conforms);
         Ok(KindValidationReport {
             source: source.clone(),
@@ -401,6 +426,16 @@ impl Repository {
             violations: Vec::new(),
             problem: None,
         };
+        if let Some(conflict) = files.name_conflict(path) {
+            result.problem = Some(KindProblemCode::NameConflict);
+            problems.push(KindProblem {
+                code: KindProblemCode::NameConflict,
+                path: path.to_string(),
+                kind: Some(spec.name.clone()),
+                message: conflict.describe(),
+            });
+            return Ok(result);
+        }
         // The walk just listed it; a concurrent delete reads as absent.
         let Some(bytes) = files.read(path)? else {
             return Ok(result);
