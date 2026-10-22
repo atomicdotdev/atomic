@@ -293,7 +293,7 @@ fn divergent_definitions() -> (Fixture, String) {
 /// versions between name-conflict markers, and `kind validate` on the working
 /// copy fails closed: the kind stays unregistered because of the markers.
 ///
-/// `kind validate --view d` does not report the conflict; see
+/// `kind validate --view d` fails closed too; see
 /// `view_validate_reports_name_conflicted_definition`.
 #[test]
 fn same_definition_path_on_two_views_becomes_a_name_conflict() {
@@ -353,13 +353,12 @@ fn same_definition_path_on_two_views_becomes_a_name_conflict() {
     assert_eq!(c["kinds"][0]["status"], "registered", "{c}");
 }
 
-/// After scenario 4, `kind validate --view d` should fail closed, as the
-/// working-copy check does. Today it exits 0 with "No kinds in the view d":
-/// `Repository::visible_file_paths` omits name-conflicted paths (and
-/// `get_file_content_on_view` refuses them), so the view source of the
-/// registry never sees `_kind.md` and the kind silently disappears.
+/// After scenario 4, `kind validate --view d` fails closed, as the
+/// working-copy check does. The view renders neither claimant of a
+/// name-conflicted path (`visible_file_paths` omits it and
+/// `get_file_content_on_view` refuses it), so the view source reports the
+/// conflict instead of silently losing the kind.
 #[test]
-#[ignore = "kinds view source drops name-conflicted definitions (fails open)"]
 fn view_validate_reports_name_conflicted_definition() {
     let (f, on_c) = divergent_definitions();
     f.ok(&["insert", &on_c]);
@@ -367,5 +366,75 @@ fn view_validate_reports_name_conflicted_definition() {
     let out = f.run(&["kind", "validate", "--view", "d"]);
     let msg = text(&out);
     assert_eq!(out.status.code(), Some(2), "{msg}");
-    assert!(msg.contains("conflict"), "{msg}");
+    assert!(
+        msg.contains(
+            "✗ .vault/kinds/adr/_kind.md: the path has an unresolved name conflict (2 claimants)"
+        ),
+        "{msg}"
+    );
+    assert!(msg.contains("adr stays unregistered"), "{msg}");
+
+    let out = f.run(&["kind", "validate", "--view", "d", "--json"]);
+    assert_eq!(out.status.code(), Some(2));
+    let report: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(report["ok"], false, "{report}");
+    assert_eq!(report["kinds"][0]["name"], "adr", "{report}");
+    assert_eq!(report["kinds"][0]["status"], "invalid", "{report}");
+    let problems: Vec<(&str, &str)> = report["problems"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| (p["code"].as_str().unwrap(), p["path"].as_str().unwrap()))
+        .collect();
+    assert_eq!(
+        problems,
+        [
+            ("KIND_INVALID", "kinds/adr/_kind.md"),
+            ("NAME_CONFLICT", "kinds"),
+            ("NAME_CONFLICT", "kinds/adr"),
+        ],
+        "{report}"
+    );
+}
+
+/// The same instance path recorded independently on two views, under a
+/// definition both inherit: only the instance is name-conflicted, and the
+/// view reports it as `NAME_CONFLICT` while the kind stays registered.
+#[test]
+fn view_validate_reports_name_conflicted_instance() {
+    const UID: &str = "01JD8ZK3M6W2Q4V7X9B5N1C3TR";
+    let f = Fixture::new();
+    f.ok(&["kind", "init", "adr"]);
+    f.record_path("feat: add adr kind", DEF_PATH);
+    let instance = format!(".vault/kinds/adr/{UID}.md");
+    let write = |title: &str| {
+        let text = format!("---\nuid: {UID}\ntitle: {title}\nstatus: draft\n---\n");
+        fs::write(f.path(&instance), text).unwrap();
+    };
+
+    f.draft("c");
+    write("From c");
+    let on_c = f.record_path("docs: adr on c", &instance);
+    f.ok(&["kind", "validate", "--view", "c"]);
+    f.ok(&["view", "switch", "dev"]);
+    f.draft("d");
+    write("From d");
+    f.record_path("docs: adr on d", &instance);
+    f.ok(&["insert", &on_c]);
+
+    let out = f.run(&["kind", "validate", "--view", "d", "--json"]);
+    assert_eq!(out.status.code(), Some(2));
+    let report: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(report["kinds"][0]["status"], "registered", "{report}");
+    assert_eq!(
+        report["kinds"][0]["instances"][0]["problem"], "NAME_CONFLICT",
+        "{report}"
+    );
+    assert_eq!(report["problems"][0]["code"], "NAME_CONFLICT", "{report}");
+    assert_eq!(
+        report["problems"][0]["path"],
+        format!("kinds/adr/{UID}.md"),
+        "{report}"
+    );
+    assert_eq!(report["problems"].as_array().unwrap().len(), 1, "{report}");
 }

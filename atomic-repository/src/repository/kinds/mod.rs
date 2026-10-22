@@ -18,7 +18,7 @@ mod validate;
 #[cfg(test)]
 mod tests;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -161,6 +161,31 @@ pub struct KindFiles<'r> {
     inner: FilesInner,
 }
 
+/// A `kinds/**` path that two or more files or directories claim in a view
+/// (an unresolved name conflict, as `atomic status` reports it). The view
+/// renders none of the claimants until the conflict is resolved and
+/// recorded. In the working copy the same conflict shows up as a file
+/// holding both sides between conflict markers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KindNameConflict {
+    /// How many inodes claim the path.
+    pub claimants: usize,
+    /// Every claimant is a directory.
+    pub directory: bool,
+}
+
+impl KindNameConflict {
+    /// One readable problem, for a report.
+    pub fn describe(&self) -> String {
+        let what = if self.directory { "directory" } else { "path" };
+        format!(
+            "the {what} has an unresolved name conflict ({} claimants); the view renders none \
+             of them until it is resolved and recorded",
+            self.claimants
+        )
+    }
+}
+
 enum FilesInner {
     WorkingCopy {
         vault_dir: PathBuf,
@@ -169,6 +194,10 @@ enum FilesInner {
         name: String,
         /// Vault-relative paths of every tracked `.vault/` file.
         paths: HashSet<String>,
+        /// Vault-relative `kinds/**` paths with an unresolved name conflict.
+        /// They are absent from `paths`: the view renders neither side, so
+        /// their content cannot be read.
+        name_conflicts: BTreeMap<String, KindNameConflict>,
         /// The registry cache key, when the view did not change while the
         /// paths were being read.
         cache_key: Option<Merkle>,
@@ -223,8 +252,32 @@ impl<'r> KindFiles<'r> {
         }
     }
 
+    /// The name conflict at the vault-relative `path`, when this is a view
+    /// source and the path has one.
+    pub fn name_conflict(&self, path: &str) -> Option<KindNameConflict> {
+        match &self.inner {
+            FilesInner::WorkingCopy { .. } => None,
+            FilesInner::View { name_conflicts, .. } => name_conflicts.get(path).copied(),
+        }
+    }
+
+    /// Every name-conflicted `kinds/**` path (files and directories), sorted;
+    /// always empty for the working copy.
+    pub fn name_conflicts(&self) -> impl Iterator<Item = (&str, KindNameConflict)> {
+        let conflicts = match &self.inner {
+            FilesInner::WorkingCopy { .. } => None,
+            FilesInner::View { name_conflicts, .. } => Some(name_conflicts),
+        };
+        conflicts
+            .into_iter()
+            .flatten()
+            .map(|(path, conflict)| (path.as_str(), *conflict))
+    }
+
     /// Every file under `kinds/`, vault-relative and sorted. Symlinks on
-    /// disk are listed (they are stray) but never followed.
+    /// disk are listed (they are stray) but never followed. In a view, a
+    /// name-conflicted file path is listed although it cannot be read (see
+    /// [`KindFiles::name_conflict`]), so the kind it belongs to is not lost.
     pub fn list_kind_files(&self) -> Result<Vec<String>, RepositoryError> {
         let mut out = match &self.inner {
             FilesInner::WorkingCopy { vault_dir } => {
@@ -232,10 +285,20 @@ impl<'r> KindFiles<'r> {
                 walk_files(&vault_dir.join(KINDS_DIR), KINDS_DIR, &mut out)?;
                 out
             }
-            FilesInner::View { paths, .. } => paths
+            FilesInner::View {
+                paths,
+                name_conflicts,
+                ..
+            } => paths
                 .iter()
                 .filter(|p| p.starts_with(KINDS_DIR) && p[KINDS_DIR.len()..].starts_with('/'))
                 .cloned()
+                .chain(
+                    name_conflicts
+                        .iter()
+                        .filter(|(p, c)| !c.directory && p.starts_with(&format!("{KINDS_DIR}/")))
+                        .map(|(p, _)| p.clone()),
+                )
                 .collect(),
         };
         out.sort();
@@ -312,10 +375,12 @@ impl Repository {
                     .into_iter()
                     .filter_map(|p| p.strip_prefix(VAULT_PREFIX).map(str::to_string))
                     .collect();
+                let name_conflicts = self.kind_name_conflicts(name)?;
                 let after = self.kind_view_cache_key(name)?;
                 FilesInner::View {
                     name: name.clone(),
                     paths,
+                    name_conflicts,
                     cache_key: (before == after).then_some(after),
                 }
             }
@@ -363,6 +428,40 @@ impl Repository {
             cache.insert(key, Arc::clone(&registry));
         }
         Ok(registry)
+    }
+
+    /// The `kinds/**` paths of view `view_name` that the tree projection
+    /// holds back as unresolved name conflicts — the same projection
+    /// [`Repository::visible_file_paths`] and
+    /// [`Repository::get_file_content_on_view`] use to omit or refuse them.
+    fn kind_name_conflicts(
+        &self,
+        view_name: &str,
+    ) -> Result<BTreeMap<String, KindNameConflict>, RepositoryError> {
+        let db = |e: atomic_core::pristine::PristineError| RepositoryError::Database(e.to_string());
+        let txn = self.pristine.read_txn().map_err(db)?;
+        let view =
+            txn.get_view(view_name)
+                .map_err(db)?
+                .ok_or_else(|| RepositoryError::ViewNotFound {
+                    name: view_name.to_string(),
+                })?;
+        let visibility = super::graph_visibility_closure(&txn, &view)?;
+        let projection = self.project_tree_for_visibility(&txn, &visibility)?;
+        Ok(projection
+            .name_conflicts
+            .into_iter()
+            .filter_map(|(path, conflict)| {
+                let rel = path.strip_prefix(VAULT_PREFIX)?;
+                let under_kinds = rel == KINDS_DIR || rel.starts_with(&format!("{KINDS_DIR}/"));
+                let sides = conflict.sides_at_path(&path);
+                let entry = KindNameConflict {
+                    claimants: sides.len(),
+                    directory: sides.iter().all(|side| side.is_directory()),
+                };
+                under_kinds.then(|| (rel.to_string(), entry))
+            })
+            .collect())
     }
 
     fn cached_kind_registry(&self, key: &Merkle) -> Option<Arc<KindRegistry>> {
