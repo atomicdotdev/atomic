@@ -350,6 +350,7 @@ impl Repository {
             pristine,
             change_store,
             is_sandbox: true,
+            kind_registry_cache: Default::default(),
         })
     }
 

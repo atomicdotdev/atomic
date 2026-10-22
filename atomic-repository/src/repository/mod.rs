@@ -243,6 +243,7 @@ mod changes;
 mod content;
 mod history;
 mod insert;
+mod kinds;
 pub mod provenance_gate;
 mod provenance_summary;
 mod record;
@@ -277,6 +278,12 @@ pub use conflict_object::{
 };
 pub use insert::{
     ImportLineIndexSeed, ImportLineIndexSeedLine, ImportWriteOutcome, ImportWriteTimings,
+};
+pub use kinds::{
+    check_instance, kind_definition_path, kind_instance_path, mint_kind_uid, InstanceCheck,
+    InstanceResult, KindDefinition, KindEntry, KindFiles, KindPath, KindProblem, KindProblemCode,
+    KindRefResolver, KindRegistry, KindReport, KindReportStatus, KindSource, KindStatus,
+    KindValidationReport, KINDS_DIR, KIND_DEFINITION_FILE,
 };
 pub use provenance_gate::{GateBlocker, GateVerdict, MacKeyProvider, PublicationGateConfig};
 pub use provenance_summary::ProvenanceSummary;
@@ -382,6 +389,8 @@ pub struct Repository {
     /// holds the sandbox's view (from its pointer file); it must not repoint
     /// the canonical `current_view` on disk.
     is_sandbox: bool,
+    /// Kind registries of views, keyed by view state.
+    kind_registry_cache: kinds::KindRegistryCache,
 }
 
 impl std::fmt::Debug for Repository {
@@ -510,6 +519,7 @@ default = "{}"
             pristine,
             change_store,
             is_sandbox: false,
+            kind_registry_cache: Default::default(),
         };
 
         Ok(repository)
@@ -613,6 +623,7 @@ default = "{}"
             pristine,
             change_store,
             is_sandbox: false,
+            kind_registry_cache: Default::default(),
         };
         repository.fence_recovery_for_budget(working_copy_id, budget)?;
 
@@ -709,6 +720,7 @@ default = "{}"
             pristine,
             change_store,
             is_sandbox: false,
+            kind_registry_cache: Default::default(),
         };
         let operation_lock = repository.try_lock_operation(working_copy_id)?;
         repository.recover_pending_deferred_tree_alignment_locked(&operation_lock)?;
@@ -767,6 +779,7 @@ default = "{}"
             pristine,
             change_store,
             is_sandbox: false,
+            kind_registry_cache: Default::default(),
         })
     }
 
@@ -851,6 +864,7 @@ default = "{}"
             pristine,
             change_store,
             is_sandbox: false,
+            kind_registry_cache: Default::default(),
         };
         if !operation_inspection
             && (repository.has_pending_deferred_tree_alignment()
@@ -908,6 +922,7 @@ default = "{}"
             pristine: Arc::new(pristine),
             change_store,
             is_sandbox: false,
+            kind_registry_cache: Default::default(),
         };
         if repository.has_pending_deferred_tree_alignment() {
             return Err(RepositoryError::InvalidOperation {
@@ -1012,6 +1027,7 @@ default = "{}"
             pristine,
             change_store,
             is_sandbox: false,
+            kind_registry_cache: Default::default(),
         };
         let operation_lock = repository.try_lock_operation(working_copy_id)?;
         repository.recover_pending_deferred_tree_alignment_locked(&operation_lock)?;
