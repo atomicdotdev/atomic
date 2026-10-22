@@ -64,6 +64,9 @@ jcs-admit = "0.1"
 postcard = { version = "1.0", features = ["alloc"] }
 toml = "0.8"
 semver = "1"
+# Vault frontmatter: event-level YAML 1.2 parser, so anchors, tags, duplicate
+# keys and runaway nesting are refused while the document streams.
+saphyr-parser = "0.2"
 
 # Parallel processing
 rayon = "1.10"

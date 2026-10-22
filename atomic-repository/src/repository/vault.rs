@@ -5,6 +5,9 @@ use atomic_core::pristine::vault::{
 };
 use atomic_core::types::{Hash, Merkle};
 
+pub(crate) use super::vault_frontmatter::parse_vault_frontmatter_at;
+use super::vault_frontmatter::parse_yaml_value;
+
 /// Directory name for the vault at the project root.
 const VAULT_DIR: &str = ".vault";
 
@@ -650,7 +653,8 @@ impl Repository {
     ) -> Result<Option<VaultFileChange>, RepositoryError> {
         {
             // Parse into frontmatter + body
-            let (frontmatter_json, body) = parse_markdown_frontmatter(file_content);
+            let (frontmatter_json, body) =
+                parse_vault_frontmatter_at(Some(&rel_path_str), file_content);
 
             // Body hashes remain useful for content/embedding caches, but
             // frontmatter is also knowledge: status, labels, identity, and
@@ -1395,55 +1399,6 @@ pub struct VaultFileChange {
     pub content: Vec<u8>,
 }
 
-/// Parse a markdown file's YAML frontmatter and body.
-///
-/// Expects the file to optionally start with `---\n...\n---\n`.
-/// Returns `(frontmatter_json, body)` where frontmatter_json is the
-/// YAML frontmatter converted to a JSON string, and body is everything
-/// after the closing `---`.
-///
-/// If there's no frontmatter, returns `("{}", full_content)`.
-/// Parse vault markdown frontmatter. Public within the crate so that
-/// `vault_intent_update` can read disk content before storing.
-pub(crate) fn parse_vault_frontmatter(content: &str) -> (String, String) {
-    parse_markdown_frontmatter(content)
-}
-
-fn parse_markdown_frontmatter(content: &str) -> (String, String) {
-    // Check for frontmatter delimiter
-    if !content.starts_with("---\n") && !content.starts_with("---\r\n") {
-        return ("{}".to_string(), content.to_string());
-    }
-
-    // Find closing delimiter
-    let after_first = if content.starts_with("---\r\n") { 5 } else { 4 };
-    let rest = &content[after_first..];
-
-    let (close_idx, skip_len) = if let Some(idx) = rest.find("\n---\n") {
-        (idx, 5) // "\n---\n" is 5 bytes
-    } else if let Some(idx) = rest.find("\n---\r\n") {
-        (idx, 6) // "\n---\r\n" is 6 bytes
-    } else if rest.ends_with("\n---") {
-        (rest.len() - 3, 3)
-    } else {
-        // No closing delimiter — treat entire content as body
-        return ("{}".to_string(), content.to_string());
-    };
-
-    let yaml_str = &rest[..close_idx];
-    let body_start = after_first + close_idx + skip_len;
-    let body = if body_start <= content.len() {
-        content[body_start..].to_string()
-    } else {
-        String::new()
-    };
-
-    // Convert YAML frontmatter to JSON
-    let frontmatter_json = yaml_frontmatter_to_json(yaml_str);
-
-    (frontmatter_json, body)
-}
-
 fn frontmatter_json_equal(left: &str, right: &str) -> bool {
     match (
         serde_json::from_str::<serde_json::Value>(left),
@@ -1452,115 +1407,6 @@ fn frontmatter_json_equal(left: &str, right: &str) -> bool {
         (Ok(left), Ok(right)) => left == right,
         _ => left == right,
     }
-}
-
-/// Convert simple YAML frontmatter to a JSON string.
-///
-/// Handles common YAML patterns:
-/// - `key: value` -> `{"key": "value"}`
-/// - `key: 123` -> `{"key": 123}`
-/// - `key: true/false` -> `{"key": true/false}`
-/// - `key: [a, b, c]` -> `{"key": ["a", "b", "c"]}`
-/// - `key: {json}` -> `{"key": {json}}`
-///
-/// This is intentionally simple — we don't need a full YAML parser.
-/// The frontmatter is our own output (from materialization), so we
-/// know the format.
-fn yaml_frontmatter_to_json(yaml: &str) -> String {
-    let mut map = serde_json::Map::new();
-
-    for line in yaml.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-
-        // Split on first ': '
-        let Some(colon_idx) = line.find(": ") else {
-            // Handle `key:` with no value (treated as empty string)
-            if let Some(key) = line.strip_suffix(':') {
-                map.insert(
-                    key.trim().to_string(),
-                    serde_json::Value::String(String::new()),
-                );
-            }
-            continue;
-        };
-
-        let key = line[..colon_idx].trim().to_string();
-        let value_str = line[colon_idx + 2..].trim();
-
-        // Skip system fields that we inject during materialization
-        // (they'll be reconstructed, not stored in frontmatter_json)
-        if matches!(
-            key.as_str(),
-            "entry_type" | "content_hash" | "created_at" | "updated_at"
-        ) {
-            continue;
-        }
-
-        let value = parse_yaml_value(value_str);
-        map.insert(key, value);
-    }
-
-    serde_json::to_string(&map).unwrap_or_else(|_| "{}".to_string())
-}
-
-/// Parse a YAML value string into a serde_json::Value.
-fn parse_yaml_value(s: &str) -> serde_json::Value {
-    // Quoted values remain strings even when their contents look like another
-    // scalar type. Decode JSON-style double-quoted escapes losslessly.
-    if s.len() >= 2 && s.starts_with('"') && s.ends_with('"') {
-        return serde_json::from_str::<String>(s)
-            .map(serde_json::Value::String)
-            .unwrap_or_else(|_| serde_json::Value::String(s[1..s.len() - 1].to_string()));
-    }
-    if s.len() >= 2 && s.starts_with('\'') && s.ends_with('\'') {
-        return serde_json::Value::String(s[1..s.len() - 1].replace("''", "'"));
-    }
-
-    // Try as integer
-    if let Ok(n) = s.parse::<i64>() {
-        return serde_json::Value::Number(n.into());
-    }
-    // Try as float
-    if let Ok(n) = s.parse::<f64>() {
-        if let Some(n) = serde_json::Number::from_f64(n) {
-            return serde_json::Value::Number(n);
-        }
-    }
-
-    // Try as boolean / null
-    match s {
-        "true" => return serde_json::Value::Bool(true),
-        "false" => return serde_json::Value::Bool(false),
-        "null" => return serde_json::Value::Null,
-        _ => {}
-    }
-
-    // Materialized arrays/objects use JSON syntax, which is also valid YAML.
-    // Parse it first so quoted commas and nested values remain lossless.
-    if (s.starts_with('[') && s.ends_with(']')) || (s.starts_with('{') && s.ends_with('}')) {
-        if let Ok(value) = serde_json::from_str::<serde_json::Value>(s) {
-            return value;
-        }
-    }
-
-    // Also accept simple hand-authored YAML arrays such as [a, b, c].
-    if s.starts_with('[') && s.ends_with(']') {
-        let inner = s[1..s.len() - 1].trim();
-        if inner.is_empty() {
-            return serde_json::Value::Array(Vec::new());
-        }
-        let items: Vec<serde_json::Value> = inner
-            .split(',')
-            .map(|item| parse_yaml_value(item.trim()))
-            .collect();
-        return serde_json::Value::Array(items);
-    }
-
-    // Default: string
-    serde_json::Value::String(s.to_string())
 }
 
 /// Infer the vault entry type from its path.
@@ -2272,7 +2118,7 @@ mod tests {
     fn test_parse_markdown_frontmatter() {
         let content =
             "---\nname: test\ntype: memory\nentry_type: memory\ncontent_hash: abc\n---\n# Hello\n\nWorld\n";
-        let (fm, body) = parse_markdown_frontmatter(content);
+        let (fm, body) = parse_vault_frontmatter_at(None, content);
 
         // entry_type and content_hash should be stripped from frontmatter JSON
         let fm_parsed: serde_json::Value = serde_json::from_str(&fm).unwrap();
@@ -2287,7 +2133,7 @@ mod tests {
     #[test]
     fn test_parse_markdown_no_frontmatter() {
         let content = "# Just content\n\nNo frontmatter here.";
-        let (fm, body) = parse_markdown_frontmatter(content);
+        let (fm, body) = parse_vault_frontmatter_at(None, content);
         assert_eq!(fm, "{}");
         assert_eq!(body, content);
     }
@@ -2491,7 +2337,7 @@ mod tests {
             "materializing an entry must not create a semantic frontmatter change"
         );
         let markdown = std::fs::read_to_string(repo.vault_dir().join(path)).unwrap();
-        let (parsed, _) = parse_markdown_frontmatter(&markdown);
+        let (parsed, _) = parse_vault_frontmatter_at(Some(path), &markdown);
         assert_eq!(
             serde_json::from_str::<serde_json::Value>(&parsed).unwrap(),
             frontmatter

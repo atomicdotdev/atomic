@@ -661,7 +661,10 @@ impl Repository {
         let disk_path = self.vault_dir().join(&intent_file);
         let (content_bytes, frontmatter_json) = if disk_path.exists() {
             let file_content = std::fs::read_to_string(&disk_path)?;
-            let (fm_json, body) = crate::repository::vault::parse_vault_frontmatter(&file_content);
+            let (fm_json, body) = crate::repository::vault::parse_vault_frontmatter_at(
+                Some(&intent_file),
+                &file_content,
+            );
             (body.into_bytes(), fm_json)
         } else {
             let entry = self.vault_retrieve(&intent_file)?.ok_or_else(|| {
@@ -1040,7 +1043,10 @@ impl Repository {
         let disk_path = self.vault_dir().join(&intent_file);
         let (content_bytes, frontmatter_json) = if disk_path.exists() {
             let file_content = std::fs::read_to_string(&disk_path)?;
-            let (fm_json, body) = crate::repository::vault::parse_vault_frontmatter(&file_content);
+            let (fm_json, body) = crate::repository::vault::parse_vault_frontmatter_at(
+                Some(&intent_file),
+                &file_content,
+            );
             (body.into_bytes(), fm_json)
         } else {
             let entry = self.vault_retrieve(&intent_file)?.ok_or_else(|| {
@@ -2202,7 +2208,8 @@ Login attempts are rate-limited to five per minute, precisely.\n:::\n\n\
         // Read the original content from disk (since update without content reads from disk)
         let intent_path = repo.vault_dir().join(&result.intent_file);
         let disk_content = std::fs::read_to_string(&intent_path).unwrap();
-        let (_, original_body) = crate::repository::vault::parse_vault_frontmatter(&disk_content);
+        let (_, original_body) =
+            crate::repository::vault::parse_vault_frontmatter_at(None, &disk_content);
 
         repo.vault_intent_update(
             &result.id,
