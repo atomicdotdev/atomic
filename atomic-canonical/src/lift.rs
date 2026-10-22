@@ -309,7 +309,7 @@ fn lift_ref(d: &Directive) -> Result<Ref> {
 }
 
 /// Wrap a local id into `urn:atomic:<kind>:<local>` unless already a urn.
-fn as_urn(kind: &str, local: &str) -> String {
+pub(crate) fn as_urn(kind: &str, local: &str) -> String {
     if local.starts_with("urn:atomic:") {
         local.to_string()
     } else {

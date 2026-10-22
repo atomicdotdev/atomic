@@ -661,7 +661,10 @@ impl Repository {
         let disk_path = self.vault_dir().join(&intent_file);
         let (content_bytes, frontmatter_json) = if disk_path.exists() {
             let file_content = std::fs::read_to_string(&disk_path)?;
-            let (fm_json, body) = crate::repository::vault::parse_vault_frontmatter(&file_content);
+            let (fm_json, body) = crate::repository::vault::parse_vault_frontmatter_at(
+                Some(&intent_file),
+                &file_content,
+            );
             (body.into_bytes(), fm_json)
         } else {
             let entry = self.vault_retrieve(&intent_file)?.ok_or_else(|| {
@@ -1040,7 +1043,10 @@ impl Repository {
         let disk_path = self.vault_dir().join(&intent_file);
         let (content_bytes, frontmatter_json) = if disk_path.exists() {
             let file_content = std::fs::read_to_string(&disk_path)?;
-            let (fm_json, body) = crate::repository::vault::parse_vault_frontmatter(&file_content);
+            let (fm_json, body) = crate::repository::vault::parse_vault_frontmatter_at(
+                Some(&intent_file),
+                &file_content,
+            );
             (body.into_bytes(), fm_json)
         } else {
             let entry = self.vault_retrieve(&intent_file)?.ok_or_else(|| {
@@ -1118,6 +1124,75 @@ impl Repository {
     /// Build the vault-relative path for an intent file: `intents/<ulid>/intent.md`.
     fn intent_file_for(&self, uid: &str) -> String {
         format!("{}/intent.md", self.intent_dir_for(uid))
+    }
+
+    /// The vault path of the intent that a **stored** reference names, with
+    /// no interpretation: `reference` must be a full 26-character ULID
+    /// (matched case-insensitively against intent uids) or a manifest key
+    /// verbatim (a full human key such as `PIMO::alice::3`, or a legacy key).
+    ///
+    /// Unlike [`Self::vault_intent_path`], nothing is composed from the
+    /// current identity and no ULID prefix is accepted, so the answer does
+    /// not depend on who asks or on which other intents exist. Kind refs
+    /// resolve through this; [`Self::canonical_intent_reference`] turns a
+    /// user-typed id into a form it accepts.
+    pub(crate) fn intent_path_strict(&self, reference: &str) -> Option<String> {
+        let manifest = self.vault_manifest().ok()?;
+        let key = if reference.len() == 26
+            && atomic_canonical::kind_spec::is_valid_ulid(&reference.to_ascii_uppercase())
+        {
+            manifest
+                .intents
+                .iter()
+                .find(|(_, summary)| summary.uid.eq_ignore_ascii_case(reference))
+                .map(|(key, _)| key.clone())?
+        } else if manifest.intents.contains_key(reference) {
+            reference.to_string()
+        } else {
+            manifest
+                .intents
+                .iter()
+                .find(|(_, summary)| {
+                    !summary.human_key.is_empty() && summary.human_key == reference
+                })
+                .map(|(key, _)| key.clone())?
+        };
+        self.find_intent_path(&key).ok().flatten()
+    }
+
+    /// The stored form of a user-typed intent reference: the intent's full
+    /// human key when it has one, else its full ULID (else, for a legacy
+    /// intent with neither, its manifest key). Accepts everything
+    /// [`Self::vault_intent_path`] does — `3`, `alice::3`, a unique ULID
+    /// prefix — and always yields a form [`Self::intent_path_strict`]
+    /// accepts.
+    ///
+    /// `Ok(None)` when no intent matches; an error when the reference is
+    /// ambiguous.
+    pub(crate) fn canonical_intent_reference(
+        &self,
+        reference: &str,
+    ) -> Result<Option<String>, RepositoryError> {
+        let key = match self.normalize_intent_id(reference) {
+            Ok(key) => key,
+            Err(e @ RepositoryError::AmbiguousIntent { .. }) => return Err(e),
+            Err(_) => return Ok(None),
+        };
+        let manifest = self.vault_manifest()?;
+        let Some(summary) = manifest.intents.get(&key) else {
+            return Ok(None);
+        };
+        let canonical = if !summary.human_key.is_empty() {
+            summary.human_key.clone()
+        } else if !summary.uid.is_empty() {
+            summary.uid.clone()
+        } else {
+            key
+        };
+        Ok(self
+            .intent_path_strict(&canonical)
+            .is_some()
+            .then_some(canonical))
     }
 
     /// Find the vault path for an intent by its resolved manifest key.
@@ -2202,7 +2277,8 @@ Login attempts are rate-limited to five per minute, precisely.\n:::\n\n\
         // Read the original content from disk (since update without content reads from disk)
         let intent_path = repo.vault_dir().join(&result.intent_file);
         let disk_content = std::fs::read_to_string(&intent_path).unwrap();
-        let (_, original_body) = crate::repository::vault::parse_vault_frontmatter(&disk_content);
+        let (_, original_body) =
+            crate::repository::vault::parse_vault_frontmatter_at(None, &disk_content);
 
         repo.vault_intent_update(
             &result.id,

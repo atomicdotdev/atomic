@@ -1,10 +1,16 @@
 //! Knowledge graph extraction and query operations for the vault.
 //!
 //! Extracts `KgNode`s and `KgEdge`s from vault entries (goals, intents,
-//! memory, skills) and stores them in the pristine KG tables.
+//! memory, skills, and user-defined kinds under `kinds/`) and stores them in
+//! the pristine KG tables.
 
+use super::kinds::{KindDefinition, KindPath, KindRefResolver, KindStatus, KINDS_DIR};
 use super::*;
 use crate::content_search::{has_content_index, search_content, ContentSearchOptions};
+use atomic_canonical::kind_spec::{
+    has_conflict_markers, instance_kg_id, instance_urn, is_reserved_kind_name, is_valid_kind_name,
+    validate_instance, BaseType, InstanceReport, KindSpec,
+};
 use atomic_canonical::lift::lift_intent;
 use atomic_canonical::CanonicalNode;
 use atomic_core::pristine::ontology::{edge_kind, predicate};
@@ -49,7 +55,8 @@ impl Repository {
             VaultEntryType::Memory => "memory",
             VaultEntryType::Skill => "skill",
             VaultEntryType::ToolResult => "tool_result",
-            VaultEntryType::Scratch => return Ok((nodes, edges)), // no KG data for scratch
+            // Scratch has no KG data, except kind files under `kinds/`.
+            VaultEntryType::Scratch => return self.vault_extract_kind_kg(path, entry),
             VaultEntryType::Attestation => return Ok((nodes, edges)), // signed blob: no KG data
         };
 
@@ -774,6 +781,233 @@ impl Repository {
     }
 }
 
+// ── Kind projection ─────────────────────────────────────────────
+
+impl Repository {
+    /// KG data for a Scratch entry: a kind definition or instance under
+    /// `kinds/`, or nothing.
+    ///
+    /// Everything comes from redb's stored vault entries, never from the
+    /// working copy: the KG is a redb-derived projection in which the last
+    /// deflate wins, so an instance and its spec must come from the same
+    /// layer. The `kind:<k>` node is built from the definition entry being
+    /// extracted; an instance is validated from its stored frontmatter and
+    /// body against the stored `kinds/<k>/_kind.md` (see
+    /// [`Repository::stored_kind_definition`]), and its refs resolve against
+    /// stored entries ([`KindRefResolver::stored`]). The per-view gate
+    /// (`kind validate`, `kind new`) still resolves from files.
+    fn vault_extract_kind_kg(
+        &self,
+        path: &str,
+        entry: &VaultEntry,
+    ) -> Result<(Vec<KgNode>, Vec<KgEdge>), RepositoryError> {
+        let mut nodes = Vec::new();
+        let mut edges = Vec::new();
+        let Some(subject) = kind_subject(path) else {
+            return Ok((nodes, edges));
+        };
+        match KindPath::classify(path) {
+            Some(KindPath::Definition { kind }) => {
+                let definition = KindDefinition::from_stored(&kind, entry);
+                nodes.push(kind_definition_node(&subject, path, &definition));
+            }
+            Some(KindPath::Instance { kind, uid }) => {
+                let Some(spec) = self
+                    .stored_kind_definition(&kind)?
+                    .and_then(|definition| definition.spec().cloned())
+                else {
+                    // Unregistered or invalid kind: the instance stays inert.
+                    return Ok((nodes, edges));
+                };
+                let Ok(fm) = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(
+                    &entry.frontmatter_json,
+                ) else {
+                    return Ok((nodes, edges));
+                };
+                let body = String::from_utf8_lossy(&entry.content_bytes);
+                // Frontmatter under `kinds/` that fails strict parsing is
+                // stored as `{}`, so a missing `uid` means there is nothing
+                // trustworthy to project. Neither is there in a body with
+                // unresolved merge-conflict markers.
+                if !fm.contains_key("uid") || has_conflict_markers(&body) {
+                    return Ok((nodes, edges));
+                }
+                let resolver = KindRefResolver::stored(self);
+                let report = validate_instance(&spec, &uid, &fm, &body, &resolver);
+                nodes.push(kind_instance_node(
+                    &subject, path, &kind, &uid, &spec, &fm, &report,
+                ));
+                for resolved in &report.resolved_refs {
+                    if let Some(edge) = &resolved.edge {
+                        edges.push(
+                            KgEdge::new(&subject, &resolved.target_id, edge)
+                                .with_metadata(serde_json::json!({ "field": resolved.field })),
+                        );
+                    }
+                }
+                extract_content_edges(&subject, VaultEntryType::Scratch, &body, &mut edges);
+            }
+            Some(KindPath::Stray) | None => {}
+        }
+        for edge in &mut edges {
+            let metadata = edge.metadata.get_or_insert_with(|| serde_json::json!({}));
+            if let Some(object) = metadata.as_object_mut() {
+                object.insert(
+                    "derived_from_vault_path".to_string(),
+                    serde_json::json!(path),
+                );
+            }
+        }
+        Ok((nodes, edges))
+    }
+
+    /// The vault paths that own (`derived_from_vault_path`) a KG edge into
+    /// any of `subjects`. Best-effort: a KG read error yields what was
+    /// collected so far.
+    pub(super) fn kg_incoming_edge_owners(
+        &self,
+        subjects: &std::collections::BTreeSet<String>,
+    ) -> std::collections::BTreeSet<String> {
+        let mut owners = std::collections::BTreeSet::new();
+        if subjects.is_empty() {
+            return owners;
+        }
+        let Ok(txn) = self.pristine.read_txn() else {
+            return owners;
+        };
+        for subject in subjects {
+            let Ok(edges) = txn.get_kg_edges_to(subject) else {
+                continue;
+            };
+            owners.extend(edges.iter().filter_map(|edge| {
+                edge.metadata
+                    .as_ref()?
+                    .get("derived_from_vault_path")?
+                    .as_str()
+                    .map(str::to_string)
+            }));
+        }
+        owners
+    }
+
+    /// Re-index every vault entry under `kinds/<kind>/` — its definition and
+    /// instances — into the KG, and re-apply the embedding policy to each.
+    ///
+    /// Run after the kind's definition changes: a spec edit can change every
+    /// instance's conformance, and a spec that becomes invalid or is deleted
+    /// removes its instances' nodes and edges. Returns the number of nodes
+    /// and edges stored.
+    pub fn vault_reindex_kind(&self, kind: &str) -> Result<usize, RepositoryError> {
+        if !is_valid_kind_name(kind) {
+            return Err(RepositoryError::InvalidOperation {
+                message: format!("'{kind}' is not a valid kind name"),
+            });
+        }
+        let mut total = 0;
+        for meta in self.vault_list(&format!("{KINDS_DIR}/{kind}/"), None)? {
+            match self.vault_index_kg(&meta.path) {
+                Ok(count) => total += count,
+                Err(e) => log::warn!("Failed to index KG for {}: {}", meta.path, e),
+            }
+            self.vault_auto_embed(&meta.path);
+        }
+        Ok(total)
+    }
+}
+
+/// The `kind:<k>` node for a kind definition.
+fn kind_definition_node(subject: &str, path: &str, definition: &KindDefinition) -> KgNode {
+    let mut metadata = serde_json::Map::new();
+    metadata.insert("vault_path".into(), serde_json::json!(path));
+    let label = match &definition.status {
+        KindStatus::Registered(spec) => {
+            metadata.insert("status".into(), serde_json::json!("registered"));
+            metadata.insert(
+                "fields".into(),
+                serde_json::json!(spec.fields.keys().collect::<Vec<_>>()),
+            );
+            metadata.insert("edges".into(), serde_json::json!(spec.edges()));
+            metadata.insert("embed".into(), serde_json::json!(spec.embed));
+            metadata.insert("context".into(), serde_json::json!(spec.context));
+            spec.title
+                .clone()
+                .unwrap_or_else(|| definition.name.clone())
+        }
+        KindStatus::Invalid(problems) => {
+            metadata.insert("status".into(), serde_json::json!("invalid"));
+            metadata.insert("problems".into(), serde_json::json!(problems));
+            definition.name.clone()
+        }
+    };
+    KgNode::new(subject, "kind", label, "vault").with_metadata(serde_json::Value::Object(metadata))
+}
+
+/// The `<k>:<ULID>` node for an instance of a registered kind.
+///
+/// Metadata holds every declared non-ref field whose value is a scalar or a
+/// list of scalars, then the projection's own keys (`vault_path`, `uid`,
+/// `urn`, `kind`, `conforms`, `violation_codes`), which win over a field of the same
+/// name.
+fn kind_instance_node(
+    subject: &str,
+    path: &str,
+    kind: &str,
+    uid: &str,
+    spec: &KindSpec,
+    fm: &serde_json::Map<String, serde_json::Value>,
+    report: &InstanceReport,
+) -> KgNode {
+    let is_scalar = |v: &serde_json::Value| {
+        matches!(
+            v,
+            serde_json::Value::String(_)
+                | serde_json::Value::Number(_)
+                | serde_json::Value::Bool(_)
+        )
+    };
+    let mut metadata = serde_json::Map::new();
+    for (name, field) in &spec.fields {
+        if field.field_type.base == BaseType::Ref {
+            continue;
+        }
+        let Some(value) = fm.get(name) else { continue };
+        let projectable = match value {
+            serde_json::Value::Array(items) => items.iter().all(is_scalar),
+            other => is_scalar(other),
+        };
+        if projectable {
+            metadata.insert(name.clone(), value.clone());
+        }
+    }
+    let title = fm
+        .get("title")
+        .and_then(serde_json::Value::as_str)
+        .filter(|t| !t.trim().is_empty());
+    if let Some(title) = title {
+        metadata.insert("title".into(), serde_json::json!(title));
+    }
+    let mut codes: Vec<&str> = Vec::new();
+    for violation in &report.violations {
+        let code = violation.code.as_str();
+        if !codes.contains(&code) {
+            codes.push(code);
+        }
+    }
+    metadata.insert("vault_path".into(), serde_json::json!(path));
+    metadata.insert("uid".into(), serde_json::json!(uid));
+    metadata.insert("urn".into(), serde_json::json!(instance_urn(kind, uid)));
+    metadata.insert("kind".into(), serde_json::json!(kind));
+    metadata.insert("conforms".into(), serde_json::json!(report.conforms));
+    metadata.insert("violation_codes".into(), serde_json::json!(codes));
+
+    let node = KgNode::new(subject, kind, title.unwrap_or(uid), "vault")
+        .with_metadata(serde_json::Value::Object(metadata));
+    match title {
+        Some(title) => node.with_summary(title),
+        None => node,
+    }
+}
+
 // ── Extraction helpers ──────────────────────────────────────────
 
 /// Derive a subject URI from a vault path and entry type.
@@ -815,7 +1049,8 @@ pub(super) fn entry_subject(path: &str, entry_type: VaultEntryType) -> String {
             format!("tool:{}", path.replace('/', ":"))
         }
         VaultEntryType::Scratch => {
-            format!("scratch:{}", path.replace('/', ":"))
+            // kinds/adr/<ULID>.md -> adr:<ULID>; kinds/adr/_kind.md -> kind:adr
+            kind_subject(path).unwrap_or_else(|| format!("scratch:{}", path.replace('/', ":")))
         }
         VaultEntryType::Attestation => {
             // attestations/<sanitized-intent-id>/attested.md -> attestation:<sanitized-intent-id>
@@ -838,8 +1073,30 @@ fn path_to_subject(path: &str) -> String {
         entry_subject(path, VaultEntryType::Memory)
     } else if path.starts_with("skills/") {
         entry_subject(path, VaultEntryType::Skill)
+    } else if let Some(subject) = kind_subject(path) {
+        subject
     } else {
         format!("vault:{}", path.replace('/', ":"))
+    }
+}
+
+/// The KG subject of a kind file, from its path alone: `kind:<k>` for
+/// `kinds/<k>/_kind.md` and `<k>:<ULID>` for `kinds/<k>/<ULID>.md`. `None`
+/// for any other path, which keeps its Scratch subject.
+///
+/// Path-only on purpose: deleting an instance or garbage-collecting it after
+/// its spec is gone must find the same node without reading the spec.
+///
+/// An instance under a reserved kind name (`kinds/intent/<ULID>.md`) has no
+/// kind subject: `intent:<ULID>` would name — and a delete would remove — a
+/// real intent node. Such a kind never registers, so nothing is lost.
+pub(super) fn kind_subject(path: &str) -> Option<String> {
+    match KindPath::classify(path)? {
+        KindPath::Definition { kind } => Some(format!("kind:{kind}")),
+        KindPath::Instance { kind, uid } if !is_reserved_kind_name(&kind) => {
+            Some(instance_kg_id(&kind, &uid))
+        }
+        KindPath::Instance { .. } | KindPath::Stray => None,
     }
 }
 
@@ -2454,6 +2711,21 @@ The billing subsystem is off limits.\n\
             ),
             "attestation:PIMO-1"
         );
+        assert_eq!(
+            entry_subject(
+                "kinds/adr/01JD8ZK3M6W2Q4V7X9B5N1C3TR.md",
+                VaultEntryType::Scratch
+            ),
+            "adr:01JD8ZK3M6W2Q4V7X9B5N1C3TR"
+        );
+        assert_eq!(
+            entry_subject("kinds/adr/_kind.md", VaultEntryType::Scratch),
+            "kind:adr"
+        );
+        assert_eq!(
+            entry_subject("scratch/idea.md", VaultEntryType::Scratch),
+            "scratch:scratch:idea.md"
+        );
     }
 
     #[test]
@@ -2469,6 +2741,11 @@ The billing subsystem is off limits.\n\
             path_to_subject("scratch/notes.md"),
             "vault:scratch:notes.md"
         );
+        assert_eq!(
+            path_to_subject("kinds/adr/01JD8ZK3M6W2Q4V7X9B5N1C3TR.md"),
+            "adr:01JD8ZK3M6W2Q4V7X9B5N1C3TR"
+        );
+        assert_eq!(path_to_subject("kinds/adr/_kind.md"), "kind:adr");
     }
 
     #[test]
@@ -2545,9 +2822,17 @@ The billing subsystem is off limits.\n\
             "2025-01-01T00:00:00Z".to_string(),
         );
 
-        let (nodes, edges) = repo.vault_extract_kg("scratch/temp.md", &entry).unwrap();
-        assert!(nodes.is_empty());
-        assert!(edges.is_empty());
+        // Outside `kinds/`, and for files under `kinds/` that are not kind
+        // files (or whose kind has no spec), Scratch still projects nothing.
+        for path in [
+            "scratch/temp.md",
+            "kinds/adr/notes.md",
+            "kinds/adr/01JD8ZK3M6W2Q4V7X9B5N1C3TR.md",
+        ] {
+            let (nodes, edges) = repo.vault_extract_kg(path, &entry).unwrap();
+            assert!(nodes.is_empty(), "{path}");
+            assert!(edges.is_empty(), "{path}");
+        }
     }
 
     #[test]
@@ -2847,5 +3132,667 @@ The billing subsystem is off limits.\n\
             .unwrap();
         assert_eq!(current.len(), 1);
         assert_eq!(current[0].id, "memory:decision");
+    }
+
+    // ── User-defined kinds ──────────────────────────────────────────
+
+    const KUID: &str = "01JD8ZK3M6W2Q4V7X9B5N1C3TR";
+    const KUID2: &str = "01JD8ZK3M6W2Q4V7X9B5N1C3TS";
+
+    const ADR_SPEC: &str = "\
+---
+name: adr
+specVersion: 1
+title: Architecture Decision Record
+fields:
+  status:
+    type: enum
+    values: [proposed, accepted, superseded]
+    required: true
+  tags:
+    type: string[]
+  priority:
+    type: integer
+  supersedes:
+    type: ref[]
+    target: [adr]
+    edge: SUPERSEDES
+  intent:
+    type: ref
+    target: [intent]
+    edge: IMPLEMENTS
+embed: true
+context: true
+---
+Say what was decided and why.
+";
+
+    fn kind_repo() -> (tempfile::TempDir, Repository) {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        repo.init_vault().unwrap();
+        (dir, repo)
+    }
+
+    fn write_vault(repo: &Repository, rel: &str, content: &str) {
+        let path = repo.vault_dir().join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, content).unwrap();
+    }
+
+    fn adr(uid: &str, extra: &str) -> String {
+        format!("---\nuid: {uid}\ntitle: Use redb storage\nstatus: accepted\n{extra}---\nWe chose redb; see src/main.rs.\n")
+    }
+
+    fn intent(repo: &Repository) -> crate::IntentCreateResult {
+        repo.vault_intent_create(crate::IntentCreateOptions {
+            title: "Adopt kinds".to_string(),
+            priority: None,
+            assignee: None,
+            labels: Vec::new(),
+            session_id: None,
+            turn_id: None,
+            kind: None,
+        })
+        .unwrap()
+    }
+
+    fn kg_node(repo: &Repository, id: &str) -> Option<KgNode> {
+        let txn = repo.pristine.read_txn().unwrap();
+        txn.get_kg_node(id).unwrap()
+    }
+
+    fn kg_edges_from(repo: &Repository, id: &str) -> Vec<KgEdge> {
+        let txn = repo.pristine.read_txn().unwrap();
+        txn.get_kg_edges_from(id).unwrap()
+    }
+
+    fn meta<'a>(node: &'a KgNode, key: &str) -> &'a serde_json::Value {
+        &node.metadata.as_ref().unwrap()[key]
+    }
+
+    #[test]
+    fn test_kind_subjects() {
+        let inst = format!("kinds/adr/{KUID}.md");
+        assert_eq!(
+            entry_subject(&inst, VaultEntryType::Scratch),
+            format!("adr:{KUID}")
+        );
+        assert_eq!(path_to_subject(&inst), format!("adr:{KUID}"));
+        assert_eq!(
+            entry_subject("kinds/adr/_kind.md", VaultEntryType::Scratch),
+            "kind:adr"
+        );
+        assert_eq!(path_to_subject("kinds/adr/_kind.md"), "kind:adr");
+        // Stray kind files keep their Scratch subjects.
+        assert_eq!(
+            entry_subject("kinds/adr/notes.md", VaultEntryType::Scratch),
+            "scratch:kinds:adr:notes.md"
+        );
+        assert_eq!(
+            path_to_subject("kinds/adr/notes.md"),
+            "vault:kinds:adr:notes.md"
+        );
+        // A reserved kind name must never alias a built-in node.
+        let reserved = format!("kinds/intent/{KUID}.md");
+        assert_eq!(
+            entry_subject(&reserved, VaultEntryType::Scratch),
+            format!("scratch:kinds:intent:{KUID}.md")
+        );
+        assert_eq!(
+            path_to_subject(&reserved),
+            format!("vault:kinds:intent:{KUID}.md")
+        );
+    }
+
+    #[test]
+    fn test_kind_projects_conforming_instance_with_edges() {
+        let (_dir, repo) = kind_repo();
+        let created = intent(&repo);
+        let intent_subject = entry_subject(&created.intent_file, VaultEntryType::Intent);
+        write_vault(&repo, "kinds/adr/_kind.md", ADR_SPEC);
+        write_vault(&repo, &format!("kinds/adr/{KUID2}.md"), &adr(KUID2, ""));
+        write_vault(
+            &repo,
+            &format!("kinds/adr/{KUID}.md"),
+            &adr(
+                KUID,
+                &format!(
+                    "tags: [storage, db]\npriority: 2\nsupersedes: [{KUID2}]\nintent: {}\n",
+                    created.uid
+                ),
+            ),
+        );
+        repo.vault_record_working_copy().unwrap();
+
+        let id = format!("adr:{KUID}");
+        let node = kg_node(&repo, &id).expect("instance node");
+        assert_eq!(node.kind, "adr");
+        assert_eq!(node.label, "Use redb storage");
+        assert_eq!(node.summary.as_deref(), Some("Use redb storage"));
+        assert_eq!(meta(&node, "vault_path"), &format!("kinds/adr/{KUID}.md"));
+        assert_eq!(meta(&node, "uid"), KUID);
+        assert_eq!(meta(&node, "kind"), "adr");
+        assert_eq!(meta(&node, "conforms"), true);
+        assert_eq!(meta(&node, "violation_codes"), &serde_json::json!([]));
+        assert_eq!(meta(&node, "status"), "accepted");
+        assert_eq!(meta(&node, "priority"), 2);
+        assert_eq!(meta(&node, "tags"), &serde_json::json!(["storage", "db"]));
+        // Refs become edges, not metadata.
+        assert!(meta(&node, "supersedes").is_null());
+        assert!(meta(&node, "intent").is_null());
+
+        let edges = kg_edges_from(&repo, &id);
+        let edge = |kind: &str, to: &str| {
+            edges
+                .iter()
+                .find(|e| e.kind == kind && e.to_id == to)
+                .unwrap_or_else(|| panic!("missing {kind} -> {to} in {edges:?}"))
+        };
+        let supersedes = edge("adr.SUPERSEDES", &format!("adr:{KUID2}"));
+        let metadata = supersedes.metadata.as_ref().unwrap();
+        assert_eq!(metadata["field"], "supersedes");
+        assert_eq!(
+            metadata["derived_from_vault_path"],
+            format!("kinds/adr/{KUID}.md")
+        );
+        assert_eq!(
+            edge("adr.IMPLEMENTS", &intent_subject)
+                .metadata
+                .as_ref()
+                .unwrap()["field"],
+            "intent"
+        );
+        // Generic content edges still apply.
+        edge(edge_kind::REFERENCES, "file:src/main.rs");
+        assert!(kg_node(&repo, &intent_subject).is_some());
+
+        let def = kg_node(&repo, "kind:adr").expect("definition node");
+        assert_eq!(def.kind, "kind");
+        assert_eq!(def.label, "Architecture Decision Record");
+        assert_eq!(meta(&def, "status"), "registered");
+        assert_eq!(meta(&def, "vault_path"), "kinds/adr/_kind.md");
+        assert_eq!(
+            meta(&def, "edges"),
+            &serde_json::json!(["adr.IMPLEMENTS", "adr.SUPERSEDES"])
+        );
+        assert_eq!(
+            meta(&def, "fields"),
+            &serde_json::json!(["intent", "priority", "status", "supersedes", "tags"])
+        );
+        assert_eq!(meta(&def, "embed"), true);
+        assert_eq!(meta(&def, "context"), true);
+
+        // `query --kinds adr`.
+        let found = repo.vault_kg_search_by_kind("redb", 10, "adr").unwrap();
+        assert_eq!(
+            found.iter().map(|n| n.id.as_str()).collect::<Vec<_>>(),
+            [format!("adr:{KUID}"), format!("adr:{KUID2}")]
+        );
+    }
+
+    #[test]
+    fn test_kind_projects_nonconforming_instance() {
+        let (_dir, repo) = kind_repo();
+        write_vault(&repo, "kinds/adr/_kind.md", ADR_SPEC);
+        write_vault(
+            &repo,
+            &format!("kinds/adr/{KUID}.md"),
+            &format!("---\nuid: {KUID}\nstatus: maybe\nowner: me\n---\nbody\n"),
+        );
+        repo.vault_record_working_copy().unwrap();
+
+        let node = kg_node(&repo, &format!("adr:{KUID}")).expect("instance node");
+        assert_eq!(node.label, KUID, "no title: the ULID labels the node");
+        assert_eq!(node.summary, None);
+        assert_eq!(meta(&node, "conforms"), false);
+        let codes = meta(&node, "violation_codes").as_array().unwrap();
+        assert!(
+            codes.contains(&serde_json::json!("NOT_IN_ENUM")),
+            "{codes:?}"
+        );
+        assert!(
+            codes.contains(&serde_json::json!("UNDECLARED_FIELD")),
+            "{codes:?}"
+        );
+        // An undeclared key is not projected.
+        assert!(meta(&node, "owner").is_null());
+    }
+
+    #[test]
+    fn test_kind_instance_inert_without_registered_spec() {
+        let (_dir, repo) = kind_repo();
+        let inst = format!("adr:{KUID}");
+        write_vault(&repo, &format!("kinds/adr/{KUID}.md"), &adr(KUID, ""));
+        repo.vault_record_working_copy().unwrap();
+        assert!(kg_node(&repo, &inst).is_none(), "no spec: inert");
+        assert!(kg_node(&repo, "kind:adr").is_none());
+
+        write_vault(
+            &repo,
+            "kinds/adr/_kind.md",
+            &ADR_SPEC.replace("specVersion: 1", "specVersion: 2"),
+        );
+        repo.vault_record_working_copy().unwrap();
+        assert!(kg_node(&repo, &inst).is_none(), "invalid spec: inert");
+        let def = kg_node(&repo, "kind:adr").expect("definition node");
+        assert_eq!(meta(&def, "status"), "invalid");
+        assert_eq!(def.label, "adr");
+        assert!(!meta(&def, "problems").as_array().unwrap().is_empty());
+
+        // Fixing the spec projects the instance without touching it.
+        write_vault(&repo, "kinds/adr/_kind.md", ADR_SPEC);
+        repo.vault_record_working_copy().unwrap();
+        assert!(kg_node(&repo, &inst).is_some());
+    }
+
+    #[test]
+    fn test_kind_instance_with_conflict_markers_or_bad_frontmatter_is_inert() {
+        let (_dir, repo) = kind_repo();
+        write_vault(&repo, "kinds/adr/_kind.md", ADR_SPEC);
+        write_vault(
+            &repo,
+            &format!("kinds/adr/{KUID}.md"),
+            &format!(
+                "---\nuid: {KUID}\nstatus: accepted\n---\n<<<<<<< ours\na\n=======\nb\n>>>>>>> theirs\n"
+            ),
+        );
+        write_vault(
+            &repo,
+            &format!("kinds/adr/{KUID2}.md"),
+            &format!("---\nuid: {KUID2}\nstatus: [unclosed\n---\nbody\n"),
+        );
+        repo.vault_record_working_copy().unwrap();
+        assert!(kg_node(&repo, &format!("adr:{KUID}")).is_none());
+        assert!(kg_node(&repo, &format!("adr:{KUID2}")).is_none());
+    }
+
+    #[test]
+    fn test_kind_spec_edit_reindexes_instances() {
+        let (_dir, repo) = kind_repo();
+        write_vault(&repo, "kinds/adr/_kind.md", ADR_SPEC);
+        write_vault(&repo, &format!("kinds/adr/{KUID}.md"), &adr(KUID, ""));
+        repo.vault_record_working_copy().unwrap();
+        let id = format!("adr:{KUID}");
+        assert_eq!(meta(&kg_node(&repo, &id).unwrap(), "conforms"), true);
+
+        // Drop `accepted` from the enum; only the spec file changes.
+        write_vault(
+            &repo,
+            "kinds/adr/_kind.md",
+            &ADR_SPEC.replace("[proposed, accepted, superseded]", "[proposed, superseded]"),
+        );
+        let updated = repo.vault_record_working_copy().unwrap();
+        assert_eq!(updated, ["kinds/adr/_kind.md"]);
+        let node = kg_node(&repo, &id).unwrap();
+        assert_eq!(meta(&node, "conforms"), false);
+        assert_eq!(
+            meta(&node, "violation_codes"),
+            &serde_json::json!(["NOT_IN_ENUM"])
+        );
+    }
+
+    #[test]
+    fn test_kind_spec_delete_removes_instance_projection() {
+        let (_dir, repo) = kind_repo();
+        write_vault(&repo, "kinds/adr/_kind.md", ADR_SPEC);
+        write_vault(&repo, &format!("kinds/adr/{KUID2}.md"), &adr(KUID2, ""));
+        write_vault(
+            &repo,
+            &format!("kinds/adr/{KUID}.md"),
+            &adr(KUID, &format!("supersedes: [{KUID2}]\n")),
+        );
+        repo.vault_record_working_copy().unwrap();
+        let id = format!("adr:{KUID}");
+        assert!(!kg_edges_from(&repo, &id).is_empty());
+
+        std::fs::remove_file(repo.vault_dir().join("kinds/adr/_kind.md")).unwrap();
+        repo.vault_record_working_copy().unwrap();
+        assert!(kg_node(&repo, "kind:adr").is_none());
+        assert!(kg_node(&repo, &id).is_none());
+        assert!(kg_node(&repo, &format!("adr:{KUID2}")).is_none());
+        assert!(kg_edges_from(&repo, &id).is_empty());
+        // The instances stay in the vault, inert.
+        assert!(repo
+            .vault_retrieve(&format!("kinds/adr/{KUID}.md"))
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn test_kind_instance_delete_removes_node() {
+        let (_dir, repo) = kind_repo();
+        write_vault(&repo, "kinds/adr/_kind.md", ADR_SPEC);
+        write_vault(&repo, &format!("kinds/adr/{KUID2}.md"), &adr(KUID2, ""));
+        write_vault(
+            &repo,
+            &format!("kinds/adr/{KUID}.md"),
+            &adr(KUID, &format!("supersedes: [{KUID2}]\n")),
+        );
+        repo.vault_record_working_copy().unwrap();
+        let id = format!("adr:{KUID}");
+        assert!(kg_node(&repo, &id).is_some());
+
+        std::fs::remove_file(repo.vault_dir().join(format!("kinds/adr/{KUID}.md"))).unwrap();
+        repo.vault_record_working_copy().unwrap();
+        assert!(kg_node(&repo, &id).is_none());
+        assert!(kg_edges_from(&repo, &id).is_empty());
+        assert!(kg_node(&repo, &format!("adr:{KUID2}")).is_some());
+    }
+
+    #[test]
+    fn test_kind_custom_has_task_edge_cannot_delete_intent_children() {
+        let (_dir, repo) = kind_repo();
+        let created = intent(&repo);
+        let intent_subject = entry_subject(&created.intent_file, VaultEntryType::Intent);
+        // Give the intent a task and a criterion, so it has child nodes.
+        let intent_path = repo.vault_dir().join(&created.intent_file);
+        let mut text = std::fs::read_to_string(&intent_path).unwrap();
+        text.push_str(
+            "\n:::acceptance-criterion{#kinds-ac-1 status=unmet}\nWorks.\n:::\n\n\
+             :::task{#kinds-1 status=unmet criteria=kinds-ac-1}\nDo it.\n:::\n",
+        );
+        std::fs::write(&intent_path, text).unwrap();
+        repo.vault_record_working_copy().unwrap();
+        let children: Vec<String> = kg_edges_from(&repo, &intent_subject)
+            .into_iter()
+            .filter(|e| INTENT_CHILD_EDGE_KINDS.contains(&e.kind.as_str()))
+            .map(|e| e.to_id)
+            .collect();
+        assert!(
+            !children.is_empty(),
+            "the intent template projects children"
+        );
+
+        write_vault(
+            &repo,
+            "kinds/plan/_kind.md",
+            "---\nname: plan\nspecVersion: 1\nfields:\n  intent:\n    type: ref\n    target: [intent]\n    edge: HAS_TASK\n---\n",
+        );
+        let inst = format!("kinds/plan/{KUID}.md");
+        write_vault(
+            &repo,
+            &inst,
+            &format!("---\nuid: {KUID}\nintent: {}\n---\nplan\n", created.uid),
+        );
+        let survives = |stage: &str| {
+            assert!(kg_node(&repo, &intent_subject).is_some(), "{stage}: intent");
+            for child in &children {
+                assert!(kg_node(&repo, child).is_some(), "{stage}: {child}");
+            }
+        };
+
+        repo.vault_record_working_copy().unwrap();
+        let id = format!("plan:{KUID}");
+        assert!(kg_edges_from(&repo, &id)
+            .iter()
+            .any(|e| e.kind == "plan.HAS_TASK" && e.to_id == intent_subject));
+        survives("indexed");
+
+        repo.vault_index_kg(&inst).unwrap();
+        assert!(repo.vault_reindex_kind("plan").unwrap() > 0);
+        survives("re-indexed");
+
+        std::fs::remove_file(repo.vault_dir().join(&inst)).unwrap();
+        repo.vault_record_working_copy().unwrap();
+        assert!(kg_node(&repo, &id).is_none());
+        survives("instance deleted");
+    }
+
+    const KUID3: &str = "01JD8ZK3M6W2Q4V7X9B5N1C3TT";
+
+    const RFC_SPEC: &str = "\
+---
+name: rfc
+specVersion: 1
+fields:
+  decidedBy:
+    type: ref
+    target: [adr]
+    edge: DECIDED_BY
+  intent:
+    type: ref
+    target: [intent]
+    edge: IMPLEMENTS
+---
+";
+
+    fn rfc(uid: &str, extra: &str) -> String {
+        format!("---\nuid: {uid}\ntitle: Storage RFC\n{extra}---\nProposal.\n")
+    }
+
+    fn conforms(repo: &Repository, id: &str) -> bool {
+        meta(&kg_node(repo, id).expect(id), "conforms")
+            .as_bool()
+            .unwrap()
+    }
+
+    fn has_edge(repo: &Repository, from: &str, kind: &str, to: &str) -> bool {
+        kg_edges_from(repo, from)
+            .iter()
+            .any(|e| e.kind == kind && e.to_id == to)
+    }
+
+    #[test]
+    fn test_kind_cross_entry_edge_survives_target_spec_round_trip() {
+        let (_dir, repo) = kind_repo();
+        write_vault(&repo, "kinds/adr/_kind.md", ADR_SPEC);
+        write_vault(&repo, &format!("kinds/adr/{KUID}.md"), &adr(KUID, ""));
+        write_vault(&repo, "kinds/rfc/_kind.md", RFC_SPEC);
+        write_vault(
+            &repo,
+            &format!("kinds/rfc/{KUID3}.md"),
+            &rfc(KUID3, &format!("decidedBy: {KUID}\n")),
+        );
+        repo.vault_record_working_copy().unwrap();
+        let (rfc_id, adr_id) = (format!("rfc:{KUID3}"), format!("adr:{KUID}"));
+        assert!(has_edge(&repo, &rfc_id, "rfc.DECIDED_BY", &adr_id));
+        assert!(conforms(&repo, &rfc_id));
+
+        // The adr spec breaks: adr:A is gone, and rfc:R no longer resolves.
+        write_vault(
+            &repo,
+            "kinds/adr/_kind.md",
+            &ADR_SPEC.replace("specVersion: 1", "specVersion: 2"),
+        );
+        repo.vault_record_working_copy().unwrap();
+        assert!(kg_node(&repo, &adr_id).is_none());
+        assert!(!has_edge(&repo, &rfc_id, "rfc.DECIDED_BY", &adr_id));
+        assert!(!conforms(&repo, &rfc_id));
+        assert_eq!(
+            meta(&kg_node(&repo, &rfc_id).unwrap(), "violation_codes"),
+            &serde_json::json!(["UNRESOLVED_REF"])
+        );
+
+        // Fixing it brings the edge back without touching rfc:R.
+        write_vault(&repo, "kinds/adr/_kind.md", ADR_SPEC);
+        let updated = repo.vault_record_working_copy().unwrap();
+        assert_eq!(updated, ["kinds/adr/_kind.md"]);
+        assert!(has_edge(&repo, &rfc_id, "rfc.DECIDED_BY", &adr_id));
+        assert!(conforms(&repo, &rfc_id));
+    }
+
+    #[test]
+    fn test_kind_deleted_ref_target_makes_referrer_nonconforming() {
+        let (_dir, repo) = kind_repo();
+        write_vault(&repo, "kinds/adr/_kind.md", ADR_SPEC);
+        write_vault(&repo, &format!("kinds/adr/{KUID}.md"), &adr(KUID, ""));
+        write_vault(&repo, "kinds/rfc/_kind.md", RFC_SPEC);
+        write_vault(
+            &repo,
+            &format!("kinds/rfc/{KUID3}.md"),
+            &rfc(KUID3, &format!("decidedBy: {KUID}\n")),
+        );
+        repo.vault_record_working_copy().unwrap();
+        let rfc_id = format!("rfc:{KUID3}");
+        assert!(conforms(&repo, &rfc_id));
+
+        std::fs::remove_file(repo.vault_dir().join(format!("kinds/adr/{KUID}.md"))).unwrap();
+        repo.vault_record_working_copy().unwrap();
+        assert!(!conforms(&repo, &rfc_id), "the KG agrees with validate");
+        let report = repo
+            .kind_validate(&super::super::kinds::KindSource::WorkingCopy, Some("rfc"))
+            .unwrap();
+        assert!(!report.kinds[0].instances[0].conforms);
+
+        // Restoring the target restores conformance and the edge.
+        write_vault(&repo, &format!("kinds/adr/{KUID}.md"), &adr(KUID, ""));
+        repo.vault_record_working_copy().unwrap();
+        assert!(conforms(&repo, &rfc_id));
+        assert!(has_edge(
+            &repo,
+            &rfc_id,
+            "rfc.DECIDED_BY",
+            &format!("adr:{KUID}")
+        ));
+    }
+
+    #[test]
+    fn test_kind_intent_added_later_resolves_referrer() {
+        let (_dir, repo) = kind_repo();
+        // Make an intent, then take it out of the vault, keeping its file.
+        let created = intent(&repo);
+        let intent_disk = repo.vault_dir().join(&created.intent_file);
+        let intent_text = std::fs::read_to_string(&intent_disk).unwrap();
+        std::fs::remove_file(&intent_disk).unwrap();
+        repo.vault_record_working_copy().unwrap();
+        assert!(repo.vault_retrieve(&created.intent_file).unwrap().is_none());
+
+        write_vault(&repo, "kinds/rfc/_kind.md", RFC_SPEC);
+        write_vault(
+            &repo,
+            &format!("kinds/rfc/{KUID3}.md"),
+            &rfc(KUID3, &format!("intent: {}\n", created.uid)),
+        );
+        repo.vault_record_working_copy().unwrap();
+        let rfc_id = format!("rfc:{KUID3}");
+        assert!(!conforms(&repo, &rfc_id));
+
+        // The intent arrives in a later batch that does not touch rfc:R.
+        std::fs::write(&intent_disk, intent_text).unwrap();
+        let updated = repo.vault_record_working_copy().unwrap();
+        assert_eq!(updated, std::slice::from_ref(&created.intent_file));
+        let intent_subject = entry_subject(&created.intent_file, VaultEntryType::Intent);
+        assert!(conforms(&repo, &rfc_id));
+        assert!(has_edge(&repo, &rfc_id, "rfc.IMPLEMENTS", &intent_subject));
+
+        // And leaves again.
+        std::fs::remove_file(&intent_disk).unwrap();
+        repo.vault_record_working_copy().unwrap();
+        assert!(!conforms(&repo, &rfc_id));
+    }
+
+    #[test]
+    fn test_kind_projection_reads_the_stored_definition() {
+        let (_dir, repo) = kind_repo();
+        write_vault(&repo, "kinds/adr/_kind.md", ADR_SPEC);
+        let inst = format!("kinds/adr/{KUID}.md");
+        write_vault(&repo, &inst, &adr(KUID, ""));
+        repo.vault_record_working_copy().unwrap();
+        let id = format!("adr:{KUID}");
+        assert!(conforms(&repo, &id));
+        assert_eq!(
+            meta(&kg_node(&repo, &id).unwrap(), "urn"),
+            &format!("urn:atomic:adr:{KUID}")
+        );
+
+        // An unrecorded edit to the working-copy definition is not what the
+        // stored instance was deflated against: projection ignores it,
+        // while the file-based gate sees it.
+        write_vault(
+            &repo,
+            "kinds/adr/_kind.md",
+            &ADR_SPEC.replace("[proposed, accepted, superseded]", "[proposed, superseded]"),
+        );
+        repo.vault_index_kg(&inst).unwrap();
+        assert!(conforms(&repo, &id));
+        assert_eq!(
+            meta(&kg_node(&repo, "kind:adr").unwrap(), "fields"),
+            &serde_json::json!(["intent", "priority", "status", "supersedes", "tags"])
+        );
+        let report = repo
+            .kind_validate(&super::super::kinds::KindSource::WorkingCopy, None)
+            .unwrap();
+        assert!(!report.kinds[0].instances[0].conforms);
+
+        // A case variant of `_kind.md` is a stray file, and never a spec.
+        std::fs::remove_file(repo.vault_dir().join("kinds/adr/_kind.md")).unwrap();
+        repo.vault_record_working_copy().unwrap();
+        assert!(kg_node(&repo, &id).is_none());
+        repo.vault_store(
+            "kinds/adr/_KIND.md",
+            VaultEntryType::Scratch,
+            Vec::new(),
+            serde_json::to_string(&serde_json::json!({"name": "adr", "specVersion": 1})).unwrap(),
+        )
+        .unwrap();
+        repo.vault_index_kg(&inst).unwrap();
+        assert!(kg_node(&repo, &id).is_none());
+    }
+
+    #[test]
+    fn test_kind_projection_of_files_not_on_disk() {
+        // A sandbox submit deflates a view's files, which need not be in the
+        // working copy at all.
+        let (_dir, repo) = kind_repo();
+        let inst = format!("kinds/rfc/{KUID3}.md");
+        let target = format!("kinds/adr/{KUID}.md");
+        repo.vault_record_files(&[
+            ("kinds/adr/_kind.md".into(), Some(ADR_SPEC.into())),
+            (target.clone(), Some(adr(KUID, ""))),
+            ("kinds/rfc/_kind.md".into(), Some(RFC_SPEC.into())),
+            (
+                inst.clone(),
+                Some(rfc(KUID3, &format!("decidedBy: {KUID}\n"))),
+            ),
+        ])
+        .unwrap();
+        assert!(!repo.vault_dir().join(&inst).exists());
+        let rfc_id = format!("rfc:{KUID3}");
+        assert!(conforms(&repo, &rfc_id));
+        assert!(has_edge(
+            &repo,
+            &rfc_id,
+            "rfc.DECIDED_BY",
+            &format!("adr:{KUID}")
+        ));
+    }
+
+    #[test]
+    fn test_stored_kind_definition_fails_closed() {
+        use super::super::kinds::KindDefinition;
+        let entry = |fm: serde_json::Value, body: &str| {
+            VaultEntry::new(
+                VaultEntryType::Scratch,
+                body.as_bytes().to_vec(),
+                fm.to_string(),
+                String::new(),
+            )
+        };
+        let ok = serde_json::json!({"name": "adr", "specVersion": 1});
+        assert!(
+            KindDefinition::from_stored("adr", &entry(ok.clone(), "guide\n"))
+                .spec()
+                .is_some()
+        );
+        let marker = "<<<<<<< ours\na\n=======\nb\n>>>>>>> theirs\n";
+        for (fm, body) in [
+            (serde_json::json!({}), "guide\n"),
+            (ok.clone(), marker),
+            (
+                serde_json::json!({"name": "adr", "specVersion": 1, "title": marker}),
+                "",
+            ),
+        ] {
+            let def = KindDefinition::from_stored("adr", &entry(fm.clone(), body));
+            assert!(def.spec().is_none(), "{fm} / {body:?}");
+        }
+    }
+
+    #[test]
+    fn test_vault_reindex_kind_rejects_invalid_name() {
+        let (_dir, repo) = kind_repo();
+        assert!(repo.vault_reindex_kind("../x").is_err());
+        assert_eq!(repo.vault_reindex_kind("adr").unwrap(), 0);
     }
 }
