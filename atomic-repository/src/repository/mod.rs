@@ -257,6 +257,7 @@ mod history;
 mod insert;
 mod kg_attestation;
 mod kg_rebuild;
+mod kinds;
 mod project_identity;
 pub mod provenance_gate;
 mod provenance_summary;
@@ -297,6 +298,12 @@ pub use conflict_object::{
 };
 pub use insert::{
     ImportLineIndexSeed, ImportLineIndexSeedLine, ImportWriteOutcome, ImportWriteTimings,
+};
+pub use kinds::{
+    check_instance, kind_definition_path, kind_instance_path, mint_kind_uid, InstanceCheck,
+    InstanceResult, KindDefinition, KindEntry, KindFiles, KindPath, KindProblem, KindProblemCode,
+    KindRefResolver, KindRegistry, KindReport, KindReportStatus, KindSource, KindStatus,
+    KindValidationReport, KINDS_DIR, KIND_DEFINITION_FILE,
 };
 pub use provenance_gate::{GateBlocker, GateVerdict, MacKeyProvider, PublicationGateConfig};
 pub use provenance_summary::ProvenanceSummary;
@@ -405,6 +412,8 @@ pub struct Repository {
     /// Per-process memo of the CRDT branch state folded per trunk over the
     /// current assembly closure; see [`semantic_closure::SemanticClosureMemo`].
     semantic_closure_memo: std::sync::Mutex<semantic_closure::SemanticClosureMemo>,
+    /// Kind registries of views, keyed by view state.
+    kind_registry_cache: kinds::KindRegistryCache,
 }
 
 impl std::fmt::Debug for Repository {
@@ -534,6 +543,7 @@ default = "{}"
             change_store,
             is_sandbox: false,
             semantic_closure_memo: Default::default(),
+            kind_registry_cache: Default::default(),
         };
 
         Ok(repository)
@@ -638,6 +648,7 @@ default = "{}"
             change_store,
             is_sandbox: false,
             semantic_closure_memo: Default::default(),
+            kind_registry_cache: Default::default(),
         };
         repository.fence_recovery_for_budget(working_copy_id, budget)?;
         if !budget.is_metadata_only() {
@@ -739,6 +750,7 @@ default = "{}"
             change_store,
             is_sandbox: false,
             semantic_closure_memo: Default::default(),
+            kind_registry_cache: Default::default(),
         };
         let operation_lock = repository.try_lock_operation(working_copy_id)?;
         repository.recover_pending_deferred_tree_alignment_locked(&operation_lock)?;
@@ -798,6 +810,7 @@ default = "{}"
             change_store,
             is_sandbox: false,
             semantic_closure_memo: Default::default(),
+            kind_registry_cache: Default::default(),
         })
     }
 
@@ -907,6 +920,7 @@ default = "{}"
             change_store,
             is_sandbox: false,
             semantic_closure_memo: Default::default(),
+            kind_registry_cache: Default::default(),
         };
         if !operation_inspection
             && (repository.has_pending_deferred_tree_alignment()
@@ -965,6 +979,7 @@ default = "{}"
             change_store,
             is_sandbox: false,
             semantic_closure_memo: Default::default(),
+            kind_registry_cache: Default::default(),
         };
         if repository.has_pending_deferred_tree_alignment() {
             return Err(RepositoryError::InvalidOperation {
@@ -1072,6 +1087,7 @@ default = "{}"
             change_store,
             is_sandbox: false,
             semantic_closure_memo: Default::default(),
+            kind_registry_cache: Default::default(),
         };
         let operation_lock = repository.try_lock_operation(working_copy_id)?;
         repository.recover_pending_deferred_tree_alignment_locked(&operation_lock)?;
