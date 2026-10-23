@@ -317,6 +317,19 @@ impl<'a> SwitchMaterializationExecutor<'a> {
     }
 }
 
+/// The bytes a symlink's target spells, the representation materialization
+/// writes for a symlink entry.
+#[cfg(unix)]
+fn link_target_bytes(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
+    use std::os::unix::ffi::OsStrExt;
+    std::fs::read_link(path).map(|target| target.as_os_str().as_bytes().to_vec())
+}
+
+#[cfg(not(unix))]
+fn link_target_bytes(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
+    std::fs::read_link(path).map(|target| target.to_string_lossy().into_owned().into_bytes())
+}
+
 impl super::materialize::MaterializationEffectExecutor for SwitchMaterializationExecutor<'_> {
     fn create_directory(&mut self, path: &str) -> Result<bool, RepositoryError> {
         if self
@@ -354,7 +367,22 @@ impl super::materialize::MaterializationEffectExecutor for SwitchMaterialization
             })
             .is_none()
         {
-            return match std::fs::read(self.repository.root().join(path)) {
+            // An unleased entry is verified in place. A symlink is compared
+            // by its target, never by reading through it: following a link to
+            // a directory (the `.agents/skills/<name>` layout) failed every
+            // switch with "Is a directory".
+            let absolute = self.repository.root().join(path);
+            let current = match std::fs::symlink_metadata(&absolute) {
+                Ok(metadata) if metadata.file_type().is_symlink() => link_target_bytes(&absolute),
+                Ok(metadata) if metadata.is_dir() => {
+                    return Err(RepositoryError::InvalidOperation {
+                        message: format!("unleased directory entry blocks file '{path}'"),
+                    });
+                }
+                Ok(_) => std::fs::read(&absolute),
+                Err(error) => Err(error),
+            };
+            return match current {
                 Ok(current) if current == content => Ok(false),
                 Ok(_) => Err(RepositoryError::InvalidOperation {
                     message: format!("unleased filesystem content changed at '{path}'"),

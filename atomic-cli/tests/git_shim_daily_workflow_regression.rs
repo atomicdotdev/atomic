@@ -25,7 +25,9 @@
 //! - `git reset --hard` onto an imported ancestor imported nothing, kept the
 //!   dropped change in the view and stranded every later command;
 //! - the pre-push hook bound every proposed branch to the current view, so
-//!   pushing any other branch was refused.
+//!   pushing any other branch was refused;
+//! - `atomic git shim switch` refused any repository whose tree holds a
+//!   symlink (`unsupported Git entry ... with mode 120000`).
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -502,4 +504,45 @@ fn pushing_a_reconciled_non_current_branch_passes_the_pre_push_gate() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("has no Atomic view"), "got:\n{stderr}");
     assert!(git(&remote, &["branch", "--list"]).contains("other"));
+}
+
+#[test]
+fn shim_switch_handles_symlinks_in_the_tree() {
+    let (root, home) = shim_repo();
+    // The agent-skills layout: a directory of symlinks to skill folders.
+    fs::create_dir_all(root.join(".claude/skills/review")).unwrap();
+    fs::write(root.join(".claude/skills/review/SKILL.md"), b"review\n").unwrap();
+    fs::create_dir_all(root.join(".agents/skills")).unwrap();
+    std::os::unix::fs::symlink(
+        "../../.claude/skills/review",
+        root.join(".agents/skills/review"),
+    )
+    .unwrap();
+    commit_all(&root, "skills layout");
+    atomic_ok(&root, &home, &["git", "shim", "reconcile"]);
+    assert_clean(&root, &home);
+
+    git(&root, &["switch", "-qc", "feature"]);
+    fs::write(root.join("tracked.txt"), b"base\nfeature\n").unwrap();
+    commit_all(&root, "feature edit");
+    atomic_ok(&root, &home, &["git", "shim", "reconcile"]);
+    git(&root, &["switch", "-q", "main"]);
+    atomic_ok(&root, &home, &["git", "shim", "reconcile"]);
+
+    atomic_ok(&root, &home, &["git", "shim", "switch", "feature"]);
+    assert_eq!(git(&root, &["branch", "--show-current"]), "feature");
+    assert_eq!(
+        fs::read(root.join("tracked.txt")).unwrap(),
+        b"base\nfeature\n"
+    );
+    assert!(root
+        .join(".agents/skills/review")
+        .symlink_metadata()
+        .unwrap()
+        .file_type()
+        .is_symlink());
+    atomic_ok(&root, &home, &["git", "shim", "switch", "main"]);
+    assert_eq!(git(&root, &["branch", "--show-current"]), "main");
+    assert_eq!(fs::read(root.join("tracked.txt")).unwrap(), b"base\n");
+    assert_clean(&root, &home);
 }

@@ -3199,6 +3199,19 @@ fn collect_git_tree(
                 })?;
                 files.insert(path, blob.content().to_vec());
             }
+            // A symlink is a path like any other for collision planning; its
+            // blob holds the link target. The `.claude/skills/<name>` layout
+            // made every switch refuse with "unsupported Git entry".
+            (Some(ObjectType::Blob), 0o120000) => {
+                let blob = git.find_blob(entry.id()).map_err(|error| {
+                    git_error(format!("cannot read Git symlink '{path}': {error}"))
+                })?;
+                files.insert(path, blob.content().to_vec());
+            }
+            // A gitlink occupies its path without content of its own.
+            (Some(ObjectType::Commit), 0o160000) => {
+                files.insert(path, Vec::new());
+            }
             _ => {
                 return Err(git_error(format!(
                     "unsupported Git entry '{path}' with mode {:o}",
