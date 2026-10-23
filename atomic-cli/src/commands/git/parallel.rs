@@ -4570,6 +4570,77 @@ impl ParallelImporter {
         Ok(ViewClaim { view, state })
     }
 
+    /// A tip that moved backwards onto an already-interpreted commit (`git
+    /// reset --hard HEAD~1`, a rebase dropping the newest commit, a
+    /// force-pull to an ancestor) plans no commits, so the per-commit
+    /// supersede gate never ran: the view kept the dropped history, every
+    /// later command refused with `HeadChanged`, and `shim status` called
+    /// the mapping synchronized. Apply the same gate against the tip: view
+    /// members whose Git origin lies outside the tip's ancestry and
+    /// interpreted closure leave the view, dependents included.
+    fn rewind_view_to_interpreted_tip(
+        &self,
+        repo: &mut Repository,
+        branch_name: &str,
+    ) -> CliResult<usize> {
+        let Ok(git) = self.open_git_repo() else {
+            return Ok(0);
+        };
+        let Some(tip) = git
+            .find_branch(branch_name, git2::BranchType::Local)
+            .ok()
+            .and_then(|branch| branch.get().target())
+        else {
+            return Ok(0);
+        };
+        let tip_sha = tip.to_string();
+        let view = self.options.target_view.clone();
+        let Some(tip_hash) = repo
+            .checked_git_sha(&tip_sha)
+            .map_err(|e| CliError::Internal(e.into()))?
+        else {
+            return Ok(0);
+        };
+        let is_member = |repo: &Repository, hash: &ContentHash| -> CliResult<bool> {
+            Ok(repo
+                .effective_history(Some(&view))
+                .map_err(|e| CliError::Internal(e.into()))?
+                .iter()
+                .any(|entry| entry.hash == *hash))
+        };
+        if !is_member(repo, &tip_hash)? {
+            return Ok(0);
+        }
+        let mut ledger = ClosureLedger::default();
+        let ancestry = ledger.ancestry_of(&git, &tip_sha)?;
+        ledger.target_closure = Some(ancestry);
+        let superseded = ledger.supersede_exclusions_for(repo, &git, &tip_sha, &view, true)?;
+        let mut removed = 0usize;
+        for hash in superseded {
+            if !is_member(repo, &hash)? {
+                continue;
+            }
+            let outcome = repo
+                .unrecord(
+                    &hash,
+                    atomic_repository::unrecord::UnrecordOptions {
+                        view: Some(view.clone()),
+                        cascade: true,
+                        update_working_copy: false,
+                        ..Default::default()
+                    },
+                )
+                .map_err(|e| CliError::Internal(e.into()))?;
+            trace_git_import(format!(
+                "rewind '{branch_name}': unrecorded {} change(s) behind {}",
+                outcome.unrecorded.len(),
+                hash.to_base32()
+            ));
+            removed += outcome.unrecorded.len();
+        }
+        Ok(removed)
+    }
+
     /// Import commits from a branch into an Atomic repository.
     ///
     /// Commits are processed in **batches** to keep memory bounded and show
@@ -4606,6 +4677,12 @@ impl ParallelImporter {
             ..ImportStats::default()
         };
         if plan.commits.is_empty() {
+            let superseded = self.rewind_view_to_interpreted_tip(repo, branch_name)?;
+            if superseded > 0 {
+                print_info(&format!(
+                    "Superseded {superseded} change(s) no longer reachable from the Git tip of '{branch_name}'"
+                ));
+            }
             return Ok(stats);
         }
 
@@ -5959,7 +6036,7 @@ impl ParallelImporter {
         // Pre-register added paths so tracking metadata exists before
         // recording (same hygiene as the legacy path). Fail closed: a
         // tracking failure must not silently produce an untracked import.
-        let mut added_paths: Vec<&str> = Vec::new();
+        let mut added_paths: Vec<std::borrow::Cow<'_, str>> = Vec::new();
         let mut deleted_paths: Vec<String> = Vec::new();
         // Paths this commit vacates: deletions and the source side of
         // renames. The tracking tree binds their old inode until the
@@ -7007,7 +7084,7 @@ impl ParallelImporter {
         let files: Vec<_> = files.into_values().collect();
         let mut recorded_files: Vec<RecordedFile> = Vec::new();
         let mut deleted_paths: Vec<String> = Vec::new();
-        let mut added_paths: Vec<&str> = Vec::new();
+        let mut added_paths: Vec<std::borrow::Cow<'_, str>> = Vec::new();
         let mut resolved_names = std::collections::HashSet::new();
         for file in &files {
             if let Some(bytes) = &file.new_content {
