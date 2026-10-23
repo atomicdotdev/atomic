@@ -925,10 +925,16 @@ impl TurnOrchestrator {
             agent_vendor: session.agent_vendor.clone(),
             change_hashes: change_hashes.to_vec(),
             previous_provenance,
-            plan_id: session
-                .managed_run
-                .as_ref()
-                .and_then(|run| run.work_item_id.clone()),
+            plan_id: self
+                .session_store
+                .turn_intent_binding(session_id, session.turn_count.max(1))?
+                .map(|binding| binding.intent_uid)
+                .or_else(|| {
+                    session
+                        .managed_run
+                        .as_ref()
+                        .and_then(|run| run.work_item_id.clone())
+                }),
             ledger_turn_number,
         };
         let reservation = sink

@@ -6489,6 +6489,12 @@ pub(crate) fn workflow_snapshot(
     let response = session.get_workflow_snapshot(pb::GetWorkflowSnapshotRequest {
         repository: Some(session.reference.clone()),
     })?;
+    decode_workflow_snapshot(response)
+}
+
+fn decode_workflow_snapshot(
+    response: pb::GetWorkflowSnapshotResponse,
+) -> CliResult<atomic_repository::repository::WorkflowSnapshot> {
     if response.api_version != 1
         || response.generation != atomic_core::kg::KG_GENERATION
         || response.ontology_version != atomic_core::kg::ontology::VERSION_IRI
@@ -6508,6 +6514,77 @@ pub(crate) fn workflow_snapshot(
             .map(kg_edge_domain)
             .collect::<CliResult<_>>()?,
     })
+}
+
+/// Compose existing local/reactor read endpoints without opening redb client-side.
+/// The selection itself runs purely over one consistent workflow snapshot.
+pub(crate) fn intent_graph(
+    id: &str,
+    max_nodes: usize,
+) -> CliResult<atomic_repository::intent_graph::IntentGraph> {
+    let root = super::find_repository_root()?;
+    let session = Service::open_root(&root)?.ok_or_else(|| CliError::InvalidArgument {
+        message: "intent graphs require a local repository service (local or reactor mode)".into(),
+    })?;
+    let canonical = atomic_core::kg::iri::parse_intent(id)
+        .ok()
+        .map(|_| id.to_owned());
+    let uid = if canonical.is_none() {
+        let response = session.get_vault_entry(pb::GetVaultEntryRequest {
+            repository: Some(session.reference.clone()),
+            kind: Kind::Intent as i32,
+            id: id.into(),
+            path: None,
+            include_bundle: true,
+            view: None,
+        })?;
+        let bundle = response
+            .entry_bundle
+            .as_ref()
+            .map(parse_entry_bundle)
+            .transpose()?
+            .ok_or_else(|| {
+                CliError::Internal(anyhow::anyhow!("intent service returned no entry bundle"))
+            })?;
+        let inputs = crate::commands::intent::bridge::inputs_from_entry(&bundle.entry)?;
+        Some(
+            inputs
+                .frontmatter
+                .get("uid")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| CliError::InvalidArgument {
+                    message: "intent has no canonical UID".into(),
+                })?
+                .to_uppercase(),
+        )
+    } else {
+        None
+    };
+    let snapshot = decode_workflow_snapshot(session.get_workflow_snapshot(
+        pb::GetWorkflowSnapshotRequest {
+            repository: Some(session.reference.clone()),
+        },
+    )?)?;
+    let canonical = match canonical {
+        Some(id) => id,
+        None => {
+            let candidates: Vec<_> = snapshot
+                .nodes
+                .iter()
+                .filter(|node| {
+                    atomic_core::kg::iri::parse_intent(&node.id)
+                        .ok()
+                        .is_some_and(|(_, value)| Some(&value) == uid.as_ref())
+                })
+                .collect();
+            if candidates.len() != 1 {
+                return Err(CliError::InvalidArgument { message: "intent is missing or ambiguous in the workflow snapshot; run atomic query enrich".into() });
+            }
+            candidates[0].id.clone()
+        }
+    };
+    atomic_repository::intent_graph::IntentGraph::from_snapshot(&snapshot, &canonical, max_nodes)
+        .map_err(CliError::Repository)
 }
 
 // ---------------------------------------------------------------------------

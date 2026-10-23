@@ -6,7 +6,7 @@ pub mod ontology;
 pub mod project_id;
 
 /// Storage generation of the derived canonical workflow graph.
-pub const KG_GENERATION: u32 = 1;
+pub const KG_GENERATION: u32 = 2;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]

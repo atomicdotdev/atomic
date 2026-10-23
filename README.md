@@ -514,6 +514,32 @@ Full documentation at **[docs.atomic.dev](https://docs.atomic.dev/)**.
 
 If replacing an older binary, first follow [the legacy upgrade steps](#upgrading-from-legacy-database-owners-0191-and-earlier).
 
+Source builds require **Rust 1.98 or newer** (including the SHACL dependencies).
+`rust-toolchain.toml` pins the supported development toolchain. Use rustup's
+`cargo`/`rustc` shims, not an older standalone Homebrew Rust installation:
+
+```sh
+rustup toolchain install 1.98.0 --profile minimal --component rustfmt --component clippy
+export PATH="$HOME/.cargo/bin:$PATH"
+rustup show active-toolchain
+rustc --version
+cargo build -r
+```
+
+If Cargo still reports `rustc 1.97.1`, inspect `type -a cargo rustc`: a direct
+`/opt/homebrew/bin/cargo` or `rustc` ahead of `~/.cargo/bin` bypasses rustup and
+the repository pin. Put the export above **after** Homebrew's PATH setup in your
+shell configuration. Do not lower `rust-version` or use `--ignore-rust-version`:
+the dependency itself requires the newer compiler. For a one-command build
+without changing the shell configuration:
+
+```sh
+PATH="$HOME/.cargo/bin:$PATH" cargo build -r
+```
+
+Also check for explicit `RUSTC`, `RUSTDOC`, `RUSTUP_TOOLCHAIN`, or Cargo config
+overrides if the shims still select the wrong compiler.
+
 ```bash
 # Build all crates
 cargo build --release

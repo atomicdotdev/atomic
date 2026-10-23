@@ -322,7 +322,11 @@ impl WriteTxn<'_> {
                         &hash.to_base32()[..12],
                         "session_ledger",
                     )
-                    .with_metadata(serde_json::json!({"hash": hash.to_base32()})),
+                    // The ledger proves identity, not object-store availability.
+                    // Repository projection upgrades these conservative facts
+                    // after loading and verifying the immutable object.
+                    .with_metadata(serde_json::json!({"hash": hash.to_base32(),
+                        "object_availability": "unknown", "projection_completeness": "reference-only"})),
                 )?;
             }
             self.upsert_kg_edge(&edge(&id, &change, Predicate::GeneratedChange))?;

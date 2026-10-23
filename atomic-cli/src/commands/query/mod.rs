@@ -436,6 +436,9 @@ impl Command for QueryGraph {
             });
         }
 
+        repo.enrich_workflow_usage(&mut nodes)
+            .map_err(CliError::Repository)?;
+
         // 4. Output
         if self.json {
             let output = serde_json::json!({
@@ -628,6 +631,50 @@ fn dot_escape_label(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
+/// Stable categorical colors with contrast against the HTML graph's dark canvas.
+/// Exhaustive matching keeps ontology additions from silently sharing a fallback.
+fn html_node_color(kind: &str) -> String {
+    let Some(class) = Class::from_iri(kind) else {
+        // Unlike a palette indexed by the types currently visible, hashing the
+        // full IRI keeps an external type's color stable between exports.
+        let hash = kind.bytes().fold(2166136261u32, |hash, byte| {
+            (hash ^ u32::from(byte)).wrapping_mul(16777619)
+        });
+        return format!("hsl({}, 65%, 68%)", hash % 360);
+    };
+    match class {
+        Class::WorkIntent => "#63d5ea",
+        Class::FeatureIntent => "#56cfe1",
+        Class::BugIntent => "#ff8a9a",
+        Class::ReviewIntent => "#a5b4fc",
+        Class::ManagedIntent => "#8be4f0",
+        Class::Goal => "#6ed4ae",
+        Class::Memory => "#e2bc81",
+        Class::Skill => "#a4d98b",
+        Class::ToolResult => "#8da9bd",
+        Class::Task => "#dd81ef",
+        Class::AcceptanceCriterion => "#c6e96e",
+        Class::ScopeItem => "#c5a582",
+        Class::Constraint => "#f59ac2",
+        Class::Todo => "#d79e64",
+        Class::Session => "#b6a4ff",
+        Class::SessionTurn => "#39b8bd",
+        Class::ManagedTurn => "#8ad4dc",
+        Class::ProvenanceGraph => "#72a7ff",
+        Class::Attestation => "#f0c4ec",
+        Class::Finding => "#ffad66",
+        Class::Change => "#ff786f",
+        Class::View => "#9878e8",
+        Class::File => "#53d89b",
+        Class::Identity => "#f4d06f",
+        Class::Concept => "#aac4a0",
+        Class::Project => "#adcbe7",
+        Class::ProjectIdentity => "#bba2a0",
+        Class::VerificationStatus => "#d4d8e3",
+    }
+    .to_owned()
+}
+
 /// Generate a self-contained HTML page with a D3.js force-directed graph.
 pub(crate) fn emit_html(query: &str, nodes: &[KgNode], edges: &[KgEdge]) -> String {
     // Build JSON data for embedding
@@ -661,9 +708,12 @@ pub(crate) fn emit_html(query: &str, nodes: &[KgNode], edges: &[KgEdge]) -> Stri
             serde_json::json!({
                 "id": n.id,
                 "kind": n.primary_type(),
+                "color": html_node_color(n.primary_type()),
                 "types": n.types,
                 "label": n.label,
                 "summary": n.summary.as_deref().unwrap_or(""),
+                "source": n.source,
+                "metadata": n.metadata,
                 "content_matches": content_matches,
                 "entity_kind": entity_kind,
                 "line": line,
@@ -679,6 +729,7 @@ pub(crate) fn emit_html(query: &str, nodes: &[KgNode], edges: &[KgEdge]) -> Stri
                 "source": e.from_id,
                 "target": e.to_id,
                 "kind": e.kind,
+                "metadata": e.metadata,
             })
         })
         .collect();
@@ -688,7 +739,11 @@ pub(crate) fn emit_html(query: &str, nodes: &[KgNode], edges: &[KgEdge]) -> Stri
         "links": graph_edges,
     });
 
-    let data_json = serde_json::to_string(&graph_data).unwrap();
+    let data_json = serde_json::to_string(&graph_data)
+        .unwrap()
+        .replace('<', "\\u003c")
+        .replace('>', "\\u003e")
+        .replace('&', "\\u0026");
     let escaped_query = query
         .replace('&', "&amp;")
         .replace('<', "&lt;")
@@ -707,16 +762,17 @@ pub(crate) fn emit_html(query: &str, nodes: &[KgNode], edges: &[KgEdge]) -> Stri
   #header h1 {{ font-size: 14px; font-weight: 600; color: #a0a0c0; letter-spacing: 1px; }}
   #header .query {{ font-size: 14px; color: #6ec6ff; }}
   #header .stats {{ font-size: 12px; color: #888; margin-left: auto; }}
-  canvas {{ display: block; width: 100vw; height: 100vh; }}
+  canvas {{ display: block; width: 100%; height: 100%; }}
   #tooltip {{ position: fixed; padding: 10px 14px; background: rgba(0,0,0,0.92); border: 1px solid #555; border-radius: 6px; font-size: 12px; pointer-events: none; display: none; z-index: 20; max-width: 420px; line-height: 1.5; }}
   #tooltip .kind {{ color: #888; font-size: 10px; text-transform: uppercase; letter-spacing: 0.5px; }}
   #tooltip .label {{ color: #fff; font-weight: 600; margin: 3px 0; word-break: break-all; }}
   #tooltip .summary {{ color: #bbb; font-size: 11px; margin-bottom: 2px; }}
   #tooltip .detail {{ color: #aaa; font-size: 11px; }}
-  #legend {{ position: fixed; bottom: 16px; right: 16px; z-index: 10; background: rgba(26,26,46,0.92); border: 1px solid #333; border-radius: 8px; padding: 10px 14px; font-size: 11px; }}
+  #legend {{ position: absolute; bottom: 16px; right: 16px; z-index: 10; background: rgba(26,26,46,0.92); border: 1px solid #333; border-radius: 8px; padding: 10px 14px; font-size: 11px; }}
   #legend .legend-title {{ color: #a0a0c0; font-weight: 600; font-size: 10px; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 6px; }}
   #legend .legend-item {{ display: flex; align-items: center; gap: 8px; margin: 3px 0; color: #ccc; }}
   #legend .legend-dot {{ width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0; }}
+  {inspector_css}
 </style>
 </head>
 <body>
@@ -731,23 +787,21 @@ pub(crate) fn emit_html(query: &str, nodes: &[KgNode], edges: &[KgEdge]) -> Stri
   <div class="summary" id="tt-summary"></div>
   <div class="detail" id="tt-detail"></div>
 </div>
-<canvas id="graph"></canvas>
-<div id="legend"></div>
+<div id="graph-layout">
+  <div id="graph-view">
+    <canvas id="graph"></canvas>
+    <div id="legend"></div>
+  </div>
+  <aside id="node-inspector" aria-label="Node details"></aside>
+</div>
 <script src="https://cdn.jsdelivr.net/npm/d3@7"></script>
 <script>
 (function() {{
+  {inspector_js}
   // Embedded graph data
   var graphData = {data_json};
 
-  var COLORS = {{
-    'https://atomic.dev/ns/workflow#File': '#2ecc71',
-    'https://atomic.dev/ns/workflow#Change': '#e74c3c',
-    'https://atomic.dev/ns/workflow#View': '#9b59b6',
-    'https://atomic.dev/ns/workflow#Identity': '#f1c40f',
-    'https://atomic.dev/ns/workflow#Goal': '#1abc9c',
-    'https://atomic.dev/ns/workflow#WorkIntent': '#1abc9c',
-    'https://atomic.dev/ns/workflow#Memory': '#f39c12',
-  }};
+  var kindColors = new Map(graphData.nodes.map(function(n) {{ return [n.kind, n.color]; }}));
   var EDGE_COLORS = {{
     'https://atomic.dev/ns/workflow#modifiesFile': '#e74c3c',
     'https://atomic.dev/ns/workflow#authoredBy': '#f1c40f',
@@ -755,7 +809,6 @@ pub(crate) fn emit_html(query: &str, nodes: &[KgNode], edges: &[KgEdge]) -> Stri
     'https://atomic.dev/ns/workflow#directlyOnView': '#9b59b6',
     'https://atomic.dev/ns/workflow#references': '#95a5a6',
   }};
-  var DEFAULT_COLOR = '#7f8c8d';
 
   function nodeRadius(d) {{
     if (d.kind === 'https://atomic.dev/ns/workflow#File') return 5 + Math.min(d.content_matches, 100) * 0.12;
@@ -763,15 +816,16 @@ pub(crate) fn emit_html(query: &str, nodes: &[KgNode], edges: &[KgEdge]) -> Stri
     return 5;
   }}
 
-  function nodeColor(d) {{ return COLORS[d.kind] || DEFAULT_COLOR; }}
+  function nodeColor(d) {{ return d.color; }}
   function edgeColor(d) {{ return EDGE_COLORS[d.kind] || '#555'; }}
 
   // Canvas setup
   var canvas = document.getElementById('graph');
+  var graphView = document.getElementById('graph-view');
   var ctx = canvas.getContext('2d');
   var dpr = window.devicePixelRatio || 1;
-  var width = window.innerWidth;
-  var height = window.innerHeight;
+  var width = graphView.clientWidth;
+  var height = graphView.clientHeight;
   canvas.width = width * dpr;
   canvas.height = height * dpr;
   canvas.style.width = width + 'px';
@@ -789,6 +843,7 @@ pub(crate) fn emit_html(query: &str, nodes: &[KgNode], edges: &[KgEdge]) -> Stri
   nodes.forEach(function(n) {{ n.r = nodeRadius(n); }});
 
   var nodeById = new Map(nodes.map(function(n) {{ return [n.id, n]; }}));
+  var selectedNodeId = null;
 
   var links = graphData.links.filter(function(l) {{
     return nodeById.has(l.source) && nodeById.has(l.target);
@@ -799,14 +854,29 @@ pub(crate) fn emit_html(query: &str, nodes: &[KgNode], edges: &[KgEdge]) -> Stri
   // Build legend from kinds present in data
   var kindsPresent = new Set(nodes.map(function(n) {{ return n.kind; }}));
   var legendEl = document.getElementById('legend');
-  var legendHTML = '<div class="legend-title">Node Types</div>';
+  var legendTitle = document.createElement('div');
+  legendTitle.className = 'legend-title';
+  legendTitle.textContent = 'Node Types';
+  legendEl.appendChild(legendTitle);
   var kindOrder = Array.from(kindsPresent).sort();
   kindOrder.forEach(function(k) {{
     if (kindsPresent.has(k)) {{
-      legendHTML += '<div class="legend-item"><span class="legend-dot" style="background:' + (COLORS[k] || DEFAULT_COLOR) + '"></span>' + k.replace('https://atomic.dev/ns/workflow#', 'atomic:') + '</div>';
+      var item = document.createElement('div');
+      item.className = 'legend-item';
+      item.dataset.kind = k;
+      var dot = document.createElement('span');
+      dot.className = 'legend-dot';
+      dot.style.background = kindColors.get(k);
+      item.appendChild(dot);
+      item.appendChild(document.createTextNode(k.replace('https://atomic.dev/ns/workflow#', 'atomic:')));
+      legendEl.appendChild(item);
     }}
   }});
-  legendEl.innerHTML = legendHTML;
+  var inspector = createGraphInspector(document.getElementById('node-inspector'), graphData, function(id) {{
+    selectedNodeId = id;
+    hideTooltip();
+    draw();
+  }});
 
   // Current zoom transform
   var currentTransform = d3.zoomIdentity;
@@ -832,6 +902,9 @@ pub(crate) fn emit_html(query: &str, nodes: &[KgNode], edges: &[KgEdge]) -> Stri
     links.forEach(function(l) {{
       var s = l.source;
       var t = l.target;
+      var highlighted = selectedNodeId && (s.id === selectedNodeId || t.id === selectedNodeId);
+      ctx.globalAlpha = selectedNodeId ? (highlighted ? 0.9 : 0.12) : 0.4;
+      ctx.lineWidth = highlighted ? 1.8 : 0.6;
       ctx.strokeStyle = edgeColor(l);
       ctx.beginPath();
       ctx.moveTo(s.x, s.y);
@@ -852,6 +925,13 @@ pub(crate) fn emit_html(query: &str, nodes: &[KgNode], edges: &[KgEdge]) -> Stri
       ctx.lineWidth = 1.2;
       ctx.globalAlpha = 1.0;
       ctx.stroke();
+      if (d.id === selectedNodeId) {{
+        ctx.beginPath();
+        ctx.arc(d.x, d.y, r + 4 / currentTransform.k, 0, 2 * Math.PI);
+        ctx.strokeStyle = '#9fd6ff';
+        ctx.lineWidth = 2 / currentTransform.k;
+        ctx.stroke();
+      }}
     }});
 
     // Draw labels for large nodes (modules and high-match files)
@@ -860,7 +940,7 @@ pub(crate) fn emit_html(query: &str, nodes: &[KgNode], edges: &[KgEdge]) -> Stri
     ctx.textAlign = 'center';
     ctx.textBaseline = 'top';
     nodes.forEach(function(d) {{
-      if (d.r > 10) {{
+      if (d.r > 10 || d.id === selectedNodeId) {{
         var label = d.label;
         if (d.kind === 'module') label += '/';
         if (label.length > 28) label = label.slice(0, 25) + '...';
@@ -876,6 +956,18 @@ pub(crate) fn emit_html(query: &str, nodes: &[KgNode], edges: &[KgEdge]) -> Stri
 
   // Zoom and pan via d3.zoom
   var zoomBehavior = d3.zoom()
+    .filter(function(event) {{
+      if (event.button || (event.ctrlKey && event.type !== 'wheel')) return false;
+      if (event.type === 'mousedown') {{
+        dragStart = [event.clientX, event.clientY];
+        dragMoved = false;
+        var rect = canvas.getBoundingClientRect();
+        // Let our node-drag handler own this gesture, rather than D3 starting
+        // a pan and stopping propagation before the node handler can run.
+        return !findNode(event.clientX - rect.left, event.clientY - rect.top);
+      }}
+      return true;
+    }})
     .scaleExtent([0.05, 10])
     .on('zoom', function(event) {{
       currentTransform = event.transform;
@@ -951,8 +1043,13 @@ pub(crate) fn emit_html(query: &str, nodes: &[KgNode], edges: &[KgEdge]) -> Stri
   // Drag state
   var dragNode = null;
   var dragSubject = null;
+  var dragStart = null;
+  var dragMoved = false;
 
   canvas.addEventListener('mousemove', function(e) {{
+    if (dragStart && Math.hypot(e.clientX - dragStart[0], e.clientY - dragStart[1]) > 4) {{
+      dragMoved = true;
+    }}
     var rect = canvas.getBoundingClientRect();
     var sx = e.clientX - rect.left;
     var sy = e.clientY - rect.top;
@@ -977,6 +1074,8 @@ pub(crate) fn emit_html(query: &str, nodes: &[KgNode], edges: &[KgEdge]) -> Stri
   }});
 
   canvas.addEventListener('mousedown', function(e) {{
+    dragStart = [e.clientX, e.clientY];
+    dragMoved = false;
     var rect = canvas.getBoundingClientRect();
     var sx = e.clientX - rect.left;
     var sy = e.clientY - rect.top;
@@ -995,6 +1094,7 @@ pub(crate) fn emit_html(query: &str, nodes: &[KgNode], edges: &[KgEdge]) -> Stri
   }});
 
   window.addEventListener('mouseup', function() {{
+    dragStart = null;
     if (dragNode) {{
       dragNode.fx = null;
       dragNode.fy = null;
@@ -1010,10 +1110,17 @@ pub(crate) fn emit_html(query: &str, nodes: &[KgNode], edges: &[KgEdge]) -> Stri
     hideTooltip();
   }});
 
+  canvas.addEventListener('click', function(e) {{
+    if (dragMoved) return;
+    var rect = canvas.getBoundingClientRect();
+    var found = findNode(e.clientX - rect.left, e.clientY - rect.top);
+    inspector.select(found ? found.id : null);
+  }});
+
   // Handle resize
-  window.addEventListener('resize', function() {{
-    width = window.innerWidth;
-    height = window.innerHeight;
+  function resizeGraph() {{
+    width = graphView.clientWidth;
+    height = graphView.clientHeight;
     canvas.width = width * dpr;
     canvas.height = height * dpr;
     canvas.style.width = width + 'px';
@@ -1021,13 +1128,18 @@ pub(crate) fn emit_html(query: &str, nodes: &[KgNode], edges: &[KgEdge]) -> Stri
     ctx.scale(dpr, dpr);
     simulation.force('center', d3.forceCenter(width / 2, height / 2));
     simulation.alpha(0.1).restart();
-  }});
+    draw();
+  }}
+  window.addEventListener('resize', resizeGraph);
+  if (window.ResizeObserver) new ResizeObserver(resizeGraph).observe(graphView);
 }})();
 </script>
 </body>
 </html>"##,
         query = escaped_query,
         data_json = data_json,
+        inspector_js = include_str!("graph_inspector.js"),
+        inspector_css = include_str!("graph_inspector.css"),
     )
 }
 
@@ -1977,6 +2089,90 @@ impl Command for QueryAsk {
 #[cfg(test)]
 mod tests {
     use super::truncate_display;
+
+    #[test]
+    fn html_palette_covers_every_workflow_class_with_unique_high_contrast_colors() {
+        use atomic_core::kg::ontology::Class;
+        fn luminance(hex: &str) -> f64 {
+            let channel = |offset| {
+                let value =
+                    f64::from(u8::from_str_radix(&hex[offset..offset + 2], 16).unwrap()) / 255.0;
+                if value <= 0.04045 {
+                    value / 12.92
+                } else {
+                    ((value + 0.055) / 1.055).powf(2.4)
+                }
+            };
+            0.2126 * channel(1) + 0.7152 * channel(3) + 0.0722 * channel(5)
+        }
+        let colors: std::collections::HashSet<_> = Class::ALL
+            .iter()
+            .map(|class| super::html_node_color(class.iri()))
+            .collect();
+        assert_eq!(
+            colors.len(),
+            Class::ALL.len(),
+            "known types must not share colors"
+        );
+        let background = luminance("#1a1a2e");
+        for color in colors {
+            assert!(color.starts_with('#') && color.len() == 7);
+            assert!(
+                (luminance(&color) + 0.05) / (background + 0.05) >= 4.5,
+                "low contrast: {color}"
+            );
+        }
+    }
+
+    #[test]
+    fn html_external_type_colors_are_stable_and_not_the_old_gray_fallback() {
+        let first = super::html_node_color("https://example.test/TypeA");
+        assert_eq!(first, super::html_node_color("https://example.test/TypeA"));
+        assert!(first.starts_with("hsl("));
+        assert_ne!(first, super::html_node_color("https://example.test/TypeB"));
+    }
+
+    #[test]
+    fn html_inspector_embeds_full_snapshot_data_without_script_injection() {
+        use atomic_core::{
+            kg::ontology::{Class, Predicate},
+            KgEdge, KgNode,
+        };
+        let hostile = "</script><script>alert('metadata')</script>";
+        let mut node = KgNode::new("urn:node:first", Class::Change, hostile, "vcs");
+        node.summary = Some("full summary ".repeat(40));
+        node.metadata =
+            Some(serde_json::json!({"hash":"FULL_HASH", "nested":{"evidence":hostile}}));
+        let neighbor = KgNode::new("urn:node:second", Class::File, "src/cli.ts", "vcs");
+        let mut edge = KgEdge::new(&node.id, &neighbor.id, Predicate::ModifiesFile);
+        edge.metadata = Some(serde_json::json!({"evidence":hostile}));
+        let html = super::emit_html(
+            "Inspect <metadata>",
+            &[node.clone(), neighbor],
+            &[edge.clone()],
+        );
+        let json = html
+            .split("var graphData = ")
+            .nth(1)
+            .unwrap()
+            .split(";\n")
+            .next()
+            .unwrap();
+        let data: serde_json::Value = serde_json::from_str(json).unwrap();
+        assert_eq!(data["nodes"][0]["metadata"], node.metadata.unwrap());
+        assert_eq!(data["nodes"][0]["summary"], node.summary.unwrap());
+        assert_eq!(data["nodes"][0]["source"], "vcs");
+        assert_eq!(
+            data["nodes"][0]["color"],
+            super::html_node_color(Class::Change.iri())
+        );
+        assert_eq!(data["links"][0]["metadata"], edge.metadata.unwrap());
+        assert!(!html.contains(hostile));
+        assert!(html.contains("\\u003c/script\\u003e"));
+        assert!(html.contains("aria-label=\"Node details\""));
+        assert!(html.contains("if (dragMoved) return;"));
+        assert!(html.contains("graphView.clientWidth"));
+    }
 
     #[test]
     fn test_truncate_display_short_ascii_unchanged() {

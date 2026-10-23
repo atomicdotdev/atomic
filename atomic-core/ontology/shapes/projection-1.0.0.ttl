@@ -3,6 +3,19 @@
 @prefix sh: <http://www.w3.org/ns/shacl#> .
 @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
 @prefix prov: <http://www.w3.org/ns/prov#> .
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+
+# Optional for older snapshots; when asserted these are closed, single-valued
+# observations. SHACL checks consistency, not object-store truth: only the
+# repository projector has access to the canonical store and can verify it.
+shape:ChangeAvailability a sh:NodeShape ;
+  sh:targetClass atomic:Change ;
+  sh:property [ sh:path atomic:objectAvailability ; sh:maxCount 1 ; sh:datatype xsd:string ; sh:in ("unknown" "absent" "available") ] ;
+  sh:property [ sh:path atomic:projectionCompleteness ; sh:maxCount 1 ; sh:datatype xsd:string ; sh:in ("reference-only" "projected") ] ;
+  sh:or (
+    [ sh:not [ sh:property [ sh:path atomic:projectionCompleteness ; sh:hasValue "projected" ] ] ]
+    [ sh:property [ sh:path atomic:objectAvailability ; sh:hasValue "available" ] ]
+  ) .
 
 shape:GeneratedChange a sh:NodeShape ;
   sh:targetObjectsOf atomic:generatedChange ;
@@ -48,7 +61,7 @@ shape:ReferencedResource a sh:NodeShape ;
     atomic:directlyOnView, atomic:sessionViewContext, atomic:childViewOf,
     atomic:authoredBy, atomic:coversChange, atomic:attests, atomic:attestsSession,
     atomic:signedBy, atomic:previousAttestation, atomic:implements,
-    atomic:attestedBy, atomic:aboutResource, atomic:verificationResult,
+    atomic:attestedBy, atomic:aboutResource, atomic:verificationResult, atomic:declaresImplementation,
     atomic:hasIdentity, atomic:issuer, atomic:explainedBy, atomic:dependsOn,
     atomic:modifies, atomic:hasScopeItem, atomic:ancestorView,
     atomic:turnOfSession, atomic:governsTurn, atomic:generatedBy, atomic:reviewedBy,

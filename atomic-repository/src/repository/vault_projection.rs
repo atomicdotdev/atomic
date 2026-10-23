@@ -461,6 +461,7 @@ impl VaultProjection {
                             "blockedBy" => P::BlockedBy,
                             "remediates" => P::Remediates,
                             "reviews" => P::Reviews,
+                            "declaresImplementation" => P::DeclaresImplementation,
                             _ => P::References,
                         };
                         let raw = if reference.to.starts_with("urn:") {
@@ -469,6 +470,15 @@ impl VaultProjection {
                             format!("urn:atomic:intent:{}", reference.to)
                         };
                         self.link(&mut graph, subject, &raw, predicate, path);
+                        if predicate == P::DeclaresImplementation {
+                            if let Some(edge) =
+                                graph.edges.last_mut().filter(|edge| edge.kind == predicate)
+                            {
+                                edge.metadata.get_or_insert_with(|| serde_json::json!({}))
+                                    ["declarationEvidence"] =
+                                    serde_json::json!(reference.declaration_evidence);
+                            }
+                        }
                     }
                 }
             }
@@ -534,6 +544,13 @@ impl VaultProjection {
                 .map(|target| (target, P::InformedBy))
                 .collect();
             for reference in node.depends_on {
+                // Implementation declarations are projected from the current
+                // intent source only. A stale signed snapshot must not restore a
+                // declaration removed from that source; its original bytes and
+                // proof remain inspectable in the attestation object.
+                if reference.edge == "declaresImplementation" {
+                    continue;
+                }
                 let predicate = match reference.edge.as_str() {
                     "dependsOn" => P::DependsOnIntent,
                     "blockedBy" => P::BlockedBy,

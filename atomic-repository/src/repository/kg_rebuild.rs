@@ -57,6 +57,7 @@ impl Repository {
             txn.project_session_kg(&record, &turns)?;
         }
         self.project_attestations_kg(&mut txn)?;
+        self.refresh_change_availability_kg(&mut txn)?;
         // No canonical endpoint may silently dangle; ontology individuals are
         // intentionally resources defined by the embedded ontology, not rows.
         for edge in txn.all_kg_edges()? {
@@ -89,6 +90,7 @@ impl Repository {
             txn.project_session_kg(&record, &turns)?;
         }
         self.project_attestations_kg(&mut txn)?;
+        self.refresh_change_availability_kg(&mut txn)?;
         txn.commit()?;
         Ok(())
     }

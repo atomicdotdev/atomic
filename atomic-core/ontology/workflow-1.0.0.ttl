@@ -73,7 +73,7 @@ atomic:dependsOnIntent a owl:ObjectProperty ; rdfs:domain atomic:WorkIntent ; rd
 atomic:modifiesFile a owl:ObjectProperty ; rdfs:domain atomic:Change ; rdfs:range atomic:File ; rdfs:subPropertyOf atomic:modifies .
 atomic:directlyOnView a owl:ObjectProperty ; rdfs:domain atomic:Change ; rdfs:range atomic:View .
 atomic:sessionViewContext a owl:ObjectProperty ; rdfs:domain atomic:Session ; rdfs:range atomic:View .
-atomic:childViewOf a owl:ObjectProperty ; rdfs:domain atomic:View ; rdfs:range atomic:View .
+atomic:childViewOf a owl:ObjectProperty ; rdfs:domain atomic:View ; rdfs:range atomic:View ; rdfs:subPropertyOf atomic:ancestorView .
 atomic:visibleFrom a owl:ObjectProperty ; rdfs:comment "Query-time visibility operator; never stored as direct membership." .
 atomic:authoredBy a owl:ObjectProperty ; rdfs:domain owl:Thing ; rdfs:range atomic:Identity ; rdfs:subPropertyOf prov:wasAttributedTo .
 atomic:coversChange a owl:ObjectProperty ; rdfs:domain atomic:Attestation ; rdfs:range atomic:Change ; owl:inverseOf atomic:attestedBy .
@@ -82,6 +82,7 @@ atomic:attestsSession a owl:ObjectProperty ; rdfs:domain atomic:Attestation ; rd
 atomic:signedBy a owl:ObjectProperty ; rdfs:domain atomic:Attestation ; rdfs:range atomic:Identity .
 atomic:previousAttestation a owl:ObjectProperty ; rdfs:domain atomic:Attestation ; rdfs:range atomic:Attestation .
 atomic:implements a owl:ObjectProperty ; rdfs:domain atomic:Change ; rdfs:range atomic:WorkIntent ; owl:propertyChainAxiom (atomic:generatedBy atomic:hasPlan) .
+atomic:declaresImplementation a owl:ObjectProperty ; rdfs:domain atomic:WorkIntent ; rdfs:range atomic:Change ; rdfs:comment "Explicit, evidence-bearing author declaration, potentially retrospective. Not an inferred implements shortcut and not proof of a generating turn." .
 atomic:attestedBy a owl:ObjectProperty ; rdfs:domain atomic:Change ; rdfs:range atomic:Attestation ; owl:inverseOf atomic:coversChange .
 atomic:aboutResource a owl:ObjectProperty ; rdfs:domain atomic:Finding ; rdfs:range owl:Thing .
 atomic:dependsOn a owl:ObjectProperty, owl:TransitiveProperty .
@@ -100,6 +101,10 @@ atomic:issuer a owl:ObjectProperty ; rdfs:domain atomic:ProjectIdentity ; rdfs:r
 atomic:status a owl:DatatypeProperty ; rdfs:range xsd:string .
 atomic:priority a owl:DatatypeProperty ; rdfs:range xsd:string .
 atomic:findingCode a owl:DatatypeProperty ; rdfs:domain atomic:Finding ; rdfs:range xsd:string .
+atomic:objectAvailability a owl:DatatypeProperty ; rdfs:domain atomic:Change ; rdfs:range xsd:string ;
+    rdfs:comment "Local canonical-object observation: unknown, absent, or available. Only successful verified loading establishes available; a ledger reference or graph registration does not. This derived observation is repository-local, not an immutable property of the change." .
+atomic:projectionCompleteness a owl:DatatypeProperty ; rdfs:domain atomic:Change ; rdfs:range xsd:string ;
+    rdfs:comment "reference-only means the node identifies a change without projecting its immutable object; projected means the verified local object's header, dependencies and eligible file operations were projected. This does not assert dependency closure, view membership, provenance or attestation completeness." .
 atomic:projectId a owl:DatatypeProperty ; rdfs:domain atomic:ProjectIdentity ; rdfs:range xsd:string .
 atomic:schemaVersion a owl:DatatypeProperty ; rdfs:domain atomic:ProjectIdentity ; rdfs:range xsd:nonNegativeInteger .
 atomic:turnNumber a owl:DatatypeProperty ; rdfs:domain atomic:SessionTurn ; rdfs:range xsd:nonNegativeInteger .

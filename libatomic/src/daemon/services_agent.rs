@@ -3493,7 +3493,7 @@ impl knowledge_service_server::KnowledgeService for KnowledgeImpl {
                 })
             }
             QueryOneof::Neighbors(neighbors) => {
-                let repo = handle.repository()?;
+                let repo = handle.repository_readonly()?;
                 let (nodes, edges) = crate::daemon::services_query::neighbors_impl(
                     &repo,
                     &neighbors.node_id,
@@ -3717,6 +3717,8 @@ impl knowledge_service_server::KnowledgeService for KnowledgeImpl {
                 let _ = &collected;
                 collected = nodes.len() as u32;
                 let _ = &collected;
+                repo.enrich_workflow_usage(&mut nodes)
+                    .map_err(repository_error)?;
                 Ok(QueryGraphResponse {
                     api_version: 1,
                     callers: Vec::new(),

@@ -1150,8 +1150,10 @@ pub fn neighbors_impl(
     node_id: &str,
     depth: u8,
 ) -> Result<(Vec<KgNode>, Vec<KgEdge>), Status> {
-    let subgraph = repo
+    let mut subgraph = repo
         .vault_kg_neighbors(node_id, depth)
+        .map_err(repository_error)?;
+    repo.enrich_workflow_usage(&mut subgraph.nodes)
         .map_err(repository_error)?;
     let nodes = subgraph.nodes.into_iter().map(kg_node_proto).collect();
     let edges = subgraph.edges.into_iter().map(kg_edge_proto).collect();

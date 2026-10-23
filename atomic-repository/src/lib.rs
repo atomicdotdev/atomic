@@ -96,6 +96,7 @@ pub mod error;
 pub mod git_binding;
 pub mod ignore;
 pub mod intent_bridge;
+pub mod intent_graph;
 pub mod manifest;
 pub mod record;
 pub mod repository;
@@ -103,6 +104,7 @@ pub mod status;
 pub mod tracking;
 pub mod triage;
 pub mod wip;
+pub(crate) mod workflow_usage;
 
 // Phase 7 additions
 pub mod archive;
@@ -131,6 +133,7 @@ pub mod content_search;
 pub mod oci;
 
 // Query plan schema and executor
+pub mod patch_evidence;
 pub mod query_plan;
 
 // Content search re-exports

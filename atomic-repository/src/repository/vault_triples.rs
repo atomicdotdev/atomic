@@ -164,6 +164,15 @@ impl Repository {
         let txn = self.pristine.read_txn()?;
         let mut nodes = txn.all_kg_nodes()?;
         let mut edges = txn.all_kg_edges()?;
+        let project = txn
+            .project_identity()?
+            .ok_or(atomic_core::PristineError::MissingProjectIdentity)?
+            .project_id()
+            .map_err(|error| RepositoryError::Serialization(error.to_string()))?;
+        let view_scopes = crate::workflow_usage::view_scopes(self, &txn, &project)?;
+        drop(txn);
+        self.hydrate_workflow_usage(&mut nodes)?;
+        crate::workflow_usage::annotate_with_views(&mut nodes, &edges, Some(&view_scopes))?;
         nodes.sort_by(|a, b| a.id.cmp(&b.id));
         edges.sort_by(|a, b| (&a.from_id, &a.to_id, a.kind).cmp(&(&b.from_id, &b.to_id, b.kind)));
         let bytes =

@@ -12,6 +12,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::patch_evidence::{PatchEvidence, PatchEvidenceLimits};
 use crate::repository::Repository;
 use crate::RepositoryError;
 use atomic_core::kg::{
@@ -36,6 +37,13 @@ pub struct QueryPlan {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum QueryStep {
+    /// Exact immutable recorded patch evidence, not current file content or KG
+    /// assertions. One literal canonical full-hash change IRI per step.
+    PatchEvidence {
+        change_iri: String,
+        #[serde(default)]
+        limits: PatchEvidenceLimits,
+    },
     /// Full-text keyword search over KG nodes.
     KgSearch {
         /// Search query text.
@@ -124,6 +132,9 @@ fn default_max_chars() -> usize {
 /// Result of executing a query plan.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlanResult {
+    /// Typed immutable patch evidence, separate from graph assertions and vault content.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub patch_evidence: Vec<PatchEvidence>,
     /// Nodes collected across all steps.
     pub nodes: Vec<KgNode>,
     /// Edges collected across all steps.
@@ -164,11 +175,34 @@ pub fn execute_plan(repo: &Repository, plan: &QueryPlan) -> Result<PlanResult, R
     let mut all_edges: Vec<KgEdge> = Vec::new();
     let mut content: HashMap<String, String> = HashMap::new();
     let mut step_stats: Vec<StepStat> = Vec::new();
+    let mut patch_evidence = Vec::new();
+    // Bound evidence fan-out even for programmatically constructed plans.
+    if plan
+        .steps
+        .iter()
+        .filter(|step| matches!(step, QueryStep::PatchEvidence { .. }))
+        .count()
+        > 8
+    {
+        return Err(RepositoryError::Serialization(
+            "at most 8 patch evidence steps per plan".into(),
+        ));
+    }
 
     for step in &plan.steps {
         let step_start = std::time::Instant::now();
 
         match step {
+            QueryStep::PatchEvidence { change_iri, limits } => {
+                let evidence = repo.patch_evidence(change_iri, *limits)?;
+                let found = evidence.status == crate::patch_evidence::PatchEvidenceStatus::Found;
+                patch_evidence.push(evidence);
+                step_stats.push(StepStat {
+                    step_type: "patch_evidence".into(),
+                    result_count: usize::from(found),
+                    elapsed_ms: step_start.elapsed().as_millis() as u64,
+                });
+            }
             QueryStep::KgSearch { query, limit, bind } => {
                 let nodes = repo.vault_kg_search(query, *limit, None)?;
                 let count = nodes.len();
@@ -390,6 +424,7 @@ pub fn execute_plan(repo: &Repository, plan: &QueryPlan) -> Result<PlanResult, R
     }
 
     Ok(PlanResult {
+        patch_evidence,
         nodes: all_nodes,
         edges: all_edges,
         content,
@@ -754,6 +789,7 @@ mod tests {
     #[test]
     fn test_plan_result_serialization() {
         let result = PlanResult {
+            patch_evidence: vec![],
             nodes: vec![KgNode::new("a", Class::WorkIntent, "A", "test")],
             edges: vec![KgEdge::new("a", "b", Predicate::DependsOnIntent)],
             content: HashMap::new(),
@@ -776,6 +812,7 @@ mod tests {
         let mut content = HashMap::new();
         content.insert("memory/a.md".to_string(), "# Hello\n".to_string());
         let result = PlanResult {
+            patch_evidence: vec![],
             nodes: vec![],
             edges: vec![],
             content,

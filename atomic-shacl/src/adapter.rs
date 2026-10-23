@@ -66,6 +66,16 @@ pub fn snapshot_ntriples(nodes: &[KgNode], edges: &[KgEdge]) -> Result<String, V
                 ("status", Predicate::Status, Datatype::String),
                 ("priority", Predicate::Priority, Datatype::String),
                 ("finding_code", Predicate::FindingCode, Datatype::String),
+                (
+                    "object_availability",
+                    Predicate::ObjectAvailability,
+                    Datatype::String,
+                ),
+                (
+                    "projection_completeness",
+                    Predicate::ProjectionCompleteness,
+                    Datatype::String,
+                ),
                 ("created_at", Predicate::DctermsCreated, Datatype::DateTime),
                 ("updated_at", Predicate::DctermsModified, Datatype::DateTime),
                 ("project_id", Predicate::ProjectId, Datatype::String),

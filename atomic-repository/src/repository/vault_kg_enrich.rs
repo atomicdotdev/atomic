@@ -124,6 +124,7 @@ impl Repository {
             stats.changes += 1;
         }
         stats.views = self.project_view_kg(txn)?;
+        self.refresh_change_availability_kg(txn)?;
         Ok(stats)
     }
 
@@ -136,8 +137,14 @@ impl Repository {
         let project = txn.kg_project()?;
         let id = iri::mint_change(hash);
         let header = &change.hashed.header;
-        txn.upsert_kg_node(&KgNode::new(&id, C::Change, &hash.to_base32()[..12], "vcs")
-            .with_summary(&header.message).with_metadata(serde_json::json!({"hash": hash.to_base32(), "created_at": header.timestamp.to_rfc3339()})))?;
+        let mut node = KgNode::new(&id, C::Change, &hash.to_base32()[..12], "vcs")
+            .with_summary(&header.message).with_metadata(serde_json::json!({"hash": hash.to_base32(), "created_at": header.timestamp.to_rfc3339(),
+                "object_availability": "available", "projection_completeness": "projected"}));
+        crate::workflow_usage::set_change_records(
+            &mut node,
+            Some(crate::workflow_usage::change_records(change, hash)),
+        )?;
+        txn.upsert_kg_node(&node)?;
         for author in &header.authors {
             let author_id = iri::mint_identity(&project, &author.name);
             txn.upsert_kg_node(&KgNode::new(&author_id, C::Identity, &author.name, "vcs"))?;
@@ -145,7 +152,13 @@ impl Repository {
         }
         let mut missing_dependency = false;
         for hash in change.dependencies() {
-            if self.has_change(hash) {
+            // Registration and filesystem existence are not integrity evidence.
+            let available = match self.load_change(hash) {
+                Ok(_) => true,
+                Err(RepositoryError::ChangeNotFound { .. }) => false,
+                Err(error) => return Err(error),
+            };
+            if available {
                 let target = iri::mint_change(hash);
                 if txn.get_kg_node(&target)?.is_none() {
                     txn.upsert_kg_node(&KgNode::new(
@@ -153,7 +166,8 @@ impl Repository {
                         C::Change,
                         &hash.to_base32()[..12],
                         "vcs",
-                    ))?;
+                    ).with_metadata(serde_json::json!({"hash": hash.to_base32(),
+                        "object_availability": "available", "projection_completeness": "reference-only"})))?;
                 }
                 txn.upsert_kg_edge(&KgEdge::new(&id, target, P::DirectlyDependsOnChange))?;
             } else {
@@ -168,11 +182,12 @@ impl Repository {
         if !missing_dependency {
             txn.del_kg_node(&iri::mint_finding(&project, "UnresolvedReference", &id))?;
         }
-        let rules = IgnoreRules::load_for_enrichment(self.root());
+        // Recorded operations are immutable impact facts. Current working-copy
+        // indexing exclusions must not change their historical projection.
         let mut paths = std::collections::BTreeSet::new();
         for file in change.file_ops() {
             let path = file.path();
-            if path.is_empty() || rules.is_ignored(std::path::Path::new(path), false) {
+            if path.is_empty() {
                 continue;
             }
             paths.insert(path);
@@ -189,6 +204,65 @@ impl Repository {
             txn.upsert_kg_edge(&KgEdge::new(&id, file_id, P::ModifiesFile))?;
         }
         Ok(paths.len())
+    }
+
+    /// Reconcile reference nodes against verified canonical objects. In
+    /// particular a session ledger may mention an object never received here.
+    /// This preserves node identity and independent edges, and never treats a
+    /// malformed/unreadable object as absent or available.
+    pub(super) fn refresh_change_availability_kg(
+        &self,
+        txn: &mut atomic_core::WriteTxn<'_>,
+    ) -> Result<(), RepositoryError> {
+        for mut node in txn.all_kg_nodes()? {
+            if !node.has_type(C::Change) {
+                continue;
+            }
+            let hash = iri::parse_change(&node.id)
+                .map_err(|error| RepositoryError::Serialization(error.to_string()))?;
+            let availability = match self.load_change(&hash) {
+                Ok(change) if !change.kind().is_snapshot() => {
+                    if node
+                        .metadata
+                        .as_ref()
+                        .and_then(|metadata| metadata.get("projection_completeness"))
+                        .and_then(serde_json::Value::as_str)
+                        != Some("projected")
+                    {
+                        self.project_change_kg(txn, &hash, &change)?;
+                    }
+                    continue;
+                }
+                Ok(_) => "available",
+                Err(RepositoryError::ChangeNotFound { .. }) => "absent",
+                Err(error) => return Err(error),
+            };
+            let metadata = node.metadata.get_or_insert_with(|| serde_json::json!({}));
+            metadata["object_availability"] = availability.into();
+            metadata["projection_completeness"] = "reference-only".into();
+            if let Some(metadata) = metadata.as_object_mut() {
+                metadata.remove("created_at");
+                for field in [
+                    "ai_usage",
+                    "ai_usage_records",
+                    "ai_usage_state",
+                    "ai_usage_record_version",
+                ] {
+                    metadata.remove(field);
+                }
+            }
+            node.summary = None;
+            for edge in txn.get_kg_edges_from(&node.id)? {
+                if matches!(
+                    edge.kind,
+                    P::AuthoredBy | P::DirectlyDependsOnChange | P::ModifiesFile
+                ) {
+                    txn.del_kg_edge(&edge.from_id, &edge.to_id, &edge.kind)?;
+                }
+            }
+            txn.upsert_kg_node(&node)?;
+        }
+        Ok(())
     }
 
     pub(super) fn repair_change_dependencies_kg(
