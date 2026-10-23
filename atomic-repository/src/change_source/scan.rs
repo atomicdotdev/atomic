@@ -318,7 +318,12 @@ where
             CandidateObservation::Present(file) => {
                 let observed_kind = canonical_kind(file.kind);
                 let type_changed = observed_kind != Some(entry.canonical_kind);
-                let permissions_changed = file.mode != Some(entry.canonical_mode);
+                // Symlink permission bits are not a fact (Git stores every
+                // link as 120000; `lstat` reports 0o777 on Linux and 0o755
+                // on macOS), mirroring `InodeStatusFacts::between`.
+                let permissions_changed =
+                    permission_bits_matter(entry.canonical_kind, observed_kind)
+                        && file.mode != Some(entry.canonical_mode);
                 let observed_row = cached.and_then(|row| {
                     observed_index_row(
                         file,
@@ -552,6 +557,12 @@ fn canonical_kind(kind: ObservedKind) -> Option<InodeKind> {
         ObservedKind::Directory => Some(InodeKind::Gitlink),
         ObservedKind::Other => None,
     }
+}
+
+/// Whether a mode difference between the canonical and the observed inode
+/// is reportable: never when either side is a symlink.
+fn permission_bits_matter(canonical: InodeKind, observed: Option<InodeKind>) -> bool {
+    canonical != InodeKind::Symlink && observed != Some(InodeKind::Symlink)
 }
 
 fn omission_lease_matches(
@@ -1100,5 +1111,51 @@ mod tests {
         );
         assert_eq!(changed.stats.content_reads, 1);
         assert_eq!(changed.index_updates.len(), 1);
+    }
+
+    #[test]
+    fn symlink_permission_bits_never_report_a_change() {
+        // Git records every link as 120000 (canonical 0o777); macOS `lstat`
+        // reports 0o755 for the same link. The bits carry no meaning, so a
+        // link whose target matches is Unchanged, never PermissionsChanged.
+        let dir = tempdir().unwrap();
+        std::os::unix::fs::symlink("target", dir.path().join("link")).unwrap();
+        let path = RepoPath::from_bytes(b"link").unwrap();
+        let paths = vec![path.clone()];
+        let tracked = vec![CanonicalTrackedPath {
+            path: path.clone(),
+            canonical_mode: 0o777,
+            canonical_kind: InodeKind::Symlink,
+        }];
+        let expected = Hash::of(b"target");
+        let cold = verify_candidates(
+            source(dir.path(), &paths),
+            &tracked,
+            &BTreeMap::new(),
+            Hash::of(b"policy"),
+            now_timestamp(),
+            &ExactFilter,
+            |_| Ok(expected),
+        )
+        .unwrap();
+        assert_eq!(
+            cold.candidates[0].change,
+            VerifiedChange::Unchanged,
+            "{:?}",
+            cold.candidates[0]
+        );
+        // A regular file still reports its permission bits.
+        assert!(permission_bits_matter(
+            InodeKind::Regular,
+            Some(InodeKind::Regular)
+        ));
+        assert!(!permission_bits_matter(
+            InodeKind::Symlink,
+            Some(InodeKind::Symlink)
+        ));
+        assert!(!permission_bits_matter(
+            InodeKind::Regular,
+            Some(InodeKind::Symlink)
+        ));
     }
 }

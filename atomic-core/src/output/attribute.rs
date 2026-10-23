@@ -77,8 +77,14 @@ impl InodeStatusFacts {
         actual_mode: u16,
         actual_kind: InodeKind,
     ) -> Self {
+        // A symlink's permission bits are not a materialized fact: POSIX
+        // ignores them, Git stores every link as `120000`, and `lstat`
+        // reports `0o777` on Linux but `0o755` on macOS, so comparing them
+        // reports a phantom change on one platform or the other.
+        let permissions_matter =
+            expected.kind != InodeKind::Symlink && actual_kind != InodeKind::Symlink;
         Self {
-            permissions_changed: expected.mode != actual_mode,
+            permissions_changed: permissions_matter && expected.mode != actual_mode,
             type_changed: expected.kind != actual_kind,
         }
     }
@@ -144,15 +150,34 @@ mod tests {
     fn status_facts_distinguish_permissions_from_type() {
         let expected = InodeMaterialization {
             mode: 0o755,
-            kind: InodeKind::Symlink,
+            kind: InodeKind::Regular,
         };
         assert_eq!(
-            InodeStatusFacts::between(expected, 0o644, InodeKind::Symlink),
+            InodeStatusFacts::between(expected, 0o644, InodeKind::Regular),
             InodeStatusFacts {
                 permissions_changed: true,
                 type_changed: false,
             }
         );
-        assert!(InodeStatusFacts::between(expected, 0o755, InodeKind::Regular).type_changed);
+        assert!(InodeStatusFacts::between(expected, 0o755, InodeKind::Symlink).type_changed);
+    }
+
+    #[test]
+    fn symlink_permission_bits_are_not_a_fact() {
+        // Git imports record links as 0o777 while macOS `lstat` reports
+        // 0o755: neither side carries meaning, so no change is reported.
+        let expected = InodeMaterialization {
+            mode: 0o777,
+            kind: InodeKind::Symlink,
+        };
+        assert_eq!(
+            InodeStatusFacts::between(expected, 0o755, InodeKind::Symlink),
+            InodeStatusFacts::default()
+        );
+        // A kind change to or from a symlink is still reported as a type
+        // change, never as a permission change.
+        let facts = InodeStatusFacts::between(expected, 0o644, InodeKind::Regular);
+        assert!(facts.type_changed);
+        assert!(!facts.permissions_changed);
     }
 }
