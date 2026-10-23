@@ -843,6 +843,35 @@ pub(crate) fn run_pre_push_verification_with_input(root: &Path, input: &str) -> 
                 .map(|byte| format!("{byte:02x}"))
                 .collect::<String>();
             for (local_ref, oid) in &proposed_content_refs {
+                // Each proposed ref binds to the view it publishes: the
+                // checked-out branch to the current view's verified
+                // projection, any other branch (`git push origin other`,
+                // `git push --all`) to its own view's projection. A
+                // reconciled branch is never refused for not being the
+                // current one; a branch no view has interpreted refuses with
+                // the step that makes it publishable.
+                let branch = local_ref
+                    .strip_prefix("refs/heads/")
+                    .unwrap_or(local_ref.as_str());
+                let (view, expected_tree) = if branch == current_view {
+                    (current_view.clone(), verified.git_tree.clone())
+                } else {
+                    if !repo.view_exists(branch).map_err(CliError::Repository)? {
+                        return Err(CliError::GitError {
+                            message: format!(
+                                "pre-push refused: branch '{branch}' has no Atomic view; run 'git switch {branch}' and 'atomic git shim reconcile' before pushing it"
+                            ),
+                        });
+                    }
+                    let project =
+                        repo.project_tree(branch, &policy)
+                            .map_err(|error| CliError::GitError {
+                                message: format!(
+                                    "pre-push refused: cannot project view '{branch}': {error}"
+                                ),
+                            })?;
+                    (branch.to_string(), project.git.root.clone())
+                };
                 let binds = git2::Oid::from_str(oid)
                     .ok()
                     .and_then(|commit_oid| git.find_commit(commit_oid).ok())
@@ -850,12 +879,12 @@ pub(crate) fn run_pre_push_verification_with_input(root: &Path, input: &str) -> 
                         super::parallel::import_expected_tree_oid(&git, commit.tree_id(), &policy)
                             .ok()
                     })
-                    .map(|expected| expected.as_bytes() == verified.git_tree.as_bytes())
+                    .map(|expected| expected.as_bytes() == expected_tree.as_bytes())
                     .unwrap_or(false);
                 if !binds {
                     return Err(CliError::GitError {
                         message: format!(
-                            "pre-push refused: the proposed OID {oid} does not carry the verified manifest state of view '{current_view}' under the active conversion policy; the local gate's verdict covers only the exact proposed objects, and this push proposes objects it did not verify (RFC §10.4 exact-OID binding)"
+                            "pre-push refused: the proposed OID {oid} does not carry the verified manifest state of view '{view}' under the active conversion policy; the local gate's verdict covers only the exact proposed objects, and this push proposes objects it did not verify (RFC §10.4 exact-OID binding)"
                         ),
                     });
                 }
