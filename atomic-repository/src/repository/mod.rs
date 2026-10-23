@@ -120,6 +120,7 @@ pub use remote_cache::{
 };
 mod revise;
 mod sandbox;
+mod semantic_closure;
 mod semantic_materialize;
 mod set_id;
 mod snapshot;
@@ -378,6 +379,9 @@ pub struct Repository {
     /// holds the sandbox's view (from its pointer file); it must not repoint
     /// the canonical `current_view` on disk.
     is_sandbox: bool,
+    /// Per-process memo of the CRDT branch state folded per trunk over the
+    /// current assembly closure; see [`semantic_closure::SemanticClosureMemo`].
+    semantic_closure_memo: std::sync::Mutex<semantic_closure::SemanticClosureMemo>,
 }
 
 impl std::fmt::Debug for Repository {
@@ -506,6 +510,7 @@ default = "{}"
             pristine,
             change_store,
             is_sandbox: false,
+            semantic_closure_memo: Default::default(),
         };
 
         Ok(repository)
@@ -609,6 +614,7 @@ default = "{}"
             pristine,
             change_store,
             is_sandbox: false,
+            semantic_closure_memo: Default::default(),
         };
         repository.fence_recovery_for_budget(working_copy_id, budget)?;
 
@@ -705,6 +711,7 @@ default = "{}"
             pristine,
             change_store,
             is_sandbox: false,
+            semantic_closure_memo: Default::default(),
         };
         let operation_lock = repository.try_lock_operation(working_copy_id)?;
         repository.recover_pending_deferred_tree_alignment_locked(&operation_lock)?;
@@ -763,6 +770,7 @@ default = "{}"
             pristine,
             change_store,
             is_sandbox: false,
+            semantic_closure_memo: Default::default(),
         })
     }
 
@@ -847,6 +855,7 @@ default = "{}"
             pristine,
             change_store,
             is_sandbox: false,
+            semantic_closure_memo: Default::default(),
         };
         if !operation_inspection
             && (repository.has_pending_deferred_tree_alignment()
@@ -904,6 +913,7 @@ default = "{}"
             pristine: Arc::new(pristine),
             change_store,
             is_sandbox: false,
+            semantic_closure_memo: Default::default(),
         };
         if repository.has_pending_deferred_tree_alignment() {
             return Err(RepositoryError::InvalidOperation {
@@ -1008,6 +1018,7 @@ default = "{}"
             pristine,
             change_store,
             is_sandbox: false,
+            semantic_closure_memo: Default::default(),
         };
         let operation_lock = repository.try_lock_operation(working_copy_id)?;
         repository.recover_pending_deferred_tree_alignment_locked(&operation_lock)?;

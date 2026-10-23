@@ -1030,70 +1030,50 @@ impl Repository {
             .ok_or_else(|| format!("view '{view_name}' does not exist"))?;
         let visibility = super::filter::assembly_visibility_excluding(&txn, &view, excluded)
             .map_err(|e| e.to_string())?;
-        let mut alive = std::collections::HashMap::new();
-        let mut after = std::collections::BTreeMap::new();
+        let state =
+            self.semantic_closure_trunk_state(&txn, view_name, excluded, &visibility, trunk)?;
+        let observed = semantic_branch_order(&state.after)?;
+        let existing_branches = observed
+            .iter()
+            .copied()
+            .filter(|branch| state.alive.get(branch) == Some(&true))
+            .collect();
+        Ok((existing_trunk_id, existing_branches, observed))
+    }
+
+    /// The branch state of `trunk` in the assembly closure, folded once per
+    /// visible change through the repository's semantic closure memo (see
+    /// `semantic_closure`): every deleted path of one commit, and every
+    /// later commit, reuses the changes folded before.
+    fn semantic_closure_trunk_state<T: atomic_core::pristine::GraphTxnT>(
+        &self,
+        txn: &T,
+        view_name: &str,
+        excluded: &[Hash],
+        visibility: &atomic_core::pristine::GraphVisibilityClosure,
+        trunk: atomic_core::crdt::TrunkId,
+    ) -> Result<super::semantic_closure::TrunkBranchState, String> {
+        let mut memo = self
+            .semantic_closure_memo
+            .lock()
+            .map_err(|_| "semantic closure memo is poisoned".to_string())?;
+        memo.align(view_name, excluded, visibility);
         for change_id in visibility
             .iter_dependency_first()
             .copied()
             .filter(|id| !id.is_root())
         {
+            if memo.is_folded(change_id) {
+                continue;
+            }
             let hash = txn
                 .get_external(change_id)
                 .map_err(|e| e.to_string())?
                 .ok_or_else(|| format!("closure change {change_id} has no hash"))?;
             let change = self.load_change(&hash).map_err(|e| e.to_string())?;
-            for ops in change.file_ops() {
-                let raw = ops.trunk_id();
-                let resolved = if raw.change_id().is_root() {
-                    atomic_core::crdt::TrunkId::new(change_id, raw.file_idx())
-                } else {
-                    raw
-                };
-                if resolved != trunk {
-                    continue;
-                }
-                for line in ops.line_ops() {
-                    let raw = line.branch_id();
-                    let branch = if raw.change_id().is_root() {
-                        atomic_core::crdt::BranchId::new(change_id, raw.branch_idx())
-                    } else {
-                        raw
-                    };
-                    use atomic_core::crdt::BranchOp;
-                    let resolve = |id: atomic_core::crdt::BranchId| {
-                        if id.change_id().is_root() {
-                            atomic_core::crdt::BranchId::new(change_id, id.branch_idx())
-                        } else {
-                            id
-                        }
-                    };
-                    match line.operation() {
-                        BranchOp::Insert {
-                            after: predecessor, ..
-                        } => {
-                            alive.insert(branch, true);
-                            after.insert(branch, predecessor.map(resolve));
-                        }
-                        BranchOp::Modify { .. } | BranchOp::Restore { .. } => {
-                            alive.insert(branch, true);
-                        }
-                        BranchOp::Delete { .. } => {
-                            alive.insert(branch, false);
-                        }
-                        BranchOp::Reparent { new_after, .. } => {
-                            after.insert(branch, new_after.map(resolve));
-                        }
-                    }
-                }
-            }
+            memo.fold(change_id, &change);
         }
-        let observed = semantic_branch_order(&after)?;
-        let existing_branches = observed
-            .iter()
-            .copied()
-            .filter(|branch| alive.get(branch) == Some(&true))
-            .collect();
-        Ok((existing_trunk_id, existing_branches, observed))
+        Ok(memo.trunk(&trunk))
     }
 
     /// This is the main entry point for creating a change from working copy
