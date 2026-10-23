@@ -27,6 +27,37 @@ fn callable(entity: &Entity) -> bool {
     matches!(entity.kind, EntityKind::Function | EntityKind::Method)
 }
 
+fn relative_script_import(importer: &str, module: &str, target: &str) -> Option<bool> {
+    let script = |path: &Path| {
+        matches!(
+            path.extension().and_then(|ext| ext.to_str()),
+            Some("ts" | "tsx" | "js" | "jsx" | "mjs" | "mts" | "cjs" | "cts")
+        )
+    };
+    if !script(Path::new(importer)) || !module.starts_with('.') {
+        return None;
+    }
+    if !script(Path::new(target)) {
+        return Some(false);
+    }
+    let mut resolved = std::path::PathBuf::new();
+    let joined = Path::new(importer)
+        .parent()
+        .unwrap_or_else(|| Path::new(""))
+        .join(module);
+    for component in joined.components() {
+        match component {
+            std::path::Component::Normal(name) => resolved.push(name),
+            std::path::Component::ParentDir if !resolved.pop() => return Some(false),
+            std::path::Component::ParentDir | std::path::Component::CurDir => {}
+            _ => return Some(false),
+        }
+    }
+    let target = Path::new(target);
+    let stem = target.with_extension("");
+    Some(target == resolved || stem == resolved || stem == resolved.join("index"))
+}
+
 impl SyntaxIndex {
     pub fn from_sources(sources: &[(String, String)]) -> Self {
         let mut parser = ParserRegistry::new();
@@ -88,7 +119,9 @@ impl SyntaxIndex {
                         .file_stem()
                         .and_then(|s| s.to_str())
                         .unwrap_or_default();
-                    if target != *path && tokens.contains(stem) {
+                    let matches = relative_script_import(path, &import.name, target)
+                        .unwrap_or_else(|| tokens.contains(stem));
+                    if target != *path && matches {
                         index.file_deps.insert(((*path).clone(), target.clone()));
                     }
                 }
@@ -183,5 +216,29 @@ impl Repository {
 
     pub fn query_callers(&self, target: &str) -> Result<Vec<Caller>, RepositoryError> {
         Ok(self.syntax_index(None)?.callers(target))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn script_imports_follow_relative_paths_instead_of_duplicate_file_stems() {
+        let index = SyntaxIndex::from_sources(&[
+            ("src/ui.ts".into(), "import { changed } from './api';\nimport '../shared';\nexport { api } from './nested';\n".into()),
+            ("src/api.ts".into(), "export function changed() {}".into()),
+            ("tests/api.ts".into(), "function other() {}".into()),
+            ("shared.ts".into(), "export const value = 1;".into()),
+            ("src/nested/index.ts".into(), "export const api = 1;".into()),
+        ]);
+        assert_eq!(
+            index.file_deps,
+            BTreeSet::from([
+                ("src/ui.ts".into(), "src/api.ts".into()),
+                ("src/ui.ts".into(), "shared.ts".into()),
+                ("src/ui.ts".into(), "src/nested/index.ts".into()),
+            ])
+        );
     }
 }

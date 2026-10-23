@@ -14,7 +14,10 @@ use std::collections::BTreeMap;
 
 pub(super) struct VaultProjection {
     project: ProjectId,
+    // Canonical IRIs are exact identities. Only historical aliases may fold
+    // case, and a collision must stay unresolved rather than pick a winner.
     subjects: BTreeMap<String, (String, C)>,
+    aliases: BTreeMap<String, Option<(String, C)>>,
     paths: BTreeMap<String, String>,
     hashes: BTreeMap<String, Hash>,
 }
@@ -40,6 +43,7 @@ impl VaultProjection {
         let mut context = Self {
             project,
             subjects: BTreeMap::new(),
+            aliases: BTreeMap::new(),
             paths: BTreeMap::new(),
             hashes,
         };
@@ -101,25 +105,22 @@ impl VaultProjection {
             context.paths.insert(meta.path.clone(), subject.clone());
             context
                 .subjects
-                .insert(subject.to_lowercase(), (subject.clone(), class));
-            context.subjects.insert(
-                format!("urn:atomic:{local_kind}:{name}").to_lowercase(),
+                .insert(subject.clone(), (subject.clone(), class));
+            context.add_alias(
+                format!("urn:atomic:{local_kind}:{name}"),
                 (subject.clone(), class),
             );
             if entry.entry_type == VaultEntryType::Intent {
                 for (key, summary) in &manifest.intents {
                     if summary.vault_path == meta.path {
-                        context.subjects.insert(
-                            format!("urn:atomic:intent:{key}").to_lowercase(),
+                        context.add_alias(
+                            format!("urn:atomic:intent:{key}"),
                             (subject.clone(), class),
                         );
                     }
                 }
                 if let Some(id) = fm.get("id").and_then(|v| v.as_str()) {
-                    context.subjects.insert(
-                        format!("urn:atomic:intent:{id}").to_lowercase(),
-                        (subject.clone(), class),
-                    );
+                    context.add_alias(format!("urn:atomic:intent:{id}"), (subject.clone(), class));
                 }
                 if let Some(map) = fm.as_object() {
                     if let Ok(node) = atomic_canonical::lift::lift_intent(
@@ -158,10 +159,8 @@ impl VaultProjection {
                                         message: e.to_string(),
                                     }
                                 })?;
-                            context
-                                .subjects
-                                .insert(raw.to_lowercase(), (id.clone(), class));
-                            context.subjects.insert(id.to_lowercase(), (id, class));
+                            context.add_alias(raw.to_owned(), (id.clone(), class));
+                            context.subjects.insert(id.clone(), (id, class));
                         }
                     }
                 }
@@ -170,12 +169,26 @@ impl VaultProjection {
         Ok(context)
     }
 
+    fn add_alias(&mut self, alias: String, target: (String, C)) {
+        self.aliases
+            .entry(alias.to_lowercase())
+            .and_modify(|existing| {
+                if existing.as_ref() != Some(&target) {
+                    *existing = None;
+                }
+            })
+            .or_insert(Some(target));
+    }
+
     fn resolve(&self, raw: &str) -> Option<(String, C)> {
         if raw.starts_with("memory:") || raw.starts_with("intent:") {
             return self.resolve(&format!("urn:atomic:{raw}"));
         }
-        if let Some(target) = self.subjects.get(&raw.to_lowercase()) {
+        if let Some(target) = self.subjects.get(raw) {
             return Some(target.clone());
+        }
+        if let Some(target) = self.aliases.get(&raw.to_lowercase()) {
+            return target.clone();
         }
         if let Ok(hash) = iri::parse_change(raw) {
             return self
@@ -225,6 +238,8 @@ impl VaultProjection {
 
     fn link(&self, graph: &mut KgSubgraph, subject: &str, raw: &str, predicate: P, path: &str) {
         if let Some((target, class)) = self.resolve(raw) {
+            // The referring entry owns the edge, never the target's metadata.
+            // In particular, a child type does not imply local ownership.
             graph
                 .nodes
                 .push(KgNode::new(&target, class, raw, "vault_reference"));
@@ -277,18 +292,14 @@ impl VaultProjection {
         };
         let fm: serde_json::Value =
             serde_json::from_str(&entry.frontmatter_json).unwrap_or_default();
-        let class = self
-            .subjects
-            .get(&subject.to_lowercase())
-            .expect("indexed subject")
-            .1;
+        let class = self.subjects.get(subject).expect("indexed subject").1;
         let label = fm
             .get("title")
             .or_else(|| fm.get("name"))
             .and_then(|v| v.as_str())
             .unwrap_or(path);
         let mut node = KgNode::new(subject, class, label, "vault")
-            .with_metadata(serde_json::json!({"vault_path": path, "created_at": entry.created_at, "updated_at": entry.updated_at,
+            .with_metadata(serde_json::json!({"vault_path": path, "derived_from_vault_path": path, "created_at": entry.created_at, "updated_at": entry.updated_at,
                 "status": fm.get("status"), "priority": fm.get("priority"), "human_key": fm.get("id"), "uid": fm.get("uid")}));
         if let Some(description) = fm
             .get("description")
@@ -388,7 +399,7 @@ impl VaultProjection {
                     for ac in &intent.has_acceptance_criterion {
                         if let Some((id, class)) = self.resolve(&ac.id) {
                             graph.nodes.push(KgNode::new(&id, class, &ac.text, "vault").with_summary(&ac.text)
-                                .with_metadata(serde_json::json!({"status": ac.ac_status, "verifiedBy": ac.verified_by, "evidence": ac.evidence})));
+                                .with_metadata(serde_json::json!({"status": ac.ac_status, "verifiedBy": ac.verified_by, "evidence": ac.evidence, "derived_from_vault_path": path})));
                             graph
                                 .edges
                                 .push(KgEdge::new(subject, id, P::HasAcceptanceCriterion));
@@ -399,7 +410,7 @@ impl VaultProjection {
                             graph.nodes.push(
                                 KgNode::new(&id, class, &task.text, "vault")
                                     .with_summary(&task.text)
-                                    .with_metadata(serde_json::json!({"status": task.task_status})),
+                                    .with_metadata(serde_json::json!({"status": task.task_status, "derived_from_vault_path": path})),
                             );
                             graph.edges.push(KgEdge::new(subject, &id, P::HasTask));
                             for ac in task.satisfies.as_slice() {
@@ -418,7 +429,10 @@ impl VaultProjection {
                             if let Some((id, class)) = self.resolve(&item.id) {
                                 graph.nodes.push(
                                     KgNode::new(&id, class, &item.text, "vault")
-                                        .with_summary(&item.text),
+                                        .with_summary(&item.text)
+                                        .with_metadata(
+                                            serde_json::json!({"derived_from_vault_path": path}),
+                                        ),
                                 );
                                 graph.edges.push(KgEdge::new(subject, id, predicate));
                             }
@@ -433,7 +447,10 @@ impl VaultProjection {
                         if let Some((id, class)) = self.resolve(&constraint.id) {
                             graph.nodes.push(
                                 KgNode::new(&id, class, &constraint.text, "vault")
-                                    .with_summary(&constraint.text),
+                                    .with_summary(&constraint.text)
+                                    .with_metadata(
+                                        serde_json::json!({"derived_from_vault_path": path}),
+                                    ),
                             );
                             graph.edges.push(KgEdge::new(subject, id, P::HasConstraint));
                         }
@@ -492,18 +509,6 @@ impl VaultProjection {
             }
         }
         graph.nodes.push(node);
-        for node in &mut graph.nodes {
-            if node.id == *subject
-                || node.has_type(C::Task)
-                || node.has_type(C::AcceptanceCriterion)
-                || node.has_type(C::ScopeItem)
-                || node.has_type(C::Constraint)
-                || node.has_type(C::Finding)
-            {
-                let metadata = node.metadata.get_or_insert_with(|| serde_json::json!({}));
-                metadata["derived_from_vault_path"] = serde_json::json!(path);
-            }
-        }
         for edge in &mut graph.edges {
             let metadata = edge.metadata.get_or_insert_with(|| serde_json::json!({}));
             metadata["derived_from_vault_path"] = serde_json::json!(path);

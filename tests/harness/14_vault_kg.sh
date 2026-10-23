@@ -53,6 +53,42 @@ assert_ran() {
     fi
 }
 
+# Discover a canonical view IRI from the query result, then require a real
+# incoming membership edge. An empty neighbors response is not a passing graph.
+assert_view_membership() {
+    local desc="$1"
+    local view_id
+    run_cmd atomic vault query search main --kind 'https://atomic.dev/ns/workflow#View' --json
+    if [[ $RC -ne 0 ]]; then
+        _fail "$desc" "view search exited $RC: $OUT"
+        return
+    fi
+    if ! view_id="$(echo "$OUT" | python3 -c '
+import json, sys
+nodes = json.load(sys.stdin)
+print(next(node["id"] for node in nodes if node["label"] == "main" and "https://atomic.dev/ns/workflow#View" in node["types"]))
+')"; then
+        _fail "$desc" "canonical main view missing: $OUT"
+        return
+    fi
+    run_cmd atomic vault query neighbors "$view_id" --json
+    if [[ $RC -ne 0 ]]; then
+        _fail "$desc" "neighbors exited $RC: $OUT"
+    elif echo "$OUT" | python3 -c '
+import json, sys
+graph = json.load(sys.stdin)
+view_id = sys.argv[1]
+ns = "https://atomic.dev/ns/workflow#"
+nodes = {node["id"]: node for node in graph["nodes"]}
+assert ns + "View" in nodes[view_id]["types"]
+assert any(edge["to_id"] == view_id and edge["kind"] == ns + "directlyOnView" and ns + "Change" in nodes[edge["from_id"]]["types"] for edge in graph["edges"])
+' "$view_id"; then
+        _pass "$desc"
+    else
+        _fail "$desc" "canonical view/change membership missing: $OUT"
+    fi
+}
+
 # ════════════════════════════════════════════════════════════════════════════
 # Section 1: Vault Initialization
 # ════════════════════════════════════════════════════════════════════════════
@@ -197,26 +233,23 @@ assert_ran "KG search finds recorded content" "change:|file:src/main\.rs"
 begin_section "Vault: KG Enrichment"
 
 make_temp_repo "vault-kg"
-init_repo --vault
+init_repo --vault --view main
 
 # Create some tracked files
 create_file "src/auth.rs" "pub fn authenticate() { }\npub fn verify() { }"
 create_file "src/main.rs" "fn main() { authenticate(); }"
 add_files "src/auth.rs" "src/main.rs"
-record_change "Add auth module" >/dev/null 2>&1 || true
+record_change "Add auth module" >/dev/null 2>&1
 
 # Run explicit KG enrichment — reports what was enriched
 run_cmd atomic vault query enrich
-assert_ran "KG enrich from VCS data" "Enriched: .*views.*files.*changes"
+assert_ran "KG enrich from VCS data" 'Enriched knowledge graph: [1-9][0-9]* item\(s\) processed\.'
 
-# Search for entities
+# Search for workflow file resources (AST entities are not stored in the KG).
 run_cmd atomic vault query search "auth" --json
 assert_ran "KG search finds 'auth' content" "auth"
 
-# Query neighbors of a view node — returns a node/edge graph
-project_urn="$(atomic repo identity show --json | python3 -c 'import json,sys; print(json.load(sys.stdin)["urn"])')"
-run_cmd atomic vault query neighbors "${project_urn}:view:dev" --json
-assert_ran "KG neighbors query for view node" '"nodes"'
+assert_view_membership "KG neighbors contain canonical view membership"
 
 # Reindex
 run_cmd atomic vault query reindex
@@ -272,7 +305,7 @@ else
     else
         cd "$GIT_KG_DIR"
 
-        run_cmd atomic init --vault
+        run_cmd atomic init --vault --view main
         if [[ $RC -eq 0 ]]; then
             _pass "init --vault in git checkout"
         else
@@ -288,16 +321,13 @@ else
 
         # Enrich KG from imported data
         run_cmd atomic vault query enrich
-        assert_ran "KG enrichment after git import" "Enriched: .*views.*files.*changes"
+        assert_ran "KG enrichment after git import" 'Enriched knowledge graph: [1-9][0-9]* item\(s\) processed\.'
 
         # Search should find content from the imported repo
         run_cmd atomic vault query search "uuid" --json
         assert_ran "KG search finds imported content" "uuid"
 
-        # Neighbors query for the imported default view
-        project_urn="$(atomic repo identity show --json | python3 -c 'import json,sys; print(json.load(sys.stdin)["urn"])')"
-        run_cmd atomic vault query neighbors "${project_urn}:view:main" --json
-        assert_ran "KG neighbors query after import" '"nodes"'
+        assert_view_membership "KG neighbors contain imported view membership"
 
         # Reindex vault entries
         run_cmd atomic vault query reindex

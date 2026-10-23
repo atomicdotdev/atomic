@@ -495,7 +495,7 @@ pub struct KgNode {
     /// Optional longer description (commit message, entity signature, etc.).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub summary: Option<String>,
-    /// Where this node was derived from (e.g., `"change_graph"`, `"ast_extraction"`, `"vault"`).
+    /// Where this node was derived from (e.g., `"vcs"`, `"session_ledger"`, `"vault"`).
     pub source: String,
     /// Arbitrary metadata as JSON.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -554,15 +554,15 @@ impl KgNode {
 
 /// A directed edge in the knowledge graph.
 ///
-/// Edges encode relationships: `MODIFIES`, `DEFINES`, `DEPENDS_ON`,
-/// `ON_VIEW`, `CHILD_OF`, `LINKED_INTENT`, etc.
+/// Only predicates from the canonical workflow ontology can be stored.
+/// Source-code relationships belong to the request-scoped syntax index.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KgEdge {
     /// Source node ID.
     pub from_id: String,
     /// Target node ID.
     pub to_id: String,
-    /// Relationship type (e.g., `"MODIFIES"`, `"DEFINES"`, `"DEPENDS_ON"`).
+    /// Canonical workflow relationship.
     pub kind: crate::kg::ontology::Predicate,
     /// Optional edge metadata.
     #[serde(skip_serializing_if = "Option::is_none")]

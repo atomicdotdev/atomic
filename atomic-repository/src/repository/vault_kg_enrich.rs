@@ -143,6 +143,7 @@ impl Repository {
             txn.upsert_kg_node(&KgNode::new(&author_id, C::Identity, &author.name, "vcs"))?;
             txn.upsert_kg_edge(&KgEdge::new(&id, author_id, P::AuthoredBy))?;
         }
+        let mut missing_dependency = false;
         for hash in change.dependencies() {
             if self.has_change(hash) {
                 let target = iri::mint_change(hash);
@@ -156,12 +157,16 @@ impl Repository {
                 }
                 txn.upsert_kg_edge(&KgEdge::new(&id, target, P::DirectlyDependsOnChange))?;
             } else {
+                missing_dependency = true;
                 txn.kg_finding(
                     "UnresolvedReference",
                     &id,
                     "A change dependency is not stored locally",
                 )?;
             }
+        }
+        if !missing_dependency {
+            txn.del_kg_node(&iri::mint_finding(&project, "UnresolvedReference", &id))?;
         }
         let rules = IgnoreRules::load_for_enrichment(self.root());
         let mut paths = std::collections::BTreeSet::new();
@@ -184,6 +189,43 @@ impl Repository {
             txn.upsert_kg_edge(&KgEdge::new(&id, file_id, P::ModifiesFile))?;
         }
         Ok(paths.len())
+    }
+
+    pub(super) fn repair_change_dependencies_kg(
+        &self,
+        txn: &mut atomic_core::WriteTxn<'_>,
+        arrived: &Hash,
+    ) -> Result<(), RepositoryError> {
+        let mut pending = std::collections::BTreeSet::new();
+        for edge in txn.all_kg_edges()? {
+            if edge.kind != P::AboutResource {
+                continue;
+            }
+            let Some(finding) = txn.get_kg_node(&edge.from_id)? else {
+                continue;
+            };
+            if finding
+                .metadata
+                .as_ref()
+                .and_then(|m| m.get("finding_code"))
+                .and_then(serde_json::Value::as_str)
+                != Some("UnresolvedReference")
+            {
+                continue;
+            }
+            if let Ok(hash) = iri::parse_change(&edge.to_id) {
+                pending.insert(hash);
+            }
+        }
+        for hash in pending {
+            if self.has_change(&hash) {
+                let change = self.load_change(&hash)?;
+                if change.dependencies().contains(arrived) {
+                    self.project_change_kg(txn, &hash, &change)?;
+                }
+            }
+        }
+        Ok(())
     }
 
     pub(super) fn project_view_kg(

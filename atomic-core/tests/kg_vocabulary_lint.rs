@@ -66,6 +66,7 @@ fn workspace_has_no_retired_kg_vocabulary_literals() {
         if path.is_dir() && (name.starts_with("atomic-") || name == "libatomic") {
             scan(&path.join("src"), &forbidden, &mut failures);
             scan(&path.join("tests"), &forbidden, &mut failures);
+            scan(&path.join("examples"), &forbidden, &mut failures);
         }
     }
     assert!(

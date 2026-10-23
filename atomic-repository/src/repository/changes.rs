@@ -143,9 +143,16 @@ impl Repository {
         let stored = self.save_change_bytes(hash, bytes, &change)?;
         self.ensure_project_identity(atomic_core::kg::project_id::MintReason::Upgrade)?;
         if !change.kind().is_snapshot() {
+            let hashes = self
+                .change_store
+                .iter_changes()
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| RepositoryError::Database(e.to_string()))?;
             let mut txn = self.pristine.write_txn()?;
             if txn.kg_writes_enabled()? {
                 self.project_change_kg(&mut txn, hash, &change)?;
+                self.repair_change_dependencies_kg(&mut txn, hash)?;
+                self.project_vault_kg(&mut txn, hashes)?;
             }
             txn.commit()?;
         }

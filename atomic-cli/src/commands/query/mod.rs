@@ -1051,10 +1051,10 @@ pub struct QueryNodes {
     #[arg(long, short = 'k', default_value = "10")]
     pub limit: usize,
 
-    /// Filter by node kind (change, entity, file, view, memory, intent, goal).
+    /// Filter by canonical class IRI (for example, <https://atomic.dev/ns/workflow#File>).
     ///
-    /// When set, only nodes of this kind are returned.
-    /// Without this flag, all kinds are returned.
+    /// When set, only nodes asserting this type are returned.
+    /// Without this flag, all types are returned.
     #[arg(long, short = 't')]
     pub kind: Option<String>,
 
@@ -1142,7 +1142,7 @@ impl Command for QueryNodes {
 /// Get the neighborhood of a KG node.
 #[derive(Parser, Debug)]
 pub struct QueryNeighbors {
-    /// Node ID (e.g., "change:abc123", "file:src/auth.rs", "intent:PIMO-1").
+    /// Canonical resource IRI, copied from query search or graph JSON.
     pub node_id: String,
 
     /// Traversal depth (1 or 2).

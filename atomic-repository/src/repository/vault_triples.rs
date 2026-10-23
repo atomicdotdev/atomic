@@ -136,18 +136,27 @@ impl Repository {
         if !txn.kg_writes_enabled()? {
             return Ok(0);
         }
-        let context = VaultProjection::new(&txn, txn.kg_project()?, hashes)?;
+        let total = self.project_vault_kg(&mut txn, hashes)?;
+        txn.commit()?;
+        self.refresh_session_kg()?;
+        Ok(total)
+    }
+
+    pub(super) fn project_vault_kg(
+        &self,
+        txn: &mut atomic_core::WriteTxn<'_>,
+        hashes: Vec<Hash>,
+    ) -> Result<usize, RepositoryError> {
+        let context = VaultProjection::new(txn, txn.kg_project()?, hashes)?;
         let entries = txn.list_vault_entries("", None)?;
         let mut total = 0;
         for meta in entries {
             if let Some(entry) = txn.get_vault_entry(&meta.path)? {
                 let graph = context.extract(&meta.path, &entry)?;
-                store_projection(&mut txn, &meta.path, &graph.nodes, &graph.edges)?;
+                store_projection(txn, &meta.path, &graph.nodes, &graph.edges)?;
                 total += graph.nodes.len() + graph.edges.len();
             }
         }
-        txn.commit()?;
-        self.refresh_session_kg()?;
         Ok(total)
     }
 

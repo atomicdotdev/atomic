@@ -73,6 +73,11 @@ jobs:
         shell: bash
         run: ATOMIC_BIN="$PWD/target/debug/atomic" bash tests/harness/run_all.sh 09
 
+      - name: Run knowledge graph closure harness
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        run: ATOMIC_BIN="$PWD/target/debug/atomic" bash tests/harness/46_knowledge_graph_closure.sh
+
   fmt:
     name: Format
     runs-on: ubuntu-latest

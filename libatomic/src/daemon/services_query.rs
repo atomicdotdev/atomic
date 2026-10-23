@@ -447,8 +447,11 @@ pub async fn get_change_impl(
             paths
                 .into_iter()
                 .map(|path| {
-                    let before_result = repo.get_file_content_before_change(&path, &hash);
-                    let after_result = repo.get_file_content_after_change(&path, &hash);
+                    let view_name = view.as_deref().unwrap_or_else(|| repo.current_view());
+                    let before_result =
+                        repo.get_file_content_before_change_on_view(&path, &hash, view_name);
+                    let after_result =
+                        repo.get_file_content_after_change_on_view(&path, &hash, view_name);
                     let before_exists =
                         before_result.as_ref().ok().map(|content| content.is_some());
                     let after_exists = after_result.as_ref().ok().map(|content| content.is_some());
@@ -473,8 +476,14 @@ pub async fn get_change_impl(
         } else {
             Vec::new()
         };
-        let blast_radius =
-            wants_blast_radius.then(|| super::change_impact::project(&repo, &change, &hash));
+        let blast_radius = wants_blast_radius.then(|| {
+            super::change_impact::project(
+                &repo,
+                &change,
+                &hash,
+                view.as_deref().unwrap_or_else(|| repo.current_view()),
+            )
+        });
         Ok::<_, Status>((
             change,
             hash,
