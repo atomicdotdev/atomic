@@ -48,10 +48,11 @@ is kept as a regression check.
   `reconcile` verifies.
 - A `.git/REBASE_HEAD` left behind by a completed interactive rebase is
   advisory; it no longer refuses every command as an in-progress rebase.
-- The pre-push hook binds each pushed branch to its own view, so
-  `git push origin <other-branch>` and `git push --all` pass for reconciled
-  branches; a branch no view has interpreted is refused with the step to
-  run.
+- The pre-push hook binds each pushed branch to its own view when one
+  exists, so `git push origin <other-branch>` and `git push --all` pass for
+  reconciled branches; a branch without a view of its own (`master`
+  publishing the `main` view) is checked against the current view's
+  verified tree as before.
 - `atomic git shim switch` (and native `atomic view switch`) handle
   repositories whose tree holds symlinks, including a symlink to a
   directory (the `.claude/skills/<name>` layout).
