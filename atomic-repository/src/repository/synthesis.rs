@@ -4024,7 +4024,7 @@ impl Repository {
         let mut pending_delete: Option<atomic_core::crdt::TrunkId> = None;
         for (change_id, change, _offsets) in staged_closure {
             for ops in change.file_ops() {
-                if ops.path() != path {
+                if crate::canonical_path_identity(ops.path()) != path {
                     continue;
                 }
                 match ops.trunk_op() {
@@ -4072,6 +4072,14 @@ impl Repository {
                 };
                 let trunk_followed = identity_trunks.contains(&resolved_trunk)
                     && !moved_away.contains(&resolved_trunk);
+                if std::env::var_os("ATOMIC_DEBUG_DELETION").is_some() {
+                    eprintln!(
+                        "[debug-deletion] replay {path}: change {change_id:?} entry {entry_index} ops.path={:?} resolved_trunk={resolved_trunk:?} canonical={canonical_trunk:?} trunk_op={:?} line_ops={}",
+                        ops.path(),
+                        ops.trunk_op(),
+                        ops.line_ops().len()
+                    );
+                }
                 let is_target = match canonical_trunk {
                     Some(identity) => resolved_trunk == identity,
                     // Retain compatibility with semantic-only legacy creates
@@ -5067,6 +5075,16 @@ impl Repository {
             .collect();
         let actual_chain =
             iter_trunk_branches_in_file_order(txn, trunk_key).map_err(|e| e.to_string())?;
+        if std::env::var_os("ATOMIC_DEBUG_DELETION").is_some() {
+            let ids: Vec<_> = staged_closure.iter().map(|(id, _, _)| *id).collect();
+            let expected: Vec<_> = branches
+                .iter()
+                .map(|(id, branch)| format!("{id:?}:{:?}", branch.state))
+                .collect();
+            eprintln!(
+                "[debug-deletion] summary {path}: closure={ids:?} trunk_key={trunk_key:?} expected={expected:?} actual_chain={actual_chain:?}"
+            );
+        }
         let mut visited: std::collections::HashSet<atomic_core::crdt::BranchId> =
             std::collections::HashSet::new();
         let debug_semantic = std::env::var_os("ATOMIC_DEBUG_DELETION").is_some();
