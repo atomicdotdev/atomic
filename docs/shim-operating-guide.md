@@ -24,6 +24,57 @@ incremental marker set is per target view. The
 [reproduction](shim-review-testing.md#9-regression-new-git-branch-after-atomic-records)
 is kept as a regression check.
 
+**Hardened (2026-10-23, review of the founding-team rollout):**
+
+- `atomic git import` refuses to materialize a branch that is not checked
+  out over unrecorded work (tracked edits, or untracked files the branch
+  tree would overwrite). Before, a detached HEAD or `-b <other>` import
+  wrote the imported tree over them.
+- Paths with spaces or non-ASCII bytes are tracked under the name on disk;
+  `atomic status` is clean right after an import and incremental imports
+  verify. A literal `%` in a file name still keeps its escaped identity.
+- Truncating a file to zero bytes imports on the mainline walk.
+- Untracked files, gitignored or not (`node_modules/`, `target/`,
+  `.DS_Store`, scratch files), are not divergence: `reconcile` and
+  `verify` ignore them.
+- `atomic git shim switch <view>` refuses a branch whose tip the view has
+  never imported instead of projecting over it (which reverted those
+  commits); reconcile the branch first.
+- A detached checkout of an imported ancestor (`git checkout <sha>`,
+  `git bisect`) maps to that commit's own closure; `reconcile` there and
+  back to the branch both work.
+- `git reset --hard` (or a rebase/force-pull) onto an imported ancestor
+  rewinds the view: the dropped changes are unrecorded and the next
+  `reconcile` verifies.
+- A `.git/REBASE_HEAD` left behind by a completed interactive rebase is
+  advisory; it no longer refuses every command as an in-progress rebase.
+- The pre-push hook binds each pushed branch to its own view, so
+  `git push origin <other-branch>` and `git push --all` pass for reconciled
+  branches; a branch no view has interpreted is refused with the step to
+  run.
+
+**Known failures (not fixed; avoid until tracked fixes land):**
+
+- An `atomic record` that deletes lines from a file already in Git history
+  makes every later `git commit` on that branch unreconcilable
+  (`staged semantic closure for '<path>': the closure's semantic
+  operations render N byte(s) ... must regenerate the commit tree`).
+  Records that only add lines, or replace a whole single-line file, are
+  fine. Recovery: `git reset --hard HEAD~1` back to the projection commit
+  and keep working through Atomic, or make the deletion through Git.
+- Linked `git worktree`s cannot reconcile (`Repository already exists`).
+- Committing `.atomicignore` to Git makes `verify`/`reconcile` report
+  `GitIndex/ExclusionPolicy .atomicignore`; keep it out of Git.
+- Interrupting an import between a change write and its Git SHA index
+  write can leave that commit unable to re-import (`already has a
+  different persisted interpretation closure`); the only recovery is a
+  fresh import.
+- Performance: `atomic record` and `reconcile` take minutes on
+  repositories with a few hundred changes, and the first `reconcile` of a
+  newly created branch re-validates the binding closure (tens of minutes
+  on such repositories). Importing a thousand-commit history takes about
+  an hour.
+
 Other limits:
 
 - `atomic git shim enable --adopt-git` is still unavailable.
