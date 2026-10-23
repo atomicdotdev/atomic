@@ -189,13 +189,22 @@ impl Repository {
         // recorded deletions. Reintroduce those paths for status classification
         // using the operation-aware projection so a filesystem reappearance is
         // an undelete of the original inode rather than an untracked new file.
+        let mut present = crate::worktree_presence::WorktreeEntries::new(&self.root);
         for absent in &projected_absent {
             let normalized = PathBuf::from(&absent.path);
             // A projected deletion is already the recorded state. Reintroduce
-            // it only when an entry actually reappears on disk, where it must
-            // be classified as an undelete of the stable inode rather than as
-            // an untracked add.
-            if std::fs::symlink_metadata(self.root.join(&normalized)).is_err() {
+            // it only when an entry actually reappears on disk under its exact
+            // name, where it must be classified as an undelete of the stable
+            // inode rather than as an untracked add. A plain stat is not
+            // enough: on a case-insensitive filesystem the old spelling of a
+            // case-only rename still resolves, and a deleted child still
+            // resolves through an ancestor that became a symlink to a
+            // directory; neither is a reappearance.
+            if present
+                .exact_metadata(&normalized)
+                .map_err(RepositoryError::Io)?
+                .is_none()
+            {
                 continue;
             }
             if !options.path_filters.is_empty() {

@@ -4293,6 +4293,7 @@ impl ParallelImporter {
             .workdir()
             .ok_or_else(|| git_error("checked-out import branch has no worktree"))?;
         let filter = GitAttributesFilter::for_repository(root);
+        let mut present = atomic_repository::worktree_presence::WorktreeEntries::new(root);
         let mut changed = std::collections::BTreeSet::new();
         for commit in commits {
             for file in &commit.parsed.files {
@@ -4319,10 +4320,19 @@ impl ParallelImporter {
                 let needs_directory = expected
                     .keys()
                     .any(|candidate| candidate.starts_with(prefix.as_bytes()));
-                if physical
-                    .symlink_metadata()
-                    .is_ok_and(|metadata| !(needs_directory && metadata.file_type().is_dir()))
-                {
+                // Exact-name lookup: `symlink_metadata` resolves the old
+                // spelling of a case-only rename on a case-insensitive
+                // filesystem, and children behind an ancestor that became a
+                // symlink to a directory; neither is a lingering Git path.
+                let lingering = present
+                    .exact_metadata(&canonical_tree_path(path))
+                    .map_err(|error| {
+                        git_error(format!(
+                            "cannot inspect deleted worktree path '{path}': {error}"
+                        ))
+                    })?
+                    .is_some_and(|metadata| !(needs_directory && metadata.file_type().is_dir()));
+                if lingering {
                     return Err(git_error(format!(
                         "deleted Git path '{path}' is still present in the worktree"
                     )));
