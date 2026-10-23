@@ -140,6 +140,18 @@ pub fn escape_repo_path(bytes: &[u8]) -> String {
     output
 }
 
+/// The canonical String identity of a graph name, whichever spelling the
+/// graph stored: the raw bytes (native tracking, and imports since the
+/// path-boundary fix) or the already-escaped identity (earlier imports).
+/// Idempotent on an escaped name; a raw name whose literal `%` does not
+/// decode keeps its bytes.
+pub fn canonical_path_identity(path: &str) -> String {
+    match unescape_repo_path(path) {
+        Ok(bytes) => escape_repo_path(&bytes),
+        Err(_) => escape_repo_path(path.as_bytes()),
+    }
+}
+
 /// The exact inverse of [`escape_repo_path`]: decode every `%XX` escape back
 /// to its byte. Errors on a malformed escape (`%` not followed by two hex
 /// digits), never silently rewriting identity.
@@ -1200,7 +1212,10 @@ impl Repository {
             .values()
             .filter(|item| !item.is_directory)
         {
-            let path = RepoPath::from_bytes(item.path.as_bytes())?;
+            // Manifest fold keys are canonical identities: the graph stores a
+            // name raw (native tracking, current imports) or already escaped
+            // (earlier imports); the Git side always folds the escaped form.
+            let path = RepoPath::from_bytes(canonical_path_identity(&item.path).as_bytes())?;
             let disposition = policy
                 .exclusions
                 .exclusion(&path)
@@ -1399,7 +1414,7 @@ impl Repository {
             .values()
             .filter(|item| !item.is_directory)
         {
-            let path = RepoPath::from_bytes(item.path.as_bytes())?;
+            let path = RepoPath::from_bytes(canonical_path_identity(&item.path).as_bytes())?;
             let disposition = policy
                 .exclusions
                 .exclusion(&path)
@@ -1448,7 +1463,7 @@ impl Repository {
             if projected_paths.contains(path.as_str()) {
                 continue;
             }
-            let repo_path = RepoPath::from_bytes(path.as_bytes())?;
+            let repo_path = RepoPath::from_bytes(canonical_path_identity(path).as_bytes())?;
             let disposition = policy
                 .exclusions
                 .exclusion(&repo_path)
@@ -1699,6 +1714,13 @@ mod tests {
         assert!(RepoPath::from_bytes(b"a/../b").is_err());
         assert!(RepoPath::from_bytes(b"a\0b").is_err());
         assert_eq!(path.escaped(), "src/%FFname");
+        // A raw and an escaped spelling share one canonical identity.
+        assert_eq!(canonical_path_identity("caf\u{e9}.txt"), "caf%C3%A9.txt");
+        assert_eq!(canonical_path_identity("caf%C3%A9.txt"), "caf%C3%A9.txt");
+        assert_eq!(canonical_path_identity("has space.txt"), "has%20space.txt");
+        assert_eq!(canonical_path_identity("plain/name.rs"), "plain/name.rs");
+        assert_eq!(canonical_path_identity("100%.txt"), "100%25.txt");
+        assert_eq!(canonical_path_identity("100%25.txt"), "100%25.txt");
     }
 
     #[test]

@@ -1,7 +1,14 @@
 //! Deterministic structured equivalence reports for Atomic, Git index, and worktree state.
 
 use super::git_observation::compute_index_tree;
-use super::project_tree::{git_object_id, GitObjectKind};
+use super::project_tree::{escape_repo_path, git_object_id, GitObjectKind};
+
+/// The manifest folds paths by their canonical escaped identity; the Git
+/// index and the worktree observe raw bytes. Compare like with like.
+fn identity_key(path: &RepoPath) -> RepoPath {
+    RepoPath::from_bytes(escape_repo_path(path.as_bytes()).as_bytes())
+        .unwrap_or_else(|_| path.clone())
+}
 use super::*;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -270,7 +277,7 @@ fn compare_index_into(
     let mut exceptional_paths = BTreeSet::new();
     for entry in &index.entries {
         if entry.stage != 0 {
-            exceptional_paths.insert(entry.path.clone());
+            exceptional_paths.insert(identity_key(&entry.path));
             report.push(
                 EquivalenceLayer::GitIndex,
                 MismatchKind::ConflictStage,
@@ -281,7 +288,7 @@ fn compare_index_into(
             continue;
         }
         if entry.intent_to_add {
-            exceptional_paths.insert(entry.path.clone());
+            exceptional_paths.insert(identity_key(&entry.path));
             report.push(
                 EquivalenceLayer::GitIndex,
                 MismatchKind::IntentToAdd,
@@ -291,7 +298,7 @@ fn compare_index_into(
             );
         }
         if entry.sparse_directory {
-            exceptional_paths.insert(entry.path.clone());
+            exceptional_paths.insert(identity_key(&entry.path));
             report.push(
                 EquivalenceLayer::GitIndex,
                 MismatchKind::SparseDirectory,
@@ -300,7 +307,7 @@ fn compare_index_into(
                 "sparse directory entry",
             );
         }
-        stage_zero.insert(entry.path.clone(), entry);
+        stage_zero.insert(identity_key(&entry.path), entry);
     }
 
     let expected: BTreeMap<_, _> = project
@@ -431,7 +438,7 @@ fn compare_worktree_into(
     let actual: BTreeMap<_, _> = worktree
         .entries
         .iter()
-        .map(|entry| (entry.path.clone(), entry))
+        .map(|entry| (identity_key(&entry.path), entry))
         .collect();
     for (path, expected_entry) in &expected {
         if expected_entry.disposition != ManifestDisposition::Included {

@@ -397,7 +397,12 @@ pub(crate) fn staged_expectation_for(
     // the CRDT tables (review F4). Rebuilding this list from `parsed.files`
     // here would demand FileOps for unchanged union content and shadow the
     // caller's argument, so the parameter is used verbatim.
-    let semantic_paths = semantic_paths.to_vec();
+    // Recorded paths carry the repository's raw spelling; the expectation
+    // speaks canonical identities throughout.
+    let semantic_paths = semantic_paths
+        .iter()
+        .map(|path| atomic_repository::canonical_path_identity(path))
+        .collect();
     atomic_repository::StagedExpectation {
         paths: parsed
             .files
@@ -2288,7 +2293,7 @@ impl ImportLineIndex {
                     .collect()
             };
 
-            let seed = match repo.import_line_index_seed(&file.path) {
+            let seed = match repo.import_line_index_seed(&repository_path(&file.path)) {
                 Ok(Some(seed)) => seed,
                 Ok(None) => continue,
                 Err(err) => {
@@ -5329,7 +5334,9 @@ impl ParallelImporter {
             match file.operation {
                 FileOperation::Deleted => {
                     // The path must be absent (or empty) in the target view.
-                    if let Ok(Some(content)) = repo.get_file_content_on_view(&file.path, target) {
+                    if let Ok(Some(content)) =
+                        repo.get_file_content_on_view(&*repository_path(&file.path), target)
+                    {
                         if !content.is_empty() {
                             return false;
                         }
@@ -5340,7 +5347,7 @@ impl ParallelImporter {
                         Some(c) => c,
                         None => continue,
                     };
-                    match repo.get_file_content_on_view(&file.path, target) {
+                    match repo.get_file_content_on_view(&*repository_path(&file.path), target) {
                         Ok(Some(actual)) if &actual == expected => {}
                         _ => return false,
                     }
@@ -5789,7 +5796,7 @@ impl ParallelImporter {
                     _ => None,
                 };
                 let projected = if file.new_mode.is_some() {
-                    repo.projected_attributes_on_view_excluding(&file.path, &target, &excluded)
+                    repo.projected_attributes_on_view_excluding(&repository_path(&file.path), &target, &excluded)
                         .map_err(|e| {
                             CliError::Internal(anyhow::anyhow!(
                                 "cannot project current attributes for '{}': {e}",
@@ -5986,14 +5993,17 @@ impl ParallelImporter {
                     if sits_under_deleted_path(&file.path, &deleted_in_commit) {
                         continue;
                     }
-                    added_paths.push(&file.path);
+                    added_paths.push(repository_path(&file.path));
                 }
-                EffectiveOp::Deleted => deleted_paths.push(file.path.clone()),
+                EffectiveOp::Deleted => {
+                    deleted_paths.push(repository_path(&file.path).into_owned())
+                }
                 _ => {}
             }
         }
         if !self.options.preserve_working_copy && !added_paths.is_empty() {
-            repo.add_batch(working_copy, &added_paths)
+            let added_refs: Vec<&str> = added_paths.iter().map(|path| path.as_ref()).collect();
+            repo.add_batch(working_copy, &added_refs)
                 .map_err(|e| CliError::Internal(e.into()))?;
         }
 
@@ -6040,7 +6050,8 @@ impl ParallelImporter {
                         // The view already renders the new bytes but the
                         // graph-backed attributes differ: the attribute
                         // writes alone are the delta (CB-9C).
-                        let mut attr_rec = RecordedFile::new(&file.path);
+                        let mut attr_rec =
+                            RecordedFile::new(repository_path(&file.path).into_owned());
                         attr_rec.set_kind(atomic_core::record::workflow::DetectionKind::Modified);
                         if let Some((inode, position)) = repo
                             .get_inode_and_position_on_view_excluding(
@@ -6089,8 +6100,8 @@ impl ParallelImporter {
                         ))
                     })?;
                     let memory_wc = Memory::new();
-                    memory_wc.add_file(&file.path, content);
-                    let detected = DetectedFile::added(&file.path);
+                    memory_wc.add_file(&repository_path(&file.path), content);
+                    let detected = DetectedFile::added(repository_path(&file.path).into_owned());
                     match record_added_file(&memory_wc, &detected, &core_options) {
                         Ok(mut rec) if !rec.is_empty() => {
                             // CB-9C: carry the Git mode/kind as graph-backed
@@ -6118,21 +6129,27 @@ impl ParallelImporter {
 
                 EffectiveOp::Renamed => {
                     let old_path = file.old_path.as_deref().unwrap_or(&file.path);
-                    let parent_path = Path::new(&file.path)
+                    let old_repository_path = repository_path(old_path);
+                    let parent_path = Path::new(&*repository_path(&file.path))
                         .parent()
                         .and_then(|p| p.to_str())
-                        .unwrap_or("");
+                        .map(str::to_string)
+                        .unwrap_or_default();
                     let can_emit_move = parent_path.is_empty()
                         || repo
                             .get_inode_and_position_on_view_excluding(
-                                parent_path,
+                                &parent_path,
                                 &target,
                                 &excluded,
                             )
                             .map_err(|e| CliError::Internal(e.into()))?
                             .is_some();
                     let inode_pos = repo
-                        .get_inode_and_position_on_view_excluding(old_path, &target, &excluded)
+                        .get_inode_and_position_on_view_excluding(
+                            &old_repository_path,
+                            &target,
+                            &excluded,
+                        )
                         .map_err(|e| CliError::Internal(e.into()))?;
                     let new_bytes = file.new_content.as_deref().unwrap_or(&[]);
                     let ambiguous = renamed_pairing_is_ambiguous(baseline.as_slice(), new_bytes);
@@ -6182,8 +6199,8 @@ impl ParallelImporter {
                             let mut move_rec = repo
                                 .record_foreign_moved_file_excluding(
                                     &target,
-                                    &file.path,
-                                    old_path,
+                                    &repository_path(&file.path),
+                                    &old_repository_path,
                                     &old_content,
                                     &new_content_owned,
                                     false,
@@ -6218,7 +6235,7 @@ impl ParallelImporter {
                             // greedy match discarded alongside this delta's
                             // own candidate.
                             if old_path != file.path {
-                                deleted_paths.push(old_path.to_string());
+                                deleted_paths.push(repository_path(old_path).into_owned());
                                 // The downgrade is real delete+add semantics:
                                 // the old path must carry a canonical FileDel
                                 // record like a plain imported deletion, bound
@@ -6227,7 +6244,9 @@ impl ParallelImporter {
                                 // instead of leaving the old trunk Alive.
                                 let deleted_record = repo
                                     .record_foreign_deleted_file_on_view_excluding(
-                                        old_path, &target, &excluded,
+                                        &old_repository_path,
+                                        &target,
+                                        &excluded,
                                     )
                                     .map_err(|message| {
                                         CliError::Internal(anyhow::anyhow!(message))
@@ -6317,8 +6336,9 @@ impl ParallelImporter {
                                     None => continue,
                                 };
                             let memory_wc = Memory::new();
-                            memory_wc.add_file(&file.path, content);
-                            let detected = DetectedFile::added(&file.path);
+                            memory_wc.add_file(&repository_path(&file.path), content);
+                            let detected =
+                                DetectedFile::added(repository_path(&file.path).into_owned());
                             match record_added_file(&memory_wc, &detected, &core_options) {
                                 Ok(mut rec) if !rec.is_empty() => {
                                     for value in attrs {
@@ -6351,7 +6371,7 @@ impl ParallelImporter {
                         ))
                     })?;
                     let memory_wc = Memory::new();
-                    memory_wc.add_file(&file.path, new_content);
+                    memory_wc.add_file(&repository_path(&file.path), new_content);
 
                     // The baseline is the commit's own context: in leg mode
                     // the Git parent-tree bytes (sibling content excluded),
@@ -6363,9 +6383,11 @@ impl ParallelImporter {
                         self.old_bytes_for(repo, file)
                     };
                     let mut detected = DetectedFile::modified(&file.path);
-                    if let Ok(Some((inode, pos))) = repo
-                        .get_inode_and_position_on_view_excluding(&file.path, &target, &excluded)
-                    {
+                    if let Ok(Some((inode, pos))) = repo.get_inode_and_position_on_view_excluding(
+                        &repository_path(&file.path),
+                        &target,
+                        &excluded,
+                    ) {
                         detected.inode = Some(inode);
                         detected.position = Some(pos);
                     }
@@ -6385,7 +6407,11 @@ impl ParallelImporter {
                     // the whole-file replacement record — the same shape
                     // their add used.
                     let recorded = if repo
-                        .get_inode_and_position_on_view_excluding(&file.path, &target, &excluded)
+                        .get_inode_and_position_on_view_excluding(
+                            &repository_path(&file.path),
+                            &target,
+                            &excluded,
+                        )
                         .map_err(|e| CliError::Internal(e.into()))?
                         .is_some()
                     {
@@ -6404,15 +6430,20 @@ impl ParallelImporter {
                         // the file tracked.
                         let conflicted = !leg_mode
                             && repo
-                                .path_has_persisted_conflict(&file.path, &target)
+                                .path_has_persisted_conflict(&repository_path(&file.path), &target)
                                 .map_err(|e| CliError::Internal(e.into()))?;
                         repo.record_foreign_modified_file_on_view_excluding(
-                            &file.path,
+                            &repository_path(&file.path),
                             &old_content,
                             new_content,
-                            // Full-history truncations retain the file's
-                            // identity through a content-only replacement.
                             conflicted || (!self.options.mainline_only && new_content.is_empty()),
+                            // A truncation to an empty file retains the
+                            // file's identity through a content-only
+                            // replacement on every import path: a
+                            // delete-every-line edit kills the path claim
+                            // and fails the staged tree check ("staged tree
+                            // is missing '<path>'") on the mainline walk
+                            // exactly as it did on the full-history one.
                             &target,
                             &excluded,
                         )
@@ -6449,7 +6480,8 @@ impl ParallelImporter {
                         // Bytes unchanged but the graph-backed attributes
                         // differ: the attribute writes alone are the delta
                         // (CB-9C chmod-only/kind-only commits).
-                        let mut attr_rec = RecordedFile::new(&file.path);
+                        let mut attr_rec =
+                            RecordedFile::new(repository_path(&file.path).into_owned());
                         attr_rec.set_kind(atomic_core::record::workflow::DetectionKind::Modified);
                         if let Some((inode, position)) = repo
                             .get_inode_and_position_on_view_excluding(
@@ -6488,7 +6520,9 @@ impl ParallelImporter {
                     // moved-to/created trunk row Alive after graph deletion.
                     let recorded = repo
                         .record_foreign_deleted_file_on_view_excluding(
-                            &file.path, &target, &excluded,
+                            &repository_path(&file.path),
+                            &target,
+                            &excluded,
                         )
                         .map_err(|message| CliError::Internal(anyhow::anyhow!(message)))?;
                     recorded_files.push(recorded);
@@ -6635,7 +6669,7 @@ impl ParallelImporter {
     /// falling back to the Git parent-tree bytes captured in Phase 1 for
     /// history whose baseline is not in the graph.
     fn old_bytes_for(&self, repo: &Repository, file: &ParsedFile) -> Vec<u8> {
-        match repo.get_file_content(&file.path) {
+        match repo.get_file_content(&*repository_path(&file.path)) {
             Ok(Some(bytes)) => bytes,
             _ => file.old_content.as_deref().unwrap_or(&[]).to_vec(),
         }
@@ -7007,7 +7041,11 @@ impl ParallelImporter {
             if file.new_content.is_some()
                 && !sits_under_deleted_path(&file.path, &deleted_in_merge)
                 && repo
-                    .get_inode_and_position_on_view_excluding(&file.path, &target, &excluded)
+                    .get_inode_and_position_on_view_excluding(
+                        &repository_path(&file.path),
+                        &target,
+                        &excluded,
+                    )
                     .map_err(|e| {
                         CliError::Internal(anyhow::anyhow!(
                             "cannot resolve exact union identity for '{}': {e}",
@@ -7016,11 +7054,12 @@ impl ParallelImporter {
                     })?
                     .is_none()
             {
-                added_paths.push(&file.path);
+                added_paths.push(repository_path(&file.path));
             }
         }
         if !self.options.preserve_working_copy && !added_paths.is_empty() {
-            repo.add_batch(working_copy, &added_paths)
+            let added_refs: Vec<&str> = added_paths.iter().map(|path| path.as_ref()).collect();
+            repo.add_batch(working_copy, &added_refs)
                 .map_err(|e| CliError::Internal(e.into()))?;
         }
         let record_start = std::time::Instant::now();
@@ -7056,7 +7095,7 @@ impl ParallelImporter {
                     // safety path.
                     let rec = repo
                         .record_foreign_modified_file_on_view_excluding(
-                            &file.path,
+                            &repository_path(&file.path),
                             &union_content,
                             new_content,
                             true,
@@ -7079,8 +7118,8 @@ impl ParallelImporter {
                 }
                 (Some(new_content), None) => {
                     let memory_wc = Memory::new();
-                    memory_wc.add_file(&file.path, new_content);
-                    let detected = DetectedFile::added(&file.path);
+                    memory_wc.add_file(&repository_path(&file.path), new_content);
+                    let detected = DetectedFile::added(repository_path(&file.path).into_owned());
                     match record_added_file(&memory_wc, &detected, &core_options) {
                         Ok(rec) if !rec.is_empty() => {
                             recorded_files.push(rec);
@@ -7102,7 +7141,9 @@ impl ParallelImporter {
                 (None, Some(_union_content)) => {
                     let recorded = repo
                         .record_foreign_deleted_file_on_view_excluding(
-                            &file.path, &target, &excluded,
+                            &repository_path(&file.path),
+                            &target,
+                            &excluded,
                         )
                         .map_err(|message| CliError::Internal(anyhow::anyhow!(message)))?;
                     if recorded.is_empty() {
@@ -7112,7 +7153,7 @@ impl ParallelImporter {
                         )));
                     }
                     recorded_files.push(recorded);
-                    deleted_paths.push(file.path.clone());
+                    deleted_paths.push(repository_path(&file.path).into_owned());
                 }
                 (None, None) => {}
             }
@@ -7140,7 +7181,11 @@ impl ParallelImporter {
                 index
             } else {
                 let (inode, position) = repo
-                    .get_inode_and_position_on_view_excluding(&file.path, &target, &excluded)
+                    .get_inode_and_position_on_view_excluding(
+                        &repository_path(&file.path),
+                        &target,
+                        &excluded,
+                    )
                     .map_err(|e| CliError::Internal(e.into()))?
                     .ok_or_else(|| {
                         git_error(format!(
@@ -7148,7 +7193,7 @@ impl ParallelImporter {
                             file.path
                         ))
                     })?;
-                let mut record = RecordedFile::new(&file.path);
+                let mut record = RecordedFile::new(repository_path(&file.path).into_owned());
                 record.set_kind(atomic_core::record::workflow::DetectionKind::Modified);
                 record.set_inode(inode);
                 record.set_position(position);
@@ -9056,6 +9101,30 @@ fn view_exists(source: &Repository, view: &str) -> CliResult<bool> {
     source
         .view_exists(view)
         .map_err(|error| CliError::Internal(error.into()))
+}
+
+/// The repository's spelling of a canonical (escaped) Git path: the raw
+/// bytes when they are UTF-8, exactly as native tracking records a path, so
+/// TREE, FILE_INDEX and the change's own file ops carry the name `atomic
+/// status` and `atomic restore <path>` see on disk. Registering the escaped
+/// identity instead left every path with a space or a non-ASCII byte
+/// tracked as `has%20space.txt`: dirty status right after import, and a
+/// view the next incremental import could not verify. A path with
+/// non-UTF-8 bytes keeps its escaped identity (the repository API takes
+/// `&str`), and so does a name with a literal `%`: the projection decodes
+/// tree names, so a raw `%` would be read as an escape (a pre-existing
+/// limit shared with native tracking).
+pub(super) fn repository_path(path: &str) -> std::borrow::Cow<'_, str> {
+    if !path.contains('%') {
+        return std::borrow::Cow::Borrowed(path);
+    }
+    match atomic_repository::unescape_repo_path(path)
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+    {
+        Some(raw) if !raw.contains('%') => std::borrow::Cow::Owned(raw),
+        _ => std::borrow::Cow::Borrowed(path),
+    }
 }
 
 /// A physical filesystem path decoded from the canonical String identity.

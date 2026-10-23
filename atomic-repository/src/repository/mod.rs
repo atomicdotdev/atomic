@@ -178,13 +178,13 @@ pub use operation::{
     OperationVerificationState, PreparedRemoteOperation, PreparedShimGitWrite,
 };
 pub use project_tree::{
-    escape_repo_path, unescape_repo_path, ConversionPolicy, ExclusionPolicy, ExclusionReason,
-    GitIndexEntry, GitIndexState, GitObject, GitObjectDatabase, GitObjectKind, GitTree,
-    GitTreeEntry, LossPolicy, ManifestDisposition, ManifestRoot, PhysicalKind,
-    PlatformCapabilities, ProjectTree, ProjectTreeError, RepoPath, RepositoryEntry,
-    RepositoryManifest, WorktreeEntry, WorktreeObservation, CONVERSION_POLICY_VERSION,
-    GIT_INDEX_STATE_VERSION, REPOSITORY_MANIFEST_VERSION, REPO_PATH_VERSION,
-    WORKTREE_OBSERVATION_VERSION,
+    atomic_private_path, canonical_path_identity, escape_repo_path, unescape_repo_path,
+    ConversionPolicy, ExclusionPolicy, ExclusionReason, GitIndexEntry, GitIndexState, GitObject,
+    GitObjectDatabase, GitObjectKind, GitTree, GitTreeEntry, LossPolicy, ManifestDisposition,
+    ManifestRoot, PhysicalKind, PlatformCapabilities, ProjectTree, ProjectTreeError, RepoPath,
+    RepositoryEntry, RepositoryManifest, WorktreeEntry, WorktreeObservation,
+    CONVERSION_POLICY_VERSION, GIT_INDEX_STATE_VERSION, REPOSITORY_MANIFEST_VERSION,
+    REPO_PATH_VERSION, WORKTREE_OBSERVATION_VERSION,
 };
 pub use projection::effective_projection_closure;
 pub use projection_commit::{

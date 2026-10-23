@@ -3439,6 +3439,14 @@ impl Repository {
         let verify_start = std::time::Instant::now();
         let projection = self.project_tree_for_visibility(txn, visibility)?;
         let _projection_ms = verify_start.elapsed().as_millis();
+        // The projection keys paths by the graph's own spelling (raw for
+        // native tracking and current imports, escaped for earlier imports);
+        // the expectation keys are canonical identities.
+        let present_by_identity: std::collections::HashMap<String, _> = projection
+            .present
+            .iter()
+            .map(|(path, item)| (crate::canonical_path_identity(path), item))
+            .collect();
         if !projection.name_conflicts.is_empty() {
             let mut conflicted_paths: Vec<&str> = projection
                 .name_conflicts
@@ -3457,7 +3465,7 @@ impl Repository {
 
         for (path, expected) in &expected_tree.entries {
             let path_start = std::time::Instant::now();
-            let Some(item) = projection.present.get(path) else {
+            let Some(item) = present_by_identity.get(path) else {
                 return Err(RepositoryError::InvalidOperation {
                     message: format!(
                         "staged tree is missing '{path}' but the commit's Git tree requires it"
@@ -3644,13 +3652,14 @@ impl Repository {
             {
                 continue;
             }
-            if expected_tree.entries.contains_key(path)
+            let identity = crate::canonical_path_identity(path);
+            if expected_tree.entries.contains_key(&identity)
                 || crate::repository::project_tree::atomic_private_path(path.as_bytes())
                 || crate::repository::project_tree::shim_private_path(path.as_bytes())
                 || expected_tree
                     .verify_paths
                     .as_ref()
-                    .is_some_and(|paths| !paths.contains(path))
+                    .is_some_and(|paths| !paths.contains(&identity))
             {
                 continue;
             }
@@ -3663,7 +3672,7 @@ impl Repository {
         // Every required structural directory must project present and as an
         // actual directory (not a file collision at an interior path).
         for directory in &required_directories {
-            match projection.present.get(*directory) {
+            match present_by_identity.get(*directory) {
                 Some(item) if item.is_directory => {}
                 Some(_) => {
                     return Err(RepositoryError::InvalidOperation {
@@ -3705,11 +3714,13 @@ impl Repository {
         //    or a pre-semantic legacy change) is content-checked by the
         //    graph layer above, not waived here — its semantic state simply
         //    does not exist to compare.
-        let staged_file_ops: std::collections::HashMap<&str, &atomic_core::change::FileOps> =
+        // File ops carry the repository's raw spelling of a path; the
+        // expectation keys carry the canonical escaped identity.
+        let staged_file_ops: std::collections::HashMap<String, &atomic_core::change::FileOps> =
             final_change
                 .file_ops()
                 .iter()
-                .map(|ops| (ops.path(), ops))
+                .map(|ops| (crate::canonical_path_identity(ops.path()), ops))
                 .collect();
         // Preload the interpreted closure ONCE for every path's semantic
         // verification (review ::15 scaling fix, 2026-09-16): the historical
@@ -3773,7 +3784,7 @@ impl Repository {
             // domain; opaque content is guarded by the same trunk
             // existence/identity/lifecycle checks plus the graph-layer byte
             // equality above.
-            let Some(item) = projection.present.get(path) else {
+            let Some(item) = present_by_identity.get(path) else {
                 // Already refused above; nothing further to reconstruct.
                 continue;
             };
@@ -3798,7 +3809,7 @@ impl Repository {
             }
         }
         for path in &expected_tree.semantic_paths {
-            if !staged_file_ops.contains_key(path.as_str()) {
+            if !staged_file_ops.contains_key(&crate::canonical_path_identity(path)) {
                 return Err(RepositoryError::InvalidOperation {
                     message: format!(
                         "staged change carries no semantic FileOps for '{path}'; the semantic layer must reconstruct it"
@@ -3985,7 +3996,7 @@ impl Repository {
         }
         let identity_trunks: std::collections::HashSet<atomic_core::crdt::TrunkId> = last_move
             .iter()
-            .filter(|(_, target)| target.as_str() == path)
+            .filter(|(_, target)| crate::escape_repo_path(target.as_bytes()) == path)
             .map(|(trunk, _)| *trunk)
             .collect();
         let moved_away: std::collections::HashSet<atomic_core::crdt::TrunkId> = last_move
@@ -4066,7 +4077,8 @@ impl Repository {
                     // Retain compatibility with semantic-only legacy creates
                     // which have no canonical FileAdd binding.
                     None => {
-                        ((ops.path() == path && !moved_away.contains(&resolved_trunk))
+                        ((crate::escape_repo_path(ops.path().as_bytes()) == path
+                            && !moved_away.contains(&resolved_trunk))
                             || trunk_followed)
                             && !superseded.contains(&resolved_trunk)
                     }
@@ -4242,7 +4254,24 @@ impl Repository {
         // another view may have moved its ambient path index. Accept that
         // derived location only when an applied out-of-closure Move proves it;
         // a missing/corrupt index without such history remains an error.
-        let indexed_trunk = txn.get_trunk_by_path(path).map_err(|e| e.to_string())?;
+        // The CRDT path index is keyed by the file ops' own spelling of the
+        // path (raw since the path-boundary fix, escaped in earlier imports);
+        // `path` is the canonical escaped identity, so try the raw spelling
+        // first and fall back to the identity itself.
+        let indexed_trunk = {
+            let raw = crate::unescape_repo_path(path)
+                .ok()
+                .and_then(|bytes| String::from_utf8(bytes).ok())
+                .filter(|raw| raw != path);
+            let by_raw = match raw.as_deref() {
+                Some(raw) => txn.get_trunk_by_path(raw).map_err(|e| e.to_string())?,
+                None => None,
+            };
+            match by_raw {
+                Some(trunk) => Some(trunk),
+                None => txn.get_trunk_by_path(path).map_err(|e| e.to_string())?,
+            }
+        };
         let expected_identity = canonical_trunk
             .or_else(|| identity_trunks.iter().next().copied())
             .or(created_trunk);
@@ -4265,7 +4294,7 @@ impl Repository {
                     {
                         let creator = self.load_change(&hash).map_err(|e| e.to_string())?;
                         let mut real_claimant = creator.file_ops().iter().any(|ops| {
-                            ops.path() == path
+                            crate::escape_repo_path(ops.path().as_bytes()) == path
                                 && file_ops_target_trunk(ops, indexed.change_id(), indexed)
                                 && matches!(
                                     ops.trunk_op(),
@@ -4294,7 +4323,7 @@ impl Repository {
                                 if writer.file_ops().iter().any(|ops| {
                                     file_ops_target_trunk(ops, owner, indexed)
                                         && matches!(ops.trunk_op(), Some(atomic_core::crdt::TrunkOp::Move { trunk, new_path })
-                                            if *trunk == indexed && new_path == path)
+                                            if *trunk == indexed && crate::canonical_path_identity(new_path) == path)
                                 }) {
                                     real_claimant = true;
                                     break;
@@ -4304,7 +4333,7 @@ impl Repository {
                         let row_agrees = txn
                             .get_crdt_trunk(&encode_trunk_id(&indexed))
                             .map_err(|e| e.to_string())?
-                            .is_some_and(|row| row.path == path);
+                            .is_some_and(|row| crate::canonical_path_identity(&row.path) == path);
                         if real_claimant && row_agrees {
                             resolved_trunk = Some(expected);
                         }
@@ -4315,7 +4344,7 @@ impl Repository {
                 .get_crdt_trunk(&encode_trunk_id(&expected))
                 .map_err(|e| e.to_string())?
             {
-                if row.path != path
+                if crate::canonical_path_identity(&row.path) != path
                     && txn
                         .get_trunk_by_path(&row.path)
                         .map_err(|e| e.to_string())?
@@ -4385,7 +4414,7 @@ impl Repository {
             .ok_or_else(|| {
                 "the path→trunk mapping resolves but the trunk row is missing".to_string()
             })?;
-        if trunk_row.path != path && !concurrent_path {
+        if crate::canonical_path_identity(&trunk_row.path) != path && !concurrent_path {
             return Err(format!(
                 "the path→trunk mapping resolves to a trunk row claiming path {:?}; the \
                  semantic index is corrupt",
