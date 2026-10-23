@@ -1417,6 +1417,7 @@ fn switch_transaction(root: &Path, target: &str) -> CliResult<()> {
             "cannot build complete prospective projection for Atomic view '{target}': {error}"
         ))
     })?;
+    require_target_branch_interpreted(&repo, &git, target, &target_project)?;
     drop(git);
 
     // After collision-specific checks, require the full clean/equality
@@ -1602,6 +1603,91 @@ fn checkpoint_matches_snapshot(checkpoint: &ShimCheckpoint, snapshot: &ShimSnaps
         && checkpoint.atomic_state == snapshot.atomic_state
         && checkpoint.git_head == snapshot.git_head
         && checkpoint.git_tree == snapshot.git_tree
+}
+
+/// Members of `view` that no Git commit introduced and that touch only
+/// Atomic-private paths (`.atomic*`): the repository initialization change
+/// tracking `.atomicignore`. Native records of project files are never
+/// selected, so an ephemeral view built from one commit's closure gains
+/// only the private bookkeeping, never later content.
+fn atomic_private_members(
+    repo: &Repository,
+    view: &str,
+) -> CliResult<Vec<atomic_core::types::Hash>> {
+    let mut members = Vec::new();
+    for (hash, origin) in repo
+        .full_chain_member_origins(view)
+        .map_err(CliError::from)?
+    {
+        if origin.is_some() {
+            continue;
+        }
+        let change = repo.load_change(&hash).map_err(CliError::from)?;
+        let mut paths: Vec<String> = change
+            .file_ops()
+            .iter()
+            .map(|ops| ops.path().to_string())
+            .collect();
+        for hunk in change.hunks() {
+            if let atomic_core::change::GraphOp::FileAdd { path, .. } = hunk {
+                paths.push(path.clone());
+            }
+        }
+        if !paths.is_empty()
+            && paths
+                .iter()
+                .all(|path| atomic_repository::atomic_private_path(path.as_bytes()))
+        {
+            members.push(hash);
+        }
+    }
+    Ok(members)
+}
+
+/// Refuse to project `target` over a branch tip the view has never
+/// interpreted. `find_or_create_target_commit` appends a projection commit
+/// whenever the tip tree differs from the view's projection, so a branch
+/// that Git moved without a reconcile (`git switch feature; git commit;
+/// git switch main` — hooks never reconcile the branch being left) would be
+/// silently reverted to the view's state behind a success message.
+fn require_target_branch_interpreted(
+    repo: &Repository,
+    git: &GitRepository,
+    target: &str,
+    target_project: &ProjectTree,
+) -> CliResult<()> {
+    let tip = match git.find_reference(&format!("refs/heads/{target}")) {
+        Ok(reference) => reference
+            .peel_to_commit()
+            .map_err(|error| git_error(format!("cannot read target branch '{target}': {error}")))?,
+        // No branch yet: the projection creates it.
+        Err(error) if error.code() == git2::ErrorCode::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(git_error(format!(
+                "cannot inspect target branch '{target}': {error}"
+            )))
+        }
+    };
+    if tip.tree_id() == write_project_tree(git, target_project)? {
+        return Ok(());
+    }
+    let tip_sha = tip.id().to_string();
+    let interpreted = match repo.checked_git_sha(&tip_sha).map_err(CliError::from)? {
+        Some(hash) => repo
+            .effective_history(Some(target))
+            .map_err(CliError::from)?
+            .iter()
+            .any(|entry| entry.hash == hash),
+        None => false,
+    };
+    if interpreted {
+        return Ok(());
+    }
+    Err(git_error(format!(
+        "Git branch '{target}' is at {} which view '{target}' has not imported; run \
+         'git switch {target}' and 'atomic git shim reconcile' before switching to it",
+        &tip_sha[..12.min(tip_sha.len())]
+    )))
 }
 
 fn find_or_create_target_commit(
