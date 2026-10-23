@@ -603,6 +603,32 @@ The pristine is the persistent storage layer using [redb](https://docs.rs/redb):
 | `REV_DEPS` | dep_id (u64) | [change_id] (u64) | Reverse deps |
 | `STATES` | (view_id, merkle) ([u8; 40]) | seq (u64) | State → sequence |
 | `TAGS` | (view_id, seq) ([u8; 16]) | merkle ([u8; 32]) | Tagged states |
+| `PATH_CLAIMS` | path (str) | [PathClaimEvent] | **Authority** for name bindings: additive, causal transitions keyed by the change that made them |
+
+### Name-Binding Ownership (Critical Invariant)
+
+`PATH_CLAIMS` is the authority for "which inode owns this name", and it is
+derived **only** from recorded changes. `TREE`, `REV_TREE`, `INODES`, and
+`REV_INODES` are caches that `atomic doctor repair-native-indexes` and the
+path-claim migration rebuild from `PATH_CLAIMS` plus the graph — never the other
+way around. So every tracked path falls into exactly one class:
+
+| Class | Written by | Rows | May be undone by |
+|---|---|---|---|
+| **Staged** | `add` | `TREE`, `REV_TREE` (+ `DIRECTORIES`) | tracking (`atomic remove`) |
+| **Recorded** | `record` | the above + `INODES`, `REV_INODES`, `PATH_CLAIMS`, graph edges | a recorded delete (`GraphOp::FileDel` + dead claim) |
+
+`Repository::remove` classifies with `tracked_path_state` (inode has an
+`INODES` binding ⇒ recorded) and only ever deletes the staged class; recorded
+paths come back in `TrackingStats::pending_deletions` with nothing mutated. The
+discriminator exists because the wrong version of this was a data-integrity bug:
+`remove` used to retire the binding unconditionally, and a surviving visible
+claim then fails to resolve its own claimant in `reduce_path_claim_entries`
+(`name_resolution.rs`), so **`status`, `record`, `switch`, and materialize all
+fail closed** with "path claim '<path>' has no inode for graph position <pos>"
+until a repair rebuilds the wiped rows. Any new untrack/retire path must check
+ownership first, and `atomic remove` mirrors `git rm` (delete from the working
+copy, then record) rather than inventing a cache-only untrack.
 
 ### Transaction Model
 

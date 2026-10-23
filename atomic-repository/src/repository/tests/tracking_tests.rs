@@ -168,3 +168,135 @@ fn test_repo_tracked_files_under() {
         );
     }
 }
+
+/// Recording a path moves its name binding out of tracking's reach.
+///
+/// Regression for the defect where `remove` retired the `INODES`/`REV_INODES`
+/// binding `record` had created while the recorded change's `PATH_CLAIMS` event
+/// stayed visible. The next name projection could not resolve its own claim and
+/// failed with `path claim '<path>' has no inode for graph position <pos>`,
+/// which errored `status` and refused every later `record`.
+#[test]
+fn remove_defers_recorded_paths_without_touching_their_binding() {
+    let (temp_dir, repo) = create_temp_repo();
+    std::fs::write(temp_dir.path().join("Cargo.lock"), b"a\nb\nc\n").unwrap();
+    repo.add("Cargo.lock", TrackingOptions::default()).unwrap();
+    repo.record_all("record the lockfile").unwrap();
+    let inode = repo
+        .get_file_inode("Cargo.lock")
+        .unwrap()
+        .expect("recorded path is tracked");
+
+    let stats = repo
+        .remove("Cargo.lock", TrackingOptions::default())
+        .unwrap();
+
+    // Nothing was untracked; the caller learns the path needs a recorded delete.
+    assert_eq!(
+        stats.files_removed, 0,
+        "a recorded path is not tracking's to untrack"
+    );
+    assert_eq!(
+        stats.pending_deletions,
+        vec![std::path::PathBuf::from("Cargo.lock")]
+    );
+
+    // The binding and the claim are intact, so name projection still resolves.
+    // Before the fix this call errored: "path claim 'Cargo.lock' has no inode
+    // for graph position 3:5".
+    assert!(repo.is_tracked("Cargo.lock").unwrap());
+    assert_eq!(repo.get_file_inode("Cargo.lock").unwrap(), Some(inode));
+    let status = repo.status_tracked().unwrap();
+    assert!(
+        status
+            .entries()
+            .iter()
+            .all(|entry| entry.path() != std::path::Path::new("Cargo.lock")),
+        "an untouched recorded path must not read as changed: {:?}",
+        status.entries()
+    );
+    let report = repo.verify_working_copy().unwrap();
+    assert!(report.is_healthy(), "derived indexes drifted: {report:?}");
+}
+
+/// Deleting the working-copy file and recording the delete is the untrack.
+#[test]
+fn recorded_delete_is_what_untracks_a_recorded_path() {
+    let (temp_dir, repo) = create_temp_repo();
+    std::fs::write(temp_dir.path().join("Cargo.lock"), b"a\nb\nc\n").unwrap();
+    repo.add("Cargo.lock", TrackingOptions::default()).unwrap();
+    repo.record_all("record the lockfile").unwrap();
+
+    let stats = repo
+        .remove("Cargo.lock", TrackingOptions::default())
+        .unwrap();
+    assert!(stats.has_pending_deletions());
+
+    std::fs::remove_file(temp_dir.path().join("Cargo.lock")).unwrap();
+    // The deletion is what status can see, which is how `git rm` behaves too.
+    let status = repo.status_tracked().unwrap();
+    assert!(
+        status
+            .get(std::path::Path::new("Cargo.lock"))
+            .is_some_and(|entry| entry.status() == FileStatus::Deleted),
+        "the removed path should read as a pending deletion: {:?}",
+        status.entries()
+    );
+
+    repo.record_all("stop tracking the lockfile").unwrap();
+
+    assert!(
+        !repo.is_tracked("Cargo.lock").unwrap(),
+        "the recorded delete should have untracked the path"
+    );
+    let report = repo.verify_working_copy().unwrap();
+    assert!(report.is_healthy(), "{:?}", report);
+}
+
+/// A staged path is exactly what tracking owns: `remove` untracks it outright and
+/// reports nothing pending.
+#[test]
+fn remove_untracks_staged_paths_with_no_pending_deletion() {
+    let (temp_dir, repo) = create_temp_repo();
+    std::fs::write(temp_dir.path().join("draft.txt"), b"notes\n").unwrap();
+    repo.add("draft.txt", TrackingOptions::default()).unwrap();
+
+    let stats = repo
+        .remove("draft.txt", TrackingOptions::default())
+        .unwrap();
+
+    assert_eq!(stats.files_removed, 1);
+    assert!(
+        stats.pending_deletions.is_empty(),
+        "a never-recorded path needs no recorded delete"
+    );
+    assert!(!repo.is_tracked("draft.txt").unwrap());
+    // The bytes are the caller's concern, not the repository's.
+    assert!(temp_dir.path().join("draft.txt").exists());
+}
+
+/// `remove_batch` must skip recorded bindings for the same reason `remove` does.
+#[test]
+fn remove_batch_skips_recorded_paths() {
+    let (temp_dir, repo) = create_temp_repo();
+    std::fs::write(temp_dir.path().join("Cargo.lock"), b"a\nb\nc\n").unwrap();
+    repo.add("Cargo.lock", TrackingOptions::default()).unwrap();
+    repo.record_all("record the lockfile").unwrap();
+
+    // Added after the record, so it stays staged: the only path the batch owns.
+    std::fs::write(temp_dir.path().join("draft.txt"), b"notes\n").unwrap();
+    repo.add("draft.txt", TrackingOptions::default()).unwrap();
+
+    let removed = repo
+        .remove_batch(&["draft.txt", "Cargo.lock"])
+        .expect("batch remove");
+
+    assert_eq!(
+        removed, 1,
+        "only the staged path is tracking's to untrack in a batch"
+    );
+    assert!(!repo.is_tracked("draft.txt").unwrap());
+    assert!(repo.is_tracked("Cargo.lock").unwrap());
+    let report = repo.verify_working_copy().unwrap();
+    assert!(report.is_healthy(), "{:?}", report);
+}

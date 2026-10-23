@@ -1044,6 +1044,43 @@ impl Repository {
         Ok(status.is_clean())
     }
 
+    /// Whether a tracked path has working-copy edits that deleting it would
+    /// destroy.
+    ///
+    /// This is the guard `git rm` applies before removing a file with local
+    /// changes. Only content-bearing differences count: `Deleted` means the bytes
+    /// are already gone, and a path absent from the status result is not something
+    /// this call can destroy.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// if repo.has_uncommitted_edits(working_copy, Path::new("Cargo.lock"))? {
+    ///     // refuse, or require an explicit force
+    /// }
+    /// ```
+    pub fn has_uncommitted_edits(
+        &self,
+        working_copy: WorkingCopyId,
+        path: &Path,
+    ) -> Result<bool, RepositoryError> {
+        let options = StatusOptions {
+            include_untracked: false,
+            path_filters: vec![path.to_path_buf()],
+            ..StatusOptions::default()
+        };
+        let status = self.status(working_copy, options)?;
+        Ok(status.get(path).is_some_and(|entry| {
+            matches!(
+                entry.status(),
+                FileStatus::Modified
+                    | FileStatus::Conflicted
+                    | FileStatus::TypeChanged
+                    | FileStatus::PermissionsChanged
+            )
+        }))
+    }
+
     /// Get only modified files.
     pub fn modified_files(
         &self,

@@ -393,7 +393,7 @@ Every change stores two parallel representations:
 |---------|-------------|
 | `atomic init` | Initialize a new repository |
 | `atomic add <paths>` | Add files to tracking |
-| `atomic remove <paths>` | Remove files from tracking |
+| `atomic remove <paths>` | Stop tracking files (`git rm` semantics: untracking recorded content needs a recorded delete) |
 | `atomic move <src> <dst>` | Move or rename tracked files |
 | `atomic status` | Show working copy status |
 | `atomic diff` | Show differences in working copy |

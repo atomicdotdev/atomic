@@ -71,9 +71,9 @@ use crate::status::{
 
 use crate::tracking::{
     add_to_tree, collect_files_for_tracking_with_rules, get_inode, is_tracked, list_tracked,
-    move_tracked, normalize_path, normalize_path_with_root, remove_from_tree,
-    should_ignore_with_rules, tracked_under_prefix, TrackedFile, TrackingError, TrackingOptions,
-    TrackingStats,
+    move_tracked, normalize_path, normalize_path_with_root, should_ignore_with_rules,
+    tracked_path_state, tracked_under_prefix, untrack_staged_path, TrackedFile, TrackedPathState,
+    TrackingError, TrackingOptions, TrackingStats,
 };
 use crate::unrecord::{UnrecordOptions, UnrecordOutcome};
 use crate::RepositoryError;

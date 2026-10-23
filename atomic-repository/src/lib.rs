@@ -198,8 +198,9 @@ pub use status::{
 pub use tracking::{
     add_to_tree, collect_files_for_tracking, collect_files_for_tracking_with_rules, get_inode,
     get_path, is_tracked, list_tracked, move_tracked, normalize_path, normalize_path_with_root,
-    remove_from_tree, should_ignore, should_ignore_with_rules, tracked_under_prefix, TrackedFile,
-    TrackingError, TrackingOptions, TrackingResult, TrackingStats,
+    remove_from_tree, should_ignore, should_ignore_with_rules, tracked_path_state,
+    tracked_under_prefix, untrack_staged_path, TrackedFile, TrackedPathState, TrackingError,
+    TrackingOptions, TrackingResult, TrackingStats,
 };
 
 // Apply exports
