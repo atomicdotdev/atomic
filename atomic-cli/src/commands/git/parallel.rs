@@ -4456,6 +4456,7 @@ impl ParallelImporter {
             })
             .collect::<CliResult<Vec<_>>>()?;
         let expected = git_object_id(policy.object_format, parsed.tree_oid)?;
+        let claim = self.resolve_view_claim(source, branch_name, parsed, &hashes)?;
         // A record projection names its exact view state next to the change
         // roots. The roots' dependency closure is NOT that state once the
         // view holds independent changes (a rename commuting with an earlier
@@ -4464,102 +4465,104 @@ impl ParallelImporter {
         // path a Git branch created from an imported tip takes
         // (docs/shim-review-testing.md §9): its projection commits name the
         // originating view, not the new branch.
-        if let Some(projection) = self.project_claimed_state(source, parsed, &hashes, policy)? {
-            verify_prospective_equivalence(&projection, &expected).map_err(|error| {
-                git_error(format!(
-                    "commit {} carries a forged Atomic state claim: {error}",
-                    parsed.git_sha
-                ))
-            })?;
-            return Ok(());
+        let mut state_projection_failure = None;
+        if let Some(state) = claim.state {
+            match source.project_tree_at_state(&claim.view, state, policy) {
+                Ok(projection) => {
+                    verify_prospective_equivalence(&projection, &expected).map_err(|error| {
+                        git_error(format!(
+                            "commit {} carries a forged Atomic state claim: {error}",
+                            parsed.git_sha
+                        ))
+                    })?;
+                    return Ok(());
+                }
+                Err(error) => {
+                    trace_git_import(format!(
+                        "commit {} names state {state} on view '{}' that is not projectable \
+                         ({error}); verifying its change closure instead",
+                        parsed.git_sha, claim.view
+                    ));
+                    state_projection_failure = Some(error.to_string());
+                }
+            }
         }
-        // The closure projection is view-independent; the view name only
-        // guards that the roots belong to a known view. A projection commit
-        // reached through a Git branch that has no Atomic view yet verifies
-        // against the view named in its own `Atomic-View` header.
-        let closure_view = if source
-            .view_exists(branch_name)
-            .map_err(|error| CliError::Internal(error.into()))?
-        {
-            branch_name.to_string()
-        } else {
-            parse_header_trailer(&parsed.full_message(), "Atomic-View")
-                .unwrap_or_else(|| branch_name.to_string())
+        // The closure projection is view-independent; the view only guards
+        // that the roots are members of a known view. A failure here names
+        // the state projection failure that led to it, so the cause is not
+        // hidden behind a forgery verdict.
+        let with_cause = |message: String| match &state_projection_failure {
+            Some(cause) => {
+                format!("{message} (the claimed state could not be projected: {cause})")
+            }
+            None => message,
         };
         let closure = source
-            .project_tree_for_change_closure(&closure_view, &hashes, policy)
+            .project_tree_for_change_closure(&claim.view, &hashes, policy)
             .map_err(|error| {
-                git_error(format!(
+                git_error(with_cause(format!(
                     "commit {} carries an unverifiable Atomic change closure: {error}",
                     parsed.git_sha
-                ))
+                )))
             })?;
         verify_prospective_equivalence(&closure, &expected).map_err(|error| {
-            git_error(format!(
+            git_error(with_cause(format!(
                 "commit {} carries a forged Atomic change closure: {error}",
                 parsed.git_sha
-            ))
+            )))
         })?;
         Ok(())
     }
 
-    /// The projection of the view state a record projection commit names in
-    /// its `Atomic-View`/`Atomic-State` headers, when that view exists, holds
-    /// the state, and every claimed change root is a member of the view at
-    /// that state. `None` leaves the caller on closure verification.
-    fn project_claimed_state(
+    /// The view a commit's Atomic claim is verified against, and the state
+    /// it names when the view holds that state.
+    ///
+    /// The view is the commit's own `Atomic-View` header when that view
+    /// exists (a record projection reached through a Git branch that has no
+    /// Atomic view yet), else the branch's view. Every claimed root must be
+    /// a member of that view; the named `Atomic-State` binds the roots and
+    /// is kept only when every root is a member at that state.
+    fn resolve_view_claim(
         &self,
         source: &Repository,
+        branch_name: &str,
         parsed: &ParsedCommit,
         claimed_roots: &[ContentHash],
-        policy: &ConversionPolicy,
-    ) -> CliResult<Option<ProjectTree>> {
+    ) -> CliResult<ViewClaim> {
         let message = parsed.full_message();
-        let (Some(view), Some(state)) = (
-            parse_header_trailer(&message, "Atomic-View"),
-            parse_header_trailer(&message, "Atomic-State")
-                .and_then(|encoded| Merkle::from_base32(encoded.as_bytes())),
-        ) else {
-            return Ok(None);
+        let view = match parse_header_trailer(&message, "Atomic-View") {
+            Some(named) if view_exists(source, &named)? => named,
+            _ => branch_name.to_string(),
         };
-        if !source
-            .view_exists(&view)
-            .map_err(|error| CliError::Internal(error.into()))?
-        {
-            return Ok(None);
+        if !view_exists(source, &view)? {
+            return Err(git_error(format!(
+                "commit {} claims Atomic changes on view '{view}', which does not exist",
+                parsed.git_sha
+            )));
         }
-        // The named state binds the roots: a claim naming a real state but
-        // roots outside that state's membership is not a record projection.
+        let claimed_state = parse_header_trailer(&message, "Atomic-State")
+            .and_then(|encoded| Merkle::from_base32(encoded.as_bytes()));
         let history = source
             .effective_history(Some(&view))
             .map_err(|error| CliError::Internal(error.into()))?;
-        let mut members_at_state = HashSet::new();
-        let mut state_found = false;
-        for entry in history {
-            members_at_state.insert(entry.hash);
-            if entry.state == state {
-                state_found = true;
-                break;
+        let mut members = HashSet::with_capacity(history.len());
+        let mut state = None;
+        for entry in &history {
+            members.insert(entry.hash);
+            if state.is_none()
+                && claimed_state == Some(entry.state)
+                && claimed_roots.iter().all(|root| members.contains(root))
+            {
+                state = Some(entry.state);
             }
         }
-        if !state_found
-            || !claimed_roots
-                .iter()
-                .all(|root| members_at_state.contains(root))
-        {
-            return Ok(None);
+        if !claimed_roots.iter().all(|root| members.contains(root)) {
+            return Err(git_error(format!(
+                "commit {} claims Atomic changes that are not members of view '{view}'",
+                parsed.git_sha
+            )));
         }
-        match source.project_tree_at_state(&view, state, policy) {
-            Ok(projection) => Ok(Some(projection)),
-            Err(error) => {
-                trace_git_import(format!(
-                    "commit {} names state {state} on view '{view}' that is not projectable \
-                     ({error}); verifying its change closure instead",
-                    parsed.git_sha
-                ));
-                Ok(None)
-            }
-        }
+        Ok(ViewClaim { view, state })
     }
 
     /// Import commits from a branch into an Atomic repository.
@@ -5951,10 +5954,16 @@ impl ParallelImporter {
         // tracking failure must not silently produce an untracked import.
         let mut added_paths: Vec<&str> = Vec::new();
         let mut deleted_paths: Vec<String> = Vec::new();
+        // Paths this commit vacates: deletions and the source side of
+        // renames. The tracking tree binds their old inode until the
+        // change's own projection unbinds it.
         let deleted_in_commit: HashSet<&str> = effective
             .iter()
-            .filter(|(_, op, _, _)| matches!(op, EffectiveOp::Deleted))
-            .map(|(file, _, _, _)| file.path.as_str())
+            .filter_map(|(file, op, _, _)| match op {
+                EffectiveOp::Deleted => Some(file.path.as_str()),
+                EffectiveOp::Renamed => file.old_path.as_deref(),
+                _ => None,
+            })
             .collect();
         for (file, op, _baseline, _attrs) in &effective {
             match op {
@@ -5968,7 +5977,8 @@ impl ParallelImporter {
                         continue;
                     }
                     // A path under a regular file or symlink this same
-                    // commit deletes (issue #279): TREE still binds the old
+                    // commit deletes or renames away (issue #279): TREE
+                    // still binds the old
                     // inode at the parent until the change's own projection
                     // unbinds it, so pre-registering the child is refused
                     // with "projected parent ... is not a directory". The
@@ -9026,12 +9036,26 @@ fn tree_entry_exists(git_repo: &GitRepository, tree: &Tree, path: &str) -> bool 
     git_tree_entry(git_repo, tree, path).is_ok()
 }
 
-/// Whether `path` lies under a path this same commit deletes: a regular
+/// Whether `path` lies under a path this same commit vacates: a regular
 /// file or symlink replaced by a directory of the same name.
 fn sits_under_deleted_path(path: &str, deleted: &HashSet<&str>) -> bool {
-    ancestor_directories(path)
-        .iter()
-        .any(|ancestor| deleted.contains(ancestor.as_str()))
+    !deleted.is_empty()
+        && path
+            .rmatch_indices('/')
+            .any(|(end, _)| deleted.contains(&path[..end]))
+}
+
+/// The view a commit's Atomic claim is verified against and, when the view
+/// holds it, the state the commit names.
+struct ViewClaim {
+    view: String,
+    state: Option<Merkle>,
+}
+
+fn view_exists(source: &Repository, view: &str) -> CliResult<bool> {
+    source
+        .view_exists(view)
+        .map_err(|error| CliError::Internal(error.into()))
 }
 
 /// A physical filesystem path decoded from the canonical String identity.

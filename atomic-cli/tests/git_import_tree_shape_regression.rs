@@ -189,3 +189,32 @@ fn import_of_case_only_rename_lands() {
     import_and_verify(&root, &home, "2 changes");
     assert_eq!(rendered_on_main(&root, "foo.md"), b"same bytes\n");
 }
+
+#[test]
+fn import_of_file_renamed_into_directory_of_its_own_name_lands() {
+    // `R tool -> tool/main.sh` plus `A tool/other.sh`: the rename vacates
+    // `tool` and the same commit creates a directory there. The added
+    // sibling must not be pre-registered while the tracking tree still
+    // binds the old file inode at `tool` (the rename-shaped twin of #279).
+    let (root, home) = git_repo();
+    let script = "#!/bin/sh\necho one\necho two\necho three\necho four\n";
+    fs::write(root.join("tool"), script).unwrap();
+    commit_all(&root, "tool is a script");
+    fs::remove_file(root.join("tool")).unwrap();
+    fs::create_dir(root.join("tool")).unwrap();
+    fs::write(root.join("tool/main.sh"), script).unwrap();
+    fs::write(root.join("tool/other.sh"), b"#!/bin/sh\necho other\n").unwrap();
+    commit_all(&root, "tool is a directory");
+    let shape = git(&root, &["show", "--name-status", "--format=", "-M", "HEAD"]);
+    assert!(
+        shape.contains("R100\ttool\ttool/main.sh"),
+        "fixture must be a rename into the vacated name, got:\n{shape}"
+    );
+
+    import_and_verify(&root, &home, "2 changes");
+    assert_eq!(rendered_on_main(&root, "tool/main.sh"), script.as_bytes());
+    assert_eq!(
+        rendered_on_main(&root, "tool/other.sh"),
+        b"#!/bin/sh\necho other\n"
+    );
+}

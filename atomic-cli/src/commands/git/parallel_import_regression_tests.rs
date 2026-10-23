@@ -179,3 +179,17 @@ fn added_path_under_same_commit_deletion_is_not_pre_registered() {
     ));
     assert!(!sits_under_deleted_path("top", &HashSet::new()));
 }
+
+#[test]
+fn sits_under_deleted_path_matches_exact_ancestors_only() {
+    let deleted: std::collections::HashSet<&str> = ["a/b", "tool"].into_iter().collect();
+    assert!(sits_under_deleted_path("a/b/c.txt", &deleted));
+    assert!(sits_under_deleted_path("tool/main.sh", &deleted));
+    assert!(!sits_under_deleted_path("a/bc/d.txt", &deleted));
+    assert!(!sits_under_deleted_path("a/b", &deleted));
+    assert!(!sits_under_deleted_path("tools/x", &deleted));
+    assert!(!sits_under_deleted_path(
+        "a/b/c.txt",
+        &std::collections::HashSet::new()
+    ));
+}
