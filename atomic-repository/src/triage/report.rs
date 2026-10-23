@@ -82,6 +82,30 @@ fn failing_view_verification(node: &CanonicalNode) -> Option<String> {
     None
 }
 
+/// Longest package name or version accepted from a checker's self-report.
+const CHECKER_FIELD_MAX: usize = 128;
+
+/// The `{package, version}` a checker names in `details.checker`. Anything
+/// else -- a missing member, an extra member, a non-string, an empty or
+/// overlong value -- names no release, so a summary never shows a guess.
+fn checker_release(details: &serde_json::Value) -> Option<CheckerRelease> {
+    let checker = details.get("checker")?.as_object()?;
+    if checker.len() != 2 {
+        return None;
+    }
+    let field = |name: &str| {
+        checker
+            .get(name)?
+            .as_str()
+            .filter(|value| !value.is_empty() && value.len() <= CHECKER_FIELD_MAX)
+            .map(str::to_owned)
+    };
+    Some(CheckerRelease {
+        package: field("package")?,
+        version: field("version")?,
+    })
+}
+
 /// Map a replay/report failure into the repository error surface. Repository
 /// failures stay typed; report parsing/hash failures are invalid operations.
 fn evidence_error(error: intent_evidence::EvidenceError) -> RepositoryError {
@@ -341,6 +365,7 @@ pub fn build_report_with_evidence(
                                     claim_type: decision.claim_type.clone(),
                                     decision: decision.decision.clone(),
                                     reason: decision.reason.clone(),
+                                    checker: checker_release(&decision.details),
                                 })
                                 .collect(),
                         });
@@ -1532,6 +1557,34 @@ mod tests {
     use atomic_core::change::ChangeHeader;
     use tempfile::TempDir;
 
+    #[test]
+    fn checker_release_reads_only_the_exact_self_report() {
+        use serde_json::json;
+        let named = |details: serde_json::Value| checker_release(&details);
+        assert_eq!(
+            named(
+                json!({"checker": {"package": "probity-verify", "version": "0.2.0"}, "scope": {}})
+            ),
+            Some(CheckerRelease {
+                package: "probity-verify".into(),
+                version: "0.2.0".into(),
+            })
+        );
+        let long = "v".repeat(CHECKER_FIELD_MAX + 1);
+        for details in [
+            serde_json::Value::Null,
+            json!({}),
+            json!({"checker": "probity-verify 0.2.0"}),
+            json!({"checker": {"package": "probity-verify"}}),
+            json!({"checker": {"package": "probity-verify", "version": 2}}),
+            json!({"checker": {"package": "", "version": "0.2.0"}}),
+            json!({"checker": {"package": "probity-verify", "version": long}}),
+            json!({"checker": {"package": "p", "version": "1", "extra": "x"}}),
+        ] {
+            assert_eq!(named(details.clone()), None, "{details}");
+        }
+    }
+
     fn record_all(repo: &Repository, message: &str) {
         let header = ChangeHeader::new(message);
         let options = RecordOptions::new()
@@ -1753,7 +1806,9 @@ Edit a.txt.
                     claim_type: "source_text_coverage/v1".into(),
                     decision: "supported".into(),
                     reason: "all_selected_spans_present".into(),
-                    details: serde_json::Value::Null,
+                    details: serde_json::json!({
+                        "checker": {"package": "probity-verify", "version": "0.2.0"}
+                    }),
                 }],
             },
         };
@@ -1778,6 +1833,14 @@ Edit a.txt.
             .expect("reached intent");
         assert_eq!(intent_report.evidence_replays.len(), 1);
         assert!(intent_report.evidence_replays[0].fresh);
+        assert_eq!(
+            intent_report.evidence_replays[0].decisions[0].checker,
+            Some(CheckerRelease {
+                package: "probity-verify".into(),
+                version: "0.2.0".into(),
+            }),
+            "the summary carries the checker release the response names"
+        );
         assert!(with
             .findings
             .iter()

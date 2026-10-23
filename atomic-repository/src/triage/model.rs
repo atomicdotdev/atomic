@@ -170,6 +170,17 @@ pub struct EvidenceReplayDecision {
     pub claim_type: String,
     pub decision: String,
     pub reason: String,
+    /// The checker release the response names in `details.checker`, so a
+    /// reviewer can hold the decision to the checker they allowlisted. `None`
+    /// when the response names none, or names it in any other shape.
+    pub checker: Option<CheckerRelease>,
+}
+
+/// The package and version a replay checker reports for itself.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CheckerRelease {
+    pub package: String,
+    pub version: String,
 }
 
 /// A single acceptance criterion under an intent (a "testcase").

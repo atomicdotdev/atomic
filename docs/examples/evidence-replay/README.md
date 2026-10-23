@@ -22,14 +22,20 @@ On Windows, select a local executable implementing the protocol below. A checker
 that cannot start, fails, or returns an invalid response remains
 `not_established`; it cannot make validation pass.
 
-Use a dedicated Python environment for the optional checker. The pinned Verify
-revision below implements the four claim adapters listed later in this document:
+Use a dedicated Python 3.11 or newer environment for the optional checker.
+`requirements.txt` pins the probity-verify release, with hashes for it and every
+dependency; that release implements the four claim adapters listed later in this
+document. CI installs the same file and runs the checker controls below, and each
+response names the installed release in `details.checker`:
 
 ```sh
 python3 -m venv /tmp/atomic-evidence-python
-/tmp/atomic-evidence-python/bin/pip install \
-  'git+https://github.com/probityai/probity-verify.git@e835ce2bd6a960e7a1cc2fa6522f16d55dce728a'
+/tmp/atomic-evidence-python/bin/pip install --require-hashes \
+  -r /path/to/atomic/docs/examples/evidence-replay/requirements.txt
 ```
+
+To move to a newer release, change `requirements.in` and regenerate the lock with
+`uv pip compile requirements.in --generate-hashes --python-version 3.11 --universal -o requirements.txt`.
 
 Create a **draft** with one criterion in an Atomic repository:
 
