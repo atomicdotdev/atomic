@@ -95,6 +95,7 @@ fn allocate_shared_inode(next_inode: &AtomicU64) -> PristineResult<Inode> {
 /// Provides read and write access to the pristine database. Only one write
 /// transaction can be active at a time.
 pub struct WriteTxn<'a> {
+    pub(crate) kg_rebuilding: bool,
     pub(crate) txn: WriteTransaction,
     pub(crate) next_node_id: &'a AtomicU64,
     pub(crate) next_view_id: &'a AtomicU64,
@@ -111,6 +112,7 @@ impl<'a> WriteTxn<'a> {
         next_inode: &'a AtomicU64,
     ) -> Self {
         Self {
+            kg_rebuilding: false,
             txn,
             next_node_id,
             next_view_id,

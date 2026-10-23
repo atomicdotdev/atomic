@@ -183,7 +183,7 @@ message ChangeBlastRadius {
   Hash change_hash = 1;
   string mode = 2; // structural | private | partial
   repeated ChangeImpactFile files = 3; // distinct paths, direct files win
-  repeated ChangeImpactEdge edges = 4; // incoming CALLS / INCLUDES, never co-change
+  repeated ChangeImpactEdge edges = 4; // incoming calls / includes from view syntax, never co-change
   repeated string warnings = 5;
   string context = 6;
 }
@@ -194,7 +194,7 @@ message ChangeImpactFile {
 message ChangeImpactEdge {
   string from_path = 1; // caller/importer
   string to_path = 2; // directly changed code
-  string relation = 3; // CALLS | INCLUDES
+  string relation = 3; // calls | includes (syntax relationships, not KG predicates)
 }
 
 // Recorded values, not estimates or signature-verification results. No prompt,

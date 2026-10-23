@@ -140,7 +140,23 @@ impl Repository {
                 computed.to_base32()
             )));
         }
-        self.save_change_bytes(hash, bytes, &change)
+        let stored = self.save_change_bytes(hash, bytes, &change)?;
+        self.ensure_project_identity(atomic_core::kg::project_id::MintReason::Upgrade)?;
+        if !change.kind().is_snapshot() {
+            let hashes = self
+                .change_store
+                .iter_changes()
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| RepositoryError::Database(e.to_string()))?;
+            let mut txn = self.pristine.write_txn()?;
+            if txn.kg_writes_enabled()? {
+                self.project_change_kg(&mut txn, hash, &change)?;
+                self.repair_change_dependencies_kg(&mut txn, hash)?;
+                self.project_vault_kg(&mut txn, hashes)?;
+            }
+            txn.commit()?;
+        }
+        Ok(stored)
     }
 
     /// Save a change using pre-serialized ATOM bytes (hash-stable).
@@ -345,6 +361,7 @@ impl Repository {
         &self,
         attestation: &atomic_core::change::Attestation,
     ) -> Result<Hash, RepositoryError> {
+        self.ensure_project_identity(atomic_core::kg::project_id::MintReason::Upgrade)?;
         use atomic_core::pristine::MutTxnT;
 
         // Save to disk
@@ -386,6 +403,7 @@ impl Repository {
         txn.commit()
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
+        self.refresh_session_kg()?;
         Ok(hash)
     }
 
@@ -472,6 +490,7 @@ impl Repository {
         &self,
         manifest: &atomic_core::change::session::SessionManifest,
     ) -> Result<Hash, RepositoryError> {
+        self.ensure_project_identity(atomic_core::kg::project_id::MintReason::Upgrade)?;
         let mut txn = self
             .pristine
             .write_txn()
@@ -491,6 +510,7 @@ impl Repository {
     /// files are reported in the result rather than aborting the rebuild.
     /// Returns `(indexed_count, skipped_existing, corrupt_count)`.
     pub fn rebuild_session_index(&self) -> Result<(usize, usize, usize), RepositoryError> {
+        self.ensure_project_identity(atomic_core::kg::project_id::MintReason::Upgrade)?;
         let mut indexed = 0usize;
         let mut skipped = 0usize;
         let mut corrupt = 0usize;
@@ -665,6 +685,7 @@ impl Repository {
             }
         }
 
+        self.refresh_session_kg()?;
         Ok((indexed, skipped, corrupt))
     }
 
@@ -682,6 +703,7 @@ impl Repository {
         parent_view: Option<String>,
         ended_at: Option<i64>,
     ) -> Result<(), RepositoryError> {
+        self.ensure_project_identity(atomic_core::kg::project_id::MintReason::Upgrade)?;
         let json_path = self
             .dot_dir
             .join("sessions")
@@ -710,6 +732,7 @@ impl Repository {
         parent_view: Option<String>,
         incomplete: &atomic_core::change::session::IncompleteSession,
     ) -> Result<atomic_core::change::session::IncompleteSession, RepositoryError> {
+        self.ensure_project_identity(atomic_core::kg::project_id::MintReason::Upgrade)?;
         let json_path = self
             .dot_dir
             .join("sessions")
@@ -743,6 +766,7 @@ impl Repository {
         boundary_end: &atomic_core::change::session::TurnBoundary,
         outcome: &atomic_core::change::session::ManagedTurnOutcome,
     ) -> Result<Option<bool>, RepositoryError> {
+        self.ensure_project_identity(atomic_core::kg::project_id::MintReason::Upgrade)?;
         let mut txn = self
             .pristine
             .write_txn()
@@ -758,6 +782,9 @@ impl Repository {
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
         txn.commit()
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        if attached {
+            self.refresh_session_kg()?;
+        }
         Ok(Some(attached))
     }
 
@@ -774,6 +801,7 @@ impl Repository {
         fork_turn: u32,
         child_session_id: &str,
     ) -> Result<(Hash, Hash), RepositoryError> {
+        self.ensure_project_identity(atomic_core::kg::project_id::MintReason::Upgrade)?;
         // Resolve the parent ledger and manifest.
         let (parent_record, parent_turns) =
             self.get_session_ledger(parent_session_id)?.ok_or_else(|| {
@@ -1208,6 +1236,7 @@ impl Repository {
         graph: &atomic_core::change::ProvenanceGraph,
         mut turn: atomic_core::change::session::SessionTurn,
     ) -> Result<atomic_core::change::session::SessionCheckpointPublication, RepositoryError> {
+        self.ensure_project_identity(atomic_core::kg::project_id::MintReason::Upgrade)?;
         use atomic_core::pristine::MutTxnT;
 
         let existing_turns = self
@@ -1270,6 +1299,7 @@ impl Repository {
             .map_err(|error| RepositoryError::Database(error.to_string()))?;
         txn.commit()
             .map_err(|error| RepositoryError::Database(error.to_string()))?;
+        self.refresh_session_kg()?;
         Ok(publication)
     }
 
@@ -1286,6 +1316,7 @@ impl Repository {
         &self,
         graph: &atomic_core::change::ProvenanceGraph,
     ) -> Result<Hash, RepositoryError> {
+        self.ensure_project_identity(atomic_core::kg::project_id::MintReason::Upgrade)?;
         use atomic_core::pristine::MutTxnT;
 
         // Save to disk
@@ -1357,6 +1388,7 @@ impl Repository {
             );
         }
 
+        self.refresh_session_kg()?;
         Ok(hash)
     }
 

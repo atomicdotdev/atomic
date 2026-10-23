@@ -282,7 +282,8 @@ fn lift_constraint(d: &Directive, id_base: &str, n: usize) -> Constraint {
 /// Lift a `:::ref{to= edge=}` leaf into a typed reference edge. Both `to` and
 /// `edge` are required (a ref with no target or no edge type is a lift error),
 /// and `edge` must be a known *ref* edge: a dependency edge (`depends`/
-/// `blockedBy`) or a remediation edge (`remediates`). Edges like
+/// `blockedBy`), review/remediation edge, or an evidence-bearing explicit
+/// implementation declaration. Edges like
 /// `verifiedBy`/`about` are rejected even though they are valid edges elsewhere.
 fn lift_ref(d: &Directive) -> Result<Ref> {
     let to = d
@@ -295,16 +296,28 @@ fn lift_ref(d: &Directive) -> Result<Ref> {
         .to_string();
     if !vocab::is_known_ref_edge(&edge) {
         return Err(CanonicalError::Lift(format!(
-            "':::ref' edge '{edge}' is not a valid ref edge (dependency {:?} or remediation {:?})",
+            "':::ref' edge '{edge}' is not a valid ref edge (dependency {:?}, remediation {:?}, review {:?}, or implementation {:?})",
             vocab::DEPENDENCY_EDGES,
-            vocab::REMEDIATION_EDGES
+            vocab::REMEDIATION_EDGES,
+            vocab::REVIEW_EDGES,
+            vocab::IMPLEMENTATION_EDGES
         )));
+    }
+    let declaration_evidence = d.attr("declarationEvidence").map(str::to_owned);
+    if edge == "declaresImplementation"
+        && (!vocab::is_canonical_change_iri(&to)
+            || declaration_evidence
+                .as_deref()
+                .is_none_or(|e| e.trim().is_empty()))
+    {
+        return Err(CanonicalError::Lift("implementation declarations require a canonical full-hash change IRI and nonempty declarationEvidence".into()));
     }
     Ok(Ref {
         type_: d.id.as_ref().map(|_| NodeType::Ref.as_str().to_string()),
         id: d.id.as_ref().map(|id| as_urn("ref", id)),
         to,
         edge,
+        declaration_evidence,
     })
 }
 

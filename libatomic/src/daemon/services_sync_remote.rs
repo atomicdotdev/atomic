@@ -1167,6 +1167,7 @@ pub async fn pull_changes_impl(
 
     // Connect.
     let config = remote_config(timeout_secs, insecure, &auth_headers);
+    let signer_client = crate::signer_refresh::client_for_remote(&remote_url, &config);
     let remote = HttpRemote::with_config(&remote_url, config).map_err(|error| {
         let (variant, message) = convert_remote_error_pull(error, &remote_url);
         sync_error("connect", variant, &remote_url, message)
@@ -1410,6 +1411,12 @@ pub async fn pull_changes_impl(
             .await
             .map_err(|error| Status::internal(error.to_string()))??
         };
+        if let Some(client) = &signer_client {
+            let repo = handle.repository()?;
+            crate::signer_refresh::refresh(&repo, client)
+                .await
+                .map_err(repository_error)?;
+        }
         let report = PullReport {
             remote_name,
             remote_url,
@@ -1515,6 +1522,13 @@ pub async fn pull_changes_impl(
         .await
         .map_err(|error| Status::internal(error.to_string()))??
     };
+
+    if let Some(client) = &signer_client {
+        let repo = handle.repository()?;
+        crate::signer_refresh::refresh(&repo, client)
+            .await
+            .map_err(repository_error)?;
+    }
 
     // Set-id verification (the server's effective set-id vs the local).
     let mut set_id_verified = false;

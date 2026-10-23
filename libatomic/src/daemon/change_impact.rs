@@ -1,10 +1,11 @@
 //! Change-local structural impact. Never read working-copy sources, rebuild the
 //! KG, traverse co-change history, or turn missing analysis into "private".
+//! Dependency context comes from recorded bytes visible in the selected Atomic
+//! view, never from a persisted code-structure graph or working-copy buffers.
 use crate::atomic::{ChangeBlastRadius, ChangeImpactEdge, ChangeImpactFile};
 use atomic_core::change::Change;
-use atomic_core::pristine::vault::KgSubgraph;
 use atomic_core::types::Hash;
-use atomic_repository::Repository;
+use atomic_repository::{Repository, SyntaxIndex};
 use atomic_semantic::{Entity, ParserRegistry};
 use similar::{ChangeTag, TextDiff};
 use std::collections::{BTreeMap, BTreeSet};
@@ -13,7 +14,12 @@ const MAX_FILES: usize = 2000;
 const MAX_SOURCE_BYTES: usize = 2 * 1024 * 1024;
 const MAX_CALLERS: usize = 30;
 
-pub(super) fn project(repo: &Repository, change: &Change, hash: &Hash) -> ChangeBlastRadius {
+pub(super) fn project(
+    repo: &Repository,
+    change: &Change,
+    hash: &Hash,
+    view: &str,
+) -> ChangeBlastRadius {
     let mut paths = atomic_repository::get_files_in_change(change);
     paths.extend(change.file_ops().iter().map(|op| op.path().to_string()));
     paths.sort();
@@ -29,6 +35,7 @@ pub(super) fn project(repo: &Repository, change: &Change, hash: &Hash) -> Change
     let mut registry = ParserRegistry::new();
     let mut analyzed = 0;
     let mut public_change = false;
+    let mut syntax = None;
     for (index, path) in paths.into_iter().enumerate() {
         if index >= 100 {
             warnings.push("Structural analysis limited to 100 direct files; remaining direct paths are retained.".into());
@@ -38,8 +45,8 @@ pub(super) fn project(repo: &Repository, change: &Change, hash: &Hash) -> Change
             warnings.push(format!("{path}: no structural parser; direct impact only."));
             continue;
         }
-        let before = repo.get_file_content_before_change(&path, hash);
-        let after = repo.get_file_content_after_change(&path, hash);
+        let before = repo.get_file_content_before_change_on_view(&path, hash, view);
+        let after = repo.get_file_content_after_change_on_view(&path, hash, view);
         let (Ok(before), Ok(after)) = (before, after) else {
             warnings.push(format!("{path}: historical content reconstruction failed."));
             continue;
@@ -80,60 +87,44 @@ pub(super) fn project(repo: &Repository, change: &Change, hash: &Hash) -> Change
             continue;
         }
         public_change = true;
-        let file_id = format!("file:{path}");
-        let Ok(graph) = repo.vault_kg_neighbors(&file_id, 1) else {
-            warnings.push(format!("{path}: knowledge graph unavailable."));
-            continue;
+        let index = syntax.get_or_insert_with(|| repo.syntax_index(Some(view)));
+        let index = match index {
+            Ok(index) => index,
+            Err(error) => {
+                warnings.push(format!("{path}: view syntax unavailable: {error}"));
+                continue;
+            }
         };
-        let defined: BTreeSet<_> = graph
-            .edges
-            .iter()
-            .filter(|e| e.from_id == file_id && e.kind.eq_ignore_ascii_case("DEFINES"))
-            .map(|e| e.to_id.as_str())
-            .collect();
-        if defined.is_empty() {
-            warnings.push(format!(
-                "{path}: no indexed definitions; structural coverage unknown."
-            ));
-            continue;
-        }
         for entity in &public {
             if !matches!(entity.kind.as_str(), "function" | "method") {
                 continue;
             }
-            // Resolve stored IDs from indexed DEFINES edges. Do not fabricate an
-            // entity ID at a historical line that may no longer exist in the KG.
-            let matches: Vec<_> = graph
-                .nodes
+            let matches: Vec<_> = index
+                .entities
                 .iter()
-                .filter(|node| defined.contains(node.id.as_str()) && node.label == entity.name)
+                .filter(|candidate| candidate.file == path && candidate.name == entity.name)
                 .collect();
             if matches.len() != 1 {
                 warnings.push(format!(
-                    "{path}::{}: indexed identity absent/ambiguous.",
+                    "{path}::{}: definition absent/ambiguous in the selected view.",
                     entity.name
                 ));
                 continue;
             }
-            match repo.vault_kg_neighbors(&matches[0].id, 2) {
-                Ok(callers) => collect_callers(
-                    &callers,
-                    &matches[0].id,
-                    &path,
-                    &mut files,
-                    &mut links,
-                    &mut warnings,
-                ),
-                Err(_) => warnings.push(format!("{path}::{}: callers unavailable.", entity.name)),
-            }
+            collect_callers(
+                index,
+                &format!("{path}#{}", entity.name),
+                &path,
+                &mut files,
+                &mut links,
+                &mut warnings,
+            );
         }
         // Importers are genuine incoming file dependencies. Include them for all
         // public API changes; do not hide type importers when callers also exist.
-        for edge in &graph.edges {
-            if edge.to_id == file_id && edge.kind.eq_ignore_ascii_case("INCLUDES") {
-                if let Some(importer) = edge.from_id.strip_prefix("file:") {
-                    add_link(importer, &path, "INCLUDES", &mut files, &mut links);
-                }
+        for (importer, target) in &index.file_deps {
+            if target == &path {
+                add_link(importer, &path, "includes", &mut files, &mut links);
             }
         }
     }
@@ -174,7 +165,7 @@ pub(super) fn project(repo: &Repository, change: &Change, hash: &Hash) -> Change
         mode: if warnings.is_empty() { mode } else { "partial" }.into(),
         files: rows.into_iter().map(|(path, hop)| ChangeImpactFile { path, hop }).collect(), edges,
         warnings: warnings.into_iter().take(100).collect(),
-        context: "Recorded change sources + current repository KG; not a historical or view-isolated dependency snapshot.".into(),
+        context: format!("Recorded change sources + syntax visible in Atomic view '{view}'; not a historical dependency snapshot."),
     }
 }
 
@@ -192,8 +183,14 @@ fn changed_entities(
     before: &str,
     after: &str,
 ) -> Option<Vec<Entity>> {
-    let old = registry.extract(path, before);
-    let new = registry.extract(path, after);
+    let definitions = |entities: Vec<Entity>| {
+        entities
+            .into_iter()
+            .filter(|entity| entity.kind != atomic_semantic::EntityKind::Import)
+            .collect::<Vec<_>>()
+    };
+    let old = definitions(registry.extract(path, before));
+    let new = definitions(registry.extract(path, after));
     if old.is_empty() && new.is_empty() {
         return None;
     }
@@ -217,14 +214,21 @@ fn changed_entities(
             _ => {}
         }
     }
-    let mut entities = Vec::new();
+    let mut entities: Vec<Entity> = Vec::new();
     for (candidates, lines) in [(old, old_lines), (new, new_lines)] {
         for entity in candidates {
-            if lines.range(entity.line..=entity.end_line).next().is_some()
-                && !entities
-                    .iter()
-                    .any(|e: &Entity| e.name == entity.name && e.kind == entity.kind)
+            if lines.range(entity.line..=entity.end_line).next().is_none() {
+                continue;
+            }
+            if let Some(existing) = entities
+                .iter_mut()
+                .find(|e| e.name == entity.name && e.kind == entity.kind)
             {
+                // Becoming public is an API change just as becoming private is.
+                // Retain visibility from either recorded version, not whichever
+                // version happened to be visited first.
+                existing.exported |= entity.exported;
+            } else {
                 entities.push(entity);
             }
         }
@@ -247,19 +251,14 @@ fn add_link(
 }
 
 fn collect_callers(
-    graph: &KgSubgraph,
+    index: &SyntaxIndex,
     target: &str,
     path: &str,
     files: &mut BTreeMap<String, u32>,
     links: &mut BTreeSet<(String, String, String)>,
     warnings: &mut Vec<String>,
 ) {
-    let callers: BTreeSet<_> = graph
-        .edges
-        .iter()
-        .filter(|e| e.to_id == target && e.kind.eq_ignore_ascii_case("CALLS"))
-        .map(|e| e.from_id.as_str())
-        .collect();
+    let callers = index.callers(target);
     if callers.len() > MAX_CALLERS {
         warnings.push(format!(
             "{path}: common/high-fanout entity skipped (over {MAX_CALLERS} callers)."
@@ -267,18 +266,7 @@ fn collect_callers(
         return;
     }
     for caller in callers {
-        let definitions: Vec<_> = graph
-            .edges
-            .iter()
-            .filter(|e| e.to_id == caller && e.kind.eq_ignore_ascii_case("DEFINES"))
-            .filter_map(|e| e.from_id.strip_prefix("file:"))
-            .collect();
-        if definitions.is_empty() {
-            warnings.push(format!("{path}: caller definition is not indexed."));
-        }
-        for source in definitions {
-            add_link(source, path, "CALLS", files, links);
-        }
+        add_link(&caller.path, path, "calls", files, links);
     }
 }
 
@@ -299,25 +287,41 @@ mod tests {
             .iter()
             .any(|e| e.name == "removed" && public_api(e)));
         assert!(changed_entities(&mut parser, "a.json", "{}", "{\"a\":1}").is_none());
+        assert!(
+            changed_entities(&mut parser, "a.ts", "import './old';", "import './new';").is_none()
+        );
     }
     #[test]
+    fn visibility_changes_use_public_api_from_either_recorded_version() {
+        let mut parser = ParserRegistry::new();
+        let private = "function changed() { return 1; }\n";
+        let public = "export function changed() { return 1; }\n";
+        for (before, after) in [(private, public), (public, private)] {
+            let entities = changed_entities(&mut parser, "a.ts", before, after).unwrap();
+            assert_eq!(entities.len(), 1);
+            assert!(public_api(&entities[0]));
+        }
+    }
+
+    #[test]
     fn callers_are_directed_and_direct_files_are_not_counted_twice() {
-        use atomic_core::pristine::vault::KgEdge;
-        let graph = KgSubgraph {
-            nodes: vec![],
-            edges: vec![
-                KgEdge::new("entity:caller", "entity:target", "CALLS"),
-                KgEdge::new("file:tests/caller.ts", "entity:caller", "DEFINES"),
-                KgEdge::new("entity:target", "entity:outgoing", "CALLS"),
-                KgEdge::new("file:wrong.ts", "entity:outgoing", "DEFINES"),
-            ],
-        };
+        let index = SyntaxIndex::from_sources(&[
+            (
+                "src/a.ts".into(),
+                "export function target() { outgoing(); }".into(),
+            ),
+            (
+                "tests/caller.ts".into(),
+                "function caller() { target(); }".into(),
+            ),
+            ("wrong.ts".into(), "function outgoing() {}".into()),
+        ]);
         let mut files = BTreeMap::from([("src/a.ts".into(), 1)]);
         let mut links = BTreeSet::new();
         let mut warnings = vec![];
         collect_callers(
-            &graph,
-            "entity:target",
+            &index,
+            "src/a.ts#target",
             "src/a.ts",
             &mut files,
             &mut links,
@@ -328,7 +332,7 @@ mod tests {
         add_link(
             "src/a.ts",
             "tests/caller.ts",
-            "INCLUDES",
+            "includes",
             &mut files,
             &mut links,
         );
@@ -338,19 +342,20 @@ mod tests {
 
     #[test]
     fn common_callable_names_produce_a_partial_coverage_warning_not_arbitrary_callers() {
-        use atomic_core::pristine::vault::KgEdge;
-        let graph = KgSubgraph {
-            nodes: vec![],
-            edges: (0..31)
-                .map(|i| KgEdge::new(format!("caller:{i}"), "target", "CALLS"))
-                .collect(),
-        };
+        let mut sources = vec![("src/a.ts".into(), "export function target() {}".into())];
+        sources.extend((0..31).map(|i| {
+            (
+                format!("caller{i}.ts"),
+                format!("function caller{i}() {{ target(); }}"),
+            )
+        }));
+        let index = SyntaxIndex::from_sources(&sources);
         let mut files = BTreeMap::from([("src/a.ts".into(), 1)]);
         let mut links = BTreeSet::new();
         let mut warnings = vec![];
         collect_callers(
-            &graph,
-            "target",
+            &index,
+            "src/a.ts#target",
             "src/a.ts",
             &mut files,
             &mut links,

@@ -223,12 +223,14 @@ empty graph change; absent summary means an older producer, not zero.
 
 `GetChange.includes.blast_radius` opts into the additive `blast_radius` response
 (field 12). It binds directly changed paths to the selected hash and observes
-incoming `CALLS`/`INCLUDES` from the current repository KG. Public API changes
+incoming `calls`/`includes` from a request-scoped syntax index of recorded files
+visible in the selected Atomic view (the current view by default). Public API changes
 are found by parsing the recorded before/after sources and matching changed
-line ranges in both versions, including deletions. Entity IDs come from indexed
-DEFINES edges, not historical-line guesses. No working-copy source reads, KG
+line ranges in both versions, including deletions. Callables use `<path>#<name>`
+selectors, not persistent entity IDs or historical-line guesses. No working-copy source reads, KG
 enrichment, co-change traversal or write-open occurs. The response is not a
-historical/view-isolated dependency snapshot and says so explicitly. Missing
+historical dependency snapshot and says so explicitly. The selected view scopes
+both historical reconstruction and current dependency context. Missing
 parsers/content/definitions, ambiguity and analysis/display limits yield partial
 coverage, never a private-change assertion. Results deduplicate file paths and
 preserve hop 1 when a direct file also appears as a caller. No random impact or

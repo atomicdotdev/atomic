@@ -139,17 +139,24 @@ fn save_change_declares_vnext_capability() {
         .pristine
         .required_repository_capabilities()
         .unwrap()
-        .is_empty());
+        .iter()
+        .all(|capability| capability.id != "change-format-vnext"));
 
     repo.save_change(&create_test_change("capability fence"))
         .unwrap();
 
     assert_eq!(
         repo.pristine.required_repository_capabilities().unwrap(),
-        vec![RequiredRepositoryCapability {
-            id: "change-format-vnext".to_string(),
-            minimum_version: 1,
-        }]
+        vec![
+            RequiredRepositoryCapability {
+                id: "change-format-vnext".to_string(),
+                minimum_version: 1,
+            },
+            RequiredRepositoryCapability {
+                id: "kg-semweb-v1".into(),
+                minimum_version: 1
+            }
+        ]
     );
 }
 
@@ -166,7 +173,8 @@ fn v1_pre_serialized_save_does_not_declare_vnext() {
         .pristine
         .required_repository_capabilities()
         .unwrap()
-        .is_empty());
+        .iter()
+        .all(|capability| capability.id != "change-format-vnext"));
     assert!(repo.change_store.change_path(&hash).is_file());
 }
 
@@ -185,10 +193,16 @@ fn v2_pre_serialized_save_marks_before_object_persistence() {
 
     assert_eq!(
         repo.pristine.required_repository_capabilities().unwrap(),
-        vec![RequiredRepositoryCapability {
-            id: "change-format-vnext".to_string(),
-            minimum_version: 1,
-        }]
+        vec![
+            RequiredRepositoryCapability {
+                id: "change-format-vnext".to_string(),
+                minimum_version: 1,
+            },
+            RequiredRepositoryCapability {
+                id: "kg-semweb-v1".into(),
+                minimum_version: 1
+            }
+        ]
     );
     assert!(!repo.change_store.change_path(&hash).exists());
 }
@@ -214,7 +228,8 @@ fn malformed_or_unsupported_pre_serialized_bytes_do_not_mutate() {
             .pristine
             .required_repository_capabilities()
             .unwrap()
-            .is_empty());
+            .iter()
+            .all(|capability| capability.id != "change-format-vnext"));
         assert!(!repo.change_store.change_path(&hash).exists());
         drop(repo);
         drop(temp);

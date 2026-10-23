@@ -123,10 +123,38 @@ fn render_cli(node: &CanonicalNode) -> String {
     }
 
     // Dependencies — each ref rendered as 'edge -> to'.
-    if !node.depends_on.is_empty() {
+    if node
+        .depends_on
+        .iter()
+        .any(|r| r.edge != "declaresImplementation")
+    {
         s.push_str("\nDependencies\n");
-        for r in &node.depends_on {
+        for r in node
+            .depends_on
+            .iter()
+            .filter(|r| r.edge != "declaresImplementation")
+        {
             s.push_str(&format!("  {} -> {}\n", r.edge, r.to));
+        }
+    }
+    if node
+        .depends_on
+        .iter()
+        .any(|r| r.edge == "declaresImplementation")
+    {
+        s.push_str("\nDeclared implementation (not captured turn provenance)\n");
+        for r in node
+            .depends_on
+            .iter()
+            .filter(|r| r.edge == "declaresImplementation")
+        {
+            s.push_str(&format!(
+                "  {}\n    {}\n",
+                r.to,
+                r.declaration_evidence
+                    .as_deref()
+                    .unwrap_or("missing evidence")
+            ));
         }
     }
 
@@ -255,6 +283,7 @@ mod tests {
                 },
             ],
             depends_on: vec![Ref {
+                declaration_evidence: None,
                 type_: None,
                 id: None,
                 to: "urn:atomic:intent:xyz".to_string(),

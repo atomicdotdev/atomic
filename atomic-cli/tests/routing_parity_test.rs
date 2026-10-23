@@ -11,6 +11,7 @@
 use std::path::Path;
 use std::process::{Command, Output};
 
+use atomic_core::kg::{iri, ontology::Class, project_id::ProjectId};
 use tempfile::TempDir;
 
 const ATOMIC_BIN: &str = env!("CARGO_BIN_EXE_atomic");
@@ -47,6 +48,13 @@ fn fixture(label: &str) -> (TempDir, TempDir) {
     );
     let _ = label;
     (repo_tmp, home_tmp)
+}
+
+fn file_iri(repo_dir: &Path, home_dir: &Path, path: &str) -> String {
+    let identity = run(repo_dir, home_dir, &["repo", "identity", "show", "--json"]);
+    let identity: serde_json::Value = serde_json::from_str(&identity).unwrap();
+    let project = ProjectId::from_base32(identity["project"].as_str().unwrap()).unwrap();
+    iri::mint_file(&project, path)
 }
 
 fn ensure_default_identity(repo_dir: &Path, home_dir: &Path) {
@@ -334,22 +342,25 @@ fn query_neighbors_json_serializes_the_full_domain_subgraph() {
     std::fs::write(repo_dir.join("kg.txt"), "kg fixture\n").unwrap();
     run(repo_dir, home_dir, &["add", "kg.txt"]);
     run(repo_dir, home_dir, &["record", "-m", "kg fixture change"]);
+    let file_id = file_iri(repo_dir, home_dir, "kg.txt");
 
     let json = run(
         repo_dir,
         home_dir,
-        &["query", "neighbors", "file:kg.txt", "--json"],
+        &["query", "neighbors", &file_id, "--json"],
     );
     let subgraph: serde_json::Value = serde_json::from_str(&json).unwrap();
     let nodes = subgraph["nodes"].as_array().unwrap();
     let file_node = nodes
         .iter()
-        .find(|node| node["id"] == "file:kg.txt")
+        .find(|node| node["id"] == file_id)
         .expect("the file node");
-    // The full domain fields the local JSON serializes: kind, label,
+    // The full domain fields the local JSON serializes: types, label,
     // summary, source, metadata.
-    assert_eq!(file_node["kind"], "file");
+    assert_eq!(file_node["types"], serde_json::json!([Class::File.iri()]));
+    assert!(file_node.get("kind").is_none());
     assert_eq!(file_node["label"], "kg.txt");
+    assert_eq!(file_node["metadata"]["path"], "kg.txt");
     assert!(file_node["source"].is_string());
     assert!(subgraph["edges"].is_array());
 
@@ -357,17 +368,17 @@ fn query_neighbors_json_serializes_the_full_domain_subgraph() {
     let json = run(repo_dir, home_dir, &["query", "search", "kg.txt", "--json"]);
     let nodes: Vec<serde_json::Value> = serde_json::from_str(&json).unwrap();
     assert!(
-        nodes.iter().any(|node| node["id"] == "file:kg.txt"),
+        nodes.iter().any(|node| node["id"] == file_id),
         "the search surfaces the file node"
     );
 
-    // The --kind filter narrows to the kind's nodes.
+    // The --kind filter selects an asserted canonical class.
     let table = run(
         repo_dir,
         home_dir,
-        &["query", "search", "kg.txt", "--kind", "file"],
+        &["query", "search", "kg.txt", "--kind", Class::File.iri()],
     );
-    assert!(table.contains("file:kg.txt"));
+    assert!(table.contains(&file_id));
 }
 
 #[test]
@@ -1350,13 +1361,12 @@ fn kg_extras_reindex_and_graph_route() {
     assert!(reindexed.contains("Indexed "), "{reindexed}");
     assert!(reindexed.contains(" nodes + edges."), "{reindexed}");
     let graph = run(repo_dir, home_dir, &["query", "graph", "greet", "--json"]);
+    let file_id = file_iri(repo_dir, home_dir, "greet.rs");
     let value: serde_json::Value = serde_json::from_str(&graph).unwrap();
     let nodes = value["nodes"].as_array().unwrap();
     assert!(!nodes.is_empty(), "the seeded graph carries nodes");
     assert!(
-        nodes
-            .iter()
-            .any(|node| node["id"] == serde_json::json!("file:greet.rs")),
+        nodes.iter().any(|node| node["id"] == file_id),
         "the seed file is present: {graph}"
     );
 }

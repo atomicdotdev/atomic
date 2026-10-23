@@ -4,6 +4,7 @@ use std::collections::{HashMap, HashSet};
 
 use clap::{Parser, Subcommand};
 
+use atomic_core::kg::ontology::{compact, Class};
 use atomic_core::pristine::vault::{KgEdge, KgNode};
 use atomic_core::types::{Base32, Hash};
 use atomic_repository::Repository;
@@ -11,10 +12,13 @@ use atomic_repository::Repository;
 use crate::commands::{find_repository_root, Command};
 use crate::error::{CliError, CliResult};
 use crate::output::{create_spinner, finish_error, finish_success};
+mod validate;
 
 /// Subcommands for vault knowledge graph queries.
 #[derive(Subcommand, Debug)]
 pub enum QueryCommands {
+    /// Evaluate builtin and local enterprise SHACL shapes over a workflow snapshot.
+    Validate(validate::Validate),
     /// Search the knowledge graph by keywords.
     ///
     /// Performs full-text search over KG node IDs, labels, and summaries,
@@ -205,6 +209,7 @@ pub struct Query {
 impl Command for Query {
     fn run(&self) -> CliResult<()> {
         match &self.command {
+            QueryCommands::Validate(cmd) => cmd.run(),
             QueryCommands::Search(cmd) => cmd.run(),
             QueryCommands::Neighbors(cmd) => cmd.run(),
             QueryCommands::Callers(cmd) => cmd.run(),
@@ -294,19 +299,18 @@ impl Command for QueryGraph {
         } else {
             self.kinds
                 .split(',')
-                .map(|s| s.trim().to_lowercase())
+                .map(|s| s.trim().to_owned())
                 .filter(|s| !s.is_empty())
                 .collect()
         };
-        let kind_allowed =
-            |kind: &str| -> bool { allow_all || allowed_kinds.contains(&kind.to_lowercase()) };
+        let kind_allowed = |kind: &str| -> bool { allow_all || allowed_kinds.contains(kind) };
 
         // 1. Seed: search the KG, filtered to allowed kinds
         let seed_nodes: Vec<KgNode> = repo
             .vault_kg_search(&self.query, self.limit * 3, None) // fetch extra, then filter
             .map_err(CliError::Repository)?
             .into_iter()
-            .filter(|n| kind_allowed(&n.kind))
+            .filter(|n| n.types.iter().any(|class| kind_allowed(class)))
             .take(self.limit)
             .collect();
 
@@ -340,11 +344,11 @@ impl Command for QueryGraph {
             let mut changes_for_seed: usize = 0;
 
             for node in subgraph.nodes {
-                if !kind_allowed(&node.kind) {
+                if !node.types.iter().any(|class| kind_allowed(class)) {
                     continue;
                 }
                 // Cap change nodes per seed
-                if node.kind == "change" && cap_changes {
+                if node.has_type(Class::Change) && cap_changes {
                     if node_map.contains_key(&node.id) {
                         continue; // already added by another seed, don't count
                     }
@@ -357,19 +361,17 @@ impl Command for QueryGraph {
             }
 
             for edge in subgraph.edges {
-                let from_kind_ok = allow_all || {
-                    let prefix = edge.from_id.split(':').next().unwrap_or("");
-                    kind_allowed(prefix)
-                };
-                let to_kind_ok = allow_all || {
-                    let prefix = edge.to_id.split(':').next().unwrap_or("");
-                    kind_allowed(prefix)
-                };
+                let from_kind_ok = node_map.contains_key(&edge.from_id);
+                let to_kind_ok = node_map.contains_key(&edge.to_id);
                 if from_kind_ok && to_kind_ok {
                     // Only add edge if both endpoints made it into node_map
                     // (respects the per-seed change cap)
                     if node_map.contains_key(&edge.from_id) || node_map.contains_key(&edge.to_id) {
-                        let key = (edge.from_id.clone(), edge.to_id.clone(), edge.kind.clone());
+                        let key = (
+                            edge.from_id.clone(),
+                            edge.to_id.clone(),
+                            edge.kind.to_string(),
+                        );
                         if edge_set.insert(key) {
                             all_edges.push(edge);
                         }
@@ -433,6 +435,9 @@ impl Command for QueryGraph {
                 connected_after_cap.contains(&n.id) || seed_ids.contains(n.id.as_str())
             });
         }
+
+        repo.enrich_workflow_usage(&mut nodes)
+            .map_err(CliError::Repository)?;
 
         // 4. Output
         if self.json {
@@ -511,7 +516,7 @@ pub(crate) fn emit_dot(nodes: &[KgNode], edges: &[KgEdge]) -> String {
 
     // Nodes
     for node in nodes {
-        let (fillcolor, shape) = node_style(&node.kind);
+        let (fillcolor, shape) = node_style(node.primary_type());
         let label = node_label(node);
         out.push_str(&format!(
             "  \"{}\" [label=\"{}\", fillcolor=\"{}\", shape={}];\n",
@@ -530,7 +535,7 @@ pub(crate) fn emit_dot(nodes: &[KgNode], edges: &[KgEdge]) -> String {
             "  \"{}\" -> \"{}\" [label=\"{}\"];\n",
             dot_escape_id(&edge.from_id),
             dot_escape_id(&edge.to_id),
-            dot_escape_label(&edge.kind),
+            dot_escape_label(&compact(edge.kind.iri())),
         ));
     }
 
@@ -540,23 +545,25 @@ pub(crate) fn emit_dot(nodes: &[KgNode], edges: &[KgEdge]) -> String {
 
 /// Returns `(fillcolor, shape)` for a given node kind.
 fn node_style(kind: &str) -> (&'static str, &'static str) {
-    match kind.to_lowercase().as_str() {
-        "module" => ("#d4e6f1", "folder"),
-        "file" => ("#d5f5e3", "box"),
-        "entity" => ("#fdebd0", "ellipse"),
-        "change" => ("#fadbd8", "note"),
-        "view" => ("#e8daef", "pentagon"),
-        "identity" => ("#fef9e7", "box"),
-        "goal" => ("#d1f2eb", "hexagon"),
-        "intent" => ("#d1f2eb", "hexagon"),
-        "memory" => ("#fef9e7", "box"),
+    match Class::from_iri(kind) {
+        Some(Class::File) => ("#d5f5e3", "box"),
+        Some(Class::Change) => ("#fadbd8", "note"),
+        Some(Class::View) => ("#e8daef", "pentagon"),
+        Some(
+            Class::Goal
+            | Class::WorkIntent
+            | Class::FeatureIntent
+            | Class::BugIntent
+            | Class::ReviewIntent,
+        ) => ("#d1f2eb", "hexagon"),
+        Some(Class::Memory | Class::Identity) => ("#fef9e7", "box"),
         _ => ("#f2f3f4", "box"),
     }
 }
 
 /// Build a human-readable label for a node in DOT output.
 fn node_label(node: &KgNode) -> String {
-    let kind = node.kind.to_lowercase();
+    let kind = compact(node.primary_type());
     match kind.as_str() {
         "module" => {
             // Last path component + trailing slash
@@ -567,7 +574,7 @@ fn node_label(node: &KgNode) -> String {
                 .unwrap_or(&node.label);
             format!("{}/", last)
         }
-        "file" => {
+        "atomic:File" => {
             // Filename, optionally with match count
             let filename = node.label.rsplit('/').next().unwrap_or(&node.label);
             if let Some(ref meta) = node.metadata {
@@ -594,7 +601,7 @@ fn node_label(node: &KgNode) -> String {
             }
             label
         }
-        "change" => {
+        "atomic:Change" => {
             // Short hash + optional summary excerpt
             let mut label = node.label.clone();
             if let Some(ref summary) = node.summary {
@@ -622,6 +629,50 @@ fn dot_escape_id(s: &str) -> String {
 
 fn dot_escape_label(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+/// Stable categorical colors with contrast against the HTML graph's dark canvas.
+/// Exhaustive matching keeps ontology additions from silently sharing a fallback.
+fn html_node_color(kind: &str) -> String {
+    let Some(class) = Class::from_iri(kind) else {
+        // Unlike a palette indexed by the types currently visible, hashing the
+        // full IRI keeps an external type's color stable between exports.
+        let hash = kind.bytes().fold(2166136261u32, |hash, byte| {
+            (hash ^ u32::from(byte)).wrapping_mul(16777619)
+        });
+        return format!("hsl({}, 65%, 68%)", hash % 360);
+    };
+    match class {
+        Class::WorkIntent => "#63d5ea",
+        Class::FeatureIntent => "#56cfe1",
+        Class::BugIntent => "#ff8a9a",
+        Class::ReviewIntent => "#a5b4fc",
+        Class::ManagedIntent => "#8be4f0",
+        Class::Goal => "#6ed4ae",
+        Class::Memory => "#e2bc81",
+        Class::Skill => "#a4d98b",
+        Class::ToolResult => "#8da9bd",
+        Class::Task => "#dd81ef",
+        Class::AcceptanceCriterion => "#c6e96e",
+        Class::ScopeItem => "#c5a582",
+        Class::Constraint => "#f59ac2",
+        Class::Todo => "#d79e64",
+        Class::Session => "#b6a4ff",
+        Class::SessionTurn => "#39b8bd",
+        Class::ManagedTurn => "#8ad4dc",
+        Class::ProvenanceGraph => "#72a7ff",
+        Class::Attestation => "#f0c4ec",
+        Class::Finding => "#ffad66",
+        Class::Change => "#ff786f",
+        Class::View => "#9878e8",
+        Class::File => "#53d89b",
+        Class::Identity => "#f4d06f",
+        Class::Concept => "#aac4a0",
+        Class::Project => "#adcbe7",
+        Class::ProjectIdentity => "#bba2a0",
+        Class::VerificationStatus => "#d4d8e3",
+    }
+    .to_owned()
 }
 
 /// Generate a self-contained HTML page with a D3.js force-directed graph.
@@ -656,9 +707,13 @@ pub(crate) fn emit_html(query: &str, nodes: &[KgNode], edges: &[KgEdge]) -> Stri
                 .unwrap_or(0);
             serde_json::json!({
                 "id": n.id,
-                "kind": n.kind,
+                "kind": n.primary_type(),
+                "color": html_node_color(n.primary_type()),
+                "types": n.types,
                 "label": n.label,
                 "summary": n.summary.as_deref().unwrap_or(""),
+                "source": n.source,
+                "metadata": n.metadata,
                 "content_matches": content_matches,
                 "entity_kind": entity_kind,
                 "line": line,
@@ -674,6 +729,7 @@ pub(crate) fn emit_html(query: &str, nodes: &[KgNode], edges: &[KgEdge]) -> Stri
                 "source": e.from_id,
                 "target": e.to_id,
                 "kind": e.kind,
+                "metadata": e.metadata,
             })
         })
         .collect();
@@ -683,7 +739,11 @@ pub(crate) fn emit_html(query: &str, nodes: &[KgNode], edges: &[KgEdge]) -> Stri
         "links": graph_edges,
     });
 
-    let data_json = serde_json::to_string(&graph_data).unwrap();
+    let data_json = serde_json::to_string(&graph_data)
+        .unwrap()
+        .replace('<', "\\u003c")
+        .replace('>', "\\u003e")
+        .replace('&', "\\u0026");
     let escaped_query = query
         .replace('&', "&amp;")
         .replace('<', "&lt;")
@@ -702,16 +762,17 @@ pub(crate) fn emit_html(query: &str, nodes: &[KgNode], edges: &[KgEdge]) -> Stri
   #header h1 {{ font-size: 14px; font-weight: 600; color: #a0a0c0; letter-spacing: 1px; }}
   #header .query {{ font-size: 14px; color: #6ec6ff; }}
   #header .stats {{ font-size: 12px; color: #888; margin-left: auto; }}
-  canvas {{ display: block; width: 100vw; height: 100vh; }}
+  canvas {{ display: block; width: 100%; height: 100%; }}
   #tooltip {{ position: fixed; padding: 10px 14px; background: rgba(0,0,0,0.92); border: 1px solid #555; border-radius: 6px; font-size: 12px; pointer-events: none; display: none; z-index: 20; max-width: 420px; line-height: 1.5; }}
   #tooltip .kind {{ color: #888; font-size: 10px; text-transform: uppercase; letter-spacing: 0.5px; }}
   #tooltip .label {{ color: #fff; font-weight: 600; margin: 3px 0; word-break: break-all; }}
   #tooltip .summary {{ color: #bbb; font-size: 11px; margin-bottom: 2px; }}
   #tooltip .detail {{ color: #aaa; font-size: 11px; }}
-  #legend {{ position: fixed; bottom: 16px; right: 16px; z-index: 10; background: rgba(26,26,46,0.92); border: 1px solid #333; border-radius: 8px; padding: 10px 14px; font-size: 11px; }}
+  #legend {{ position: absolute; bottom: 16px; right: 16px; z-index: 10; background: rgba(26,26,46,0.92); border: 1px solid #333; border-radius: 8px; padding: 10px 14px; font-size: 11px; }}
   #legend .legend-title {{ color: #a0a0c0; font-weight: 600; font-size: 10px; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 6px; }}
   #legend .legend-item {{ display: flex; align-items: center; gap: 8px; margin: 3px 0; color: #ccc; }}
   #legend .legend-dot {{ width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0; }}
+  {inspector_css}
 </style>
 </head>
 <body>
@@ -726,54 +787,45 @@ pub(crate) fn emit_html(query: &str, nodes: &[KgNode], edges: &[KgEdge]) -> Stri
   <div class="summary" id="tt-summary"></div>
   <div class="detail" id="tt-detail"></div>
 </div>
-<canvas id="graph"></canvas>
-<div id="legend"></div>
+<div id="graph-layout">
+  <div id="graph-view">
+    <canvas id="graph"></canvas>
+    <div id="legend"></div>
+  </div>
+  <aside id="node-inspector" aria-label="Node details"></aside>
+</div>
 <script src="https://cdn.jsdelivr.net/npm/d3@7"></script>
 <script>
 (function() {{
+  {inspector_js}
   // Embedded graph data
   var graphData = {data_json};
 
-  var COLORS = {{
-    module:   '#3498db',
-    file:     '#2ecc71',
-    entity:   '#e67e22',
-    change:   '#e74c3c',
-    view:     '#9b59b6',
-    identity: '#f1c40f',
-    goal:     '#1abc9c',
-    intent:   '#1abc9c',
-    memory:   '#f39c12',
-  }};
+  var kindColors = new Map(graphData.nodes.map(function(n) {{ return [n.kind, n.color]; }}));
   var EDGE_COLORS = {{
-    DEFINES:     '#e67e22',
-    MODIFIES:    '#e74c3c',
-    PART_OF:     '#3498db',
-    INCLUDES:    '#2ecc71',
-    AUTHORED_BY: '#f1c40f',
-    DEPENDS_ON:  '#e74c3c',
-    ON_VIEW:     '#9b59b6',
-    REFERENCES:  '#95a5a6',
+    'https://atomic.dev/ns/workflow#modifiesFile': '#e74c3c',
+    'https://atomic.dev/ns/workflow#authoredBy': '#f1c40f',
+    'https://atomic.dev/ns/workflow#directlyDependsOnChange': '#e74c3c',
+    'https://atomic.dev/ns/workflow#directlyOnView': '#9b59b6',
+    'https://atomic.dev/ns/workflow#references': '#95a5a6',
   }};
-  var DEFAULT_COLOR = '#7f8c8d';
 
   function nodeRadius(d) {{
-    if (d.kind === 'module') return 14 + Math.min(d.content_matches, 50) * 0.3;
-    if (d.kind === 'file') return 5 + Math.min(d.content_matches, 100) * 0.12;
-    if (d.kind === 'entity') return 4;
-    if (d.kind === 'change') return 4;
+    if (d.kind === 'https://atomic.dev/ns/workflow#File') return 5 + Math.min(d.content_matches, 100) * 0.12;
+    if (d.kind === 'https://atomic.dev/ns/workflow#Change') return 4;
     return 5;
   }}
 
-  function nodeColor(d) {{ return COLORS[d.kind] || DEFAULT_COLOR; }}
+  function nodeColor(d) {{ return d.color; }}
   function edgeColor(d) {{ return EDGE_COLORS[d.kind] || '#555'; }}
 
   // Canvas setup
   var canvas = document.getElementById('graph');
+  var graphView = document.getElementById('graph-view');
   var ctx = canvas.getContext('2d');
   var dpr = window.devicePixelRatio || 1;
-  var width = window.innerWidth;
-  var height = window.innerHeight;
+  var width = graphView.clientWidth;
+  var height = graphView.clientHeight;
   canvas.width = width * dpr;
   canvas.height = height * dpr;
   canvas.style.width = width + 'px';
@@ -791,6 +843,7 @@ pub(crate) fn emit_html(query: &str, nodes: &[KgNode], edges: &[KgEdge]) -> Stri
   nodes.forEach(function(n) {{ n.r = nodeRadius(n); }});
 
   var nodeById = new Map(nodes.map(function(n) {{ return [n.id, n]; }}));
+  var selectedNodeId = null;
 
   var links = graphData.links.filter(function(l) {{
     return nodeById.has(l.source) && nodeById.has(l.target);
@@ -801,14 +854,29 @@ pub(crate) fn emit_html(query: &str, nodes: &[KgNode], edges: &[KgEdge]) -> Stri
   // Build legend from kinds present in data
   var kindsPresent = new Set(nodes.map(function(n) {{ return n.kind; }}));
   var legendEl = document.getElementById('legend');
-  var legendHTML = '<div class="legend-title">Node Types</div>';
-  var kindOrder = ['module', 'file', 'entity', 'change', 'view', 'identity', 'goal', 'intent', 'memory'];
+  var legendTitle = document.createElement('div');
+  legendTitle.className = 'legend-title';
+  legendTitle.textContent = 'Node Types';
+  legendEl.appendChild(legendTitle);
+  var kindOrder = Array.from(kindsPresent).sort();
   kindOrder.forEach(function(k) {{
     if (kindsPresent.has(k)) {{
-      legendHTML += '<div class="legend-item"><span class="legend-dot" style="background:' + (COLORS[k] || DEFAULT_COLOR) + '"></span>' + k + '</div>';
+      var item = document.createElement('div');
+      item.className = 'legend-item';
+      item.dataset.kind = k;
+      var dot = document.createElement('span');
+      dot.className = 'legend-dot';
+      dot.style.background = kindColors.get(k);
+      item.appendChild(dot);
+      item.appendChild(document.createTextNode(k.replace('https://atomic.dev/ns/workflow#', 'atomic:')));
+      legendEl.appendChild(item);
     }}
   }});
-  legendEl.innerHTML = legendHTML;
+  var inspector = createGraphInspector(document.getElementById('node-inspector'), graphData, function(id) {{
+    selectedNodeId = id;
+    hideTooltip();
+    draw();
+  }});
 
   // Current zoom transform
   var currentTransform = d3.zoomIdentity;
@@ -834,6 +902,9 @@ pub(crate) fn emit_html(query: &str, nodes: &[KgNode], edges: &[KgEdge]) -> Stri
     links.forEach(function(l) {{
       var s = l.source;
       var t = l.target;
+      var highlighted = selectedNodeId && (s.id === selectedNodeId || t.id === selectedNodeId);
+      ctx.globalAlpha = selectedNodeId ? (highlighted ? 0.9 : 0.12) : 0.4;
+      ctx.lineWidth = highlighted ? 1.8 : 0.6;
       ctx.strokeStyle = edgeColor(l);
       ctx.beginPath();
       ctx.moveTo(s.x, s.y);
@@ -854,6 +925,13 @@ pub(crate) fn emit_html(query: &str, nodes: &[KgNode], edges: &[KgEdge]) -> Stri
       ctx.lineWidth = 1.2;
       ctx.globalAlpha = 1.0;
       ctx.stroke();
+      if (d.id === selectedNodeId) {{
+        ctx.beginPath();
+        ctx.arc(d.x, d.y, r + 4 / currentTransform.k, 0, 2 * Math.PI);
+        ctx.strokeStyle = '#9fd6ff';
+        ctx.lineWidth = 2 / currentTransform.k;
+        ctx.stroke();
+      }}
     }});
 
     // Draw labels for large nodes (modules and high-match files)
@@ -862,7 +940,7 @@ pub(crate) fn emit_html(query: &str, nodes: &[KgNode], edges: &[KgEdge]) -> Stri
     ctx.textAlign = 'center';
     ctx.textBaseline = 'top';
     nodes.forEach(function(d) {{
-      if (d.r > 10) {{
+      if (d.r > 10 || d.id === selectedNodeId) {{
         var label = d.label;
         if (d.kind === 'module') label += '/';
         if (label.length > 28) label = label.slice(0, 25) + '...';
@@ -878,6 +956,18 @@ pub(crate) fn emit_html(query: &str, nodes: &[KgNode], edges: &[KgEdge]) -> Stri
 
   // Zoom and pan via d3.zoom
   var zoomBehavior = d3.zoom()
+    .filter(function(event) {{
+      if (event.button || (event.ctrlKey && event.type !== 'wheel')) return false;
+      if (event.type === 'mousedown') {{
+        dragStart = [event.clientX, event.clientY];
+        dragMoved = false;
+        var rect = canvas.getBoundingClientRect();
+        // Let our node-drag handler own this gesture, rather than D3 starting
+        // a pan and stopping propagation before the node handler can run.
+        return !findNode(event.clientX - rect.left, event.clientY - rect.top);
+      }}
+      return true;
+    }})
     .scaleExtent([0.05, 10])
     .on('zoom', function(event) {{
       currentTransform = event.transform;
@@ -953,8 +1043,13 @@ pub(crate) fn emit_html(query: &str, nodes: &[KgNode], edges: &[KgEdge]) -> Stri
   // Drag state
   var dragNode = null;
   var dragSubject = null;
+  var dragStart = null;
+  var dragMoved = false;
 
   canvas.addEventListener('mousemove', function(e) {{
+    if (dragStart && Math.hypot(e.clientX - dragStart[0], e.clientY - dragStart[1]) > 4) {{
+      dragMoved = true;
+    }}
     var rect = canvas.getBoundingClientRect();
     var sx = e.clientX - rect.left;
     var sy = e.clientY - rect.top;
@@ -979,6 +1074,8 @@ pub(crate) fn emit_html(query: &str, nodes: &[KgNode], edges: &[KgEdge]) -> Stri
   }});
 
   canvas.addEventListener('mousedown', function(e) {{
+    dragStart = [e.clientX, e.clientY];
+    dragMoved = false;
     var rect = canvas.getBoundingClientRect();
     var sx = e.clientX - rect.left;
     var sy = e.clientY - rect.top;
@@ -997,6 +1094,7 @@ pub(crate) fn emit_html(query: &str, nodes: &[KgNode], edges: &[KgEdge]) -> Stri
   }});
 
   window.addEventListener('mouseup', function() {{
+    dragStart = null;
     if (dragNode) {{
       dragNode.fx = null;
       dragNode.fy = null;
@@ -1012,10 +1110,17 @@ pub(crate) fn emit_html(query: &str, nodes: &[KgNode], edges: &[KgEdge]) -> Stri
     hideTooltip();
   }});
 
+  canvas.addEventListener('click', function(e) {{
+    if (dragMoved) return;
+    var rect = canvas.getBoundingClientRect();
+    var found = findNode(e.clientX - rect.left, e.clientY - rect.top);
+    inspector.select(found ? found.id : null);
+  }});
+
   // Handle resize
-  window.addEventListener('resize', function() {{
-    width = window.innerWidth;
-    height = window.innerHeight;
+  function resizeGraph() {{
+    width = graphView.clientWidth;
+    height = graphView.clientHeight;
     canvas.width = width * dpr;
     canvas.height = height * dpr;
     canvas.style.width = width + 'px';
@@ -1023,13 +1128,18 @@ pub(crate) fn emit_html(query: &str, nodes: &[KgNode], edges: &[KgEdge]) -> Stri
     ctx.scale(dpr, dpr);
     simulation.force('center', d3.forceCenter(width / 2, height / 2));
     simulation.alpha(0.1).restart();
-  }});
+    draw();
+  }}
+  window.addEventListener('resize', resizeGraph);
+  if (window.ResizeObserver) new ResizeObserver(resizeGraph).observe(graphView);
 }})();
 </script>
 </body>
 </html>"##,
         query = escaped_query,
         data_json = data_json,
+        inspector_js = include_str!("graph_inspector.js"),
+        inspector_css = include_str!("graph_inspector.css"),
     )
 }
 
@@ -1053,10 +1163,10 @@ pub struct QueryNodes {
     #[arg(long, short = 'k', default_value = "10")]
     pub limit: usize,
 
-    /// Filter by node kind (change, entity, file, view, memory, intent, goal).
+    /// Filter by canonical class IRI (for example, <https://atomic.dev/ns/workflow#File>).
     ///
-    /// When set, only nodes of this kind are returned.
-    /// Without this flag, all kinds are returned.
+    /// When set, only nodes asserting this type are returned.
+    /// Without this flag, all types are returned.
     #[arg(long, short = 't')]
     pub kind: Option<String>,
 
@@ -1105,10 +1215,10 @@ impl Command for QueryNodes {
             .map_err(CliError::Repository)?;
 
         let nodes: Vec<_> = if let Some(ref kind_filter) = self.kind {
-            let k = kind_filter.to_lowercase();
+            let k = kind_filter.to_owned();
             all_nodes
                 .into_iter()
-                .filter(|n| n.kind.to_lowercase() == k)
+                .filter(|n| n.types.contains(&k))
                 .take(self.limit)
                 .collect()
         } else {
@@ -1127,7 +1237,12 @@ impl Command for QueryNodes {
                 } else {
                     format!("  {}", truncate_display(summary, 60))
                 };
-                println!("  [{}] {}{}", node.kind, node.id, summary_display);
+                println!(
+                    "  [{}] {}{}",
+                    compact(node.primary_type()),
+                    node.id,
+                    summary_display
+                );
             }
             println!("\n{} result(s).", nodes.len());
         }
@@ -1139,7 +1254,7 @@ impl Command for QueryNodes {
 /// Get the neighborhood of a KG node.
 #[derive(Parser, Debug)]
 pub struct QueryNeighbors {
-    /// Node ID (e.g., "change:abc123", "file:src/auth.rs", "intent:PIMO-1").
+    /// Canonical resource IRI, copied from query search or graph JSON.
     pub node_id: String,
 
     /// Traversal depth (1 or 2).
@@ -1177,7 +1292,12 @@ impl Command for QueryNeighbors {
                 } else {
                     format!("  {}", truncate_display(summary, 50))
                 };
-                println!("  [{}] {}{}", node.kind, node.id, summary_display);
+                println!(
+                    "  [{}] {}{}",
+                    compact(node.primary_type()),
+                    node.id,
+                    summary_display
+                );
             }
             println!("\nEdges ({}):", subgraph.edges.len());
             for edge in &subgraph.edges {
@@ -1199,10 +1319,7 @@ impl Command for QueryNeighbors {
 /// Find all functions that call a given entity node.
 #[derive(Parser, Debug)]
 pub struct QueryCallers {
-    /// Full entity node ID, e.g. `entity:src/auth.rs:verify:42`.
-    ///
-    /// Use `atomic vault query entities <file>` to list entity IDs for a file,
-    /// then pass one here.
+    /// Symbol selector: `<path>#<name>` or a bare symbol name.
     pub entity_id: String,
 
     /// Output as JSON.
@@ -1220,70 +1337,42 @@ impl Command for QueryCallers {
         let root = find_repository_root()?;
         let repo = Repository::open(&root).map_err(CliError::Repository)?;
 
-        let subgraph = repo
-            .vault_kg_neighbors(&self.entity_id, 1)
+        let callers = repo
+            .query_callers(&self.entity_id)
             .map_err(CliError::Repository)?;
-
-        // Incoming CALLS edges: from_id is the caller, to_id is our entity.
-        let caller_edges: Vec<&KgEdge> = subgraph
-            .edges
-            .iter()
-            .filter(|e| e.kind.to_uppercase() == "CALLS" && e.to_id == self.entity_id)
-            .collect();
-
-        if self.json {
-            let out: Vec<serde_json::Value> = caller_edges
-                .iter()
-                .map(|e| {
-                    let node = subgraph.nodes.iter().find(|n| n.id == e.from_id);
-                    serde_json::json!({
-                        "caller_id": e.from_id,
-                        "summary": node.and_then(|n| n.summary.as_deref()),
-                    })
-                })
-                .collect();
-            println!("{}", serde_json::to_string_pretty(&out).unwrap());
-            return Ok(());
-        }
-
-        if caller_edges.is_empty() {
-            println!("No callers found for '{}'.", self.entity_id);
-            // Distinguish "no callers" from "CALLS edges not yet enriched"
-            let has_any_calls = subgraph
-                .edges
-                .iter()
-                .any(|e| e.kind.to_uppercase() == "CALLS");
-            if !has_any_calls {
-                println!(
-                    "Hint: run `atomic vault query enrich` to populate CALLS edges, \
-                    then retry."
-                );
-            } else {
-                println!("This function is an entry point — nothing in the repo calls it.");
-            }
-        } else {
-            println!("{} caller(s) of {}:\n", caller_edges.len(), self.entity_id);
-            for edge in &caller_edges {
-                // Parse entity:{file}:{name}:{line} for a readable display
-                let display = if let Some(rest) = edge.from_id.strip_prefix("entity:") {
-                    let last = rest.rfind(':').unwrap_or(rest.len());
-                    let inner = &rest[..last]; // {file}:{name}
-                    let sig = subgraph
-                        .nodes
-                        .iter()
-                        .find(|n| n.id == edge.from_id)
-                        .and_then(|n| n.summary.as_deref())
-                        .map(|s| format!("  [{}]", s.lines().next().unwrap_or(s)));
-                    format!("  {}{}", inner, sig.unwrap_or_default())
-                } else {
-                    format!("  {}", edge.from_id)
-                };
-                println!("{display}");
-            }
-        }
-
-        Ok(())
+        render_callers(&self.entity_id, &callers, self.json)
     }
+}
+
+pub(crate) fn render_callers(
+    target: &str,
+    callers: &[atomic_repository::repository::Caller],
+    json: bool,
+) -> CliResult<()> {
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(callers).map_err(|e| CliError::Internal(e.into()))?
+        );
+    } else if callers.is_empty() {
+        println!("No callers found for '{target}'.");
+    } else {
+        println!("{} caller(s) of {target}:\n", callers.len());
+        for caller in callers {
+            println!(
+                "  {}#{}:{}{}",
+                caller.path,
+                caller.name,
+                caller.line,
+                caller
+                    .summary
+                    .as_ref()
+                    .map(|summary| format!("  [{summary}]"))
+                    .unwrap_or_default()
+            );
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1590,7 +1679,7 @@ mod enrich_tests {
             )
             .unwrap();
         let full_hash = outcome.hash().to_base32();
-        let node_id = format!("change:{}", &full_hash[..12]);
+        let node_id = atomic_core::kg::iri::mint_change(outcome.hash());
         assert!(repo.vault_kg_node(&node_id).unwrap().is_none());
         drop(repo);
 
@@ -1639,14 +1728,10 @@ impl Command for QueryEnrich {
             return Ok(());
         }
 
-        // Clean rebuild: drop stale VCS/AST-derived nodes so files that became
-        // ignored or were deleted don't linger. Vault/session nodes are kept.
+        // Shared file/view resources also carry vault/session relationships;
+        // regenerate the whole read model rather than cascade-delete those joins.
         if self.rebuild {
-            let spinner = create_spinner("Clearing stale KG entries...");
-            match repo.kg_clear_derived() {
-                Ok(n) => finish_success(&spinner, &format!("{} stale node(s) removed", n)),
-                Err(e) => finish_error(&spinner, &format!("clear failed: {}", e)),
-            }
+            repo.rebuild_kg(true).map_err(CliError::Repository)?;
         }
 
         let mut total = atomic_repository::KgEnrichStats::default();
@@ -1671,16 +1756,6 @@ impl Command for QueryEnrich {
             Err(e) => finish_error(&spinner, &format!("files failed: {}", e)),
         }
 
-        // Phase 3: Modules + PART_OF edges
-        let spinner = create_spinner("Enriching modules...");
-        match repo.kg_enrich_modules(working_copy) {
-            Ok(n) => {
-                total.modules = n;
-                finish_success(&spinner, &format!("{} module(s)", n));
-            }
-            Err(e) => finish_error(&spinner, &format!("modules failed: {}", e)),
-        }
-
         // Phase 4: Changes
         let spinner = create_spinner("Enriching changes...");
         match repo.kg_enrich_changes(working_copy) {
@@ -1689,36 +1764,6 @@ impl Command for QueryEnrich {
                 finish_success(&spinner, &format!("{} change(s)", n));
             }
             Err(e) => finish_error(&spinner, &format!("changes failed: {}", e)),
-        }
-
-        // Phase 5: AST entities
-        let spinner = create_spinner("Extracting entities (tree-sitter)...");
-        match repo.kg_enrich_entities(working_copy) {
-            Ok(n) => {
-                total.entities = n;
-                finish_success(&spinner, &format!("{} entit(ies)", n));
-            }
-            Err(e) => finish_error(&spinner, &format!("entities failed: {}", e)),
-        }
-
-        // Phase 6: INCLUDES edges
-        let spinner = create_spinner("Resolving includes...");
-        match repo.kg_enrich_includes(working_copy) {
-            Ok(n) => {
-                total.includes = n;
-                finish_success(&spinner, &format!("{} include(s)", n));
-            }
-            Err(e) => finish_error(&spinner, &format!("includes failed: {}", e)),
-        }
-
-        // Phase 7: CALLS edges (caller entity → callee entity)
-        let spinner = create_spinner("Resolving call sites...");
-        match repo.kg_enrich_calls(working_copy) {
-            Ok(n) => {
-                total.calls = n;
-                finish_success(&spinner, &format!("{} call(s)", n));
-            }
-            Err(e) => finish_error(&spinner, &format!("calls failed: {}", e)),
         }
 
         // Phase 8: Content search index (syntext)
@@ -1749,22 +1794,15 @@ impl Command for QueryEnrich {
 
 /// Rebuild the KG index from all vault entries.
 #[derive(Parser, Debug)]
-pub struct Reindex;
+pub struct Reindex {
+    /// Rebuild the complete workflow graph from canonical objects.
+    #[arg(long)]
+    pub full: bool,
+}
 
 impl Command for Reindex {
     fn run(&self) -> CliResult<()> {
-        // Route every form through the service layer (the handler runs
-        // the same vault_reindex_kg domain call).
-        if crate::commands::rpc::query_reindex()? {
-            return Ok(());
-        }
-        let root = find_repository_root()?;
-        let repo = Repository::open(&root).map_err(CliError::Repository)?;
-
-        let count = repo.vault_reindex_kg().map_err(CliError::Repository)?;
-        println!("Indexed {} nodes + edges.", count);
-
-        Ok(())
+        crate::commands::rpc::query_reindex(self.full)
     }
 }
 
@@ -1831,7 +1869,7 @@ impl Command for QueryEmbed {
 /// Use `--json` for machine-readable output.
 ///
 /// Example plan:
-/// {"steps":[{"type":"kg_search","query":"auth","limit":5,"bind":"results"}]}
+/// {"schema_version":1,"steps":[{"type":"kg_search","query":"auth","limit":5,"bind":"results"}]}
 #[derive(Parser, Debug)]
 pub struct PlanExec {
     /// Output as JSON.
@@ -1883,7 +1921,7 @@ impl Command for PlanExec {
             if !result.nodes.is_empty() {
                 println!("\nNodes ({}):", result.nodes.len());
                 for node in &result.nodes {
-                    print!("  [{}] {}", node.kind, node.label);
+                    print!("  [{}] {}", compact(node.primary_type()), node.label);
                     if let Some(ref s) = node.summary {
                         // Truncate safely for Unicode text.
                         let short: String = s.chars().take(60).collect();
@@ -1968,12 +2006,11 @@ Strategy:
 5. Answer concisely using what you found. Cite file paths and line numbers.
 
 The knowledge graph contains:
-- file nodes (file:path) — tracked files
-- entity nodes (entity:file:name:line) — functions, structs, classes from tree-sitter
-- change nodes (change:hash) — commit history with dates and messages
-- view nodes (view:name) — like branches
-- goal/intent/memory nodes — development sessions and work items
-- edges: MODIFIES, DEFINES, AUTHORED_BY, DEPENDS_ON, REFERENCES, ON_VIEW, etc.";
+- nodes with asserted class IRIs in https://atomic.dev/ns/workflow# (File, Change, View, WorkIntent, Goal, Memory)
+- project-qualified resource IRIs and global full-hash change IRIs; copy IDs from search results
+- predicates: atomic:modifiesFile, atomic:authoredBy, atomic:directlyDependsOnChange, atomic:references, atomic:directlyOnView, atomic:hasPlan, atomic:implements
+- views filter membership in one common graph; directlyOnView is own membership, not inherited visibility
+- source entities and callers are parsed live with list_entities/code_search, never stored in the workflow graph.";
 
 impl Command for QueryAsk {
     fn run(&self) -> CliResult<()> {
@@ -2052,6 +2089,90 @@ impl Command for QueryAsk {
 #[cfg(test)]
 mod tests {
     use super::truncate_display;
+
+    #[test]
+    fn html_palette_covers_every_workflow_class_with_unique_high_contrast_colors() {
+        use atomic_core::kg::ontology::Class;
+        fn luminance(hex: &str) -> f64 {
+            let channel = |offset| {
+                let value =
+                    f64::from(u8::from_str_radix(&hex[offset..offset + 2], 16).unwrap()) / 255.0;
+                if value <= 0.04045 {
+                    value / 12.92
+                } else {
+                    ((value + 0.055) / 1.055).powf(2.4)
+                }
+            };
+            0.2126 * channel(1) + 0.7152 * channel(3) + 0.0722 * channel(5)
+        }
+        let colors: std::collections::HashSet<_> = Class::ALL
+            .iter()
+            .map(|class| super::html_node_color(class.iri()))
+            .collect();
+        assert_eq!(
+            colors.len(),
+            Class::ALL.len(),
+            "known types must not share colors"
+        );
+        let background = luminance("#1a1a2e");
+        for color in colors {
+            assert!(color.starts_with('#') && color.len() == 7);
+            assert!(
+                (luminance(&color) + 0.05) / (background + 0.05) >= 4.5,
+                "low contrast: {color}"
+            );
+        }
+    }
+
+    #[test]
+    fn html_external_type_colors_are_stable_and_not_the_old_gray_fallback() {
+        let first = super::html_node_color("https://example.test/TypeA");
+        assert_eq!(first, super::html_node_color("https://example.test/TypeA"));
+        assert!(first.starts_with("hsl("));
+        assert_ne!(first, super::html_node_color("https://example.test/TypeB"));
+    }
+
+    #[test]
+    fn html_inspector_embeds_full_snapshot_data_without_script_injection() {
+        use atomic_core::{
+            kg::ontology::{Class, Predicate},
+            KgEdge, KgNode,
+        };
+        let hostile = "</script><script>alert('metadata')</script>";
+        let mut node = KgNode::new("urn:node:first", Class::Change, hostile, "vcs");
+        node.summary = Some("full summary ".repeat(40));
+        node.metadata =
+            Some(serde_json::json!({"hash":"FULL_HASH", "nested":{"evidence":hostile}}));
+        let neighbor = KgNode::new("urn:node:second", Class::File, "src/cli.ts", "vcs");
+        let mut edge = KgEdge::new(&node.id, &neighbor.id, Predicate::ModifiesFile);
+        edge.metadata = Some(serde_json::json!({"evidence":hostile}));
+        let html = super::emit_html(
+            "Inspect <metadata>",
+            &[node.clone(), neighbor],
+            &[edge.clone()],
+        );
+        let json = html
+            .split("var graphData = ")
+            .nth(1)
+            .unwrap()
+            .split(";\n")
+            .next()
+            .unwrap();
+        let data: serde_json::Value = serde_json::from_str(json).unwrap();
+        assert_eq!(data["nodes"][0]["metadata"], node.metadata.unwrap());
+        assert_eq!(data["nodes"][0]["summary"], node.summary.unwrap());
+        assert_eq!(data["nodes"][0]["source"], "vcs");
+        assert_eq!(
+            data["nodes"][0]["color"],
+            super::html_node_color(Class::Change.iri())
+        );
+        assert_eq!(data["links"][0]["metadata"], edge.metadata.unwrap());
+        assert!(!html.contains(hostile));
+        assert!(html.contains("\\u003c/script\\u003e"));
+        assert!(html.contains("aria-label=\"Node details\""));
+        assert!(html.contains("if (dragMoved) return;"));
+        assert!(html.contains("graphView.clientWidth"));
+    }
 
     #[test]
     fn test_truncate_display_short_ascii_unchanged() {

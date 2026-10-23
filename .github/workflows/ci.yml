@@ -73,6 +73,11 @@ jobs:
         shell: bash
         run: ATOMIC_BIN="$PWD/target/debug/atomic" bash tests/harness/run_all.sh 09
 
+      - name: Run knowledge graph closure harness
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        run: ATOMIC_BIN="$PWD/target/debug/atomic" bash tests/harness/46_knowledge_graph_closure.sh
+
   fmt:
     name: Format
     runs-on: ubuntu-latest
@@ -153,5 +158,10 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-msrv-
 
-      - name: cargo check (MSRV)
-        run: cargo check --workspace
+      - name: cargo check (shared library MSRV)
+        run: cargo check --workspace --exclude atomic-cli --exclude atomic-shacl --locked
+
+      - uses: dtolnay/rust-toolchain@1.98
+
+      - name: cargo check (CLI and SHACL MSRV)
+        run: cargo check -p atomic-cli -p atomic-shacl --locked

@@ -132,6 +132,21 @@ pub fn validate_intent(node: &CanonicalNode) -> ValidationReport {
     }
 
     // attributedTo must be present (sh:class prov:Agent deferred — see M0 notes).
+    for reference in &node.depends_on {
+        if reference.edge == "declaresImplementation"
+            && (!vocab::is_canonical_change_iri(&reference.to)
+                || reference
+                    .declaration_evidence
+                    .as_deref()
+                    .is_none_or(|value| value.trim().is_empty()))
+        {
+            out.push(Violation {
+                focus_node: focus.clone(), shape: "ImplementationDeclarationShape".into(),
+                path: Some("dependsOn".into()),
+                message: "implementation declarations require a canonical full-hash change IRI and nonempty declarationEvidence".into(),
+            });
+        }
+    }
     if node.attributed_to.as_deref().unwrap_or("").is_empty() {
         out.push(Violation {
             focus_node: focus.clone(),
@@ -521,6 +536,7 @@ mod tests {
     /// A `:::ref{edge=reviews}` targeting another intent.
     fn reviews_ref(target: &str) -> Ref {
         Ref {
+            declaration_evidence: None,
             type_: None,
             id: None,
             to: target.to_string(),

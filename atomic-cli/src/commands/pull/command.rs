@@ -960,19 +960,6 @@ impl Pull {
             }
         }
 
-        // Enrich the knowledge graph from pulled VCS data (views, files, changes).
-        // This runs for every pull that applies changes, not just vaulted repos.
-        if stats.changes_applied > 0 {
-            // Ensure KG tables exist (idempotent — no-op if already created)
-            if let Err(e) = repo.init_kg() {
-                log::warn!("KG table init failed: {}", e);
-            }
-            match repo.kg_enrich_from_vcs(working_copy) {
-                Ok(kg_stats) => log::info!("KG enriched after pull: {}", kg_stats),
-                Err(e) => log::warn!("KG enrichment after pull failed: {}", e),
-            }
-        }
-
         // Keep partial output, but return failure when any step failed.
         print_blank();
         if stats.has_failures() || !apply_errors.is_empty() || materialize_failed {

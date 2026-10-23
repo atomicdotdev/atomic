@@ -320,6 +320,7 @@ impl Repository {
             return crate::unrecord::preview_unrecord(&txn, &view, &[*hash], &options)
                 .map_err(|error| RepositoryError::Unrecord(error.to_string()));
         }
+        self.ensure_project_identity(atomic_core::kg::project_id::MintReason::Upgrade)?;
         let working_copy = self.require_working_copy_id()?;
         let operation_lock = self.try_lock_operation(working_copy)?;
         if let OperationHeadState::Diverged(heads) =
@@ -458,6 +459,10 @@ impl Repository {
         txn.update_view(&view)
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
         let affected_tree_paths = self.realign_tree_projection_in_txn(&mut txn, &view_name)?;
+
+        if txn.kg_writes_enabled()? {
+            self.project_view_kg(&mut txn)?;
+        }
 
         // Commit the transaction
         txn.commit()
@@ -666,6 +671,7 @@ impl Repository {
         hash: &Hash,
         at_sequence: Option<u64>,
     ) -> Result<(Merkle, u64), RepositoryError> {
+        self.ensure_project_identity(atomic_core::kg::project_id::MintReason::Upgrade)?;
         let change = self.load_change(hash)?;
 
         // Get write transaction
@@ -701,6 +707,9 @@ impl Repository {
         txn.update_view(&view)
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
         let affected_tree_paths = self.realign_tree_projection_in_txn(&mut txn, view_name)?;
+        if txn.kg_writes_enabled()? {
+            self.project_view_kg(&mut txn)?;
+        }
 
         // Commit the transaction
         txn.commit()

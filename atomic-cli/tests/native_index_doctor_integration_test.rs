@@ -123,7 +123,7 @@ fn doctor_check_does_not_recreate_a_missing_change_store() {
         assert_eq!(
             std::fs::read(&pristine).unwrap().len(),
             pristine_before.len(),
-            "doctor wrote to atomic.redb (length changed); byte-for-byte equality is
+            "{args:?} wrote to atomic.redb (length changed); byte-for-byte equality is
              intentionally not required because redb 4.2 rewrites its
              graceful-shutdown marker on every clean close"
         );
@@ -189,7 +189,7 @@ fn doctor_rejects_corrupt_current_view_without_repairing_dev() {
         assert_eq!(
             std::fs::read(&pristine).unwrap().len(),
             pristine_before.len(),
-            "doctor wrote to atomic.redb (length changed); byte-for-byte equality is
+            "{args:?} wrote to atomic.redb (length changed); byte-for-byte equality is
              intentionally not required because redb 4.2 rewrites its
              graceful-shutdown marker on every clean close"
         );
@@ -252,7 +252,7 @@ fn doctor_reports_missing_change_authority_as_unrepairable_without_writes() {
         assert_eq!(
             std::fs::read(&pristine_path).unwrap().len(),
             pristine_before.len(),
-            "doctor wrote to atomic.redb (length changed); byte-for-byte equality is
+            "{args:?} wrote to atomic.redb (length changed); byte-for-byte equality is
              intentionally not required because redb 4.2 rewrites its
              graceful-shutdown marker on every clean close"
         );
@@ -263,4 +263,66 @@ fn doctor_reports_missing_change_authority_as_unrepairable_without_writes() {
         assert!(!change_path.exists());
         assert!(preserved_change.is_file());
     }
+}
+
+#[test]
+fn doctor_repairs_missing_native_rows_through_rpc_and_repeated_repair_is_readonly() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo = Repository::init(temp.path()).unwrap();
+    let working_copy = repo.require_working_copy_id().unwrap();
+    std::fs::write(temp.path().join("f.txt"), b"preserved content\n").unwrap();
+    repo.add(working_copy, "f.txt", TrackingOptions::default())
+        .unwrap();
+    repo.record_all(working_copy, "repair fixture").unwrap();
+    let inode = repo.get_file_inode("f.txt").unwrap().unwrap();
+    let database = repo.pristine().shared_database().unwrap();
+    let transaction = database.begin_write().unwrap();
+    transaction
+        .open_table(atomic_core::pristine::REV_TREE)
+        .unwrap()
+        .remove(inode.get())
+        .unwrap();
+    transaction.commit().unwrap();
+    drop(database);
+    assert!(!repo.verify_native_derived_indexes().unwrap().is_healthy());
+    drop(repo);
+
+    let log = temp.path().join("requests.jsonl");
+    let repair = || {
+        Command::new(env!("CARGO_BIN_EXE_atomic"))
+            .current_dir(temp.path())
+            .env("ATOMIC_SERVICE", "local")
+            .env("ATOMIC_DAEMON_LOG_REQUESTS", &log)
+            .args(["doctor", "repair-native-indexes"])
+            .output()
+            .unwrap()
+    };
+    let output = repair();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("journaled as operation"));
+    assert!(std::fs::read_to_string(&log).unwrap().contains("Repair"));
+    assert!(Repository::open_readonly_for_native_repair(temp.path())
+        .unwrap()
+        .verify_native_derived_indexes()
+        .unwrap()
+        .is_healthy());
+    assert_eq!(
+        std::fs::read(temp.path().join("f.txt")).unwrap(),
+        b"preserved content\n"
+    );
+
+    let path = temp.path().join(".atomic/atomic.redb");
+    let before = blake3::hash(&std::fs::read(&path).unwrap());
+    let output = repair();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("already consistent"));
+    assert_eq!(blake3::hash(&std::fs::read(path).unwrap()), before);
 }

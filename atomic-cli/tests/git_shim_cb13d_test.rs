@@ -39,6 +39,8 @@ fn atomic(root: &Path, home: &Path, args: &[&str]) -> Output {
         .current_dir(root)
         .env("HOME", home)
         .env("ATOMIC_HOME", home.join(".atomic"))
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_AUTHOR_NAME", "CB-13D Tests")
         .env("GIT_AUTHOR_EMAIL", "cb13d@example.com")
         .env("GIT_COMMITTER_NAME", "CB-13D Tests")
@@ -80,6 +82,10 @@ fn git(root: &Path, args: &[&str]) -> Output {
     Command::new("git")
         .args(args)
         .current_dir(root)
+        // These fixtures compare commit OIDs. User/system signing and hooks
+        // configuration must not introduce signatures or mutate their commits.
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_AUTHOR_NAME", "CB-13D Tests")
         .env("GIT_AUTHOR_EMAIL", "cb13d@example.com")
         .env("GIT_COMMITTER_NAME", "CB-13D Tests")
@@ -281,6 +287,8 @@ impl WatchFixture {
                 "--detach",
                 linked_root.path().to_str().expect("utf8"),
             ])
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("GIT_AUTHOR_DATE", "@1726732800 +0000")
             .env("GIT_COMMITTER_DATE", "@1726732800 +0000")
             .output()

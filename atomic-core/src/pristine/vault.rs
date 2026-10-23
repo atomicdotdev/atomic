@@ -7,6 +7,31 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+pub(crate) fn rank_kg_hits(
+    txn: &impl crate::pristine::KgTxnT,
+    hits: HashMap<String, usize>,
+    limit: usize,
+) -> Result<Vec<KgNode>, crate::pristine::PristineError> {
+    let mut ranked = Vec::new();
+    for (id, hits) in hits {
+        if let Some(node) = txn.get_kg_node(&id)? {
+            let score = hits
+                * if node.has_type(crate::kg::ontology::Class::File) {
+                    2
+                } else {
+                    1
+                };
+            ranked.push((score, node));
+        }
+    }
+    ranked.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.id.cmp(&b.1.id)));
+    Ok(ranked
+        .into_iter()
+        .take(limit)
+        .map(|(_, node)| node)
+        .collect())
+}
+
 /// Type of vault entry.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -463,14 +488,14 @@ pub fn parse_intent_reference(
 pub struct KgNode {
     /// Structured identifier (e.g., `"change:{hash}"`, `"file:{path}"`).
     pub id: String,
-    /// Node category: `"change"`, `"file"`, `"entity"`, `"view"`, `"goal"`, `"intent"`, `"memory"`.
-    pub kind: String,
+    /// Asserted absolute class IRIs (also indexed in KG_TYPES).
+    pub types: Vec<String>,
     /// Human-readable label (short hash, filename, symbol name).
     pub label: String,
     /// Optional longer description (commit message, entity signature, etc.).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub summary: Option<String>,
-    /// Where this node was derived from (e.g., `"change_graph"`, `"ast_extraction"`, `"vault"`).
+    /// Where this node was derived from (e.g., `"vcs"`, `"session_ledger"`, `"vault"`).
     pub source: String,
     /// Arbitrary metadata as JSON.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -478,16 +503,35 @@ pub struct KgNode {
 }
 
 impl KgNode {
+    pub fn has_type(&self, class: crate::kg::ontology::Class) -> bool {
+        self.types.iter().any(|iri| iri == class.iri())
+    }
+
+    pub fn primary_type(&self) -> &str {
+        self.types.first().map(String::as_str).unwrap_or_default()
+    }
+
+    pub fn with_type(mut self, class: crate::kg::ontology::Class) -> Self {
+        if !self.has_type(class) {
+            self.types.push(class.iri().to_owned());
+            self.types.sort();
+        }
+        self
+    }
+
+    pub fn path(&self) -> Option<&str> {
+        self.metadata.as_ref()?.get("path")?.as_str()
+    }
     /// Create a new KG node.
     pub fn new(
         id: impl Into<String>,
-        kind: impl Into<String>,
+        class: crate::kg::ontology::Class,
         label: impl Into<String>,
         source: impl Into<String>,
     ) -> Self {
         Self {
             id: id.into(),
-            kind: kind.into(),
+            types: vec![class.iri().to_owned()],
             label: label.into(),
             summary: None,
             source: source.into(),
@@ -510,16 +554,16 @@ impl KgNode {
 
 /// A directed edge in the knowledge graph.
 ///
-/// Edges encode relationships: `MODIFIES`, `DEFINES`, `DEPENDS_ON`,
-/// `ON_VIEW`, `CHILD_OF`, `LINKED_INTENT`, etc.
+/// Only predicates from the canonical workflow ontology can be stored.
+/// Source-code relationships belong to the request-scoped syntax index.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KgEdge {
     /// Source node ID.
     pub from_id: String,
     /// Target node ID.
     pub to_id: String,
-    /// Relationship type (e.g., `"MODIFIES"`, `"DEFINES"`, `"DEPENDS_ON"`).
-    pub kind: String,
+    /// Canonical workflow relationship.
+    pub kind: crate::kg::ontology::Predicate,
     /// Optional edge metadata.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<serde_json::Value>,
@@ -529,12 +573,12 @@ impl KgEdge {
     pub fn new(
         from_id: impl Into<String>,
         to_id: impl Into<String>,
-        kind: impl Into<String>,
+        predicate: crate::kg::ontology::Predicate,
     ) -> Self {
         Self {
             from_id: from_id.into(),
             to_id: to_id.into(),
-            kind: kind.into(),
+            kind: predicate,
             metadata: None,
         }
     }
@@ -948,21 +992,30 @@ mod tests {
 
     #[test]
     fn kg_node_new_and_builder() {
-        let node = KgNode::new("change:abc123", "change", "abc123", "change_graph")
-            .with_summary("Fix auth bug")
-            .with_metadata(serde_json::json!({"view": "main"}));
+        let node = KgNode::new(
+            "change:abc123",
+            crate::kg::ontology::Class::Change,
+            "abc123",
+            "change_graph",
+        )
+        .with_summary("Fix auth bug")
+        .with_metadata(serde_json::json!({"view": "main"}));
         assert_eq!(node.id, "change:abc123");
-        assert_eq!(node.kind, "change");
+        assert!(node.has_type(crate::kg::ontology::Class::Change));
         assert_eq!(node.summary, Some("Fix auth bug".to_string()));
         assert!(node.metadata.is_some());
     }
 
     #[test]
     fn kg_edge_new() {
-        let edge = KgEdge::new("change:abc", "file:src/auth.rs", "MODIFIES");
+        let edge = KgEdge::new(
+            "change:abc",
+            "file:src/auth.rs",
+            crate::kg::ontology::Predicate::ModifiesFile,
+        );
         assert_eq!(edge.from_id, "change:abc");
         assert_eq!(edge.to_id, "file:src/auth.rs");
-        assert_eq!(edge.kind, "MODIFIES");
+        assert_eq!(edge.kind, crate::kg::ontology::Predicate::ModifiesFile);
         assert!(edge.metadata.is_none());
     }
 
@@ -974,7 +1027,12 @@ mod tests {
 
     #[test]
     fn kg_node_json_roundtrip() {
-        let node = KgNode::new("file:src/main.rs", "file", "src/main.rs", "change_graph");
+        let node = KgNode::new(
+            "file:src/main.rs",
+            crate::kg::ontology::Class::File,
+            "src/main.rs",
+            "change_graph",
+        );
         let json = serde_json::to_string(&node).unwrap();
         let decoded: KgNode = serde_json::from_str(&json).unwrap();
         assert_eq!(node, decoded);
@@ -982,7 +1040,7 @@ mod tests {
 
     #[test]
     fn kg_node_skips_none_fields() {
-        let node = KgNode::new("x", "y", "z", "w");
+        let node = KgNode::new("x", crate::kg::ontology::Class::Memory, "z", "w");
         let json = serde_json::to_string(&node).unwrap();
         assert!(!json.contains("summary"));
         assert!(!json.contains("metadata"));
