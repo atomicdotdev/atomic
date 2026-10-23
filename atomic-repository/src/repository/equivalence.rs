@@ -173,7 +173,7 @@ pub fn compare_project_to_worktree(
 
 /// [`compare_project_to_worktree`] with the Git index at hand: worktree
 /// paths the index does not track are not divergence (see
-/// [`drop_untracked_extras`]).
+/// `drop_untracked_extras`).
 pub fn compare_project_to_worktree_with_index(
     project: &ProjectTree,
     worktree: &WorktreeObservation,
@@ -228,7 +228,7 @@ pub fn compare_project_state(
 
 /// [`compare_project_state`] for the shim's verify, reconcile and
 /// publication gates, where a worktree path Git does not track is not
-/// state either side publishes (see [`drop_untracked_extras`]).
+/// state either side publishes (see `drop_untracked_extras`).
 pub fn compare_project_state_tolerating_untracked(
     project: &ProjectTree,
     index: &GitIndexState,
