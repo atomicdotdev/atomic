@@ -81,12 +81,13 @@ use atomic_core::types::{
     Base32, ChangePosition, EdgeFlags, GraphNode, Hash as ContentHash, Merkle, Position, SetId,
 };
 use atomic_repository::{
-    compare_project_state, git_resolution_metadata, git_synthesis_metadata,
-    graph_visibility_closure, observe_git_index, observe_worktree, verify_prospective_equivalence,
-    ContentFilter, ConversionPolicy, EquivalenceClaims, EquivalenceReport, ExclusionPolicy,
-    GitAttributesFilter, GitResolutionOrigin, GitSynthesisOrigin, LossNote, ManifestDisposition,
-    MoveBasis, MoveEvidence, PlatformCapabilities, ProbableMove, ProjectTree, RenameCandidate,
-    RepoPath, Repository, RepositoryEntry, RepositoryManifest, VerifiedProspectiveEquivalence,
+    compare_project_state, compare_project_state_tolerating_untracked, git_resolution_metadata,
+    git_synthesis_metadata, graph_visibility_closure, observe_git_index, observe_worktree,
+    verify_prospective_equivalence, ContentFilter, ConversionPolicy, EquivalenceClaims,
+    EquivalenceReport, ExclusionPolicy, GitAttributesFilter, GitResolutionOrigin,
+    GitSynthesisOrigin, LossNote, ManifestDisposition, MoveBasis, MoveEvidence,
+    PlatformCapabilities, ProbableMove, ProjectTree, RenameCandidate, RepoPath, Repository,
+    RepositoryEntry, RepositoryManifest, VerifiedProspectiveEquivalence,
 };
 
 use crate::error::{CliError, CliResult};
@@ -2037,7 +2038,8 @@ pub(crate) fn verify_complete_equivalence(
         git_tree_root: Some(git_object_id(policy.object_format, tree.id())?),
         ..EquivalenceClaims::default()
     };
-    let report = compare_project_state(&project, &index, &observed, &policy, &claims);
+    let report =
+        compare_project_state_tolerating_untracked(&project, &index, &observed, &policy, &claims);
     if report.is_equivalent() {
         Ok(())
     } else {
@@ -5897,7 +5899,7 @@ impl ParallelImporter {
                 // The exact assembly view bytes (excluded lineages invisible,
                 // storage errors propagated — fail closed, never swallowed).
                 let view_baseline: Option<Vec<u8>> = repo
-                    .get_file_content_on_view_excluding(&file.path, &target, &excluded)
+                    .get_file_content_on_view_excluding(&*repository_path(&file.path), &target, &excluded)
                     .map_err(|e| {
                         CliError::Internal(anyhow::anyhow!(
                             "cannot read exact baseline for '{}': {e}",
@@ -7190,7 +7192,11 @@ impl ParallelImporter {
                 continue;
             }
             let union_bytes = repo
-                .get_file_content_on_view_excluding(&file.path, &target, &excluded)
+                .get_file_content_on_view_excluding(
+                    &*repository_path(&file.path),
+                    &target,
+                    &excluded,
+                )
                 .map_err(|e| {
                     CliError::Internal(anyhow::anyhow!(
                         "cannot read exact union baseline for '{}': {e}",
