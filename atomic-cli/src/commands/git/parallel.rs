@@ -6436,7 +6436,6 @@ impl ParallelImporter {
                             &repository_path(&file.path),
                             &old_content,
                             new_content,
-                            conflicted || (!self.options.mainline_only && new_content.is_empty()),
                             // A truncation to an empty file retains the
                             // file's identity through a content-only
                             // replacement on every import path: a
@@ -6444,6 +6443,7 @@ impl ParallelImporter {
                             // and fails the staged tree check ("staged tree
                             // is missing '<path>'") on the mainline walk
                             // exactly as it did on the full-history one.
+                            conflicted || new_content.is_empty(),
                             &target,
                             &excluded,
                         )
