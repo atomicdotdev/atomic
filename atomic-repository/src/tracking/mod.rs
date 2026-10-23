@@ -74,6 +74,16 @@
 //! - Stores content in the graph
 //! - Creates a change that can be applied
 //!
+//! # Who Owns a Name Binding
+//!
+//! [`TrackedPathState`] splits tracked paths by who wrote their state, and
+//! [`Repository::remove`](crate::Repository::remove) honors that split: it
+//! deletes only a staged path's `TREE`/`REV_TREE` rows, and reports a recorded
+//! path in `TrackingStats::pending_deletions` without touching any table.
+//! Untracking a recorded path is a change (`GraphOp::FileDel` plus its dead
+//! claim event), which is what `atomic remove` mirrors from `git rm` by deleting
+//! the path from the working copy for `atomic record` to pick up.
+//!
 //! # Ignore Patterns
 //!
 //! The tracking system respects `.atomicignore` patterns. See [`crate::ignore`]
@@ -100,7 +110,7 @@
 //!     println!("File is tracked");
 //! }
 //!
-//! // Remove from tracking (does not delete the file)
+//! // Remove a staged (never recorded) file from tracking; the file stays on disk
 //! repo.remove("old_file.txt")?;
 //!
 //! // Move/rename a tracked file
@@ -208,6 +218,47 @@ pub enum TrackingError {
         /// The file path
         path: String,
     },
+
+    /// The path has recorded content, so its name binding belongs to a change
+    /// rather than to tracking. Untracking it requires recording a delete.
+    #[error(
+        "'{path}' has recorded content; untracking a recorded path requires a \
+         recorded delete, not a tracking edit"
+    )]
+    RecordedPathNotUntrackable {
+        /// The path whose content is recorded
+        path: String,
+    },
+}
+
+// Tracked Path State
+
+/// Which part of the repository owns a tracked path's state.
+///
+/// A path appears in `TREE` either way, but how it got there differs, and so
+/// does what untracking it correctly means:
+///
+/// | State | Written by | Rows that exist | Untracking means |
+/// |---|---|---|---|
+/// | [`Staged`](TrackedPathState::Staged) | `add` | `TREE`, `REV_TREE` (+ `DIRECTORIES`) | delete those rows |
+/// | [`Recorded`](TrackedPathState::Recorded) | `record` | the above, plus `INODES`, `REV_INODES`, `PATH_CLAIMS`, and the graph edges | record a delete |
+///
+/// `PATH_CLAIMS` is the authority for a name and is re-derived from recorded
+/// changes by `atomic doctor repair-native-indexes` and by the path-claim
+/// migration, so deleting the derived `INODES`/`REV_INODES` binding of a
+/// recorded path is not a durable untrack. It is worse than a no-op: every name
+/// projection that still sees the recorded change's claim fails to resolve its
+/// claimant (`path claim '<path>' has no inode for graph position <pos>`),
+/// which wedges `status`, `record`, `switch`, and materialize until a repair
+/// rebuilds the wiped rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrackedPathState {
+    /// Tracked by `add` and never recorded: the binding belongs to tracking.
+    Staged,
+
+    /// `record` bound the inode to a graph position and claimed the name, so
+    /// the binding and the claim are change-derived and not tracking's to edit.
+    Recorded,
 }
 
 // TrackingStats
@@ -238,6 +289,17 @@ pub struct TrackingStats {
 
     /// Paths that were skipped with reasons.
     pub skipped_paths: Vec<(PathBuf, String)>,
+
+    /// Tracked paths whose content is recorded, so `remove` could not untrack
+    /// them by editing tracking state.
+    ///
+    /// Their name binding is owned by a change: `PATH_CLAIMS` still claims the
+    /// path for that change, and `INODES`/`REV_INODES` are derived from it. The
+    /// correct way to stop tracking such a path is to remove it from the working
+    /// copy and record the deletion, which appends the `GraphOp::FileDel` and the
+    /// matching dead claim event. Callers that mirror `git rm` delete these paths
+    /// from disk and leave the deletion pending; nothing here was mutated.
+    pub pending_deletions: Vec<PathBuf>,
 }
 
 impl TrackingStats {
@@ -265,6 +327,16 @@ impl TrackingStats {
     pub fn skip(&mut self, path: PathBuf, reason: &str) {
         self.skipped += 1;
         self.skipped_paths.push((path, reason.to_string()));
+    }
+
+    /// Whether any recorded path was left for the caller to delete and record.
+    pub fn has_pending_deletions(&self) -> bool {
+        !self.pending_deletions.is_empty()
+    }
+
+    /// Record a path whose untracking was deferred to a recorded delete.
+    pub fn defer_deletion(&mut self, path: PathBuf) {
+        self.pending_deletions.push(path);
     }
 }
 

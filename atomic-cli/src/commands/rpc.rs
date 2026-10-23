@@ -2838,13 +2838,61 @@ pub fn remove(args: &super::remove::Remove) -> CliResult<bool> {
         keep_working_copy: !args.delete || args.keep,
         dry_run: args.dry_run,
         force: args.force,
+        untrack_only: args.keep,
     };
     let response = session.remove_files(request)?;
+    let untrack_only = response
+        .refusals
+        .iter()
+        .filter(|refusal| refusal.reason == "untrack-only")
+        .map(|refusal| refusal.path.clone())
+        .collect::<Vec<_>>();
+    let dirty = response
+        .refusals
+        .iter()
+        .filter(|refusal| refusal.reason == "uncommitted-edits")
+        .map(|refusal| refusal.path.clone())
+        .collect::<Vec<_>>();
+
     if args.dry_run {
-        println!("Would remove {} file(s) from tracking", response.removed);
+        println!(
+            "Would remove {} file(s) from tracking",
+            response.removed as usize + response.pending_deletions.len()
+        );
+        for pending in &response.pending_deletions {
+            println!("Would delete recorded path: {pending} (then 'atomic record' it)");
+        }
+        for path in &untrack_only {
+            println!("Would refuse {path}: a recorded path needs a recorded delete");
+        }
+        for path in &dirty {
+            println!("Would refuse {path}: it has uncommitted edits (--force to discard)");
+        }
         return Ok(true);
     }
-    println!("Removed {} file(s) from tracking", response.removed);
+
+    if response.removed > 0 {
+        println!("Untracked {} file(s)", response.removed);
+    }
+    if !response.pending_deletions.is_empty() {
+        println!(
+            "Removed {} recorded file(s) from the working copy",
+            response.pending_deletions.len()
+        );
+        println!();
+        println!("Hint: Run 'atomic record' to record these deletions and stop tracking them");
+    }
+    if response.removed == 0 && response.pending_deletions.is_empty() && untrack_only.is_empty() {
+        println!("Nothing to remove");
+    }
+    if !untrack_only.is_empty() {
+        super::remove::print_keep_guidance(&untrack_only);
+    }
+    if !untrack_only.is_empty() || !dirty.is_empty() {
+        return Err(CliError::InvalidArgument {
+            message: super::remove::refusal_message(&untrack_only, &dirty),
+        });
+    }
     Ok(true)
 }
 

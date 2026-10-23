@@ -46,13 +46,32 @@ message RemoveFilesRequest {
   RepositoryRef repository = 1;
   RequestMeta meta = 2;
   repeated string paths = 3;
-  bool keep_working_copy = 4;        // `--keep`
+  bool keep_working_copy = 4;        // `--delete` was not given: do not delete
+                                     // paths that tracking untracks outright
   bool dry_run = 5;                  // report what would be untracked; no mutation
   bool force = 6;                    // remove even with uncommitted edits
+  // `--keep`: never touch the working copy. A recorded path cannot be untracked
+  // this way - its name binding belongs to its change - so the handler refuses
+  // those paths instead of reporting a successful no-op.
+  bool untrack_only = 7;
 }
 message RemoveFilesResponse {
   uint32 removed = 1;
+  // Recorded paths the handler deleted from the working copy (or, for a dry run,
+  // would delete). Each still needs a recorded delete to stop being tracked.
+  repeated string pending_deletions = 2;
+  // Paths the handler will not act on, whether this is a preview or a mutation:
+  // a preview never fails, and a mutation reports every refusal at once.
+  repeated RemovalRefusal refusals = 3;
   ResponseMeta meta = 100;
+}
+
+/// One path a removal refused, with why.
+message RemovalRefusal {
+  string path = 1;
+  // "untrack-only": a recorded path cannot be untracked while kept on disk.
+  // "uncommitted-edits": deleting it would discard edits, so --force is needed.
+  string reason = 2;
 }
 
 message MoveFileRequest {

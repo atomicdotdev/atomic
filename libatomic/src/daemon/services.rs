@@ -1569,7 +1569,11 @@ impl repository_mutation_service_server::RepositoryMutationService for MutationI
             .state
             .resolve(request.repository.as_ref().unwrap_or(&default_ref()))?;
         self.state.log_rpc("RemoveFiles", Some(&handle));
+        // `keep_working_copy` guards the paths tracking untracks outright
+        // (`--delete`); `untrack_only` is `--keep`, which cannot carry a recorded
+        // path's untrack at all. The daemon mirrors the CLI's `git rm` matrix.
         let keep = request.keep_working_copy;
+        let untrack_only = request.untrack_only;
         let gate_handle = handle.clone();
         let _gate = gate_handle.exclusive().await;
         let result = tokio::task::spawn_blocking(move || -> Result<RemoveFilesResponse, Status> {
@@ -1584,8 +1588,12 @@ impl repository_mutation_service_server::RepositoryMutationService for MutationI
                 dry_run: request.dry_run,
                 ..TrackingOptions::default()
             };
-            let mut removed: u32 = 0;
-            let mut to_delete: Vec<std::path::PathBuf> = Vec::new();
+            // Validate every path before applying any of it, as `git rm` does: a
+            // refusal must never leave the other paths half-untracked. The plan
+            // is the same classification a mutation applies, so a preview reports
+            // exactly what the command would do.
+            let mut refusals: Vec<RemovalRefusal> = Vec::new();
+            let mut plan: Vec<(String, usize, Vec<std::path::PathBuf>)> = Vec::new();
             for path in &request.paths {
                 // Normalize exactly like the CLI: absolute paths must be
                 // inside the repository root and are made relative.
@@ -1602,26 +1610,97 @@ impl repository_mutation_service_server::RepositoryMutationService for MutationI
                 } else {
                     path.clone()
                 };
+                let preview = TrackingOptions {
+                    dry_run: true,
+                    ..options.clone()
+                };
                 let stats = repo
-                    .remove(working_copy, &normalized, options.clone())
+                    .remove(working_copy, &normalized, preview)
+                    .map_err(repository_error)?;
+
+                let mut pending: Vec<std::path::PathBuf> = Vec::new();
+                for candidate in stats.pending_deletions {
+                    if untrack_only {
+                        // A recorded path cannot be untracked while it is kept on
+                        // disk. Refuse it rather than wipe its binding.
+                        refusals.push(RemovalRefusal {
+                            path: candidate.to_string_lossy().to_string(),
+                            reason: "untrack-only".to_string(),
+                        });
+                        continue;
+                    }
+                    let absolute = handle.root.join(&candidate);
+                    if absolute.exists()
+                        && !request.force
+                        // Fail closed when status cannot be computed, as the CLI does.
+                        && repo
+                            .has_uncommitted_edits(working_copy, &candidate)
+                            .unwrap_or(true)
+                    {
+                        refusals.push(RemovalRefusal {
+                            path: candidate.to_string_lossy().to_string(),
+                            reason: "uncommitted-edits".to_string(),
+                        });
+                        continue;
+                    }
+                    pending.push(candidate);
+                }
+                plan.push((normalized, stats.files_removed, pending));
+            }
+
+            // A preview reports and applies nothing. A mutation with any refusal
+            // also applies nothing, so the caller can fix the request and rerun.
+            if request.dry_run || !refusals.is_empty() {
+                let pending_deletions = if request.dry_run {
+                    plan.iter()
+                        .flat_map(|(_, _, pending)| pending.iter())
+                        .map(|path| path.to_string_lossy().to_string())
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                return Ok(RemoveFilesResponse {
+                    removed: if request.dry_run {
+                        plan.iter().map(|(_, removed, _)| *removed).sum::<usize>() as u32
+                    } else {
+                        0
+                    },
+                    pending_deletions,
+                    refusals,
+                    meta: None,
+                });
+            }
+
+            let mut removed: u32 = 0;
+            let mut pending_deletions: Vec<String> = Vec::new();
+            let mut to_delete: Vec<std::path::PathBuf> = Vec::new();
+            for (normalized, _planned_removed, pending) in &plan {
+                let stats = repo
+                    .remove(working_copy, normalized, options.clone())
                     .map_err(repository_error)?;
                 removed += stats.files_removed as u32;
-                if !keep {
-                    to_delete.push(handle.root.join(&normalized));
+                if stats.files_removed > 0 && !keep {
+                    to_delete.push(handle.root.join(normalized));
+                }
+                for path in pending {
+                    // An already-absent path is simply pending its recorded delete.
+                    pending_deletions.push(path.to_string_lossy().to_string());
+                    to_delete.push(path.clone());
                 }
             }
             // The CLI deletes from disk only after every tracking removal
-            // succeeded; the daemon mirrors that ordering. A dry run
-            // reports the untrack counts without touching disk.
-            if !request.dry_run {
-                for path in to_delete {
-                    if path.is_file() {
-                        let _ = std::fs::remove_file(&path);
-                    }
+            // succeeded; the daemon mirrors that ordering.
+            for path in to_delete {
+                if path.is_file() {
+                    let _ = std::fs::remove_file(&path);
+                } else if path.is_dir() {
+                    let _ = std::fs::remove_dir(&path);
                 }
             }
             Ok(RemoveFilesResponse {
                 removed,
+                pending_deletions,
+                refusals,
                 meta: None,
             })
         })

@@ -5,7 +5,7 @@ fn removal_candidates<T: TreeTxnT>(
     txn: &T,
     path: &Path,
     options: &TrackingOptions,
-) -> Result<Vec<(String, Inode)>, RepositoryError> {
+) -> Result<Vec<(String, Inode, TrackedPathState)>, RepositoryError> {
     let normalized = normalize_path(path);
     let files = if options.recursive {
         tracked_under_prefix(txn, &normalized)
@@ -21,7 +21,14 @@ fn removal_candidates<T: TreeTxnT>(
             path: path.to_path_buf(),
         });
     }
-    Ok(files)
+    files
+        .into_iter()
+        .map(|(candidate, inode)| {
+            tracked_path_state(txn, inode)
+                .map(|state| (candidate, inode, state))
+                .map_err(|e| RepositoryError::Database(e.to_string()))
+        })
+        .collect()
 }
 
 impl Repository {
@@ -259,6 +266,14 @@ impl Repository {
             if let Some(inode) = crate::tracking::get_inode(&txn, &normalized)
                 .map_err(|e| RepositoryError::Database(e.to_string()))?
             {
+                // Recorded bindings belong to their change (see `remove`); plan
+                // only the staged ones so the batch never orphans a live claim.
+                if tracked_path_state(&txn, inode)
+                    .map_err(|e| RepositoryError::Database(e.to_string()))?
+                    == TrackedPathState::Recorded
+                {
+                    continue;
+                }
                 operations.push(TreeProjectionOperation::Delete {
                     inode,
                     retire: true,
@@ -407,8 +422,20 @@ impl Repository {
 
     /// Remove a file or directory from tracking.
     ///
-    /// This removes the file from version control tracking. It does NOT
-    /// delete the file from disk.
+    /// Only a **staged** path — one `add` tracked but `record` never recorded —
+    /// is untracked here, by deleting the `TREE`/`REV_TREE` rows `add` created.
+    /// Nothing is deleted from disk; that is the caller's decision.
+    ///
+    /// A **recorded** path cannot be untracked this way. Its name is durable in
+    /// `PATH_CLAIMS` and its `INODES`/`REV_INODES` binding is derived from the
+    /// change that recorded it, so wiping the binding would leave the surviving
+    /// claim unresolvable and every later projection (`status`, `record`,
+    /// `switch`, materialize) would fail with `path claim '<path>' has no inode
+    /// for graph position <pos>` until `atomic doctor repair-native-indexes`
+    /// rebuilt the rows. Such paths are reported untouched in
+    /// [`TrackingStats::pending_deletions`]; removing them from the working copy
+    /// and recording the delete is what actually stops tracking them, which is
+    /// what `atomic remove` does for them, mirroring `git rm`.
     ///
     /// # Arguments
     ///
@@ -419,11 +446,14 @@ impl Repository {
     /// # Example
     ///
     /// ```rust,ignore
-    /// // Remove a single file
-    /// repo.remove(working_copy, "old_file.txt", TrackingOptions::default())?;
+    /// // Untrack a single staged file
+    /// let stats = repo.remove(working_copy, "old_file.txt", TrackingOptions::default())?;
+    /// assert_eq!(stats.files_removed, 1);
     ///
-    /// // Remove a directory recursively
-    /// repo.remove(working_copy, "old_dir/", TrackingOptions::default())?;
+    /// // A recorded path is deferred, not untracked
+    /// let stats = repo.remove(working_copy, "Cargo.lock", TrackingOptions::default())?;
+    /// assert_eq!(stats.files_removed, 0);
+    /// assert!(stats.has_pending_deletions());
     /// ```
     pub fn remove<P: AsRef<Path>>(
         &self,
@@ -439,7 +469,16 @@ impl Repository {
                 .pristine
                 .read_txn()
                 .map_err(|e| RepositoryError::Database(e.to_string()))?;
-            stats.files_removed = removal_candidates(&txn, path, &options)?.len();
+            // Preview reports the same split the mutation applies, so a dry run
+            // never promises an untrack that the recorder owns.
+            for (file_path, _inode, state) in removal_candidates(&txn, path, &options)? {
+                match state {
+                    TrackedPathState::Staged => stats.files_removed += 1,
+                    TrackedPathState::Recorded => {
+                        stats.defer_deletion(PathBuf::from(file_path));
+                    }
+                }
+            }
             return Ok(stats);
         }
         let mut txn = self
@@ -448,10 +487,17 @@ impl Repository {
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
         let to_remove = removal_candidates(&txn, path, &options)?;
 
-        for (file_path, _inode) in to_remove {
-            remove_from_tree(&mut txn, &file_path)
-                .map_err(|e| RepositoryError::Database(e.to_string()))?;
-            stats.files_removed += 1;
+        for (file_path, _inode, state) in to_remove {
+            match state {
+                TrackedPathState::Staged => {
+                    untrack_staged_path(&mut txn, &file_path)
+                        .map_err(|e| RepositoryError::Database(e.to_string()))?;
+                    stats.files_removed += 1;
+                }
+                TrackedPathState::Recorded => {
+                    stats.defer_deletion(PathBuf::from(file_path));
+                }
+            }
         }
 
         txn.commit()
