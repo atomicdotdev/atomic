@@ -1,25 +1,11 @@
 //! `atomic provenance` — project & sign W3C PROV over captured provenance.
 //!
-//! A top-level command (a sibling of `atomic intent` / `atomic memory`) that
-//! PROJECTS the per-turn `ProvenanceGraph` atomic already captures into a signed
-//! W3C PROV JSON-LD named subgraph. This is a PROJECTION, not new capture: the
-//! agent's capture path is never touched.
-//!
-//! # Verbs
-//!
-//! ```text
-//! atomic provenance trace <CHANGE>   Walk the flywheel chain for a change
-//! atomic provenance show  <CHANGE>   Emit the signed PROV JSON-LD @graph
-//! ```
-//!
-//! # Compute-on-demand — writes nothing
-//!
-//! Both verbs only READ (`find_provenance_for_change` + disk-scan fallback +
-//! `load_provenance_graph`) and project+sign in memory. No new `VaultEntryType`,
-//! no stored entry, no sidecar, no `save_provenance_graph`, no `content_hash` /
-//! manifest-merkle change. The person's real `did:atomic` signs the projection;
-//! the `SoftwareAgent` is a NON-VERIFIABLE descriptive label
-//! (`urn:atomic:agent:<slug>`, never a DID).
+//! A read-only projection of captured provenance, unsigned by default. `--sign`
+//! adds a native Data Integrity proof. With the optional `dsse-export` feature,
+//! `--dsse` signs a portable export container and `verify-dsse` consumes it using
+//! a caller-pinned exporter key. Neither signature establishes the truth of the
+//! graph's claims or verifies referenced primaries.
+//! No repository objects, sidecars or capture records are written.
 
 use clap::{Parser, Subcommand};
 
@@ -28,6 +14,8 @@ use crate::error::CliResult;
 
 pub mod command;
 pub mod mapping;
+#[cfg(feature = "dsse-export")]
+mod verify_dsse;
 
 pub use command::{ProvenanceShow, ProvenanceTrace};
 
@@ -39,8 +27,8 @@ pub enum ProvenanceCommands {
     /// Loads the change's per-turn provenance graph, projects it, and prints the
     /// chain: the activity that generated the change, what it generated, the
     /// agent label and person, and the parent turn (walking `previous`). No
-    /// identity is required for the plain chain; `--json` emits the signed
-    /// PROV JSON-LD `@graph` (identical to `show --json`).
+    /// identity is required for the plain chain; `--json` emits unsigned
+    /// PROV JSON-LD (identical to `show`). Add `--sign` for a native proof.
     ///
     /// # Examples
     ///
@@ -51,28 +39,22 @@ pub enum ProvenanceCommands {
     /// ```
     Trace(ProvenanceTrace),
 
-    /// Emit the signed W3C PROV JSON-LD named subgraph for a change.
+    /// Emit W3C PROV JSON-LD for a change, unsigned unless `--sign` is supplied.
     ///
-    /// Projects the change's provenance graph and signs it on the fly with the
-    /// person's identity — the verifiable artifact you hand an auditor. It
-    /// carries a top-level `attributedTo`/`contentHash`/`proof` envelope (the
-    /// person's `did:atomic` signs the whole subgraph); this one-line divergence
-    /// from the doc example is intentional and documented in `atomic-canonical`'s
-    /// `prov` module.
-    ///
-    /// # Examples
-    ///
-    /// ```text
-    /// atomic provenance show ABCDEF
-    /// atomic provenance show ABCDEF --identity alice-work
-    /// ```
+    /// `--identity` selects the Person shown in the derived projection and the
+    /// exporter key when signing. It does not recover the original author.
     Show(ProvenanceShow),
+
+    /// Verify an optional DSSE export with a pinned exporter key, emitting only
+    /// the exact authenticated JSON payload. Does not verify native proofs.
+    #[cfg(feature = "dsse-export")]
+    VerifyDsse(verify_dsse::VerifyDsse),
 }
 
 /// Project & trace W3C PROV over the provenance atomic already captures.
 ///
 /// A sibling of `atomic intent` / `atomic memory`. Read-only and
-/// compute-on-demand: it projects the per-turn `ProvenanceGraph` into signed
+/// compute-on-demand: it projects the per-turn `ProvenanceGraph` into
 /// PROV JSON-LD without ever touching the capture path or writing anything.
 #[derive(Debug, clap::Args)]
 #[command(name = "provenance")]
@@ -86,6 +68,8 @@ impl Command for Provenance {
         match &self.command {
             ProvenanceCommands::Trace(cmd) => cmd.run(),
             ProvenanceCommands::Show(cmd) => cmd.run(),
+            #[cfg(feature = "dsse-export")]
+            ProvenanceCommands::VerifyDsse(cmd) => cmd.run(),
         }
     }
 }

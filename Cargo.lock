@@ -199,6 +199,7 @@ dependencies = [
  "bs58",
  "chrono",
  "data-encoding",
+ "dsse",
  "jcs-admit",
  "serde",
  "serde_json",
@@ -1062,6 +1063,18 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.9",
+]
+
+[[package]]
+name = "dsse"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "798e08f6718e7fb7e747d140f873e7aa376f965b12124c59be6067657b1d683d"
+dependencies = [
+ "base64 0.23.1",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
