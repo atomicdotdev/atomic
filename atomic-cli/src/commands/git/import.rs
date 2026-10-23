@@ -1357,9 +1357,21 @@ impl MaterializationTarget<'_> {
         let mut paths = HashSet::new();
         match self {
             Self::Branch(branch) => {
-                let tree = git_repo
-                    .find_branch(branch, git2::BranchType::Local)
-                    .and_then(|found| found.get().peel_to_tree())
+                // A view imported ahead of its Git branch (a switch that
+                // stopped before creating the branch) has no tree to collide
+                // with; the tracked-changes requirement above still holds.
+                let branch_ref = match git_repo.find_branch(branch, git2::BranchType::Local) {
+                    Ok(found) => found,
+                    Err(error) if error.code() == git2::ErrorCode::NotFound => return Ok(paths),
+                    Err(error) => {
+                        return Err(CliError::GitError {
+                            message: format!("cannot read branch '{branch}': {error}"),
+                        })
+                    }
+                };
+                let tree = branch_ref
+                    .get()
+                    .peel_to_tree()
                     .map_err(|error| CliError::GitError {
                         message: format!("cannot read the tree of branch '{branch}': {error}"),
                     })?;

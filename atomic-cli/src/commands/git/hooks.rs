@@ -2411,8 +2411,9 @@ mod pre_push_tests {
         assert!(
             text.contains("does not carry the verified manifest state")
                 || text.contains("no verified projection")
-                || text.contains("not the verified projection"),
-            "the refusal names the exact-OID binding: {text}"
+                || text.contains("not the verified projection")
+                || text.contains("has no Atomic view"),
+            "the refusal names the exact-OID binding or the missing view: {text}"
         );
     }
 }

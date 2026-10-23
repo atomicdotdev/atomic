@@ -967,12 +967,17 @@ fn shim_verify_is_read_only_around_an_interrupted_switch() {
     );
 
     // Drift must be reported without any repair: verify fails and the
-    // manifest stays byte-identical.
-    fs::write(fixture.root().join("drift.txt"), b"drift\n").expect("write drift file");
+    // manifest stays byte-identical. The drift is a tracked path's bytes:
+    // an untracked file is not divergence to the shim gates.
+    fs::write(
+        fixture.root().join("feature-only/02-second.txt"),
+        b"drift\n",
+    )
+    .expect("write drift into a tracked file");
     let diverged = fixture.atomic(&["git", "shim", "verify"]);
     assert!(
         !diverged.status.success(),
-        "verify must fail on untracked-worktree drift against the projection"
+        "verify must fail on tracked-worktree drift against the projection"
     );
     let after_diverged = atomic_manifest(fixture.root());
     assert_eq!(
