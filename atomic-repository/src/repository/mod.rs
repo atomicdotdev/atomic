@@ -152,8 +152,9 @@ pub use database::{
 };
 pub use equivalence::{
     compare_project_state, compare_project_to_index, compare_project_to_worktree,
-    verify_prospective_equivalence, EquivalenceClaims, EquivalenceLayer, EquivalenceMismatch,
-    EquivalenceReport, MismatchKind, VerifiedProspectiveEquivalence,
+    compare_project_to_worktree_with_index, verify_prospective_equivalence, EquivalenceClaims,
+    EquivalenceLayer, EquivalenceMismatch, EquivalenceReport, MismatchKind,
+    VerifiedProspectiveEquivalence,
 };
 pub use file_index_v2::FileIndexV2BackfillOutcome;
 pub use filter::{

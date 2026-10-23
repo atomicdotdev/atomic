@@ -171,6 +171,47 @@ pub fn compare_project_to_worktree(
     report
 }
 
+/// [`compare_project_to_worktree`] with the Git index at hand: worktree
+/// paths the index does not track are not divergence (see
+/// [`drop_untracked_extras`]).
+pub fn compare_project_to_worktree_with_index(
+    project: &ProjectTree,
+    worktree: &WorktreeObservation,
+    index: &GitIndexState,
+    policy: &ConversionPolicy,
+) -> EquivalenceReport {
+    let mut report = EquivalenceReport::new(project);
+    report.worktree_root = Some(worktree.root());
+    compare_policy_into(project, worktree, policy, &mut report);
+    compare_worktree_into(project, worktree, policy, &mut report);
+    drop_untracked_extras(&mut report, index);
+    report.finish();
+    report
+}
+
+/// A worktree path Git does not track is not state either side publishes:
+/// an untracked scratch file, a gitignored build tree, an editor's
+/// `.DS_Store`. Reporting it as `Worktree/ExtraPath` made every reconcile
+/// and verify refuse on any real project (and, after the next Git commit,
+/// every native command). The observation still lists such paths for
+/// staging status; only the equivalence verdict ignores them.
+fn drop_untracked_extras(report: &mut EquivalenceReport, index: &GitIndexState) {
+    let tracked_identities: BTreeSet<RepoPath> = index
+        .entries
+        .iter()
+        .filter(|entry| entry.stage == 0)
+        .map(|entry| identity_key(&entry.path))
+        .collect();
+    report.mismatches.retain(|mismatch| {
+        !(mismatch.layer == EquivalenceLayer::Worktree
+            && mismatch.kind == MismatchKind::ExtraPath
+            && mismatch
+                .path
+                .as_ref()
+                .is_some_and(|path| !tracked_identities.contains(path)))
+    });
+}
+
 /// Joint comparison used by future push/import adoption gates.
 pub fn compare_project_state(
     project: &ProjectTree,
@@ -193,6 +234,7 @@ pub fn compare_project_state(
         .filter(|entry| entry.stage == 0 && entry.skip_worktree)
         .map(|entry| entry.path.clone())
         .collect();
+    drop_untracked_extras(&mut report, index);
     report.mismatches.retain(|mismatch| {
         !(mismatch.layer == EquivalenceLayer::Worktree
             && mismatch.kind == MismatchKind::MissingPath

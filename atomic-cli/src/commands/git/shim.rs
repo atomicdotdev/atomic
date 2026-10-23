@@ -13,9 +13,10 @@ use atomic_repository::repository::observability::{
     ReconcileDirectionCode, RefusalClass, RemediationCode, WorkspaceModeCode,
 };
 use atomic_repository::{
-    compare_project_to_worktree, graph_visibility_closure, observe_git_index, observe_worktree,
-    verify_prospective_equivalence, GitAttributesFilter, GitObjectKind, InsertOptions, ProjectTree,
-    Repository, RepositoryError, StatusOptions, WorkspaceTxnMode,
+    compare_project_to_worktree, compare_project_to_worktree_with_index, graph_visibility_closure,
+    observe_git_index, observe_worktree, verify_prospective_equivalence, GitAttributesFilter,
+    GitObjectKind, InsertOptions, ProjectTree, Repository, RepositoryError, StatusOptions,
+    WorkspaceTxnMode,
 };
 use clap::{Parser, Subcommand};
 use git2::{
@@ -2453,7 +2454,12 @@ fn verify() -> CliResult<ShimSnapshot> {
         let project = repo
             .project_tree(&view_name, &policy)
             .map_err(|error| error.to_string())?;
-        let report = atomic_repository::compare_project_to_worktree(&project, &observed, &policy);
+        let report = atomic_repository::compare_project_to_worktree_with_index(
+            &project,
+            &observed,
+            &index_state,
+            &policy,
+        );
         Ok(report.is_equivalent())
     })();
     match worktree_verdict {
@@ -2907,7 +2913,7 @@ pub(crate) fn project_atomic_to_git(
     let filter = GitAttributesFilter::for_repository(root);
     let worktree = observe_worktree(root, Some(&index), &filter, &policy)
         .map_err(|error| git_error(format!("cannot observe Git worktree: {error}")))?;
-    let report = compare_project_to_worktree(&project, &worktree, &policy);
+    let report = compare_project_to_worktree_with_index(&project, &worktree, &index, &policy);
     if !report.is_equivalent() {
         return Err(equivalence_error("Atomic-to-Git shim projection", &report));
     }

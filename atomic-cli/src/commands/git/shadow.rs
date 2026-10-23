@@ -25,8 +25,9 @@ use atomic_core::Base32;
 use atomic_objects::content_key;
 use atomic_repository::{
     compare_project_state, compare_project_to_index, compare_project_to_worktree,
-    observe_git_index, observe_worktree, ConversionPolicy, EquivalenceClaims, GitAttributesFilter,
-    GitObjectKind, ManifestRoot, MismatchKind, ProjectTree, Repository,
+    compare_project_to_worktree_with_index, observe_git_index, observe_worktree, ConversionPolicy,
+    EquivalenceClaims, GitAttributesFilter, GitObjectKind, ManifestRoot, MismatchKind, ProjectTree,
+    Repository,
 };
 
 use crate::error::{CliError, CliResult};
@@ -337,7 +338,7 @@ fn verify_git_publication_with_policy(
         };
         compare_project_state(&project, &index, &worktree, &policy, &claims)
     } else {
-        compare_project_to_worktree(&project, &worktree, &policy)
+        compare_project_to_worktree_with_index(&project, &worktree, &index, &policy)
     };
     if !report.is_equivalent() {
         let details = report
