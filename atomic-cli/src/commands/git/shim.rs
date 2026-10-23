@@ -1807,29 +1807,62 @@ fn import_git_to_atomic_budgeted(root: &Path, budget: ReconcileEffectBudget) -> 
                     ));
                 }
                 atomic_repository::DetachedImportTarget::Ephemeral { view } => {
-                    // §7.5: the ephemeral Draft's parent is the nearest bound
-                    // Shared workspace view (the checkpoint's view when it is
-                    // Shared), else none.
-                    let parent = read_workspace_metadata(root)?
-                        .map(|checkpoint| checkpoint.view)
-                        .filter(|name| {
-                            repo.get_view_info(name)
-                                .map(|info| info.scope == atomic_core::pristine::ViewScope::Shared)
-                                .unwrap_or(false)
-                        });
-                    match parent.as_deref() {
-                        Some(parent) => repo
-                            .create_draft_view(&view, parent)
-                            .map_err(CliError::from)?,
-                        None => repo
-                            .create_view_with_identity(
-                                &view,
-                                atomic_core::pristine::ViewScope::Draft,
-                                None,
-                            )
-                            .map_err(CliError::from)?,
+                    // A detached HEAD on a commit this repository already
+                    // interpreted (a checkout of an imported ancestor, `git
+                    // bisect`) is exactly that commit's closure: a parentless
+                    // Draft referencing the change. A Draft under the
+                    // checkpoint view would inherit every later member, so
+                    // its tip could never be an ancestor of the parent's tip
+                    // and the reconcile would strand the workspace.
+                    let interpreted = repo.checked_git_sha(&oid_hex).map_err(CliError::from)?;
+                    if let Some(hash) = interpreted {
+                        repo.create_view_with_identity(
+                            &view,
+                            atomic_core::pristine::ViewScope::Draft,
+                            None,
+                        )
+                        .map_err(CliError::from)?;
+                        repo.ensure_union_state(&view, &[hash])
+                            .map_err(CliError::from)?;
+                        // The checkpoint view's Atomic-private members (the
+                        // initialization change that tracks `.atomicignore`)
+                        // belong to no Git commit's closure; without them the
+                        // ephemeral view reports those files as untracked.
+                        if let Some(checkpoint) = read_workspace_metadata(root)? {
+                            let private = atomic_private_members(&repo, &checkpoint.view)?;
+                            if !private.is_empty() {
+                                repo.ensure_union_state(&view, &private)
+                                    .map_err(CliError::from)?;
+                            }
+                        }
+                        (view, true)
+                    } else {
+                        // §7.5: the ephemeral Draft's parent is the nearest
+                        // bound Shared workspace view (the checkpoint's view
+                        // when it is Shared), else none.
+                        let parent = read_workspace_metadata(root)?
+                            .map(|checkpoint| checkpoint.view)
+                            .filter(|name| {
+                                repo.get_view_info(name)
+                                    .map(|info| {
+                                        info.scope == atomic_core::pristine::ViewScope::Shared
+                                    })
+                                    .unwrap_or(false)
+                            });
+                        match parent.as_deref() {
+                            Some(parent) => repo
+                                .create_draft_view(&view, parent)
+                                .map_err(CliError::from)?,
+                            None => repo
+                                .create_view_with_identity(
+                                    &view,
+                                    atomic_core::pristine::ViewScope::Draft,
+                                    None,
+                                )
+                                .map_err(CliError::from)?,
+                        }
+                        (view, true)
                     }
-                    (view, true)
                 }
             };
             drop(repo);
