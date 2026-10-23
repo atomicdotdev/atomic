@@ -526,6 +526,15 @@ pub fn observe_worktree(
             }
             continue;
         }
+        // A path Git does not track is not worktree state either side
+        // publishes: an untracked scratch file, a gitignored build tree, an
+        // editor's `.DS_Store`. Observing it made every reconcile refuse
+        // with `Worktree/ExtraPath` on any real project. Missing and
+        // modified tracked paths are still observed through the index, and
+        // an Atomic-only path still surfaces on the Git index layer.
+        if index.is_some() && !entry.file_type().is_dir() && !stage_zero.contains_key(&path) {
+            continue;
+        }
         let metadata =
             fs::symlink_metadata(entry.path()).map_err(|error| ObservationError::WorktreeIo {
                 path: path.escaped(),
