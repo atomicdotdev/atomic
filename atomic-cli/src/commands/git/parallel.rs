@@ -5179,6 +5179,51 @@ impl ParallelImporter {
             // resurrection over synthesis. Trailers, names, and index rows
             // cannot reach this path: only crypto + Git-content verification.
             if let Some(binding) = self.verified_binding_for(repo, &git, parsed)? {
+                // A binding whose whole closure is already present locally is
+                // referenced into the target view (metadata only) instead of
+                // restored and re-projected: the first reconcile of a branch
+                // created from an anchored tip re-restored every change of
+                // that tip otherwise (tens of minutes on a few hundred
+                // changes). The closure is the binding's own ordered list,
+                // Atomic-private members included, so the view gains exactly
+                // what a resurrection would have proven present.
+                let ordered = &binding.payload().ordered_changes;
+                let all_local =
+                    !ordered.is_empty() && ordered.iter().all(|hash| repo.has_change(hash));
+                if all_local {
+                    repo.ensure_union_state(&self.options.target_view, ordered)
+                        .map_err(|e| CliError::Internal(e.into()))?;
+                    if repo
+                        .git_commit_closure(&parsed.git_sha)
+                        .map_err(|e| CliError::Internal(e.into()))?
+                        .is_none()
+                    {
+                        repo.record_git_commit_closure(&parsed.git_sha, ordered)
+                            .map_err(|e| CliError::Internal(e.into()))?;
+                    }
+                    let atomic_hash = repo
+                        .checked_git_sha(&parsed.git_sha)
+                        .map_err(|e| CliError::Internal(e.into()))?
+                        .or_else(|| ordered.last().copied())
+                        .expect("non-empty closure");
+                    ledger.record_introduced(
+                        &parsed.git_sha,
+                        atomic_hash,
+                        &self.options.target_view,
+                    );
+                    tracing::info!(target: GIT_IMPORT_LOG_TARGET, "bound commit's closure already present locally; referenced instead of resurrected");
+                    stats.changes_written += 1;
+                    stats.files_processed += parsed.files.len();
+                    imported_commits.push(ImportedCommitInfo {
+                        git_sha: parsed.git_sha.clone(),
+                        short_sha: parsed.short_sha.clone(),
+                        atomic_hash,
+                        is_merge: parsed.is_merge,
+                        message: parsed.full_message(),
+                        squash_insert: None,
+                    });
+                    continue;
+                }
                 tracing::info!(target: GIT_IMPORT_LOG_TARGET, "resurrect from its verified binding");
                 let info = self.resurrect_commit(repo, &git, parsed, &binding)?;
                 stats.changes_written += 1;
