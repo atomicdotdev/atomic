@@ -14,6 +14,7 @@ use std::sync::Arc;
 
 use crate::atomic::ErrorCode;
 use crate::atomic::*;
+use atomic_repository::intent_evidence;
 use atomic_repository::Repository;
 use tonic::{Request, Response, Status};
 
@@ -129,6 +130,7 @@ impl triage_service_server::TriageService for TriageImpl {
         let _gate = gate_handle.exclusive().await;
         let feature_arg = request.from_view.clone();
         let into_arg = request.to_view.clone();
+        let evidence_payloads = request.evidence_reports;
         let report = tokio::task::spawn_blocking(move || {
             let repo = handle.repository_readonly()?;
             // Empty strings read as "not given" — the same defaults the
@@ -136,8 +138,27 @@ impl triage_service_server::TriageService for TriageImpl {
             let feature = (!feature_arg.is_empty()).then_some(feature_arg.as_str());
             let into = (!into_arg.is_empty()).then_some(into_arg.as_str());
             let (feature, target) = resolve_triage_views(&repo, feature, into)?;
-            let report = atomic_repository::triage::build_report(&repo, &feature, &target)
-                .map_err(repository_error)?;
+            let evidence_reports = evidence_payloads
+                .iter()
+                .map(|bytes| {
+                    if bytes.schema != intent_evidence::REPORT_DOCUMENT_SCHEMA {
+                        return Err(domain_status(
+                            ErrorCode::InvalidArgument,
+                            format!("unsupported evidence report schema: {}", bytes.schema),
+                        ));
+                    }
+                    intent_evidence::parse_report(&bytes.payload).map_err(|error| {
+                        domain_status(ErrorCode::InvalidArgument, error.to_string())
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let report = atomic_repository::triage::build_report_with_evidence(
+                &repo,
+                &feature,
+                &target,
+                &evidence_reports,
+            )
+            .map_err(repository_error)?;
             let payload = serde_json::to_vec(&report)
                 .map_err(|error| Status::internal(format!("triage report encode: {error}")))?;
             Ok::<_, Status>(payload)

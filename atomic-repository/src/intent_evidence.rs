@@ -85,11 +85,24 @@ pub struct EvidenceDecision {
     pub details: Value,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EvidenceReport {
-    pub schema_version: &'static str,
+    pub schema_version: String,
     pub decisions: Vec<EvidenceDecision>,
 }
+
+/// The retained report document produced by
+/// `atomic intent validate --json --replay-evidence ...`. Unknown top-level
+/// fields (`conforms`, `results`) are ignored so the full validate output is a
+/// valid input.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EvidenceReportDocument {
+    pub evidence_context: EvidenceContext,
+    pub evidence_replay: EvidenceReport,
+}
+
+/// Wire/schema name for a retained replay report payload.
+pub const REPORT_DOCUMENT_SCHEMA: &str = "atomic.intent.evidence-replay.v1";
 
 impl EvidenceReport {
     /// Map every non-supported decision to a canonical-gate violation.
@@ -122,6 +135,14 @@ pub enum EvidenceError {
     ViewCycle,
     #[error("evidence replay manifest exceeds 1 MiB")]
     ManifestTooLarge,
+    #[error("evidence replay report exceeds 1 MiB")]
+    ReportTooLarge,
+    #[error("evidence replay report admission refused: {0}")]
+    ReportAdmission(String),
+    #[error("invalid evidence replay report: {0}")]
+    InvalidReport(String),
+    #[error("unsupported evidence replay report schema: {0}")]
+    UnsupportedReportSchema(String),
     #[error("evidence replay manifest admission refused: {0}")]
     ManifestAdmission(String),
     #[error("invalid evidence replay manifest: {0}")]
@@ -212,6 +233,48 @@ pub fn read_manifest(path: &Path) -> Result<Vec<u8>, EvidenceError> {
     Ok(bytes)
 }
 
+/// Parse a retained `atomic intent validate --json --replay-evidence` report.
+/// Unknown top-level validate fields are ignored; the replay document itself is
+/// strict.
+pub fn parse_report(bytes: &[u8]) -> Result<EvidenceReportDocument, EvidenceError> {
+    if bytes.len() as u64 > MANIFEST_LIMIT {
+        return Err(EvidenceError::ReportTooLarge);
+    }
+    let value = atomic_canonical::jcs::admit_document(bytes)
+        .map_err(|error| EvidenceError::ReportAdmission(error.to_string()))?;
+    let document: EvidenceReportDocument = serde_json::from_value(value)
+        .map_err(|error| EvidenceError::InvalidReport(error.to_string()))?;
+    if document.evidence_replay.schema_version != "atomic-evidence-replay-report/v1" {
+        return Err(EvidenceError::UnsupportedReportSchema(
+            document.evidence_replay.schema_version,
+        ));
+    }
+    Ok(document)
+}
+
+/// Read a retained report within the protocol ceiling.
+pub fn read_report_bytes(path: &Path) -> Result<Vec<u8>, EvidenceError> {
+    let file = std::fs::File::open(path)?;
+    let mut bytes = Vec::new();
+    file.take(MANIFEST_LIMIT + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MANIFEST_LIMIT {
+        return Err(EvidenceError::ReportTooLarge);
+    }
+    Ok(bytes)
+}
+
+/// Read and parse a retained report within the protocol ceiling.
+pub fn read_report(path: &Path) -> Result<EvidenceReportDocument, EvidenceError> {
+    parse_report(&read_report_bytes(path)?)
+}
+
+/// Canonical content hash of a retained report document. Triage binds this hash
+/// into its reference and signed report.
+pub fn report_hash(document: &EvidenceReportDocument) -> Result<String, EvidenceError> {
+    let value = serde_json::to_value(document)?;
+    Ok(atomic_canonical::hash::content_hash(&value))
+}
+
 /// Read and replay a manifest file. Relative artifact roots resolve against the
 /// manifest's parent directory.
 pub fn replay(
@@ -292,7 +355,7 @@ pub fn replay_bytes(
         decisions.push(decision);
     }
     Ok(EvidenceReport {
-        schema_version: "atomic-evidence-replay-report/v1",
+        schema_version: "atomic-evidence-replay-report/v1".into(),
         decisions,
     })
 }
@@ -508,7 +571,7 @@ mod tests {
         assert!(!valid_decision(&decision, &claim, "request-2"));
         assert_eq!(
             EvidenceReport {
-                schema_version: "test",
+                schema_version: "test".into(),
                 decisions: vec![decision]
             }
             .violations()
@@ -519,7 +582,7 @@ mod tests {
         decision.decision = "contradicted".into();
         assert_eq!(
             EvidenceReport {
-                schema_version: "test",
+                schema_version: "test".into(),
                 decisions: vec![decision]
             }
             .violations()
@@ -529,7 +592,7 @@ mod tests {
         decision = unknown(&claim, "request-1", "all_selected_spans_present");
         decision.decision = "supported".into();
         assert!(EvidenceReport {
-            schema_version: "test",
+            schema_version: "test".into(),
             decisions: vec![decision]
         }
         .violations()
@@ -562,6 +625,44 @@ mod tests {
         assert!(current.intent_substance_hash.starts_with("blake3:"));
         assert_eq!(current.view_chain[0].name, "replay");
         assert_eq!(current.view_chain[1].name, parent);
+    }
+
+    #[test]
+    fn retained_report_parses_hashes_and_ignores_validate_skins() {
+        let node = node();
+        let current = context(&node);
+        let claim = manifest(&node).claims.remove(0);
+        let document = EvidenceReportDocument {
+            evidence_context: current.clone(),
+            evidence_replay: EvidenceReport {
+                schema_version: "atomic-evidence-replay-report/v1".into(),
+                decisions: vec![unknown(&claim, "request-1", "missing_artifact")],
+            },
+        };
+        let bytes = serde_json::to_vec(&document).unwrap();
+        assert_eq!(parse_report(&bytes).unwrap(), document);
+        let hash = report_hash(&document).unwrap();
+        assert!(hash.starts_with("blake3:"));
+        let mut changed = document.clone();
+        changed.evidence_replay.decisions[0].reason = "different".into();
+        assert_ne!(hash, report_hash(&changed).unwrap());
+
+        // The full `intent validate --json` document is accepted; its
+        // conforms/results fields are outside the replay document.
+        let wrapped = json!({
+            "conforms": false,
+            "results": [{"message": "unattested"}],
+            "evidence_context": current,
+            "evidence_replay": document.evidence_replay,
+        });
+        assert!(parse_report(&serde_json::to_vec(&wrapped).unwrap()).is_ok());
+
+        let mut unsupported = serde_json::to_value(&document).unwrap();
+        unsupported["evidence_replay"]["schema_version"] = json!("other");
+        assert!(matches!(
+            parse_report(&serde_json::to_vec(&unsupported).unwrap()),
+            Err(EvidenceError::UnsupportedReportSchema(_))
+        ));
     }
 
     #[cfg(unix)]

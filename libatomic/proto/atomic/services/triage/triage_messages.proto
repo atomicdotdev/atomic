@@ -45,6 +45,10 @@ message GenerateTriageReviewRequest {
   // — the walkthrough/dashboard/JSON renders run client-side over the
   // wire-carried domain report.
   optional VersionedBytes report = 4;
+  // Retained evidence-replay reports (schema
+  // "atomic.intent.evidence-replay.v1"). Each document's pins are re-checked
+  // against current state; stale reports are surfaced, never trusted.
+  repeated VersionedBytes evidence_reports = 5;
 }
 message GenerateTriageReviewResponse {
   repeated TriageLayer layers = 1;    // ordered semantic walkthrough layers
