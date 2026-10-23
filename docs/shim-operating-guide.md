@@ -60,8 +60,14 @@ is kept as a regression check.
   (`staged semantic closure for '<path>': the closure's semantic
   operations render N byte(s) ... must regenerate the commit tree`).
   Records that only add lines, or replace a whole single-line file, are
-  fine. Recovery: `git reset --hard HEAD~1` back to the projection commit
-  and keep working through Atomic, or make the deletion through Git.
+  fine. Cause: the WIP evidence snapshot taken at the record boundary
+  (`Bridge pre-transition capture`, recorded into the `wc/<id>` Draft view)
+  applies its semantic ops into the repository-wide CRDT tables, so the
+  chain holds a second branch for the edited line; the next record's
+  delete targets that snapshot branch, and the staged replay of the Git
+  commit's closure then counts the record's own line as alive. Recovery:
+  `git reset --hard HEAD~1` back to the projection commit and keep working
+  through Atomic, or make the deletion through Git.
 - Linked `git worktree`s cannot reconcile (`Repository already exists`).
 - Committing `.atomicignore` to Git makes `verify`/`reconcile` report
   `GitIndex/ExclusionPolicy .atomicignore`; keep it out of Git.
