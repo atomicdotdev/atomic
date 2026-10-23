@@ -200,11 +200,20 @@ impl Repository {
             // case-only rename still resolves, and a deleted child still
             // resolves through an ancestor that became a symlink to a
             // directory; neither is a reappearance.
-            if present
-                .exact_metadata(&normalized)
-                .map_err(RepositoryError::Io)?
-                .is_none()
-            {
+            let reappeared = match present.exact_metadata(&normalized) {
+                Ok(Some(_)) => true,
+                Ok(None) => false,
+                // An unreadable ancestor is not a reappearance; status keeps
+                // reporting the rest of the workspace, as the plain stat did.
+                Err(error) => {
+                    log::debug!(
+                        "status: cannot inspect projected-absent path '{}': {error}",
+                        absent.path
+                    );
+                    false
+                }
+            };
+            if !reappeared {
                 continue;
             }
             if !options.path_filters.is_empty() {

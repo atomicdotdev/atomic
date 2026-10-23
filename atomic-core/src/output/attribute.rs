@@ -71,20 +71,26 @@ pub struct InodeStatusFacts {
     pub type_changed: bool,
 }
 
+/// Whether a mode difference between an expected and an observed inode is
+/// a reportable fact.
+///
+/// A symlink's permission bits are not: POSIX ignores them, Git stores every
+/// link as `120000`, and `lstat` reports `0o777` on Linux but `0o755` on
+/// macOS, so comparing them reports a phantom change on one platform or the
+/// other. A kind change to or from a symlink is still a type change.
+pub fn permission_bits_matter(expected: InodeKind, observed: InodeKind) -> bool {
+    expected != InodeKind::Symlink && observed != InodeKind::Symlink
+}
+
 impl InodeStatusFacts {
     pub fn between(
         expected: InodeMaterialization,
         actual_mode: u16,
         actual_kind: InodeKind,
     ) -> Self {
-        // A symlink's permission bits are not a materialized fact: POSIX
-        // ignores them, Git stores every link as `120000`, and `lstat`
-        // reports `0o777` on Linux but `0o755` on macOS, so comparing them
-        // reports a phantom change on one platform or the other.
-        let permissions_matter =
-            expected.kind != InodeKind::Symlink && actual_kind != InodeKind::Symlink;
         Self {
-            permissions_changed: permissions_matter && expected.mode != actual_mode,
+            permissions_changed: permission_bits_matter(expected.kind, actual_kind)
+                && expected.mode != actual_mode,
             type_changed: expected.kind != actual_kind,
         }
     }
@@ -179,5 +185,17 @@ mod tests {
         let facts = InodeStatusFacts::between(expected, 0o644, InodeKind::Regular);
         assert!(facts.type_changed);
         assert!(!facts.permissions_changed);
+        assert!(permission_bits_matter(
+            InodeKind::Regular,
+            InodeKind::Regular
+        ));
+        assert!(!permission_bits_matter(
+            InodeKind::Regular,
+            InodeKind::Symlink
+        ));
+        assert!(!permission_bits_matter(
+            InodeKind::Symlink,
+            InodeKind::Symlink
+        ));
     }
 }

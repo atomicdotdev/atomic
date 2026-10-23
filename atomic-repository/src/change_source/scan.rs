@@ -3,6 +3,7 @@ use std::fs;
 use std::path::Path;
 
 use atomic_core::change::InodeKind;
+use atomic_core::output::permission_bits_matter;
 use atomic_core::pristine::{FileIndexTimestamp, FileIndexV2Entry};
 use atomic_core::types::Hash;
 
@@ -321,9 +322,10 @@ where
                 // Symlink permission bits are not a fact (Git stores every
                 // link as 120000; `lstat` reports 0o777 on Linux and 0o755
                 // on macOS), mirroring `InodeStatusFacts::between`.
-                let permissions_changed =
-                    permission_bits_matter(entry.canonical_kind, observed_kind)
-                        && file.mode != Some(entry.canonical_mode);
+                let permissions_changed = permission_bits_matter(
+                    entry.canonical_kind,
+                    observed_kind.unwrap_or(entry.canonical_kind),
+                ) && file.mode != Some(entry.canonical_mode);
                 let observed_row = cached.and_then(|row| {
                     observed_index_row(
                         file,
@@ -557,12 +559,6 @@ fn canonical_kind(kind: ObservedKind) -> Option<InodeKind> {
         ObservedKind::Directory => Some(InodeKind::Gitlink),
         ObservedKind::Other => None,
     }
-}
-
-/// Whether a mode difference between the canonical and the observed inode
-/// is reportable: never when either side is a symlink.
-fn permission_bits_matter(canonical: InodeKind, observed: Option<InodeKind>) -> bool {
-    canonical != InodeKind::Symlink && observed != Some(InodeKind::Symlink)
 }
 
 fn omission_lease_matches(
@@ -1144,18 +1140,5 @@ mod tests {
             "{:?}",
             cold.candidates[0]
         );
-        // A regular file still reports its permission bits.
-        assert!(permission_bits_matter(
-            InodeKind::Regular,
-            Some(InodeKind::Regular)
-        ));
-        assert!(!permission_bits_matter(
-            InodeKind::Symlink,
-            Some(InodeKind::Symlink)
-        ));
-        assert!(!permission_bits_matter(
-            InodeKind::Regular,
-            Some(InodeKind::Symlink)
-        ));
     }
 }
