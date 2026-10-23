@@ -4455,15 +4455,45 @@ impl ParallelImporter {
                 })
             })
             .collect::<CliResult<Vec<_>>>()?;
+        let expected = git_object_id(policy.object_format, parsed.tree_oid)?;
+        // A record projection names its exact view state next to the change
+        // roots. The roots' dependency closure is NOT that state once the
+        // view holds independent changes (a rename commuting with an earlier
+        // edit of the same file), so the projection at the named state is
+        // the identity to verify whenever that state is present. This is the
+        // path a Git branch created from an imported tip takes
+        // (docs/shim-review-testing.md §9): its projection commits name the
+        // originating view, not the new branch.
+        if let Some(projection) = self.project_claimed_state(source, parsed, &hashes, policy)? {
+            verify_prospective_equivalence(&projection, &expected).map_err(|error| {
+                git_error(format!(
+                    "commit {} carries a forged Atomic state claim: {error}",
+                    parsed.git_sha
+                ))
+            })?;
+            return Ok(());
+        }
+        // The closure projection is view-independent; the view name only
+        // guards that the roots belong to a known view. A projection commit
+        // reached through a Git branch that has no Atomic view yet verifies
+        // against the view named in its own `Atomic-View` header.
+        let closure_view = if source
+            .view_exists(branch_name)
+            .map_err(|error| CliError::Internal(error.into()))?
+        {
+            branch_name.to_string()
+        } else {
+            parse_header_trailer(&parsed.full_message(), "Atomic-View")
+                .unwrap_or_else(|| branch_name.to_string())
+        };
         let closure = source
-            .project_tree_for_change_closure(branch_name, &hashes, policy)
+            .project_tree_for_change_closure(&closure_view, &hashes, policy)
             .map_err(|error| {
                 git_error(format!(
                     "commit {} carries an unverifiable Atomic change closure: {error}",
                     parsed.git_sha
                 ))
             })?;
-        let expected = git_object_id(policy.object_format, parsed.tree_oid)?;
         verify_prospective_equivalence(&closure, &expected).map_err(|error| {
             git_error(format!(
                 "commit {} carries a forged Atomic change closure: {error}",
@@ -4471,6 +4501,65 @@ impl ParallelImporter {
             ))
         })?;
         Ok(())
+    }
+
+    /// The projection of the view state a record projection commit names in
+    /// its `Atomic-View`/`Atomic-State` headers, when that view exists, holds
+    /// the state, and every claimed change root is a member of the view at
+    /// that state. `None` leaves the caller on closure verification.
+    fn project_claimed_state(
+        &self,
+        source: &Repository,
+        parsed: &ParsedCommit,
+        claimed_roots: &[ContentHash],
+        policy: &ConversionPolicy,
+    ) -> CliResult<Option<ProjectTree>> {
+        let message = parsed.full_message();
+        let (Some(view), Some(state)) = (
+            parse_header_trailer(&message, "Atomic-View"),
+            parse_header_trailer(&message, "Atomic-State")
+                .and_then(|encoded| Merkle::from_base32(encoded.as_bytes())),
+        ) else {
+            return Ok(None);
+        };
+        if !source
+            .view_exists(&view)
+            .map_err(|error| CliError::Internal(error.into()))?
+        {
+            return Ok(None);
+        }
+        // The named state binds the roots: a claim naming a real state but
+        // roots outside that state's membership is not a record projection.
+        let history = source
+            .effective_history(Some(&view))
+            .map_err(|error| CliError::Internal(error.into()))?;
+        let mut members_at_state = HashSet::new();
+        let mut state_found = false;
+        for entry in history {
+            members_at_state.insert(entry.hash);
+            if entry.state == state {
+                state_found = true;
+                break;
+            }
+        }
+        if !state_found
+            || !claimed_roots
+                .iter()
+                .all(|root| members_at_state.contains(root))
+        {
+            return Ok(None);
+        }
+        match source.project_tree_at_state(&view, state, policy) {
+            Ok(projection) => Ok(Some(projection)),
+            Err(error) => {
+                trace_git_import(format!(
+                    "commit {} names state {state} on view '{view}' that is not projectable \
+                     ({error}); verifying its change closure instead",
+                    parsed.git_sha
+                ));
+                Ok(None)
+            }
+        }
     }
 
     /// Import commits from a branch into an Atomic repository.

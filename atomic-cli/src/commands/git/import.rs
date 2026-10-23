@@ -334,6 +334,27 @@ impl Import {
             .effective_history(Some(view_name))
             .map_err(|error| CliError::Internal(error.into()))?;
         let needs_legacy_backfill = shas.is_empty() && !entries.is_empty();
+        // The index is repository-wide, but a marker only skips a commit for
+        // THIS view when the commit's change is a member of this view. A
+        // commit interpreted under another branch's view (a feature branch
+        // that `main` later fast-forwards onto) is not imported here yet;
+        // the writer references its existing change into the target view
+        // instead of re-synthesizing it.
+        let view_members: HashSet<atomic_core::types::Hash> =
+            entries.iter().map(|entry| entry.hash).collect();
+        let mut foreign_view_shas = Vec::new();
+        for sha in &shas {
+            let member = repo
+                .checked_git_sha(sha)
+                .map_err(|error| CliError::Internal(error.into()))?
+                .is_some_and(|hash| view_members.contains(&hash));
+            if !member {
+                foreign_view_shas.push(sha.clone());
+            }
+        }
+        for sha in foreign_view_shas {
+            shas.remove(&sha);
+        }
         for entry in entries {
             states.insert(entry.state);
             if !needs_legacy_backfill {

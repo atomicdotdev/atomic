@@ -15,10 +15,14 @@ The shim imports Git history, projects Atomic records into Git, checks that
 both sides agree, and helps switch between views and branches. Git hooks and
 an optional watcher notice changes; commands still check the current state.
 
-**Known bug:** after recording an edit and rename with Atomic, creating a new
-Git branch and committing there can make `reconcile` fail with
-`view '<branch>' not found`. See the [reproduction](shim-review-testing.md#9-known-failure-new-git-branch-after-atomic-records).
-This remains unfixed in the tested revision.
+**Fixed (2026-10-23):** creating a new Git branch from an imported tip and
+committing there used to make `reconcile` fail with
+`view '<branch>' not found` (then `forged Atomic change closure`), and a
+fast-forward merge of such a branch back into `main` imported nothing. Record
+projection commits are now verified by the view state they name, and the
+incremental marker set is per target view. The
+[reproduction](shim-review-testing.md#9-regression-new-git-branch-after-atomic-records)
+is kept as a regression check.
 
 Other limits:
 
