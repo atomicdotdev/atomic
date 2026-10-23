@@ -332,6 +332,56 @@ message ValidateVaultEntityResponse {
   repeated string issues = 2;
 }
 
+// Native evidence pins. Ordered from the selected view through its ancestors.
+message EvidenceViewPin {
+  string name = 1;
+  string merkle = 2;
+  string scope = 3;
+}
+message EvidenceContext {
+  string intent_id = 1;
+  string intent_substance_hash = 2;
+  string intent_source_hash = 3;
+  repeated EvidenceViewPin view_chain = 4;
+}
+message EvidenceDecision {
+  string schema_version = 1;
+  string request_digest = 2;
+  string criterion_id = 3;
+  string claim_type = 4;
+  string decision = 5;
+  string reason = 6;
+  // The checker's exact `details` value as canonical JSON text.
+  string details_json = 7;
+}
+message EvidenceReplay {
+  string schema_version = 1;
+  repeated EvidenceDecision decisions = 2;
+  bool freshness_changed = 3;
+}
+
+// `atomic intent validate --replay-evidence ...` — opt-in replay of bounded
+// retained-evidence claims. The manifest bytes and checker path are resolved on
+// the service host; the checker is explicit trusted local code and is never
+// named by the manifest. Replay never changes acceptance status.
+message ReplayVaultEvidenceRequest {
+  RepositoryRef repository = 1;
+  VaultEntityKind kind = 2;  // must be VAULT_ENTITY_KIND_INTENT
+  string id = 3;
+  bool evidence_context = 4;  // return native pins even without a manifest
+  bytes manifest = 5;         // strict JSON; empty for context-only requests
+  string manifest_base = 6;   // service-host directory for relative artifact roots
+  string checker = 7;         // explicit executable on the service host
+  ViewRef view = 20;
+}
+message ReplayVaultEvidenceResponse {
+  bool valid = 1;
+  // Ordinary canonical-gate violations as rendered message strings.
+  repeated string issues = 2;
+  EvidenceContext evidence_context = 3;
+  EvidenceReplay evidence_replay = 4;
+}
+
 message LinkVaultEntitiesRequest {
   RepositoryRef repository = 1;
   RequestMeta meta = 2;

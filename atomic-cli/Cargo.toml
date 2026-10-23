@@ -90,6 +90,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 bytes = { workspace = true }
 fs2 = "0.4"
+tempfile = { workspace = true }
 url = { workspace = true }
 
 # Parallelism
@@ -107,7 +108,6 @@ libc = "0.2"
 windows-sys = { version = "0.61", features = ["Win32_Foundation"] }
 
 [dev-dependencies]
-tempfile = { workspace = true }
 serial_test = { workspace = true }
 # The remote-sandbox end-to-end test serves libatomic over a temp Unix socket.
 tokio-stream = { workspace = true, features = ["net"] }

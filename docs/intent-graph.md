@@ -210,3 +210,14 @@ atomic vault query reindex
 
 See also [Intent Identity](./intent-identity.md) for how `intent:<ULID>` node
 ids and the `PROJECT::author::seq` references are formed.
+
+## Optional retained-evidence replay
+
+Reviewers can supplement `atomic intent validate ID` with bounded claims over
+pinned artifacts using `--replay-evidence MANIFEST --evidence-checker PROGRAM`.
+`--json --evidence-context` supplies native intent/substance/source and view-chain
+pins for the manifest. The checker is optional trusted local code; replay never
+changes acceptance status or the ordinary authoring gate. Missing, stale,
+contradictory, unsupported, and failed-checker evidence cannot pass. A supported
+claim only establishes its declared scope, not arbitrary task correctness.
+See the [runnable example and protocol](examples/evidence-replay/README.md).

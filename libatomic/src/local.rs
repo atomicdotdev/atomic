@@ -15,8 +15,8 @@ use crate::atomic::{
     repository_query_service_server::RepositoryQueryService, vault_service_server::VaultService,
     view_service_server::ViewService, AddFilesRequest, CreateViewRequest, DeleteViewRequest,
     GetChangeRequest, GetVaultContextRequest, GetVaultEntryRequest, ListVaultEntriesRequest,
-    ListViewsRequest, LogRequest, PreviewRestoreRequest, RecordRequest, ResolveRepositoryRequest,
-    StatusRequest, SwitchViewRequest, VerifyAttestationRequest,
+    ListViewsRequest, LogRequest, PreviewRestoreRequest, RecordRequest, ReplayVaultEvidenceRequest,
+    ResolveRepositoryRequest, StatusRequest, SwitchViewRequest, VerifyAttestationRequest,
 };
 use crate::daemon::{
     services::{DaemonImpl, MutationImpl, QueryImpl},
@@ -33,9 +33,9 @@ use crate::daemon::{
 ///
 /// Supports repository resolution, basic working-copy/change/view operations,
 /// read-only restore previews (including recorded file bytes),
-/// read-only vault get/list/context, and attestation verification. View-scoped
-/// vault reads are not supported; unsupported methods fail explicitly with
-/// `Unimplemented`.
+/// read-only vault get/list/context, attestation verification, and bounded
+/// evidence replay. View-scoped vault reads are not supported; unsupported
+/// methods fail explicitly with `Unimplemented`.
 #[derive(Clone)]
 pub struct LocalService {
     state: Arc<DaemonState>,
@@ -230,6 +230,16 @@ impl LocalService {
                     state: self.state.clone(),
                 }
                 .get_vault_context(Request::new(request))
+                .await?;
+                Ok(response.into_inner().encode_to_vec())
+            }
+            "/atomic.VaultService/ReplayVaultEvidence" => {
+                let request = decode::<ReplayVaultEvidenceRequest>(request)?;
+                require_repository(&request.repository)?;
+                let response = VaultImpl {
+                    state: self.state.clone(),
+                }
+                .replay_vault_evidence(Request::new(request))
                 .await?;
                 Ok(response.into_inner().encode_to_vec())
             }

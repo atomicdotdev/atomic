@@ -96,6 +96,7 @@ pub mod error;
 pub mod git_binding;
 pub mod ignore;
 pub mod intent_bridge;
+pub mod intent_evidence;
 pub mod manifest;
 pub mod record;
 pub mod repository;
