@@ -151,10 +151,10 @@ pub use database::{
     LEGACY_DIR, LEGACY_PRISTINE_FILE,
 };
 pub use equivalence::{
-    compare_project_state, compare_project_to_index, compare_project_to_worktree,
-    compare_project_to_worktree_with_index, verify_prospective_equivalence, EquivalenceClaims,
-    EquivalenceLayer, EquivalenceMismatch, EquivalenceReport, MismatchKind,
-    VerifiedProspectiveEquivalence,
+    compare_project_state, compare_project_state_tolerating_untracked, compare_project_to_index,
+    compare_project_to_worktree, compare_project_to_worktree_with_index,
+    verify_prospective_equivalence, EquivalenceClaims, EquivalenceLayer, EquivalenceMismatch,
+    EquivalenceReport, MismatchKind, VerifiedProspectiveEquivalence,
 };
 pub use file_index_v2::FileIndexV2BackfillOutcome;
 pub use filter::{

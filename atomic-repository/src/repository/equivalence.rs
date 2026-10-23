@@ -213,12 +213,39 @@ fn drop_untracked_extras(report: &mut EquivalenceReport, index: &GitIndexState) 
 }
 
 /// Joint comparison used by future push/import adoption gates.
+/// Every layer, strictly: untracked worktree paths count as divergence.
+/// Anchoring and adoption classify pending work with this verdict, so an
+/// untracked scratch file is pending work there.
 pub fn compare_project_state(
     project: &ProjectTree,
     index: &GitIndexState,
     worktree: &WorktreeObservation,
     policy: &ConversionPolicy,
     claims: &EquivalenceClaims,
+) -> EquivalenceReport {
+    compare_project_state_with(project, index, worktree, policy, claims, false)
+}
+
+/// [`compare_project_state`] for the shim's verify, reconcile and
+/// publication gates, where a worktree path Git does not track is not
+/// state either side publishes (see [`drop_untracked_extras`]).
+pub fn compare_project_state_tolerating_untracked(
+    project: &ProjectTree,
+    index: &GitIndexState,
+    worktree: &WorktreeObservation,
+    policy: &ConversionPolicy,
+    claims: &EquivalenceClaims,
+) -> EquivalenceReport {
+    compare_project_state_with(project, index, worktree, policy, claims, true)
+}
+
+fn compare_project_state_with(
+    project: &ProjectTree,
+    index: &GitIndexState,
+    worktree: &WorktreeObservation,
+    policy: &ConversionPolicy,
+    claims: &EquivalenceClaims,
+    tolerate_untracked: bool,
 ) -> EquivalenceReport {
     let mut report = EquivalenceReport::new(project);
     report.index_root = Some(index.root());
@@ -234,7 +261,9 @@ pub fn compare_project_state(
         .filter(|entry| entry.stage == 0 && entry.skip_worktree)
         .map(|entry| entry.path.clone())
         .collect();
-    drop_untracked_extras(&mut report, index);
+    if tolerate_untracked {
+        drop_untracked_extras(&mut report, index);
+    }
     report.mismatches.retain(|mismatch| {
         !(mismatch.layer == EquivalenceLayer::Worktree
             && mismatch.kind == MismatchKind::MissingPath
