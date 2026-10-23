@@ -5852,6 +5852,11 @@ impl ParallelImporter {
         // tracking failure must not silently produce an untracked import.
         let mut added_paths: Vec<&str> = Vec::new();
         let mut deleted_paths: Vec<String> = Vec::new();
+        let deleted_in_commit: HashSet<&str> = effective
+            .iter()
+            .filter(|(_, op, _, _)| matches!(op, EffectiveOp::Deleted))
+            .map(|(file, _, _, _)| file.path.as_str())
+            .collect();
         for (file, op, _baseline, _attrs) in &effective {
             match op {
                 EffectiveOp::Added => {
@@ -5861,6 +5866,15 @@ impl ParallelImporter {
                     // FileAdd creates the projection; pre-registering them
                     // here would make disk-driven tracking fail the import.
                     if matches!(file.new_mode, Some(0o160000 | 0o120000)) {
+                        continue;
+                    }
+                    // A path under a regular file or symlink this same
+                    // commit deletes (issue #279): TREE still binds the old
+                    // inode at the parent until the change's own projection
+                    // unbinds it, so pre-registering the child is refused
+                    // with "projected parent ... is not a directory". The
+                    // graph DirAdd/FileAdd create the projection instead.
+                    if sits_under_deleted_path(&file.path, &deleted_in_commit) {
                         continue;
                     }
                     added_paths.push(&file.path);
@@ -6870,11 +6884,19 @@ impl ParallelImporter {
                 }
             }
         }
+        let deleted_in_merge: HashSet<&str> = files
+            .iter()
+            .filter(|file| file.new_content.is_none())
+            .map(|file| file.path.as_str())
+            .collect();
         for file in &files {
             if resolved_names.contains(&file.path) {
                 continue;
             }
+            // See `write_commit_synthesized`: a child of a same-commit
+            // deletion is projected by its own graph FileAdd (issue #279).
             if file.new_content.is_some()
+                && !sits_under_deleted_path(&file.path, &deleted_in_merge)
                 && repo
                     .get_inode_and_position_on_view_excluding(&file.path, &target, &excluded)
                     .map_err(|e| {
@@ -8903,6 +8925,14 @@ fn git_mode_at(git_repo: &GitRepository, tree: &Tree<'_>, path: &str) -> Option<
 /// Whether a path exists in the tree (any entry kind).
 fn tree_entry_exists(git_repo: &GitRepository, tree: &Tree, path: &str) -> bool {
     git_tree_entry(git_repo, tree, path).is_ok()
+}
+
+/// Whether `path` lies under a path this same commit deletes: a regular
+/// file or symlink replaced by a directory of the same name.
+fn sits_under_deleted_path(path: &str, deleted: &HashSet<&str>) -> bool {
+    ancestor_directories(path)
+        .iter()
+        .any(|ancestor| deleted.contains(ancestor.as_str()))
 }
 
 /// A physical filesystem path decoded from the canonical String identity.

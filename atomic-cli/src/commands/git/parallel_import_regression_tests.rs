@@ -159,3 +159,23 @@ fn tree_lookup_preserves_nested_raw_names_and_modes_on_every_host() {
     assert!(!tree_entry_exists(&git, &tree, "missing"));
     assert!(git_tree_entry(&git, &tree, "dir%00name").is_err());
 }
+
+#[test]
+fn added_path_under_same_commit_deletion_is_not_pre_registered() {
+    // Issue #279: `x` (file or symlink) becomes a directory `x/...` in one
+    // commit; only paths strictly below a deleted path are affected.
+    let deleted: HashSet<&str> = ["x", ".agents/skills/review"].into_iter().collect();
+    assert!(sits_under_deleted_path("x/y", &deleted));
+    assert!(sits_under_deleted_path("x/deep/z", &deleted));
+    assert!(sits_under_deleted_path(
+        ".agents/skills/review/SKILL.md",
+        &deleted
+    ));
+    assert!(!sits_under_deleted_path("x", &deleted));
+    assert!(!sits_under_deleted_path("xy/z", &deleted));
+    assert!(!sits_under_deleted_path(
+        ".agents/skills/other/SKILL.md",
+        &deleted
+    ));
+    assert!(!sits_under_deleted_path("top", &HashSet::new()));
+}
