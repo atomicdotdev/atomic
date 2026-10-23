@@ -52,6 +52,18 @@ is kept as a regression check.
   `git push origin <other-branch>` and `git push --all` pass for reconciled
   branches; a branch no view has interpreted is refused with the step to
   run.
+- `atomic git shim switch` (and native `atomic view switch`) handle
+  repositories whose tree holds symlinks, including a symlink to a
+  directory (the `.claude/skills/<name>` layout).
+- The first `reconcile` of a branch created from an anchored tip references
+  the tip's closure instead of restoring and re-projecting it.
+
+**Repositories imported before this change must be re-imported.** The old
+importer tracked paths with spaces or non-ASCII bytes under their escaped
+names (`SolanaLogo%2022.png`); such a repository reports those entries
+deleted and the real files untracked, and every reconcile refuses. Remove
+`.atomic` (after recording anything pending elsewhere) and run
+`atomic git import` again with this build.
 
 **Known failures (not fixed; avoid until tracked fixes land):**
 
