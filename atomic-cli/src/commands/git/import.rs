@@ -1007,6 +1007,10 @@ impl Command for Import {
                 reindex_working_copy(&repo, working_copy);
             } else {
                 // Detached imports have no checked-out branch to adopt.
+                require_materializable_worktree(
+                    &git_repo,
+                    MaterializationTarget::CurrentView(&repo),
+                )?;
                 print_info("Materializing working copy...");
                 match repo.materialize(working_copy) {
                     Ok(result) => {
@@ -1165,6 +1169,10 @@ impl Command for Import {
                             .to_string(),
                     });
                 }
+                require_materializable_worktree(
+                    &git_repo,
+                    MaterializationTarget::Branch(&branch_name),
+                )?;
                 print_info("Materializing working copy...");
                 match repo.materialize(working_copy) {
                     Ok(result) => {
@@ -1328,6 +1336,116 @@ fn import_git_tags_into_view(repo: &mut Repository, git_repo: &GitRepository, vi
 /// authoritative Git checkout for the imported branch, so there is no reason
 /// to materialize the same content back out of Atomic. Indexing the tracked
 /// files makes the post-import `atomic status` baseline clean.
+/// What a working-copy materialization is about to write over the disk.
+enum MaterializationTarget<'a> {
+    /// The tree of a local Git branch that is not checked out.
+    Branch(&'a str),
+    /// The current Atomic view (an `--all` import under a detached HEAD).
+    CurrentView(&'a Repository),
+}
+
+impl MaterializationTarget<'_> {
+    fn describe(&self) -> String {
+        match self {
+            Self::Branch(branch) => format!("branch '{branch}'"),
+            Self::CurrentView(_) => "the current Atomic view".to_string(),
+        }
+    }
+
+    /// Every repository path the materialization writes.
+    fn paths(&self, git_repo: &GitRepository) -> CliResult<HashSet<String>> {
+        let mut paths = HashSet::new();
+        match self {
+            Self::Branch(branch) => {
+                let tree = git_repo
+                    .find_branch(branch, git2::BranchType::Local)
+                    .and_then(|found| found.get().peel_to_tree())
+                    .map_err(|error| CliError::GitError {
+                        message: format!("cannot read the tree of branch '{branch}': {error}"),
+                    })?;
+                tree.walk(git2::TreeWalkMode::PreOrder, |directory, entry| {
+                    if let Some(name) = entry.name() {
+                        paths.insert(format!("{directory}{name}"));
+                    }
+                    git2::TreeWalkResult::Ok
+                })
+                .map_err(|error| CliError::GitError {
+                    message: format!("cannot walk the tree of branch '{branch}': {error}"),
+                })?;
+            }
+            Self::CurrentView(repo) => {
+                for file in repo
+                    .list_tracked_files()
+                    .map_err(|error| CliError::Internal(error.into()))?
+                {
+                    let canonical = file.path.to_string_lossy();
+                    paths.insert(
+                        super::parallel::canonical_tree_path(&canonical)
+                            .to_string_lossy()
+                            .into_owned(),
+                    );
+                }
+            }
+        }
+        Ok(paths)
+    }
+}
+
+/// Refuse to materialize over a worktree holding work Git has not recorded:
+/// a detached HEAD or an `-b <other>` import writes the imported tree over
+/// the disk, and the only worktree check on that path
+/// (`verify_changed_worktree_paths`) returns early when HEAD is not on the
+/// branch. Tracked modifications and untracked files at paths the
+/// materialization writes are both lost without this guard.
+fn require_materializable_worktree(
+    git_repo: &GitRepository,
+    target: MaterializationTarget<'_>,
+) -> CliResult<()> {
+    let what = target.describe();
+    super::shim::require_clean_git_worktree(git_repo).map_err(|error| CliError::GitError {
+        message: format!(
+            "cannot materialize {what} over unrecorded work: {error}; commit, stash or \
+             discard the changes (or check the branch out) first"
+        ),
+    })?;
+    let target_paths = target.paths(git_repo)?;
+    let mut options = git2::StatusOptions::new();
+    options.include_untracked(true).recurse_untracked_dirs(true);
+    let statuses = git_repo
+        .statuses(Some(&mut options))
+        .map_err(|error| CliError::GitError {
+            message: format!("cannot inspect Git status: {error}"),
+        })?;
+    let mut colliding: Vec<String> = statuses
+        .iter()
+        .filter(|entry| entry.status().contains(git2::Status::WT_NEW))
+        .filter_map(|entry| entry.path().map(str::to_string))
+        .filter(|path| target_paths.contains(path))
+        .collect();
+    colliding.sort();
+    if colliding.is_empty() {
+        return Ok(());
+    }
+    let shown = colliding
+        .iter()
+        .take(5)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ");
+    let more = colliding.len().saturating_sub(5);
+    Err(CliError::GitError {
+        message: format!(
+            "cannot materialize {what}: untracked file(s) would be overwritten: {shown}{}; \
+             move or remove them (or check the branch out) first",
+            if more > 0 {
+                format!(" and {more} more")
+            } else {
+                String::new()
+            }
+        ),
+    })
+}
+
 fn reindex_working_copy(repo: &Repository, working_copy: WorkingCopyId) {
     use atomic_core::types::Hash;
     let started = std::time::Instant::now();
