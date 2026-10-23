@@ -24,8 +24,10 @@ setTimeout(function() {
     ['https://atomic.dev/ns/workflow#Change', 'https://atomic.dev/ns/workflow#FeatureIntent'].forEach(function(kind) {
       var usageNode = graphData.nodes.find(function(node) { return node.kind === kind; });
       assert(usageNode, 'usage fixture node must be exported');
+      pane.scrollTop = 100;
       picker.value = usageNode.id;
       picker.dispatchEvent(new Event('change'));
+      assert(pane.scrollTop === 0, 'new selection must reveal usage details at the top of the pane');
       var usagePane = pane.querySelector('.inspector-ai-usage');
       assert(usagePane && usagePane.textContent.includes('$0.125000 USD'), 'change/intent must show recorded cost');
       assert(usagePane.textContent.includes('Cache read') && usagePane.textContent.includes('Recorded total'), 'token categories must be shown');

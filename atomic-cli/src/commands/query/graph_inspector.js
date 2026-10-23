@@ -145,6 +145,7 @@ function createGraphInspector(container, graphData, onSelect) {
     clear.disabled = !node;
     container.dataset.selectedNode = node ? node.id : '';
     content.replaceChildren();
+    container.scrollTop = 0;
     if (!node) {
       status.textContent = 'No node selected.';
       content.appendChild(element('p', 'Click a node to pin its details here. Follow a relationship to inspect its other endpoint. Escape or Clear resets selection.', 'inspector-muted'));

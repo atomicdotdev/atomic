@@ -48,8 +48,9 @@ precise USD costs, and coverage. Changes and intents also show their contributin
 models, tools and vendors; mixed attribution is listed separately rather than
 reduced to a single model. The same summary is exported as `metadata.ai_usage` in
 graph JSON.
-The summaries are also included by `atomic query neighbors <canonical-node-IRI>
---json`, so the same usage data can be queried without opening HTML.
+The summaries are also included by
+`atomic query neighbors <canonical-node-IRI> --json`, so the same usage data can be
+queried without opening HTML.
 
 - **Change:** its immutable recorded AI provenance.
 - **Intent:** the union of explicitly implementing changes and changes recording
