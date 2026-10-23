@@ -1,6 +1,7 @@
 //! The semantic closure memo must answer a foreign deletion exactly like a
-//! fresh fold of the closure, fold each visible change once per process,
-//! and extend by exactly the newly visible changes.
+//! fresh fold of the closure, fold each visible change once per closure,
+//! extend by exactly the newly visible changes, and keep the closures an
+//! import stream alternates between.
 
 use super::*;
 use crate::record::RecordOptions;
@@ -18,6 +19,10 @@ fn record_all(repo: &TestRepository, message: &str) -> crate::record::RecordOutc
 
 fn folded_changes(repo: &TestRepository) -> usize {
     repo.semantic_closure_memo.lock().unwrap().folded_len()
+}
+
+fn retained_closures(repo: &TestRepository) -> usize {
+    repo.semantic_closure_memo.lock().unwrap().closure_count()
 }
 
 #[test]
@@ -56,7 +61,7 @@ fn foreign_deletion_domain_is_stable_across_memo_reuse() {
 }
 
 #[test]
-fn memo_restarts_when_the_closure_key_changes() {
+fn memo_keeps_recent_closures_side_by_side() {
     let (temp, repo) = create_temp_repo();
     std::fs::write(temp.path().join("f.txt"), b"a\nb\n").unwrap();
     repo.add("f.txt", TrackingOptions::default()).unwrap();
@@ -70,9 +75,9 @@ fn memo_restarts_when_the_closure_key_changes() {
     let full = folded_changes(&repo);
     assert!(full >= 2, "folded {full} changes");
 
-    // Excluding the unrelated head change is a different closure key: the
-    // memo starts over, folds only what stays visible, and f.txt's domain
-    // is unchanged.
+    // Excluding the unrelated head change is a different closure key: a
+    // second closure folds only what stays visible, and f.txt's domain is
+    // unchanged.
     let view = repo.current_view.clone();
     let excluded = repo
         .record_foreign_deleted_file_on_view_excluding("f.txt", &view, &[*two.hash()])
@@ -81,12 +86,14 @@ fn memo_restarts_when_the_closure_key_changes() {
     let partial = folded_changes(&repo);
     assert!(
         partial < full,
-        "memo restarted on the exclusion key: {partial} < {full}"
+        "the exclusion key folds its own closure: {partial} < {full}"
     );
+    assert_eq!(retained_closures(&repo), 2);
 
-    // Back on the plain key the memo starts over again and folds the full
-    // closure.
+    // Back on the plain key the retained closure answers without a refold,
+    // and the exclusion closure stays available for the next merge.
     let again = repo.record_foreign_deleted_file("f.txt").unwrap();
     assert_eq!(again.crdt_ops(), Some(&cold_ops));
     assert_eq!(folded_changes(&repo), full);
+    assert_eq!(retained_closures(&repo), 2);
 }

@@ -313,7 +313,7 @@ impl Import {
         // rows are dropped, so a corrupt cache produces exactly the same
         // skip decisions as a cold cache (the legacy backfill below).
         let (indexed, dropped) = repo
-            .checked_git_sha_markers()
+            .checked_git_sha_marker_hashes()
             .map_err(|error| CliError::Internal(error.into()))?;
         for sha in dropped.iter().take(3) {
             log::warn!(
@@ -321,8 +321,6 @@ impl Import {
                 &sha[..8.min(sha.len())]
             );
         }
-        let mut shas: HashSet<String> = indexed.into_iter().collect();
-        let _ = dropped;
         let mut states = HashSet::new();
         let mut index_repairs = Vec::new();
 
@@ -333,7 +331,7 @@ impl Import {
         let entries = repo
             .effective_history(Some(view_name))
             .map_err(|error| CliError::Internal(error.into()))?;
-        let needs_legacy_backfill = shas.is_empty() && !entries.is_empty();
+        let needs_legacy_backfill = indexed.is_empty() && !entries.is_empty();
         // The index is repository-wide, but a marker only skips a commit for
         // THIS view when the commit's change is a member of this view. A
         // commit interpreted under another branch's view (a feature branch
@@ -342,19 +340,11 @@ impl Import {
         // instead of re-synthesizing it.
         let view_members: HashSet<atomic_core::types::Hash> =
             entries.iter().map(|entry| entry.hash).collect();
-        let mut foreign_view_shas = Vec::new();
-        for sha in &shas {
-            let member = repo
-                .checked_git_sha(sha)
-                .map_err(|error| CliError::Internal(error.into()))?
-                .is_some_and(|hash| view_members.contains(&hash));
-            if !member {
-                foreign_view_shas.push(sha.clone());
-            }
-        }
-        for sha in foreign_view_shas {
-            shas.remove(&sha);
-        }
+        let mut shas: HashSet<String> = indexed
+            .into_iter()
+            .filter(|(_, hash)| view_members.contains(hash))
+            .map(|(sha, _)| sha)
+            .collect();
         for entry in entries {
             states.insert(entry.state);
             if !needs_legacy_backfill {

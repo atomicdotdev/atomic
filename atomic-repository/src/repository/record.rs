@@ -1053,10 +1053,17 @@ impl Repository {
         visibility: &atomic_core::pristine::GraphVisibilityClosure,
         trunk: atomic_core::crdt::TrunkId,
     ) -> Result<super::semantic_closure::TrunkBranchState, String> {
+        // The memo is a pure cache: a fold that panicked leaves nothing worth
+        // keeping, so a poisoned lock starts over instead of failing every
+        // later record in this process.
         let mut memo = self
             .semantic_closure_memo
             .lock()
-            .map_err(|_| "semantic closure memo is poisoned".to_string())?;
+            .unwrap_or_else(|poisoned| {
+                let mut memo = poisoned.into_inner();
+                *memo = Default::default();
+                memo
+            });
         memo.align(view_name, excluded, visibility);
         for change_id in visibility
             .iter_dependency_first()
