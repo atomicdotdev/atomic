@@ -419,7 +419,14 @@ pub fn retrieve_graph<T: GraphTxnT>(
     }
 
     // Settle bypass attachments the dead-walk declined on a partial graph.
-    attach_deferred_bypasses(&mut result.graph, &cache, deferred_bypasses);
+    attach_deferred_bypasses(
+        txn,
+        &options,
+        &mut result.graph,
+        &cache,
+        &mut chain_memo,
+        deferred_bypasses,
+    )?;
 
     // Adjacent independent replacements leave each new span anchored to
     // deleted old context. For old A -> B, replacing A with X and B with Y
@@ -573,14 +580,17 @@ struct DeferredBypass {
 /// chain (its edge to the successor is the stale pre-insertion edge the
 /// additive model keeps), and one that never entered the alive graph is not
 /// visible at all; neither orders the successor. When no alternate remains,
-/// the successor is attached under the owner exactly as the inline path
-/// would have done. Attachments can unlock further records (chained stale
-/// edges), so the pass repeats until it settles.
-fn attach_deferred_bypasses(
+/// the successor is attached under the owner with the dead-walk's own
+/// shadowing rule ([`attach_bypass_child`]). Attachments can unlock further
+/// records (chained stale edges), so the pass repeats until it settles.
+fn attach_deferred_bypasses<T: GraphTxnT>(
+    txn: &T,
+    options: &RetrieveOptions,
     graph: &mut AliveGraph,
     cache: &std::collections::HashMap<GraphNode<NodeId>, VertexId>,
+    chain_memo: &mut std::collections::HashMap<(GraphNode<NodeId>, GraphNode<NodeId>), bool>,
     deferred: Vec<DeferredBypass>,
-) {
+) -> Result<(), PristineError> {
     let mut pending = deferred;
     loop {
         let mut attached_any = false;
@@ -600,14 +610,16 @@ fn attach_deferred_bypasses(
                 still_pending.push(item);
                 continue;
             }
-            if !graph
-                .children(owner_vid)
-                .any(|(_, child)| *child == successor_vid)
-            {
-                if let Some(owner) = graph.get_vertex_mut(owner_vid) {
-                    owner.extra.push((None, successor_vid));
-                    attached_any = true;
-                }
+            if attach_bypass_child(
+                txn,
+                options,
+                graph,
+                chain_memo,
+                owner_vid,
+                item.successor,
+                successor_vid,
+            )? {
+                attached_any = true;
             }
         }
         if !attached_any || still_pending.is_empty() {
@@ -615,6 +627,58 @@ fn attach_deferred_bypasses(
         }
         pending = still_pending;
     }
+    Ok(())
+}
+
+/// Attach `successor` under `owner` exactly as the inline dead-walk would
+/// have: a successor an existing child already reaches is not attached (it
+/// is ordered behind that child), and existing children the successor
+/// reaches are replaced by it (they are ordered behind the successor).
+/// Attaching both would fork the owner into two paths that rejoin, which
+/// fork detection misreads as a conflict. Returns whether the graph changed.
+fn attach_bypass_child<T: GraphTxnT>(
+    txn: &T,
+    options: &RetrieveOptions,
+    graph: &mut AliveGraph,
+    chain_memo: &mut std::collections::HashMap<(GraphNode<NodeId>, GraphNode<NodeId>), bool>,
+    owner_vid: VertexId,
+    successor: GraphNode<NodeId>,
+    successor_vid: VertexId,
+) -> Result<bool, PristineError> {
+    let existing: Vec<(VertexId, GraphNode<NodeId>)> = graph
+        .children(owner_vid)
+        .map(|(_, child)| *child)
+        .filter(|child| !child.is_dummy())
+        .map(|child| (child, graph.get_vertex(child).node))
+        .collect();
+    if existing.iter().any(|(child, _)| *child == successor_vid) {
+        return Ok(false);
+    }
+    for (_, node) in &existing {
+        if memo_visible_chain_reaches(txn, options, *node, successor, chain_memo)? {
+            return Ok(false);
+        }
+    }
+    let mut shadowed = Vec::new();
+    for (child, node) in &existing {
+        if memo_visible_chain_reaches(txn, options, successor, *node, chain_memo)? {
+            shadowed.push(*child);
+        }
+    }
+    match shadowed.split_first() {
+        Some((first, rest)) => {
+            graph.replace_child(owner_vid, *first, successor_vid);
+            for child in rest {
+                graph.replace_child(owner_vid, *child, VertexId::DUMMY);
+            }
+        }
+        None => {
+            if let Some(owner) = graph.get_vertex_mut(owner_vid) {
+                owner.extra.push((None, successor_vid));
+            }
+        }
+    }
+    Ok(true)
 }
 
 #[allow(clippy::too_many_arguments)] // memoised traversal; each param is a distinct cache
@@ -736,13 +800,20 @@ fn walk_through_dead<T: GraphTxnT>(
                                 && !alternates.contains(&source_vertex)
                             {
                                 alternates.push(source_vertex);
+                                // The boolean query never settles deferred
+                                // attachments (`retrieve_graph` returns
+                                // before `attach_deferred_bypasses`), so
+                                // one alternate answers it.
+                                if options.stop_at_first_content {
+                                    break;
+                                }
                             }
                         }
                         _ => {}
                     }
                 }
                 let has_alive_alt_parent = !alternates.is_empty();
-                if has_alive_alt_parent {
+                if has_alive_alt_parent && !options.stop_at_first_content {
                     deferred.push(DeferredBypass {
                         owner: owner_parent,
                         successor: next_vertex,

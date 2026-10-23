@@ -257,6 +257,29 @@ impl AliveGraph {
 
     /// Get a mutable span by ID, returning None if out of bounds.
     #[inline]
+    /// Replace the child entry `old` of `id` with `new`, whether it sits in
+    /// the contiguous child range or among the extra edges.
+    ///
+    /// Returns whether an entry changed. Replacing with [`VertexId::DUMMY`]
+    /// drops the child: every consumer skips dummy entries.
+    pub fn replace_child(&mut self, id: VertexId, old: VertexId, new: VertexId) -> bool {
+        let (start, count) = {
+            let vertex = &self.vertices[id.index()];
+            (vertex.children, vertex.n_children)
+        };
+        let replaced = self.children[start..start + count]
+            .iter_mut()
+            .chain(self.vertices[id.index()].extra.iter_mut())
+            .find(|(_, child)| *child == old);
+        match replaced {
+            Some(entry) => {
+                entry.1 = new;
+                true
+            }
+            None => false,
+        }
+    }
+
     pub fn get_vertex_mut(&mut self, id: VertexId) -> Option<&mut AliveVertex> {
         self.vertices.get_mut(id.index())
     }
@@ -915,6 +938,25 @@ mod tests {
         // Iterate all children
         let children: Vec<_> = graph.children(VertexId::new(1)).collect();
         assert_eq!(children.len(), 3);
+    }
+
+    #[test]
+    fn test_graph_replace_child_in_range_and_extra() {
+        let mut graph = AliveGraph::new();
+        graph.push_vertex(AliveVertex::DUMMY);
+        graph.push_vertex(AliveVertex::new(GraphNode::ROOT));
+        graph.set_last_children_start();
+        graph.push_child_to_last(None, VertexId::new(10));
+        graph.add_extra_child(VertexId::new(1), None, VertexId::new(20));
+
+        assert!(graph.replace_child(VertexId::new(1), VertexId::new(10), VertexId::new(11)));
+        assert!(graph.replace_child(VertexId::new(1), VertexId::new(20), VertexId::DUMMY));
+        assert!(!graph.replace_child(VertexId::new(1), VertexId::new(99), VertexId::new(1)));
+        let children: Vec<VertexId> = graph
+            .children(VertexId::new(1))
+            .map(|(_, child)| *child)
+            .collect();
+        assert_eq!(children, vec![VertexId::new(11), VertexId::DUMMY]);
     }
 
     #[test]
