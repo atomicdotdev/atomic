@@ -853,16 +853,12 @@ pub(crate) fn run_pre_push_verification_with_input(root: &Path, input: &str) -> 
                 let branch = local_ref
                     .strip_prefix("refs/heads/")
                     .unwrap_or(local_ref.as_str());
-                let (view, expected_tree) = if branch == current_view {
-                    (current_view.clone(), verified.git_tree.clone())
-                } else {
-                    if !repo.view_exists(branch).map_err(CliError::Repository)? {
-                        return Err(CliError::GitError {
-                            message: format!(
-                                "pre-push refused: branch '{branch}' has no Atomic view; run 'git switch {branch}' and 'atomic git shim reconcile' before pushing it"
-                            ),
-                        });
-                    }
+                // A branch without a view of its own (`master` publishing
+                // the `main` view, a renamed branch) still binds to the
+                // current view's verified tree exactly as before.
+                let (view, expected_tree) = if branch != current_view
+                    && repo.view_exists(branch).map_err(CliError::Repository)?
+                {
                     let project =
                         repo.project_tree(branch, &policy)
                             .map_err(|error| CliError::GitError {
@@ -871,6 +867,8 @@ pub(crate) fn run_pre_push_verification_with_input(root: &Path, input: &str) -> 
                                 ),
                             })?;
                     (branch.to_string(), project.git.root.clone())
+                } else {
+                    (current_view.clone(), verified.git_tree.clone())
                 };
                 let binds = git2::Oid::from_str(oid)
                     .ok()
@@ -2368,7 +2366,7 @@ mod pre_push_tests {
 
         // Publication verification needs a Git repository (shadow checks).
         git2::Repository::init(&root).unwrap();
-        let result = run_pre_push_verification(&root);
+        let result = run_pre_push_verification_with_input(&root, "");
         // Either the full publication verification passes (empty clean
         // repos may still refuse on missing Git state) or the refusal is a
         // Git/publication error — the provenance gate must NOT be the
@@ -2411,9 +2409,8 @@ mod pre_push_tests {
         assert!(
             text.contains("does not carry the verified manifest state")
                 || text.contains("no verified projection")
-                || text.contains("not the verified projection")
-                || text.contains("has no Atomic view"),
-            "the refusal names the exact-OID binding or the missing view: {text}"
+                || text.contains("not the verified projection"),
+            "the refusal names the exact-OID binding: {text}"
         );
     }
 }

@@ -502,7 +502,11 @@ fn pushing_a_reconciled_non_current_branch_passes_the_pre_push_gate() {
         "an un-reconciled branch must be refused"
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("has no Atomic view"), "got:\n{stderr}");
+    assert!(
+        stderr.contains("pre-push refused"),
+        "got:
+{stderr}"
+    );
     assert!(git(&remote, &["branch", "--list"]).contains("other"));
 }
 
