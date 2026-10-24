@@ -1611,7 +1611,7 @@ fn checkpoint_matches_snapshot(checkpoint: &ShimCheckpoint, snapshot: &ShimSnaps
 /// tracking `.atomicignore`. Native records of project files are never
 /// selected, so an ephemeral view built from one commit's closure gains
 /// only the private bookkeeping, never later content.
-fn atomic_private_members(
+pub(super) fn atomic_private_members(
     repo: &Repository,
     view: &str,
 ) -> CliResult<Vec<atomic_core::types::Hash>> {

@@ -264,6 +264,86 @@ impl Import {
         Ok(stats)
     }
 
+    /// Seed a branch's missing view from the nearest first-parent ancestor
+    /// this repository already interpreted, so the import walks only the
+    /// commits above it.
+    ///
+    /// A new Git branch (`git switch -c topic`, commit, reconcile) otherwise
+    /// starts from an empty view and re-walks the whole history (92 minutes
+    /// on a 363-commit repository), re-referencing changes that exist. The
+    /// ancestor's persisted closure is exactly the state the view needs;
+    /// referencing it is metadata-only, the same idempotent insert the
+    /// per-commit reuse performs. Does nothing when the view exists, the
+    /// branch has no tip, or no ancestor is interpreted.
+    fn seed_new_view_from_interpreted_ancestor(
+        &self,
+        repo: &mut Repository,
+        git_repo: &GitRepository,
+        branch_name: &str,
+    ) -> CliResult<()> {
+        if repo.view_exists(branch_name).map_err(CliError::from)? {
+            return Ok(());
+        }
+        let Some(tip) = git_repo
+            .find_branch(branch_name, git2::BranchType::Local)
+            .ok()
+            .and_then(|branch| branch.get().target())
+        else {
+            return Ok(());
+        };
+        let mut walk = git_repo.revwalk().map_err(|error| CliError::GitError {
+            message: format!("cannot walk branch '{branch_name}': {error}"),
+        })?;
+        walk.push(tip).map_err(|error| CliError::GitError {
+            message: format!("cannot walk branch '{branch_name}': {error}"),
+        })?;
+        walk.simplify_first_parent()
+            .map_err(|error| CliError::GitError {
+                message: format!("cannot walk branch '{branch_name}': {error}"),
+            })?;
+        let mut ahead = 0usize;
+        for oid in walk {
+            let sha = oid
+                .map_err(|error| CliError::GitError {
+                    message: format!("cannot walk branch '{branch_name}': {error}"),
+                })?
+                .to_string();
+            let interpreted = repo
+                .checked_git_sha(&sha)
+                .map_err(CliError::from)?
+                .is_some();
+            let closure = if interpreted {
+                repo.git_commit_closure(&sha).map_err(CliError::from)?
+            } else {
+                None
+            };
+            let Some(closure) = closure else {
+                ahead += 1;
+                continue;
+            };
+            repo.create_shared_view(branch_name)
+                .map_err(|error| CliError::Internal(error.into()))?;
+            repo.ensure_union_state(branch_name, &closure)
+                .map_err(CliError::from)?;
+            // The source view's Atomic-private members (the initialization
+            // change tracking `.atomicignore`) belong to no Git commit's
+            // closure; without them the new view reports them untracked.
+            let source_view = repo.current_view().to_string();
+            let private = super::shim::atomic_private_members(repo, &source_view)?;
+            if !private.is_empty() {
+                repo.ensure_union_state(branch_name, &private)
+                    .map_err(CliError::from)?;
+            }
+            print_info(&format!(
+                "Seeded view '{branch_name}' from interpreted ancestor {} ({} changes); {ahead} commit(s) ahead to import",
+                &sha[..8.min(sha.len())],
+                closure.len()
+            ));
+            return Ok(());
+        }
+        Ok(())
+    }
+
     /// Get repository name from remote URL or working directory.
     fn get_repo_name(&self, git_repo: &GitRepository) -> String {
         git_repo
@@ -783,6 +863,11 @@ impl Command for Import {
             // import mode: legacy bytes stay authoritative, and history that
             // deepens below an indexed commit is refused instead of silently
             // re-derived. (Dry-run forecasts keep their own semantics.)
+            if self.incremental && detached_tip.is_none() {
+                if let Some(repo) = preopened_repo.as_mut() {
+                    self.seed_new_view_from_interpreted_ancestor(repo, &git_repo, branch_name)?;
+                }
+            }
             let (imported_shas, known_states) = match preopened_repo.as_ref() {
                 Some(repo) if repo.view_exists(branch_name).map_err(CliError::from)? => {
                     self.get_incremental_markers(repo, branch_name, false)?

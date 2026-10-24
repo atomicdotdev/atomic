@@ -610,3 +610,33 @@ fn native_record_rewriting_a_line_keeps_later_git_commits_reconcilable() {
     );
 }
 
+#[test]
+fn a_new_branch_reconciles_only_its_own_commits() {
+    let (root, home) = shim_repo();
+    for n in 1..=3 {
+        fs::write(root.join("tracked.txt"), format!("base\n{n}\n")).unwrap();
+        commit_all(&root, &format!("main {n}"));
+    }
+    atomic_ok(&root, &home, &["git", "shim", "reconcile"]);
+    assert_clean(&root, &home);
+
+    // Branch off the reconciled tip, commit once, reconcile: the new view is
+    // seeded from the tip's interpreted closure and imports one commit, not
+    // the whole history again.
+    git(&root, &["switch", "-qc", "topic"]);
+    fs::write(root.join("topic.txt"), b"topic\n").unwrap();
+    commit_all(&root, "topic 1");
+    let out = atomic_ok(&root, &home, &["git", "shim", "reconcile"]);
+    assert!(
+        out.contains("Imported 1 change"),
+        "the new branch must import only its own commit:\n{out}"
+    );
+    assert_clean(&root, &home);
+    let log = atomic_ok(&root, &home, &["log", "--short"]);
+    for message in ["baseline", "main 1", "main 2", "main 3", "topic 1"] {
+        assert!(
+            log.contains(message),
+            "{message} missing from the topic view:\n{log}"
+        );
+    }
+}
