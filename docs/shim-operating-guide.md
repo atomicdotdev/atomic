@@ -73,6 +73,18 @@ is kept as a regression check.
 - `atomic git shim switch` handles a directory that later became a symlink
   (the `.claude/commands -> ../.agents/commands` agents layout): the old
   files beneath the link are no longer scheduled for removal through it.
+- Deleting a Git branch whose view was adopted (`git switch -c topic`,
+  `git switch main`, `git branch -D topic`) retires the branch's ref
+  mapping; it no longer refuses every later reconcile with "the mapped ref
+  ... advanced beyond the last observed mapping". A renamed branch
+  (`git branch -m`) still refuses with the explicit remediation.
+- A branch created after a no-ff merge is seeded from the source view's own
+  log, so the merged line renders once; the commit's persisted closure
+  (the union of the merge's parents) is no longer used as a seed.
+- An edit of a file whose graph vertices no longer line up with its lines
+  (seen on pallets/markupsafe after a maintenance-branch merge) rewrites
+  the file wholesale from the full new content instead of keeping only the
+  edited lines; the staged check used to refuse the import at that commit.
 - The staged check of an incremental single-parent commit replays the
   semantic closure only for the paths the commit touches (every path still
   gets the byte, mode and kind checks); merges, exclusions and fresh
