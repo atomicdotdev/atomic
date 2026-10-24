@@ -598,8 +598,13 @@ where
     // puts the edit boundary at EOF, where partial-hunk slicing is
     // fragile; route through the sentinel whole-file replace, which
     // rewrites the file byte-exactly.
-    let eof_boundary_edit = old_content.last().is_some_and(|&b| b != b'\n')
-        || new_content.last().is_some_and(|&b| b != b'\n');
+    // Identical content (a pure move of the file) is no edit at all: without
+    // this guard a moved file lacking a trailing newline took the whole-file
+    // replace below, re-inserting every line of content that never changed.
+    let content_differs = old_content != new_content.as_slice();
+    let eof_boundary_edit = content_differs
+        && (old_content.last().is_some_and(|&b| b != b'\n')
+            || new_content.last().is_some_and(|&b| b != b'\n'));
     let force_whole_file = options.get_force_whole_file_replace()
         || (super::globalize::should_use_opaque_generated_vertices(&detected.path)
             && existing_branches.is_some_and(|branches| !branches.is_empty()))

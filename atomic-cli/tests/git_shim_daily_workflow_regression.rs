@@ -65,6 +65,26 @@ fn atomic_ok(root: &Path, home: &Path, args: &[&str]) -> String {
     String::from_utf8_lossy(&output.stdout).into_owned()
 }
 
+/// `atomic_ok` with extra environment variables for this one invocation.
+fn atomic_ok_env(root: &Path, home: &Path, envs: &[(&str, &str)], args: &[&str]) -> String {
+    let output = Command::new(ATOMIC_BIN)
+        .args(args)
+        .current_dir(root)
+        .env("HOME", home)
+        .env("ATOMIC_HOME", home.join(".atomic"))
+        .env("ATOMIC_NONINTERACTIVE", "1")
+        .envs(envs.iter().copied())
+        .output()
+        .expect("run atomic");
+    assert!(
+        output.status.success(),
+        "atomic {args:?} failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
 fn atomic_err(root: &Path, home: &Path, args: &[&str]) -> String {
     let output = atomic(root, home, args);
     assert!(
@@ -811,4 +831,92 @@ fn linked_worktree_status_and_reconcile_refuse_without_creating_a_repository() {
         "no second repository may be created in the linked worktree"
     );
     assert_clean(&root, &home);
+}
+
+#[test]
+fn renaming_a_file_without_a_trailing_newline_keeps_later_git_commits_reconcilable() {
+    let (root, home) = shim_repo();
+    // Git already holds the file; its last line has no newline.
+    fs::write(root.join("notes.md"), b"# Notes\n\nfirst\nlast").unwrap();
+    commit_all(&root, "notes");
+    atomic_ok(&root, &home, &["git", "shim", "reconcile"]);
+
+    // A native record of another file first (the team's usual sequence),
+    // then a plain mv plus a native record: the record detects the rename.
+    fs::write(root.join("tracked.txt"), b"base\nedited\n").unwrap();
+    atomic_ok(&root, &home, &["record", "-am", "edit tracked"]);
+    assert_clean(&root, &home);
+    fs::rename(root.join("notes.md"), root.join("notes.renamed.md")).unwrap();
+    atomic_ok(&root, &home, &["record", "-am", "rename notes"]);
+    assert_clean(&root, &home);
+    assert_eq!(
+        git(
+            &root,
+            &["ls-tree", "--name-only", "HEAD", "notes.renamed.md"]
+        ),
+        "notes.renamed.md"
+    );
+
+    // A Git commit elsewhere, verified against the WHOLE tree (what a merge
+    // or a fresh import does): the renamed file's semantic closure must
+    // render its bytes once, not twice.
+    fs::write(root.join("tracked.txt"), b"base\nedited\nagain\n").unwrap();
+    commit_all(&root, "edit elsewhere");
+    atomic_ok_env(
+        &root,
+        &home,
+        &[("ATOMIC_FULL_SEMANTIC_VERIFY", "1")],
+        &["git", "shim", "reconcile"],
+    );
+    assert_clean(&root, &home);
+
+    // And a commit touching the renamed file still reconciles.
+    fs::write(
+        root.join("notes.renamed.md"),
+        b"# Notes\n\nfirst\nlast\nmore\n",
+    )
+    .unwrap();
+    commit_all(&root, "edit renamed");
+    atomic_ok(&root, &home, &["git", "shim", "reconcile"]);
+    assert_clean(&root, &home);
+    assert_eq!(
+        fs::read(root.join("notes.renamed.md")).unwrap(),
+        b"# Notes\n\nfirst\nlast\nmore\n"
+    );
+}
+
+#[test]
+fn renaming_and_editing_a_file_in_one_record_keeps_later_git_commits_reconcilable() {
+    let (root, home) = shim_repo();
+    fs::write(root.join("notes.md"), b"# Notes\n\nfirst\nlast").unwrap();
+    commit_all(&root, "notes");
+    atomic_ok(&root, &home, &["git", "shim", "reconcile"]);
+    fs::write(root.join("tracked.txt"), b"base\nedited\n").unwrap();
+    atomic_ok(&root, &home, &["record", "-am", "edit tracked"]);
+
+    // Rename AND change the content in the same native record: the moved
+    // file takes the whole-file replace, which must tombstone the lines the
+    // view holds, not the ones the shared rows happen to show alive.
+    fs::rename(root.join("notes.md"), root.join("notes.renamed.md")).unwrap();
+    fs::write(
+        root.join("notes.renamed.md"),
+        b"# Notes\n\nfirst\nlast\nappended",
+    )
+    .unwrap();
+    atomic_ok(&root, &home, &["record", "-am", "rename and edit notes"]);
+    assert_clean(&root, &home);
+
+    fs::write(root.join("tracked.txt"), b"base\nedited\nagain\n").unwrap();
+    commit_all(&root, "edit elsewhere");
+    atomic_ok_env(
+        &root,
+        &home,
+        &[("ATOMIC_FULL_SEMANTIC_VERIFY", "1")],
+        &["git", "shim", "reconcile"],
+    );
+    assert_clean(&root, &home);
+    assert_eq!(
+        fs::read(root.join("notes.renamed.md")).unwrap(),
+        b"# Notes\n\nfirst\nlast\nappended"
+    );
 }

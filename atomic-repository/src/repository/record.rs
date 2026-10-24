@@ -1661,8 +1661,13 @@ impl Repository {
                     || crate::content_filter::looks_binary(&filtered.bytes));
             let moved_working_copy = Memory::new();
             moved_working_copy.add_file(&planned.new_path, &filtered.bytes);
-            let (trunk, branches) =
-                existing_crdt_identity(&shared_txn, planned.inode, &shared_graph_visibility)?;
+            let (trunk, branches) = existing_crdt_identity(
+                self,
+                &shared_txn,
+                planned.inode,
+                &effective_view,
+                &shared_graph_visibility,
+            )?;
             let detected = DetectedFile::moved(&planned.old_path, &planned.new_path)
                 .with_inode(planned.inode)
                 .with_position(planned.claimant);
@@ -1924,8 +1929,10 @@ impl Repository {
                                         })?
                                         .0;
                                     let (trunk, branches) = existing_crdt_identity(
+                                        self,
                                         &shared_txn,
                                         absent.inode,
+                                        &effective_view,
                                         &baseline,
                                     )?;
                                     record_undeleted_file(
@@ -4043,12 +4050,13 @@ fn visibility_before_deletions(
 }
 
 fn existing_crdt_identity(
+    repo: &Repository,
     txn: &atomic_core::pristine::ReadTxn,
     inode: Inode,
+    view_name: &str,
     visibility: &GraphVisibilityClosure,
 ) -> Result<(atomic_core::crdt::TrunkId, Vec<atomic_core::crdt::BranchId>), RecordError> {
-    use atomic_core::crdt::queries::iter_trunk_branches_in_file_order;
-    use atomic_core::crdt::tables::{decode_trunk_id, encode_branch_id};
+    use atomic_core::crdt::tables::decode_trunk_id;
     use atomic_core::pristine::CrdtTxnT;
 
     let trunk_key = txn
@@ -4061,22 +4069,13 @@ fn existing_crdt_identity(
             ))
         })?;
     let trunk = decode_trunk_id(&trunk_key);
-    let mut branches = Vec::new();
-    for branch in iter_trunk_branches_in_file_order(txn, trunk)
-        .map_err(|error| RecordError::Database(error.to_string()))?
-    {
-        if !visibility.contains(branch.change_id()) {
-            continue;
-        }
-        let key = encode_branch_id(&branch);
-        if txn
-            .get_crdt_branch(&key)
-            .map_err(|error| RecordError::Database(error.to_string()))?
-            .is_some_and(|data| data.state.is_alive())
-        {
-            branches.push(branch);
-        }
-    }
+    // Folded through the view's closure, never read from the shared rows: a
+    // WIP evidence snapshot tombstones the moved file's rows globally, and a
+    // whole-file replace built from the global alive set then tombstoned
+    // nothing, leaving the old lines alive next to the fresh ones.
+    let branches = repo
+        .view_alive_branches_in_order(txn, view_name, visibility, trunk)
+        .map_err(RecordError::Database)?;
     Ok((trunk, branches))
 }
 
