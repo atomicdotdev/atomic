@@ -144,12 +144,11 @@ pub struct Import {
     #[arg(skip)]
     pub(crate) reactive_budget: Option<atomic_repository::repository::ReconcileEffectBudget>,
 
-    /// Internal: the workspace's checkpoint view, whose Atomic-private
-    /// members (the initialization change tracking `.atomicignore`) join a
-    /// branch view seeded from an interpreted ancestor. The shim passes its
-    /// checkpoint; a plain import seeds the closure alone.
+    /// Internal: the workspace's checkpoint view, searched first when a new
+    /// branch view is seeded from an existing view's log at an interpreted
+    /// ancestor. The shim passes its checkpoint.
     #[arg(skip)]
-    pub(crate) seed_private_members_from: Option<String>,
+    pub(crate) seed_source_view: Option<String>,
 }
 
 fn current_git_branch(git_repo: &GitRepository) -> Option<String> {
@@ -271,17 +270,18 @@ impl Import {
         Ok(stats)
     }
 
-    /// Seed a branch's missing view from the nearest first-parent ancestor
-    /// this repository already interpreted, so the import walks only the
-    /// commits above it.
+    /// Seed a branch's missing view from an existing view's state at the
+    /// nearest first-parent ancestor this repository already interpreted, so
+    /// the import walks only the commits above it.
     ///
     /// A new Git branch (`git switch -c topic`, commit, reconcile) otherwise
     /// starts from an empty view and re-walks the whole history (92 minutes
-    /// on a 363-commit repository), re-referencing changes that exist. The
-    /// ancestor's persisted closure is exactly the state the view needs;
-    /// referencing it is metadata-only, the same idempotent insert the
-    /// per-commit reuse performs. Does nothing when the view exists, the
-    /// branch has no tip, or no ancestor is interpreted.
+    /// on a 363-commit repository). The seed is the SOURCE VIEW's own log up
+    /// to the ancestor's change, never the commit's persisted interpretation
+    /// closure: that closure is the union of a merge's parent closures and
+    /// still names a merged leg's change that the merge resolution replaced
+    /// in the view, so seeding from it rendered the merged line twice.
+    /// Nothing is seeded when no view holds the ancestor's change.
     fn seed_new_view_from_interpreted_ancestor(
         &self,
         repo: &mut Repository,
@@ -298,58 +298,72 @@ impl Import {
         else {
             return Ok(());
         };
-        let mut walk = git_repo.revwalk().map_err(|error| CliError::GitError {
+        let walk_error = |error: git2::Error| CliError::GitError {
             message: format!("cannot walk branch '{branch_name}': {error}"),
-        })?;
-        walk.push(tip).map_err(|error| CliError::GitError {
-            message: format!("cannot walk branch '{branch_name}': {error}"),
-        })?;
-        walk.simplify_first_parent()
-            .map_err(|error| CliError::GitError {
-                message: format!("cannot walk branch '{branch_name}': {error}"),
-            })?;
+        };
+        let mut walk = git_repo.revwalk().map_err(walk_error)?;
+        walk.push(tip).map_err(walk_error)?;
+        walk.simplify_first_parent().map_err(walk_error)?;
         let mut ahead = 0usize;
         for oid in walk {
-            let sha = oid
-                .map_err(|error| CliError::GitError {
-                    message: format!("cannot walk branch '{branch_name}': {error}"),
-                })?
-                .to_string();
-            let interpreted = repo
-                .checked_git_sha(&sha)
-                .map_err(CliError::from)?
-                .is_some();
-            let closure = if interpreted {
-                repo.git_commit_closure(&sha).map_err(CliError::from)?
-            } else {
-                None
-            };
-            let Some(closure) = closure else {
+            let sha = oid.map_err(walk_error)?.to_string();
+            let Some(hash) = repo.checked_git_sha(&sha).map_err(CliError::from)? else {
                 ahead += 1;
                 continue;
             };
+            let Some((source_view, prefix)) = self.view_log_up_to(repo, &hash)? else {
+                return Ok(());
+            };
             repo.create_shared_view(branch_name)
                 .map_err(|error| CliError::Internal(error.into()))?;
-            repo.ensure_union_state(branch_name, &closure)
+            for member in &prefix {
+                repo.insert_change(
+                    member,
+                    atomic_repository::InsertOptions::with_dependencies().view(branch_name),
+                )
                 .map_err(CliError::from)?;
-            // The checkpoint view's Atomic-private members (the initialization
-            // change tracking `.atomicignore`) belong to no Git commit's
-            // closure; without them the new view reports them untracked.
-            if let Some(source_view) = self.seed_private_members_from.as_deref() {
-                let private = super::shim::atomic_private_members(repo, source_view)?;
-                if !private.is_empty() {
-                    repo.ensure_union_state(branch_name, &private)
-                        .map_err(CliError::from)?;
-                }
             }
             print_info(&format!(
-                "Seeded view '{branch_name}' from interpreted ancestor {} ({} changes); {ahead} commit(s) ahead to import",
+                "Seeded view '{branch_name}' from view '{source_view}' at interpreted ancestor {} ({} changes); {ahead} commit(s) ahead to import",
                 &sha[..8.min(sha.len())],
-                closure.len()
+                prefix.len()
             ));
             return Ok(());
         }
         Ok(())
+    }
+
+    /// The first view whose effective log holds `hash`, with that log's
+    /// prefix up to and including it (root to leaf). The checkpoint view the
+    /// shim names is searched first.
+    fn view_log_up_to(
+        &self,
+        repo: &Repository,
+        hash: &atomic_core::types::Hash,
+    ) -> CliResult<Option<(String, Vec<atomic_core::types::Hash>)>> {
+        let mut candidates: Vec<String> = Vec::new();
+        candidates.extend(self.seed_source_view.iter().cloned());
+        for view in repo.list_views().map_err(CliError::from)? {
+            if !candidates.contains(&view) {
+                candidates.push(view);
+            }
+        }
+        for view in candidates {
+            if !repo.view_exists(&view).map_err(CliError::from)? {
+                continue;
+            }
+            let entries = repo
+                .effective_history(Some(&view))
+                .map_err(CliError::from)?;
+            if let Some(position) = entries.iter().position(|entry| entry.hash == *hash) {
+                let prefix = entries[..=position]
+                    .iter()
+                    .map(|entry| entry.hash)
+                    .collect();
+                return Ok(Some((view, prefix)));
+            }
+        }
+        Ok(None)
     }
 
     /// Get repository name from remote URL or working directory.
