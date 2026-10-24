@@ -647,6 +647,8 @@ fn a_new_branch_reconciles_only_its_own_commits() {
             "{message} missing from the topic view:\n{log}"
         );
     }
+}
+
 /// Every Git hook `atomic git shim enable` installs as an Atomic-owned
 /// dispatcher.
 const ATOMIC_HOOKS: [&str; 5] = [

@@ -58,14 +58,26 @@ pub(crate) fn detect_linked_worktree(path: &Path) -> Option<LinkedWorktree> {
     })
 }
 
-/// Hook entry points: inside a linked worktree the dispatcher passes through
-/// (returns `true`) after one advisory line on stderr. Detection starts at
-/// the current directory because Git runs hooks from the worktree root.
+/// A linked worktree the shim does not manage: one without an Atomic
+/// repository of its own. A linked worktree that was initialized as its own
+/// repository resolves to that repository and is handled like any other.
+pub(crate) fn detect_unmanaged_linked_worktree(path: &Path) -> Option<LinkedWorktree> {
+    let linked = detect_linked_worktree(path)?;
+    if atomic_repository::has_database(&linked.root.join(DOT_DIR)) {
+        return None;
+    }
+    Some(linked)
+}
+
+/// Hook entry points: inside an unmanaged linked worktree the dispatcher
+/// passes through (returns `true`) after one advisory line on stderr.
+/// Detection starts at the current directory because Git runs hooks from
+/// the worktree root.
 pub(crate) fn hook_passes_through(hook_name: &str) -> bool {
     let Ok(cwd) = std::env::current_dir() else {
         return false;
     };
-    let Some(linked) = detect_linked_worktree(&cwd) else {
+    let Some(linked) = detect_unmanaged_linked_worktree(&cwd) else {
         return false;
     };
     if hook_name != SILENT_HOOK {
@@ -79,7 +91,7 @@ pub(crate) fn hook_passes_through(hook_name: &str) -> bool {
 
 /// `git shim` commands refuse inside a linked worktree.
 pub(crate) fn refuse_shim_command(path: &Path) -> CliResult<()> {
-    match detect_linked_worktree(path) {
+    match detect_unmanaged_linked_worktree(path) {
         Some(linked) => Err(refusal(&linked)),
         None => Ok(()),
     }
@@ -89,7 +101,7 @@ pub(crate) fn refuse_shim_command(path: &Path) -> CliResult<()> {
 /// worktree only when the main worktree is shim-enrolled; a repository that
 /// never enabled the shim keeps its native linked-worktree support.
 pub(crate) fn refuse_when_shim_enrolled(path: &Path) -> CliResult<()> {
-    let Some(linked) = detect_linked_worktree(path) else {
+    let Some(linked) = detect_unmanaged_linked_worktree(path) else {
         return Ok(());
     };
     if main_worktree_shim_enrolled(&linked.main_root)? {
@@ -186,6 +198,16 @@ mod tests {
             ],
         );
         (main, parent)
+    }
+
+    #[test]
+    fn a_linked_worktree_with_its_own_repository_is_not_unmanaged() {
+        let (_main, parent) = repository_with_linked_worktree();
+        let linked = parent.path().join("linked");
+        assert!(detect_unmanaged_linked_worktree(&linked).is_some());
+        drop(atomic_repository::Repository::init(&linked).unwrap());
+        assert_eq!(detect_unmanaged_linked_worktree(&linked), None);
+        refuse_shim_command(&linked).expect("an independent repository is not refused");
     }
 
     #[test]
