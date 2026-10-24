@@ -2007,6 +2007,8 @@ fn import_git_to_atomic_budgeted(root: &Path, budget: ReconcileEffectBudget) -> 
     }
 
     let was_detached = detached_tip.is_some();
+    let seed_private_members_from =
+        read_workspace_metadata(root)?.map(|checkpoint| checkpoint.view);
     Import {
         incremental: true,
         branch: Some(view.clone()),
@@ -2016,6 +2018,7 @@ fn import_git_to_atomic_budgeted(root: &Path, budget: ReconcileEffectBudget) -> 
         full_tree_verification: true,
         detached_tip,
         reactive_budget: (budget.is_metadata_only()).then_some(budget),
+        seed_private_members_from,
         ..Import::default()
     }
     .run()?;

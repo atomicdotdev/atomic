@@ -143,6 +143,13 @@ pub struct Import {
     /// and working-copy materialization — and runs metadata-only work only.
     #[arg(skip)]
     pub(crate) reactive_budget: Option<atomic_repository::repository::ReconcileEffectBudget>,
+
+    /// Internal: the workspace's checkpoint view, whose Atomic-private
+    /// members (the initialization change tracking `.atomicignore`) join a
+    /// branch view seeded from an interpreted ancestor. The shim passes its
+    /// checkpoint; a plain import seeds the closure alone.
+    #[arg(skip)]
+    pub(crate) seed_private_members_from: Option<String>,
 }
 
 fn current_git_branch(git_repo: &GitRepository) -> Option<String> {
@@ -325,14 +332,15 @@ impl Import {
                 .map_err(|error| CliError::Internal(error.into()))?;
             repo.ensure_union_state(branch_name, &closure)
                 .map_err(CliError::from)?;
-            // The source view's Atomic-private members (the initialization
+            // The checkpoint view's Atomic-private members (the initialization
             // change tracking `.atomicignore`) belong to no Git commit's
             // closure; without them the new view reports them untracked.
-            let source_view = repo.current_view().to_string();
-            let private = super::shim::atomic_private_members(repo, &source_view)?;
-            if !private.is_empty() {
-                repo.ensure_union_state(branch_name, &private)
-                    .map_err(CliError::from)?;
+            if let Some(source_view) = self.seed_private_members_from.as_deref() {
+                let private = super::shim::atomic_private_members(repo, source_view)?;
+                if !private.is_empty() {
+                    repo.ensure_union_state(branch_name, &private)
+                        .map_err(CliError::from)?;
+                }
             }
             print_info(&format!(
                 "Seeded view '{branch_name}' from interpreted ancestor {} ({} changes); {ahead} commit(s) ahead to import",
