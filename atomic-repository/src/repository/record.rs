@@ -627,7 +627,11 @@ impl Repository {
         // graph and semantic layers agree with the commit tree byte-exactly.
         let branch_line_divergence =
             existing_branches.len() != atomic_core::diff::Line::from_bytes(old_content).len();
-        let options = if force_whole_file_replace || branch_line_divergence {
+        let graph_line_divergence = self
+            .alive_graph_lines_on_view_excluding(inode, position, view_name, excluded)?
+            != atomic_core::diff::Line::from_bytes(old_content).len();
+        let options = if force_whole_file_replace || branch_line_divergence || graph_line_divergence
+        {
             atomic_core::record::workflow::RecordingOptions::new().force_whole_file_replace(true)
         } else {
             atomic_core::record::workflow::RecordingOptions::new()
@@ -957,6 +961,40 @@ impl Repository {
     /// canonical trunk, alive branches in closure-local file order, and all
     /// observed branch identities. The latter is the deletion domain of a
     /// whole-file resolution; it must not depend on ambient lifecycle rows.
+    /// The alive content vertices the view's graph holds for `inode`, with
+    /// `excluded` held invisible. A positional edit indexes lines by vertex:
+    /// when the two no longer line up (a maintenance-branch merge left
+    /// tox.ini with vertices that do not match its lines on markupsafe), the
+    /// per-line hunk cannot map, the graph falls back to a whole-file
+    /// rewrite and the semantic ops stay positional, so the staged check
+    /// refuses the import. The caller rewrites both layers wholesale instead.
+    fn alive_graph_lines_on_view_excluding(
+        &self,
+        inode: Inode,
+        position: Position<NodeId>,
+        view_name: &str,
+        excluded: &[Hash],
+    ) -> Result<usize, String> {
+        let txn = self
+            .pristine
+            .read_txn()
+            .map_err(|e| format!("cannot open pristine: {e}"))?;
+        let view = txn
+            .get_view(view_name)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("view '{view_name}' does not exist"))?;
+        let visibility = super::filter::assembly_visibility_excluding(&txn, &view, excluded)
+            .map_err(|e| e.to_string())?;
+        let view_graph = atomic_core::pristine::ViewGraph::new(&txn, visibility);
+        Ok(
+            atomic_core::record::workflow::globalize::alive_content_vertex_count(
+                &view_graph,
+                inode,
+                position,
+            ),
+        )
+    }
+
     /// Errors fail closed.
     fn resolve_existing_semantic_state(
         &self,
@@ -2354,12 +2392,35 @@ impl Repository {
                 detected.position = Some(file_position);
                 let filtered_working_copy = Memory::new();
                 filtered_working_copy.add_file(path, &repository_bytes);
+                // The view graph's alive vertices must line up with the old
+                // content's lines for a positional edit to map; otherwise the
+                // graph falls back to a whole-file rewrite while the semantic
+                // ops stay positional, and the two layers disagree (the same
+                // divergence the foreign record guards against).
+                let graph_line_divergence = {
+                    let view_graph = atomic_core::pristine::ViewGraph::new(
+                        &shared_cached_txn,
+                        shared_graph_visibility.clone(),
+                    );
+                    atomic_core::record::workflow::globalize::alive_content_vertex_count(
+                        &view_graph,
+                        file_inode,
+                        file_position,
+                    ) != atomic_core::diff::Line::from_bytes(&old_content).len()
+                };
                 let file_options = if opaque {
                     log::warn!(
                         "record: Git-tracked '{}' is large or binary; preserving exact repository bytes as opaque content",
                         path
                     );
                     opaque_core_options.clone().force_whole_file_replace(true)
+                } else if graph_line_divergence && !had_fork_structure {
+                    log::debug!(
+                        "record: '{}' holds graph vertices that do not line up with its lines; \
+                         recording a whole-file replace",
+                        path
+                    );
+                    core_options.clone().force_whole_file_replace(true)
                 } else if had_fork_structure {
                     if conflicted_paths.contains(path.as_str()) {
                         // The fork is a surfaced conflict this record is

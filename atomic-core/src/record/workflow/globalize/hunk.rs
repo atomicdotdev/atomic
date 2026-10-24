@@ -830,6 +830,19 @@ where
 /// with live content hanging off any of them.  A single-successor walk
 /// picks one chain and silently drops the others, and an index mapping
 /// that is off by even one line deletes the wrong vertices.
+/// The number of alive content vertices the (view-filtered) graph holds for
+/// `inode`. A positional hunk indexes lines by vertex, so a caller that finds
+/// this count differing from the file's line count must rewrite the file
+/// wholesale instead of recording a per-line edit.
+pub fn alive_content_vertex_count<T>(txn: &T, inode: Inode, inode_pos: Position<NodeId>) -> usize
+where
+    T: GraphTxnT + InodeGraphOps,
+{
+    collect_sorted_content_vertices(txn, inode, inode_pos)
+        .map(|vertices| vertices.len())
+        .unwrap_or(0)
+}
+
 fn collect_sorted_content_vertices<T>(
     txn: &T,
     inode: Inode,
