@@ -31,7 +31,7 @@ use super::observation::{
 use super::parallel::{
     conversion_policy, equivalence_error, git_object_id, verify_complete_equivalence,
 };
-use super::{anchor, hooks, Import};
+use super::{anchor, hooks, linked_worktree, Import};
 use crate::commands::workspace_txn::{
     enter_remediation_workspace, enter_remediation_workspace_budgeted, enter_workspace,
     remediation_error,
@@ -681,23 +681,33 @@ impl Command for Shim {
                 new_head,
                 checkout_flag,
             } => {
-                let root = find_repository_root()?;
+                let Some(root) = hook_root("post-checkout")? else {
+                    return Ok(());
+                };
                 hooks::record_post_checkout(&root, old_head, new_head, checkout_flag)
             }
             ShimCommand::HookPostRewrite => {
-                let root = find_repository_root()?;
+                let Some(root) = hook_root("post-rewrite")? else {
+                    return Ok(());
+                };
                 hooks::record_post_rewrite(&root)
             }
             ShimCommand::HookPreCommit => {
-                let root = find_repository_root()?;
+                let Some(root) = hook_root("pre-commit")? else {
+                    return Ok(());
+                };
                 hooks::record_pre_commit(&root)
             }
             ShimCommand::HookReferenceTransaction { state } => {
-                let root = find_repository_root()?;
+                let Some(root) = hook_root("reference-transaction")? else {
+                    return Ok(());
+                };
                 hooks::record_reference_transaction(&root, state)
             }
             ShimCommand::HookPrePush => {
-                let root = find_repository_root()?;
+                let Some(root) = hook_root("pre-push")? else {
+                    return Ok(());
+                };
                 hooks::run_pre_push_verification(&root)
             }
             ShimCommand::VerifyReceive { unprotected } => {
@@ -749,8 +759,18 @@ fn classify_direction(
     }
 }
 
+/// The repository root for a `hook-*` entry point, or `None` when Git ran
+/// the dispatcher inside a linked worktree and the hook passes through.
+fn hook_root(hook_name: &str) -> CliResult<Option<PathBuf>> {
+    if linked_worktree::hook_passes_through(hook_name) {
+        return Ok(None);
+    }
+    find_repository_root().map(Some)
+}
+
 fn reconcile() -> CliResult<()> {
     let root = find_repository_root()?;
+    linked_worktree::refuse_shim_command(&root)?;
     // The transaction brackets the FileWatcher with atomic-bridge enter/leave,
     // including failure cleanup; shim-originated writes inside the span are
     // self-suppressed so they never feed back into reconciliation.

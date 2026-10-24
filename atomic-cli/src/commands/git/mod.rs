@@ -62,6 +62,7 @@ pub(crate) mod checkpoint;
 pub(crate) mod guard;
 pub mod hooks;
 pub mod import;
+pub(crate) mod linked_worktree;
 pub(crate) mod observation;
 pub mod parallel;
 pub(crate) mod push;
