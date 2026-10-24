@@ -3802,7 +3802,10 @@ impl Repository {
                 .is_some_and(|scope| !scope.contains(path))
             {
                 // An untouched trunk of a plain child commit: its closure is
-                // unchanged since the previous verification.
+                // exactly what the previous verification replayed. The raw
+                // consumer walker is not a substitute here: a WIP evidence
+                // snapshot legitimately leaves out-of-closure rows on the
+                // trunk that only the closure-aware replay can attribute.
                 continue;
             }
             let semantic_start = std::time::Instant::now();

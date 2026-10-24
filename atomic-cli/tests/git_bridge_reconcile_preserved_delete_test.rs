@@ -177,26 +177,6 @@ impl Preserved {
         );
     }
 
-    /// Atomic cleanliness tolerating paths the preserved foreign view owns:
-    /// the fresh import records `.atomicignore` into the *foreign* view, so
-    /// while `main` is adopted the file sits on disk untracked by `main`.
-    /// That is the preserved working-copy contract, not drift.
-    fn assert_atomic_clean_allow_untracked(&self, allowed: &[&str]) {
-        let status = self.atomic(&["status", "--short"]);
-        let unexpected: Vec<String> = status
-            .lines()
-            .filter(|line| {
-                let path = line.get(3..).unwrap_or_default().trim();
-                !allowed.contains(&path)
-            })
-            .map(str::to_owned)
-            .collect();
-        assert!(
-            unexpected.is_empty(),
-            "atomic status has unexpected entries (allowed untracked: {allowed:?}): {status}"
-        );
-    }
-
     fn assert_bridge_verified(&self) {
         let output = self.atomic_output(&["git", "shim", "verify"]);
         assert!(
@@ -348,12 +328,14 @@ fn reconcile_delete_binds_target_closure_not_ambient_tree_binding() {
          closure:\n{reconcile}"
     );
 
-    assert_eq!(fixture.view_change_count("main"), 3);
+    // base, the add, the delete, plus the `.atomicignore` change the fresh
+    // import recorded under `foreign`: a new branch view is seeded from its
+    // interpreted ancestor's closure and the source view's Atomic-private
+    // members, so `.atomicignore` is tracked here as well.
+    assert_eq!(fixture.view_change_count("main"), 4);
     assert_path_absent(fixture.root(), "skills/nested/SKILL.md");
     fixture.assert_git_clean();
-    // `.atomicignore` was recorded by the foreign view's fresh import and
-    // is preserved on disk while `main` owns the working copy.
-    fixture.assert_atomic_clean_allow_untracked(&[".atomicignore"]);
+    fixture.assert_atomic_clean();
     fixture.assert_bridge_verified();
     // The unrelated view's own history is untouched.
     assert_eq!(fixture.view_change_count("foreign"), 3);
