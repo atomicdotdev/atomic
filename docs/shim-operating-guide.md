@@ -57,7 +57,21 @@ is kept as a regression check.
   repositories whose tree holds symlinks, including a symlink to a
   directory (the `.claude/skills/<name>` layout).
 - The first `reconcile` of a branch created from an anchored tip references
-  the tip's closure instead of restoring and re-projecting it.
+  the tip's closure instead of restoring and re-projecting it, and a branch
+  whose view does not exist yet is seeded from the nearest interpreted
+  first-parent ancestor, so only the commits above it import
+  (`Seeded view 'topic' from interpreted ancestor ...; 1 commit(s) ahead`).
+  Before: the whole history replayed into the new view (92 minutes on a
+  363-commit repository).
+- A native `atomic record` that deletes or rewrites lines in a file Git
+  already holds no longer makes the next `git commit` unreconcilable: the
+  record folds the file's existing branches through its own view instead
+  of reading the shared rows, which a WIP evidence snapshot can tombstone.
+- The staged check of an incremental single-parent commit replays the
+  semantic closure only for the paths the commit touches (every path still
+  gets the byte, mode and kind checks); merges, exclusions and fresh
+  imports keep the whole-tree replay, and `ATOMIC_FULL_SEMANTIC_VERIFY=1`
+  forces it.
 
 **Repositories imported before this change must be re-imported.** The old
 importer tracked paths with spaces or non-ASCII bytes under their escaped
@@ -68,19 +82,6 @@ deleted and the real files untracked, and every reconcile refuses. Remove
 
 **Known failures (not fixed; avoid until tracked fixes land):**
 
-- An `atomic record` that deletes lines from a file already in Git history
-  makes every later `git commit` on that branch unreconcilable
-  (`staged semantic closure for '<path>': the closure's semantic
-  operations render N byte(s) ... must regenerate the commit tree`).
-  Records that only add lines, or replace a whole single-line file, are
-  fine. Cause: the WIP evidence snapshot taken at the record boundary
-  (`Bridge pre-transition capture`, recorded into the `wc/<id>` Draft view)
-  applies its semantic ops into the repository-wide CRDT tables, so the
-  chain holds a second branch for the edited line; the next record's
-  delete targets that snapshot branch, and the staged replay of the Git
-  commit's closure then counts the record's own line as alive. Recovery:
-  `git reset --hard HEAD~1` back to the projection commit and keep working
-  through Atomic, or make the deletion through Git.
 - Linked `git worktree`s cannot reconcile (`Repository already exists`).
 - Committing `.atomicignore` to Git makes `verify`/`reconcile` report
   `GitIndex/ExclusionPolicy .atomicignore`; keep it out of Git.
@@ -88,11 +89,11 @@ deleted and the real files untracked, and every reconcile refuses. Remove
   write can leave that commit unable to re-import (`already has a
   different persisted interpretation closure`); the only recovery is a
   fresh import.
-- Performance: `atomic record` and `reconcile` take minutes on
-  repositories with a few hundred changes, and the first `reconcile` of a
-  newly created branch re-validates the binding closure (tens of minutes
-  on such repositories). Importing a thousand-commit history takes about
-  an hour.
+- Performance: `atomic record` and `reconcile` still take minutes on
+  repositories with a few hundred files (a one-commit reconcile spent
+  about ten minutes on a 967-file repository before the scoped replay
+  above; the retrieval hot paths remain). Importing a thousand-commit
+  history takes hours.
 
 Other limits:
 
