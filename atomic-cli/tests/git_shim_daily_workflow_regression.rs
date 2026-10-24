@@ -27,7 +27,15 @@
 //! - the pre-push hook bound every proposed branch to the current view, so
 //!   pushing any other branch was refused;
 //! - `atomic git shim switch` refused any repository whose tree holds a
-//!   symlink (`unsupported Git entry ... with mode 120000`).
+//!   symlink (`unsupported Git entry ... with mode 120000`);
+//! - `atomic git shim disable` and `atomic git hooks uninstall` left the
+//!   pre-push dispatcher on disk, so a plain `git push` was still refused
+//!   after the team opted out;
+//! - inside a linked `git worktree` the pre-push dispatcher refused every
+//!   push (`working-copy identity ... requires writable migration`), the
+//!   other dispatchers journaled into a stray `.atomic/bridge` there, and
+//!   `atomic git shim reconcile` tried to initialize a second repository
+//!   (`Repository already exists`).
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -639,4 +647,166 @@ fn a_new_branch_reconciles_only_its_own_commits() {
             "{message} missing from the topic view:\n{log}"
         );
     }
+/// Every Git hook `atomic git shim enable` installs as an Atomic-owned
+/// dispatcher.
+const ATOMIC_HOOKS: [&str; 5] = [
+    "post-checkout",
+    "pre-commit",
+    "pre-push",
+    "post-rewrite",
+    "reference-transaction",
+];
+
+fn add_bare_origin(root: &Path) -> PathBuf {
+    let remote = tempfile::tempdir().unwrap().keep();
+    git(&remote, &["init", "-q", "--bare"]);
+    git(root, &["remote", "add", "origin", remote.to_str().unwrap()]);
+    remote
+}
+
+/// A linked `git worktree` of `root` on a fresh branch, created with the
+/// hook environment pinned so the post-checkout dispatcher runs as it would
+/// for the team.
+fn linked_worktree(root: &Path, home: &Path, branch: &str) -> PathBuf {
+    let worktree = tempfile::tempdir().unwrap().keep().join("linked");
+    let output = git_with_home(
+        root,
+        home,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            branch,
+            worktree.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "git worktree add failed:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    worktree
+}
+
+#[test]
+fn shim_disable_removes_every_dispatcher_and_unblocks_push() {
+    let (root, home) = shim_repo();
+    add_bare_origin(&root);
+    let hooks_dir = root.join(".git/hooks");
+    for hook in ATOMIC_HOOKS {
+        assert!(hooks_dir.join(hook).is_file(), "enable installs {hook}");
+    }
+    // A branch no view has interpreted: the pre-push gate refuses it.
+    git(&root, &["switch", "-qc", "never"]);
+    fs::write(root.join("n.txt"), b"n\n").unwrap();
+    commit_all(&root, "n");
+    let refused = git_with_home(&root, &home, &["push", "-q", "origin", "never"]);
+    assert!(!refused.status.success(), "precondition: the gate refuses");
+
+    let disabled = atomic_ok(&root, &home, &["git", "shim", "disable"]);
+    for hook in ATOMIC_HOOKS {
+        assert!(
+            !hooks_dir.join(hook).exists(),
+            "disable must remove the {hook} dispatcher; output:\n{disabled}"
+        );
+    }
+    let pushed = git_with_home(&root, &home, &["push", "-q", "origin", "never"]);
+    let stderr = String::from_utf8_lossy(&pushed.stderr);
+    assert!(
+        pushed.status.success() && !stderr.contains("pre-push refused"),
+        "a plain git push must not be refused after disable:\n{stderr}"
+    );
+}
+
+#[test]
+fn hooks_uninstall_removes_atomic_dispatchers_but_keeps_foreign_hooks() {
+    let (root, home) = shim_repo();
+    let hooks_dir = root.join(".git/hooks");
+    let custom = b"#!/bin/sh\necho custom pre-push\nexit 0\n";
+    fs::write(hooks_dir.join("pre-push"), custom).unwrap();
+    fs::write(hooks_dir.join("commit-msg"), custom).unwrap();
+
+    let run = atomic(&root, &home, &["git", "hooks", "uninstall"]);
+    assert!(run.status.success(), "uninstall failed");
+    // Removals are reported on stdout, kept foreign hooks as warnings on stderr.
+    let output = format!(
+        "{}{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    for hook in [
+        "post-checkout",
+        "pre-commit",
+        "post-rewrite",
+        "reference-transaction",
+    ] {
+        assert!(
+            !hooks_dir.join(hook).exists(),
+            "uninstall must remove the {hook} dispatcher; output:\n{output}"
+        );
+        assert!(output.contains(hook), "each removal is reported:\n{output}");
+    }
+    assert_eq!(fs::read(hooks_dir.join("pre-push")).unwrap(), custom);
+    assert_eq!(fs::read(hooks_dir.join("commit-msg")).unwrap(), custom);
+    assert!(
+        output.contains("pre-push") && output.contains("not Atomic-owned"),
+        "the kept foreign hook is reported:\n{output}"
+    );
+    let status = atomic_ok(&root, &home, &["git", "hooks", "status"]);
+    for hook in ATOMIC_HOOKS {
+        assert!(status.contains(&format!("{hook}:")), "got:\n{status}");
+    }
+}
+
+#[test]
+fn linked_worktree_commit_and_push_pass_through_the_hooks() {
+    let (root, home) = shim_repo();
+    add_bare_origin(&root);
+    let worktree = linked_worktree(&root, &home, "wt");
+    fs::write(worktree.join("w.txt"), b"w\n").unwrap();
+    git(&worktree, &["add", "-A"]);
+
+    let commit = git_with_home(&worktree, &home, &["commit", "-qm", "w"]);
+    let commit_stderr = String::from_utf8_lossy(&commit.stderr);
+    assert!(commit.status.success(), "commit failed:\n{commit_stderr}");
+    assert!(
+        commit_stderr.contains("linked worktree") && commit_stderr.contains("hooks pass through"),
+        "the pre-commit dispatcher must advise once:\n{commit_stderr}"
+    );
+
+    let push = git_with_home(&worktree, &home, &["push", "-q", "origin", "wt"]);
+    let push_stderr = String::from_utf8_lossy(&push.stderr);
+    assert!(
+        push.status.success() && !push_stderr.contains("pre-push refused"),
+        "push from a linked worktree must pass through:\n{push_stderr}"
+    );
+    assert!(
+        push_stderr.contains("hooks pass through"),
+        "got:\n{push_stderr}"
+    );
+    assert!(
+        !worktree.join(".atomic").exists(),
+        "hooks must not create a repository"
+    );
+    assert_clean(&root, &home);
+}
+
+#[test]
+fn linked_worktree_status_and_reconcile_refuse_without_creating_a_repository() {
+    let (root, home) = shim_repo();
+    let worktree = linked_worktree(&root, &home, "wt");
+    let expected = format!(
+        "linked git worktrees are not supported by the shim yet; run from the main worktree '{}'",
+        root.canonicalize().unwrap().display()
+    );
+    for args in [&["status"][..], &["git", "shim", "reconcile"][..]] {
+        let error = atomic_err(&worktree, &home, args);
+        assert!(error.contains(&expected), "atomic {args:?} got:\n{error}");
+    }
+    assert!(
+        !worktree.join(".atomic").exists(),
+        "no second repository may be created in the linked worktree"
+    );
+    assert_clean(&root, &home);
 }
