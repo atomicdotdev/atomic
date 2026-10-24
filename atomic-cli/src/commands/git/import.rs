@@ -356,10 +356,19 @@ impl Import {
                 .effective_history(Some(&view))
                 .map_err(CliError::from)?;
             if let Some(position) = entries.iter().position(|entry| entry.hash == *hash) {
-                let prefix = entries[..=position]
+                let mut prefix: Vec<atomic_core::types::Hash> = entries[..=position]
                     .iter()
                     .map(|entry| entry.hash)
                     .collect();
+                // The view's Atomic-private members (the initialization change
+                // tracking `.atomicignore`) may sit after the ancestor's change
+                // in the log; without them the new view reports those files
+                // untracked.
+                for member in super::shim::atomic_private_members(repo, &view)? {
+                    if !prefix.contains(&member) {
+                        prefix.push(member);
+                    }
+                }
                 return Ok(Some((view, prefix)));
             }
         }

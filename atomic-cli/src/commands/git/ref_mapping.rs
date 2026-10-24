@@ -370,7 +370,7 @@ pub(crate) fn classify_mapping_direction(
 }
 
 /// The local branch `git branch -m` renamed `old_ref` to, found through the
-/// "renamed <old> to <new>" reflog entry Git writes on the new branch, or
+/// `renamed <old> to <new>` reflog entry Git writes on the new branch, or
 /// `None` when no branch carries such a trail (the ref was deleted).
 fn renamed_branch_target(git: &GitRepository, old_ref: &str) -> Option<String> {
     let needle = format!("renamed {old_ref} to ");
