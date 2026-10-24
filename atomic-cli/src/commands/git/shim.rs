@@ -31,7 +31,7 @@ use super::observation::{
 use super::parallel::{
     conversion_policy, equivalence_error, git_object_id, verify_complete_equivalence,
 };
-use super::{anchor, hooks, linked_worktree, Import};
+use super::{anchor, hook_dispatchers, hooks, linked_worktree, Import};
 use crate::commands::workspace_txn::{
     enter_remediation_workspace, enter_remediation_workspace_budgeted, enter_workspace,
     remediation_error,
@@ -663,12 +663,15 @@ impl Command for Shim {
                 let root = find_repository_root()?;
                 if record_shim_opt_in(&root, false)? {
                     print_success(
-                        "Recorded shim rollback in the repository configuration ([git.shim] enabled = false). The automatic telemetry sink stops writing without consent; advisory dispatchers remain on disk.",
+                        "Recorded shim rollback in the repository configuration ([git.shim] enabled = false). The automatic telemetry sink stops writing without consent.",
                     );
                 } else {
                     print_info("Shim was already disabled in the repository configuration.");
                 }
-                Ok(())
+                // Disable is the inverse of enable: the advisory dispatchers
+                // come off disk too, so a plain `git push` is never refused by
+                // a shim nobody consents to any more.
+                hook_dispatchers::uninstall_shim(&root)
             }
             ShimCommand::Cutover { rollback } => run_cutover(*rollback),
             ShimCommand::Binding { command } => command.clone().run(),

@@ -60,6 +60,7 @@ pub(crate) mod bootstrap;
 pub mod census;
 pub(crate) mod checkpoint;
 pub(crate) mod guard;
+pub(crate) mod hook_dispatchers;
 pub mod hooks;
 pub mod import;
 pub(crate) mod linked_worktree;
