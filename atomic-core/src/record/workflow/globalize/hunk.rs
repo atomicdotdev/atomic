@@ -180,13 +180,29 @@ where
                     // Middle insert into a single-vertex file — fall back to
                     // a whole-file Replace using the full file content (not
                     // just the inserted slice).
-                    globalize_replace(ctx, built, inode, inode_pos, full_content, local, encoding)
+                    globalize_replace(
+                        ctx,
+                        built,
+                        inode,
+                        inode_pos,
+                        full_content,
+                        full_content,
+                        local,
+                        encoding,
+                    )
                 }
             }
         }
-        BuiltHunkKind::Replace => {
-            globalize_replace(ctx, built, inode, inode_pos, content, local, encoding)
-        }
+        BuiltHunkKind::Replace => globalize_replace(
+            ctx,
+            built,
+            inode,
+            inode_pos,
+            content,
+            full_content,
+            local,
+            encoding,
+        ),
         BuiltHunkKind::Delete => globalize_delete(ctx, built, inode, inode_pos, local, encoding),
     }
 }
@@ -300,6 +316,7 @@ fn globalize_replace<T>(
     inode: Inode,
     inode_pos: Position<NodeId>,
     content: &[u8],
+    full_content: &[u8],
     local: Local,
     encoding: Option<Encoding>,
 ) -> GlobalizeResult<Vec<GraphOp<Option<Hash>>>>
@@ -321,6 +338,11 @@ where
     // sorted.is_empty()), and whole-file lifecycle paths (add/delete/
     // globalize_replace_whole_file) keep their opaque insert shape.
 
+    // Every whole-file fallback below rewrites the file from the FULL new
+    // content: the hunk slice holds only the replaced lines, and a replace
+    // built from it deleted every vertex and kept just those lines (a
+    // one-line tox.ini edit on a file whose vertices no longer matched its
+    // lines rendered 63 of 855 bytes and the import refused).
     let sorted = collect_sorted_content_vertices_cached(ctx, inode, inode_pos)?;
 
     // Legacy: file has no visible content vertices in this view.  Fall
@@ -336,7 +358,7 @@ where
     // dependencies — producing a phantom supersession relationship
     // between the just-recorded change and the other view's edits.
     if sorted.is_empty() {
-        return globalize_replace_whole_file(ctx, inode, inode_pos, content, local, encoding);
+        return globalize_replace_whole_file(ctx, inode, inode_pos, full_content, local, encoding);
     }
 
     // Pure insertion (no lines deleted) — treat as a middle/append insert.
@@ -348,7 +370,12 @@ where
                 Ok(p) => p,
                 Err(_) => {
                     return globalize_replace_whole_file(
-                        ctx, inode, inode_pos, content, local, encoding,
+                        ctx,
+                        inode,
+                        inode_pos,
+                        full_content,
+                        local,
+                        encoding,
                     );
                 }
             };
@@ -398,7 +425,7 @@ where
                 sorted.len()
             );
         }
-        return globalize_replace_whole_file(ctx, inode, inode_pos, content, local, encoding);
+        return globalize_replace_whole_file(ctx, inode, inode_pos, full_content, local, encoding);
     }
 
     // Resolve predecessor (end of vertex before the first deleted line).
