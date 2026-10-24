@@ -986,3 +986,102 @@ fn shim_switch_handles_a_symlinked_directory_in_the_tree() {
     );
     assert_clean(&root, &home);
 }
+
+#[test]
+fn a_branch_created_after_an_amend_and_a_revert_reconciles() {
+    let (root, home) = shim_repo();
+    fs::write(root.join("tracked.txt"), b"base\namend base\n").unwrap();
+    commit_all(&root, "amend base");
+    atomic_ok(&root, &home, &["git", "shim", "reconcile"]);
+    assert_clean(&root, &home);
+
+    // Amend the tip (history rewritten), then revert the amended commit.
+    fs::write(root.join("tracked.txt"), b"base\namend base\namended\n").unwrap();
+    git(&root, &["commit", "-q", "--amend", "-am", "amended"]);
+    atomic_ok(&root, &home, &["git", "shim", "reconcile"]);
+    assert_clean(&root, &home);
+    git(&root, &["revert", "--no-edit", "HEAD"]);
+    atomic_ok(&root, &home, &["git", "shim", "reconcile"]);
+    assert_clean(&root, &home);
+    assert_eq!(fs::read(root.join("tracked.txt")).unwrap(), b"base\n");
+
+    // A branch off that tip must reconcile with the tree Git has.
+    git(&root, &["switch", "-qc", "topic"]);
+    fs::write(root.join("topic.txt"), b"topic\n").unwrap();
+    commit_all(&root, "topic 1");
+    atomic_ok(&root, &home, &["git", "shim", "reconcile"]);
+    assert_clean(&root, &home);
+    assert_eq!(fs::read(root.join("tracked.txt")).unwrap(), b"base\n");
+}
+
+#[test]
+fn a_branch_created_after_merges_reconciles_with_the_same_tree() {
+    let (root, home) = shim_repo();
+    fs::write(root.join("tracked.txt"), b"base\ngit edit\n").unwrap();
+    commit_all(&root, "git edit");
+    atomic_ok(&root, &home, &["git", "shim", "reconcile"]);
+
+    // A fast-forwarded branch, then a no-ff merged branch, each appending a
+    // line: the history main carries into the next branch.
+    git(&root, &["switch", "-qc", "feature/real"]);
+    fs::write(root.join("tracked.txt"), b"base\ngit edit\nbranch edit\n").unwrap();
+    commit_all(&root, "branch edit");
+    atomic_ok(&root, &home, &["git", "shim", "reconcile"]);
+    git(&root, &["switch", "-q", "main"]);
+    atomic_ok(&root, &home, &["git", "shim", "reconcile"]);
+    git(&root, &["merge", "-q", "--ff-only", "feature/real"]);
+    atomic_ok(&root, &home, &["git", "shim", "reconcile"]);
+    git(&root, &["switch", "-qc", "feature/noff"]);
+    fs::write(
+        root.join("tracked.txt"),
+        b"base\ngit edit\nbranch edit\nnoff edit\n",
+    )
+    .unwrap();
+    commit_all(&root, "noff edit");
+    atomic_ok(&root, &home, &["git", "shim", "reconcile"]);
+    git(&root, &["switch", "-q", "main"]);
+    atomic_ok(&root, &home, &["git", "shim", "reconcile"]);
+    git(
+        &root,
+        &["merge", "-q", "--no-ff", "-m", "merge noff", "feature/noff"],
+    );
+    atomic_ok(&root, &home, &["git", "shim", "reconcile"]);
+    assert_clean(&root, &home);
+
+    // The next branch is seeded from main's closure: its tree must render
+    // exactly what Git holds (the noff line once, at the end).
+    git(&root, &["switch", "-qc", "topic"]);
+    fs::write(root.join("topic.txt"), b"topic\n").unwrap();
+    commit_all(&root, "topic 1");
+    atomic_ok(&root, &home, &["git", "shim", "reconcile"]);
+    assert_clean(&root, &home);
+    assert_eq!(
+        fs::read(root.join("tracked.txt")).unwrap(),
+        b"base\ngit edit\nbranch edit\nnoff edit\n"
+    );
+}
+
+#[test]
+fn deleting_a_branch_whose_view_was_adopted_does_not_block_reconcile() {
+    let (root, home) = shim_repo();
+    // `git switch -c topic` at the tip adopts a view for the branch; the user
+    // then goes back to main and deletes the branch.
+    git(&root, &["switch", "-qc", "topic"]);
+    atomic_ok(&root, &home, &["git", "shim", "reconcile"]);
+    assert_clean(&root, &home);
+    git(&root, &["switch", "-q", "main"]);
+    git(&root, &["branch", "-qD", "topic"]);
+
+    // The deleted branch's mapping is retired, not reported as a ref that
+    // moved independently of HEAD; work on main continues.
+    let out = atomic_ok(&root, &home, &["git", "shim", "reconcile"]);
+    assert!(
+        !out.contains("advanced beyond the last observed mapping"),
+        "got:\n{out}"
+    );
+    assert_clean(&root, &home);
+    fs::write(root.join("tracked.txt"), b"base\nafter delete\n").unwrap();
+    commit_all(&root, "after delete");
+    atomic_ok(&root, &home, &["git", "shim", "reconcile"]);
+    assert_clean(&root, &home);
+}
