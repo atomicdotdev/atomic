@@ -421,8 +421,40 @@ pub(crate) fn staged_expectation_for(
             entries,
             semantic_paths,
             verify_paths: touched.cloned(),
+            semantic_verify_paths: None,
         }),
     }
+}
+
+/// The paths whose semantic closure the staged check replays for `parsed`,
+/// or `None` for the whole tree.
+///
+/// A single-parent commit of an incremental import that excludes nothing
+/// changes the closure of exactly the trunks it touches; every other trunk's
+/// closure is what the previous import already replayed byte-exact, so only
+/// the touched paths (plus every recorded delta path) replay. Merges,
+/// exclusions, a fresh import's commits and `ATOMIC_FULL_SEMANTIC_VERIFY=1`
+/// keep the whole-tree replay.
+fn semantic_replay_scope(
+    parsed: &ParsedCommit,
+    semantic_paths: &[String],
+    closure_unchanged: bool,
+    incremental: bool,
+) -> Option<std::collections::BTreeSet<String>> {
+    if parsed.is_merge
+        || !closure_unchanged
+        || !incremental
+        || std::env::var_os("ATOMIC_FULL_SEMANTIC_VERIFY").is_some()
+    {
+        return None;
+    }
+    let mut scope = touched_paths(parsed);
+    scope.extend(
+        semantic_paths
+            .iter()
+            .map(|path| atomic_repository::canonical_path_identity(path)),
+    );
+    Some(scope)
 }
 
 /// Every path a single-parent commit touches: added, modified, deleted,
@@ -6698,8 +6730,16 @@ impl ParallelImporter {
             .map(|recorded| recorded.path().to_string())
             .collect();
         let touched = touched_only.then(|| touched_paths(parsed));
-        let expectation =
+        let mut expectation =
             staged_expectation_for(parsed, prospective, &semantic_paths, touched.as_ref());
+        if let Some(tree) = expectation.tree.as_mut() {
+            tree.semantic_verify_paths = semantic_replay_scope(
+                parsed,
+                &semantic_paths,
+                excluded.is_empty() && superseded.is_empty(),
+                self.options.incremental,
+            );
+        }
         let progress = SlowImportProgress::start(
             slow_import_commit_label(parsed),
             slow_import_record_summary(parsed, &recorded_files),

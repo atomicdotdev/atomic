@@ -545,6 +545,14 @@ pub struct StagedTreeExpectation {
     /// the last commit and merges verify the whole tree. `None` checks every
     /// path.
     pub verify_paths: Option<std::collections::BTreeSet<String>>,
+    /// When set, only these paths replay their semantic closure (review F4
+    /// text replay); every entry still gets the graph-layer byte, mode and
+    /// kind checks. The importer sets it for a single-parent commit of an
+    /// incremental import with no exclusions: the closure of every other
+    /// trunk is exactly what the previous import verified, so replaying all
+    /// of them again only costs time (seconds per commit on a few hundred
+    /// files). `None` replays every present text path.
+    pub semantic_verify_paths: Option<std::collections::BTreeSet<String>>,
 }
 
 impl StagedExpectation {
@@ -3788,6 +3796,15 @@ impl Repository {
                 // Already refused above; nothing further to reconstruct.
                 continue;
             };
+            if expected_tree
+                .semantic_verify_paths
+                .as_ref()
+                .is_some_and(|scope| !scope.contains(path))
+            {
+                // An untouched trunk of a plain child commit: its closure is
+                // unchanged since the previous verification.
+                continue;
+            }
             let semantic_start = std::time::Instant::now();
             self.verify_staged_semantic_closure(
                 txn,
