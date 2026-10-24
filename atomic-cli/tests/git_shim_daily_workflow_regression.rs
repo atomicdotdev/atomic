@@ -920,3 +920,69 @@ fn renaming_and_editing_a_file_in_one_record_keeps_later_git_commits_reconcilabl
         b"# Notes\n\nfirst\nlast\nappended"
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn shim_switch_handles_a_symlinked_directory_in_the_tree() {
+    use std::os::unix::fs::symlink;
+    let (root, home) = shim_repo();
+    // `.claude/commands` starts as a real directory with files ...
+    fs::create_dir_all(root.join(".claude/commands")).unwrap();
+    fs::write(root.join(".claude/commands/add.md"), b"add\n").unwrap();
+    fs::write(root.join(".claude/commands/fix.md"), b"fix\n").unwrap();
+    commit_all(&root, "real commands directory");
+    // ... and later becomes a symlink to a tracked directory elsewhere (the
+    // agents layout): Git stores the link, the files live under `.agents`.
+    git(&root, &["rm", "-rq", ".claude/commands"]);
+    fs::create_dir_all(root.join(".agents/commands")).unwrap();
+    fs::write(root.join(".agents/commands/add.md"), b"add\n").unwrap();
+    fs::write(root.join(".agents/commands/fix.md"), b"fix\n").unwrap();
+    fs::create_dir_all(root.join(".claude")).unwrap();
+    symlink("../.agents/commands", root.join(".claude/commands")).unwrap();
+    commit_all(&root, "symlinked directory");
+    atomic_ok(&root, &home, &["git", "shim", "reconcile"]);
+    assert_clean(&root, &home);
+
+    // A native record must not sweep the files behind the symlink into the
+    // view under the link's path.
+    fs::write(root.join("tracked.txt"), b"base\nrecorded\n").unwrap();
+    let recorded = atomic_ok(&root, &home, &["record", "-am", "native edit"]);
+    assert!(
+        !recorded.contains(".claude/commands/"),
+        "the record must not list files beneath the symlink:\n{recorded}"
+    );
+    assert_clean(&root, &home);
+    assert_eq!(
+        git(
+            &root,
+            &["ls-tree", "--name-only", "HEAD", ".claude/commands/"]
+        ),
+        "",
+        "the projection must not hold files beneath the symlink"
+    );
+
+    git(&root, &["switch", "-qc", "topic"]);
+    fs::write(root.join("tracked.txt"), b"base\ntopic\n").unwrap();
+    commit_all(&root, "topic edit");
+    atomic_ok(&root, &home, &["git", "shim", "reconcile"]);
+    assert_clean(&root, &home);
+
+    atomic_ok(&root, &home, &["git", "shim", "switch", "main"]);
+    assert_eq!(git(&root, &["branch", "--show-current"]), "main");
+    assert_eq!(
+        fs::read(root.join("tracked.txt")).unwrap(),
+        b"base\nrecorded\n"
+    );
+    assert!(root
+        .join(".claude/commands")
+        .symlink_metadata()
+        .unwrap()
+        .file_type()
+        .is_symlink());
+    atomic_ok(&root, &home, &["git", "shim", "switch", "topic"]);
+    assert_eq!(
+        fs::read(root.join("tracked.txt")).unwrap(),
+        b"base\ntopic\n"
+    );
+    assert_clean(&root, &home);
+}

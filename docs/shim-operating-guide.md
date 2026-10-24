@@ -67,6 +67,12 @@ is kept as a regression check.
   already holds no longer makes the next `git commit` unreconcilable: the
   record folds the file's existing branches through its own view instead
   of reading the shared rows, which a WIP evidence snapshot can tombstone.
+  The same fold covers a native rename (`mv` plus `atomic record -a`) of a
+  file whose last line has no newline, which used to leave the file's
+  semantic closure holding every line twice.
+- `atomic git shim switch` handles a directory that later became a symlink
+  (the `.claude/commands -> ../.agents/commands` agents layout): the old
+  files beneath the link are no longer scheduled for removal through it.
 - The staged check of an incremental single-parent commit replays the
   semantic closure only for the paths the commit touches (every path still
   gets the byte, mode and kind checks); merges, exclusions and fresh
@@ -89,7 +95,8 @@ deleted and the real files untracked, and every reconcile refuses. Remove
   stderr; `git commit` and `git push` proceed) and `atomic status` refuses
   with `linked git worktrees are not supported by the shim yet; run from
   the main worktree '<path>'` instead of initializing a second repository.
-  `atomic git shim reconcile` refuses the same way in every linked worktree.
+  A linked worktree registered with the repository (the `.atomic/repository`
+  pointer) adopts its own view and reconciles as before.
 - Committing `.atomicignore` to Git makes `verify`/`reconcile` report
   `GitIndex/ExclusionPolicy .atomicignore`; keep it out of Git.
 - Interrupting an import between a change write and its Git SHA index
