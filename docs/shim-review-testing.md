@@ -258,7 +258,7 @@ Database migration is separate from `git shim cutover`. See
 [operating guide section 15](shim-operating-guide.md#15-shim-cutover-and-database-migration)
 for cutover limits.
 
-## 9. Known failure: new Git branch after Atomic records
+## 9. Regression: new Git branch after Atomic records
 
 Run this in a **fresh test repo immediately after sections 1–4**, before
 disabling the shim or running the agent test:
@@ -275,20 +275,22 @@ Expected: reconcile imports the commit and verify passes. Switching between
 `main` and `foreign-edit`, then reconciling, should show `atomic edit` and
 `Git edit` respectively.
 
-**Observed on `27d06ff`, default build, macOS, local service mode:**
+**Previously observed on `27d06ff`** (`reconcile` exited 4):
 
 ```text
 Git error: commit <oid> carries an unverifiable Atomic change closure:
 repository projection failed: view 'foreign-edit' not found
 ```
 
-`reconcile` exits 4. This fails both with Atomic hooks installed and with a
-custom hook path that prevents installation. Earlier steps pass. The existing
-`git_shim_workspace_test` suite passes but does not catch this sequence.
-
-Keep the failed repo for debugging. The cause and comparison against `dev`
-have not been confirmed. This bug needs a fix before these basic shim
-workflows can be marked ready to merge.
+Cause: record projection commits carry `atomic-*` lines in their final
+paragraph, so they never parsed as push trailers and were verified by the
+dependency closure of their `Atomic-Changes` roots, which demanded a view
+named after the new branch and is not the view state once a rename commutes
+with an earlier edit. They are now verified by the `Atomic-View` /
+`Atomic-State` they name. A fast-forward merge of the branch back into `main`
+is also covered: the incremental marker set is per target view, so the
+already-interpreted commits are referenced into `main`'s view. Both flows
+are exercised by `atomic-cli/tests/git_shim_branch_reconcile_regression.rs`.
 
 ## 10. Evidence and reporting
 

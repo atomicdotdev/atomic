@@ -99,11 +99,18 @@ fn check_case(states: Vec<Vec<(&str, &[u8], i32)>>, merge: bool) {
     import(root.path(), &git, *ids.last().unwrap(), config.path());
     let repo = atomic_repository::Repository::open(root.path()).unwrap();
     for (path, bytes, _) in states.last().unwrap() {
-        let path = atomic_repository::escape_repo_path(path.as_bytes());
+        // The repository tracks an imported path under its on-disk spelling
+        // (as native tracking does); a name with a literal `%` keeps its
+        // escaped identity, so look the path up under either spelling.
+        let escaped = atomic_repository::escape_repo_path(path.as_bytes());
+        let content = repo
+            .get_file_content(path)
+            .unwrap()
+            .or_else(|| repo.get_file_content(&escaped).unwrap());
         assert_eq!(
-            repo.get_file_content(&path).unwrap().unwrap(),
-            *bytes,
-            "path={path}"
+            content.as_deref(),
+            Some(*bytes),
+            "path={path} (escaped {escaped})"
         );
     }
 }

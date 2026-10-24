@@ -42,6 +42,7 @@ mod record_tests;
 mod ref_mapping_tests;
 mod rename_tests;
 mod resurrection_tests;
+mod semantic_closure_tests;
 mod shadow_lock_tests;
 mod shim_git_journal_tests;
 mod snapshot_tests;

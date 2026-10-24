@@ -681,6 +681,9 @@ impl Command for Status {
     /// - The repository cannot be opened
     /// - Status computation fails
     fn run(&self) -> CliResult<()> {
+        // A shim-enrolled repository's linked worktrees are not managed yet:
+        // refuse before any constructor registers a second working copy there.
+        crate::commands::git::linked_worktree::refuse_when_shim_enrolled_from_cwd()?;
         if crate::commands::rpc::status(self)? {
             return Ok(());
         }

@@ -177,6 +177,8 @@ fn full_tree_expectation(entries: &[(&str, &[u8])], semantic_paths: &[&str]) -> 
         tree: Some(super::super::synthesis::StagedTreeExpectation {
             entries: tree_entries,
             semantic_paths: semantic_paths.iter().map(|p| p.to_string()).collect(),
+            semantic_verify_paths: None,
+
             verify_paths: None,
         }),
     }
@@ -652,6 +654,8 @@ fn deletion_synthesis_uses_repository_state_and_canonical_filedel() {
                 tree: Some(super::super::synthesis::StagedTreeExpectation {
                     entries: std::collections::BTreeMap::new(),
                     semantic_paths: vec!["plain.txt".to_string()],
+                    semantic_verify_paths: None,
+
                     verify_paths: None,
                 }),
             },

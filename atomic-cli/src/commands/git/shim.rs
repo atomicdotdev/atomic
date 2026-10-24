@@ -13,9 +13,10 @@ use atomic_repository::repository::observability::{
     ReconcileDirectionCode, RefusalClass, RemediationCode, WorkspaceModeCode,
 };
 use atomic_repository::{
-    compare_project_to_worktree, graph_visibility_closure, observe_git_index, observe_worktree,
-    verify_prospective_equivalence, GitAttributesFilter, GitObjectKind, InsertOptions, ProjectTree,
-    Repository, RepositoryError, StatusOptions, WorkspaceTxnMode,
+    compare_project_to_worktree, compare_project_to_worktree_with_index, graph_visibility_closure,
+    observe_git_index, observe_worktree, verify_prospective_equivalence, GitAttributesFilter,
+    GitObjectKind, InsertOptions, ProjectTree, Repository, RepositoryError, StatusOptions,
+    WorkspaceTxnMode,
 };
 use clap::{Parser, Subcommand};
 use git2::{
@@ -30,7 +31,7 @@ use super::observation::{
 use super::parallel::{
     conversion_policy, equivalence_error, git_object_id, verify_complete_equivalence,
 };
-use super::{anchor, hooks, Import};
+use super::{anchor, hook_dispatchers, hooks, linked_worktree, Import};
 use crate::commands::workspace_txn::{
     enter_remediation_workspace, enter_remediation_workspace_budgeted, enter_workspace,
     remediation_error,
@@ -662,12 +663,15 @@ impl Command for Shim {
                 let root = find_repository_root()?;
                 if record_shim_opt_in(&root, false)? {
                     print_success(
-                        "Recorded shim rollback in the repository configuration ([git.shim] enabled = false). The automatic telemetry sink stops writing without consent; advisory dispatchers remain on disk.",
+                        "Recorded shim rollback in the repository configuration ([git.shim] enabled = false). The automatic telemetry sink stops writing without consent.",
                     );
                 } else {
                     print_info("Shim was already disabled in the repository configuration.");
                 }
-                Ok(())
+                // Disable is the inverse of enable: the advisory dispatchers
+                // come off disk too, so a plain `git push` is never refused by
+                // a shim nobody consents to any more.
+                hook_dispatchers::uninstall_shim(&root)
             }
             ShimCommand::Cutover { rollback } => run_cutover(*rollback),
             ShimCommand::Binding { command } => command.clone().run(),
@@ -680,23 +684,33 @@ impl Command for Shim {
                 new_head,
                 checkout_flag,
             } => {
-                let root = find_repository_root()?;
+                let Some(root) = hook_root("post-checkout")? else {
+                    return Ok(());
+                };
                 hooks::record_post_checkout(&root, old_head, new_head, checkout_flag)
             }
             ShimCommand::HookPostRewrite => {
-                let root = find_repository_root()?;
+                let Some(root) = hook_root("post-rewrite")? else {
+                    return Ok(());
+                };
                 hooks::record_post_rewrite(&root)
             }
             ShimCommand::HookPreCommit => {
-                let root = find_repository_root()?;
+                let Some(root) = hook_root("pre-commit")? else {
+                    return Ok(());
+                };
                 hooks::record_pre_commit(&root)
             }
             ShimCommand::HookReferenceTransaction { state } => {
-                let root = find_repository_root()?;
+                let Some(root) = hook_root("reference-transaction")? else {
+                    return Ok(());
+                };
                 hooks::record_reference_transaction(&root, state)
             }
             ShimCommand::HookPrePush => {
-                let root = find_repository_root()?;
+                let Some(root) = hook_root("pre-push")? else {
+                    return Ok(());
+                };
                 hooks::run_pre_push_verification(&root)
             }
             ShimCommand::VerifyReceive { unprotected } => {
@@ -748,8 +762,18 @@ fn classify_direction(
     }
 }
 
+/// The repository root for a `hook-*` entry point, or `None` when Git ran
+/// the dispatcher inside a linked worktree and the hook passes through.
+fn hook_root(hook_name: &str) -> CliResult<Option<PathBuf>> {
+    if linked_worktree::hook_passes_through(hook_name) {
+        return Ok(None);
+    }
+    find_repository_root().map(Some)
+}
+
 fn reconcile() -> CliResult<()> {
     let root = find_repository_root()?;
+    linked_worktree::refuse_shim_command(&root)?;
     // The transaction brackets the FileWatcher with atomic-bridge enter/leave,
     // including failure cleanup; shim-originated writes inside the span are
     // self-suppressed so they never feed back into reconciliation.
@@ -1417,6 +1441,7 @@ fn switch_transaction(root: &Path, target: &str) -> CliResult<()> {
             "cannot build complete prospective projection for Atomic view '{target}': {error}"
         ))
     })?;
+    require_target_branch_interpreted(&repo, &git, target, &target_project)?;
     drop(git);
 
     // After collision-specific checks, require the full clean/equality
@@ -1604,6 +1629,91 @@ fn checkpoint_matches_snapshot(checkpoint: &ShimCheckpoint, snapshot: &ShimSnaps
         && checkpoint.git_tree == snapshot.git_tree
 }
 
+/// Members of `view` that no Git commit introduced and that touch only
+/// Atomic-private paths (`.atomic*`): the repository initialization change
+/// tracking `.atomicignore`. Native records of project files are never
+/// selected, so an ephemeral view built from one commit's closure gains
+/// only the private bookkeeping, never later content.
+pub(super) fn atomic_private_members(
+    repo: &Repository,
+    view: &str,
+) -> CliResult<Vec<atomic_core::types::Hash>> {
+    let mut members = Vec::new();
+    for (hash, origin) in repo
+        .full_chain_member_origins(view)
+        .map_err(CliError::from)?
+    {
+        if origin.is_some() {
+            continue;
+        }
+        let change = repo.load_change(&hash).map_err(CliError::from)?;
+        let mut paths: Vec<String> = change
+            .file_ops()
+            .iter()
+            .map(|ops| ops.path().to_string())
+            .collect();
+        for hunk in change.hunks() {
+            if let atomic_core::change::GraphOp::FileAdd { path, .. } = hunk {
+                paths.push(path.clone());
+            }
+        }
+        if !paths.is_empty()
+            && paths
+                .iter()
+                .all(|path| atomic_repository::atomic_private_path(path.as_bytes()))
+        {
+            members.push(hash);
+        }
+    }
+    Ok(members)
+}
+
+/// Refuse to project `target` over a branch tip the view has never
+/// interpreted. `find_or_create_target_commit` appends a projection commit
+/// whenever the tip tree differs from the view's projection, so a branch
+/// that Git moved without a reconcile (`git switch feature; git commit;
+/// git switch main` — hooks never reconcile the branch being left) would be
+/// silently reverted to the view's state behind a success message.
+fn require_target_branch_interpreted(
+    repo: &Repository,
+    git: &GitRepository,
+    target: &str,
+    target_project: &ProjectTree,
+) -> CliResult<()> {
+    let tip = match git.find_reference(&format!("refs/heads/{target}")) {
+        Ok(reference) => reference
+            .peel_to_commit()
+            .map_err(|error| git_error(format!("cannot read target branch '{target}': {error}")))?,
+        // No branch yet: the projection creates it.
+        Err(error) if error.code() == git2::ErrorCode::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(git_error(format!(
+                "cannot inspect target branch '{target}': {error}"
+            )))
+        }
+    };
+    if tip.tree_id() == write_project_tree(git, target_project)? {
+        return Ok(());
+    }
+    let tip_sha = tip.id().to_string();
+    let interpreted = match repo.checked_git_sha(&tip_sha).map_err(CliError::from)? {
+        Some(hash) => repo
+            .effective_history(Some(target))
+            .map_err(CliError::from)?
+            .iter()
+            .any(|entry| entry.hash == hash),
+        None => false,
+    };
+    if interpreted {
+        return Ok(());
+    }
+    Err(git_error(format!(
+        "Git branch '{target}' is at {} which view '{target}' has not imported; run \
+         'git switch {target}' and 'atomic git shim reconcile' before switching to it",
+        &tip_sha[..12.min(tip_sha.len())]
+    )))
+}
+
 fn find_or_create_target_commit(
     git: &GitRepository,
     target: &str,
@@ -1721,29 +1831,62 @@ fn import_git_to_atomic_budgeted(root: &Path, budget: ReconcileEffectBudget) -> 
                     ));
                 }
                 atomic_repository::DetachedImportTarget::Ephemeral { view } => {
-                    // §7.5: the ephemeral Draft's parent is the nearest bound
-                    // Shared workspace view (the checkpoint's view when it is
-                    // Shared), else none.
-                    let parent = read_workspace_metadata(root)?
-                        .map(|checkpoint| checkpoint.view)
-                        .filter(|name| {
-                            repo.get_view_info(name)
-                                .map(|info| info.scope == atomic_core::pristine::ViewScope::Shared)
-                                .unwrap_or(false)
-                        });
-                    match parent.as_deref() {
-                        Some(parent) => repo
-                            .create_draft_view(&view, parent)
-                            .map_err(CliError::from)?,
-                        None => repo
-                            .create_view_with_identity(
-                                &view,
-                                atomic_core::pristine::ViewScope::Draft,
-                                None,
-                            )
-                            .map_err(CliError::from)?,
+                    // A detached HEAD on a commit this repository already
+                    // interpreted (a checkout of an imported ancestor, `git
+                    // bisect`) is exactly that commit's closure: a parentless
+                    // Draft referencing the change. A Draft under the
+                    // checkpoint view would inherit every later member, so
+                    // its tip could never be an ancestor of the parent's tip
+                    // and the reconcile would strand the workspace.
+                    let interpreted = repo.checked_git_sha(&oid_hex).map_err(CliError::from)?;
+                    if let Some(hash) = interpreted {
+                        repo.create_view_with_identity(
+                            &view,
+                            atomic_core::pristine::ViewScope::Draft,
+                            None,
+                        )
+                        .map_err(CliError::from)?;
+                        repo.ensure_union_state(&view, &[hash])
+                            .map_err(CliError::from)?;
+                        // The checkpoint view's Atomic-private members (the
+                        // initialization change that tracks `.atomicignore`)
+                        // belong to no Git commit's closure; without them the
+                        // ephemeral view reports those files as untracked.
+                        if let Some(checkpoint) = read_workspace_metadata(root)? {
+                            let private = atomic_private_members(&repo, &checkpoint.view)?;
+                            if !private.is_empty() {
+                                repo.ensure_union_state(&view, &private)
+                                    .map_err(CliError::from)?;
+                            }
+                        }
+                        (view, true)
+                    } else {
+                        // §7.5: the ephemeral Draft's parent is the nearest
+                        // bound Shared workspace view (the checkpoint's view
+                        // when it is Shared), else none.
+                        let parent = read_workspace_metadata(root)?
+                            .map(|checkpoint| checkpoint.view)
+                            .filter(|name| {
+                                repo.get_view_info(name)
+                                    .map(|info| {
+                                        info.scope == atomic_core::pristine::ViewScope::Shared
+                                    })
+                                    .unwrap_or(false)
+                            });
+                        match parent.as_deref() {
+                            Some(parent) => repo
+                                .create_draft_view(&view, parent)
+                                .map_err(CliError::from)?,
+                            None => repo
+                                .create_view_with_identity(
+                                    &view,
+                                    atomic_core::pristine::ViewScope::Draft,
+                                    None,
+                                )
+                                .map_err(CliError::from)?,
+                        }
+                        (view, true)
                     }
-                    (view, true)
                 }
             };
             drop(repo);
@@ -1864,6 +2007,8 @@ fn import_git_to_atomic_budgeted(root: &Path, budget: ReconcileEffectBudget) -> 
     }
 
     let was_detached = detached_tip.is_some();
+    let seed_private_members_from =
+        read_workspace_metadata(root)?.map(|checkpoint| checkpoint.view);
     Import {
         incremental: true,
         branch: Some(view.clone()),
@@ -1873,6 +2018,7 @@ fn import_git_to_atomic_budgeted(root: &Path, budget: ReconcileEffectBudget) -> 
         full_tree_verification: true,
         detached_tip,
         reactive_budget: (budget.is_metadata_only()).then_some(budget),
+        seed_private_members_from,
         ..Import::default()
     }
     .run()?;
@@ -2334,7 +2480,12 @@ fn verify() -> CliResult<ShimSnapshot> {
         let project = repo
             .project_tree(&view_name, &policy)
             .map_err(|error| error.to_string())?;
-        let report = atomic_repository::compare_project_to_worktree(&project, &observed, &policy);
+        let report = atomic_repository::compare_project_to_worktree_with_index(
+            &project,
+            &observed,
+            &index_state,
+            &policy,
+        );
         Ok(report.is_equivalent())
     })();
     match worktree_verdict {
@@ -2788,7 +2939,7 @@ pub(crate) fn project_atomic_to_git(
     let filter = GitAttributesFilter::for_repository(root);
     let worktree = observe_worktree(root, Some(&index), &filter, &policy)
         .map_err(|error| git_error(format!("cannot observe Git worktree: {error}")))?;
-    let report = compare_project_to_worktree(&project, &worktree, &policy);
+    let report = compare_project_to_worktree_with_index(&project, &worktree, &index, &policy);
     if !report.is_equivalent() {
         return Err(equivalence_error("Atomic-to-Git shim projection", &report));
     }
@@ -3073,6 +3224,19 @@ fn collect_git_tree(
                     git_error(format!("cannot read Git blob '{path}': {error}"))
                 })?;
                 files.insert(path, blob.content().to_vec());
+            }
+            // A symlink is a path like any other for collision planning; its
+            // blob holds the link target. The `.claude/skills/<name>` layout
+            // made every switch refuse with "unsupported Git entry".
+            (Some(ObjectType::Blob), 0o120000) => {
+                let blob = git.find_blob(entry.id()).map_err(|error| {
+                    git_error(format!("cannot read Git symlink '{path}': {error}"))
+                })?;
+                files.insert(path, blob.content().to_vec());
+            }
+            // A gitlink occupies its path without content of its own.
+            (Some(ObjectType::Commit), 0o160000) => {
+                files.insert(path, Vec::new());
             }
             _ => {
                 return Err(git_error(format!(

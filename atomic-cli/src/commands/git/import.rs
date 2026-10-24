@@ -143,6 +143,13 @@ pub struct Import {
     /// and working-copy materialization — and runs metadata-only work only.
     #[arg(skip)]
     pub(crate) reactive_budget: Option<atomic_repository::repository::ReconcileEffectBudget>,
+
+    /// Internal: the workspace's checkpoint view, whose Atomic-private
+    /// members (the initialization change tracking `.atomicignore`) join a
+    /// branch view seeded from an interpreted ancestor. The shim passes its
+    /// checkpoint; a plain import seeds the closure alone.
+    #[arg(skip)]
+    pub(crate) seed_private_members_from: Option<String>,
 }
 
 fn current_git_branch(git_repo: &GitRepository) -> Option<String> {
@@ -264,6 +271,87 @@ impl Import {
         Ok(stats)
     }
 
+    /// Seed a branch's missing view from the nearest first-parent ancestor
+    /// this repository already interpreted, so the import walks only the
+    /// commits above it.
+    ///
+    /// A new Git branch (`git switch -c topic`, commit, reconcile) otherwise
+    /// starts from an empty view and re-walks the whole history (92 minutes
+    /// on a 363-commit repository), re-referencing changes that exist. The
+    /// ancestor's persisted closure is exactly the state the view needs;
+    /// referencing it is metadata-only, the same idempotent insert the
+    /// per-commit reuse performs. Does nothing when the view exists, the
+    /// branch has no tip, or no ancestor is interpreted.
+    fn seed_new_view_from_interpreted_ancestor(
+        &self,
+        repo: &mut Repository,
+        git_repo: &GitRepository,
+        branch_name: &str,
+    ) -> CliResult<()> {
+        if repo.view_exists(branch_name).map_err(CliError::from)? {
+            return Ok(());
+        }
+        let Some(tip) = git_repo
+            .find_branch(branch_name, git2::BranchType::Local)
+            .ok()
+            .and_then(|branch| branch.get().target())
+        else {
+            return Ok(());
+        };
+        let mut walk = git_repo.revwalk().map_err(|error| CliError::GitError {
+            message: format!("cannot walk branch '{branch_name}': {error}"),
+        })?;
+        walk.push(tip).map_err(|error| CliError::GitError {
+            message: format!("cannot walk branch '{branch_name}': {error}"),
+        })?;
+        walk.simplify_first_parent()
+            .map_err(|error| CliError::GitError {
+                message: format!("cannot walk branch '{branch_name}': {error}"),
+            })?;
+        let mut ahead = 0usize;
+        for oid in walk {
+            let sha = oid
+                .map_err(|error| CliError::GitError {
+                    message: format!("cannot walk branch '{branch_name}': {error}"),
+                })?
+                .to_string();
+            let interpreted = repo
+                .checked_git_sha(&sha)
+                .map_err(CliError::from)?
+                .is_some();
+            let closure = if interpreted {
+                repo.git_commit_closure(&sha).map_err(CliError::from)?
+            } else {
+                None
+            };
+            let Some(closure) = closure else {
+                ahead += 1;
+                continue;
+            };
+            repo.create_shared_view(branch_name)
+                .map_err(|error| CliError::Internal(error.into()))?;
+            repo.ensure_union_state(branch_name, &closure)
+                .map_err(CliError::from)?;
+            // The checkpoint view's Atomic-private members (the initialization
+            // change tracking `.atomicignore`) belong to no Git commit's
+            // closure; without them the new view reports them untracked.
+            if let Some(source_view) = self.seed_private_members_from.as_deref() {
+                let private = super::shim::atomic_private_members(repo, source_view)?;
+                if !private.is_empty() {
+                    repo.ensure_union_state(branch_name, &private)
+                        .map_err(CliError::from)?;
+                }
+            }
+            print_info(&format!(
+                "Seeded view '{branch_name}' from interpreted ancestor {} ({} changes); {ahead} commit(s) ahead to import",
+                &sha[..8.min(sha.len())],
+                closure.len()
+            ));
+            return Ok(());
+        }
+        Ok(())
+    }
+
     /// Get repository name from remote URL or working directory.
     fn get_repo_name(&self, git_repo: &GitRepository) -> String {
         git_repo
@@ -313,7 +401,7 @@ impl Import {
         // rows are dropped, so a corrupt cache produces exactly the same
         // skip decisions as a cold cache (the legacy backfill below).
         let (indexed, dropped) = repo
-            .checked_git_sha_markers()
+            .checked_git_sha_marker_hashes()
             .map_err(|error| CliError::Internal(error.into()))?;
         for sha in dropped.iter().take(3) {
             log::warn!(
@@ -321,8 +409,6 @@ impl Import {
                 &sha[..8.min(sha.len())]
             );
         }
-        let mut shas: HashSet<String> = indexed.into_iter().collect();
-        let _ = dropped;
         let mut states = HashSet::new();
         let mut index_repairs = Vec::new();
 
@@ -333,7 +419,20 @@ impl Import {
         let entries = repo
             .effective_history(Some(view_name))
             .map_err(|error| CliError::Internal(error.into()))?;
-        let needs_legacy_backfill = shas.is_empty() && !entries.is_empty();
+        let needs_legacy_backfill = indexed.is_empty() && !entries.is_empty();
+        // The index is repository-wide, but a marker only skips a commit for
+        // THIS view when the commit's change is a member of this view. A
+        // commit interpreted under another branch's view (a feature branch
+        // that `main` later fast-forwards onto) is not imported here yet;
+        // the writer references its existing change into the target view
+        // instead of re-synthesizing it.
+        let view_members: HashSet<atomic_core::types::Hash> =
+            entries.iter().map(|entry| entry.hash).collect();
+        let mut shas: HashSet<String> = indexed
+            .into_iter()
+            .filter(|(_, hash)| view_members.contains(hash))
+            .map(|(sha, _)| sha)
+            .collect();
         for entry in entries {
             states.insert(entry.state);
             if !needs_legacy_backfill {
@@ -772,6 +871,11 @@ impl Command for Import {
             // import mode: legacy bytes stay authoritative, and history that
             // deepens below an indexed commit is refused instead of silently
             // re-derived. (Dry-run forecasts keep their own semantics.)
+            if self.incremental && detached_tip.is_none() {
+                if let Some(repo) = preopened_repo.as_mut() {
+                    self.seed_new_view_from_interpreted_ancestor(repo, &git_repo, branch_name)?;
+                }
+            }
             let (imported_shas, known_states) = match preopened_repo.as_ref() {
                 Some(repo) if repo.view_exists(branch_name).map_err(CliError::from)? => {
                     self.get_incremental_markers(repo, branch_name, false)?
@@ -996,6 +1100,10 @@ impl Command for Import {
                 reindex_working_copy(&repo, working_copy);
             } else {
                 // Detached imports have no checked-out branch to adopt.
+                require_materializable_worktree(
+                    &git_repo,
+                    MaterializationTarget::CurrentView(&repo),
+                )?;
                 print_info("Materializing working copy...");
                 match repo.materialize(working_copy) {
                     Ok(result) => {
@@ -1154,6 +1262,10 @@ impl Command for Import {
                             .to_string(),
                     });
                 }
+                require_materializable_worktree(
+                    &git_repo,
+                    MaterializationTarget::Branch(&branch_name),
+                )?;
                 print_info("Materializing working copy...");
                 match repo.materialize(working_copy) {
                     Ok(result) => {
@@ -1317,6 +1429,128 @@ fn import_git_tags_into_view(repo: &mut Repository, git_repo: &GitRepository, vi
 /// authoritative Git checkout for the imported branch, so there is no reason
 /// to materialize the same content back out of Atomic. Indexing the tracked
 /// files makes the post-import `atomic status` baseline clean.
+/// What a working-copy materialization is about to write over the disk.
+enum MaterializationTarget<'a> {
+    /// The tree of a local Git branch that is not checked out.
+    Branch(&'a str),
+    /// The current Atomic view (an `--all` import under a detached HEAD).
+    CurrentView(&'a Repository),
+}
+
+impl MaterializationTarget<'_> {
+    fn describe(&self) -> String {
+        match self {
+            Self::Branch(branch) => format!("branch '{branch}'"),
+            Self::CurrentView(_) => "the current Atomic view".to_string(),
+        }
+    }
+
+    /// Every repository path the materialization writes.
+    fn paths(&self, git_repo: &GitRepository) -> CliResult<HashSet<String>> {
+        let mut paths = HashSet::new();
+        match self {
+            Self::Branch(branch) => {
+                // A view imported ahead of its Git branch (a switch that
+                // stopped before creating the branch) has no tree to collide
+                // with; the tracked-changes requirement above still holds.
+                let branch_ref = match git_repo.find_branch(branch, git2::BranchType::Local) {
+                    Ok(found) => found,
+                    Err(error) if error.code() == git2::ErrorCode::NotFound => return Ok(paths),
+                    Err(error) => {
+                        return Err(CliError::GitError {
+                            message: format!("cannot read branch '{branch}': {error}"),
+                        })
+                    }
+                };
+                let tree = branch_ref
+                    .get()
+                    .peel_to_tree()
+                    .map_err(|error| CliError::GitError {
+                        message: format!("cannot read the tree of branch '{branch}': {error}"),
+                    })?;
+                tree.walk(git2::TreeWalkMode::PreOrder, |directory, entry| {
+                    if let Some(name) = entry.name() {
+                        paths.insert(format!("{directory}{name}"));
+                    }
+                    git2::TreeWalkResult::Ok
+                })
+                .map_err(|error| CliError::GitError {
+                    message: format!("cannot walk the tree of branch '{branch}': {error}"),
+                })?;
+            }
+            Self::CurrentView(repo) => {
+                for file in repo
+                    .list_tracked_files()
+                    .map_err(|error| CliError::Internal(error.into()))?
+                {
+                    let canonical = file.path.to_string_lossy();
+                    paths.insert(
+                        super::parallel::canonical_tree_path(&canonical)
+                            .to_string_lossy()
+                            .into_owned(),
+                    );
+                }
+            }
+        }
+        Ok(paths)
+    }
+}
+
+/// Refuse to materialize over a worktree holding work Git has not recorded:
+/// a detached HEAD or an `-b <other>` import writes the imported tree over
+/// the disk, and the only worktree check on that path
+/// (`verify_changed_worktree_paths`) returns early when HEAD is not on the
+/// branch. Tracked modifications and untracked files at paths the
+/// materialization writes are both lost without this guard.
+fn require_materializable_worktree(
+    git_repo: &GitRepository,
+    target: MaterializationTarget<'_>,
+) -> CliResult<()> {
+    let what = target.describe();
+    super::shim::require_clean_git_worktree(git_repo).map_err(|error| CliError::GitError {
+        message: format!(
+            "cannot materialize {what} over unrecorded work: {error}; commit, stash or \
+             discard the changes (or check the branch out) first"
+        ),
+    })?;
+    let target_paths = target.paths(git_repo)?;
+    let mut options = git2::StatusOptions::new();
+    options.include_untracked(true).recurse_untracked_dirs(true);
+    let statuses = git_repo
+        .statuses(Some(&mut options))
+        .map_err(|error| CliError::GitError {
+            message: format!("cannot inspect Git status: {error}"),
+        })?;
+    let mut colliding: Vec<String> = statuses
+        .iter()
+        .filter(|entry| entry.status().contains(git2::Status::WT_NEW))
+        .filter_map(|entry| entry.path().map(str::to_string))
+        .filter(|path| target_paths.contains(path))
+        .collect();
+    colliding.sort();
+    if colliding.is_empty() {
+        return Ok(());
+    }
+    let shown = colliding
+        .iter()
+        .take(5)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ");
+    let more = colliding.len().saturating_sub(5);
+    Err(CliError::GitError {
+        message: format!(
+            "cannot materialize {what}: untracked file(s) would be overwritten: {shown}{}; \
+             move or remove them (or check the branch out) first",
+            if more > 0 {
+                format!(" and {more} more")
+            } else {
+                String::new()
+            }
+        ),
+    })
+}
+
 fn reindex_working_copy(repo: &Repository, working_copy: WorkingCopyId) {
     use atomic_core::types::Hash;
     let started = std::time::Instant::now();

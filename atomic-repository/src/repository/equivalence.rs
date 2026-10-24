@@ -1,7 +1,14 @@
 //! Deterministic structured equivalence reports for Atomic, Git index, and worktree state.
 
 use super::git_observation::compute_index_tree;
-use super::project_tree::{git_object_id, GitObjectKind};
+use super::project_tree::{escape_repo_path, git_object_id, GitObjectKind};
+
+/// The manifest folds paths by their canonical escaped identity; the Git
+/// index and the worktree observe raw bytes. Compare like with like.
+fn identity_key(path: &RepoPath) -> RepoPath {
+    RepoPath::from_bytes(escape_repo_path(path.as_bytes()).as_bytes())
+        .unwrap_or_else(|_| path.clone())
+}
 use super::*;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -164,13 +171,81 @@ pub fn compare_project_to_worktree(
     report
 }
 
+/// [`compare_project_to_worktree`] with the Git index at hand: worktree
+/// paths the index does not track are not divergence (see
+/// `drop_untracked_extras`).
+pub fn compare_project_to_worktree_with_index(
+    project: &ProjectTree,
+    worktree: &WorktreeObservation,
+    index: &GitIndexState,
+    policy: &ConversionPolicy,
+) -> EquivalenceReport {
+    let mut report = EquivalenceReport::new(project);
+    report.worktree_root = Some(worktree.root());
+    compare_policy_into(project, worktree, policy, &mut report);
+    compare_worktree_into(project, worktree, policy, &mut report);
+    drop_untracked_extras(&mut report, index);
+    report.finish();
+    report
+}
+
+/// A worktree path Git does not track is not state either side publishes:
+/// an untracked scratch file, a gitignored build tree, an editor's
+/// `.DS_Store`. Reporting it as `Worktree/ExtraPath` made every reconcile
+/// and verify refuse on any real project (and, after the next Git commit,
+/// every native command). The observation still lists such paths for
+/// staging status; only the equivalence verdict ignores them.
+fn drop_untracked_extras(report: &mut EquivalenceReport, index: &GitIndexState) {
+    let tracked_identities: BTreeSet<RepoPath> = index
+        .entries
+        .iter()
+        .filter(|entry| entry.stage == 0)
+        .map(|entry| identity_key(&entry.path))
+        .collect();
+    report.mismatches.retain(|mismatch| {
+        !(mismatch.layer == EquivalenceLayer::Worktree
+            && mismatch.kind == MismatchKind::ExtraPath
+            && mismatch
+                .path
+                .as_ref()
+                .is_some_and(|path| !tracked_identities.contains(path)))
+    });
+}
+
 /// Joint comparison used by future push/import adoption gates.
+/// Every layer, strictly: untracked worktree paths count as divergence.
+/// Anchoring and adoption classify pending work with this verdict, so an
+/// untracked scratch file is pending work there.
 pub fn compare_project_state(
     project: &ProjectTree,
     index: &GitIndexState,
     worktree: &WorktreeObservation,
     policy: &ConversionPolicy,
     claims: &EquivalenceClaims,
+) -> EquivalenceReport {
+    compare_project_state_with(project, index, worktree, policy, claims, false)
+}
+
+/// [`compare_project_state`] for the shim's verify, reconcile and
+/// publication gates, where a worktree path Git does not track is not
+/// state either side publishes (see `drop_untracked_extras`).
+pub fn compare_project_state_tolerating_untracked(
+    project: &ProjectTree,
+    index: &GitIndexState,
+    worktree: &WorktreeObservation,
+    policy: &ConversionPolicy,
+    claims: &EquivalenceClaims,
+) -> EquivalenceReport {
+    compare_project_state_with(project, index, worktree, policy, claims, true)
+}
+
+fn compare_project_state_with(
+    project: &ProjectTree,
+    index: &GitIndexState,
+    worktree: &WorktreeObservation,
+    policy: &ConversionPolicy,
+    claims: &EquivalenceClaims,
+    tolerate_untracked: bool,
 ) -> EquivalenceReport {
     let mut report = EquivalenceReport::new(project);
     report.index_root = Some(index.root());
@@ -186,6 +261,9 @@ pub fn compare_project_state(
         .filter(|entry| entry.stage == 0 && entry.skip_worktree)
         .map(|entry| entry.path.clone())
         .collect();
+    if tolerate_untracked {
+        drop_untracked_extras(&mut report, index);
+    }
     report.mismatches.retain(|mismatch| {
         !(mismatch.layer == EquivalenceLayer::Worktree
             && mismatch.kind == MismatchKind::MissingPath
@@ -270,7 +348,7 @@ fn compare_index_into(
     let mut exceptional_paths = BTreeSet::new();
     for entry in &index.entries {
         if entry.stage != 0 {
-            exceptional_paths.insert(entry.path.clone());
+            exceptional_paths.insert(identity_key(&entry.path));
             report.push(
                 EquivalenceLayer::GitIndex,
                 MismatchKind::ConflictStage,
@@ -281,7 +359,7 @@ fn compare_index_into(
             continue;
         }
         if entry.intent_to_add {
-            exceptional_paths.insert(entry.path.clone());
+            exceptional_paths.insert(identity_key(&entry.path));
             report.push(
                 EquivalenceLayer::GitIndex,
                 MismatchKind::IntentToAdd,
@@ -291,7 +369,7 @@ fn compare_index_into(
             );
         }
         if entry.sparse_directory {
-            exceptional_paths.insert(entry.path.clone());
+            exceptional_paths.insert(identity_key(&entry.path));
             report.push(
                 EquivalenceLayer::GitIndex,
                 MismatchKind::SparseDirectory,
@@ -300,7 +378,7 @@ fn compare_index_into(
                 "sparse directory entry",
             );
         }
-        stage_zero.insert(entry.path.clone(), entry);
+        stage_zero.insert(identity_key(&entry.path), entry);
     }
 
     let expected: BTreeMap<_, _> = project
@@ -431,7 +509,7 @@ fn compare_worktree_into(
     let actual: BTreeMap<_, _> = worktree
         .entries
         .iter()
-        .map(|entry| (entry.path.clone(), entry))
+        .map(|entry| (identity_key(&entry.path), entry))
         .collect();
     for (path, expected_entry) in &expected {
         if expected_entry.disposition != ManifestDisposition::Included {

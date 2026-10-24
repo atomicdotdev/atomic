@@ -103,6 +103,7 @@ pub mod status;
 pub mod tracking;
 pub mod triage;
 pub mod wip;
+pub mod worktree_presence;
 
 // Phase 7 additions
 pub mod archive;

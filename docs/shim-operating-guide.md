@@ -15,10 +15,99 @@ The shim imports Git history, projects Atomic records into Git, checks that
 both sides agree, and helps switch between views and branches. Git hooks and
 an optional watcher notice changes; commands still check the current state.
 
-**Known bug:** after recording an edit and rename with Atomic, creating a new
-Git branch and committing there can make `reconcile` fail with
-`view '<branch>' not found`. See the [reproduction](shim-review-testing.md#9-known-failure-new-git-branch-after-atomic-records).
-This remains unfixed in the tested revision.
+**Fixed (2026-10-23):** creating a new Git branch from an imported tip and
+committing there used to make `reconcile` fail with
+`view '<branch>' not found` (then `forged Atomic change closure`), and a
+fast-forward merge of such a branch back into `main` imported nothing. Record
+projection commits are now verified by the view state they name, and the
+incremental marker set is per target view. The
+[reproduction](shim-review-testing.md#9-regression-new-git-branch-after-atomic-records)
+is kept as a regression check.
+
+**Hardened (2026-10-23, review of the founding-team rollout):**
+
+- `atomic git import` refuses to materialize a branch that is not checked
+  out over unrecorded work (tracked edits, or untracked files the branch
+  tree would overwrite). Before, a detached HEAD or `-b <other>` import
+  wrote the imported tree over them.
+- Paths with spaces or non-ASCII bytes are tracked under the name on disk;
+  `atomic status` is clean right after an import and incremental imports
+  verify. A literal `%` in a file name still keeps its escaped identity.
+- Truncating a file to zero bytes imports on the mainline walk.
+- Untracked files, gitignored or not (`node_modules/`, `target/`,
+  `.DS_Store`, scratch files), are not divergence: `reconcile` and
+  `verify` ignore them.
+- `atomic git shim switch <view>` refuses a branch whose tip the view has
+  never imported instead of projecting over it (which reverted those
+  commits); reconcile the branch first.
+- A detached checkout of an imported ancestor (`git checkout <sha>`,
+  `git bisect`) maps to that commit's own closure; `reconcile` there and
+  back to the branch both work.
+- `git reset --hard` (or a rebase/force-pull) onto an imported ancestor
+  rewinds the view: the dropped changes are unrecorded and the next
+  `reconcile` verifies.
+- A `.git/REBASE_HEAD` left behind by a completed interactive rebase is
+  advisory; it no longer refuses every command as an in-progress rebase.
+- The pre-push hook binds each pushed branch to its own view when one
+  exists, so `git push origin <other-branch>` and `git push --all` pass for
+  reconciled branches; a branch without a view of its own (`master`
+  publishing the `main` view) is checked against the current view's
+  verified tree as before.
+- `atomic git shim switch` (and native `atomic view switch`) handle
+  repositories whose tree holds symlinks, including a symlink to a
+  directory (the `.claude/skills/<name>` layout).
+- The first `reconcile` of a branch created from an anchored tip references
+  the tip's closure instead of restoring and re-projecting it, and a branch
+  whose view does not exist yet is seeded from the nearest interpreted
+  first-parent ancestor, so only the commits above it import
+  (`Seeded view 'topic' from interpreted ancestor ...; 1 commit(s) ahead`).
+  Before: the whole history replayed into the new view (92 minutes on a
+  363-commit repository).
+- A native `atomic record` that deletes or rewrites lines in a file Git
+  already holds no longer makes the next `git commit` unreconcilable: the
+  record folds the file's existing branches through its own view instead
+  of reading the shared rows, which a WIP evidence snapshot can tombstone.
+  The same fold covers a native rename (`mv` plus `atomic record -a`) of a
+  file whose last line has no newline, which used to leave the file's
+  semantic closure holding every line twice.
+- `atomic git shim switch` handles a directory that later became a symlink
+  (the `.claude/commands -> ../.agents/commands` agents layout): the old
+  files beneath the link are no longer scheduled for removal through it.
+- The staged check of an incremental single-parent commit replays the
+  semantic closure only for the paths the commit touches (every path still
+  gets the byte, mode and kind checks); merges, exclusions and fresh
+  imports keep the whole-tree replay, and `ATOMIC_FULL_SEMANTIC_VERIFY=1`
+  forces it.
+
+**Repositories imported before this change must be re-imported.** The old
+importer tracked paths with spaces or non-ASCII bytes under their escaped
+names (`SolanaLogo%2022.png`); such a repository reports those entries
+deleted and the real files untracked, and every reconcile refuses. Remove
+`.atomic` (after recording anything pending elsewhere) and run
+`atomic git import` again with this build.
+
+**Known failures (not fixed; avoid until tracked fixes land):**
+
+- Linked `git worktree`s are not managed by the shim yet. In a worktree that
+  was never registered with the repository (plain `git worktree add`, no
+  `.atomic/repository` pointer) Atomic's hooks pass through (one `Atomic
+  shim: linked worktree '...' is not managed; hooks pass through` line on
+  stderr; `git commit` and `git push` proceed) and `atomic status` refuses
+  with `linked git worktrees are not supported by the shim yet; run from
+  the main worktree '<path>'` instead of initializing a second repository.
+  A linked worktree registered with the repository (the `.atomic/repository`
+  pointer) adopts its own view and reconciles as before.
+- Committing `.atomicignore` to Git makes `verify`/`reconcile` report
+  `GitIndex/ExclusionPolicy .atomicignore`; keep it out of Git.
+- Interrupting an import between a change write and its Git SHA index
+  write can leave that commit unable to re-import (`already has a
+  different persisted interpretation closure`); the only recovery is a
+  fresh import.
+- Performance: `atomic record` and `reconcile` still take minutes on
+  repositories with a few hundred files (a one-commit reconcile spent
+  about ten minutes on a 967-file repository before the scoped replay
+  above; the retrieval hot paths remain). Importing a thousand-commit
+  history takes hours.
 
 Other limits:
 
@@ -64,14 +153,20 @@ symlinks untouched and prints integration instructions instead.
 atomic git shim disable
 ```
 
-Disable sets shim consent to false and stops automatic shim telemetry.
-It leaves installed hooks and existing checkpoints in place. A previously
-anchored workspace still checks for a stale baseline. A workspace that was
-never anchored returns to native behavior.
+Disable sets shim consent to false, stops automatic shim telemetry, and
+removes every Atomic-owned hook dispatcher that `enable` installed
+(post-checkout, pre-commit, pre-push, post-rewrite, reference-transaction),
+so a plain `git push` is never refused by a shim nobody consents to any
+more. Existing checkpoints stay in place: a previously anchored workspace
+still checks for a stale baseline, and a workspace that was never anchored
+returns to native behavior.
 
-`atomic git hooks uninstall` currently removes only Atomic's post-checkout
-hook. The other installed hooks need separate removal when decommissioning
-that integration.
+`atomic git hooks uninstall` removes the same set of dispatchers (plus
+Atomic-only legacy import hooks) without touching the consent flag. Both
+only remove exact Atomic-owned content: a custom hook, symlink, or foreign
+script under one of those names is reported and left untouched, and a
+custom `core.hooksPath` is never modified. `atomic git hooks status`
+reports all five dispatchers.
 
 ## 3. Vault policy: private by default, tracked under explicit record
 
@@ -131,6 +226,8 @@ Each physical directory has a working-copy ID in `.atomic/working_copy_id`.
 Linked Git worktrees and agent sandboxes have separate IDs, shelves, and caches.
 Some operation history is shared across the repository. An unfinished shared
 operation can block work in another linked worktree until it is recovered.
+A shim-enrolled repository does not manage its linked Git worktrees yet: work
+from the main worktree (see the linked-worktree limit in §1).
 
 ## 5. Draft views, detached HEAD, and explicit publish
 
