@@ -82,12 +82,14 @@ deleted and the real files untracked, and every reconcile refuses. Remove
 
 **Known failures (not fixed; avoid until tracked fixes land):**
 
-- Linked `git worktree`s are not managed by the shim yet. Atomic's hooks
-  pass through there (one `Atomic shim: linked worktree '...' is not
-  managed; hooks pass through` line on stderr; `git commit` and `git push`
-  proceed), and `atomic status` / `atomic git shim reconcile` refuse with
-  `linked git worktrees are not supported by the shim yet; run from the
-  main worktree '<path>'` instead of initializing a second repository.
+- Linked `git worktree`s are not managed by the shim yet. In a worktree that
+  was never registered with the repository (plain `git worktree add`, no
+  `.atomic/repository` pointer) Atomic's hooks pass through (one `Atomic
+  shim: linked worktree '...' is not managed; hooks pass through` line on
+  stderr; `git commit` and `git push` proceed) and `atomic status` refuses
+  with `linked git worktrees are not supported by the shim yet; run from
+  the main worktree '<path>'` instead of initializing a second repository.
+  `atomic git shim reconcile` refuses the same way in every linked worktree.
 - Committing `.atomicignore` to Git makes `verify`/`reconcile` report
   `GitIndex/ExclusionPolicy .atomicignore`; keep it out of Git.
 - Interrupting an import between a change write and its Git SHA index

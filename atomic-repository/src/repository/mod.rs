@@ -222,6 +222,7 @@ pub use tag_projection::TagProjectionOutcome;
 pub use views::{ManifestApplyOutcome, ViewInfo};
 pub use working_copy::canonical_dot_dir_for;
 pub use working_copy::detect_repository_root;
+pub use working_copy::REPOSITORY_POINTER;
 pub use working_copy_reconcile::{WorkingCopyReconcileOutcome, WorkingCopyRegistrationDiagnosis};
 pub use workspace_txn::{
     git_locks_present, git_state_quiescent, GitQuiescence, ReconcileEffectBudget,

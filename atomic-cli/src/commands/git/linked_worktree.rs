@@ -11,6 +11,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use atomic_repository::REPOSITORY_POINTER;
 use git2::Repository as GitRepository;
 
 use super::observation::resolve_common_dir;
@@ -58,12 +59,26 @@ pub(crate) fn detect_linked_worktree(path: &Path) -> Option<LinkedWorktree> {
     })
 }
 
-/// A linked worktree the shim does not manage: one without an Atomic
-/// repository of its own. A linked worktree that was initialized as its own
-/// repository resolves to that repository and is handled like any other.
-pub(crate) fn detect_unmanaged_linked_worktree(path: &Path) -> Option<LinkedWorktree> {
+/// A linked worktree without an Atomic repository of its own. The shim cannot
+/// reconcile such a worktree: its import path would initialize a second
+/// repository over the common one. A linked worktree that was initialized as
+/// its own repository resolves to that repository and is handled like any
+/// other.
+fn linked_worktree_without_repository(path: &Path) -> Option<LinkedWorktree> {
     let linked = detect_linked_worktree(path)?;
     if atomic_repository::has_database(&linked.root.join(DOT_DIR)) {
+        return None;
+    }
+    Some(linked)
+}
+
+/// A linked worktree the shim does not manage at all: no repository of its
+/// own and no `.atomic/repository` pointer either. The pointer marks a linked
+/// working copy registered against the common repository, which native
+/// commands and the hooks handle like any other working copy.
+pub(crate) fn detect_unmanaged_linked_worktree(path: &Path) -> Option<LinkedWorktree> {
+    let linked = linked_worktree_without_repository(path)?;
+    if linked.root.join(DOT_DIR).join(REPOSITORY_POINTER).is_file() {
         return None;
     }
     Some(linked)
@@ -89,9 +104,11 @@ pub(crate) fn hook_passes_through(hook_name: &str) -> bool {
     true
 }
 
-/// `git shim` commands refuse inside a linked worktree.
+/// `git shim` commands refuse inside any linked worktree without a
+/// repository of its own, registered or not: reconcile cannot create one
+/// there.
 pub(crate) fn refuse_shim_command(path: &Path) -> CliResult<()> {
-    match detect_unmanaged_linked_worktree(path) {
+    match linked_worktree_without_repository(path) {
         Some(linked) => Err(refusal(&linked)),
         None => Ok(()),
     }
@@ -208,6 +225,21 @@ mod tests {
         drop(atomic_repository::Repository::init(&linked).unwrap());
         assert_eq!(detect_unmanaged_linked_worktree(&linked), None);
         refuse_shim_command(&linked).expect("an independent repository is not refused");
+    }
+
+    #[test]
+    fn a_registered_linked_worktree_is_managed_but_still_cannot_reconcile() {
+        let (_main, parent) = repository_with_linked_worktree();
+        let linked = parent.path().join("linked");
+        let dot_dir = linked.join(DOT_DIR);
+        fs::create_dir_all(&dot_dir).unwrap();
+        fs::write(dot_dir.join(REPOSITORY_POINTER), b"/elsewhere/.atomic").unwrap();
+        assert_eq!(detect_unmanaged_linked_worktree(&linked), None);
+        refuse_when_shim_enrolled(&linked).expect("a registered working copy is handled natively");
+        assert!(
+            refuse_shim_command(&linked).is_err(),
+            "reconcile still cannot run in a linked worktree"
+        );
     }
 
     #[test]
