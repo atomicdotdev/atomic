@@ -550,3 +550,63 @@ fn shim_switch_handles_symlinks_in_the_tree() {
     assert_eq!(fs::read(root.join("tracked.txt")).unwrap(), b"base\n");
     assert_clean(&root, &home);
 }
+
+#[test]
+fn native_record_deleting_lines_keeps_later_git_commits_reconcilable() {
+    let (root, home) = shim_repo();
+    // A multi-line file lands through Git first.
+    fs::write(root.join("tracked.txt"), b"base\nsecond\nthird\n").unwrap();
+    commit_all(&root, "three lines");
+    atomic_ok(&root, &home, &["git", "shim", "reconcile"]);
+    assert_clean(&root, &home);
+
+    // A native record deletes the middle line.
+    fs::write(root.join("tracked.txt"), b"base\nthird\n").unwrap();
+    atomic_ok(&root, &home, &["record", "-a", "-m", "drop second"]);
+    assert_clean(&root, &home);
+    assert_eq!(
+        git(&root, &["show", "HEAD:tracked.txt"]),
+        "base\nthird",
+        "the record projects to Git"
+    );
+
+    // The next Git commit on the same file must still reconcile.
+    fs::write(root.join("tracked.txt"), b"base\nthird\nfourth\n").unwrap();
+    commit_all(&root, "fourth line");
+    atomic_ok(&root, &home, &["git", "shim", "reconcile"]);
+    assert_clean(&root, &home);
+    assert_eq!(
+        fs::read(root.join("tracked.txt")).unwrap(),
+        b"base\nthird\nfourth\n"
+    );
+    assert!(atomic_ok(&root, &home, &["log", "--short"]).contains("fourth line"));
+}
+
+#[test]
+fn native_record_rewriting_a_line_keeps_later_git_commits_reconcilable() {
+    let (root, home) = shim_repo();
+    fs::write(root.join("tracked.txt"), b"base\nsecond\nthird\n").unwrap();
+    commit_all(&root, "three lines");
+    atomic_ok(&root, &home, &["git", "shim", "reconcile"]);
+
+    // A native record rewrites the middle line in place.
+    fs::write(root.join("tracked.txt"), b"base\nSECOND\nthird\n").unwrap();
+    atomic_ok(&root, &home, &["record", "-am", "rewrite second"]);
+    assert_clean(&root, &home);
+
+    // A later Git commit on another file still reconciles, and so does one
+    // on the rewritten file.
+    fs::write(root.join("other.txt"), b"other\n").unwrap();
+    commit_all(&root, "other file");
+    atomic_ok(&root, &home, &["git", "shim", "reconcile"]);
+    assert_clean(&root, &home);
+    fs::write(root.join("tracked.txt"), b"base\nSECOND\n").unwrap();
+    commit_all(&root, "drop third");
+    atomic_ok(&root, &home, &["git", "shim", "reconcile"]);
+    assert_clean(&root, &home);
+    assert_eq!(
+        fs::read(root.join("tracked.txt")).unwrap(),
+        b"base\nSECOND\n"
+    );
+}
+

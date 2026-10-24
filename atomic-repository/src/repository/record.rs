@@ -1041,6 +1041,25 @@ impl Repository {
         Ok((existing_trunk_id, existing_branches, observed))
     }
 
+    /// The trunk's alive branches in file order as the view's own closure
+    /// records them (the same fold the foreign record and the staged replay
+    /// use), so positional Delete/Modify ops bind the branches the view's
+    /// lines actually are.
+    fn view_alive_branches_in_order<T: atomic_core::pristine::GraphTxnT>(
+        &self,
+        txn: &T,
+        view_name: &str,
+        visibility: &atomic_core::pristine::GraphVisibilityClosure,
+        trunk: atomic_core::crdt::TrunkId,
+    ) -> Result<Vec<atomic_core::crdt::BranchId>, String> {
+        let state = self.semantic_closure_trunk_state(txn, view_name, &[], visibility, trunk)?;
+        let observed = semantic_branch_order(&state.after)?;
+        Ok(observed
+            .into_iter()
+            .filter(|branch| state.alive.get(branch) == Some(&true))
+            .collect())
+    }
+
     /// The branch state of `trunk` in the assembly closure, folded once per
     /// visible change through the repository's semantic closure memo (see
     /// `semantic_closure`): every deleted path of one commit, and every
@@ -2265,8 +2284,13 @@ impl Repository {
                 // real BranchIds so the old-content lines get tombstoned;
                 // without them the CRDT walker leaves stale lines alive after a
                 // modify/delete. Empty when the file has no CRDT rows yet.
-                use atomic_core::crdt::queries::iter_trunk_branches_in_file_order;
-                use atomic_core::crdt::tables::{decode_trunk_id, encode_branch_id};
+                // The alive branches are folded from THIS view's closure, never
+                // read from the shared rows: a change outside the view (the WIP
+                // evidence snapshot in `wc/<id>`) tombstones shared branch rows,
+                // and a record indexing its old lines by the global alive rows
+                // bound its deletes to the wrong branches, which the next Git
+                // commit's staged replay then refused.
+                use atomic_core::crdt::tables::decode_trunk_id;
                 use atomic_core::pristine::CrdtTxnT;
                 let inode_u64 = file_inode.get();
                 let existing_trunk_id = match shared_txn.get_crdt_inode_trunk(inode_u64) {
@@ -2274,23 +2298,20 @@ impl Repository {
                     _ => None,
                 };
                 let existing_branches = match existing_trunk_id {
-                    Some(trunk_id) => {
-                        match iter_trunk_branches_in_file_order(&shared_txn, trunk_id) {
-                            Ok(all) => {
-                                let mut alive = Vec::with_capacity(all.len());
-                                for b in all {
-                                    let bk = encode_branch_id(&b);
-                                    if let Ok(Some(bd)) = shared_txn.get_crdt_branch(&bk) {
-                                        if bd.state.is_alive() {
-                                            alive.push(b);
-                                        }
-                                    }
-                                }
-                                alive
-                            }
-                            Err(_) => Vec::new(),
+                    Some(trunk_id) => match self.view_alive_branches_in_order(
+                        &shared_txn,
+                        &effective_view,
+                        &shared_graph_visibility,
+                        trunk_id,
+                    ) {
+                        Ok(alive) => alive,
+                        Err(error) => {
+                            return ModifiedResult::Error(
+                                path.clone(),
+                                format!("semantic state of '{path}' on the view: {error}"),
+                            )
                         }
-                    }
+                    },
                     None => Vec::new(),
                 };
 

@@ -4079,6 +4079,9 @@ impl Repository {
                         ops.trunk_op(),
                         ops.line_ops().len()
                     );
+                    for line_op in ops.line_ops() {
+                        eprintln!("[debug-deletion]     line_op {line_op:?}");
+                    }
                 }
                 let is_target = match canonical_trunk {
                     Some(identity) => resolved_trunk == identity,
@@ -5079,7 +5082,13 @@ impl Repository {
             let ids: Vec<_> = staged_closure.iter().map(|(id, _, _)| *id).collect();
             let expected: Vec<_> = branches
                 .iter()
-                .map(|(id, branch)| format!("{id:?}:{:?}", branch.state))
+                .map(|(id, branch)| {
+                    format!(
+                        "{id:?}:{:?}:{:?}",
+                        branch.state,
+                        String::from_utf8_lossy(&branch.bytes)
+                    )
+                })
                 .collect();
             eprintln!(
                 "[debug-deletion] summary {path}: closure={ids:?} trunk_key={trunk_key:?} expected={expected:?} actual_chain={actual_chain:?}"
