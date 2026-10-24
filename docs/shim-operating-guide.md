@@ -82,7 +82,12 @@ deleted and the real files untracked, and every reconcile refuses. Remove
 
 **Known failures (not fixed; avoid until tracked fixes land):**
 
-- Linked `git worktree`s cannot reconcile (`Repository already exists`).
+- Linked `git worktree`s are not managed by the shim yet. Atomic's hooks
+  pass through there (one `Atomic shim: linked worktree '...' is not
+  managed; hooks pass through` line on stderr; `git commit` and `git push`
+  proceed), and `atomic status` / `atomic git shim reconcile` refuse with
+  `linked git worktrees are not supported by the shim yet; run from the
+  main worktree '<path>'` instead of initializing a second repository.
 - Committing `.atomicignore` to Git makes `verify`/`reconcile` report
   `GitIndex/ExclusionPolicy .atomicignore`; keep it out of Git.
 - Interrupting an import between a change write and its Git SHA index
@@ -139,14 +144,20 @@ symlinks untouched and prints integration instructions instead.
 atomic git shim disable
 ```
 
-Disable sets shim consent to false and stops automatic shim telemetry.
-It leaves installed hooks and existing checkpoints in place. A previously
-anchored workspace still checks for a stale baseline. A workspace that was
-never anchored returns to native behavior.
+Disable sets shim consent to false, stops automatic shim telemetry, and
+removes every Atomic-owned hook dispatcher that `enable` installed
+(post-checkout, pre-commit, pre-push, post-rewrite, reference-transaction),
+so a plain `git push` is never refused by a shim nobody consents to any
+more. Existing checkpoints stay in place: a previously anchored workspace
+still checks for a stale baseline, and a workspace that was never anchored
+returns to native behavior.
 
-`atomic git hooks uninstall` currently removes only Atomic's post-checkout
-hook. The other installed hooks need separate removal when decommissioning
-that integration.
+`atomic git hooks uninstall` removes the same set of dispatchers (plus
+Atomic-only legacy import hooks) without touching the consent flag. Both
+only remove exact Atomic-owned content: a custom hook, symlink, or foreign
+script under one of those names is reported and left untouched, and a
+custom `core.hooksPath` is never modified. `atomic git hooks status`
+reports all five dispatchers.
 
 ## 3. Vault policy: private by default, tracked under explicit record
 
@@ -206,6 +217,8 @@ Each physical directory has a working-copy ID in `.atomic/working_copy_id`.
 Linked Git worktrees and agent sandboxes have separate IDs, shelves, and caches.
 Some operation history is shared across the repository. An unfinished shared
 operation can block work in another linked worktree until it is recovered.
+A shim-enrolled repository does not manage its linked Git worktrees yet: work
+from the main worktree (see the linked-worktree limit in §1).
 
 ## 5. Draft views, detached HEAD, and explicit publish
 
