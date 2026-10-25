@@ -292,57 +292,123 @@ does not track `.vault/` keeps the vault private and ignored by Git.
 
 ### Knowledge Graph — Code Intelligence at Scale
 
-Atomic builds a **knowledge graph** from your entire codebase — source code content, file structure, tree-sitter entities (functions, classes, types), module hierarchy, change history, and their relationships. Search it, traverse it, visualize it, or let an LLM explore it with tools.
+Atomic's **workflow knowledge graph** connects intents, sessions, turns, provenance,
+attestations, changes, files, and views, alongside goals and memories. It is a
+deterministic, rebuildable read model: recorded changes, session ledgers, provenance
+sidecars, attestations, and vault objects remain authoritative.
+
+Workflow relationships use the canonical `atomic:` namespace
+(`https://atomic.dev/ns/workflow#`). For example:
+
+```text
+Session     ──atomic:hasTurn───────────▶ Turn
+Turn        ──atomic:hasPlan───────────▶ Intent
+Turn        ──atomic:generatedChange───▶ Change
+Turn        ──atomic:turnExplainedBy───▶ ProvenanceGraph
+Change      ──atomic:implements───────▶ Intent
+Change      ──atomic:changeExplainedBy─▶ ProvenanceGraph
+Change      ──atomic:attestedBy────────▶ Attestation
+Attestation ──atomic:coversChange──────▶ Change
+Change      ──atomic:modifiesFile──────▶ File
+Change      ──atomic:directlyOnView────▶ View
+```
+
+These links reflect captured facts, not guessed historical associations. Missing
+facts produce explicit gap findings. `atomic:directlyOnView` means a view's own
+change membership, not visibility inherited from ancestors or dependencies.
+
+Resources have canonical IRIs: local workflow resources are qualified by the
+repository's stable ProjectId, while changes, provenance graphs, and session
+attestations use full, algorithm-qualified content hashes. JSON nodes carry
+asserted class IRIs in `types`, and edge `kind` values are absolute predicate IRIs.
+Copy resource IDs from search or graph JSON rather than constructing legacy
+`file:…`, `entity:…`, or abbreviated `change:…` IDs.
 
 ```bash
-# Search the knowledge graph — unified structural + content search
+# Refresh workflow facts from recorded changes, files, and views
+atomic query enrich
+
+# Search workflow resources, with indexed source-content matches
 atomic query search "replication"
 
-# Search source code content (powered by syntext trigram index)
-atomic query code "replication" -t cpp -g src/mongo/db/repl/
+# Explore a resource's asserted relationships (1–2 hops)
+atomic query neighbors "<resource-iri-from-search>" --json
 
-# List tree-sitter entities in a file (functions, classes, types)
-atomic query entities src/mongo/db/repl/replication_coordinator_impl.cpp
-
-# Explore relationships around a node (1-2 hops)
-atomic query neighbors "module:src/mongo/db/repl"
-
-# Visualize the graph — opens interactive D3 force-directed layout
+# Visualize a search neighborhood in an interactive HTML graph
 atomic query graph "replication" -k 20 --depth 2
+
+# Inspect an intent's lineage and dependency closure, not a generic neighborhood
+atomic intent graph ATOM::alice::1 --html
 ```
 
-The KG contains seven node types connected by typed edges:
+Intent graphs distinguish captured and explicitly declared implementation from
+changes that merely record the intent artifact, and report truncation and missing
+resources. Change, intent, and view nodes also expose recorded AI usage summaries,
+with cost/token coverage and model attribution; missing usage is not assumed to be
+free. See [Intent semantic change graphs](docs/intent-graph.md) for scope and
+accounting details.
 
-```
-module:src/mongo/db/repl          ← directory-level grouping
-  ├─ PART_OF ← file:replication_coordinator.h    ← tracked files
-  │              ├─ DEFINES → entity:ReplicationCoordinator (class, L42-890)
-  │              └─ INCLUDES → file:replication_process.h
-  ├─ PART_OF ← file:bgsync.cpp
-  │              └─ MODIFIES ← change:R4YQUAS2 ("fix replication lag")
-  │                              ├─ AUTHORED_BY → identity:alice
-  │                              └─ DEPENDS_ON → change:XMJZ3IPF
-  └─ PART_OF → module:src/mongo/db  (parent module)
-```
-
-Search is powered by two indexes that work together:
-- **KG FTS** — searches node labels, summaries, and metadata (structural search)
-- **syntext** — trigram-indexed content search across all source files, ~20x faster than grep
-
-Results are ranked: `src/` files above tests, modules above flat files, content match counts as a signal. A bounded min-heap ensures the top N results surface from thousands of matches without sorting the full set.
-
-For agents (Claude Code, Gemini, etc.), the CLI commands ARE the tools. An agent calls `atomic query search`, `atomic query neighbors`, `atomic query entities`, and its own `read_file` — the same path a human follows. No grep, no find, no LLM-calling-LLM overhead.
-
-For humans on the terminal, `ask` provides an agentic loop with tool use:
+**Code structure is queried live, not persisted in the workflow KG.** Tree-sitter
+provides entities and caller relationships on demand; module, call, definition,
+and import edges are not stored as a parallel code graph.
 
 ```bash
-# LLM explores the KG with tools and answers your question
+# Build/update the separate syntext source-content index
+atomic query index
+
+# Search indexed source text; -t filters language and -g filters paths
+atomic query code "replication" -t rs -g atomic-core/src/
+
+# Parse a file's functions, classes, and types with line ranges
+atomic query entities atomic-core/src/kg/iri.rs
+
+# Find callers by path-qualified symbol or bare name using live parsing
+atomic query callers "atomic-core/src/kg/iri.rs#mint_change" --json
+```
+
+Search combines **KG full-text search** over resource IDs, labels, and summaries
+with **syntext** indexed source-content matches. The content index can be updated
+with `atomic query index`; it is separate from the workflow graph.
+
+**SHACL validation** runs locally in the CLI using PurRDF. Builtin profiles and
+enterprise-authored `.atomic/shapes/*.ttl` files use the same engine:
+
+```bash
+# Validate the asserted workflow snapshot (default projection profile)
+atomic query validate --format json
+
+# Apply the stricter managed-plan, provenance, and verified-attestation checks
+atomic query validate --profile publication --format json
+
+# Explicitly rebuild the complete derived workflow graph, including vault entries
+atomic query reindex --full
+```
+
+The projection profile permits a missing shortcut only with its matching gap
+finding. Reports include snapshot/profile identity, target coverage, and standard
+validation results. Conformance with no applicable targets is vacuous, not proof of
+complete history. Exit codes are **0** for conformance, **1** for violations, and
+**3** for shape or engine errors. Imports resolve only among explicitly loaded
+shape bundles, without implicit network fetching.
+
+Phase 1 does **not** enable OWL inference or mandatory validation hooks on sync or
+publication. Signature verification remains separate from SHACL. See the
+[KG upgrade guide](docs/knowledge-graph-phase1-upgrade.md) for the breaking API
+changes and migration behavior.
+
+Agents can use the same CLI queries directly. For interactive natural-language
+questions, `ask` provides an LLM tool-use loop:
+
+```bash
 atomic query ask "who fixed the auth bug?"
 ```
 
-The `ask` command gives the LLM six tools (`kg_search`, `kg_neighbors`, `read_file`, `list_entities`, `code_search`, `vault_read`) and lets it decide what to look up. Provider-agnostic — works with Anthropic or OpenAI. Set `ANTHROPIC_API_KEY` or `OPENAI_API_KEY` to enable.
+The model can search workflow facts, inspect source files, parse entities, and read
+vault entries. Set `ANTHROPIC_API_KEY` or `OPENAI_API_KEY` to enable it. Answers are
+model-generated interpretations, not machine-validated historical audit evidence.
 
-No API key required for `search`, `code`, `entities`, `neighbors`, `graph`, or `enrich`.
+No LLM API key is required for `search`, `code`, `entities`, `callers`, `neighbors`,
+`graph`, `enrich`, `index`, `reindex`, or `validate`.
 
 ## Quick Start
 
@@ -409,12 +475,14 @@ Every change stores two parallel representations:
 | `atomic query search <query>` | Search the knowledge graph (structural + content) |
 | `atomic query code <pattern>` | Search source code content (trigram-indexed, `-t` for file type, `-g` for path filter) |
 | `atomic query entities <path>` | List tree-sitter entities in a file (functions, classes, types with line ranges) |
-| `atomic query neighbors <id>` | Explore the graph around a node (DEFINES, MODIFIES, PART_OF, INCLUDES edges) |
-| `atomic query graph <query>` | Visualize the knowledge graph as interactive HTML (D3 force-directed, `-k` seeds, `--depth`, `--kinds`) |
+| `atomic query callers <path#name\|name>` | Find callers using live source parsing, without stored KG code edges |
+| `atomic query neighbors <resource-iri>` | Explore asserted workflow relationships around a canonical resource |
+| `atomic query graph <query>` | Visualize the workflow graph as interactive HTML (`-k` seeds, `--depth`, `--kinds` with class IRIs) |
 | `atomic query ask <question>` | Natural-language Q&A with agentic tool loop (requires API key) |
-| `atomic query enrich` | Build/rebuild KG from VCS data + content index (modules, entities, includes) |
+| `atomic query enrich` | Refresh VCS workflow facts (changes, files, views) |
 | `atomic query index` | Build/update the content search index (`--rebuild` for full, `--stats` for info) |
-| `atomic query reindex` | Rebuild the KG index from vault entries |
+| `atomic query reindex [--full]` | Reproject vault entries; `--full` rebuilds the complete derived workflow graph |
+| `atomic query validate` | Run builtin and local enterprise SHACL shapes (`--profile projection\|publication`, `--format json`) |
 
 ### View Commands
 

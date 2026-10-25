@@ -5,6 +5,9 @@ on:
   push:
     branches: [release]
     tags: ['v*']
+    paths-ignore:
+      - '**.md'
+      - '**.markdown'
   # Callable from the Prepare Release dispatch workflow, which bumps the
   # version, merges dev into release, and then invokes this build directly.
   # Invoking via workflow_call runs in the same workflow run, so it works
