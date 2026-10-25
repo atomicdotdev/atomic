@@ -123,6 +123,41 @@ is kept as a regression check.
   reporting the deleted file as `D` right after the deleting record. The
   whole-file deletion walk now also collects a file's vertices through
   its own index.
+- A commit that moves a file into a subdirectory while a symlink to the
+  moved file takes its old path (srid/emanote: `README.md`, `LICENSE` and
+  `CHANGELOG.md` became links into `emanote/`), and the mirror shape (a
+  symlink replaced by the regular file it pointed to), import. Rename
+  detection paired the vacated blob with the moved path and the fold then
+  wiped the entry the same commit put at the old path, refusing with
+  `prospective import tree mismatch`; both shapes are now folded the way
+  Git itself reports them (a typechange beside an add, or a delete).
+- A repository whose committed tree already carries conflict markers (a
+  `Cargo.lock` merged by hand upstream) records through the shim: the
+  post-record Git projection discounts markers that Git HEAD already holds
+  byte-for-byte at the same path instead of refusing every later record
+  after it had landed (which left Git permanently behind Atomic). A record
+  that itself writes markers is still refused before anything lands.
+- Importing a history whose tree is large (hundreds of MB of committed
+  binaries, thousands of files) no longer holds a private copy of every
+  file's bytes per imported commit: the prospective fold and the per-commit
+  Git object store now share bytes between the per-commit trees. A 285 MB
+  tree over 427 commits reached a 70 GB footprint and was killed by the OS.
+- A CRLF file committed before the repository adopted `* text=auto eol=lf`
+  (Git keeps the blob as committed and reports the worktree clean by its
+  index stat) imports, and `atomic status`, `reconcile` and `verify` treat
+  it as clean: a worktree file whose raw bytes are exactly the recorded
+  blob is Git's own clean state even though the clean filter would
+  normalize it on the next add. The importer used to refuse with `changed
+  worktree path ... does not match the verified Git tree` and status
+  reported the file modified forever.
+- `git mv` of the last file out of a directory leaves the emptied
+  directory on disk (Git cannot represent it). In a repository colocated
+  with Git, `atomic status` no longer reports it as a reappeared `new dir`,
+  so reconcile, verify and the next record proceed; a leftover directory
+  holding only ignored entries (`.DS_Store`) is treated the same way; an
+  empty directory you do mean to track is added with `atomic add
+  --directory <path>`. A repository without Git keeps tracking empty
+  directories as before.
 
 **Repositories imported before this change must be re-imported.** The old
 importer tracked paths with spaces or non-ASCII bytes under their escaped

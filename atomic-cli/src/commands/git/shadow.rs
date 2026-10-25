@@ -1126,14 +1126,12 @@ pub(crate) fn project_view_to_git_with_conflicts(
         // V1 must run before even content-addressed object writes. A clean
         // state must not carry raw marker text; a conflicted state projects
         // markers deliberately and is resolved below.
-        let (policy, _) = {
-            let discovered = GitRepository::discover(repo_root)
-                .map_err(|error| git_error(format!("cannot discover Git repository: {error}")))?;
-            current_conversion_policy(repo_root, &discovered)?
-        };
+        let discovered = GitRepository::discover(repo_root)
+            .map_err(|error| git_error(format!("cannot discover Git repository: {error}")))?;
+        let (policy, _) = current_conversion_policy(repo_root, &discovered)?;
         let conflict_export = resolve_conflict_export(repo, view, &policy, allow_conflicts)?;
         if matches!(conflict_export, ConflictExport::Clean) {
-            refuse_conflict_markers(repo, repo_root, view)?;
+            refuse_conflict_markers(repo, &discovered, Some(&provisional), repo_root, view)?;
         }
         let publication = match &conflict_export {
             ConflictExport::Clean => verify_git_publication_mode(repo, repo_root, view, false)?,
@@ -1221,7 +1219,7 @@ pub(crate) fn project_view_to_git_with_conflicts(
                     GitObjectKind::Blob => git2::ObjectType::Blob,
                     GitObjectKind::Tree => git2::ObjectType::Tree,
                 };
-                (oid.clone(), kind, object.bytes.clone())
+                (oid.clone(), kind, object.bytes.to_vec())
             })
             .collect();
         if !project_objects.is_empty() {
@@ -1241,6 +1239,7 @@ pub(crate) fn project_view_to_git_with_conflicts(
         let tree_oid = stage_and_validate_tree(
             repo,
             git_repo,
+            Some(&target_ref),
             repo_root,
             &publication,
             if matches!(conflict_export, ConflictExport::Snapshot { .. }) {
@@ -1947,6 +1946,7 @@ pub(crate) fn acquire_shadow_lock(
 pub(crate) fn stage_and_validate_tree(
     repo: &Repository,
     git_repo: &GitRepository,
+    baseline_ref: Option<&str>,
     repo_root: &Path,
     publication: &VerifiedPublication,
     conflict_markers: ConflictMarkerPolicy,
@@ -1959,7 +1959,7 @@ pub(crate) fn stage_and_validate_tree(
     // ── Rule V1 — no unresolved conflict markers ────────────────────────────
     // Shares `atomic record`'s detector so the two paths cannot disagree.
     if conflict_markers == ConflictMarkerPolicy::Refuse {
-        refuse_conflict_markers(repo, repo_root, view)?;
+        refuse_conflict_markers(repo, git_repo, baseline_ref, repo_root, view)?;
     }
 
     // Prevention: make sure git is configured to exclude Atomic's shadow /
@@ -2003,7 +2003,15 @@ pub(crate) fn stage_and_validate_tree(
     Ok(tree_oid)
 }
 
-fn refuse_conflict_markers(repo: &Repository, repo_root: &Path, view: &str) -> CliResult<()> {
+/// `baseline_ref` names the ref the projection commits onto; its tip is the
+/// Git state a marker must be new against (HEAD when the ref is absent).
+fn refuse_conflict_markers(
+    repo: &Repository,
+    git_repo: &GitRepository,
+    baseline_ref: Option<&str>,
+    repo_root: &Path,
+    view: &str,
+) -> CliResult<()> {
     let working_copy = repo
         .require_working_copy_id()
         .map_err(CliError::Repository)?;
@@ -2016,11 +2024,23 @@ fn refuse_conflict_markers(repo: &Repository, repo_root: &Path, view: &str) -> C
     // canonical content still holds the markers). The switch/shadow boundary
     // therefore ALSO scans the materialized view content: unresolved markers
     // must never become Git evidence, whatever their worktree status.
+    //
+    // Markers the baseline commit already holds byte-for-byte are not this
+    // commit's doing (llmlang: a dependabot merge committed `Cargo.lock`
+    // with its markers; every later `atomic record` of an unrelated file was
+    // refused here AFTER the record had landed, leaving Git behind Atomic
+    // for good). Only a file whose projected bytes the baseline does not
+    // hold can introduce or keep an unresolved marker.
+    let baseline = baseline_tree(git_repo, baseline_ref);
     let marker = marker.or_else(|| {
-        repo.first_view_conflict_marker(working_copy)
-            .map_err(CliError::Repository)
-            .ok()
-            .flatten()
+        repo.first_view_conflict_marker_where(working_copy, &|path, content| {
+            !baseline
+                .as_ref()
+                .is_some_and(|tree| tree_holds_bytes(git_repo, tree, path, content))
+        })
+        .map_err(CliError::Repository)
+        .ok()
+        .flatten()
     });
     let Some((path, line)) = marker else {
         return Ok(());
@@ -2045,6 +2065,40 @@ fn refuse_conflict_markers(repo: &Repository, repo_root: &Path, view: &str) -> C
             path, line
         ),
     })
+}
+
+/// The tree the projection builds on: the tip of `baseline_ref` when it
+/// resolves, else HEAD's. `None` (unborn, or neither resolves) leaves every
+/// marker counted.
+fn baseline_tree<'g>(git: &'g GitRepository, baseline_ref: Option<&str>) -> Option<git2::Tree<'g>> {
+    let from_ref = baseline_ref
+        .and_then(|name| git.find_reference(name).ok())
+        .and_then(|reference| reference.peel_to_tree().ok());
+    from_ref.or_else(|| git.head().ok()?.peel_to_tree().ok())
+}
+
+/// Whether `tree` holds exactly `bytes`: at `path`, or — after a rename of
+/// the marker-bearing file — as the same blob anywhere in the tree. A tree
+/// or gitlink entry at `path` is not a blob and does not count.
+fn tree_holds_bytes(git: &GitRepository, tree: &git2::Tree<'_>, path: &str, bytes: &[u8]) -> bool {
+    let Ok(blob_oid) = git2::Oid::hash_object(git2::ObjectType::Blob, bytes) else {
+        return false;
+    };
+    let at_path = tree.get_path(Path::new(path)).ok().is_some_and(|entry| {
+        entry.kind() == Some(git2::ObjectType::Blob) && entry.id() == blob_oid
+    });
+    if at_path {
+        return true;
+    }
+    let mut found = false;
+    let _ = tree.walk(git2::TreeWalkMode::PreOrder, |_, entry| {
+        if entry.kind() == Some(git2::ObjectType::Blob) && entry.id() == blob_oid {
+            found = true;
+            return git2::TreeWalkResult::Abort;
+        }
+        git2::TreeWalkResult::Ok
+    });
+    found
 }
 
 fn write_project_tree(git: &GitRepository, project: &ProjectTree) -> CliResult<git2::Oid> {

@@ -9,6 +9,7 @@ use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use atomic_core::change::InodeKind;
 use atomic_core::operation::{GitHashAlgorithm, GitObjectId};
@@ -379,10 +380,16 @@ pub enum ManifestDisposition {
 }
 
 /// One canonical repository entry. `repository_bytes` are already-clean bytes.
+///
+/// The bytes are reference-counted: a project tree is cloned once per
+/// imported commit (the prospective fold keeps every commit's tree), so an
+/// owned buffer per entry per commit cost commits × tree bytes — a 285 MB
+/// tree over 427 commits reached a 70 GB footprint and was killed. Cloning
+/// an entry now shares its bytes.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RepositoryEntry {
     pub path: RepoPath,
-    pub repository_bytes: Vec<u8>,
+    pub repository_bytes: Arc<[u8]>,
     pub content_identity: ObjectKey,
     pub mode: u16,
     pub kind: InodeKind,
@@ -418,7 +425,7 @@ impl RepositoryEntry {
         Ok(Self {
             path,
             content_identity: content_key(&repository_bytes),
-            repository_bytes,
+            repository_bytes: Arc::from(repository_bytes),
             mode,
             kind,
             gitlink,
@@ -768,10 +775,14 @@ pub enum GitObjectKind {
     Tree,
 }
 
+/// One Git object. The bytes are reference-counted for the same reason as
+/// [`RepositoryEntry::repository_bytes`]: every per-commit project tree of
+/// an import carries its own object database, and the blobs must not be
+/// copied per commit.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GitObject {
     pub kind: GitObjectKind,
-    pub bytes: Vec<u8>,
+    pub bytes: Arc<[u8]>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -823,6 +834,17 @@ impl GitObjectDatabase {
         algorithm: GitHashAlgorithm,
         kind: GitObjectKind,
         bytes: Vec<u8>,
+    ) -> Result<GitObjectId, ProjectTreeError> {
+        self.insert_shared(algorithm, kind, Arc::from(bytes))
+    }
+
+    /// [`Self::insert`] for bytes another holder already shares (a
+    /// repository entry's bytes): no copy is made.
+    pub fn insert_shared(
+        &mut self,
+        algorithm: GitHashAlgorithm,
+        kind: GitObjectKind,
+        bytes: Arc<[u8]>,
     ) -> Result<GitObjectId, ProjectTreeError> {
         let oid = git_object_id(algorithm, kind, &bytes)?;
         self.objects.insert(oid.clone(), GitObject { kind, bytes });
@@ -943,7 +965,7 @@ impl GitObjectDatabase {
                 "blob object identity or kind mismatch".into(),
             ));
         }
-        Ok(object.bytes.clone())
+        Ok(object.bytes.to_vec())
     }
 }
 
@@ -1038,7 +1060,7 @@ fn write_directory(
                 .gitlink
                 .clone()
                 .ok_or_else(|| ProjectTreeError::InvalidGitlink("missing object ID".into()))?,
-            InodeKind::Regular | InodeKind::Symlink => objects.insert(
+            InodeKind::Regular | InodeKind::Symlink => objects.insert_shared(
                 algorithm,
                 GitObjectKind::Blob,
                 entry.repository_bytes.clone(),
@@ -1968,7 +1990,7 @@ mod tests {
                         .get(&projected.git.root)
                         .unwrap()
                         .bytes
-                        .as_slice()
+                        .as_ref()
                 )
                 .unwrap(),
                 projected.git.root
@@ -1991,5 +2013,30 @@ mod tests {
                 .parse_manifest(&projected.git.root, &other),
             Err(ProjectTreeError::ObjectAlgorithmMismatch)
         ));
+    }
+}
+
+#[cfg(test)]
+mod shared_bytes_tests {
+    use super::*;
+    use atomic_core::change::InodeKind;
+
+    #[test]
+    fn cloning_an_entry_shares_its_bytes() {
+        let entry = RepositoryEntry::new(
+            RepoPath::from_bytes(b"big.bin").unwrap(),
+            vec![7u8; 4096],
+            0o644,
+            InodeKind::Regular,
+            None,
+            ManifestDisposition::Included,
+        )
+        .unwrap();
+        let copy = entry.clone();
+        assert!(
+            Arc::ptr_eq(&entry.repository_bytes, &copy.repository_bytes),
+            "a cloned entry must not own a second copy of its bytes"
+        );
+        assert_eq!(copy, entry);
     }
 }

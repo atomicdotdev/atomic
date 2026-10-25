@@ -27,7 +27,30 @@ pub trait FilesystemProvider: Send + Sync {
         file: &ObservedFile,
         path: &RepoPath,
         filter: &dyn ContentFilter,
-    ) -> Result<Hash, ChangeSourceError>;
+    ) -> Result<CanonicalContentId, ChangeSourceError>;
+}
+
+/// The content identities of one observed file: its bytes after the clean
+/// filter, and its raw bytes. Raw bytes that are the canonical content
+/// themselves are Git's own clean state even when the filter would
+/// normalize them on the next add (a CRLF file committed before the
+/// repository adopted `* text=auto eol=lf`), so status accepts either.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CanonicalContentId {
+    pub cleaned: Hash,
+    pub raw: Hash,
+}
+
+impl CanonicalContentId {
+    /// The identity to record for `expected`: the canonical hash when
+    /// either form matches it, else the cleaned hash (a modification).
+    pub fn resolve_against(self, expected: Hash) -> Hash {
+        if self.cleaned == expected || self.raw == expected {
+            expected
+        } else {
+            self.cleaned
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -48,7 +71,7 @@ impl FilesystemProvider for RealFilesystemProvider {
         file: &ObservedFile,
         path: &RepoPath,
         filter: &dyn ContentFilter,
-    ) -> Result<Hash, ChangeSourceError> {
+    ) -> Result<CanonicalContentId, ChangeSourceError> {
         read_canonical_content(file, path, filter)
     }
 }
@@ -366,10 +389,11 @@ where
                 }
 
                 stats.cache_misses += 1;
-                let content_id = provider.canonical_content_id(file, &entry.path, filter)?;
+                let observed_content = provider.canonical_content_id(file, &entry.path, filter)?;
                 stats.content_reads += 1;
                 stats.content_hashes += 1;
                 let expected_content = canonical_content(&entry.path)?;
+                let content_id = observed_content.resolve_against(expected_content);
                 let change = if type_changed {
                     VerifiedChange::TypeChanged
                 } else if permissions_changed {
@@ -603,7 +627,7 @@ fn read_canonical_content(
     file: &ObservedFile,
     path: &RepoPath,
     filter: &dyn ContentFilter,
-) -> Result<Hash, ChangeSourceError> {
+) -> Result<CanonicalContentId, ChangeSourceError> {
     let bytes = match file.kind {
         ObservedKind::Regular => fs::read(&file.native_path),
         ObservedKind::Symlink => read_link_bytes(&file.native_path),
@@ -618,6 +642,7 @@ fn read_canonical_content(
         path: path.escaped(),
         message: error.to_string(),
     })?;
+    let raw = Hash::of(&bytes);
     let canonical = if file.kind == ObservedKind::Regular {
         let native = path
             .to_native()
@@ -632,7 +657,10 @@ fn read_canonical_content(
     } else {
         bytes
     };
-    Ok(Hash::of(&canonical))
+    Ok(CanonicalContentId {
+        cleaned: Hash::of(&canonical),
+        raw,
+    })
 }
 
 #[cfg(unix)]

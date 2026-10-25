@@ -190,6 +190,11 @@ impl Repository {
         // using the operation-aware projection so a filesystem reappearance is
         // an undelete of the original inode rather than an untracked new file.
         let mut present = crate::worktree_presence::WorktreeEntries::new(&self.root);
+        // Loaded on the first reappeared directory only; most status calls
+        // never see one.
+        let reappearance_rules: std::cell::OnceCell<Option<crate::ignore::IgnoreRules>> =
+            std::cell::OnceCell::new();
+        let git_colocated = self.root.join(".git").symlink_metadata().is_ok();
         for absent in &projected_absent {
             let normalized = PathBuf::from(&absent.path);
             // A projected deletion is already the recorded state. Reintroduce
@@ -201,8 +206,8 @@ impl Repository {
             // resolves through an ancestor that became a symlink to a
             // directory; neither is a reappearance.
             let reappeared = match present.exact_metadata(&normalized) {
-                Ok(Some(_)) => true,
-                Ok(None) => false,
+                Ok(Some(metadata)) => metadata,
+                Ok(None) => continue,
                 // An unreadable ancestor is not a reappearance; status keeps
                 // reporting the rest of the workspace, as the plain stat did.
                 Err(error) => {
@@ -210,18 +215,39 @@ impl Repository {
                         "status: cannot inspect projected-absent path '{}': {error}",
                         absent.path
                     );
-                    false
+                    continue;
                 }
             };
-            if !reappeared {
-                continue;
-            }
             if !options.path_filters.is_empty() {
                 let matches = options
                     .path_filters
                     .iter()
                     .any(|f| normalized.starts_with(f) || f.starts_with(&normalized));
                 if !matches {
+                    continue;
+                }
+            }
+            // A directory Git emptied (`git mv` of its last file) stays on
+            // disk holding nothing Git could ever commit; in a repository
+            // colocated with Git it is not a reappearance of the recorded
+            // directory. A native repository keeps tracking empty
+            // directories, so there a re-created one is still the undelete
+            // it always was; a symlink or file at the directory's path is a
+            // reappearance like before.
+            if absent.directory && reappeared.file_type().is_dir() && git_colocated {
+                let rules = reappearance_rules
+                    .get_or_init(|| {
+                        options
+                            .respect_ignore_files
+                            .then(|| self.load_ignore_rules())
+                    })
+                    .as_ref();
+                if !crate::leftover_directory::holds_visible_entries(&self.root, &normalized, rules)
+                {
+                    log::debug!(
+                        "status: projected-absent directory '{}' is on disk but holds nothing visible; not a reappearance",
+                        absent.path
+                    );
                     continue;
                 }
             }

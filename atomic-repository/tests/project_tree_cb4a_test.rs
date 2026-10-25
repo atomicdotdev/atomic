@@ -90,7 +90,7 @@ fn graph_projection_and_git_parser_agree_for_sha1_and_sha256() {
             .find(|entry| entry.path.as_bytes() == b"links/current")
             .unwrap();
         assert_eq!(link.kind, InodeKind::Symlink);
-        assert_eq!(link.repository_bytes, b"../empty");
+        assert_eq!(&link.repository_bytes[..], b"../empty");
         let empty = projected
             .manifest
             .entries

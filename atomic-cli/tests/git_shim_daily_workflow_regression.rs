@@ -48,7 +48,24 @@
 //! - deleting a truncated file whose neighbour was rewritten wholesale in
 //!   the truncating commit, while editing that neighbour again, refused the
 //!   import: the deletion collected the neighbour's first line as the
-//!   truncated file's content (objx: `go.sum` beside `map_test.go`).
+//!   truncated file's content (objx: `go.sum` beside `map_test.go`);
+//! - moving a file into a subdirectory while a symlink to it takes the old
+//!   path (emanote: `README.md` -> `emanote/README.md`) refused the import
+//!   (`prospective import tree mismatch`): the rename's source removal wiped
+//!   the symlink the same commit added there, and the mirror shape (a
+//!   symlink replaced by the file it pointed to) lost the moved file;
+//! - a repository whose committed tree already holds conflict markers (a
+//!   merged-by-hand `Cargo.lock`) refused every `atomic record` through the
+//!   shim after the record had landed, leaving Git behind Atomic for good;
+//! - `git mv` of the last file out of a directory leaves the emptied
+//!   directory on disk (Git cannot represent it); `atomic status` reported
+//!   it as a reappeared `new dir`, so every reconcile and verify refused
+//!   with `Atomic working copy is not clean` until it was removed by hand;
+//! - a CRLF file committed before the repository adopted `* text=auto
+//!   eol=lf` (Git keeps the blob as committed until the next add) refused
+//!   the import (`changed worktree path ... does not match the verified Git
+//!   tree`): the worktree bytes were judged through the clean filter
+//!   although they are exactly the committed blob.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -1269,5 +1286,214 @@ fn deleting_a_truncated_file_beside_a_rewritten_neighbour_imports() {
     assert_eq!(
         repo.get_file_content_on_view("go.sum", "main").unwrap(),
         None
+    );
+}
+
+#[test]
+fn importing_a_file_moved_into_a_package_and_symlinked_from_its_old_path() {
+    let (root, home) = git_repo();
+    fs::write(root.join("README.md"), b"readme\n").unwrap();
+    fs::write(root.join("LICENSE"), b"MIT\n").unwrap();
+    fs::create_dir_all(root.join("default")).unwrap();
+    fs::write(root.join("default/index.yaml"), b"x: 1\n").unwrap();
+    fs::write(root.join("main.rs"), b"fn main() {}\n").unwrap();
+    commit_all(&root, "base");
+    // emanote dc1fb69: the package moves into a subdirectory and the
+    // top-level docs become symlinks into it.
+    fs::create_dir_all(root.join("pkg")).unwrap();
+    git(&root, &["mv", "default", "pkg/default"]);
+    git(&root, &["mv", "README.md", "pkg/README.md"]);
+    git(&root, &["mv", "LICENSE", "pkg/LICENSE"]);
+    std::os::unix::fs::symlink("pkg/README.md", root.join("README.md")).unwrap();
+    std::os::unix::fs::symlink("pkg/LICENSE", root.join("LICENSE")).unwrap();
+    commit_all(&root, "move the package, symlink the docs");
+    fs::write(root.join("main.rs"), b"fn main() {}\n// after\n").unwrap();
+    commit_all(&root, "after");
+
+    let summary = atomic_ok(&root, &home, &["git", "import", "--no-vault"]);
+    assert!(summary.contains("3 changes"), "got:\n{summary}");
+    assert_clean(&root, &home);
+    let repo = atomic_repository::Repository::open(&root).unwrap();
+    assert_eq!(
+        repo.get_file_content_on_view("README.md", "main").unwrap(),
+        Some(b"pkg/README.md".to_vec()),
+        "the old path holds the symlink target"
+    );
+    assert_eq!(
+        repo.get_file_content_on_view("pkg/README.md", "main")
+            .unwrap(),
+        Some(b"readme\n".to_vec())
+    );
+    assert_eq!(
+        repo.get_file_content_on_view("default/index.yaml", "main")
+            .unwrap(),
+        None
+    );
+}
+
+#[test]
+fn importing_a_symlink_replaced_by_the_file_it_pointed_to() {
+    let (root, home) = git_repo();
+    fs::create_dir_all(root.join("pkg")).unwrap();
+    fs::write(root.join("pkg/README.md"), b"readme\n").unwrap();
+    std::os::unix::fs::symlink("pkg/README.md", root.join("README.md")).unwrap();
+    fs::write(root.join("main.rs"), b"fn main() {}\n").unwrap();
+    commit_all(&root, "base");
+    fs::remove_file(root.join("README.md")).unwrap();
+    git(&root, &["mv", "pkg/README.md", "README.md"]);
+    commit_all(&root, "move the file over its symlink");
+    fs::write(root.join("main.rs"), b"fn main() {}\n// after\n").unwrap();
+    commit_all(&root, "after");
+
+    let summary = atomic_ok(&root, &home, &["git", "import", "--no-vault"]);
+    assert!(summary.contains("3 changes"), "got:\n{summary}");
+    assert_clean(&root, &home);
+    let repo = atomic_repository::Repository::open(&root).unwrap();
+    assert_eq!(
+        repo.get_file_content_on_view("README.md", "main").unwrap(),
+        Some(b"readme\n".to_vec())
+    );
+    assert_eq!(
+        repo.get_file_content_on_view("pkg/README.md", "main")
+            .unwrap(),
+        None
+    );
+}
+
+#[test]
+fn recording_beside_a_committed_file_with_conflict_markers_projects_to_git() {
+    let (root, home) = git_repo();
+    fs::write(root.join("tracked.txt"), b"base\n").unwrap();
+    // llmlang: a dependabot merge committed Cargo.lock with its markers.
+    fs::write(
+        root.join("Cargo.lock"),
+        b"[[package]]\n<<<<<<< HEAD\nversion = \"1.0.0\"\n=======\nversion = \"1.0.1\"\n>>>>>>> origin/dep\n",
+    )
+    .unwrap();
+    commit_all(&root, "baseline with a half-merged lockfile");
+    atomic_ok(&root, &home, &["git", "import", "--no-vault"]);
+    let key = home.join("binding.key");
+    fs::write(&key, "ab".repeat(32)).unwrap();
+    atomic_ok(
+        &root,
+        &home,
+        &[
+            "git",
+            "shim",
+            "enable",
+            "--no-refspecs",
+            "--binding-key-file",
+            key.to_str().unwrap(),
+        ],
+    );
+    atomic_ok(&root, &home, &["git", "shim", "reconcile"]);
+    assert_clean(&root, &home);
+
+    // An unrelated record must land in Atomic AND in Git: the markers were
+    // already Git's own content, so nothing unresolved is being introduced.
+    fs::write(root.join("tracked.txt"), b"base\nedit\n").unwrap();
+    atomic_ok(&root, &home, &["record", "-am", "edit beside the lockfile"]);
+    assert_eq!(git(&root, &["show", "HEAD:tracked.txt"]), "base\nedit");
+    assert!(
+        git(&root, &["log", "-1", "--format=%B"]).contains("Atomic record projection"),
+        "the record projected a Git commit"
+    );
+    assert_clean(&root, &home);
+
+    // A record that itself writes markers is still refused before anything
+    // lands.
+    fs::write(
+        root.join("tracked.txt"),
+        b"base\n<<<<<<< ours\nedit\n=======\nother\n>>>>>>> theirs\n",
+    )
+    .unwrap();
+    let error = atomic_err(&root, &home, &["record", "-am", "half-merged edit"]);
+    assert!(error.contains("conflict marker"), "got:\n{error}");
+    fs::write(root.join("tracked.txt"), b"base\nedit\n").unwrap();
+    assert_clean(&root, &home);
+}
+
+#[test]
+fn moving_the_last_file_out_of_a_directory_reconciles() {
+    let (root, home) = shim_repo();
+    fs::create_dir_all(root.join("pkg")).unwrap();
+    fs::write(root.join("pkg/README.md"), b"readme\n").unwrap();
+    commit_all(&root, "package");
+    atomic_ok(&root, &home, &["git", "shim", "reconcile"]);
+    assert_clean(&root, &home);
+
+    git(&root, &["mv", "pkg/README.md", "README.md"]);
+    commit_all(&root, "move out of the package");
+    assert!(
+        root.join("pkg").is_dir(),
+        "git leaves the emptied directory on disk"
+    );
+    atomic_ok(&root, &home, &["git", "shim", "reconcile"]);
+    assert_clean(&root, &home);
+    {
+        // Scoped: the handle holds the database lock the CLI needs below.
+        let repo = atomic_repository::Repository::open(&root).unwrap();
+        assert_eq!(
+            repo.get_file_content_on_view("README.md", "main").unwrap(),
+            Some(b"readme\n".to_vec())
+        );
+        assert_eq!(
+            repo.get_file_content_on_view("pkg/README.md", "main")
+                .unwrap(),
+            None
+        );
+    }
+
+    // The leftover directory keeps not blocking later work on either side.
+    fs::write(root.join("README.md"), b"readme\nmore\n").unwrap();
+    atomic_ok(&root, &home, &["record", "-am", "edit after the move"]);
+    assert_eq!(git(&root, &["show", "HEAD:README.md"]), "readme\nmore");
+    fs::write(root.join("tracked.txt"), b"base\ngit\n").unwrap();
+    commit_all(&root, "git edit after the move");
+    atomic_ok(&root, &home, &["git", "shim", "reconcile"]);
+    assert_clean(&root, &home);
+}
+
+#[test]
+fn importing_a_move_that_empties_a_directory_leaves_status_clean() {
+    let (root, home) = git_repo();
+    fs::create_dir_all(root.join("pkg")).unwrap();
+    fs::write(root.join("pkg/README.md"), b"readme\n").unwrap();
+    fs::write(root.join("main.rs"), b"fn main() {}\n").unwrap();
+    commit_all(&root, "base");
+    git(&root, &["mv", "pkg/README.md", "README.md"]);
+    commit_all(&root, "move out of the package");
+    fs::write(root.join("main.rs"), b"fn main() {}\n// after\n").unwrap();
+    commit_all(&root, "after");
+    assert!(root.join("pkg").is_dir());
+
+    let summary = atomic_ok(&root, &home, &["git", "import", "--no-vault"]);
+    assert!(summary.contains("3 changes"), "got:\n{summary}");
+    assert_clean(&root, &home);
+}
+
+#[test]
+fn importing_a_crlf_file_committed_before_eol_normalization() {
+    let (root, home) = git_repo();
+    fs::write(root.join("RULES.md"), b"rule one\r\nrule two\r\n").unwrap();
+    fs::write(root.join("main.rs"), b"fn main() {}\n").unwrap();
+    commit_all(&root, "crlf file");
+    // The attribute arrives later; the committed blob keeps its CRLF and Git
+    // reports the worktree clean by its index stat.
+    fs::write(root.join(".gitattributes"), b"* text=auto eol=lf\n").unwrap();
+    commit_all(&root, "normalize line endings from now on");
+    fs::write(root.join("main.rs"), b"fn main() {}\n// after\n").unwrap();
+    commit_all(&root, "after");
+    assert_eq!(git(&root, &["status", "--porcelain"]), "");
+    assert!(fs::read(root.join("RULES.md")).unwrap().contains(&b'\r'));
+
+    let summary = atomic_ok(&root, &home, &["git", "import", "--no-vault"]);
+    assert!(summary.contains("3 changes"), "got:\n{summary}");
+    assert_clean(&root, &home);
+    let repo = atomic_repository::Repository::open(&root).unwrap();
+    assert_eq!(
+        repo.get_file_content_on_view("RULES.md", "main").unwrap(),
+        Some(b"rule one\r\nrule two\r\n".to_vec()),
+        "the recorded bytes are the committed blob"
     );
 }

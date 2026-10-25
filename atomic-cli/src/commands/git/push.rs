@@ -314,6 +314,7 @@ impl Command for Push {
         let tree_oid = super::shadow::stage_and_validate_tree(
             &repo,
             &git_repo,
+            None,
             &repo_root,
             &publication,
             marker_policy,

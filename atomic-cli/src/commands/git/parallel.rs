@@ -382,7 +382,7 @@ pub(crate) fn staged_expectation_for(
         entries.insert(
             path,
             atomic_repository::StagedPathExpectation {
-                bytes: entry.repository_bytes.clone(),
+                bytes: entry.repository_bytes.to_vec(),
                 mode: entry.mode,
                 kind: entry.kind,
             },
@@ -1483,24 +1483,31 @@ impl ProspectiveProjectTree {
             self.entries.clear();
         }
 
+        // Two phases: every path the commit vacates (rename sources,
+        // deletions) leaves the fold before any insertion, so a rename chain
+        // or swap (`a→b`, `c→a`) folds the same whatever order libgit2 emits
+        // the deltas in.
         for file in &parsed.files {
-            if file.operation == FileOperation::Renamed {
-                if let Some(old_path) = &file.old_path {
-                    self.entries.remove(
-                        &RepoPath::from_bytes(old_path.as_bytes()).map_err(|e| {
-                            git_error(format!("invalid Git path '{old_path}': {e}"))
-                        })?,
-                    );
-                }
+            let vacated = match file.operation {
+                FileOperation::Renamed => file.old_path.as_deref(),
+                FileOperation::Deleted => Some(file.path.as_str()),
+                _ => None,
+            };
+            if let Some(vacated) = vacated {
+                self.entries.remove(
+                    &RepoPath::from_bytes(vacated.as_bytes())
+                        .map_err(|e| git_error(format!("invalid Git path '{vacated}': {e}")))?,
+                );
+            }
+        }
+        for file in &parsed.files {
+            if file.operation == FileOperation::Deleted {
+                continue;
             }
             // CB-9C path fidelity: the canonical String identity decodes to
             // the exact raw bytes before entering the RepoPath-keyed fold.
             let path = RepoPath::from_bytes(file.path.as_bytes())
                 .map_err(|e| git_error(format!("invalid Git path '{}': {e}", file.path)))?;
-            if file.operation == FileOperation::Deleted {
-                self.entries.remove(&path);
-                continue;
-            }
             let bytes = file.new_content.clone().ok_or_else(|| {
                 git_error(format!(
                     "commit {} omitted bytes for '{}'",
@@ -4393,7 +4400,14 @@ impl ParallelImporter {
                     "cannot clean changed worktree path '{path}': {error}"
                 ))
             })?;
-            if cleaned.bytes != entry.repository_bytes {
+            // Raw bytes that ARE the committed blob are Git's own clean
+            // state: Git keeps such a file clean by its index stat even when
+            // a later `text=auto` attribute would normalize it on the next
+            // add (a CRLF file committed before the repository adopted
+            // `eol=lf`). The filter still runs first, so a required driver
+            // that fails keeps refusing the import.
+            let raw_matches = bytes[..] == entry.repository_bytes[..];
+            if !raw_matches && cleaned.bytes[..] != entry.repository_bytes[..] {
                 return Err(git_error(format!(
                     "changed worktree path '{path}' does not match the verified Git tree"
                 )));
@@ -7161,7 +7175,7 @@ impl ParallelImporter {
                     new_mode: git_mode_at(git, &merge_tree, &path),
                     path,
                     operation: FileOperation::Modified,
-                    new_content: Some(entry.repository_bytes.clone()),
+                    new_content: Some(entry.repository_bytes.to_vec()),
                     old_content: None,
                     diff_lines: None,
                     old_path: None,
@@ -8994,7 +9008,7 @@ fn parse_diff_files(
     // Modified delta carrying the exact old bytes, new bytes, and the new
     // canonical mode. Kind and mode then ride the graph-backed attribute
     // registers instead of a spurious delete/recreate.
-    Ok(normalize_typechanges(files))
+    Ok(normalize_typechanges(normalize_rename_collisions(files)))
 }
 
 fn normalize_typechanges(files: Vec<ParsedFile>) -> Vec<ParsedFile> {
@@ -9027,6 +9041,133 @@ fn normalize_typechanges(files: Vec<ParsedFile>) -> Vec<ParsedFile> {
             }
             Some(file)
         })
+        .collect()
+}
+
+/// The collisions between a commit's renames and its other deltas.
+///
+/// `onto_deleted`: target path of a rename whose target the commit also
+/// deletes → the moved bytes and mode. `reoccupied`: source path of a rename
+/// that an `Added` delta of the same commit re-occupies → the bytes the
+/// source held in the parent. Only a plain add re-occupies: a rename or copy
+/// landing on the vacated path (a swap or rotation) is Git's own rename
+/// chain and is left to the fold.
+#[derive(Default)]
+struct RenameCollisions {
+    onto_deleted: HashMap<String, (Option<Vec<u8>>, Option<u32>)>,
+    reoccupied: HashMap<String, Option<Vec<u8>>>,
+}
+
+impl RenameCollisions {
+    fn collect(files: &[ParsedFile]) -> Self {
+        let added: HashSet<&str> = files
+            .iter()
+            .filter(|file| file.operation == FileOperation::Added)
+            .map(|file| file.path.as_str())
+            .collect();
+        let deleted: HashSet<&str> = files
+            .iter()
+            .filter(|file| file.operation == FileOperation::Deleted)
+            .map(|file| file.path.as_str())
+            .collect();
+        let renames = files
+            .iter()
+            .filter(|file| file.operation == FileOperation::Renamed)
+            .filter_map(|file| file.old_path.as_deref().map(|old_path| (file, old_path)));
+        let onto_deleted: HashMap<String, (Option<Vec<u8>>, Option<u32>)> = renames
+            .clone()
+            .filter(|(file, _)| deleted.contains(file.path.as_str()))
+            .map(|(file, _)| (file.path.clone(), (file.new_content.clone(), file.new_mode)))
+            .collect();
+        let reoccupied = renames
+            .filter(|(file, old_path)| {
+                !onto_deleted.contains_key(&file.path) && added.contains(old_path)
+            })
+            .map(|(file, old_path)| (old_path.to_string(), file.old_content.clone()))
+            .collect();
+        Self {
+            onto_deleted,
+            reoccupied,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.onto_deleted.is_empty() && self.reoccupied.is_empty()
+    }
+
+    /// Rewrite one delta into the shape Git itself reports for the
+    /// collision; deltas not involved are returned untouched.
+    fn rewrite(&self, file: ParsedFile) -> ParsedFile {
+        match file.operation {
+            FileOperation::Renamed if self.onto_deleted.contains_key(&file.path) => ParsedFile {
+                path: file.old_path.clone().unwrap_or_default(),
+                operation: FileOperation::Deleted,
+                new_content: None,
+                old_content: file.old_content,
+                diff_lines: None,
+                old_path: None,
+                new_mode: None,
+            },
+            FileOperation::Renamed
+                if file
+                    .old_path
+                    .as_ref()
+                    .is_some_and(|old_path| self.reoccupied.contains_key(old_path)) =>
+            {
+                ParsedFile {
+                    operation: FileOperation::Added,
+                    old_content: None,
+                    diff_lines: None,
+                    old_path: None,
+                    ..file
+                }
+            }
+            FileOperation::Added if self.reoccupied.contains_key(&file.path) => ParsedFile {
+                operation: FileOperation::Modified,
+                old_content: self.reoccupied[&file.path].clone(),
+                diff_lines: None,
+                ..file
+            },
+            FileOperation::Deleted if self.onto_deleted.contains_key(&file.path) => {
+                let (new_content, new_mode) = self.onto_deleted[&file.path].clone();
+                ParsedFile {
+                    operation: FileOperation::Modified,
+                    new_content,
+                    new_mode,
+                    diff_lines: None,
+                    ..file
+                }
+            }
+            _ => file,
+        }
+    }
+}
+
+/// Resolve a rename that collides with another delta of the same commit.
+///
+/// Rename detection pairs a vacated blob with an added path even when the
+/// commit re-occupies the vacated path (emanote `dc1fb69`: `README.md`
+/// moved into `emanote/` while a symlink to the moved file takes the old
+/// path) or deletes the entry that held the target path (the mirror: a
+/// symlink replaced by the regular file it pointed to). The fold then holds
+/// a rename plus a same-path add or delete, and applying them in delta order
+/// lost one entry, so the prospective tree never matched Git
+/// (`prospective import tree mismatch`).
+///
+/// Git itself reports both shapes as a typechange beside an add (or a
+/// delete), so normalize to that: the re-occupied source becomes a Modified
+/// delta carrying the exact old bytes and the rename degrades to a plain add;
+/// a rename onto a deleted path becomes a plain delete of the source and a
+/// Modified delta of the target carrying the deleted entry's bytes as its
+/// baseline. Ordinary renames, swaps and rotations are returned untouched.
+fn normalize_rename_collisions(files: Vec<ParsedFile>) -> Vec<ParsedFile> {
+    let collisions = RenameCollisions::collect(&files);
+    if collisions.is_empty() {
+        return files;
+    }
+    files
+        .into_iter()
+        .map(|file| collisions.rewrite(file))
         .collect()
 }
 

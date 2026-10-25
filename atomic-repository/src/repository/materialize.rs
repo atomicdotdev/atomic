@@ -209,6 +209,20 @@ impl Repository {
         &self,
         working_copy: WorkingCopyId,
     ) -> Result<Option<(String, u32)>, RepositoryError> {
+        self.first_view_conflict_marker_where(working_copy, &|_, _| true)
+    }
+
+    /// [`Self::first_view_conflict_marker`] restricted to the files for
+    /// which `counts(path, content)` holds. A boundary that projects into a
+    /// Git history whose committed tree already carries marker bytes (a
+    /// lockfile merged by hand upstream) must not refuse every later record
+    /// over content Git itself holds; it passes a predicate that discounts
+    /// files whose bytes are already Git's own.
+    pub fn first_view_conflict_marker_where(
+        &self,
+        working_copy: WorkingCopyId,
+        counts: &dyn Fn(&str, &[u8]) -> bool,
+    ) -> Result<Option<(String, u32)>, RepositoryError> {
         self.validate_working_copy(working_copy)?;
         for tracked in self.list_tracked_files()? {
             if tracked.is_directory {
@@ -218,7 +232,9 @@ impl Repository {
             let full_path = self.root.join(&tracked.path);
             if let Ok(content) = std::fs::read(&full_path) {
                 if let Some(line) = first_conflict_marker_line(&content) {
-                    return Ok(Some((path, line)));
+                    if counts(&path, &content) {
+                        return Ok(Some((path, line)));
+                    }
                 }
             }
         }

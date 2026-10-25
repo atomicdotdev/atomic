@@ -577,7 +577,11 @@ fn compare_worktree_into(
             continue;
         }
         let actual_bytes = observed.repository_bytes_after_clean.as_deref();
-        if actual_bytes != Some(expected_entry.repository_bytes.as_slice()) {
+        // Raw bytes that ARE the committed blob are Git's own clean state
+        // even when the clean filter would normalize them on the next add
+        // (a CRLF file committed before `* text=auto eol=lf`).
+        let raw_matches = observed.worktree_bytes[..] == expected_entry.repository_bytes[..];
+        if !raw_matches && actual_bytes != Some(&expected_entry.repository_bytes[..]) {
             let kind = if expected_entry.kind == InodeKind::Symlink {
                 MismatchKind::LinkTarget
             } else if actual_bytes.is_some_and(|bytes| {

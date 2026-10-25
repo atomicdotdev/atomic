@@ -21,7 +21,8 @@ pub use fsmonitor::FsmonitorChangeSource;
 pub use process::{CommandOutput, CommandRunner, CommandSpec, ProcessCommandRunner};
 pub use scan::{
     conversion_policy_fingerprint, now_timestamp, verify_candidates,
-    verify_candidates_with_provider, FilesystemProvider, RealFilesystemProvider, ScanChangeSource,
+    verify_candidates_with_provider, CanonicalContentId, FilesystemProvider,
+    RealFilesystemProvider, ScanChangeSource,
 };
 pub use selected::{ChangeSourceEnvironment, SelectedChangeSource};
 pub use token::{
