@@ -2,7 +2,6 @@ use atomic_core::{
     change::{Change, ChangeHeader, ProvenanceGraph},
     kg::iri,
     pristine::VaultEntryType,
-    types::Base32,
 };
 use atomic_repository::Repository;
 use std::{
@@ -71,6 +70,20 @@ fn graph_resolves_ids_renders_all_formats_and_preserves_database() {
     let canonical = fixture(root);
     let database = root.join(".atomic/atomic.redb");
     let before = std::fs::read(&database).unwrap();
+    let shown = success(command(root, &["intent", "show", KEY]).output().unwrap());
+    assert!(shown.starts_with(&format!("Intent {KEY} — ")));
+    assert!(shown.contains("├── Metadata\n│   ├── Status: in_progress\n│   └── Kind: feature\n"));
+    assert!(shown.contains("├── Why\n│   └── Inspect exact lineage.\n"));
+    assert!(shown.ends_with("    └── Signed: no\n"));
+    assert_eq!(shown.matches("Kind: feature").count(), 1);
+    let json_show: serde_json::Value = serde_json::from_str(&success(
+        command(root, &["intent", "show", KEY, "--json"])
+            .output()
+            .unwrap(),
+    ))
+    .unwrap();
+    assert_eq!(json_show["status"], "in_progress");
+    assert!(json_show["@id"].as_str().unwrap().contains(UID));
     let mut expected = None;
     for id in [KEY, UID, canonical.as_str()] {
         let output = success(
@@ -119,8 +132,17 @@ fn graph_resolves_ids_renders_all_formats_and_preserves_database() {
         expected = Some(json);
     }
     let text = success(command(root, &["intent", "graph", KEY]).output().unwrap());
-    assert!(text.contains("implementing change"));
-    assert!(text.contains("atomic:generatedChange"));
+    assert!(text.contains("├── Implementing changes (1)"));
+    assert!(!text.contains("atomic:generatedChange"));
+    assert!(!text.contains("Summary: [context]"));
+    let details = success(
+        command(root, &["intent", "graph", KEY, "--details"])
+            .output()
+            .unwrap(),
+    );
+    assert!(details.contains("├── Implementing changes (1)"));
+    assert!(details.contains("atomic:generatedChange →"));
+    assert!(details.contains(&format!("ID: {canonical}")));
     let dot = success(
         command(root, &["intent", "graph", KEY, "--dot"])
             .output()
@@ -300,8 +322,14 @@ fn graph_distinguishes_explicit_declaration_from_captured_implementation() {
             .output()
             .unwrap(),
     );
-    assert!(text.contains("declared implementation; original turn provenance not established"));
-    assert!(text.contains("Declaration evidence: Author explicitly repairs"));
+    assert!(text.contains("[declared; original turn unproven]"));
+    let details = success(
+        command(directory.path(), &["intent", "graph", KEY, "--details"])
+            .output()
+            .unwrap(),
+    );
+    assert!(details.contains("declared implementation; original turn provenance not established"));
+    assert!(details.contains("Declaration evidence: Author explicitly repairs"));
 }
 
 /// The demo-2 failure: real, fully recorded source and intent artifacts exist,
@@ -309,6 +337,7 @@ fn graph_distinguishes_explicit_declaration_from_captured_implementation() {
 #[cfg(unix)]
 #[test]
 fn graph_exposes_real_recording_evidence_without_plan_id_or_database_mutation() {
+    use atomic_core::types::Base32;
     use std::fs;
     let directory = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
@@ -374,8 +403,10 @@ fn graph_exposes_real_recording_evidence_without_plan_id_or_database_mutation() 
         .iter()
         .any(|n| n["metadata"]["path"] == "src/cli.ts"));
     let text = run(&["intent", "graph", KEY]);
-    assert!(text.contains("1 intent-artifact recording changes"));
-    assert!(text.contains("records intent artifact; implementation attribution not asserted"));
+    assert!(text.contains("0 implementing · 1 recording"));
+    assert!(text.contains("Intent recording evidence (not implementation) (1)"));
+    let details = run(&["intent", "graph", KEY, "--details"]);
+    assert!(details.contains("records intent artifact; implementation attribution not asserted"));
     assert!(!text.contains("No implementing changes are linked"));
     let dot = run(&["intent", "graph", KEY, "--dot"]);
     assert!(dot.contains("records intent artifact"));
@@ -409,6 +440,7 @@ async fn graph_has_local_reactor_parity_through_shared_read_endpoints() {
             .output()
             .unwrap(),
     );
+    let local_show = success(command(&root, &["intent", "show", KEY]).output().unwrap());
     // Keep the Unix socket short enough for sockaddr_un on macOS.
     let socket_dir = tempfile::Builder::new()
         .prefix("ig-")
@@ -434,12 +466,18 @@ async fn graph_has_local_reactor_parity_through_shared_read_endpoints() {
                 },
             ),
     );
-    let output = tokio::task::spawn_blocking(move || {
-        command(&root, &["intent", "graph", KEY, "--json"])
+    let (output, show_output) = tokio::task::spawn_blocking(move || {
+        let graph = command(&root, &["intent", "graph", KEY, "--json"])
             .env("ATOMIC_SERVICE", "reactor")
-            .env("ATOMIC_DAEMON_SOCKET", socket)
+            .env("ATOMIC_DAEMON_SOCKET", &socket)
             .output()
-            .unwrap()
+            .unwrap();
+        let show = command(&root, &["intent", "show", KEY])
+            .env("ATOMIC_SERVICE", "reactor")
+            .env("ATOMIC_DAEMON_SOCKET", &socket)
+            .output()
+            .unwrap();
+        (graph, show)
     })
     .await
     .unwrap();
@@ -450,4 +488,5 @@ async fn graph_has_local_reactor_parity_through_shared_read_endpoints() {
         serde_json::from_str::<serde_json::Value>(&local).unwrap(),
         serde_json::from_str::<serde_json::Value>(&reactor).unwrap()
     );
+    assert_eq!(success(show_output), local_show);
 }

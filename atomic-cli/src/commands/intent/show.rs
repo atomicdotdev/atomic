@@ -8,7 +8,7 @@ use crate::commands::intent::bridge;
 use crate::commands::{find_repository_root, Command};
 use crate::error::{CliError, CliResult};
 
-/// Show an intent as a rendered read-time projection.
+/// Show an intent as a complete terminal tree.
 ///
 /// Projects the lifted canonical node (as opposed to dumping the raw stored
 /// body).
@@ -57,25 +57,6 @@ pub(crate) fn project(
         );
     } else {
         print!("{}", render(&node, Target::Cli));
-        // The renderer has no `kind` field of its own, so surface the
-        // classification (and, for a review, what it reviews) here.
-        println!("Kind:      {}", node.kind);
-        if node.kind == "review" {
-            let targets: Vec<&str> = node
-                .depends_on
-                .iter()
-                .filter(|r| r.edge == "reviews")
-                .map(|r| r.to.as_str())
-                .collect();
-            if targets.is_empty() {
-                println!("Reviews:   (none declared)");
-            } else {
-                println!("Reviews:");
-                for t in targets {
-                    println!("  • {t}");
-                }
-            }
-        }
     }
     Ok(())
 }

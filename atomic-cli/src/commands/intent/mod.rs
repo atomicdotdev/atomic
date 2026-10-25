@@ -72,10 +72,10 @@ pub enum IntentCommands {
     /// Validate an intent against the canonical shapes (the authoring gate).
     Validate(IntentValidate),
 
-    /// Show an intent as a rendered read-time projection.
+    /// Show an intent as a complete terminal tree (--json for canonical JSON-LD).
     Show(IntentShow),
 
-    /// Show an intent-rooted semantic change graph, including dependencies and evidence links.
+    /// Show an intent tree (--details expands evidence; --html opens a browser graph).
     Graph(IntentGraph),
 
     /// Scaffold a new directive-based intent into the vault.

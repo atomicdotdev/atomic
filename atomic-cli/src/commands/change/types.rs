@@ -7,7 +7,7 @@ use super::*;
 /// or machine parsing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Default)]
 pub enum ChangeFormat {
-    /// Full detailed format with all information.
+    /// Tree format with metadata, changed paths and recorded provenance.
     ///
     /// Shows hash, author, date, message, description, dependencies, and hunks summary.
     #[default]

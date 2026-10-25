@@ -284,6 +284,27 @@ fn intent_show_json_projects_the_attested_node() {
         node.get("proof").is_some(),
         "the signed proof rides the node"
     );
+    let text = run(repo_dir, home_dir, &["intent", "show", &id]);
+    assert!(text.starts_with(&format!("Intent {id} — Projected intent\n")));
+    assert!(text.contains("├── Metadata\n"));
+    assert!(text.contains("└── Provenance\n"));
+    assert!(text.ends_with("    └── Signed: yes\n"));
+    assert_eq!(text.matches("Kind: feature").count(), 1);
+
+    // A changed spine must warn and render the current unsigned tree, never
+    // reuse the proof on the old content or append a second metadata footer.
+    run(
+        repo_dir,
+        home_dir,
+        &["intent", "update", &id, "--title", "Revised intent"],
+    );
+    let stale = atomic(repo_dir, home_dir, &["intent", "show", &id]);
+    assert!(stale.status.success());
+    assert!(String::from_utf8_lossy(&stale.stderr).contains("stale"));
+    let text = String::from_utf8(stale.stdout).unwrap();
+    assert!(text.starts_with(&format!("Intent {id} — Revised intent\n")));
+    assert!(text.ends_with("    └── Signed: no\n"));
+    assert_eq!(text.matches("Kind: feature").count(), 1);
 }
 
 #[test]

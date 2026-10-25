@@ -57,10 +57,12 @@ pub(crate) fn view_scopes(
                     if !scope.changes.insert(iri::mint_change(&hash)) {
                         continue;
                     }
-                    if !dependency_cache.contains_key(&hash) {
+                    if let std::collections::btree_map::Entry::Vacant(entry) =
+                        dependency_cache.entry(hash)
+                    {
                         match repo.load_change(&hash) {
                             Ok(change) => {
-                                dependency_cache.insert(hash, change.dependencies().to_vec());
+                                entry.insert(change.dependencies().to_vec());
                             }
                             Err(RepositoryError::ChangeNotFound { .. }) => {
                                 scope.error = Some(format!("View change {} is unavailable; dependency closure may be incomplete", hash.to_base32()));
