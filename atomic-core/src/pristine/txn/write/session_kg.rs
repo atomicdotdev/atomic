@@ -249,7 +249,7 @@ impl WriteTxn<'_> {
             }
         }
         self.kg_clear_finding("UnresolvedReference", &id)?;
-        let created_at = chrono::DateTime::from_timestamp(turn.timestamp, 0)
+        let created_at = crate::pristine::vault::session_timestamp_datetime(turn.timestamp)
             .ok_or_else(|| PristineError::Serialization {
                 message: "session turn timestamp is outside the RDF dateTime range".into(),
             })?

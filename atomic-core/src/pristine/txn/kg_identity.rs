@@ -24,7 +24,7 @@ macro_rules! reads {
             };
             table
                 .iter()?
-                .map(|row| serde_json::from_slice(row?.1.value()).map_err(serialization))
+                .map(|row| crate::KgNode::from_json(row?.1.value()).map_err(serialization))
                 .collect()
         }
         pub fn all_kg_edges(&self) -> PristineResult<Vec<crate::KgEdge>> {

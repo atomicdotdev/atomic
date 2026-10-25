@@ -479,6 +479,18 @@ pub fn parse_intent_reference(
 
 // ── Knowledge Graph ─────────────────────────────────────────────
 
+// Legacy session epochs are untagged. Keep small values as seconds (including
+// old fixtures near 1970); contemporary millisecond epochs exceed this bound.
+const SESSION_MILLISECOND_THRESHOLD: u64 = 100_000_000_000;
+
+pub(crate) fn session_timestamp_datetime(timestamp: i64) -> Option<chrono::DateTime<chrono::Utc>> {
+    if timestamp.unsigned_abs() >= SESSION_MILLISECOND_THRESHOLD {
+        chrono::DateTime::from_timestamp_millis(timestamp)
+    } else {
+        chrono::DateTime::from_timestamp(timestamp, 0)
+    }
+}
+
 /// A node in the knowledge graph.
 ///
 /// Nodes represent repository artifacts: changes, files, entities, views,
@@ -503,6 +515,37 @@ pub struct KgNode {
 }
 
 impl KgNode {
+    /// Normalize the legacy session projector's seconds/milliseconds mix-up in
+    /// the returned read model only. Stored KG and provenance bytes stay intact.
+    pub(crate) fn from_json(bytes: &[u8]) -> Result<Self, serde_json::Error> {
+        let mut node: Self = serde_json::from_slice(bytes)?;
+        if node.source == "session_ledger" && node.has_type(crate::kg::ontology::Class::SessionTurn)
+        {
+            if let Some(created_at) = node.metadata.as_mut().and_then(|m| m.get_mut("created_at")) {
+                if let Some(legacy) = created_at
+                    .as_str()
+                    .and_then(|value| {
+                        chrono::DateTime::parse_from_rfc3339(value)
+                            // Chrono emits expanded years for the erroneous
+                            // date, but its strict RFC-3339 parser rejects them.
+                            .or_else(|_| {
+                                chrono::DateTime::parse_from_str(value, "%Y-%m-%dT%H:%M:%S%.f%:z")
+                            })
+                            .ok()
+                    })
+                    .filter(|value| {
+                        value.timestamp().unsigned_abs() >= SESSION_MILLISECOND_THRESHOLD
+                    })
+                {
+                    if let Some(corrected) = session_timestamp_datetime(legacy.timestamp()) {
+                        *created_at = serde_json::json!(corrected.to_rfc3339());
+                    }
+                }
+            }
+        }
+        Ok(node)
+    }
+
     pub fn has_type(&self, class: crate::kg::ontology::Class) -> bool {
         self.types.iter().any(|iri| iri == class.iri())
     }
@@ -655,6 +698,62 @@ pub struct SearchResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_epoch_formatting_accepts_seconds_and_milliseconds() {
+        for (raw, expected) in [
+            (1_792_920_379, "2026-10-25T09:26:19+00:00"),
+            (1_792_920_379_589, "2026-10-25T09:26:19.589+00:00"),
+            (0, "1970-01-01T00:00:00+00:00"),
+        ] {
+            assert_eq!(
+                session_timestamp_datetime(raw).unwrap().to_rfc3339(),
+                expected
+            );
+        }
+        assert!(session_timestamp_datetime(i64::MAX).is_none());
+        assert!(session_timestamp_datetime(i64::MIN).is_none());
+    }
+
+    #[test]
+    fn cached_session_date_is_normalized_only_in_the_read_model() {
+        use crate::kg::ontology::Class;
+        let original = KgNode::new("turn", Class::SessionTurn, "continue", "session_ledger")
+            .with_metadata(serde_json::json!({"created_at": "+58785-05-21T06:46:29+00:00"}));
+        let bytes = serde_json::to_vec(&original).unwrap();
+        let decoded = KgNode::from_json(&bytes).unwrap();
+        assert_eq!(
+            decoded.metadata.unwrap()["created_at"],
+            "2026-10-25T09:26:19.589+00:00"
+        );
+        assert_eq!(serde_json::to_vec(&original).unwrap(), bytes);
+    }
+
+    #[test]
+    fn date_normalization_leaves_valid_dates_and_unrelated_nodes_unchanged() {
+        use crate::kg::ontology::Class;
+        for (class, source, date) in [
+            (
+                Class::SessionTurn,
+                "session_ledger",
+                "2026-10-25T09:26:19.589Z",
+            ),
+            (Class::SessionTurn, "session_ledger", "not a date"),
+            (Class::SessionTurn, "other", "+58785-05-21T06:46:29+00:00"),
+            (
+                Class::Memory,
+                "session_ledger",
+                "+58785-05-21T06:46:29+00:00",
+            ),
+        ] {
+            let original = KgNode::new("node", class, "label", source)
+                .with_metadata(serde_json::json!({"created_at": date}));
+            assert_eq!(
+                KgNode::from_json(&serde_json::to_vec(&original).unwrap()).unwrap(),
+                original
+            );
+        }
+    }
 
     #[test]
     fn compose_human_key_uppercases_project_and_keeps_author() {

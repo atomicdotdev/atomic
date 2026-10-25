@@ -1379,11 +1379,10 @@ impl KgTxnT for ReadTxn {
         };
         match table.get(id)? {
             Some(value) => {
-                let node: KgNode = serde_json::from_slice(value.value()).map_err(|e| {
-                    PristineError::Serialization {
+                let node =
+                    KgNode::from_json(value.value()).map_err(|e| PristineError::Serialization {
                         message: e.to_string(),
-                    }
-                })?;
+                    })?;
                 Ok(Some(node))
             }
             None => Ok(None),

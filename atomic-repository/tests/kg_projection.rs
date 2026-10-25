@@ -12,6 +12,112 @@ use atomic_repository::{Repository, UnrecordOptions, ViewManifest};
 const UID: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
 
 #[test]
+fn session_dates_accept_both_epoch_units_without_a_kg_upgrade() {
+    let directory = tempfile::tempdir().unwrap();
+    let repo = Repository::init(directory.path()).unwrap();
+    for (session, timestamp, expected) in [
+        ("seconds", 1_792_920_379, "2026-10-25T09:26:19+00:00"),
+        (
+            "milliseconds",
+            1_792_920_379_589,
+            "2026-10-25T09:26:19.589+00:00",
+        ),
+    ] {
+        let graph = ProvenanceGraph::builder(session, "opencode")
+            .timestamp(timestamp)
+            .build();
+        let bytes = graph.serialize().unwrap();
+        let hash = repo.save_provenance_graph(&graph).unwrap();
+        let id = iri::mint_turn(&repo.project_id().unwrap(), session, 0);
+        assert_eq!(
+            repo.vault_kg_node(&id).unwrap().unwrap().metadata.unwrap()["created_at"],
+            expected
+        );
+        assert_eq!(
+            repo.load_provenance_graph(&hash)
+                .unwrap()
+                .serialize()
+                .unwrap(),
+            bytes
+        );
+    }
+    assert_eq!(
+        repo.pristine().read_txn().unwrap().kg_generation().unwrap(),
+        2
+    );
+}
+
+#[test]
+fn readonly_queries_correct_cached_turn_dates_without_reindexing_or_writes() {
+    use atomic_core::pristine::tables::{KG_INDEX_META, KG_NODES};
+    use redb::ReadableDatabase;
+
+    let directory = tempfile::tempdir().unwrap();
+    let repo = Repository::init(directory.path()).unwrap();
+    let graph = ProvenanceGraph::builder("legacy-timestamp", "opencode")
+        .timestamp(1_792_920_379_589)
+        .build();
+    let hash = repo.save_provenance_graph(&graph).unwrap();
+    let manifest_head = repo.get_session_head("legacy-timestamp").unwrap();
+    let id = iri::mint_turn(&repo.project_id().unwrap(), "legacy-timestamp", 0);
+    let mut cached = repo.vault_kg_node(&id).unwrap().unwrap();
+    cached.metadata.as_mut().unwrap()["created_at"] =
+        serde_json::json!("+58785-05-21T06:46:29+00:00");
+    let cached_bytes = serde_json::to_vec(&cached).unwrap();
+    let db_path = repo.dot_dir().join("atomic.redb");
+    drop(repo);
+    {
+        let db = redb::Database::open(&db_path).unwrap();
+        let txn = db.begin_write().unwrap();
+        txn.open_table(KG_NODES)
+            .unwrap()
+            .insert(id.as_str(), cached_bytes.as_slice())
+            .unwrap();
+        txn.commit().unwrap();
+    }
+
+    let repo = Repository::open_readonly(directory.path()).unwrap();
+    let expected = "2026-10-25T09:26:19.589+00:00";
+    assert_eq!(
+        repo.vault_kg_node(&id).unwrap().unwrap().metadata.unwrap()["created_at"],
+        expected
+    );
+    let snapshot = repo.workflow_snapshot().unwrap();
+    let turn = snapshot.nodes.iter().find(|node| node.id == id).unwrap();
+    assert_eq!(turn.metadata.as_ref().unwrap()["created_at"], expected);
+    assert_eq!(snapshot.generation, 2);
+    assert_eq!(
+        repo.get_session_head("legacy-timestamp").unwrap(),
+        manifest_head
+    );
+    assert_eq!(repo.load_provenance_graph(&hash).unwrap(), graph);
+    drop(repo);
+
+    // Both the old cached date and the generation marker remain byte-for-byte
+    // untouched: correcting the returned date must not require writable open.
+    let db = redb::Database::open(&db_path).unwrap();
+    let txn = db.begin_read().unwrap();
+    assert_eq!(
+        txn.open_table(KG_NODES)
+            .unwrap()
+            .get(id.as_str())
+            .unwrap()
+            .unwrap()
+            .value(),
+        cached_bytes
+    );
+    assert_eq!(
+        txn.open_table(KG_INDEX_META)
+            .unwrap()
+            .get("kg_generation")
+            .unwrap()
+            .unwrap()
+            .value(),
+        2
+    );
+}
+
+#[test]
 fn references_never_take_ownership_of_another_intents_children() {
     for reference_first in [false, true] {
         let directory = tempfile::tempdir().unwrap();

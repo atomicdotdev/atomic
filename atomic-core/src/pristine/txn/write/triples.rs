@@ -164,10 +164,9 @@ impl<'a> KgTxnT for WriteTxn<'a> {
         let result = match table.get(id)? {
             Some(value) => {
                 let bytes: &[u8] = value.value();
-                let node: KgNode =
-                    serde_json::from_slice(bytes).map_err(|e| PristineError::Serialization {
-                        message: e.to_string(),
-                    })?;
+                let node = KgNode::from_json(bytes).map_err(|e| PristineError::Serialization {
+                    message: e.to_string(),
+                })?;
                 Some(node)
             }
             None => None,
