@@ -22,6 +22,7 @@
 //! - Cross-file queries remain possible via the primary index
 
 mod impls;
+pub(crate) mod probe;
 mod scoped;
 mod types;
 

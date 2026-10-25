@@ -35,7 +35,20 @@
 //!   push (`working-copy identity ... requires writable migration`), the
 //!   other dispatchers journaled into a stray `.atomic/bridge` there, and
 //!   `atomic git shim reconcile` tried to initialize a second repository
-//!   (`Repository already exists`).
+//!   (`Repository already exists`);
+//! - a commit that truncated one file and extended another left the next
+//!   edit of the extended file attached to the truncation's empty vertex,
+//!   so the import refused the following commit (objx: `go.sum`);
+//! - an empty lockfile or checksum file (`package-lock.json`, `go.sum`)
+//!   that later gained content imported without semantic ops, so the staged
+//!   semantic closure rendered zero bytes and the import refused;
+//! - `atomic record` of a moved directory whose first entry is an empty
+//!   file next to a non-empty sibling (a Python package's `__init__.py`)
+//!   failed to apply (`ambiguous source ... for prior FOLDER edge`);
+//! - deleting a truncated file whose neighbour was rewritten wholesale in
+//!   the truncating commit, while editing that neighbour again, refused the
+//!   import: the deletion collected the neighbour's first line as the
+//!   truncated file's content (objx: `go.sum` beside `map_test.go`).
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -1084,4 +1097,177 @@ fn deleting_a_branch_whose_view_was_adopted_does_not_block_reconcile() {
     commit_all(&root, "after delete");
     atomic_ok(&root, &home, &["git", "shim", "reconcile"]);
     assert_clean(&root, &home);
+}
+
+#[test]
+fn importing_a_truncation_recorded_with_an_edit_keeps_later_edits() {
+    let (root, home) = git_repo();
+    fs::write(root.join("a.txt"), b"a\n").unwrap();
+    fs::write(root.join("notes.txt"), b"l1\nl2\nl3\n").unwrap();
+    commit_all(&root, "base");
+    // notes.txt serializes after a.txt, so the truncation's empty vertex
+    // sits exactly where a.txt's new last line ends.
+    fs::write(root.join("notes.txt"), b"").unwrap();
+    fs::write(root.join("a.txt"), b"a\nb\n").unwrap();
+    commit_all(&root, "truncate notes, extend a");
+    fs::write(root.join("a.txt"), b"a\nb\nc\n").unwrap();
+    commit_all(&root, "extend a again");
+    // Deleting the appended line resolves the deletion edge's source at the
+    // same boundary.
+    fs::write(root.join("a.txt"), b"a\nb\n").unwrap();
+    commit_all(&root, "drop the appended line");
+
+    let summary = atomic_ok(&root, &home, &["git", "import", "--no-vault"]);
+    assert!(summary.contains("4 changes"), "got:\n{summary}");
+    assert_clean(&root, &home);
+    let repo = atomic_repository::Repository::open(&root).unwrap();
+    assert_eq!(
+        repo.get_file_content_on_view("a.txt", "main").unwrap(),
+        Some(b"a\nb\n".to_vec())
+    );
+    assert_eq!(
+        repo.get_file_content_on_view("notes.txt", "main").unwrap(),
+        Some(Vec::new())
+    );
+}
+
+#[test]
+fn reconciling_a_truncation_recorded_with_an_edit_keeps_later_edits() {
+    let (root, home) = shim_repo();
+    fs::write(root.join("zz-notes.txt"), b"l1\nl2\nl3\n").unwrap();
+    commit_all(&root, "notes");
+    atomic_ok(&root, &home, &["git", "shim", "reconcile"]);
+    assert_clean(&root, &home);
+
+    fs::write(root.join("zz-notes.txt"), b"").unwrap();
+    fs::write(root.join("tracked.txt"), b"base\nsecond\n").unwrap();
+    commit_all(&root, "truncate notes, extend tracked");
+    atomic_ok(&root, &home, &["git", "shim", "reconcile"]);
+    assert_clean(&root, &home);
+
+    fs::write(root.join("tracked.txt"), b"base\nsecond\nthird\n").unwrap();
+    commit_all(&root, "extend tracked again");
+    atomic_ok(&root, &home, &["git", "shim", "reconcile"]);
+    assert_clean(&root, &home);
+    let repo = atomic_repository::Repository::open(&root).unwrap();
+    assert_eq!(
+        repo.get_file_content_on_view("tracked.txt", "main")
+            .unwrap(),
+        Some(b"base\nsecond\nthird\n".to_vec())
+    );
+}
+
+#[test]
+fn an_empty_lockfile_that_gains_content_imports() {
+    let (root, home) = git_repo();
+    fs::write(root.join("a.txt"), b"a\n").unwrap();
+    fs::write(root.join("package-lock.json"), b"").unwrap();
+    fs::write(root.join("go.sum"), b"h1\nh2\n").unwrap();
+    commit_all(&root, "base");
+    fs::write(root.join("go.sum"), b"").unwrap();
+    commit_all(&root, "truncate go.sum");
+    fs::write(root.join("package-lock.json"), b"{}\n").unwrap();
+    fs::write(root.join("go.sum"), b"h3\n").unwrap();
+    commit_all(&root, "regenerate both");
+
+    let summary = atomic_ok(&root, &home, &["git", "import", "--no-vault"]);
+    assert!(summary.contains("3 changes"), "got:\n{summary}");
+    assert_clean(&root, &home);
+    let repo = atomic_repository::Repository::open(&root).unwrap();
+    assert_eq!(
+        repo.get_file_content_on_view("package-lock.json", "main")
+            .unwrap(),
+        Some(b"{}\n".to_vec())
+    );
+    assert_eq!(
+        repo.get_file_content_on_view("go.sum", "main").unwrap(),
+        Some(b"h3\n".to_vec())
+    );
+}
+
+#[test]
+fn an_empty_lockfile_that_gains_content_reconciles() {
+    let (root, home) = shim_repo();
+    fs::write(root.join("Cargo.lock"), b"").unwrap();
+    commit_all(&root, "empty lockfile");
+    atomic_ok(&root, &home, &["git", "shim", "reconcile"]);
+    assert_clean(&root, &home);
+
+    fs::write(root.join("Cargo.lock"), b"# generated\nversion = 4\n").unwrap();
+    commit_all(&root, "generate lockfile");
+    atomic_ok(&root, &home, &["git", "shim", "reconcile"]);
+    assert_clean(&root, &home);
+
+    fs::write(root.join("Cargo.lock"), b"").unwrap();
+    commit_all(&root, "truncate lockfile");
+    atomic_ok(&root, &home, &["git", "shim", "reconcile"]);
+    assert_clean(&root, &home);
+    fs::write(root.join("Cargo.lock"), b"version = 5\n").unwrap();
+    commit_all(&root, "regenerate lockfile");
+    atomic_ok(&root, &home, &["git", "shim", "reconcile"]);
+    assert_clean(&root, &home);
+}
+
+#[test]
+fn moving_a_package_directory_with_an_empty_init_records_through_the_shim() {
+    let (root, home) = shim_repo();
+    fs::create_dir_all(root.join("pkg")).unwrap();
+    fs::write(root.join("pkg/__init__.py"), b"").unwrap();
+    fs::write(root.join("pkg/mod.py"), b"x = 1\n").unwrap();
+    commit_all(&root, "add package");
+    atomic_ok(&root, &home, &["git", "shim", "reconcile"]);
+    assert_clean(&root, &home);
+
+    // The whole package is renamed on disk and recorded natively.
+    fs::rename(root.join("pkg"), root.join("pkg2")).unwrap();
+    atomic_ok(&root, &home, &["record", "-a", "-m", "move the package"]);
+    assert_clean(&root, &home);
+    assert_eq!(
+        git(&root, &["ls-tree", "-r", "--name-only", "HEAD"]),
+        "pkg2/__init__.py\npkg2/mod.py\ntracked.txt",
+        "the move projects to Git"
+    );
+
+    // A later Git commit inside the moved package still reconciles.
+    fs::write(root.join("pkg2/mod.py"), b"x = 2\n").unwrap();
+    commit_all(&root, "edit the moved module");
+    atomic_ok(&root, &home, &["git", "shim", "reconcile"]);
+    assert_clean(&root, &home);
+}
+
+#[test]
+fn deleting_a_truncated_file_beside_a_rewritten_neighbour_imports() {
+    let (root, home) = git_repo();
+    let neighbour =
+        "package x\n\nimport (\n\t\"testing\"\n\t\"assert\"\n\t\"require\"\n)\n\nvar m = 1\n";
+    let rewritten = "package x\n\nimport (\n\t\"testing\"\n)\n\nvar m = 1\n";
+    fs::write(root.join("a.txt"), b"a\n").unwrap();
+    fs::write(root.join("go.sum"), b"h1\nh2\nh3\nh4\n").unwrap();
+    fs::write(root.join("map_test.go"), neighbour).unwrap();
+    commit_all(&root, "base");
+    // Truncating go.sum records a zero-length vertex at the change's first
+    // content position; dropping two contiguous import lines rewrites the
+    // neighbour wholesale, so its first line starts at that same position.
+    fs::write(root.join("go.sum"), b"").unwrap();
+    fs::write(root.join("map_test.go"), rewritten).unwrap();
+    commit_all(&root, "drop testify");
+    let edited = format!("{rewritten}// more\n");
+    fs::write(root.join("go.sum"), b"").unwrap();
+    git(&root, &["rm", "-q", "go.sum"]);
+    fs::write(root.join("map_test.go"), &edited).unwrap();
+    commit_all(&root, "delete go.sum, edit the neighbour");
+
+    let summary = atomic_ok(&root, &home, &["git", "import", "--no-vault"]);
+    assert!(summary.contains("3 changes"), "got:\n{summary}");
+    assert_clean(&root, &home);
+    let repo = atomic_repository::Repository::open(&root).unwrap();
+    assert_eq!(
+        repo.get_file_content_on_view("map_test.go", "main")
+            .unwrap(),
+        Some(edited.into_bytes())
+    );
+    assert_eq!(
+        repo.get_file_content_on_view("go.sum", "main").unwrap(),
+        None
+    );
 }

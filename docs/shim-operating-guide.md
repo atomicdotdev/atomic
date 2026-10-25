@@ -90,6 +90,39 @@ is kept as a regression check.
   gets the byte, mode and kind checks); merges, exclusions and fresh
   imports keep the whole-tree replay, and `ATOMIC_FULL_SEMANTIC_VERIFY=1`
   forces it.
+- A change that truncates one file to zero bytes and extends another no
+  longer captures the next edit of the extended file: a zero-length vertex
+  sits exactly where the neighbouring file's last line ends, and the
+  position-only context lookup used to attach the new line to it. Context
+  positions now resolve through the file's own vertex index first. Seen as
+  `atomic status` reporting a file modified right after a clean native
+  record, and as `atomic git import` of stretchr/objx refusing at the
+  commit that deleted the truncated `go.sum`.
+- An empty lockfile or checksum file (`package-lock.json`, `Cargo.lock`,
+  `go.sum`) that later gains content, or one truncated and regenerated,
+  imports and reconciles: the regeneration is recorded as a whole-file
+  replace on the file's existing semantic trunk instead of the
+  "no semantic state" fast path, which emitted no semantic ops and left
+  the staged closure rendering zero bytes.
+- `atomic record` of a moved directory whose first entry is an empty file
+  next to a non-empty sibling (a Python package with an empty
+  `__init__.py`) applies: the empty file's inode marker starts where the
+  sibling's name vertex starts, and the FOLDER edge source is now chosen by
+  the marker/name alternation instead of failing with `ambiguous source ...
+  for prior FOLDER edge` (or, on longer histories, projecting an
+  `unresolved path claims` tree).
+- Truncating a file to zero bytes no longer records a zero-length content
+  vertex (the deletion of its lines is the whole change): that vertex sat
+  at the same offset as the first line of whatever the same change
+  rewrote next, and the position-only lookups in the projection, the
+  content retrieval and the whole-file deletion walk read the neighbour's
+  first line as the truncated file's content. Seen on stretchr/objx as
+  `atomic git import` refusing the commit that deleted the truncated
+  `go.sum` while editing `map_test.go` ("staged path 'go.sum' is present
+  but the commit tree does not hold it"), and natively as `atomic status`
+  reporting the deleted file as `D` right after the deleting record. The
+  whole-file deletion walk now also collects a file's vertices through
+  its own index.
 
 **Repositories imported before this change must be re-imported.** The old
 importer tracked paths with spaces or non-ASCII bytes under their escaped
@@ -109,6 +142,15 @@ deleted and the real files untracked, and every reconcile refuses. Remove
   the main worktree '<path>'` instead of initializing a second repository.
   A linked worktree registered with the repository (the `.atomic/repository`
   pointer) adopts its own view and reconciles as before.
+- A native `atomic record -a` of a moved directory that follows another
+  native record without an `atomic status` in between can refuse with
+  `cannot build Atomic publication project tree: ... unresolved path
+  claims: <new directory>, ...` (seen on a 36-file notebook directory with
+  byte-identical files under two subdirectories): the workspace boundary
+  first captures the pending move as a snapshot, whose tree maintenance
+  already moves the inodes, and the durable record then plans the moves
+  against that state and re-creates the directory. Run `atomic status`
+  before the record, or move with `git mv` + `git commit` + `reconcile`.
 - Committing `.atomicignore` to Git makes `verify`/`reconcile` report
   `GitIndex/ExclusionPolicy .atomicignore`; keep it out of Git.
 - Interrupting an import between a change write and its Git SHA index

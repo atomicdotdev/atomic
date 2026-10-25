@@ -44,7 +44,7 @@
 
 use crate::change::{Change, EdgeUpdate, NewEdge, VerifiedCausalFrontier};
 use crate::pristine::GraphTxnT;
-use crate::types::{ChangePosition, EdgeKind, GraphNode, Hash, NodeId, Position};
+use crate::types::{ChangePosition, EdgeKind, GraphNode, Hash, Inode, NodeId, Position};
 
 use super::error::LocalApplyError;
 use super::graph_batch::{add_edge_with_reverse, CachedWriteGraphTxn};
@@ -207,12 +207,18 @@ fn write_new_edge(
         resolve_vertex(txn, target_pos, false)?
     };
 
-    let source_pos = resolve_position(txn, &edge.from, change_id)?;
-    let source =
-        resolve_exact_source_edge(txn, source_pos, target, edge.previous, previous_introducer)?;
-
-    // Resolve inode for indexing
+    // Resolve inode for indexing and for inode-scoped source resolution
     let resolved_inode = resolve_inode(txn, inode, change_id)?;
+
+    let source_pos = resolve_position(txn, &edge.from, change_id)?;
+    let source = resolve_exact_source_edge(
+        txn,
+        resolved_inode,
+        source_pos,
+        target,
+        edge.previous,
+        previous_introducer,
+    )?;
 
     // Parse the edge kind for semantic dispatch.
     // `edge.flag` is still `EdgeFlags` (wire format from the change), so we
@@ -264,8 +270,16 @@ fn write_new_edge(
     Ok(())
 }
 
+/// Resolve the source vertex of an edge update: the vertex at `position`
+/// that holds exactly the `previous` edge into `target`.
+///
+/// Candidates come from the file's own vertex index first (a zero-length
+/// vertex of a neighbouring file can sit at the same position; see
+/// `CachedWriteGraphTxn::find_block_end_in_inode`), then from the global
+/// span lookups; only candidates carrying the exact prior edge qualify.
 fn resolve_exact_source_edge(
     txn: &CachedWriteGraphTxn<'_, '_>,
+    inode: Option<Inode>,
     position: Position<NodeId>,
     target: GraphNode<NodeId>,
     previous: crate::types::EdgeFlags,
@@ -284,20 +298,34 @@ fn resolve_exact_source_edge(
         });
     }
 
-    let mut candidates = Vec::with_capacity(2);
-    if let Ok(candidate) = txn.find_block_end(position) {
-        candidates.push(candidate);
-    }
-    if let Ok(candidate) = txn.find_block(position) {
-        if !candidates.contains(&candidate) {
+    let mut candidates = Vec::with_capacity(4);
+    let mut consider = |candidate: Option<GraphNode<NodeId>>| {
+        if let Some(candidate) = candidate.filter(|candidate| !candidates.contains(candidate)) {
             candidates.push(candidate);
         }
+    };
+    if let Some(inode) = inode {
+        consider(txn.find_block_end_in_inode(inode, position).ok().flatten());
+        consider(txn.find_block_in_inode(inode, position).ok().flatten());
     }
+    consider(txn.find_block_end(position).ok());
+    consider(txn.find_block(position).ok());
 
     let mut matching = Vec::new();
     for candidate in candidates {
         if source_has_exact_edge(txn, candidate, target, previous, introduced_by)? {
             matching.push(candidate);
+        }
+    }
+    if matching.len() > 1 && previous.contains(crate::types::EdgeFlags::FOLDER) {
+        let fitting: Vec<GraphNode<NodeId>> = matching
+            .iter()
+            .copied()
+            .filter(|candidate| folder_edge_source_fits(*candidate, target))
+            .collect();
+        // Keep the ambiguity visible when the alternation does not settle it.
+        if fitting.len() == 1 {
+            matching = fitting;
         }
     }
     match matching.as_slice() {
@@ -315,6 +343,19 @@ fn resolve_exact_source_edge(
             ),
         }),
     }
+}
+
+/// Whether `source` can be the origin of a FOLDER edge into `target`.
+///
+/// The folder graph alternates between zero-length markers (the root and
+/// every inode) and non-empty name vertices: a marker names its children and
+/// a name vertex points at its inode. Edges record only the target's start
+/// position, and an empty file's inode marker starts exactly where its next
+/// sibling's name vertex starts, so a position match from the parent's
+/// marker to the sibling also matches the empty file's name vertex. The
+/// alternation tells the two apart: into a name vertex only a marker fits.
+fn folder_edge_source_fits(source: GraphNode<NodeId>, target: GraphNode<NodeId>) -> bool {
+    source.is_empty() != target.is_empty()
 }
 
 fn source_has_exact_edge(
@@ -579,6 +620,28 @@ mod tests {
             start: ChangePosition::new(start),
             end: ChangePosition::new(end),
         }
+    }
+
+    // FOLDER edge source disambiguation
+
+    #[test]
+    fn a_marker_is_the_only_fit_for_an_edge_into_a_name_vertex() {
+        let change = NodeId::new(1);
+        let directory_marker = make_internal_vertex(change, 3, 3);
+        let empty_file_name = make_internal_vertex(change, 3, 7);
+        let sibling_name = make_internal_vertex(change, 7, 11);
+        assert!(folder_edge_source_fits(directory_marker, sibling_name));
+        assert!(!folder_edge_source_fits(empty_file_name, sibling_name));
+    }
+
+    #[test]
+    fn a_name_vertex_is_the_only_fit_for_an_edge_into_a_marker() {
+        let change = NodeId::new(1);
+        let name = make_internal_vertex(change, 3, 7);
+        let inode_marker = make_internal_vertex(change, 7, 7);
+        let other_marker = make_internal_vertex(change, 7, 7);
+        assert!(folder_edge_source_fits(name, inode_marker));
+        assert!(!folder_edge_source_fits(other_marker, inode_marker));
     }
 
     // NewEdge Structure Tests

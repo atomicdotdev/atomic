@@ -2354,110 +2354,23 @@ impl<'txn> crate::pristine::InodeGraphOps for CachedGraphTxn<'txn> {
         inode: Inode,
         pos: Position<NodeId>,
     ) -> Result<Option<GraphNode<NodeId>>, Self::InodeError> {
-        let table = &self.inode_graph_table;
-        let inode_id = inode.get();
-        let change_id = pos.change.get();
-        let target_pos = pos.pos.get();
-
-        // Fast path: probe exact start position
-        let exact_start = encode_inode_vertex(inode_id, change_id, target_pos, 0);
-        let exact_end = encode_inode_vertex(inode_id, change_id, target_pos, u64::MAX);
-        let mut empty_match = None;
-
-        for result in table.range::<&[u8; 32]>(&exact_start..=&exact_end)? {
-            let (key, _) = result?;
-            let (_, v_change, v_start, v_end) = decode_inode_vertex(key.value());
-            if v_change != change_id || v_start != target_pos {
-                continue;
-            }
-            if v_start != v_end {
-                return Ok(Some(GraphNode {
-                    change: NodeId::new(v_change),
-                    start: ChangePosition::new(v_start),
-                    end: ChangePosition::new(v_end),
-                }));
-            }
-            if empty_match.is_none() {
-                empty_match = Some(GraphNode {
-                    change: NodeId::new(v_change),
-                    start: ChangePosition::new(v_start),
-                    end: ChangePosition::new(v_end),
-                });
-            }
-        }
-
-        if let Some(m) = empty_match {
-            return Ok(Some(m));
-        }
-
-        // Slow path: scan all vertices for this change within the inode
-        let start_key = encode_inode_vertex(inode_id, change_id, 0, 0);
-        let end_key = encode_inode_vertex(inode_id, change_id, u64::MAX, u64::MAX);
-
-        for result in table.range::<&[u8; 32]>(&start_key..=&end_key)? {
-            let (key, _) = result?;
-            let (_, v_change, v_start, v_end) = decode_inode_vertex(key.value());
-            if v_change == change_id && v_start <= target_pos && target_pos < v_end {
-                return Ok(Some(GraphNode {
-                    change: NodeId::new(v_change),
-                    start: ChangePosition::new(v_start),
-                    end: ChangePosition::new(v_end),
-                }));
-            }
-        }
-
-        Ok(None)
+        crate::pristine::inode_graph::probe::find_block_in_inode(
+            &self.inode_graph_table,
+            inode,
+            pos,
+        )
     }
-
     fn find_block_end_in_inode(
         &self,
         inode: Inode,
         pos: Position<NodeId>,
     ) -> Result<Option<GraphNode<NodeId>>, Self::InodeError> {
-        let table = &self.inode_graph_table;
-        let inode_id = inode.get();
-        let change_id = pos.change.get();
-        let target_pos = pos.pos.get();
-
-        // Check for empty vertex at exact position
-        let empty_key = encode_inode_vertex(inode_id, change_id, target_pos, target_pos);
-        if try_is_present(table.get(&empty_key)?)? {
-            return Ok(Some(GraphNode {
-                change: NodeId::new(change_id),
-                start: ChangePosition::new(target_pos),
-                end: ChangePosition::new(target_pos),
-            }));
-        }
-
-        // Scan for vertex ending at this position
-        let start_key = encode_inode_vertex(inode_id, change_id, 0, 0);
-        let end_key = encode_inode_vertex(inode_id, change_id, target_pos, u64::MAX);
-
-        for result in table.range::<&[u8; 32]>(&start_key..=&end_key)? {
-            let (key, _) = result?;
-            let (_, v_change, v_start, v_end) = decode_inode_vertex(key.value());
-            if v_change != change_id {
-                continue;
-            }
-            if v_end == target_pos && v_start < v_end {
-                return Ok(Some(GraphNode {
-                    change: NodeId::new(v_change),
-                    start: ChangePosition::new(v_start),
-                    end: ChangePosition::new(v_end),
-                }));
-            }
-            if v_start <= target_pos && target_pos < v_end {
-                return Ok(Some(GraphNode {
-                    change: NodeId::new(v_change),
-                    start: ChangePosition::new(v_start),
-                    end: ChangePosition::new(v_end),
-                }));
-            }
-        }
-
-        Ok(None)
+        crate::pristine::inode_graph::probe::find_block_end_in_inode(
+            &self.inode_graph_table,
+            inode,
+            pos,
+        )
     }
-
     fn count_inode_vertices(&self, inode: Inode) -> Result<usize, Self::InodeError> {
         let table = &self.inode_graph_table;
         let inode_id = inode.get();

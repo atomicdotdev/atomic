@@ -874,3 +874,32 @@ fn test_crdt_ops_into_ownership() {
     let crdt_ops = recorded.into_crdt_ops();
     assert!(crdt_ops.is_some());
 }
+
+// ========================================================================
+// Generated-file (opaque) routing
+// ========================================================================
+
+#[test]
+fn an_opaque_file_without_any_semantic_state_takes_the_fast_path() {
+    assert!(opaque_without_semantic_state("go.sum", None, None));
+    assert!(opaque_without_semantic_state(
+        "package-lock.json",
+        None,
+        Some(&[])
+    ));
+    assert!(!opaque_without_semantic_state("notes.txt", None, None));
+}
+
+#[test]
+fn an_opaque_file_with_a_trunk_but_no_branches_is_a_whole_file_replace() {
+    let trunk = TrunkId::new(NodeId::new(1), 0);
+    assert!(!opaque_without_semantic_state(
+        "go.sum",
+        Some(trunk),
+        Some(&[])
+    ));
+    assert!(opaque_with_semantic_state("go.sum", Some(trunk), Some(&[])));
+    assert!(opaque_with_semantic_state("Cargo.lock", Some(trunk), None));
+    assert!(!opaque_with_semantic_state("Cargo.lock", None, Some(&[])));
+    assert!(!opaque_with_semantic_state("notes.txt", Some(trunk), None));
+}
