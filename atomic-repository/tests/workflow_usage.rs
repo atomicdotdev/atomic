@@ -66,8 +66,13 @@ fn legacy_projected_changes_gain_usage_in_read_models_without_rebuilding_or_writ
         txn.update_view(&current).unwrap();
         txn.commit().unwrap();
     }
+    // Windows denies raw reads of redb's locked file while a writable handle
+    // is alive. Close the writer before taking the byte-for-byte baseline,
+    // then exercise hydration through a genuinely read-only repository.
+    drop(repo);
     let database = root.join(".atomic/atomic.redb");
     let before = std::fs::read(&database).unwrap();
+    let repo = Repository::open_readonly(root).unwrap();
     let snapshot = repo.workflow_snapshot().unwrap();
     assert!(
         !snapshot
@@ -104,7 +109,6 @@ fn legacy_projected_changes_gain_usage_in_read_models_without_rebuilding_or_writ
         selected[0].metadata.as_ref().unwrap()["ai_usage"]["coverage"]["changes"],
         1
     );
-    assert_eq!(std::fs::read(database).unwrap(), before);
     assert!(
         repo.vault_kg_node(&id)
             .unwrap()
@@ -115,4 +119,6 @@ fn legacy_projected_changes_gain_usage_in_read_models_without_rebuilding_or_writ
             .is_none(),
         "reading must not backfill stored rows"
     );
+    drop(repo);
+    assert_eq!(std::fs::read(database).unwrap(), before);
 }

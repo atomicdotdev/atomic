@@ -694,7 +694,10 @@ mod tests {
             assert_eq!(url.scheme(), "file");
             assert!(target.contains("%23") && target.contains("%25") && target.contains("%20"));
             assert_eq!(
-                url.to_file_path().unwrap(),
+                // Windows file URLs decode without the verbatim `\\?\`
+                // prefix returned by canonicalize. Compare canonical paths on
+                // both sides, not two valid spellings of the same file.
+                std::fs::canonicalize(url.to_file_path().unwrap()).unwrap(),
                 std::fs::canonicalize(&path).unwrap()
             );
             assert_eq!(std::fs::read_to_string(&path).unwrap(), html);
