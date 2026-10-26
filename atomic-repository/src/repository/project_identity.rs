@@ -161,19 +161,7 @@ impl Repository {
         &self,
         remote: &ProjectIdentityRecord,
     ) -> Result<IdentityAdoption, RepositoryError> {
-        let object: serde_json::Value = serde_json::from_slice(&remote.object)
-            .map_err(|e| invalid(format!("remote identity is not valid JSON: {e}")))?;
-        if project_identity_hash(&object) != remote.hash {
-            return Err(invalid("remote project identity hash mismatch"));
-        }
-        match self.remote_identity_signer_key(&object)? {
-            Some(key) => verify_project_identity(remote, Some(&key))?,
-            None if object.get("proof").is_none() => verify_project_identity(remote, None)?,
-            // Proofed identity, signer unresolved: hash verified above; the
-            // signature check is deferred to publication-time verification.
-            None => {}
-        }
-
+        self.verify_remote_identity(remote)?;
         let adoption = {
             let mut txn = self.pristine.write_txn()?;
             let current = txn.project_identity()?;
@@ -204,6 +192,70 @@ impl Repository {
             }
         };
         Ok(adoption)
+    }
+
+    /// Shared verification for a remotely fetched identity: recompute the
+    /// canonical proof-free hash, and verify the DID proof when the signer key
+    /// resolves locally (deferred otherwise — see `adopt_remote_project_identity`).
+    fn verify_remote_identity(
+        &self,
+        remote: &ProjectIdentityRecord,
+    ) -> Result<(), RepositoryError> {
+        let object: serde_json::Value = serde_json::from_slice(&remote.object)
+            .map_err(|e| invalid(format!("remote identity is not valid JSON: {e}")))?;
+        if project_identity_hash(&object) != remote.hash {
+            return Err(invalid("remote project identity hash mismatch"));
+        }
+        match self.remote_identity_signer_key(&object)? {
+            Some(key) => verify_project_identity(remote, Some(&key))?,
+            None if object.get("proof").is_none() => verify_project_identity(remote, None)?,
+            // Proofed identity, signer unresolved: hash verified above; the
+            // signature check is deferred to publication-time verification.
+            None => {}
+        }
+        Ok(())
+    }
+
+    /// Explicit divergence remediation (`atomic repo identity adopt`):
+    /// verify the remote identity and unconditionally replace whatever is
+    /// local — including an established `Created`/`Adopted` identity. The
+    /// project identity is only the KG namespace (canonical data uses
+    /// intrinsic ids), so this is safe; the derived KG is invalidated and the
+    /// caller rebuilds it via [`Self::rebuild_kg`].
+    pub fn force_adopt_remote_identity(
+        &self,
+        remote: &ProjectIdentityRecord,
+    ) -> Result<ProjectIdentityRecord, RepositoryError> {
+        self.verify_remote_identity(remote)?;
+        let mut adopted = remote.clone();
+        adopted.mint_reason = MintReason::Adopted;
+        let mut txn = self.pristine.write_txn()?;
+        txn.force_write_project_identity(&adopted)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        txn.commit()?;
+        Ok(adopted)
+    }
+
+    /// Explicit fork (`atomic repo identity fork`): mint a fresh identity —
+    /// signed by the local default identity when one exists — replacing
+    /// whatever is local. The previous lineage is abandoned: remotes that
+    /// bound the old id will refuse pushes from this repository until they
+    /// adopt it (or a new project is created for it).
+    pub fn fork_identity(&self) -> Result<ProjectIdentityRecord, RepositoryError> {
+        let keypair = if let Ok(store) = atomic_identity::IdentityStore::open_default() {
+            match store.get_default() {
+                Ok(Some(identity)) => store.load_keypair(&identity.id, None).ok(),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let record = build_project_identity(MintReason::Created, keypair.as_ref());
+        let mut txn = self.pristine.write_txn()?;
+        txn.force_write_project_identity(&record)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        txn.commit()?;
+        Ok(record)
     }
 
     /// Resolve the signer key for a remote identity's DID proof, if the proof

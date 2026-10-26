@@ -114,3 +114,71 @@ fn adoption_refuses_a_document_whose_hash_does_not_match() {
     assert!(repo.adopt_remote_project_identity(&tampered).is_err());
     assert!(repo.project_identity().unwrap().is_none());
 }
+
+// ── Explicit remediation (`repo identity adopt` / `repo identity fork`) ─────
+
+#[test]
+fn force_adopt_replaces_an_established_identity_and_invalidates_the_derived_kg() {
+    let directory = tempfile::tempdir().unwrap();
+    let repo = Repository::init(directory.path()).unwrap();
+    // An ESTABLISHED local identity (Created) — the case plain adoption
+    // refuses.
+    let established = repo.ensure_project_identity(MintReason::Created).unwrap();
+    assert!(!repo.rebuild_kg(false).unwrap());
+
+    let remote = remote_identity();
+    assert_eq!(
+        repo.adopt_remote_project_identity(&remote).unwrap(),
+        IdentityAdoption::Diverged,
+        "plain adoption must still refuse"
+    );
+
+    let adopted = repo.force_adopt_remote_identity(&remote).unwrap();
+    assert_eq!(adopted.mint_reason, MintReason::Adopted);
+    assert_eq!(repo.project_identity().unwrap().unwrap().hash, remote.hash);
+    // The derived graph re-projects under the adopted id.
+    assert!(
+        repo.rebuild_kg(false).unwrap(),
+        "force adopt must force a rebuild"
+    );
+    assert!(!repo.rebuild_kg(false).unwrap());
+    let _ = established;
+}
+
+#[test]
+fn force_adopt_still_verifies_the_document() {
+    let directory = tempfile::tempdir().unwrap();
+    let repo = Repository::init(directory.path()).unwrap();
+    repo.ensure_project_identity(MintReason::Created).unwrap();
+    let mut tampered = remote_identity();
+    let mut object: serde_json::Value = serde_json::from_slice(&tampered.object).unwrap();
+    object["dcterms:created"] = serde_json::json!("2031-01-01T00:00:00Z");
+    tampered.object = serde_json::to_vec(&object).unwrap();
+    assert!(repo.force_adopt_remote_identity(&tampered).is_err());
+}
+
+#[test]
+fn fork_mints_a_fresh_distinct_identity_and_abandons_the_old_lineage() {
+    let directory = tempfile::tempdir().unwrap();
+    let repo = Repository::init(directory.path()).unwrap();
+    let before = repo.ensure_project_identity(MintReason::Created).unwrap();
+
+    let forked = repo.fork_identity().unwrap();
+    assert_ne!(forked.hash, before.hash);
+    assert_eq!(repo.project_identity().unwrap().unwrap().hash, forked.hash);
+    // A second fork mints yet another lineage (idempotence is NOT a property
+    // of fork — every call is a new project).
+    let again = repo.fork_identity().unwrap();
+    assert_ne!(again.hash, forked.hash);
+    // A forked lineage is ESTABLISHED: plain adoption of the abandoned
+    // lineage refuses (Diverged) — taking it back is an explicit
+    // force-adopt, same as any other divergence remediation.
+    assert_eq!(
+        repo.adopt_remote_project_identity(&before).unwrap(),
+        IdentityAdoption::Diverged
+    );
+    assert_eq!(
+        repo.force_adopt_remote_identity(&before).unwrap().hash,
+        before.hash
+    );
+}

@@ -173,6 +173,29 @@ impl WriteTxn<'_> {
         Ok(())
     }
 
+    /// Unconditionally write the identity row and invalidate the derived KG.
+    /// For explicit remediation (`repo identity adopt`/`fork`) — the caller
+    /// has already decided the namespace change is intended. Preserves the
+    /// record's mint reason as given.
+    pub fn force_write_project_identity(
+        &mut self,
+        record: &ProjectIdentityRecord,
+    ) -> PristineResult<ProjectIdentityRecord> {
+        record.project_id().map_err(serialization)?;
+        let bytes = serde_json::to_vec(record).map_err(serialization)?;
+        self.txn
+            .open_table(PROJECT_IDENTITY)?
+            .insert(0, bytes.as_slice())?;
+        if self.kg_generation()? == crate::kg::KG_GENERATION {
+            // Invalidate the derived graph: project-qualified IRIs just
+            // changed. (A pre-rebuild repository stays at generation 0.)
+            self.txn
+                .open_table(KG_INDEX_META)?
+                .insert("kg_generation", 0u32)?;
+        }
+        Ok(record.clone())
+    }
+
     /// Compare-and-insert; concurrent minting keeps the first committed identity.
     pub fn put_project_identity_if_absent(
         &mut self,

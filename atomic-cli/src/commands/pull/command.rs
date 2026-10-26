@@ -782,7 +782,7 @@ impl Pull {
             Ok(report) => {
                 if let Some((remote_id, local_id)) = &report.diverged {
                     print_warning(&format!(
-                        "Remote project identity {remote_id} differs from local {local_id}; keeping local."
+                        "Remote project identity {remote_id} differs from local {local_id}; keeping local. Run 'atomic repo identity adopt' to take the remote lineage."
                     ));
                 } else if let Some(adopted) = &report.adopted {
                     print_success(&format!("Adopted project identity {adopted}"));
