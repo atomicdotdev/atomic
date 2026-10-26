@@ -7,10 +7,11 @@
 //! - Grant admin (`OpenSandbox`/`RenewSandbox`/`CloseSandbox`), local callers
 //!   only, through the state's [`super::sandbox_grants::SandboxGrants`].
 //! - The remote-sandbox data ops (`Materialize`, `GetFileStates`,
-//!   `GetChanges`, `SubmitChange`, `PublishProvenance`) on the repository's
-//!   remote-cache kernel (`atomic_repository::remote_cache`). A sandbox
-//!   caller reaches exactly its grant's view of its grant's repository; a
-//!   local caller names the view.
+//!   `GetChanges`, `SubmitChange`, `PublishProvenance`, `SubmitAttestation`)
+//!   on the repository's remote-cache kernel
+//!   (`atomic_repository::remote_cache`). A sandbox caller reaches exactly
+//!   its grant's view of its grant's repository; a local caller names the
+//!   view.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -840,6 +841,121 @@ impl sandbox_service_server::SandboxService for SandboxImpl {
         Ok(Response::new(SubmitChangeResponse {
             outcome: Some(outcome),
             meta: Some(meta),
+        }))
+    }
+
+    /// `SubmitAttestation`: a remote sandbox's session-end attestation — the
+    /// signed audit node its agent created — plus the session state file it
+    /// verifies under, saved in the repository (CB-12B).
+    ///
+    /// The gate that decides whether a managed change may cross a
+    /// publication boundary needs two things this sandbox holds and no other
+    /// transport carries: a same-session attestation over the change, and the
+    /// session MAC key to verify it (`.atomic/sessions/<id>.json`). Both ride
+    /// here, or every managed change the session recorded fails closed on the
+    /// owner with `MissingAttestation`.
+    ///
+    /// A sandbox submits attestations for its own sessions only, and the
+    /// session id is sanitized before it names a file
+    /// ([`Repository::save_sandbox_session_state`], the gate's own path
+    /// rules). A malformed attestation is a domain refusal — nothing is
+    /// written. The session state is only adopted when it carries a
+    /// non-empty `mac_key`; a DID-signed attestation rides regardless (the
+    /// owner may resolve DID keys later — signature policy is not the
+    /// transport's to decide).
+    async fn submit_attestation(
+        &self,
+        request: Request<SubmitAttestationRequest>,
+    ) -> Result<Response<SubmitAttestationResponse>, Status> {
+        let caller = self.state.sandbox_caller(&request)?;
+        let request = request.into_inner();
+        let repository = repository_ref(&request.repository)?;
+        let handle = self.state.resolve(&repository)?;
+        self.state.log_rpc("SubmitAttestation", Some(&handle));
+        let view = data_view(
+            caller.as_ref(),
+            &handle,
+            &repository,
+            request.target.as_ref(),
+            "attestation.write",
+        )?;
+        let session_id = request.session_id;
+        if session_id.is_empty() {
+            return Err(invalid("session_id is required"));
+        }
+        let bytes = wire::attestation_from(request.attestation.as_ref()).map_err(invalid)?;
+        let attestation = match atomic_core::change::attestation::Attestation::deserialize(&bytes) {
+            Ok((attestation, _)) => attestation,
+            Err(e) => {
+                return Ok(Response::new(SubmitAttestationResponse {
+                    outcome: Some(submit_attestation_response::Outcome::Refused(
+                        wire::rejection_error_info(&SubmitRejection::Malformed(e.to_string())),
+                    )),
+                    meta: response_meta(&request.meta),
+                }))
+            }
+        };
+        if attestation.session_id != session_id {
+            return Err(invalid("the attestation names another session"));
+        }
+        if let Some(caller) = &caller {
+            let owns = self
+                .state
+                .sandbox_grants()
+                .owns_session(&caller.grant, &session_id)
+                .map_err(|e| e.status())?;
+            if !owns {
+                return Err(domain_status(
+                    ErrorCode::Forbidden,
+                    format!(
+                        "session '{}' is not this sandbox's (view '{}')",
+                        session_id,
+                        caller.view()
+                    ),
+                ));
+            }
+        }
+        let meta = request.meta.clone();
+        let session_json = request.session_json;
+        let gate_handle = handle.clone();
+        let _gate = gate_handle.exclusive().await;
+        if let Some(caller) = &caller {
+            caller.revalidate(&self.state)?;
+        }
+        let outcome = tokio::task::spawn_blocking(move || {
+            let repo = handle.repository()?;
+            check_view(&repo, caller.as_ref(), &view)?;
+            // The session state first: a gate that runs between the two
+            // writes never sees an attestation whose key it cannot read.
+            let session_state = repo
+                .save_sandbox_session_state(&session_id, &session_json)
+                .map_err(repository_error)?;
+            let hash = repo
+                .save_attestation(&attestation)
+                .map_err(repository_error)?;
+            use atomic_core::types::Base32;
+            tracing::info!(
+                "Saved a remote sandbox's attestation {} for session {} (session state {})",
+                hash.to_base32(),
+                session_id,
+                if session_state {
+                    "written"
+                } else {
+                    "not carried"
+                },
+            );
+            Ok::<_, Status>(submit_attestation_response::Outcome::Submitted(
+                AttestationSubmitted {
+                    attestation_hash: Some(hash_proto(&hash)),
+                    session_state,
+                },
+            ))
+        })
+        .await
+        .map_err(joined)??;
+        Ok(Response::new(SubmitAttestationResponse {
+            outcome: Some(outcome),
+            meta: response_meta(&meta),
         }))
     }
 }

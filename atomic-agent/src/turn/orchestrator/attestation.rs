@@ -424,6 +424,49 @@ impl TurnOrchestrator {
         // unattested operation and no durable refusal (review R3/R6 probe).
         match repo.save_attestation(&attestation) {
             Ok(hash) => {
+                // CB-12B: a remote sandbox's owner never sees its cache. Hand
+                // the attestation — and the session state file its MAC
+                // signature verifies under — to the repository, or every
+                // managed change this session recorded fails the owner's
+                // publication gate with `MissingAttestation` (its gate reads
+                // the key from the owner's `.atomic/sessions/<id>.json`,
+                // which never leaves the sandbox any other way). A
+                // DID-signed attestation rides without a MAC key too: the
+                // host may resolve DID keys later, and signature policy is
+                // not the transport's to decide. Failure is a typed error —
+                // an unattested session is exactly the failure mode this
+                // submission exists to prevent (review R3/R6).
+                if repo.is_remote_sandbox() {
+                    let bytes = attestation.serialize().map_err(|e| {
+                        crate::error::AgentError::AttestationFailed {
+                            session_id: session.session_id.clone(),
+                            reason: format!(
+                                "failed to serialize the attestation for the owner: {e}"
+                            ),
+                        }
+                    })?;
+                    // Exactly the JSON the session store writes — the owner
+                    // files it verbatim where its gate reads it.
+                    let session_json = serde_json::to_string_pretty(&*session).map_err(|e| {
+                        crate::error::AgentError::AttestationFailed {
+                            session_id: session.session_id.clone(),
+                            reason: format!(
+                                "failed to serialize the session state for the owner: {e}"
+                            ),
+                        }
+                    })?;
+                    repo.submit_remote_sandbox_attestation(
+                        &session.session_id,
+                        &bytes,
+                        &session_json,
+                    )
+                    .map_err(|e| {
+                        crate::error::AgentError::AttestationFailed {
+                            session_id: session.session_id.clone(),
+                            reason: format!("failed to submit the attestation to the owner: {e}"),
+                        }
+                    })?;
+                }
                 log::info!(
                     "Created signed attestation {} for session {} ({}{} changes, {} models, +{} -{}, wall: {})",
                     hash.to_base32(),

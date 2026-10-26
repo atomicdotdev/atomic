@@ -355,7 +355,11 @@ fn kind_rank(blocker: &GateBlocker) -> u8 {
 
 /// Validate a session id for local file lookup (mirrors the agent session
 /// store's traversal rules). Returns `None` for ids that cannot name a file.
-fn safe_session_id(session: &str) -> Option<&str> {
+///
+/// Public: the serve side of the sandbox attestation transport files a
+/// remote sandbox's session state under the same `<sessions>/<id>.json`
+/// path this gate later reads it from — one sanitizer, both ends.
+pub fn safe_session_id(session: &str) -> Option<&str> {
     if session.is_empty()
         || session.contains('/')
         || session.contains('\\')

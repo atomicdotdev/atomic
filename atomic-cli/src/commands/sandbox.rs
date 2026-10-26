@@ -305,13 +305,15 @@ impl Command for Seal {
 // ---------------------------------------------------------------------------
 
 /// What a remote sandbox's grant carries when `--capability` is not given:
-/// enough to read and land its view's work and its agent's provenance.
+/// enough to read and land its view's work, its agent's provenance, and its
+/// agent's session attestations.
 const DEFAULT_CAPABILITIES: &[&str] = &[
     "sandbox.read",
     "sandbox.submit",
     "provenance.read",
     "provenance.write",
     "agent.checkpoint",
+    "attestation.write",
     "vault.read",
     "vault.write",
 ];

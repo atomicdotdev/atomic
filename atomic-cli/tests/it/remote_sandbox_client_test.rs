@@ -688,6 +688,96 @@ fn an_agent_turn_in_a_remote_sandbox_lands_with_its_provenance() {
     assert_only_the_cache(&vm);
 }
 
+/// A remote sandbox's session attestation rides to its owner (CB-12B): the
+/// session ends in the sandbox, and the owner's repository carries the
+/// attestation covering the turn's change — verified under the session MAC
+/// key, filed where the owner's publication gate reads it.
+#[test]
+fn a_remote_sandboxs_session_attestation_reaches_its_owner() {
+    let (_server, env, host) = setup();
+    let host = host.path();
+    let vms = TempDir::new().unwrap();
+    let vm = vms.path().join("work");
+    open(&env, host, "exp-1", &vm);
+    ok(env.run(&vm, &["sandbox", "materialize"]), "materialize");
+
+    let cwd = vm.to_str().unwrap();
+    let now = "2026-01-01T00:00:00Z";
+    let sid = "agent-session";
+    let turn = |n: u32| {
+        serde_json::json!({
+            "session_id": sid, "cwd": cwd, "model": "m", "provider": "p",
+            "turn_number": n, "intent_title": "greet the reader", "timestamp": now,
+        })
+    };
+    ok(
+        hook(
+            &env,
+            &vm,
+            "session-start",
+            serde_json::json!({
+                "session_id": sid, "cwd": cwd, "model": "m", "provider": "p",
+                "turn_number": 0, "timestamp": now,
+            }),
+        ),
+        "session-start",
+    );
+    ok(hook(&env, &vm, "turn-start", turn(1)), "turn-start");
+    write(&vm, "README.md", "hello\nreader\n");
+    ok(hook(&env, &vm, "turn-end", turn(1)), "turn-end");
+    ok(
+        hook(
+            &env,
+            &vm,
+            "session-end",
+            serde_json::json!({
+                "session_id": sid, "cwd": cwd, "turn_number": 1, "timestamp": now,
+            }),
+        ),
+        "session-end",
+    );
+
+    // The turn's change, from the session ledger the session-end
+    // publication built on the host.
+    let repo = atomic_repository::Repository::open_existing(host).unwrap();
+    let (_, turns) = repo
+        .get_session_ledger(sid)
+        .unwrap()
+        .unwrap_or_else(|| panic!("no session ledger for {sid} on the host"));
+    let change = turns
+        .iter()
+        .flat_map(|turn| turn.change_hashes.iter())
+        .copied()
+        .next()
+        .unwrap_or_else(|| panic!("no change in {sid}'s ledger: {turns:?}"));
+
+    // The owner carries the attestation for that change and session.
+    let attestations = repo.find_attestations_for_change(&change).unwrap();
+    let (_, attestation) = attestations
+        .iter()
+        .find(|(_, attest)| attest.session_id == sid)
+        .unwrap_or_else(|| panic!("no attestation for {sid}: {attestations:?}"));
+
+    // The owner's session state file carries the MAC key, where the
+    // publication gate reads it — and the attestation verifies under it.
+    let session_json = std::fs::read(
+        host.join(".atomic")
+            .join("sessions")
+            .join(format!("{sid}.json")),
+    )
+    .unwrap_or_else(|e| panic!("no session state filed on the host: {e}"));
+    let value: Value = serde_json::from_slice(&session_json).unwrap();
+    assert!(
+        value["mac_key"].as_str().is_some_and(|k| !k.is_empty()),
+        "{value}"
+    );
+    let key =
+        atomic_repository::repository::provenance_gate::local_session_mac_key_provider(&repo)(sid)
+            .expect("the gate resolves the session's MAC key");
+    assert!(attestation.verify_mac(&key));
+    assert_only_the_cache(&vm);
+}
+
 /// A sherpa turn's provenance is the full account of how the change was
 /// made: the transcript the harness writes (assistant text, tool calls, tool
 /// results — Claude Code's JSONL shape) rides the change as its unhashed

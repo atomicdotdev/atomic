@@ -16,7 +16,8 @@
 //! `diff`, `log`, `restore`, `intent`, ...): `Repository` resolves the
 //! pointer to the cache, and the cache calls back here through the
 //! [`RemoteSandboxLink`] this module installs for slices, change files,
-//! submissions and provenance. The agent hooks' provenance journal goes over
+//! submissions, provenance and session attestations. The agent hooks'
+//! provenance journal goes over
 //! ProvenanceService with the same token (`agent::provenance_rpc`).
 
 use std::path::{Path, PathBuf};
@@ -317,6 +318,42 @@ impl RemoteSandboxLink for CliLink {
                     Ok(Ok(wire::publication_from(&published)?))
                 }
                 pb::publish_provenance_response::Outcome::Refused(info) => {
+                    Ok(Err(wire::rejection_from_error_info(&info)
+                        .ok_or_else(|| info.message.clone())?))
+                }
+            }
+        })
+    }
+
+    fn submit_attestation(
+        &self,
+        root: &Path,
+        session_id: &str,
+        attestation: Vec<u8>,
+        session_json: String,
+    ) -> Result<Result<Hash, SubmitRejection>, String> {
+        let session_id = session_id.to_string();
+        exchange(root, move |repository, target, channel| async move {
+            let response = sandbox_client(channel)
+                .submit_attestation(pb::SubmitAttestationRequest {
+                    repository: Some(repository),
+                    meta: Some(pb::RequestMeta {
+                        request_id: uuid::Uuid::new_v4().to_string(),
+                        observed_at: None,
+                    }),
+                    session_id,
+                    attestation: Some(wire::attestation_bytes(attestation)),
+                    session_json,
+                    target: Some(target),
+                })
+                .await
+                .map_err(refused)?
+                .into_inner();
+            match response.outcome.ok_or("no outcome in SubmitAttestation")? {
+                pb::submit_attestation_response::Outcome::Submitted(submitted) => Ok(Ok(
+                    wire::hash_from_proto(submitted.attestation_hash.as_ref())?,
+                )),
+                pb::submit_attestation_response::Outcome::Refused(info) => {
                     Ok(Err(wire::rejection_from_error_info(&info)
                         .ok_or_else(|| info.message.clone())?))
                 }
