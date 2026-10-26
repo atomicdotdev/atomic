@@ -84,7 +84,7 @@ async fn query(
     repository: &pb::RepositoryRef,
     view: Option<pb::ViewRef>,
     query: pb::query_graph_request::Query,
-) -> Result<pb::QueryGraphResponse, tonic::Status> {
+) -> Result<pb::QueryGraphResponse, Box<tonic::Status>> {
     let bytes = service
         .call(
             "/atomic.KnowledgeService/QueryGraph",
