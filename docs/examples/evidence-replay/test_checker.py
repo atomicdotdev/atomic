@@ -3,13 +3,24 @@ import copy
 import hashlib
 import importlib.util
 import json
+import re
 import tempfile
 import unittest
+from importlib.metadata import version
 from pathlib import Path
 
 spec = importlib.util.spec_from_file_location("checker", Path(__file__).with_name("probity-checker.py"))
 checker = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(checker)
+
+
+def pinned_verify_version():
+    """The probity-verify version requirements.txt pins."""
+    text = Path(__file__).with_name("requirements.txt").read_text(encoding="utf-8")
+    pins = re.findall(r"^probity-verify==([^\s;\\]+)", text, flags=re.MULTILINE)
+    if len(pins) != 1:
+        raise AssertionError(f"requirements.txt pins probity-verify {len(pins)} times")
+    return pins[0]
 
 
 class ReplayCheckerTests(unittest.TestCase):
@@ -44,6 +55,15 @@ class ReplayCheckerTests(unittest.TestCase):
             "claim": {"criterion_id": "urn:atomic:ac:fixture-ac-1", "claim_type": "source_text_coverage/v1",
                       "artifact_root": str(root), "case": case, "policy": policy},
         }}
+
+    def test_installed_verify_is_the_pinned_release(self):
+        self.assertEqual(version("probity-verify"), pinned_verify_version())
+
+    def test_every_response_names_the_checker_release(self):
+        pinned = {"package": "probity-verify", "version": pinned_verify_version()}
+        self.assertEqual(checker.check(self.request)["details"]["checker"], pinned)
+        (self.root / "record.txt").unlink()
+        self.assertEqual(checker.check(self.request)["details"]["checker"], pinned)
 
     def test_supported_preserves_binding_and_bounded_scope(self):
         result = checker.check(self.request)

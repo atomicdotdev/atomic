@@ -170,6 +170,11 @@ and view chain and compares them to the report's `evidence_context`:
 - a report for an intent outside the candidate set is surfaced as
   `EVIDENCE_REPLAY_UNRELATED`, never silently dropped.
 
+Each summarized decision carries `checker`, the `{package, version}` the
+checker's response named in `details.checker`, or `null` when it named none in
+that exact shape. A reviewer who allowlists a checker release can hold every
+decision to it; the example checker reports the probity-verify release it ran.
+
 The report content hashes are bound into `inputs.evidence_reports` and the
 `urn:atomic:triage:<hash>` reference, so attaching or changing a report changes
 the reference. `--attest` signs the summaries as part of the report.
