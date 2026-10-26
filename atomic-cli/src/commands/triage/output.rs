@@ -860,6 +860,7 @@ mod tests {
                 candidate_changes: vec!["HASH1".to_string()],
                 closure_additions: vec![],
                 intent_substance_hashes: BTreeMap::new(),
+                evidence_reports: Vec::new(),
             },
             summary: Summary {
                 changes: 1,
@@ -884,6 +885,7 @@ mod tests {
                     satisfied_by: vec!["HASH1".to_string()],
                 }],
                 reviewed_by: Some("did:atomic:<reviewer>&co".to_string()),
+                evidence_replays: Vec::new(),
             }],
             changes: vec![ChangeReport {
                 id: "HASH1".to_string(),

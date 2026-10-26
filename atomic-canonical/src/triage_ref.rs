@@ -34,6 +34,11 @@ pub struct TriagePins {
     pub candidate_changes: Vec<String>,
     /// Intent id → `intentSubstanceHash` at review time.
     pub intent_substance_hashes: BTreeMap<String, String>,
+    /// Content hashes of attached retained evidence-replay reports. Sorted
+    /// before hashing; omitted from the canonical form when empty so existing
+    /// triage references stay stable.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence_report_hashes: Vec<String>,
 }
 
 /// The `urn:atomic:triage:<blake3-hex>` reference for a set of pins.
@@ -45,6 +50,7 @@ pub struct TriagePins {
 pub fn triage_reference(pins: &TriagePins) -> String {
     let mut canonical_pins = pins.clone();
     canonical_pins.candidate_changes.sort();
+    canonical_pins.evidence_report_hashes.sort();
     let value =
         serde_json::to_value(&canonical_pins).expect("TriagePins serialization is infallible");
     let canonical = jcs::canonicalize(&value);
@@ -72,6 +78,7 @@ mod tests {
             view_merkle: "MERKLEBASE32".to_string(),
             candidate_changes: vec!["CH2".to_string(), "CH1".to_string(), "CH3".to_string()],
             intent_substance_hashes: substance,
+            evidence_report_hashes: Vec::new(),
         }
     }
 
@@ -117,6 +124,20 @@ mod tests {
             .intent_substance_hashes
             .insert("urn:atomic:intent:a".to_string(), "blake3:zzz".to_string());
         assert_ne!(triage_reference(&substance), base);
+
+        let mut evidence = pins();
+        evidence
+            .evidence_report_hashes
+            .push("blake3:report".to_string());
+        assert_ne!(triage_reference(&evidence), base);
+        evidence.evidence_report_hashes = vec!["blake3:b".to_string(), "blake3:a".to_string()];
+        let mut reordered = evidence.clone();
+        reordered.evidence_report_hashes.reverse();
+        assert_eq!(
+            triage_reference(&evidence),
+            triage_reference(&reordered),
+            "report hashes are a set"
+        );
     }
 
     #[test]

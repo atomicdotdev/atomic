@@ -27,6 +27,7 @@ use atomic_core::types::{Base32, Hash};
 use crate::diff_engine::{change_file_diffs, DiffFormat, DiffOutputConfig, FileChangeStatus};
 use crate::error::RepositoryError;
 use crate::intent_bridge as bridge;
+use crate::intent_evidence::{self, EvidenceReportDocument};
 use crate::Repository;
 
 use super::model::*;
@@ -81,11 +82,59 @@ fn failing_view_verification(node: &CanonicalNode) -> Option<String> {
     None
 }
 
+/// Longest package name or version accepted from a checker's self-report.
+const CHECKER_FIELD_MAX: usize = 128;
+
+/// The `{package, version}` a checker names in `details.checker`. Anything
+/// else -- a missing member, an extra member, a non-string, an empty or
+/// overlong value -- names no release, so a summary never shows a guess.
+fn checker_release(details: &serde_json::Value) -> Option<CheckerRelease> {
+    let checker = details.get("checker")?.as_object()?;
+    if checker.len() != 2 {
+        return None;
+    }
+    let field = |name: &str| {
+        checker
+            .get(name)?
+            .as_str()
+            .filter(|value| !value.is_empty() && value.len() <= CHECKER_FIELD_MAX)
+            .map(str::to_owned)
+    };
+    Some(CheckerRelease {
+        package: field("package")?,
+        version: field("version")?,
+    })
+}
+
+/// Map a replay/report failure into the repository error surface. Repository
+/// failures stay typed; report parsing/hash failures are invalid operations.
+fn evidence_error(error: intent_evidence::EvidenceError) -> RepositoryError {
+    match error {
+        intent_evidence::EvidenceError::Repository(error) => error,
+        other => RepositoryError::InvalidOperation {
+            message: other.to_string(),
+        },
+    }
+}
+
 /// Build the canonical triage report for `feature` relative to `target`.
 pub fn build_report(
     repo: &Repository,
     feature: &str,
     target: &str,
+) -> Result<TriageReport, RepositoryError> {
+    build_report_with_evidence(repo, feature, target, &[])
+}
+
+/// Build the report with retained evidence-replay reports attached. Reports are
+/// bound by content hash into the triage reference and summarized per intent;
+/// a report whose pins no longer match the current intent/view chain is stale
+/// and never contributes a supported/contradicted verdict of its own.
+pub fn build_report_with_evidence(
+    repo: &Repository,
+    feature: &str,
+    target: &str,
+    evidence_reports: &[EvidenceReportDocument],
 ) -> Result<TriageReport, RepositoryError> {
     // 1. The candidate set (T0): only-in-feature, closure additions, baggage.
     let set = repo.triage_candidate_set(feature, target)?;
@@ -96,6 +145,28 @@ pub fn build_report(
     // Promotion scope: an unreviewed change BLOCKS promotion into a shared
     // view, but is only a warning into a draft. Resolved once here.
     let target_is_shared = repo.get_view_info(target)?.scope.is_shared();
+
+    // Retained replay reports: dedupe by content hash, then group by the intent
+    // they pin. Deterministic hash order keeps findings stable.
+    let mut parsed_reports: Vec<(String, &EvidenceReportDocument)> = evidence_reports
+        .iter()
+        .map(|document| Ok((intent_evidence::report_hash(document)?, document)))
+        .collect::<Result<_, intent_evidence::EvidenceError>>()
+        .map_err(evidence_error)?;
+    parsed_reports.sort_by(|a, b| a.0.cmp(&b.0));
+    parsed_reports.dedup_by(|a, b| a.0 == b.0);
+    let evidence_report_hashes: Vec<String> = parsed_reports
+        .iter()
+        .map(|(hash, _)| hash.clone())
+        .collect();
+    let mut evidence_by_intent: BTreeMap<String, Vec<(String, &EvidenceReportDocument)>> =
+        BTreeMap::new();
+    for (hash, document) in &parsed_reports {
+        evidence_by_intent
+            .entry(child_kg_id(&document.evidence_context.intent_id))
+            .or_default()
+            .push((hash.clone(), document));
+    }
 
     // 3. The change → intent join.
     //
@@ -268,6 +339,95 @@ pub fn build_report(
                 let report = validate_intent(&node);
                 let current_substance = intent_substance_hash(&node);
                 intent_substance_hashes.insert(intent_kg_id.clone(), current_substance.clone());
+
+                // Attached retained replay reports. Only a report whose
+                // intent/source/view-chain pins still match the current state
+                // may contribute a supported or contradicted verdict; a stale
+                // report is surfaced and its decisions are not promoted.
+                let attached = evidence_by_intent.remove(intent_kg_id).unwrap_or_default();
+                let mut evidence_replays = Vec::new();
+                if !attached.is_empty() {
+                    let current_context =
+                        intent_evidence::read_context(repo, bare).map_err(evidence_error)?;
+                    for (report_hash, document) in attached {
+                        let fresh = document.evidence_context == current_context;
+                        evidence_replays.push(EvidenceReplaySummary {
+                            report_hash: report_hash.clone(),
+                            intent_id: document.evidence_context.intent_id.clone(),
+                            schema_version: document.evidence_replay.schema_version.clone(),
+                            fresh,
+                            decisions: document
+                                .evidence_replay
+                                .decisions
+                                .iter()
+                                .map(|decision| EvidenceReplayDecision {
+                                    criterion_id: decision.criterion_id.clone(),
+                                    claim_type: decision.claim_type.clone(),
+                                    decision: decision.decision.clone(),
+                                    reason: decision.reason.clone(),
+                                    checker: checker_release(&decision.details),
+                                })
+                                .collect(),
+                        });
+                        if !fresh {
+                            findings.push(
+                                Finding::new(
+                                    F_EVIDENCE_REPLAY_STALE,
+                                    SEV_WARN,
+                                    intent_kg_id.clone(),
+                                    format!(
+                                        "evidence replay report {report_hash} no longer matches \
+                                         intent {intent_kg_id}'s substance/source or view-chain pins"
+                                    ),
+                                )
+                                .with_remedy(
+                                    "re-run `atomic intent validate <id> --json --replay-evidence \
+                                     <manifest> --evidence-checker <checker>` against the current \
+                                     state; a stale report cannot support or contradict a claim",
+                                ),
+                            );
+                            continue;
+                        }
+                        for decision in &document.evidence_replay.decisions {
+                            let (code, severity, remedy) = match decision.decision.as_str() {
+                                "supported" => (
+                                    F_EVIDENCE_REPLAY_SUPPORTED,
+                                    SEV_INFO,
+                                    "none — the claim is supported at the pinned state",
+                                ),
+                                "contradicted" => (
+                                    F_EVIDENCE_REPLAY_CONTRADICTED,
+                                    if target_is_shared {
+                                        SEV_BLOCK
+                                    } else {
+                                        SEV_WARN
+                                    },
+                                    "treat the claim as false; fix the artifact or leave the \
+                                     review criterion unmet",
+                                ),
+                                _ => (
+                                    F_EVIDENCE_REPLAY_NOT_ESTABLISHED,
+                                    SEV_WARN,
+                                    "re-run replay with the declared artifacts and a checker that \
+                                     can establish the claim",
+                                ),
+                            };
+                            findings.push(
+                                Finding::new(
+                                    code,
+                                    severity,
+                                    decision.criterion_id.clone(),
+                                    format!(
+                                        "evidence replay {report_hash} for {intent_kg_id} \
+                                         ({}) {}: {}",
+                                        decision.claim_type, decision.decision, decision.reason
+                                    ),
+                                )
+                                .with_remedy(remedy),
+                            );
+                        }
+                    }
+                }
 
                 // STALE_TRIAGE (warn, T5b): a granted `done` whose reviewable
                 // substance drifted from the pin recorded at grant time. The
@@ -532,6 +692,7 @@ pub fn build_report(
                     gate_violations,
                     criteria,
                     reviewed_by,
+                    evidence_replays,
                 });
             }
             Err(e) => {
@@ -554,8 +715,31 @@ pub fn build_report(
                     gate_violations: vec![msg],
                     criteria: Vec::new(),
                     reviewed_by: None,
+                    evidence_replays: Vec::new(),
                 });
             }
+        }
+    }
+
+    // A supplied report that did not match a reached intent is visible, never
+    // silently dropped. This also covers intents that failed to load above.
+    for (intent_id, attached) in evidence_by_intent {
+        for (report_hash, _) in attached {
+            findings.push(
+                Finding::new(
+                    F_EVIDENCE_REPLAY_UNRELATED,
+                    SEV_INFO,
+                    intent_id.clone(),
+                    format!(
+                        "evidence replay report {report_hash} addresses {intent_id}, which is \
+                         outside this candidate set or could not be loaded"
+                    ),
+                )
+                .with_remedy(
+                    "attach reports only for intents in this promotion; a report for another \
+                     intent does not participate in this verdict",
+                ),
+            );
         }
     }
 
@@ -827,6 +1011,7 @@ pub fn build_report(
         view_merkle: view_merkle.clone(),
         candidate_changes: set.only_in_feature.clone(),
         intent_substance_hashes: intent_substance_hashes.clone(),
+        evidence_report_hashes: evidence_report_hashes.clone(),
     };
     let reference = triage_reference(&pins);
 
@@ -854,6 +1039,7 @@ pub fn build_report(
             candidate_changes: set.only_in_feature.clone(),
             closure_additions: set.closure_additions.clone(),
             intent_substance_hashes,
+            evidence_reports: evidence_report_hashes,
         },
         summary,
         intents: intent_reports,
@@ -1371,6 +1557,34 @@ mod tests {
     use atomic_core::change::ChangeHeader;
     use tempfile::TempDir;
 
+    #[test]
+    fn checker_release_reads_only_the_exact_self_report() {
+        use serde_json::json;
+        let named = |details: serde_json::Value| checker_release(&details);
+        assert_eq!(
+            named(
+                json!({"checker": {"package": "probity-verify", "version": "0.2.0"}, "scope": {}})
+            ),
+            Some(CheckerRelease {
+                package: "probity-verify".into(),
+                version: "0.2.0".into(),
+            })
+        );
+        let long = "v".repeat(CHECKER_FIELD_MAX + 1);
+        for details in [
+            serde_json::Value::Null,
+            json!({}),
+            json!({"checker": "probity-verify 0.2.0"}),
+            json!({"checker": {"package": "probity-verify"}}),
+            json!({"checker": {"package": "probity-verify", "version": 2}}),
+            json!({"checker": {"package": "", "version": "0.2.0"}}),
+            json!({"checker": {"package": "probity-verify", "version": long}}),
+            json!({"checker": {"package": "p", "version": "1", "extra": "x"}}),
+        ] {
+            assert_eq!(named(details.clone()), None, "{details}");
+        }
+    }
+
     fn record_all(repo: &Repository, message: &str) {
         let header = ChangeHeader::new(message);
         let options = RecordOptions::new()
@@ -1514,6 +1728,166 @@ mod tests {
         )
         .unwrap();
         repo.vault_index_kg(intent_file).unwrap();
+    }
+
+    /// Fresh reports contribute scoped findings and bind into the reference;
+    /// stale reports are surfaced but never trusted; contradicted reports block
+    /// for a shared target; unrelated reports stay visible.
+    #[test]
+    fn review_ingests_fresh_stale_and_unrelated_evidence_reports() {
+        use crate::intent_evidence::{EvidenceDecision, EvidenceReport, EvidenceReportDocument};
+
+        let temp = TempDir::new().unwrap();
+        let mut repo = Repository::init(temp.path()).unwrap();
+        repo.init_vault().unwrap();
+        let working_copy = repo.require_working_copy_id().unwrap();
+        let base_view = repo.current_view().to_string();
+        let shared = repo.get_view_info(&base_view).unwrap().scope.is_shared();
+
+        let file = temp.path().join("a.txt");
+        std::fs::write(&file, "base\n").unwrap();
+        repo.add(working_copy, "a.txt", Default::default()).unwrap();
+        record_all(&repo, "base change");
+
+        let body = "\
+:::why
+Because a.txt matters.
+:::
+
+:::acceptance-criterion{#a-ac-1 status=unmet}
+a.txt is correct.
+:::
+
+:::task{#a-1 status=unmet criteria=a-ac-1}
+Edit a.txt.
+::file-ref{path=a.txt}
+:::";
+        let a = repo.vault_intent_create(intent_opts("Intent A")).unwrap();
+        let a_node_id = format!("intent:{}", a.uid.to_uppercase());
+
+        repo.create_view_from("feature", &base_view).unwrap();
+        repo.switch_view(working_copy, "feature").unwrap();
+        // Install after the switch: materializing the base view would otherwise
+        // restore the scaffold body and hide the directive body from the lift.
+        install_intent_body(&repo, &a.intent_file, body, None);
+        std::fs::write(&file, "base\nfeature edit\n").unwrap();
+        repo.record(
+            working_copy,
+            ChangeHeader::new("feature change"),
+            RecordOptions::new()
+                .with_all(true)
+                .save_to_store(true)
+                .apply_after_record(true)
+                .enrich_kg(true)
+                .sync_vault(false),
+        )
+        .unwrap();
+
+        let context = intent_evidence::read_context(&repo, &a.uid).unwrap();
+        let entry = repo.vault_retrieve(&a.intent_file).unwrap().unwrap();
+        let frontmatter: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(&entry.frontmatter_json).unwrap();
+        let body = String::from_utf8(entry.content_bytes).unwrap();
+        let node = atomic_canonical::lift::lift_intent(&frontmatter, &body).unwrap();
+        assert!(
+            !node.has_acceptance_criterion.is_empty(),
+            "installed body must lift an acceptance criterion: {body:?}"
+        );
+        let criterion = node.has_acceptance_criterion[0].id.clone();
+
+        let document = EvidenceReportDocument {
+            evidence_context: context,
+            evidence_replay: EvidenceReport {
+                schema_version: "atomic-evidence-replay-report/v1".into(),
+                decisions: vec![EvidenceDecision {
+                    schema_version: "atomic-evidence-replay-response/v1".into(),
+                    request_digest: "blake3:request".into(),
+                    criterion_id: criterion,
+                    claim_type: "source_text_coverage/v1".into(),
+                    decision: "supported".into(),
+                    reason: "all_selected_spans_present".into(),
+                    details: serde_json::json!({
+                        "checker": {"package": "probity-verify", "version": "0.2.0"}
+                    }),
+                }],
+            },
+        };
+
+        let without = build_report(&repo, "feature", &base_view).unwrap();
+        let with = build_report_with_evidence(
+            &repo,
+            "feature",
+            &base_view,
+            std::slice::from_ref(&document),
+        )
+        .unwrap();
+        assert_ne!(
+            with.reference, without.reference,
+            "reports bind into the reference"
+        );
+        assert_eq!(with.inputs.evidence_reports.len(), 1);
+        let intent_report = with
+            .intents
+            .iter()
+            .find(|intent| intent.id == a_node_id)
+            .expect("reached intent");
+        assert_eq!(intent_report.evidence_replays.len(), 1);
+        assert!(intent_report.evidence_replays[0].fresh);
+        assert_eq!(
+            intent_report.evidence_replays[0].decisions[0].checker,
+            Some(CheckerRelease {
+                package: "probity-verify".into(),
+                version: "0.2.0".into(),
+            }),
+            "the summary carries the checker release the response names"
+        );
+        assert!(with
+            .findings
+            .iter()
+            .any(|finding| finding.code == F_EVIDENCE_REPLAY_SUPPORTED
+                && finding.severity == SEV_INFO));
+
+        let mut stale = document.clone();
+        stale.evidence_context.view_chain[0].merkle = "stale".into();
+        let stale_report =
+            build_report_with_evidence(&repo, "feature", &base_view, &[stale]).unwrap();
+        let stale_intent = stale_report
+            .intents
+            .iter()
+            .find(|intent| intent.id == a_node_id)
+            .expect("reached intent");
+        assert!(!stale_intent.evidence_replays[0].fresh);
+        assert!(stale_report
+            .findings
+            .iter()
+            .any(|finding| finding.code == F_EVIDENCE_REPLAY_STALE));
+        assert!(
+            !stale_report
+                .findings
+                .iter()
+                .any(|finding| finding.code == F_EVIDENCE_REPLAY_SUPPORTED),
+            "stale evidence must not support a claim"
+        );
+
+        let mut contradicted = document.clone();
+        contradicted.evidence_replay.decisions[0].decision = "contradicted".into();
+        let contradicted_report =
+            build_report_with_evidence(&repo, "feature", &base_view, &[contradicted]).unwrap();
+        let finding = contradicted_report
+            .findings
+            .iter()
+            .find(|finding| finding.code == F_EVIDENCE_REPLAY_CONTRADICTED)
+            .expect("contradicted finding");
+        assert_eq!(finding.severity, if shared { SEV_BLOCK } else { SEV_WARN });
+
+        let mut unrelated = document;
+        unrelated.evidence_context.intent_id = "urn:atomic:intent:01UNRELATED".into();
+        let unrelated_report =
+            build_report_with_evidence(&repo, "feature", &base_view, &[unrelated]).unwrap();
+        assert!(unrelated_report
+            .findings
+            .iter()
+            .any(|finding| finding.code == F_EVIDENCE_REPLAY_UNRELATED));
     }
 
     /// Build a report where intent A (reached by a candidate change that edits

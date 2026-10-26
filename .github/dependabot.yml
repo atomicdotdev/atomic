@@ -1,0 +1,8 @@
+version: 2
+updates:
+  # The release the optional evidence replay checker runs on.
+  - package-ecosystem: pip
+    directory: /docs/examples/evidence-replay
+    target-branch: dev
+    schedule:
+      interval: weekly

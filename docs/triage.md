@@ -148,6 +148,41 @@ draft merkle B:  npm run serve → PASS   (observed @B, supersedes the @A failur
   promoted. `npm run serve` failing lands here by default; if diagnosably
   attributable to a change, it also attaches to that change's AC.
 
+## Attached evidence replay
+
+`atomic triage review <feature> --into <target> --json --evidence-report <path>`
+attaches a retained report produced by:
+
+```sh
+atomic intent validate <work-id> --json \
+  --replay-evidence retained/manifest.json \
+  --evidence-checker /trusted/checker > retained/replay-report.json
+```
+
+The reviewer runs replay with a checker they trust; the author supplies the
+manifest and artifacts, never the executable. Triage re-reads the current intent
+and view chain and compares them to the report's `evidence_context`:
+
+- a **fresh** report contributes per-intent `evidence_replays[]` summaries and
+  `EVIDENCE_REPLAY_*` findings;
+- a **stale** report is surfaced, but its decisions are never treated as
+  supported or contradicted;
+- a report for an intent outside the candidate set is surfaced as
+  `EVIDENCE_REPLAY_UNRELATED`, never silently dropped.
+
+Each summarized decision carries `checker`, the `{package, version}` the
+checker's response named in `details.checker`, or `null` when it named none in
+that exact shape. A reviewer who allowlists a checker release can hold every
+decision to it; the example checker reports the probity-verify release it ran.
+
+The report content hashes are bound into `inputs.evidence_reports` and the
+`urn:atomic:triage:<hash>` reference, so attaching or changing a report changes
+the reference. `--attest` signs the summaries as part of the report.
+
+The full reviewer procedure lives in the `triage-review` skill. See
+[examples/evidence-replay/README.md](./examples/evidence-replay/README.md) for the
+manifest/checker protocol.
+
 ## The three invalidation axes
 
 A granted `done` is a **standing grant conditioned on freshness**. Three
@@ -406,13 +441,22 @@ Both the shapes and the skill branch on `code`, so it is a closed vocabulary.
 | `STALE_TRIAGE` | warn | intent | pinned inputs no longer match current state |
 | `OPEN_REMEDIATION` | info | intent | promoted code has a `remediates`-linked intent in flight |
 | `UNREVIEWED_CHANGE` | block →shared / warn draft | intent | no `done`, independent (non-author) review covers this intent's changes |
+| `EVIDENCE_REPLAY_SUPPORTED` | info | ac | attached replay report supports its claim at the current pins |
+| `EVIDENCE_REPLAY_CONTRADICTED` | block →shared / warn draft | ac | retained bytes contradict the claim |
+| `EVIDENCE_REPLAY_NOT_ESTABLISHED` | warn | ac | missing/unknown/failed/timed-out checker result |
+| `EVIDENCE_REPLAY_STALE` | warn | intent | report pins no longer match the intent/source/view chain |
+| `EVIDENCE_REPLAY_UNRELATED` | info | intent | report addresses an intent outside this candidate set |
 
 ## The review skill
 
 `triage-review` drives the content judgment the gate deliberately leaves honest
 ("presence is enforced; content is left honest"):
 
-1. `atomic triage <feature> --into <dev> --json` → the worklist.
+1. `atomic triage review <feature> --into <dev> --json --evidence-report <report>`
+   → the worklist. When the author sealed a claim, run replay yourself first and
+   attach the report; a supported claim can back a met review criterion, while
+   contradicted/not-established/stale leaves it unmet (see "Attached evidence
+   replay").
 2. For each `block` finding and every `judgment_required` criterion, investigate
    with the code-intelligence tools (`callers`, `entities`, `code`) and **read the
    actual diffs** (`atomic change <hash>`, `atomic diff -c <hash> --word-diff`) —
@@ -552,6 +596,10 @@ edge, a `ReviewShape` gate rule, `atomic intent new --review`, and the
 
 - `atomic-repository/src/repository/content.rs` — `diff_views` (candidate set),
   `get_file_content_via_filter`.
+- `atomic-repository/src/intent_evidence.rs` — bounded replay core and retained
+  report parsing/hashing.
+- `atomic-repository/src/triage/report.rs` — report ingestion, pin freshness,
+  and `EVIDENCE_REPLAY_*` findings.
 - `atomic-cli/src/commands/query/mod.rs` — `neighbors`, `callers` (blast radius),
   `entities`, `graph` / `emit_html` (the HTML surface), `plan`.
 - `atomic-cli/src/commands/provenance/command.rs` — `provenance trace` (the PROV

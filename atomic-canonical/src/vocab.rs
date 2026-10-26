@@ -98,6 +98,11 @@ pub const FINDING_CODE: &[&str] = &[
     "OPEN_REMEDIATION",
     "UNREVIEWED_CHANGE",
     "PUBLICATION_GATE",
+    "EVIDENCE_REPLAY_SUPPORTED",
+    "EVIDENCE_REPLAY_CONTRADICTED",
+    "EVIDENCE_REPLAY_NOT_ESTABLISHED",
+    "EVIDENCE_REPLAY_STALE",
+    "EVIDENCE_REPLAY_UNRELATED",
 ];
 
 /// Directive names recognized by the parser + lift (closed set).

@@ -11,6 +11,7 @@ use std::process::{Command as ProcessCommand, Stdio};
 use clap::{Parser, Subcommand};
 use clap_complete::engine::ArgValueCompleter;
 
+use atomic_repository::intent_evidence;
 use atomic_repository::{Repository, RepositoryError};
 
 use crate::commands::complete::complete_view_names;
@@ -25,7 +26,9 @@ pub mod model {
 }
 pub mod output;
 pub mod project {
-    pub use atomic_repository::triage::report::{build_report, build_walkthrough, TaskFact};
+    pub use atomic_repository::triage::report::{
+        build_report, build_report_with_evidence, build_walkthrough, TaskFact,
+    };
 }
 
 /// Triage a feature view against a target before insert.
@@ -299,6 +302,12 @@ pub struct TriageReview {
     #[arg(long)]
     pub json: bool,
 
+    /// Attach a retained evidence-replay report produced by
+    /// `atomic intent validate --json --replay-evidence ...`. Repeatable; the
+    /// report's pins must still match the current intent/view state.
+    #[arg(long = "evidence-report", value_name = "PATH")]
+    pub evidence_reports: Vec<PathBuf>,
+
     /// Print the guided walkthrough: the candidate changes grouped into
     /// ordered semantic layers (foundations first), with each layer's
     /// rationale, files, and inspect commands. Bounded — never a diff dump.
@@ -343,8 +352,25 @@ impl Command for TriageReview {
         let repo = Repository::open(&root).map_err(CliError::Repository)?;
         let (feature, into) = resolve_views(&repo, self.feature.as_deref(), self.into.as_deref())?;
 
-        let report = project::build_report(&repo, &feature, &into)?;
+        let evidence_reports = self
+            .evidence_reports
+            .iter()
+            .map(|path| intent_evidence::read_report(path).map_err(evidence_error))
+            .collect::<CliResult<Vec<_>>>()?;
+        let report =
+            project::build_report_with_evidence(&repo, &feature, &into, &evidence_reports)?;
         render_report(self, &report)
+    }
+}
+
+/// Map a retained-report failure into the CLI's exit-code surface.
+fn evidence_error(error: intent_evidence::EvidenceError) -> CliError {
+    match error {
+        intent_evidence::EvidenceError::Repository(error) => CliError::Repository(error),
+        intent_evidence::EvidenceError::Io(error) => CliError::Io(error),
+        other => CliError::InvalidArgument {
+            message: other.to_string(),
+        },
     }
 }
 
@@ -557,6 +583,19 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("No view named 'nope'"), "unexpected: {msg}");
         assert!(msg.contains("omit --into"), "unexpected: {msg}");
+    }
+
+    #[test]
+    fn evidence_report_flag_is_repeatable() {
+        let review = TriageReview::try_parse_from([
+            "review",
+            "--evidence-report",
+            "one.json",
+            "--evidence-report",
+            "two.json",
+        ])
+        .unwrap();
+        assert_eq!(review.evidence_reports.len(), 2);
     }
 
     #[test]

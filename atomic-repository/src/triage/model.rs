@@ -45,8 +45,22 @@ pub const F_UNREVIEWED_CHANGE: &str = FINDING_CODE[10];
 /// provenance evidence fails the trusted publication gate (CB-12B). Blocking
 /// for shared targets only; content correctness is separate.
 pub const F_PUBLICATION_GATE: &str = FINDING_CODE[11];
+/// A retained evidence-replay report supports its declared claim at the
+/// current intent/view pins.
+pub const F_EVIDENCE_REPLAY_SUPPORTED: &str = FINDING_CODE[12];
+/// A retained evidence-replay report contradicts its declared claim.
+pub const F_EVIDENCE_REPLAY_CONTRADICTED: &str = FINDING_CODE[13];
+/// A retained evidence-replay report could not establish its claim.
+pub const F_EVIDENCE_REPLAY_NOT_ESTABLISHED: &str = FINDING_CODE[14];
+/// A retained evidence-replay report no longer matches the current intent or
+/// view-chain pins.
+pub const F_EVIDENCE_REPLAY_STALE: &str = FINDING_CODE[15];
+/// A retained evidence-replay report addresses an intent outside the candidate
+/// set (surfaced, never silently dropped).
+pub const F_EVIDENCE_REPLAY_UNRELATED: &str = FINDING_CODE[16];
 
-// All twelve closed-vocabulary finding codes are now populated by `build_report`.
+// All closed-vocabulary finding codes are recognized here; the
+// EVIDENCE_REPLAY_* codes appear only when retained reports are attached.
 
 // ── Severities ──────────────────────────────────────────────────────────────
 
@@ -100,6 +114,10 @@ pub struct Inputs {
     /// Intent id → `intentSubstanceHash` at review time. `BTreeMap` for a
     /// canonical, reproducible key order.
     pub intent_substance_hashes: BTreeMap<String, String>,
+    /// Sorted content hashes of attached retained evidence-replay reports.
+    /// Omitted when empty, preserving existing report shapes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence_reports: Vec<String>,
 }
 
 /// Bounded counts — the summary skin the CLI leads with.
@@ -126,6 +144,43 @@ pub struct IntentReport {
     /// covers this work intent's changes, when one exists.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reviewed_by: Option<String>,
+    /// Retained evidence-replay reports attached to this intent, with their
+    /// current-pin freshness. Empty when no report was supplied.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence_replays: Vec<EvidenceReplaySummary>,
+}
+
+/// One attached retained replay report summarized for the triage report.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EvidenceReplaySummary {
+    /// `blake3:` content hash of the parsed report document.
+    pub report_hash: String,
+    /// The native intent URN the report is bound to.
+    pub intent_id: String,
+    pub schema_version: String,
+    /// True iff the report's intent/view pins equal the current pins.
+    pub fresh: bool,
+    pub decisions: Vec<EvidenceReplayDecision>,
+}
+
+/// One replay decision, without the checker's unbounded `details` payload.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EvidenceReplayDecision {
+    pub criterion_id: String,
+    pub claim_type: String,
+    pub decision: String,
+    pub reason: String,
+    /// The checker release the response names in `details.checker`, so a
+    /// reviewer can hold the decision to the checker they allowlisted. `None`
+    /// when the response names none, or names it in any other shape.
+    pub checker: Option<CheckerRelease>,
+}
+
+/// The package and version a replay checker reports for itself.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CheckerRelease {
+    pub package: String,
+    pub version: String,
 }
 
 /// A single acceptance criterion under an intent (a "testcase").
@@ -303,6 +358,17 @@ mod tests {
         assert_eq!(F_VIEW_VERIFY_FAIL, "VIEW_VERIFY_FAIL");
         assert_eq!(F_BLAST_UNREVIEWED, "BLAST_UNREVIEWED");
         assert_eq!(F_UNREVIEWED_CHANGE, "UNREVIEWED_CHANGE");
+        assert_eq!(F_EVIDENCE_REPLAY_SUPPORTED, "EVIDENCE_REPLAY_SUPPORTED");
+        assert_eq!(
+            F_EVIDENCE_REPLAY_CONTRADICTED,
+            "EVIDENCE_REPLAY_CONTRADICTED"
+        );
+        assert_eq!(
+            F_EVIDENCE_REPLAY_NOT_ESTABLISHED,
+            "EVIDENCE_REPLAY_NOT_ESTABLISHED"
+        );
+        assert_eq!(F_EVIDENCE_REPLAY_STALE, "EVIDENCE_REPLAY_STALE");
+        assert_eq!(F_EVIDENCE_REPLAY_UNRELATED, "EVIDENCE_REPLAY_UNRELATED");
 
         for c in [
             F_VIEW_VERIFY_FAIL,
@@ -316,6 +382,12 @@ mod tests {
             F_STALE_TRIAGE,
             F_OPEN_REMEDIATION,
             F_UNREVIEWED_CHANGE,
+            F_PUBLICATION_GATE,
+            F_EVIDENCE_REPLAY_SUPPORTED,
+            F_EVIDENCE_REPLAY_CONTRADICTED,
+            F_EVIDENCE_REPLAY_NOT_ESTABLISHED,
+            F_EVIDENCE_REPLAY_STALE,
+            F_EVIDENCE_REPLAY_UNRELATED,
         ] {
             assert!(is_known_finding_code(c), "{c} must be in the closed set");
         }

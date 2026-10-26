@@ -155,3 +155,21 @@ jobs:
 
       - name: cargo check (MSRV)
         run: cargo check --workspace
+
+  evidence-checker:
+    name: Evidence replay checker
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # The optional checker's release is pinned, with hashes, in
+      # requirements.txt; Dependabot proposes each new release.
+      - name: Install the pinned checker release
+        run: python -m pip install --require-hashes -r docs/examples/evidence-replay/requirements.txt
+
+      - name: Run the checker controls
+        run: python -m unittest discover -s docs/examples/evidence-replay -p test_checker.py -v

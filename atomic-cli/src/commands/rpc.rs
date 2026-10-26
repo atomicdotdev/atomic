@@ -6834,11 +6834,24 @@ pub(crate) fn triage_review(
     let Some(session) = Service::open()? else {
         return Ok(None);
     };
+    let evidence_reports = args
+        .evidence_reports
+        .iter()
+        .map(|path| {
+            intent_evidence::read_report_bytes(path)
+                .map(|payload| pb::VersionedBytes {
+                    schema: intent_evidence::REPORT_DOCUMENT_SCHEMA.to_string(),
+                    payload,
+                })
+                .map_err(evidence_cli_error)
+        })
+        .collect::<CliResult<Vec<_>>>()?;
     let request = pb::GenerateTriageReviewRequest {
         repository: Some(session.reference.clone()),
         from_view: args.feature.clone().unwrap_or_default(),
         to_view: args.into.clone().unwrap_or_default(),
         report: None,
+        evidence_reports,
     };
     let response = session.generate_triage_review(request)?;
     let Some(bundle) = response

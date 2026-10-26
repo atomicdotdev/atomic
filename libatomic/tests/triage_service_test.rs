@@ -23,8 +23,9 @@ use tempfile::TempDir;
 use tonic::{Code, Request};
 
 use atomic_core::change::ChangeHeader;
+use atomic_repository::intent_evidence;
 use libatomic::atomic::triage_service_server::TriageService;
-use libatomic::atomic::{GenerateTriageReviewRequest, RepositoryRef};
+use libatomic::atomic::{GenerateTriageReviewRequest, RepositoryRef, VersionedBytes};
 
 fn write(root: &std::path::Path, rel: &str, content: &str) {
     let path = root.join(rel);
@@ -97,6 +98,7 @@ async fn the_review_arrives_as_the_wire_report_shape() {
             from_view: "feat".into(),
             to_view: "dev".into(),
             report: None,
+            evidence_reports: Vec::new(),
         }))
         .await
         .expect("the handler serves the report");
@@ -142,8 +144,74 @@ async fn an_unknown_view_is_refused() {
             from_view: "nope".into(),
             to_view: "dev".into(),
             report: None,
+            evidence_reports: Vec::new(),
         }))
         .await
         .expect_err("refused");
+    assert_eq!(refused.code(), Code::InvalidArgument, "{refused}");
+}
+
+/// Retained replay reports ride the wire, bind into the report's pinned inputs,
+/// and surface an unmatched report instead of trusting it.
+#[tokio::test]
+async fn evidence_reports_are_carried_and_bound_into_the_wire_report() {
+    let (_dir, _root, state, repository) = host();
+    let triage = TriageImpl { state };
+    let document = serde_json::json!({
+        "evidence_context": {
+            "intent_id": "urn:atomic:intent:01UNRELATED",
+            "intent_substance_hash": "blake3:substance",
+            "intent_source_hash": "blake3:source",
+            "view_chain": [{"name": "feat", "merkle": "STALE", "scope": "draft"}]
+        },
+        "evidence_replay": {
+            "schema_version": "atomic-evidence-replay-report/v1",
+            "decisions": [{
+                "schema_version": "atomic-evidence-replay-response/v1",
+                "request_digest": "blake3:request",
+                "criterion_id": "urn:atomic:ac:01UNRELATED-ac-1",
+                "claim_type": "source_text_coverage/v1",
+                "decision": "supported",
+                "reason": "all_selected_spans_present",
+                "details": null
+            }]
+        }
+    });
+    let response = triage
+        .generate_triage_review(Request::new(GenerateTriageReviewRequest {
+            repository: Some(repository.clone()),
+            from_view: "feat".into(),
+            to_view: "dev".into(),
+            report: None,
+            evidence_reports: vec![VersionedBytes {
+                schema: intent_evidence::REPORT_DOCUMENT_SCHEMA.into(),
+                payload: serde_json::to_vec(&document).unwrap(),
+            }],
+        }))
+        .await
+        .expect("the handler serves the report");
+    let bundle = response.into_inner().report.expect("report bundle");
+    let report: atomic_repository::triage::TriageReport =
+        serde_json::from_slice(&bundle.payload).unwrap();
+    assert_eq!(report.inputs.evidence_reports.len(), 1);
+    assert!(report.inputs.evidence_reports[0].starts_with("blake3:"));
+    assert!(report
+        .findings
+        .iter()
+        .any(|finding| finding.code == "EVIDENCE_REPLAY_UNRELATED"));
+
+    let refused = triage
+        .generate_triage_review(Request::new(GenerateTriageReviewRequest {
+            repository: Some(repository),
+            from_view: "feat".into(),
+            to_view: "dev".into(),
+            report: None,
+            evidence_reports: vec![VersionedBytes {
+                schema: "wrong".into(),
+                payload: serde_json::to_vec(&document).unwrap(),
+            }],
+        }))
+        .await
+        .expect_err("unsupported schema refused");
     assert_eq!(refused.code(), Code::InvalidArgument, "{refused}");
 }
