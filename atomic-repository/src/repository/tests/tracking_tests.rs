@@ -253,6 +253,93 @@ fn recorded_delete_is_what_untracks_a_recorded_path() {
     assert!(report.is_healthy(), "{:?}", report);
 }
 
+/// `--keep` stages the untrack as per-view intent: nothing tracking owns is
+/// deleted, nothing graph-owned is touched — only the marker row appears, and
+/// `record` is what lands the deletion with the bytes kept.
+#[test]
+fn remove_keep_marks_pending_untrack_without_touching_any_cache() {
+    let (temp_dir, repo) = create_temp_repo();
+    std::fs::write(temp_dir.path().join("art.psd"), b"master\n").unwrap();
+    repo.add("art.psd", TrackingOptions::default()).unwrap();
+    repo.record_all("record the psd").unwrap();
+    let inode = repo
+        .get_file_inode("art.psd")
+        .unwrap()
+        .expect("recorded path is tracked");
+
+    let keep = TrackingOptions::default().with_keep_recorded(true);
+    let stats = repo.remove("art.psd", keep.clone()).unwrap();
+
+    assert_eq!(
+        stats.files_removed, 0,
+        "a recorded path is not tracking's to untrack"
+    );
+    assert!(
+        stats.pending_deletions.is_empty(),
+        "--keep never defers to a working-copy deletion"
+    );
+    assert_eq!(
+        stats.pending_untracks,
+        vec![std::path::PathBuf::from("art.psd")]
+    );
+
+    // The binding and claim are untouched, so everything still resolves —
+    // twice, because marking the same path twice stays one intent.
+    assert!(repo.is_tracked("art.psd").unwrap());
+    assert_eq!(repo.get_file_inode("art.psd").unwrap(), Some(inode));
+    let again = repo.remove("art.psd", keep).unwrap();
+    assert_eq!(again.pending_untracks.len(), 1);
+
+    let status = repo.status(StatusOptions::default()).unwrap();
+    assert!(
+        status
+            .pending_untrack()
+            .any(|entry| entry.path() == std::path::Path::new("art.psd")),
+        "status must show the staged untrack: {:?}",
+        status.entries()
+    );
+    let report = repo.verify_working_copy().unwrap();
+    assert!(report.is_healthy(), "derived indexes drifted: {report:?}");
+}
+
+/// The next record consumes the marker: the path's claim dies, the bytes
+/// stay, and afterwards the recreated-looking file reads as untracked.
+#[test]
+fn record_lands_the_pending_untrack_with_bytes_kept() {
+    let (temp_dir, repo) = create_temp_repo();
+    std::fs::write(temp_dir.path().join("art.psd"), b"master\n").unwrap();
+    repo.add("art.psd", TrackingOptions::default()).unwrap();
+    repo.record_all("record the psd").unwrap();
+    repo.remove(
+        "art.psd",
+        TrackingOptions::default().with_keep_recorded(true),
+    )
+    .unwrap();
+
+    repo.record_all("stop tracking the psd").unwrap();
+
+    assert!(
+        !repo.is_tracked("art.psd").unwrap(),
+        "the recorded pending untrack must untrack the path"
+    );
+    assert_eq!(
+        std::fs::read(temp_dir.path().join("art.psd")).unwrap(),
+        b"master\n",
+        "the bytes are the whole point of --keep"
+    );
+    let status = repo.status(StatusOptions::default()).unwrap();
+    assert_eq!(status.pending_untrack_count(), 0, "the marker is consumed");
+    assert!(
+        status
+            .untracked()
+            .any(|entry| entry.path() == std::path::Path::new("art.psd")),
+        "after the untrack the kept file reads as untracked: {:?}",
+        status.entries()
+    );
+    let report = repo.verify_working_copy().unwrap();
+    assert!(report.is_healthy(), "{report:?}");
+}
+
 /// A staged path is exactly what tracking owns: `remove` untracks it outright and
 /// reports nothing pending.
 #[test]

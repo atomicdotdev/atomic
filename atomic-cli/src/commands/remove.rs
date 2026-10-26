@@ -30,15 +30,16 @@
 //! | Path state | `atomic remove f` | with `--keep` | with `--delete` |
 //! |---|---|---|---|
 //! | `add`ed, never recorded | untracked; file stays on disk | untracked; file stays on disk | untracked; file deleted |
-//! | recorded | file deleted; deletion pending until `atomic record` | refused | same as the default |
+//! | recorded | file deleted; deletion pending until `atomic record` | untrack staged; bytes kept, `atomic record` completes it | same as the default |
 //!
 //! Untracking recorded content is a *change*: the name is durable in
 //! `PATH_CLAIMS`, and the `INODES`/`REV_INODES` binding is derived from the
 //! change that recorded it ([`Repository::remove`] reports such paths in
 //! [`atomic_repository::TrackingStats::pending_deletions`] instead of editing
-//! them). Deleting the file and recording the delete is the only sequence that
-//! durably stops tracking it, so `--keep` refuses rather than pretending to
-//! succeed.
+//! them). Deleting the file and recording the delete is the durable untrack
+//! that mirrors `git rm`; `--keep` is the `git rm --cached` shape — it stages
+//! the untrack as per-view intent that the next `atomic record` lands as the
+//! `FileDel` while the bytes stay on disk (and then read as untracked).
 //!
 //! Mirroring `git rm`, deleting a recorded file that has uncommitted edits is
 //! refused unless `--force` is given.
@@ -83,14 +84,15 @@ use crate::output::{print_hint, print_success, print_warning};
 ///
 /// - Staged paths: untracked; the file stays on disk unless `--delete`
 /// - Recorded paths: deleted from the working copy; record to stop tracking
-/// - Recorded paths with `--keep`: refused, because nothing would be untracked
+/// - Recorded paths with `--keep`: bytes kept; the untrack is staged and the
+///   next record completes it (`git rm --cached`)
 /// - Directories: handled recursively by default
 /// - Untracked paths: error unless `--force` is used
 ///
 /// # Options
 ///
 /// - `--delete`: Also delete staged paths from disk
-/// - `--keep`: Never delete files from disk (refused for recorded paths)
+/// - `--keep`: Never delete files from disk (stages a recorded path's untrack)
 /// - `--recursive` / `-r`: Recursively remove directory contents (default: true)
 /// - `--no-recursive`: Don't recursively remove directory contents
 /// - `--dry-run` / `-n`: Preview what would be removed
@@ -112,11 +114,13 @@ pub struct Remove {
     #[arg(long)]
     pub delete: bool,
 
-    /// Never delete files from disk.
+    /// Never delete files from disk (`git rm --cached`).
     ///
-    /// This is the counterpart of `git rm --cached`. A recorded path cannot be
-    /// untracked without recording its deletion, so combining `--keep` with a
-    /// recorded path is refused rather than silently doing nothing.
+    /// A staged path is untracked and stays on disk. A recorded path cannot be
+    /// untracked by editing tracking state — its binding belongs to the change
+    /// that recorded it — so `--keep` stages the untrack as pending intent on
+    /// the current view: the next `atomic record` emits the deletion while the
+    /// bytes stay on disk and then read as untracked.
     #[arg(long)]
     pub keep: bool,
 
@@ -200,7 +204,8 @@ impl Remove {
     fn to_tracking_options(&self) -> TrackingOptions {
         let mut options = TrackingOptions::default()
             .with_recursive(self.recursive && !self.no_recursive)
-            .with_force(self.force);
+            .with_force(self.force)
+            .with_keep_recorded(self.keep);
         options.dry_run = self.dry_run;
         options
     }
@@ -285,7 +290,7 @@ impl Command for Remove {
         let mut targets: Vec<String> = Vec::new();
         let mut plan_untrack = 0usize;
         let mut plan_delete: Vec<PathBuf> = Vec::new();
-        let mut kept_recorded: Vec<String> = Vec::new();
+        let mut plan_mark = 0usize;
         let mut dirty_guarded: Vec<String> = Vec::new();
         let mut total_errors = 0usize;
 
@@ -311,19 +316,19 @@ impl Command for Remove {
                     if self.dry_run && stats.files_removed > 0 {
                         println!("Would untrack: {}", normalized);
                     }
+                    for pending in stats.pending_untracks {
+                        plan_mark += 1;
+                        if self.dry_run {
+                            println!(
+                                "Would stage untrack of {}: bytes kept; 'atomic record' \
+                                 completes it",
+                                pending.to_string_lossy()
+                            );
+                        }
+                    }
                     for pending in stats.pending_deletions {
                         let relative = pending.to_string_lossy().to_string();
                         let absolute = repo_root.join(&pending);
-                        if self.keep {
-                            if self.dry_run {
-                                println!(
-                                    "Would refuse {relative}: a recorded path cannot be \
-                                     untracked while kept on disk"
-                                );
-                            }
-                            kept_recorded.push(relative);
-                            continue;
-                        }
                         if absolute.exists()
                             && !self.force
                             && self.has_uncommitted_edits(&repo, working_copy, &pending)
@@ -353,12 +358,9 @@ impl Command for Remove {
         }
 
         // A refusal is reported either way; only a mutation stops before applying.
-        if !kept_recorded.is_empty() {
-            print_keep_guidance(&kept_recorded);
-        }
-        if !self.dry_run && (!kept_recorded.is_empty() || !dirty_guarded.is_empty()) {
+        if !self.dry_run && !dirty_guarded.is_empty() {
             return Err(CliError::InvalidArgument {
-                message: refusal_message(&kept_recorded, &dirty_guarded),
+                message: refusal_message(&dirty_guarded),
             });
         }
 
@@ -366,7 +368,7 @@ impl Command for Remove {
             println!();
             print_hint(&format!(
                 "Would remove {} file(s) from tracking",
-                plan_untrack + plan_delete.len()
+                plan_untrack + plan_delete.len() + plan_mark
             ));
             if total_errors > 0 {
                 print_warning(&format!(
@@ -382,10 +384,12 @@ impl Command for Remove {
         // still bound, or a binding retired with its bytes still on disk. Plan and
         // apply share one workspace transaction, so nothing can change between them.
         let mut untracked: Vec<String> = Vec::new();
+        let mut marked = 0usize;
         let mut to_delete: Vec<PathBuf> = Vec::new();
         for target in &targets {
             match repo.remove(working_copy, target, options.clone()) {
                 Ok(stats) => {
+                    marked += stats.pending_untracks.len();
                     if stats.files_removed > 0 {
                         println!("Untracking: {}", target);
                         untracked.push(target.clone());
@@ -432,7 +436,13 @@ impl Command for Remove {
                 removed_recorded
             ));
         }
-        if untracked.is_empty() && removed_recorded == 0 && total_errors == 0 {
+        if marked > 0 {
+            print_success(&format!(
+                "Staged untrack of {} recorded file(s); bytes kept",
+                marked
+            ));
+        }
+        if untracked.is_empty() && removed_recorded == 0 && marked == 0 && total_errors == 0 {
             print_hint("Nothing to remove");
         }
         if total_errors > 0 {
@@ -443,7 +453,7 @@ impl Command for Remove {
         }
 
         // A recorded delete is the only durable untrack, so say what comes next.
-        if removed_recorded > 0 {
+        if removed_recorded > 0 || marked > 0 {
             println!();
             print_hint("Run 'atomic record' to record these deletions and stop tracking them");
         }
@@ -459,41 +469,17 @@ impl Command for Remove {
 }
 
 /// The shared refusal sentence for both removal paths, so a caller sees one
-/// explanation whether the local body or the service handler rejected the request.
-pub(crate) fn refusal_message(kept_recorded: &[String], dirty_guarded: &[String]) -> String {
-    let mut parts = Vec::new();
-    if !kept_recorded.is_empty() {
-        parts.push(format!(
-            "cannot untrack recorded path(s) while keeping them on disk: {}",
-            kept_recorded.join(", ")
-        ));
-    }
-    if !dirty_guarded.is_empty() {
-        parts.push(format!(
-            "recorded path(s) have uncommitted edits: {}",
-            dirty_guarded.join(", ")
-        ));
-    }
+/// explanation whether the local body or the service handler rejected the
+/// request. Only uncommitted edits can refuse a request now: `--keep` has a
+/// real `git rm --cached` meaning and never needs guidance toward the
+/// move-aside dance.
+pub(crate) fn refusal_message(dirty_guarded: &[String]) -> String {
     format!(
-        "{}; untracking recorded content is a recorded delete (remove it from the \
-         working copy, then record)",
-        parts.join("; ")
+        "recorded path(s) have uncommitted edits: {}; deleting them would discard \
+         those edits (--force to discard, or --keep to untrack while keeping the \
+         bytes)",
+        dirty_guarded.join(", ")
     )
-}
-
-/// How to actually stop tracking the paths `--keep` refused, shared by both paths.
-pub(crate) fn print_keep_guidance(kept_recorded: &[String]) {
-    print_hint(&format!(
-        "To stop tracking {}: atomic remove {} (removes it from the working copy), \
-         then atomic record.",
-        kept_recorded.join(", "),
-        kept_recorded.join(" ")
-    ));
-    print_hint(
-        "To keep the bytes: move them aside, remove and record the deletion, then \
-         move them back — a recreated path stays untracked until you 'atomic add' \
-         it again.",
-    );
 }
 
 /// The paths whose bytes are still in the working copy because the deletion could
@@ -684,33 +670,19 @@ mod tests {
     // Refusal Message Tests
 
     #[test]
-    fn refusal_names_the_paths_that_cannot_be_untracked_by_tracking() {
-        let message = refusal_message(&["Cargo.lock".to_string()], &[]);
-        assert!(
-            message.contains("cannot untrack recorded path(s) while keeping them on disk"),
-            "{message}"
-        );
+    fn refusal_names_the_paths_with_uncommitted_edits_and_both_escapes() {
+        let message = refusal_message(&["Cargo.lock".to_string()]);
+        assert!(message.contains("uncommitted edits"), "{message}");
         assert!(message.contains("Cargo.lock"), "{message}");
         assert!(
-            message.contains("recorded delete"),
+            message.contains("--force") && message.contains("--keep"),
             "the refusal must say what to do instead: {message}"
         );
     }
 
     #[test]
-    fn refusal_reports_uncommitted_edits_separately() {
-        let message = refusal_message(&[], &["yarn.lock".to_string()]);
-        assert!(message.contains("uncommitted edits"), "{message}");
-        assert!(message.contains("yarn.lock"), "{message}");
-        assert!(
-            !message.contains("keeping them on disk"),
-            "a --force-only refusal should not mention --keep: {message}"
-        );
-    }
-
-    #[test]
-    fn refusal_reports_both_reasons_at_once() {
-        let message = refusal_message(&["a.lock".to_string()], &["b.lock".to_string()]);
+    fn refusal_carries_every_refused_path_at_once() {
+        let message = refusal_message(&["a.lock".to_string(), "b.lock".to_string()]);
         assert!(
             message.contains("a.lock") && message.contains("b.lock"),
             "{message}"

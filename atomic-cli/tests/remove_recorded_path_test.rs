@@ -164,38 +164,141 @@ fn recorded_path_stays_in_history_until_the_delete_is_recorded() {
     cli(dir, &["doctor", "check"]);
 }
 
-/// `--keep` is the `git rm --cached` shape, and a recorded untrack cannot be
-/// expressed that way, so it must refuse loudly rather than report success.
+/// `--keep` is `git rm --cached`: the untrack is staged as pending intent,
+/// bytes untouched, and the next record lands the deletion. After that the
+/// path reads as untracked and no marker remains.
 #[test]
-fn keep_refuses_recorded_paths_and_preserves_everything() {
+fn keep_stages_a_recorded_untrack_and_record_completes_it() {
     let root = init();
     let dir = root.path();
     record_file(dir, "yarn.lock", b"one\ntwo\nthree\n");
 
-    let refused = run(dir, &["remove", "--keep", "yarn.lock"]);
+    // The preview reports exactly what the mutation stages.
+    let preview = cli(dir, &["remove", "--keep", "--dry-run", "yarn.lock"]);
     assert!(
-        !refused.status.success(),
-        "--keep on a recorded path must not report success: {}",
-        output_text(&refused)
-    );
-    assert!(
-        output_text(&refused).contains("cannot untrack recorded path(s)"),
-        "the refusal should explain why: {}",
-        output_text(&refused)
-    );
-
-    // Refusing leaves the file and the repository untouched.
-    assert_eq!(
-        fs::read(dir.join("yarn.lock")).unwrap(),
-        b"one\ntwo\nthree\n",
-        "a refusal must not delete the file"
+        preview.contains("Would stage untrack of yarn.lock"),
+        "dry run must preview the staged untrack: {preview}"
     );
     let status = cli(dir, &["status"]);
     assert!(
         status.contains("nothing to record"),
-        "a refusal must not create a pending change: {status}"
+        "a dry run mutates nothing: {status}"
+    );
+
+    let out = cli(dir, &["remove", "--keep", "yarn.lock"]);
+    assert!(
+        out.contains("Staged untrack of 1 recorded file(s); bytes kept"),
+        "{out}"
+    );
+    assert_eq!(
+        fs::read(dir.join("yarn.lock")).unwrap(),
+        b"one\ntwo\nthree\n",
+        "--keep must never touch the bytes"
+    );
+    let status = cli(dir, &["status"]);
+    assert!(
+        status.contains("untrack pending:") && status.contains("yarn.lock"),
+        "status must show the staged untrack: {status}"
+    );
+    // Idempotent: a second mark does not duplicate the intent.
+    cli(dir, &["remove", "--keep", "yarn.lock"]);
+
+    // Recording lands the deletion — bytes stay.
+    cli(dir, &["record", "-m", "stop tracking yarn.lock"]);
+    assert!(dir.join("yarn.lock").exists(), "the kept bytes survive");
+    assert_eq!(
+        fs::read(dir.join("yarn.lock")).unwrap(),
+        b"one\ntwo\nthree\n"
+    );
+    let status = cli(dir, &["status"]);
+    assert!(
+        !status.contains("untrack pending"),
+        "the marker must not outlive the record that consumed it: {status}"
+    );
+    assert!(
+        status.contains("Untracked files") && status.contains("yarn.lock"),
+        "after the recorded untrack the file reads as untracked: {status}"
     );
     cli(dir, &["doctor", "check"]);
+}
+
+/// `atomic add` on a marked path cancels the staged untrack — re-tracking is
+/// as deliberate as untracking was.
+#[test]
+fn add_cancels_a_pending_untrack() {
+    let root = init();
+    let dir = root.path();
+    record_file(dir, "keepme.txt", b"mine\n");
+    cli(dir, &["remove", "--keep", "keepme.txt"]);
+    assert!(
+        cli(dir, &["status"]).contains("untrack pending:"),
+        "precondition: the untrack is staged"
+    );
+
+    cli(dir, &["add", "keepme.txt"]);
+    let status = cli(dir, &["status"]);
+    assert!(
+        !status.contains("untrack pending"),
+        "add must cancel the staged untrack: {status}"
+    );
+    assert!(
+        status.contains("nothing to record"),
+        "the path is simply tracked again: {status}"
+    );
+    assert!(dir.join("keepme.txt").exists());
+}
+
+/// Git offers `--cached` as the escape hatch for locally-modified files:
+/// `--keep` never touches bytes, so uncommitted edits are accepted without
+/// `--force` and survive the recorded untrack.
+#[test]
+fn keep_accepts_dirty_paths_and_the_edited_bytes_survive() {
+    let root = init();
+    let dir = root.path();
+    record_file(dir, "regen.me", b"committed\n");
+    fs::write(dir.join("regen.me"), b"my local edits\n").unwrap();
+
+    cli(dir, &["remove", "--keep", "regen.me"]);
+    let status = cli(dir, &["status"]);
+    assert!(
+        status.contains("untrack pending:") && status.contains("regen.me"),
+        "the staged untrack takes precedence over the edit display: {status}"
+    );
+
+    cli(dir, &["record", "-m", "stop tracking regen.me"]);
+    assert_eq!(
+        fs::read(dir.join("regen.me")).unwrap(),
+        b"my local edits\n",
+        "the edits must survive the whole flow"
+    );
+    cli(dir, &["doctor", "check"]);
+}
+
+/// The staged untrack is per-view intent: switching to a sibling view that
+/// shares the recorded add shows no pending untrack, and switching back
+/// restores it.
+#[test]
+fn pending_untrack_is_contained_to_its_view() {
+    let root = init();
+    let dir = root.path();
+    record_file(dir, "viewbound.txt", b"shared\n");
+    cli(dir, &["remove", "--keep", "viewbound.txt"]);
+    cli(dir, &["view", "create", "sibling", "--draft"]);
+
+    // The sibling inherits the add change but not the current view's marker.
+    cli(dir, &["view", "switch", "sibling"]);
+    let status = cli(dir, &["status"]);
+    assert!(
+        !status.contains("untrack pending"),
+        "another view must not see this view's intent: {status}"
+    );
+
+    cli(dir, &["view", "switch", "dev"]);
+    let status = cli(dir, &["status"]);
+    assert!(
+        status.contains("untrack pending:") && status.contains("viewbound.txt"),
+        "the mark returns with its own view: {status}"
+    );
 }
 
 /// Like `git rm` without `-f`, deleting a recorded path with uncommitted edits is

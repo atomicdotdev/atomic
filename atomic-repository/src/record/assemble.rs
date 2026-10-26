@@ -466,6 +466,7 @@ pub fn filter_files<'a>(
                 FileStatus::Modified
                     | FileStatus::Added
                     | FileStatus::Deleted
+                    | FileStatus::PendingUntrack
                     | FileStatus::TypeChanged
                     | FileStatus::PermissionsChanged
             )

@@ -77,6 +77,7 @@ pub(crate) fn visit_tables(visitor: &mut impl TableVisitor) -> PristineResult<()
     visitor.table(REV_VIEW_CHANGES)?;
     visitor.table(VIEW_SET_ID_INDEX)?;
     visitor.table(CONFLICTS)?;
+    visitor.table(PENDING_UNTRACKS)?;
 
     // File tree
     visitor.table(PRISTINE_META)?;

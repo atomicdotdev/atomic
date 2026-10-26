@@ -42,7 +42,8 @@ use crate::pristine::traits::{
 
 use super::helpers::{
     collect_preload_edges, collect_until_error, deserialize_conflicts, deserialize_edge,
-    deserialize_view_state, graph_presence, try_collect, try_is_present, AdjIterator,
+    deserialize_pending_untracks, deserialize_view_state, graph_presence, try_collect,
+    try_is_present, AdjIterator,
 };
 
 /// Read-only transaction
@@ -542,6 +543,14 @@ impl ViewTxnT for ReadTxn {
             }
         }
         Ok(out)
+    }
+
+    fn pending_untracks(&self, view_id: u64) -> PristineResult<Vec<String>> {
+        let table = self.txn.open_table(PENDING_UNTRACKS)?;
+        match table.get(&view_id)? {
+            Some(value) => deserialize_pending_untracks(value.value()),
+            None => Ok(Vec::new()),
+        }
     }
 
     fn snapshot_conflicts(&self) -> PristineResult<Vec<(u64, Inode, Vec<StoredConflict>)>> {
@@ -2260,6 +2269,10 @@ impl<'txn> ViewTxnT for CachedGraphTxn<'txn> {
         self.txn.iter_conflicts(view_id)
     }
 
+    fn pending_untracks(&self, view_id: u64) -> PristineResult<Vec<String>> {
+        self.txn.pending_untracks(view_id)
+    }
+
     fn snapshot_conflicts(&self) -> PristineResult<Vec<(u64, Inode, Vec<StoredConflict>)>> {
         self.txn.snapshot_conflicts()
     }
@@ -2805,6 +2818,10 @@ impl<'txn> ViewTxnT for InodePreloadTxn<'txn> {
 
     fn iter_conflicts(&self, view_id: u64) -> PristineResult<Vec<(u64, Vec<StoredConflict>)>> {
         self.txn.iter_conflicts(view_id)
+    }
+
+    fn pending_untracks(&self, view_id: u64) -> PristineResult<Vec<String>> {
+        self.txn.pending_untracks(view_id)
     }
 
     fn snapshot_conflicts(&self) -> PristineResult<Vec<(u64, Inode, Vec<StoredConflict>)>> {

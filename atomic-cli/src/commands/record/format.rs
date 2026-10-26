@@ -206,6 +206,7 @@ pub(crate) fn render_dry_run(entries: &[(FileStatus, String)], all: bool, files:
             FileStatus::Modified => "modified:",
             FileStatus::Deleted => "deleted: ",
             FileStatus::Untracked => "new file:",
+            FileStatus::PendingUntrack => "untrack pending:",
             FileStatus::TypeChanged => "typechange:",
             FileStatus::PermissionsChanged => "permissions:",
             FileStatus::Conflicted => "conflicted:",

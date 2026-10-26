@@ -311,6 +311,7 @@ impl Pristine {
             write_txn.open_table(REV_VIEW_CHANGES)?;
             write_txn.open_table(VIEW_SET_ID_INDEX)?;
             write_txn.open_table(CONFLICTS)?;
+            write_txn.open_table(PENDING_UNTRACKS)?;
 
             // Tree tables
             write_txn.open_table(PRISTINE_META)?;

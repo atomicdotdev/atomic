@@ -1309,6 +1309,15 @@ impl Repository {
                     name: effective_view.clone(),
                 })
             })?;
+        // Snapshot this view's `remove --keep` markers at assembly time.
+        // A marker whose path is still live-tracked is captured by the
+        // PendingUntrack status entry and recorded as a delete; a marker whose
+        // claim has already died by other means was fulfilled by that other
+        // route. Either way it must not outlive the record it was waiting on,
+        // so the apply step below consumes or drops every one of them.
+        let markers_at_record = shared_txn
+            .pending_untracks(view.id)
+            .map_err(|e| RecordError::Database(e.to_string()))?;
         let shared_graph_visibility =
             graph_visibility_closure(&shared_txn, &view).map_err(RecordError::Repository)?;
         let tree_projection = self
@@ -1524,6 +1533,7 @@ impl Repository {
             .filter_map(|entry| {
                 let path = entry.path().to_string_lossy().to_string();
                 if entry.status() == FileStatus::Deleted
+                    || entry.status() == FileStatus::PendingUntrack
                     || entry.details() == Some("directory")
                     || renamed_from.contains(&path)
                     || renamed_to.contains(&path)
@@ -2041,7 +2051,7 @@ impl Repository {
                     }
                 }
 
-                FileStatus::Deleted if is_directory => {
+                FileStatus::Deleted | FileStatus::PendingUntrack if is_directory => {
                     // Handle deleted directory - create DirDel graph_op
                     // Look up the directory's inode
                     let txn = self
@@ -2097,7 +2107,7 @@ impl Repository {
                     recorded_files.push(recorded);
                 }
 
-                FileStatus::Deleted => {
+                FileStatus::Deleted | FileStatus::PendingUntrack => {
                     // For deleted files, we need to look up the inode and position
                     // from the pristine so that globalization can find the content
                     // vertices to mark as deleted.
@@ -3056,6 +3066,18 @@ impl Repository {
             match apply_result {
                 Ok(apply_outcome) => {
                     outcome.set_applied(apply_outcome.new_state);
+                    // Every marker this record observed is now consumed (it
+                    // emitted its delete) or fulfilled by another route; none
+                    // may outlive the record it awaited. Best-effort: a lost
+                    // clear self-heals — status never injects an entry for a
+                    // dead claim, and the next applied record drops it too.
+                    if !markers_at_record.is_empty() {
+                        if let Err(error) =
+                            self.clear_pending_untracks(&target_view, &markers_at_record)
+                        {
+                            log::warn!("record: failed to clear pending untracks: {error}");
+                        }
+                    }
                     if target_view == desired_view {
                         self.refresh_working_copy_desired_state(working_copy)
                             .map_err(RecordError::Repository)?;

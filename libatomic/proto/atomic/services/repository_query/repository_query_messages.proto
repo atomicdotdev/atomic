@@ -64,6 +64,7 @@ enum FileStatus {
   FILE_STATUS_UNTRACKED = 3;
   FILE_STATUS_ADDED = 4;
   FILE_STATUS_CONFLICTED = 5;
+  FILE_STATUS_PENDING_UNTRACK = 6;   // staged by `remove --keep`; the next record deletes it
 }
 // Mirrors FileStatusEntry (status.rs:263).
 message FileStatusEntry {

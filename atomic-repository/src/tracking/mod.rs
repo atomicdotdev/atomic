@@ -300,6 +300,15 @@ pub struct TrackingStats {
     /// matching dead claim event. Callers that mirror `git rm` delete these paths
     /// from disk and leave the deletion pending; nothing here was mutated.
     pub pending_deletions: Vec<PathBuf>,
+
+    /// Tracked paths whose untracking a marker has staged on the current view
+    /// ([`TrackingOptions::keep_recorded`]).
+    ///
+    /// Nothing else was mutated and no bytes moved: the marker joins the next
+    /// record's deletion set, which emits the `FileDel` + dead claim even
+    /// though the bytes remain on disk. After that record the path reads as
+    /// untracked; a later `atomic add` re-tracks it as a fresh binding.
+    pub pending_untracks: Vec<PathBuf>,
 }
 
 impl TrackingStats {
@@ -338,6 +347,11 @@ impl TrackingStats {
     pub fn defer_deletion(&mut self, path: PathBuf) {
         self.pending_deletions.push(path);
     }
+
+    /// Whether any recorded path was marked pending-untrack with bytes kept.
+    pub fn has_pending_untracks(&self) -> bool {
+        !self.pending_untracks.is_empty()
+    }
 }
 
 // TrackingOptions
@@ -367,6 +381,20 @@ pub struct TrackingOptions {
     ///
     /// Default: `false`
     pub dry_run: bool,
+
+    /// Recorded paths report [`TrackingStats::pending_untracks`]
+    /// (`git rm --cached`).
+    ///
+    /// Staged paths untrack normally (bytes were never the caller's to keep,
+    /// so on-disk effect is the same as the default). Recorded paths are NOT
+    /// deferred to a working-copy deletion: they are marked pending-untrack on
+    /// the current view — intent state that `record` converts into the
+    /// `FileDel` + dead claim while the bytes stay on disk and then read as
+    /// untracked. The marker is not a cache row and the ownership invariant
+    /// is untouched: the untrack still becomes durable only as a recorded
+    /// change.
+    /// Default: `false`
+    pub keep_recorded: bool,
 }
 
 impl Default for TrackingOptions {
@@ -376,6 +404,7 @@ impl Default for TrackingOptions {
             force: false,
             include_hidden: true,
             dry_run: false,
+            keep_recorded: false,
         }
     }
 }
@@ -420,6 +449,12 @@ impl TrackingOptions {
     /// Set include_hidden option.
     pub fn with_hidden(mut self, include: bool) -> Self {
         self.include_hidden = include;
+        self
+    }
+
+    /// Set the keep_recorded option (`git rm --cached` shape).
+    pub fn with_keep_recorded(mut self, keep: bool) -> Self {
+        self.keep_recorded = keep;
         self
     }
 }

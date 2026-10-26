@@ -84,6 +84,7 @@ fn compute_working_copy_diff(
             DomainFileStatus::Modified
             | DomainFileStatus::Added
             | DomainFileStatus::Deleted
+            | DomainFileStatus::PendingUntrack
             | DomainFileStatus::TypeChanged
             | DomainFileStatus::PermissionsChanged => true,
             DomainFileStatus::Untracked => include_untracked,

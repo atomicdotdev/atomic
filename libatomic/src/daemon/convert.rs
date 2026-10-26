@@ -53,6 +53,7 @@ pub fn file_status_proto(status: atomic_repository::status::FileStatus) -> pb::F
         Domain::Added => pb::FileStatus::Added,
         Domain::Conflicted => pb::FileStatus::Conflicted,
         Domain::Clean => pb::FileStatus::Unspecified,
+        Domain::PendingUntrack => pb::FileStatus::PendingUntrack,
         Domain::TypeChanged | Domain::PermissionsChanged => pb::FileStatus::Modified,
     }
 }

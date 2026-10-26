@@ -162,6 +162,9 @@ path's content has been recorded:
 - **Already recorded** — removed from the working copy, and the deletion must be
   recorded to complete the untrack. A recorded path's name is owned by the change
   that recorded it, so it cannot be untracked by editing tracking state alone.
+  With `--keep` the untrack is instead staged as pending intent: the bytes are
+  never touched, the next `atomic record` lands the deletion, and the file then
+  reads as untracked — still on disk, yours to keep, ignore, or re-`add`.
 
 ```bash
 # Untrack a file that was added but never recorded (the file stays on disk)
@@ -174,8 +177,9 @@ atomic record -m "Stop tracking Cargo.lock"
 # Also delete never-recorded files from disk
 atomic remove --delete secrets.txt
 
-# Never delete anything from disk (git rm --cached); refused for recorded paths
-atomic remove --keep draft_notes.txt
+# Never delete anything from disk (git rm --cached): stages the untrack, and
+# the next record completes it with the bytes kept
+atomic remove --keep .env
 
 # Discard uncommitted edits the way `git rm -f` does
 atomic remove --force Cargo.lock
@@ -188,9 +192,11 @@ atomic remove --dry-run Cargo.lock
 ```
 
 `remove` refuses to delete a recorded path that has uncommitted edits unless
-`--force` is given, so a mistake never destroys work. To undo a removal before
-you record it, run `atomic restore <path>` — the content is still in the graph,
-and the path is still tracked.
+`--force` is given, so a mistake never destroys work (`--keep` never touches
+the bytes, so it accepts edited paths). To undo a removal before you record it,
+run `atomic restore <path>` — the content is still in the graph, and the path is
+still tracked. To cancel a staged `--keep` untrack before recording it, run
+`atomic add <path>`.
 
 **Alias:** `atomic rm`
 

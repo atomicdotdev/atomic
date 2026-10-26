@@ -154,6 +154,20 @@ pub const VIEW_SET_ID_INDEX: TableDefinition<u64, &[u8]> =
 /// clears it when a file is recorded without markers.
 pub const CONFLICTS: TableDefinition<&[u8; 16], &[u8]> = TableDefinition::new("conflicts");
 
+/// Per-view pending untracks: `view_id → versioned path list`.
+///
+/// This is **intent state, not a projection**: it records the user's decision
+/// (`atomic remove --keep`) that a live, recorded path must be untracked by the
+/// next record, with its bytes kept on disk. Nothing in the graph authority
+/// derives or rebuilds it — `doctor repair-native-indexes` never touches it,
+/// and `atomic status` reads it only to label a still-tracked path as pending
+/// untrack. `record` consumes marked paths through the explicit-deletion
+/// channel (emitting `FileDel` even though the bytes are present) and clears
+/// each marker as it lands; `add` cancels a pending marker. An entry whose
+/// claim has since died by other means (inserted delete, untracked path) is a
+/// no-op and is silently dropped when observed.
+pub const PENDING_UNTRACKS: TableDefinition<u64, &[u8]> = TableDefinition::new("pending_untracks");
+
 // File Tree Tables
 
 /// Repository metadata and pristine schema completion markers.

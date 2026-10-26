@@ -616,19 +616,30 @@ way around. So every tracked path falls into exactly one class:
 | Class | Written by | Rows | May be undone by |
 |---|---|---|---|
 | **Staged** | `add` | `TREE`, `REV_TREE` (+ `DIRECTORIES`) | tracking (`atomic remove`) |
-| **Recorded** | `record` | the above + `INODES`, `REV_INODES`, `PATH_CLAIMS`, graph edges | a recorded delete (`GraphOp::FileDel` + dead claim) |
+| **Recorded** | `record` | the above + `INODES`, `REV_INODES`, `PATH_CLAIMS`, graph edges | a recorded delete (`GraphOp::FileDel` + dead claim), landed directly or staged by `remove --keep` |
 
 `Repository::remove` classifies with `tracked_path_state` (inode has an
 `INODES` binding ⇒ recorded) and only ever deletes the staged class; recorded
-paths come back in `TrackingStats::pending_deletions` with nothing mutated. The
-discriminator exists because the wrong version of this was a data-integrity bug:
-`remove` used to retire the binding unconditionally, and a surviving visible
-claim then fails to resolve its own claimant in `reduce_path_claim_entries`
-(`name_resolution.rs`), so **`status`, `record`, `switch`, and materialize all
-fail closed** with "path claim '<path>' has no inode for graph position <pos>"
-until a repair rebuilds the wiped rows. Any new untrack/retire path must check
-ownership first, and `atomic remove` mirrors `git rm` (delete from the working
-copy, then record) rather than inventing a cache-only untrack.
+paths come back in `TrackingStats::pending_deletions` with nothing mutated, or
+— with `--keep` (`git rm --cached`) — in `TrackingStats::pending_untracks`
+after writing a `PENDING_UNTRACKS` row. That table is **intent, not
+projection**: like the user's own decisions it is never derived from graph
+authority and must never be rebuilt or cleared by repair. `record` snapshots
+the current view's markers at assembly, feeds marked paths through the same
+`FileDel` assembly an observed deletion uses (bytes present are ignored, kept
+on disk), and drops every marker it observed after apply lands — including
+stale ones whose claim died elsewhere. `atomic add` cancels a pending marker;
+`status` shows one as `PendingUntrack` (`untrack pending:`), which renders and
+propagates like a deletion but never counts as a working-copy diff. The
+discriminator exists because the wrong version of this was a data-integrity
+bug: `remove` used to retire the binding unconditionally, and a surviving
+visible claim then fails to resolve its own claimant in
+`reduce_path_claim_entries` (`name_resolution.rs`), so **`status`, `record`,
+`switch`, and materialize all fail closed** with "path claim '<path>' has no
+inode for graph position <pos>" until a repair rebuilds the wiped rows. Any
+new untrack/retire path must check ownership first, and `atomic remove`
+mirrors `git rm` (delete from the working copy, then record; or `--keep` to
+stage the untrack with bytes kept) rather than inventing a cache-only untrack.
 
 ### Transaction Model
 

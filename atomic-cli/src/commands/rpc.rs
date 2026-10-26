@@ -534,6 +534,9 @@ pub fn record(args: &super::record::Record) -> CliResult<bool> {
                     Ok(pb::FileStatus::Conflicted) => {
                         atomic_repository::status::FileStatus::Conflicted
                     }
+                    Ok(pb::FileStatus::PendingUntrack) => {
+                        atomic_repository::status::FileStatus::PendingUntrack
+                    }
                     _ => atomic_repository::status::FileStatus::Clean,
                 };
                 (status, file.path.clone())
@@ -2841,12 +2844,6 @@ pub fn remove(args: &super::remove::Remove) -> CliResult<bool> {
         untrack_only: args.keep,
     };
     let response = session.remove_files(request)?;
-    let untrack_only = response
-        .refusals
-        .iter()
-        .filter(|refusal| refusal.reason == "untrack-only")
-        .map(|refusal| refusal.path.clone())
-        .collect::<Vec<_>>();
     let dirty = response
         .refusals
         .iter()
@@ -2857,13 +2854,15 @@ pub fn remove(args: &super::remove::Remove) -> CliResult<bool> {
     if args.dry_run {
         println!(
             "Would remove {} file(s) from tracking",
-            response.removed as usize + response.pending_deletions.len()
+            response.removed as usize
+                + response.pending_deletions.len()
+                + response.pending_untracks.len()
         );
         for pending in &response.pending_deletions {
             println!("Would delete recorded path: {pending} (then 'atomic record' it)");
         }
-        for path in &untrack_only {
-            println!("Would refuse {path}: a recorded path needs a recorded delete");
+        for pending in &response.pending_untracks {
+            println!("Would stage untrack of {pending}: bytes kept; 'atomic record' completes it");
         }
         for path in &dirty {
             println!("Would refuse {path}: it has uncommitted edits (--force to discard)");
@@ -2879,6 +2878,14 @@ pub fn remove(args: &super::remove::Remove) -> CliResult<bool> {
             "Removed {} recorded file(s) from the working copy",
             response.pending_deletions.len()
         );
+    }
+    if !response.pending_untracks.is_empty() {
+        println!(
+            "Staged untrack of {} recorded file(s); bytes kept",
+            response.pending_untracks.len()
+        );
+    }
+    if !response.pending_deletions.is_empty() || !response.pending_untracks.is_empty() {
         println!();
         println!("Hint: Run 'atomic record' to record these deletions and stop tracking them");
     }
@@ -2887,18 +2894,15 @@ pub fn remove(args: &super::remove::Remove) -> CliResult<bool> {
     }
     if response.removed == 0
         && response.pending_deletions.is_empty()
+        && response.pending_untracks.is_empty()
         && response.failed_deletions.is_empty()
-        && untrack_only.is_empty()
         && dirty.is_empty()
     {
         println!("Nothing to remove");
     }
-    if !untrack_only.is_empty() {
-        super::remove::print_keep_guidance(&untrack_only);
-    }
-    if !untrack_only.is_empty() || !dirty.is_empty() {
+    if !dirty.is_empty() {
         return Err(CliError::InvalidArgument {
-            message: super::remove::refusal_message(&untrack_only, &dirty),
+            message: super::remove::refusal_message(&dirty),
         });
     }
     // A path whose bytes are still on disk was not removed, so the command did

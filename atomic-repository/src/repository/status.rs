@@ -703,6 +703,38 @@ impl Repository {
         // Any tracked path not found on disk in the loop above is deleted.
         // (Already handled inline above for regular files and directories.)
 
+        // ── Pending untracks (`remove --keep` intent) ─────────────────
+        //
+        // A marked path is still fully tracked until record lands its
+        // FileDel: the marker changes only what the next record captures,
+        // not what is on disk. Surface the intent where it would otherwise
+        // be invisible (a clean file) and override local edits (the delete,
+        // not the edit, is what will be recorded). A marked path missing
+        // from disk keeps its `deleted:` entry — same recorded outcome —
+        // and a marker whose claim has died or moved elsewhere is skipped
+        // here and dropped by record when it observes it.
+        let pending_untracks = txn
+            .pending_untracks(view.id)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        for pending in &pending_untracks {
+            let path_buf = PathBuf::from(pending);
+            if std::fs::symlink_metadata(self.root.join(&path_buf)).is_err() {
+                continue;
+            }
+            let Some(inode) = inode_map.get(&path_buf).copied() else {
+                continue;
+            };
+            if !projected_present_paths.contains(&path_buf) {
+                continue;
+            }
+            let mut entry = FileStatusEntry::new(path_buf, FileStatus::PendingUntrack);
+            entry.set_inode(inode);
+            if directory_inodes.contains(&inode) {
+                entry.set_details("directory".to_string());
+            }
+            status.add_or_replace_entry(entry);
+        }
+
         // ── Filesystem walk for untracked files ────────────────────────
         //
         // Only do the expensive walkdir when the caller wants untracked

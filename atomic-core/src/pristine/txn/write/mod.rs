@@ -31,8 +31,9 @@ use crate::pristine::{
 };
 
 use super::helpers::{
-    deserialize_conflicts, deserialize_edge, deserialize_view_state, serialize_conflicts,
-    serialize_edge, serialize_view_state, AdjIterator,
+    deserialize_conflicts, deserialize_edge, deserialize_pending_untracks, deserialize_view_state,
+    serialize_conflicts, serialize_edge, serialize_pending_untracks, serialize_view_state,
+    AdjIterator,
 };
 
 const SESSION_LEDGER_SCHEMA_VERSION: u32 = 1;
@@ -1670,6 +1671,9 @@ impl<'a> MutTxnT for WriteTxn<'a> {
 
         // Remove all persisted conflict state for this view.
         self.del_conflicts_prefix(view.id)?;
+        // Pending untracks are per-view intent: the view is gone, so the
+        // intent to untrack on it is meaningless and must not linger.
+        self.put_pending_untracks(view.id, &[])?;
 
         Ok(())
     }
@@ -1714,6 +1718,17 @@ impl<'a> MutTxnT for WriteTxn<'a> {
         let mut table = self.txn.open_table(CONFLICTS)?;
         for key in &keys {
             table.remove(key)?;
+        }
+        Ok(())
+    }
+
+    fn put_pending_untracks(&mut self, view_id: u64, paths: &[String]) -> PristineResult<()> {
+        let mut table = self.txn.open_table(PENDING_UNTRACKS)?;
+        if paths.is_empty() {
+            table.remove(&view_id)?;
+        } else {
+            let bytes = serialize_pending_untracks(paths)?;
+            table.insert(&view_id, bytes.as_slice())?;
         }
         Ok(())
     }

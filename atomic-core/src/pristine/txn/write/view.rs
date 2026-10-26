@@ -76,6 +76,15 @@ impl<'a> ViewTxnT for WriteTxn<'a> {
         Ok(out)
     }
 
+    fn pending_untracks(&self, view_id: u64) -> PristineResult<Vec<String>> {
+        let table = self.txn.open_table(PENDING_UNTRACKS)?;
+        let result = table.get(&view_id)?;
+        match result {
+            Some(value) => deserialize_pending_untracks(value.value()),
+            None => Ok(Vec::new()),
+        }
+    }
+
     fn snapshot_conflicts(&self) -> PristineResult<Vec<(u64, Inode, Vec<StoredConflict>)>> {
         let table = self.txn.open_table(CONFLICTS)?;
         let mut rows = Vec::new();

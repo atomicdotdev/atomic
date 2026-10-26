@@ -1592,8 +1592,9 @@ impl repository_mutation_service_server::RepositoryMutationService for MutationI
             .resolve(request.repository.as_ref().unwrap_or(&default_ref()))?;
         self.state.log_rpc("RemoveFiles", Some(&handle));
         // `keep_working_copy` guards the paths tracking untracks outright
-        // (`--delete`); `untrack_only` is `--keep`, which cannot carry a recorded
-        // path's untrack at all. The daemon mirrors the CLI's `git rm` matrix.
+        // (`--delete`); `untrack_only` is `--keep`, the `git rm --cached` shape
+        // that stages a recorded path's untrack as pending intent with bytes
+        // kept. The daemon mirrors the CLI's `git rm` matrix.
         let keep = request.keep_working_copy;
         let untrack_only = request.untrack_only;
         let gate_handle = handle.clone();
@@ -1608,6 +1609,11 @@ impl repository_mutation_service_server::RepositoryMutationService for MutationI
             let options = TrackingOptions {
                 force: request.force,
                 dry_run: request.dry_run,
+                // `--keep` (`git rm --cached`): recorded paths stage their
+                // untrack as per-view pending intent instead of deferring to a
+                // working-copy deletion; the next record lands the delete with
+                // the bytes kept.
+                keep_recorded: untrack_only,
                 ..TrackingOptions::default()
             };
             // Validate every path before applying any of it, as `git rm` does: a
@@ -1615,7 +1621,12 @@ impl repository_mutation_service_server::RepositoryMutationService for MutationI
             // is the same classification a mutation applies, so a preview reports
             // exactly what the command would do.
             let mut refusals: Vec<RemovalRefusal> = Vec::new();
-            let mut plan: Vec<(String, usize, Vec<std::path::PathBuf>)> = Vec::new();
+            let mut plan: Vec<(
+                String,
+                usize,
+                Vec<std::path::PathBuf>,
+                Vec<std::path::PathBuf>,
+            )> = Vec::new();
             for path in &request.paths {
                 // Normalize exactly like the CLI: absolute paths must be
                 // inside the repository root and are made relative.
@@ -1641,16 +1652,13 @@ impl repository_mutation_service_server::RepositoryMutationService for MutationI
                     .map_err(repository_error)?;
 
                 let mut pending: Vec<std::path::PathBuf> = Vec::new();
+                let mut marks: Vec<std::path::PathBuf> = Vec::new();
+                for mark in stats.pending_untracks {
+                    // A staged untrack touches no bytes: nothing can refuse it
+                    // on their behalf.
+                    marks.push(mark);
+                }
                 for candidate in stats.pending_deletions {
-                    if untrack_only {
-                        // A recorded path cannot be untracked while it is kept on
-                        // disk. Refuse it rather than wipe its binding.
-                        refusals.push(RemovalRefusal {
-                            path: candidate.to_string_lossy().to_string(),
-                            reason: "untrack-only".to_string(),
-                        });
-                        continue;
-                    }
                     let absolute = handle.root.join(&candidate);
                     if absolute.exists()
                         && !request.force
@@ -1667,7 +1675,7 @@ impl repository_mutation_service_server::RepositoryMutationService for MutationI
                     }
                     pending.push(candidate);
                 }
-                plan.push((normalized, stats.files_removed, pending));
+                plan.push((normalized, stats.files_removed, pending, marks));
             }
 
             // A preview reports and applies nothing. A mutation with any refusal
@@ -1675,7 +1683,15 @@ impl repository_mutation_service_server::RepositoryMutationService for MutationI
             if request.dry_run || !refusals.is_empty() {
                 let pending_deletions = if request.dry_run {
                     plan.iter()
-                        .flat_map(|(_, _, pending)| pending.iter())
+                        .flat_map(|(_, _, pending, _)| pending.iter())
+                        .map(|path| path.to_string_lossy().to_string())
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                let pending_untracks = if request.dry_run {
+                    plan.iter()
+                        .flat_map(|(_, _, _, marks)| marks.iter())
                         .map(|path| path.to_string_lossy().to_string())
                         .collect()
                 } else {
@@ -1683,13 +1699,16 @@ impl repository_mutation_service_server::RepositoryMutationService for MutationI
                 };
                 return Ok(RemoveFilesResponse {
                     removed: if request.dry_run {
-                        plan.iter().map(|(_, removed, _)| *removed).sum::<usize>() as u32
+                        plan.iter()
+                            .map(|(_, removed, _, _)| *removed)
+                            .sum::<usize>() as u32
                     } else {
                         0
                     },
                     pending_deletions,
                     refusals,
                     failed_deletions: Vec::new(),
+                    pending_untracks,
                     meta: None,
                 });
             }
@@ -1702,11 +1721,16 @@ impl repository_mutation_service_server::RepositoryMutationService for MutationI
             // silently delete nothing while the command reported success.
             let mut staged_to_delete: Vec<(String, std::path::PathBuf)> = Vec::new();
             let mut recorded_to_delete: Vec<(String, std::path::PathBuf)> = Vec::new();
-            for (normalized, _planned_removed, pending) in &plan {
+            let mut pending_untracks: Vec<String> = Vec::new();
+            for (normalized, _planned_removed, pending, _marks) in &plan {
                 let stats = repo
                     .remove(working_copy, normalized, options.clone())
                     .map_err(repository_error)?;
                 removed += stats.files_removed as u32;
+                // Report the marks the mutation actually landed.
+                for mark in stats.pending_untracks {
+                    pending_untracks.push(mark.to_string_lossy().to_string());
+                }
                 if stats.files_removed > 0 && !keep {
                     staged_to_delete.push((normalized.clone(), handle.root.join(normalized)));
                 }
@@ -1738,6 +1762,7 @@ impl repository_mutation_service_server::RepositoryMutationService for MutationI
                 pending_deletions,
                 refusals,
                 failed_deletions,
+                pending_untracks,
                 meta: None,
             })
         })
