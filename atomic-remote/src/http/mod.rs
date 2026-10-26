@@ -33,6 +33,7 @@
 mod bare;
 pub mod code_sync;
 mod download;
+pub mod identity;
 mod queries;
 mod upload;
 

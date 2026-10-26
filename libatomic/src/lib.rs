@@ -34,6 +34,7 @@ pub mod atomic {
 pub use crate::atomic as proto;
 
 pub mod daemon;
+pub mod identity_transport;
 pub mod local;
 pub mod signer_refresh;
 
