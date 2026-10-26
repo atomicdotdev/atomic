@@ -2,7 +2,7 @@ name: CI
 
 on:
   pull_request:
-    branches: [dev]
+    branches: [dev, feat/semweb-knowledge-graph]
     paths-ignore:
       - '**.md'
       - '**.markdown'
