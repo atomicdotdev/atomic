@@ -185,33 +185,43 @@ impl Repository {
             tracked_paths.insert(normalized);
         }
 
-        // TREE is aligned to the current visible lifecycle and therefore omits
-        // recorded deletions. Reintroduce those paths for status classification
-        // using the operation-aware projection so a filesystem reappearance is
-        // an undelete of the original inode rather than an untracked new file.
-        for absent in &projected_absent {
-            let normalized = PathBuf::from(&absent.path);
-            // A projected deletion is already the recorded state. Reintroduce
-            // it only when an entry actually reappears on disk, where it must
-            // be classified as an undelete of the stable inode rather than as
-            // an untracked add.
-            if std::fs::symlink_metadata(self.root.join(&normalized)).is_err() {
-                continue;
-            }
-            if !options.path_filters.is_empty() {
-                let matches = options
-                    .path_filters
-                    .iter()
-                    .any(|f| normalized.starts_with(f) || f.starts_with(&normalized));
-                if !matches {
+        // A recorded deletion is final state, not a pending change, in a local
+        // working copy: bytes that reappear at a deleted path are untracked
+        // content, exactly as after a committed `git rm`. Status therefore does
+        // NOT reintroduce projected-absent paths there — an implicit sweep
+        // would silently re-track work the user explicitly removed.
+        // Re-tracking is deliberate: `atomic add` stages the path, and
+        // record's own projection lookup then undeletes it with its original
+        // inode when the same record does not also delete that inode's current
+        // path.
+        //
+        // A remote sandbox cache is different: the submitting workspace has no
+        // staging vocabulary. A file its checkout recreates at a deleted path
+        // IS the sandbox undeleting that path's original identity, so the
+        // reappearance must surface as a change candidate for the submission
+        // record to capture. The flag is set only by the pointer-based remote
+        // sandbox open, never by a plain local repository.
+        if self.is_sandbox {
+            for absent in &projected_absent {
+                let normalized = PathBuf::from(&absent.path);
+                if std::fs::symlink_metadata(self.root.join(&normalized)).is_err() {
                     continue;
                 }
-            }
-            tracked_paths.insert(normalized.clone());
-            inode_map.insert(normalized.clone(), absent.inode);
-            has_graph_content_cache.insert(normalized.clone(), true);
-            if absent.directory {
-                directory_inodes.insert(absent.inode);
+                if !options.path_filters.is_empty() {
+                    let matches = options
+                        .path_filters
+                        .iter()
+                        .any(|f| normalized.starts_with(f) || f.starts_with(&normalized));
+                    if !matches {
+                        continue;
+                    }
+                }
+                tracked_paths.insert(normalized.clone());
+                inode_map.insert(normalized.clone(), absent.inode);
+                has_graph_content_cache.insert(normalized.clone(), true);
+                if absent.directory {
+                    directory_inodes.insert(absent.inode);
+                }
             }
         }
 

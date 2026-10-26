@@ -1547,6 +1547,31 @@ impl Repository {
             if projected_name_conflicts.contains_key(&path) {
                 continue;
             }
+            // An explicit `atomic add` at a recorded-deleted path is captured
+            // below as an undelete of that path's original claimant, never as
+            // a new FileAdd (unless the same record also deletes the
+            // claimant's current path — a genuine fresh start). The staged
+            // binding carries a fresh inode with no graph position, so anchor
+            // attributes to the resurrected claimant; otherwise they queue
+            // against a FileAdd this record will never create.
+            let inode = match (inode, move_position) {
+                (Some(current), None)
+                    if !fresh_additions.contains(&path)
+                        && shared_txn
+                            .inode_position(current)
+                            .map_err(|error| RecordError::Database(error.to_string()))?
+                            .is_none() =>
+                {
+                    Some(
+                        projected_absent
+                            .get(&path)
+                            .filter(|absent| !absent.directory)
+                            .map(|absent| absent.inode)
+                            .unwrap_or(current),
+                    )
+                }
+                (other, _) => other,
+            };
             let attrs = super::attributes::working_inode_attrs(&self.root.join(&path))
                 .map_err(RecordError::Repository)?;
             let position = match move_position {

@@ -403,13 +403,17 @@ impl Command for Remove {
         to_delete.extend(plan_delete.iter().cloned());
 
         let mut failed_unlinks: Vec<PathBuf> = Vec::new();
+        let mut failed_deletions: Vec<String> = Vec::new();
         for path in &to_delete {
             if let Err(e) = self.delete_file(&repo_root, &path.to_string_lossy()) {
-                print_warning(&format!("Failed to delete '{}': {}", path.display(), e));
-                total_errors += 1;
                 failed_unlinks.push(path.clone());
+                failed_deletions.push(format!("{}: {}", path.display(), e));
             }
         }
+        // The same wording the service handler's caller prints, so a failed
+        // deletion reads identically whichever path ran the removal.
+        print_failed_deletions(&failed_deletions);
+        total_errors += failed_deletions.len();
         // A recorded path that was already absent from the working copy still
         // needed no unlink, so it counts: its delete is pending either way.
         let removed_recorded = plan_delete
@@ -442,6 +446,12 @@ impl Command for Remove {
         if removed_recorded > 0 {
             println!();
             print_hint("Run 'atomic record' to record these deletions and stop tracking them");
+        }
+
+        // The same failure the service path reports, so a removal that could not
+        // delete never reads as a success whichever path ran it.
+        if !failed_deletions.is_empty() {
+            return Err(failed_deletions_error(failed_deletions.len()));
         }
 
         Ok(())
@@ -481,8 +491,38 @@ pub(crate) fn print_keep_guidance(kept_recorded: &[String]) {
     ));
     print_hint(
         "To keep the bytes: move them aside, remove and record the deletion, then \
-         restore them as an untracked file or ignore the path.",
+         move them back — a recreated path stays untracked until you 'atomic add' \
+         it again.",
     );
+}
+
+/// The paths whose bytes are still in the working copy because the deletion could
+/// not be performed, shared by both removal paths.
+///
+/// A removal that could not delete reports that, and only that: counting such a
+/// path as removed is what let an unlink failure read as a success.
+pub(crate) fn print_failed_deletions(failures: &[String]) {
+    for failure in failures {
+        print_warning(&format!("Failed to delete {failure}"));
+    }
+    if !failures.is_empty() {
+        print_warning(&format!(
+            "{} with errors",
+            format_count(failures.len(), "path")
+        ));
+    }
+}
+
+/// The sentence both removal paths end on when a deletion could not be
+/// performed: the bytes survive, so the untrack is not complete.
+pub(crate) fn failed_deletions_error(count: usize) -> CliError {
+    CliError::ServiceRefusal {
+        message: format!(
+            "could not delete {} from the working copy; the bytes are still on \
+             disk, so the untrack is not complete",
+            format_count(count, "path")
+        ),
+    }
 }
 
 impl Remove {
@@ -503,7 +543,7 @@ impl Remove {
 }
 
 /// Format a count with singular/plural word.
-fn format_count(count: usize, word: &str) -> String {
+pub(crate) fn format_count(count: usize, word: &str) -> String {
     if count == 1 {
         format!("{} {}", count, word)
     } else {

@@ -27,6 +27,28 @@ use super::convert::*;
 use super::sandbox_wire::hash_from_proto;
 use super::state::{domain_status, repository_error, DaemonState};
 
+/// Delete one already-resolved working-copy path, as `atomic remove` does when a
+/// path has to leave the working copy.
+///
+/// Directories leave recursively: a recorded directory's untrack reports its
+/// contents before the directory itself, so a non-recursive removal would fail
+/// on the still-occupied parents and leave the tree half-untracked. A path that
+/// is already absent needs no deletion and is a success — it is pending its
+/// recorded delete either way.
+///
+/// An unlink that cannot be performed is returned to the caller, never
+/// swallowed: reporting a removal whose bytes are still on disk is the failure
+/// this exists to prevent.
+fn remove_from_working_copy(path: &std::path::Path) -> std::io::Result<()> {
+    if path.is_dir() {
+        std::fs::remove_dir_all(path)
+    } else if path.exists() {
+        std::fs::remove_file(path)
+    } else {
+        Ok(())
+    }
+}
+
 // ---------------------------------------------------------------------------
 // DaemonService
 // ---------------------------------------------------------------------------
@@ -1667,40 +1689,55 @@ impl repository_mutation_service_server::RepositoryMutationService for MutationI
                     },
                     pending_deletions,
                     refusals,
+                    failed_deletions: Vec::new(),
                     meta: None,
                 });
             }
 
             let mut removed: u32 = 0;
-            let mut pending_deletions: Vec<String> = Vec::new();
-            let mut to_delete: Vec<std::path::PathBuf> = Vec::new();
+            // What still has to leave the working copy, as (reported path, disk
+            // path). The disk path is always resolved against the repository
+            // root: the daemon's own working directory is wherever it was
+            // started, so a relative path would resolve against nothing and
+            // silently delete nothing while the command reported success.
+            let mut staged_to_delete: Vec<(String, std::path::PathBuf)> = Vec::new();
+            let mut recorded_to_delete: Vec<(String, std::path::PathBuf)> = Vec::new();
             for (normalized, _planned_removed, pending) in &plan {
                 let stats = repo
                     .remove(working_copy, normalized, options.clone())
                     .map_err(repository_error)?;
                 removed += stats.files_removed as u32;
                 if stats.files_removed > 0 && !keep {
-                    to_delete.push(handle.root.join(normalized));
+                    staged_to_delete.push((normalized.clone(), handle.root.join(normalized)));
                 }
                 for path in pending {
-                    // An already-absent path is simply pending its recorded delete.
-                    pending_deletions.push(path.to_string_lossy().to_string());
-                    to_delete.push(path.clone());
+                    recorded_to_delete
+                        .push((path.to_string_lossy().to_string(), handle.root.join(path)));
                 }
             }
             // The CLI deletes from disk only after every tracking removal
             // succeeded; the daemon mirrors that ordering.
-            for path in to_delete {
-                if path.is_file() {
-                    let _ = std::fs::remove_file(&path);
-                } else if path.is_dir() {
-                    let _ = std::fs::remove_dir(&path);
+            let mut pending_deletions: Vec<String> = Vec::new();
+            let mut failed_deletions: Vec<String> = Vec::new();
+            for (reported, path) in staged_to_delete {
+                if let Err(error) = remove_from_working_copy(&path) {
+                    failed_deletions.push(format!("{reported}: {error}"));
+                }
+            }
+            // A recorded path that left the working copy is pending its recorded
+            // delete; one that could not be deleted reports the failure instead,
+            // and is never counted as removed.
+            for (reported, path) in recorded_to_delete {
+                match remove_from_working_copy(&path) {
+                    Ok(()) => pending_deletions.push(reported),
+                    Err(error) => failed_deletions.push(format!("{reported}: {error}")),
                 }
             }
             Ok(RemoveFilesResponse {
                 removed,
                 pending_deletions,
                 refusals,
+                failed_deletions,
                 meta: None,
             })
         })

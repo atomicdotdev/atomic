@@ -19,8 +19,16 @@ use std::{
 };
 
 fn run(root: &Path, args: &[&str]) -> Output {
+    run_in(root, root, args)
+}
+
+/// Run from an explicit working directory. The handler resolves every path it
+/// deletes against the repository root, so where the command was invoked from
+/// must not change what it removes — in reactor mode the daemon's own working
+/// directory is never the repository at all.
+fn run_in(cwd: &Path, root: &Path, args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_atomic"))
-        .current_dir(root)
+        .current_dir(cwd)
         .args(args)
         .env("ATOMIC_HOME", root.join(".atomic/test-home"))
         .env_remove("ATOMIC_RPC")
@@ -367,4 +375,174 @@ fn already_deleted_recorded_path_reports_the_pending_delete() {
         status.contains("nothing to record"),
         "the pending delete should record: {status}"
     );
+}
+
+/// A removal run from a subdirectory must still delete the recorded path from the
+/// working copy. The handler resolves the bytes against the repository root; a
+/// relative path would resolve against the daemon's own working directory, where
+/// nothing exists, so the command used to report success and delete nothing.
+#[test]
+fn removing_a_recorded_path_from_a_subdirectory_deletes_it() {
+    let root = init();
+    let dir = root.path();
+    fs::create_dir_all(dir.join("sub")).unwrap();
+    record_file(dir, "sub/f.txt", b"nested\n");
+
+    let removed = run_in(&dir.join("sub"), dir, &["remove", "sub/f.txt"]);
+    let text = output_text(&removed);
+    assert!(removed.status.success(), "remove failed: {text}");
+    assert!(
+        !dir.join("sub/f.txt").exists(),
+        "the recorded path must leave the working copy however remove was invoked: {text}"
+    );
+
+    // One removal plus one record completes the untrack: no leftover rounds.
+    cli(dir, &["record", "-m", "stop tracking sub/f.txt"]);
+    let status = cli(dir, &["status"]);
+    assert!(
+        status.contains("nothing to record"),
+        "the recorded delete should complete the untrack: {status}"
+    );
+    assert!(!dir.join("sub/f.txt").exists());
+    cli(dir, &["doctor", "check"]);
+}
+
+/// A recursive removal of a recorded directory takes the directories with it.
+/// The candidates are reported parent-first, so a non-recursive removal left
+/// every directory on disk and still tracked, and the untrack needed several
+/// remove+record rounds.
+#[test]
+fn removing_a_recorded_directory_takes_the_directories() {
+    let root = init();
+    let dir = root.path();
+    fs::create_dir_all(dir.join("gen/sub")).unwrap();
+    fs::write(dir.join("gen/a.lock"), b"a\n").unwrap();
+    fs::write(dir.join("gen/sub/b.lock"), b"b\n").unwrap();
+    cli(dir, &["add", "gen"]);
+    cli(dir, &["record", "-m", "record generated tree", "gen"]);
+
+    cli(dir, &["remove", "gen"]);
+    assert!(!dir.join("gen/a.lock").exists(), "recursive remove failed");
+    assert!(!dir.join("gen/sub/b.lock").exists(), "nested remove failed");
+    assert!(
+        !dir.join("gen/sub").exists(),
+        "an emptied directory must not survive as a recorded path"
+    );
+
+    // A single record untracks the whole tree, files and directories alike.
+    cli(dir, &["record", "-m", "stop tracking generated tree"]);
+    let status = cli(dir, &["status"]);
+    assert!(
+        status.contains("nothing to record"),
+        "one record should finish the recursive untrack: {status}"
+    );
+    assert!(
+        !dir.join("gen").exists(),
+        "the directory itself must be gone, not left behind as an untracked empty dir"
+    );
+    cli(dir, &["doctor", "check"]);
+}
+
+/// An unlink that cannot be performed is reported, not swallowed: the bytes are
+/// still in the working copy, so the path was not removed and the command fails
+/// instead of claiming it succeeded.
+#[test]
+fn a_deletion_that_cannot_unlink_is_reported_as_a_failure() {
+    let root = init();
+    let dir = root.path();
+    fs::create_dir_all(dir.join("ro")).unwrap();
+    record_file(dir, "ro/f.txt", b"locked\n");
+
+    let permissions = std::os::unix::fs::PermissionsExt::from_mode(0o555);
+    fs::set_permissions(dir.join("ro"), permissions).unwrap();
+    // A root user ignores directory permissions, so the refusal under test
+    // cannot happen there; say so rather than assert the impossible.
+    if fs::write(dir.join("ro/.probe"), b"").is_ok() {
+        fs::remove_file(dir.join("ro/.probe")).unwrap();
+        fs::set_permissions(
+            dir.join("ro"),
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .unwrap();
+        eprintln!("skipping: directory permissions are not enforced for this user");
+        return;
+    }
+
+    let removed = run(dir, &["remove", "ro/f.txt"]);
+    let text = output_text(&removed);
+    assert!(
+        !removed.status.success(),
+        "a removal that could not delete must not report success: {text}"
+    );
+    assert!(
+        text.contains("Failed to delete") && text.contains("ro/f.txt"),
+        "the failure must name the path it could not delete: {text}"
+    );
+    assert!(
+        dir.join("ro/f.txt").exists(),
+        "the bytes must survive a failed deletion"
+    );
+
+    fs::set_permissions(
+        dir.join("ro"),
+        std::os::unix::fs::PermissionsExt::from_mode(0o755),
+    )
+    .unwrap();
+    // Nothing was untracked, so the repository is exactly as it was.
+    cli(dir, &["doctor", "check"]);
+    let status = cli(dir, &["status"]);
+    assert!(
+        status.contains("nothing to record"),
+        "a failed deletion must leave the path tracked and unchanged: {status}"
+    );
+}
+
+/// Git parity: a recorded delete that comes back on disk reads as untracked.
+/// `status` never proposes it as a change, a `record` of other work never
+/// re-captures it, and only an explicit `atomic add` re-tracks the path.
+#[test]
+fn a_recreated_deleted_file_is_untracked_until_add() {
+    let root = init();
+    let dir = root.path();
+    record_file(dir, "art.psd", b"masterpiece\n");
+
+    run(dir, &["remove", "art.psd"]);
+    run(dir, &["record", "-m", "stop tracking art.psd"]);
+    assert!(!dir.join("art.psd").exists(), "the delete was recorded");
+
+    // The user puts bytes back at the now-untracked path.
+    fs::write(dir.join("art.psd"), b"local copy\n").unwrap();
+
+    let status = cli(dir, &["status"]);
+    assert!(
+        status.contains("Untracked files") && status.contains("art.psd"),
+        "a recreated deleted path must read as untracked: {status}"
+    );
+    let pending = status.split("Untracked files").next().unwrap();
+    assert!(
+        !pending.contains("art.psd"),
+        "a recreated deleted path must not be a change candidate: {status}"
+    );
+
+    // Recording unrelated work must not sweep the kept bytes back into
+    // tracking — this is the silent re-capture the contract forbids.
+    fs::write(dir.join("notes.txt"), b"tracked\n").unwrap();
+    cli(dir, &["add", "notes.txt"]);
+    cli(dir, &["record", "-m", "track notes"]);
+    let status = cli(dir, &["status"]);
+    assert!(
+        status.contains("Untracked files") && status.contains("art.psd"),
+        "a record of other work must leave the recreated path untracked: {status}"
+    );
+
+    // An explicit add is the only way back in.
+    cli(dir, &["add", "art.psd"]);
+    cli(dir, &["record", "-m", "track art.psd again"]);
+    let status = cli(dir, &["status"]);
+    assert!(
+        status.contains("nothing to record"),
+        "the explicit add + record re-tracks the path: {status}"
+    );
+    assert_eq!(fs::read(dir.join("art.psd")).unwrap(), b"local copy\n");
+    cli(dir, &["doctor", "check"]);
 }

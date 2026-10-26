@@ -2882,7 +2882,15 @@ pub fn remove(args: &super::remove::Remove) -> CliResult<bool> {
         println!();
         println!("Hint: Run 'atomic record' to record these deletions and stop tracking them");
     }
-    if response.removed == 0 && response.pending_deletions.is_empty() && untrack_only.is_empty() {
+    if !response.failed_deletions.is_empty() {
+        super::remove::print_failed_deletions(&response.failed_deletions);
+    }
+    if response.removed == 0
+        && response.pending_deletions.is_empty()
+        && response.failed_deletions.is_empty()
+        && untrack_only.is_empty()
+        && dirty.is_empty()
+    {
         println!("Nothing to remove");
     }
     if !untrack_only.is_empty() {
@@ -2892,6 +2900,13 @@ pub fn remove(args: &super::remove::Remove) -> CliResult<bool> {
         return Err(CliError::InvalidArgument {
             message: super::remove::refusal_message(&untrack_only, &dirty),
         });
+    }
+    // A path whose bytes are still on disk was not removed, so the command did
+    // not do what it reported: fail instead of counting it as a success.
+    if !response.failed_deletions.is_empty() {
+        return Err(super::remove::failed_deletions_error(
+            response.failed_deletions.len(),
+        ));
     }
     Ok(true)
 }

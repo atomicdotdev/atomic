@@ -1062,7 +1062,16 @@ fn child_deletion_does_not_import_the_owners_live_reverse_path() {
         Some(identity.2)
     );
 
-    // Reappearance is an undelete of the child's original identity.
+    // The submission cache is opened exactly as a remote sandbox cache is —
+    // on its pointer's view — where the submitting workspace has no staging
+    // vocabulary: recreated bytes at the deleted path ARE the child undeleting
+    // its original identity, so the reappearance must surface as an
+    // identity-bearing candidate for the submission record to capture.
+    drop(cache);
+    let cache = Repository::open_sandbox(cache_dir.path(), cache_dir.path(), "child").unwrap();
+    cache
+        .reindex_working_copy(cache.require_working_copy_id().unwrap())
+        .unwrap();
     write(cache_dir.path(), "README.md", "restored in child\n");
     let status = cache
         .status(
@@ -1074,7 +1083,7 @@ fn child_deletion_does_not_import_the_owners_live_reverse_path() {
         .entries()
         .iter()
         .find(|entry| entry.path() == Path::new("README.md"))
-        .unwrap();
+        .expect("a sandbox recreation must surface as a change candidate");
     assert_eq!(restored.inode(), Some(identity.1));
     let outcome = cache
         .record(
@@ -1241,6 +1250,18 @@ fn a_deleted_path_reappearing_with_new_attributes_restores_its_identity() {
             )
             .unwrap();
         }
+        // The submission cache is a plain repository: recreate the bytes,
+        // stage the path deliberately, and status must classify it by
+        // lifecycle (Added) — never as a bare attribute/type difference —
+        // while the record restores the original identity carrying the new
+        // mode/kind attributes.
+        cache
+            .add(
+                cache.require_working_copy_id().unwrap(),
+                "returning",
+                TrackingOptions::default(),
+            )
+            .unwrap();
         let status = cache
             .status(
                 cache.require_working_copy_id().unwrap(),
@@ -1257,7 +1278,6 @@ fn a_deleted_path_reappearing_with_new_attributes_restores_its_identity() {
             FileStatus::Added,
             "lifecycle takes precedence over attributes"
         );
-        assert_eq!(entry.inode(), Some(original.1));
         let outcome = cache
             .record(
                 cache.require_working_copy_id().unwrap(),

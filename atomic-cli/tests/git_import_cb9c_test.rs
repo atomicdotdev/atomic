@@ -1813,7 +1813,7 @@ fn empty_directory_projection_emits_loss_and_binding_round_trip_preserves_it() {
     // state even though Git cannot represent it. Reuse the historical path
     // to cover the distinction between an implicit and an explicit identity.
     fs::create_dir(root.join("sub")).unwrap();
-    atomic_ok(&root, &home, &["add", "sub"]);
+    atomic_ok(&root, &home, &["add", "--directory", "sub"]);
     atomic_ok(&root, &home, &["record", "-m", "native empty directory"]);
 
     let repo = open_repo(&root);
