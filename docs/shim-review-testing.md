@@ -241,6 +241,38 @@ The injection feature enables simulated failures. It also excludes the
 default-only `shipping_build_cannot_execute_adoption_injection_variables` test,
 so run both configurations. Build the normal CLI without the injection feature.
 
+### Real-repository suite
+
+`tests/harness/47_git_shim_real_repo.sh` runs the whole shim lifecycle on a
+real public repository: import, enable, reconcile/verify, a Git commit
+through the hooks, native records (edit and rename), a feature branch,
+fast-forward and no-ff merges, shim switches (phase 1), then amend, revert,
+cherry-pick, rebase, stash, tag, `pull --rebase` from a bare remote,
+a directory move, a binary file, a native line deletion and a linked
+worktree (phase 2), with reconcile, verify and both statuses checked after
+every mutation. Every bug found in the founding-team rollout came from this
+flow on real repositories, not from the fixture suites.
+
+```sh
+# default: antirez/sds (60 commits, a few minutes)
+ATOMIC_BIN=target/release/atomic tests/harness/47_git_shim_real_repo.sh
+
+# another repository; name the text file to edit and the file to rename
+GIT_SHIM_REAL_REPO_URL=https://github.com/sindresorhus/p-limit.git \
+GIT_SHIM_REAL_REPO_EDIT=readme.md GIT_SHIM_REAL_REPO_RENAME=license \
+  tests/harness/47_git_shim_real_repo.sh
+
+# phase 1 only, or skip the suite under run_all.sh
+GIT_SHIM_REAL_REPO_DAY2=0 tests/harness/47_git_shim_real_repo.sh
+GIT_SHIM_REAL_REPO_SKIP=1 tests/harness/run_all.sh
+```
+
+The suite isolates `HOME` and the Atomic config directory and needs the
+network. Repositories with a few hundred commits take tens of minutes to
+hours (the import and the per-commit reconcile are the known slow steps);
+pick a small one for a smoke run. The per-step output is kept in the
+isolated home (`steps.log`, printed at the end).
+
 ## 8. Database migration
 
 Stop all writers, then copy an old-format repository. With the old client,
