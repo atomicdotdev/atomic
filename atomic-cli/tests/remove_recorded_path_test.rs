@@ -549,6 +549,10 @@ fn removing_a_recorded_directory_takes_the_directories() {
 /// An unlink that cannot be performed is reported, not swallowed: the bytes are
 /// still in the working copy, so the path was not removed and the command fails
 /// instead of claiming it succeeded.
+///
+/// Unix-only: it makes the unlink fail with directory permissions, which NTFS
+/// does not model the same way.
+#[cfg(unix)]
 #[test]
 fn a_deletion_that_cannot_unlink_is_reported_as_a_failure() {
     let root = init();
