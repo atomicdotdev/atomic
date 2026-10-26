@@ -64,7 +64,7 @@ message RemoveFilesResponse {
   // a preview never fails, and a mutation reports every refusal at once.
   repeated RemovalRefusal refusals = 3;
   // Paths whose bytes are still in the working copy because the deletion could
-  // not be performed, each as "<path>: <reason>". A path listed here is NOT in
+  // not be performed, each as `<path>: <reason>`. A path listed here is NOT in
   // pending_deletions: reporting a removal whose bytes survive is the bug this
   // field exists to prevent.
   repeated string failed_deletions = 4;
