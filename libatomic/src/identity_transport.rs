@@ -215,10 +215,38 @@ pub async fn bind_before_push(
             Err(RepositoryError::InvalidOperation {
                 message: format!(
                     "remote project identity is {remote_id}; local is {local_id}. \
-                     These are different projects — pull to adopt the remote identity, \
-                     or push to a different remote."
+                     These are different projects — run 'atomic repo identity adopt' \
+                     to take the remote lineage, or 'atomic repo identity fork' to \
+                     start a new project, then push accordingly."
                 ),
             })
         }
     }
+}
+
+/// Explicit divergence remediation (`atomic repo identity adopt`): fetch the
+/// remote's binding and unconditionally replace the local identity, then
+/// rebuild the derived KG under the adopted id. Errors when the remote has no
+/// binding (or predates the transport) — there is nothing to adopt.
+pub async fn adopt_from_remote(
+    repo: &Repository,
+    remote: &HttpRemote,
+) -> Result<String, RepositoryError> {
+    let Some(document) = fetch_identity(remote).await? else {
+        return Err(RepositoryError::InvalidOperation {
+            message: "remote has no bound project identity to adopt".into(),
+        });
+    };
+    let record = record_from_document(&document)
+        .map_err(|e| RepositoryError::InvalidOperation { message: e })?;
+    let adopted = repo.force_adopt_remote_identity(&record)?;
+    let project_id = adopted
+        .project_id()
+        .map_err(|e| RepositoryError::InvalidOperation {
+            message: e.to_string(),
+        })?
+        .to_base32();
+    // The adopted id re-keys every project-qualified IRI.
+    repo.rebuild_kg(false)?;
+    Ok(project_id)
 }
