@@ -93,6 +93,7 @@ mod conflict_reconcile;
 mod cutover;
 pub mod database;
 mod deferred_tree;
+mod dependency_closure;
 mod equivalence;
 mod file_index_v2;
 mod filter;

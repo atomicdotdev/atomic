@@ -287,44 +287,29 @@ fn change_depends_on<T: GraphTxnT>(
     txn: &T,
     descendant: Hash,
     ancestor: Hash,
-    memo: &mut HashMap<(Hash, Hash), bool>,
+    memo: &mut super::dependency_closure::DependencyClosures<Hash>,
 ) -> Result<bool, RepositoryError> {
-    if descendant == ancestor {
-        return Ok(true);
-    }
-    if let Some(result) = memo.get(&(descendant, ancestor)) {
-        return Ok(*result);
-    }
-    let descendant_id = txn
-        .get_internal(&descendant)
+    memo.depends_on(descendant, ancestor, &mut |change| {
+        indexed_dependencies(txn, change)
+    })
+}
+
+/// The indexed dependencies of `change`. Legacy repositories predate the
+/// dependency index: an unindexed change is treated as a leaf here, since
+/// this walk only has `GraphTxnT` (no change-store access); callers that
+/// need the full closure resolve through the repository's load path (see
+/// `check_unrecord_safety`, dev #196/#206 parity).
+fn indexed_dependencies<T: GraphTxnT>(txn: &T, change: Hash) -> Result<Vec<Hash>, RepositoryError> {
+    let change_id = txn
+        .get_internal(&change)
         .map_err(|error| RepositoryError::Database(error.to_string()))?
         .ok_or_else(|| RepositoryError::InvalidOperation {
             message: format!(
                 "tree projection references unknown change {}",
-                descendant.to_base32()
+                change.to_base32()
             ),
         })?;
-    // Legacy repositories predate the dependency index. Never mistake an
-    // unindexed change for one with zero dependencies — fall back to the
-    // change file (dev #196/#206 parity, exercised by the unrecord-safety
-    // legacy fixtures).
-    // Legacy repositories predate the dependency index. Never mistake an
-    // unindexed change for one with zero dependencies. change_depends_on
-    // only has GraphTxnT (no change-store access), so unindexed changes
-    // are treated as leaves here; callers that need the full closure
-    // resolve through the repository's load path (see
-    // check_unrecord_safety, dev #196/#206 parity).
-    let dependencies = txn
-        .get_indexed_change_deps(descendant_id)
-        .unwrap_or_default();
-    for dependency in dependencies {
-        if dependency == ancestor || change_depends_on(txn, dependency, ancestor, memo)? {
-            memo.insert((descendant, ancestor), true);
-            return Ok(true);
-        }
-    }
-    memo.insert((descendant, ancestor), false);
-    Ok(false)
+    Ok(txn.get_indexed_change_deps(change_id).unwrap_or_default())
 }
 
 fn desired_tree_paths_for_txn<T: GraphTxnT>(
@@ -332,7 +317,7 @@ fn desired_tree_paths_for_txn<T: GraphTxnT>(
     ops: &[DeferredTreeOp],
     visible_changes: &HashSet<Hash>,
 ) -> Result<HashMap<Position<Hash>, DesiredTreePath>, RepositoryError> {
-    let mut memo = HashMap::new();
+    let mut memo = super::dependency_closure::DependencyClosures::default();
     desired_tree_paths(ops, visible_changes, |descendant, ancestor| {
         change_depends_on(txn, descendant, ancestor, &mut memo)
     })
