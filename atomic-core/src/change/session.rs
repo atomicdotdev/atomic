@@ -302,7 +302,9 @@ pub struct SessionRecord {
     pub first_provenance: Option<Hash>,
     pub latest_provenance: Option<Hash>,
     pub turn_count: u32,
+    /// Unix epoch milliseconds; historical records may contain seconds.
     pub started_at: i64,
+    /// Unix epoch milliseconds; historical records may contain seconds.
     pub ended_at: Option<i64>,
     pub status: SessionStatus,
 }
@@ -422,6 +424,7 @@ pub struct SessionTurn {
     pub provenance_hash: Hash,
     pub change_hashes: Vec<Hash>,
     pub previous_provenance: Option<Hash>,
+    /// Unix epoch milliseconds; historical turns may contain seconds.
     pub timestamp: i64,
     /// Stable vault work-item/intent ID governing this turn, when known.
     #[serde(default)]
@@ -465,7 +468,13 @@ pub fn canonicalize_session_turns(turns: Vec<SessionTurn>) -> Vec<SessionTurn> {
     let sort_keys: Vec<SortKey> = turns
         .iter()
         .enumerate()
-        .map(|(index, turn)| (turn.timestamp, *turn.provenance_hash.as_bytes(), index))
+        .map(|(index, turn)| {
+            (
+                crate::types::timestamp::epoch_millis(turn.timestamp),
+                *turn.provenance_hash.as_bytes(),
+                index,
+            )
+        })
         .collect();
     let mut children = vec![Vec::new(); count];
     let mut blocked = vec![false; count];
@@ -647,6 +656,20 @@ pub struct SessionManifest {
 }
 
 impl SessionRecord {
+    /// Latest turn time, or the session end/start time if it has no turns.
+    /// Handles current milliseconds and historical seconds without changing them.
+    pub fn activity_datetime(
+        &self,
+        turns: &[SessionTurn],
+    ) -> Option<chrono::DateTime<chrono::Utc>> {
+        let timestamp = turns
+            .last()
+            .map(|turn| turn.timestamp)
+            .or(self.ended_at)
+            .unwrap_or(self.started_at);
+        crate::types::timestamp::epoch_datetime(timestamp)
+    }
+
     pub fn to_bytes(&self) -> Vec<u8> {
         postcard::to_allocvec(self).expect("SessionRecord serialization")
     }
@@ -665,6 +688,12 @@ impl SessionRecord {
 }
 
 impl SessionTurn {
+    /// Decode current milliseconds and historical seconds without changing the
+    /// serialized turn or the content-addressed manifest that contains it.
+    pub fn timestamp_datetime(&self) -> Option<chrono::DateTime<chrono::Utc>> {
+        crate::types::timestamp::epoch_datetime(self.timestamp)
+    }
+
     pub fn to_bytes(&self) -> Vec<u8> {
         postcard::to_allocvec(self).expect("SessionTurn serialization")
     }
@@ -1458,6 +1487,40 @@ mod tests {
         let later = encode_session_turn_key(namespace, 2);
         assert!(earlier < later);
         assert_eq!(decode_session_turn_key(&later), (namespace, 2));
+    }
+
+    #[test]
+    fn turn_order_preserves_subseconds_and_compares_legacy_seconds() {
+        let make_turn = |timestamp: i64| SessionTurn {
+            session_id: "timestamp-order".into(),
+            turn_number: 99,
+            goal: None,
+            provenance_hash: Hash::of(&timestamp.to_le_bytes()),
+            change_hashes: Vec::new(),
+            previous_provenance: None,
+            timestamp,
+            plan_id: None,
+            todos: Vec::new(),
+            boundary_start: None,
+            boundary_end: None,
+            outcome: None,
+        };
+        for (earlier, later) in [
+            (1_792_920_379_100, 1_792_920_379_589),
+            (1_792_920_379_589, 1_792_920_380),
+        ] {
+            let ordered = canonicalize_session_turns(vec![make_turn(later), make_turn(earlier)]);
+            assert_eq!(ordered[0].timestamp, earlier);
+            assert_eq!(ordered[1].timestamp, later);
+            assert_eq!(ordered[0].turn_number, 0);
+            assert_eq!(ordered[1].turn_number, 1);
+        }
+        let parent = make_turn(1_792_920_380);
+        let mut child = make_turn(1_792_920_379_589);
+        child.previous_provenance = Some(parent.provenance_hash);
+        let ordered = canonicalize_session_turns(vec![child.clone(), parent.clone()]);
+        assert_eq!(ordered[0].provenance_hash, parent.provenance_hash);
+        assert_eq!(ordered[1].provenance_hash, child.provenance_hash);
     }
 
     #[test]

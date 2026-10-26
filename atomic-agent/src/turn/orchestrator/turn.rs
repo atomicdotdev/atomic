@@ -186,7 +186,7 @@ impl TurnOrchestrator {
         if let Some(ref prompt) = event.prompt {
             if !prompt.is_empty() && self.journal_sink.is_none() {
                 if let Some(mut acc) = self.load_accumulator(session_id) {
-                    acc.append_goal(prompt, event.timestamp.timestamp());
+                    acc.append_goal(prompt, event.timestamp.timestamp_millis());
                     self.save_accumulator(session_id, &acc);
                 }
             }

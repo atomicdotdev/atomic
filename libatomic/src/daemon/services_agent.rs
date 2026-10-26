@@ -4247,18 +4247,19 @@ impl provenance_service_server::ProvenanceService for ProvenanceImpl {
                             .unwrap_or(0)
                     };
                     intent_counts.push(intent_count as u32);
+                    let started_at =
+                        atomic_core::types::timestamp::epoch_datetime(record.started_at)
+                            .map(super::convert::timestamp_proto);
+                    let ended_at = record
+                        .ended_at
+                        .and_then(atomic_core::types::timestamp::epoch_datetime)
+                        .map(super::convert::timestamp_proto);
                     SessionSummary {
                         session_id: record.session_id,
                         view: record.view_name,
                         turn_count: record.turn_count.max(turns.len() as u32),
-                        started_at: Some(prost_types::Timestamp {
-                            seconds: record.started_at,
-                            nanos: 0,
-                        }),
-                        ended_at: record.ended_at.map(|ended| prost_types::Timestamp {
-                            seconds: ended,
-                            nanos: 0,
-                        }),
+                        started_at,
+                        ended_at,
                     }
                 })
                 .collect::<Vec<_>>();
@@ -4790,7 +4791,9 @@ async fn export_provenance_impl(
                 ),
             ));
         }
-        graphs.sort_by_key(|(_, graph)| std::cmp::Reverse(graph.timestamp));
+        graphs.sort_by_key(|(_, graph)| {
+            std::cmp::Reverse(atomic_core::types::timestamp::epoch_millis(graph.timestamp))
+        });
         let mut bundles = Vec::with_capacity(graphs.len());
         for (graph_hash, graph) in &graphs {
             let (input, previous) = provenance_map_input(&repo, graph, &change_hash, &person_did);

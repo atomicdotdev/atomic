@@ -601,8 +601,8 @@ impl Repository {
 
         for (session_id, mut session_graphs) in by_session {
             session_graphs.sort_by(|(a_hash, a), (b_hash, b)| {
-                a.timestamp
-                    .cmp(&b.timestamp)
+                atomic_core::types::timestamp::epoch_millis(a.timestamp)
+                    .cmp(&atomic_core::types::timestamp::epoch_millis(b.timestamp))
                     .then_with(|| a_hash.as_bytes().cmp(b_hash.as_bytes()))
             });
 
@@ -1506,7 +1506,7 @@ impl Repository {
         }
 
         // Sort by timestamp (oldest first) for stable ordering.
-        graphs.sort_by_key(|(_, g)| g.timestamp);
+        graphs.sort_by_key(|(_, g)| atomic_core::types::timestamp::epoch_millis(g.timestamp));
 
         Ok(graphs)
     }
@@ -1543,7 +1543,7 @@ impl Repository {
         }
 
         // Sort by timestamp (oldest first) for chain reconstruction
-        graphs.sort_by_key(|(_, g)| g.timestamp);
+        graphs.sort_by_key(|(_, g)| atomic_core::types::timestamp::epoch_millis(g.timestamp));
 
         Ok(graphs)
     }
@@ -1612,11 +1612,13 @@ impl Repository {
             let activity =
                 |record: &atomic_core::change::session::SessionRecord,
                  turns: &[atomic_core::change::session::SessionTurn]| {
-                    turns
-                        .last()
-                        .map(|turn| turn.timestamp)
-                        .or(record.ended_at)
-                        .unwrap_or(record.started_at)
+                    atomic_core::types::timestamp::epoch_millis(
+                        turns
+                            .last()
+                            .map(|turn| turn.timestamp)
+                            .or(record.ended_at)
+                            .unwrap_or(record.started_at),
+                    )
                 };
             activity(b_record, b_turns)
                 .cmp(&activity(a_record, a_turns))

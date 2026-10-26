@@ -445,7 +445,11 @@ impl<'a> WriteTxn<'a> {
         }
         record.latest_provenance = Some(turn.provenance_hash);
         record.turn_count = turn.turn_number.saturating_add(1);
-        record.started_at = record.started_at.min(turn.timestamp);
+        if crate::types::timestamp::epoch_millis(turn.timestamp)
+            < crate::types::timestamp::epoch_millis(record.started_at)
+        {
+            record.started_at = turn.timestamp;
+        }
         {
             let mut sessions = self.txn.open_table(SESSIONS)?;
             let bytes = record.to_bytes();
@@ -553,7 +557,11 @@ impl<'a> WriteTxn<'a> {
         record.latest_provenance = turns.last().map(|turn| turn.provenance_hash);
         record.turn_count = turns.len() as u32;
         if let Some(first) = turns.first() {
-            record.started_at = record.started_at.min(first.timestamp);
+            if crate::types::timestamp::epoch_millis(first.timestamp)
+                < crate::types::timestamp::epoch_millis(record.started_at)
+            {
+                record.started_at = first.timestamp;
+            }
         }
         {
             let mut sessions = self.txn.open_table(SESSIONS)?;
@@ -833,7 +841,7 @@ impl<'a> WriteTxn<'a> {
             first_provenance: None,
             latest_provenance: None,
             turn_count: 0,
-            started_at: chrono::Utc::now().timestamp(),
+            started_at: chrono::Utc::now().timestamp_millis(),
             ended_at: None,
             status: crate::change::session::SessionStatus::Active,
         };
@@ -849,6 +857,8 @@ impl<'a> WriteTxn<'a> {
     /// session has no ledger entries yet; otherwise updates only the fields
     /// supplied, preserving ledger data (provenance links, turn count).
     /// `ended_at: None` on a re-entered (resumed) session clears a prior end.
+    /// New `ended_at` values use Unix epoch milliseconds; legacy seconds are
+    /// still accepted without changing historical records.
     pub fn upsert_session_lifecycle(
         &mut self,
         session_id: &str,
@@ -874,7 +884,7 @@ impl<'a> WriteTxn<'a> {
                 first_provenance: None,
                 latest_provenance: None,
                 turn_count: 0,
-                started_at: chrono::Utc::now().timestamp(),
+                started_at: chrono::Utc::now().timestamp_millis(),
                 ended_at: None,
                 status: crate::change::session::SessionStatus::Active,
             },
@@ -944,7 +954,7 @@ impl<'a> WriteTxn<'a> {
                 first_provenance: None,
                 latest_provenance: None,
                 turn_count: 0,
-                started_at: chrono::Utc::now().timestamp(),
+                started_at: chrono::Utc::now().timestamp_millis(),
                 ended_at: None,
                 status: SessionStatus::Active,
             },
@@ -1048,9 +1058,9 @@ impl<'a> WriteTxn<'a> {
     }
 }
 
-/// Format a Unix epoch milliseconds timestamp to RFC-3339 string.
+/// Format an event timestamp, including legacy seconds, to RFC-3339.
 fn format_timestamp_ms(epoch_ms: i64) -> String {
-    chrono::DateTime::from_timestamp_millis(epoch_ms)
+    crate::types::timestamp::epoch_datetime(epoch_ms)
         .map(|dt| dt.to_rfc3339())
         .unwrap_or_else(|| format!("{}", epoch_ms))
 }

@@ -479,18 +479,6 @@ pub fn parse_intent_reference(
 
 // ── Knowledge Graph ─────────────────────────────────────────────
 
-// Legacy session epochs are untagged. Keep small values as seconds (including
-// old fixtures near 1970); contemporary millisecond epochs exceed this bound.
-const SESSION_MILLISECOND_THRESHOLD: u64 = 100_000_000_000;
-
-pub(crate) fn session_timestamp_datetime(timestamp: i64) -> Option<chrono::DateTime<chrono::Utc>> {
-    if timestamp.unsigned_abs() >= SESSION_MILLISECOND_THRESHOLD {
-        chrono::DateTime::from_timestamp_millis(timestamp)
-    } else {
-        chrono::DateTime::from_timestamp(timestamp, 0)
-    }
-}
-
 /// A node in the knowledge graph.
 ///
 /// Nodes represent repository artifacts: changes, files, entities, views,
@@ -534,10 +522,13 @@ impl KgNode {
                             .ok()
                     })
                     .filter(|value| {
-                        value.timestamp().unsigned_abs() >= SESSION_MILLISECOND_THRESHOLD
+                        value.timestamp().unsigned_abs()
+                            >= crate::types::timestamp::MILLISECOND_EPOCH_THRESHOLD
                     })
                 {
-                    if let Some(corrected) = session_timestamp_datetime(legacy.timestamp()) {
+                    if let Some(corrected) =
+                        crate::types::timestamp::epoch_datetime(legacy.timestamp())
+                    {
                         *created_at = serde_json::json!(corrected.to_rfc3339());
                     }
                 }
@@ -707,12 +698,14 @@ mod tests {
             (0, "1970-01-01T00:00:00+00:00"),
         ] {
             assert_eq!(
-                session_timestamp_datetime(raw).unwrap().to_rfc3339(),
+                crate::types::timestamp::epoch_datetime(raw)
+                    .unwrap()
+                    .to_rfc3339(),
                 expected
             );
         }
-        assert!(session_timestamp_datetime(i64::MAX).is_none());
-        assert!(session_timestamp_datetime(i64::MIN).is_none());
+        assert!(crate::types::timestamp::epoch_datetime(i64::MAX).is_none());
+        assert!(crate::types::timestamp::epoch_datetime(i64::MIN).is_none());
     }
 
     #[test]

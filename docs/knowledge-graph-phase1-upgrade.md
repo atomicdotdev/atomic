@@ -68,3 +68,21 @@ Run the Phase 1 acceptance harness with a freshly built CLI:
 cargo build -p atomic-cli --bin atomic
 ATOMIC_BIN="$PWD/target/debug/atomic" bash tests/harness/46_knowledge_graph_closure.sh
 ```
+
+## Agent timestamp precision (no KG upgrade)
+
+New agent activity timestamps use Unix epoch **milliseconds**: provenance nodes
+and graph headers, session turns and lifecycle times, AI request metadata, and
+turn-envelope timings. RPC timestamps retain that precision in their standard
+seconds-plus-nanoseconds representation. Causal links remain authoritative for
+ordering; clocks and milliseconds alone do not establish causality.
+
+Readers and chronological comparisons also accept historical second epochs.
+Untagged values below 100 billion in absolute magnitude retain their historical
+seconds interpretation; larger values are interpreted as milliseconds. Ambiguous
+values near 1970 cannot be distinguished without a unit tag. New graph writers
+use the explicit `timestamp_millis` setter; raw historical values remain intact.
+
+Existing incorrect cached session-turn dates are corrected in query results,
+including read-only queries. This correction requires no generation change,
+migration, or reindex and does not rewrite provenance bytes or historical hashes.

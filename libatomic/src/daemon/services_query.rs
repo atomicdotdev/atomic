@@ -692,6 +692,9 @@ fn vault_turn_intent(repo: &Repository, session_id: &str, turn_number: u32) -> O
 /// Map a stored session turn to the wire shape (the fields the ledger owns:
 /// turn number, provenance hash, and the turn timestamp).
 fn stored_turn_proto(turn: atomic_core::change::session::SessionTurn) -> StoredProvenanceTurn {
+    let created_at = turn
+        .timestamp_datetime()
+        .map(super::convert::timestamp_proto);
     StoredProvenanceTurn {
         schema_version: 1,
         provenance_id: 0,
@@ -700,15 +703,40 @@ fn stored_turn_proto(turn: atomic_core::change::session::SessionTurn) -> StoredP
         state: ProvenanceTurnState::Unspecified as i32,
         generation: 0,
         next_event_seq: 0,
-        created_at: Some(prost_types::Timestamp {
-            seconds: turn.timestamp,
-            nanos: 0,
-        }),
+        created_at,
         updated_at: None,
         completed_at: None,
         final_hash: Some(hash_proto(&turn.provenance_hash)),
         checkpoint_attempt: None,
         stop_state: None,
+    }
+}
+
+#[cfg(test)]
+mod timestamp_tests {
+    use super::*;
+
+    #[test]
+    fn stored_turn_timestamp_preserves_milliseconds_and_accepts_legacy_seconds() {
+        for (timestamp, nanos) in [(1_792_920_379, 0), (1_792_920_379_589, 589_000_000)] {
+            let turn = atomic_core::change::session::SessionTurn {
+                session_id: "timestamp-wire".into(),
+                turn_number: 0,
+                goal: None,
+                provenance_hash: atomic_core::types::Hash::of(b"provenance"),
+                change_hashes: Vec::new(),
+                previous_provenance: None,
+                timestamp,
+                plan_id: None,
+                todos: Vec::new(),
+                boundary_start: None,
+                boundary_end: None,
+                outcome: None,
+            };
+            let created = stored_turn_proto(turn).created_at.unwrap();
+            assert_eq!(created.seconds, 1_792_920_379);
+            assert_eq!(created.nanos, nanos);
+        }
     }
 }
 

@@ -556,6 +556,35 @@ async fn test_sandbox_turn_end_leaves_canonical_current_view_untouched() {
 // TurnStart tests
 
 #[tokio::test]
+async fn fallback_goal_reasoning_and_response_use_millisecond_epochs() {
+    let dir = TempDir::new().unwrap();
+    let mut orch = make_orchestrator(&dir);
+    orch.dispatch(session_start_event("timestamp-fallback"))
+        .await
+        .unwrap();
+    let mut start = turn_start_event("timestamp-fallback", "Preserve subsecond actions");
+    start.timestamp = chrono::DateTime::from_timestamp_millis(1_792_920_379_100).unwrap();
+    orch.dispatch(start).await.unwrap();
+    let session = orch
+        .session_store
+        .load("timestamp-fallback")
+        .unwrap()
+        .unwrap();
+    let mut end = turn_end_event("timestamp-fallback");
+    end.timestamp = chrono::DateTime::from_timestamp_millis(1_792_920_379_589).unwrap();
+    end.raw_json = Some(serde_json::json!({
+        "reasoning_text": "Check the timestamp unit",
+        "response": "Done"
+    }));
+    orch.inject_reasoning_nodes("timestamp-fallback", &end);
+    orch.inject_response_node("timestamp-fallback", &session, &end);
+    let accumulator = orch.load_accumulator("timestamp-fallback").unwrap();
+    assert_eq!(accumulator.nodes()[0].timestamp, 1_792_920_379_100);
+    assert_eq!(accumulator.nodes()[1].timestamp, 1_792_920_379_589);
+    assert_eq!(accumulator.nodes()[2].timestamp, 1_792_920_379_589);
+}
+
+#[tokio::test]
 async fn test_turn_start_transitions_to_active() {
     let dir = TempDir::new().unwrap();
     let mut orch = make_orchestrator(&dir);

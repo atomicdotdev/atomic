@@ -484,7 +484,7 @@ impl TurnOrchestrator {
             None => return,
         };
 
-        let timestamp = event.timestamp.timestamp();
+        let timestamp = event.timestamp.timestamp_millis();
 
         self.with_accumulator(session_id, |acc| {
             let mut block_count = 0;
@@ -584,7 +584,7 @@ impl TurnOrchestrator {
             return;
         };
 
-        let timestamp = event.timestamp.timestamp();
+        let timestamp = event.timestamp.timestamp_millis();
         self.with_accumulator(session_id, |acc| {
             acc.append_llm_response(&response, timestamp);
             true

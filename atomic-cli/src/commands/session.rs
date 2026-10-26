@@ -203,7 +203,8 @@ pub(crate) fn render_recent_sessions(
             .map(|turn| turn.timestamp)
             .or(record.ended_at)
             .unwrap_or(record.started_at);
-        let activity = chrono::DateTime::from_timestamp(activity, 0)
+        let activity = record
+            .activity_datetime(&turns)
             .map(|time| time.format("%Y-%m-%d %H:%M").to_string())
             .unwrap_or_else(|| activity.to_string());
         let intents_display = if intent_count > 0 {
