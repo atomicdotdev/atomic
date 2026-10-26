@@ -1044,6 +1044,26 @@ impl Clone {
         let change_objects = Self::change_objects_from_pack(&pack);
         finish_success(&spinner, "Fetched from remote");
 
+        // Adopt the remote's project identity so every clone of one project
+        // shares one namespace. A remote without the identity endpoints (or
+        // without a binding yet) leaves the local mint untouched; a diverged
+        // binding is reported, never overwritten. Runs before the KG is
+        // projected so adopted IRIs are used from the start.
+        match libatomic::identity_transport::reconcile_after_fetch(&repo, &remote).await {
+            Ok(report) => {
+                if let Some((remote_id, local_id)) = &report.diverged {
+                    print_warning(&format!(
+                        "Remote project identity {remote_id} differs from local {local_id}; keeping local."
+                    ));
+                } else if let Some(adopted) = &report.adopted {
+                    print_success(&format!("Adopted project identity {adopted}"));
+                }
+            }
+            Err(error) => {
+                print_warning(&format!("Project-identity adoption skipped: {error}"));
+            }
+        }
+
         // Reconstruct the requested view's manifest chain (view → ... → root)
         // from the pulled snapshots. The manifests carry each view's identity,
         // so clone reconstructs scope and parent exactly.

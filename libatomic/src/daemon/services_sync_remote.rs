@@ -840,6 +840,27 @@ pub async fn push_changes_impl(
     // Send everything in one /code push, then verify the union: every
     // declared manifest's patch must be present remotely.
     if !pack.is_empty() {
+        // Bind the local project identity before anything moves; a remote
+        // bound to a different identity refuses the push before publication.
+        // Bind the local project identity before anything moves; a remote
+        // bound to a different identity refuses the push before publication.
+        {
+            let handle = handle.clone();
+            let bind_remote = remote.clone();
+            let local_identity = tokio::task::spawn_blocking(move || {
+                handle.repository().and_then(|repo| {
+                    repo.project_identity()
+                        .map_err(|e| Status::internal(e.to_string()))
+                })
+            })
+            .await
+            .map_err(|error| Status::internal(error.to_string()))??;
+            if let Some(local_identity) = local_identity {
+                crate::identity_transport::bind_before_push(&local_identity, &bind_remote)
+                    .await
+                    .map_err(|error| Status::failed_precondition(error.to_string()))?;
+            }
+        }
         remote.sync_push(&pack).await.map_err(|error| {
             let (variant, message) = convert_remote_error_push(error, &remote_url);
             sync_error("send", variant, &remote_url, message)
@@ -1198,6 +1219,39 @@ pub async fn pull_changes_impl(
                 ));
             }
         };
+    // Project-identity adoption: fetch here (async), apply inside a blocking
+    // task with the repository handle. Additive — never fails the pull.
+    let identity_document = crate::identity_transport::fetch_identity(&remote).await;
+    match identity_document {
+        Ok(Some(document)) => {
+            let handle = handle.clone();
+            let report = tokio::task::spawn_blocking(move || match handle.repository() {
+                Ok(repo) => {
+                    match crate::identity_transport::apply_fetched_identity(&repo, &document) {
+                        Ok(report) => Ok(report),
+                        Err(error) => Err(format!("Project-identity adoption skipped: {error}")),
+                    }
+                }
+                Err(status) => Err(format!("Project-identity adoption skipped: {status}")),
+            })
+            .await
+            .map_err(|error| Status::internal(error.to_string()))?;
+            match report {
+                Ok(report) => {
+                    if let Some((remote_id, local_id)) = &report.diverged {
+                        warnings.push(format!(
+                            "Remote project identity {remote_id} differs from local {local_id}; keeping local."
+                        ));
+                    }
+                }
+                Err(warning) => warnings.push(warning),
+            }
+        }
+        Ok(None) => {}
+        Err(error) => {
+            warnings.push(format!("Project-identity fetch skipped: {error}"));
+        }
+    }
     // --to-view renames only the requested leaf locally.
     if let Some(leaf) = remote_chain.last_mut() {
         leaf.name = local_view.clone();

@@ -55,8 +55,15 @@ impl fmt::Display for ProjectId {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MintReason {
+    /// Minted by `atomic init`/`atomic git import` at project creation.
     Created,
+    /// Minted on a writable open of a repository predating identities.
+    /// Marks the identity as replaceable by transport: a clone may adopt its
+    /// origin's identity over an `Upgrade`-minted one.
     Upgrade,
+    /// Carried over from the project's origin via clone/pull identity
+    /// transport. Never minted locally.
+    Adopted,
 }
 
 /// Singleton persisted outside the change/view system. `object` is canonical

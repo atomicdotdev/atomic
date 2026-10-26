@@ -1004,6 +1004,19 @@ impl Push {
             .prepare_remote_operation(working_copy, OperationKind::Push, &remote_name, evidence)
             .map_err(CliError::Repository)?;
 
+        // Bind the local project identity before anything moves: an unbound
+        // remote adopts ours; a remote bound to a DIFFERENT identity refuses
+        // the push here rather than publishing under the wrong namespace.
+        if let Some(local_identity) = repo.project_identity().map_err(CliError::Repository)? {
+            match libatomic::identity_transport::bind_before_push(&local_identity, &remote).await {
+                Ok(libatomic::identity_transport::PushBind::Bound(project_id)) => {
+                    print_success(&format!("Bound project identity {project_id} to remote"));
+                }
+                Ok(libatomic::identity_transport::PushBind::Unsupported) => {}
+                Err(error) => return Err(CliError::Repository(error)),
+            }
+        }
+
         // Send everything in one `/code` push: objects stored + refs CAS-moved.
         if !pack.is_empty() {
             // Close the local observation-to-remote-CAS window after operation

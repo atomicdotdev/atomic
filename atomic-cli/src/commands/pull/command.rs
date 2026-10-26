@@ -775,6 +775,24 @@ impl Pull {
             return Ok(());
         }
 
+        // Adopt the remote's project identity: none/`Upgrade` locally → the
+        // remote identity takes over; a differing established identity is
+        // reported and kept. Additive — never fails the pull.
+        match libatomic::identity_transport::reconcile_after_fetch(&repo, &remote).await {
+            Ok(report) => {
+                if let Some((remote_id, local_id)) = &report.diverged {
+                    print_warning(&format!(
+                        "Remote project identity {remote_id} differs from local {local_id}; keeping local."
+                    ));
+                } else if let Some(adopted) = &report.adopted {
+                    print_success(&format!("Adopted project identity {adopted}"));
+                }
+            }
+            Err(error) => {
+                print_warning(&format!("Project-identity adoption skipped: {error}"));
+            }
+        }
+
         // Reconcile view metadata root-to-leaf over the now-populated common
         // graph. Shared ancestors union their local and remote own memberships;
         // the requested draft (if any) then naturally inherits the synchronized
