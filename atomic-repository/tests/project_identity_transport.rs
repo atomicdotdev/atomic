@@ -37,7 +37,7 @@ fn adoption_into_a_repository_without_identity() {
 #[test]
 fn adoption_replaces_the_upgrade_mint_and_invalidates_the_derived_kg() {
     let directory = tempfile::tempdir().unwrap();
-    let mut repo = Repository::init(directory.path()).unwrap();
+    let repo = Repository::init(directory.path()).unwrap();
     // Simulate what a full writable open does to an identity-less clone.
     let placeholder = repo.ensure_project_identity(MintReason::Upgrade).unwrap();
     // The derived KG is current for the placeholder id.
