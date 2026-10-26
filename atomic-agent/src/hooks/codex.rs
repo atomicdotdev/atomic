@@ -22,7 +22,7 @@ use serde_json::{Map, Value};
 use crate::error::{AgentError, AgentResult};
 use crate::event::{HookType, TurnEvent};
 
-use super::AgentHook;
+use super::{timestamp::TimestampFormat, AgentHook};
 
 const CODEX_DIR: &str = ".codex";
 const HOOKS_FILE: &str = "hooks.json";
@@ -222,6 +222,7 @@ impl AgentHook for CodexHook {
 
     fn parse_event(&self, hook_type: HookType, input: &[u8]) -> AgentResult<TurnEvent> {
         let raw_json = self.parse_json(hook_type, input)?;
+        let timestamp = TimestampFormat::Rfc3339.parse(self.name(), hook_type, &raw_json)?;
 
         match hook_type {
             HookType::SessionStart => {
@@ -306,6 +307,7 @@ impl AgentHook for CodexHook {
                 Ok(event)
             }
         }
+        .map(|event| event.with_timestamp(timestamp))
     }
 
     fn install(&self, repo_root: &Path) -> AgentResult<usize> {

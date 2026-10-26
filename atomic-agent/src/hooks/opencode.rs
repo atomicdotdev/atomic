@@ -67,7 +67,7 @@ use serde::Deserialize;
 
 use crate::error::{AgentError, AgentResult};
 use crate::event::{HookType, TurnEvent};
-use crate::hooks::AgentHook;
+use crate::hooks::{timestamp::TimestampFormat, AgentHook};
 
 /// The OpenCode config directory name.
 const OPENCODE_DIR: &str = ".opencode";
@@ -414,21 +414,7 @@ impl AgentHook for OpenCodeHook {
                 reason: e.to_string(),
             })?;
 
-        let timestamp = raw_json
-            .get("timestamp")
-            .filter(|value| !value.is_null())
-            .map(|value| {
-                value
-                    .as_str()
-                    .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
-                    .map(|value| value.with_timezone(&chrono::Utc))
-                    .ok_or_else(|| AgentError::HookParseFailed {
-                        agent: self.name().to_string(),
-                        hook_type: hook_type.as_str().to_string(),
-                        reason: "timestamp must be an RFC-3339 string".into(),
-                    })
-            })
-            .transpose()?;
+        let timestamp = TimestampFormat::Rfc3339.parse(self.name(), hook_type, &raw_json)?;
 
         match hook_type {
             HookType::SessionStart => {
@@ -597,12 +583,7 @@ impl AgentHook for OpenCodeHook {
                 Ok(event)
             }
         }
-        .map(|mut event| {
-            if let Some(timestamp) = timestamp {
-                event.timestamp = timestamp;
-            }
-            event
-        })
+        .map(|event| event.with_timestamp(timestamp))
     }
 
     fn install(&self, _repo_root: &Path) -> AgentResult<usize> {

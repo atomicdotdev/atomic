@@ -15,7 +15,7 @@ use serde_json::Value;
 use crate::error::{AgentError, AgentResult};
 use crate::event::{HookType, TurnEvent};
 
-use super::AgentHook;
+use super::{timestamp::TimestampFormat, AgentHook};
 
 const HERMES_DIR: &str = ".hermes";
 
@@ -108,6 +108,7 @@ impl AgentHook for HermesHook {
 
     fn parse_event(&self, hook_type: HookType, input: &[u8]) -> AgentResult<TurnEvent> {
         let raw_json = self.parse_json(hook_type, input)?;
+        let timestamp = TimestampFormat::Rfc3339.parse(self.name(), hook_type, &raw_json)?;
         let mut event = TurnEvent::new(Self::extract_session_id(&raw_json), hook_type)
             .with_raw_json(with_hermes_provider(raw_json.clone()));
 
@@ -130,7 +131,7 @@ impl AgentHook for HermesHook {
             }
         }
 
-        Ok(event)
+        Ok(event.with_timestamp(timestamp))
     }
 
     fn install(&self, _repo_root: &Path) -> AgentResult<usize> {

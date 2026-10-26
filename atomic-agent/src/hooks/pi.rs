@@ -60,7 +60,7 @@ use serde::Deserialize;
 
 use crate::error::{AgentError, AgentResult};
 use crate::event::{HookType, TurnEvent};
-use crate::hooks::AgentHook;
+use crate::hooks::{timestamp::TimestampFormat, AgentHook};
 
 /// The Pi config directory name.
 const PI_DIR: &str = ".pi";
@@ -333,6 +333,8 @@ impl AgentHook for PiHook {
                 reason: e.to_string(),
             })?;
 
+        let timestamp = TimestampFormat::Rfc3339.parse(self.name(), hook_type, &raw_json)?;
+
         match hook_type {
             HookType::SessionStart => {
                 let parsed: SessionStartInput =
@@ -500,6 +502,7 @@ impl AgentHook for PiHook {
                 Ok(event)
             }
         }
+        .map(|event| event.with_timestamp(timestamp))
     }
 
     fn install(&self, _repo_root: &Path) -> AgentResult<usize> {
