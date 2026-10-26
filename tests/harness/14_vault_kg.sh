@@ -54,12 +54,27 @@ assert_ran() {
     fi
 }
 
-# Discover a canonical view IRI from the query result, then require a real
-# incoming membership edge. An empty neighbors response is not a passing graph.
+# Discover the registered current view and its canonical IRI, then require a real
+# incoming membership edge. Import may select a different view than init created.
+# An empty neighbors response is not a passing graph.
 assert_view_membership() {
     local desc="$1"
-    local view_id
-    run_cmd atomic vault query search main --kind 'https://atomic.dev/ns/workflow#View' --json
+    local view_name view_id
+    run_cmd atomic view list --json
+    if [[ $RC -ne 0 ]]; then
+        _fail "$desc" "view list exited $RC: $OUT"
+        return
+    fi
+    if ! view_name="$(echo "$OUT" | python3 -c '
+import json, sys
+name = json.load(sys.stdin)["current_view"]
+assert isinstance(name, str) and name
+print(name)
+')"; then
+        _fail "$desc" "registered current view missing: $OUT"
+        return
+    fi
+    run_cmd atomic vault query search "$view_name" --kind 'https://atomic.dev/ns/workflow#View' --json
     if [[ $RC -ne 0 ]]; then
         _fail "$desc" "view search exited $RC: $OUT"
         return
@@ -67,9 +82,9 @@ assert_view_membership() {
     if ! view_id="$(echo "$OUT" | python3 -c '
 import json, sys
 nodes = json.load(sys.stdin)
-print(next(node["id"] for node in nodes if node["label"] == "main" and "https://atomic.dev/ns/workflow#View" in node["types"]))
-')"; then
-        _fail "$desc" "canonical main view missing: $OUT"
+print(next(node["id"] for node in nodes if node["label"] == sys.argv[1] and "https://atomic.dev/ns/workflow#View" in node["types"]))
+' "$view_name")"; then
+        _fail "$desc" "canonical $view_name view missing: $OUT"
         return
     fi
     run_cmd atomic vault query neighbors "$view_id" --json
