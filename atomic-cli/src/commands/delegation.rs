@@ -351,7 +351,7 @@ mod tests {
     /// The automation path: a runner is handed a grant in the environment and
     /// needs nothing installed.
     #[test]
-    #[serial_test::serial]
+    #[serial_test::file_serial]
     fn a_grant_in_the_environment_is_used() {
         let f = fixture();
         let terms = Delegation::new(&f.human, &f.agent, scope_for("https://atomic.storage"))
@@ -371,7 +371,7 @@ mod tests {
     /// A grant issued to someone else must not be usable just because it is in
     /// the environment.
     #[test]
-    #[serial_test::serial]
+    #[serial_test::file_serial]
     fn a_grant_for_another_agent_is_refused() {
         let f = fixture();
         let other = Identity::builder("alice+gemini")
@@ -394,7 +394,7 @@ mod tests {
     /// the store — silently using a different grant than the one asked for is
     /// how an agent ends up with a scope nobody intended.
     #[test]
-    #[serial_test::serial]
+    #[serial_test::file_serial]
     fn a_broken_environment_grant_does_not_fall_back() {
         let f = fixture();
         issue(&f, scope_for("https://atomic.storage"), Duration::days(30));
@@ -412,7 +412,7 @@ mod tests {
     /// An empty variable is treated as unset, so `ATOMIC_DELEGATION=` in a
     /// shell profile does not break an otherwise working setup.
     #[test]
-    #[serial_test::serial]
+    #[serial_test::file_serial]
     fn an_empty_environment_variable_is_ignored() {
         let f = fixture();
         issue(&f, scope_for("https://atomic.storage"), Duration::days(30));
@@ -425,7 +425,7 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::serial]
+    #[serial_test::file_serial]
     fn finds_the_certificate_for_this_agent() {
         let f = fixture();
         issue(&f, scope_for("https://atomic.storage"), Duration::days(30));
@@ -436,7 +436,7 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::serial]
+    #[serial_test::file_serial]
     fn ignores_certificates_belonging_to_another_agent() {
         let f = fixture();
         issue(&f, scope_for("https://atomic.storage"), Duration::days(30));
@@ -451,7 +451,7 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::serial]
+    #[serial_test::file_serial]
     fn no_certificate_says_how_to_issue_one() {
         let f = fixture();
         let err = active_for(&f.store, &f.agent, None).unwrap_err();
@@ -461,7 +461,7 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::serial]
+    #[serial_test::file_serial]
     fn an_expired_certificate_says_renew_not_issue() {
         let f = fixture();
         // expires_in with a negative duration puts expiry in the past.
@@ -474,7 +474,7 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::serial]
+    #[serial_test::file_serial]
     fn a_locally_revoked_certificate_is_refused() {
         let f = fixture();
         let id = issue(&f, scope_for("https://atomic.storage"), Duration::days(30));
@@ -485,7 +485,7 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::serial]
+    #[serial_test::file_serial]
     fn a_certificate_for_another_server_is_refused_with_the_scope_shown() {
         let f = fixture();
         issue(&f, scope_for("https://atomic.storage"), Duration::days(30));
@@ -500,7 +500,7 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::serial]
+    #[serial_test::file_serial]
     fn a_tampered_certificate_is_skipped_not_trusted() {
         let f = fixture();
         let id = issue(&f, scope_for("https://atomic.storage"), Duration::days(30));
@@ -517,7 +517,7 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::serial]
+    #[serial_test::file_serial]
     fn permission_check_names_the_missing_permission() {
         let f = fixture();
         issue(&f, scope_for("https://atomic.storage"), Duration::days(30));
@@ -544,7 +544,7 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::serial]
+    #[serial_test::file_serial]
     fn permission_check_names_the_out_of_scope_project() {
         let f = fixture();
         issue(&f, scope_for("https://atomic.storage"), Duration::days(30));
@@ -563,7 +563,7 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::serial]
+    #[serial_test::file_serial]
     fn the_freshest_certificate_wins() {
         let f = fixture();
         issue(&f, DelegationScope::read_only(), Duration::days(30));

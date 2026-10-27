@@ -332,7 +332,7 @@ mod tests {
     use std::process::Command as ProcessCommand;
 
     use super::*;
-    use serial_test::serial;
+    use serial_test::file_serial;
 
     // -------------------------------------------------------------------------
     // Directory Guard for Safe Current Dir Changes
@@ -438,7 +438,7 @@ mod tests {
     // -------------------------------------------------------------------------
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn test_switch_to_existing_view() {
         use tempfile::tempdir;
 
@@ -470,7 +470,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     #[cfg_attr(
         not(unix),
         ignore = "the Git shim projection requires lossless unix paths (ProjectTreeError::UnsupportedPlatformPath)"
@@ -590,7 +590,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     #[cfg_attr(
         not(unix),
         ignore = "the Git shim projection requires lossless unix paths (ProjectTreeError::UnsupportedPlatformPath)"
@@ -696,7 +696,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn test_switch_to_nonexistent_view() {
         use tempfile::tempdir;
 
@@ -729,7 +729,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn test_switch_to_current_view() {
         use tempfile::tempdir;
 

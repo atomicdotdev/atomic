@@ -1183,7 +1183,7 @@ mod tests {
 
     // Integration Tests (require temp directories)
 
-    use serial_test::serial;
+    use serial_test::file_serial;
 
     /// Guard that restores the current directory when dropped.
     struct DirGuard {
@@ -1205,7 +1205,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn test_diff_run_outside_repository() {
         let _guard = DirGuard::new();
 
@@ -1220,7 +1220,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn test_diff_run_no_changes() {
         let _guard = DirGuard::new();
 
@@ -1242,7 +1242,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn test_diff_run_with_untracked_file() {
         let _guard = DirGuard::new();
 
@@ -1266,7 +1266,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn test_diff_short_flag() {
         let _guard = DirGuard::new();
 
@@ -1291,7 +1291,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn test_diff_untracked_flag() {
         let _guard = DirGuard::new();
 
@@ -1325,7 +1325,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn test_diff_run_with_added_file() {
         let _guard = DirGuard::new();
 
@@ -1351,7 +1351,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn test_diff_run_name_only_format() {
         let _guard = DirGuard::new();
 
@@ -1376,7 +1376,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn test_diff_run_stat_format() {
         let _guard = DirGuard::new();
 
@@ -1401,7 +1401,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn test_diff_end_to_end_modified_file() {
         let _guard = DirGuard::new();
 
@@ -1475,7 +1475,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn test_diff_end_to_end_multiple_files() {
         let _guard = DirGuard::new();
 
@@ -1672,7 +1672,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn test_diff_with_specific_file() {
         let _guard = DirGuard::new();
 
@@ -1701,7 +1701,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn test_diff_patience_algorithm() {
         let _guard = DirGuard::new();
 
@@ -1727,7 +1727,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn test_diff_no_color() {
         let _guard = DirGuard::new();
 
@@ -1752,7 +1752,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn test_diff_word_diff_enabled() {
         let _guard = DirGuard::new();
 
@@ -1794,7 +1794,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn test_diff_custom_context_lines() {
         let _guard = DirGuard::new();
 

@@ -7,7 +7,7 @@ use atomic_core::change::{AITool, AIVendor, SuggestionType};
 #[allow(clippy::module_inception)]
 mod tests {
     use super::*;
-    use serial_test::serial;
+    use serial_test::file_serial;
     use std::ffi::OsString;
     use std::path::PathBuf;
 
@@ -381,7 +381,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn test_record_run_outside_repository() {
         let _guard = DirGuard::new();
 
@@ -396,7 +396,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn test_record_run_nothing_to_record() {
         let _guard = DirGuard::new();
 
@@ -418,7 +418,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn test_record_dry_run_shows_changes() {
         let _guard = DirGuard::new();
 
@@ -445,7 +445,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn test_record_with_message_and_file() {
         let _guard = DirGuard::new();
 
@@ -473,7 +473,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn test_record_with_specific_files() {
         let _guard = DirGuard::new();
 
@@ -505,7 +505,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn test_record_all_includes_untracked() {
         let _guard = DirGuard::new();
 
@@ -683,7 +683,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn test_build_provenance_disabled() {
         let _env = AiEnvGuard::clear();
         let record = Record::new();
@@ -692,7 +692,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn test_build_provenance_enabled_without_provider() {
         let _env = AiEnvGuard::clear();
         let record = Record::new().with_ai_assisted(true);
@@ -840,7 +840,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn test_build_options_without_provenance() {
         let _env = AiEnvGuard::clear();
         let record = Record::new();
@@ -850,7 +850,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn test_build_provenance_from_env_var() {
         let _env = AiEnvGuard::clear();
         // Set environment variables
@@ -873,7 +873,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn test_build_provenance_cli_overrides_env() {
         let _env = AiEnvGuard::clear();
         // Set environment variables

@@ -715,7 +715,7 @@ fn reject_parent_traversal(agent: &str, src: &str) -> AgentResult<()> {
 mod tests {
     use super::*;
     use crate::integrations::MANIFEST_FILE;
-    use serial_test::serial;
+    use serial_test::file_serial;
 
     /// Render a filesystem path for embedding in a TOML basic (double-quoted)
     /// string. On Windows, paths contain backslashes, which TOML treats as
@@ -791,7 +791,7 @@ manifest = "hooks/hooks.json"
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn installs_files_and_settings_and_receipt() {
         let home = tempfile::tempdir().unwrap();
         std::env::set_var("ATOMIC_INTEGRATIONS_HOME", home.path());
@@ -828,7 +828,7 @@ manifest = "hooks/hooks.json"
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn reinstall_refreshes_ours_but_skips_foreign_and_modified() {
         let home = tempfile::tempdir().unwrap();
         std::env::set_var("ATOMIC_INTEGRATIONS_HOME", home.path());
@@ -877,7 +877,7 @@ manifest = "hooks/hooks.json"
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn force_overwrites_foreign_files() {
         let home = tempfile::tempdir().unwrap();
         std::env::set_var("ATOMIC_INTEGRATIONS_HOME", home.path());
@@ -897,7 +897,7 @@ manifest = "hooks/hooks.json"
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn uninstall_removes_ours_keeps_modified_and_strips_hooks() {
         let home = tempfile::tempdir().unwrap();
         std::env::set_var("ATOMIC_INTEGRATIONS_HOME", home.path());
@@ -937,7 +937,7 @@ manifest = "hooks/hooks.json"
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn agent_mismatch_rejected() {
         let home = tempfile::tempdir().unwrap();
         std::env::set_var("ATOMIC_INTEGRATIONS_HOME", home.path());
@@ -950,7 +950,7 @@ manifest = "hooks/hooks.json"
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn parent_traversal_src_rejected() {
         let home = tempfile::tempdir().unwrap();
         std::env::set_var("ATOMIC_INTEGRATIONS_HOME", home.path());
@@ -1051,7 +1051,7 @@ dst = "{0}/skills/atomic-vault/SKILL.md"
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn installs_skills_from_cache() {
         let home = tempfile::tempdir().unwrap();
         std::env::set_var("ATOMIC_INTEGRATIONS_HOME", home.path());
@@ -1074,7 +1074,7 @@ dst = "{0}/skills/atomic-vault/SKILL.md"
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn skills_without_cache_errors() {
         let home = tempfile::tempdir().unwrap();
         std::env::set_var("ATOMIC_INTEGRATIONS_HOME", home.path());
@@ -1087,7 +1087,7 @@ dst = "{0}/skills/atomic-vault/SKILL.md"
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn installs_repo_file_into_repo_root() {
         let home = tempfile::tempdir().unwrap();
         std::env::set_var("ATOMIC_INTEGRATIONS_HOME", home.path());
@@ -1127,7 +1127,7 @@ dst = "AGENTS.md"
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn repo_file_skipped_without_repo_root() {
         let home = tempfile::tempdir().unwrap();
         std::env::set_var("ATOMIC_INTEGRATIONS_HOME", home.path());
@@ -1163,7 +1163,7 @@ dst = "AGENTS.md"
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn repo_file_rejects_absolute_dst() {
         let home = tempfile::tempdir().unwrap();
         std::env::set_var("ATOMIC_INTEGRATIONS_HOME", home.path());
@@ -1199,7 +1199,7 @@ dst = "/etc/passwd"
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn repo_file_rejects_traversal_dst() {
         let home = tempfile::tempdir().unwrap();
         std::env::set_var("ATOMIC_INTEGRATIONS_HOME", home.path());
@@ -1233,7 +1233,7 @@ dst = "../escape.md"
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn stitches_agent_definition_at_install() {
         let home = tempfile::tempdir().unwrap();
         std::env::set_var("ATOMIC_INTEGRATIONS_HOME", home.path());
@@ -1287,7 +1287,7 @@ slot = "{0}/agents/atomic.md"
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn agent_definition_without_cache_errors() {
         let home = tempfile::tempdir().unwrap();
         std::env::set_var("ATOMIC_INTEGRATIONS_HOME", home.path());
@@ -1324,7 +1324,7 @@ slot = "{0}/agents/atomic.md"
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn repo_file_uninstall_removes_from_repo() {
         let home = tempfile::tempdir().unwrap();
         std::env::set_var("ATOMIC_INTEGRATIONS_HOME", home.path());
@@ -1363,7 +1363,7 @@ dst = "AGENTS.md"
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn repo_file_merges_with_existing_user_file() {
         let home = tempfile::tempdir().unwrap();
         std::env::set_var("ATOMIC_INTEGRATIONS_HOME", home.path());
@@ -1414,7 +1414,7 @@ dst = "AGENTS.md"
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn repo_file_refreshes_when_atomic_marker_present() {
         let home = tempfile::tempdir().unwrap();
         std::env::set_var("ATOMIC_INTEGRATIONS_HOME", home.path());
@@ -1460,7 +1460,7 @@ dst = "AGENTS.md"
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn repo_file_force_clobbers_user_file() {
         let home = tempfile::tempdir().unwrap();
         std::env::set_var("ATOMIC_INTEGRATIONS_HOME", home.path());
@@ -1503,7 +1503,7 @@ dst = "AGENTS.md"
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn skills_glob_installs_all_from_cache() {
         let home = tempfile::tempdir().unwrap();
         std::env::set_var("ATOMIC_INTEGRATIONS_HOME", home.path());
@@ -1547,7 +1547,7 @@ dst_pattern = "{0}/skills/{{name}}/SKILL.md"
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn skills_glob_flat_pattern() {
         let home = tempfile::tempdir().unwrap();
         std::env::set_var("ATOMIC_INTEGRATIONS_HOME", home.path());
@@ -1589,7 +1589,7 @@ dst_pattern = "{0}/workflows/{{name}}.md"
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn skills_glob_picks_up_new_skill_automatically() {
         let home = tempfile::tempdir().unwrap();
         std::env::set_var("ATOMIC_INTEGRATIONS_HOME", home.path());
@@ -1645,7 +1645,7 @@ dst_pattern = "{0}/skills/{{name}}/SKILL.md"
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn skills_glob_errors_without_name_placeholder() {
         let home = tempfile::tempdir().unwrap();
         std::env::set_var("ATOMIC_INTEGRATIONS_HOME", home.path());

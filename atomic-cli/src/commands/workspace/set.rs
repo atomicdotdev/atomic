@@ -258,10 +258,10 @@ mod tests {
     // future refactors.
     //
     // Tests redirect `ATOMIC_CONFIG_DIR` to isolate `GlobalConfig::{load,save}`
-    // at a tempdir, so `#[serial]` is required.
+    // at a tempdir, so `#[file_serial]` is required.
     // -----------------------------------------------------------------
 
-    use serial_test::serial;
+    use serial_test::file_serial;
 
     /// Redirect `ATOMIC_CONFIG_DIR` to a tempdir for the lifetime of the guard,
     /// isolating `GlobalConfig` from the real user config. `ATOMIC_CONFIG_DIR`
@@ -277,8 +277,8 @@ mod tests {
             let tmp = tempfile::tempdir().unwrap();
             let original = std::env::var_os("ATOMIC_CONFIG_DIR");
             // SAFETY: env mutation is technically UB under concurrent access.
-            // `#[serial]` serializes these tests, and no other test reads
-            // ATOMIC_CONFIG_DIR outside its own `#[serial]` block.
+            // `#[file_serial]` serializes these tests, and no other test reads
+            // ATOMIC_CONFIG_DIR outside its own `#[file_serial]` block.
             unsafe {
                 std::env::set_var("ATOMIC_CONFIG_DIR", tmp.path());
             }
@@ -313,7 +313,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn config_unchanged_when_verifier_fails() {
         let _guard = HomeGuard::new();
         seed_config("acme", Some(("acme", "old-ws")));
@@ -343,7 +343,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn config_written_when_verifier_succeeds() {
         let _guard = HomeGuard::new();
         seed_config("acme", Some(("acme", "old-ws")));
@@ -365,7 +365,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn no_verify_skips_verifier_entirely() {
         let _guard = HomeGuard::new();
         seed_config("acme", None);
@@ -389,7 +389,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn explicit_org_overrides_default_for_target() {
         // Side-benefit test: writing to a non-default org leaves the
         // default org's workspace alone.

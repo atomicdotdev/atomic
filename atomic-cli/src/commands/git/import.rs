@@ -1488,7 +1488,7 @@ mod tests {
     use std::process::Command as ProcessCommand;
 
     use atomic_core::types::Base32;
-    use serial_test::serial;
+    use serial_test::file_serial;
 
     use super::*;
 
@@ -1538,7 +1538,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn forged_self_push_header_is_rejected_without_atomic_mutation() {
         let root = tempfile::tempdir().unwrap();
         init_git(root.path());
@@ -1560,7 +1560,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn forged_squash_header_is_rejected_without_atomic_mutation() {
         let root = tempfile::tempdir().unwrap();
         init_git(root.path());
@@ -1581,7 +1581,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    #[serial]
+    #[file_serial]
     fn stale_mode_link_and_empty_projection_is_rejected_without_atomic_mutation() {
         use std::os::unix::fs::{symlink, PermissionsExt};
 
@@ -1617,7 +1617,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn required_filter_failure_rejects_incremental_import_without_view_mutation() {
         let _dir_guard = DirGuard::new();
         let root = tempfile::tempdir().unwrap();
@@ -1691,7 +1691,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     #[cfg_attr(
         not(unix),
         ignore = "the Git shim projection requires lossless unix paths (ProjectTreeError::UnsupportedPlatformPath)"
@@ -1769,7 +1769,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     #[cfg_attr(
         not(unix),
         ignore = "the Git shim projection requires lossless unix paths (ProjectTreeError::UnsupportedPlatformPath)"
@@ -1808,7 +1808,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     #[cfg_attr(
         not(unix),
         ignore = "the Git shim projection requires lossless unix paths (ProjectTreeError::UnsupportedPlatformPath)"
@@ -1853,7 +1853,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     #[cfg_attr(
         not(unix),
         ignore = "the Git shim projection requires lossless unix paths (ProjectTreeError::UnsupportedPlatformPath)"

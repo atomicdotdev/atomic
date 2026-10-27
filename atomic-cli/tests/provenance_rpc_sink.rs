@@ -19,7 +19,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use atomic_repository::Repository;
-use serial_test::serial;
+use serial_test::file_serial;
 use tempfile::TempDir;
 
 /// Kills the spawned daemon when dropped — a panic in the test must not
@@ -237,7 +237,7 @@ fn run_atomic(args: &[&str], current_dir: &Path, stdin: Option<&[u8]>) -> std::p
 
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[serial]
+#[file_serial]
 async fn rpc_sink_drives_the_full_trait_flow_over_the_socket() {
     use libatomic::atomic::{
         daemon_service_server::DaemonServiceServer,
@@ -360,7 +360,7 @@ async fn rpc_sink_drives_the_full_trait_flow_over_the_socket() {
 }
 
 #[test]
-#[serial]
+#[file_serial]
 fn hooks_prefer_the_rpc_journal_sink_when_the_daemon_is_reachable() {
     if !daemon_binary().is_some_and(|daemon| daemon.exists()) {
         skip_without_reactor("hooks_prefer_the_rpc_journal_sink_when_the_daemon_is_reachable");
@@ -422,7 +422,7 @@ fn hooks_prefer_the_rpc_journal_sink_when_the_daemon_is_reachable() {
 }
 
 #[test]
-#[serial]
+#[file_serial]
 fn hooks_start_the_daemon_when_none_is_running() {
     if !daemon_binary().is_some_and(|daemon| daemon.exists()) {
         skip_without_reactor("hooks_start_the_daemon_when_none_is_running");

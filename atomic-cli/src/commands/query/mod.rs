@@ -1658,7 +1658,7 @@ mod enrich_tests {
     }
 
     #[test]
-    #[serial_test::serial]
+    #[serial_test::file_serial]
     fn targeted_enrichment_materializes_a_change_recorded_without_kg_work() {
         let _guard = DirGuard::new();
         let temp = tempfile::tempdir().unwrap();

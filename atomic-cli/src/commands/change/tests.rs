@@ -546,7 +546,7 @@ mod tests {
 
     // Integration Tests
 
-    use serial_test::serial;
+    use serial_test::file_serial;
     use std::env;
     use tempfile::TempDir;
 
@@ -574,7 +574,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn test_change_run_outside_repository() {
         let _guard = TestGuard::new();
 
@@ -590,7 +590,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn test_change_run_empty_repository() {
         let _guard = TestGuard::new();
 
@@ -605,7 +605,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn test_change_run_invalid_sequence() {
         let _guard = TestGuard::new();
 
@@ -619,7 +619,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn test_change_run_nonexistent_view() {
         let _guard = TestGuard::new();
 
@@ -634,7 +634,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn test_change_run_json_format() {
         let _guard = TestGuard::new();
 
@@ -648,7 +648,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn test_change_run_short_format() {
         let _guard = TestGuard::new();
 
@@ -662,7 +662,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn test_change_run_with_show_deps() {
         let _guard = TestGuard::new();
 
@@ -676,7 +676,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn test_change_run_with_show_hunks() {
         let _guard = TestGuard::new();
 
