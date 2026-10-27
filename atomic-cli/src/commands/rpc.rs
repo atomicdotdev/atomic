@@ -1071,6 +1071,17 @@ pub fn memory_new(args: &super::memory::new::MemoryNew) -> CliResult<bool> {
     };
     let response = session.create_vault_entity(request)?;
     let entry = response.entry.expect("created entry");
+    if args.json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "id": entry.id,
+                "file": entry.vault_path.unwrap_or_default(),
+                "kind": args.kind,
+            })
+        );
+        return Ok(true);
+    }
     println!("Created memory: {}", entry.id);
     println!("  file: {}", entry.vault_path.clone().unwrap_or_default());
     println!("  kind: {}", args.kind);

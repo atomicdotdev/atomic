@@ -112,6 +112,63 @@ fn intent_list_json_carries_attestation_columns_over_the_wire() {
 }
 
 #[test]
+fn memory_new_json_outputs_only_the_created_memory_object() {
+    let (repo, home) = fixture("memory-new-json");
+    let (repo_dir, home_dir) = (repo.path(), home.path());
+
+    for text in [
+        "JSON creation routes over the wire.",
+        ":::memory\nJSON creation routes over the wire.\n:::",
+    ] {
+        let output = run(
+            repo_dir,
+            home_dir,
+            &[
+                "memory", "new", "--kind", "lesson", "--text", text, "--json",
+            ],
+        );
+        let value: serde_json::Value = serde_json::from_str(&output)
+            .unwrap_or_else(|error| panic!("memory new must emit only JSON: {error}: {output}"));
+        let id = value["id"].as_str().expect("created memory id");
+        assert!(!id.is_empty(), "created memory id must not be empty");
+        let file = format!(".vault/memory/{id}.md");
+        assert_eq!(
+            value,
+            serde_json::json!({"id": id, "file": file, "kind": "lesson"})
+        );
+        assert!(repo_dir.join(&file).is_file(), "created file: {file}");
+    }
+}
+
+#[test]
+fn memory_new_without_json_preserves_the_human_summary() {
+    let (repo, home) = fixture("memory-new-human");
+    let output = run(
+        repo.path(),
+        home.path(),
+        &[
+            "memory",
+            "new",
+            "--kind",
+            "context",
+            "--text",
+            "Human creation summary.",
+        ],
+    );
+    let id = output
+        .lines()
+        .next()
+        .and_then(|line| line.strip_prefix("Created memory: "))
+        .expect("human memory creation summary");
+    assert_eq!(
+        output,
+        format!(
+            "Created memory: {id}\n  file: .vault/memory/{id}.md\n  kind: context\n  status: active\n"
+        )
+    );
+}
+
+#[test]
 fn memory_list_json_carries_kind_status_about_columns() {
     let (repo, home) = fixture("memory-list");
     let (repo_dir, home_dir) = (repo.path(), home.path());
