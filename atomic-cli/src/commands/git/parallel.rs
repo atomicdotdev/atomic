@@ -9259,6 +9259,10 @@ fn parse_diff_files_via_git_cli(
     parent_tree: &Tree<'_>,
 ) -> CliResult<Vec<ParsedFile>> {
     let output = Command::new("git")
+        // The caller may run alongside another thread that changes or removes
+        // the process cwd. Git resolves cwd even with --git-dir; anchor the
+        // child to this live repository instead of inheriting that global state.
+        .current_dir(git_repo.path())
         .arg("--git-dir")
         .arg(git_repo.path())
         .arg("diff-tree")

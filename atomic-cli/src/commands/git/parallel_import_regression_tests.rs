@@ -88,6 +88,34 @@ fn audit_fallback_unicode() {
     audit_fallback_path("中文.txt".as_bytes());
 }
 
+#[cfg(unix)]
+#[test]
+fn fallback_diff_survives_removed_process_cwd() {
+    const CHILD: &str = "ATOMIC_FALLBACK_REMOVED_CWD_CHILD";
+    if std::env::var_os(CHILD).is_some() {
+        let original = std::env::current_dir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        std::env::set_current_dir(cwd.path()).unwrap();
+        // Only this child process uses the disposable directory as cwd.
+        std::fs::remove_dir(cwd.path()).unwrap();
+        audit_fallback_path(b"plain.txt");
+        std::env::set_current_dir(original).unwrap();
+        return;
+    }
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .arg("--exact")
+        .arg("commands::git::parallel::import_regression_tests::fallback_diff_survives_removed_process_cwd")
+        .arg("--nocapture")
+        .env(CHILD, "1")
+        .output().unwrap();
+    assert!(
+        output.status.success(),
+        "isolated child failed:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 #[test]
 fn fallback_newline() {
     audit_fallback_path(b"line\nbreak");
