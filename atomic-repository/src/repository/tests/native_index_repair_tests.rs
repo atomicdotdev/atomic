@@ -1037,3 +1037,108 @@ fn path_claims_repair_journals_reconstructible_inverse_and_undo_restores_it() {
     );
     assert!(repo.has_change(&recorded.hash().clone()));
 }
+
+/// The detach/re-attach lifecycle keeps PATH_CLAIMS truthful: a change no
+/// view references is DORMANT authority (its GRAPH edges survive too), not a
+/// stale row. Regression for the wedge where `unrecord` of a recorded delete
+/// made `doctor check` fail closed until a rebuild.
+#[test]
+fn detached_change_claims_are_dormant_authority_not_stale() {
+    use crate::UnrecordOptions;
+    let (temp, repo) = create_temp_repo();
+    std::fs::write(temp.path().join("f.txt"), b"content\n").unwrap();
+    repo.add("f.txt", TrackingOptions::default()).unwrap();
+    record_all(&repo, "add f");
+    let inode = repo.get_file_inode("f.txt").unwrap().unwrap();
+
+    std::fs::remove_file(temp.path().join("f.txt")).unwrap();
+    let dropped = record_all(&repo, "drop f");
+    let drop_hash = *dropped.hash();
+
+    repo.unrecord(&drop_hash, UnrecordOptions::default())
+        .unwrap();
+    let report = repo.verify_native_derived_indexes().unwrap();
+    assert!(
+        report.is_healthy(),
+        "dormant claim rows must be expected, not stale: {:?}",
+        report.problems
+    );
+    assert_eq!(
+        repo.get_file_inode("f.txt").unwrap(),
+        Some(inode),
+        "the re-attached add still owns the binding"
+    );
+
+    // Re-attaching the delete must find its dormant rows exactly as stored.
+    repo.reinsert_change(&drop_hash, None).unwrap();
+    let report = repo.verify_native_derived_indexes().unwrap();
+    assert!(report.is_healthy(), "{:?}", report.problems);
+    assert!(
+        !repo.is_tracked("f.txt").unwrap(),
+        "the reinserted delete untracks the path again"
+    );
+    let report = repo.verify_working_copy().unwrap();
+    assert!(report.is_healthy(), "{report:?}");
+}
+
+/// The documented remediation must not destroy reversibility: a full native
+/// rebuild while a change is detached re-derives its dormant rows (they are
+/// part of the registered authority domain), so a later reinsert still lands.
+#[test]
+fn repair_between_detach_and_reinsert_preserves_dormant_claims() {
+    use crate::UnrecordOptions;
+    let (temp, repo) = create_temp_repo();
+    std::fs::write(temp.path().join("g.txt"), b"content\n").unwrap();
+    repo.add("g.txt", TrackingOptions::default()).unwrap();
+    record_all(&repo, "add g");
+    std::fs::remove_file(temp.path().join("g.txt")).unwrap();
+    let dropped = record_all(&repo, "drop g");
+    let drop_hash = *dropped.hash();
+
+    repo.unrecord(&drop_hash, UnrecordOptions::default())
+        .unwrap();
+    repo.repair_native_derived_indexes().unwrap();
+    let report = repo.verify_native_derived_indexes().unwrap();
+    assert!(report.is_healthy(), "{:?}", report.problems);
+
+    repo.reinsert_change(&drop_hash, None).unwrap();
+    let report = repo.verify_native_derived_indexes().unwrap();
+    assert!(
+        report.is_healthy(),
+        "reinsert after a detached-state repair must stay consistent: {:?}",
+        report.problems
+    );
+    assert!(!repo.is_tracked("g.txt").unwrap());
+}
+
+/// The `--keep` flow's consuming record unrecords the same way: dormant
+/// claims stay expected, and the kept bytes remain untouched throughout.
+#[test]
+fn detached_marker_consuming_record_is_dormant_not_stale() {
+    use crate::UnrecordOptions;
+    let (temp, repo) = create_temp_repo();
+    std::fs::write(temp.path().join("h.txt"), b"keepme\n").unwrap();
+    repo.add("h.txt", TrackingOptions::default()).unwrap();
+    record_all(&repo, "add h");
+    let stats = repo
+        .remove("h.txt", TrackingOptions::default().with_keep_recorded(true))
+        .unwrap();
+    assert!(stats.has_pending_untracks());
+    let dropped = record_all(&repo, "drop h via marker");
+    assert_eq!(
+        std::fs::read(temp.path().join("h.txt")).unwrap(),
+        b"keepme\n",
+        "the marker flow never touches bytes"
+    );
+
+    let report = repo.verify_native_derived_indexes().unwrap();
+    assert!(report.is_healthy(), "{:?}", report.problems);
+    repo.unrecord(dropped.hash(), UnrecordOptions::default())
+        .unwrap();
+    let report = repo.verify_native_derived_indexes().unwrap();
+    assert!(report.is_healthy(), "{:?}", report.problems);
+    assert_eq!(
+        std::fs::read(temp.path().join("h.txt")).unwrap(),
+        b"keepme\n"
+    );
+}
