@@ -62,7 +62,9 @@ jobs:
         if: runner.os == 'Windows'
         uses: samypr100/setup-dev-drive@v4
         with:
-          drive-size: 14GB
+          # Dynamic VHDX on the runner's D: disk: it only uses what target/ needs.
+          # 14GB ran out while linking the test binaries.
+          drive-size: 60GB
           mount-path: ${{ runner.workspace }}/devdrive
           env-mapping: |
             CARGO_TARGET_DIR,{{ DEV_DRIVE }}/target
