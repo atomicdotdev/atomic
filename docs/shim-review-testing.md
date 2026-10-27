@@ -204,25 +204,25 @@ Check failures and skipped tests in the output.
 
 ```sh
 cd "$ATOMIC_REVIEW_SOURCE"
-cargo test --locked -p atomic-cli \
-  --test adaptation_regression_test \
-  --test git_shim_opt_in_test \
-  --test git_shim_workspace_test \
-  --test bridge_agent_workflow_regression_test \
-  --test git_shim_logging_test
+cargo test --locked -p atomic-cli --test it -- \
+  adaptation_regression_test:: \
+  git_shim_opt_in_test:: \
+  git_shim_workspace_test:: \
+  bridge_agent_workflow_regression_test:: \
+  git_shim_logging_test::
 
-cargo test --locked -p atomic-cli \
-  --test working_copy_service_adaptation_test \
-  --test compact_service_integration_test
+cargo test --locked -p atomic-cli --test it -- \
+  working_copy_service_adaptation_test:: \
+  compact_service_integration_test::
 cargo test --locked -p libatomic \
   --test record_service_test --test status_service_test --test sandbox_service_test
 
-cargo test --locked -p atomic-repository \
-  --test database_consolidation_shim_test --test migration_recovery_test
+cargo test --locked -p atomic-repository --test it -- \
+  database_consolidation_shim_test:: migration_recovery_test::
 
 cargo test --locked -p atomic-cli \
-  --features adoption-test-injection \
-  --test git_shim_cb13d_test --test git_cutover_cb13b_test
+  --features adoption-test-injection --test it -- \
+  git_shim_cb13d_test:: git_cutover_cb13b_test::
 ```
 
 `working_copy_service_adaptation_test` starts a real RPC server using this

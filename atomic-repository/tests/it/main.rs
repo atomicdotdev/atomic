@@ -38,3 +38,4 @@ mod view_setid_test;
 mod view_split_test;
 mod whole_file_diff_test;
 mod workflow_usage;
+mod zero_length_vertex_regression_test;
