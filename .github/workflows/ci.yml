@@ -114,6 +114,9 @@ jobs:
       - name: Run knowledge graph closure harness
         if: matrix.os == 'ubuntu-latest'
         shell: bash
+        # The harness's own cargo test suites already ran under nextest above.
+        env:
+          ATOMIC_HARNESS_SKIP_CARGO_TESTS: 1
         run: ATOMIC_BIN="$PWD/target/debug/atomic" bash tests/harness/46_knowledge_graph_closure.sh
 
   fmt:
