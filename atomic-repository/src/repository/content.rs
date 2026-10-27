@@ -1225,6 +1225,14 @@ mod namespace_liveness_tests {
         record(&repo, "delete");
         assert_verdict(&repo, inode, position, false);
         std::fs::write(dir.path().join("live.txt"), b"one\ntwo\nthree\n").unwrap();
+        // A locally recreated recorded deletion is untracked until explicitly
+        // added; adding it restores the original inode, not a fresh identity.
+        repo.add(
+            repo.require_working_copy_id().unwrap(),
+            "live.txt",
+            TrackingOptions::default(),
+        )
+        .unwrap();
         record(&repo, "restore");
         assert_verdict(&repo, inode, position, true);
         std::fs::write(dir.path().join("live.txt"), b"").unwrap();

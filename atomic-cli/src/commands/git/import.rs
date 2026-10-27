@@ -833,6 +833,10 @@ impl Command for Import {
             return Ok(());
         }
 
+        if self.stream && !cfg!(unix) {
+            return Err(CliError::GitError { message: "--stream requires lossless native path verification, which is unsupported on this platform; no import was started".into() });
+        }
+
         // Validate the complete prospective import before Git excludes, Atomic
         // initialization, view creation, graph/change publication, derived-index
         // writes, or materialization. Existing repositories are opened read-only
@@ -1822,6 +1826,10 @@ mod tests {
 
     #[test]
     #[serial]
+    #[cfg_attr(
+        not(unix),
+        ignore = "the Git shim projection requires lossless unix paths (ProjectTreeError::UnsupportedPlatformPath)"
+    )]
     fn stream_flag_routes_real_command_without_rewriting_git_files() {
         let temp = tempfile::tempdir().unwrap();
         init_git(temp.path());
@@ -1898,6 +1906,10 @@ mod tests {
 
     #[test]
     #[serial]
+    #[cfg_attr(
+        not(unix),
+        ignore = "the Git shim projection requires lossless unix paths (ProjectTreeError::UnsupportedPlatformPath)"
+    )]
     fn ordinary_import_seeds_v2_for_filtered_and_escaped_paths_before_status() {
         let temp = tempfile::tempdir().unwrap();
         init_git(temp.path());
@@ -1928,6 +1940,30 @@ mod tests {
             fs::read(temp.path().join("100%.txt")).unwrap(),
             b"canonical\r\n"
         );
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    #[serial]
+    fn stream_refuses_unsupported_native_paths_before_initialization() {
+        let temp = tempfile::tempdir().unwrap();
+        init_git(temp.path());
+        fs::write(temp.path().join("tracked.txt"), b"canonical\n").unwrap();
+        git_ok(temp.path(), &["add", "."]);
+        git_ok(temp.path(), &["commit", "-qm", "seed"]);
+        let _guard = DirGuard::new();
+        std::env::set_current_dir(temp.path()).unwrap();
+        let error = Import {
+            stream: true,
+            no_vault: true,
+            ..Default::default()
+        }
+        .run()
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("lossless native path verification"));
+        assert!(!temp.path().join(".atomic").exists());
     }
 
     #[test]

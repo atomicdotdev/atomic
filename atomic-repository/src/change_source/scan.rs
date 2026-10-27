@@ -3,7 +3,7 @@ use std::fs;
 use std::path::Path;
 
 use atomic_core::change::InodeKind;
-use atomic_core::output::permission_bits_matter;
+use atomic_core::output::inode_permissions_changed;
 use atomic_core::pristine::{FileIndexTimestamp, FileIndexV2Entry};
 use atomic_core::types::Hash;
 
@@ -28,6 +28,74 @@ pub trait FilesystemProvider: Send + Sync {
         path: &RepoPath,
         filter: &dyn ContentFilter,
     ) -> Result<CanonicalContentId, ChangeSourceError>;
+}
+
+#[cfg(all(test, windows))]
+mod windows_permission_tests {
+    use super::*;
+
+    #[test]
+    fn git_modes_match_windows_writable_files_and_readonly_is_detected() {
+        let dir = tempfile::tempdir().unwrap();
+        let native = dir.path().join("file");
+        fs::write(&native, b"canonical").unwrap();
+        let path = RepoPath::from_bytes(b"file").unwrap();
+        let paths = vec![path.clone()];
+        let policy = Hash::of(b"policy");
+        let filter = crate::content_filter::GitAttributesFilter::for_repository(dir.path());
+        let observe = || {
+            ScanChangeSource
+                .changes(ChangeSourceRequest {
+                    root: dir.path(),
+                    tracked_paths: &paths,
+                    previous_token: None,
+                })
+                .unwrap()
+        };
+        for mode in [0o644, 0o755] {
+            let tracked = [CanonicalTrackedPath {
+                path: path.clone(),
+                canonical_mode: mode,
+                canonical_kind: InodeKind::Regular,
+            }];
+            let result = verify_candidates(
+                observe(),
+                &tracked,
+                &BTreeMap::new(),
+                policy,
+                now_timestamp(),
+                &filter,
+                |_| Ok(Hash::of(b"canonical")),
+            )
+            .unwrap();
+            assert_eq!(result.candidates[0].change, VerifiedChange::Unchanged);
+        }
+        let mut permissions = fs::metadata(&native).unwrap().permissions();
+        permissions.set_readonly(true);
+        fs::set_permissions(&native, permissions).unwrap();
+        let tracked = [CanonicalTrackedPath {
+            path,
+            canonical_mode: 0o644,
+            canonical_kind: InodeKind::Regular,
+        }];
+        let result = verify_candidates(
+            observe(),
+            &tracked,
+            &BTreeMap::new(),
+            policy,
+            now_timestamp(),
+            &filter,
+            |_| Ok(Hash::of(b"canonical")),
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&native).unwrap().permissions();
+        permissions.set_readonly(false);
+        fs::set_permissions(&native, permissions).unwrap();
+        assert_eq!(
+            result.candidates[0].change,
+            VerifiedChange::PermissionsChanged
+        );
+    }
 }
 
 /// The content identities of one observed file: its bytes after the clean
@@ -364,10 +432,14 @@ where
                 // Symlink permission bits are not a fact (Git stores every
                 // link as 120000; `lstat` reports 0o777 on Linux and 0o755
                 // on macOS), mirroring `InodeStatusFacts::between`.
-                let permissions_changed = permission_bits_matter(
-                    entry.canonical_kind,
-                    observed_kind.unwrap_or(entry.canonical_kind),
-                ) && file.mode != Some(entry.canonical_mode);
+                let permissions_changed = file.mode.is_none_or(|mode| {
+                    inode_permissions_changed(
+                        entry.canonical_kind,
+                        entry.canonical_mode,
+                        observed_kind.unwrap_or(entry.canonical_kind),
+                        mode,
+                    )
+                });
                 let observed_row = cached.and_then(|row| {
                     observed_index_row(
                         file,

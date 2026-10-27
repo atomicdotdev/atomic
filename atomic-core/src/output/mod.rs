@@ -156,9 +156,9 @@ pub mod repo;
 mod traits;
 
 pub use attribute::{
-    permission_bits_matter, platform_symlink_mode, project_inode_attributes,
-    InodeAttributeConflict, InodeAttributeProjection, InodeMaterialization, InodeStatusFacts,
-    DEFAULT_REGULAR_MODE,
+    inode_permissions_changed, permission_bits_matter, platform_symlink_mode,
+    project_inode_attributes, InodeAttributeConflict, InodeAttributeProjection,
+    InodeMaterialization, InodeStatusFacts, DEFAULT_REGULAR_MODE,
 };
 
 // Re-export error types

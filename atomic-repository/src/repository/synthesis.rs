@@ -2939,7 +2939,7 @@ impl Repository {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn apply_synthesized_change_in_txn(
         &self,
-        mut txn: &mut atomic_core::pristine::WriteTxn<'_>,
+        txn: &mut atomic_core::pristine::WriteTxn<'_>,
         view_name: &str,
         hash: &Hash,
         v3_bytes: &[u8],
@@ -3013,7 +3013,7 @@ impl Repository {
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
         let tree_projection = self.plan_tree_projection(
-            &mut txn,
+            txn,
             change_id,
             *hash,
             final_change,
@@ -3048,7 +3048,7 @@ impl Repository {
             )
         } else {
             write_change_to_graph(
-                &mut txn,
+                txn,
                 view_name,
                 change_id,
                 hash,
@@ -3099,7 +3099,7 @@ impl Repository {
             failpoints::semantic_corrupt_trunk_deleted(&mut *txn, &untouched_paths)?;
         }
         self.apply_tree_projection(
-            &mut txn,
+            txn,
             &tree_projection,
             view_name,
             preserve_existing_tree_paths,
@@ -3116,7 +3116,7 @@ impl Repository {
         // assembly-excluded but never superseded; the isolated filter
         // remains their proof, and the merge resolution re-references them.
         if !supersede.is_empty() {
-            self.supersede_excluded_members_locked(&mut txn, view_name, supersede)?;
+            self.supersede_excluded_members_locked(txn, view_name, supersede)?;
             // Review C4: the alignment removes target-local members only.
             // An exclusion that also lives in an ANCESTOR view survives the
             // removal and would remain visible in the published effective
@@ -3156,7 +3156,7 @@ impl Repository {
             .surviving_exclusions(&*txn, view_name, assembly_excluded)?
             .is_empty();
         self.verify_staged_projection(
-            &txn,
+            txn,
             view_name,
             final_change,
             assembly_excluded,
