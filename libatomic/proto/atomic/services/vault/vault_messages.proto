@@ -112,6 +112,22 @@ message GetVaultEntryResponse {
   optional VersionedBytes entry_bundle = 21;
 }
 
+// The order of the intent and memory listings (add-only). UNSPECIFIED is
+// the kind's own default: intents by id, memories by last update, newest
+// first. Every other key sorts ascending (ATTESTED: fresh, stale, none;
+// VERIFIES: yes, no, na), and ties fall back to id order.
+enum VaultListSort {
+  VAULT_LIST_SORT_UNSPECIFIED = 0;
+  VAULT_LIST_SORT_ID = 1;
+  VAULT_LIST_SORT_UPDATED = 2;  // memory only; newest first
+  VAULT_LIST_SORT_TITLE = 3;    // intent only
+  VAULT_LIST_SORT_STATUS = 4;
+  VAULT_LIST_SORT_KIND = 5;     // intent: manifest kind; memory: memoryKind
+  VAULT_LIST_SORT_ABOUT = 6;    // memory only
+  VAULT_LIST_SORT_ATTESTED = 7;
+  VAULT_LIST_SORT_VERIFIES = 8;
+}
+
 message ListVaultEntriesRequest {
   RepositoryRef repository = 1;
   optional VaultEntityKind kind = 2;
@@ -132,6 +148,12 @@ message ListVaultEntriesRequest {
   // path_prefix, with each entry's id set to the filename stem and its
   // body set to the first-200-char content preview.
   bool tool_result_previews = 11;
+  // Intent/memory listing order (add-only), applied before the budget so
+  // a limit keeps the first N in this order. A key the kind does not carry,
+  // or any key on another listing, is INVALID_ARGUMENT.
+  optional VaultListSort sort = 12;
+  // Flip the sort key (add-only); ties still fall back to id order.
+  bool reverse = 13;
   ViewRef view = 20;
 }
 message ListVaultEntriesResponse {

@@ -90,7 +90,22 @@ pub enum IntentSort {
     Verifies,
 }
 
-/// Order `rows` by `key`, with id as the tiebreak. `reverse` flips the key,
+impl IntentSort {
+    pub(crate) fn wire(self) -> atomic_client::proto::VaultListSort {
+        use atomic_client::proto::VaultListSort as W;
+        match self {
+            IntentSort::Id => W::Id,
+            IntentSort::Title => W::Title,
+            IntentSort::Status => W::Status,
+            IntentSort::Kind => W::Kind,
+            IntentSort::Attested => W::Attested,
+            IntentSort::Verifies => W::Verifies,
+        }
+    }
+}
+
+/// Order `rows` by `key` (the local body's twin of the service's listing
+/// sort), with id as the tiebreak. `reverse` flips the key,
 /// not the tiebreak.
 pub(crate) fn sort_rows(rows: &mut [Row], key: IntentSort, reverse: bool) {
     rows.sort_by(|a, b| {

@@ -89,15 +89,31 @@ pub enum MemorySort {
     Verifies,
 }
 
+impl MemorySort {
+    pub(crate) fn wire(self) -> atomic_client::proto::VaultListSort {
+        use atomic_client::proto::VaultListSort as W;
+        match self {
+            MemorySort::Updated => W::Updated,
+            MemorySort::Id => W::Id,
+            MemorySort::Kind => W::Kind,
+            MemorySort::Status => W::Status,
+            MemorySort::About => W::About,
+            MemorySort::Attested => W::Attested,
+            MemorySort::Verifies => W::Verifies,
+        }
+    }
+}
+
 impl MemoryList {
-    /// The order both the local body and the service apply on their own, so
-    /// `--limit` can be pushed down without re-sorting.
-    pub(crate) fn is_default_sort(&self) -> bool {
+    /// The enumeration's own order, so `--limit` can cut before the per-row
+    /// attestation work.
+    fn is_default_sort(&self) -> bool {
         self.sort == MemorySort::Updated && !self.reverse
     }
 }
 
-/// Order `rows` by `key`, with id as the tiebreak. `reverse` flips the key,
+/// Order `rows` by `key` (the local body's twin of the service's listing
+/// sort), with id as the tiebreak. `reverse` flips the key,
 /// not the tiebreak.
 pub(crate) fn sort_rows(rows: &mut [Row], key: MemorySort, reverse: bool) {
     rows.sort_by(|a, b| {
