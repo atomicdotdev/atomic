@@ -2903,6 +2903,56 @@ impl Repository {
         parent_interpretation_closure: &[Hash],
         supersede: &[Hash],
     ) -> Result<ImportWriteOutcome, RepositoryError> {
+        let mut write = self.apply_synthesized_change_in_txn(
+            &mut txn,
+            view_name,
+            hash,
+            v3_bytes,
+            final_change,
+            deleted_paths,
+            preserve_existing_tree_paths,
+            options,
+            assembly_excluded,
+            expectation,
+            git_commit_sha,
+            parent_interpretation_closure,
+            supersede,
+        )?;
+        let commit_start = std::time::Instant::now();
+        txn.commit()
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        let commit_disk_ms = commit_start.elapsed().as_millis();
+        write.timings.commit_ms += commit_disk_ms;
+        if std::env::var_os("ATOMIC_TRACE_GIT_IMPORT").is_some() {
+            eprintln!(
+                "[git-import] commit {}: commit_disk={}ms",
+                hash.to_base32(),
+                commit_disk_ms,
+            );
+        }
+        Ok(write)
+    }
+
+    /// Stage and verify one interpretation without committing. The caller owns
+    /// the ordered operation lock, prepared journal operation and transaction.
+    /// This is the same mutation path used by ordinary single-change synthesis.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn apply_synthesized_change_in_txn(
+        &self,
+        mut txn: &mut atomic_core::pristine::WriteTxn<'_>,
+        view_name: &str,
+        hash: &Hash,
+        v3_bytes: &[u8],
+        final_change: &Change,
+        deleted_paths: &[String],
+        preserve_existing_tree_paths: bool,
+        options: &crate::InsertOptions,
+        assembly_excluded: &[Hash],
+        expectation: &StagedExpectation,
+        git_commit_sha: Option<&str>,
+        parent_interpretation_closure: &[Hash],
+        supersede: &[Hash],
+    ) -> Result<ImportWriteOutcome, RepositoryError> {
         use crate::apply::write_change_to_graph;
         use atomic_core::apply::compute_new_state;
 
@@ -3122,16 +3172,13 @@ impl Repository {
         })?;
         let verify_done = commit_start.elapsed();
 
-        txn.commit()
-            .map_err(|e| RepositoryError::Database(e.to_string()))?;
         timings.commit_ms = commit_start.elapsed().as_millis();
         if std::env::var_os("ATOMIC_TRACE_GIT_IMPORT").is_some() {
             eprintln!(
-                "[git-import] write phases {}: projection={}ms verify={}ms commit_disk={}ms",
+                "[git-import] staged write phases {}: projection={}ms verify={}ms",
                 hash.to_base32(),
                 projection_done.as_millis(),
                 (verify_done - projection_done).as_millis(),
-                (commit_start.elapsed() - verify_done).as_millis(),
             );
         }
 
@@ -3286,7 +3333,7 @@ impl Repository {
     /// side of the comparison is the expectation captured from the commit's
     /// tree, the Atomic side is the freshly applied graph state.
     #[allow(clippy::too_many_arguments)]
-    fn verify_staged_projection(
+    pub(super) fn verify_staged_projection(
         &self,
         txn: &atomic_core::pristine::WriteTxn<'_>,
         view_name: &str,
@@ -5375,3 +5422,6 @@ impl Repository {
         Ok(Some(row_node))
     }
 }
+
+#[cfg(test)]
+mod streaming_sample;

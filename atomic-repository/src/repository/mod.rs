@@ -98,6 +98,10 @@ mod equivalence;
 mod file_index_v2;
 mod filter;
 mod git_observation;
+mod git_stream;
+pub use git_stream::{
+    GitGraphImportSession, GitStreamLimits, GitStreamOutcome, PreparedGitGraphChange,
+};
 mod ignore_mirror;
 mod locks;
 mod materialize;

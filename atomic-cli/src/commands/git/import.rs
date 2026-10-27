@@ -118,6 +118,13 @@ pub struct Import {
     #[arg(long = "with-crdt")]
     pub with_crdt: bool,
 
+    /// Experimental direct first-parent graph stream for a fresh repository.
+    /// Verifies the final tip, not every historical state. Unsupported input
+    /// refuses; it never falls back to ordinary recording. Uses 100-change,
+    /// 32-MiB private batches and preserves the normal finalization checks.
+    #[arg(long, conflicts_with_all = ["with_crdt", "incremental", "all_branches"])]
+    pub stream: bool,
+
     /// Internal shim imports align and checkpoint in their outer operation.
     #[arg(skip)]
     pub(crate) skip_checkpoint_refresh: bool,
@@ -262,6 +269,10 @@ impl Import {
         };
 
         let importer = ParallelImporter::new(git_repo, options);
+
+        if self.stream {
+            return importer.import_graph_stream_prevalidated(repo, plan);
+        }
 
         // Run the three-phase parallel import
         let stats = importer.import_prevalidated(branch_name, repo, plan)?;
@@ -845,6 +856,19 @@ impl Command for Import {
             });
         }
         let repo_exists = atomic_repository::has_database(&workdir.join(".atomic"));
+        if self.stream {
+            let selected = self.branch.as_deref().unwrap_or(&default_branch);
+            if workdir.join(".atomic").exists()
+                || self.with_crdt
+                || self.incremental
+                || self.all_branches
+                || detached_tip.is_some()
+                || self.reactive_budget.is_some()
+                || current_git_branch(&git_repo).as_deref() != Some(selected)
+            {
+                return Err(CliError::GitError { message: "--stream initially requires a fresh Atomic repository and the checked-out first-parent branch; eager CRDT, incremental, --all and internal reactive/detached imports are unsupported".into() });
+            }
+        }
         // CB-13D review R1: the metadata-only watch path never bootstraps a
         // repository — init, ignore templates, and vault setup are
         // command-boundary effects.
@@ -917,12 +941,22 @@ impl Command for Import {
                 validate_equivalence: false,
                 verify_touched_paths: false,
             };
-            let plan = ParallelImporter::new(&git_repo, options)
-                .validate_branch_prospectively_for_tip(
-                    branch_name,
-                    preopened_repo.as_ref(),
-                    detached_tip,
-                )?;
+            let importer = ParallelImporter::new(&git_repo, options);
+            if self.stream {
+                let tip = git_repo
+                    .find_branch(branch_name, git2::BranchType::Local)
+                    .ok()
+                    .and_then(|branch| branch.get().target())
+                    .ok_or_else(|| CliError::GitError {
+                        message: "missing direct-stream branch tip".into(),
+                    })?;
+                importer.validate_graph_stream_input(tip)?;
+            }
+            let plan = importer.validate_branch_prospectively_for_tip(
+                branch_name,
+                preopened_repo.as_ref(),
+                detached_tip,
+            )?;
             prospective_plans.insert(branch_name.clone(), (plan, imported_shas, known_states));
         }
         trace_git_import(format!("import preflight: {:?}", preflight_start.elapsed()));
@@ -1272,6 +1306,8 @@ impl Command for Import {
                 } else {
                     reindex_working_copy(&repo, working_copy);
                 }
+            } else if self.stream {
+                return Err(CliError::GitError { message: "Git checkout changed during --stream import; refusing filesystem materialization. Imported graph remains at the pinned tip; inspect before retrying.".into() });
             } else {
                 // Importing a non-checked-out branch must update disk from Atomic.
                 // CB-13D review R1: the metadata-only watch path never
@@ -1779,6 +1815,91 @@ mod tests {
         git_ok(root, &["symbolic-ref", "HEAD", "refs/heads/main"]);
         git_ok(root, &["config", "user.name", "Atomic Test"]);
         git_ok(root, &["config", "user.email", "atomic@example.com"]);
+    }
+
+    #[test]
+    #[serial]
+    fn stream_flag_routes_real_command_without_rewriting_git_files() {
+        let temp = tempfile::tempdir().unwrap();
+        init_git(temp.path());
+        fs::write(temp.path().join("tracked.txt"), b"first\n").unwrap();
+        git_ok(temp.path(), &["add", "."]);
+        git_ok(temp.path(), &["commit", "-qm", "first"]);
+        fs::write(temp.path().join("tracked.txt"), b"first\nsecond\n").unwrap();
+        git_ok(temp.path(), &["commit", "-qam", "second"]);
+        let before = fs::metadata(temp.path().join("tracked.txt"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        let _dir_guard = DirGuard::new();
+        std::env::set_current_dir(temp.path()).unwrap();
+        Import {
+            stream: true,
+            no_vault: true,
+            ..Default::default()
+        }
+        .run()
+        .unwrap();
+        assert_eq!(
+            fs::metadata(temp.path().join("tracked.txt"))
+                .unwrap()
+                .modified()
+                .unwrap(),
+            before
+        );
+        let repo = Repository::open(temp.path()).unwrap();
+        let mut foreign = 0;
+        for entry in repo.effective_history(Some("main")).unwrap() {
+            let change = repo.load_change(&entry.hash).unwrap();
+            if matches!(
+                change.origin(),
+                atomic_core::change::ChangeOrigin::GitSynthesized { .. }
+            ) {
+                foreign += 1;
+                assert!(
+                    change.file_ops().is_empty(),
+                    "the stream command used ordinary recorded FileOps"
+                );
+            }
+        }
+        assert_eq!(foreign, 2);
+        assert_eq!(
+            repo.get_file_content("tracked.txt").unwrap(),
+            Some(b"first\nsecond\n".to_vec())
+        );
+    }
+
+    #[test]
+    fn stream_flag_conflicts_are_explicit() {
+        assert!(
+            Import::try_parse_from(["import", "--stream", "--no-vault"])
+                .unwrap()
+                .stream
+        );
+        for incompatible in ["--with-crdt", "--incremental", "--all"] {
+            assert!(Import::try_parse_from(["import", "--stream", incompatible]).is_err());
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn unsupported_stream_path_rejects_before_atomic_or_git_exclude_writes() {
+        let temp = tempfile::tempdir().unwrap();
+        init_git(temp.path());
+        fs::write(temp.path().join("100%.txt"), b"literal\n").unwrap();
+        git_ok(temp.path(), &["add", "."]);
+        git_ok(temp.path(), &["commit", "-qm", "percent"]);
+        let exclude = temp.path().join(".git/info/exclude");
+        let before = fs::read(&exclude).unwrap();
+        assert_rejected_before_atomic_init(
+            temp.path(),
+            Import {
+                stream: true,
+                no_vault: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(fs::read(exclude).unwrap(), before);
     }
 
     fn assert_rejected_before_atomic_init(root: &Path, import: Import) {

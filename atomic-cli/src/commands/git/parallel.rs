@@ -367,6 +367,13 @@ pub(crate) fn staged_expectation_for(
     semantic_paths: &[String],
     touched: Option<&std::collections::BTreeSet<String>>,
 ) -> atomic_repository::StagedExpectation {
+    // Only the disposable real-history unit-test driver can defer content
+    // proof to its private import's final promotion. Shipping builds and
+    // ordinary shim imports retain their existing verification contract.
+    #[cfg(test)]
+    if real_import_sample::content_verification_deferred() {
+        return atomic_repository::StagedExpectation::empty();
+    }
     let mut entries = std::collections::BTreeMap::new();
     for entry in &prospective.manifest.entries {
         if entry.disposition != atomic_repository::ManifestDisposition::Included {
@@ -2172,6 +2179,7 @@ struct ImportLine {
     start: ChangePosition,
     end: ChangePosition,
     incoming_by: ContentHash,
+    incoming_from: Position<Option<ContentHash>>,
     content: Vec<u8>,
 }
 
@@ -2233,6 +2241,7 @@ impl ImportLineIndex {
                             start: contents.start,
                             end: contents.end,
                             incoming_by: change_hash,
+                            incoming_from: inode_pos,
                             content: change.contents
                                 [contents.start.as_usize()..contents.end.as_usize()]
                                 .to_vec(),
@@ -2269,6 +2278,14 @@ impl ImportLineIndex {
                             start: insertion.start,
                             end: insertion.end,
                             incoming_by: change_hash,
+                            incoming_from: stream_position(
+                                insertion
+                                    .predecessors
+                                    .first()
+                                    .copied()
+                                    .unwrap_or(indexed.inode_pos),
+                                change_hash,
+                            ),
                             content: change.contents
                                 [insertion.start.as_usize()..insertion.end.as_usize()]
                                 .to_vec(),
@@ -2362,13 +2379,25 @@ impl ImportLineIndex {
                 .lines
                 .iter()
                 .zip(old_lines)
-                .map(|(line, content)| {
+                .enumerate()
+                .map(|(index, (line, content))| {
                     imported_changes.insert(line.incoming_by);
                     ImportLine {
                         change: line.change,
                         start: line.start,
                         end: line.end,
                         incoming_by: line.incoming_by,
+                        incoming_from: if index == 0 {
+                            Position {
+                                change: Some(seed.inode_pos.change),
+                                pos: seed.inode_pos.pos,
+                            }
+                        } else {
+                            Position {
+                                change: Some(seed.lines[index - 1].change),
+                                pos: seed.lines[index - 1].end,
+                            }
+                        },
                         content,
                     }
                 })
@@ -2436,13 +2465,25 @@ impl ImportLineIndex {
             .lines
             .iter()
             .zip(line_contents)
-            .map(|(line, content)| {
+            .enumerate()
+            .map(|(index, (line, content))| {
                 imported_changes.insert(line.incoming_by);
                 ImportLine {
                     change: line.change,
                     start: line.start,
                     end: line.end,
                     incoming_by: line.incoming_by,
+                    incoming_from: if index == 0 {
+                        Position {
+                            change: Some(seed.inode_pos.change),
+                            pos: seed.inode_pos.pos,
+                        }
+                    } else {
+                        Position {
+                            change: Some(seed.lines[index - 1].change),
+                            pos: seed.lines[index - 1].end,
+                        }
+                    },
                     content,
                 }
             })
@@ -3354,12 +3395,9 @@ fn build_graph_first_change(
                             inode: indexed.inode_pos,
                         };
                         for line_idx in start_idx..end_idx {
-                            let from = if line_idx == 0 {
-                                indexed.inode_pos
-                            } else {
-                                indexed.lines[line_idx - 1].end_pos()
-                            };
                             let old_line = &indexed.lines[line_idx];
+                            let from = old_line.incoming_from;
+                            dependencies.extend(position_hashes(&from));
                             dependencies.insert(old_line.change);
                             dependencies.insert(old_line.incoming_by);
                             edge_update.edges.push(NewEdge {
@@ -3453,12 +3491,14 @@ fn build_graph_first_change(
                             });
                         }
 
+                        let successor_incoming_by_current =
+                            !new_ranges.is_empty() && successor.is_some();
                         pending_replacements.push(PendingLineReplacement {
                             start_idx,
                             old_len: replacement.old_len,
                             new_ranges,
                             new_lines: replacement.new_lines,
-                            successor_incoming_by_current: successor.is_some(),
+                            successor_incoming_by_current,
                         });
                     }
 
@@ -3478,17 +3518,15 @@ fn build_graph_first_change(
                     });
                     continue;
                 };
+                dependencies.extend(position_hashes(&indexed.inode_pos));
                 let mut edge_update = EdgeUpdate {
                     edges: Vec::with_capacity(indexed.lines.len()),
                     inode: indexed.inode_pos,
                 };
                 for line_idx in 0..indexed.lines.len() {
-                    let from = if line_idx == 0 {
-                        indexed.inode_pos
-                    } else {
-                        indexed.lines[line_idx - 1].end_pos()
-                    };
                     let old_line = &indexed.lines[line_idx];
+                    let from = old_line.incoming_from;
+                    dependencies.extend(position_hashes(&from));
                     dependencies.insert(old_line.change);
                     dependencies.insert(old_line.incoming_by);
                     edge_update.edges.push(NewEdge {
@@ -3499,15 +3537,11 @@ fn build_graph_first_change(
                         introduced_by: Some(old_line.incoming_by),
                     });
                 }
-                hunks.push(GraphOp::Edit {
-                    change: Atom::EdgeUpdate(edge_update),
-                    local: Local::new(&file.path, 1),
-                    encoding: file
-                        .old_content
-                        .as_deref()
-                        .map(Encoding::detect)
-                        .filter(|enc| *enc != Encoding::Binary)
-                        .or(Some(Encoding::Utf8)),
+                hunks.push(GraphOp::FileDel {
+                    del: edge_update,
+                    contents: None,
+                    path: file.path.clone(),
+                    encoding: file.old_content.as_deref().map(Encoding::detect),
                 });
                 pending.push(PendingLineIndexUpdate::Delete {
                     path: file.path.clone(),
@@ -3530,6 +3564,7 @@ fn build_graph_first_change(
             skips.push(GraphFirstSkip::new(file, "modified_missing_line_index"));
             continue;
         };
+        dependencies.extend(position_hashes(&indexed.inode_pos));
         let Some(new_content) = file.new_content.as_deref() else {
             skips.push(GraphFirstSkip::new(file, "modified_missing_new_content"));
             continue;
@@ -3547,7 +3582,7 @@ fn build_graph_first_change(
                         vec![new_content.to_vec()]
                     },
                 }]
-            } else if parsed.is_merge {
+            } else if parsed.is_merge || graph_only {
                 current_state_replacements(indexed, new_content)
             } else {
                 let Some(diff_lines) = file.diff_lines.as_ref() else {
@@ -3584,12 +3619,7 @@ fn build_graph_first_change(
             }
         }
 
-        let encoding = file
-            .new_content
-            .as_deref()
-            .map(Encoding::detect)
-            .filter(|enc| *enc != Encoding::Binary)
-            .or(Some(Encoding::Utf8));
+        let encoding = file.new_content.as_deref().map(Encoding::detect);
 
         let mut pending_replacements = Vec::new();
 
@@ -3633,12 +3663,9 @@ fn build_graph_first_change(
             };
 
             for line_idx in start_idx..end_idx {
-                let from = if line_idx == 0 {
-                    indexed.inode_pos
-                } else {
-                    indexed.lines[line_idx - 1].end_pos()
-                };
                 let old_line = &indexed.lines[line_idx];
+                let from = old_line.incoming_from;
+                dependencies.extend(position_hashes(&from));
                 dependencies.insert(old_line.change);
                 dependencies.insert(old_line.incoming_by);
                 edge_update.edges.push(NewEdge {
@@ -3729,12 +3756,13 @@ fn build_graph_first_change(
                 });
             }
 
+            let successor_incoming_by_current = !new_ranges.is_empty() && successor.is_some();
             pending_replacements.push(PendingLineReplacement {
                 start_idx,
                 old_len: replacement.old_len,
                 new_ranges,
                 new_lines: replacement.new_lines,
-                successor_incoming_by_current: successor.is_some(),
+                successor_incoming_by_current,
             });
         }
 
@@ -3943,6 +3971,16 @@ fn parse_git_diff_replacements(lines: &[GitDiffLine]) -> Option<Vec<GitReplaceme
     Some(blocks)
 }
 
+fn stream_position(
+    mut position: Position<Option<ContentHash>>,
+    hash: ContentHash,
+) -> Position<Option<ContentHash>> {
+    if position.change.is_none() {
+        position.change = Some(hash);
+    }
+    position
+}
+
 fn apply_line_index_updates(
     line_index: &mut ImportLineIndex,
     change_hash: ContentHash,
@@ -3972,11 +4010,20 @@ fn apply_line_index_updates(
                 let lines = new_ranges
                     .iter()
                     .zip(new_lines)
-                    .map(|(&(start, end), content)| ImportLine {
+                    .enumerate()
+                    .map(|(index, (&(start, end), content))| ImportLine {
                         change: change_hash,
                         start,
                         end,
                         incoming_by: change_hash,
+                        incoming_from: if index == 0 {
+                            inode_pos
+                        } else {
+                            Position {
+                                change: Some(change_hash),
+                                pos: new_ranges[index - 1].1,
+                            }
+                        },
                         content,
                     })
                     .collect();
@@ -4003,15 +4050,29 @@ fn apply_line_index_updates(
                     let adjusted_end = adjusted_start
                         .saturating_add(replacement.old_len)
                         .min(indexed.lines.len());
+                    let predecessor = if adjusted_start == 0 {
+                        indexed.inode_pos
+                    } else {
+                        indexed.lines[adjusted_start - 1].end_pos()
+                    };
                     let new_lines: Vec<ImportLine> = replacement
                         .new_ranges
                         .iter()
                         .zip(replacement.new_lines)
-                        .map(|(&(start, end), content)| ImportLine {
+                        .enumerate()
+                        .map(|(index, (&(start, end), content))| ImportLine {
                             change: change_hash,
                             start,
                             end,
                             incoming_by: change_hash,
+                            incoming_from: if index == 0 {
+                                predecessor
+                            } else {
+                                Position {
+                                    change: Some(change_hash),
+                                    pos: replacement.new_ranges[index - 1].1,
+                                }
+                            },
                             content,
                         })
                         .collect();
@@ -4021,8 +4082,15 @@ fn apply_line_index_updates(
 
                     if replacement.successor_incoming_by_current {
                         let successor_idx = adjusted_start + replacement.new_ranges.len();
+                        let from = indexed
+                            .lines
+                            .get(successor_idx - 1)
+                            .map(ImportLine::end_pos);
                         if let Some(successor) = indexed.lines.get_mut(successor_idx) {
                             successor.incoming_by = change_hash;
+                            if let Some(from) = from {
+                                successor.incoming_from = from;
+                            }
                         }
                     }
 
@@ -5550,6 +5618,8 @@ impl ParallelImporter {
         boundaries: &[&'static str],
         touched_only: bool,
     ) -> CliResult<ImportedCommitInfo> {
+        #[cfg(test)]
+        stream::assert_ordinary_recorder_allowed();
         // CB-9B F1-adjacent sibling import: a Git commit already interpreted
         // locally (same full SHA) has exactly one Atomic change. Re-synthesizing
         // it in a second branch view allocates a second incarnation with new
@@ -8443,6 +8513,16 @@ fn parse_commit(
     _index: usize,
     oid_to_index: &std::collections::HashMap<Oid, usize>,
 ) -> CliResult<ParsedCommit> {
+    parse_commit_with_scope(git_repo, oid, _index, oid_to_index, true)
+}
+
+fn parse_commit_with_scope(
+    git_repo: &GitRepository,
+    oid: Oid,
+    _index: usize,
+    oid_to_index: &std::collections::HashMap<Oid, usize>,
+    include_merge_union: bool,
+) -> CliResult<ParsedCommit> {
     let parse_start = Instant::now();
     let commit = git_repo.find_commit(oid).map_err(|e| CliError::GitError {
         message: format!("Failed to find commit {}: {}", oid, e),
@@ -8574,7 +8654,7 @@ fn parse_commit(
     // per-parent diffs. Keep the first-parent operation for shared paths:
     // all deltas describe the same target bytes, but replacing a Rename with
     // a side-parent Modify loses its old path and retains a stale name.
-    if is_merge {
+    if is_merge && include_merge_union {
         trace_git_import(format!(
             "parse-union {} candidate_paths={}",
             short_sha,
@@ -9178,13 +9258,9 @@ fn parse_diff_files_via_git_cli(
     tree: &Tree<'_>,
     parent_tree: &Tree<'_>,
 ) -> CliResult<Vec<ParsedFile>> {
-    let repo_root = git_repo.path().parent().ok_or_else(|| CliError::GitError {
-        message: "Failed to locate git repository root".to_string(),
-    })?;
-
     let output = Command::new("git")
-        .arg("-C")
-        .arg(repo_root)
+        .arg("--git-dir")
+        .arg(git_repo.path())
         .arg("diff-tree")
         .arg("-r")
         .arg("--name-status")
@@ -9546,6 +9622,13 @@ fn parse_commit_message(message: &str) -> (String, Option<String>) {
 #[cfg(test)]
 #[path = "parallel_import_regression_tests.rs"]
 mod import_regression_tests;
+
+#[cfg(test)]
+#[path = "real_import_sample.rs"]
+mod real_import_sample;
+
+#[path = "stream.rs"]
+mod stream;
 
 #[cfg(test)]
 mod tests {
