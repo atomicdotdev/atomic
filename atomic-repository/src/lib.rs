@@ -130,6 +130,8 @@ pub mod ai;
 
 // Content search powered by syntext
 pub mod content_search;
+#[cfg(any(test, feature = "query-test-instrumentation"))]
+pub mod query_diagnostics;
 
 // OCI image layout production (sandbox stage/seal)
 pub mod oci;

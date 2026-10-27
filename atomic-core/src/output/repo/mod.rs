@@ -119,8 +119,9 @@ pub use content::{
 };
 pub use error::{OutputError, OutputResult};
 pub use file::{
-    output_file, output_file_to_buffer, output_file_to_buffer_with_options, FileOutputError,
-    FileOutputOptions, FileOutputResult,
+    output_file, output_file_to_buffer, output_file_to_buffer_bounded,
+    output_file_to_buffer_with_options, BoundedFileOutput, FileOutputError, FileOutputOptions,
+    FileOutputResult,
 };
 pub use names::{live_inode_names, live_inode_names_with_claims};
 pub use options::OutputOptions;

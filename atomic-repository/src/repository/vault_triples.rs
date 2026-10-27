@@ -296,26 +296,20 @@ impl Repository {
         query: &str,
         limit: usize,
         pool: Option<usize>,
-        scope: Option<&super::query::QueryView>,
+        scope: Option<&super::query::QueryView<'_>>,
         kind: Option<&str>,
     ) -> Result<Vec<KgNode>, RepositoryError> {
         let kind = kind.filter(|kind| !kind.is_empty());
-        let txn = self.pristine.read_txn()?;
+        let unscoped_txn;
+        let txn = if let Some(scope) = scope {
+            &scope.txn
+        } else {
+            unscoped_txn = self.pristine.read_txn()?;
+            &unscoped_txn
+        };
         let mut rows = BTreeMap::new();
         let mut content = HashMap::<String, usize>::new();
-        if let Some(scope) = scope {
-            if let Ok(result) = scope.search_content(
-                query,
-                crate::content_search::ContentSearchOptions {
-                    max_results: Some(2000),
-                    ..Default::default()
-                },
-            ) {
-                for result in result.matches {
-                    *content.entry(result.path).or_default() += 1;
-                }
-            }
-        } else if crate::content_search::has_content_index(self.root()) {
+        if scope.is_none() && crate::content_search::has_content_index(self.root()) {
             if let Ok(result) = crate::content_search::search_content(
                 self.root(),
                 query,
@@ -332,7 +326,7 @@ impl Repository {
         for (id, _) in txn.kg_fts_match_ids(query)? {
             if let Some(node) = txn.get_kg_node(&id)? {
                 let node = if let Some(scope) = scope {
-                    let Some(node) = scope.project_node(&txn, node)? else {
+                    let Some(node) = scope.project_node(txn, node)? else {
                         continue;
                     };
                     node
@@ -351,6 +345,30 @@ impl Repository {
                 let hits = fts_hits(node, query);
                 if hits > 0 {
                     rows.insert(node.id.clone(), (node.clone(), hits));
+                }
+            }
+            // File promotion always needs the original global 2,000-match
+            // window. Other types need it only when a surviving candidate has
+            // a source path that can receive content scoring. Do not suppress
+            // such scores on multi-typed/path-bearing non-File nodes.
+            let needs_content = kind.is_none_or(|kind| kind == Class::File.iri())
+                || rows.values().any(|(node, _)| {
+                    kind.is_none_or(|kind| node.types.iter().any(|ty| ty == kind))
+                        && node.path().is_some_and(|path| scope.contains_file(path))
+                });
+            if needs_content {
+                // KG keyword search historically ignores invalid regex patterns,
+                // but actual selected-source failures must still propagate.
+                if let Ok(plan) = scope.content_plan(
+                    query,
+                    crate::content_search::ContentSearchOptions {
+                        max_results: Some(2000),
+                        ..Default::default()
+                    },
+                ) {
+                    for result in scope.search_content_plan(plan)?.matches {
+                        *content.entry(result.path).or_default() += 1;
+                    }
                 }
             }
         }

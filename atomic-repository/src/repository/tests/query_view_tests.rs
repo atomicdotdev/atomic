@@ -1,8 +1,385 @@
 use super::*;
-use crate::{ContentSearchOptions, RecordOptions};
+use crate::{ContentSearchOptions, CrossViewInsertOptions, RecordOptions};
 use atomic_core::kg::{iri, ontology::Class};
 use atomic_core::pristine::vault::KgNode;
 use atomic_core::pristine::{KgMutTxnT, ViewTxnT};
+
+#[test]
+fn narrow_query_retrieves_only_selected_bytes_and_retains_only_display_limit() {
+    let (temp, repo) = create_temp_repo();
+    for (path, content) in [
+        ("src/selected.rs", "needle\n".repeat(100)),
+        ("src/other.rs", "needle\n".repeat(100)),
+        ("src-other/other.rs", "needle\n".repeat(100)),
+        ("src/notes.md", "needle\n".repeat(100)),
+    ] {
+        let full = temp.path().join(path);
+        std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+        std::fs::write(full, content).unwrap();
+        repo.add(path, TrackingOptions::default()).unwrap();
+    }
+    record(&repo, "record selective query fixture");
+    let (result, resources) = crate::query_diagnostics::measure(|| {
+        repo.search_content_paths_on_view(
+            "dev",
+            "needle",
+            ContentSearchOptions {
+                max_results: Some(1),
+                ..Default::default()
+            },
+            &["src/selected.rs".into()],
+        )
+        .unwrap()
+    });
+    assert_eq!(result.total_matches, 100);
+    assert_eq!(result.matches.len(), 1);
+    assert_eq!(resources.files_retrieved, 1, "{resources:?}");
+    assert!(resources.displayed_records_high_water <= 1, "{resources:?}");
+
+    let (scope, resources) = crate::query_diagnostics::measure(|| repo.query_view("dev").unwrap());
+    assert_eq!(
+        resources.files_retrieved, 0,
+        "metadata projection must be lazy"
+    );
+    assert_eq!(scope.nodes().len(), 4);
+    drop(scope);
+    for (paths, glob, kind, exclude, expected) in [
+        (vec!["src/"], None, None, None, 3),
+        (
+            vec!["src", "src/", "src/selected.rs"],
+            Some("**/*.rs"),
+            Some("rs"),
+            None,
+            2,
+        ),
+        (vec!["src"], None, None, Some("rs"), 1),
+        (vec!["src/selected.rs"], Some("**/*.md"), None, None, 0),
+        (vec!["src/selected"], None, None, None, 0),
+        (vec!["missing"], None, None, None, 0),
+        (vec!["."], None, None, None, 0),
+        (vec!["/src"], None, None, None, 0),
+        (vec!["../src"], None, None, None, 0),
+    ] {
+        let (result, resources) = crate::query_diagnostics::measure(|| {
+            repo.search_content_paths_on_view(
+                "dev",
+                "needle",
+                ContentSearchOptions {
+                    path_filter: glob.map(str::to_owned),
+                    file_type: kind.map(str::to_owned),
+                    exclude_type: exclude.map(str::to_owned),
+                    max_results: Some(0),
+                    ..Default::default()
+                },
+                &paths
+                    .iter()
+                    .map(|path| (*path).to_owned())
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap()
+        });
+        assert_eq!(result.total_matches, expected * 100, "paths={paths:?}");
+        assert_eq!(resources.files_retrieved, expected, "paths={paths:?}");
+        assert_eq!(resources.displayed_records_high_water, 0);
+    }
+    std::fs::write(temp.path().join(".atomicignore"), "src/selected.rs\n").unwrap();
+    let (result, resources) = crate::query_diagnostics::measure(|| {
+        repo.search_content_paths_on_view(
+            "dev",
+            "needle",
+            ContentSearchOptions::default(),
+            &["src/selected.rs".into()],
+        )
+        .unwrap()
+    });
+    assert_eq!(
+        result.total_matches, 0,
+        "existing ambient ignore behavior is intentional"
+    );
+    assert_eq!(resources.files_retrieved, 0);
+}
+
+#[test]
+fn selected_content_errors_propagate_but_excluded_content_is_not_read() {
+    let (temp, repo) = create_temp_repo();
+    std::fs::write(temp.path().join("good.rs"), "needle\n").unwrap();
+    repo.add("good.rs", TrackingOptions::default()).unwrap();
+    record(&repo, "good source");
+    std::fs::write(temp.path().join("bad.rs"), "other\n").unwrap();
+    repo.add("bad.rs", TrackingOptions::default()).unwrap();
+    let bad = record(&repo, "bad source");
+    // Reopen to eliminate cached payloads before corrupting a disposable store.
+    drop(repo);
+    let repo = Repository::open(temp.path()).unwrap();
+    std::fs::write(
+        repo.change_store().change_path(&bad),
+        b"invalid stored payload",
+    )
+    .unwrap();
+    let selected = |path: &str, pattern: &str, limit| {
+        repo.search_content_paths_on_view(
+            "dev",
+            pattern,
+            ContentSearchOptions {
+                max_results: Some(limit),
+                ..Default::default()
+            },
+            &[path.into()],
+        )
+    };
+    assert_eq!(selected("good.rs", "needle", 1).unwrap().total_matches, 1);
+    assert!(selected("bad.rs", "other", 1).is_err());
+    assert!(selected("bad.rs", "other", 0).is_err());
+    assert!(selected("missing", "[", 0).is_err());
+    assert!(repo
+        .vault_kg_search_on_view("dev", "other", 10, None)
+        .is_err());
+}
+
+#[test]
+fn recorded_query_plan_keeps_one_snapshot_across_later_records() {
+    let (temp, repo) = create_temp_repo();
+    std::fs::write(temp.path().join("source.rs"), "before_marker\n").unwrap();
+    repo.add("source.rs", TrackingOptions::default()).unwrap();
+    record(&repo, "before snapshot");
+    let scope = repo.query_view("dev").unwrap();
+    std::fs::write(temp.path().join("source.rs"), "after_marker\n").unwrap();
+    record(&repo, "after snapshot");
+    let old = scope
+        .search_content(
+            "before_marker|after_marker",
+            ContentSearchOptions::default(),
+        )
+        .unwrap();
+    assert_eq!(old.matches[0].line_content, "before_marker");
+    let new = repo
+        .search_content_on_view(
+            "dev",
+            "before_marker|after_marker",
+            ContentSearchOptions::default(),
+        )
+        .unwrap();
+    assert_eq!(new.matches[0].line_content, "after_marker");
+}
+
+#[test]
+fn bounded_retrieval_matches_full_rendering_for_linear_and_deleted_graphs() {
+    use super::super::content::{retrieve_content_bounded, BoundedContent};
+    let (temp, mut repo) = create_temp_repo();
+    std::fs::write(temp.path().join("source.rs"), "first\nsecond\nthird\n").unwrap();
+    repo.add("source.rs", TrackingOptions::default()).unwrap();
+    record(&repo, "linear source");
+    for revision in ["first\nsecond\nthird\n", "first\nthird\n"] {
+        if revision == "first\nthird\n" {
+            std::fs::write(temp.path().join("source.rs"), revision).unwrap();
+            record(&repo, "delete middle line");
+        }
+        let txn = repo.pristine().read_txn().unwrap();
+        let inode = txn.get_inode("source.rs").unwrap().unwrap();
+        let position = txn.inode_position(inode).unwrap().unwrap();
+        let view = txn.get_view("dev").unwrap().unwrap();
+        let visibility = graph_visibility_closure(&txn, &view).unwrap();
+        let options =
+            atomic_core::output::alive::RetrieveOptions::new().with_graph_visibility(visibility);
+        let (full, _, had_fork) = atomic_core::output::repo::output_file_to_buffer_with_options(
+            &txn,
+            repo.change_store(),
+            position,
+            Default::default(),
+            options.clone(),
+        )
+        .unwrap();
+        assert_eq!(full, revision.as_bytes());
+        for cap in [0, 1, full.len() - 1, full.len(), full.len() + 1] {
+            let bounded = atomic_core::output::repo::output_file_to_buffer_bounded(
+                &txn,
+                repo.change_store(),
+                position,
+                options.clone(),
+                cap,
+            )
+            .unwrap();
+            assert_eq!(bounded.had_fork_structure, had_fork);
+            assert!(bounded.buffer_high_water <= cap);
+            assert_eq!(
+                bounded.content.as_deref(),
+                (cap >= full.len()).then_some(full.as_slice())
+            );
+            match retrieve_content_bounded(
+                &txn,
+                repo.change_store(),
+                inode,
+                position,
+                options.clone(),
+                cap,
+            )
+            .unwrap()
+            {
+                BoundedContent::Complete(bytes) => assert_eq!(bytes, full),
+                BoundedContent::Oversized { retained_bytes } => {
+                    assert!(cap < full.len());
+                    assert!(retained_bytes <= cap);
+                }
+            }
+        }
+    }
+    repo.create_view_from("bounded-side", "dev").unwrap();
+    repo.switch_view("bounded-side").unwrap();
+    std::fs::write(temp.path().join("source.rs"), "first\nside\nthird\n").unwrap();
+    record(&repo, "side insertion");
+    repo.switch_view("dev").unwrap();
+    std::fs::write(temp.path().join("source.rs"), "first\nmain\nthird\n").unwrap();
+    record(&repo, "main insertion");
+    repo.insert_from_view(CrossViewInsertOptions::new("bounded-side", "dev"))
+        .unwrap();
+    let txn = repo.pristine().read_txn().unwrap();
+    let inode = txn.get_inode("source.rs").unwrap().unwrap();
+    let position = txn.inode_position(inode).unwrap().unwrap();
+    let view = txn.get_view("dev").unwrap().unwrap();
+    let options = atomic_core::output::alive::RetrieveOptions::new()
+        .with_graph_visibility(graph_visibility_closure(&txn, &view).unwrap());
+    let (full, _, had_fork) = atomic_core::output::repo::output_file_to_buffer_with_options(
+        &txn,
+        repo.change_store(),
+        position,
+        Default::default(),
+        options.clone(),
+    )
+    .unwrap();
+    assert!(had_fork, "fixture must exercise semantic fork resolution");
+    for cap in [0, full.len() - 1, full.len(), full.len() + 1] {
+        let bounded = atomic_core::output::repo::output_file_to_buffer_bounded(
+            &txn,
+            repo.change_store(),
+            position,
+            options.clone(),
+            cap,
+        )
+        .unwrap();
+        assert_eq!(bounded.had_fork_structure, had_fork);
+        assert_eq!(
+            bounded.content.as_deref(),
+            (cap >= full.len()).then_some(full.as_slice())
+        );
+        match retrieve_content_bounded(
+            &txn,
+            repo.change_store(),
+            inode,
+            position,
+            options.clone(),
+            cap,
+        )
+        .unwrap()
+        {
+            BoundedContent::Complete(bytes) => assert_eq!(bytes, full),
+            BoundedContent::Oversized { retained_bytes } => {
+                assert!(cap < full.len());
+                assert!(retained_bytes <= cap);
+            }
+        }
+    }
+}
+
+#[test]
+fn kg_content_window_and_nonfile_path_scoring_are_preserved() {
+    let (temp, repo) = create_temp_repo();
+    for (path, lines) in [("src/a.rs", 1999), ("src/z.rs", 2), ("tests/a.rs", 10)] {
+        let full = temp.path().join(path);
+        std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+        std::fs::write(full, "windowmarker\n".repeat(lines)).unwrap();
+        repo.add(path, TrackingOptions::default()).unwrap();
+    }
+    record(&repo, "promotion window fixture");
+    let project = repo.project_id().unwrap();
+    let memory_id = iri::mint_memory(&project, "pathless");
+    let path_id = iri::mint_goal(&project, "withpath");
+    let mut txn = repo.pristine().write_txn().unwrap();
+    txn.upsert_kg_node(&KgNode::new(
+        &memory_id,
+        Class::Memory,
+        "windowmarker",
+        "vault",
+    ))
+    .unwrap();
+    txn.upsert_kg_node(
+        &KgNode::new(&path_id, Class::Goal, "windowmarker", "vault")
+            .with_type(Class::Memory)
+            .with_metadata(serde_json::json!({"path": "src/z.rs"})),
+    )
+    .unwrap();
+    txn.commit().unwrap();
+    let nodes = repo
+        .vault_kg_search_on_view("dev", "windowmarker", 20, None)
+        .unwrap();
+    assert_eq!(
+        nodes
+            .iter()
+            .find(|node| node.id == iri::mint_file(&project, "src/a.rs"))
+            .unwrap()
+            .metadata
+            .as_ref()
+            .unwrap()["content_matches"],
+        1999
+    );
+    assert_eq!(
+        nodes
+            .iter()
+            .find(|node| node.id == iri::mint_file(&project, "src/z.rs"))
+            .unwrap()
+            .metadata
+            .as_ref()
+            .unwrap()["content_matches"],
+        1
+    );
+    assert!(!nodes
+        .iter()
+        .any(|node| node.id == iri::mint_file(&project, "tests/a.rs")));
+    let filtered = repo
+        .vault_kg_search_on_view_with_kind(
+            "dev",
+            "windowmarker",
+            20,
+            None,
+            Some(Class::Memory.iri()),
+        )
+        .unwrap();
+    assert_eq!(filtered[0].id, path_id);
+    assert_eq!(filtered[0].metadata.as_ref().unwrap()["content_matches"], 1);
+    let (nodes, resources) = crate::query_diagnostics::measure(|| {
+        repo.vault_kg_search_on_view_with_kind(
+            "dev",
+            "windowmarker",
+            20,
+            None,
+            Some(Class::View.iri()),
+        )
+        .unwrap()
+    });
+    assert!(nodes.is_empty());
+    assert_eq!(resources.files_retrieved, 0);
+    // A genuinely vault-only match cannot receive a content score.
+    let mut txn = repo.pristine().write_txn().unwrap();
+    txn.upsert_kg_node(&KgNode::new(
+        &memory_id,
+        Class::Memory,
+        "vaultonlymarker",
+        "vault",
+    ))
+    .unwrap();
+    txn.commit().unwrap();
+    let (nodes, resources) = crate::query_diagnostics::measure(|| {
+        repo.vault_kg_search_on_view_with_kind(
+            "dev",
+            "vaultonlymarker",
+            1,
+            Some(1),
+            Some(Class::Memory.iri()),
+        )
+        .unwrap()
+    });
+    assert_eq!(nodes[0].id, memory_id);
+    assert_eq!(resources.files_retrieved, 0);
+}
 
 fn record(repo: &TestRepository, message: &str) -> Hash {
     let author = if message == "sibling_history_marker" {
@@ -277,6 +654,16 @@ fn invalid_dependency_closure_fails_closed_for_every_query() {
             .unwrap_err(),
         repo.search_content_on_view("feature", "sibling", ContentSearchOptions::default())
             .unwrap_err(),
+        repo.search_content_paths_on_view(
+            "feature",
+            "sibling",
+            ContentSearchOptions {
+                max_results: Some(0),
+                ..Default::default()
+            },
+            &["missing/file.rs".into()],
+        )
+        .unwrap_err(),
         repo.query_callers_on_view("feature", "src/lib.rs#target")
             .unwrap_err(),
         repo.vault_kg_search_on_view_with_kind(

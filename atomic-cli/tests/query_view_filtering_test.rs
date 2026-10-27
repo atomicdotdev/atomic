@@ -143,6 +143,76 @@ fn query_verbs_render_filtered_json_and_human_output_over_the_service() {
 }
 
 #[test]
+fn code_keeps_exact_totals_and_late_source_ranking_at_small_limits() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let repo = Repository::init(dir.path()).unwrap();
+    let wc = repo.require_working_copy_id().unwrap();
+    for (path, content) in [
+        ("docs/a.md", "needle\n".repeat(2500)),
+        ("src/z.rs", "prefix needle\r\nneedle\n".into()),
+    ] {
+        let full = dir.path().join(path);
+        std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+        std::fs::write(full, content).unwrap();
+        repo.add(wc, path, TrackingOptions::default()).unwrap();
+    }
+    record(&repo, "late ranked source fixture");
+    let expected = repo
+        .search_content_on_view(
+            "dev",
+            "needle",
+            atomic_repository::ContentSearchOptions {
+                max_results: Some(1),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    drop(repo);
+    let result = json(
+        dir.path(),
+        home.path(),
+        &["query", "code", "needle", "-n", "1", "--json"],
+    );
+    assert_eq!(result, serde_json::to_value(expected).unwrap());
+    assert_eq!(result["matches"][0]["path"], "src/z.rs");
+    assert_eq!(result["total_matches"], 2502);
+    let result = json(
+        dir.path(),
+        home.path(),
+        &["query", "code", "needle", "-n", "0", "--json"],
+    );
+    assert_eq!(result["matches"], serde_json::json!([]));
+    assert_eq!(result["total_matches"], 2502);
+    let narrow = json(
+        dir.path(),
+        home.path(),
+        &[
+            "query", "code", "needle", "-g", "src/", "-t", "rs", "-n", "1", "--json",
+        ],
+    );
+    assert_eq!(narrow["total_matches"], 2);
+    assert_eq!(narrow["matches"][0]["byte_offset"], 7);
+    let invalid = run(
+        dir.path(),
+        home.path(),
+        &["query", "code", "[", "-g", "missing/", "-n", "0"],
+    );
+    assert!(!invalid.status.success());
+    let human = run(
+        dir.path(),
+        home.path(),
+        &["query", "code", "needle", "-n", "1"],
+    );
+    assert!(human.status.success());
+    assert!(String::from_utf8_lossy(&human.stdout).contains("src/z.rs:1: prefix needle"));
+    assert!(!dir
+        .path()
+        .join(".atomic/content-index/manifest.json")
+        .exists());
+}
+
+#[test]
 fn search_kind_with_tiny_pool_returns_the_matching_memory_over_the_service() {
     let dir = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();

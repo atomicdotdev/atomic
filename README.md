@@ -379,7 +379,20 @@ use request-scoped tree-sitter parsing, not persisted KG code edges. This
 correctness-first path renders/scans the selected view per query. RPC clients can
 select a view explicitly; omitting it uses the working copy's registered desired
 view. Other query verbs retain their existing scope semantics. The separate
-working-copy content index is still available to its existing consumers.
+working-copy content index is still available to its existing consumers. Existing
+ambient ignore rules still suppress ignored paths, including recorded files; that
+policy is intentional and unchanged.
+
+Recorded code search applies path/type filters **before reading file contents**,
+then scans eligible files one at a time. It keeps at most the requested number of
+best matches while still counting every match and directory facet—even with a
+zero display limit. Facet-count ties sort by directory path. Rendered files over
+10 MiB are skipped, not searched as truncated files. Closure, path-claim, and inode
+attribute validation still precede request filtering: invalid global metadata
+fails closed, while content-only errors in excluded files are deliberately unread.
+Selected-file content errors still propagate. No persistent cache or reindex is
+required. See [query resource diagnostics](docs/query-view-performance.md) for
+memory bounds, costs excluded from those bounds, and a reproducible benchmark.
 
 For `query search`, `--kind` matches an exact, case-sensitive absolute class IRI
 against **any asserted type**, before candidate-pool truncation. An omitted or

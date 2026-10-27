@@ -179,7 +179,7 @@ where
 ///
 /// Results are ranked: source files (`src/`, `lib/`, `pkg/`, `internal/`)
 /// are prioritized over config, test, build, and generated files. Within
-/// each tier, results preserve filesystem order from the index.
+/// each tier, results follow path order and preserve the verifier's within-file order.
 ///
 /// The returned [`ContentSearchResult`] includes both the ranked matches
 /// (capped to `max_results`) and the `total_matches` count so callers
@@ -228,9 +228,133 @@ pub fn search_content(
     Ok(rank_content_matches(raw_matches, display_limit))
 }
 
+/// Recorded-query byte and regex-automaton cutoff (10 MiB).
+pub(crate) const RECORDED_CONTENT_LIMIT: usize = 10 * 1024 * 1024;
+
+/// An immutable path/filter plan and bounded collector for recorded content.
+/// Paths are scanned in result order (tier, then canonical path), so retaining
+/// the first N records is equivalent to the exhaustive stable tier sort.
+pub(crate) struct RecordedContentSearch {
+    re: regex::bytes::Regex,
+    paths: Vec<String>,
+    display_limit: usize,
+}
+
+impl RecordedContentSearch {
+    pub(crate) fn new<'path>(
+        paths: impl IntoIterator<Item = &'path str>,
+        pattern: &str,
+        opts: ContentSearchOptions,
+    ) -> Result<Self, ContentSearchError> {
+        // Compile even for empty scopes and zero display limits.
+        let re = regex::bytes::RegexBuilder::new(pattern)
+            .case_insensitive(opts.case_insensitive)
+            .size_limit(RECORDED_CONTENT_LIMIT)
+            .dfa_size_limit(RECORDED_CONTENT_LIMIT)
+            .build()
+            .map_err(|error| ContentSearchError::InvalidPattern(error.to_string()))?;
+        let mut paths: Vec<_> = paths.into_iter().map(std::path::PathBuf::from).collect();
+        paths.sort();
+        let index = syntext::path::PathIndex::build(&paths);
+        let filter = syntext::path::filter::build_filter(
+            &index,
+            opts.file_type.as_deref(),
+            opts.exclude_type.as_deref(),
+            opts.path_filter.as_deref(),
+        );
+        let mut paths: Vec<_> = paths
+            .into_iter()
+            .enumerate()
+            .filter(|(id, _)| {
+                filter
+                    .as_ref()
+                    .is_none_or(|filter| filter.file_ids.contains(*id as u32))
+            })
+            .map(|(_, path)| path.to_string_lossy().into_owned())
+            .collect();
+        paths.sort_by(|a, b| recorded_path_order(a, b));
+        Ok(Self {
+            re,
+            paths,
+            display_limit: opts.max_results.unwrap_or(50),
+        })
+    }
+
+    pub(crate) fn run<E>(
+        self,
+        mut retrieve: impl FnMut(&str) -> Result<Option<Vec<u8>>, E>,
+    ) -> Result<ContentSearchResult, E> {
+        let mut matches = Vec::new();
+        let mut total_matches = 0;
+        let mut directories = std::collections::BTreeMap::<String, usize>::new();
+        for path in self.paths {
+            let Some(content) = retrieve(&path)? else {
+                continue;
+            };
+            if content.len() > RECORDED_CONTENT_LIMIT || syntext::index::is_binary(&content) {
+                continue;
+            }
+            let mut line_start = 0;
+            let mut file_count = 0;
+            // This borrowed-line adapter implements syntext 1.4's verifier
+            // contract: first match per line, CR stripped only before LF, no
+            // artificial trailing empty line, and file-level binary detection.
+            // Differential tests below keep it pinned to verify_regex, including
+            // NULs beyond the first 8192 bytes. No dependency fork is required.
+            for (index, raw_line) in content.split_inclusive(|byte| *byte == b'\n').enumerate() {
+                let line = raw_line
+                    .strip_suffix(b"\n")
+                    .map(|line| line.strip_suffix(b"\r").unwrap_or(line))
+                    .unwrap_or(raw_line);
+                if let Some(found) = self.re.find(line) {
+                    file_count += 1;
+                    if matches.len() < self.display_limit {
+                        matches.push(ContentMatch {
+                            path: path.clone(),
+                            line_number: (index + 1) as u32,
+                            line_content: String::from_utf8_lossy(line).into_owned(),
+                            byte_offset: (line_start + found.start()) as u64,
+                            submatch_start: found.start(),
+                            submatch_end: found.end(),
+                        });
+                        #[cfg(any(test, feature = "query-test-instrumentation"))]
+                        crate::query_diagnostics::retained(matches.len());
+                    }
+                }
+                line_start += raw_line.len();
+            }
+            if file_count > 0 {
+                total_matches += file_count;
+                *directories.entry(directory_bucket(&path)).or_default() += file_count;
+            }
+        }
+        Ok(ContentSearchResult {
+            matches,
+            total_matches,
+            dir_facets: directory_facets(directories),
+        })
+    }
+}
+
+fn recorded_path_order(a: &str, b: &str) -> std::cmp::Ordering {
+    path_tier(a).cmp(&path_tier(b)).then_with(|| a.cmp(b))
+}
+
+fn directory_bucket(path: &str) -> String {
+    path.splitn(3, '/').take(2).collect::<Vec<_>>().join("/")
+}
+
+fn directory_facets(counts: impl IntoIterator<Item = (String, usize)>) -> Vec<(String, usize)> {
+    let mut facets: Vec<_> = counts.into_iter().collect();
+    facets.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    facets.truncate(10);
+    facets
+}
+
 /// Search graph-rendered bytes without consulting the working-copy index.
 /// Path/type matching and line verification use the same syntext machinery as
 /// indexed search; filtering and ranking happen before the display limit.
+#[cfg(test)]
 pub(crate) fn search_file_contents(
     files: &std::collections::BTreeMap<String, Vec<u8>>,
     pattern: &str,
@@ -276,36 +400,30 @@ fn rank_content_matches(
     display_limit: usize,
 ) -> ContentSearchResult {
     let total_matches = raw_matches.len();
+    #[cfg(any(test, feature = "query-test-instrumentation"))]
+    crate::query_diagnostics::retained(total_matches);
 
     // Build per-directory match counts for the facets summary.
     let mut dir_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     for m in &raw_matches {
-        let path_str = m.path.to_string_lossy();
-        // Use the first two path components as the directory bucket.
-        let dir = path_str
-            .splitn(3, '/')
-            .take(2)
-            .collect::<Vec<_>>()
-            .join("/");
+        let dir = directory_bucket(&m.path.to_string_lossy());
         *dir_counts.entry(dir).or_insert(0) += 1;
     }
 
-    // Sort directory facets by count (descending).
-    let mut dir_facets: Vec<(String, usize)> = dir_counts.into_iter().collect();
-    dir_facets.sort_by_key(|entry| std::cmp::Reverse(entry.1));
-    dir_facets.truncate(10); // top 10 directories
+    let dir_facets = directory_facets(dir_counts);
 
     // Rank matches: source code files first, then everything else.
-    let mut ranked: Vec<(usize, &syntext::SearchMatch)> = raw_matches
-        .iter()
-        .map(|m| (path_tier(m.path.to_string_lossy().as_ref()), m))
-        .collect();
-    ranked.sort_by_key(|(tier, _)| *tier);
+    let mut ranked: Vec<_> = raw_matches.iter().collect();
+    // syntext's indexed results and the recorded oracle already arrive in path
+    // order. Use the same stable comparator as the bounded path plan; records
+    // within each file retain the verifier's original order.
+    ranked
+        .sort_by(|a, b| recorded_path_order(&a.path.to_string_lossy(), &b.path.to_string_lossy()));
 
     let matches: Vec<ContentMatch> = ranked
         .into_iter()
         .take(display_limit)
-        .map(|(_, m)| ContentMatch {
+        .map(|m| ContentMatch {
             path: m.path.to_string_lossy().to_string(),
             line_number: m.line_number,
             line_content: String::from_utf8_lossy(&m.line_content).to_string(),
@@ -456,7 +574,8 @@ pub struct ContentSearchOptions {
     /// Exclude files of this type.
     pub exclude_type: Option<String>,
     /// Maximum number of results to display (default: 50).
-    /// Internally, more results are fetched for ranking.
+    /// Recorded search counts all eligible matches while retaining at most this
+    /// many records. Working-copy indexed search retains its candidate overfetch.
     pub max_results: Option<usize>,
     /// Case-insensitive matching.
     pub case_insensitive: bool,
@@ -585,6 +704,175 @@ impl From<IndexError> for ContentSearchError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn streaming(
+        files: &std::collections::BTreeMap<String, Vec<u8>>,
+        pattern: &str,
+        opts: ContentSearchOptions,
+    ) -> ContentSearchResult {
+        RecordedContentSearch::new(files.keys().map(String::as_str), pattern, opts)
+            .unwrap()
+            .run::<std::convert::Infallible>(|path| Ok(Some(files[path].clone())))
+            .unwrap()
+    }
+
+    #[test]
+    fn recorded_stream_matches_exhaustive_verifier_boundaries_and_filters() {
+        let files = std::collections::BTreeMap::from([
+            (
+                "src/z.rs".into(),
+                b"one needle needle\r\n\r\nNEEDLE\nlast\r".to_vec(),
+            ),
+            ("src/a.rs".into(), b"\n\nneedle\n".to_vec()),
+            ("tests/a.rs".into(), b"needle\n".to_vec()),
+            ("src/empty.rs".into(), Vec::new()),
+            ("src/binary.rs".into(), b"needle\0\n".to_vec()),
+            ("src/invalid.rs".into(), b"before\xffneedle\n".to_vec()),
+            (
+                "src/unicode.rs".into(),
+                "é needle🦀\r\n終わり needle".as_bytes().to_vec(),
+            ),
+            ("notes.md".into(), b"needle\n".to_vec()),
+            (
+                "src/late-nul.rs".into(),
+                [vec![b'x'; 8200], b"\nneedle\0\n".to_vec()].concat(),
+            ),
+        ]);
+        for pattern in [
+            "needle",
+            "",
+            "^",
+            "$",
+            "^$",
+            "needle.*",
+            r"(?-u)\xFF|\x00",
+            "needle\\n",
+        ] {
+            for max_results in [None, Some(0), Some(1), Some(5), Some(100)] {
+                for (path_filter, file_type, exclude_type) in [
+                    (None, None, None),
+                    (Some("src/"), Some("rs"), None),
+                    (Some("**/*.rs"), None, Some("rs")),
+                    (Some("notes.md"), None, None),
+                    (Some("missing/**"), Some("unknown_type"), None),
+                    (None, Some("unknown_type"), None),
+                    (Some("."), None, None),
+                    (Some("/src/"), None, None),
+                    (Some("../src/"), None, None),
+                ] {
+                    let opts = ContentSearchOptions {
+                        max_results,
+                        case_insensitive: true,
+                        path_filter: path_filter.map(str::to_owned),
+                        file_type: file_type.map(str::to_owned),
+                        exclude_type: exclude_type.map(str::to_owned),
+                    };
+                    let expected = search_file_contents(&files, pattern, opts.clone()).unwrap();
+                    let actual = streaming(&files, pattern, opts);
+                    assert_eq!(
+                        serde_json::to_value(actual).unwrap(),
+                        serde_json::to_value(expected).unwrap(),
+                        "pattern={pattern:?} limit={max_results:?} filter={path_filter:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn randomized_recorded_stream_matches_exhaustive_order_counts_and_offsets() {
+        use rand::{Rng, SeedableRng};
+        let mut rng = rand::rngs::StdRng::seed_from_u64(11);
+        for case in 0..80 {
+            let mut files = std::collections::BTreeMap::new();
+            for path in ["docs/a.md", "src/z.rs", "src/a.rs", "tests/b.rs", "root.py"] {
+                let mut bytes: Vec<u8> = (0..rng.gen_range(0..500))
+                    .map(|_| {
+                        let alphabet = b"aaaazz\r\n\xff ";
+                        alphabet[rng.gen_range(0..alphabet.len())]
+                    })
+                    .collect();
+                if case % 7 == 0 && !bytes.is_empty() {
+                    bytes[0] = 0;
+                }
+                files.insert(path.into(), bytes);
+            }
+            for pattern in ["a+", "z|a", "^$", "", r"(?-u)\xFF"] {
+                for max_results in [Some(0), Some(1), Some(10), None] {
+                    let opts = ContentSearchOptions {
+                        max_results,
+                        ..Default::default()
+                    };
+                    assert_eq!(
+                        serde_json::to_value(streaming(&files, pattern, opts.clone())).unwrap(),
+                        serde_json::to_value(search_file_contents(&files, pattern, opts).unwrap())
+                            .unwrap(),
+                        "case={case} pattern={pattern}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn recorded_stream_counts_dense_matches_without_retaining_them() {
+        let files = std::collections::BTreeMap::from([(
+            "src/dense.rs".into(),
+            b"needle\n".repeat(100_000),
+        )]);
+        for limit in [0, 1, 10] {
+            let (result, resources) = crate::query_diagnostics::measure(|| {
+                streaming(
+                    &files,
+                    "needle",
+                    ContentSearchOptions {
+                        max_results: Some(limit),
+                        ..Default::default()
+                    },
+                )
+            });
+            assert_eq!(result.total_matches, 100_000);
+            assert_eq!(result.matches.len(), limit);
+            assert_eq!(result.dir_facets, [("src/dense.rs".into(), 100_000)]);
+            assert_eq!(resources.displayed_records_high_water, limit);
+        }
+        for paths in [vec![], vec!["missing.rs"]] {
+            assert!(RecordedContentSearch::new(
+                paths,
+                "[",
+                ContentSearchOptions {
+                    max_results: Some(0),
+                    ..Default::default()
+                }
+            )
+            .is_err());
+        }
+        let tied: std::collections::BTreeMap<_, _> = (0..12)
+            .rev()
+            .map(|i| (format!("dir{i:02}/a.rs"), b"needle\n".to_vec()))
+            .collect();
+        let result = streaming(&tied, "needle", ContentSearchOptions::default());
+        assert_eq!(
+            result.dir_facets,
+            (0..10)
+                .map(|i| (format!("dir{i:02}/a.rs"), 1))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn recorded_stream_applies_the_exact_content_cutoff() {
+        let files = std::collections::BTreeMap::from([
+            ("src/exact.rs".into(), vec![b'x'; RECORDED_CONTENT_LIMIT]),
+            (
+                "src/oversized.rs".into(),
+                vec![b'x'; RECORDED_CONTENT_LIMIT + 1],
+            ),
+        ]);
+        let result = streaming(&files, "^x", ContentSearchOptions::default());
+        assert_eq!(result.total_matches, 1);
+        assert_eq!(result.matches[0].path, "src/exact.rs");
+    }
 
     #[test]
     fn search_content_excludes_ignored_and_internal_paths() {

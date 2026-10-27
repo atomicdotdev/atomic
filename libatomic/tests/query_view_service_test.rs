@@ -626,3 +626,157 @@ async fn tonic_kind_filter_is_applied_before_pool_and_result_limits() {
     stop.send(()).unwrap();
     server.await.unwrap();
 }
+
+#[tokio::test]
+async fn bounded_content_queries_preserve_exact_results_across_all_boundaries() {
+    use libatomic::daemon::{services_agent::KnowledgeImpl, state::DaemonState};
+    use std::sync::Arc;
+    let (dir, local, local_repository) = fixture().await;
+    let repo = Repository::open(dir.path()).unwrap();
+    let wc = repo.require_working_copy_id().unwrap();
+    for (path, bytes) in [
+        ("docs/a.md", b"needle\n".repeat(2500)),
+        ("src/z.rs", b"prefix needle needle\r\n\r\nneedle\n".to_vec()),
+        ("tests/a.rs", b"needle\n".repeat(3)),
+    ] {
+        let full = dir.path().join(path);
+        std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+        std::fs::write(full, bytes).unwrap();
+        repo.add(wc, path, TrackingOptions::default()).unwrap();
+    }
+    record(&repo, "dense and late source-tier matches");
+    let before = std::fs::read(dir.path().join("src/lib.rs")).unwrap();
+    let graph_before = serde_json::to_value(repo.workflow_snapshot().unwrap()).unwrap();
+    let index_before =
+        std::fs::read(dir.path().join(".atomic/content-index/manifest.json")).unwrap();
+    drop(repo);
+    let state = Arc::new(DaemonState::new());
+    let repository = state
+        .register(dir.path().canonicalize().unwrap())
+        .repository_ref();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (stop, stopped) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(pb::knowledge_service_server::KnowledgeServiceServer::new(
+                KnowledgeImpl { state },
+            ))
+            .serve_with_incoming_shutdown(
+                tokio_stream::wrappers::TcpListenerStream::new(listener),
+                async {
+                    let _ = stopped.await;
+                },
+            )
+            .await
+            .unwrap();
+    });
+    let mut client =
+        pb::knowledge_service_client::KnowledgeServiceClient::connect(format!("http://{address}"))
+            .await
+            .unwrap();
+    for name in ["dev", "feature"] {
+        for limit in [0, 1, 3] {
+            for paths in [
+                vec![],
+                vec!["src/".into(), "tests/".into()],
+                vec!["missing".into()],
+            ] {
+                let content =
+                    pb::query_graph_request::Query::ContentSearch(pb::ContentSearchQuery {
+                        query: "needle".into(),
+                        paths: paths.clone(),
+                        max_results: Some(limit),
+                        ..Default::default()
+                    });
+                let repo = Repository::open_readonly(dir.path()).unwrap();
+                let expected = repo
+                    .search_content_paths_on_view(
+                        name,
+                        "needle",
+                        atomic_repository::ContentSearchOptions {
+                            max_results: Some(limit as usize),
+                            ..Default::default()
+                        },
+                        &paths,
+                    )
+                    .unwrap();
+                drop(repo);
+                let actual = query(&local, &local_repository, Some(view(name)), content.clone())
+                    .await
+                    .unwrap();
+                let over_wire = client
+                    .query_graph(pb::QueryGraphRequest {
+                        repository: Some(repository.clone()),
+                        view: Some(view(name)),
+                        limit: 1,
+                        query: Some(content),
+                    })
+                    .await
+                    .unwrap()
+                    .into_inner();
+                assert_eq!(actual, over_wire);
+                let result = actual.content_result.unwrap();
+                assert_eq!(result.total_matches, expected.total_matches as u64);
+                assert_eq!(result.matches.len(), expected.matches.len());
+                assert_eq!(
+                    result
+                        .dir_facets
+                        .iter()
+                        .map(|facet| (facet.path.clone(), facet.count as usize))
+                        .collect::<Vec<_>>(),
+                    expected.dir_facets
+                );
+                for (actual, expected) in result.matches.iter().zip(expected.matches) {
+                    assert_eq!(actual.path, expected.path);
+                    assert_eq!(actual.line_number, expected.line_number);
+                    assert_eq!(actual.byte_offset, expected.byte_offset);
+                    assert_eq!(actual.line_content, expected.line_content);
+                    assert_eq!(actual.submatch_start, expected.submatch_start as u64);
+                    assert_eq!(actual.submatch_end, expected.submatch_end as u64);
+                }
+                if paths.is_empty() && limit > 0 {
+                    assert_eq!(
+                        result.matches[0].path, "src/z.rs",
+                        "late source must outrank earlier docs"
+                    );
+                    assert_eq!(result.total_matches, 2505);
+                }
+            }
+        }
+    }
+    let bad = pb::query_graph_request::Query::ContentSearch(pb::ContentSearchQuery {
+        query: "[".into(),
+        paths: vec!["missing".into()],
+        max_results: Some(0),
+        ..Default::default()
+    });
+    assert!(query(&local, &local_repository, None, bad.clone())
+        .await
+        .is_err());
+    assert!(client
+        .query_graph(pb::QueryGraphRequest {
+            repository: Some(repository),
+            query: Some(bad),
+            ..Default::default()
+        })
+        .await
+        .is_err());
+    assert_eq!(
+        std::fs::read(dir.path().join("src/lib.rs")).unwrap(),
+        before
+    );
+    assert_eq!(
+        std::fs::read(dir.path().join(".atomic/content-index/manifest.json")).unwrap(),
+        index_before
+    );
+    let repo = Repository::open_readonly(dir.path()).unwrap();
+    assert_eq!(
+        serde_json::to_value(repo.workflow_snapshot().unwrap()).unwrap(),
+        graph_before
+    );
+    assert_eq!(repo.desired_view_name(wc).unwrap(), "dev");
+    drop(client);
+    stop.send(()).unwrap();
+    server.await.unwrap();
+}

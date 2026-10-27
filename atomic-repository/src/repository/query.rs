@@ -10,18 +10,28 @@ use atomic_core::pristine::KgTxnT;
 use atomic_core::KgNode;
 
 use super::*;
-use crate::content_search::{search_file_contents, ContentSearchOptions, ContentSearchResult};
+use crate::content_search::{
+    ContentSearchOptions, ContentSearchResult, RecordedContentSearch, RECORDED_CONTENT_LIMIT,
+};
+use atomic_core::pristine::GraphVisibilityClosure;
 
-pub(super) struct QueryView {
-    pub files: BTreeMap<String, Vec<u8>>,
+pub(super) struct QueryView<'repo> {
+    repo: &'repo Repository,
+    pub(super) txn: atomic_core::ReadTxn,
+    visibility: GraphVisibilityClosure,
+    files: BTreeMap<String, (Inode, Position<NodeId>)>,
     changes: HashSet<String>,
     views: HashSet<String>,
     nodes: BTreeMap<String, KgNode>,
 }
 
-impl QueryView {
+impl QueryView<'_> {
     pub fn nodes(&self) -> &BTreeMap<String, KgNode> {
         &self.nodes
+    }
+
+    pub fn contains_file(&self, path: &str) -> bool {
+        self.files.contains_key(path)
     }
 
     /// Project ambient candidates before ranking. File identities are canonical,
@@ -68,16 +78,58 @@ impl QueryView {
         pattern: &str,
         opts: ContentSearchOptions,
     ) -> Result<ContentSearchResult, RepositoryError> {
-        search_file_contents(&self.files, pattern, opts).map_err(|error| {
+        let plan = self.content_plan(pattern, opts).map_err(|error| {
             RepositoryError::InvalidOperation {
                 message: format!("code search failed: {error}"),
             }
+        })?;
+        self.search_content_plan(plan)
+    }
+
+    pub fn content_plan(
+        &self,
+        pattern: &str,
+        opts: ContentSearchOptions,
+    ) -> Result<RecordedContentSearch, crate::content_search::ContentSearchError> {
+        RecordedContentSearch::new(self.files.keys().map(String::as_str), pattern, opts)
+    }
+
+    pub fn search_content_plan(
+        &self,
+        plan: RecordedContentSearch,
+    ) -> Result<ContentSearchResult, RepositoryError> {
+        plan.run(|path| {
+            let (inode, position) = self.files[path];
+            let rendered = super::content::retrieve_content_bounded(
+                &self.txn,
+                &self.repo.change_store,
+                inode,
+                position,
+                atomic_core::output::alive::RetrieveOptions::new()
+                    .with_graph_visibility(self.visibility.clone()),
+                RECORDED_CONTENT_LIMIT,
+            )
+            .map_err(|error| RepositoryError::Database(error.to_string()))?;
+            let (bytes, retained_bytes) = match rendered {
+                super::content::BoundedContent::Complete(bytes) => {
+                    let retained = bytes.len();
+                    (Some(bytes), retained)
+                }
+                super::content::BoundedContent::Oversized { retained_bytes } => {
+                    (None, retained_bytes)
+                }
+            };
+            #[cfg(any(test, feature = "query-test-instrumentation"))]
+            crate::query_diagnostics::retrieved(retained_bytes);
+            #[cfg(not(any(test, feature = "query-test-instrumentation")))]
+            let _ = retained_bytes;
+            Ok(bytes)
         })
     }
 }
 
 impl Repository {
-    pub(super) fn query_view(&self, view_name: &str) -> Result<QueryView, RepositoryError> {
+    pub(super) fn query_view(&self, view_name: &str) -> Result<QueryView<'_>, RepositoryError> {
         let txn = self.pristine.read_txn()?;
         let view = txn
             .get_view(view_name)?
@@ -131,16 +183,7 @@ impl Repository {
             if attrs.materialization.kind != atomic_core::change::InodeKind::Regular {
                 continue;
             }
-            let bytes = super::content::retrieve_content_with_filter_fast(
-                &txn,
-                &self.change_store,
-                item.inode,
-                item.position,
-                atomic_core::output::alive::RetrieveOptions::new()
-                    .with_graph_visibility(visibility.clone()),
-            )
-            .map_err(|error| RepositoryError::Database(error.to_string()))?;
-            files.insert(path, bytes);
+            files.insert(path, (item.inode, item.position));
         }
         let nodes = files
             .keys()
@@ -153,6 +196,9 @@ impl Repository {
             })
             .collect();
         Ok(QueryView {
+            repo: self,
+            txn,
+            visibility,
             files,
             changes,
             views,
@@ -163,6 +209,8 @@ impl Repository {
     /// Search recorded source bytes through a view's validated ancestor and
     /// dependency closure. Unrecorded files/edits and the working-copy content
     /// index are excluded; no index rebuild or checkout occurs.
+    /// Existing ambient ignore rules still apply. Totals/facets are exact even
+    /// with zero displayed matches; rendered files over 10 MiB are skipped.
     pub fn search_content_on_view(
         &self,
         view_name: &str,
@@ -174,6 +222,8 @@ impl Repository {
 
     /// Like [`Self::search_content_on_view`], restricted to a union of exact
     /// repository-relative paths and directory prefixes before matching.
+    /// Path/type filters precede content I/O; closure/path/attribute validation
+    /// remains global. Content errors outside the selected files are not read.
     pub fn search_content_paths_on_view(
         &self,
         view_name: &str,
@@ -205,15 +255,21 @@ impl Repository {
         target: &str,
     ) -> Result<Vec<Caller>, RepositoryError> {
         let scope = self.query_view(view_name)?;
-        let sources: Vec<_> = scope
-            .files
-            .iter()
-            .filter_map(|(path, bytes)| {
-                std::str::from_utf8(bytes)
-                    .ok()
-                    .map(|source| (path.clone(), source.to_owned()))
-            })
-            .collect();
+        let mut sources = Vec::new();
+        for (path, (inode, position)) in &scope.files {
+            let bytes = super::content::retrieve_content_with_filter_fast(
+                &scope.txn,
+                &self.change_store,
+                *inode,
+                *position,
+                atomic_core::output::alive::RetrieveOptions::new()
+                    .with_graph_visibility(scope.visibility.clone()),
+            )
+            .map_err(|error| RepositoryError::Database(error.to_string()))?;
+            if let Ok(source) = String::from_utf8(bytes) {
+                sources.push((path.clone(), source));
+            }
+        }
         Ok(SyntaxIndex::from_sources(&sources).callers(target))
     }
 }

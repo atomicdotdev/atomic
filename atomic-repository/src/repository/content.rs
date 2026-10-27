@@ -1071,12 +1071,81 @@ where
         + atomic_core::pristine::TreeTxnT,
     C: atomic_core::change::ChangeStore,
 {
+    Ok(
+        try_retrieve_linear_content_bounded(txn, changes, inode, position, options, usize::MAX)?
+            .and_then(|content| match content {
+                BoundedContent::Complete(bytes) => Some(bytes),
+                BoundedContent::Oversized { .. } => None,
+            }),
+    )
+}
+
+#[derive(Debug)]
+pub(crate) enum BoundedContent {
+    Complete(Vec<u8>),
+    Oversized { retained_bytes: usize },
+}
+
+/// The query consumer's cap applies to emitted bytes, not to raw change sizes.
+/// Both paths use the ordinary graph visibility and semantic rendering rules.
+pub(crate) fn retrieve_content_bounded<T, C>(
+    txn: &T,
+    changes: &C,
+    inode: Inode,
+    position: Position<NodeId>,
+    options: atomic_core::output::alive::RetrieveOptions,
+    max_bytes: usize,
+) -> atomic_core::record::RecordResult<BoundedContent>
+where
+    T: atomic_core::pristine::GraphTxnT
+        + atomic_core::pristine::InodeGraphOps<InodeError = atomic_core::pristine::PristineError>
+        + atomic_core::pristine::TreeTxnT,
+    C: atomic_core::change::ChangeStore,
+{
+    if let Some(content) =
+        try_retrieve_linear_content_bounded(txn, changes, inode, position, &options, max_bytes)?
+    {
+        return Ok(content);
+    }
+    let result = match atomic_core::pristine::InodeScopedGraph::new(txn, inode) {
+        Ok(scoped) => atomic_core::output::repo::output_file_to_buffer_bounded(
+            &scoped, changes, position, options, max_bytes,
+        ),
+        Err(_) => atomic_core::output::repo::output_file_to_buffer_bounded(
+            txn, changes, position, options, max_bytes,
+        ),
+    }
+    .map_err(|error| {
+        atomic_core::record::RecordError::Io(std::io::Error::other(error.to_string()))
+    })?;
+    Ok(match result.content {
+        Some(bytes) => BoundedContent::Complete(bytes),
+        None => BoundedContent::Oversized {
+            retained_bytes: result.buffer_high_water,
+        },
+    })
+}
+
+fn try_retrieve_linear_content_bounded<T, C>(
+    txn: &T,
+    changes: &C,
+    inode: Inode,
+    position: Position<NodeId>,
+    options: &atomic_core::output::alive::RetrieveOptions,
+    max_bytes: usize,
+) -> atomic_core::record::RecordResult<Option<BoundedContent>>
+where
+    T: atomic_core::pristine::GraphTxnT
+        + atomic_core::pristine::InodeGraphOps<InodeError = atomic_core::pristine::PristineError>
+        + atomic_core::pristine::TreeTxnT,
+    C: atomic_core::change::ChangeStore,
+{
     #[allow(unused_imports)]
     use atomic_core::types::EdgeFlags;
     let trace_retrieve = std::env::var_os("ATOMIC_TRACE_RETRIEVE").is_some();
 
     if position == Position::ROOT {
-        return Ok(Some(Vec::new()));
+        return Ok(Some(BoundedContent::Complete(Vec::new())));
     }
 
     let inode_marker = position.inode_node();
@@ -1139,9 +1208,28 @@ where
             }
             .into());
         }
-        let mut span = vec![0u8; end - start];
+        let length = end - start;
+        if length > max_bytes.saturating_sub(content.len()) {
+            return Ok(Some(BoundedContent::Oversized {
+                retained_bytes: content.len(),
+            }));
+        }
+        let offset = content.len();
+        if offset + length > content.capacity() {
+            let capacity = content
+                .capacity()
+                .saturating_mul(2)
+                .max(offset + length)
+                .min(max_bytes);
+            content.reserve_exact(capacity - offset);
+        }
+        content.resize(offset + length, 0);
         let copied = changes
-            .get_contents(|id| txn.get_external(id).ok().flatten(), node, &mut span)
+            .get_contents(
+                |id| txn.get_external(id).ok().flatten(),
+                node,
+                &mut content[offset..],
+            )
             .map_err(|error| {
                 atomic_core::record::RecordError::Io(std::io::Error::other(format!(
                     "content span {}..{} for {} exceeds change {} content length: {}",
@@ -1162,10 +1250,9 @@ where
             }
             .into());
         }
-        content.extend_from_slice(&span);
     }
 
-    Ok(Some(content))
+    Ok(Some(BoundedContent::Complete(content)))
 }
 
 #[cfg(test)]
