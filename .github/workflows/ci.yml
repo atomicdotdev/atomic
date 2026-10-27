@@ -51,6 +51,14 @@ jobs:
       # target/ (and the cache) much smaller than full debug info.
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
       CARGO_PROFILE_TEST_DEBUG: line-tables-only
+      # Build-script dependencies default to no debug info, except crates that
+      # are also normal dependencies, which take the line above. Which crates
+      # those are differs between the nextest build and the lib-only doctest
+      # build (shlex, which cc depends on), so without this the doctest step
+      # rebuilt cc, every crate whose build script uses it, and everything
+      # above them.
+      CARGO_PROFILE_DEV_BUILD_OVERRIDE_DEBUG: line-tables-only
+      CARGO_PROFILE_TEST_BUILD_OVERRIDE_DEBUG: line-tables-only
     steps:
       - uses: actions/checkout@v4
 
