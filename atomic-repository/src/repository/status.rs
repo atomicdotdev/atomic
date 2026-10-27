@@ -117,7 +117,14 @@ impl Repository {
                     .any(|filter| path.starts_with(filter) || filter.starts_with(&path))
         };
 
-        let projection = self.project_tree_for_visibility(&txn, &visibility)?;
+        let projection = {
+            // Namespace projection resolves historical name/content spans for
+            // absent claims. Share the existing transaction-local span index
+            // instead of range-scanning a change's GRAPH for every lookup.
+            let cached_txn = atomic_core::pristine::CachedGraphTxn::new(&txn)
+                .map_err(|error| RepositoryError::Database(error.to_string()))?;
+            self.project_tree_for_visibility(&cached_txn, &visibility)?
+        };
         let projected_present = projection.present;
         let projected_present_paths: HashSet<PathBuf> =
             projected_present.keys().map(PathBuf::from).collect();
@@ -307,6 +314,10 @@ impl Repository {
         let mut projected_by_worktree_path = std::collections::BTreeMap::new();
         let mut gitlink_paths: std::collections::HashSet<PathBuf> =
             std::collections::HashSet::new();
+        // Classification uses the same read transaction and visibility as
+        // candidate discovery; do not resolve the two attribute registers a
+        // second time for every tracked inode.
+        let mut projected_attributes = HashMap::new();
         for path in &tracked_paths {
             if inode_map
                 .get(path)
@@ -332,6 +343,7 @@ impl Repository {
                 visibility.attribute_visibility(),
             )
             .map_err(|error| RepositoryError::Database(error.to_string()))?;
+            projected_attributes.insert(inode, projected.clone());
             if projected.is_conflicted() {
                 continue;
             }
@@ -641,12 +653,17 @@ impl Repository {
                     inode,
                     inode.and_then(|inode| txn.inode_position(inode).ok().flatten()),
                 ) {
-                    let projected = atomic_core::output::project_inode_attributes(
-                        &txn,
-                        position,
-                        visibility.attribute_visibility(),
-                    )
-                    .map_err(|error| RepositoryError::Database(error.to_string()))?;
+                    let projected = match projected_attributes.entry(inode) {
+                        std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+                        std::collections::hash_map::Entry::Vacant(entry) => entry.insert(
+                            atomic_core::output::project_inode_attributes(
+                                &txn,
+                                position,
+                                visibility.attribute_visibility(),
+                            )
+                            .map_err(|error| RepositoryError::Database(error.to_string()))?,
+                        ),
+                    };
                     if projected.is_conflicted() {
                         let mut entry = FileStatusEntry::new(path.clone(), FileStatus::Conflicted);
                         entry.set_inode(inode);

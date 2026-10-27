@@ -161,7 +161,7 @@ pub use equivalence::{
     verify_prospective_equivalence, EquivalenceClaims, EquivalenceLayer, EquivalenceMismatch,
     EquivalenceReport, MismatchKind, VerifiedProspectiveEquivalence,
 };
-pub use file_index_v2::FileIndexV2BackfillOutcome;
+pub use file_index_v2::{FileIndexV2BackfillOutcome, FileIndexV2SeedOutcome};
 pub use filter::{
     collect_view_change_ids, collect_visible_change_ids, collect_visible_change_ids_with_deps,
     graph_visibility_closure, graph_visibility_from_membership, view_membership,

@@ -49,6 +49,7 @@ pub(super) struct ReducedPathClaims {
     pub(super) present: Vec<ProjectedPathClaim>,
     pub(super) absent: Vec<super::deferred_tree::ProjectedAbsent>,
     pub(super) conflicts: HashMap<String, ProjectedNameConflict>,
+    pub(super) name_claims: HashMap<Position<NodeId>, Vec<(String, PathClaimId)>>,
 }
 
 pub(super) fn path_claim_events_for_change<T>(
@@ -276,8 +277,16 @@ where
     T: GraphTxnT + TreeTxnT,
 {
     let mut by_logical_claim = BTreeMap::<(String, Position<NodeId>), Vec<PathClaimEvent>>::new();
+    let mut name_claims = HashMap::<Position<NodeId>, Vec<(String, PathClaimId)>>::new();
     for entry in entries.iter().cloned() {
         if visibility.contains(entry.event.event_change) {
+            let claims = name_claims.entry(entry.event.claim.claimant).or_default();
+            if !claims
+                .iter()
+                .any(|(path, claim)| path == &entry.path && claim == &entry.event.claim)
+            {
+                claims.push((entry.path.clone(), entry.event.claim));
+            }
             by_logical_claim
                 .entry((entry.path, entry.event.claim.claimant))
                 .or_default()
@@ -537,6 +546,7 @@ where
         present,
         absent: unambiguous_absent,
         conflicts,
+        name_claims,
     })
 }
 

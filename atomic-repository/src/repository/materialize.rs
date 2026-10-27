@@ -299,12 +299,40 @@ pub(crate) fn live_names_for_path<T: GraphTxnT, C: atomic_core::change::ChangeSt
     path: &str,
     filter: &HashSet<NodeId>,
 ) -> Result<Vec<atomic_core::types::GraphNode<NodeId>>, RepositoryError> {
+    live_names_for_path_with_claims(txn, store, position, path, filter, &[])
+}
+
+pub(super) fn live_names_for_path_with_claims<T: GraphTxnT, C: atomic_core::change::ChangeStore>(
+    txn: &T,
+    store: &C,
+    position: Position<NodeId>,
+    path: &str,
+    filter: &HashSet<NodeId>,
+    claims: &[(String, atomic_core::pristine::PathClaimId)],
+) -> Result<Vec<atomic_core::types::GraphNode<NodeId>>, RepositoryError> {
     let options = atomic_core::output::RetrieveOptions::new().with_change_filter(filter.clone());
-    let names = atomic_core::output::repo::live_inode_names(txn, position, &options)
-        .map_err(|e| RepositoryError::Database(format!("{path}: {e}")))?;
+    let structural: Vec<_> = claims.iter().map(|(_, claim)| *claim).collect();
+    let names = atomic_core::output::repo::live_inode_names_with_claims(
+        txn,
+        position,
+        &options,
+        &structural,
+    )
+    .map_err(|e| RepositoryError::Database(format!("{path}: {e}")))?;
     let filename = path.rsplit('/').next().unwrap_or(path).as_bytes();
     let mut matching = Vec::new();
     for name in names {
+        // PATH_CLAIMS is the canonical namespace authority: it already binds
+        // this exact immutable name span to this path. Do not deserialize an
+        // entire change (including provenance) merely to re-read its basename.
+        // Undescribed legacy/other names retain the byte-comparison fallback.
+        if claims
+            .iter()
+            .any(|(known_path, claim)| known_path == path && claim.name == name)
+        {
+            matching.push(name);
+            continue;
+        }
         let mut bytes = vec![0; (name.end.get() - name.start.get()) as usize];
         store
             .get_contents(|id| txn.get_external(id).ok().flatten(), name, &mut bytes)
