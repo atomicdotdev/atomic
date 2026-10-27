@@ -175,7 +175,7 @@ pub struct Status {
     pub short: bool,
 
     /// Emit a versioned JSON document for IDEs and other integrations.
-    #[arg(long, conflicts_with_all = ["short", "debug_ignore"])]
+    #[arg(long, conflicts_with_all = ["short", "debug_ignore", "no_reconcile"])]
     pub json: bool,
 
     /// Don't show untracked files.

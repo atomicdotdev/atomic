@@ -868,6 +868,10 @@ pub fn intent_attest(args: &super::intent::attest::IntentAttest) -> CliResult<bo
     };
     let response = session.record_attestation(request)?;
     let info = response.attestation.expect("recorded attestation");
+    if args.json {
+        print_attestation_json(&session, &info)?;
+        return Ok(true);
+    }
     println!("Attested intent: {}", info.id);
     println!(
         "  vault:     {}",
@@ -880,6 +884,33 @@ pub fn intent_attest(args: &super::intent::attest::IntentAttest) -> CliResult<bo
     println!("  author:    {}", info.identity_did);
     println!("conforms: yes");
     Ok(true)
+}
+
+fn print_attestation_json(session: &Service, info: &pb::AttestationInfo) -> CliResult<()> {
+    let path = info.vault_path.as_deref().ok_or_else(|| {
+        CliError::Internal(anyhow::anyhow!("the service returned no attestation path"))
+    })?;
+    let response = session.get_vault_entry(pb::GetVaultEntryRequest {
+        repository: Some(session.reference.clone()),
+        kind: Kind::Unspecified as i32,
+        id: String::new(),
+        path: Some(path.trim_start_matches(".vault/").to_string()),
+        include_bundle: true,
+        view: None,
+    })?;
+    let bundle = response.entry_bundle.as_ref().ok_or_else(|| {
+        CliError::Internal(anyhow::anyhow!(
+            "the service returned no attestation bundle"
+        ))
+    })?;
+    let bundle = parse_entry_bundle(bundle)?;
+    let node: serde_json::Value = serde_json::from_slice(&bundle.entry.content_bytes)
+        .map_err(|error| CliError::Internal(anyhow::anyhow!("attested node: {error}")))?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&node).map_err(|error| CliError::Internal(error.into()))?
+    );
+    Ok(())
 }
 
 pub fn intent_validate(args: &super::intent::validate::IntentValidate) -> CliResult<bool> {
@@ -1106,6 +1137,10 @@ pub fn memory_attest(args: &super::memory::attest::MemoryAttest) -> CliResult<bo
     };
     let response = session.record_attestation(request)?;
     let info = response.attestation.expect("recorded attestation");
+    if args.json {
+        print_attestation_json(&session, &info)?;
+        return Ok(true);
+    }
     println!("Attested memory: {}", info.id);
     println!(
         "  vault:     {}",
@@ -6230,12 +6265,8 @@ pub fn query_graph(args: &super::query::QueryGraph) -> CliResult<bool> {
         .iter()
         .map(kg_edge_domain)
         .collect::<CliResult<Vec<_>>>()?;
-    if nodes.is_empty() {
-        if args.json {
-            println!("{{\"nodes\":[],\"edges\":[]}}");
-        } else {
-            eprintln!("No results for {:?} (kinds: {}).", args.query, args.kinds);
-        }
+    if nodes.is_empty() && !args.json {
+        eprintln!("No results for {:?} (kinds: {}).", args.query, args.kinds);
         return Ok(true);
     }
     // Cap note: the wire carries only the final set; the note's collected

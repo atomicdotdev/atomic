@@ -60,6 +60,7 @@ mod insert_promote_integration_test;
 mod intent_attest_external_signer_test;
 mod intent_graph_test;
 mod intent_turn_binding_test;
+mod json_output_contract_test;
 mod kg_service_integration_test;
 mod logging_integration_test;
 mod memory_compatibility_test;
