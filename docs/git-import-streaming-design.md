@@ -1,8 +1,362 @@
 # Streaming Git tree/blob → Atomic graph import
 
-Status: proposed architecture, investigated in `atomic-shim-2`. **The production
-streaming importer is not implemented.** A limited publication-stage experiment
-is implemented and measured below. `atomic-shim` is historical reference; its
+## Rolling CLI (default for fresh imports)
+
+Fresh `atomic git import` commands now select the rolling path by default.
+`--no-stream` explicitly selects the ordinary importer; `--stream` still forces
+the restricted stream route. Existing Atomic repositories, `--incremental`,
+`--all`, `--with-crdt`, internal detached/reactive imports keep the ordinary
+path unless streaming is explicitly requested (and refused if unsupported).
+`--stream-window-mib 128` can be supplied without `--stream` for a default fresh
+import; it defaults to 32 MiB and is incompatible with ordinary-only options.
+Unsupported stream input never triggers a silent fallback; shallow/boundary
+and provenance cases must use the ordinary path explicitly where supported.
+Upstream raw-name, symlink and gitlink support is preserved in both the direct
+and rolling stream; the obsolete ASCII-only/kind restriction is not restored.
+
+### Graph-only history; native CRDT handoff is separate
+
+The rolling compiler and the direct graph API both emit **zero FileOps**.
+The prepared-change boundary rejects nonempty FileOps. Git does not capture
+Atomic CRDT history; synthetic historical trunk/branch/token identities are not
+part of streaming. Publication uses hash anchors, with no identity cache,
+post-publication NodeId lookup, or identity-dependent early flush.
+
+Read-ahead is capped at 500 commits. Publication batches are capped at 100
+commits and the configured byte budget (32 MiB default, range 1–256). These are
+buffer/batch budgets, **not a total RSS limit**. Empty interpretations retain
+the established empty-commit facts schema, and Git provenance/loss facts remain.
+Private staging, journaling, final graph verification and checkpoint finalization
+are unchanged; no historical checkout or per-commit reconstructed-graph diff is
+introduced. Shared/native semantic verifiers are not weakened.
+
+Graph-only history is not a promise that every downstream native record or
+incremental operation works. That handoff is a separate task. Semantic lifecycle
+and ordinary fidelity tests explicitly select `--no-stream`; streaming tests
+check graph bytes, zero FileOps, bounded batches and equality with the direct API.
+
+The rejected synthetic-identity implementation was measured at 89.50 s for the
+1,097-commit default import during concurrent builds/tests. That is historical
+evidence, not a controlled performance comparison. Its logs remain at
+`/private/var/folders/hl/fwbg_jc93tvgz43rj7t25x240000gn/T/opencode/default-stream-3AO4YY92/`.
+
+Graph-only restoration checks:
+
+- Git-command unit tests: 221 passed, 4 manual benchmarks ignored. Coverage
+  includes default/ordinary routing, budgets, agent parsing/help wording,
+  zero FileOps, empty facts, direct/rolling equality and input/worktree guards.
+- Repository stream tests: 3 passed (FileOps rejection, batch rollback, final
+  proof refusal without promotion).
+- Git import integration suites: 115 passed across provenance, ordinary
+  semantic lifecycle, corpus/path fidelity, tree shapes and tracked-vault tests.
+- Scoped `rustfmt --check` passed. Strict production Clippy passed. All-target
+  Clippy passed with only `clippy::manual_is_multiple_of` allowed for the
+  pre-existing test-only expression in `real_import_sample.rs:262`; the fully
+  strict all-target invocation reports that unrelated lint.
+
+Pinned release validation after restoration:
+
+- Hyperfine tip `c5161524980522320c7d3425e714cc0965a869a5`, 1,097 first-parent
+  commits, fresh disposable clone, isolated copied release binary.
+- Default `git import --no-vault --agent-mode --stream-window-mib 32`
+  (no `--stream` flag): **30.98 s**, **11 private publication batches**;
+  `atomic git shim verify`: **9.72 s**, all layers passed.
+- All 75 tracked files retained their bytes, modes and mtimes; HEAD was
+  unchanged and Git status remained clean. Existing unbound-tag warnings remain;
+  no tag-binding guard was bypassed. Agent mode was exercised noninteractively;
+  this run does not claim new terminal-resize or animation-render validation.
+- The first benchmark setup stopped before import because cloning preserved an
+  existing `import-bench` branch. The successful retry used a separate fresh
+  `repo-2` target and a new branch; the source was never modified.
+- Evidence (script, isolated binary, snapshots, import/verify logs and
+  `result.json`):
+  `/private/var/folders/hl/fwbg_jc93tvgz43rj7t25x240000gn/T/opencode/graph-only-stream-zMuJyPRe/`.
+  These are single-run timings, not a controlled multi-run speedup comparison.
+
+### Agent-mode visual
+
+The `--agent-mode` flag is visible in normal help with the description
+"For agents only: if you are an agent trying to do a git import, this is for you".
+It replaces the usual live dashboard with the user's
+dancing ASCII character and a compact import-status line:
+
+```sh
+atomic git import --agent-mode
+atomic git import --stream --agent-mode --stream-window-mib 32
+```
+
+Its help metadata is exactly: "if you are an agent trying to do a git import,
+this is for you". It affects only presentation and works with ordinary and
+streamed imports. On interactive stdout **and** stderr, it animates in a
+Ratatui alternate screen at a nominal 10 fps, from command entry through
+preflight, import, indexing and checkpoint finalization. The original ASCII
+glyphs are embedded as text, downsampled to fit smaller terminals, and moved
+to sway, wave and tap. It does not play a GIF or require an image-capable terminal.
+Dry runs, redirected output, missing `TERM` and `TERM=dumb` retain normal output.
+
+The agent visual owns the screen; it suppresses the competing stream dashboard.
+Normal progress-print helpers update its status instead of scrolling the terminal.
+Messages continue to use the existing logging path; on exit the latest success
+and up to 64 retained warning/error messages (up to 4096 characters each) replay
+after terminal restoration. Omitted diagnostics are counted with a reminder to
+consult the full log. Returned import errors retain their normal error status
+and reporting. No raw mode or signal handlers are introduced; forced termination
+still cannot guarantee alternate-screen cleanup.
+
+Validation includes ordinary/streamed import equivalence, character-pose tests
+at four terminal sizes, pseudo-terminal success/failure cleanup, and dry-run,
+dumb-terminal and redirected-output checks. The corrected 1097-commit stream CLI
+run showed the animation, resized twice, replayed tag warnings, preserved tracked
+bytes/modes/mtimes and completed in 43.03 s (one optimized-dev run, not a speedup
+claim). Evidence is under
+`/private/var/folders/hl/fwbg_jc93tvgz43rj7t25x240000gn/T/opencode/agent-mode-AdJLXGCp/`
+(`fixed-result.json`, `fixed-terminal-capture.txt`, `smoke-results.json`). The
+initial full test completed the import but **failed its animation assertion**:
+`Terminal::clear()` requested a cursor-position response and the monitor exited.
+The corrected code uses normal fullscreen `draw()` and issues no cursor queries;
+the initial failed evidence is retained separately as `result.json`.
+
+### Ratatui dashboard
+
+The live display now uses Ratatui 0.30 with a Crossterm backend, rather than
+hand-padded ASCII rows. It redraws changed cells every ~500 ms and adapts to
+terminal resizes. At 76 columns / 22 rows or larger it shows aligned panels for:
+
+- private staging progress, current phase and elapsed time;
+- average staged commits/s and estimated remaining staging time;
+- rolling queue occupancy, checked/loaded/in-flight counts and commits left to load;
+- queued blob reservation against the selected MiB budget;
+- process RSS and lifetime peak RSS, plus a bounded RSS sparkline;
+- process CPU, observed sampled peak CPU and a bounded CPU sparkline.
+
+The histories retain at most 120 samples (~60 seconds at nominal cadence), with
+auto-scaled graphs. Narrow/short terminals use a wrapped compact view; missing
+resource data is labelled unavailable. Staging throughput counts **private**
+staging, not final verified promotion; the estimate explicitly excludes final
+proof/promotion, whose duration is not predictable from commit throughput.
+Process CPU can exceed 100% (one core), and the blob reservation is neither
+actual window allocation nor total RSS. No importer or verification behavior
+changes with this UI.
+
+Run as before: `atomic git import --stream --stream-window-mib 32`. A non-TTY
+production command keeps ordinary progress messages. The dashboard prototype's
+explicit test opt-in uses simple text for non-TTY / `TERM=dumb`. No raw terminal
+mode is enabled, so Ctrl-C remains owned by the CLI. Alternate screen and cursor
+are restored on completion, returned errors or unwinding; forced termination
+still cannot guarantee cleanup. If terminal initialization/drawing fails, the
+monitor falls back to text rather than failing the import.
+
+Validation includes Ratatui test-backend draws at 120×30, 80×24, 60×20, 30×12
+and 1×1; metric/estimate tests; pseudo-terminal success/error cleanup; and plain
+output tests. An actual optimized-dev CLI run imported the pinned 1,097 Hyperfine
+commits, resized 110×30 → 50×18 → 110×30, preserved tracked bytes/modes/mtimes,
+and passed all `git shim verify` layers. The single run took 45.38 s; this is
+not a controlled performance comparison or release benchmark. Evidence:
+`/private/var/folders/hl/fwbg_jc93tvgz43rj7t25x240000gn/T/opencode/ratatui-import-sUdb15En/`.
+
+### Rolling input and budgets
+
+`atomic git import --stream` now performs its prospective guardrails without
+retaining every historical commit, then reads ahead up to 500 commits and
+publishes up to 100 at a time. `--stream-window-mib <MIB>` defaults to 32 and
+accepts 1–256. It caps the queued old/new blob-header reservations and each
+prepared graph batch; a single input or compiled change above that budget is
+refused with an instruction to increase it. It is not a hard RSS limit: current
+file state, diffs, metadata, databases, allocator and caches are not fully
+charged. The queue may contain fewer than 500 commits when it reaches the byte
+budget. The normal importer remains unchanged.
+
+On a capable terminal, the CLI automatically shows the dashboard during rolling
+compilation, publication and final proof/promotion. Preflight runs before the
+dashboard. Non-terminal output retains normal progress messages. CPU is process
+usage, not machine-wide utilization. As with the existing experimental stream,
+the route supports fresh checkouts and first-parent graph-only imports, rejects
+unsupported histories and provenance claims, and verifies the final state, not
+every historical graph state. Worktree checks and checkpoint finalization remain
+in place; historical working copies are never materialized.
+
+On a fresh clone of the pinned 1,097-commit Hyperfine history, an optimized dev
+CLI run with a 32 MiB budget completed in 39.03 s, rendered 64 dashboard frames,
+and preserved Git-tracked bytes, modes and mtimes. `atomic git shim verify`
+passed all layers. This is a single local run, not a release benchmark. Evidence:
+`/private/var/folders/hl/fwbg_jc93tvgz43rj7t25x240000gn/T/opencode/rolling-cli-iKjzFWkG/`.
+
+## Test-only rolling-window sample
+
+### Live terminal dashboard prototype
+
+Set `ATOMIC_ROLLING_DASHBOARD=1` to monitor the **test-only** rolling sample.
+It refreshes every 500 ms, including during a long batch publish or final proof:
+
+```text
++---------------- ATOMIC ROLLING IMPORT ----------------+
+| phase: publishing batch     elapsed:   12.5s      |
+| staged    [############----------]   600/1097  |
+| window    [#################-----]   397/500   |
+| checked:  1097   loaded:  1097   in flight: 100     |
+| blob reservation:    17.5 / 32.0    MiB           |
+| process RSS:    193.0 MiB    peak:    200.3 MiB |
+| process CPU: 87.2% of one core                       |
++-------------------------------------------------------+
+Blob reservation is not total window or process memory.
+```
+
+The CPU number is the process's CPU time over the sampling interval, not total
+machine utilization; it can exceed 100% when multiple cores are active. Current
+RSS is sampled via `ps`, and peak RSS is the process-lifetime `getrusage`
+high-water mark on macOS/Linux. Missing metrics show as unavailable. Blob
+reservation is based on input Git blob headers, **not actual memory held by the
+window** or total RSS. Terminal output uses an alternate screen and restores the
+cursor on normal completion, returned errors and unwinding. It does not install
+signal handlers, so abrupt termination cannot guarantee restoration. On non-TTY
+output or `TERM=dumb`, it prints periodic plain-text frames with no terminal
+control sequences. Sampling and terminal output are best effort and do not
+determine whether the import succeeds.
+
+For the pinned Hyperfine history, use a fresh artifact directory and run in a
+terminal (the test harness needs `--nocapture`):
+
+```sh
+CARGO_PROFILE_TEST_OPT_LEVEL=2 CARGO_PROFILE_TEST_DEBUG=1 \
+ATOMIC_ROLLING_DASHBOARD=1 ATOMIC_ROLLING_WINDOW_MIB=32 \
+ATOMIC_ROLLING_GIT=/path/to/hyperfine \
+ATOMIC_ROLLING_ARTIFACT=/path/to/fresh/artifacts \
+cargo test --locked -p atomic-cli --bin atomic rolling_sample_hyperfine \
+  -- --ignored --nocapture --test-threads=1
+```
+
+The prototype described here is separate from the production dashboard above.
+A pseudo-terminal full-history run
+rendered 66 frames, displayed final proof, completed with matching ordered hashes
+and restored the terminal; a separate early-error run also restored it. The full
+run's captured output and result are under
+`/private/var/folders/hl/fwbg_jc93tvgz43rj7t25x240000gn/T/opencode/rolling-dashboard-pH1JROY8/`.
+The temporary capture contains terminal control sequences; it is evidence, not a
+standalone replay player. The sample then runs its ordinary direct-API comparison
+after the dashboard closes.
+
+### Process-memory trace, 32-MiB window
+
+Intent `ATOM::continuouslee::21` adds opt-in macOS/Linux process-memory samples
+to this test-only driver. `ATOMIC_ROLLING_MEMORY_LOG` selects a JSONL file; every
+actual refill and every batch publication emits the number of loaded, processed
+and queued commits, reserved input-blob bytes, current process RSS from `ps`,
+and the process-lifetime maximum RSS from `getrusage`. There are also samples
+before/after preflight and final proof. The high-water mark can capture an
+intervening peak; the current samples do not provide a continuous curve or
+identify which allocation caused a peak. RSS includes the test process, mapped
+database pages, allocator retention, Git/libgit2 and all other resident memory.
+
+One fresh-process, optimized-test-profile run of the same 1,097 commits set the
+window blob-header budget to **32 MiB**; it completed with 500 queued commits,
+six refills, 11 batches, no budget stalls, the same final hash and no checkout.
+Its maximum reserved blob headers were **24.7 MiB**, but total RSS was much higher:
+
+| Sample | Current RSS | Process high-water RSS |
+| --- | ---: | ---: |
+| Before preflight | 23.4 MiB | 23.4 MiB |
+| After preflight | 53.4 MiB | 53.4 MiB |
+| Initial 500-commit refill | 75.0 MiB | 75.0 MiB |
+| After publishing 100 | 121.5 MiB | 122.5 MiB |
+| After publishing 500 | 170.8 MiB | 170.8 MiB |
+| After publishing 1,000 | 263.0 MiB | 263.0 MiB |
+| After publishing 1,097 | 340.8 MiB | 369.3 MiB |
+| After final proof/promotion | 926.2 MiB | **936.1 MiB** |
+
+The final proof/promotion raised the high-water mark after the queue had emptied;
+the sample does not attribute that rise to a particular allocator or operation.
+Publishing in this experiment never materializes historical or final worktrees.
+A separately launched same-build direct-API baseline reached **1,030.3 MiB**
+process high-water RSS and the same final hash. The rolling run's peak was about
+94.2 MiB lower in these two individual runs, but the baseline lacks the sample's
+additional prospective preflight and OS caches/residency vary; this is **not** a
+controlled general memory-reduction claim. Nor does a 32-MiB *window* mean a
+32-MiB container or process limit would work. The rolling sample took 33.17 s,
+including sampling overhead; the independent direct API took 32.69 s. Neither is
+a full CLI measurement, and the larger repository that motivated the 128-MiB
+setting has not been tested here.
+
+The raw logs and reports are at
+`/private/var/folders/hl/fwbg_jc93tvgz43rj7t25x240000gn/T/opencode/rolling-rss-RHHRYHLW/`
+(`rss.jsonl`, `direct-rss.jsonl`, and the two result JSON files). To reproduce,
+use a fresh artifact directory and the pinned local source; the second command is
+intentionally a separate test process so its peak is not inherited from the first:
+
+```sh
+export CARGO_PROFILE_TEST_OPT_LEVEL=2 CARGO_PROFILE_TEST_DEBUG=1
+export ATOMIC_ROLLING_GIT=/path/to/hyperfine
+export ATOMIC_ROLLING_ARTIFACT=/path/to/fresh/artifacts
+ATOMIC_ROLLING_WINDOW_MIB=32 ATOMIC_ROLLING_MEMORY_LOG="$ATOMIC_ROLLING_ARTIFACT/rss.jsonl" \
+cargo test --locked -p atomic-cli --bin atomic rolling_sample_hyperfine \
+  -- --ignored --nocapture --test-threads=1
+ATOMIC_ROLLING_MEMORY_LOG="$ATOMIC_ROLLING_ARTIFACT/direct-rss.jsonl" \
+cargo test --locked -p atomic-cli --bin atomic rolling_memory_direct_baseline \
+  -- --ignored --nocapture --test-threads=1
+```
+
+### Window sample and identity comparison
+
+Intent `ATOM::continuouslee::20` adds a test-only sample to
+`atomic-cli/src/commands/git/stream.rs`; it does **not** change the CLI route.
+It runs the direct stream's boundary, tree-capability and claim-refusal checks,
+then parses and prospectively validates one historical commit at a time. It
+retains at most the immediately preceding prospective project; other parents
+are read from Git. Import rereads the pinned history through a 500-commit
+window, publishes 100 at a time, discards consumed parsed payloads, and refills.
+Prepared graph batches retain the existing 32-MiB cap. The window also reserves
+old/new Git blob-header sizes against a 512-MiB limit before parsing, and
+refuses an individually oversized commit. This is **not a hard RSS bound**:
+diff lines, metadata, compiler/current-file state, libgit2, allocator and database
+caches are not fully charged. The compact OID/position index grows with history.
+
+On the pinned 1,097-commit first-parent Hyperfine history, a single local
+`CARGO_PROFILE_TEST_OPT_LEVEL=2 CARGO_PROFILE_TEST_DEBUG=1` run reported:
+
+| Measurement | Result |
+| --- | ---: |
+| Guardrail + prospective preflight | 0.799 s |
+| Rolling sample including preflight and final proof/promotion | 33.157 s |
+| Existing direct API baseline, same test/build/source | 32.548 s |
+| Private publication batches | 11 |
+| Peak window | 500 commits; 25,937,396 reserved input-blob bytes |
+| Refills after initial window | 6: 500–600 through 1000–1097 |
+
+All ordered Atomic change hashes and the final state matched the existing direct
+API in the same run, all Git SHA mappings survived reopen, and both private
+targets contained no working files. Neither path materialized a checkout. The
+sample keeps the direct import's final-tip graph proof, not independent historical
+graph-state certification. The baseline is the **direct API**, not the full CLI,
+and does not run the sample's additional prospective preflight; these are single
+warm local runs, not a release benchmark. The 500/100 count and 512-MiB limit are
+sample settings, not proposed production defaults.
+
+The test uses a fresh standalone target and **does not exercise the real CLI's
+checked-out worktree/adoption/changed-path guardrails, initialization, indexing,
+tags or checkpoint finalization**. It rejects direct-stream unsupported input,
+including provenance claims and non-first-parent modes, rather than claiming the
+ordinary import's broader compatibility. Integrating it into the CLI requires a
+separate bounded replacement for those command-boundary checks and tests proving
+they run before publication; it must not silently remove them. It also needs
+complete accounting or a documented larger-payload policy before claiming a hard
+memory bound. No working-tree materialization or per-commit historical graph
+diffs are part of this sample or proposed integration.
+
+The sample and baseline data are retained at
+`/private/var/folders/hl/fwbg_jc93tvgz43rj7t25x240000gn/T/opencode/rolling-import-final-2jiD0CDE/rolling-result.json`.
+To reproduce with a local source containing the pinned Hyperfine objects and a
+fresh artifact directory:
+
+```sh
+CARGO_PROFILE_TEST_OPT_LEVEL=2 CARGO_PROFILE_TEST_DEBUG=1 \
+ATOMIC_ROLLING_GIT=/path/to/hyperfine \
+ATOMIC_ROLLING_ARTIFACT=/path/to/fresh/artifacts \
+cargo test --locked -p atomic-cli --bin atomic rolling_sample_hyperfine \
+  -- --ignored --nocapture --test-threads=1
+```
+
+Status: the experimental production `--stream` route has bounded historical
+payload preflight and a rolling window; the sample and measurements below remain
+test-only. `atomic-shim` is historical reference; its
 experimental importer must not be copied wholesale into this clean tree.
 
 ## Recommendation
@@ -1055,10 +1409,11 @@ compiled batches. The CLI defaults to 100 changes and 128 MiB; the byte bound
 also applies to an individual commit's combined old/new input blob sizes.
 Compiler memory grows with the **current** files/line anchors;
 blob/cache/container overhead and pristine/libgit2 caches are not an RSS bound.
-The public command still retains its existing whole-history prospective
-preflight before releasing that plan, so **the entire CLI has not acquired a
-constant-memory preflight guarantee**. There is no recorder/source-publication
-pass in either the direct API or the flag's write path.
+At the time of this experiment, the public command retained its whole-history
+prospective preflight before releasing that plan. The later experimental rolling
+CLI described above replaces that payload retention, but still does not claim
+constant total memory. There is no recorder/source-publication pass in either the
+direct API or the flag's write path.
 
 The direct importer never materializes files itself. The checked-out command
 uses the already correct Git working copy without rewriting its tracked files.
@@ -1147,7 +1502,8 @@ proof does not certify every intermediate historical state; all-parent history
 and eager CRDT remain outside this experiment. Subsequent hardening adds
 binding-transport refusal, deterministic deepest-first/lexical sibling directory
 retirement, and refusal to materialize if Git changes branches during import.
-The command still retains the prospective-preflight memory limitation above.
+At that time the command still retained the prospective-preflight limitation
+described above; the later rolling CLI removes that historical-payload retention.
 
 Final hardened-binary repeat: **42.053 s** import, **13.793 s** separate shim
 verification, again with all 75 tracked files' bytes/modes/mtimes and HEAD

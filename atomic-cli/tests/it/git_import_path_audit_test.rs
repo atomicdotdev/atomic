@@ -66,7 +66,9 @@ fn import(root: &Path, git: &GitRepository, tip: Oid, config: &Path) {
         .args(["git", "import", "--no-vault", "--no-color"])
         .args(
             std::env::var("ATOMIC_AUDIT_FLAGS")
-                .unwrap_or_default()
+                // The full path/type corpus targets the ordinary importer;
+                // an explicit audit override can still select --stream.
+                .unwrap_or_else(|_| "--no-stream".into())
                 .split_whitespace(),
         )
         .output()

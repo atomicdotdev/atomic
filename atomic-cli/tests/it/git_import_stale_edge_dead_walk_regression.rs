@@ -124,7 +124,11 @@ fn import_of_replace_and_delete_behind_stale_insert_edge_renders_byte_exact() {
     // successful import proves EVERY intermediate state rendered
     // byte-exactly against its commit tree. Pre-fix, this failed at the
     // last commit with "renders 29 byte(s) but the commit tree expects 34".
-    let summary = atomic_ok(&root, &home, &["git", "import", "--no-vault"]);
+    let summary = atomic_ok(
+        &root,
+        &home,
+        &["git", "import", "--no-stream", "--no-vault"],
+    );
     assert!(
         summary.contains("3 changes"),
         "expected 3 imported changes, got:\n{summary}"

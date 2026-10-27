@@ -1,4 +1,4 @@
-//! Private, bounded publication for a direct graph-only Git producer. This
+//! Private, bounded publication for a direct Git producer. This
 //! module owns transactions, not graph algorithms or working-copy recording.
 
 use super::operation::{current_operation_timestamp_ms, working_copy_state_ref};
@@ -338,6 +338,8 @@ impl<'a> GitGraphImportSession<'a> {
             paths: Vec::new(),
             tree: Some(StagedTreeExpectation {
                 entries: expected,
+                // Full closure verification below checks every inherited
+                // semantic path; an empty Git tip need not invent FileOps.
                 semantic_paths: Vec::new(),
                 verify_paths: None,
                 semantic_verify_paths: None,
@@ -587,6 +589,37 @@ mod tests {
         )
         .unwrap()
     }
+    #[test]
+    fn prepared_graph_boundary_rejects_file_ops() {
+        let (project, _) = project();
+        let prepared = entry(1, None, "a.txt", b"one\n", &project, false);
+        let mut change = prepared.change;
+        change
+            .hashed
+            .file_ops
+            .push(atomic_core::change::FileOps::create(
+                atomic_core::crdt::TrunkId::new(atomic_core::types::NodeId::ROOT, 0),
+                "a.txt".into(),
+                Some(Encoding::Utf8),
+            ));
+        let origin = GitSynthesisOrigin::root(
+            GitObjectId::new(GitHashAlgorithm::Sha1, vec![1; 20]).unwrap(),
+            project.git.root.clone(),
+        )
+        .unwrap();
+        let error = PreparedGitGraphChange::new(
+            change,
+            origin.clone(),
+            Vec::new(),
+            crate::git_synthesis_metadata(&origin, &[], None),
+        )
+        .err()
+        .expect("FileOps must be rejected before finalization or publication");
+        assert!(error
+            .to_string()
+            .contains("eager semantics are unsupported"));
+    }
+
     #[test]
     fn failed_final_proof_never_promotes_private_stream() {
         let dir = tempfile::tempdir().unwrap();

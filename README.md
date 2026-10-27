@@ -290,6 +290,27 @@ in `.atomic/config.toml` — so the vault participates in Git equivalence and
 publication checks exactly like any other tracked path. A repository whose Git tree
 does not track `.vault/` keeps the vault private and ignored by Git.
 
+**Rolling Git import (default for fresh repositories):** in a fresh, checked-out
+Git repository, `atomic git import` imports first-parent history with a live dashboard
+when running in a terminal. The responsive Ratatui dashboard shows progress,
+staging throughput/ETA, CPU and memory history, and the rolling window separately.
+The ETA excludes final verification. Use `--stream-window-mib 128` to raise the default
+32 MiB limit on queued Git blob reservations and prepared batches (1–256 MiB).
+This is **not** a limit on total process memory. Read-ahead is capped at 500 commits;
+publication batches are capped at 100 commits and the byte budget. The stream
+imports **graph-only changes with zero FileOps** and verifies the final Git tree,
+not every historical graph state. Git does not capture Atomic CRDT history, so
+streaming does not synthesize historical identities. Native/incremental handoff
+from graph-only imports remains a separate limitation; use the ordinary importer
+when you need its semantic lifecycle support.
+Unsupported history is refused rather than silently falling back: use
+`--no-stream` for the ordinary importer where supported. Streaming shares the
+ordinary parser's raw-name, symlink and gitlink support; these are not rejected
+merely for using the streaming route.
+`--all`, `--incremental`, `--with-crdt` and existing-repository imports retain
+their ordinary path. Explicit `--stream` remains available for requiring the
+restricted fresh-import route.
+
 ### Knowledge Graph — Code Intelligence at Scale
 
 Atomic's **workflow knowledge graph** connects intents, sessions, turns, provenance,

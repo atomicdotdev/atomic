@@ -54,6 +54,7 @@
 //! $ atomic git import --incremental
 //! ```
 
+mod agent_mode;
 pub mod anchor;
 pub mod binding;
 pub(crate) mod bootstrap;

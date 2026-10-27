@@ -7,9 +7,8 @@ use atomic_repository::{
     GitGraphImportSession, GitStreamLimits, GitStreamOutcome, PreparedGitGraphChange,
 };
 
-// Applies to each commit's input blobs and to compiled private batch payloads,
-// not total process memory. Keep room for large initial asset commits.
-const DEFAULT_STREAM_BYTE_LIMIT: usize = 128 * 1024 * 1024;
+#[path = "rolling_dashboard.rs"]
+mod rolling_dashboard;
 
 #[cfg(test)]
 thread_local! { static FORBID_ORDINARY_RECORDER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
@@ -38,6 +37,14 @@ impl Drop for RecorderGuard {
 }
 
 fn input_budget(git: &GitRepository, commit: &git2::Commit<'_>, limit: usize) -> CliResult<()> {
+    let bytes = input_blob_bytes(git, commit)?;
+    if bytes > limit {
+        return Err(git_error(format!("direct stream commit {} needs {bytes} input bytes, above {limit}; increase the explicit bound", commit.id())));
+    }
+    Ok(())
+}
+
+fn input_blob_bytes(git: &GitRepository, commit: &git2::Commit<'_>) -> CliResult<usize> {
     let tree = commit.tree().map_err(|e| git_error(e.to_string()))?;
     let parent = if commit.parent_count() == 0 {
         None
@@ -71,10 +78,7 @@ fn input_budget(git: &GitRepository, commit: &git2::Commit<'_>, limit: usize) ->
             }
         }
     }
-    if bytes > limit {
-        return Err(git_error(format!("direct stream commit {} needs {bytes} input bytes, above {limit}; increase the explicit bound", commit.id())));
-    }
-    Ok(())
+    Ok(bytes)
 }
 
 #[derive(Default)]
@@ -83,6 +87,7 @@ struct Compiler {
     attrs: HashMap<String, (u16, atomic_core::change::InodeKind, ContentHash)>,
     last_hash: Option<ContentHash>,
 }
+
 impl Compiler {
     fn compile(
         &mut self,
@@ -354,9 +359,16 @@ impl Compiler {
         .map_err(CliError::from)?;
         provenance["git"]["stream"] = serde_json::json!({"semantics":"graph-only; derived, not native token provenance","history":"first-parent; side legs not separately imported","rename_identity_loss":losses});
         let unhashed = git_synthesis_metadata(&origin, boundaries, Some(provenance));
-        let prepared =
-            PreparedGitGraphChange::new(compiled, origin, foreign_commit_facts(parsed)?, unhashed)
-                .map_err(CliError::from)?;
+        let mut facts = foreign_commit_facts(parsed)?;
+        if parsed.is_empty {
+            let mut record: serde_json::Value =
+                serde_json::from_slice(&facts).map_err(|error| git_error(error.to_string()))?;
+            record["format"] = serde_json::json!(EMPTY_COMMIT_FACTS_FORMAT);
+            record["tree_algorithm"] = record["algorithm"].clone();
+            facts = serde_json::to_vec(&record).map_err(|error| git_error(error.to_string()))?;
+        }
+        let prepared = PreparedGitGraphChange::new(compiled, origin, facts, unhashed)
+            .map_err(CliError::from)?;
         let hash = prepared.hash();
         self.last_hash = Some(hash);
         apply_line_index_updates(&mut self.index, hash, pending);
@@ -401,43 +413,78 @@ impl Compiler {
 }
 
 impl ParallelImporter {
+    /// Validate the restricted stream without retaining historical payloads.
+    pub(crate) fn validate_graph_stream_prospectively(
+        &self,
+        branch: &str,
+        tip: Oid,
+        limits: GitStreamLimits,
+    ) -> CliResult<ProspectiveImportPlan> {
+        let (git, policy, ordered) = self.graph_stream_inputs(tip)?;
+        let positions: HashMap<_, _> = ordered
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(index, oid)| (oid, index))
+            .collect();
+        let mut prospective = ProspectiveProjectTree::new(policy.clone(), None)?;
+        let mut changed = std::collections::BTreeSet::new();
+        let (mut merges, mut empty, mut files) = (0usize, 0usize, 0usize);
+        let mut last = None;
+        for (index, oid) in ordered.iter().copied().enumerate() {
+            let commit = git
+                .find_commit(oid)
+                .map_err(|error| git_error(error.to_string()))?;
+            input_budget(&git, &commit, limits.bytes())?;
+            let parsed = parse_commit(&git, oid, index, &positions)?;
+            for file in &parsed.files {
+                changed.insert(file.path.clone());
+                if let Some(old) = &file.old_path {
+                    changed.insert(old.clone());
+                }
+            }
+            merges += usize::from(parsed.is_merge);
+            empty += usize::from(parsed.is_empty && !parsed.is_merge);
+            files += parsed.files.len();
+            let (project, verified) = prospective.apply_commit(&parsed, Some(&git))?;
+            prospective
+                .manifests
+                .retain(|tree, _| *tree == parsed.tree_oid);
+            last = Some((project, verified, parsed.tree_oid));
+        }
+        let (project, verified, raw_tree) =
+            last.ok_or_else(|| git_error("direct stream needs a nonempty history"))?;
+        self.verify_worktree_path_set(&project, changed.iter().map(String::as_str), branch, &git)?;
+        Ok(ProspectiveImportPlan {
+            commits: Vec::new(),
+            boundaries: Vec::new(),
+            stream: Some(StreamPreflight {
+                tip,
+                ordered,
+                expected_tree: verified.expected_git_tree().clone(),
+                raw_tree: git_object_id(policy.object_format, raw_tree)?,
+                changed_paths: changed.into_iter().map(PathBuf::from).collect(),
+                merges,
+                empty,
+                files,
+            }),
+        })
+    }
+
     pub(crate) fn import_graph_stream_prevalidated(
         &self,
         repo: &mut Repository,
         plan: ProspectiveImportPlan,
+        limits: GitStreamLimits,
     ) -> CliResult<ImportStats> {
-        let tip = plan
-            .commits
-            .last()
-            .ok_or_else(|| git_error("direct stream needs a nonempty history"))?
-            .parsed
-            .git_sha
-            .clone();
-        let total = plan.commits.len();
-        let merges = plan
-            .commits
-            .iter()
-            .filter(|commit| commit.parsed.is_merge)
-            .count();
-        let empty = plan
-            .commits
-            .iter()
-            .filter(|commit| commit.parsed.is_empty && !commit.parsed.is_merge)
-            .count();
-        let files = plan
-            .commits
-            .iter()
-            .map(|commit| commit.parsed.files.len())
-            .sum();
-        // Preserve existing command preflight/adoption, release its historical
-        // payloads here, and never run a recorder-backed preparation pass.
-        drop(plan);
+        let stream = plan
+            .stream
+            .ok_or_else(|| git_error("missing compact stream preflight"))?;
+        let total = stream.ordered.len();
+        let (merges, empty, files) = (stream.merges, stream.empty, stream.files);
         let started = Instant::now();
-        let outcome = self.import_graph_stream(
-            repo,
-            Oid::from_str(&tip).map_err(|e| git_error(e.to_string()))?,
-            GitStreamLimits::new(100, DEFAULT_STREAM_BYTE_LIMIT).map_err(CliError::from)?,
-        )?;
+        let outcome =
+            self.import_graph_stream_rolling(repo, stream.tip, limits, &stream.ordered)?;
         print_info(&format!("Direct graph stream: {} commits in {} private batches; final tip verified (historical states not independently verified)", outcome.commits, outcome.batches));
         Ok(ImportStats {
             commits_found: total,
@@ -450,10 +497,6 @@ impl ParallelImporter {
             ..Default::default()
         })
     }
-    pub(crate) fn validate_graph_stream_input(&self, tip: Oid) -> CliResult<()> {
-        self.graph_stream_inputs(tip).map(|_| ())
-    }
-
     fn graph_stream_inputs(
         &self,
         tip: Oid,
@@ -465,7 +508,7 @@ impl ParallelImporter {
         {
             let reference = reference.map_err(|error| git_error(error.to_string()))?;
             if reference.name_bytes().starts_with(b"refs/atomic/bindings/") {
-                return Err(git_error("direct stream does not restore Atomic binding transport; use ordinary import explicitly"));
+                return Err(git_error("direct stream does not restore Atomic binding transport; use --no-stream for the ordinary importer"));
             }
         }
         if !detect_git_boundaries(&git)?.is_empty() {
@@ -484,7 +527,7 @@ impl ParallelImporter {
             if parse_push_trailer(&message).is_some()
                 || parse_atomic_changes_trailer(&message).is_some()
             {
-                return Err(git_error("direct stream refuses Atomic provenance/binding claims; use ordinary import explicitly"));
+                return Err(git_error("direct stream refuses Atomic provenance/binding claims; use --no-stream for the ordinary importer"));
             }
             let tree = commit.tree().map_err(|e| git_error(e.to_string()))?;
             // Share the ordinary importer's kind/mode validation. The parser
@@ -493,6 +536,128 @@ impl ParallelImporter {
             validate_import_tree_capabilities(&git, &tree, "")?;
         }
         Ok((git, policy, ordered))
+    }
+
+    /// Read ahead at most 500 commits and publish up to 100 at a time. Both
+    /// queued input blob reservations and prepared batches have explicit caps.
+    fn import_graph_stream_rolling(
+        &self,
+        repo: &mut Repository,
+        tip: Oid,
+        limits: GitStreamLimits,
+        expected_order: &[Oid],
+    ) -> CliResult<GitStreamOutcome> {
+        use std::collections::VecDeque;
+        use std::io::IsTerminal;
+        #[cfg(test)]
+        let _recorder_guard = RecorderGuard::new();
+        if !self.options.graph_only
+            || !self.options.mainline_only
+            || self.options.incremental
+            || !self.options.imported_shas.is_empty()
+            || self.options.target_view != repo.current_view()
+        {
+            return Err(git_error("direct stream requires graph-only fresh first-parent import into the current empty view"));
+        }
+        let (git, policy, ordered) = self.graph_stream_inputs(tip)?;
+        if ordered != expected_order {
+            return Err(git_error(
+                "pinned Git stream history changed after preflight",
+            ));
+        }
+        let positions: HashMap<_, _> = ordered
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(index, oid)| (oid, index))
+            .collect();
+        let mut session = GitGraphImportSession::begin(repo, limits).map_err(CliError::from)?;
+        let enabled = std::io::stderr().is_terminal()
+            && std::env::var_os("TERM").is_some_and(|term| term != "dumb");
+        let mut dashboard = rolling_dashboard::Dashboard::start(500, limits.bytes(), enabled);
+        dashboard.update(|state| {
+            state.total = ordered.len();
+            state.checked = ordered.len();
+        });
+        let mut compiler = Compiler::default();
+        let mut pending = VecDeque::new();
+        let (mut next, mut processed, mut pending_bytes) = (0usize, 0usize, 0usize);
+        let started = Instant::now();
+        while processed < ordered.len() {
+            dashboard.update(|state| state.phase = "loading window");
+            while pending.len() < 500 && next < ordered.len() {
+                let oid = ordered[next];
+                let commit = git
+                    .find_commit(oid)
+                    .map_err(|error| git_error(error.to_string()))?;
+                let reserved = input_blob_bytes(&git, &commit)?;
+                if reserved > limits.bytes() {
+                    return Err(git_error(format!("commit {oid} exceeds the stream input-blob budget; raise --stream-window-mib")));
+                }
+                if reserved > limits.bytes() - pending_bytes {
+                    break;
+                }
+                let parsed = parse_commit_with_scope(&git, oid, next, &positions, false)?;
+                pending.push_back((parsed, reserved));
+                pending_bytes += reserved;
+                next += 1;
+                dashboard.update(|state| {
+                    state.loaded = next;
+                    state.queued = pending.len();
+                    state.reserved_bytes = pending_bytes;
+                });
+            }
+            let mut batch = Vec::new();
+            let (mut bytes, mut flushed) = (0usize, 0usize);
+            for _ in 0..limits.commits().min(pending.len()) {
+                let (parsed, reserved) = pending.pop_front().expect("nonempty rolling window");
+                pending_bytes -= reserved;
+                dashboard.update(|state| {
+                    state.phase = "compiling";
+                    state.queued = pending.len();
+                    state.reserved_bytes = pending_bytes;
+                    state.in_flight = next - pending.len() - processed - flushed;
+                });
+                let metadata = self.build_git_metadata(&parsed, parsed.is_empty, parsed.is_merge);
+                let prepared = compiler.compile(&parsed, &policy, &[], metadata)?;
+                if prepared.payload_bytes() > limits.bytes() {
+                    return Err(git_error("single compiled stream change exceeds the stream budget; raise --stream-window-mib"));
+                }
+                if !batch.is_empty() && prepared.payload_bytes() > limits.bytes() - bytes {
+                    dashboard.update(|state| state.phase = "publishing batch");
+                    session.publish(&batch).map_err(CliError::from)?;
+                    flushed += batch.len();
+                    dashboard.update(|state| {
+                        state.published = processed + flushed;
+                        state.in_flight = next - pending.len() - state.published;
+                    });
+                    batch.clear();
+                    bytes = 0;
+                }
+                bytes += prepared.payload_bytes();
+                batch.push(prepared);
+            }
+            if !batch.is_empty() {
+                dashboard.update(|state| state.phase = "publishing batch");
+                session.publish(&batch).map_err(CliError::from)?;
+            }
+            processed = next - pending.len();
+            dashboard.update(|state| {
+                state.published = processed;
+                state.in_flight = 0;
+            });
+            if !dashboard.enabled() {
+                print_info(&format!(
+                    "Direct stream staged {processed}/{} commits privately ({:.2}s)",
+                    ordered.len(),
+                    started.elapsed().as_secs_f64()
+                ));
+            }
+        }
+        dashboard.update(|state| state.phase = "final proof / promote");
+        let outcome = finish_graph_stream(session, &git, &policy, tip)?;
+        dashboard.finish();
+        Ok(outcome)
     }
     /// Experimental direct graph-only import. No fallback to working-copy
     /// recording; caller controls the optional final checkout after success.
@@ -562,6 +727,274 @@ impl ParallelImporter {
                 started.elapsed().as_secs_f64()
             ));
         }
+        finish_graph_stream(session, &git, &policy, tip)
+    }
+}
+
+fn finish_graph_stream(
+    session: GitGraphImportSession<'_>,
+    git: &GitRepository,
+    policy: &ConversionPolicy,
+    tip: Oid,
+) -> CliResult<GitStreamOutcome> {
+    let tree = git
+        .find_commit(tip)
+        .and_then(|commit| commit.tree())
+        .map_err(|e| git_error(e.to_string()))?;
+    let entries = repository_entries_from_git_tree(git, tree.clone(), policy)?;
+    let manifest = RepositoryManifest::new(
+        SetId::ZERO,
+        policy.root().content_key,
+        entries.into_values().collect(),
+    )
+    .map_err(|error| git_error(error.to_string()))?;
+    let project = ProjectTree::from_manifest(manifest, policy)
+        .map_err(|error| git_error(error.to_string()))?;
+    let expected = import_expected_tree_oid(git, tree.id(), policy)?;
+    let proof = verify_prospective_equivalence(&project, &expected)
+        .map_err(|error| git_error(error.to_string()))?;
+    session.finish(&project, &proof).map_err(CliError::from)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::VecDeque;
+
+    /// Optional process-level samples for the manual rolling benchmark. `ps`
+    /// reads current RSS; getrusage records the process-lifetime high-water
+    /// mark, including peaks that occur between our explicit samples.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn rolling_memory_sample(
+        phase: &str,
+        processed: usize,
+        loaded: usize,
+        queued: usize,
+        reserved: usize,
+    ) -> CliResult<()> {
+        let Some(path) = std::env::var_os("ATOMIC_ROLLING_MEMORY_LOG") else {
+            return Ok(());
+        };
+        let output = std::process::Command::new("ps")
+            .args(["-o", "rss=", "-p", &std::process::id().to_string()])
+            .output()
+            .map_err(|e| git_error(format!("cannot sample RSS: {e}")))?;
+        if !output.status.success() {
+            return Err(git_error("ps failed to sample rolling process RSS"));
+        }
+        let rss_kib: u64 = String::from_utf8_lossy(&output.stdout)
+            .trim()
+            .parse()
+            .map_err(|e| git_error(format!("invalid ps RSS: {e}")))?;
+        let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
+        // SAFETY: getrusage initializes the provided rusage on success.
+        if unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) } != 0 {
+            return Err(git_error(format!(
+                "getrusage failed: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+        // SAFETY: the successful call above initialized this value.
+        let peak_raw = unsafe { usage.assume_init() }.ru_maxrss as u64;
+        #[cfg(target_os = "macos")]
+        let peak_rss_bytes = peak_raw;
+        #[cfg(target_os = "linux")]
+        let peak_rss_bytes = peak_raw * 1024;
+        let sample = serde_json::json!({
+            "phase": phase, "processed": processed, "loaded": loaded,
+            "queued": queued, "reserved_blob_bytes": reserved,
+            "rss_bytes": rss_kib * 1024, "peak_rss_bytes": peak_rss_bytes,
+        });
+        use std::io::Write;
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .map_err(|e| git_error(format!("cannot open memory log: {e}")))?;
+        writeln!(file, "{sample}")
+            .map_err(|e| git_error(format!("cannot write memory log: {e}")))?;
+        if std::env::var_os("ATOMIC_ROLLING_DASHBOARD").is_none() {
+            println!("ROLLING MEMORY {sample}");
+        }
+        Ok(())
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    fn rolling_memory_sample(
+        _phase: &str,
+        _processed: usize,
+        _loaded: usize,
+        _queued: usize,
+        _reserved: usize,
+    ) -> CliResult<()> {
+        if std::env::var_os("ATOMIC_ROLLING_MEMORY_LOG").is_some() {
+            return Err(git_error("rolling memory samples require macOS or Linux"));
+        }
+        Ok(())
+    }
+
+    /// Test-only prototype: preflight one commit at a time, then keep a
+    /// count- and input-blob-budgeted window feeding the existing private publisher.
+    /// It deliberately does not replace the CLI's checkout/adoption preflight.
+    fn rolling_sample(
+        importer: &ParallelImporter,
+        repo: &mut Repository,
+        tip: Oid,
+        window_size: usize,
+        batch_size: usize,
+        window_blob_limit: usize,
+    ) -> CliResult<(GitStreamOutcome, usize, usize, usize, usize, f64)> {
+        assert!(window_size > 0 && batch_size > 0 && batch_size <= window_size);
+        let _recorder_guard = RecorderGuard::new();
+        let mut dashboard = rolling_dashboard::Dashboard::start(
+            window_size,
+            window_blob_limit,
+            std::env::var_os("ATOMIC_ROLLING_DASHBOARD").is_some(),
+        );
+        rolling_memory_sample("before_preflight", 0, 0, 0, 0)?;
+        let preflight_start = Instant::now();
+        let (git, policy, ordered) = importer.graph_stream_inputs(tip)?;
+        dashboard.update(|state| state.total = ordered.len());
+        let positions: HashMap<_, _> = ordered
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(index, oid)| (oid, index))
+            .collect();
+        let limits = GitStreamLimits::new(batch_size, 32 * 1024 * 1024).map_err(CliError::from)?;
+
+        // Retain only the immediately preceding prospective project. For a
+        // different parent, apply_commit reloads its tree from the ODB.
+        let mut prospective = ProspectiveProjectTree::new(policy.clone(), None)?;
+        for (index, oid) in ordered.iter().copied().enumerate() {
+            let commit = git.find_commit(oid).map_err(|e| git_error(e.to_string()))?;
+            input_budget(&git, &commit, limits.bytes())?;
+            if input_blob_bytes(&git, &commit)? > window_blob_limit {
+                return Err(git_error(format!(
+                    "commit {oid} exceeds rolling window input-blob budget"
+                )));
+            }
+            let parsed = parse_commit(&git, oid, index, &positions)?;
+            prospective.apply_commit(&parsed, Some(&git))?;
+            prospective
+                .manifests
+                .retain(|tree, _| *tree == parsed.tree_oid);
+            dashboard.update(|state| state.checked = index + 1);
+        }
+        drop(prospective);
+        let preflight_seconds = preflight_start.elapsed().as_secs_f64();
+        rolling_memory_sample("after_preflight", 0, 0, 0, 0)?;
+
+        let mut session = GitGraphImportSession::begin(repo, limits).map_err(CliError::from)?;
+        let mut compiler = Compiler::default();
+        let mut pending = VecDeque::new();
+        let mut next = 0usize;
+        let mut processed = 0usize;
+        let mut advances = 0usize;
+        let mut peak = 0usize;
+        let mut pending_bytes = 0usize;
+        let mut peak_bytes = 0usize;
+        let mut budget_stalls = 0usize;
+        while processed < ordered.len() {
+            dashboard.update(|state| state.phase = "loading window");
+            let start = next;
+            while pending.len() < window_size && next < ordered.len() {
+                let oid = ordered[next];
+                let commit = git.find_commit(oid).map_err(|e| git_error(e.to_string()))?;
+                let reserved = input_blob_bytes(&git, &commit)?;
+                if reserved > window_blob_limit {
+                    return Err(git_error(format!(
+                        "commit {oid} exceeds rolling window input-blob budget"
+                    )));
+                }
+                if reserved > window_blob_limit - pending_bytes {
+                    budget_stalls += 1;
+                    break;
+                }
+                let parsed = parse_commit_with_scope(&git, oid, next, &positions, false)?;
+                pending.push_back((parsed, reserved));
+                pending_bytes += reserved;
+                next += 1;
+                dashboard.update(|state| {
+                    state.loaded = next;
+                    state.queued = pending.len();
+                    state.reserved_bytes = pending_bytes;
+                });
+            }
+            if start > 0 && next > start {
+                advances += 1;
+                if !dashboard.enabled() {
+                    println!("ROLLING refill {start}..{next} after {processed} published");
+                }
+            }
+            peak = peak.max(pending.len());
+            peak_bytes = peak_bytes.max(pending_bytes);
+            if next > start {
+                rolling_memory_sample(
+                    "after_refill",
+                    processed,
+                    next,
+                    pending.len(),
+                    pending_bytes,
+                )?;
+            }
+
+            let mut batch = Vec::new();
+            let mut bytes = 0usize;
+            let mut flushed = 0usize;
+            for _ in 0..batch_size.min(pending.len()) {
+                let (parsed, reserved) = pending.pop_front().expect("window was filled");
+                pending_bytes -= reserved;
+                dashboard.update(|state| {
+                    state.phase = "compiling";
+                    state.queued = pending.len();
+                    state.reserved_bytes = pending_bytes;
+                    state.in_flight = next - pending.len() - processed - flushed;
+                });
+                let metadata =
+                    importer.build_git_metadata(&parsed, parsed.is_empty, parsed.is_merge);
+                let prepared = compiler.compile(&parsed, &policy, &[], metadata)?;
+                if prepared.payload_bytes() > limits.bytes() {
+                    return Err(git_error(
+                        "single compiled stream change exceeds byte bound",
+                    ));
+                }
+                if !batch.is_empty() && bytes + prepared.payload_bytes() > limits.bytes() {
+                    dashboard.update(|state| state.phase = "publishing batch");
+                    session.publish(&batch).map_err(CliError::from)?;
+                    flushed += batch.len();
+                    dashboard.update(|state| {
+                        state.published = processed + flushed;
+                        state.in_flight = next - pending.len() - state.published;
+                    });
+                    batch.clear();
+                    bytes = 0;
+                }
+                bytes += prepared.payload_bytes();
+                batch.push(prepared);
+            }
+            // If the byte cap flushed part of this group, the number processed
+            // is the number removed from the window, not the last sub-batch.
+            if !batch.is_empty() {
+                dashboard.update(|state| state.phase = "publishing batch");
+                session.publish(&batch).map_err(CliError::from)?;
+            }
+            drop(batch);
+            processed = next - pending.len();
+            dashboard.update(|state| {
+                state.published = processed;
+                state.in_flight = 0;
+            });
+            rolling_memory_sample(
+                "after_publish",
+                processed,
+                next,
+                pending.len(),
+                pending_bytes,
+            )?;
+        }
+
+        dashboard.update(|state| state.phase = "final proof / promote");
         let tree = git
             .find_commit(tip)
             .and_then(|commit| commit.tree())
@@ -578,13 +1011,19 @@ impl ParallelImporter {
         let expected = import_expected_tree_oid(&git, tree.id(), &policy)?;
         let proof = verify_prospective_equivalence(&project, &expected)
             .map_err(|error| git_error(error.to_string()))?;
-        session.finish(&project, &proof).map_err(CliError::from)
+        rolling_memory_sample("before_final_proof", processed, next, 0, 0)?;
+        let outcome = session.finish(&project, &proof).map_err(CliError::from)?;
+        rolling_memory_sample("after_final_proof", processed, next, 0, 0)?;
+        dashboard.finish();
+        Ok((
+            outcome,
+            advances,
+            peak,
+            peak_bytes,
+            budget_stalls,
+            preflight_seconds,
+        ))
     }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
 
     // Construct Git objects directly: the host filesystem must not normalize
     // Unicode names or reject raw bytes before the importer can see them.
@@ -643,7 +1082,7 @@ mod tests {
         let policy = conversion_policy(git).unwrap();
         for tip in tips {
             let mut state = None;
-            for batch in [1, 100] {
+            for (batch, rolling) in [(1, false), (100, false), (100, true)] {
                 let output = tempfile::tempdir().unwrap();
                 let mut repo = Repository::init(output.path()).unwrap();
                 let importer = ParallelImporter::new(
@@ -654,13 +1093,19 @@ mod tests {
                         ..Default::default()
                     },
                 );
-                let outcome = importer
-                    .import_graph_stream(
-                        &mut repo,
-                        *tip,
-                        GitStreamLimits::new(batch, 32 * 1024 * 1024).unwrap(),
-                    )
-                    .unwrap_or_else(|error| panic!("tip {tip}, batch {batch}: {error}"));
+                let limits = GitStreamLimits::new(batch, 32 * 1024 * 1024).unwrap();
+                let outcome = if rolling {
+                    let (_, _, ordered) = importer.graph_stream_inputs(*tip).unwrap();
+                    importer.import_graph_stream_rolling(&mut repo, *tip, limits, &ordered)
+                } else {
+                    importer.import_graph_stream(&mut repo, *tip, limits)
+                }
+                .unwrap_or_else(|error| {
+                    panic!("tip {tip}, batch {batch}, rolling {rolling}: {error}")
+                });
+                for entry in repo.effective_history(None).unwrap() {
+                    assert!(repo.load_change(&entry.hash).unwrap().file_ops().is_empty());
+                }
                 if let Some(state) = state {
                     assert_eq!(outcome.state, state, "batch size changed identity at {tip}");
                 } else {
@@ -795,7 +1240,7 @@ mod tests {
     }
 
     #[test]
-    fn direct_stream_default_budget_accepts_commits_above_32_mib() {
+    fn direct_stream_explicit_budget_accepts_commits_above_32_mib() {
         let input = tempfile::tempdir().unwrap();
         let git = GitRepository::init_bare(input.path()).unwrap();
         let size = 33 * 1024 * 1024;
@@ -819,7 +1264,7 @@ mod tests {
             .import_graph_stream(
                 &mut repo,
                 tip,
-                GitStreamLimits::new(100, DEFAULT_STREAM_BYTE_LIMIT).unwrap(),
+                GitStreamLimits::new(100, 128 * 1024 * 1024).unwrap(),
             )
             .unwrap();
         assert_eq!(outcome.commits, 1);
@@ -933,6 +1378,430 @@ mod tests {
             );
         }
         (temp, git, previous.unwrap(), files)
+    }
+
+    #[test]
+    fn rolling_sample_matches_direct_import_and_advances_window() {
+        let (_git_dir, git, tip, _) = fixture(32);
+        let target = tempfile::tempdir().unwrap();
+        let mut repo = Repository::init(target.path()).unwrap();
+        let importer = ParallelImporter::new(
+            &git,
+            ParallelImportOptions {
+                graph_only: true,
+                target_view: repo.current_view().into(),
+                ..Default::default()
+            },
+        );
+        let (rolling, advances, peak, _, _, _) =
+            rolling_sample(&importer, &mut repo, tip, 8, 3, 1024 * 1024).unwrap();
+        assert_eq!(rolling.commits, 32);
+        assert!(advances >= 5);
+        assert_eq!(peak, 8);
+        assert_eq!(fs::read_dir(target.path()).unwrap().count(), 1);
+
+        let other = tempfile::tempdir().unwrap();
+        let mut baseline = Repository::init(other.path()).unwrap();
+        let ordinary = importer
+            .import_graph_stream(
+                &mut baseline,
+                tip,
+                GitStreamLimits::new(3, 32 * 1024 * 1024).unwrap(),
+            )
+            .unwrap();
+        assert_eq!(rolling.state, ordinary.state);
+        let a: Vec<_> = repo
+            .effective_history(None)
+            .unwrap()
+            .iter()
+            .map(|e| e.hash)
+            .collect();
+        let b: Vec<_> = baseline
+            .effective_history(None)
+            .unwrap()
+            .iter()
+            .map(|e| e.hash)
+            .collect();
+        assert_eq!(a, b);
+        assert_eq!(fs::read_dir(other.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn production_rolling_is_graph_only_and_matches_direct_api() {
+        let (_git_dir, git, tip, _) = fixture(32);
+        let target = tempfile::tempdir().unwrap();
+        let mut repo = Repository::init(target.path()).unwrap();
+        let importer = ParallelImporter::new(
+            &git,
+            ParallelImportOptions {
+                graph_only: true,
+                target_view: repo.current_view().into(),
+                ..Default::default()
+            },
+        );
+        let limits = GitStreamLimits::new(3, 32 * 1024 * 1024).unwrap();
+        let plan = importer
+            .validate_graph_stream_prospectively("main", tip, limits)
+            .unwrap();
+        let stream = plan.stream.as_ref().unwrap();
+        assert!(plan.commits.is_empty());
+        assert_eq!(stream.ordered.len(), 32);
+        let outcome = importer
+            .import_graph_stream_rolling(&mut repo, tip, limits, &stream.ordered)
+            .unwrap();
+        assert_eq!(
+            outcome.batches, 11,
+            "hot files must not force identity flushes"
+        );
+        for entry in repo.effective_history(None).unwrap() {
+            assert!(repo.load_change(&entry.hash).unwrap().file_ops().is_empty());
+        }
+        let other = tempfile::tempdir().unwrap();
+        let mut baseline = Repository::init(other.path()).unwrap();
+        let direct = importer
+            .import_graph_stream(
+                &mut baseline,
+                tip,
+                GitStreamLimits::new(1, 32 * 1024 * 1024).unwrap(),
+            )
+            .unwrap();
+        assert_eq!(outcome.state, direct.state);
+        let hashes = |repo: &Repository| {
+            repo.effective_history(None)
+                .unwrap()
+                .into_iter()
+                .map(|e| e.hash)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(hashes(&repo), hashes(&baseline));
+        assert_eq!(fs::read_dir(target.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn production_rolling_refills_under_byte_pressure() {
+        let input = tempfile::tempdir().unwrap();
+        let git = GitRepository::init_bare(input.path()).unwrap();
+        let signature = git2::Signature::new(
+            "Rolling",
+            "rolling@example.invalid",
+            &git2::Time::new(1_700_000_000, 0),
+        )
+        .unwrap();
+        let mut prior = None;
+        for index in 0..10 {
+            let parent = prior.map(|oid| git.find_commit(oid).unwrap());
+            let old_tree = parent.as_ref().map(|commit| commit.tree().unwrap());
+            let mut builder = git.treebuilder(old_tree.as_ref()).unwrap();
+            let mut bytes = vec![0u8; 256 * 1024];
+            bytes[1] = index as u8;
+            builder
+                .insert(format!("{index}.bin"), git.blob(&bytes).unwrap(), 0o100644)
+                .unwrap();
+            let tree = git.find_tree(builder.write().unwrap()).unwrap();
+            prior = Some(
+                git.commit(
+                    Some("refs/heads/main"),
+                    &signature,
+                    &signature,
+                    &format!("commit {index}"),
+                    &tree,
+                    &parent.iter().collect::<Vec<_>>(),
+                )
+                .unwrap(),
+            );
+        }
+        let tip = prior.unwrap();
+        let target = tempfile::tempdir().unwrap();
+        let mut repo = Repository::init(target.path()).unwrap();
+        let importer = ParallelImporter::new(
+            &git,
+            ParallelImportOptions {
+                graph_only: true,
+                target_view: repo.current_view().into(),
+                ..Default::default()
+            },
+        );
+        let limits = GitStreamLimits::new(100, 1024 * 1024).unwrap();
+        let plan = importer
+            .validate_graph_stream_prospectively("main", tip, limits)
+            .unwrap();
+        let stream = plan.stream.as_ref().unwrap();
+        let outcome = importer
+            .import_graph_stream_rolling(&mut repo, tip, limits, &stream.ordered)
+            .unwrap();
+        assert_eq!(outcome.commits, 10);
+        assert!(
+            outcome.batches >= 3,
+            "byte pressure must force refills and publications"
+        );
+        assert_eq!(fs::read_dir(target.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn graph_stream_retains_suffix_bytes_after_repeated_edits() {
+        let input = tempfile::tempdir().unwrap();
+        let git = GitRepository::init_bare(input.path()).unwrap();
+        let signature = git2::Signature::new(
+            "Graph stream",
+            "stream@example.invalid",
+            &git2::Time::new(1_700_000_000, 0),
+        )
+        .unwrap();
+        let versions: &[&[u8]] = &[
+            b"a\nb\nc\n",
+            b"a\nx\nc\n",
+            b"a\ny\nc\n",
+            b"a\nx\nmiddle\nc\n",
+            b"top\na\nx\nmiddle\nc\n",
+            b"top\nc\n",
+        ];
+        let mut prior = None;
+        let mut tips = Vec::new();
+        for bytes in versions {
+            let mut files = Files::new();
+            files.insert("hot.txt".into(), (bytes.to_vec(), 0o100644));
+            let tree = git.find_tree(tree(&git, &files, "")).unwrap();
+            let parent = prior.map(|id| git.find_commit(id).unwrap());
+            let tip = git
+                .commit(
+                    Some("refs/heads/main"),
+                    &signature,
+                    &signature,
+                    "edit hot file",
+                    &tree,
+                    &parent.iter().collect::<Vec<_>>(),
+                )
+                .unwrap();
+            tips.push(tip);
+            prior = Some(tip);
+        }
+        for (tip, bytes) in tips.into_iter().zip(versions) {
+            let target = tempfile::tempdir().unwrap();
+            let mut repo = Repository::init(target.path()).unwrap();
+            let importer = ParallelImporter::new(
+                &git,
+                ParallelImportOptions {
+                    graph_only: true,
+                    target_view: repo.current_view().into(),
+                    ..Default::default()
+                },
+            );
+            let limits = GitStreamLimits::new(100, 32 * 1024 * 1024).unwrap();
+            let plan = importer
+                .validate_graph_stream_prospectively("main", tip, limits)
+                .unwrap();
+            let ordered = &plan.stream.as_ref().unwrap().ordered;
+            let outcome = importer
+                .import_graph_stream_rolling(&mut repo, tip, limits, ordered)
+                .unwrap();
+            assert_eq!(
+                outcome.batches, 1,
+                "repeated edits share a graph-only batch"
+            );
+            for entry in repo.effective_history(None).unwrap() {
+                assert!(repo.load_change(&entry.hash).unwrap().file_ops().is_empty());
+            }
+            assert_eq!(
+                repo.get_file_content("hot.txt").unwrap().as_deref(),
+                Some(*bytes)
+            );
+            assert_eq!(fs::read_dir(target.path()).unwrap().count(), 1);
+        }
+    }
+
+    #[test]
+    fn rolling_sample_applies_blob_budget_and_refuses_oversized_commit() {
+        let (_git_dir, git, tip, _) = fixture(32);
+        let target = tempfile::tempdir().unwrap();
+        let mut repo = Repository::init(target.path()).unwrap();
+        let importer = ParallelImporter::new(
+            &git,
+            ParallelImportOptions {
+                graph_only: true,
+                target_view: repo.current_view().into(),
+                ..Default::default()
+            },
+        );
+        let (_, _, _, peak_bytes, stalls, _) =
+            rolling_sample(&importer, &mut repo, tip, 8, 3, 80).unwrap();
+        assert!(stalls > 0);
+        assert!(peak_bytes <= 80);
+        let other = tempfile::tempdir().unwrap();
+        let mut refused = Repository::init(other.path()).unwrap();
+        assert!(rolling_sample(&importer, &mut refused, tip, 8, 3, 1).is_err());
+        assert_eq!(refused.effective_history(None).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn rolling_sample_refuses_late_atomic_claim_before_publishing() {
+        let (_git_dir, git, tip, mut files) = fixture(16);
+        files.insert("late-file".into(), (b"target".to_vec(), 0o100644));
+        let tree = git.find_tree(tree(&git, &files, "")).unwrap();
+        let parent = git.find_commit(tip).unwrap();
+        let signature = git2::Signature::now("Sample", "sample@example.invalid").unwrap();
+        let bad_tip = git
+            .commit(
+                Some("refs/heads/main"),
+                &signature,
+                &signature,
+                &format!(
+                    "claimed final commit\n\nAtomic-Changes: {}",
+                    ContentHash::of(b"unverified claim").to_base32()
+                ),
+                &tree,
+                &[&parent],
+            )
+            .unwrap();
+        let target = tempfile::tempdir().unwrap();
+        let mut repo = Repository::init(target.path()).unwrap();
+        let importer = ParallelImporter::new(
+            &git,
+            ParallelImportOptions {
+                graph_only: true,
+                target_view: repo.current_view().into(),
+                ..Default::default()
+            },
+        );
+        assert!(rolling_sample(&importer, &mut repo, bad_tip, 8, 3, 1024 * 1024).is_err());
+        assert!(repo.effective_history(None).unwrap().is_empty());
+        assert_eq!(fs::read_dir(target.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    #[ignore = "real rolling import sample; set ATOMIC_ROLLING_GIT and ATOMIC_ROLLING_ARTIFACT"]
+    fn rolling_sample_hyperfine() {
+        let git = GitRepository::open(std::env::var_os("ATOMIC_ROLLING_GIT").unwrap()).unwrap();
+        let artifact = PathBuf::from(std::env::var_os("ATOMIC_ROLLING_ARTIFACT").unwrap());
+        fs::create_dir_all(&artifact).unwrap();
+        assert!(
+            !artifact.join("repo").exists(),
+            "sample target must be fresh"
+        );
+        let mut repo = Repository::init(artifact.join("repo")).unwrap();
+        let importer = ParallelImporter::new(
+            &git,
+            ParallelImportOptions {
+                graph_only: true,
+                target_view: repo.current_view().into(),
+                ..Default::default()
+            },
+        );
+        let tip = Oid::from_str("c5161524980522320c7d3425e714cc0965a869a5").unwrap();
+        let ordered = importer.collect_commit_oids_from_tip(&git, tip).unwrap();
+        assert_eq!(ordered.len(), 1097);
+        let start = Instant::now();
+        let window_mib: usize = std::env::var("ATOMIC_ROLLING_WINDOW_MIB")
+            .unwrap_or_else(|_| "512".into())
+            .parse()
+            .unwrap();
+        let window_bytes = window_mib.checked_mul(1024 * 1024).unwrap();
+        let (outcome, advances, peak, peak_bytes, stalls, preflight_seconds) =
+            rolling_sample(&importer, &mut repo, tip, 500, 100, window_bytes).unwrap();
+        let elapsed_seconds = start.elapsed().as_secs_f64();
+        assert_eq!(outcome.commits, ordered.len());
+        assert!(advances >= 5);
+        assert!(peak <= 500);
+        assert_eq!(fs::read_dir(repo.root()).unwrap().count(), 1);
+        drop(repo);
+        let repo = Repository::open(artifact.join("repo")).unwrap();
+        assert_eq!(repo.effective_history(None).unwrap().len(), ordered.len());
+        for oid in &ordered {
+            let hash = repo.checked_git_sha(&oid.to_string()).unwrap().unwrap();
+            assert!(repo.load_change(&hash).unwrap().file_ops().is_empty());
+        }
+        assert!(!artifact.join("baseline").exists());
+        let mut baseline = Repository::init(artifact.join("baseline")).unwrap();
+        let baseline_start = Instant::now();
+        let direct = importer
+            .import_graph_stream(
+                &mut baseline,
+                tip,
+                GitStreamLimits::new(100, 32 * 1024 * 1024).unwrap(),
+            )
+            .unwrap();
+        let baseline_seconds = baseline_start.elapsed().as_secs_f64();
+        assert_eq!(outcome.state, direct.state);
+        let rolling_history: Vec<_> = repo
+            .effective_history(None)
+            .unwrap()
+            .iter()
+            .map(|entry| entry.hash)
+            .collect();
+        let baseline_history: Vec<_> = baseline
+            .effective_history(None)
+            .unwrap()
+            .iter()
+            .map(|entry| entry.hash)
+            .collect();
+        assert_eq!(rolling_history, baseline_history);
+        assert_eq!(fs::read_dir(baseline.root()).unwrap().count(), 1);
+        let report = serde_json::json!({
+            "commits": outcome.commits, "batches": outcome.batches,
+            "window_size": 500, "batch_size": 100, "peak_window_commits": peak,
+            "window_blob_budget": window_bytes, "peak_reserved_blob_bytes": peak_bytes,
+            "blob_budget_stalls": stalls,
+            "window_advances": advances, "preflight_seconds": preflight_seconds,
+            "elapsed_seconds": elapsed_seconds, "state": outcome.state.to_base32(),
+            "direct_api_baseline_seconds": baseline_seconds, "ordered_hashes_match_baseline": true,
+            "private_publish_seconds": outcome.private_publish_seconds,
+            "final_proof_promotion_seconds": outcome.final_proof_promotion_seconds,
+            "historical_graph_states_verified": false, "materialized": false,
+            "checkout_adoption_preflight": false, "hard_rss_bound": false,
+        });
+        fs::write(
+            artifact.join("rolling-result.json"),
+            serde_json::to_vec_pretty(&report).unwrap(),
+        )
+        .unwrap();
+        println!("ROLLING RESULT {report}");
+    }
+
+    #[test]
+    #[ignore = "separate-process direct import RSS baseline; set ATOMIC_ROLLING_GIT, ATOMIC_ROLLING_ARTIFACT and ATOMIC_ROLLING_MEMORY_LOG"]
+    fn rolling_memory_direct_baseline() {
+        assert!(std::env::var_os("ATOMIC_ROLLING_MEMORY_LOG").is_some());
+        let git = GitRepository::open(std::env::var_os("ATOMIC_ROLLING_GIT").unwrap()).unwrap();
+        let artifact = PathBuf::from(std::env::var_os("ATOMIC_ROLLING_ARTIFACT").unwrap());
+        fs::create_dir_all(&artifact).unwrap();
+        assert!(!artifact.join("direct-baseline").exists());
+        let mut repo = Repository::init(artifact.join("direct-baseline")).unwrap();
+        let importer = ParallelImporter::new(
+            &git,
+            ParallelImportOptions {
+                graph_only: true,
+                target_view: repo.current_view().into(),
+                ..Default::default()
+            },
+        );
+        let tip = Oid::from_str("c5161524980522320c7d3425e714cc0965a869a5").unwrap();
+        rolling_memory_sample("before_direct", 0, 0, 0, 0).unwrap();
+        let start = Instant::now();
+        let outcome = importer
+            .import_graph_stream(
+                &mut repo,
+                tip,
+                GitStreamLimits::new(100, 32 * 1024 * 1024).unwrap(),
+            )
+            .unwrap();
+        let elapsed_seconds = start.elapsed().as_secs_f64();
+        rolling_memory_sample(
+            "after_direct_final_proof",
+            outcome.commits,
+            outcome.commits,
+            0,
+            0,
+        )
+        .unwrap();
+        assert_eq!(outcome.commits, 1097);
+        assert_eq!(fs::read_dir(repo.root()).unwrap().count(), 1);
+        let report = serde_json::json!({"commits": outcome.commits, "elapsed_seconds": elapsed_seconds,
+            "state": outcome.state.to_base32(), "materialized": false});
+        fs::write(
+            artifact.join("direct-baseline-result.json"),
+            serde_json::to_vec_pretty(&report).unwrap(),
+        )
+        .unwrap();
+        println!("DIRECT MEMORY BASELINE {report}");
     }
 
     #[test]

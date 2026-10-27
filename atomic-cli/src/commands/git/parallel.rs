@@ -1119,17 +1119,36 @@ pub(crate) struct VerifiedImportCommit {
 
 pub(crate) struct ProspectiveImportPlan {
     commits: Vec<VerifiedImportCommit>,
+    /// Compact first-parent stream preflight; historical payloads are not retained.
+    stream: Option<StreamPreflight>,
     /// Explicit Git closure boundaries detected before sequencing; stamped
     /// into every synthesized change's unhashed provenance.
     boundaries: Vec<&'static str>,
 }
 
+struct StreamPreflight {
+    tip: Oid,
+    ordered: Vec<Oid>,
+    expected_tree: GitObjectId,
+    raw_tree: GitObjectId,
+    changed_paths: Vec<PathBuf>,
+    merges: usize,
+    empty: usize,
+    files: usize,
+}
+
 impl ProspectiveImportPlan {
+    pub(crate) fn is_stream(&self) -> bool {
+        self.stream.is_some()
+    }
     pub(crate) fn boundaries(&self) -> &[&'static str] {
         &self.boundaries
     }
 
     pub(crate) fn expected_git_tree(&self) -> Option<GitObjectId> {
+        if let Some(stream) = &self.stream {
+            return Some(stream.expected_tree.clone());
+        }
         self.commits
             .last()
             .map(|commit| commit.verified.expected_git_tree().clone())
@@ -1137,12 +1156,18 @@ impl ProspectiveImportPlan {
 
     /// The last verified commit's RAW Git tree OID (HEAD-stability anchor).
     pub(crate) fn raw_git_tree(&self) -> Option<GitObjectId> {
+        if let Some(stream) = &self.stream {
+            return Some(stream.raw_tree.clone());
+        }
         self.commits
             .last()
             .map(|commit| commit.raw_tree_oid.clone())
     }
 
     pub(crate) fn changed_paths(&self) -> Vec<PathBuf> {
+        if let Some(stream) = &self.stream {
+            return stream.changed_paths.clone();
+        }
         let mut paths = std::collections::BTreeSet::new();
         for commit in &self.commits {
             for file in &commit.parsed.files {
@@ -2554,7 +2579,7 @@ impl ImportLineIndex {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum PendingLineIndexUpdate {
     DirectoryAdd {
         path: String,
@@ -2579,7 +2604,7 @@ enum PendingLineIndexUpdate {
     },
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct PendingLineReplacement {
     start_idx: usize,
     old_len: usize,
@@ -4308,6 +4333,7 @@ impl ParallelImporter {
         if commit_oids.is_empty() {
             return Ok(ProspectiveImportPlan {
                 commits: Vec::new(),
+                stream: None,
                 boundaries,
             });
         }
@@ -4400,6 +4426,7 @@ impl ParallelImporter {
         trace_git_import(format!("prospective total: {:?}", total_start.elapsed()));
         Ok(ProspectiveImportPlan {
             commits: verified_commits,
+            stream: None,
             boundaries,
         })
     }
@@ -4408,6 +4435,25 @@ impl ParallelImporter {
         &self,
         prospective: &ProjectTree,
         commits: &[VerifiedImportCommit],
+        branch_name: &str,
+        git: &GitRepository,
+    ) -> CliResult<()> {
+        let mut changed = std::collections::BTreeSet::new();
+        for commit in commits {
+            for file in &commit.parsed.files {
+                changed.insert(file.path.as_str());
+                if let Some(old_path) = file.old_path.as_deref() {
+                    changed.insert(old_path);
+                }
+            }
+        }
+        self.verify_worktree_path_set(prospective, changed, branch_name, git)
+    }
+
+    fn verify_worktree_path_set<'a>(
+        &self,
+        prospective: &ProjectTree,
+        changed: impl IntoIterator<Item = &'a str>,
         branch_name: &str,
         git: &GitRepository,
     ) -> CliResult<()> {
@@ -4425,15 +4471,6 @@ impl ParallelImporter {
             .ok_or_else(|| git_error("checked-out import branch has no worktree"))?;
         let filter = GitAttributesFilter::for_repository(root);
         let mut present = atomic_repository::worktree_presence::WorktreeEntries::new(root);
-        let mut changed = std::collections::BTreeSet::new();
-        for commit in commits {
-            for file in &commit.parsed.files {
-                changed.insert(file.path.as_str());
-                if let Some(old_path) = file.old_path.as_deref() {
-                    changed.insert(old_path);
-                }
-            }
-        }
         let expected: BTreeMap<_, _> = prospective
             .manifest
             .entries
