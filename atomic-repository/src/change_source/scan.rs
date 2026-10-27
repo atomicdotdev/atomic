@@ -3,7 +3,7 @@ use std::fs;
 use std::path::Path;
 
 use atomic_core::change::InodeKind;
-use atomic_core::output::inode_permissions_changed;
+use atomic_core::output::{inode_permissions_changed, permission_bits_matter};
 use atomic_core::pristine::{FileIndexTimestamp, FileIndexV2Entry};
 use atomic_core::types::Hash;
 
@@ -432,14 +432,18 @@ where
                 // Symlink permission bits are not a fact (Git stores every
                 // link as 120000; `lstat` reports 0o777 on Linux and 0o755
                 // on macOS), mirroring `InodeStatusFacts::between`.
-                let permissions_changed = file.mode.is_none_or(|mode| {
-                    inode_permissions_changed(
-                        entry.canonical_kind,
-                        entry.canonical_mode,
-                        observed_kind.unwrap_or(entry.canonical_kind),
-                        mode,
-                    )
-                });
+                let actual_kind = observed_kind.unwrap_or(entry.canonical_kind);
+                let permissions_changed = file.mode.map_or_else(
+                    || permission_bits_matter(entry.canonical_kind, actual_kind),
+                    |mode| {
+                        inode_permissions_changed(
+                            entry.canonical_kind,
+                            entry.canonical_mode,
+                            actual_kind,
+                            mode,
+                        )
+                    },
+                );
                 let observed_row = cached.and_then(|row| {
                     observed_index_row(
                         file,
@@ -1400,5 +1404,23 @@ mod tests {
             "{:?}",
             cold.candidates[0]
         );
+
+        let mut unknown_mode = source(dir.path(), &paths);
+        if let CandidateObservation::Present(file) = &mut unknown_mode.candidates[0].observation {
+            file.mode = None;
+        } else {
+            panic!("fixture symlink is missing");
+        }
+        let verified = verify_candidates(
+            unknown_mode,
+            &tracked,
+            &BTreeMap::new(),
+            Hash::of(b"policy"),
+            now_timestamp(),
+            &ExactFilter,
+            |_| Ok(expected),
+        )
+        .unwrap();
+        assert_eq!(verified.candidates[0].change, VerifiedChange::Unchanged);
     }
 }
