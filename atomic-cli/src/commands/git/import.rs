@@ -1825,7 +1825,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     #[cfg_attr(
         not(unix),
         ignore = "the Git shim projection requires lossless unix paths (ProjectTreeError::UnsupportedPlatformPath)"
@@ -1905,7 +1905,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     #[cfg_attr(
         not(unix),
         ignore = "the Git shim projection requires lossless unix paths (ProjectTreeError::UnsupportedPlatformPath)"
@@ -1944,7 +1944,7 @@ mod tests {
 
     #[cfg(not(unix))]
     #[test]
-    #[serial]
+    #[file_serial]
     fn stream_refuses_unsupported_native_paths_before_initialization() {
         let temp = tempfile::tempdir().unwrap();
         init_git(temp.path());
@@ -1967,7 +1967,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     #[cfg(unix)]
     fn stream_flag_imports_spaces_unicode_percent_and_symlinks() {
         let temp = tempfile::tempdir().unwrap();
@@ -2051,7 +2051,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn unsupported_stream_boundary_rejects_before_atomic_or_git_exclude_writes() {
         let temp = tempfile::tempdir().unwrap();
         init_git(temp.path());
