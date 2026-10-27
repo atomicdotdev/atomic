@@ -65,6 +65,9 @@ mod service;
 
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 
+#[cfg(feature = "git-shim")]
+use commands::Git;
+
 use commands::{
     Add,
     Agent,
@@ -77,7 +80,6 @@ use commands::{
     Conflicts,
     Diff,
     Doctor,
-    Git,
     Identity,
     Init,
     Insert,
@@ -516,6 +518,7 @@ enum Commands {
     /// # Preview without creating repository
     /// atomic git import --dry-run
     /// ```
+    #[cfg(feature = "git-shim")]
     Git(Git),
 
     /// Manage views (perspectives on the graph).
@@ -947,6 +950,16 @@ fn main() {
 
     // Initialize logging
     logging::init();
+    #[cfg(feature = "git-shim")]
+    atomic_git_shim::output::set_reporter(|kind, message| {
+        use atomic_git_shim::output::Notice;
+        match kind {
+            Notice::Success => output::print_success(message),
+            Notice::Info => output::print_info(message),
+            Notice::Warning => output::print_warning(message),
+            Notice::Hint => output::print_hint(message),
+        }
+    });
 
     // Dynamic shell completion. When invoked in completion mode (the `COMPLETE`
     // env var is set by the installed shell hook), this emits candidates —
@@ -1004,6 +1017,12 @@ fn main() {
         }
     }
 
+    #[cfg(not(feature = "git-shim"))]
+    if let Err(error) = commands::git_support::ensure_current_workspace_supported() {
+        print_error(&error.to_string());
+        std::process::exit(error.exit_code());
+    }
+
     // Execute the command and handle errors
     let result = match cli.command {
         Commands::Agent(agent) => agent.run(),
@@ -1047,7 +1066,8 @@ fn main() {
         Commands::Doctor(doctor) => doctor.run(),
         Commands::Compact(compact) => compact.run(),
 
-        Commands::Git(git) => git.run(),
+        #[cfg(feature = "git-shim")]
+        Commands::Git(git) => git.run().map_err(Into::into),
 
         Commands::Insert(insert) => insert.run(),
 

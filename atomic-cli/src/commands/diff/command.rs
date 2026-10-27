@@ -272,6 +272,7 @@ impl Diff {
     /// Read-only comparison of two adjacent layers:
     /// - `--cached`: Git baseline (HEAD tree) → index (staged),
     /// - default: index → worktree (unstaged).
+    #[cfg(feature = "git-shim")]
     fn run_git_diff(&self, repo_root: &std::path::Path) -> CliResult<()> {
         use std::collections::BTreeMap;
 
@@ -556,7 +557,10 @@ impl Command for Diff {
 
         // Git-inspired, versioned staging diff (observation-only).
         if self.git {
+            #[cfg(feature = "git-shim")]
             return self.run_git_diff(&repo_root);
+            #[cfg(not(feature = "git-shim"))]
+            return Err(crate::commands::git_support::unavailable_error());
         }
 
         // Open the repository and retain its stable workspace boundary for all diff work.

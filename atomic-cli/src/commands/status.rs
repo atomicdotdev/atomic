@@ -92,6 +92,7 @@
 //!     modified:   src/lib.rs
 //! ```
 
+#[cfg(feature = "git-shim")]
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
@@ -104,11 +105,13 @@ use atomic_repository::{
     Repository, SnapshotStatus, WorkspaceRemediation, WorkspaceTxnMode, WorkspaceTxnStart,
 };
 
+#[cfg(feature = "git-shim")]
 use crate::commands::git::observation::{
     classify_provisional_checkpoint, display_git_bytes, observe_git, AtomicAnchorObservation,
     GitObservation, IndexHeadEquivalence, ManifestEquivalence, ProvisionalCheckpointEligibility,
     RefTargetObservation,
 };
+#[cfg(feature = "git-shim")]
 use crate::commands::git::shim::read_checkpoint_observation;
 use crate::commands::workspace_txn::{enter_workspace, observe_workspace};
 use crate::commands::{find_repository_root, Command, DEFAULT_HASH_LENGTH};
@@ -293,7 +296,9 @@ impl Status {
         }
         let repo = Repository::open_readonly_wait(&root, atomic_repository::database_lock_wait())
             .map_err(CliError::Repository)?;
+        #[cfg(feature = "git-shim")]
         crate::commands::status_git::apply_git_informed_overlays(&repo, &root, &mut status)?;
+        #[cfg(feature = "git-shim")]
         crate::commands::git::ref_mapping::print_divergence_notices(&repo)?;
         if repo.shim_workspace_active().map_err(CliError::Repository)? {
             if let Ok(git) = git2::Repository::discover(&root) {
@@ -714,6 +719,7 @@ impl Command for Status {
     fn run(&self) -> CliResult<()> {
         // A shim-enrolled repository's linked worktrees are not managed yet:
         // refuse before any constructor registers a second working copy there.
+        #[cfg(feature = "git-shim")]
         crate::commands::git::linked_worktree::refuse_when_shim_enrolled_from_cwd()?;
         if crate::commands::rpc::status(self)? {
             return Ok(());
@@ -724,7 +730,11 @@ impl Command for Status {
 
         // Git-inspired, versioned staging subset (observation-only).
         if self.git {
-            return crate::commands::status_git::run_git_status(&repo_root, self.json);
+            #[cfg(feature = "git-shim")]
+            return crate::commands::status_git::run_git_status(&repo_root, self.json)
+                .map_err(Into::into);
+            #[cfg(not(feature = "git-shim"))]
+            return Err(super::git_support::unavailable_error());
         }
 
         if self.no_reconcile {
@@ -737,6 +747,7 @@ impl Command for Status {
                     let view = workspace.view().name.clone();
                     let result = print_forensic_status(&repo_root, &repo, &view, None);
                     // CB-10A: surface ref-mapping divergence (read-only).
+                    #[cfg(feature = "git-shim")]
                     let _ = crate::commands::git::ref_mapping::print_divergence_notices(&repo);
                     return result;
                 }
@@ -751,6 +762,7 @@ impl Command for Status {
                         .map_err(CliError::from)?;
                     let result =
                         print_forensic_status(&repo_root, &repo, &view, Some(&remediation));
+                    #[cfg(feature = "git-shim")]
                     let _ = crate::commands::git::ref_mapping::print_divergence_notices(&repo);
                     return result;
                 }
@@ -839,6 +851,7 @@ impl Command for Status {
         // Git-informed overlays (colocated only): index-new paths displayed
         // as pending additions, unmerged entries as Git merge conflicts.
         // Display only — durable tracking is never mutated here.
+        #[cfg(feature = "git-shim")]
         crate::commands::status_git::apply_git_informed_overlays(&repo, &repo_root, &mut status)?;
 
         if let Some(notice) = &git_merge_notice {
@@ -847,6 +860,7 @@ impl Command for Status {
 
         // CB-10A: surface ref-mapping divergence with actionable remediation
         // (read-only; never materializes).
+        #[cfg(feature = "git-shim")]
         crate::commands::git::ref_mapping::print_divergence_notices(&repo)?;
 
         // Print in appropriate format
@@ -864,6 +878,7 @@ impl Command for Status {
     }
 }
 
+#[cfg(feature = "git-shim")]
 fn print_forensic_status(
     repo_root: &Path,
     repo: &Repository,
@@ -907,6 +922,7 @@ fn print_forensic_status(
     Ok(())
 }
 
+#[cfg(feature = "git-shim")]
 fn forensic_manifest_root(repo_root: &Path, repo: &Repository, view: &str) -> Option<String> {
     if !repo_root.join(".git").exists() {
         return None;
@@ -921,6 +937,7 @@ fn forensic_manifest_root(repo_root: &Path, repo: &Repository, view: &str) -> Op
 /// Report observed drift between the checkpoint and current state as plain
 /// observations. No stale-baseline classification is made: index movement is
 /// legitimate Git work between boundaries (CB-11A).
+#[cfg(feature = "git-shim")]
 fn forensic_drift(
     checkpoint: Option<&crate::commands::git::observation::ShimCheckpointObservation>,
     atomic: &AtomicAnchorObservation,
@@ -972,6 +989,7 @@ fn forensic_drift(
     drift
 }
 
+#[cfg(feature = "git-shim")]
 fn build_forensic_report(
     repo_root: &Path,
     atomic: &AtomicAnchorObservation,
@@ -1215,6 +1233,7 @@ fn build_forensic_report(
     report
 }
 
+#[cfg(feature = "git-shim")]
 fn write_raw_path_list(report: &mut String, label: &str, paths: &[Vec<u8>]) {
     let _ = writeln!(report, "      {label}: {}", paths.len());
     for path in paths {
@@ -2272,4 +2291,19 @@ mod tests {
         let result = status_cmd.print_short_format(&repo_status);
         assert!(result.is_ok());
     }
+}
+
+#[cfg(not(feature = "git-shim"))]
+fn print_forensic_status(
+    root: &Path,
+    repo: &Repository,
+    view: &str,
+    remediation: Option<&WorkspaceRemediation>,
+) -> CliResult<()> {
+    let info = repo.get_view_info(view)?;
+    println!("Forensic status (read-only; reconciliation disabled)\nAtomic root: {}\nAtomic view: {view}\nAtomic state: {}", root.display(), info.state);
+    if let Some(remediation) = remediation {
+        println!("Workspace remediation required: {remediation:#?}");
+    }
+    Ok(())
 }

@@ -61,8 +61,7 @@ use atomic_agent::hooks::AgentRegistry;
 use atomic_core::change::session::{IncompleteSession, SessionIncompleteOrigin};
 use atomic_core::types::Base32;
 
-use crate::commands::git::guard::GuardOperation;
-use crate::commands::git::wip::{capture_or_reuse_tracked_wip, WipCaptureRequest};
+use atomic_repository::wip::{capture_or_reuse_tracked_wip, WipCaptureRequest};
 use atomic_repository::{Repository, WorkspaceTxnMode, WorkspaceTxnStart};
 
 use crate::commands::{find_repository_root, Command};
@@ -349,6 +348,7 @@ impl Command for Hooks {
             // Set the agent identity so new sessions get the correct name
             // (e.g., "claude-code" / "Claude Code" instead of "unknown")
             orchestrator.set_agent(&agent_name, &agent_display);
+            #[cfg(feature = "git-shim")]
             orchestrator.set_session_view_coordinator(|root, view| {
                 crate::commands::git::shadow::sync_inherited_agent_view(root, view)
                     .map_err(|error| error.to_string())
@@ -398,6 +398,7 @@ impl Command for Hooks {
             // shim projection as an ordinary CLI/service record. Keep all
             // provenance/refusal checks ahead of this publication.
             drop(orchestrator);
+            #[cfg(feature = "git-shim")]
             if dispatch_result.incomplete.is_none() {
                 if let (Some(outcome), Some(view)) =
                     (&dispatch_result.change_recorded, &dispatch_result.view)
@@ -550,8 +551,8 @@ pub(crate) fn guard_agent_boundary(
     hook_type: HookType,
 ) -> CliResult<Option<IncompleteSession>> {
     let operation = match hook_type {
-        HookType::TurnEnd => GuardOperation::AgentTurnEnd,
-        HookType::SessionEnd => GuardOperation::AgentSessionEnd,
+        HookType::TurnEnd => "agent turn-end",
+        HookType::SessionEnd => "agent session-end",
         _ => return Ok(None),
     };
 
@@ -774,6 +775,7 @@ mod tests {
     use git2::{Oid, Repository as GitRepository, Signature};
     use std::{fs, path::Path};
 
+    #[cfg(feature = "git-shim")]
     use crate::commands::git::checkpoint::{self, VerifiedCheckpointInput};
 
     fn commit_file(repository: &GitRepository, root: &Path, content: &[u8], message: &str) -> Oid {
@@ -806,17 +808,22 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "git-shim")]
     fn initialized_colocated_repository(root: &Path) -> (GitRepository, Oid) {
         atomic_repository::Repository::init(root).unwrap();
         let git = GitRepository::init(root).unwrap();
         let head = commit_file(&git, root, b"checkpoint\n", "checkpoint");
         let tree = git.find_commit(head).unwrap().tree_id();
-        let atomic = checkpoint::observe_current_atomic(root).unwrap();
+        let repo = atomic_repository::Repository::open_readonly(root).unwrap();
+        let working_copy = repo.require_working_copy_id().unwrap();
+        let view = repo.desired_view_name(working_copy).unwrap();
+        let state = repo.get_view_info(&view).unwrap().state.to_string();
+        drop(repo);
         checkpoint::write_verified_checkpoint(
             root,
             VerifiedCheckpointInput {
-                view: &atomic.view,
-                atomic_state: &atomic.state,
+                view: &view,
+                atomic_state: &state,
                 git_head: &head.to_string(),
                 git_tree: &tree.to_string(),
             },
@@ -1097,6 +1104,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "git-shim")]
     fn managed_boundary_uses_shared_guard_and_persists_first_refusal() {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path();
@@ -1146,6 +1154,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "git-shim")]
     fn unmanaged_boundary_reuses_wip_on_duplicate_and_crash_retry() {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path();
@@ -1184,6 +1193,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "git-shim")]
     fn inherited_agent_view_name_mismatch_passes_shared_guard() {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path();

@@ -104,61 +104,15 @@ impl Switch {
     }
 }
 
-fn checkpoint_shadow_switch(
-    shadow_sync: crate::commands::git::shadow::ShadowSwitchSync,
-    repo_root: &std::path::Path,
-    view: &str,
-) -> CliResult<()> {
-    let shadow_was_synchronized = shadow_sync.is_synchronized();
-    // A native (unenrolled) colocated repository must neither fail its view
-    // switch on Git observation errors nor bootstrap the first shim
-    // checkpoint: `.git` beside `.atomic` is not shim consent. Only an
-    // enrolled workspace refreshes; import anchors explicitly.
-    if !shadow_was_synchronized
-        && !crate::commands::git::shadow::shim_workspace_enrolled(repo_root)?
-    {
-        return Ok(());
-    }
-    let checkpoint = match crate::commands::git::shim::refresh_checkpoint_if_aligned(repo_root) {
-        Ok(outcome) => outcome,
-        Err(error) => {
-            return match shadow_sync.rollback(repo_root) {
-                Ok(()) => Err(error),
-                Err(rollback_error) => Err(CliError::GitError {
-                    message: format!("{error}; {rollback_error}"),
-                }),
-            };
-        }
-    };
-    if shadow_was_synchronized
-        && checkpoint != crate::commands::git::shim::CheckpointRefresh::Refreshed
-    {
-        let error = CliError::GitError {
-            message: format!(
-                "Git shadow synchronization for view '{view}' completed, but the shim verifier did not refresh its checkpoint ({checkpoint:?}); run `atomic git shim verify` for details"
-            ),
-        };
-        return match shadow_sync.rollback(repo_root) {
-            Ok(()) => Err(error),
-            Err(rollback_error) => Err(CliError::GitError {
-                message: format!("{error}; {rollback_error}"),
-            }),
-        };
-    }
-    Ok(())
-}
+#[cfg(feature = "git-shim")]
+use atomic_git_shim::commands::shadow::checkpoint_shadow_switch;
 
-/// Finish the existing Git boundary after a successful service-owned native
-/// switch. The service has released its workspace lease and database handle.
 pub(crate) fn finish_service_switch(repo_root: &std::path::Path, view: &str) -> CliResult<()> {
-    let repo = Repository::open_for_workspace_transaction_wait(
-        repo_root,
-        atomic_repository::database_lock_wait(),
-    )
-    .map_err(CliError::Repository)?;
-    let shadow_sync = crate::commands::git::shadow::sync_git_head_to_view(&repo, repo_root, view)?;
-    drop(repo);
-    checkpoint_shadow_switch(shadow_sync, repo_root, view)
+    #[cfg(feature = "git-shim")]
+    atomic_git_shim::commands::shadow::finish_service_switch(repo_root, view)?;
+    #[cfg(not(feature = "git-shim"))]
+    let _ = (repo_root, view);
+    Ok(())
 }
 
 impl Command for Switch {
@@ -211,14 +165,17 @@ impl Command for Switch {
         // not print a false success while Git evidence is still stale.
         if desired_view == name.as_str() {
             drop(workspace);
-            let shadow_sync =
-                crate::commands::git::shadow::sync_git_head_to_view(&repo, &repo_root, name)?;
-            if !shadow_sync.is_synchronized() {
-                print_success(&format!("Already on view: {}", style_view(name)));
-                return Ok(());
+            #[cfg(feature = "git-shim")]
+            {
+                let shadow_sync =
+                    crate::commands::git::shadow::sync_git_head_to_view(&repo, &repo_root, name)?;
+                if !shadow_sync.is_synchronized() {
+                    print_success(&format!("Already on view: {}", style_view(name)));
+                    return Ok(());
+                }
+                drop(repo);
+                checkpoint_shadow_switch(shadow_sync, &repo_root, name)?;
             }
-            drop(repo);
-            checkpoint_shadow_switch(shadow_sync, &repo_root, name)?;
             print_success(&format!("Already on view: {}", style_view(name)));
             return Ok(());
         }
@@ -279,6 +236,7 @@ impl Command for Switch {
         // align HEAD plus the live index without touching the working copy.
         // Active shadow sync is coordinated and fallible; plain no-Git and
         // non-shadow repositories remain no-ops.
+        #[cfg(feature = "git-shim")]
         let shadow_sync =
             match crate::commands::git::shadow::sync_git_head_to_view(&repo, &repo_root, name) {
                 Ok(outcome) => outcome,
@@ -287,7 +245,7 @@ impl Command for Switch {
                         &spinner,
                         "View materialized, but Git shadow synchronization failed",
                     );
-                    return Err(error);
+                    return Err(error.into());
                 }
             };
 
@@ -303,12 +261,13 @@ impl Command for Switch {
         // fresh checkpoint; no-Git and non-shadow switches preserve their
         // existing no-op behavior.
         drop(repo);
+        #[cfg(feature = "git-shim")]
         if let Err(error) = checkpoint_shadow_switch(shadow_sync, &repo_root, name) {
             crate::output::finish_error(
                 &spinner,
                 "View and Git shadow aligned, but checkpoint refresh failed",
             );
-            return Err(error);
+            return Err(error.into());
         }
 
         crate::output::finish_success(
@@ -376,6 +335,7 @@ mod tests {
     // -------------------------------------------------------------------------
 
     #[test]
+    #[cfg(feature = "git-shim")]
     fn checkpoint_refresh_skips_native_unenrolled_repositories() {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path();
@@ -475,6 +435,7 @@ mod tests {
         not(unix),
         ignore = "the Git shim projection requires lossless unix paths (ProjectTreeError::UnsupportedPlatformPath)"
     )]
+    #[cfg(feature = "git-shim")]
     fn native_colocated_switch_projects_parent_advance_into_child_shadow() {
         let _guard = DirGuard::new();
         let temp = tempfile::tempdir().unwrap();
@@ -488,12 +449,9 @@ mod tests {
         git_ok(root, &["commit", "-q", "-m", "initial"]);
         std::env::set_current_dir(root).unwrap();
 
-        crate::commands::git::Import {
-            no_vault: true,
-            ..crate::commands::git::Import::default()
-        }
-        .run()
-        .unwrap();
+        let mut import = crate::commands::git::Import::default();
+        import.no_vault = true;
+        import.run().unwrap();
         {
             let mut repo = Repository::open(root).unwrap();
             repo.create_view_from("feature", "main").unwrap();
@@ -595,6 +553,7 @@ mod tests {
         not(unix),
         ignore = "the Git shim projection requires lossless unix paths (ProjectTreeError::UnsupportedPlatformPath)"
     )]
+    #[cfg(feature = "git-shim")]
     fn conflicted_shadow_projection_fails_and_restores_git_evidence() {
         let _guard = DirGuard::new();
         let temp = tempfile::tempdir().unwrap();
@@ -608,12 +567,9 @@ mod tests {
         git_ok(root, &["commit", "-q", "-m", "initial"]);
         std::env::set_current_dir(root).unwrap();
 
-        crate::commands::git::Import {
-            no_vault: true,
-            ..crate::commands::git::Import::default()
-        }
-        .run()
-        .unwrap();
+        let mut import = crate::commands::git::Import::default();
+        import.no_vault = true;
+        import.run().unwrap();
         {
             let mut repo = Repository::open(root).unwrap();
             repo.create_view_from("feature", "main").unwrap();

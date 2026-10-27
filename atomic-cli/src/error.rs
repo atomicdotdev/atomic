@@ -1303,3 +1303,53 @@ mod tests {
         }
     }
 }
+
+#[cfg(feature = "git-shim")]
+impl From<atomic_git_shim::error::ShimError> for CliError {
+    fn from(error: atomic_git_shim::error::ShimError) -> Self {
+        use atomic_git_shim::error::ShimError;
+        match error {
+            ShimError::GitError { message } => Self::GitError { message },
+            ShimError::StaleBaseline { report } => Self::StaleBaseline { report },
+            ShimError::RepositoryNotFound { searched_path } => {
+                Self::RepositoryNotFound { searched_path }
+            }
+            ShimError::InvalidRepository { reason } => Self::InvalidRepository { reason },
+            ShimError::ViewNotFound { name } => Self::ViewNotFound { name },
+            ShimError::Repository(error) => Self::Repository(error),
+            ShimError::Io(error) => Self::Io(error),
+            ShimError::Config(error) => Self::Config(error),
+            ShimError::Internal(error) => Self::Internal(error),
+        }
+    }
+}
+
+#[cfg(all(test, feature = "git-shim"))]
+#[test]
+fn shim_errors_keep_their_display_across_the_cli_boundary() {
+    use atomic_git_shim::error::ShimError;
+    // Shim operations also embed errors in remediation/rollback reports.
+    // Formatting before conversion must preserve the same user-facing text.
+    for error in [
+        ShimError::RepositoryNotFound {
+            searched_path: PathBuf::from("/missing/repository"),
+        },
+        ShimError::InvalidRepository {
+            reason: "corrupt".into(),
+        },
+        ShimError::ViewNotFound {
+            name: "topic".into(),
+        },
+        ShimError::GitError {
+            message: "ref moved".into(),
+        },
+        ShimError::StaleBaseline {
+            report: "reconcile required".into(),
+        },
+        ShimError::Io(std::io::Error::other("unreadable index")),
+        ShimError::Internal(anyhow::anyhow!("checkpoint failure")),
+    ] {
+        let before = error.to_string();
+        assert_eq!(CliError::from(error).to_string(), before);
+    }
+}

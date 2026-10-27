@@ -23,6 +23,38 @@ commands, and expected results. The [RFC](RFC-ATOMIC-GIT-CAUSAL-BRIDGE.md)
 contains the full design. The [task tracker](RFC-ATOMIC-GIT-CAUSAL-BRIDGE-TODO.md)
 contains implementation and review history.
 
+## Build availability and repository enrollment
+
+Git interoperability is implemented by the independent
+[`atomic-git-shim`](../atomic-git-shim/README.md) crate. The CLI's `git-shim`
+Cargo feature includes that adapter; it is enabled in default builds to
+preserve existing behavior. This is separate from the per-repository
+`[git.shim] enabled` setting, which remains opt-in.
+
+```sh
+# Existing CLI, including Git commands and teams.
+cargo build -p atomic-cli
+
+# Native CLI with teams, without the Git adapter.
+cargo build -p atomic-cli --no-default-features --features teams
+
+# Git adapter enabled, teams disabled.
+cargo build -p atomic-cli --no-default-features --features git-shim
+```
+
+A build without `git-shim` omits `atomic git` and refuses Git clone/adoption,
+`status --git`, and `diff --git`. Native init, record, and view operations
+remain available. An already enrolled workspace requires a shim-enabled
+binary: the native-only CLI refuses before command execution, including RPC
+dispatch, instead of updating Atomic without its Git publication adapter.
+Use a shim-enabled binary to continue or to explicitly disable enrollment.
+
+This split does not remove Git-related repository data or every transitive
+Git dependency. Repository guards, graph history, closure resolution, and
+workspace transactions retain their existing owners. The `shadow` module
+inside the adapter still coordinates projection and checkpoint rollback;
+its name does not make that behavior obsolete.
+
 ## 1. Current behavior and scope
 
 The shim imports Git history, projects Atomic records into Git, checks that
@@ -284,6 +316,13 @@ it is **private by default** — excluded from the repository manifest projectio
 invisible to Git equivalence checks and publication — **but may be tracked** when
 the colocated Git repository itself tracks `.vault/` in its tree.
 
+Git publication is not a complete backup or synchronization protocol for
+Atomic's knowledge graph. Materialized vault files alone do not carry the
+full database state, goal/intent relationships, or query indexes. The crate
+split preserves the existing vault conversion policy below; it does not
+silently untrack an existing vault or promise those capabilities on a Git
+clone.
+
 The policy is recorded in `.atomic/config.toml`:
 
 ```toml
@@ -514,7 +553,7 @@ format fences. Later operations can prevent rollback.
 **Known limit:** a `record` can save its Atomic change, then fail with
 `git-bridge-cutover` when legacy shadow projection runs. Check `atomic log`,
 `atomic op log`, and both statuses before retrying. See the
-[cutover tests](../atomic-cli/tests/git_cutover_cb13b_test.rs).
+[cutover tests](../atomic-cli/tests/it/git_cutover_cb13b_test.rs).
 
 ### redb consolidation
 

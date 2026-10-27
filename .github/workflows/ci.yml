@@ -39,6 +39,14 @@ jobs:
       - name: cargo check
         run: cargo check --workspace
 
+      - name: Check CLI without Git shim (with and without teams)
+        run: |
+          cargo check -p atomic-cli --no-default-features --all-targets
+          cargo check -p atomic-cli --no-default-features --features teams --all-targets
+
+      - name: Test native CLI without Git shim
+        run: cargo test -p atomic-cli --no-default-features --no-fail-fast
+
   test:
     name: Test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}

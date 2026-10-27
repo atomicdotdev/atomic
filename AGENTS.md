@@ -18,6 +18,7 @@ Atomic is a mathematically sound distributed version control system built in Rus
 ```
 atomic/
 ├── atomic-cli/           # CLI application
+├── atomic-git-shim/      # Optional Git adapter; CLI feature: git-shim
 ├── atomic-core/          # Core VCS engine
 │   ├── types/            # Fundamental data types
 │   └── pristine/         # Storage layer (redb)

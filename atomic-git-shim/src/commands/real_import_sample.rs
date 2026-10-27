@@ -182,7 +182,7 @@ fn prepare_hyperfine_publication_sample() {
         previous["mainline_merges"].as_u64().unwrap() as usize
     });
     let mut preflight_ms = 0.0;
-    let result: CliResult<()> = (|| {
+    let result: ShimResult<()> = (|| {
         let plan = importer.validate_branch_prospectively_for_tip(
             &view,
             Some(&repo),
@@ -216,7 +216,7 @@ fn prepare_hyperfine_publication_sample() {
             })?;
             let change = repo
                 .load_change(&info.atomic_hash)
-                .map_err(CliError::from)?;
+                .map_err(ShimError::from)?;
             let semantic_paths: Vec<_> = change
                 .file_ops()
                 .iter()
@@ -251,11 +251,11 @@ fn prepare_hyperfine_publication_sample() {
                     "deleted_paths": deleted_paths,
                 }),
             )
-            .map_err(|error| CliError::Internal(error.into()))?;
-            writeln!(&mut manifest).map_err(|error| CliError::Internal(error.into()))?;
+            .map_err(|error| ShimError::Internal(error.into()))?;
+            writeln!(&mut manifest).map_err(|error| ShimError::Internal(error.into()))?;
             manifest
                 .flush()
-                .map_err(|error| CliError::Internal(error.into()))?;
+                .map_err(|error| ShimError::Internal(error.into()))?;
             completed += 1;
             merges += usize::from(parsed.is_merge);
             assert_no_checkout(repo.root());

@@ -13,10 +13,10 @@ use atomic_core::pristine::ViewScope;
 use atomic_core::types::{Base32, Merkle};
 use atomic_repository::{HistoryEntry, HistoryOptions, Repository};
 
-use crate::commands::workspace_txn::{enter_workspace, remediation_error};
-use crate::commands::{find_repository_root, Command};
-use crate::error::{CliError, CliResult};
+use crate::error::{ShimError, ShimResult};
+use crate::find_repository_root;
 use crate::output::{print_info, print_success, print_warning};
+use crate::workspace_txn::{enter_workspace, remediation_error};
 use atomic_repository::WorkspaceTxnMode;
 
 /// Push Atomic changes to Git.
@@ -93,19 +93,19 @@ impl Default for Push {
     }
 }
 
-impl Command for Push {
-    fn run(&self) -> CliResult<()> {
+impl Push {
+    pub fn run(&self) -> ShimResult<()> {
         // Preflight through a read-only Atomic handle. This CB-4B gate happens
         // before writable repository open can recover/create a local operation,
         // and before any Git exclude/index/ODB/ref mutation.
         let repo_root = find_repository_root()?;
-        let readonly_repo = Repository::open_readonly(&repo_root).map_err(CliError::Repository)?;
+        let readonly_repo = Repository::open_readonly(&repo_root).map_err(ShimError::Repository)?;
         let working_copy = readonly_repo
             .require_working_copy_id()
-            .map_err(CliError::Repository)?;
+            .map_err(ShimError::Repository)?;
         let current_view = readonly_repo
             .desired_view_name(working_copy)
-            .map_err(CliError::Repository)?;
+            .map_err(ShimError::Repository)?;
         let mut publication =
             super::shadow::verify_git_publication(&readonly_repo, &repo_root, &current_view)?;
         // CB-12B: trusted provenance publication gate for Git ref export
@@ -117,7 +117,7 @@ impl Command for Push {
         {
             let view_changes: Vec<atomic_core::types::Hash> = readonly_repo
                 .get_view_changes(Some(&current_view))
-                .map_err(CliError::Repository)?
+                .map_err(ShimError::Repository)?
                 .into_iter()
                 .map(|(_, hash)| hash)
                 .collect();
@@ -125,14 +125,14 @@ impl Command for Push {
                 &readonly_repo,
                 &view_changes,
             )
-            .map_err(CliError::Repository)?;
+            .map_err(ShimError::Repository)?;
             let provider =
                 atomic_repository::repository::provenance_gate::local_session_mac_key_provider(
                     &readonly_repo,
                 );
             readonly_repo
                 .enforce_publication_gate("Git ref export", &closure, Some(&provider))
-                .map_err(CliError::Repository)?;
+                .map_err(ShimError::Repository)?;
         }
         // RFC §8.3 (CB-8B): remote export of a view with unresolved Atomic
         // conflicts is refused by default. Even with --allow-conflicts the
@@ -142,11 +142,11 @@ impl Command for Push {
         {
             let conflicted = readonly_repo
                 .capture_view_conflict_set(&current_view)
-                .map_err(CliError::Repository)?
+                .map_err(ShimError::Repository)?
                 .is_some();
             if conflicted {
                 if !self.allow_conflicts {
-                    return Err(CliError::Repository(
+                    return Err(ShimError::Repository(
                         atomic_repository::RepositoryError::InvalidOperation {
                             message: format!(
                                 "view '{current_view}' has unresolved Atomic conflicts; remote \
@@ -159,23 +159,23 @@ impl Command for Push {
                     ));
                 }
                 let git_for_conflicts =
-                    GitRepository::discover(&repo_root).map_err(|error| CliError::GitError {
+                    GitRepository::discover(&repo_root).map_err(|error| ShimError::GitError {
                         message: format!("cannot discover Git repository: {error}"),
                     })?;
                 let object = readonly_repo
                     .capture_view_conflict_set(&current_view)
-                    .map_err(CliError::Repository)?
+                    .map_err(ShimError::Repository)?
                     .expect("conflict presence checked above");
                 let set_hash = object.hash().map_err(|error| {
-                    CliError::Repository(atomic_repository::RepositoryError::InvalidOperation {
+                    ShimError::Repository(atomic_repository::RepositoryError::InvalidOperation {
                         message: format!("cannot hash the conflict set: {error}"),
                     })
                 })?;
                 let mut pack_current = false;
-                for id in readonly_repo.binding_ids().map_err(CliError::Repository)? {
+                for id in readonly_repo.binding_ids().map_err(ShimError::Repository)? {
                     if let Some(pack) = readonly_repo
                         .load_binding_conflicts_pack(&git_for_conflicts, &id)
-                        .map_err(CliError::Repository)?
+                        .map_err(ShimError::Repository)?
                     {
                         if atomic_repository::git_binding::validate_conflicts_pack(&pack, &set_hash)
                             .is_ok()
@@ -186,7 +186,7 @@ impl Command for Push {
                     }
                 }
                 if !pack_current {
-                    return Err(CliError::Repository(
+                    return Err(ShimError::Repository(
                         atomic_repository::RepositoryError::InvalidOperation {
                             message: format!(
                                 "--allow-conflicts requires a published binding whose \
@@ -201,7 +201,7 @@ impl Command for Push {
         }
         drop(readonly_repo);
 
-        let mut repo = Repository::open(&repo_root).map_err(CliError::Repository)?;
+        let mut repo = Repository::open(&repo_root).map_err(ShimError::Repository)?;
         // Enter the shared workspace transaction and retain its authority for
         // the whole export; the working copy and view come from the
         // working-copy record, never current_view.
@@ -209,7 +209,7 @@ impl Command for Push {
         let working_copy = workspace.working_copy();
         let current_view = workspace.view().name.clone();
         drop(workspace);
-        let git_repo = GitRepository::discover(&repo_root).map_err(|_| CliError::GitError {
+        let git_repo = GitRepository::discover(&repo_root).map_err(|_| ShimError::GitError {
             message: "Not a git repository (or any parent up to mount point)".to_string(),
         })?;
 
@@ -230,7 +230,7 @@ impl Command for Push {
         // historical behavior (commit lands on the current git branch).
         let view_scope = repo
             .get_view_info(&current_view)
-            .map_err(CliError::Repository)?
+            .map_err(ShimError::Repository)?
             .scope;
         let branch_override =
             Self::resolve_branch_override(self.branch.as_deref(), view_scope, &current_view)?;
@@ -247,7 +247,7 @@ impl Command for Push {
         // Load change history for commit message + trailers
         let history = repo
             .log(HistoryOptions::default().load_headers(true))
-            .map_err(CliError::Repository)?;
+            .map_err(ShimError::Repository)?;
 
         if history.is_empty() {
             print_info("No changes recorded in the current view. Nothing to push.");
@@ -285,7 +285,7 @@ impl Command for Push {
                          not in view '{}' history (drift).",
                         current_view
                     ));
-                    return Err(CliError::GitError {
+                    return Err(ShimError::GitError {
                         message: format!(
                             "git shadow drift (V3): the branch was last published from a \
                              state view '{}' cannot reach. Reconcile first, then re-push — \
@@ -321,7 +321,7 @@ impl Command for Push {
         )?;
         let tree = git_repo
             .find_tree(tree_oid)
-            .map_err(|e| CliError::GitError {
+            .map_err(|e| ShimError::GitError {
                 message: format!("Failed to find tree: {}", e),
             })?;
 
@@ -335,7 +335,7 @@ impl Command for Push {
         if let Some(ref ht) = head_tree {
             let diff = git_repo
                 .diff_tree_to_tree(Some(ht), Some(&tree), None)
-                .map_err(|e| CliError::GitError {
+                .map_err(|e| ShimError::GitError {
                     message: format!("Failed to diff: {}", e),
                 })?;
             if diff.deltas().count() == 0 {
@@ -418,7 +418,7 @@ impl Command for Push {
         // Create the commit
         let commit_oid = git_repo
             .commit(Some("HEAD"), &sig, &sig, &commit_message, &tree, &parents)
-            .map_err(|e| CliError::GitError {
+            .map_err(|e| ShimError::GitError {
                 message: format!("Failed to create commit: {}", e),
             })?;
 
@@ -484,10 +484,10 @@ impl Push {
         view: &str,
         publication: &super::shadow::VerifiedPublication,
         git_repo: &GitRepository,
-    ) -> CliResult<(String, git2::Signature<'static>)> {
+    ) -> ShimResult<(String, git2::Signature<'static>)> {
         let latest_state = latest_state.to_base32();
         if publication.view() != view || publication.atomic_state() != latest_state {
-            return Err(CliError::GitError {
+            return Err(ShimError::GitError {
                 message: "Atomic view/state changed after publication verification".to_string(),
             });
         }
@@ -526,14 +526,14 @@ impl Push {
         // RFC §8.2 operation-identity headers. The projection SetId comes
         // from the canonical effective closure; the author DID from the
         // §5.5 email mapping.
-        let set_id = repo.view_set_id(view).map_err(CliError::Repository)?;
+        let set_id = repo.view_set_id(view).map_err(ShimError::Repository)?;
         let state =
-            Merkle::from_base32(latest_state.as_bytes()).ok_or_else(|| CliError::GitError {
+            Merkle::from_base32(latest_state.as_bytes()).ok_or_else(|| ShimError::GitError {
                 message: "verified view state is not a valid Merkle value".to_string(),
             })?;
         msg.push_str(&format!("atomic-set {}\n", set_id.to_base32()));
         msg.push_str(&format!("atomic-state {latest_state}\n"));
-        let git_sig = git_repo.signature().map_err(|e| CliError::GitError {
+        let git_sig = git_repo.signature().map_err(|e| ShimError::GitError {
             message: format!("Failed to get git signature: {}", e),
         })?;
         let author =
@@ -551,7 +551,7 @@ impl Push {
         }
 
         let owned_sig =
-            git2::Signature::now(&author.name, &author.email).map_err(|e| CliError::GitError {
+            git2::Signature::now(&author.name, &author.email).map_err(|e| ShimError::GitError {
                 message: format!("Failed to build projected commit signature: {}", e),
             })?;
         Ok((msg, owned_sig))
@@ -629,14 +629,14 @@ impl Push {
         explicit: Option<&str>,
         scope: ViewScope,
         view: &str,
-    ) -> CliResult<Option<String>> {
+    ) -> ShimResult<Option<String>> {
         if let Some(branch) = explicit {
             return Ok(Some(branch.to_string()));
         }
         if scope.is_draft() {
             let refname = format!("refs/heads/{}", view);
             if !git2::Reference::is_valid_name(&refname) {
-                return Err(CliError::GitError {
+                return Err(ShimError::GitError {
                     message: format!(
                         "Draft view '{}' is not a valid git branch name; \
                          pass --branch to choose an explicit target.",
@@ -729,15 +729,15 @@ impl Push {
         override_branch: Option<&str>,
         publication: &super::shadow::VerifiedPublication,
         common: &atomic_repository::RepositoryCommonLockGuard,
-    ) -> CliResult<()> {
-        let head = git_repo.head().map_err(|e| CliError::GitError {
+    ) -> ShimResult<()> {
+        let head = git_repo.head().map_err(|e| ShimError::GitError {
             message: format!("Failed to get HEAD: {}", e),
         })?;
         let current = head.shorthand().unwrap_or("HEAD");
         let target = override_branch.unwrap_or(current);
         let destination = format!("refs/heads/{}", target);
         if !super::is_publishable_git_ref(destination.as_bytes()) {
-            return Err(CliError::GitError {
+            return Err(ShimError::GitError {
                 message: format!("refusing to publish local recovery ref '{destination}'"),
             });
         }
@@ -745,12 +745,12 @@ impl Push {
         // mutable HEAD — the refspec names the exact commit the publication
         // snapshot verified, so a branch that moves after verification
         // cannot change what is pushed.
-        let verified_head = publication.git_head.ok_or_else(|| CliError::GitError {
+        let verified_head = publication.git_head.ok_or_else(|| ShimError::GitError {
             message: "the verified publication carries no Git commit to push".to_string(),
         })?;
         let refspec = format!("{}:{destination}", verified_head);
 
-        let workdir = git_repo.workdir().ok_or_else(|| CliError::GitError {
+        let workdir = git_repo.workdir().ok_or_else(|| ShimError::GitError {
             message: "Git repository has no working directory (bare repository?)".to_string(),
         })?;
 
@@ -765,10 +765,10 @@ impl Push {
         let current_view = publication.view().to_string();
         let working_copy = repo
             .require_working_copy_id()
-            .map_err(CliError::Repository)?;
+            .map_err(ShimError::Repository)?;
         let mapping = match repo
             .get_ref_mapping(&current_view)
-            .map_err(CliError::Repository)?
+            .map_err(ShimError::Repository)?
         {
             Some(mapping) => Some(mapping),
             None => {
@@ -781,7 +781,7 @@ impl Push {
                     &current_view,
                 )?;
                 repo.get_ref_mapping(&current_view)
-                    .map_err(CliError::Repository)?
+                    .map_err(ShimError::Repository)?
             }
         };
         // The tracked remote pair: the mapping's pair when it matches this
@@ -835,12 +835,12 @@ impl Push {
                     .and_then(|head| head.shorthand().map(str::to_string))
                     .unwrap_or_else(|| "master".to_string())
             );
-            let verified = publication.git_head.ok_or_else(|| CliError::GitError {
+            let verified = publication.git_head.ok_or_else(|| ShimError::GitError {
                 message: "race fixture: no verified commit".to_string(),
             })?;
             let signature =
                 git2::Signature::now("Racer", "racer@example.com").map_err(|error| {
-                    CliError::GitError {
+                    ShimError::GitError {
                         message: error.to_string(),
                     }
                 })?;
@@ -848,21 +848,21 @@ impl Push {
                 let mut builder =
                     git_repo
                         .treebuilder(None)
-                        .map_err(|error| CliError::GitError {
+                        .map_err(|error| ShimError::GitError {
                             message: error.to_string(),
                         })?;
-                builder.write().map_err(|error| CliError::GitError {
+                builder.write().map_err(|error| ShimError::GitError {
                     message: error.to_string(),
                 })?
             };
             let tree = git_repo
                 .find_tree(tree_id)
-                .map_err(|error| CliError::GitError {
+                .map_err(|error| ShimError::GitError {
                     message: error.to_string(),
                 })?;
             let parent = git_repo
                 .find_commit(verified)
-                .map_err(|error| CliError::GitError {
+                .map_err(|error| ShimError::GitError {
                     message: error.to_string(),
                 })?;
             let moved = git_repo
@@ -874,18 +874,18 @@ impl Push {
                     &tree,
                     &[&parent],
                 )
-                .map_err(|error| CliError::GitError {
+                .map_err(|error| ShimError::GitError {
                     message: error.to_string(),
                 })?;
             let mut reference =
                 git_repo
                     .find_reference(&branch_ref)
-                    .map_err(|error| CliError::GitError {
+                    .map_err(|error| ShimError::GitError {
                         message: error.to_string(),
                     })?;
             reference
                 .set_target(moved, "raced branch move after the publication snapshot")
-                .map_err(|error| CliError::GitError {
+                .map_err(|error| ShimError::GitError {
                     message: error.to_string(),
                 })?;
         }
@@ -916,7 +916,7 @@ impl Push {
             .args(&args)
             .current_dir(workdir)
             .status()
-            .map_err(|e| CliError::GitError {
+            .map_err(|e| ShimError::GitError {
                 message: format!("Failed to run git push: {}", e),
             })?;
 
@@ -927,7 +927,7 @@ impl Push {
             } else {
                 ""
             };
-            return Err(CliError::GitError {
+            return Err(ShimError::GitError {
                 message: format!("git push exited with {}{stale}", status),
             });
         }
@@ -953,7 +953,7 @@ impl Push {
                 )?;
             }
             other => {
-                return Err(CliError::GitError {
+                return Err(ShimError::GitError {
                     message: format!(
                         "remote '{}/{}' holds {:?} but the pushed commit is {pushed_oid}; \
                          the remote update is NOT recorded as observed",
@@ -1191,7 +1191,7 @@ mod tests {
         // silent rename.
         let err = Push::resolve_branch_override(None, ViewScope::Draft, "bad~name").unwrap_err();
         match err {
-            CliError::GitError { message } => {
+            ShimError::GitError { message } => {
                 assert!(message.contains("bad~name"));
                 assert!(message.contains("--branch"));
             }

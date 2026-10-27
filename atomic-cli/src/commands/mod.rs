@@ -97,7 +97,8 @@ pub mod split;
 pub mod stage;
 pub mod stash;
 pub mod status;
-pub mod status_git;
+#[cfg(feature = "git-shim")]
+pub use atomic_git_shim::commands::status as status_git;
 pub mod tag;
 pub mod triage;
 pub mod unrecord;
@@ -122,7 +123,9 @@ pub mod sidecars;
 pub mod identity;
 
 // Git Interoperability
+#[cfg(feature = "git-shim")]
 pub mod git;
+pub(crate) mod git_support;
 
 // Knowledge graph query (top-level command)
 pub mod query;
@@ -152,6 +155,7 @@ pub use completions::Completions;
 pub use conflicts::Conflicts;
 pub use diff::Diff;
 pub use doctor::Doctor;
+#[cfg(feature = "git-shim")]
 pub use git::Git;
 pub use identity::Identity;
 pub use init::Init;

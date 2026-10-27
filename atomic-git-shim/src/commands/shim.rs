@@ -32,13 +32,13 @@ use super::parallel::{
     conversion_policy, equivalence_error, git_object_id, verify_complete_equivalence,
 };
 use super::{anchor, hook_dispatchers, hooks, linked_worktree, Import};
-use crate::commands::workspace_txn::{
+use crate::error::{ShimError, ShimResult};
+use crate::find_repository_root;
+use crate::output::{print_info, print_success, print_warning};
+use crate::workspace_txn::{
     enter_remediation_workspace, enter_remediation_workspace_budgeted, enter_workspace,
     remediation_error,
 };
-use crate::commands::{find_repository_root, Command};
-use crate::error::{CliError, CliResult};
-use crate::output::{print_info, print_success, print_warning};
 use atomic_agent::watcher::bridge::{bracket_bridge_transaction, watcher_config};
 use atomic_repository::repository::ReconcileEffectBudget;
 
@@ -55,7 +55,7 @@ pub(crate) fn journal_and_move_branch(
     target_ref: &str,
     commit: Oid,
     message: &str,
-) -> CliResult<()> {
+) -> ShimResult<()> {
     let observed_old = git
         .find_reference(target_ref)
         .ok()
@@ -191,7 +191,7 @@ pub(crate) fn journal_and_create_branch_cas(
     target_ref: &str,
     commit: Oid,
     message: &str,
-) -> CliResult<()> {
+) -> ShimResult<()> {
     let observed_old = git
         .find_reference(target_ref)
         .ok()
@@ -286,7 +286,7 @@ pub(crate) fn journal_and_create_branch_cas_with_mapping(
     commit: Oid,
     message: &str,
     mapping_intent: atomic_core::operation::MetadataTransition,
-) -> CliResult<()> {
+) -> ShimResult<()> {
     let observed_old = git
         .find_reference(target_ref)
         .ok()
@@ -576,8 +576,8 @@ pub enum ShimCommand {
     },
 }
 
-impl Command for Shim {
-    fn run(&self) -> CliResult<()> {
+impl Shim {
+    pub fn run(&self) -> ShimResult<()> {
         match &self.command {
             ShimCommand::Reconcile => reconcile(),
             ShimCommand::Verify => {
@@ -764,14 +764,14 @@ fn classify_direction(
 
 /// The repository root for a `hook-*` entry point, or `None` when Git ran
 /// the dispatcher inside a linked worktree and the hook passes through.
-fn hook_root(hook_name: &str) -> CliResult<Option<PathBuf>> {
+fn hook_root(hook_name: &str) -> ShimResult<Option<PathBuf>> {
     if linked_worktree::hook_passes_through(hook_name) {
         return Ok(None);
     }
     find_repository_root().map(Some)
 }
 
-fn reconcile() -> CliResult<()> {
+fn reconcile() -> ShimResult<()> {
     let root = find_repository_root()?;
     linked_worktree::refuse_shim_command(&root)?;
     // The transaction brackets the FileWatcher with atomic-bridge enter/leave,
@@ -784,9 +784,9 @@ fn reconcile() -> CliResult<()> {
 
 /// Load the repository configuration for `root` (review R4: the shim
 /// consent surface is read where it is acted on, not only in tests).
-pub(crate) fn shim_config(root: &Path) -> CliResult<atomic_config::RepoConfig> {
+pub(crate) fn shim_config(root: &Path) -> ShimResult<atomic_config::RepoConfig> {
     let config_path = Repository::canonical_dot_dir(root)
-        .map_err(CliError::from)?
+        .map_err(ShimError::from)?
         .join("config.toml");
     atomic_config::RepoConfig::load(&config_path)
         .map_err(|error| git_error(format!("cannot load the repository configuration: {error}")))
@@ -800,11 +800,11 @@ pub(crate) fn shim_config(root: &Path) -> CliResult<atomic_config::RepoConfig> {
 /// lock with an expected-old lease and an atomic file replacement — the
 /// caller's observed consent state is the lease, so a concurrent consent
 /// change refuses instead of being overwritten.
-fn record_shim_opt_in(root: &Path, enabled: bool) -> CliResult<bool> {
+fn record_shim_opt_in(root: &Path, enabled: bool) -> ShimResult<bool> {
     let observed = shim_config(root)?.git.shim.enabled;
-    let repo = Repository::open(root).map_err(CliError::from)?;
+    let repo = Repository::open(root).map_err(ShimError::from)?;
     repo.set_shim_consent(enabled, Some(observed))
-        .map_err(CliError::from)
+        .map_err(ShimError::from)
 }
 
 /// The reachable CB-13B cutover entry point: the CLI command owns the
@@ -812,11 +812,11 @@ fn record_shim_opt_in(root: &Path, enabled: bool) -> CliResult<bool> {
 /// consent is a precondition — the cutover never flips enablement
 /// implicitly — and every readiness refusal is reported verbatim without
 /// partial enablement (hook, remote and unsupported surfaces refuse).
-fn run_cutover(rollback: bool) -> CliResult<()> {
+fn run_cutover(rollback: bool) -> ShimResult<()> {
     let root = find_repository_root()?;
     if rollback {
-        let mut repo = Repository::open(&root).map_err(CliError::from)?;
-        let undone = repo.rollback_shim_cutover().map_err(CliError::from)?;
+        let mut repo = Repository::open(&root).map_err(ShimError::from)?;
+        let undone = repo.rollback_shim_cutover().map_err(ShimError::from)?;
         print_success(&format!(
             "Cutover {undone} rolled back through the journal's typed inverse; \
              the legacy shadow writer fence is lifted and newer format fences are kept."
@@ -830,8 +830,8 @@ fn run_cutover(rollback: bool) -> CliResult<()> {
              `atomic git shim enable` first (the cutover never enables implicitly)",
         ));
     }
-    let repo = Repository::open(&root).map_err(CliError::from)?;
-    let outcome = repo.execute_shim_cutover().map_err(CliError::from)?;
+    let repo = Repository::open(&root).map_err(ShimError::from)?;
+    let outcome = repo.execute_shim_cutover().map_err(ShimError::from)?;
     if outcome.resumed {
         print_success(&format!(
             "Resumed the interrupted cutover {}: the fence was already durable and the \
@@ -907,26 +907,26 @@ pub(crate) type WatchNoticeSink<'s> = dyn Fn(WatchNoticeKind, &str) + 's;
 /// Best-effort: suppression attribution is advisory, and a failure to
 /// record it never fails the reconciled pass.
 pub(crate) fn record_last_shim_operation(root: &Path) {
-    let record = (|| -> CliResult<()> {
-        let repo = Repository::open_readonly(root).map_err(CliError::from)?;
-        let working_copy = repo.require_working_copy_id().map_err(CliError::from)?;
+    let record = (|| -> ShimResult<()> {
+        let repo = Repository::open_readonly(root).map_err(ShimError::from)?;
+        let working_copy = repo.require_working_copy_id().map_err(ShimError::from)?;
         let log = repo
             .operation_log(
                 atomic_core::operation::OperationScope::WorkingCopy(working_copy),
                 Some(1),
                 true,
             )
-            .map_err(CliError::from)?;
+            .map_err(ShimError::from)?;
         let head = match &log.head_state {
             atomic_repository::repository::OperationHeadState::Single(id) => id.to_string(),
             _ => String::new(),
         };
         let heads = head.clone();
         let path = Repository::canonical_dot_dir(root)
-            .map_err(CliError::from)?
+            .map_err(ShimError::from)?
             .join("bridge/suppressed-operation.json");
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(CliError::from)?;
+            std::fs::create_dir_all(parent).map_err(ShimError::from)?;
         }
         let payload = format!(
             "{{\"operation_id\":\"{head}\",\"heads\":\"{heads}\",\"recorded_at\":{}}}",
@@ -935,7 +935,7 @@ pub(crate) fn record_last_shim_operation(root: &Path) {
                 .map(|d| d.as_millis())
                 .unwrap_or(0)
         );
-        std::fs::write(&path, payload).map_err(CliError::from)?;
+        std::fs::write(&path, payload).map_err(ShimError::from)?;
         Ok(())
     })();
     if let Err(error) = record {
@@ -948,7 +948,7 @@ pub(crate) fn reconcile_transaction_budgeted(
     root: &Path,
     budget: ReconcileEffectBudget,
     notice: Option<&WatchNoticeSink<'_>>,
-) -> CliResult<()> {
+) -> ShimResult<()> {
     let emit_notice = |kind: WatchNoticeKind, detail: &str| {
         if let Some(notice) = notice {
             notice(kind, detail);
@@ -959,7 +959,7 @@ pub(crate) fn reconcile_transaction_budgeted(
     // the entry/observation failures that previously bypassed the sink).
     // Emission is lossy; reconcile is an explicit shim command boundary.
     let journal = BridgeEventJournal::new(
-        &Repository::canonical_dot_dir(root).map_err(CliError::from)?,
+        &Repository::canonical_dot_dir(root).map_err(ShimError::from)?,
         None,
     );
     let refused_run = |direction: ReconcileDirectionCode, refusal_class: RefusalClass| {
@@ -1042,7 +1042,7 @@ pub(crate) fn reconcile_transaction_budgeted(
     // The observation phase (heads, branch, checkpoint, mapping) is
     // pre-mutation: any failure here is a true refusal and is recorded as
     // one.
-    let (current, direction, mapping_outcome) = match (|| -> CliResult<_> {
+    let (current, direction, mapping_outcome) = match (|| -> ShimResult<_> {
         let current = current_heads(&repo, working_copy, &git)?;
         let current_git_branch = current_git_branch_or_view(&git, &current.view)?;
         let checkpoint = read_workspace_metadata(root)?;
@@ -1223,8 +1223,8 @@ pub(crate) fn reconcile_transaction_budgeted(
             // that IS the verified HEAD commit may be bound as the exported
             // state; anything else keeps the previous export binding.
             {
-                let repo = Repository::open_with_budget(root, budget).map_err(CliError::from)?;
-                let working_copy = repo.require_working_copy_id().map_err(CliError::from)?;
+                let repo = Repository::open_with_budget(root, budget).map_err(ShimError::from)?;
+                let working_copy = repo.require_working_copy_id().map_err(ShimError::from)?;
                 let git = open_git(root)?;
                 let verified_export = match &mapping_outcome {
                     Some((mapping, _, _)) => {
@@ -1316,7 +1316,7 @@ pub(crate) fn reconcile_transaction_budgeted(
                      Atomic→Git; run 'atomic git shim reconcile' explicitly to project",
                 ));
             }
-            let projected = (|| -> CliResult<()> {
+            let projected = (|| -> ShimResult<()> {
                 project_atomic_to_git(root, &repo, working_copy, &git, &current)?;
                 drop(git);
                 drop(repo);
@@ -1328,8 +1328,8 @@ pub(crate) fn reconcile_transaction_budgeted(
                 // Synchronized observation bound to that exact verified tip.
                 {
                     let repo =
-                        Repository::open_with_budget(root, budget).map_err(CliError::from)?;
-                    let working_copy = repo.require_working_copy_id().map_err(CliError::from)?;
+                        Repository::open_with_budget(root, budget).map_err(ShimError::from)?;
+                    let working_copy = repo.require_working_copy_id().map_err(ShimError::from)?;
                     let git = open_git(root)?;
                     super::ref_mapping::refresh_mapping_observation(
                         &repo,
@@ -1378,7 +1378,7 @@ pub(crate) fn reconcile_transaction_budgeted(
     }
 }
 
-fn switch(target: &str) -> CliResult<()> {
+fn switch(target: &str) -> ShimResult<()> {
     let root = find_repository_root()?;
     // The transaction brackets the FileWatcher with atomic-bridge enter/leave,
     // including failure cleanup; shim-originated writes inside the span are
@@ -1391,13 +1391,13 @@ fn switch(target: &str) -> CliResult<()> {
 }
 
 #[tracing::instrument(name = "switch", skip_all, fields(view = target))]
-fn switch_transaction(root: &Path, target: &str) -> CliResult<()> {
+fn switch_transaction(root: &Path, target: &str) -> ShimResult<()> {
     let checkpoint = read_workspace_metadata(root)?.ok_or_else(|| {
         git_error(
             "shim switch requires an existing checkpoint; run 'atomic git shim reconcile' first",
         )
     })?;
-    let mut repo = Repository::open(root).map_err(CliError::from)?;
+    let mut repo = Repository::open(root).map_err(ShimError::from)?;
 
     // Shared workspace transaction: switch is a mutating boundary that owns
     // Git refs, the Git index, and the Atomic working copy together, so it
@@ -1424,7 +1424,7 @@ fn switch_transaction(root: &Path, target: &str) -> CliResult<()> {
 
     let target_state = repo
         .get_view_info(target)
-        .map_err(CliError::from)?
+        .map_err(ShimError::from)?
         .state
         .to_string();
     let current_paths = git_head_paths(&git)?;
@@ -1465,10 +1465,10 @@ fn switch_transaction(root: &Path, target: &str) -> CliResult<()> {
     // so Git can be prepared before filesystem mutation.
     tracing::info!("switch: materializing the target view");
     repo.switch_view(working_copy, target)
-        .map_err(CliError::from)?;
+        .map_err(ShimError::from)?;
     let atomic_status = repo
         .status(working_copy, StatusOptions::default())
-        .map_err(CliError::from)?;
+        .map_err(ShimError::from)?;
     if !atomic_status.is_clean() {
         return Err(git_error(
             "Atomic materialization did not produce a clean target view",
@@ -1511,8 +1511,8 @@ fn switch_transaction(root: &Path, target: &str) -> CliResult<()> {
     // the snapshot verified HEAD; record the fresh Synchronized observation
     // bound to that exact verified tip.
     {
-        let repo = Repository::open(root).map_err(CliError::from)?;
-        let working_copy = repo.require_working_copy_id().map_err(CliError::from)?;
+        let repo = Repository::open(root).map_err(ShimError::from)?;
+        let working_copy = repo.require_working_copy_id().map_err(ShimError::from)?;
         let git = open_git(root)?;
         super::ref_mapping::refresh_mapping_observation(
             &repo,
@@ -1536,7 +1536,7 @@ fn switch_transaction(root: &Path, target: &str) -> CliResult<()> {
 /// attribution (review CB-9C hermeticity).
 pub(crate) fn projection_signature(
     git: &GitRepository,
-) -> Result<git2::Signature<'static>, CliError> {
+) -> Result<git2::Signature<'static>, ShimError> {
     if let Ok(signature) = git.signature() {
         return Ok(signature);
     }
@@ -1544,7 +1544,7 @@ pub(crate) fn projection_signature(
         .map_err(|error| git_error(format!("cannot build the projection signature: {error}")))
 }
 
-fn git_head_paths(git: &GitRepository) -> CliResult<BTreeSet<String>> {
+fn git_head_paths(git: &GitRepository) -> ShimResult<BTreeSet<String>> {
     let tree = git
         .head()
         .and_then(|head| head.peel_to_commit())
@@ -1553,7 +1553,7 @@ fn git_head_paths(git: &GitRepository) -> CliResult<BTreeSet<String>> {
     Ok(read_git_tree(git, &tree)?.into_keys().collect())
 }
 
-fn git_branch_paths(git: &GitRepository, branch: &str) -> CliResult<BTreeSet<String>> {
+fn git_branch_paths(git: &GitRepository, branch: &str) -> ShimResult<BTreeSet<String>> {
     let reference_name = format!("refs/heads/{branch}");
     let tree = git
         .find_reference(&reference_name)
@@ -1637,16 +1637,16 @@ fn checkpoint_matches_snapshot(checkpoint: &ShimCheckpoint, snapshot: &ShimSnaps
 pub(super) fn atomic_private_members(
     repo: &Repository,
     view: &str,
-) -> CliResult<Vec<atomic_core::types::Hash>> {
+) -> ShimResult<Vec<atomic_core::types::Hash>> {
     let mut members = Vec::new();
     for (hash, origin) in repo
         .full_chain_member_origins(view)
-        .map_err(CliError::from)?
+        .map_err(ShimError::from)?
     {
         if origin.is_some() {
             continue;
         }
-        let change = repo.load_change(&hash).map_err(CliError::from)?;
+        let change = repo.load_change(&hash).map_err(ShimError::from)?;
         let mut paths: Vec<String> = change
             .file_ops()
             .iter()
@@ -1679,7 +1679,7 @@ fn require_target_branch_interpreted(
     git: &GitRepository,
     target: &str,
     target_project: &ProjectTree,
-) -> CliResult<()> {
+) -> ShimResult<()> {
     let tip = match git.find_reference(&format!("refs/heads/{target}")) {
         Ok(reference) => reference
             .peel_to_commit()
@@ -1696,10 +1696,10 @@ fn require_target_branch_interpreted(
         return Ok(());
     }
     let tip_sha = tip.id().to_string();
-    let interpreted = match repo.checked_git_sha(&tip_sha).map_err(CliError::from)? {
+    let interpreted = match repo.checked_git_sha(&tip_sha).map_err(ShimError::from)? {
         Some(hash) => repo
             .effective_history(Some(target))
-            .map_err(CliError::from)?
+            .map_err(ShimError::from)?
             .iter()
             .any(|entry| entry.hash == hash),
         None => false,
@@ -1719,7 +1719,7 @@ fn find_or_create_target_commit(
     target: &str,
     target_tree_oid: Oid,
     atomic_state: &str,
-) -> CliResult<Oid> {
+) -> ShimResult<Oid> {
     let target_ref = format!("refs/heads/{target}");
     let parent_oid = match git.find_reference(&target_ref) {
         Ok(reference) => {
@@ -1768,7 +1768,7 @@ fn update_target_branch(
     git: &GitRepository,
     target_ref: &str,
     commit: Oid,
-) -> CliResult<()> {
+) -> ShimResult<()> {
     journal_and_move_branch(
         repo,
         working_copy,
@@ -1779,7 +1779,7 @@ fn update_target_branch(
     )
 }
 
-fn import_git_to_atomic(root: &Path) -> CliResult<()> {
+fn import_git_to_atomic(root: &Path) -> ShimResult<()> {
     import_git_to_atomic_budgeted(root, ReconcileEffectBudget::Command)
 }
 
@@ -1789,7 +1789,7 @@ fn import_git_to_atomic(root: &Path) -> CliResult<()> {
 /// Every writable open in the path carries the budget so pending recovery
 /// defers instead of replaying.
 #[tracing::instrument(name = "import_head", skip_all, fields(budget = ?budget))]
-fn import_git_to_atomic_budgeted(root: &Path, budget: ReconcileEffectBudget) -> CliResult<()> {
+fn import_git_to_atomic_budgeted(root: &Path, budget: ReconcileEffectBudget) -> ShimResult<()> {
     let git = open_git(root)?;
     let head = observe_head(&git).map_err(observation_error)?;
     // §7.5: a detached HEAD imports behind its commit into the workspace
@@ -1807,10 +1807,10 @@ fn import_git_to_atomic_budgeted(root: &Path, budget: ReconcileEffectBudget) -> 
         ),
         HeadObservation::Detached { oid } => {
             let oid_hex = oid.to_string();
-            let mut repo = Repository::open_with_budget(root, budget).map_err(CliError::from)?;
+            let mut repo = Repository::open_with_budget(root, budget).map_err(ShimError::from)?;
             let target = repo
                 .detached_import_target(&oid_hex)
-                .map_err(CliError::from)?;
+                .map_err(ShimError::from)?;
             let (view, created) = match target {
                 atomic_repository::DetachedImportTarget::Mapped { view } => (view, false),
                 // CB-13D ::24 R1: an ephemeral view creation is a
@@ -1822,7 +1822,7 @@ fn import_git_to_atomic_budgeted(root: &Path, budget: ReconcileEffectBudget) -> 
                 atomic_repository::DetachedImportTarget::Ephemeral { view }
                     if budget.is_metadata_only() =>
                 {
-                    return Err(CliError::Repository(
+                    return Err(ShimError::Repository(
                         atomic_repository::RepositoryError::ReactiveDeferred {
                             detail: format!(
                                 "detached Git HEAD '{oid_hex}' would create ephemeral view                                  '{view}'; that metadata-changing import step is deferred to                                  an explicit 'atomic git shim reconcile'"
@@ -1838,16 +1838,16 @@ fn import_git_to_atomic_budgeted(root: &Path, budget: ReconcileEffectBudget) -> 
                     // checkpoint view would inherit every later member, so
                     // its tip could never be an ancestor of the parent's tip
                     // and the reconcile would strand the workspace.
-                    let interpreted = repo.checked_git_sha(&oid_hex).map_err(CliError::from)?;
+                    let interpreted = repo.checked_git_sha(&oid_hex).map_err(ShimError::from)?;
                     if let Some(hash) = interpreted {
                         repo.create_view_with_identity(
                             &view,
                             atomic_core::pristine::ViewScope::Draft,
                             None,
                         )
-                        .map_err(CliError::from)?;
+                        .map_err(ShimError::from)?;
                         repo.ensure_union_state(&view, &[hash])
-                            .map_err(CliError::from)?;
+                            .map_err(ShimError::from)?;
                         // The checkpoint view's Atomic-private members (the
                         // initialization change that tracks `.atomicignore`)
                         // belong to no Git commit's closure; without them the
@@ -1856,7 +1856,7 @@ fn import_git_to_atomic_budgeted(root: &Path, budget: ReconcileEffectBudget) -> 
                             let private = atomic_private_members(&repo, &checkpoint.view)?;
                             if !private.is_empty() {
                                 repo.ensure_union_state(&view, &private)
-                                    .map_err(CliError::from)?;
+                                    .map_err(ShimError::from)?;
                             }
                         }
                         (view, true)
@@ -1876,14 +1876,14 @@ fn import_git_to_atomic_budgeted(root: &Path, budget: ReconcileEffectBudget) -> 
                         match parent.as_deref() {
                             Some(parent) => repo
                                 .create_draft_view(&view, parent)
-                                .map_err(CliError::from)?,
+                                .map_err(ShimError::from)?,
                             None => repo
                                 .create_view_with_identity(
                                     &view,
                                     atomic_core::pristine::ViewScope::Draft,
                                     None,
                                 )
-                                .map_err(CliError::from)?,
+                                .map_err(ShimError::from)?,
                         }
                         (view, true)
                     }
@@ -1920,13 +1920,13 @@ fn import_git_to_atomic_budgeted(root: &Path, budget: ReconcileEffectBudget) -> 
     // creating a self-contained shared view instead of replaying Git history.
     if detached_tip.is_none() {
         if let Some(checkpoint) = read_workspace_metadata(root)? {
-            let mut repo = Repository::open_with_budget(root, budget).map_err(CliError::from)?;
-            let working_copy = repo.require_working_copy_id().map_err(CliError::from)?;
-            let view_exists = repo.view_exists(&view).map_err(CliError::from)?;
+            let mut repo = Repository::open_with_budget(root, budget).map_err(ShimError::from)?;
+            let working_copy = repo.require_working_copy_id().map_err(ShimError::from)?;
+            let view_exists = repo.view_exists(&view).map_err(ShimError::from)?;
             if git_head == checkpoint.git_head && !view_exists {
                 let source_state = repo
                     .get_view_info(&checkpoint.view)
-                    .map_err(CliError::from)?
+                    .map_err(ShimError::from)?
                     .state
                     .to_string();
                 if source_state != checkpoint.atomic_state {
@@ -1950,29 +1950,29 @@ fn import_git_to_atomic_budgeted(root: &Path, budget: ReconcileEffectBudget) -> 
                 // must not leave a partially created adoption view behind.
                 let closure = {
                     let txn = repo.pristine().read_txn().map_err(|error| {
-                        CliError::from(RepositoryError::Database(error.to_string()))
+                        ShimError::from(RepositoryError::Database(error.to_string()))
                     })?;
                     let source = txn
                         .get_view(&checkpoint.view)
                         .map_err(|error| {
-                            CliError::from(RepositoryError::Database(error.to_string()))
+                            ShimError::from(RepositoryError::Database(error.to_string()))
                         })?
                         .ok_or_else(|| {
-                            CliError::from(RepositoryError::ViewNotFound {
+                            ShimError::from(RepositoryError::ViewNotFound {
                                 name: checkpoint.view.clone(),
                             })
                         })?;
                     let visibility =
-                        graph_visibility_closure(&txn, &source).map_err(CliError::from)?;
+                        graph_visibility_closure(&txn, &source).map_err(ShimError::from)?;
                     let mut hashes = Vec::with_capacity(visibility.len());
                     for change_id in visibility.iter_dependency_first().copied() {
                         let hash = txn
                             .get_external(change_id)
                             .map_err(|error| {
-                                CliError::from(RepositoryError::Database(error.to_string()))
+                                ShimError::from(RepositoryError::Database(error.to_string()))
                             })?
                             .ok_or_else(|| {
-                                CliError::from(RepositoryError::Database(format!(
+                                ShimError::from(RepositoryError::Database(format!(
                                     "visible change {} has no external hash",
                                     change_id.get()
                                 )))
@@ -1981,15 +1981,15 @@ fn import_git_to_atomic_budgeted(root: &Path, budget: ReconcileEffectBudget) -> 
                     }
                     hashes
                 };
-                repo.create_shared_view(&view).map_err(CliError::from)?;
+                repo.create_shared_view(&view).map_err(ShimError::from)?;
                 for hash in closure {
                     repo.insert_change(&hash, InsertOptions::with_dependencies().view(&view))
-                        .map_err(CliError::from)?;
+                        .map_err(ShimError::from)?;
                 }
                 repo.align_to_view(working_copy, &view)
-                    .map_err(CliError::from)?;
+                    .map_err(ShimError::from)?;
                 repo.reindex_working_copy(working_copy)
-                    .map_err(CliError::from)?;
+                    .map_err(ShimError::from)?;
                 drop(repo);
                 let snapshot = verify_at(root)?;
                 write_workspace_metadata(root, &snapshot)?;
@@ -2026,12 +2026,12 @@ fn import_git_to_atomic_budgeted(root: &Path, budget: ReconcileEffectBudget) -> 
     // pointer when Git switched to another branch. Adopt the imported view by
     // aligning deferred TREE metadata and rebuilding FILE_INDEX only; neither
     // operation writes source files.
-    let mut repo = Repository::open_with_budget(root, budget).map_err(CliError::from)?;
-    let working_copy = repo.require_working_copy_id().map_err(CliError::from)?;
+    let mut repo = Repository::open_with_budget(root, budget).map_err(ShimError::from)?;
+    let working_copy = repo.require_working_copy_id().map_err(ShimError::from)?;
     repo.align_to_view(working_copy, &view)
-        .map_err(CliError::from)?;
+        .map_err(ShimError::from)?;
     repo.reindex_working_copy(working_copy)
-        .map_err(CliError::from)?;
+        .map_err(ShimError::from)?;
     drop(repo);
 
     // §7.5: a detached HEAD verifies against its view projection instead of a
@@ -2054,7 +2054,7 @@ fn import_git_to_atomic_budgeted(root: &Path, budget: ReconcileEffectBudget) -> 
 /// import observed Git's new tip and imported it into the view). No verified
 /// export happened: the previous export binding is preserved (CB-10A review
 /// R4 — only a verified export transition binds the export state).
-fn refresh_import_mapping(root: &Path, snapshot: &ShimSnapshot) -> CliResult<()> {
+fn refresh_import_mapping(root: &Path, snapshot: &ShimSnapshot) -> ShimResult<()> {
     refresh_import_mapping_budgeted(root, snapshot, ReconcileEffectBudget::Command)
 }
 
@@ -2064,9 +2064,9 @@ fn refresh_import_mapping_budgeted(
     root: &Path,
     snapshot: &ShimSnapshot,
     budget: ReconcileEffectBudget,
-) -> CliResult<()> {
-    let repo = Repository::open_with_budget(root, budget).map_err(CliError::from)?;
-    let working_copy = repo.require_working_copy_id().map_err(CliError::from)?;
+) -> ShimResult<()> {
+    let repo = Repository::open_with_budget(root, budget).map_err(ShimError::from)?;
+    let working_copy = repo.require_working_copy_id().map_err(ShimError::from)?;
     let git = open_git(root)?;
     super::ref_mapping::refresh_mapping_observation(
         &repo,
@@ -2079,7 +2079,7 @@ fn refresh_import_mapping_budgeted(
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum CheckpointRefresh {
+pub enum CheckpointRefresh {
     Refreshed,
     SkippedNoGit,
     SkippedUnsupportedHead,
@@ -2099,10 +2099,10 @@ pub(crate) fn refresh_checkpoint_after_verified_import(
     view: &str,
     expected_tree: &GitObjectId,
     git_tree: &GitObjectId,
-) -> CliResult<CheckpointRefresh> {
+) -> ShimResult<CheckpointRefresh> {
     if repo
         .desired_view_name(working_copy)
-        .map_err(CliError::from)?
+        .map_err(ShimError::from)?
         != view
     {
         return Ok(CheckpointRefresh::SkippedViewMismatch);
@@ -2146,7 +2146,7 @@ pub(crate) fn refresh_checkpoint_after_verified_import(
     let tree_id = tree.id().to_string();
     let atomic_state = repo
         .get_view_info(view)
-        .map_err(CliError::from)?
+        .map_err(ShimError::from)?
         .state
         .to_string();
     let checkpoint = ShimCheckpoint {
@@ -2170,7 +2170,7 @@ pub(crate) fn refresh_checkpoint_after_verified_import(
     };
     let seeded = repo
         .seed_verified_import_file_index_v2(working_copy, &project, &import_proof)
-        .map_err(CliError::from)?;
+        .map_err(ShimError::from)?;
     log::debug!(
         "verified import V2 index: seeded={}, uncached={}",
         seeded.seeded,
@@ -2180,7 +2180,7 @@ pub(crate) fn refresh_checkpoint_after_verified_import(
     Ok(CheckpointRefresh::Refreshed)
 }
 
-pub(crate) fn refresh_checkpoint_if_aligned(root: &Path) -> CliResult<CheckpointRefresh> {
+pub fn refresh_checkpoint_if_aligned(root: &Path) -> ShimResult<CheckpointRefresh> {
     let observation = observe_git(root).map_err(observation_error)?;
     let GitObservation::Repository(git) = observation else {
         return Ok(CheckpointRefresh::SkippedNoGit);
@@ -2197,10 +2197,10 @@ pub(crate) fn refresh_checkpoint_if_aligned(root: &Path) -> CliResult<Checkpoint
     };
 
     let current_view = {
-        let repo = Repository::open(root).map_err(CliError::from)?;
-        let working_copy = repo.require_working_copy_id().map_err(CliError::from)?;
+        let repo = Repository::open(root).map_err(ShimError::from)?;
+        let working_copy = repo.require_working_copy_id().map_err(ShimError::from)?;
         repo.desired_view_name(working_copy)
-            .map_err(CliError::from)?
+            .map_err(ShimError::from)?
     };
     if branch != current_view {
         return Ok(CheckpointRefresh::SkippedViewMismatch);
@@ -2219,23 +2219,23 @@ pub(crate) fn refresh_checkpoint_if_aligned(root: &Path) -> CliResult<Checkpoint
 fn refresh_detached_checkpoint(
     root: &Path,
     head: &HeadObservation,
-) -> CliResult<CheckpointRefresh> {
+) -> ShimResult<CheckpointRefresh> {
     use atomic_core::pristine::ViewScope;
 
     let HeadObservation::Detached { oid } = head else {
         return Ok(CheckpointRefresh::SkippedUnsupportedHead);
     };
-    let repo = Repository::open(root).map_err(CliError::from)?;
-    let working_copy = repo.require_working_copy_id().map_err(CliError::from)?;
+    let repo = Repository::open(root).map_err(ShimError::from)?;
+    let working_copy = repo.require_working_copy_id().map_err(ShimError::from)?;
     let view = repo
         .desired_view_name(working_copy)
-        .map_err(CliError::from)?;
+        .map_err(ShimError::from)?;
     let view_state = repo
         .get_view_info(&view)
-        .map_err(CliError::from)?
+        .map_err(ShimError::from)?
         .state
         .to_string();
-    if repo.get_view_info(&view).map_err(CliError::from)?.scope != ViewScope::Draft {
+    if repo.get_view_info(&view).map_err(ShimError::from)?.scope != ViewScope::Draft {
         return Ok(CheckpointRefresh::SkippedUnsupportedHead);
     }
     let git = open_git(root)?;
@@ -2362,14 +2362,15 @@ fn operation_layer_verdict(
 }
 
 #[tracing::instrument(name = "verify", skip_all)]
-fn verify() -> CliResult<ShimSnapshot> {
+fn verify() -> ShimResult<ShimSnapshot> {
     let root = find_repository_root()?;
     // CB-13A R2: diagnosis is a read-only observation boundary. Opening for
     // operation inspection performs no migration, no deferred-tree alignment,
     // and no operation recovery, so an incomplete repository is *reported*
     // rather than silently repaired before any verdict is collected.
-    let repo = Repository::open_readonly_for_operation_inspection(&root).map_err(CliError::from)?;
-    let working_copy = repo.require_working_copy_id().map_err(CliError::from)?;
+    let repo =
+        Repository::open_readonly_for_operation_inspection(&root).map_err(ShimError::from)?;
+    let working_copy = repo.require_working_copy_id().map_err(ShimError::from)?;
     let git = open_git(&root)?;
     let policy = conversion_policy(&git)?;
     let filter = GitAttributesFilter::for_repository(&root);
@@ -2386,11 +2387,11 @@ fn verify() -> CliResult<ShimSnapshot> {
     // Layer 1 — durable: working-copy desired state equals the view head.
     let view_name = repo
         .desired_view_name(working_copy)
-        .map_err(CliError::from)?;
+        .map_err(ShimError::from)?;
     let record = repo
         .working_copy_record(working_copy)
-        .map_err(CliError::from)?;
-    let view_info = repo.get_view_info(&view_name).map_err(CliError::from)?;
+        .map_err(ShimError::from)?;
+    let view_info = repo.get_view_info(&view_name).map_err(ShimError::from)?;
     let durable_ok = view_info.state == record.desired_state;
     verdicts.push((
         "durable",
@@ -2511,7 +2512,9 @@ fn verify() -> CliResult<ShimSnapshot> {
 
     // Layer 5 — snapshot: pending snapshot/remainder are content-addressed
     // and re-readable (staged/remainder bytes survive reopen).
-    let snapshot_status = repo.snapshot_status(working_copy).map_err(CliError::from)?;
+    let snapshot_status = repo
+        .snapshot_status(working_copy)
+        .map_err(ShimError::from)?;
     let snapshot_verdict: (bool, String) =
         match (&snapshot_status.snapshot, &snapshot_status.remainder) {
             (None, None) => (true, "no pending snapshot or remainder".to_string()),
@@ -2574,7 +2577,7 @@ fn verify() -> CliResult<ShimSnapshot> {
     verify_complete_equivalence(&repo, &branch, &root, &git, "Git shim verification")?;
     let atomic_state = repo
         .get_view_info(&branch)
-        .map_err(CliError::from)?
+        .map_err(ShimError::from)?
         .state
         .to_string();
 
@@ -2587,11 +2590,11 @@ fn verify() -> CliResult<ShimSnapshot> {
 }
 
 #[tracing::instrument(name = "verify", skip_all)]
-fn verify_at(root: &Path) -> CliResult<ShimSnapshot> {
+fn verify_at(root: &Path) -> ShimResult<ShimSnapshot> {
     // CB-13A R2: the same read-only diagnostic boundary as `verify` — the
     // repository is observed for operation inspection without recovery.
-    let repo = Repository::open_readonly_for_operation_inspection(root).map_err(CliError::from)?;
-    let working_copy = repo.require_working_copy_id().map_err(CliError::from)?;
+    let repo = Repository::open_readonly_for_operation_inspection(root).map_err(ShimError::from)?;
+    let working_copy = repo.require_working_copy_id().map_err(ShimError::from)?;
     let git = open_git(root)?;
     // CB-13A R2: an incomplete or diverged operation head may never pass
     // the inspection helper when the writable path would recover or gate
@@ -2606,7 +2609,7 @@ fn verify_at(root: &Path) -> CliResult<ShimSnapshot> {
     require_clean_git_worktree(&git)?;
     let atomic_status = repo
         .status(working_copy, StatusOptions::default())
-        .map_err(CliError::from)?;
+        .map_err(ShimError::from)?;
     // CB-13C review R1: status itself never writes telemetry. This helper
     // runs only inside explicit shim command flows (reconcile/switch/
     // import/publish), so it is the authorized sink boundary that records
@@ -2628,7 +2631,7 @@ fn verify_at(root: &Path) -> CliResult<ShimSnapshot> {
     verify_complete_equivalence(&repo, &branch, root, &git, "Git shim verification")?;
     let atomic_state = repo
         .get_view_info(&branch)
-        .map_err(CliError::from)?
+        .map_err(ShimError::from)?
         .state
         .to_string();
 
@@ -2643,7 +2646,7 @@ fn verify_at(root: &Path) -> CliResult<ShimSnapshot> {
 /// Verify a workspace whose HEAD may be detached (RFC §7.5, CB-8A Draft
 /// policy): an attached HEAD follows the branch rule; a detached HEAD aligns
 /// when its commit tree exactly equals the desired view's projection.
-pub(crate) fn verify_at_detached_ok(root: &Path) -> CliResult<ShimSnapshot> {
+pub(crate) fn verify_at_detached_ok(root: &Path) -> ShimResult<ShimSnapshot> {
     verify_at(root)
 }
 
@@ -2654,19 +2657,19 @@ pub(crate) fn verify_with(
     repo: &Repository,
     working_copy: WorkingCopyId,
     git: &GitRepository,
-) -> CliResult<ShimSnapshot> {
+) -> ShimResult<ShimSnapshot> {
     let (branch, head, tree) = workspace_head_aligned(repo, working_copy, git)?;
     require_clean_git_worktree(git)?;
     let atomic_status = repo
         .status(working_copy, StatusOptions::default())
-        .map_err(CliError::from)?;
+        .map_err(ShimError::from)?;
     if !atomic_status.is_clean() {
         return Err(git_error("Atomic working copy is not clean"));
     }
     verify_complete_equivalence(repo, &branch, repo.root(), git, "Git shim verification")?;
     let atomic_state = repo
         .get_view_info(&branch)
-        .map_err(CliError::from)?
+        .map_err(ShimError::from)?
         .state
         .to_string();
 
@@ -2685,7 +2688,7 @@ pub(crate) fn workspace_head_aligned(
     repo: &Repository,
     working_copy: WorkingCopyId,
     git: &GitRepository,
-) -> CliResult<(String, git2::Oid, git2::Oid)> {
+) -> ShimResult<(String, git2::Oid, git2::Oid)> {
     let head_obs = observe_head(git).map_err(observation_error)?;
     match &head_obs {
         HeadObservation::Attached { symref, .. } => {
@@ -2697,7 +2700,7 @@ pub(crate) fn workspace_head_aligned(
                 })?;
             let desired_view = repo
                 .desired_view_name(working_copy)
-                .map_err(CliError::from)?;
+                .map_err(ShimError::from)?;
             if branch != desired_view {
                 return Err(git_error(format!(
                     "Git branch '{branch}' does not match current Atomic view '{desired_view}'"
@@ -2718,7 +2721,7 @@ pub(crate) fn workspace_head_aligned(
         HeadObservation::Detached { oid } => {
             let desired_view = repo
                 .desired_view_name(working_copy)
-                .map_err(CliError::from)?;
+                .map_err(ShimError::from)?;
             let commit = git.find_commit(*oid).map_err(|error| {
                 git_error(format!("cannot read detached Git HEAD commit: {error}"))
             })?;
@@ -2749,7 +2752,7 @@ pub(crate) fn current_heads(
     repo: &Repository,
     working_copy: WorkingCopyId,
     git: &GitRepository,
-) -> CliResult<ShimSnapshot> {
+) -> ShimResult<ShimSnapshot> {
     let head = git
         .head()
         .map_err(|error| git_error(format!("Git HEAD is unavailable: {error}")))?;
@@ -2762,10 +2765,10 @@ pub(crate) fn current_heads(
         .map_err(|error| git_error(format!("cannot read Git HEAD tree: {error}")))?;
     let view = repo
         .desired_view_name(working_copy)
-        .map_err(CliError::from)?;
+        .map_err(ShimError::from)?;
     let atomic_state = repo
         .get_view_info(&view)
-        .map_err(CliError::from)?
+        .map_err(ShimError::from)?
         .state
         .to_string();
     Ok(ShimSnapshot {
@@ -2776,9 +2779,7 @@ pub(crate) fn current_heads(
     })
 }
 
-pub(crate) fn read_checkpoint_observation(
-    root: &Path,
-) -> CliResult<Option<ShimCheckpointObservation>> {
+pub fn read_checkpoint_observation(root: &Path) -> ShimResult<Option<ShimCheckpointObservation>> {
     read_workspace_metadata(root).map(|checkpoint| {
         checkpoint.map(|checkpoint| ShimCheckpointObservation {
             view: checkpoint.view,
@@ -2789,15 +2790,15 @@ pub(crate) fn read_checkpoint_observation(
     })
 }
 
-pub(crate) fn read_workspace_metadata(root: &Path) -> CliResult<Option<ShimCheckpoint>> {
+pub(crate) fn read_workspace_metadata(root: &Path) -> ShimResult<Option<ShimCheckpoint>> {
     checkpoint::read_checkpoint(root).map_err(checkpoint_error)
 }
 
-pub(crate) fn open_git(root: &Path) -> CliResult<GitRepository> {
+pub(crate) fn open_git(root: &Path) -> ShimResult<GitRepository> {
     GitRepository::open(root).map_err(|error| git_error(format!("cannot open repository: {error}")))
 }
 
-fn current_attached_git_branch(git: &GitRepository) -> CliResult<String> {
+fn current_attached_git_branch(git: &GitRepository) -> ShimResult<String> {
     match observe_head(git).map_err(observation_error)? {
         HeadObservation::Attached { symref, .. } => symref
             .strip_prefix("refs/heads/")
@@ -2820,7 +2821,7 @@ fn current_attached_git_branch(git: &GitRepository) -> CliResult<String> {
 /// An attached HEAD keeps its branch; a detached HEAD keeps the workspace
 /// view (§7.5): the symbolic branch did not change, so only commit/tree
 /// movement counts as a Git-side change and routes to the §7.5 import.
-fn current_git_branch_or_view(git: &GitRepository, view: &str) -> CliResult<String> {
+fn current_git_branch_or_view(git: &GitRepository, view: &str) -> ShimResult<String> {
     match observe_head(git).map_err(observation_error)? {
         HeadObservation::Attached { symref, .. } => symref
             .strip_prefix("refs/heads/")
@@ -2836,7 +2837,7 @@ fn current_git_branch_or_view(git: &GitRepository, view: &str) -> CliResult<Stri
     }
 }
 
-pub(crate) fn require_clean_git_worktree(git: &GitRepository) -> CliResult<()> {
+pub(crate) fn require_clean_git_worktree(git: &GitRepository) -> ShimResult<()> {
     let index = git
         .index()
         .map_err(|error| git_error(format!("cannot read Git index: {error}")))?;
@@ -2864,11 +2865,11 @@ fn require_matching_clean_workspaces<'repo>(
     working_copy: WorkingCopyId,
     git: &'repo GitRepository,
     require_atomic_clean: bool,
-) -> CliResult<(String, git2::Oid, git2::Tree<'repo>)> {
+) -> ShimResult<(String, git2::Oid, git2::Tree<'repo>)> {
     let branch = current_attached_git_branch(git)?;
     let desired_view = repo
         .desired_view_name(working_copy)
-        .map_err(CliError::from)?;
+        .map_err(ShimError::from)?;
     if branch != desired_view {
         return Err(git_error(format!(
             "Git branch '{branch}' does not match current Atomic view '{desired_view}'"
@@ -2880,7 +2881,7 @@ fn require_matching_clean_workspaces<'repo>(
     if require_atomic_clean {
         let atomic_status = repo
             .status(working_copy, StatusOptions::default())
-            .map_err(CliError::from)?;
+            .map_err(ShimError::from)?;
         if !atomic_status.is_clean() {
             return Err(git_error("Atomic working copy is not clean"));
         }
@@ -2906,7 +2907,7 @@ pub(crate) fn project_atomic_to_git(
     working_copy: WorkingCopyId,
     git: &GitRepository,
     current: &ShimSnapshot,
-) -> CliResult<()> {
+) -> ShimResult<()> {
     let head = git
         .head()
         .map_err(|error| git_error(format!("Git HEAD is unavailable: {error}")))?;
@@ -2918,7 +2919,7 @@ pub(crate) fn project_atomic_to_git(
         .ok_or_else(|| git_error("Git branch name is not valid UTF-8"))?;
     let desired_view = repo
         .desired_view_name(working_copy)
-        .map_err(CliError::from)?;
+        .map_err(ShimError::from)?;
     if branch != desired_view {
         return Err(git_error(format!(
             "Git branch '{branch}' does not match current Atomic view '{desired_view}'"
@@ -2927,7 +2928,7 @@ pub(crate) fn project_atomic_to_git(
 
     let atomic_status = repo
         .status(working_copy, StatusOptions::default())
-        .map_err(CliError::from)?;
+        .map_err(ShimError::from)?;
     if !atomic_status.is_clean() {
         return Err(git_error("Atomic working copy is not clean"));
     }
@@ -2992,7 +2993,7 @@ pub(crate) fn project_atomic_to_git(
     Ok(())
 }
 
-fn require_clean_git_index(git: &GitRepository) -> CliResult<()> {
+fn require_clean_git_index(git: &GitRepository) -> ShimResult<()> {
     let index = git
         .index()
         .map_err(|error| git_error(format!("cannot read Git index: {error}")))?;
@@ -3037,7 +3038,7 @@ fn staged_delta(status: Status) -> bool {
     )
 }
 
-fn write_project_tree(git: &GitRepository, project: &ProjectTree) -> CliResult<Oid> {
+fn write_project_tree(git: &GitRepository, project: &ProjectTree) -> ShimResult<Oid> {
     if project.git.algorithm != atomic_core::operation::GitHashAlgorithm::Sha1 {
         return Err(git_error(format!(
             "libgit2 cannot safely publish {:?} Atomic projections",
@@ -3077,7 +3078,7 @@ struct GitTreeNode {
     directories: BTreeMap<String, GitTreeNode>,
 }
 
-fn write_git_tree(git: &GitRepository, files: &BTreeMap<String, Vec<u8>>) -> CliResult<Oid> {
+fn write_git_tree(git: &GitRepository, files: &BTreeMap<String, Vec<u8>>) -> ShimResult<Oid> {
     let mut root = GitTreeNode::default();
     for (path, content) in files {
         let mut components = path.split('/').peekable();
@@ -3093,7 +3094,7 @@ fn write_git_tree(git: &GitRepository, files: &BTreeMap<String, Vec<u8>>) -> Cli
     write_git_tree_node(git, &root)
 }
 
-fn write_git_tree_node(git: &GitRepository, node: &GitTreeNode) -> CliResult<Oid> {
+fn write_git_tree_node(git: &GitRepository, node: &GitTreeNode) -> ShimResult<Oid> {
     let mut builder = git
         .treebuilder(None)
         .map_err(|error| git_error(format!("cannot create Git tree builder: {error}")))?;
@@ -3116,7 +3117,7 @@ fn write_git_tree_node(git: &GitRepository, node: &GitTreeNode) -> CliResult<Oid
         .map_err(|error| git_error(format!("cannot write Git tree: {error}")))
 }
 
-fn read_filesystem(root: &Path) -> CliResult<BTreeMap<String, Vec<u8>>> {
+fn read_filesystem(root: &Path) -> ShimResult<BTreeMap<String, Vec<u8>>> {
     let mut files = BTreeMap::new();
     collect_filesystem(root, root, &mut files)?;
     Ok(files)
@@ -3126,7 +3127,7 @@ fn collect_filesystem(
     root: &Path,
     directory: &Path,
     files: &mut BTreeMap<String, Vec<u8>>,
-) -> CliResult<()> {
+) -> ShimResult<()> {
     let entries = fs::read_dir(directory).map_err(|error| {
         git_error(format!(
             "cannot read working tree directory '{}': {error}",
@@ -3162,7 +3163,7 @@ fn collect_filesystem(
     Ok(())
 }
 
-fn path_to_git_string(path: &Path) -> CliResult<String> {
+fn path_to_git_string(path: &Path) -> ShimResult<String> {
     let components: Result<Vec<_>, _> = path
         .components()
         .map(|component| {
@@ -3194,7 +3195,7 @@ fn tracked_delta(status: Status) -> bool {
 fn read_git_tree(
     git: &GitRepository,
     tree: &git2::Tree<'_>,
-) -> CliResult<BTreeMap<String, Vec<u8>>> {
+) -> ShimResult<BTreeMap<String, Vec<u8>>> {
     let mut files = BTreeMap::new();
     collect_git_tree(git, tree, "", &mut files)?;
     Ok(files)
@@ -3205,7 +3206,7 @@ fn collect_git_tree(
     tree: &git2::Tree<'_>,
     prefix: &str,
     files: &mut BTreeMap<String, Vec<u8>>,
-) -> CliResult<()> {
+) -> ShimResult<()> {
     for entry in tree.iter() {
         let name = entry
             .name()
@@ -3312,7 +3313,7 @@ fn format_paths<T: AsRef<str>>(paths: &[&T]) -> String {
     }
 }
 
-fn write_workspace_metadata(root: &Path, snapshot: &ShimSnapshot) -> CliResult<()> {
+fn write_workspace_metadata(root: &Path, snapshot: &ShimSnapshot) -> ShimResult<()> {
     checkpoint::write_verified_checkpoint(
         root,
         VerifiedCheckpointInput {
@@ -3326,16 +3327,16 @@ fn write_workspace_metadata(root: &Path, snapshot: &ShimSnapshot) -> CliResult<(
     .map_err(checkpoint_error)
 }
 
-fn checkpoint_error(error: checkpoint::CheckpointError) -> CliError {
+fn checkpoint_error(error: checkpoint::CheckpointError) -> ShimError {
     git_error(error.to_string())
 }
 
-fn observation_error(error: ObservationError) -> CliError {
+fn observation_error(error: ObservationError) -> ShimError {
     git_error(error.to_string())
 }
 
-fn git_error(message: impl Into<String>) -> CliError {
-    CliError::GitError {
+fn git_error(message: impl Into<String>) -> ShimError {
+    ShimError::GitError {
         message: message.into(),
     }
 }
@@ -3343,12 +3344,12 @@ fn git_error(message: impl Into<String>) -> CliError {
 #[cfg(test)]
 mod tests {
     #[cfg(test)]
-    fn record_last_shim_operation_probe(root: &std::path::Path) -> CliResult<()> {
+    fn record_last_shim_operation_probe(root: &std::path::Path) -> ShimResult<()> {
         // The marker writer is best-effort (returns ()). For the regression we
         // verify the WRITE against a real repository: the marker must appear.
         record_last_shim_operation(root);
         let marker = Repository::canonical_dot_dir(root)
-            .map_err(CliError::from)?
+            .map_err(ShimError::from)?
             .join("bridge/suppressed-operation.json");
         if marker.exists() {
             Ok(())

@@ -657,6 +657,14 @@ cargo install --path atomic-cli
 atomic --version
 ```
 
+The CLI enables the `git-shim` and `teams` Cargo features by default. Git
+interoperability lives in the independent [`atomic-git-shim`](atomic-git-shim/README.md)
+crate. To build the CLI without that adapter, use
+`cargo build -p atomic-cli --no-default-features --features teams` (omit
+`--features teams` to disable both). Such builds retain native Atomic workflows
+and refuse operations in shim-enrolled working copies until enrollment is
+explicitly disabled with a shim-enabled build.
+
 Local builds include their source commit in the version output, for example
 `atomic 0.19.1 (dev 4b143dfbcad2)`, with `-dirty` appended for tracked changes.
 The release workflow sets `ATOMIC_BUILD_CHANNEL=release` to report only the

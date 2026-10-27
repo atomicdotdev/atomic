@@ -37,7 +37,7 @@ use atomic_repository::repository::observability::{
 use atomic_repository::Repository;
 use git2::Repository as GitRepository;
 
-use crate::error::{CliError, CliResult};
+use crate::error::{ShimError, ShimResult};
 use crate::output::{print_info, print_success, print_warning};
 
 /// One refused ref update with its exact reason.
@@ -52,12 +52,12 @@ struct ReceiveRefusal {
 /// non-zero when any update is refused. `--unprotected <prefix>` may be
 /// passed repeatedly to exempt explicitly chosen ref prefixes; everything
 /// else fails closed.
-pub(crate) fn run_verify_receive(root: &Path, unprotected: &[String]) -> CliResult<()> {
+pub(crate) fn run_verify_receive(root: &Path, unprotected: &[String]) -> ShimResult<()> {
     let mut stdin = std::io::stdin().lock();
     let mut input = String::new();
     stdin
         .read_to_string(&mut input)
-        .map_err(|error| CliError::GitError {
+        .map_err(|error| ShimError::GitError {
             message: format!("cannot read ref-update lines: {error}"),
         })?;
     drop(stdin);
@@ -70,7 +70,7 @@ pub(crate) fn verify_receive_updates(
     root: &Path,
     unprotected: &[String],
     input: &str,
-) -> CliResult<()> {
+) -> ShimResult<()> {
     let lines: Vec<String> = input
         .lines()
         .map(str::trim)
@@ -78,14 +78,14 @@ pub(crate) fn verify_receive_updates(
         .map(ToString::to_string)
         .collect();
     if lines.is_empty() {
-        return Err(CliError::GitError {
+        return Err(ShimError::GitError {
             message: "verify-receive received no ref-update lines; refusing (fail closed)"
                 .to_string(),
         });
     }
 
-    let repo = Repository::open_readonly(root).map_err(CliError::Repository)?;
-    let git_repo = GitRepository::open(root).map_err(|error| CliError::GitError {
+    let repo = Repository::open_readonly(root).map_err(ShimError::Repository)?;
+    let git_repo = GitRepository::open(root).map_err(|error| ShimError::GitError {
         message: format!("cannot open receiving Git repository: {error}"),
     })?;
 
@@ -137,7 +137,7 @@ pub(crate) fn verify_receive_updates(
         // in telemetry. The receive boundary counts ref updates (review
         // R5: accurate units).
         BridgeEventJournal::new(
-            &Repository::canonical_dot_dir(root).map_err(CliError::Repository)?,
+            &Repository::canonical_dot_dir(root).map_err(ShimError::Repository)?,
             None,
         )
         .emit_lossy(BridgeEventKind::PublicationRefusal {
@@ -146,7 +146,7 @@ pub(crate) fn verify_receive_updates(
             checked: lines.len(),
             unit: PublicationUnit::Refs,
         });
-        return Err(CliError::GitError {
+        return Err(ShimError::GitError {
             message: format!(
                 "verify-receive refused {} of {} ref update(s); the boundary accepted nothing \
                  for refused refs",

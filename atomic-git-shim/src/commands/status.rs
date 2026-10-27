@@ -23,24 +23,23 @@ use atomic_repository::{
 };
 use atomic_repository::{Repository, WorkspaceRemediation, WorkspaceTxnStart};
 
-use crate::commands::git::parallel::conversion_policy;
-use crate::error::{CliError, CliResult};
-use crate::output::print_blank;
+use crate::commands::parallel::conversion_policy;
+use crate::error::{ShimError, ShimResult};
 
 /// Version of the machine-readable `status --git --json` document.
 pub const GIT_STATUS_JSON_VERSION: u32 = 1;
 
 /// Render `status --git` for the repository at `repo_root`.
-pub fn run_git_status(repo_root: &Path, json: bool) -> CliResult<()> {
+pub fn run_git_status(repo_root: &Path, json: bool) -> ShimResult<()> {
     let mut repo =
-        Repository::open_readonly(repo_root).map_err(|e| CliError::InvalidRepository {
+        Repository::open_readonly(repo_root).map_err(|e| ShimError::InvalidRepository {
             reason: e.to_string(),
         })?;
 
     // Observe-only boundary: --git never journals or mutates.
     let boundary = repo
         .begin_workspace_txn(atomic_repository::WorkspaceTxnMode::Observe)
-        .map_err(CliError::Repository)?;
+        .map_err(ShimError::Repository)?;
 
     let git_repo = open_git(repo_root)?;
     let policy = conversion_policy(&git_repo)?;
@@ -49,7 +48,7 @@ pub fn run_git_status(repo_root: &Path, json: bool) -> CliResult<()> {
         WorkspaceTxnStart::Ready(workspace) => {
             let working_copy = workspace.working_copy();
             let staging = observe_staging_state(&repo, working_copy, &policy)
-                .map_err(|error| CliError::Internal(error.into()))?;
+                .map_err(|error| ShimError::Internal(error.into()))?;
             let shim = ShimSummary {
                 state: "aligned".to_string(),
                 origin: if workspace.checkpoint().is_some() {
@@ -70,7 +69,7 @@ pub fn run_git_status(repo_root: &Path, json: bool) -> CliResult<()> {
         }
         WorkspaceTxnStart::Remediation(remediation) => {
             let mut staging = observe_git_staging_state(repo_root, &policy)
-                .map_err(|error| CliError::Internal(error.into()))?;
+                .map_err(|error| ShimError::Internal(error.into()))?;
             // The remediation notice is rendered once; drop the duplicate
             // operation-in-progress notice the raw observation produced.
             staging
@@ -113,7 +112,7 @@ pub fn run_git_status(repo_root: &Path, json: bool) -> CliResult<()> {
         }
     };
 
-    let ignore = check_ignore_policy(repo_root).map_err(|error| CliError::GitError {
+    let ignore = check_ignore_policy(repo_root).map_err(|error| ShimError::GitError {
         message: error.to_string(),
     })?;
     let shelved = collect_shelved_artifacts(repo_root, &shim.view);
@@ -129,7 +128,7 @@ pub fn run_git_status(repo_root: &Path, json: bool) -> CliResult<()> {
         println!(
             "{}",
             serde_json::to_string_pretty(&document)
-                .map_err(|error| CliError::Internal(error.into()))?
+                .map_err(|error| ShimError::Internal(error.into()))?
         );
         return Ok(());
     }
@@ -146,20 +145,20 @@ pub fn run_git_status(repo_root: &Path, json: bool) -> CliResult<()> {
 
     let mut printed_note = false;
     if let Some(notice) = &remediation_notice {
-        print_blank();
+        println!();
         println!("Note: {notice}");
         printed_note = true;
     }
     for notice in describe_notices(&staging.notices) {
         if !printed_note {
-            print_blank();
+            println!();
             printed_note = true;
         }
         println!("Note: {notice}");
     }
     if ignore.diverges() {
         if !printed_note {
-            print_blank();
+            println!();
             printed_note = true;
         }
         println!(
@@ -169,7 +168,7 @@ pub fn run_git_status(repo_root: &Path, json: bool) -> CliResult<()> {
     }
     if !shelved.is_empty() {
         if !printed_note {
-            print_blank();
+            println!();
         }
         println!("Shelved (excluded from view status; swapped on view change):");
         for path in &shelved {
@@ -407,8 +406,8 @@ fn git_status_json(
     })
 }
 
-fn open_git(repo_root: &Path) -> CliResult<git2::Repository> {
-    git2::Repository::open(repo_root).map_err(|error| CliError::GitError {
+fn open_git(repo_root: &Path) -> ShimResult<git2::Repository> {
+    git2::Repository::open(repo_root).map_err(|error| ShimError::GitError {
         message: format!("cannot open Git repository: {error}"),
     })
 }
@@ -423,29 +422,31 @@ fn open_git(repo_root: &Path) -> CliResult<git2::Repository> {
 ///   `Added` with an explicit "staged via Git index" detail;
 /// - index stages 1-3 (unmerged) are displayed as `Conflicted` with a
 ///   Git merge detail.
-pub(crate) fn apply_git_informed_overlays(
+pub fn apply_git_informed_overlays(
     repo: &Repository,
     repo_root: &Path,
     status: &mut atomic_repository::RepositoryStatus,
-) -> CliResult<()> {
+) -> ShimResult<()> {
     // Git-informed overlays are colocated shim behavior (RFC §9); native
     // status of a working copy that never enrolled stays Git-independent.
     if !repo_root.join(".git").exists()
-        || !repo.shim_workspace_active().map_err(CliError::Repository)?
+        || !repo
+            .shim_workspace_active()
+            .map_err(ShimError::Repository)?
     {
         return Ok(());
     }
     let git_repo = open_git(repo_root)?;
     let policy = conversion_policy(&git_repo)?;
     let index = atomic_repository::observe_git_index(repo_root, &policy).map_err(|error| {
-        CliError::GitError {
+        ShimError::GitError {
             message: error.to_string(),
         }
     })?;
 
     let durably_tracked: std::collections::BTreeSet<String> = repo
         .list_tracked_files()
-        .map_err(|e| CliError::Internal(e.into()))?
+        .map_err(|e| ShimError::Internal(e.into()))?
         .iter()
         .filter(|file| !file.is_directory)
         .map(|file| atomic_repository::canonical_path_identity(&file.path.to_string_lossy()))
@@ -471,7 +472,7 @@ pub(crate) fn apply_git_informed_overlays(
             continue;
         }
         let mut entry = atomic_repository::FileStatusEntry::new(
-            path.to_native().map_err(|error| CliError::GitError {
+            path.to_native().map_err(|error| ShimError::GitError {
                 message: error.to_string(),
             })?,
             atomic_repository::FileStatus::Added,
@@ -486,7 +487,7 @@ pub(crate) fn apply_git_informed_overlays(
     // Unmerged index entries displayed as Git merge conflicts.
     for path in &unmerged {
         let mut entry = atomic_repository::FileStatusEntry::new(
-            path.to_native().map_err(|error| CliError::GitError {
+            path.to_native().map_err(|error| ShimError::GitError {
                 message: error.to_string(),
             })?,
             atomic_repository::FileStatus::Conflicted,

@@ -291,7 +291,9 @@ impl New {
                 style_view(name),
                 result.files_written,
             ));
+            #[cfg(feature = "git-shim")]
             let repo_root = find_repository_root()?;
+            #[cfg(feature = "git-shim")]
             if crate::commands::git::shadow::shim_publication_required(&repo_root) {
                 let shadow_sync =
                     crate::commands::git::shadow::sync_git_head_to_view(repo, &repo_root, name)?;

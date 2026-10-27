@@ -54,6 +54,7 @@
 
 pub mod create;
 pub mod delete;
+#[cfg(feature = "teams")]
 pub mod grant;
 pub mod list;
 pub mod set;
@@ -64,6 +65,7 @@ use clap::Subcommand;
 
 pub use create::WorkspaceCreate;
 pub use delete::WorkspaceDelete;
+#[cfg(feature = "teams")]
 pub use grant::GrantCmd;
 pub use list::WorkspaceList;
 pub use set::WorkspaceSet;
@@ -167,6 +169,7 @@ pub enum WorkspaceCommands {
     /// atomic workspace grant add my-team --team engineering --permission write
     /// atomic workspace grant remove my-team --team engineering
     /// ```
+    #[cfg(feature = "teams")]
     Grant(GrantCmd),
 }
 
@@ -190,6 +193,7 @@ impl Command for WorkspaceCmd {
             WorkspaceCommands::Update(cmd) => cmd.run(),
             WorkspaceCommands::Delete(cmd) => cmd.run(),
             WorkspaceCommands::Set(cmd) => cmd.run(),
+            #[cfg(feature = "teams")]
             WorkspaceCommands::Grant(cmd) => cmd.run(),
         }
     }
@@ -209,6 +213,7 @@ mod tests {
                 WorkspaceCommands::Update(_) => "update",
                 WorkspaceCommands::Delete(_) => "delete",
                 WorkspaceCommands::Set(_) => "set",
+                #[cfg(feature = "teams")]
                 WorkspaceCommands::Grant(_) => "grant",
             }
         }

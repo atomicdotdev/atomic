@@ -25,10 +25,10 @@ use atomic_repository::{BindingPublication, ClosureReadiness, Repository};
 use git2::Repository as GitRepository;
 
 use super::transport::HttpBindingChangeSource;
-use crate::commands::workspace_txn::{boundary_mode, enter_workspace};
-use crate::commands::{find_repository_root, Command};
-use crate::error::{CliError, CliResult};
+use crate::error::{ShimError, ShimResult};
+use crate::find_repository_root;
 use crate::output::{print_hint, print_info, print_success, print_warning};
+use crate::workspace_txn::{boundary_mode, enter_workspace};
 
 use clap::Subcommand;
 
@@ -125,7 +125,7 @@ pub enum BindingCommand {
 }
 
 impl BindingCommand {
-    pub fn run(self) -> CliResult<()> {
+    pub fn run(self) -> ShimResult<()> {
         match self {
             BindingCommand::Publish {
                 key_file,
@@ -155,7 +155,7 @@ impl BindingCommand {
     }
 
     /// Run from a shared reference (clap passes subcommands by reference).
-    pub fn run_owned(self) -> CliResult<()> {
+    pub fn run_owned(self) -> ShimResult<()> {
         self.run()
     }
 }
@@ -164,9 +164,9 @@ impl BindingCommand {
 ///
 /// CB-7A keeps binding/Anchor signatures on explicit key files only; no
 /// default identity is wired (managed signing is CB-12B).
-pub(crate) fn load_signing_key(key_file: &Path) -> CliResult<atomic_identity::keypair::KeyPair> {
+pub(crate) fn load_signing_key(key_file: &Path) -> ShimResult<atomic_identity::keypair::KeyPair> {
     let text = std::fs::read_to_string(key_file).map_err(|error| {
-        CliError::Repository(atomic_repository::RepositoryError::InvalidOperation {
+        ShimError::Repository(atomic_repository::RepositoryError::InvalidOperation {
             message: format!(
                 "cannot read signing key file '{}': {error}",
                 key_file.display()
@@ -175,7 +175,7 @@ pub(crate) fn load_signing_key(key_file: &Path) -> CliResult<atomic_identity::ke
     })?;
     let hex = text.trim();
     if hex.len() != 64 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
-        return Err(CliError::Repository(
+        return Err(ShimError::Repository(
             atomic_repository::RepositoryError::InvalidOperation {
                 message: "signing key file must hold exactly 64 hex characters (a 32-byte Ed25519 secret key)"
                     .to_string(),
@@ -185,7 +185,7 @@ pub(crate) fn load_signing_key(key_file: &Path) -> CliResult<atomic_identity::ke
     let mut secret = [0u8; 32];
     for (index, byte) in secret.iter_mut().enumerate() {
         *byte = u8::from_str_radix(&hex[index * 2..index * 2 + 2], 16).map_err(|error| {
-            CliError::Repository(atomic_repository::RepositoryError::InvalidOperation {
+            ShimError::Repository(atomic_repository::RepositoryError::InvalidOperation {
                 message: format!("invalid hex in signing key file: {error}"),
             })
         })?;
@@ -201,11 +201,11 @@ pub(crate) fn load_signing_key(key_file: &Path) -> CliResult<atomic_identity::ke
 pub(crate) fn assemble_changes_pack_from_view(
     repo: &Repository,
     ordered: &[atomic_core::Hash],
-) -> CliResult<Vec<u8>> {
+) -> ShimResult<Vec<u8>> {
     let mut records = Vec::with_capacity(ordered.len());
     for hash in ordered {
         if !repo.has_change(hash) {
-            return Err(CliError::Repository(
+            return Err(ShimError::Repository(
                 atomic_repository::RepositoryError::InvalidOperation {
                     message: format!(
                         "cannot assemble the changes.pack: change {} is not in the local store; \
@@ -217,7 +217,7 @@ pub(crate) fn assemble_changes_pack_from_view(
         }
         let path = repo.change_store().change_path(hash);
         let bytes = std::fs::read(&path).map_err(|error| {
-            CliError::Repository(atomic_repository::RepositoryError::InvalidOperation {
+            ShimError::Repository(atomic_repository::RepositoryError::InvalidOperation {
                 message: format!("cannot read change {}: {error}", hash.to_base32()),
             })
         })?;
@@ -226,12 +226,12 @@ pub(crate) fn assemble_changes_pack_from_view(
         let mut probe = bytes.as_slice();
         let (_, identity) =
             atomic_core::change::Change::deserialize(&mut probe).map_err(|error| {
-                CliError::Repository(atomic_repository::RepositoryError::InvalidOperation {
+                ShimError::Repository(atomic_repository::RepositoryError::InvalidOperation {
                     message: format!("stored change {} is corrupt: {error}", hash.to_base32()),
                 })
             })?;
         if &identity != hash {
-            return Err(CliError::Repository(
+            return Err(ShimError::Repository(
                 atomic_repository::RepositoryError::InvalidOperation {
                     message: format!(
                         "stored change {} does not hash to its identity; refusing to pack it",
@@ -251,21 +251,25 @@ pub(crate) fn assemble_changes_pack_from_view(
         &BindingPackLimits::default_limits(),
     )
     .map_err(|error| {
-        CliError::Repository(atomic_repository::RepositoryError::InvalidOperation {
+        ShimError::Repository(atomic_repository::RepositoryError::InvalidOperation {
             message: format!("cannot assemble the changes.pack: {error}"),
         })
     })
 }
 
-fn publish(key_file: PathBuf, with_changes_pack: bool, with_conflicts_pack: bool) -> CliResult<()> {
+fn publish(
+    key_file: PathBuf,
+    with_changes_pack: bool,
+    with_conflicts_pack: bool,
+) -> ShimResult<()> {
     let keypair = load_signing_key(&key_file)?;
     let root = find_repository_root()?;
-    let mut repo = Repository::open(root.clone()).map_err(CliError::from)?;
+    let mut repo = Repository::open(root.clone()).map_err(ShimError::from)?;
     let workspace = enter_workspace(&mut repo, atomic_repository::WorkspaceTxnMode::Reconcile)?;
     let working_copy = workspace.working_copy();
     let view_name = repo
         .desired_view_name(working_copy)
-        .map_err(CliError::from)?;
+        .map_err(ShimError::from)?;
 
     let git = open_git(&root)?;
     let head = git
@@ -273,7 +277,7 @@ fn publish(key_file: PathBuf, with_changes_pack: bool, with_conflicts_pack: bool
         .ok()
         .and_then(|head| head.target())
         .ok_or_else(|| {
-            CliError::Repository(atomic_repository::RepositoryError::InvalidOperation {
+            ShimError::Repository(atomic_repository::RepositoryError::InvalidOperation {
                 message: "binding publish requires an attached Git HEAD commit".to_string(),
             })
         })?;
@@ -296,10 +300,10 @@ fn publish(key_file: PathBuf, with_changes_pack: bool, with_conflicts_pack: bool
     // Graph-derived identities: additive SetId v1, the Merkle state, and the
     // effective closure in view-log order. Snapshots and private material
     // never enter this payload.
-    let identity = repo.view_identity(&view_name).map_err(CliError::from)?;
+    let identity = repo.view_identity(&view_name).map_err(ShimError::from)?;
     let ordered_changes: Vec<atomic_core::Hash> = repo
         .effective_history(Some(&view_name))
-        .map_err(CliError::from)?
+        .map_err(ShimError::from)?
         .iter()
         .map(|entry| entry.hash)
         .collect();
@@ -342,7 +346,7 @@ fn publish(key_file: PathBuf, with_changes_pack: bool, with_conflicts_pack: bool
     let binding = match find_stored_identical_binding(&repo, &payload, &keypair) {
         Some(existing) => existing,
         None => GitStateBinding::sign(payload, &keypair).map_err(|error| {
-            CliError::Repository(atomic_repository::RepositoryError::InvalidOperation {
+            ShimError::Repository(atomic_repository::RepositoryError::InvalidOperation {
                 message: format!("cannot sign the binding: {error}"),
             })
         })?,
@@ -370,9 +374,9 @@ fn publish(key_file: PathBuf, with_changes_pack: bool, with_conflicts_pack: bool
     let conflicts_pack = if with_conflicts_pack {
         let object = repo
             .capture_view_conflict_set(&view_name)
-            .map_err(CliError::from)?
+            .map_err(ShimError::from)?
             .ok_or_else(|| {
-                CliError::Repository(atomic_repository::RepositoryError::InvalidOperation {
+                ShimError::Repository(atomic_repository::RepositoryError::InvalidOperation {
                     message: format!(
                         "--with-conflicts-pack requires persisted unresolved conflicts on \
                          view '{view_name}'; there is no conflict state to pack"
@@ -380,7 +384,7 @@ fn publish(key_file: PathBuf, with_changes_pack: bool, with_conflicts_pack: bool
                 })
             })?;
         let bytes = object.canonical_bytes().map_err(|error| {
-            CliError::Repository(atomic_repository::RepositoryError::InvalidOperation {
+            ShimError::Repository(atomic_repository::RepositoryError::InvalidOperation {
                 message: format!("cannot encode the conflict object: {error}"),
             })
         })?;
@@ -400,16 +404,16 @@ fn publish(key_file: PathBuf, with_changes_pack: bool, with_conflicts_pack: bool
                 pack,
                 conflicts,
             )
-            .map_err(CliError::from)?,
+            .map_err(ShimError::from)?,
         (Some(pack), None) => repo
             .publish_binding_with_changes_pack(working_copy, &git, &binding, None, pack)
-            .map_err(CliError::from)?,
+            .map_err(ShimError::from)?,
         (None, Some(conflicts)) => repo
             .publish_binding_with_conflicts_pack(working_copy, &git, &binding, None, conflicts)
-            .map_err(CliError::from)?,
+            .map_err(ShimError::from)?,
         (None, None) => repo
             .publish_binding(working_copy, &git, &binding, None)
-            .map_err(CliError::from)?,
+            .map_err(ShimError::from)?,
     };
     let binding_commit_hex = match &publication {
         BindingPublication::Published { binding_commit, .. }
@@ -466,7 +470,7 @@ fn find_stored_identical_binding(
     None
 }
 
-fn parents_from(git: &GitRepository, head: &git2::Oid) -> CliResult<Vec<GitOid>> {
+fn parents_from(git: &GitRepository, head: &git2::Oid) -> ShimResult<Vec<GitOid>> {
     let commit = git
         .find_commit(*head)
         .map_err(|error| git_map(error.to_string()))?;
@@ -484,7 +488,7 @@ fn parents_from(git: &GitRepository, head: &git2::Oid) -> CliResult<Vec<GitOid>>
 fn binding_loss_notes(
     repo: &atomic_repository::Repository,
     view_name: &str,
-) -> CliResult<Vec<LossNote>> {
+) -> ShimResult<Vec<LossNote>> {
     let notes = repo.empty_directory_loss_notes(view_name)?;
     Ok(notes
         .into_iter()
@@ -502,23 +506,23 @@ fn binding_loss_notes(
 fn sole_working_copy_operation(
     repo: &atomic_repository::Repository,
     working_copy: atomic_core::types::WorkingCopyId,
-) -> CliResult<OperationId> {
+) -> ShimResult<OperationId> {
     let log = repo
         .operation_log(
             atomic_core::operation::OperationScope::WorkingCopy(working_copy),
             Some(1),
             false,
         )
-        .map_err(CliError::from)?;
+        .map_err(ShimError::from)?;
     match log.head_state {
         atomic_repository::OperationHeadState::Single(head) => Ok(head),
-        OperationHeadState::Empty => Err(CliError::Repository(
+        OperationHeadState::Empty => Err(ShimError::Repository(
             atomic_repository::RepositoryError::InvalidOperation {
                 message: "no causal operation exists to bind; record or project state first"
                     .to_string(),
             },
         )),
-        OperationHeadState::Diverged(heads) => Err(CliError::Repository(
+        OperationHeadState::Diverged(heads) => Err(ShimError::Repository(
             atomic_repository::RepositoryError::InvalidOperation {
                 message: format!(
                     "operation heads are diverged: {}",
@@ -533,9 +537,9 @@ fn sole_working_copy_operation(
     }
 }
 
-fn verify(id: &str) -> CliResult<()> {
+fn verify(id: &str) -> ShimResult<()> {
     let root = find_repository_root()?;
-    let repo = Repository::open_readonly(root.clone()).map_err(CliError::from)?;
+    let repo = Repository::open_readonly(root.clone()).map_err(ShimError::from)?;
     let git = open_git(&root)?;
 
     let binding = if id.len() == 64 && id.chars().all(|c| c.is_ascii_hexdigit()) {
@@ -545,12 +549,12 @@ fn verify(id: &str) -> CliResult<()> {
     };
 
     verify_binding_cryptography(&binding).map_err(|error| {
-        CliError::Repository(atomic_repository::RepositoryError::InvalidOperation {
+        ShimError::Repository(atomic_repository::RepositoryError::InvalidOperation {
             message: format!("binding {} fails cryptography: {error}", binding.id()),
         })
     })?;
     verify_binding_content(&git, &binding).map_err(|error| {
-        CliError::Repository(atomic_repository::RepositoryError::InvalidOperation {
+        ShimError::Repository(atomic_repository::RepositoryError::InvalidOperation {
             message: format!("binding {} does not match Git: {error}", binding.id()),
         })
     })?;
@@ -558,7 +562,7 @@ fn verify(id: &str) -> CliResult<()> {
     // Trust policy: trust is distinct from content validity.
     let config =
         atomic_config::RepoConfig::load(&root.join(".atomic/config.toml")).map_err(|error| {
-            CliError::Repository(atomic_repository::RepositoryError::InvalidOperation {
+            ShimError::Repository(atomic_repository::RepositoryError::InvalidOperation {
                 message: error.to_string(),
             })
         })?;
@@ -594,7 +598,7 @@ fn verify(id: &str) -> CliResult<()> {
         binding.payload().signer.did,
     );
     if !evaluation.can_satisfy_publication_gate() {
-        return Err(CliError::Repository(
+        return Err(ShimError::Repository(
             atomic_repository::RepositoryError::InvalidOperation {
                 message: format!(
                     "binding {} verifies but its provenance is {verdict} and cannot satisfy a publication gate",
@@ -606,30 +610,30 @@ fn verify(id: &str) -> CliResult<()> {
     Ok(())
 }
 
-fn resolve_by_hex(repo: &Repository, id: &str) -> CliResult<GitStateBinding> {
-    let ids = repo.binding_ids().map_err(CliError::from)?;
+fn resolve_by_hex(repo: &Repository, id: &str) -> ShimResult<GitStateBinding> {
+    let ids = repo.binding_ids().map_err(ShimError::from)?;
     for candidate in ids {
         if candidate.to_hex() == id.to_ascii_lowercase() {
             return repo
                 .load_binding(&candidate)
-                .map_err(CliError::from)?
+                .map_err(ShimError::from)?
                 .ok_or_else(|| {
-                    CliError::Repository(atomic_repository::RepositoryError::InvalidOperation {
+                    ShimError::Repository(atomic_repository::RepositoryError::InvalidOperation {
                         message: format!("binding {id} not stored"),
                     })
                 });
         }
     }
-    Err(CliError::Repository(
+    Err(ShimError::Repository(
         atomic_repository::RepositoryError::InvalidOperation {
             message: format!("binding {id} is not stored locally"),
         },
     ))
 }
 
-fn resolve_by_prefix(repo: &Repository, prefix: &str) -> CliResult<GitStateBinding> {
+fn resolve_by_prefix(repo: &Repository, prefix: &str) -> ShimResult<GitStateBinding> {
     let lower = prefix.to_ascii_lowercase();
-    let ids = repo.binding_ids().map_err(CliError::from)?;
+    let ids = repo.binding_ids().map_err(ShimError::from)?;
     let matches: Vec<_> = ids
         .iter()
         .filter(|id| id.to_hex().starts_with(&lower))
@@ -637,18 +641,18 @@ fn resolve_by_prefix(repo: &Repository, prefix: &str) -> CliResult<GitStateBindi
     match matches.as_slice() {
         [id] => repo
             .load_binding(id)
-            .map_err(CliError::from)?
+            .map_err(ShimError::from)?
             .ok_or_else(|| {
-                CliError::Repository(atomic_repository::RepositoryError::InvalidOperation {
+                ShimError::Repository(atomic_repository::RepositoryError::InvalidOperation {
                     message: format!("binding {prefix} is not stored locally"),
                 })
             }),
-        [] => Err(CliError::Repository(
+        [] => Err(ShimError::Repository(
             atomic_repository::RepositoryError::InvalidOperation {
                 message: format!("binding prefix {prefix} matches nothing"),
             },
         )),
-        many => Err(CliError::Repository(
+        many => Err(ShimError::Repository(
             atomic_repository::RepositoryError::InvalidOperation {
                 message: format!(
                     "binding prefix {prefix} is ambiguous: {} matches",
@@ -659,8 +663,8 @@ fn resolve_by_prefix(repo: &Repository, prefix: &str) -> CliResult<GitStateBindi
     }
 }
 
-fn git_map(error: impl std::fmt::Display) -> CliError {
-    CliError::Repository(atomic_repository::RepositoryError::InvalidOperation {
+fn git_map(error: impl std::fmt::Display) -> ShimError {
+    ShimError::Repository(atomic_repository::RepositoryError::InvalidOperation {
         message: error.to_string(),
     })
 }
@@ -668,7 +672,7 @@ fn git_map(error: impl std::fmt::Display) -> CliError {
 /// Resolve a published binding (full id or unambiguous prefix) through the
 /// create-only Git refs — not through the local store, so bindings fetched
 /// from a Git remote resolve without any local adoption.
-fn resolve_published_binding(git: &GitRepository, id: &str) -> CliResult<GitStateBinding> {
+fn resolve_published_binding(git: &GitRepository, id: &str) -> ShimResult<GitStateBinding> {
     let lower = id.to_ascii_lowercase();
     let mut matches: Vec<GitStateBinding> = Vec::new();
     let glob = format!("{}*", atomic_repository::BINDING_REF_PREFIX);
@@ -692,12 +696,12 @@ fn resolve_published_binding(git: &GitRepository, id: &str) -> CliResult<GitStat
     }
     match matches.len() {
         1 => Ok(matches.remove(0)),
-        0 => Err(CliError::Repository(
+        0 => Err(ShimError::Repository(
             atomic_repository::RepositoryError::InvalidOperation {
                 message: format!("binding {id} is not published on any refs/atomic/bindings/* ref"),
             },
         )),
-        n => Err(CliError::Repository(
+        n => Err(ShimError::Repository(
             atomic_repository::RepositoryError::InvalidOperation {
                 message: format!("binding prefix {id} is ambiguous: {n} matches"),
             },
@@ -709,7 +713,7 @@ fn load_binding_at_ref(
     git: &GitRepository,
     ref_name: &str,
     target: git2::Oid,
-) -> CliResult<GitStateBinding> {
+) -> ShimResult<GitStateBinding> {
     let commit = git.find_commit(target).map_err(|error| {
         git_map(format!(
             "binding ref '{ref_name}' points at a missing commit: {error}"
@@ -735,12 +739,12 @@ fn load_binding_at_ref(
 
 /// Closure acquisition through the CLI (CB-6B, RFC §8.6): Atomic remote
 /// first, the binding's bounded `changes.pack` as verified fallback.
-fn fetch(id: &str, remote: Option<String>, timeout: u64, insecure: bool) -> CliResult<()> {
+fn fetch(id: &str, remote: Option<String>, timeout: u64, insecure: bool) -> ShimResult<()> {
     use atomic_repository::{ClosureReadiness, IncompletenessReason};
 
     let root = find_repository_root()?;
     let mut repo =
-        Repository::open_for_workspace_transaction(&root).map_err(CliError::Repository)?;
+        Repository::open_for_workspace_transaction(&root).map_err(ShimError::Repository)?;
     let workspace = enter_workspace(&mut repo, boundary_mode(false))?;
 
     let git = open_git(&root)?;
@@ -749,12 +753,12 @@ fn fetch(id: &str, remote: Option<String>, timeout: u64, insecure: bool) -> CliR
     // Cryptography + structural verification first: a tampered binding is
     // never a source of truth for a closure fetch.
     verify_binding_cryptography(&binding).map_err(|error| {
-        CliError::Repository(atomic_repository::RepositoryError::InvalidOperation {
+        ShimError::Repository(atomic_repository::RepositoryError::InvalidOperation {
             message: format!("binding {} fails cryptography: {error}", binding.id()),
         })
     })?;
     verify_binding_content(&git, &binding).map_err(|error| {
-        CliError::Repository(atomic_repository::RepositoryError::InvalidOperation {
+        ShimError::Repository(atomic_repository::RepositoryError::InvalidOperation {
             message: format!("binding {} does not match Git: {error}", binding.id()),
         })
     })?;
@@ -775,7 +779,7 @@ fn fetch(id: &str, remote: Option<String>, timeout: u64, insecure: bool) -> CliR
 
     let wanted = repo
         .missing_closure_objects(&binding)
-        .map_err(CliError::Repository)?;
+        .map_err(ShimError::Repository)?;
     println!(
         "Fetching closure for binding {} ({} change(s), {} missing)",
         binding.id().to_hex(),
@@ -794,10 +798,10 @@ fn fetch(id: &str, remote: Option<String>, timeout: u64, insecure: bool) -> CliR
                 Some(source),
                 &BindingPackLimits::default_limits(),
             )
-            .map_err(CliError::Repository)?,
+            .map_err(ShimError::Repository)?,
         None => repo
             .fetch_binding_closure(&git, &binding, None, &BindingPackLimits::default_limits())
-            .map_err(CliError::Repository)?,
+            .map_err(ShimError::Repository)?,
     };
     drop(source);
     drop(workspace);
@@ -858,7 +862,7 @@ fn fetch(id: &str, remote: Option<String>, timeout: u64, insecure: bool) -> CliR
                     }
                 }
             }
-            Err(CliError::Repository(
+            Err(ShimError::Repository(
                 atomic_repository::RepositoryError::InvalidOperation {
                     message: "binding closure is incomplete; explicit refusal (no adoption)"
                         .to_string(),
@@ -878,7 +882,7 @@ fn build_remote_source(
     remote: Option<&str>,
     timeout: u64,
     insecure: bool,
-) -> CliResult<Option<HttpBindingChangeSource>> {
+) -> ShimResult<Option<HttpBindingChangeSource>> {
     match remote {
         Some(remote) => {
             let url = if remote.contains("://") {
@@ -886,7 +890,7 @@ fn build_remote_source(
             } else {
                 repo.get_remote(remote)
                     .map(|entry| entry.url)
-                    .map_err(CliError::Repository)?
+                    .map_err(ShimError::Repository)?
             };
             println!("Atomic remote preferred for closure objects: {url}");
             let config = atomic_remote::HttpRemoteConfig::new()
@@ -909,12 +913,12 @@ fn resurrect(
     timeout: u64,
     insecure: bool,
     to_view: Option<String>,
-) -> CliResult<()> {
+) -> ShimResult<()> {
     use atomic_repository::{ClosureReadiness, IncompletenessReason};
 
     let root = find_repository_root()?;
     let mut repo =
-        Repository::open_for_workspace_transaction(&root).map_err(CliError::Repository)?;
+        Repository::open_for_workspace_transaction(&root).map_err(ShimError::Repository)?;
     let workspace = enter_workspace(&mut repo, boundary_mode(false))?;
 
     let git = open_git(&root)?;
@@ -923,12 +927,12 @@ fn resurrect(
     // Cryptography + structural verification first: a tampered binding is
     // never a source of truth.
     verify_binding_cryptography(&binding).map_err(|error| {
-        CliError::Repository(atomic_repository::RepositoryError::InvalidOperation {
+        ShimError::Repository(atomic_repository::RepositoryError::InvalidOperation {
             message: format!("binding {} fails cryptography: {error}", binding.id()),
         })
     })?;
     verify_binding_content(&git, &binding).map_err(|error| {
-        CliError::Repository(atomic_repository::RepositoryError::InvalidOperation {
+        ShimError::Repository(atomic_repository::RepositoryError::InvalidOperation {
             message: format!("binding {} does not match Git: {error}", binding.id()),
         })
     })?;
@@ -940,9 +944,9 @@ fn resurrect(
         None => {
             let working_copy = repo
                 .require_working_copy_id()
-                .map_err(CliError::Repository)?;
+                .map_err(ShimError::Repository)?;
             repo.desired_view_name(working_copy)
-                .map_err(CliError::Repository)?
+                .map_err(ShimError::Repository)?
         }
     };
 
@@ -955,10 +959,10 @@ fn resurrect(
     let outcome = match source.as_mut() {
         Some(source) => repo
             .resurrect_binding_exact(&git, &binding, &view, Some(source))
-            .map_err(CliError::Repository)?,
+            .map_err(ShimError::Repository)?,
         None => repo
             .resurrect_binding_exact(&git, &binding, &view, None)
-            .map_err(CliError::Repository)?,
+            .map_err(ShimError::Repository)?,
     };
     drop(source);
 
@@ -987,16 +991,20 @@ fn resurrect(
             // — verified in the fresh store. Any divergence refuses.
             if let Some(pack) = repo
                 .load_binding_conflicts_pack(&git, &binding.id())
-                .map_err(CliError::Repository)?
+                .map_err(ShimError::Repository)?
             {
                 let expected = atomic_repository::repository::ConflictSetObject::decode(&pack)
                     .map_err(|error| {
-                        CliError::Repository(atomic_repository::RepositoryError::InvalidOperation {
-                            message: format!("the binding's conflicts.pack is invalid: {error}"),
-                        })
+                        ShimError::Repository(
+                            atomic_repository::RepositoryError::InvalidOperation {
+                                message: format!(
+                                    "the binding's conflicts.pack is invalid: {error}"
+                                ),
+                            },
+                        )
                     })?;
                 repo.verify_restored_conflict_state(&view, &expected)
-                    .map_err(CliError::Repository)?;
+                    .map_err(ShimError::Repository)?;
                 print_success(&format!(
                     "Restored {} conflicted path(s) with complete conflict objects \
                      (conflict set {}); identities, sides, modes, and claimants verified",
@@ -1009,7 +1017,7 @@ fn resurrect(
             }
         }
         proof => {
-            return Err(CliError::Repository(
+            return Err(ShimError::Repository(
                 atomic_repository::RepositoryError::InvalidOperation {
                     message: format!(
                         "projection proof mismatch: recomputed {} vs bound {}",
@@ -1025,9 +1033,9 @@ fn resurrect(
 }
 
 /// CB-10B bounded create-only publication queue (RFC §8.6, §8.5).
-fn queue(remote: Option<&str>, max: usize, degraded_head_fallback: bool) -> CliResult<()> {
+fn queue(remote: Option<&str>, max: usize, degraded_head_fallback: bool) -> ShimResult<()> {
     let root = find_repository_root()?;
-    let mut repo = Repository::open(&root).map_err(CliError::Repository)?;
+    let mut repo = Repository::open(&root).map_err(ShimError::Repository)?;
     let workspace = enter_workspace(&mut repo, boundary_mode(false))?;
     let working_copy = workspace.working_copy();
     let git = open_git(&root)?;
@@ -1036,7 +1044,7 @@ fn queue(remote: Option<&str>, max: usize, degraded_head_fallback: bool) -> CliR
 
     if !outcome.all_local_ok() {
         drop(workspace);
-        return Err(CliError::Repository(
+        return Err(ShimError::Repository(
             atomic_repository::RepositoryError::InvalidOperation {
                 message: format!(
                     "{} stored binding(s) failed to load and were not published; \

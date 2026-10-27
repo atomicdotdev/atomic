@@ -15,9 +15,9 @@ use atomic_repository::REPOSITORY_POINTER;
 use git2::Repository as GitRepository;
 
 use super::observation::resolve_common_dir;
-use crate::commands::DOT_DIR;
-use crate::error::{CliError, CliResult};
+use crate::error::{ShimError, ShimResult};
 use crate::output::print_warning;
+use crate::DOT_DIR;
 
 /// Git's administrative directory name; the main worktree is its parent.
 const GIT_DIR_NAME: &str = ".git";
@@ -108,7 +108,7 @@ pub(crate) fn hook_passes_through(hook_name: &str) -> bool {
 /// neither a repository of its own nor the `.atomic/repository` pointer.
 /// A registered linked worktree (the sandbox-style pointer, CB-13D) adopts
 /// its own ephemeral view and reconciles like any working copy.
-pub(crate) fn refuse_shim_command(path: &Path) -> CliResult<()> {
+pub(crate) fn refuse_shim_command(path: &Path) -> ShimResult<()> {
     match detect_unmanaged_linked_worktree(path) {
         Some(linked) => Err(refusal(&linked)),
         None => Ok(()),
@@ -118,7 +118,7 @@ pub(crate) fn refuse_shim_command(path: &Path) -> CliResult<()> {
 /// Native commands that reconcile through the shim refuse inside a linked
 /// worktree only when the main worktree is shim-enrolled; a repository that
 /// never enabled the shim keeps its native linked-worktree support.
-pub(crate) fn refuse_when_shim_enrolled(path: &Path) -> CliResult<()> {
+pub(crate) fn refuse_when_shim_enrolled(path: &Path) -> ShimResult<()> {
     let Some(linked) = detect_unmanaged_linked_worktree(path) else {
         return Ok(());
     };
@@ -130,15 +130,15 @@ pub(crate) fn refuse_when_shim_enrolled(path: &Path) -> CliResult<()> {
 
 /// `refuse_when_shim_enrolled` for the current directory, before any
 /// repository constructor can write into the linked worktree.
-pub(crate) fn refuse_when_shim_enrolled_from_cwd() -> CliResult<()> {
-    let cwd = std::env::current_dir().map_err(CliError::Io)?;
+pub fn refuse_when_shim_enrolled_from_cwd() -> ShimResult<()> {
+    let cwd = std::env::current_dir().map_err(ShimError::Io)?;
     refuse_when_shim_enrolled(&cwd)
 }
 
 /// Whether the main worktree's repository is enrolled in the shim (a verified
 /// checkpoint or recorded consent), read through a read-only open of the
 /// MAIN root so nothing is written into the linked worktree.
-fn main_worktree_shim_enrolled(main_root: &Path) -> CliResult<bool> {
+fn main_worktree_shim_enrolled(main_root: &Path) -> ShimResult<bool> {
     if !atomic_repository::has_database(&main_root.join(DOT_DIR)) {
         return Ok(false);
     }
@@ -146,10 +146,10 @@ fn main_worktree_shim_enrolled(main_root: &Path) -> CliResult<bool> {
         main_root,
         atomic_repository::database_lock_wait(),
     )
-    .map_err(CliError::Repository)?;
+    .map_err(ShimError::Repository)?;
     repository
         .shim_workspace_active()
-        .map_err(CliError::Repository)
+        .map_err(ShimError::Repository)
 }
 
 fn main_worktree_root(common_dir: &Path) -> PathBuf {
@@ -163,8 +163,8 @@ fn canonical_or_raw(path: &Path) -> PathBuf {
     fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
-fn refusal(linked: &LinkedWorktree) -> CliError {
-    CliError::GitError {
+fn refusal(linked: &LinkedWorktree) -> ShimError {
+    ShimError::GitError {
         message: format!(
             "linked git worktrees are not supported by the shim yet; run from the main worktree '{}'",
             linked.main_root.display()

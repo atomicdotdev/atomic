@@ -37,7 +37,7 @@ impl Drop for RecorderGuard {
     }
 }
 
-fn input_budget(git: &GitRepository, commit: &git2::Commit<'_>, limit: usize) -> CliResult<()> {
+fn input_budget(git: &GitRepository, commit: &git2::Commit<'_>, limit: usize) -> ShimResult<()> {
     let tree = commit.tree().map_err(|e| git_error(e.to_string()))?;
     let parent = if commit.parent_count() == 0 {
         None
@@ -90,7 +90,7 @@ impl Compiler {
         policy: &ConversionPolicy,
         boundaries: &[&'static str],
         mut provenance: serde_json::Value,
-    ) -> CliResult<PreparedGitGraphChange> {
+    ) -> ShimResult<PreparedGitGraphChange> {
         let mut lowered = parsed.clone();
         lowered.files.clear();
         let mut losses = Vec::new();
@@ -333,7 +333,7 @@ impl Compiler {
             .parent_oids
             .iter()
             .map(|oid| git_object_id(algorithm, *oid))
-            .collect::<CliResult<Vec<_>>>()?;
+            .collect::<ShimResult<Vec<_>>>()?;
         let derivation = if parents.is_empty() {
             GitDerivation::Root
         } else if parents.len() > 1 {
@@ -351,12 +351,12 @@ impl Compiler {
             parents,
             derivation,
         )
-        .map_err(CliError::from)?;
+        .map_err(ShimError::from)?;
         provenance["git"]["stream"] = serde_json::json!({"semantics":"graph-only; derived, not native token provenance","history":"first-parent; side legs not separately imported","rename_identity_loss":losses});
         let unhashed = git_synthesis_metadata(&origin, boundaries, Some(provenance));
         let prepared =
             PreparedGitGraphChange::new(compiled, origin, foreign_commit_facts(parsed)?, unhashed)
-                .map_err(CliError::from)?;
+                .map_err(ShimError::from)?;
         let hash = prepared.hash();
         self.last_hash = Some(hash);
         apply_line_index_updates(&mut self.index, hash, pending);
@@ -405,7 +405,7 @@ impl ParallelImporter {
         &self,
         repo: &mut Repository,
         plan: ProspectiveImportPlan,
-    ) -> CliResult<ImportStats> {
+    ) -> ShimResult<ImportStats> {
         let tip = plan
             .commits
             .last()
@@ -436,7 +436,7 @@ impl ParallelImporter {
         let outcome = self.import_graph_stream(
             repo,
             Oid::from_str(&tip).map_err(|e| git_error(e.to_string()))?,
-            GitStreamLimits::new(100, DEFAULT_STREAM_BYTE_LIMIT).map_err(CliError::from)?,
+            GitStreamLimits::new(100, DEFAULT_STREAM_BYTE_LIMIT).map_err(ShimError::from)?,
         )?;
         print_info(&format!("Direct graph stream: {} commits in {} private batches; final tip verified (historical states not independently verified)", outcome.commits, outcome.batches));
         Ok(ImportStats {
@@ -450,14 +450,14 @@ impl ParallelImporter {
             ..Default::default()
         })
     }
-    pub(crate) fn validate_graph_stream_input(&self, tip: Oid) -> CliResult<()> {
+    pub(crate) fn validate_graph_stream_input(&self, tip: Oid) -> ShimResult<()> {
         self.graph_stream_inputs(tip).map(|_| ())
     }
 
     fn graph_stream_inputs(
         &self,
         tip: Oid,
-    ) -> CliResult<(GitRepository, ConversionPolicy, Vec<Oid>)> {
+    ) -> ShimResult<(GitRepository, ConversionPolicy, Vec<Oid>)> {
         let git = self.open_git_repo()?;
         for reference in git
             .references()
@@ -501,7 +501,7 @@ impl ParallelImporter {
         repo: &mut Repository,
         tip: Oid,
         limits: GitStreamLimits,
-    ) -> CliResult<GitStreamOutcome> {
+    ) -> ShimResult<GitStreamOutcome> {
         #[cfg(test)]
         let _recorder_guard = RecorderGuard::new();
         if !self.options.graph_only
@@ -519,7 +519,7 @@ impl ParallelImporter {
             .enumerate()
             .map(|(index, oid)| (oid, index))
             .collect();
-        let mut session = GitGraphImportSession::begin(repo, limits).map_err(CliError::from)?;
+        let mut session = GitGraphImportSession::begin(repo, limits).map_err(ShimError::from)?;
         let mut compiler = Compiler::default();
         let mut batch = Vec::new();
         let mut bytes = 0usize;
@@ -540,7 +540,7 @@ impl ParallelImporter {
                 && (batch.len() == limits.commits()
                     || bytes + prepared.payload_bytes() > limits.bytes())
             {
-                session.publish(&batch).map_err(CliError::from)?;
+                session.publish(&batch).map_err(ShimError::from)?;
                 staged += batch.len();
                 print_info(&format!(
                     "Direct stream staged {staged}/{} commits privately ({:.2}s)",
@@ -554,7 +554,7 @@ impl ParallelImporter {
             batch.push(prepared);
         }
         if !batch.is_empty() {
-            session.publish(&batch).map_err(CliError::from)?;
+            session.publish(&batch).map_err(ShimError::from)?;
             staged += batch.len();
             print_info(&format!(
                 "Direct stream staged {staged}/{} commits privately ({:.2}s)",
@@ -578,7 +578,7 @@ impl ParallelImporter {
         let expected = import_expected_tree_oid(&git, tree.id(), &policy)?;
         let proof = verify_prospective_equivalence(&project, &expected)
             .map_err(|error| git_error(error.to_string()))?;
-        session.finish(&project, &proof).map_err(CliError::from)
+        session.finish(&project, &proof).map_err(ShimError::from)
     }
 }
 

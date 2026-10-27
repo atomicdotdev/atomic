@@ -617,11 +617,13 @@ pub fn record(args: &super::record::Record) -> CliResult<bool> {
     let view = response
         .view
         .ok_or_else(|| CliError::Internal(anyhow::anyhow!("record returned no view")))?;
+    #[cfg(feature = "git-shim")]
     let bytes: [u8; 32] = change
         .hash
         .as_ref()
         .and_then(|hash| hash.value.as_slice().try_into().ok())
         .ok_or_else(|| CliError::Internal(anyhow::anyhow!("record returned an invalid hash")))?;
+    #[cfg(feature = "git-shim")]
     crate::commands::git::shadow::sync_git_projection_after_record(
         &root,
         &view,

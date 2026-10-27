@@ -90,7 +90,7 @@ use atomic_repository::{
     RepositoryEntry, RepositoryManifest, VerifiedProspectiveEquivalence,
 };
 
-use crate::error::{CliError, CliResult};
+use crate::error::{ShimError, ShimResult};
 use crate::output::{print_info, print_warning};
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -297,7 +297,7 @@ pub(crate) struct ForeignCommitFacts {
 /// blocker 6). The raw object bytes come from Phase 1's parse
 /// ([`ParsedCommit::raw_object`]); hex encoding keeps the JSON record
 /// byte-safe for non-UTF-8 identity data.
-pub(crate) fn foreign_commit_facts(parsed: &ParsedCommit) -> CliResult<Vec<u8>> {
+pub(crate) fn foreign_commit_facts(parsed: &ParsedCommit) -> ShimResult<Vec<u8>> {
     let algorithm = git_algorithm_for_sha(&parsed.git_sha)?;
     let record = ForeignCommitFacts {
         format: FOREIGN_COMMIT_FACTS_FORMAT,
@@ -311,7 +311,7 @@ pub(crate) fn foreign_commit_facts(parsed: &ParsedCommit) -> CliResult<Vec<u8>> 
                 let tagged = git_object_id(algorithm, *oid)?;
                 Ok(tagged_oid_hex(&tagged))
             })
-            .collect::<CliResult<Vec<_>>>()?,
+            .collect::<ShimResult<Vec<_>>>()?,
         author: ForeignSignatureFacts {
             name: parsed.metadata.author_name.clone(),
             email: parsed.metadata.author_email.clone(),
@@ -330,7 +330,7 @@ pub(crate) fn foreign_commit_facts(parsed: &ParsedCommit) -> CliResult<Vec<u8>> 
         },
         raw_object_hex: hex_bytes(Some(&parsed.raw_object)),
     };
-    serde_json::to_vec(&record).map_err(|e| CliError::Internal(e.into()))
+    serde_json::to_vec(&record).map_err(|e| ShimError::Internal(e.into()))
 }
 
 /// Hex-encode raw bytes (`""` when absent) for the hashed fact records.
@@ -830,13 +830,13 @@ impl ClosureLedger {
         &mut self,
         git: &GitRepository,
         sha: &str,
-    ) -> CliResult<std::sync::Arc<HashSet<String>>> {
+    ) -> ShimResult<std::sync::Arc<HashSet<String>>> {
         if let Some(cached) = self.ancestry.get(sha) {
             return Ok(cached.clone());
         }
         let oid = git2::Oid::from_str(sha)
             .map_err(|e| git_error(format!("cannot parse commit oid '{sha}': {e}")))?;
-        let commit = git.find_commit(oid).map_err(|e| CliError::GitError {
+        let commit = git.find_commit(oid).map_err(|e| ShimError::GitError {
             message: format!("cannot read commit {sha} for ancestry: {e}"),
         })?;
         let mut set: HashSet<String> = HashSet::new();
@@ -863,14 +863,14 @@ impl ClosureLedger {
         repo: &Repository,
         git: &GitRepository,
         sha: &str,
-    ) -> CliResult<std::sync::Arc<HashSet<ContentHash>>> {
+    ) -> ShimResult<std::sync::Arc<HashSet<ContentHash>>> {
         if let Some(cached) = self.closures.get(sha) {
             return Ok(cached.clone());
         }
         let mut closure: HashSet<ContentHash> = HashSet::new();
         if let Some(persisted) = repo
             .git_commit_closure(sha)
-            .map_err(|e| CliError::Internal(e.into()))?
+            .map_err(|e| ShimError::Internal(e.into()))?
         {
             trace_git_import(format!(
                 "closure {sha}: persisted {} hash(es)",
@@ -879,11 +879,11 @@ impl ClosureLedger {
             closure.extend(persisted);
         } else if let Some(hash) = repo
             .checked_git_sha(sha)
-            .map_err(|e| CliError::Internal(e.into()))?
+            .map_err(|e| ShimError::Internal(e.into()))?
         {
             for dep in repo
                 .change_dependency_closure(&hash)
-                .map_err(|e| CliError::Internal(e.into()))?
+                .map_err(|e| ShimError::Internal(e.into()))?
             {
                 closure.insert(dep);
             }
@@ -900,7 +900,7 @@ impl ClosureLedger {
         }
         if let Some(own) = repo
             .checked_git_sha(sha)
-            .map_err(|e| CliError::Internal(e.into()))?
+            .map_err(|e| ShimError::Internal(e.into()))?
         {
             closure.insert(own);
         }
@@ -915,11 +915,11 @@ impl ClosureLedger {
         &mut self,
         repo: &Repository,
         target_view: &str,
-    ) -> CliResult<Vec<(ContentHash, Option<String>)>> {
+    ) -> ShimResult<Vec<(ContentHash, Option<String>)>> {
         if self.member_origins.is_none() {
             self.member_origins = Some(
                 repo.full_chain_member_origins(target_view)
-                    .map_err(|e| CliError::Internal(e.into()))?,
+                    .map_err(|e| ShimError::Internal(e.into()))?,
             );
         }
         Ok(self.member_origins.as_ref().expect("loaded above").clone())
@@ -945,7 +945,7 @@ impl ClosureLedger {
         sha: &str,
         target_view: &str,
         has_git_parent: bool,
-    ) -> CliResult<Vec<ContentHash>> {
+    ) -> ShimResult<Vec<ContentHash>> {
         if !has_git_parent {
             // A root commit has no Git parent closure to assemble against:
             // its tree replaces the view state, so the whole view is the
@@ -996,7 +996,7 @@ impl ClosureLedger {
         sha: &str,
         target_view: &str,
         has_git_parent: bool,
-    ) -> CliResult<Vec<ContentHash>> {
+    ) -> ShimResult<Vec<ContentHash>> {
         let assembly = self.exclusions_for(repo, git, sha, target_view, has_git_parent)?;
         if assembly.is_empty() {
             return Ok(Vec::new());
@@ -1085,10 +1085,10 @@ pub(crate) fn is_full_oid(value: &str) -> bool {
 /// every transitive parent), walked on the live object database. Used by the
 /// bound-range containment probe to skip ancestors, whose content is
 /// trivially contained in any descendant.
-fn standalone_git_ancestry(git: &GitRepository, sha: &str) -> CliResult<HashSet<String>> {
+fn standalone_git_ancestry(git: &GitRepository, sha: &str) -> ShimResult<HashSet<String>> {
     let oid = git2::Oid::from_str(sha)
         .map_err(|e| git_error(format!("cannot parse commit oid '{sha}': {e}")))?;
-    let commit = git.find_commit(oid).map_err(|e| CliError::GitError {
+    let commit = git.find_commit(oid).map_err(|e| ShimError::GitError {
         message: format!("cannot read commit {sha} for ancestry: {e}"),
     })?;
     let mut set: HashSet<String> = HashSet::new();
@@ -1175,7 +1175,7 @@ pub(crate) fn import_expected_tree_oid(
     git: &GitRepository,
     tree_oid: Oid,
     policy: &ConversionPolicy,
-) -> CliResult<GitObjectId> {
+) -> ShimResult<GitObjectId> {
     // Fold the Git tree into the tree OID the prospective gate must compare
     // against: the complete Git tree MINUS the entries the versioned
     // conversion policy declares Shim-private (`.atomic*/`, `.vault/`).
@@ -1203,7 +1203,7 @@ pub(crate) fn import_expected_tree_oid(
         prefix: Vec<u8>,
         policy: &ConversionPolicy,
         objects: &mut atomic_repository::repository::GitObjectDatabase,
-    ) -> CliResult<Option<GitObjectId>> {
+    ) -> ShimResult<Option<GitObjectId>> {
         let mut entries: Vec<(Vec<u8>, u32, GitObjectId, bool)> = Vec::new();
         for entry in tree.iter() {
             let name = entry.name_bytes().to_vec();
@@ -1323,7 +1323,7 @@ fn repository_entries_from_git_tree(
     git: &GitRepository,
     tree: git2::Tree<'_>,
     policy: &ConversionPolicy,
-) -> CliResult<BTreeMap<RepoPath, RepositoryEntry>> {
+) -> ShimResult<BTreeMap<RepoPath, RepositoryEntry>> {
     let mut entries = BTreeMap::new();
     let mut queue: Vec<(Vec<u8>, git2::Tree<'_>)> = vec![(Vec::new(), tree)];
     while let Some((prefix, current)) = queue.pop() {
@@ -1444,7 +1444,7 @@ fn oid_bytes_as_hex(oid: &GitObjectId) -> Vec<u8> {
 }
 
 impl ProspectiveProjectTree {
-    fn new(policy: ConversionPolicy, current: Option<ProjectTree>) -> CliResult<Self> {
+    fn new(policy: ConversionPolicy, current: Option<ProjectTree>) -> ShimResult<Self> {
         let mut manifests = HashMap::new();
         let entries = if let Some(project) = current {
             let oid = Oid::from_bytes(project.git.root.as_bytes())
@@ -1472,7 +1472,7 @@ impl ProspectiveProjectTree {
         &mut self,
         parsed: &ParsedCommit,
         git: Option<&GitRepository>,
-    ) -> CliResult<(ProjectTree, VerifiedProspectiveEquivalence)> {
+    ) -> ShimResult<(ProjectTree, VerifiedProspectiveEquivalence)> {
         if let Some(parent) = parsed.parent_tree_oid {
             if let Some(project) = self.manifests.get(&parent) {
                 self.entries = project
@@ -1633,7 +1633,7 @@ impl ProspectiveProjectTree {
     }
 }
 
-pub(crate) fn conversion_policy(git: &GitRepository) -> CliResult<ConversionPolicy> {
+pub fn conversion_policy(git: &GitRepository) -> ShimResult<ConversionPolicy> {
     let config = git
         .config()
         .map_err(|error| git_error(format!("cannot read Git configuration: {error}")))?;
@@ -1679,10 +1679,10 @@ pub(crate) fn conversion_policy(git: &GitRepository) -> CliResult<ConversionPoli
 /// needs the decision, so it persists the detected value once, here, and
 /// every later command reconstructs this exact conversion policy from the
 /// record instead of re-detecting against a moving HEAD.
-pub(crate) fn record_imported_vault_policy(repo: &Repository, tracked: bool) -> CliResult<()> {
+pub(crate) fn record_imported_vault_policy(repo: &Repository, tracked: bool) -> ShimResult<()> {
     if tracked {
         repo.set_shim_vault_policy(atomic_config::ShimVaultPolicy::Tracked, None)
-            .map_err(CliError::from)?;
+            .map_err(ShimError::from)?;
         print_info(
             "Git tracks .vault/: recorded shim vault policy 'tracked' — the vault joins \
              the manifest projection exactly like any other tracked path.",
@@ -1691,7 +1691,7 @@ pub(crate) fn record_imported_vault_policy(repo: &Repository, tracked: bool) -> 
     Ok(())
 }
 
-pub(crate) fn git_object_id(algorithm: GitHashAlgorithm, oid: Oid) -> CliResult<GitObjectId> {
+pub(crate) fn git_object_id(algorithm: GitHashAlgorithm, oid: Oid) -> ShimResult<GitObjectId> {
     GitObjectId::new(algorithm, oid.as_bytes().to_vec()).map_err(|error| {
         git_error(format!(
             "Git object ID {oid} does not match {algorithm:?}: {error}"
@@ -1703,14 +1703,14 @@ pub(crate) fn git_object_id(algorithm: GitHashAlgorithm, oid: Oid) -> CliResult<
 pub(crate) fn git_object_id_for_sha(
     algorithm: GitHashAlgorithm,
     sha: &str,
-) -> CliResult<GitObjectId> {
+) -> ShimResult<GitObjectId> {
     let oid = Oid::from_str(sha)
         .map_err(|error| git_error(format!("invalid Git commit SHA '{sha}': {error}")))?;
     git_object_id(algorithm, oid)
 }
 
 /// The tagged Git hash algorithm for a commit SHA, by digest width.
-pub(crate) fn git_algorithm_for_sha(sha: &str) -> CliResult<GitHashAlgorithm> {
+pub(crate) fn git_algorithm_for_sha(sha: &str) -> ShimResult<GitHashAlgorithm> {
     match sha.len() {
         40 => Ok(GitHashAlgorithm::Sha1),
         64 => Ok(GitHashAlgorithm::Sha256),
@@ -1769,7 +1769,7 @@ impl GitClosureBoundary {
 }
 
 /// Detect explicit Git closure boundaries (CB-9A §7).
-pub(crate) fn detect_git_boundaries(git: &GitRepository) -> CliResult<Vec<GitClosureBoundary>> {
+pub(crate) fn detect_git_boundaries(git: &GitRepository) -> ShimResult<Vec<GitClosureBoundary>> {
     let mut boundaries = Vec::new();
     let git_dir = git.path();
     if git_dir.join("shallow").exists() {
@@ -1836,7 +1836,7 @@ pub(crate) fn verify_commit_closure_objects_with_shallow(
     git: &GitRepository,
     commit_oids: &[Oid],
     shallow: &HashSet<String>,
-) -> CliResult<()> {
+) -> ShimResult<()> {
     for oid in commit_oids {
         let commit = git.find_commit(*oid).map_err(|error| {
             git_error(format!(
@@ -1873,7 +1873,7 @@ pub(crate) fn verify_commit_closure_objects_with_shallow(
 pub(crate) fn sequence_commits_deterministically(
     git: &GitRepository,
     commit_oids: &[Oid],
-) -> CliResult<(Vec<Oid>, usize)> {
+) -> ShimResult<(Vec<Oid>, usize)> {
     use std::cmp::Ordering as CmpOrdering;
     use std::collections::BinaryHeap;
 
@@ -1981,7 +1981,7 @@ pub(crate) fn detect_deepened_history(
     git: &GitRepository,
     ordered_oids: &[Oid],
     indexed_shas: &HashSet<String>,
-) -> CliResult<usize> {
+) -> ShimResult<usize> {
     let collected: HashSet<Oid> = ordered_oids.iter().copied().collect();
     let mut children_of: HashMap<Oid, Vec<Oid>> = HashMap::with_capacity(ordered_oids.len());
     for oid in ordered_oids {
@@ -2035,7 +2035,7 @@ fn validate_import_tree_capabilities(
     git: &GitRepository,
     tree: &Tree<'_>,
     prefix: &str,
-) -> CliResult<()> {
+) -> ShimResult<()> {
     for entry in tree.iter() {
         // CB-9C path fidelity (review R7): names are RAW bytes, canonicalized
         // through the reversible escape for display; non-UTF-8 names no
@@ -2081,7 +2081,7 @@ pub(crate) fn verify_complete_equivalence(
     root: &Path,
     git: &GitRepository,
     context: &str,
-) -> CliResult<()> {
+) -> ShimResult<()> {
     let policy = conversion_policy(git)?;
     let project = repository
         .project_tree(view, &policy)
@@ -2110,7 +2110,7 @@ pub(crate) fn verify_complete_equivalence(
     }
 }
 
-pub(crate) fn equivalence_error(context: &str, report: &EquivalenceReport) -> CliError {
+pub(crate) fn equivalence_error(context: &str, report: &EquivalenceReport) -> ShimError {
     let detail = report
         .mismatches
         .iter()
@@ -2130,8 +2130,8 @@ pub(crate) fn equivalence_error(context: &str, report: &EquivalenceReport) -> Cl
     git_error(format!("{context} failed complete equivalence: {detail}"))
 }
 
-fn git_error(message: impl Into<String>) -> CliError {
-    CliError::GitError {
+fn git_error(message: impl Into<String>) -> ShimError {
+    ShimError::GitError {
         message: message.into(),
     }
 }
@@ -4198,8 +4198,8 @@ impl ParallelImporter {
     }
 
     /// Open a new git repository instance (for thread-local use).
-    fn open_git_repo(&self) -> CliResult<GitRepository> {
-        GitRepository::open(&self.git_repo_path).map_err(|e| CliError::GitError {
+    fn open_git_repo(&self) -> ShimResult<GitRepository> {
+        GitRepository::open(&self.git_repo_path).map_err(|e| ShimError::GitError {
             message: format!("Failed to open git repository: {}", e),
         })
     }
@@ -4208,7 +4208,7 @@ impl ParallelImporter {
         &self,
         branch_name: &str,
         source: Option<&Repository>,
-    ) -> CliResult<ProspectiveImportPlan> {
+    ) -> ShimResult<ProspectiveImportPlan> {
         self.validate_branch_prospectively_for_tip(branch_name, source, None)
     }
 
@@ -4221,7 +4221,7 @@ impl ParallelImporter {
         branch_name: &str,
         source: Option<&Repository>,
         tip: Option<Oid>,
-    ) -> CliResult<ProspectiveImportPlan> {
+    ) -> ShimResult<ProspectiveImportPlan> {
         let total_start = Instant::now();
         let git = self.open_git_repo()?;
         let policy = conversion_policy(&git)?;
@@ -4286,7 +4286,7 @@ impl ParallelImporter {
         // in the view but absent from Git (e.g. `.atomicignore`) then stay
         // in the expectation exactly as they stay alive in the view.
         let current = match source {
-            Some(source) if source.view_exists(branch_name).map_err(CliError::from)? => {
+            Some(source) if source.view_exists(branch_name).map_err(ShimError::from)? => {
                 Some(source.project_tree(branch_name, &policy).map_err(|error| {
                     git_error(format!("cannot project current Atomic tree: {error}"))
                 })?)
@@ -4410,7 +4410,7 @@ impl ParallelImporter {
         commits: &[VerifiedImportCommit],
         branch_name: &str,
         git: &GitRepository,
-    ) -> CliResult<()> {
+    ) -> ShimResult<()> {
         if git
             .head()
             .ok()
@@ -4508,7 +4508,7 @@ impl ParallelImporter {
         parsed: &ParsedCommit,
         trailer: &PushTrailer,
         policy: &ConversionPolicy,
-    ) -> CliResult<()> {
+    ) -> ShimResult<()> {
         let source = source.ok_or_else(|| {
             git_error(format!(
                 "commit {} claims Atomic state but no Atomic repository exists",
@@ -4538,7 +4538,7 @@ impl ParallelImporter {
         source: Option<&Repository>,
         parsed: &ParsedCommit,
         encoded_hashes: &[String],
-    ) -> CliResult<()> {
+    ) -> ShimResult<()> {
         let source = source.ok_or_else(|| {
             git_error(format!(
                 "commit {} claims Atomic changes but no Atomic repository exists",
@@ -4569,7 +4569,7 @@ impl ParallelImporter {
         parsed: &ParsedCommit,
         encoded_hashes: Option<&[String]>,
         policy: &ConversionPolicy,
-    ) -> CliResult<()> {
+    ) -> ShimResult<()> {
         let source = source.ok_or_else(|| {
             git_error(format!(
                 "commit {} claims Atomic provenance but no Atomic repository exists",
@@ -4592,7 +4592,7 @@ impl ParallelImporter {
                     ))
                 })
             })
-            .collect::<CliResult<Vec<_>>>()?;
+            .collect::<ShimResult<Vec<_>>>()?;
         let expected = git_object_id(policy.object_format, parsed.tree_oid)?;
         let claim = self.resolve_view_claim(source, branch_name, parsed, &hashes)?;
         // A record projection names its exact view state next to the change
@@ -4666,7 +4666,7 @@ impl ParallelImporter {
         branch_name: &str,
         parsed: &ParsedCommit,
         claimed_roots: &[ContentHash],
-    ) -> CliResult<ViewClaim> {
+    ) -> ShimResult<ViewClaim> {
         let message = parsed.full_message();
         let view = match parse_header_trailer(&message, "Atomic-View") {
             Some(named) if view_exists(source, &named)? => named,
@@ -4682,7 +4682,7 @@ impl ParallelImporter {
             .and_then(|encoded| Merkle::from_base32(encoded.as_bytes()));
         let history = source
             .effective_history(Some(&view))
-            .map_err(|error| CliError::Internal(error.into()))?;
+            .map_err(|error| ShimError::Internal(error.into()))?;
         let mut members = HashSet::with_capacity(history.len());
         let mut state = None;
         for entry in &history {
@@ -4715,7 +4715,7 @@ impl ParallelImporter {
         &self,
         repo: &mut Repository,
         branch_name: &str,
-    ) -> CliResult<usize> {
+    ) -> ShimResult<usize> {
         let Ok(git) = self.open_git_repo() else {
             return Ok(0);
         };
@@ -4730,14 +4730,14 @@ impl ParallelImporter {
         let view = self.options.target_view.clone();
         let Some(tip_hash) = repo
             .checked_git_sha(&tip_sha)
-            .map_err(|e| CliError::Internal(e.into()))?
+            .map_err(|e| ShimError::Internal(e.into()))?
         else {
             return Ok(0);
         };
-        let is_member = |repo: &Repository, hash: &ContentHash| -> CliResult<bool> {
+        let is_member = |repo: &Repository, hash: &ContentHash| -> ShimResult<bool> {
             Ok(repo
                 .effective_history(Some(&view))
-                .map_err(|e| CliError::Internal(e.into()))?
+                .map_err(|e| ShimError::Internal(e.into()))?
                 .iter()
                 .any(|entry| entry.hash == *hash))
         };
@@ -4763,7 +4763,7 @@ impl ParallelImporter {
                         ..Default::default()
                     },
                 )
-                .map_err(|e| CliError::Internal(e.into()))?;
+                .map_err(|e| ShimError::Internal(e.into()))?;
             trace_git_import(format!(
                 "rewind '{branch_name}': unrecorded {} change(s) behind {}",
                 outcome.unrecorded.len(),
@@ -4785,7 +4785,7 @@ impl ParallelImporter {
         &self,
         branch_name: &str,
         repo: &mut Repository,
-    ) -> CliResult<ImportStats> {
+    ) -> ShimResult<ImportStats> {
         let plan = self.validate_branch_prospectively(branch_name, Some(repo))?;
         self.import_prevalidated(branch_name, repo, plan)
     }
@@ -4800,10 +4800,10 @@ impl ParallelImporter {
         branch_name: &str,
         repo: &mut Repository,
         plan: ProspectiveImportPlan,
-    ) -> CliResult<ImportStats> {
+    ) -> ShimResult<ImportStats> {
         let working_copy = repo
             .require_working_copy_id()
-            .map_err(|e| CliError::Internal(e.into()))?;
+            .map_err(|e| ShimError::Internal(e.into()))?;
         let mut stats = ImportStats {
             commits_found: plan.commits.len(),
             commits_parsed: plan.commits.len(),
@@ -4852,7 +4852,7 @@ impl ParallelImporter {
             // CB-13C F4: the partial failure is accounted — the aggregate
             // emits with the landed count before the error propagates.
             emit_import_synthesis(repo, &stats, Some(landed));
-            return Err(CliError::Internal(anyhow::anyhow!(
+            return Err(ShimError::Internal(anyhow::anyhow!(
                 "partial import failed after {landed} landed commit(s): {failure}"
             )));
         }
@@ -5046,16 +5046,19 @@ impl ParallelImporter {
         &self,
         git_repo: &GitRepository,
         branch_name: &str,
-    ) -> CliResult<Vec<Oid>> {
+    ) -> ShimResult<Vec<Oid>> {
         let reference = git_repo
             .find_branch(branch_name, git2::BranchType::Local)
-            .map_err(|e| CliError::GitError {
+            .map_err(|e| ShimError::GitError {
                 message: format!("Branch '{}' not found: {}", branch_name, e),
             })?;
 
-        let target_oid = reference.get().target().ok_or_else(|| CliError::GitError {
-            message: format!("Branch '{}' has no target commit", branch_name),
-        })?;
+        let target_oid = reference
+            .get()
+            .target()
+            .ok_or_else(|| ShimError::GitError {
+                message: format!("Branch '{}' has no target commit", branch_name),
+            })?;
         self.collect_commit_oids_from_target(git_repo, target_oid)
     }
 
@@ -5066,7 +5069,7 @@ impl ParallelImporter {
         &self,
         git_repo: &GitRepository,
         tip: Oid,
-    ) -> CliResult<Vec<Oid>> {
+    ) -> ShimResult<Vec<Oid>> {
         self.collect_commit_oids_from_target(git_repo, tip)
     }
 
@@ -5074,7 +5077,7 @@ impl ParallelImporter {
         &self,
         git_repo: &GitRepository,
         target_oid: Oid,
-    ) -> CliResult<Vec<Oid>> {
+    ) -> ShimResult<Vec<Oid>> {
         // Linearized import — the documented plain-import behavior. Walk the
         // first-parent chain from the tip, stopping at the imported frontier
         // for incremental runs. Merge commits arrive as ordinary
@@ -5097,11 +5100,11 @@ impl ParallelImporter {
                     break;
                 }
                 newest_first.push(oid);
-                let commit = git_repo.find_commit(oid).map_err(|e| CliError::GitError {
+                let commit = git_repo.find_commit(oid).map_err(|e| ShimError::GitError {
                     message: format!("Failed to load commit {oid}: {e}"),
                 })?;
                 current = if commit.parent_count() > 0 {
-                    Some(commit.parent_id(0).map_err(|e| CliError::GitError {
+                    Some(commit.parent_id(0).map_err(|e| ShimError::GitError {
                         message: format!("Failed to load parent of {oid}: {e}"),
                     })?)
                 } else {
@@ -5117,10 +5120,10 @@ impl ParallelImporter {
         // missing-object boundary check and the deepening guard run against
         // the full closure before already-indexed commits are dropped in
         // validate_branch_prospectively.
-        let mut revwalk = git_repo.revwalk().map_err(|e| CliError::GitError {
+        let mut revwalk = git_repo.revwalk().map_err(|e| ShimError::GitError {
             message: format!("Failed to create revwalk: {}", e),
         })?;
-        revwalk.push(target_oid).map_err(|e| CliError::GitError {
+        revwalk.push(target_oid).map_err(|e| ShimError::GitError {
             message: format!("Failed to push target to revwalk: {}", e),
         })?;
         // CB-9B: mainline_only no longer simplifies to first-parent history.
@@ -5128,7 +5131,7 @@ impl ParallelImporter {
         // reachable closure is collected and deterministically sequenced.
         revwalk
             .set_sorting(git2::Sort::TOPOLOGICAL | git2::Sort::REVERSE)
-            .map_err(|e| CliError::GitError {
+            .map_err(|e| ShimError::GitError {
                 message: format!("Failed to set sorting: {}", e),
             })?;
 
@@ -5138,7 +5141,7 @@ impl ParallelImporter {
         // already-indexed commits are dropped in validate_branch_prospectively.
         let mut oids = Vec::new();
         for oid_result in revwalk {
-            let oid = oid_result.map_err(|e| CliError::GitError {
+            let oid = oid_result.map_err(|e| ShimError::GitError {
                 message: format!("Revwalk error: {}", e),
             })?;
             oids.push(oid);
@@ -5152,7 +5155,7 @@ impl ParallelImporter {
 
     /// Phase 1: Parse all commits in parallel using rayon.
     #[tracing::instrument(name = "parse", skip_all, fields(commits = commit_oids.len()))]
-    fn phase1_parse(&self, commit_oids: &[Oid]) -> CliResult<Vec<ParsedCommit>> {
+    fn phase1_parse(&self, commit_oids: &[Oid]) -> ShimResult<Vec<ParsedCommit>> {
         // Build a map from OID to index for parent lookups
         let oid_to_index: std::collections::HashMap<Oid, usize> = commit_oids
             .iter()
@@ -5170,7 +5173,7 @@ impl ParallelImporter {
         let parse_span = tracing::Span::current();
 
         // Parse commits in parallel - each thread opens its own git repo
-        let results: Vec<CliResult<ParsedCommit>> = commit_oids
+        let results: Vec<ShimResult<ParsedCommit>> = commit_oids
             .par_iter()
             .enumerate()
             .map(|(idx, oid)| {
@@ -5182,9 +5185,10 @@ impl ParallelImporter {
                 }
 
                 // Open a thread-local git repo
-                let git_repo = GitRepository::open(&repo_path).map_err(|e| CliError::GitError {
-                    message: format!("Failed to open git repository: {}", e),
-                })?;
+                let git_repo =
+                    GitRepository::open(&repo_path).map_err(|e| ShimError::GitError {
+                        message: format!("Failed to open git repository: {}", e),
+                    })?;
 
                 let parsed = parse_commit(&git_repo, *oid, idx, &oid_to_index)?;
                 Ok(parsed)
@@ -5228,10 +5232,10 @@ impl ParallelImporter {
         line_index: &mut ImportLineIndex,
         boundaries: &[&'static str],
         target_tip: Option<git2::Oid>,
-    ) -> CliResult<(WriteStats, Vec<ImportedCommitInfo>)> {
+    ) -> ShimResult<(WriteStats, Vec<ImportedCommitInfo>)> {
         let working_copy = repo
             .require_working_copy_id()
-            .map_err(|e| CliError::Internal(e.into()))?;
+            .map_err(|e| ShimError::Internal(e.into()))?;
         let mut stats = WriteStats::default();
         let mut imported_commits = Vec::new();
         let total = commits.len();
@@ -5251,7 +5255,7 @@ impl ParallelImporter {
             let tip_sha = tip.to_string();
             let closure = ledger
                 .ancestry_of(&git, &tip_sha)
-                .map_err(|e| CliError::GitError {
+                .map_err(|e| ShimError::GitError {
                     message: format!("cannot read target tip {tip_sha} ancestry: {e}"),
                 })?;
             ledger.target_closure = Some(closure);
@@ -5325,18 +5329,18 @@ impl ParallelImporter {
                     !ordered.is_empty() && ordered.iter().all(|hash| repo.has_change(hash));
                 if all_local {
                     repo.ensure_union_state(&self.options.target_view, ordered)
-                        .map_err(|e| CliError::Internal(e.into()))?;
+                        .map_err(|e| ShimError::Internal(e.into()))?;
                     if repo
                         .git_commit_closure(&parsed.git_sha)
-                        .map_err(|e| CliError::Internal(e.into()))?
+                        .map_err(|e| ShimError::Internal(e.into()))?
                         .is_none()
                     {
                         repo.record_git_commit_closure(&parsed.git_sha, ordered)
-                            .map_err(|e| CliError::Internal(e.into()))?;
+                            .map_err(|e| ShimError::Internal(e.into()))?;
                     }
                     let atomic_hash = repo
                         .checked_git_sha(&parsed.git_sha)
-                        .map_err(|e| CliError::Internal(e.into()))?
+                        .map_err(|e| ShimError::Internal(e.into()))?
                         .or_else(|| ordered.last().copied())
                         .expect("non-empty closure");
                     ledger.record_introduced(
@@ -5470,7 +5474,7 @@ impl ParallelImporter {
         &self,
         repo: &mut Repository,
         parsed: &ParsedCommit,
-    ) -> CliResult<SquashDecision> {
+    ) -> ShimResult<SquashDecision> {
         use atomic_repository::InsertOptions;
 
         // Merges are handled by the normal path + the phase-3 merge tag.
@@ -5634,7 +5638,7 @@ impl ParallelImporter {
         prospective: &atomic_repository::ProjectTree,
         boundaries: &[&'static str],
         touched_only: bool,
-    ) -> CliResult<ImportedCommitInfo> {
+    ) -> ShimResult<ImportedCommitInfo> {
         #[cfg(test)]
         stream::assert_ordinary_recorder_allowed();
         // CB-9B F1-adjacent sibling import: a Git commit already interpreted
@@ -5647,10 +5651,10 @@ impl ParallelImporter {
         // same interpretation every view sees.
         if let Some(existing) = repo
             .checked_git_sha(&parsed.git_sha)
-            .map_err(|e| CliError::Internal(e.into()))?
+            .map_err(|e| ShimError::Internal(e.into()))?
         {
             repo.ensure_union_state(&self.options.target_view, &[existing])
-                .map_err(|e| CliError::Internal(e.into()))?;
+                .map_err(|e| ShimError::Internal(e.into()))?;
             ledger.record_introduced(&parsed.git_sha, existing, &self.options.target_view);
             trace_git_import(format!(
                 "write {} reuse existing change {} (commit already interpreted locally; \
@@ -5685,7 +5689,7 @@ impl ParallelImporter {
             let mut members: Vec<_> = closure.iter().copied().collect();
             members.sort();
             repo.ensure_union_state(&self.options.target_view, &members)
-                .map_err(|e| CliError::Internal(e.into()))?;
+                .map_err(|e| ShimError::Internal(e.into()))?;
         }
 
         // CB-9A: root and single-parent commits use normal recorded-file
@@ -5743,13 +5747,13 @@ impl ParallelImporter {
         repo: &Repository,
         git: &GitRepository,
         parsed: &ParsedCommit,
-    ) -> CliResult<Option<atomic_repository::git_binding::GitStateBinding>> {
+    ) -> ShimResult<Option<atomic_repository::git_binding::GitStateBinding>> {
         use atomic_repository::GitShaResolution;
         let algorithm = git_algorithm_for_sha(&parsed.git_sha)?;
         let commit = git_object_id_for_sha(algorithm, &parsed.git_sha)?;
         match repo
             .resolve_git_sha(git, &commit)
-            .map_err(|e| CliError::Internal(e.into()))?
+            .map_err(|e| ShimError::Internal(e.into()))?
         {
             atomic_repository::GitShaResolution::VerifiedBinding { binding, .. } => {
                 Ok(Some(binding))
@@ -5777,7 +5781,7 @@ impl ParallelImporter {
         git: &GitRepository,
         parsed: &ParsedCommit,
         binding: &atomic_repository::git_binding::GitStateBinding,
-    ) -> CliResult<ImportedCommitInfo> {
+    ) -> ShimResult<ImportedCommitInfo> {
         // An anchor may extend an existing interpretation with Atomic-only
         // changes (for example the imported repository's .atomicignore).
         // Keep the original immutable interpretation when it is contained
@@ -5785,7 +5789,7 @@ impl ParallelImporter {
         // alone must not authorize replacing unrelated causal identities.
         let existing_closure = repo
             .git_commit_closure(&parsed.git_sha)
-            .map_err(|e| CliError::Internal(e.into()))?;
+            .map_err(|e| ShimError::Internal(e.into()))?;
         if let Some(existing) = &existing_closure {
             let bound = &binding.payload().ordered_changes;
             if !existing.iter().all(|hash| bound.contains(hash)) {
@@ -5801,7 +5805,7 @@ impl ParallelImporter {
                         existing,
                         &conversion_policy(git)?,
                     )
-                    .map_err(|e| CliError::Internal(e.into()))?;
+                    .map_err(|e| ShimError::Internal(e.into()))?;
                 if projection.git.root.as_bytes() != parsed.tree_oid.as_bytes() {
                     return Err(git_error(format!(
                         "persisted interpretation closure for {} does not reproduce its Git tree",
@@ -5812,7 +5816,7 @@ impl ParallelImporter {
         }
         let outcome = repo
             .resurrect_binding_exact(git, binding, &self.options.target_view, None)
-            .map_err(|e| CliError::Internal(e.into()))?;
+            .map_err(|e| ShimError::Internal(e.into()))?;
         // Persist the resurrected commit's interpreted closure (review R1):
         // every restored or already-present change with its dependency
         // closure, so descendants in later runs keep the exact parent
@@ -5822,7 +5826,7 @@ impl ParallelImporter {
         restored_hashes.extend(outcome.already_present.iter().copied());
         if existing_closure.is_none() && !restored_hashes.is_empty() {
             repo.record_git_commit_closure(&parsed.git_sha, &restored_hashes)
-                .map_err(|e| CliError::Internal(e.into()))?;
+                .map_err(|e| ShimError::Internal(e.into()))?;
         }
         print_info(&format!(
             "Resurrected verified binding for {} ({} change(s) restored, {} already present{}), \
@@ -5891,7 +5895,7 @@ impl ParallelImporter {
         prospective: &atomic_repository::ProjectTree,
         boundaries: &[&'static str],
         touched_only: bool,
-    ) -> CliResult<ImportedCommitInfo> {
+    ) -> ShimResult<ImportedCommitInfo> {
         use atomic_core::output::memory::Memory;
         use atomic_core::record::workflow::{
             record_added_file, record_modified_file, DetectedFile, RecordingOptions,
@@ -5899,7 +5903,7 @@ impl ParallelImporter {
 
         let working_copy = repo
             .require_working_copy_id()
-            .map_err(|e| CliError::Internal(e.into()))?;
+            .map_err(|e| ShimError::Internal(e.into()))?;
         let commit_start = std::time::Instant::now();
         let target = self.options.target_view.clone();
 
@@ -5954,7 +5958,7 @@ impl ParallelImporter {
                 },
             )
         }
-        .map_err(|e| CliError::Internal(e.into()))?;
+        .map_err(|e| ShimError::Internal(e.into()))?;
 
         // CB-9B: rewrite evidence is event/binding-driven, not only
         // message-shaped. A captured post-rewrite event naming this commit
@@ -6025,7 +6029,7 @@ impl ParallelImporter {
         // change instead of silently losing the mode (or failing the staged
         // tree check after publishing nothing).
         #[allow(clippy::type_complexity)] // per-file effective op row
-        let effective: CliResult<Vec<(&ParsedFile, EffectiveOp, Vec<u8>, Vec<atomic_core::change::InodeAttr>)>> = parsed
+        let effective: ShimResult<Vec<(&ParsedFile, EffectiveOp, Vec<u8>, Vec<atomic_core::change::InodeAttr>)>> = parsed
             .files
             .iter()
             .map(|file| {
@@ -6034,7 +6038,7 @@ impl ParallelImporter {
                 let view_baseline: Option<Vec<u8>> = repo
                     .get_file_content_on_view_excluding(&*repository_path(&file.path), &target, &excluded)
                     .map_err(|e| {
-                        CliError::Internal(anyhow::anyhow!(
+                        ShimError::Internal(anyhow::anyhow!(
                             "cannot read exact baseline for '{}': {e}",
                             file.path
                         ))
@@ -6055,7 +6059,7 @@ impl ParallelImporter {
                 let projected = if file.new_mode.is_some() {
                     repo.projected_attributes_on_view_excluding(&repository_path(&file.path), &target, &excluded)
                         .map_err(|e| {
-                            CliError::Internal(anyhow::anyhow!(
+                            ShimError::Internal(anyhow::anyhow!(
                                 "cannot project current attributes for '{}': {e}",
                                 file.path
                             ))
@@ -6065,7 +6069,7 @@ impl ParallelImporter {
                 };
                 if let Some(projected) = &projected {
                     if projected.is_conflicted() {
-                        return Err(CliError::Internal(anyhow::anyhow!(
+                        return Err(ShimError::Internal(anyhow::anyhow!(
                             "path '{}' has conflicted inode attribute registers in view '{}'; \
                              refusing to synthesize attributes over an unresolved register",
                             file.path, target
@@ -6261,7 +6265,7 @@ impl ParallelImporter {
         if !self.options.preserve_working_copy && !added_paths.is_empty() {
             let added_refs: Vec<&str> = added_paths.iter().map(|path| path.as_ref()).collect();
             repo.add_batch(working_copy, &added_refs)
-                .map_err(|e| CliError::Internal(e.into()))?;
+                .map_err(|e| ShimError::Internal(e.into()))?;
         }
 
         // Record every file through the normal workflow: the commit's own
@@ -6298,7 +6302,7 @@ impl ParallelImporter {
                     let mut rec = repo
                         .record_resolution_modified_file(&file.path, new_content, &target, false)
                         .map_err(|message| {
-                            CliError::Internal(anyhow::anyhow!(
+                            ShimError::Internal(anyhow::anyhow!(
                                 "cannot record modified path '{}': {message}",
                                 file.path
                             ))
@@ -6314,7 +6318,7 @@ impl ParallelImporter {
                             .get_inode_and_position_on_view_excluding(
                                 &file.path, &target, &excluded,
                             )
-                            .map_err(|e| CliError::Internal(e.into()))?
+                            .map_err(|e| ShimError::Internal(e.into()))?
                         {
                             attr_rec.set_inode(inode);
                             attr_rec.set_position(position);
@@ -6332,7 +6336,7 @@ impl ParallelImporter {
                         // legitimate. An empty record with a real delta is a
                         // failure and stays an error below.
                         if baseline.as_slice() != new_content {
-                            return Err(CliError::Internal(anyhow::anyhow!(
+                            return Err(ShimError::Internal(anyhow::anyhow!(
                                 "cannot record modified path '{}': record is empty",
                                 file.path
                             )));
@@ -6370,13 +6374,13 @@ impl ParallelImporter {
                             recorded_files.push(rec);
                         }
                         Ok(_) => {
-                            return Err(CliError::Internal(anyhow::anyhow!(
+                            return Err(ShimError::Internal(anyhow::anyhow!(
                                 "cannot record added path '{}': record is empty",
                                 file.path
                             )));
                         }
                         Err(message) => {
-                            return Err(CliError::Internal(anyhow::anyhow!(
+                            return Err(ShimError::Internal(anyhow::anyhow!(
                                 "cannot record added path '{}': {message}",
                                 file.path
                             )));
@@ -6399,7 +6403,7 @@ impl ParallelImporter {
                                 &target,
                                 &excluded,
                             )
-                            .map_err(|e| CliError::Internal(e.into()))?
+                            .map_err(|e| ShimError::Internal(e.into()))?
                             .is_some();
                     let inode_pos = repo
                         .get_inode_and_position_on_view_excluding(
@@ -6407,7 +6411,7 @@ impl ParallelImporter {
                             &target,
                             &excluded,
                         )
-                        .map_err(|e| CliError::Internal(e.into()))?;
+                        .map_err(|e| ShimError::Internal(e.into()))?;
                     let new_bytes = file.new_content.as_deref().unwrap_or(&[]);
                     let ambiguous = renamed_pairing_is_ambiguous(baseline.as_slice(), new_bytes);
                     match (can_emit_move, inode_pos) {
@@ -6464,7 +6468,7 @@ impl ParallelImporter {
                                     &excluded,
                                 )
                                 .map_err(|message| {
-                                    CliError::Internal(anyhow::anyhow!(
+                                    ShimError::Internal(anyhow::anyhow!(
                                         "cannot record renamed path '{}': {message}",
                                         file.path
                                     ))
@@ -6506,10 +6510,10 @@ impl ParallelImporter {
                                         &excluded,
                                     )
                                     .map_err(|message| {
-                                        CliError::Internal(anyhow::anyhow!(message))
+                                        ShimError::Internal(anyhow::anyhow!(message))
                                     })?;
                                 if deleted_record.is_empty() {
-                                    return Err(CliError::Internal(anyhow::anyhow!(
+                                    return Err(ShimError::Internal(anyhow::anyhow!(
                                         "cannot import ambiguous rename source '{}': canonical FileDel is empty",
                                         old_path
                                     )));
@@ -6604,13 +6608,13 @@ impl ParallelImporter {
                                     recorded_files.push(rec);
                                 }
                                 Ok(_) => {
-                                    return Err(CliError::Internal(anyhow::anyhow!(
+                                    return Err(ShimError::Internal(anyhow::anyhow!(
                                         "cannot record renamed path '{}': record is empty",
                                         file.path
                                     )));
                                 }
                                 Err(message) => {
-                                    return Err(CliError::Internal(anyhow::anyhow!(
+                                    return Err(ShimError::Internal(anyhow::anyhow!(
                                         "cannot record renamed path '{}': {message}",
                                         file.path
                                     )));
@@ -6669,7 +6673,7 @@ impl ParallelImporter {
                             &target,
                             &excluded,
                         )
-                        .map_err(|e| CliError::Internal(e.into()))?
+                        .map_err(|e| ShimError::Internal(e.into()))?
                         .is_some()
                     {
                         // CB-11A regression fix: a committed conflict
@@ -6688,7 +6692,7 @@ impl ParallelImporter {
                         let conflicted = !leg_mode
                             && repo
                                 .path_has_persisted_conflict(&repository_path(&file.path), &target)
-                                .map_err(|e| CliError::Internal(e.into()))?;
+                                .map_err(|e| ShimError::Internal(e.into()))?;
                         repo.record_foreign_modified_file_on_view_excluding(
                             &repository_path(&file.path),
                             &old_content,
@@ -6705,7 +6709,7 @@ impl ParallelImporter {
                             &excluded,
                         )
                         .map_err(|message| {
-                            CliError::Internal(anyhow::anyhow!(
+                            ShimError::Internal(anyhow::anyhow!(
                                 "cannot record modified path '{}': {message}",
                                 file.path
                             ))
@@ -6721,7 +6725,7 @@ impl ParallelImporter {
                             None,
                         )
                         .map_err(|message| {
-                            CliError::Internal(anyhow::anyhow!(
+                            ShimError::Internal(anyhow::anyhow!(
                                 "cannot record modified path '{}': {message}",
                                 file.path
                             ))
@@ -6744,7 +6748,7 @@ impl ParallelImporter {
                             .get_inode_and_position_on_view_excluding(
                                 &file.path, &target, &excluded,
                             )
-                            .map_err(|e| CliError::Internal(e.into()))?
+                            .map_err(|e| ShimError::Internal(e.into()))?
                         {
                             attr_rec.set_inode(inode);
                             attr_rec.set_position(position);
@@ -6758,7 +6762,7 @@ impl ParallelImporter {
                         // graph delta. Only a divergent baseline makes an
                         // empty record a failure.
                         if old_content.as_slice() != new_content {
-                            return Err(CliError::Internal(anyhow::anyhow!(
+                            return Err(ShimError::Internal(anyhow::anyhow!(
                                 "cannot record modified path '{}': record is empty",
                                 file.path
                             )));
@@ -6781,7 +6785,7 @@ impl ParallelImporter {
                             &target,
                             &excluded,
                         )
-                        .map_err(|message| CliError::Internal(anyhow::anyhow!(message)))?;
+                        .map_err(|message| ShimError::Internal(anyhow::anyhow!(message)))?;
                     recorded_files.push(recorded);
                 }
 
@@ -6798,12 +6802,12 @@ impl ParallelImporter {
         // the same namespaced merge the record path performs.
         if !move_evidence.is_empty() {
             let value = serde_json::to_value(&move_evidence).map_err(|error| {
-                CliError::Internal(anyhow::anyhow!(
+                ShimError::Internal(anyhow::anyhow!(
                     "cannot serialize import move evidence: {error}"
                 ))
             })?;
             let object = unhashed.as_object_mut().ok_or_else(|| {
-                CliError::Internal(anyhow::anyhow!(
+                ShimError::Internal(anyhow::anyhow!(
                     "git synthesis metadata is not a JSON object; cannot attach move evidence"
                 ))
             })?;
@@ -6883,7 +6887,7 @@ impl ParallelImporter {
                 // would corrupt later commits' baselines.
                 &superseded,
             )
-            .map_err(|e| CliError::Internal(e.into()))?;
+            .map_err(|e| ShimError::Internal(e.into()))?;
         let progress_reported = progress.finish();
 
         // Index git SHA → Atomic change in GIT_SHA_INDEX
@@ -6962,7 +6966,7 @@ impl ParallelImporter {
         prospective: &atomic_repository::ProjectTree,
         boundaries: &[&'static str],
         touched_only: bool,
-    ) -> CliResult<ImportedCommitInfo> {
+    ) -> ShimResult<ImportedCommitInfo> {
         let commit_start = Instant::now();
 
         let mut header_builder = ChangeHeader::builder()
@@ -6988,10 +6992,10 @@ impl ParallelImporter {
                 .parent_oids
                 .iter()
                 .map(|oid| git_object_id(algorithm, *oid))
-                .collect::<CliResult<Vec<_>>>()?,
+                .collect::<ShimResult<Vec<_>>>()?,
             GitDerivation::EmptyCommit,
         )
-        .map_err(|e| CliError::Internal(e.into()))?;
+        .map_err(|e| ShimError::Internal(e.into()))?;
 
         let empty_facts = EmptyCommitFacts {
             format: EMPTY_COMMIT_FACTS_FORMAT,
@@ -7016,7 +7020,7 @@ impl ParallelImporter {
             raw_object_hex: hex_bytes(Some(&parsed.raw_object)),
         };
         let hashed_metadata =
-            serde_json::to_vec(&empty_facts).map_err(|e| CliError::Internal(e.into()))?;
+            serde_json::to_vec(&empty_facts).map_err(|e| ShimError::Internal(e.into()))?;
 
         let metadata = git_synthesis_metadata(
             &origin,
@@ -7077,7 +7081,7 @@ impl ParallelImporter {
                 // same-closure sibling legs stay members.
                 &superseded,
             )
-            .map_err(|e| CliError::Internal(e.into()))?;
+            .map_err(|e| ShimError::Internal(e.into()))?;
         // Index git SHA → Atomic change in GIT_SHA_INDEX
         let _ = repo.index_git_sha(&parsed.git_sha, &outcome.write.hash);
 
@@ -7128,13 +7132,13 @@ impl ParallelImporter {
         verified: &VerifiedProspectiveEquivalence,
         prospective: &atomic_repository::ProjectTree,
         boundaries: &[&'static str],
-    ) -> CliResult<ImportedCommitInfo> {
+    ) -> ShimResult<ImportedCommitInfo> {
         use atomic_core::output::memory::Memory;
         use atomic_core::record::workflow::{record_added_file, DetectedFile, RecordingOptions};
 
         let working_copy = repo
             .require_working_copy_id()
-            .map_err(|e| CliError::Internal(e.into()))?;
+            .map_err(|e| ShimError::Internal(e.into()))?;
         let commit_start = std::time::Instant::now();
         let target = self.options.target_view.clone();
 
@@ -7168,7 +7172,7 @@ impl ParallelImporter {
             let sha = oid.to_string();
             let hash = repo
                 .checked_git_sha(&sha)
-                .map_err(|e| CliError::Internal(e.into()))?
+                .map_err(|e| ShimError::Internal(e.into()))?
                 .ok_or_else(|| {
                     git_error(format!(
                         "merge {} parent {} has no locally verified imported change; \
@@ -7193,10 +7197,10 @@ impl ParallelImporter {
         let parent_closure: Vec<atomic_core::types::Hash> =
             parent_closure_set.into_iter().collect();
         repo.ensure_union_state(&target, &parent_closure)
-            .map_err(|e| CliError::Internal(e.into()))?;
+            .map_err(|e| ShimError::Internal(e.into()))?;
         let frontier = repo
             .view_frontier_for_members(&parent_closure)
-            .map_err(|e| CliError::Internal(e.into()))?;
+            .map_err(|e| ShimError::Internal(e.into()))?;
         let _ = parent_tip_hashes;
         let algorithm = git_algorithm_for_sha(&parsed.git_sha)?;
         let origin = GitResolutionOrigin::new(
@@ -7205,10 +7209,10 @@ impl ParallelImporter {
                 .parent_oids
                 .iter()
                 .map(|oid| git_object_id(algorithm, *oid))
-                .collect::<CliResult<Vec<_>>>()?,
+                .collect::<ShimResult<Vec<_>>>()?,
             frontier,
         )
-        .map_err(|e| CliError::Internal(e.into()))?;
+        .map_err(|e| ShimError::Internal(e.into()))?;
 
         // Record the union→merge-tree delta through the normal workflow.
         // Per-parent Git diffs alone cannot identify the delta: identical
@@ -7312,7 +7316,7 @@ impl ParallelImporter {
                         &excluded,
                     )
                     .map_err(|e| {
-                        CliError::Internal(anyhow::anyhow!(
+                        ShimError::Internal(anyhow::anyhow!(
                             "cannot resolve exact union identity for '{}': {e}",
                             file.path
                         ))
@@ -7325,7 +7329,7 @@ impl ParallelImporter {
         if !self.options.preserve_working_copy && !added_paths.is_empty() {
             let added_refs: Vec<&str> = added_paths.iter().map(|path| path.as_ref()).collect();
             repo.add_batch(working_copy, &added_refs)
-                .map_err(|e| CliError::Internal(e.into()))?;
+                .map_err(|e| ShimError::Internal(e.into()))?;
         }
         let record_start = std::time::Instant::now();
         for file in &files {
@@ -7339,7 +7343,7 @@ impl ParallelImporter {
                     &excluded,
                 )
                 .map_err(|e| {
-                    CliError::Internal(anyhow::anyhow!(
+                    ShimError::Internal(anyhow::anyhow!(
                         "cannot read exact union baseline for '{}': {e}",
                         file.path
                     ))
@@ -7372,13 +7376,13 @@ impl ParallelImporter {
                             &excluded,
                         )
                         .map_err(|message| {
-                            CliError::Internal(anyhow::anyhow!(
+                            ShimError::Internal(anyhow::anyhow!(
                                 "cannot record merge resolution for '{}': {message}",
                                 file.path
                             ))
                         })?;
                     if rec.is_empty() {
-                        return Err(CliError::Internal(anyhow::anyhow!(
+                        return Err(ShimError::Internal(anyhow::anyhow!(
                             "cannot record merge resolution for '{}': record is empty",
                             file.path
                         )));
@@ -7394,13 +7398,13 @@ impl ParallelImporter {
                             recorded_files.push(rec);
                         }
                         Ok(_) => {
-                            return Err(CliError::Internal(anyhow::anyhow!(
+                            return Err(ShimError::Internal(anyhow::anyhow!(
                                 "cannot record merge addition '{}': record is empty",
                                 file.path
                             )));
                         }
                         Err(message) => {
-                            return Err(CliError::Internal(anyhow::anyhow!(
+                            return Err(ShimError::Internal(anyhow::anyhow!(
                                 "cannot record merge addition '{}': {message}",
                                 file.path
                             )));
@@ -7414,9 +7418,9 @@ impl ParallelImporter {
                             &target,
                             &excluded,
                         )
-                        .map_err(|message| CliError::Internal(anyhow::anyhow!(message)))?;
+                        .map_err(|message| ShimError::Internal(anyhow::anyhow!(message)))?;
                     if recorded.is_empty() {
-                        return Err(CliError::Internal(anyhow::anyhow!(
+                        return Err(ShimError::Internal(anyhow::anyhow!(
                             "cannot import merge deletion '{}': canonical FileDel is empty",
                             file.path
                         )));
@@ -7455,7 +7459,7 @@ impl ParallelImporter {
                         &target,
                         &excluded,
                     )
-                    .map_err(|e| CliError::Internal(e.into()))?
+                    .map_err(|e| ShimError::Internal(e.into()))?
                     .ok_or_else(|| {
                         git_error(format!(
                             "merge attribute resolution for '{}' has no canonical inode",
@@ -7528,13 +7532,13 @@ impl ParallelImporter {
                 Some(&parsed.git_sha),
                 &parent_closure,
             )
-            .map_err(|e| CliError::Internal(e.into()))?;
+            .map_err(|e| ShimError::Internal(e.into()))?;
 
         let _ = repo.index_git_sha(&parsed.git_sha, &outcome.write.hash);
         if !self.options.preserve_working_copy && !deleted_paths.is_empty() {
             let del_refs: Vec<&str> = deleted_paths.iter().map(|s| s.as_str()).collect();
             repo.del_file_index_batch(working_copy, &del_refs)
-                .map_err(|e| CliError::Internal(e.into()))?;
+                .map_err(|e| ShimError::Internal(e.into()))?;
         }
 
         trace_git_import(format!(
@@ -7573,7 +7577,7 @@ impl ParallelImporter {
         repo: &Repository,
         parsed: &ParsedCommit,
         evidence: &[RewriteEvidence],
-    ) -> CliResult<()> {
+    ) -> ShimResult<()> {
         let tag_name = format!("rewrite-candidate-{}", parsed.git_sha);
         let metadata = serde_json::json!({
             "git": {
@@ -7617,7 +7621,7 @@ impl ParallelImporter {
         )
         .map(|_| ())
         .map_err(|e| {
-            CliError::Internal(anyhow::anyhow!(
+            ShimError::Internal(anyhow::anyhow!(
                 "failed to record rewrite-candidate link for {}: {e}",
                 parsed.short_sha
             ))
@@ -7691,7 +7695,7 @@ impl ParallelImporter {
         repo: &Repository,
         git: &GitRepository,
         parsed: &ParsedCommit,
-    ) -> CliResult<Vec<RewriteEvidence>> {
+    ) -> ShimResult<Vec<RewriteEvidence>> {
         let mut evidence = Vec::new();
 
         // 1. Captured post-rewrite events with exact full-OID linkage.
@@ -7730,7 +7734,7 @@ impl ParallelImporter {
         let tree_hex = tagged_oid_hex(&git_object_id(algorithm, parsed.tree_oid)?);
         for id in repo
             .binding_ids()
-            .map_err(|e| CliError::Internal(e.into()))?
+            .map_err(|e| ShimError::Internal(e.into()))?
         {
             let Ok(Some(binding)) = repo.load_binding(&id) else {
                 continue;
@@ -7807,7 +7811,7 @@ impl ParallelImporter {
                     tagged_oid_hex(&git_object_id(algorithm, *first_parent_oid)?);
                 if first_parent_hex != bound_commit_hex {
                     let bound_commit_oid = git2::Oid::from_bytes(bound_commit.as_bytes())
-                        .map_err(|e| CliError::Internal(anyhow::anyhow!("{e}")))?;
+                        .map_err(|e| ShimError::Internal(anyhow::anyhow!("{e}")))?;
                     let in_range = git
                         .merge_base(*first_parent_oid, bound_commit_oid)
                         .map(|base| base == *first_parent_oid)
@@ -8049,7 +8053,7 @@ impl ParallelImporter {
         &self,
         repo: &mut Repository,
         imported: &[ImportedCommitInfo],
-    ) -> CliResult<ClassificationStats> {
+    ) -> ShimResult<ClassificationStats> {
         use atomic_core::pristine::TagKind;
 
         let mut stats = ClassificationStats::default();
@@ -8167,7 +8171,7 @@ impl ParallelImporter {
     // ═══════════════════════════════════════════════════════════════════════
 
     /// Phase 3: Finalization and verification.
-    fn phase3_finalize(&self, stats: &ImportStats) -> CliResult<()> {
+    fn phase3_finalize(&self, stats: &ImportStats) -> ShimResult<()> {
         // Verify counts
         let expected = stats.commits_parsed;
         let actual = stats.changes_written
@@ -8178,7 +8182,7 @@ impl ParallelImporter {
             + stats.squash_skipped;
 
         if actual != expected {
-            return Err(CliError::GitError {
+            return Err(ShimError::GitError {
                 message: format!(
                     "Import verification failed: {} commits parsed but {} changes created",
                     expected, actual
@@ -8529,7 +8533,7 @@ fn parse_commit(
     oid: Oid,
     _index: usize,
     oid_to_index: &std::collections::HashMap<Oid, usize>,
-) -> CliResult<ParsedCommit> {
+) -> ShimResult<ParsedCommit> {
     parse_commit_with_scope(git_repo, oid, _index, oid_to_index, true)
 }
 
@@ -8539,9 +8543,9 @@ fn parse_commit_with_scope(
     _index: usize,
     oid_to_index: &std::collections::HashMap<Oid, usize>,
     include_merge_union: bool,
-) -> CliResult<ParsedCommit> {
+) -> ShimResult<ParsedCommit> {
     let parse_start = Instant::now();
-    let commit = git_repo.find_commit(oid).map_err(|e| CliError::GitError {
+    let commit = git_repo.find_commit(oid).map_err(|e| ShimError::GitError {
         message: format!("Failed to find commit {}: {}", oid, e),
     })?;
 
@@ -8552,10 +8556,10 @@ fn parse_commit_with_scope(
     // 6): the hashed fact records retain them so the exact signed object
     // can be recovered and re-verified without the source Git ODB.
     let raw_object = {
-        let odb = git_repo.odb().map_err(|e| CliError::GitError {
+        let odb = git_repo.odb().map_err(|e| ShimError::GitError {
             message: format!("Failed to open ODB for {}: {}", oid, e),
         })?;
-        let object = odb.read(oid).map_err(|e| CliError::GitError {
+        let object = odb.read(oid).map_err(|e| ShimError::GitError {
             message: format!("Failed to read raw commit object {}: {}", oid, e),
         })?;
         object.data().to_vec()
@@ -8577,7 +8581,7 @@ fn parse_commit_with_scope(
     let is_merge = commit.parent_count() > 1;
 
     // Get trees for diff
-    let tree = commit.tree().map_err(|e| CliError::GitError {
+    let tree = commit.tree().map_err(|e| ShimError::GitError {
         message: format!("Failed to get tree: {}", e),
     })?;
 
@@ -8585,11 +8589,11 @@ fn parse_commit_with_scope(
         Some(
             commit
                 .parent(0)
-                .map_err(|e| CliError::GitError {
+                .map_err(|e| ShimError::GitError {
                     message: format!("Failed to get parent: {}", e),
                 })?
                 .tree()
-                .map_err(|e| CliError::GitError {
+                .map_err(|e| ShimError::GitError {
                     message: format!("Failed to get parent tree: {}", e),
                 })?,
         )
@@ -8606,7 +8610,7 @@ fn parse_commit_with_scope(
     let diff_start = Instant::now();
     let mut diff = git_repo
         .diff_tree_to_tree(parent_tree.as_ref(), Some(&tree), Some(&mut diff_opts))
-        .map_err(|e| CliError::GitError {
+        .map_err(|e| ShimError::GitError {
             message: format!("Failed to compute diff: {}", e),
         })?;
     let diff_ms = diff_start.elapsed().as_millis();
@@ -8688,18 +8692,18 @@ fn parse_commit_with_scope(
         for parent_number in 1..commit.parent_count() {
             let parent_tree = commit
                 .parent(parent_number)
-                .map_err(|e| CliError::GitError {
+                .map_err(|e| ShimError::GitError {
                     message: format!("Failed to get parent {parent_number}: {e}"),
                 })?
                 .tree()
-                .map_err(|e| CliError::GitError {
+                .map_err(|e| ShimError::GitError {
                     message: format!("Failed to get parent tree: {e}"),
                 })?;
             let mut side_opts = DiffOptions::new();
             side_opts.include_untracked(false);
             let side_diff = git_repo
                 .diff_tree_to_tree(Some(&parent_tree), Some(&tree), Some(&mut side_opts))
-                .map_err(|e| CliError::GitError {
+                .map_err(|e| ShimError::GitError {
                     message: format!("Failed to compute side-parent diff: {e}"),
                 })?;
             for delta in side_diff.deltas() {
@@ -8823,7 +8827,7 @@ fn parse_push_trailer(message: &str) -> Option<PushTrailer> {
 /// offsets from the raw commit object, so no UTF-8 or UTC normalization
 /// destroys foreign identity data. The display strings remain best-effort
 /// lossy conversions for presentation only.
-fn extract_commit_metadata(commit: &git2::Commit) -> CliResult<CommitMetadata> {
+fn extract_commit_metadata(commit: &git2::Commit) -> ShimResult<CommitMetadata> {
     let author = commit.author();
     let author_name = author.name().unwrap_or("Unknown").to_string();
     let author_email = author.email().map(|s| s.to_string());
@@ -8895,7 +8899,7 @@ fn parse_diff_files(
     tree: &Tree,
     parent_tree: Option<&Tree>,
     capture_diff_lines: bool,
-) -> CliResult<Vec<ParsedFile>> {
+) -> ShimResult<Vec<ParsedFile>> {
     use std::collections::HashMap;
 
     // ── Step 1: collect per-file diff lines via diff.foreach ────────────
@@ -8948,7 +8952,7 @@ fn parse_diff_files(
     // bytes (fixture oracle) and normalization never becomes identity.
     // Refusing here (the historical behavior) lost the file from the imported
     // history instead of preserving it.
-    let delta_path = |file: &git2::DiffFile| -> CliResult<Option<String>> {
+    let delta_path = |file: &git2::DiffFile| -> ShimResult<Option<String>> {
         Ok(file.path_bytes().map(atomic_repository::escape_repo_path))
     };
 
@@ -9274,7 +9278,7 @@ fn parse_diff_files_via_git_cli(
     parent_oid: Oid,
     tree: &Tree<'_>,
     parent_tree: &Tree<'_>,
-) -> CliResult<Vec<ParsedFile>> {
+) -> ShimResult<Vec<ParsedFile>> {
     let output = Command::new("git")
         // The caller may run alongside another thread that changes or removes
         // the process cwd. Git resolves cwd even with --git-dir; anchor the
@@ -9290,12 +9294,12 @@ fn parse_diff_files_via_git_cli(
         .arg(parent_oid.to_string())
         .arg(commit_oid.to_string())
         .output()
-        .map_err(|e| CliError::GitError {
+        .map_err(|e| ShimError::GitError {
             message: format!("Failed to run git diff-tree fallback: {}", e),
         })?;
 
     if !output.status.success() {
-        return Err(CliError::GitError {
+        return Err(ShimError::GitError {
             message: format!(
                 "git diff-tree fallback failed: {}",
                 String::from_utf8_lossy(&output.stderr).trim()
@@ -9448,7 +9452,7 @@ impl ExpectedMaterialization {
     }
 }
 
-fn expected_materialization(git_mode: u32) -> CliResult<ExpectedMaterialization> {
+fn expected_materialization(git_mode: u32) -> ShimResult<ExpectedMaterialization> {
     let expected = match git_mode {
         0o100644 => ExpectedMaterialization {
             kind: atomic_core::change::InodeKind::Regular,
@@ -9503,10 +9507,10 @@ struct ViewClaim {
     state: Option<Merkle>,
 }
 
-fn view_exists(source: &Repository, view: &str) -> CliResult<bool> {
+fn view_exists(source: &Repository, view: &str) -> ShimResult<bool> {
     source
         .view_exists(view)
-        .map_err(|error| CliError::Internal(error.into()))
+        .map_err(|error| ShimError::Internal(error.into()))
 }
 
 /// The repository's spelling of a canonical (escaped) Git path: the raw
@@ -9562,7 +9566,7 @@ fn git_tree_entry(
     git_repo: &GitRepository,
     tree: &Tree<'_>,
     path: &str,
-) -> CliResult<git2::TreeEntry<'static>> {
+) -> ShimResult<git2::TreeEntry<'static>> {
     let raw = atomic_repository::unescape_repo_path(path)
         .map_err(|error| git_error(format!("invalid encoded Git path '{path}': {error}")))?;
     let mut components = raw.split(|byte| *byte == b'/').peekable();
@@ -9586,7 +9590,7 @@ fn git_tree_entry(
     Err(git_error(format!("invalid empty Git tree path '{path}'")))
 }
 
-fn get_file_content(git_repo: &GitRepository, tree: &Tree, path: &str) -> CliResult<Vec<u8>> {
+fn get_file_content(git_repo: &GitRepository, tree: &Tree, path: &str) -> ShimResult<Vec<u8>> {
     // CB-9C path fidelity: the String identity is the reversible escape of
     // the raw Git bytes, so the tree lookup decodes before reading.
     let entry = git_tree_entry(git_repo, tree, path)?;
@@ -9596,14 +9600,14 @@ fn get_file_content(git_repo: &GitRepository, tree: &Tree, path: &str) -> CliRes
     }
 
     if entry.kind() != Some(ObjectType::Blob) {
-        return Err(CliError::GitError {
+        return Err(ShimError::GitError {
             message: "Not a file".to_string(),
         });
     }
 
     let blob = git_repo
         .find_blob(entry.id())
-        .map_err(|e| CliError::GitError {
+        .map_err(|e| ShimError::GitError {
             message: format!("Failed to find blob: {}", e),
         })?;
 
@@ -10599,7 +10603,7 @@ mod tests {
 
         assert!(matches!(
             importer.phase3_finalize(&stats),
-            Err(CliError::GitError { .. })
+            Err(ShimError::GitError { .. })
         ));
     }
 
