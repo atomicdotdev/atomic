@@ -240,7 +240,7 @@ impl Repository {
         limit: usize,
         pool: Option<usize>,
     ) -> Result<Vec<KgNode>, RepositoryError> {
-        self.vault_kg_search_inner(query, limit, pool, None)
+        self.vault_kg_search_inner(query, limit, pool, None, None)
     }
 
     /// Search VCS nodes and source content through the requested view's
@@ -253,8 +253,42 @@ impl Repository {
         limit: usize,
         pool: Option<usize>,
     ) -> Result<Vec<KgNode>, RepositoryError> {
+        self.vault_kg_search_on_view_with_kind(view_name, query, limit, pool, None)
+    }
+
+    /// Search a recorded view, optionally filtering by an exact asserted class IRI.
+    ///
+    /// View projection and class filtering precede ranking and pool truncation.
+    /// The class is matched against every asserted type, case-sensitively; an
+    /// absent or empty class leaves the search unfiltered. Unknown classes match
+    /// nothing. Filtered results are the top `limit` nodes by score, without
+    /// cross-type diversity, regardless of `pool` (retained at least to `limit`).
+    /// A zero `limit` returns no nodes but still validates the requested view.
+    /// Vault-only nodes remain shared; no index is built or refreshed.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use atomic_core::kg::ontology::Class;
+    /// use atomic_repository::{Repository, RepositoryError};
+    /// # fn main() -> Result<(), RepositoryError> {
+    /// let repo = Repository::open_readonly("path/to/repository")?;
+    /// let memories = repo.vault_kg_search_on_view_with_kind(
+    ///     "dev", "leases", 10, Some(1), Some(Class::Memory.iri()),
+    /// )?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn vault_kg_search_on_view_with_kind(
+        &self,
+        view_name: &str,
+        query: &str,
+        limit: usize,
+        pool: Option<usize>,
+        kind: Option<&str>,
+    ) -> Result<Vec<KgNode>, RepositoryError> {
         let scope = self.query_view(view_name)?;
-        self.vault_kg_search_inner(query, limit, pool, Some(&scope))
+        self.vault_kg_search_inner(query, limit, pool, Some(&scope), kind)
     }
 
     fn vault_kg_search_inner(
@@ -263,7 +297,9 @@ impl Repository {
         limit: usize,
         pool: Option<usize>,
         scope: Option<&super::query::QueryView>,
+        kind: Option<&str>,
     ) -> Result<Vec<KgNode>, RepositoryError> {
+        let kind = kind.filter(|kind| !kind.is_empty());
         let txn = self.pristine.read_txn()?;
         let mut rows = BTreeMap::new();
         let mut content = HashMap::<String, usize>::new();
@@ -331,6 +367,11 @@ impl Repository {
         }
         let mut ranked = Vec::new();
         for (_, (mut node, hits)) in rows {
+            // All candidate sources, including content-only File stubs, obey
+            // the class predicate before competing for retained result slots.
+            if kind.is_some_and(|kind| !node.types.iter().any(|ty| ty == kind)) {
+                continue;
+            }
             let count = node
                 .path()
                 .and_then(|path| content.get(path))
@@ -353,7 +394,7 @@ impl Repository {
         }
         ranked.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.id.cmp(&b.1.id)));
         ranked.truncate(pool.unwrap_or(limit).max(limit));
-        if pool.is_some_and(|pool| pool > limit) {
+        if kind.is_none() && pool.is_some_and(|pool| pool > limit) {
             let mut per_type = HashMap::<String, usize>::new();
             let mut selected = Vec::new();
             let mut remaining = Vec::new();

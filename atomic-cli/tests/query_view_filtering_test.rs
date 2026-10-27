@@ -141,3 +141,128 @@ fn query_verbs_render_filtered_json_and_human_output_over_the_service() {
         "pub fn disk_only() {}\n"
     );
 }
+
+#[test]
+fn search_kind_with_tiny_pool_returns_the_matching_memory_over_the_service() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    drop(Repository::init(dir.path()).unwrap());
+    let created = run(
+        dir.path(),
+        home.path(),
+        &[
+            "memory",
+            "new",
+            "--kind",
+            "context",
+            "--text",
+            "Pool starvation regression.",
+        ],
+    );
+    assert!(
+        created.status.success(),
+        "{}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+    let created = String::from_utf8(created.stdout).unwrap();
+    let memory = created
+        .lines()
+        .find_map(|line| line.strip_prefix("Created memory: "))
+        .unwrap();
+    let repo = Repository::open(dir.path()).unwrap();
+    let wc = repo.require_working_copy_id().unwrap();
+    let memory_id = atomic_core::kg::iri::mint_memory(&repo.project_id().unwrap(), memory);
+    for index in 0..12 {
+        let path = format!("pool_{index}.rs");
+        std::fs::write(dir.path().join(&path), format!("// {memory}\n")).unwrap();
+        repo.add(wc, &path, TrackingOptions::default()).unwrap();
+    }
+    record(&repo, "higher scored file candidates");
+    drop(repo);
+    let class = atomic_core::kg::ontology::Class::Memory.iri();
+    let mut expected = None;
+    for pool in ["0", "1", "100"] {
+        let nodes = json(
+            dir.path(),
+            home.path(),
+            &[
+                "query", "search", memory, "--kind", class, "--pool", pool, "--limit", "1",
+                "--json",
+            ],
+        );
+        assert_eq!(nodes.as_array().unwrap().len(), 1, "pool={pool}");
+        assert_eq!(nodes[0]["id"], memory_id);
+        assert!(nodes[0]["types"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|ty| ty == class));
+        if let Some(expected) = &expected {
+            assert_eq!(&nodes, expected, "pool changed filtered result");
+        } else {
+            expected = Some(nodes);
+        }
+    }
+    let nodes = json(
+        dir.path(),
+        home.path(),
+        &[
+            "query", "search", memory, "--kind", class, "--pool", "0", "--limit", "0", "--json",
+        ],
+    );
+    assert_eq!(
+        nodes,
+        expected.unwrap(),
+        "CLI zero uses the service default, not literal zero"
+    );
+    let plain = json(
+        dir.path(),
+        home.path(),
+        &[
+            "query", "search", memory, "--pool", "1", "--limit", "1", "--json",
+        ],
+    );
+    assert_eq!(
+        plain[0]["types"][0],
+        atomic_core::kg::ontology::Class::File.iri()
+    );
+    let empty_kind = json(
+        dir.path(),
+        home.path(),
+        &[
+            "query", "search", memory, "--kind", "", "--pool", "1", "--limit", "1", "--json",
+        ],
+    );
+    assert_eq!(empty_kind, plain);
+    for kind in [
+        "Memory",
+        "https://atomic.dev/ns/workflow#memory",
+        "urn:unknown:class",
+    ] {
+        assert_eq!(
+            json(
+                dir.path(),
+                home.path(),
+                &["query", "search", memory, "--kind", kind, "--pool", "1", "--json",]
+            ),
+            serde_json::json!([])
+        );
+    }
+    let output = run(
+        dir.path(),
+        home.path(),
+        &[
+            "query", "search", memory, "--kind", class, "--pool", "1", "--limit", "1",
+        ],
+    );
+    assert!(output.status.success());
+    let output = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        output.contains(&memory_id) && output.contains("1 result(s)."),
+        "{output}"
+    );
+    assert!(!dir
+        .path()
+        .join(".atomic/content-index/manifest.json")
+        .exists());
+}

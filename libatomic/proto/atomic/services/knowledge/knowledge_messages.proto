@@ -44,7 +44,7 @@ message GetWorkflowSnapshotResponse {
 
 message QueryGraphRequest {
   RepositoryRef repository = 1;
-  uint32 limit = 2;             // default 10-20 per kind today
+  uint32 limit = 2;             // kg_search: 0 uses 10; other kinds use their defaults
   oneof query {
     ContentSearchQuery content_search = 3;   // `query code` (recorded view bytes)
     KgSearchQuery kg_search = 4;             // `query search`
@@ -80,10 +80,15 @@ message ContentSearchQuery {
 message KgSearchQuery {
   string query = 1;
   // `query search --kind` (add-only): keep only nodes asserting this absolute
-  // class IRI, applied over the candidate pool before the limit.
+  // class IRI. Exact, case-sensitive membership in any asserted type is applied
+  // AFTER view projection and BEFORE pool truncation or the result limit.
+  // Absent/empty means no filter; an unknown class matches nothing.
   optional string kind = 2;
-  // The candidate pool size (add-only): how many candidates to score
-  // before selecting the top results (the CLI's --pool, default 5000).
+  // Candidate retention budget (the CLI's --pool, default 5000), normalized
+  // to at least the effective result limit. All eligible candidates are scored.
+  // Without kind, a larger pool supports cross-type diversity. With kind,
+  // return the highest-ranked matching nodes without cross-type diversity;
+  // a small pool (including zero) cannot starve matching results.
   optional uint32 pool = 3;
 }
 message EntityQuery {

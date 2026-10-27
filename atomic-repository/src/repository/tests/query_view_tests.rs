@@ -279,8 +279,222 @@ fn invalid_dependency_closure_fails_closed_for_every_query() {
             .unwrap_err(),
         repo.query_callers_on_view("feature", "src/lib.rs#target")
             .unwrap_err(),
+        repo.vault_kg_search_on_view_with_kind(
+            "feature",
+            "sibling",
+            0,
+            Some(0),
+            Some("urn:unknown:class"),
+        )
+        .unwrap_err(),
     ];
     for error in errors {
         assert!(error.to_string().contains(&missing.to_base32()), "{error}");
     }
+}
+
+#[test]
+fn query_kind_filter_is_pool_independent_and_matches_every_asserted_type() {
+    let (temp, repo) = create_temp_repo();
+    let marker = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+    repo.vault_store(
+        &format!("memory/{marker}.md"),
+        atomic_core::pristine::VaultEntryType::Memory,
+        b":::memory\nPool regression.\n:::\n".to_vec(),
+        serde_json::json!({"id": marker, "kind": "context"}).to_string(),
+    )
+    .unwrap();
+    std::fs::create_dir_all(temp.path().join("src")).unwrap();
+    for index in 0..8 {
+        // Both filename and content match, so FTS/projected/content candidates
+        // must be deduplicated and must not displace an eligible Memory.
+        let path = format!("src/{marker}_{index}.rs");
+        std::fs::write(temp.path().join(&path), format!("// {marker}\n")).unwrap();
+        repo.add(&path, TrackingOptions::default()).unwrap();
+    }
+    record(&repo, "record pool files");
+    let project = repo.project_id().unwrap();
+    let memory_id = iri::mint_memory(&project, marker);
+    let mut txn = repo.pristine().write_txn().unwrap();
+    for index in 0..4 {
+        txn.upsert_kg_node(
+            &KgNode::new(
+                iri::mint_goal(&project, &format!("pool-{index}")),
+                Class::Goal,
+                marker,
+                "vault",
+            )
+            .with_type(Class::Memory),
+        )
+        .unwrap();
+    }
+    txn.commit().unwrap();
+    let exhaustive = repo
+        .vault_kg_search_on_view("dev", marker, usize::MAX, None)
+        .unwrap();
+    let expected_memories: Vec<_> = exhaustive
+        .iter()
+        .filter(|node| node.has_type(Class::Memory))
+        .cloned()
+        .collect();
+    assert_eq!(expected_memories.len(), 5);
+    assert!(expected_memories.iter().any(|node| node.id == memory_id));
+    assert!(expected_memories
+        .iter()
+        .any(|node| node.primary_type() != Class::Memory.iri()));
+
+    for limit in [0, 1, 3, 20] {
+        for pool in [None, Some(0), Some(1), Some(3), Some(100)] {
+            for kind in [
+                None,
+                Some(""),
+                Some(Class::Memory.iri()),
+                Some(Class::File.iri()),
+                Some("Memory"),
+                Some("https://atomic.dev/ns/workflow#memory"),
+                Some("urn:unknown:class"),
+            ] {
+                let actual = repo
+                    .vault_kg_search_on_view_with_kind("dev", marker, limit, pool, kind)
+                    .unwrap();
+                let expected: Vec<_> = if let Some(kind) = kind.filter(|kind| !kind.is_empty()) {
+                    exhaustive
+                        .iter()
+                        .filter(|node| node.types.iter().any(|ty| ty == kind))
+                        .take(limit)
+                        .cloned()
+                        .collect()
+                } else {
+                    repo.vault_kg_search_on_view("dev", marker, limit, pool)
+                        .unwrap()
+                };
+                assert_eq!(
+                    actual, expected,
+                    "limit={limit}, pool={pool:?}, kind={kind:?}"
+                );
+                let ids: std::collections::HashSet<_> =
+                    actual.iter().map(|node| &node.id).collect();
+                assert_eq!(ids.len(), actual.len(), "duplicate results: {actual:?}");
+            }
+        }
+    }
+    for (view, query) in [("dev", "no_matching_token"), ("missing", marker)] {
+        for limit in [0, 3] {
+            for kind in [Class::Memory.iri(), "urn:unknown:class"] {
+                let result =
+                    repo.vault_kg_search_on_view_with_kind(view, query, limit, Some(0), Some(kind));
+                if view == "missing" {
+                    assert!(result.is_err(), "unknown view must not short-circuit");
+                } else {
+                    assert!(result.unwrap().is_empty());
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn query_kind_filter_preserves_view_projection_before_type_matching() {
+    let (temp, mut repo, feature_hash) = fixture();
+    repo.create_draft_view("child-filtered", "feature").unwrap();
+    repo.create_view_with_identity("tip-filtered", ViewScope::Shared, None)
+        .unwrap();
+    let mut txn = repo.pristine().write_txn().unwrap();
+    let mut view = txn.get_view("tip-filtered").unwrap().unwrap();
+    let id = txn.get_internal(&feature_hash).unwrap().unwrap();
+    txn.put_change(&mut view, id, &feature_hash).unwrap();
+    txn.update_view(&view).unwrap();
+    txn.commit().unwrap();
+    let before = std::fs::read(temp.path().join("src/lib.rs")).unwrap();
+    for view in ["dev", "feature", "child-filtered", "tip-filtered"] {
+        for query in [
+            "sibling",
+            "SiblingSecret",
+            "HiddenSiblingAuthor",
+            "inherited",
+        ] {
+            let exhaustive = repo
+                .vault_kg_search_on_view(view, query, 100, None)
+                .unwrap();
+            for class in [Class::File, Class::Change, Class::Identity, Class::View] {
+                let expected: Vec<_> = exhaustive
+                    .iter()
+                    .filter(|node| node.has_type(class))
+                    .take(1)
+                    .cloned()
+                    .collect();
+                let actual = repo
+                    .vault_kg_search_on_view_with_kind(view, query, 1, Some(1), Some(class.iri()))
+                    .unwrap();
+                assert_eq!(
+                    actual, expected,
+                    "view={view}, query={query}, class={class:?}"
+                );
+            }
+        }
+    }
+    assert_eq!(
+        std::fs::read(temp.path().join("src/lib.rs")).unwrap(),
+        before
+    );
+    assert_eq!(
+        repo.desired_view_name(repo.working_copy()).unwrap(),
+        "feature"
+    );
+}
+
+#[test]
+fn query_no_kind_ranking_and_diversity_retain_their_golden_order() {
+    let (_temp, repo) = create_temp_repo();
+    repo.init_kg().unwrap();
+    let project = repo.project_id().unwrap();
+    let mut goals = Vec::new();
+    let mut memories = Vec::new();
+    let mut txn = repo.pristine().write_txn().unwrap();
+    for index in 0..4 {
+        let id = iri::mint_goal(&project, &format!("golden-{index}"));
+        txn.upsert_kg_node(&KgNode::new(&id, Class::Goal, "goldenmarker", "vault"))
+            .unwrap();
+        goals.push(id);
+    }
+    for index in 0..2 {
+        let id = iri::mint_memory(&project, &format!("golden-{index}"));
+        txn.upsert_kg_node(&KgNode::new(&id, Class::Memory, "goldenmarker", "vault"))
+            .unwrap();
+        memories.push(id);
+    }
+    txn.commit().unwrap();
+    for (pool, expected) in [
+        (None, goals.clone()),
+        (Some(0), goals.clone()),
+        (Some(4), goals.clone()),
+        (Some(100), [goals[..2].to_vec(), memories].concat()),
+    ] {
+        let plain = repo
+            .vault_kg_search_on_view("dev", "goldenmarker", 4, pool)
+            .unwrap();
+        assert_eq!(
+            plain.iter().map(|node| node.id.clone()).collect::<Vec<_>>(),
+            expected
+        );
+        assert_eq!(
+            repo.vault_kg_search("goldenmarker", 4, pool).unwrap(),
+            plain
+        );
+        for kind in [None, Some("")] {
+            assert_eq!(
+                repo.vault_kg_search_on_view_with_kind("dev", "goldenmarker", 4, pool, kind)
+                    .unwrap(),
+                plain,
+            );
+        }
+    }
+    assert_eq!(
+        repo.vault_kg_search_by_kind("goldenmarker", 4, Class::Goal)
+            .unwrap()
+            .iter()
+            .map(|node| node.id.clone())
+            .collect::<Vec<_>>(),
+        goals,
+    );
 }

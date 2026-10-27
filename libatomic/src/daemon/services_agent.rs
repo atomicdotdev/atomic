@@ -3555,31 +3555,18 @@ impl knowledge_service_server::KnowledgeService for KnowledgeImpl {
             QueryOneof::KgSearch(search) => {
                 let repo = handle.repository_readonly()?;
                 let view = query_view_name(&repo, requested_view.as_ref())?;
-                // The candidate pool the CLI's --pool names (default 5000)
-                // — the pool is what lets lower-scored kinds survive the
-                // diversity selection, so it rides the request.
-                let pool = search.pool.map(|pool| pool as usize).unwrap_or(5000);
-                let nodes = if let Some(kind_filter) =
-                    search.kind.clone().filter(|kind| !kind.is_empty())
-                {
-                    // The --kind form: search the full pool, keep the
-                    // kind's nodes, take the limit AFTER filtering — the
-                    // local post-filter order.
-                    let kind = kind_filter;
-                    repo.vault_kg_search_on_view(&view, &search.query, pool, Some(pool))
-                        .map_err(repository_error)?
-                        .into_iter()
-                        .filter(|node| node.types.contains(&kind))
-                        .take(limit)
-                        .map(|node| crate::daemon::services_query::kg_node_proto(node.clone()))
-                        .collect::<Vec<_>>()
-                } else {
-                    repo.vault_kg_search_on_view(&view, &search.query, limit, Some(pool))
-                        .map_err(repository_error)?
-                        .into_iter()
-                        .map(|node| crate::daemon::services_query::kg_node_proto(node.clone()))
-                        .collect()
-                };
+                let nodes = repo
+                    .vault_kg_search_on_view_with_kind(
+                        &view,
+                        &search.query,
+                        limit,
+                        Some(search.pool.map(|pool| pool as usize).unwrap_or(5000)),
+                        search.kind.as_deref(),
+                    )
+                    .map_err(repository_error)?
+                    .into_iter()
+                    .map(crate::daemon::services_query::kg_node_proto)
+                    .collect();
                 Ok::<_, Status>(QueryGraphResponse {
                     api_version: 1,
                     callers: Vec::new(),

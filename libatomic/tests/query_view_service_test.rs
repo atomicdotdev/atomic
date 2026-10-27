@@ -2,6 +2,8 @@
 //! LocalService and the daemon, including explicit non-materialized views.
 
 use atomic_core::change::ChangeHeader;
+use atomic_core::kg::{iri, ontology::Class};
+use atomic_core::pristine::{KgMutTxnT, KgTxnT, MutTxnT, VaultEntryType};
 use atomic_repository::{RecordOptions, Repository, TrackingOptions};
 use libatomic::{proto as pb, LocalService};
 use prost::Message;
@@ -85,6 +87,16 @@ async fn query(
     view: Option<pb::ViewRef>,
     query: pb::query_graph_request::Query,
 ) -> Result<pb::QueryGraphResponse, Box<tonic::Status>> {
+    query_with_limit(service, repository, view, query, 1).await
+}
+
+async fn query_with_limit(
+    service: &LocalService,
+    repository: &pb::RepositoryRef,
+    view: Option<pb::ViewRef>,
+    query: pb::query_graph_request::Query,
+    limit: u32,
+) -> Result<pb::QueryGraphResponse, Box<tonic::Status>> {
     let bytes = service
         .call(
             "/atomic.KnowledgeService/QueryGraph",
@@ -92,7 +104,7 @@ async fn query(
                 repository: Some(repository.clone()),
                 view,
                 query: Some(query),
-                limit: 1,
+                limit,
             }
             .encode_to_vec(),
         )
@@ -342,6 +354,272 @@ async fn tonic_transport_serves_the_same_filtered_contract() {
                 assert_eq!(feature.callers[0].name, "sibling_only");
             }
             _ => unreachable!(),
+        }
+    }
+    drop(client);
+    stop.send(()).unwrap();
+    server.await.unwrap();
+}
+
+async fn pool_fixture() -> (tempfile::TempDir, LocalService, pb::RepositoryRef, String) {
+    let (dir, service, repository) = fixture().await;
+    let repo = Repository::open(dir.path()).unwrap();
+    let wc = repo.require_working_copy_id().unwrap();
+    let memory = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+    repo.vault_store(
+        &format!("memory/{memory}.md"),
+        VaultEntryType::Memory,
+        b":::memory\nPool starvation regression.\n:::\n".to_vec(),
+        serde_json::json!({"id": memory, "kind": "context", "status": "active"}).to_string(),
+    )
+    .unwrap();
+    let memory_id = iri::mint_memory(&repo.project_id().unwrap(), memory);
+    for index in 0..12 {
+        let path = format!("src/pool_{index}.rs");
+        std::fs::write(dir.path().join(&path), format!("// {memory}\n")).unwrap();
+        repo.add(wc, &path, TrackingOptions::default()).unwrap();
+    }
+    record(&repo, "record higher-scored pool candidates");
+    drop(repo);
+    (dir, service, repository, memory_id)
+}
+
+#[tokio::test]
+async fn kind_filter_precedes_the_mixed_candidate_pool() {
+    let (_dir, service, repository, memory_id) = pool_fixture().await;
+    for pool in [100, 1, 0] {
+        let response = query(
+            &service,
+            &repository,
+            None,
+            pb::query_graph_request::Query::KgSearch(pb::KgSearchQuery {
+                query: "01ARZ3NDEKTSV4RRFFQ69G5FAV".into(),
+                kind: Some(Class::Memory.iri().into()),
+                pool: Some(pool),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.nodes.len(), 1, "pool={pool}: {response:?}");
+        assert_eq!(response.nodes[0].id, memory_id, "pool={pool}");
+        assert!(response.nodes[0]
+            .types
+            .iter()
+            .any(|ty| ty == Class::Memory.iri()));
+    }
+}
+
+#[tokio::test]
+async fn kind_rpc_preserves_nonprimary_types_zero_defaults_and_view_errors() {
+    let (dir, service, repository, memory_id) = pool_fixture().await;
+    let repo = Repository::open(dir.path()).unwrap();
+    let project = repo.project_id().unwrap();
+    let mut txn = repo.pristine().write_txn().unwrap();
+    let memory = txn
+        .get_kg_node(&memory_id)
+        .unwrap()
+        .unwrap()
+        .with_type(Class::Goal);
+    assert_ne!(memory.primary_type(), Class::Memory.iri());
+    txn.upsert_kg_node(&memory).unwrap();
+    let mut default_ids = Vec::new();
+    for index in 0..12 {
+        let id = iri::mint_memory(&project, &format!("default-{index:02}"));
+        txn.upsert_kg_node(&atomic_core::KgNode::new(
+            &id,
+            Class::Memory,
+            "defaultmarker",
+            "vault",
+        ))
+        .unwrap();
+        default_ids.push(id);
+    }
+    txn.commit().unwrap();
+    let before = std::fs::read(dir.path().join("src/lib.rs")).unwrap();
+    let graph_before = serde_json::to_value(repo.workflow_snapshot().unwrap()).unwrap();
+    let index_before = std::fs::read(dir.path().join(".atomic/content-index/manifest.json")).ok();
+    drop(repo);
+    for requested_view in [None, Some(view("dev")), Some(view("feature"))] {
+        for pool in [None, Some(0), Some(1), Some(100)] {
+            let result = query(
+                &service,
+                &repository,
+                requested_view.clone(),
+                pb::query_graph_request::Query::KgSearch(pb::KgSearchQuery {
+                    query: "01ARZ3NDEKTSV4RRFFQ69G5FAV".into(),
+                    kind: Some(Class::Memory.iri().into()),
+                    pool,
+                }),
+            )
+            .await
+            .unwrap();
+            assert_eq!(result.nodes.len(), 1, "pool={pool:?}");
+            assert_eq!(result.nodes[0].id, memory_id);
+            assert_eq!(result.nodes[0].types, memory.types);
+        }
+    }
+    for kind in [
+        None,
+        Some(""),
+        Some(Class::Memory.iri()),
+        Some("urn:unknown:class"),
+    ] {
+        let result = query_with_limit(
+            &service,
+            &repository,
+            None,
+            pb::query_graph_request::Query::KgSearch(pb::KgSearchQuery {
+                query: "defaultmarker".into(),
+                kind: kind.map(str::to_owned),
+                pool: Some(0),
+            }),
+            0,
+        )
+        .await
+        .unwrap();
+        let expected = if kind == Some("urn:unknown:class") {
+            vec![]
+        } else {
+            default_ids[..10].to_vec()
+        };
+        assert_eq!(
+            result
+                .nodes
+                .iter()
+                .map(|node| node.id.clone())
+                .collect::<Vec<_>>(),
+            expected
+        );
+    }
+    for term in ["sibling", "SiblingSecret"] {
+        let kind = pb::query_graph_request::Query::KgSearch(pb::KgSearchQuery {
+            query: term.into(),
+            kind: Some(Class::File.iri().into()),
+            pool: Some(1),
+        });
+        assert!(query(&service, &repository, None, kind.clone())
+            .await
+            .unwrap()
+            .nodes
+            .is_empty());
+        assert!(
+            !query(&service, &repository, Some(view("feature")), kind.clone())
+                .await
+                .unwrap()
+                .nodes
+                .is_empty()
+        );
+        assert!(
+            query(&service, &repository, Some(view("missing")), kind.clone())
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            query(
+                &service,
+                &repository,
+                Some(pb::ViewRef {
+                    name: Some("dev".into()),
+                    view_id: vec![1; 32]
+                }),
+                kind
+            )
+            .await
+            .unwrap_err()
+            .code(),
+            tonic::Code::InvalidArgument
+        );
+    }
+    assert_eq!(
+        std::fs::read(dir.path().join("src/lib.rs")).unwrap(),
+        before
+    );
+    assert_eq!(
+        std::fs::read(dir.path().join(".atomic/content-index/manifest.json")).ok(),
+        index_before
+    );
+    let repo = Repository::open_readonly(dir.path()).unwrap();
+    assert_eq!(
+        serde_json::to_value(repo.workflow_snapshot().unwrap()).unwrap(),
+        graph_before
+    );
+    assert_eq!(
+        repo.desired_view_name(repo.require_working_copy_id().unwrap())
+            .unwrap(),
+        "dev"
+    );
+}
+
+#[tokio::test]
+async fn tonic_kind_filter_is_applied_before_pool_and_result_limits() {
+    use libatomic::daemon::{services_agent::KnowledgeImpl, state::DaemonState};
+    use std::sync::Arc;
+
+    let (dir, local, local_repository, memory_id) = pool_fixture().await;
+    let repo = Repository::open(dir.path()).unwrap();
+    let mut txn = repo.pristine().write_txn().unwrap();
+    let memory = txn
+        .get_kg_node(&memory_id)
+        .unwrap()
+        .unwrap()
+        .with_type(Class::Goal);
+    txn.upsert_kg_node(&memory).unwrap();
+    txn.commit().unwrap();
+    drop(repo);
+    let state = Arc::new(DaemonState::new());
+    let repository = state
+        .register(dir.path().canonicalize().unwrap())
+        .repository_ref();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (stop, stopped) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(pb::knowledge_service_server::KnowledgeServiceServer::new(
+                KnowledgeImpl { state },
+            ))
+            .serve_with_incoming_shutdown(
+                tokio_stream::wrappers::TcpListenerStream::new(listener),
+                async {
+                    let _ = stopped.await;
+                },
+            )
+            .await
+            .unwrap();
+    });
+    let mut client =
+        pb::knowledge_service_client::KnowledgeServiceClient::connect(format!("http://{address}"))
+            .await
+            .unwrap();
+    for limit in [0, 1, 3] {
+        for pool in [None, Some(0), Some(1), Some(100)] {
+            let kind = pb::query_graph_request::Query::KgSearch(pb::KgSearchQuery {
+                query: "01ARZ3NDEKTSV4RRFFQ69G5FAV".into(),
+                kind: Some(Class::Memory.iri().into()),
+                pool,
+            });
+            let expected = query_with_limit(
+                &local,
+                &local_repository,
+                Some(view("feature")),
+                kind.clone(),
+                limit,
+            )
+            .await
+            .unwrap();
+            let actual = client
+                .query_graph(pb::QueryGraphRequest {
+                    repository: Some(repository.clone()),
+                    view: Some(view("feature")),
+                    query: Some(kind),
+                    limit,
+                })
+                .await
+                .unwrap()
+                .into_inner();
+            assert_eq!(actual, expected, "limit={limit}, pool={pool:?}");
+            assert_eq!(actual.nodes[0].id, memory_id);
+            assert_eq!(actual.nodes[0].types, memory.types);
         }
     }
     drop(client);

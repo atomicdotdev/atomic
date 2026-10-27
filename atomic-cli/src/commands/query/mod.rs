@@ -1159,23 +1159,21 @@ pub struct QueryNodes {
     /// Search query text (keyword search over node IDs, labels, and summaries).
     pub query: String,
 
-    /// Maximum results.
+    /// Maximum results (0 uses the service default of 10).
     #[arg(long, short = 'k', default_value = "10")]
     pub limit: usize,
 
     /// Filter by canonical class IRI (for example, <https://atomic.dev/ns/workflow#File>).
     ///
-    /// When set, only nodes asserting this type are returned.
-    /// Without this flag, all types are returned.
+    /// Matches any asserted type exactly and case-sensitively, before pool limits.
+    /// Omitted or empty: all types. An unknown class returns no results.
     #[arg(long, short = 't')]
     pub kind: Option<String>,
 
-    /// Candidate pool size.
+    /// Candidate retention budget (default: 5000; at least --limit).
     ///
-    /// How many candidates to score before selecting the top results.
-    /// A larger pool surfaces lower-scored node kinds (e.g. changes)
-    /// that would otherwise be crowded out by files with content matches.
-    /// Default: same as --limit.
+    /// Without --kind, a larger pool allows diversity across types. With --kind,
+    /// only matching nodes compete; a small pool cannot hide their top results.
     #[arg(long, short = 'p')]
     pub pool: Option<usize>,
 
@@ -1199,37 +1197,7 @@ impl Command for QueryNodes {
             .desired_view_name(working_copy)
             .map_err(CliError::Repository)?;
 
-        // When filtering by kind, we need enough candidates of that kind
-        // to survive the diversity selection.  Ask for a large pool so the
-        // heap retains many candidates, then post-filter to the target kind.
-        let (fetch_limit, pool) = if self.kind.is_some() {
-            let pool_val = self.pool.unwrap_or(5000);
-            // fetch_limit = pool so all pool candidates become results
-            (pool_val, Some(pool_val))
-        } else {
-            // Without a kind filter, request a generous candidate pool so the
-            // diversity-aware selection in `vault_kg_search` engages. Otherwise
-            // (pool == limit) it falls back to plain top-N by score, and once a
-            // content index exists, high-scoring `file`/`module` nodes crowd
-            // out lower-scored vault nodes (intents, todos, sessions,
-            // memories), so an enriched repo would only ever return files.
-            (self.limit, Some(self.pool.unwrap_or(5000)))
-        };
-
-        let all_nodes = repo
-            .vault_kg_search_on_view(&view, &self.query, fetch_limit, pool)
-            .map_err(CliError::Repository)?;
-
-        let nodes: Vec<_> = if let Some(ref kind_filter) = self.kind {
-            let k = kind_filter.to_owned();
-            all_nodes
-                .into_iter()
-                .filter(|n| n.types.contains(&k))
-                .take(self.limit)
-                .collect()
-        } else {
-            all_nodes.into_iter().take(self.limit).collect()
-        };
+        let nodes = self.search_on_view(&repo, &view)?;
 
         if self.json {
             println!("{}", serde_json::to_string_pretty(&nodes).unwrap());
@@ -1254,6 +1222,88 @@ impl Command for QueryNodes {
         }
 
         Ok(())
+    }
+}
+
+impl QueryNodes {
+    fn search_on_view(&self, repo: &Repository, view: &str) -> CliResult<Vec<KgNode>> {
+        repo.vault_kg_search_on_view_with_kind(
+            view,
+            &self.query,
+            self.limit,
+            Some(self.pool.unwrap_or(5000)),
+            self.kind.as_deref(),
+        )
+        .map_err(CliError::Repository)
+    }
+}
+
+#[cfg(test)]
+mod search_tests {
+    use super::*;
+    use atomic_core::kg::iri;
+    use atomic_core::pristine::VaultEntryType;
+
+    #[test]
+    fn direct_search_helper_filters_kind_before_pool_limits() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        let memory = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+        repo.vault_store(
+            &format!("memory/{memory}.md"),
+            VaultEntryType::Memory,
+            b":::memory\nFallback regression.\n:::\n".to_vec(),
+            serde_json::json!({"id": memory, "kind": "context"}).to_string(),
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("pool.rs"), format!("// {memory}\n")).unwrap();
+        let wc = repo.require_working_copy_id().unwrap();
+        repo.add(wc, "pool.rs", Default::default()).unwrap();
+        repo.record(
+            wc,
+            atomic_core::change::ChangeHeader::new("record fallback fixture"),
+            atomic_repository::RecordOptions::new()
+                .with_all(true)
+                .save_to_store(true)
+                .apply_after_record(true),
+        )
+        .unwrap();
+        let memory_id = iri::mint_memory(&repo.project_id().unwrap(), memory);
+        for pool in [0, 1, 100] {
+            let args = QueryNodes::try_parse_from([
+                "search",
+                memory,
+                "--kind",
+                Class::Memory.iri(),
+                "--pool",
+                &pool.to_string(),
+                "--limit",
+                "1",
+            ])
+            .unwrap();
+            let nodes = args.search_on_view(&repo, "dev").unwrap();
+            assert_eq!(nodes.len(), 1, "pool={pool}");
+            assert_eq!(nodes[0].id, memory_id);
+            let args = QueryNodes { limit: 0, ..args };
+            assert!(args.search_on_view(&repo, "dev").unwrap().is_empty());
+        }
+        for kind in [None, Some(String::new()), Some("urn:unknown:class".into())] {
+            let args = QueryNodes {
+                query: memory.into(),
+                limit: 1,
+                pool: Some(1),
+                kind: kind.clone(),
+                json: true,
+            };
+            let nodes = args.search_on_view(&repo, "dev").unwrap();
+            if kind.as_deref() == Some("urn:unknown:class") {
+                assert!(nodes.is_empty());
+            } else {
+                assert_eq!(nodes.len(), 1);
+                assert!(nodes[0].has_type(Class::File));
+            }
+            assert!(args.search_on_view(&repo, "missing").is_err());
+        }
     }
 }
 

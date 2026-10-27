@@ -1192,9 +1192,8 @@ pub fn memory_list(args: &super::memory::list::MemoryList) -> CliResult<bool> {
 /// `atomic vault query search` over QueryGraph (KgSearch) — every form:
 /// the wire's KGNode now carries the full domain fields (source,
 /// metadata), so the JSON serializes the same shape the local body
-/// emits; `--kind` rides the request (the handler filters the candidate
-/// pool server-side, taking the limit after the filter — the local
-/// post-filter order) and `--pool` names the candidate pool. The plain
+/// emits; `--kind` rides the request (the repository filters projected nodes
+/// before ranking/pool limits) and `--pool` names the retention budget. The plain
 /// render reads the same kind/id/summary columns.
 pub fn query_search(args: &super::query::QueryNodes) -> CliResult<bool> {
     let Some(session) = Service::open()? else {

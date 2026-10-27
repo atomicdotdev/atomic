@@ -381,6 +381,17 @@ select a view explicitly; omitting it uses the working copy's registered desired
 view. Other query verbs retain their existing scope semantics. The separate
 working-copy content index is still available to its existing consumers.
 
+For `query search`, `--kind` matches an exact, case-sensitive absolute class IRI
+against **any asserted type**, before candidate-pool truncation. An omitted or
+empty kind means no filter; an unknown class matches nothing. `--pool` defaults
+to 5000 and is a retention budget, normalized to at least the result limit—not a
+cap on which eligible candidates are examined. Without a kind filter, a larger
+pool enables cross-type diversity. With a kind filter, results are the highest-
+ranked matching nodes without cross-type diversity, so even `--pool 1` cannot hide
+their top result. CLI/service search defaults to 10 results; a service request
+limit of zero (including CLI `--limit 0`) uses that default. Direct repository
+search APIs instead interpret a zero limit literally and return no nodes.
+
 **SHACL validation** runs locally in the CLI using PurRDF. Builtin profiles and
 enterprise-authored `.atomic/shapes/*.ttl` files use the same engine:
 
