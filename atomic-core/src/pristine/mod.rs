@@ -154,7 +154,7 @@ mod attribute;
 mod bindings;
 mod capability;
 mod error;
-mod inode_graph;
+pub(crate) mod inode_graph;
 pub mod merge;
 mod path_claim;
 mod ref_mapping;

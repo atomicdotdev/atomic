@@ -162,6 +162,34 @@ impl<'txn, 'a> CachedWriteGraphTxn<'txn, 'a> {
 // …) work unchanged against the cached writer, and every read observes edges
 // written earlier in the same batch.
 
+/// Inode-scoped vertex lookups served from the cached INODE_GRAPH handle.
+///
+/// A zero-length vertex (an empty file, or a file truncated to nothing)
+/// shares its position with the end of the content serialized just before
+/// it and the start of what follows, so the global `find_block_end` /
+/// `find_block` can hand back a neighbouring file's vertex. INODE_GRAPH
+/// attributes every vertex to its file; these answer "which vertex of THIS
+/// inode sits at `pos`" and return `None` when the inode has no row there.
+impl<'txn, 'a> CachedWriteGraphTxn<'txn, 'a> {
+    /// `probe::find_block_end_in_inode` (`pristine::inode_graph`) over the cached handle.
+    pub fn find_block_end_in_inode(
+        &self,
+        inode: Inode,
+        pos: Position<NodeId>,
+    ) -> PristineResult<Option<GraphNode<NodeId>>> {
+        crate::pristine::inode_graph::probe::find_block_end_in_inode(&self.inode_graph, inode, pos)
+    }
+
+    /// `probe::find_block_in_inode` (`pristine::inode_graph`) over the cached handle.
+    pub fn find_block_in_inode(
+        &self,
+        inode: Inode,
+        pos: Position<NodeId>,
+    ) -> PristineResult<Option<GraphNode<NodeId>>> {
+        crate::pristine::inode_graph::probe::find_block_in_inode(&self.inode_graph, inode, pos)
+    }
+}
+
 impl<'txn, 'a> GraphTxnT for CachedWriteGraphTxn<'txn, 'a> {
     type Adj = AdjIterator;
 

@@ -1431,7 +1431,7 @@ fn append_suffix(path: &Path, suffix: &str) -> PathBuf {
     PathBuf::from(value)
 }
 
-fn resolve_common_dir(worktree_git_dir: &Path) -> Result<PathBuf, ObservationError> {
+pub(super) fn resolve_common_dir(worktree_git_dir: &Path) -> Result<PathBuf, ObservationError> {
     let path = worktree_git_dir.join("commondir");
     let bytes = match fs::read(&path) {
         Ok(bytes) => bytes,

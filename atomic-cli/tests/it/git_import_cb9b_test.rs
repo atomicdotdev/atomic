@@ -2163,11 +2163,14 @@ fn synthesis_failpoints_fail_closed_and_publish_nothing() {
         // The second commit must fail at the injected stage.
         fs::write(root.join("f.txt"), b"base\nedit\n").unwrap();
         git_commit(&root, "edit");
+        // The whole-tree semantic replay is forced: an incremental
+        // single-parent commit otherwise replays only the paths it touches,
+        // and the untouched-path probes below corrupt inherited state.
         let failed = atomic_env(
             &root,
             &home,
             &["git", "import", "--incremental", "--no-vault"],
-            &[(fail_var, "1")],
+            &[(fail_var, "1"), ("ATOMIC_FULL_SEMANTIC_VERIFY", "1")],
         );
         assert!(
             !failed.status.success(),

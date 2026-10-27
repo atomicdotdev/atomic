@@ -99,11 +99,18 @@ fn check_case(states: Vec<Vec<(&str, &[u8], i32)>>, merge: bool) {
     import(root.path(), &git, *ids.last().unwrap(), config.path());
     let repo = atomic_repository::Repository::open(root.path()).unwrap();
     for (path, bytes, _) in states.last().unwrap() {
-        let path = atomic_repository::escape_repo_path(path.as_bytes());
+        // The repository tracks an imported path under its on-disk spelling
+        // (as native tracking does); a name with a literal `%` keeps its
+        // escaped identity, so look the path up under either spelling.
+        let escaped = atomic_repository::escape_repo_path(path.as_bytes());
+        let content = repo
+            .get_file_content(path)
+            .unwrap()
+            .or_else(|| repo.get_file_content(&escaped).unwrap());
         assert_eq!(
-            repo.get_file_content(&path).unwrap().unwrap(),
-            *bytes,
-            "path={path}"
+            content.as_deref(),
+            Some(*bytes),
+            "path={path} (escaped {escaped})"
         );
     }
 }
@@ -116,6 +123,64 @@ fn audit_side_parent_space() {
 fn audit_side_parent_percent_escape() {
     side_only("a%41.txt");
 }
+
+#[test]
+fn audit_percent_path_working_copy_is_clean() {
+    let root = tempfile::tempdir().unwrap();
+    let config = tempfile::tempdir().unwrap();
+    let git = GitRepository::init(root.path()).unwrap();
+    let tip = commit(
+        &git,
+        &[
+            ("100%.txt", b"percent\n", 0o100644),
+            ("a%41.txt", b"literal escape\n", 0o100644),
+            ("aA.txt", b"decoded lookalike\n", 0o100644),
+            ("dir%/café space.txt", b"nested percent\n", 0o100644),
+            ("link%.txt", b"100%.txt", 0o120000),
+        ],
+        &[],
+    );
+    import(root.path(), &git, tip, config.path());
+    let repo = atomic_repository::Repository::open(root.path()).unwrap();
+    let wc = repo.require_working_copy_id().unwrap();
+    let status = repo.status(wc, Default::default()).unwrap();
+    assert!(status.is_clean(), "unexpected status: {status:#?}");
+
+    std::fs::write(root.path().join("a%41.txt"), b"edited literal escape\n").unwrap();
+    let status = repo.status(wc, Default::default()).unwrap();
+    assert_eq!(status.entries().len(), 1, "{status:#?}");
+    assert_eq!(status.entries()[0].path(), Path::new("a%2541.txt"));
+    assert_eq!(
+        status.entries()[0].status(),
+        atomic_repository::FileStatus::Modified
+    );
+    let filtered = repo
+        .status(
+            wc,
+            atomic_repository::StatusOptions {
+                path_filters: vec!["a%41.txt".into()],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(filtered.entries().len(), 1, "{filtered:#?}");
+    assert_eq!(filtered.entries()[0].path(), Path::new("a%2541.txt"));
+    assert_eq!(
+        filtered.entries()[0].status(),
+        atomic_repository::FileStatus::Modified
+    );
+
+    std::fs::write(root.path().join("a%41.txt"), b"literal escape\n").unwrap();
+    std::fs::remove_file(root.path().join("100%.txt")).unwrap();
+    let status = repo.status(wc, Default::default()).unwrap();
+    assert_eq!(status.entries().len(), 1, "{status:#?}");
+    assert_eq!(status.entries()[0].path(), Path::new("100%25.txt"));
+    assert_eq!(
+        status.entries()[0].status(),
+        atomic_repository::FileStatus::Deleted
+    );
+}
+
 #[test]
 fn audit_side_parent_unicode() {
     side_only("中文.txt");

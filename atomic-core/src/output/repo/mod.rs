@@ -122,7 +122,7 @@ pub use file::{
     output_file, output_file_to_buffer, output_file_to_buffer_with_options, FileOutputError,
     FileOutputOptions, FileOutputResult,
 };
-pub use names::live_inode_names;
+pub use names::{live_inode_names, live_inode_names_with_claims};
 pub use options::OutputOptions;
 pub use outcome::{FileWritten, OutputOutcome};
 pub use repository::{

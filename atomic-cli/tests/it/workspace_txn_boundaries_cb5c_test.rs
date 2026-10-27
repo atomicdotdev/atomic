@@ -347,7 +347,9 @@ fn every_git_sequence_marker_is_informative_under_observe_and_refused_for_mutati
         );
 
         // Mutation: an ordinary working-copy boundary must refuse typed.
-        // AUTO_MERGE is ADVISORY (mirrors the repository observer: it is a
+        // AUTO_MERGE and REBASE_HEAD are ADVISORY (mirrors the repository
+        // observer: a completed interactive rebase leaves REBASE_HEAD behind,
+        // and AUTO_MERGE is a
         // derived merge-ort ref removed on completion; a stopped merge also
         // carries MERGE_HEAD), so the boundary does not classify it as an
         // active Git operation — the record then behaves ordinarily (here:
@@ -367,8 +369,8 @@ fn every_git_sequence_marker_is_informative_under_observe_and_refused_for_mutati
         let typed_refusal = report.contains("Unsafe operation")
             || report.contains("workspace reconciliation required")
             || report.contains("Unsafe operation: record");
-        let advisory_clean_refusal =
-            *marker == "AUTO_MERGE" && report.contains("Nothing to record");
+        let advisory_clean_refusal = (*marker == "AUTO_MERGE" || *marker == "REBASE_HEAD")
+            && report.contains("Nothing to record");
         assert!(
             typed_refusal || advisory_clean_refusal,
             "record under marker {marker} did not produce a typed refusal:\n{report}"

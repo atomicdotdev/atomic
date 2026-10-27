@@ -1,6 +1,8 @@
 //! Advisory Git hook integration for the colocated Atomic shim.
 //!
-//! Atomic installs only an explicitly owned `post-checkout` dispatcher. The
+//! Atomic installs only explicitly owned dispatchers (the `post-checkout`
+//! dispatcher plus the stdin-reading evidence and pre-push dispatchers; see
+//! `hook_dispatchers` for the table and their removal). The `post-checkout`
 //! dispatcher appends immutable local evidence and schedules a read-only
 //! observation after Git exits; it never imports, reconciles, materializes, or
 //! moves refs. Unmanaged hook systems and custom `core.hooksPath` values are
@@ -44,9 +46,9 @@ pub struct Hooks {
 
 #[derive(Debug, Subcommand)]
 pub enum HookCommands {
-    /// Enable the advisory shim `post-checkout` dispatcher.
+    /// Install or refresh the advisory shim dispatchers.
     Install,
-    /// Remove an Atomic-owned shim dispatcher.
+    /// Remove every Atomic-owned shim dispatcher (foreign hooks are kept).
     Uninstall,
     /// Show advisory shim hook status.
     Status,
@@ -57,16 +59,16 @@ impl Command for Hooks {
         let root = find_repository_root()?;
         match &self.command {
             HookCommands::Install => enable_shim(&root, false),
-            HookCommands::Uninstall => uninstall_shim(&root),
-            HookCommands::Status => show_status(&root),
+            HookCommands::Uninstall => super::hook_dispatchers::uninstall_shim(&root),
+            HookCommands::Status => super::hook_dispatchers::show_status(&root),
         }
     }
 }
 
 #[derive(Debug)]
-struct GitHookContext {
-    common_dir: PathBuf,
-    custom_hooks_path: Option<PathBuf>,
+pub(super) struct GitHookContext {
+    pub(super) common_dir: PathBuf,
+    pub(super) custom_hooks_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -258,7 +260,7 @@ pub(crate) fn mirror_ignores_with_consent(root: &Path) -> CliResult<()> {
     Ok(())
 }
 
-fn git_hook_context(root: &Path) -> CliResult<GitHookContext> {
+pub(super) fn git_hook_context(root: &Path) -> CliResult<GitHookContext> {
     let common_dir = match observe_git(root)
         .map_err(|error| git_error(format!("cannot resolve Git administrative paths: {error}")))?
     {
@@ -368,7 +370,7 @@ fn shell_quote(path: &Path) -> io::Result<String> {
     Ok(format!("'{}'", value.replace('\'', "'\\''")))
 }
 
-fn print_unmanaged_instructions(reason: &str, binary: &Path) -> CliResult<()> {
+pub(super) fn print_unmanaged_instructions(reason: &str, binary: &Path) -> CliResult<()> {
     let command = integration_command(binary).map_err(|error| {
         git_error(format!(
             "cannot format hook integration instructions: {error}"
@@ -407,12 +409,12 @@ fn install_or_refresh_dispatcher(path: &Path, script: &str) -> io::Result<Dispat
     }
 }
 
-fn is_owned_dispatcher(content: &[u8]) -> bool {
+pub(super) fn is_owned_dispatcher(content: &[u8]) -> bool {
     let expected = format!("#!/bin/sh\n{DISPATCHER_MARKER}\n");
     content.starts_with(expected.as_bytes())
 }
 
-fn is_legacy_atomic_only(content: &[u8]) -> bool {
+pub(super) fn is_legacy_atomic_only(content: &[u8]) -> bool {
     let Ok(content) = std::str::from_utf8(content) else {
         return false;
     };
@@ -524,91 +526,6 @@ fn set_executable(path: &Path) -> io::Result<()> {
 
 #[cfg(not(unix))]
 fn set_executable(_path: &Path) -> io::Result<()> {
-    Ok(())
-}
-
-fn uninstall_shim(root: &Path) -> CliResult<()> {
-    let root = canonical_root(root)?;
-    let binary = std::env::current_exe()
-        .map_err(|error| git_error(format!("cannot resolve the Atomic binary path: {error}")))?;
-    let context = git_hook_context(&root)?;
-    if let Some(custom_hooks_path) = context.custom_hooks_path {
-        print_unmanaged_instructions(
-            &format!(
-                "core.hooksPath is configured as '{}'; Atomic did not modify that hook system",
-                custom_hooks_path.display()
-            ),
-            &binary,
-        )?;
-        return Ok(());
-    }
-
-    let path = context.common_dir.join("hooks/post-checkout");
-    let metadata = match fs::symlink_metadata(&path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == ErrorKind::NotFound => {
-            print_info("No Atomic advisory post-checkout dispatcher is installed.");
-            return Ok(());
-        }
-        Err(error) => {
-            return Err(git_error(format!(
-                "cannot inspect hook '{}': {error}",
-                path.display()
-            )))
-        }
-    };
-
-    if metadata.file_type().is_file() {
-        let content = fs::read(&path).map_err(|error| {
-            git_error(format!("cannot read hook '{}': {error}", path.display()))
-        })?;
-        if is_owned_dispatcher(&content) || is_legacy_atomic_only(&content) {
-            fs::remove_file(&path).map_err(|error| {
-                git_error(format!("cannot remove hook '{}': {error}", path.display()))
-            })?;
-            print_info("Removed the Atomic advisory post-checkout dispatcher.");
-            return Ok(());
-        }
-    }
-
-    print_unmanaged_instructions(
-        &format!(
-            "post-checkout hook '{}' is not Atomic-owned and was left untouched",
-            path.display()
-        ),
-        &binary,
-    )
-}
-
-fn show_status(root: &Path) -> CliResult<()> {
-    let root = canonical_root(root)?;
-    let context = git_hook_context(&root)?;
-    if let Some(custom_hooks_path) = context.custom_hooks_path {
-        print_info(&format!(
-            "post-checkout: externally managed through core.hooksPath '{}'",
-            custom_hooks_path.display()
-        ));
-        return Ok(());
-    }
-
-    let path = context.common_dir.join("hooks/post-checkout");
-    let status = match fs::symlink_metadata(&path) {
-        Err(error) if error.kind() == ErrorKind::NotFound => "not installed",
-        Err(error) => {
-            return Err(git_error(format!(
-                "cannot inspect hook '{}': {error}",
-                path.display()
-            )))
-        }
-        Ok(metadata) if metadata.file_type().is_symlink() => "unmanaged symlink",
-        Ok(metadata) if !metadata.file_type().is_file() => "unmanaged non-file",
-        Ok(_) => match fs::read(&path) {
-            Ok(content) if is_owned_dispatcher(&content) => "Atomic-owned dispatcher installed",
-            Ok(_) => "unmanaged hook installed",
-            Err(_) => "unmanaged unreadable hook",
-        },
-    };
-    print_info(&format!("post-checkout: {status} ({})", path.display()));
     Ok(())
 }
 
@@ -843,6 +760,33 @@ pub(crate) fn run_pre_push_verification_with_input(root: &Path, input: &str) -> 
                 .map(|byte| format!("{byte:02x}"))
                 .collect::<String>();
             for (local_ref, oid) in &proposed_content_refs {
+                // Each proposed ref binds to the view it publishes: the
+                // checked-out branch to the current view's verified
+                // projection, any other branch (`git push origin other`,
+                // `git push --all`) to its own view's projection. A
+                // reconciled branch is never refused for not being the
+                // current one; a branch no view has interpreted refuses with
+                // the step that makes it publishable.
+                let branch = local_ref
+                    .strip_prefix("refs/heads/")
+                    .unwrap_or(local_ref.as_str());
+                // A branch without a view of its own (`master` publishing
+                // the `main` view, a renamed branch) still binds to the
+                // current view's verified tree exactly as before.
+                let (view, expected_tree) = if branch != current_view
+                    && repo.view_exists(branch).map_err(CliError::Repository)?
+                {
+                    let project =
+                        repo.project_tree(branch, &policy)
+                            .map_err(|error| CliError::GitError {
+                                message: format!(
+                                    "pre-push refused: cannot project view '{branch}': {error}"
+                                ),
+                            })?;
+                    (branch.to_string(), project.git.root.clone())
+                } else {
+                    (current_view.clone(), verified.git_tree.clone())
+                };
                 let binds = git2::Oid::from_str(oid)
                     .ok()
                     .and_then(|commit_oid| git.find_commit(commit_oid).ok())
@@ -850,12 +794,12 @@ pub(crate) fn run_pre_push_verification_with_input(root: &Path, input: &str) -> 
                         super::parallel::import_expected_tree_oid(&git, commit.tree_id(), &policy)
                             .ok()
                     })
-                    .map(|expected| expected.as_bytes() == verified.git_tree.as_bytes())
+                    .map(|expected| expected.as_bytes() == expected_tree.as_bytes())
                     .unwrap_or(false);
                 if !binds {
                     return Err(CliError::GitError {
                         message: format!(
-                            "pre-push refused: the proposed OID {oid} does not carry the verified manifest state of view '{current_view}' under the active conversion policy; the local gate's verdict covers only the exact proposed objects, and this push proposes objects it did not verify (RFC §10.4 exact-OID binding)"
+                            "pre-push refused: the proposed OID {oid} does not carry the verified manifest state of view '{view}' under the active conversion policy; the local gate's verdict covers only the exact proposed objects, and this push proposes objects it did not verify (RFC §10.4 exact-OID binding)"
                         ),
                     });
                 }
@@ -1839,7 +1783,7 @@ fn warn_if_view_mismatch(root: &Path) {
     }
 }
 
-fn canonical_root(root: &Path) -> CliResult<PathBuf> {
+pub(super) fn canonical_root(root: &Path) -> CliResult<PathBuf> {
     fs::canonicalize(root).map_err(|error| {
         git_error(format!(
             "cannot resolve repository root '{}': {error}",
@@ -1848,7 +1792,7 @@ fn canonical_root(root: &Path) -> CliResult<PathBuf> {
     })
 }
 
-fn git_error(message: impl Into<String>) -> CliError {
+pub(super) fn git_error(message: impl Into<String>) -> CliError {
     CliError::GitError {
         message: message.into(),
     }
@@ -2339,7 +2283,7 @@ mod pre_push_tests {
 
         // Publication verification needs a Git repository (shadow checks).
         git2::Repository::init(&root).unwrap();
-        let result = run_pre_push_verification(&root);
+        let result = run_pre_push_verification_with_input(&root, "");
         // Either the full publication verification passes (empty clean
         // repos may still refuse on missing Git state) or the refusal is a
         // Git/publication error — the provenance gate must NOT be the

@@ -137,6 +137,10 @@ pub fn retrieve_graph<T: GraphTxnT>(
     // Reuse only fully explored subgraphs with no live successor at all;
     // positive walks retain their owner-specific ordering and attachment.
     let mut empty_dead_subgraphs = std::collections::HashSet::new();
+    // Bypass attachments declined inline because an alternate alive parent
+    // did not reach the owner in the alive graph built SO FAR; re-checked
+    // against the complete graph after the traversal (see `DeferredBypass`).
+    let mut deferred_bypasses: Vec<DeferredBypass> = Vec::new();
 
     // Add dummy span at index 0
     result.graph.push_vertex(AliveVertex::DUMMY);
@@ -264,6 +268,7 @@ pub fn retrieve_graph<T: GraphTxnT>(
                         &mut dep_memo,
                         &mut liveness_dead_seen,
                         &mut empty_dead_subgraphs,
+                        &mut deferred_bypasses,
                         &mut result,
                     )?;
                     // Collect bypass children; placement decided after
@@ -314,6 +319,7 @@ pub fn retrieve_graph<T: GraphTxnT>(
                             &mut dep_memo,
                             &mut liveness_dead_seen,
                             &mut empty_dead_subgraphs,
+                            &mut deferred_bypasses,
                             &mut result,
                         )?;
                         for succ_vid in successors {
@@ -342,6 +348,7 @@ pub fn retrieve_graph<T: GraphTxnT>(
                         &mut dep_memo,
                         &mut liveness_dead_seen,
                         &mut empty_dead_subgraphs,
+                        &mut deferred_bypasses,
                         &mut result,
                     )?;
                     for succ_vid in successors {
@@ -410,6 +417,16 @@ pub fn retrieve_graph<T: GraphTxnT>(
     if options.stop_at_first_content {
         return Ok(result);
     }
+
+    // Settle bypass attachments the dead-walk declined on a partial graph.
+    attach_deferred_bypasses(
+        txn,
+        &options,
+        &mut result.graph,
+        &cache,
+        &mut chain_memo,
+        deferred_bypasses,
+    )?;
 
     // Adjacent independent replacements leave each new span anchored to
     // deleted old context. For old A -> B, replacing A with X and B with Y
@@ -539,6 +556,131 @@ fn memo_vertex_alive<T: GraphTxnT>(
     Ok(alive)
 }
 
+/// A live successor found behind a dead chain whose attachment under the
+/// owner was declined inline because an alternate alive parent outside the
+/// dead chain did not reach the owner in the alive graph built so far.
+///
+/// The inline answer depends on DFS order: the owner may have been pushed
+/// through a dead chain before the chain that leads to it from the
+/// alternate was walked. The record is settled against the complete alive
+/// graph by [`attach_deferred_bypasses`].
+struct DeferredBypass {
+    /// The alive vertex whose dead-walk found the successor.
+    owner: GraphNode<NodeId>,
+    /// The live successor behind the dead chain.
+    successor: GraphNode<NodeId>,
+    /// Alive parents of `successor` outside the dead chain that did not
+    /// reach `owner` when the walk ran.
+    alternates: Vec<GraphNode<NodeId>>,
+}
+
+/// Settle every [`DeferredBypass`] against the complete alive graph.
+///
+/// An alternate that reaches the owner is an ancestor on the same linear
+/// chain (its edge to the successor is the stale pre-insertion edge the
+/// additive model keeps), and one that never entered the alive graph is not
+/// visible at all; neither orders the successor. When no alternate remains,
+/// the successor is attached under the owner with the dead-walk's own
+/// shadowing rule ([`attach_bypass_child`]). Attachments can unlock further
+/// records (chained stale edges), so the pass repeats until it settles.
+fn attach_deferred_bypasses<T: GraphTxnT>(
+    txn: &T,
+    options: &RetrieveOptions,
+    graph: &mut AliveGraph,
+    cache: &std::collections::HashMap<GraphNode<NodeId>, VertexId>,
+    chain_memo: &mut std::collections::HashMap<(GraphNode<NodeId>, GraphNode<NodeId>), bool>,
+    deferred: Vec<DeferredBypass>,
+) -> Result<(), PristineError> {
+    let mut pending = deferred;
+    loop {
+        let mut attached_any = false;
+        let mut still_pending = Vec::with_capacity(pending.len());
+        for item in pending {
+            let (Some(&owner_vid), Some(&successor_vid)) =
+                (cache.get(&item.owner), cache.get(&item.successor))
+            else {
+                continue;
+            };
+            let blocked = item.alternates.iter().any(|alternate| {
+                cache
+                    .get(alternate)
+                    .is_some_and(|&alt_vid| !alive_graph_reaches(graph, alt_vid, owner_vid))
+            });
+            if blocked {
+                still_pending.push(item);
+                continue;
+            }
+            if attach_bypass_child(
+                txn,
+                options,
+                graph,
+                chain_memo,
+                owner_vid,
+                item.successor,
+                successor_vid,
+            )? {
+                attached_any = true;
+            }
+        }
+        if !attached_any || still_pending.is_empty() {
+            break;
+        }
+        pending = still_pending;
+    }
+    Ok(())
+}
+
+/// Attach `successor` under `owner` exactly as the inline dead-walk would
+/// have: a successor an existing child already reaches is not attached (it
+/// is ordered behind that child), and existing children the successor
+/// reaches are replaced by it (they are ordered behind the successor).
+/// Attaching both would fork the owner into two paths that rejoin, which
+/// fork detection misreads as a conflict. Returns whether the graph changed.
+fn attach_bypass_child<T: GraphTxnT>(
+    txn: &T,
+    options: &RetrieveOptions,
+    graph: &mut AliveGraph,
+    chain_memo: &mut std::collections::HashMap<(GraphNode<NodeId>, GraphNode<NodeId>), bool>,
+    owner_vid: VertexId,
+    successor: GraphNode<NodeId>,
+    successor_vid: VertexId,
+) -> Result<bool, PristineError> {
+    let existing: Vec<(VertexId, GraphNode<NodeId>)> = graph
+        .children(owner_vid)
+        .map(|(_, child)| *child)
+        .filter(|child| !child.is_dummy())
+        .map(|child| (child, graph.get_vertex(child).node))
+        .collect();
+    if existing.iter().any(|(child, _)| *child == successor_vid) {
+        return Ok(false);
+    }
+    for (_, node) in &existing {
+        if memo_visible_chain_reaches(txn, options, *node, successor, chain_memo)? {
+            return Ok(false);
+        }
+    }
+    let mut shadowed = Vec::new();
+    for (child, node) in &existing {
+        if memo_visible_chain_reaches(txn, options, successor, *node, chain_memo)? {
+            shadowed.push(*child);
+        }
+    }
+    match shadowed.split_first() {
+        Some((first, rest)) => {
+            graph.replace_child(owner_vid, *first, successor_vid);
+            for child in rest {
+                graph.replace_child(owner_vid, *child, VertexId::DUMMY);
+            }
+        }
+        None => {
+            if let Some(owner) = graph.get_vertex_mut(owner_vid) {
+                owner.extra.push((None, successor_vid));
+            }
+        }
+    }
+    Ok(true)
+}
+
 #[allow(clippy::too_many_arguments)] // memoised traversal; each param is a distinct cache
 fn walk_through_dead<T: GraphTxnT>(
     txn: &T,
@@ -552,6 +694,7 @@ fn walk_through_dead<T: GraphTxnT>(
     dep_memo: &mut std::collections::HashMap<(NodeId, NodeId), bool>,
     liveness_dead_seen: &mut std::collections::HashSet<GraphNode<NodeId>>,
     empty_dead_subgraphs: &mut std::collections::HashSet<GraphNode<NodeId>>,
+    deferred: &mut Vec<DeferredBypass>,
     result: &mut RetrieveResult,
 ) -> Result<Vec<VertexId>, PristineError> {
     use std::collections::HashSet;
@@ -613,7 +756,18 @@ fn walk_through_dead<T: GraphTxnT>(
                 // Ancestors of `owner_parent` in the already-built alive
                 // graph do not count as alternates; they are the same
                 // linear chain we are currently bypassing for.
-                let mut has_alive_alt_parent = false;
+                //
+                // The alive graph is still being built here: a vertex's
+                // children are recorded only once it is popped from the DFS
+                // stack, so a negative reachability answer is inconclusive.
+                // When the owner was discovered through a dead chain (and
+                // pushed on the stack) before the replacement chain that
+                // also leads to it was walked, an ancestor's path to the
+                // owner is not in the graph yet. A positive answer is final;
+                // every alternate that fails the check is kept and the
+                // declined attachment is re-evaluated against the complete
+                // graph after the traversal (`DeferredBypass`).
+                let mut alternates: Vec<GraphNode<NodeId>> = Vec::new();
                 for parent in txn.iter_parents(next_vertex, true)? {
                     if !options.passes_filter(parent.introduced_by) {
                         continue;
@@ -642,13 +796,29 @@ fn walk_through_dead<T: GraphTxnT>(
                                     continue;
                                 }
                             }
-                            if !dead_visited.contains(&source_vertex) {
-                                has_alive_alt_parent = true;
-                                break;
+                            if !dead_visited.contains(&source_vertex)
+                                && !alternates.contains(&source_vertex)
+                            {
+                                alternates.push(source_vertex);
+                                // The boolean query never settles deferred
+                                // attachments (`retrieve_graph` returns
+                                // before `attach_deferred_bypasses`), so
+                                // one alternate answers it.
+                                if options.stop_at_first_content {
+                                    break;
+                                }
                             }
                         }
                         _ => {}
                     }
+                }
+                let has_alive_alt_parent = !alternates.is_empty();
+                if has_alive_alt_parent && !options.stop_at_first_content {
+                    deferred.push(DeferredBypass {
+                        owner: owner_parent,
+                        successor: next_vertex,
+                        alternates,
+                    });
                 }
 
                 // Add to alive graph (so the normal traversal can find it

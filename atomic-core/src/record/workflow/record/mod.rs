@@ -193,6 +193,36 @@ pub struct GitDiffLine {
 // RECORDING FUNCTIONS
 // ============================================================================
 
+/// A generated file (lockfile, checksum, bundled output) that has no
+/// semantic state at all: no CRDT trunk and no bound branches. Only such a
+/// file may take the single-vertex fast path, which records no semantic
+/// ops. A tracked file always has a trunk, even when every branch is gone
+/// (an empty lockfile, or one truncated to nothing): regenerating it must
+/// emit the semantic ops the trunk's closure replays, or the file renders
+/// as zero bytes at the semantic layer.
+fn opaque_without_semantic_state(
+    path: &str,
+    existing_trunk_id: Option<TrunkId>,
+    existing_branches: Option<&[BranchId]>,
+) -> bool {
+    super::globalize::should_use_opaque_generated_vertices(path)
+        && existing_trunk_id.is_none()
+        && existing_branches.is_none_or(|branches| branches.is_empty())
+}
+
+/// A generated file whose semantic state exists: its modify is routed
+/// through the sentinel whole-file replace, which tombstones every bound
+/// branch and inserts the full content fresh on the existing trunk.
+fn opaque_with_semantic_state(
+    path: &str,
+    existing_trunk_id: Option<TrunkId>,
+    existing_branches: Option<&[BranchId]>,
+) -> bool {
+    super::globalize::should_use_opaque_generated_vertices(path)
+        && (existing_trunk_id.is_some()
+            || existing_branches.is_some_and(|branches| !branches.is_empty()))
+}
+
 /// Record a single added file from the working copy.
 ///
 /// Reads the file content and creates appropriate hunks for a new file.
@@ -525,9 +555,7 @@ where
     // per-line record: the diff produces Modify ops bound to the existing
     // branches (the proven shape every plain-file modify uses), and the
     // final content fidelity is identical.
-    if super::globalize::should_use_opaque_generated_vertices(&detected.path)
-        && existing_branches.is_none_or(|branches| branches.is_empty())
-    {
+    if opaque_without_semantic_state(&detected.path, existing_trunk_id, existing_branches) {
         let mut replace_hunk = BuiltHunk::new_replace_with_lines(
             Local::new(&detected.path, 1),
             Some(encoding),
@@ -598,11 +626,17 @@ where
     // puts the edit boundary at EOF, where partial-hunk slicing is
     // fragile; route through the sentinel whole-file replace, which
     // rewrites the file byte-exactly.
-    let eof_boundary_edit = old_content.last().is_some_and(|&b| b != b'\n')
-        || new_content.last().is_some_and(|&b| b != b'\n');
+    // Identical content (a pure move of the file) is no edit at all: without
+    // this guard a moved file lacking a trailing newline took the whole-file
+    // replace below, re-inserting every line of content that never changed.
+    let content_differs = old_content != new_content.as_slice();
+    let eof_boundary_edit = content_differs
+        && (old_content.last().is_some_and(|&b| b != b'\n')
+            || new_content.last().is_some_and(|&b| b != b'\n'));
+    // A pure move of an unchanged generated file records only the move.
     let force_whole_file = options.get_force_whole_file_replace()
-        || (super::globalize::should_use_opaque_generated_vertices(&detected.path)
-            && existing_branches.is_some_and(|branches| !branches.is_empty()))
+        || (content_differs
+            && opaque_with_semantic_state(&detected.path, existing_trunk_id, existing_branches))
         || has_multi_line_deletion
         || eof_boundary_edit;
 

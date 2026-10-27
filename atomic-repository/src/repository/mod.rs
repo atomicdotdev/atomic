@@ -93,10 +93,15 @@ mod conflict_reconcile;
 mod cutover;
 pub mod database;
 mod deferred_tree;
+mod dependency_closure;
 mod equivalence;
 mod file_index_v2;
 mod filter;
 mod git_observation;
+mod git_stream;
+pub use git_stream::{
+    GitGraphImportSession, GitStreamLimits, GitStreamOutcome, PreparedGitGraphChange,
+};
 mod ignore_mirror;
 mod locks;
 mod materialize;
@@ -120,6 +125,7 @@ pub use remote_cache::{
 };
 mod revise;
 mod sandbox;
+mod semantic_closure;
 mod semantic_materialize;
 mod set_id;
 mod snapshot;
@@ -152,11 +158,12 @@ pub use database::{
     LEGACY_DIR, LEGACY_PRISTINE_FILE,
 };
 pub use equivalence::{
-    compare_project_state, compare_project_to_index, compare_project_to_worktree,
+    compare_project_state, compare_project_state_tolerating_untracked, compare_project_to_index,
+    compare_project_to_worktree, compare_project_to_worktree_with_index,
     verify_prospective_equivalence, EquivalenceClaims, EquivalenceLayer, EquivalenceMismatch,
     EquivalenceReport, MismatchKind, VerifiedProspectiveEquivalence,
 };
-pub use file_index_v2::FileIndexV2BackfillOutcome;
+pub use file_index_v2::{FileIndexV2BackfillOutcome, FileIndexV2SeedOutcome};
 pub use filter::{
     collect_view_change_ids, collect_visible_change_ids, collect_visible_change_ids_with_deps,
     graph_visibility_closure, graph_visibility_from_membership, view_membership,
@@ -179,13 +186,13 @@ pub use operation::{
     OperationVerificationState, PreparedRemoteOperation, PreparedShimGitWrite,
 };
 pub use project_tree::{
-    escape_repo_path, unescape_repo_path, ConversionPolicy, ExclusionPolicy, ExclusionReason,
-    GitIndexEntry, GitIndexState, GitObject, GitObjectDatabase, GitObjectKind, GitTree,
-    GitTreeEntry, LossPolicy, ManifestDisposition, ManifestRoot, PhysicalKind,
-    PlatformCapabilities, ProjectTree, ProjectTreeError, RepoPath, RepositoryEntry,
-    RepositoryManifest, WorktreeEntry, WorktreeObservation, CONVERSION_POLICY_VERSION,
-    GIT_INDEX_STATE_VERSION, REPOSITORY_MANIFEST_VERSION, REPO_PATH_VERSION,
-    WORKTREE_OBSERVATION_VERSION,
+    atomic_private_path, canonical_path_identity, escape_repo_path, unescape_repo_path,
+    ConversionPolicy, ExclusionPolicy, ExclusionReason, GitIndexEntry, GitIndexState, GitObject,
+    GitObjectDatabase, GitObjectKind, GitTree, GitTreeEntry, LossPolicy, ManifestDisposition,
+    ManifestRoot, PhysicalKind, PlatformCapabilities, ProjectTree, ProjectTreeError, RepoPath,
+    RepositoryEntry, RepositoryManifest, WorktreeEntry, WorktreeObservation,
+    CONVERSION_POLICY_VERSION, GIT_INDEX_STATE_VERSION, REPOSITORY_MANIFEST_VERSION,
+    REPO_PATH_VERSION, WORKTREE_OBSERVATION_VERSION,
 };
 pub use projection::effective_projection_closure;
 pub use projection_commit::{
@@ -222,6 +229,7 @@ pub use tag_projection::TagProjectionOutcome;
 pub use views::{ManifestApplyOutcome, ViewInfo};
 pub use working_copy::canonical_dot_dir_for;
 pub use working_copy::detect_repository_root;
+pub use working_copy::REPOSITORY_POINTER;
 pub use working_copy_reconcile::{WorkingCopyReconcileOutcome, WorkingCopyRegistrationDiagnosis};
 pub use workspace_txn::{
     git_locks_present, git_state_quiescent, GitQuiescence, ReconcileEffectBudget,
@@ -388,6 +396,9 @@ pub struct Repository {
     /// holds the sandbox's view (from its pointer file); it must not repoint
     /// the canonical `current_view` on disk.
     is_sandbox: bool,
+    /// Per-process memo of the CRDT branch state folded per trunk over the
+    /// current assembly closure; see [`semantic_closure::SemanticClosureMemo`].
+    semantic_closure_memo: std::sync::Mutex<semantic_closure::SemanticClosureMemo>,
 }
 
 impl std::fmt::Debug for Repository {
@@ -516,6 +527,7 @@ default = "{}"
             pristine,
             change_store,
             is_sandbox: false,
+            semantic_closure_memo: Default::default(),
         };
 
         Ok(repository)
@@ -619,6 +631,7 @@ default = "{}"
             pristine,
             change_store,
             is_sandbox: false,
+            semantic_closure_memo: Default::default(),
         };
         repository.fence_recovery_for_budget(working_copy_id, budget)?;
         if !budget.is_metadata_only() {
@@ -719,6 +732,7 @@ default = "{}"
             pristine,
             change_store,
             is_sandbox: false,
+            semantic_closure_memo: Default::default(),
         };
         let operation_lock = repository.try_lock_operation(working_copy_id)?;
         repository.recover_pending_deferred_tree_alignment_locked(&operation_lock)?;
@@ -777,6 +791,7 @@ default = "{}"
             pristine,
             change_store,
             is_sandbox: false,
+            semantic_closure_memo: Default::default(),
         })
     }
 
@@ -861,6 +876,7 @@ default = "{}"
             pristine,
             change_store,
             is_sandbox: false,
+            semantic_closure_memo: Default::default(),
         };
         if !operation_inspection
             && (repository.has_pending_deferred_tree_alignment()
@@ -918,6 +934,7 @@ default = "{}"
             pristine: Arc::new(pristine),
             change_store,
             is_sandbox: false,
+            semantic_closure_memo: Default::default(),
         };
         if repository.has_pending_deferred_tree_alignment() {
             return Err(RepositoryError::InvalidOperation {
@@ -1022,6 +1039,7 @@ default = "{}"
             pristine,
             change_store,
             is_sandbox: false,
+            semantic_closure_memo: Default::default(),
         };
         let operation_lock = repository.try_lock_operation(working_copy_id)?;
         repository.recover_pending_deferred_tree_alignment_locked(&operation_lock)?;

@@ -181,7 +181,14 @@ fn next_inode_id(read_txn: &ReadTransaction) -> PristineResult<u64> {
         let (_, inode) = decode_view_seq(key.value());
         max_id = max_id.max(inode);
     }
-    for result in read_txn.open_multimap_table(INODE_GRAPH)?.iter()? {
+    // INODE_GRAPH keys start with the big-endian inode, so the final key
+    // proves the maximum even for unbound/orphaned inodes. Do not scan every
+    // content vertex merely to initialize an allocator on each query open.
+    if let Some(result) = read_txn
+        .open_multimap_table(INODE_GRAPH)?
+        .iter()?
+        .next_back()
+    {
         let (key, _values) = result?;
         let (inode, _, _, _) = decode_inode_vertex(key.value());
         max_id = max_id.max(inode);
@@ -1088,6 +1095,48 @@ mod tests {
         let reopened = Pristine::open(&db_path).unwrap();
         let mut txn = reopened.write_txn().unwrap();
         assert_eq!(txn.alloc_inode().unwrap().get(), 2);
+        txn.abort().unwrap();
+    }
+
+    #[test]
+    fn inode_graph_end_key_preserves_orphan_high_water_mark_across_opens() {
+        use crate::pristine::{MutTxnT, PathClaimMutTxnT};
+        use crate::types::{
+            ChangePosition, EdgeFlags, GraphNode, Inode, NodeId, Position, SerializedGraphEdge,
+        };
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("inode-max.redb");
+        let maximum = (1u64 << 32) + 1;
+        {
+            let pristine = Pristine::open(&path).unwrap();
+            let mut txn = pristine.write_txn().unwrap();
+            for (offset, inode) in [1, 255, 256, 65535, 65536, maximum].into_iter().enumerate() {
+                // Deliberately reverse the other key components: only the
+                // big-endian inode prefix determines the global maximum.
+                let id = NodeId::new(100 - offset as u64);
+                let node = GraphNode::new(id, ChangePosition::new(0), ChangePosition::new(1));
+                let edge = SerializedGraphEdge::new(
+                    EdgeFlags::BLOCK,
+                    Position::new(id, ChangePosition::new(0)),
+                    id,
+                );
+                txn.put_inode_graph(Inode::new(inode), node, edge).unwrap();
+            }
+            txn.complete_path_claim_migration().unwrap();
+            txn.commit().unwrap();
+        }
+        {
+            let readonly = Pristine::open_readonly(&path).unwrap();
+            assert_eq!(
+                readonly
+                    .next_inode
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                maximum + 1
+            );
+        }
+        let writable = Pristine::open_existing(&path).unwrap();
+        let mut txn = writable.write_txn().unwrap();
+        assert_eq!(txn.alloc_inode().unwrap().get(), maximum + 1);
         txn.abort().unwrap();
     }
 

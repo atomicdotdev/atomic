@@ -93,17 +93,16 @@ impl Repository {
     }
 
     /// Whether an inode renders any alive content for the requested visibility,
-    /// using the inode-scoped `INODE_GRAPH` fast path before the exhaustive
-    /// global retrieval.
+    /// using the canonical retrieval pipeline over the file-local index.
     ///
     /// `is_file_alive_via_retrieval` runs `retrieve_graph` (global `GRAPH`
     /// traversal) for EVERY absent path-claim entry on every projection; on a
     /// large repository that is a per-entry bottleneck (measured 14–62 s per
     /// entry on the workspace graph, 659 entries per projection). The
-    /// inode-linear walk reads the file's own `INODE_GRAPH` rows, so a path
-    /// that simply has no alive content resolves without touching the global
-    /// graph. A non-linear (fork/delete-through) structure still falls back to
-    /// the exhaustive retrieval, so the verdict stays exact.
+    /// Preloading the inode's adjacency makes forks and delete-through walks
+    /// file-local too. Only the existence of an alive content span matters:
+    /// copying canonical bytes from the change store is unnecessary. An absent
+    /// inode index transparently delegates to the original graph reader.
     pub(crate) fn inode_renders_alive_content<T>(
         &self,
         txn: &T,
@@ -116,20 +115,9 @@ impl Repository {
             + atomic_core::pristine::InodeGraphOps<InodeError = atomic_core::pristine::PristineError>
             + atomic_core::pristine::TreeTxnT,
     {
-        let options = atomic_core::output::alive::RetrieveOptions::new()
-            .with_graph_visibility(visibility.clone());
-        match try_retrieve_linear_content_with_filter(
-            txn,
-            &self.change_store,
-            inode,
-            position,
-            &options,
-        ) {
-            Ok(Some(content)) => return Ok(!content.is_empty()),
-            Ok(None) => {}
-            Err(_) => {}
-        }
-        super::status::is_file_alive_via_retrieval(txn, inode, position, visibility)
+        let scoped = atomic_core::pristine::InodeScopedGraph::new(txn, inode)
+            .map_err(|error| RepositoryError::Database(error.to_string()))?;
+        super::status::is_file_alive_via_retrieval(&scoped, inode, position, visibility)
     }
 
     /// Get file content, excluding a specific change.
@@ -1178,4 +1166,136 @@ where
     }
 
     Ok(Some(content))
+}
+
+#[cfg(test)]
+mod namespace_liveness_tests {
+    use super::*;
+    use crate::TrackingOptions;
+    use atomic_core::change::ChangeHeader;
+    use atomic_core::pristine::MutTxnT;
+
+    fn record(repo: &Repository, message: &str) {
+        repo.record(
+            repo.require_working_copy_id().unwrap(),
+            ChangeHeader::new(message),
+            crate::RecordOptions::new()
+                .with_all(true)
+                .save_to_store(true)
+                .apply_after_record(true),
+        )
+        .unwrap();
+    }
+
+    fn seed() -> (tempfile::TempDir, Repository, Inode, Position<NodeId>) {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        let wc = repo.require_working_copy_id().unwrap();
+        std::fs::write(dir.path().join("live.txt"), b"one\ntwo\nthree\n").unwrap();
+        repo.add(wc, "live.txt", TrackingOptions::default())
+            .unwrap();
+        record(&repo, "seed");
+        let txn = repo.pristine.read_txn().unwrap();
+        let inode = txn.get_inode("live.txt").unwrap().unwrap();
+        let position = txn.inode_position(inode).unwrap().unwrap();
+        drop(txn);
+        (dir, repo, inode, position)
+    }
+
+    fn assert_verdict(repo: &Repository, inode: Inode, position: Position<NodeId>, expected: bool) {
+        let txn = repo.pristine.read_txn().unwrap();
+        let view = txn.get_view(repo.current_view()).unwrap().unwrap();
+        let visibility = graph_visibility_closure(&txn, &view).unwrap();
+        let reference =
+            super::super::status::is_file_alive_via_retrieval(&txn, inode, position, &visibility)
+                .unwrap();
+        assert_eq!(
+            repo.inode_renders_alive_content(&txn, inode, position, &visibility)
+                .unwrap(),
+            reference
+        );
+        assert_eq!(reference, expected);
+    }
+
+    #[test]
+    fn scoped_namespace_liveness_matches_canonical_delete_restore_and_truncate() {
+        let (dir, repo, inode, position) = seed();
+        assert_verdict(&repo, inode, position, true);
+        std::fs::remove_file(dir.path().join("live.txt")).unwrap();
+        record(&repo, "delete");
+        assert_verdict(&repo, inode, position, false);
+        std::fs::write(dir.path().join("live.txt"), b"one\ntwo\nthree\n").unwrap();
+        // A locally recreated recorded deletion is untracked until explicitly
+        // added; adding it restores the original inode, not a fresh identity.
+        repo.add(
+            repo.require_working_copy_id().unwrap(),
+            "live.txt",
+            TrackingOptions::default(),
+        )
+        .unwrap();
+        record(&repo, "restore");
+        assert_verdict(&repo, inode, position, true);
+        std::fs::write(dir.path().join("live.txt"), b"").unwrap();
+        record(&repo, "truncate");
+        assert_verdict(&repo, inode, position, false);
+    }
+
+    #[test]
+    fn scoped_namespace_liveness_falls_back_when_inode_index_is_absent() {
+        let (_dir, repo, inode, position) = seed();
+        let txn = repo.pristine.read_txn().unwrap();
+        let rows = txn
+            .iter_inode_vertices(inode)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        drop(txn);
+        assert!(!rows.is_empty());
+        let mut txn = repo.pristine.write_txn().unwrap();
+        for (node, edge) in rows {
+            txn.del_inode_graph(inode, node, edge).unwrap();
+        }
+        txn.commit().unwrap();
+        assert_verdict(&repo, inode, position, true);
+    }
+
+    #[test]
+    fn namespace_claims_do_not_load_change_payload_for_known_name() {
+        use atomic_core::change::MemoryChangeStore;
+        use atomic_core::pristine::PathClaimTxnT;
+        let (_dir, repo, _inode, position) = seed();
+        let txn = repo.pristine.read_txn().unwrap();
+        let view = txn.get_view(repo.current_view()).unwrap().unwrap();
+        let visibility = graph_visibility_closure(&txn, &view).unwrap();
+        let filter = visibility.iter_dependency_first().copied().collect();
+        let claims: Vec<_> = txn
+            .get_path_claims("live.txt")
+            .unwrap()
+            .into_iter()
+            .map(|event| ("live.txt".to_string(), event.claim))
+            .collect();
+        assert!(!claims.is_empty());
+        let empty_store = MemoryChangeStore::new();
+        let names = super::super::materialize::live_names_for_path_with_claims(
+            &txn,
+            &empty_store,
+            position,
+            "live.txt",
+            &filter,
+            &claims,
+        )
+        .unwrap();
+        assert_eq!(names.len(), 1);
+        assert!(
+            super::super::materialize::live_names_for_path(
+                &txn,
+                &empty_store,
+                position,
+                "live.txt",
+                &filter,
+            )
+            .is_err(),
+            "legacy fallback silently omitted content verification"
+        );
+    }
 }

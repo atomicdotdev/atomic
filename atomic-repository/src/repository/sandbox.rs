@@ -350,6 +350,7 @@ impl Repository {
             pristine,
             change_store,
             is_sandbox: true,
+            semantic_closure_memo: Default::default(),
         })
     }
 

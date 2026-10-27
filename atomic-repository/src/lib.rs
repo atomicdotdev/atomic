@@ -97,6 +97,7 @@ pub mod git_binding;
 pub mod ignore;
 pub mod intent_bridge;
 pub mod intent_graph;
+pub(crate) mod leftover_directory;
 pub mod manifest;
 pub mod record;
 pub mod repository;
@@ -105,6 +106,7 @@ pub mod tracking;
 pub mod triage;
 pub mod wip;
 pub(crate) mod workflow_usage;
+pub mod worktree_presence;
 
 // Phase 7 additions
 pub mod archive;

@@ -311,6 +311,24 @@ pub(crate) fn classify_mapping_direction(
         .map_err(CliError::from)?
         .state
         .to_base32();
+    // `git branch -D` on the mapped branch leaves no ref to reconcile: the
+    // mapping is unrepresentable, not a Git movement to import (which refused
+    // every later reconcile of the view with "advanced beyond the last
+    // observed mapping"). A rename (`git branch -m`) leaves a reflog trail on
+    // the new branch and stays the refused independent movement.
+    if tip.is_none()
+        && mapping.last_observed_local.is_some()
+        && mapping
+            .local_ref
+            .as_deref()
+            .is_some_and(|reference| renamed_branch_target(git, reference).is_none())
+    {
+        return Ok(RefMappingDecision {
+            action: ThreeWayAction::Unrepresentable,
+            git_moved: true,
+            atomic_moved: Some(current_atomic) != mapping.last_observed_atomic,
+        });
+    }
     let observation = ThreeWayObservation {
         current_git: tip.clone(),
         current_atomic: current_atomic.clone(),
@@ -349,6 +367,30 @@ pub(crate) fn classify_mapping_direction(
             git_contains_atomic,
         },
     ))
+}
+
+/// The local branch `git branch -m` renamed `old_ref` to, found through the
+/// `renamed <old> to <new>` reflog entry Git writes on the new branch, or
+/// `None` when no branch carries such a trail (the ref was deleted).
+fn renamed_branch_target(git: &GitRepository, old_ref: &str) -> Option<String> {
+    let needle = format!("renamed {old_ref} to ");
+    let branches = git.branches(Some(git2::BranchType::Local)).ok()?;
+    for (branch, _) in branches.flatten() {
+        let Some(name) = branch.get().name() else {
+            continue;
+        };
+        let Ok(reflog) = git.reflog(name) else {
+            continue;
+        };
+        if reflog.iter().any(|entry| {
+            entry
+                .message()
+                .is_some_and(|message| message.contains(&needle))
+        }) {
+            return Some(name.to_string());
+        }
+    }
+    None
 }
 
 /// Persist the `Diverged` status without moving either side (RFC §8.5).

@@ -3,6 +3,7 @@ use std::fs;
 use std::path::Path;
 
 use atomic_core::change::InodeKind;
+use atomic_core::output::{inode_permissions_changed, permission_bits_matter};
 use atomic_core::pristine::{FileIndexTimestamp, FileIndexV2Entry};
 use atomic_core::types::Hash;
 
@@ -26,7 +27,98 @@ pub trait FilesystemProvider: Send + Sync {
         file: &ObservedFile,
         path: &RepoPath,
         filter: &dyn ContentFilter,
-    ) -> Result<Hash, ChangeSourceError>;
+    ) -> Result<CanonicalContentId, ChangeSourceError>;
+}
+
+#[cfg(all(test, windows))]
+mod windows_permission_tests {
+    use super::*;
+
+    #[test]
+    fn git_modes_match_windows_writable_files_and_readonly_is_detected() {
+        let dir = tempfile::tempdir().unwrap();
+        let native = dir.path().join("file");
+        fs::write(&native, b"canonical").unwrap();
+        let path = RepoPath::from_bytes(b"file").unwrap();
+        let paths = vec![path.clone()];
+        let policy = Hash::of(b"policy");
+        let filter = crate::content_filter::GitAttributesFilter::for_repository(dir.path());
+        let observe = || {
+            ScanChangeSource
+                .changes(ChangeSourceRequest {
+                    root: dir.path(),
+                    tracked_paths: &paths,
+                    previous_token: None,
+                })
+                .unwrap()
+        };
+        for mode in [0o644, 0o755] {
+            let tracked = [CanonicalTrackedPath {
+                path: path.clone(),
+                canonical_mode: mode,
+                canonical_kind: InodeKind::Regular,
+            }];
+            let result = verify_candidates(
+                observe(),
+                &tracked,
+                &BTreeMap::new(),
+                policy,
+                now_timestamp(),
+                &filter,
+                |_| Ok(Hash::of(b"canonical")),
+            )
+            .unwrap();
+            assert_eq!(result.candidates[0].change, VerifiedChange::Unchanged);
+        }
+        let mut permissions = fs::metadata(&native).unwrap().permissions();
+        permissions.set_readonly(true);
+        fs::set_permissions(&native, permissions).unwrap();
+        let tracked = [CanonicalTrackedPath {
+            path,
+            canonical_mode: 0o644,
+            canonical_kind: InodeKind::Regular,
+        }];
+        let result = verify_candidates(
+            observe(),
+            &tracked,
+            &BTreeMap::new(),
+            policy,
+            now_timestamp(),
+            &filter,
+            |_| Ok(Hash::of(b"canonical")),
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&native).unwrap().permissions();
+        permissions.set_readonly(false);
+        fs::set_permissions(&native, permissions).unwrap();
+        assert_eq!(
+            result.candidates[0].change,
+            VerifiedChange::PermissionsChanged
+        );
+    }
+}
+
+/// The content identities of one observed file: its bytes after the clean
+/// filter, and its raw bytes. Raw bytes that are the canonical content
+/// themselves are Git's own clean state even when the filter would
+/// normalize them on the next add (a CRLF file committed before the
+/// repository adopted `* text=auto eol=lf`), so status accepts either.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CanonicalContentId {
+    pub cleaned: Hash,
+    pub raw: Hash,
+}
+
+impl CanonicalContentId {
+    /// The identity to record for `expected`: the canonical hash when
+    /// either form matches it, else the cleaned hash (a modification).
+    pub fn resolve_against(self, expected: Hash) -> Hash {
+        if self.cleaned == expected || self.raw == expected {
+            expected
+        } else {
+            self.cleaned
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -47,7 +139,7 @@ impl FilesystemProvider for RealFilesystemProvider {
         file: &ObservedFile,
         path: &RepoPath,
         filter: &dyn ContentFilter,
-    ) -> Result<Hash, ChangeSourceError> {
+    ) -> Result<CanonicalContentId, ChangeSourceError> {
         read_canonical_content(file, path, filter)
     }
 }
@@ -183,15 +275,33 @@ where
     let original_source = source.source;
     let mut fallback = source.fallback.clone();
     let mut force_full = fallback.is_some();
+    // Losing an incremental watcher requires enumerating every tracked path,
+    // not discarding clean-content leases whose full stat observation still
+    // matches. Otherwise watch=off, CI, and unavailable watcher fallback render
+    // the entire graph on every status, even after a successful clean scan.
+    let mut invalidate_leases = matches!(
+        fallback,
+        Some(
+            ChangeSourceFallbackReason::MissingIndex
+                | ChangeSourceFallbackReason::MalformedIndex(_)
+                | ChangeSourceFallbackReason::ConversionPolicyChanged
+                | ChangeSourceFallbackReason::CanonicalAttributesChanged
+                | ChangeSourceFallbackReason::SparsePolicyChanged
+                | ChangeSourceFallbackReason::ConfigurationChanged
+                | ChangeSourceFallbackReason::FilterChanged
+        )
+    );
 
     for entry in tracked {
         match index.get(&entry.path) {
             None => {
                 force_full = true;
+                invalidate_leases = true;
                 fallback.get_or_insert(ChangeSourceFallbackReason::MissingIndex);
             }
             Some(row) if row.conversion_policy != Some(conversion_policy) => {
                 force_full = true;
+                invalidate_leases = true;
                 fallback.get_or_insert(ChangeSourceFallbackReason::ConversionPolicyChanged);
             }
             Some(row)
@@ -200,6 +310,7 @@ where
                     || row.canonical_kind != Some(entry.canonical_kind) =>
             {
                 force_full = true;
+                invalidate_leases = true;
                 fallback.get_or_insert(ChangeSourceFallbackReason::CanonicalAttributesChanged);
             }
             _ => {}
@@ -318,7 +429,21 @@ where
             CandidateObservation::Present(file) => {
                 let observed_kind = canonical_kind(file.kind);
                 let type_changed = observed_kind != Some(entry.canonical_kind);
-                let permissions_changed = file.mode != Some(entry.canonical_mode);
+                // Symlink permission bits are not a fact (Git stores every
+                // link as 120000; `lstat` reports 0o777 on Linux and 0o755
+                // on macOS), mirroring `InodeStatusFacts::between`.
+                let actual_kind = observed_kind.unwrap_or(entry.canonical_kind);
+                let permissions_changed = file.mode.map_or_else(
+                    || permission_bits_matter(entry.canonical_kind, actual_kind),
+                    |mode| {
+                        inode_permissions_changed(
+                            entry.canonical_kind,
+                            entry.canonical_mode,
+                            actual_kind,
+                            mode,
+                        )
+                    },
+                );
                 let observed_row = cached.and_then(|row| {
                     observed_index_row(
                         file,
@@ -336,7 +461,7 @@ where
                 if racy {
                     stats.racy_candidates += 1;
                 }
-                let lease_valid = !force_full
+                let lease_valid = !invalidate_leases
                     && !type_changed
                     && !permissions_changed
                     && cached
@@ -359,10 +484,11 @@ where
                 }
 
                 stats.cache_misses += 1;
-                let content_id = provider.canonical_content_id(file, &entry.path, filter)?;
+                let observed_content = provider.canonical_content_id(file, &entry.path, filter)?;
                 stats.content_reads += 1;
                 stats.content_hashes += 1;
                 let expected_content = canonical_content(&entry.path)?;
+                let content_id = observed_content.resolve_against(expected_content);
                 let change = if type_changed {
                     VerifiedChange::TypeChanged
                 } else if permissions_changed {
@@ -596,7 +722,7 @@ fn read_canonical_content(
     file: &ObservedFile,
     path: &RepoPath,
     filter: &dyn ContentFilter,
-) -> Result<Hash, ChangeSourceError> {
+) -> Result<CanonicalContentId, ChangeSourceError> {
     let bytes = match file.kind {
         ObservedKind::Regular => fs::read(&file.native_path),
         ObservedKind::Symlink => read_link_bytes(&file.native_path),
@@ -611,6 +737,7 @@ fn read_canonical_content(
         path: path.escaped(),
         message: error.to_string(),
     })?;
+    let raw = Hash::of(&bytes);
     let canonical = if file.kind == ObservedKind::Regular {
         let native = path
             .to_native()
@@ -625,7 +752,10 @@ fn read_canonical_content(
     } else {
         bytes
     };
-    Ok(Hash::of(&canonical))
+    Ok(CanonicalContentId {
+        cleaned: Hash::of(&canonical),
+        raw,
+    })
 }
 
 #[cfg(unix)]
@@ -940,6 +1070,145 @@ mod tests {
 
     #[test]
     fn same_size_and_restored_mtime_attack_is_rehashed() {
+        restored_mtime_attack_is_rehashed(None);
+        restored_mtime_attack_is_rehashed(Some(ChangeSourceFallbackReason::ConfiguredOff));
+        restored_mtime_attack_is_rehashed(Some(ChangeSourceFallbackReason::SourceError(
+            "watchers unavailable".into(),
+        )));
+    }
+
+    #[test]
+    fn complete_watcher_fallback_scans_keep_verified_clean_leases() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("tracked"), b"canonical").unwrap();
+        let path = RepoPath::from_bytes(b"tracked").unwrap();
+        let paths = vec![path.clone()];
+        let policy = Hash::of(b"policy");
+        let expected = Hash::of(b"canonical");
+        let cold = verify_candidates(
+            source(dir.path(), &paths),
+            &tracked(&path),
+            &BTreeMap::new(),
+            policy,
+            now_timestamp(),
+            &ExactFilter,
+            |_| Ok(expected),
+        )
+        .unwrap();
+        let index = cold.index_updates.into_iter().collect();
+        for reason in [
+            ChangeSourceFallbackReason::ConfiguredOff,
+            ChangeSourceFallbackReason::DisabledInCi,
+            ChangeSourceFallbackReason::DisabledInContainer,
+            ChangeSourceFallbackReason::Unavailable("no watcher".into()),
+            ChangeSourceFallbackReason::UnknownToken,
+            ChangeSourceFallbackReason::Overflow,
+            ChangeSourceFallbackReason::MalformedResponse("bad watcher".into()),
+            ChangeSourceFallbackReason::Timeout { milliseconds: 5 },
+            ChangeSourceFallbackReason::SourceError("both watchers unavailable".into()),
+        ] {
+            let mut fallback = source(dir.path(), &paths);
+            fallback.fallback = Some(reason.clone());
+            let result = verify_candidates(
+                fallback,
+                &tracked(&path),
+                &index,
+                policy,
+                now_timestamp(),
+                &ExactFilter,
+                |_| panic!("watcher degradation must not reconstruct unchanged graph content"),
+            )
+            .unwrap();
+            assert_eq!(result.root, cold.root);
+            assert_eq!(result.fallback, Some(reason));
+            assert_eq!(result.stats.metadata_reads, 1);
+            assert_eq!(result.stats.content_reads, 0);
+            assert_eq!(result.stats.cache_leases, 1);
+        }
+
+        // An invalid incremental token must still force complete discovery,
+        // even if the source omitted every otherwise-clean tracked path.
+        let mut omitted = source(dir.path(), &paths);
+        omitted.complete = false;
+        omitted.candidates.clear();
+        omitted.fallback = Some(ChangeSourceFallbackReason::UnknownToken);
+        let rescanned = verify_candidates(
+            omitted,
+            &tracked(&path),
+            &index,
+            policy,
+            now_timestamp(),
+            &ExactFilter,
+            |_| panic!("full metadata discovery still has a valid clean-content lease"),
+        )
+        .unwrap();
+        assert_eq!(rescanned.root, cold.root);
+        assert_eq!(rescanned.stats.content_reads, 0);
+        assert_eq!(rescanned.stats.cache_leases, 1);
+    }
+
+    #[test]
+    fn canonical_invalidation_and_racy_files_still_rehash_on_fallback() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("tracked"), b"canonical").unwrap();
+        let path = RepoPath::from_bytes(b"tracked").unwrap();
+        let paths = vec![path.clone()];
+        let policy = Hash::of(b"policy");
+        let expected = Hash::of(b"canonical");
+        let cold = verify_candidates(
+            source(dir.path(), &paths),
+            &tracked(&path),
+            &BTreeMap::new(),
+            policy,
+            now_timestamp(),
+            &ExactFilter,
+            |_| Ok(expected),
+        )
+        .unwrap();
+        let index: BTreeMap<_, _> = cold.index_updates.into_iter().collect();
+        for reason in [
+            ChangeSourceFallbackReason::MalformedIndex("bad cache".into()),
+            ChangeSourceFallbackReason::ConversionPolicyChanged,
+            ChangeSourceFallbackReason::CanonicalAttributesChanged,
+            ChangeSourceFallbackReason::SparsePolicyChanged,
+            ChangeSourceFallbackReason::ConfigurationChanged,
+            ChangeSourceFallbackReason::FilterChanged,
+        ] {
+            let mut fallback = source(dir.path(), &paths);
+            fallback.fallback = Some(reason);
+            let result = verify_candidates(
+                fallback,
+                &tracked(&path),
+                &index,
+                policy,
+                now_timestamp(),
+                &ExactFilter,
+                |_| Ok(expected),
+            )
+            .unwrap();
+            assert_eq!(result.stats.content_reads, 1);
+            assert_eq!(result.stats.cache_leases, 0);
+        }
+        let mut racy_index = index;
+        let row = racy_index.get_mut(&path).unwrap();
+        row.racy_after = row.mtime;
+        let mut fallback = source(dir.path(), &paths);
+        fallback.fallback = Some(ChangeSourceFallbackReason::ConfiguredOff);
+        let result = verify_candidates(
+            fallback,
+            &tracked(&path),
+            &racy_index,
+            policy,
+            now_timestamp(),
+            &ExactFilter,
+            |_| Ok(expected),
+        )
+        .unwrap();
+        assert_eq!(result.stats.content_reads, 1);
+        assert_eq!(result.stats.racy_candidates, 1);
+    }
+
+    fn restored_mtime_attack_is_rehashed(fallback: Option<ChangeSourceFallbackReason>) {
         let dir = tempdir().unwrap();
         let native = dir.path().join("tracked");
         fs::write(&native, b"abcdefgh").unwrap();
@@ -964,8 +1233,10 @@ mod tests {
         let file = fs::OpenOptions::new().write(true).open(&native).unwrap();
         file.set_times(fs::FileTimes::new().set_modified(original_mtime))
             .unwrap();
+        let mut observed = source(dir.path(), &paths);
+        observed.fallback = fallback;
         let attacked = verify_candidates(
-            source(dir.path(), &paths),
+            observed,
             &tracked(&path),
             &index,
             policy,
@@ -1100,5 +1371,56 @@ mod tests {
         );
         assert_eq!(changed.stats.content_reads, 1);
         assert_eq!(changed.index_updates.len(), 1);
+    }
+
+    #[test]
+    fn symlink_permission_bits_never_report_a_change() {
+        // Git records every link as 120000 (canonical 0o777); macOS `lstat`
+        // reports 0o755 for the same link. The bits carry no meaning, so a
+        // link whose target matches is Unchanged, never PermissionsChanged.
+        let dir = tempdir().unwrap();
+        std::os::unix::fs::symlink("target", dir.path().join("link")).unwrap();
+        let path = RepoPath::from_bytes(b"link").unwrap();
+        let paths = vec![path.clone()];
+        let tracked = vec![CanonicalTrackedPath {
+            path: path.clone(),
+            canonical_mode: 0o777,
+            canonical_kind: InodeKind::Symlink,
+        }];
+        let expected = Hash::of(b"target");
+        let cold = verify_candidates(
+            source(dir.path(), &paths),
+            &tracked,
+            &BTreeMap::new(),
+            Hash::of(b"policy"),
+            now_timestamp(),
+            &ExactFilter,
+            |_| Ok(expected),
+        )
+        .unwrap();
+        assert_eq!(
+            cold.candidates[0].change,
+            VerifiedChange::Unchanged,
+            "{:?}",
+            cold.candidates[0]
+        );
+
+        let mut unknown_mode = source(dir.path(), &paths);
+        if let CandidateObservation::Present(file) = &mut unknown_mode.candidates[0].observation {
+            file.mode = None;
+        } else {
+            panic!("fixture symlink is missing");
+        }
+        let verified = verify_candidates(
+            unknown_mode,
+            &tracked,
+            &BTreeMap::new(),
+            Hash::of(b"policy"),
+            now_timestamp(),
+            &ExactFilter,
+            |_| Ok(expected),
+        )
+        .unwrap();
+        assert_eq!(verified.candidates[0].change, VerifiedChange::Unchanged);
     }
 }

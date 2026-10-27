@@ -2169,40 +2169,41 @@ impl Repository {
                 name: view_name.to_string(),
             })?;
 
-        // Collect all needed changes (including the target)
+        // Collect every missing change (the target included) in dependency
+        // order: a depth-first post-order over the dependency graph lists
+        // each change after all of its dependencies. The previous
+        // breadth-first list reversed was not topological (a dependency
+        // listed after a sibling that needs it came out after that sibling),
+        // so a closure referenced into a new view could apply a change
+        // before the change its edges anchor to; the misanchored lines then
+        // rendered twice (a branch seeded after merges rendered a merged
+        // line both at the top and at the end of the file).
         let mut to_insert = Vec::new();
         let mut visited = std::collections::HashSet::new();
-        let mut queue = std::collections::VecDeque::new();
-        queue.push_back(*hash);
-
-        while let Some(current_hash) = queue.pop_front() {
-            if visited.contains(&current_hash) {
+        let mut stack: Vec<(Hash, bool)> = vec![(*hash, false)];
+        while let Some((current_hash, expanded)) = stack.pop() {
+            if expanded {
+                to_insert.push(current_hash);
                 continue;
             }
-            visited.insert(current_hash);
-
-            // Check if already inserted
+            if !visited.insert(current_hash) {
+                continue;
+            }
+            // Already inserted: its own dependencies are present by invariant.
             if let Ok(Some(id)) = read_txn.get_internal(&current_hash) {
                 if read_txn.get_change_seq(&view, id).ok().flatten().is_some() {
-                    continue; // Already inserted
+                    continue;
                 }
             }
-
-            // Load and queue dependencies
             let dep_change = self.load_change(&current_hash)?;
+            stack.push((current_hash, true));
             for dep in dep_change.dependencies() {
                 if !visited.contains(dep) {
-                    queue.push_back(*dep);
+                    stack.push((*dep, false));
                 }
             }
-
-            to_insert.push(current_hash);
         }
-
         drop(read_txn);
-
-        // Reverse to get topological order (dependencies first)
-        to_insert.reverse();
 
         // CB-12B: gate the complete reachable closure ONCE before any
         // mutation when the target is Shared. The per-change gate inside
