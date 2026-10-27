@@ -966,6 +966,7 @@ pub fn intent_list(args: &super::intent::list::IntentList) -> CliResult<bool> {
     if let Some(kind) = &filter {
         rows.retain(|row| &row.kind == kind);
     }
+    super::intent::list::sort_rows(&mut rows, args.sort, args.reverse);
     super::intent::list::IntentList::render(&rows, args.json);
     Ok(true)
 }
@@ -1174,10 +1175,16 @@ pub fn memory_list(args: &super::memory::list::MemoryList) -> CliResult<bool> {
         status: None,
         summaries_only: false,
         cursor: None,
-        budget: args.limit.map(|limit| pb::PageBudget {
-            max_items: Some(limit as u32),
-            max_bytes: None,
-        }),
+        // The service lists in the default order, so the limit only rides
+        // the wire for it; any other `--sort` fetches everything and cuts
+        // after sorting here.
+        budget: args
+            .limit
+            .filter(|_| args.is_default_sort())
+            .map(|limit| pb::PageBudget {
+                max_items: Some(limit as u32),
+                max_bytes: None,
+            }),
         view: None,
         identity: args.identity.clone(),
         path_prefix: None,
@@ -1186,11 +1193,17 @@ pub fn memory_list(args: &super::memory::list::MemoryList) -> CliResult<bool> {
         tool_result_previews: false,
     };
     let response = session.list_vault_entries(request)?;
-    let rows = response
+    let mut rows = response
         .entries
         .iter()
         .map(super::memory::list::wire_row)
         .collect::<Vec<_>>();
+    if !args.is_default_sort() {
+        super::memory::list::sort_rows(&mut rows, args.sort, args.reverse);
+        if let Some(limit) = args.limit {
+            rows.truncate(limit);
+        }
+    }
     super::memory::list::MemoryList::render(&rows, args.json);
     Ok(true)
 }

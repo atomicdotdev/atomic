@@ -1930,7 +1930,7 @@ impl vault_service_server::VaultService for VaultImpl {
                     }
                     let entries = items
                         .iter()
-                        .map(|(id, _)| {
+                        .map(|(id, updated)| {
                             // kind/status/about degrade to "–"/0 when a single
                             // memory cannot be read or lifted — never the list.
                             let degraded = (
@@ -2021,6 +2021,8 @@ impl vault_service_server::VaultService for VaultImpl {
                                 about_count: Some(about),
                                 attested: Some(attested.to_string()),
                                 verifies: Some(verifies.to_string()),
+                                // Drives the CLI's `--sort updated`.
+                                updated_at_label: Some(updated.clone()),
                                 ..Default::default()
                             }
                         })
