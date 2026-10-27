@@ -412,8 +412,9 @@ pub fn local_session_mac_key_provider(repo: &Repository) -> impl Fn(&str) -> Opt
 }
 
 /// A [`DidKeyProvider`] that resolves an attestation signer DID to its
-/// Ed25519 public key through the serving host's default identity store
-/// (`~/.atomic/identities/`, `ATOMIC_CONFIG_DIR`-relocatable).
+/// Ed25519 public key through the repository's own identity store first
+/// (`<repo>/.atomic/identities/`), falling back to the serving host's
+/// default store (`~/.atomic/identities/`, `ATOMIC_CONFIG_DIR`-relocatable).
 ///
 /// Resolution mirrors the host's author resolution
 /// (`libatomic::daemon::services::resolve_author_for`): a signer that names
@@ -424,28 +425,52 @@ pub fn local_session_mac_key_provider(repo: &Repository) -> impl Fn(&str) -> Opt
 /// resolves to nothing yields `None`, which makes its attestation
 /// unverifiable — fail closed.
 ///
+/// The repo-local store first is what makes a hosted clone self-sufficient:
+/// an attestation's signer (a delegated agent identity) lives with the
+/// project — written into the clone by the host that opens the sandbox —
+/// not necessarily in the serving account's global store. A receiving
+/// repository without a local store simply falls back, and a clone with
+/// neither resolves nothing.
+///
 /// Read-only store access: no secret keys are loaded and the repository's
-/// write lock is never taken. The `repo` parameter exists for call-site
-/// symmetry with [`local_session_mac_key_provider`]; the identity store is
-/// global, not per-repository.
-pub fn local_did_key_provider(_repo: &Repository) -> impl Fn(&str) -> Option<[u8; 32]> {
+/// write lock is never taken. The repo-local store is opened existing-only
+/// (`IdentityStore::open_existing`), so resolution never creates files.
+pub fn local_did_key_provider(repo: &Repository) -> impl Fn(&str) -> Option<[u8; 32]> {
+    let local_store = repo.dot_dir().join("identities");
     move |signer: &str| {
-        let store = atomic_identity::IdentityStore::open_default().ok()?;
-        // A signer that names a stored identity resolves to that identity.
-        if let Ok(identity) = store.load_by_name(signer) {
-            return Some(*identity.public_key.as_bytes());
+        // Repo-local first: the identities the clone carries with it.
+        if let Some(key) = atomic_identity::IdentityStore::open_existing(&local_store)
+            .ok()
+            .and_then(|store| did_key_from_store(&store, signer))
+        {
+            return Some(key);
         }
-        // Otherwise scan for an identity whose DID matches the signer
-        // (either `did:atomic` or `did:key` rendering of its public key).
-        store
-            .list()
-            .ok()?
-            .iter()
-            .find(|identity| {
-                atomic_canonical::did::did_matches_public_key(signer, &identity.public_key)
-            })
-            .map(|identity| *identity.public_key.as_bytes())
+        // Then the serving host's global store.
+        atomic_identity::IdentityStore::open_default()
+            .ok()
+            .and_then(|store| did_key_from_store(&store, signer))
     }
+}
+
+/// Resolve a signer DID (or identity name) to a public key through one store:
+/// a signer that names a stored identity resolves to that identity; otherwise
+/// the store is scanned for an identity whose DID matches the signer (either
+/// the `did:atomic` or the `did:key` rendering of its public key).
+fn did_key_from_store(store: &atomic_identity::IdentityStore, signer: &str) -> Option<[u8; 32]> {
+    // A signer that names a stored identity resolves to that identity.
+    if let Ok(identity) = store.load_by_name(signer) {
+        return Some(*identity.public_key.as_bytes());
+    }
+    // Otherwise scan for an identity whose DID matches the signer
+    // (either `did:atomic` or `did:key` rendering of its public key).
+    store
+        .list()
+        .ok()?
+        .iter()
+        .find(|identity| {
+            atomic_canonical::did::did_matches_public_key(signer, &identity.public_key)
+        })
+        .map(|identity| *identity.public_key.as_bytes())
 }
 
 impl Repository {
@@ -1573,6 +1598,88 @@ mod tests {
         repo.create_view("gate-draft").expect("draft view");
         let outcome = repo.insert_change(&hash, crate::InsertOptions::default().view("gate-draft"));
         assert!(outcome.is_ok(), "draft insertion is not gated: {error:?}");
+    }
+
+    /// A DID signer written into the clone's repo-local identity store
+    /// (`<dot>/identities`) resolves through it: name, `did:atomic`, and
+    /// `did:key` forms all reach the identity's public key, and a signer
+    /// matching nothing resolves to nothing — fail closed.
+    #[test]
+    fn did_provider_resolves_the_clones_repo_local_identity() {
+        use atomic_canonical::did;
+        use atomic_identity::{Identity, IdentityStore, KeyPair};
+
+        let (_dir, repo) = create_temp_repo();
+        let keypair = KeyPair::generate();
+        let agent = Identity::new("aaron+rook", &keypair);
+        IdentityStore::open(&repo.dot_dir().join("identities"))
+            .expect("the clone's identity store opens")
+            .save(&agent)
+            .expect("the agent identity is saved into the clone");
+
+        let provider = super::local_did_key_provider(&repo);
+        // Both DID renderings resolve to the agent's public key.
+        assert_eq!(
+            provider(&did::did_for_public_key(&keypair.public)),
+            Some(*keypair.public.as_bytes())
+        );
+        assert_eq!(
+            provider(&did::did_key_for_public_key(&keypair.public)),
+            Some(*keypair.public.as_bytes())
+        );
+        // A signer that names the stored identity resolves too.
+        assert_eq!(provider("aaron+rook"), Some(*keypair.public.as_bytes()));
+        // A signer matching nothing resolves to nothing — unverifiable,
+        // fail closed.
+        let other = KeyPair::generate();
+        assert_eq!(provider(&did::did_for_public_key(&other.public)), None);
+    }
+
+    /// The global store is the fallback: a signer the clone does not carry
+    /// locally still resolves through the serving host's default store,
+    /// and the repo-local store wins when both could answer.
+    #[test]
+    fn did_provider_falls_back_to_the_global_store() {
+        use atomic_canonical::did;
+        use atomic_identity::{Identity, IdentityStore, KeyPair};
+
+        // Relocate the global store for the duration of the test (the same
+        // override `IdentityStore::open_default` reads), and restore it.
+        let global = tempfile::TempDir::new().unwrap();
+        let previous = std::env::var_os("ATOMIC_CONFIG_DIR");
+        std::env::set_var("ATOMIC_CONFIG_DIR", global.path());
+
+        let global_keypair = KeyPair::generate();
+        let host = Identity::new("host-account", &global_keypair);
+        IdentityStore::open_default()
+            .expect("the relocated global store opens")
+            .save(&host)
+            .expect("the host identity is saved globally");
+
+        let (_dir, repo) = create_temp_repo();
+        let local_keypair = KeyPair::generate();
+        let agent = Identity::new("aaron+rook", &local_keypair);
+        IdentityStore::open(&repo.dot_dir().join("identities"))
+            .expect("the clone's identity store opens")
+            .save(&agent)
+            .expect("the agent identity is saved into the clone");
+
+        let provider = super::local_did_key_provider(&repo);
+        // The host's signer is not in the clone: the fallback resolves it.
+        assert_eq!(
+            provider(&did::did_for_public_key(&global_keypair.public)),
+            Some(*global_keypair.public.as_bytes())
+        );
+        // The clone's own signer resolves — repo-local first.
+        assert_eq!(
+            provider(&did::did_for_public_key(&local_keypair.public)),
+            Some(*local_keypair.public.as_bytes())
+        );
+
+        match previous {
+            Some(value) => std::env::set_var("ATOMIC_CONFIG_DIR", value),
+            None => std::env::remove_var("ATOMIC_CONFIG_DIR"),
+        }
     }
 }
 
