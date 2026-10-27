@@ -1,0 +1,15 @@
+# W3C SHACL test-suite core/node/class-001, approved test.
+# Source: https://github.com/w3c/data-shapes/blob/gh-pages/data-shapes-test-suite/tests/core/node/class-001.ttl
+# Data/shape statements retained; test-manifest/report statements omitted.
+# W3C Software and Document License: https://www.w3.org/copyright/software-license/
+@prefix ex: <http://datashapes.org/sh/tests/core/node/class-001.test#> .
+@prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix sh: <http://www.w3.org/ns/shacl#> .
+ex:John rdf:type ex:MalePerson .
+ex:MalePerson rdf:type rdfs:Class ; rdfs:subClassOf ex:Person .
+ex:Person rdf:type rdfs:Class ; rdfs:subClassOf rdfs:Resource .
+ex:Quokki rdf:type ex:Animal .
+ex:Someone rdf:type ex:Person .
+ex:TestShape rdf:type sh:NodeShape ; sh:class ex:Person ;
+    sh:targetNode ex:John, ex:Quokki, ex:Someone, ex:Typeless .

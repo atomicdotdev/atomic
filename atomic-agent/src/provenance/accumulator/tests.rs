@@ -588,6 +588,33 @@ fn test_from_serialized_rebuilds_commitments_since_patch() {
 // ---- to_provenance_graph conversion ----
 
 #[test]
+fn graph_header_preserves_explicit_milliseconds_without_unit_guessing() {
+    for timestamp_ms in [-1001, 0, 1000, 1_792_920_379_589] {
+        let mut accumulator = ProvenanceAccumulator::new("timestamp-millis");
+        accumulator.append_goal("Preserve event milliseconds verbatim", timestamp_ms);
+        let graph = accumulator
+            .prepare_provenance_graph("agent", "Agent", "vendor", &[])
+            .graph;
+        assert_eq!(graph.timestamp, timestamp_ms);
+        assert_eq!(graph.nodes[0].timestamp, timestamp_ms);
+    }
+}
+
+#[test]
+fn graph_header_uses_only_the_new_turns_millisecond_timestamps() {
+    let mut accumulator = ProvenanceAccumulator::new("timestamp-delta");
+    accumulator.append_goal("first", 1_792_920_379_589);
+    accumulator.to_provenance_graph("agent", "Agent", "vendor", &[]);
+    // A skewed clock must not reuse the previous turn's later timestamp.
+    accumulator.append_goal("second", 1_792_920_379_100);
+    let graph = accumulator
+        .prepare_provenance_graph("agent", "Agent", "vendor", &[])
+        .graph;
+    assert_eq!(graph.timestamp, 1_792_920_379_100);
+    assert_eq!(graph.nodes.len(), 1);
+}
+
+#[test]
 fn test_to_provenance_graph_basic() {
     use atomic_core::change::provenance_graph as pg;
     use atomic_core::types::Hash;

@@ -70,6 +70,8 @@ use super::UnsupportedRepositoryCapability;
 /// ```
 #[derive(Debug)]
 pub enum PristineError {
+    MissingProjectIdentity,
+    KgNeedsRebuild,
     // Database Errors (from redb)
     /// Error opening or creating the database
     ///
@@ -531,6 +533,8 @@ impl fmt::Display for PristineError {
 
             // Serialization errors
             Self::Serialization { message } => write!(f, "serialization error: {}", message),
+            Self::MissingProjectIdentity => f.write_str("MissingProjectIdentity: project identity is required before KG projection"),
+            Self::KgNeedsRebuild => f.write_str("KgNeedsRebuild: open the repository writable or run atomic query reindex --full"),
 
             // Schema errors
             Self::UnsupportedSchema { found, supported } => write!(

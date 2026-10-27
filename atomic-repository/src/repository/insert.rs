@@ -1758,6 +1758,7 @@ impl Repository {
         hash: &Hash,
         options: InsertOptions,
     ) -> Result<InsertOutcome, RepositoryError> {
+        self.ensure_project_identity(atomic_core::kg::project_id::MintReason::Upgrade)?;
         let trace_insert = std::env::var_os("ATOMIC_TRACE_INSERT").is_some();
         let t0 = std::time::Instant::now();
 
@@ -2065,6 +2066,9 @@ impl Repository {
 
         // Commit the transaction
         log::debug!("insert_change: committing transaction...");
+        if txn.kg_writes_enabled()? {
+            self.project_view_kg(&mut txn)?;
+        }
         let commit_start = std::time::Instant::now();
         txn.commit()
             .map_err(|e| RepositoryError::Database(e.to_string()))?;

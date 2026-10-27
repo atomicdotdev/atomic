@@ -51,6 +51,7 @@ anyhow = { workspace = true }
 rand = { workspace = true }
 uuid = { workspace = true }
 tracing = { workspace = true }
+url = { workspace = true }
 
 [dev-dependencies]
 # Loopback protocol acceptance harness only; no production listener is added.

@@ -1010,8 +1010,11 @@ impl Command for Import {
             ));
             // Seed the default view with Git's default branch name so Atomic's
             // shared view matches the project's Git default branch.
-            Repository::init_with_view(workdir, &default_branch)
-                .map_err(|e| CliError::Internal(e.into()))?
+            let repo = Repository::init_with_view(workdir, &default_branch)
+                .map_err(|e| CliError::Internal(e.into()))?;
+            repo.ensure_project_identity(atomic_core::kg::project_id::MintReason::Created)
+                .map_err(CliError::Repository)?;
+            repo
         };
 
         // Record the detected vault policy for a freshly created repository

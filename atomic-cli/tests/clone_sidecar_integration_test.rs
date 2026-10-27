@@ -227,7 +227,7 @@ fn fresh_clone_ingests_provenance_and_attestations() {
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
-        stdout.contains("=== Change Ledger ==="),
+        stdout.contains("└── Change Ledger\n"),
         "change view lacks the ledger — sidecars were not ingested:\n{stdout}"
     );
     assert!(

@@ -7,7 +7,7 @@ use super::*;
 /// or machine parsing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Default)]
 pub enum ChangeFormat {
-    /// Full detailed format with all information.
+    /// Tree format with metadata, changed paths and recorded provenance.
     ///
     /// Shows hash, author, date, message, description, dependencies, and hunks summary.
     #[default]
@@ -331,7 +331,7 @@ pub struct JsonChangeLedger {
     /// AI vendor (e.g. "anthropic", "openai").
     #[serde(skip_serializing_if = "String::is_empty")]
     pub agent_vendor: String,
-    /// Graph creation timestamp (Unix epoch seconds).
+    /// Graph creation timestamp (Unix epoch milliseconds; historical values may be seconds).
     pub timestamp: i64,
     /// Schema profile identifier (e.g. "sherpa-trace/1.0.0"), when present.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -487,7 +487,7 @@ pub struct JsonProvenance {
     /// Temperature setting.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f64>,
-    /// Request timestamp.
+    /// Request timestamp (Unix epoch milliseconds; historical values may be seconds).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timestamp: Option<i64>,
     /// Request ID from provider.

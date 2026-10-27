@@ -2,9 +2,9 @@
 //!
 //! The canonical-family analogue of `atomic vault intent update`. It delegates
 //! to the exact same [`Repository::vault_intent_update`] write path, so its
-//! behavior (frontmatter/status/priority/title/reason/source-memory updates,
-//! body replacement, the started-or-linked guard behind `--force`) is
-//! byte-for-byte identical to the vault verb it supersedes.
+//! field updates and the started-or-linked guard behind `--force` share the
+//! vault verb's implementation. Work-start declarations additionally persist
+//! explicit agent turn context before updating status.
 
 use clap::Parser;
 
@@ -27,6 +27,15 @@ pub struct IntentUpdate {
     /// New status.
     #[arg(long)]
     pub status: Option<String>,
+
+    /// Bind work start to this active agent session (or ATOMIC_SESSION_ID).
+    /// Only valid with --status in_progress; never inferred from active sessions.
+    #[arg(long)]
+    pub session_id: Option<String>,
+
+    /// Expected 1-indexed hook turn, to reject delayed work-start declarations.
+    #[arg(long)]
+    pub turn: Option<u32>,
 
     /// New assignee.
     #[arg(long)]
@@ -63,6 +72,58 @@ pub struct IntentUpdate {
 }
 
 impl IntentUpdate {
+    fn bind_work_start(&self) -> CliResult<()> {
+        let starting = matches!(self.status.as_deref(), Some("in_progress" | "in-progress"));
+        if !starting {
+            if self.session_id.is_some() || self.turn.is_some() {
+                return Err(CliError::InvalidArgument {
+                    message: "--session-id and --turn require --status in_progress".into(),
+                });
+            }
+            return Ok(());
+        }
+        let session_id = self
+            .session_id
+            .clone()
+            .or_else(|| std::env::var("ATOMIC_SESSION_ID").ok());
+        let Some(session_id) = session_id else {
+            if self.turn.is_some() {
+                return Err(CliError::InvalidArgument {
+                    message: "--turn requires --session-id or ATOMIC_SESSION_ID".into(),
+                });
+            }
+            return Ok(()); // Human status-only updates remain supported.
+        };
+        let root = find_repository_root()?;
+        let uid = {
+            let repo =
+                crate::commands::open_readonly_repository(&root).map_err(CliError::Repository)?;
+            let inputs =
+                super::bridge::read_intent(&repo, &self.id).map_err(CliError::Repository)?;
+            inputs
+                .frontmatter
+                .get("uid")
+                .and_then(|value| value.as_str())
+                .filter(|uid| !uid.is_empty())
+                .ok_or_else(|| CliError::InvalidArgument {
+                    message: "intent has no canonical UID; cannot bind work start".into(),
+                })?
+                .to_string()
+        };
+        let dot = Repository::canonical_dot_dir(&root).map_err(CliError::Repository)?;
+        let store = atomic_agent::turn::session::SessionStore::new(dot.join("sessions"))
+            .map_err(|error| CliError::Internal(error.into()))?;
+        // Persist the declaration before status mutation or any record hook.
+        let binding = store
+            .bind_turn_intent(&session_id, self.turn, &uid)
+            .map_err(|error| CliError::Internal(error.into()))?;
+        println!(
+            "Bound governing intent: {} (session {}, turn {})",
+            binding.intent_uid, binding.session_id, binding.turn_number
+        );
+        Ok(())
+    }
+
     /// Resolve the body override: inline `--body` or `--body-stdin`.
     ///
     /// Shared by the local body and the service-layer hook — reading the
@@ -86,6 +147,7 @@ impl IntentUpdate {
 
 impl Command for IntentUpdate {
     fn run(&self) -> CliResult<()> {
+        self.bind_work_start()?;
         if crate::commands::rpc::intent_update(self)? {
             return Ok(());
         }

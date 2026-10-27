@@ -28,6 +28,7 @@ mod node_id;
 mod operation_id;
 mod position;
 mod set_id;
+pub mod timestamp;
 mod working_copy_id;
 
 pub use edge_kind::{Edge, EdgeKind, ForwardEdge, ParentEdge, ParentEdgeKind};

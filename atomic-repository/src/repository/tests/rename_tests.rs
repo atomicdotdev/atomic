@@ -512,27 +512,56 @@ fn test_unrelated_content_at_historical_path_is_not_authoritative_move() {
     std::fs::remove_file(&new).unwrap();
     std::fs::write(&old, "completely unrelated replacement payload\n").unwrap();
 
-    let outcome = record_all(&repo, "delete current and recreate historical path").unwrap();
-    assert!(!outcome.change().hunks().iter().any(|operation| matches!(
-        operation,
-        GraphOp::FileMove { .. } | GraphOp::FileUndel { .. }
-    )));
+    let outcome = record_all(&repo, "delete current path").unwrap();
+    // The recreated historical path is untracked: no hunk mentions it, and no
+    // move evidence may claim it. Only the live deletion is recorded.
+    assert!(!outcome
+        .change()
+        .hunks()
+        .iter()
+        .any(|operation| match operation {
+            GraphOp::FileAdd { path, .. }
+            | GraphOp::FileUndel { path, .. }
+            | GraphOp::FileMove { path, .. } => path == "old.txt",
+            _ => false,
+        }));
     assert!(outcome
         .change()
         .hunks()
         .iter()
         .any(|operation| matches!(operation, GraphOp::FileDel { path, .. } if path == "new.txt")));
-    assert!(outcome
-        .change()
-        .hunks()
+    assert!(repo.get_file_inode("old.txt").unwrap().is_none());
+    assert!(repo
+        .status(StatusOptions::default())
+        .unwrap()
+        .entries()
         .iter()
-        .any(|operation| matches!(operation, GraphOp::FileAdd { path, .. } if path == "old.txt")));
+        .any(|entry| entry.path() == std::path::Path::new("old.txt")
+            && entry.status() == FileStatus::Untracked));
     assert!(outcome
         .move_evidence()
         .unwrap()
         .is_none_or(|evidence| evidence.authoritative_moves.is_empty()));
-    let recreated_inode = repo.get_file_inode("old.txt").unwrap().unwrap();
-    assert_ne!(recreated_inode, original_inode);
+
+    // An explicit add re-tracks the historical path by choice: with its
+    // claimant no longer live anywhere, the record undeletes that claimant —
+    // never a fabricated move.
+    repo.add("old.txt", TrackingOptions::default()).unwrap();
+    let retaken = record_all(&repo, "re-track the historical path").unwrap();
+    assert!(!retaken
+        .change()
+        .hunks()
+        .iter()
+        .any(|operation| matches!(operation, GraphOp::FileMove { .. })));
+    assert!(retaken.change().hunks().iter().any(|operation| matches!(
+        operation,
+        GraphOp::FileUndel { path, .. } if path == "old.txt"
+    )));
+    assert_eq!(
+        repo.get_file_inode("old.txt").unwrap(),
+        Some(original_inode),
+        "the explicit re-add undeletes the path's last claimant with its identity"
+    );
 }
 
 #[test]
@@ -550,6 +579,11 @@ fn test_historical_path_is_fresh_add_when_rename_detection_is_disabled() {
     std::fs::remove_file(&new).unwrap();
     std::fs::write(&old, "unrelated recreated payload\n").unwrap();
 
+    // Staging the historical path while the same record still deletes the
+    // claimant's current path must be a fresh add — never an implicit
+    // undelete that hijacks an identity that is still live in this change,
+    // even with heuristic detection disabled.
+    repo.add("old.txt", TrackingOptions::default()).unwrap();
     let outcome = repo
         .record(
             ChangeHeader::new("detection disabled"),

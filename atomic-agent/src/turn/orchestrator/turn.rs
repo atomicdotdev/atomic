@@ -186,7 +186,7 @@ impl TurnOrchestrator {
         if let Some(ref prompt) = event.prompt {
             if !prompt.is_empty() && self.journal_sink.is_none() {
                 if let Some(mut acc) = self.load_accumulator(session_id) {
-                    acc.append_goal(prompt, event.timestamp.timestamp());
+                    acc.append_goal(prompt, event.timestamp.timestamp_millis());
                     self.save_accumulator(session_id, &acc);
                 }
             }
@@ -297,6 +297,8 @@ impl TurnOrchestrator {
                     // The load_or_create + Idle consultation below handles it.
                 }
                 let turn_number = session.end_turn();
+                self.session_store
+                    .freeze_turn_intent(session_id, turn_number)?;
                 let boundary_end = atomic_repository::Repository::open_readonly(&self.repo_root)
                     .ok()
                     .and_then(|repo| {
@@ -466,6 +468,8 @@ impl TurnOrchestrator {
         // OpenCode writes no transcript file of its own.
         self.enrich_opencode_turn(&mut session, &mut event)?;
         let pending_turn_number = session.turn_count.saturating_add(1);
+        self.session_store
+            .freeze_turn_intent(session_id, pending_turn_number)?;
         self.commit_turn_completion_events(&session, &event, pending_turn_number)?;
 
         // A read-only turn still owns a journal turn number and immutable

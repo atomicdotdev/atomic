@@ -7,6 +7,31 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+pub(crate) fn rank_kg_hits(
+    txn: &impl crate::pristine::KgTxnT,
+    hits: HashMap<String, usize>,
+    limit: usize,
+) -> Result<Vec<KgNode>, crate::pristine::PristineError> {
+    let mut ranked = Vec::new();
+    for (id, hits) in hits {
+        if let Some(node) = txn.get_kg_node(&id)? {
+            let score = hits
+                * if node.has_type(crate::kg::ontology::Class::File) {
+                    2
+                } else {
+                    1
+                };
+            ranked.push((score, node));
+        }
+    }
+    ranked.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.id.cmp(&b.1.id)));
+    Ok(ranked
+        .into_iter()
+        .take(limit)
+        .map(|(_, node)| node)
+        .collect())
+}
+
 /// Type of vault entry.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -463,14 +488,14 @@ pub fn parse_intent_reference(
 pub struct KgNode {
     /// Structured identifier (e.g., `"change:{hash}"`, `"file:{path}"`).
     pub id: String,
-    /// Node category: `"change"`, `"file"`, `"entity"`, `"view"`, `"goal"`, `"intent"`, `"memory"`.
-    pub kind: String,
+    /// Asserted absolute class IRIs (also indexed in KG_TYPES).
+    pub types: Vec<String>,
     /// Human-readable label (short hash, filename, symbol name).
     pub label: String,
     /// Optional longer description (commit message, entity signature, etc.).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub summary: Option<String>,
-    /// Where this node was derived from (e.g., `"change_graph"`, `"ast_extraction"`, `"vault"`).
+    /// Where this node was derived from (e.g., `"vcs"`, `"session_ledger"`, `"vault"`).
     pub source: String,
     /// Arbitrary metadata as JSON.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -478,16 +503,69 @@ pub struct KgNode {
 }
 
 impl KgNode {
+    /// Normalize the legacy session projector's seconds/milliseconds mix-up in
+    /// the returned read model only. Stored KG and provenance bytes stay intact.
+    pub(crate) fn from_json(bytes: &[u8]) -> Result<Self, serde_json::Error> {
+        let mut node: Self = serde_json::from_slice(bytes)?;
+        if node.source == "session_ledger" && node.has_type(crate::kg::ontology::Class::SessionTurn)
+        {
+            if let Some(created_at) = node.metadata.as_mut().and_then(|m| m.get_mut("created_at")) {
+                if let Some(legacy) = created_at
+                    .as_str()
+                    .and_then(|value| {
+                        chrono::DateTime::parse_from_rfc3339(value)
+                            // Chrono emits expanded years for the erroneous
+                            // date, but its strict RFC-3339 parser rejects them.
+                            .or_else(|_| {
+                                chrono::DateTime::parse_from_str(value, "%Y-%m-%dT%H:%M:%S%.f%:z")
+                            })
+                            .ok()
+                    })
+                    .filter(|value| {
+                        value.timestamp().unsigned_abs()
+                            >= crate::types::timestamp::MILLISECOND_EPOCH_THRESHOLD
+                    })
+                {
+                    if let Some(corrected) =
+                        crate::types::timestamp::epoch_datetime(legacy.timestamp())
+                    {
+                        *created_at = serde_json::json!(corrected.to_rfc3339());
+                    }
+                }
+            }
+        }
+        Ok(node)
+    }
+
+    pub fn has_type(&self, class: crate::kg::ontology::Class) -> bool {
+        self.types.iter().any(|iri| iri == class.iri())
+    }
+
+    pub fn primary_type(&self) -> &str {
+        self.types.first().map(String::as_str).unwrap_or_default()
+    }
+
+    pub fn with_type(mut self, class: crate::kg::ontology::Class) -> Self {
+        if !self.has_type(class) {
+            self.types.push(class.iri().to_owned());
+            self.types.sort();
+        }
+        self
+    }
+
+    pub fn path(&self) -> Option<&str> {
+        self.metadata.as_ref()?.get("path")?.as_str()
+    }
     /// Create a new KG node.
     pub fn new(
         id: impl Into<String>,
-        kind: impl Into<String>,
+        class: crate::kg::ontology::Class,
         label: impl Into<String>,
         source: impl Into<String>,
     ) -> Self {
         Self {
             id: id.into(),
-            kind: kind.into(),
+            types: vec![class.iri().to_owned()],
             label: label.into(),
             summary: None,
             source: source.into(),
@@ -510,16 +588,16 @@ impl KgNode {
 
 /// A directed edge in the knowledge graph.
 ///
-/// Edges encode relationships: `MODIFIES`, `DEFINES`, `DEPENDS_ON`,
-/// `ON_VIEW`, `CHILD_OF`, `LINKED_INTENT`, etc.
+/// Only predicates from the canonical workflow ontology can be stored.
+/// Source-code relationships belong to the request-scoped syntax index.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KgEdge {
     /// Source node ID.
     pub from_id: String,
     /// Target node ID.
     pub to_id: String,
-    /// Relationship type (e.g., `"MODIFIES"`, `"DEFINES"`, `"DEPENDS_ON"`).
-    pub kind: String,
+    /// Canonical workflow relationship.
+    pub kind: crate::kg::ontology::Predicate,
     /// Optional edge metadata.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<serde_json::Value>,
@@ -529,12 +607,12 @@ impl KgEdge {
     pub fn new(
         from_id: impl Into<String>,
         to_id: impl Into<String>,
-        kind: impl Into<String>,
+        predicate: crate::kg::ontology::Predicate,
     ) -> Self {
         Self {
             from_id: from_id.into(),
             to_id: to_id.into(),
-            kind: kind.into(),
+            kind: predicate,
             metadata: None,
         }
     }
@@ -611,6 +689,64 @@ pub struct SearchResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_epoch_formatting_accepts_seconds_and_milliseconds() {
+        for (raw, expected) in [
+            (1_792_920_379, "2026-10-25T09:26:19+00:00"),
+            (1_792_920_379_589, "2026-10-25T09:26:19.589+00:00"),
+            (0, "1970-01-01T00:00:00+00:00"),
+        ] {
+            assert_eq!(
+                crate::types::timestamp::epoch_datetime(raw)
+                    .unwrap()
+                    .to_rfc3339(),
+                expected
+            );
+        }
+        assert!(crate::types::timestamp::epoch_datetime(i64::MAX).is_none());
+        assert!(crate::types::timestamp::epoch_datetime(i64::MIN).is_none());
+    }
+
+    #[test]
+    fn cached_session_date_is_normalized_only_in_the_read_model() {
+        use crate::kg::ontology::Class;
+        let original = KgNode::new("turn", Class::SessionTurn, "continue", "session_ledger")
+            .with_metadata(serde_json::json!({"created_at": "+58785-05-21T06:46:29+00:00"}));
+        let bytes = serde_json::to_vec(&original).unwrap();
+        let decoded = KgNode::from_json(&bytes).unwrap();
+        assert_eq!(
+            decoded.metadata.unwrap()["created_at"],
+            "2026-10-25T09:26:19.589+00:00"
+        );
+        assert_eq!(serde_json::to_vec(&original).unwrap(), bytes);
+    }
+
+    #[test]
+    fn date_normalization_leaves_valid_dates_and_unrelated_nodes_unchanged() {
+        use crate::kg::ontology::Class;
+        for (class, source, date) in [
+            (
+                Class::SessionTurn,
+                "session_ledger",
+                "2026-10-25T09:26:19.589Z",
+            ),
+            (Class::SessionTurn, "session_ledger", "not a date"),
+            (Class::SessionTurn, "other", "+58785-05-21T06:46:29+00:00"),
+            (
+                Class::Memory,
+                "session_ledger",
+                "+58785-05-21T06:46:29+00:00",
+            ),
+        ] {
+            let original = KgNode::new("node", class, "label", source)
+                .with_metadata(serde_json::json!({"created_at": date}));
+            assert_eq!(
+                KgNode::from_json(&serde_json::to_vec(&original).unwrap()).unwrap(),
+                original
+            );
+        }
+    }
 
     #[test]
     fn compose_human_key_uppercases_project_and_keeps_author() {
@@ -948,21 +1084,30 @@ mod tests {
 
     #[test]
     fn kg_node_new_and_builder() {
-        let node = KgNode::new("change:abc123", "change", "abc123", "change_graph")
-            .with_summary("Fix auth bug")
-            .with_metadata(serde_json::json!({"view": "main"}));
+        let node = KgNode::new(
+            "change:abc123",
+            crate::kg::ontology::Class::Change,
+            "abc123",
+            "change_graph",
+        )
+        .with_summary("Fix auth bug")
+        .with_metadata(serde_json::json!({"view": "main"}));
         assert_eq!(node.id, "change:abc123");
-        assert_eq!(node.kind, "change");
+        assert!(node.has_type(crate::kg::ontology::Class::Change));
         assert_eq!(node.summary, Some("Fix auth bug".to_string()));
         assert!(node.metadata.is_some());
     }
 
     #[test]
     fn kg_edge_new() {
-        let edge = KgEdge::new("change:abc", "file:src/auth.rs", "MODIFIES");
+        let edge = KgEdge::new(
+            "change:abc",
+            "file:src/auth.rs",
+            crate::kg::ontology::Predicate::ModifiesFile,
+        );
         assert_eq!(edge.from_id, "change:abc");
         assert_eq!(edge.to_id, "file:src/auth.rs");
-        assert_eq!(edge.kind, "MODIFIES");
+        assert_eq!(edge.kind, crate::kg::ontology::Predicate::ModifiesFile);
         assert!(edge.metadata.is_none());
     }
 
@@ -974,7 +1119,12 @@ mod tests {
 
     #[test]
     fn kg_node_json_roundtrip() {
-        let node = KgNode::new("file:src/main.rs", "file", "src/main.rs", "change_graph");
+        let node = KgNode::new(
+            "file:src/main.rs",
+            crate::kg::ontology::Class::File,
+            "src/main.rs",
+            "change_graph",
+        );
         let json = serde_json::to_string(&node).unwrap();
         let decoded: KgNode = serde_json::from_str(&json).unwrap();
         assert_eq!(node, decoded);
@@ -982,7 +1132,7 @@ mod tests {
 
     #[test]
     fn kg_node_skips_none_fields() {
-        let node = KgNode::new("x", "y", "z", "w");
+        let node = KgNode::new("x", crate::kg::ontology::Class::Memory, "z", "w");
         let json = serde_json::to_string(&node).unwrap();
         assert!(!json.contains("summary"));
         assert!(!json.contains("metadata"));

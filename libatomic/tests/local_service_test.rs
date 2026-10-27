@@ -494,12 +494,8 @@ fn embedded_descriptor_contains_the_status_contract() {
 }
 
 #[tokio::test]
-async fn change_blast_radius_is_readonly_change_local_and_uses_incoming_structural_edges() {
+async fn change_blast_radius_is_readonly_change_local_and_uses_view_syntax() {
     use atomic_core::change::ChangeHeader;
-    use atomic_core::pristine::{
-        vault::{KgEdge, KgNode},
-        KgMutTxnT, MutTxnT,
-    };
     use atomic_repository::RecordOptions;
     let dir = tempfile::tempdir().unwrap();
     let repo = Repository::init(dir.path()).unwrap();
@@ -512,6 +508,15 @@ async fn change_blast_radius_is_readonly_change_local_and_uses_incoming_structur
     )
     .unwrap();
     repo.add(wc, "src/api.ts", Default::default()).unwrap();
+    std::fs::create_dir(dir.path().join("tests")).unwrap();
+    for (path, source) in [
+        ("tests/api.ts", "function test() { changed(); }\n"),
+        ("src/ui.ts", "import { changed } from './api';\n"),
+        ("unrelated.ts", "function unrelated() { return 1; }\n"),
+    ] {
+        std::fs::write(dir.path().join(path), source).unwrap();
+        repo.add(wc, path, Default::default()).unwrap();
+    }
     let options = || {
         RecordOptions::new()
             .with_all(true)
@@ -529,33 +534,11 @@ async fn change_blast_radius_is_readonly_change_local_and_uses_incoming_structur
         .record(wc, ChangeHeader::new("public change"), options())
         .unwrap()
         .hash();
-    let target = "entity:src/api.ts:changed:1";
-    let caller = "entity:tests/api.ts:test:1";
-    let mut txn = repo.pristine().write_txn().unwrap();
-    for (id, kind, label) in [
-        ("file:src/api.ts", "file", "api.ts"),
-        ("file:tests/api.ts", "file", "api.ts"),
-        ("file:src/ui.ts", "file", "ui.ts"),
-        (target, "entity", "changed"),
-        (caller, "entity", "test"),
-    ] {
-        txn.upsert_kg_node(&KgNode::new(id, kind, label, "ast"))
-            .unwrap();
-    }
-    for (from, to, kind) in [
-        ("file:src/api.ts", target, "DEFINES"),
-        ("file:tests/api.ts", caller, "DEFINES"),
-        (caller, target, "CALLS"),
-        ("file:src/ui.ts", "file:src/api.ts", "INCLUDES"),
-        (target, caller, "CALLS"),
-        ("file:unrelated.ts", "file:src/api.ts", "CO_CHANGED"),
-    ] {
-        txn.upsert_kg_edge(&KgEdge::new(from, to, kind)).unwrap();
-    }
-    txn.commit().unwrap();
     // The working copy is now unrelated to the recorded change. Analysis must
     // still use the exact before/after change sources rather than this buffer.
     std::fs::write(&file, "function totallyDifferent() {}\n").unwrap();
+    std::fs::write(dir.path().join("tests/api.ts"), "function test() {}\n").unwrap();
+    std::fs::write(dir.path().join("src/ui.ts"), "").unwrap();
     drop(repo);
     let service = LocalService::new();
     let reference = resolve(&service, dir.path()).await;
@@ -602,6 +585,102 @@ async fn change_blast_radius_is_readonly_change_local_and_uses_incoming_structur
         std::fs::read(database).unwrap(),
         "analysis must not write or enrich the KG"
     );
+}
+
+#[tokio::test]
+async fn change_impact_and_recorded_bytes_use_the_selected_view_not_the_working_copy_view() {
+    use atomic_core::change::ChangeHeader;
+    use atomic_repository::RecordOptions;
+    let dir = tempfile::tempdir().unwrap();
+    let mut repo = Repository::init(dir.path()).unwrap();
+    let wc = repo.require_working_copy_id().unwrap();
+    let selected_view = repo.current_view().to_owned();
+    let options = || {
+        RecordOptions::new()
+            .with_all(true)
+            .save_to_store(true)
+            .apply_after_record(true)
+    };
+    for (path, source) in [
+        ("api.ts", "function changed() { return 1; }\n"),
+        ("caller.ts", "function caller() { changed(); }\n"),
+    ] {
+        std::fs::write(dir.path().join(path), source).unwrap();
+        repo.add(wc, path, Default::default()).unwrap();
+    }
+    repo.record(wc, ChangeHeader::new("selected baseline"), options())
+        .unwrap();
+    std::fs::write(
+        dir.path().join("api.ts"),
+        "export function changed() { return 2; }\n",
+    )
+    .unwrap();
+    let hash = *repo
+        .record(wc, ChangeHeader::new("selected public change"), options())
+        .unwrap()
+        .hash();
+    repo.create_shared_view("unrelated").unwrap();
+    repo.switch_view(wc, "unrelated").unwrap();
+    std::fs::write(
+        dir.path().join("unrelated.ts"),
+        "function unrelated() { changed(); }\n",
+    )
+    .unwrap();
+    repo.add(wc, "unrelated.ts", Default::default()).unwrap();
+    repo.record(wc, ChangeHeader::new("different view caller"), options())
+        .unwrap();
+    drop(repo);
+
+    let service = LocalService::new();
+    let reference = resolve(&service, dir.path()).await;
+    let database = dir.path().join(".atomic/atomic.redb");
+    let before = std::fs::read(&database).unwrap();
+    let response: proto::GetChangeResponse = invoke(
+        &service,
+        "/atomic.RepositoryQueryService/GetChange",
+        &proto::GetChangeRequest {
+            repository: Some(reference),
+            r#ref: Some(proto::ChangeRef {
+                kind: Some(proto::change_ref::Kind::Hash(proto::Hash {
+                    value: hash.0.to_vec(),
+                    ..Default::default()
+                })),
+            }),
+            view: Some(proto::ViewRef {
+                name: Some(selected_view.clone()),
+                ..Default::default()
+            }),
+            includes: Some(proto::ChangeIncludes {
+                blast_radius: true,
+                ..Default::default()
+            }),
+            include_file_contents: true,
+        },
+    )
+    .await;
+    let impact = response.blast_radius.unwrap();
+    assert_eq!(impact.mode, "structural", "{:?}", impact.warnings);
+    assert!(impact.context.contains(&selected_view));
+    assert_eq!(impact.files.len(), 2);
+    assert_eq!(impact.edges.len(), 1);
+    assert_eq!(impact.edges[0].from_path, "caller.ts");
+    assert_eq!(impact.edges[0].to_path, "api.ts");
+    let file = response
+        .file_contents
+        .iter()
+        .find(|file| file.path == "api.ts")
+        .unwrap();
+    assert_eq!(
+        file.before.as_deref(),
+        Some(&b"function changed() { return 1; }\n"[..])
+    );
+    assert_eq!(
+        file.after.as_deref(),
+        Some(&b"export function changed() { return 2; }\n"[..])
+    );
+    assert_eq!(before, std::fs::read(database).unwrap());
+    let repo = Repository::open_readonly(dir.path()).unwrap();
+    assert_eq!(repo.current_view(), "unrelated");
 }
 
 #[tokio::test]

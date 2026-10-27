@@ -213,73 +213,68 @@ impl Repository {
             tracked_paths.insert(normalized);
         }
 
-        // TREE is aligned to the current visible lifecycle and therefore omits
-        // recorded deletions. Reintroduce those paths for status classification
-        // using the operation-aware projection so a filesystem reappearance is
-        // an undelete of the original inode rather than an untracked new file.
-        let mut present = crate::worktree_presence::WorktreeEntries::new(&self.root);
-        // Loaded on the first reappeared directory only; most status calls
-        // never see one.
-        let reappearance_rules: std::cell::OnceCell<Option<crate::ignore::IgnoreRules>> =
-            std::cell::OnceCell::new();
-        for absent in &projected_absent {
-            let normalized = PathBuf::from(&absent.path);
-            // A projected deletion is already the recorded state. Reintroduce
-            // it only when an entry actually reappears on disk under its exact
-            // name, where it must be classified as an undelete of the stable
-            // inode rather than as an untracked add. A plain stat is not
-            // enough: on a case-insensitive filesystem the old spelling of a
-            // case-only rename still resolves, and a deleted child still
-            // resolves through an ancestor that became a symlink to a
-            // directory; neither is a reappearance.
-            let reappeared = match present.exact_metadata(&worktree_path(&normalized)) {
-                Ok(Some(metadata)) => metadata,
-                Ok(None) => continue,
-                // An unreadable ancestor is not a reappearance; status keeps
-                // reporting the rest of the workspace, as the plain stat did.
-                Err(error) => {
-                    log::debug!(
-                        "status: cannot inspect projected-absent path '{}': {error}",
-                        absent.path
-                    );
+        // A recorded deletion is final state, not a pending change, in a local
+        // working copy: bytes that reappear at a deleted path are untracked
+        // content, exactly as after a committed `git rm`. Status therefore does
+        // NOT reintroduce projected-absent paths there — an implicit sweep
+        // would silently re-track work the user explicitly removed.
+        // Re-tracking is deliberate: `atomic add` stages the path, and
+        // record's own projection lookup then undeletes it with its original
+        // inode when the same record does not also delete that inode's current
+        // path.
+        //
+        // A remote sandbox cache is different: the submitting workspace has no
+        // staging vocabulary. A file its checkout recreates at a deleted path
+        // IS the sandbox undeleting that path's original identity, so the
+        // reappearance must surface as a change candidate for the submission
+        // record to capture. The flag is set only by the pointer-based remote
+        // sandbox open, never by a plain local repository.
+        if self.is_sandbox {
+            // Match exact names without following symlink ancestors or treating
+            // a case-only rename's old spelling as a recreated entry.
+            let mut present = crate::worktree_presence::WorktreeEntries::new(&self.root);
+            let reappearance_rules: std::cell::OnceCell<Option<crate::ignore::IgnoreRules>> =
+                std::cell::OnceCell::new();
+            for absent in &projected_absent {
+                let normalized = PathBuf::from(&absent.path);
+                if !path_selected(&normalized) {
                     continue;
                 }
-            };
-            if !path_selected(&normalized) {
-                continue;
-            }
-            // A directory Git emptied (`git mv` of its last file) stays on
-            // disk holding nothing Git could ever commit; in a repository
-            // colocated with Git it is not a reappearance of the recorded
-            // directory. A native repository keeps tracking empty
-            // directories, so there a re-created one is still the undelete
-            // it always was; a symlink or file at the directory's path is a
-            // reappearance like before.
-            if absent.directory && reappeared.file_type().is_dir() && git_colocated {
-                let rules = reappearance_rules
-                    .get_or_init(|| {
-                        options
-                            .respect_ignore_files
-                            .then(|| self.load_ignore_rules())
-                    })
-                    .as_ref();
-                if !crate::leftover_directory::holds_visible_entries(
-                    &self.root,
-                    &worktree_path(&normalized),
-                    rules,
-                ) {
-                    log::debug!(
-                        "status: projected-absent directory '{}' is on disk but holds nothing visible; not a reappearance",
-                        absent.path
-                    );
-                    continue;
+                let reappeared = match present.exact_metadata(&worktree_path(&normalized)) {
+                    Ok(Some(metadata)) => metadata,
+                    Ok(None) => continue,
+                    Err(error) => {
+                        log::debug!(
+                            "status: cannot inspect projected-absent path '{}': {error}",
+                            absent.path
+                        );
+                        continue;
+                    }
+                };
+                // A Git-emptied directory containing only ignored files is
+                // not a recreated tracked directory in a colocated workspace.
+                if absent.directory && reappeared.file_type().is_dir() && git_colocated {
+                    let rules = reappearance_rules
+                        .get_or_init(|| {
+                            options
+                                .respect_ignore_files
+                                .then(|| self.load_ignore_rules())
+                        })
+                        .as_ref();
+                    if !crate::leftover_directory::holds_visible_entries(
+                        &self.root,
+                        &worktree_path(&normalized),
+                        rules,
+                    ) {
+                        continue;
+                    }
                 }
-            }
-            tracked_paths.insert(normalized.clone());
-            inode_map.insert(normalized.clone(), absent.inode);
-            has_graph_content_cache.insert(normalized.clone(), true);
-            if absent.directory {
-                directory_inodes.insert(absent.inode);
+                tracked_paths.insert(normalized.clone());
+                inode_map.insert(normalized.clone(), absent.inode);
+                has_graph_content_cache.insert(normalized.clone(), true);
+                if absent.directory {
+                    directory_inodes.insert(absent.inode);
+                }
             }
         }
 
@@ -778,6 +773,38 @@ impl Repository {
         // Any tracked path not found on disk in the loop above is deleted.
         // (Already handled inline above for regular files and directories.)
 
+        // ── Pending untracks (`remove --keep` intent) ─────────────────
+        //
+        // A marked path is still fully tracked until record lands its
+        // FileDel: the marker changes only what the next record captures,
+        // not what is on disk. Surface the intent where it would otherwise
+        // be invisible (a clean file) and override local edits (the delete,
+        // not the edit, is what will be recorded). A marked path missing
+        // from disk keeps its `deleted:` entry — same recorded outcome —
+        // and a marker whose claim has died or moved elsewhere is skipped
+        // here and dropped by record when it observes it.
+        let pending_untracks = txn
+            .pending_untracks(view.id)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        for pending in &pending_untracks {
+            let path_buf = PathBuf::from(pending);
+            if std::fs::symlink_metadata(self.root.join(&path_buf)).is_err() {
+                continue;
+            }
+            let Some(inode) = inode_map.get(&path_buf).copied() else {
+                continue;
+            };
+            if !projected_present_paths.contains(&path_buf) {
+                continue;
+            }
+            let mut entry = FileStatusEntry::new(path_buf, FileStatus::PendingUntrack);
+            entry.set_inode(inode);
+            if directory_inodes.contains(&inode) {
+                entry.set_details("directory".to_string());
+            }
+            status.add_or_replace_entry(entry);
+        }
+
         // ── Filesystem walk for untracked files ────────────────────────
         //
         // Only do the expensive walkdir when the caller wants untracked
@@ -1126,6 +1153,43 @@ impl Repository {
     ) -> Result<bool, RepositoryError> {
         let status = self.status(working_copy, StatusOptions::fast())?;
         Ok(status.is_clean())
+    }
+
+    /// Whether a tracked path has working-copy edits that deleting it would
+    /// destroy.
+    ///
+    /// This is the guard `git rm` applies before removing a file with local
+    /// changes. Only content-bearing differences count: `Deleted` means the bytes
+    /// are already gone, and a path absent from the status result is not something
+    /// this call can destroy.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// if repo.has_uncommitted_edits(working_copy, Path::new("Cargo.lock"))? {
+    ///     // refuse, or require an explicit force
+    /// }
+    /// ```
+    pub fn has_uncommitted_edits(
+        &self,
+        working_copy: WorkingCopyId,
+        path: &Path,
+    ) -> Result<bool, RepositoryError> {
+        let options = StatusOptions {
+            include_untracked: false,
+            path_filters: vec![path.to_path_buf()],
+            ..StatusOptions::default()
+        };
+        let status = self.status(working_copy, options)?;
+        Ok(status.get(path).is_some_and(|entry| {
+            matches!(
+                entry.status(),
+                FileStatus::Modified
+                    | FileStatus::Conflicted
+                    | FileStatus::TypeChanged
+                    | FileStatus::PermissionsChanged
+            )
+        }))
     }
 
     /// Get only modified files.

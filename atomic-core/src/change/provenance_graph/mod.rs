@@ -174,7 +174,9 @@ pub struct ProvenanceGraph {
     /// Schema version for forward compatibility.
     pub version: u8,
 
-    /// Timestamp when this graph was created (Unix epoch seconds).
+    /// Timestamp when this graph was created (Unix epoch milliseconds).
+    /// Historical graphs may contain seconds; use [`Self::timestamp_datetime`]
+    /// when interpreting the value without changing its content hash.
     pub timestamp: i64,
 
     /// Session identifier linking provenance graphs within the same session.
@@ -240,6 +242,12 @@ pub struct ProvenanceGraph {
 }
 
 impl ProvenanceGraph {
+    /// Decode millisecond timestamps and historical second timestamps using the
+    /// compatibility convention in [`crate::types::timestamp::epoch_datetime`].
+    pub fn timestamp_datetime(&self) -> Option<chrono::DateTime<chrono::Utc>> {
+        crate::types::timestamp::epoch_datetime(self.timestamp)
+    }
+
     /// Create a builder for constructing a provenance graph.
     pub fn builder(
         session_id: impl Into<String>,

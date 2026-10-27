@@ -549,6 +549,52 @@ impl StorageClient {
     ) -> Result<IdentityInfo, RemoteError> {
         self.get(&format!("/identities/by-key/{public_key}")).await
     }
+
+    /// Resolve a `did:atomic:` identifier to the identity that registered
+    /// the fingerprinted key.
+    ///
+    /// Signed objects (attestations, delegations) carry only the signer's
+    /// DID — `did:atomic:<base32(blake3(public_key))>`, a one-way
+    /// fingerprint — so verifying such an object means first recovering the
+    /// key through the server.
+    ///
+    /// Authenticated like the name/email resolution (unlike `by-key`:
+    /// holding a DID proves nothing, since DIDs circulate in public signed
+    /// objects). **The returned key is verified against the requested DID
+    /// before the call counts as success** — the server is the obvious
+    /// adversary for a fingerprint lookup (it indexes by the fingerprint,
+    /// so a mismatched answer looks well-formed), and a client that trusts
+    /// the answer to verify a signature must not take it on faith. A
+    /// mismatch is an error, never a success.
+    pub async fn resolve_identity_by_did(&self, did: &str) -> Result<IdentityInfo, RemoteError> {
+        let info: IdentityInfo = self
+            .get(&format!("/identities/by-did/{}", urlencoding::encode(did)))
+            .await?;
+        verify_did_binding(did, &info)?;
+        Ok(info)
+    }
+}
+
+/// Does the identity record a server returned actually belong to `did`?
+///
+/// The failure modes are deliberately unified into one error: a missing key
+/// (an old server behind this endpoint), an unparseable key, and a key that
+/// simply is not the one the DID fingerprints all mean "this answer cannot
+/// be trusted for signature verification", and letting any of them through
+/// as success would accept a spoofed signer.
+fn verify_did_binding(did: &str, info: &IdentityInfo) -> Result<(), RemoteError> {
+    let key_b32 = info.public_key.as_deref().ok_or_else(|| {
+        RemoteError::other("identity lookup by DID returned no public key to verify")
+    })?;
+    let public_key = atomic_identity::keypair::PublicKey::from_base32(key_b32)
+        .map_err(|e| RemoteError::other(format!("returned public key is unusable: {e}")))?;
+    if atomic_canonical::did::did_matches_public_key(did, &public_key) {
+        Ok(())
+    } else {
+        Err(RemoteError::other(format!(
+            "server returned public key {key_b32} that does not match DID {did}"
+        )))
+    }
 }
 
 #[cfg(test)]
@@ -620,6 +666,43 @@ mod tests {
         let client = StorageClient::new("https://example.com", "acme", "tok").unwrap();
         let err = client.parse_error_body(502, "Bad Gateway");
         assert!(err.to_string().contains("502"));
+    }
+
+    fn info_with_key(public_key: Option<String>) -> IdentityInfo {
+        IdentityInfo {
+            id: uuid::Uuid::nil(),
+            name: "tester".to_string(),
+            status: "active".to_string(),
+            created_at: chrono::Utc::now(),
+            public_key,
+        }
+    }
+
+    #[test]
+    fn did_binding_accepts_the_key_it_fingerprints() {
+        let kp = atomic_identity::KeyPair::generate();
+        let did = atomic_canonical::did::did_for_public_key(&kp.public);
+        let info = info_with_key(Some(kp.public.to_base32()));
+        assert!(verify_did_binding(&did, &info).is_ok());
+    }
+
+    #[test]
+    fn did_binding_rejects_every_way_the_answer_cannot_be_trusted() {
+        use atomic_identity::KeyPair;
+
+        let kp = KeyPair::generate();
+        let stranger = KeyPair::generate();
+        let did = atomic_canonical::did::did_for_public_key(&kp.public);
+
+        // Someone else's key: the server answered our DID with a key that
+        // belongs to another identity. Success here would validate a
+        // spoofed signer, so it must be an error.
+        let mismatch = info_with_key(Some(stranger.public.to_base32()));
+        assert!(verify_did_binding(&did, &mismatch).is_err());
+
+        // No key at all, and an unparseable one: equally untrusted answers.
+        assert!(verify_did_binding(&did, &info_with_key(None)).is_err());
+        assert!(verify_did_binding(&did, &info_with_key(Some("not base32!".to_string()))).is_err());
     }
 
     #[test]

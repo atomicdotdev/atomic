@@ -1557,17 +1557,28 @@ impl Repository {
                 .ok_or_else(|| RepositoryError::InvalidOperation {
                     message: format!("tree projection position {} has no inode", position),
                 })?;
-            if let Some(expected_directory) = state.directory {
-                let cached_directory = txn
-                    .is_directory(inode)
-                    .map_err(|error| RepositoryError::Database(error.to_string()))?;
-                if expected_directory != cached_directory {
-                    return Err(RepositoryError::InvalidOperation {
-                        message: format!(
-                            "tree projection kind for inode {} disagrees with DIRECTORIES",
-                            inode.get()
-                        ),
-                    });
+            // `DIRECTORIES` projects which inodes are directories *in the
+            // projected tree*, so it clears with the inode's last path. An
+            // inode that no longer holds any path has no row to disagree with,
+            // and a journal action naming a path it has already lost must not
+            // fail the projection it no longer participates in.
+            let holds_a_path = txn
+                .get_path(inode)
+                .map_err(|error| RepositoryError::Database(error.to_string()))?
+                .is_some();
+            if holds_a_path {
+                if let Some(expected_directory) = state.directory {
+                    let cached_directory = txn
+                        .is_directory(inode)
+                        .map_err(|error| RepositoryError::Database(error.to_string()))?;
+                    if expected_directory != cached_directory {
+                        return Err(RepositoryError::InvalidOperation {
+                            message: format!(
+                                "tree projection kind for inode {} disagrees with DIRECTORIES",
+                                inode.get()
+                            ),
+                        });
+                    }
                 }
             }
         }
@@ -1608,8 +1619,22 @@ impl Repository {
             .into_values()
             .map(|item| (item.inode, (item.path, item.is_directory)))
             .collect();
+        // A name-conflict side holds no path in `desired` yet is very much a
+        // projected directory: the conflict resolution below still needs its
+        // `DIRECTORIES` row to type the claimant.
+        let conflicted_inodes: HashSet<Inode> = projection
+            .name_conflicts
+            .values()
+            .flat_map(|conflict| conflict.sides.iter().map(|side| side.inode))
+            .collect();
         let mut operations = Vec::new();
         let mut affected = HashSet::new();
+        // Inodes whose path binding this realignment removes and which the
+        // projection does not re-place: they are gone, so any `DIRECTORIES`
+        // row they kept is stale authority (a recorded `DirDel` reported its
+        // inodes here). The row is dropped below, after the plan lands, so a
+        // directory the projection re-places at another path keeps its row.
+        let mut gone_inodes: Vec<Inode> = Vec::new();
 
         for entry in txn
             .iter_tree()
@@ -1631,6 +1656,7 @@ impl Repository {
                     inode,
                     retire: false,
                 });
+                gone_inodes.push(inode);
                 continue;
             }
             if desired
@@ -1642,6 +1668,9 @@ impl Repository {
                     inode,
                     retire: false,
                 });
+                if !desired.contains_key(&inode) && !conflicted_inodes.contains(&inode) {
+                    gone_inodes.push(inode);
+                }
             }
         }
 
@@ -1694,6 +1723,14 @@ impl Repository {
             .map_err(projection_error)?;
         txn.validate_tree_bijection()
             .map_err(|error| RepositoryError::Database(error.to_string()))?;
+        // Drop the directory rows of inodes the projection no longer places, so
+        // `DIRECTORIES` never outlives the path it described. An inode the
+        // projection keeps — including one moved to another path — keeps its
+        // row, because the inode is still that directory in the graph.
+        for inode in gone_inodes {
+            txn.del_directory(inode)
+                .map_err(|error| RepositoryError::Database(error.to_string()))?;
+        }
         Ok(affected)
     }
 

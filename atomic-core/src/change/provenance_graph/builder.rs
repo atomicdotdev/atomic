@@ -158,10 +158,17 @@ impl ProvenanceGraphBuilder {
         self
     }
 
-    /// Set the timestamp (Unix epoch seconds). Defaults to now.
+    /// Set a raw epoch timestamp, preserved verbatim for historical imports.
+    /// New writers should use [`Self::timestamp_millis`]; legacy seconds remain
+    /// readable without rewriting their payloads.
     pub fn timestamp(mut self, ts: i64) -> Self {
         self.timestamp = Some(ts);
         self
+    }
+
+    /// Set the timestamp in Unix epoch milliseconds. Defaults to now.
+    pub fn timestamp_millis(self, ts: i64) -> Self {
+        self.timestamp(ts)
     }
 
     /// Set the vault work-item/intent governing this turn.
@@ -181,7 +188,7 @@ impl ProvenanceGraphBuilder {
         let timestamp = self.timestamp.unwrap_or_else(|| {
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs() as i64)
+                .map(|d| d.as_millis() as i64)
                 .unwrap_or(0)
         });
 

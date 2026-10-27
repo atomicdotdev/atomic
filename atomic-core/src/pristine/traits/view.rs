@@ -864,6 +864,13 @@ pub trait ViewTxnT: GraphTxnT {
         view_id: u64,
     ) -> Result<Vec<(u64, Vec<StoredConflict>)>, PristineError>;
 
+    /// Read a view's pending-untrack paths, in stable sorted order.
+    ///
+    /// Returns an empty vec when nothing is pending. This is intent state:
+    /// never derived from the graph, never rebuilt by repair (see the
+    /// `PENDING_UNTRACKS` table docs).
+    fn pending_untracks(&self, view_id: u64) -> Result<Vec<String>, PristineError>;
+
     /// Return every CONFLICTS row in deterministic key order.
     ///
     /// Unlike [`Self::iter_conflicts`], this is a complete storage snapshot: it
@@ -1062,6 +1069,10 @@ mod tests {
             &self,
             _view_id: u64,
         ) -> Result<Vec<(u64, Vec<StoredConflict>)>, PristineError> {
+            Ok(Vec::new())
+        }
+
+        fn pending_untracks(&self, _view_id: u64) -> Result<Vec<String>, PristineError> {
             Ok(Vec::new())
         }
 

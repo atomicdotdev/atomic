@@ -634,32 +634,7 @@ impl Repository {
         path: P,
         change_hash: &Hash,
     ) -> Result<Option<Vec<u8>>, RepositoryError> {
-        let path = path.as_ref();
-        let normalized = normalize_path(path);
-
-        let txn = self
-            .pristine
-            .read_txn()
-            .map_err(|e| RepositoryError::Database(e.to_string()))?;
-
-        // Get the current view
-        let view = txn
-            .get_view(&self.current_view)
-            .map_err(|e| RepositoryError::Database(e.to_string()))?
-            .ok_or_else(|| RepositoryError::ViewNotFound {
-                name: self.current_view.clone(),
-            })?;
-
-        let Some(visibility) = graph_visibility_at_change(&txn, &view, change_hash, false)? else {
-            return Ok(None);
-        };
-
-        let cached_txn =
-            CachedGraphTxn::new(&txn).map_err(|e| RepositoryError::Database(e.to_string()))?;
-        match self.get_materialized_entry_with_visibility(&cached_txn, &normalized, visibility)? {
-            MaterializedEntry::Absent { .. } => Ok(None),
-            MaterializedEntry::Present { bytes, .. } => Ok(Some(bytes)),
-        }
+        self.get_file_content_before_change_on_view(path, change_hash, &self.current_view)
     }
 
     /// Get file content as it was AFTER a specific change was applied.
@@ -699,7 +674,40 @@ impl Repository {
         path: P,
         change_hash: &Hash,
     ) -> Result<Option<Vec<u8>>, RepositoryError> {
-        let path = path.as_ref();
+        self.get_file_content_after_change_on_view(path, change_hash, &self.current_view)
+    }
+
+    /// Reconstruct the state before a change in the named view's effective
+    /// history, without switching the working copy. Returns `None` when the
+    /// file or change is absent in that view.
+    pub fn get_file_content_before_change_on_view<P: AsRef<Path>>(
+        &self,
+        path: P,
+        change_hash: &Hash,
+        view_name: &str,
+    ) -> Result<Option<Vec<u8>>, RepositoryError> {
+        self.file_content_at_change_on_view(path.as_ref(), change_hash, view_name, false)
+    }
+
+    /// Reconstruct the state after a change in the named view's effective
+    /// history, without switching the working copy. Returns `None` when the
+    /// file or change is absent in that view.
+    pub fn get_file_content_after_change_on_view<P: AsRef<Path>>(
+        &self,
+        path: P,
+        change_hash: &Hash,
+        view_name: &str,
+    ) -> Result<Option<Vec<u8>>, RepositoryError> {
+        self.file_content_at_change_on_view(path.as_ref(), change_hash, view_name, true)
+    }
+
+    fn file_content_at_change_on_view(
+        &self,
+        path: &Path,
+        change_hash: &Hash,
+        view_name: &str,
+        include_change: bool,
+    ) -> Result<Option<Vec<u8>>, RepositoryError> {
         let normalized = normalize_path(path);
 
         let txn = self
@@ -707,15 +715,16 @@ impl Repository {
             .read_txn()
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
-        // Get the current view
         let view = txn
-            .get_view(&self.current_view)
+            .get_view(view_name)
             .map_err(|e| RepositoryError::Database(e.to_string()))?
             .ok_or_else(|| RepositoryError::ViewNotFound {
-                name: self.current_view.clone(),
+                name: view_name.to_owned(),
             })?;
 
-        let Some(visibility) = graph_visibility_at_change(&txn, &view, change_hash, true)? else {
+        let Some(visibility) =
+            graph_visibility_at_change(&txn, &view, change_hash, include_change)?
+        else {
             return Ok(None);
         };
 

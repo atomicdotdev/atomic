@@ -301,8 +301,14 @@ fn remove_preview_does_not_capture_pending_shim_edits() {
     cli(root.path(), &["git", "import", "--no-vault"]);
     fs::write(root.path().join("file.txt"), "pending edit\n").unwrap();
     let before = snapshot(root.path());
+    // The preview names the path and reports why it would refuse to delete it
+    // (uncommitted edits, like `git rm` without `-f`) rather than promising a
+    // removal it will not perform.
     let output = cli(root.path(), &["remove", "--dry-run", "file.txt"]);
-    assert!(output.contains("Would remove 1"), "{output}");
+    assert!(
+        output.contains("file.txt") && output.contains("Would refuse"),
+        "{output}"
+    );
     assert_eq!(
         snapshot(root.path()),
         before,

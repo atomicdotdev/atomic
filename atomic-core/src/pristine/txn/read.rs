@@ -42,7 +42,8 @@ use crate::pristine::traits::{
 
 use super::helpers::{
     collect_preload_edges, collect_until_error, deserialize_conflicts, deserialize_edge,
-    deserialize_view_state, graph_presence, try_collect, try_is_present, AdjIterator,
+    deserialize_pending_untracks, deserialize_view_state, graph_presence, try_collect,
+    try_is_present, AdjIterator,
 };
 
 /// Read-only transaction
@@ -542,6 +543,14 @@ impl ViewTxnT for ReadTxn {
             }
         }
         Ok(out)
+    }
+
+    fn pending_untracks(&self, view_id: u64) -> PristineResult<Vec<String>> {
+        let table = self.txn.open_table(PENDING_UNTRACKS)?;
+        match table.get(&view_id)? {
+            Some(value) => deserialize_pending_untracks(value.value()),
+            None => Ok(Vec::new()),
+        }
     }
 
     fn snapshot_conflicts(&self) -> PristineResult<Vec<(u64, Inode, Vec<StoredConflict>)>> {
@@ -1371,6 +1380,7 @@ impl VaultTxnT for ReadTxn {
 
 impl KgTxnT for ReadTxn {
     fn get_kg_node(&self, id: &str) -> PristineResult<Option<KgNode>> {
+        self.require_current_kg()?;
         let table = match self.txn.open_table(KG_NODES) {
             Ok(t) => t,
             Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
@@ -1378,11 +1388,10 @@ impl KgTxnT for ReadTxn {
         };
         match table.get(id)? {
             Some(value) => {
-                let node: KgNode = serde_json::from_slice(value.value()).map_err(|e| {
-                    PristineError::Serialization {
+                let node =
+                    KgNode::from_json(value.value()).map_err(|e| PristineError::Serialization {
                         message: e.to_string(),
-                    }
-                })?;
+                    })?;
                 Ok(Some(node))
             }
             None => Ok(None),
@@ -1390,6 +1399,7 @@ impl KgTxnT for ReadTxn {
     }
 
     fn get_kg_edges_from(&self, node_id: &str) -> PristineResult<Vec<KgEdge>> {
+        self.require_current_kg()?;
         let from_table = match self.txn.open_multimap_table(KG_EDGES_FROM) {
             Ok(t) => t,
             Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
@@ -1419,6 +1429,7 @@ impl KgTxnT for ReadTxn {
     }
 
     fn get_kg_edges_to(&self, node_id: &str) -> PristineResult<Vec<KgEdge>> {
+        self.require_current_kg()?;
         let to_table = match self.txn.open_multimap_table(KG_EDGES_TO) {
             Ok(t) => t,
             Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
@@ -1448,6 +1459,7 @@ impl KgTxnT for ReadTxn {
     }
 
     fn kg_fts_search(&self, query: &str, limit: usize) -> PristineResult<Vec<KgNode>> {
+        self.require_current_kg()?;
         let fts_table = match self.txn.open_multimap_table(KG_FTS) {
             Ok(t) => t,
             Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
@@ -1474,40 +1486,11 @@ impl KgTxnT for ReadTxn {
             }
         }
 
-        // Sort by relevance: boost entity nodes (3x) and file nodes (2x)
-        // over change nodes (1x). Entities and files are more useful for
-        // code exploration than individual change records.
-        let mut ranked: Vec<(String, usize)> = hit_counts.into_iter().collect();
-        ranked.sort_by(|a, b| {
-            let boost_a = if a.0.starts_with("entity:") {
-                a.1 * 3
-            } else if a.0.starts_with("file:") {
-                a.1 * 2
-            } else {
-                a.1
-            };
-            let boost_b = if b.0.starts_with("entity:") {
-                b.1 * 3
-            } else if b.0.starts_with("file:") {
-                b.1 * 2
-            } else {
-                b.1
-            };
-            boost_b.cmp(&boost_a)
-        });
-        ranked.truncate(limit);
-
-        // Fetch full nodes
-        let mut nodes = Vec::new();
-        for (id, _) in &ranked {
-            if let Some(node) = self.get_kg_node(id)? {
-                nodes.push(node);
-            }
-        }
-        Ok(nodes)
+        crate::pristine::vault::rank_kg_hits(self, hit_counts, limit)
     }
 
     fn kg_fts_match_ids(&self, query: &str) -> PristineResult<Vec<(String, usize)>> {
+        self.require_current_kg()?;
         let fts_table = match self.txn.open_multimap_table(KG_FTS) {
             Ok(t) => t,
             Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
@@ -1537,6 +1520,7 @@ impl KgTxnT for ReadTxn {
     }
 
     fn count_kg_nodes(&self) -> PristineResult<usize> {
+        self.require_current_kg()?;
         let table = match self.txn.open_table(KG_NODES) {
             Ok(t) => t,
             Err(redb::TableError::TableDoesNotExist(_)) => return Ok(0),
@@ -1546,6 +1530,7 @@ impl KgTxnT for ReadTxn {
     }
 
     fn kg_node_ids_by_source(&self, sources: &[&str]) -> PristineResult<Vec<String>> {
+        self.require_current_kg()?;
         let table = match self.txn.open_table(KG_NODES) {
             Ok(t) => t,
             Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
@@ -1564,6 +1549,7 @@ impl KgTxnT for ReadTxn {
     }
 
     fn count_kg_edges(&self) -> PristineResult<usize> {
+        self.require_current_kg()?;
         let table = match self.txn.open_table(KG_EDGES) {
             Ok(t) => t,
             Err(redb::TableError::TableDoesNotExist(_)) => return Ok(0),
@@ -2338,6 +2324,10 @@ impl<'txn> ViewTxnT for CachedGraphTxn<'txn> {
         self.txn.iter_conflicts(view_id)
     }
 
+    fn pending_untracks(&self, view_id: u64) -> PristineResult<Vec<String>> {
+        self.txn.pending_untracks(view_id)
+    }
+
     fn snapshot_conflicts(&self) -> PristineResult<Vec<(u64, Inode, Vec<StoredConflict>)>> {
         self.txn.snapshot_conflicts()
     }
@@ -2796,6 +2786,10 @@ impl<'txn> ViewTxnT for InodePreloadTxn<'txn> {
 
     fn iter_conflicts(&self, view_id: u64) -> PristineResult<Vec<(u64, Vec<StoredConflict>)>> {
         self.txn.iter_conflicts(view_id)
+    }
+
+    fn pending_untracks(&self, view_id: u64) -> PristineResult<Vec<String>> {
+        self.txn.pending_untracks(view_id)
     }
 
     fn snapshot_conflicts(&self) -> PristineResult<Vec<(u64, Inode, Vec<StoredConflict>)>> {

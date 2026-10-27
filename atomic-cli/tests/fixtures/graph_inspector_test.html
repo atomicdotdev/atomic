@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="en">
+<meta charset="utf-8">
+<title>Atomic graph inspector DOM regression</title>
+<body>
+<aside id="inspector" aria-label="Node details"></aside>
+<pre id="results"></pre>
+<script src="../../src/commands/query/graph_inspector.js"></script>
+<script>
+(function() {
+  var checks = 0;
+  function assert(value, message) {
+    checks++;
+    if (!value) throw new Error(message);
+  }
+  try {
+    var malicious = '\u003cimg src=x onerror="window.inspectorInjection=true">';
+    var summary = 'Full summary '.repeat(30) + 'END OF SUMMARY';
+    var tokens = {input: 54, output: 2177, reasoning: 105, cache_read: 500, cache_write: 7, total: 2336};
+    function usage(basis) {
+      return {basis: basis, scope_complete: true,
+        coverage: {changes: 1, with_provenance: 1, without_provenance: 0, unavailable: 0, duplicate_usage_records: 0, conflicting_usage_records: 0, records_without_cost: 0},
+        tokens: tokens, cost: {currency: 'USD', amount: '0.086176', amount_micros: 86176},
+        contributors: [{model: 'model-a', vendor: 'openrouter', tool: 'CLI: opencode', tokens: tokens, cost_usd: '0.086176'}], notes: ['Recorded values, not estimates.']};
+    }
+    var missing = usage('change_provenance');
+    missing.tokens = null;
+    missing.cost = null;
+    missing.contributors = [];
+    missing.coverage = {changes: 1, with_provenance: 0, without_provenance: 1, unavailable: 0};
+    var data = {
+      nodes: [
+        {id: 'urn:first', kind: 'atomic:Change', types: ['atomic:Change', 'atomic:Artifact'], label: malicious, summary: summary, source: 'vcs', metadata: {hash: 'FULL_HASH', verification: {status: 'verified', evidence: malicious}, ai_usage: usage('change_provenance')}},
+        {id: 'urn:second', kind: 'atomic:File', types: ['atomic:File'], label: 'src/cli.ts', source: 'vcs'},
+        {id: 'urn:view', kind: 'https://atomic.dev/ns/workflow#View', types: ['https://atomic.dev/ns/workflow#View'], label: 'dev', metadata: {ai_usage: usage('view_canonical_effective_membership_including_ancestors_and_dependencies')}},
+        {id: 'urn:intent', kind: 'https://atomic.dev/ns/workflow#FeatureIntent', types: ['https://atomic.dev/ns/workflow#FeatureIntent'], label: 'intent', metadata: {ai_usage: usage('intent_implementation_and_recording_evidence_excluding_dependencies')}},
+        {id: 'urn:missing', kind: 'https://atomic.dev/ns/workflow#Change', types: ['https://atomic.dev/ns/workflow#Change'], label: 'no provenance', metadata: {ai_usage: missing}}
+      ],
+      // D3 replaces link endpoints with objects during simulation. The
+      // inspector must work with these as well as the original string IDs.
+      links: [
+        {source: {id: 'urn:first'}, target: {id: 'urn:second'}, kind: 'https://atomic.dev/ns/workflow#modifiesFile', metadata: {evidence: 'recorded graph operation'}},
+        {source: 'urn:second', target: 'urn:first', kind: 'https://atomic.dev/ns/workflow#references'}
+      ]
+    };
+    var container = document.getElementById('inspector');
+    var selected = [];
+    var inspector = createGraphInspector(container, data, function(id) { selected.push(id); });
+    assert(selected.length === 0, 'initialization must not redraw a half-initialized canvas');
+    assert(container.textContent.includes('No node selected'), 'initial empty state');
+    inspector.select('urn:first');
+    assert(container.dataset.selectedNode === 'urn:first', 'select canonical node ID');
+    assert(selected.at(-1) === 'urn:first', 'selection notifies canvas');
+    assert(container.textContent.includes(summary), 'full summary, not hover truncation');
+    assert(container.textContent.includes('atomic:Artifact'), 'all asserted types');
+    assert(container.textContent.includes('FULL_HASH'), 'node metadata');
+    assert(container.textContent.includes('verified'), 'nested metadata');
+    assert(container.textContent.includes('Outgoing relationships (1)'), 'outgoing relationships');
+    assert(container.textContent.includes('Incoming relationships (1)'), 'incoming relationships');
+    assert(container.textContent.includes('recorded graph operation'), 'edge metadata');
+    assert(container.textContent.includes('$0.086176 USD'), 'precise recorded cost');
+    assert(container.textContent.includes('Cache read') && container.textContent.includes('Cache write') && container.textContent.includes('Reasoning'), 'all token categories');
+    assert(container.textContent.includes('2,336'), 'recorded total formatted');
+    assert(container.textContent.includes('Vendor: openrouter') && container.textContent.includes('Tool: CLI: opencode') && container.textContent.includes('model-a'), 'model/tool/vendor attribution');
+    assert(container.textContent.includes(malicious), 'untrusted text remains visible');
+    assert(!container.querySelector('img') && !window.inspectorInjection, 'untrusted text must not become markup');
+    container.querySelector('.inspector-neighbor').click();
+    assert(container.dataset.selectedNode === 'urn:second', 'navigate by relationship');
+    assert(container.textContent.includes('No metadata exported'), 'missing metadata fallback');
+    assert(document.activeElement === container.querySelector('select'), 'relationship keyboard focus retained');
+    var picker = container.querySelector('select');
+    picker.value = 'urn:first';
+    picker.dispatchEvent(new Event('change'));
+    assert(container.dataset.selectedNode === 'urn:first', 'keyboard-accessible node picker');
+    document.dispatchEvent(new KeyboardEvent('keydown', {key: 'Escape'}));
+    assert(container.dataset.selectedNode === '' && selected.at(-1) === null, 'Escape clears selection');
+    inspector.select('urn:first');
+    container.querySelector('.inspector-clear').click();
+    assert(container.dataset.selectedNode === '', 'Clear button');
+    inspector.select('missing');
+    assert(container.textContent.includes('No node selected'), 'unknown node handled safely');
+    inspector.select('urn:view');
+    assert(container.textContent.includes('Effective view membership') && container.textContent.includes('$0.086176 USD'), 'view usage scope and cost');
+    inspector.select('urn:intent');
+    assert(container.textContent.includes('dependency-only changes excluded') && container.textContent.includes('model-a'), 'intent scope and model attribution');
+    inspector.select('urn:missing');
+    assert(container.textContent.includes('Cost not recorded') && container.textContent.includes('Not recorded'), 'missing usage is not zero');
+    assert(!container.querySelector('.inspector-ai-usage').textContent.includes('$0.000000'), 'unknown cost must not look free');
+    document.body.dataset.testStatus = 'passed';
+    document.getElementById('results').textContent = checks + ' DOM assertions passed';
+  } catch (error) {
+    document.body.dataset.testStatus = 'failed';
+    document.getElementById('results').textContent = error.stack;
+  }
+})();
+</script>
+</body>
+</html>

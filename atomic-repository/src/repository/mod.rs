@@ -71,9 +71,9 @@ use crate::status::{
 
 use crate::tracking::{
     add_to_tree, collect_files_for_tracking_with_rules, get_inode, is_tracked, list_tracked,
-    move_tracked, normalize_path, normalize_path_with_root, remove_from_tree,
-    should_ignore_with_rules, tracked_under_prefix, TrackedFile, TrackingError, TrackingOptions,
-    TrackingStats,
+    move_tracked, normalize_path, normalize_path_with_root, should_ignore_with_rules,
+    tracked_path_state, tracked_under_prefix, untrack_staged_path, TrackedFile, TrackedPathState,
+    TrackingError, TrackingOptions, TrackingStats,
 };
 use crate::unrecord::{UnrecordOptions, UnrecordOutcome};
 use crate::RepositoryError;
@@ -134,7 +134,9 @@ mod split;
 mod staging;
 mod stash;
 mod switch;
+mod syntax_index;
 mod synthesis;
+pub use syntax_index::{Caller, SyntaxIndex};
 mod tag_projection;
 mod views;
 mod working_copy;
@@ -251,8 +253,14 @@ mod changes;
 mod content;
 mod history;
 mod insert;
+mod kg_attestation;
+mod kg_rebuild;
+mod project_identity;
 pub mod provenance_gate;
 mod provenance_summary;
+pub use project_identity::{
+    build_project_identity, project_identity_hash, verify_project_identity, IdentityAdoption,
+};
 mod record;
 mod remotes;
 mod status;
@@ -261,6 +269,8 @@ mod tracking;
 mod triage;
 mod vault;
 mod vault_defaults;
+mod vault_projection;
+pub use vault_triples::WorkflowSnapshot;
 mod vault_embeddings;
 mod vault_goal;
 mod vault_identity;
@@ -624,6 +634,10 @@ default = "{}"
             semantic_closure_memo: Default::default(),
         };
         repository.fence_recovery_for_budget(working_copy_id, budget)?;
+        if !budget.is_metadata_only() {
+            repository.ensure_project_identity(atomic_core::kg::project_id::MintReason::Upgrade)?;
+            repository.rebuild_kg(false)?;
+        }
 
         // Deferred TREE or operation recovery may rewrite the compatibility
         // pointer. Reassert the persistent record as the sole authority.

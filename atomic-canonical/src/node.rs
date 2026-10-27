@@ -110,7 +110,8 @@ pub struct Constraint {
     pub text: String,
 }
 
-/// A typed dependency edge leaf, lifted from a `:::ref{to= edge=}` directive.
+/// A typed reference leaf, lifted from a `::ref{to= edge=}` directive.
+/// Includes dependency, review, remediation and explicit implementation claims.
 /// `@type`/`@id` are omitted when absent (the doc's `:::ref` carries only
 /// `to`/`edge`), so no empty JSON-LD keys leak into the hash.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -122,6 +123,13 @@ pub struct Ref {
     pub id: Option<String>,
     pub to: String,
     pub edge: String,
+    /// Evidence for an explicit implementation declaration, not captured turn provenance.
+    #[serde(
+        rename = "declarationEvidence",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub declaration_evidence: Option<String>,
 }
 
 /// The acceptance criteria a task fulfills, in whichever JSON shape it was read.
@@ -309,6 +317,8 @@ pub struct CanonicalNode {
         skip_serializing_if = "Vec::is_empty"
     )]
     pub has_constraint: Vec<Constraint>,
+    /// Historical wire name; inspect each reference's edge before treating it
+    /// as a dependency. Reviews and implementation declarations are not deps.
     #[serde(rename = "dependsOn", default, skip_serializing_if = "Vec::is_empty")]
     pub depends_on: Vec<Ref>,
 

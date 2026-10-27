@@ -347,12 +347,12 @@ pub fn session_turn_from(bytes: Option<&pb::VersionedBytes>) -> Result<SessionTu
 pub fn publication_proto(
     publication: &SessionCheckpointPublication,
 ) -> Result<pb::ProvenancePublished, String> {
+    let published_at = publication.turn.timestamp_datetime().ok_or_else(|| {
+        "session publication timestamp is outside the supported range".to_string()
+    })?;
     Ok(pb::ProvenancePublished {
         provenance_hash: Some(hash_proto(&publication.turn.provenance_hash)),
-        published_at: Some(prost_types::Timestamp {
-            seconds: publication.turn.timestamp,
-            nanos: 0,
-        }),
+        published_at: Some(super::convert::timestamp_proto(published_at)),
         manifest_hash: Some(hash_proto(&publication.manifest_hash)),
         publication: Some(versioned(
             PUBLICATION_SCHEMA,
@@ -371,6 +371,34 @@ pub fn publication_from(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn publication_timestamp_preserves_milliseconds_and_original_turn_payload() {
+        for (timestamp, nanos) in [(1_792_920_379, 0), (1_792_920_379_589, 589_000_000)] {
+            let publication = SessionCheckpointPublication {
+                turn: SessionTurn {
+                    session_id: "timestamp-wire".into(),
+                    turn_number: 0,
+                    goal: None,
+                    provenance_hash: Hash::of(b"provenance"),
+                    change_hashes: Vec::new(),
+                    previous_provenance: None,
+                    timestamp,
+                    plan_id: None,
+                    todos: Vec::new(),
+                    boundary_start: None,
+                    boundary_end: None,
+                    outcome: None,
+                },
+                manifest_hash: Hash::of(b"manifest"),
+            };
+            let wire = publication_proto(&publication).unwrap();
+            let published = wire.published_at.as_ref().unwrap();
+            assert_eq!(published.seconds, 1_792_920_379);
+            assert_eq!(published.nanos, nanos);
+            assert_eq!(publication_from(&wire).unwrap(), publication);
+        }
+    }
 
     #[test]
     fn every_rejection_survives_the_wire() {
