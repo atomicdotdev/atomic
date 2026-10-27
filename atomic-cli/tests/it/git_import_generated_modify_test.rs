@@ -143,9 +143,9 @@ fn git_import_records_the_real_helpers_history_with_exact_content() {
     // import failed with "staged path
     // 'atomic-cli/src/commands/push/helpers.rs' renders 27472 byte(s) but
     // the commit tree expects 23819 byte(s)".
-    let c1 = include_bytes!("fixtures/helpers_c1.rs");
-    let c5 = include_bytes!("fixtures/helpers_c5.rs");
-    let c6 = include_bytes!("fixtures/helpers_c6.rs");
+    let c1 = include_bytes!("../fixtures/helpers_c1.rs");
+    let c5 = include_bytes!("../fixtures/helpers_c5.rs");
+    let c6 = include_bytes!("../fixtures/helpers_c6.rs");
 
     let root = tempfile::tempdir().unwrap().keep();
     let home = tempfile::tempdir().unwrap().keep();

@@ -12,6 +12,14 @@ const CHILD_ROOT: &str = "ATOMIC_DATABASE_LOCK_ROOT";
 const CHILD_REPORT: &str = "ATOMIC_DATABASE_LOCK_REPORT";
 const CHILD_TEST: &str = "database_handles_exclude_incompatible_opens_across_processes";
 
+/// libtest's name for the child test: its module path without the crate name.
+fn child_test_name() -> String {
+    match module_path!().split_once("::") {
+        Some((_, module)) => format!("{module}::{CHILD_TEST}"),
+        None => CHILD_TEST.to_string(),
+    }
+}
+
 fn probe(root: &Path) -> String {
     let readonly = match Repository::open_readonly_wait(root, Duration::ZERO) {
         Ok(_) => "readonly-ok".to_string(),
@@ -39,7 +47,7 @@ fn probe(root: &Path) -> String {
 
 fn child_probe(root: &Path, report_path: &Path) -> String {
     let mut child = Command::new(std::env::current_exe().expect("test binary path"))
-        .args(["--exact", CHILD_TEST, "--test-threads=1"])
+        .args(["--exact", &child_test_name(), "--test-threads=1"])
         .env(CHILD_ROOT, root)
         .env(CHILD_REPORT, report_path)
         .stdout(Stdio::piped())

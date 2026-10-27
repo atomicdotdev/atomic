@@ -86,7 +86,7 @@ Browser interaction regressions can be run explicitly with Chrome/Chromium:
 
 ```sh
 ATOMIC_TEST_CHROME=/path/to/chrome \
-  cargo test -p atomic-cli --test intent_graph_test -- --ignored
+  cargo test -p atomic-cli --test it -- intent_graph_test:: --ignored
 ```
 
 Set `ATOMIC_TEST_D3=/path/to/d3.min.js` to use a local D3 v7 bundle for the canvas

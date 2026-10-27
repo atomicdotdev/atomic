@@ -940,7 +940,7 @@ Global identity configuration is stored in `~/.config/atomic/` (or platform equi
 cargo test -p atomic-cli
 
 # Validate that every public command path renders help
-cargo test -p atomic-cli --test cli_surface_integration_test
+cargo test -p atomic-cli --test it -- cli_surface_integration_test::
 
 # Run the black-box CLI harness against a freshly built binary
 cargo build -p atomic-cli

@@ -52,7 +52,7 @@ impl Fixture {
             "[package]\nname = \"version-fixture\"\nversion = \"0.19.1\"\nedition = \"2021\"\n",
         )
         .unwrap();
-        fs::write(source.join("build.rs"), include_str!("../build.rs")).unwrap();
+        fs::write(source.join("build.rs"), include_str!("../../build.rs")).unwrap();
         fs::write(
             source.join("src/main.rs"),
             "fn main() { println!(\"{}\", env!(\"ATOMIC_CLI_VERSION\")); }\n",

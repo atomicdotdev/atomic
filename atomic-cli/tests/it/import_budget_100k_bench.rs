@@ -10,7 +10,7 @@
 //! ```text
 //! TMPDIR=/home/aaron/code/work/atomic/target/bench-tmp \
 //!   cargo test -p atomic-cli --release \
-//!   --test import_budget_100k_bench -- --ignored --nocapture
+//!   --test it -- import_budget_100k_bench:: --ignored --nocapture
 //! ```
 //!
 //! The run prints the measured wall-clock numbers and the environment

@@ -1422,19 +1422,19 @@ fn hyperfine_fixture_versions() -> [(&'static str, &'static [u8]); 4] {
     [
         (
             "a658ab8c",
-            include_bytes!("fixtures/hyperfine/a658ab8c_main.rs"),
+            include_bytes!("../fixtures/hyperfine/a658ab8c_main.rs"),
         ),
         (
             "d4ebdd7b",
-            include_bytes!("fixtures/hyperfine/d4ebdd7b_main.rs"),
+            include_bytes!("../fixtures/hyperfine/d4ebdd7b_main.rs"),
         ),
         (
             "197f9fb",
-            include_bytes!("fixtures/hyperfine/197f9fb_main.rs"),
+            include_bytes!("../fixtures/hyperfine/197f9fb_main.rs"),
         ),
         (
             "68fdc2c",
-            include_bytes!("fixtures/hyperfine/68fdc2c_main.rs"),
+            include_bytes!("../fixtures/hyperfine/68fdc2c_main.rs"),
         ),
     ]
 }

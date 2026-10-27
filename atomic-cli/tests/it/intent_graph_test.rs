@@ -249,7 +249,7 @@ fn exported_graph_canvas_selection_drag_zoom_and_responsive_layout() {
         "</body>",
         &format!(
             "<script>{}</script></body>",
-            include_str!("fixtures/graph_canvas_test.js")
+            include_str!("../fixtures/graph_canvas_test.js")
         ),
     );
     let path = directory.path().join("canvas-inspector.html");

@@ -1,4 +1,4 @@
-#[path = "../src/commands/git/wip.rs"]
+#[path = "../../src/commands/git/wip.rs"]
 mod wip;
 
 use std::collections::BTreeSet;
