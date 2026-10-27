@@ -102,6 +102,80 @@ fn assert_clean_and_verified(root: &Path, home: &Path) {
 }
 
 #[test]
+fn literal_percent_path_reconciles_without_stale_checkpoint() {
+    let (root, home) = shim_repo();
+    fs::write(root.join("100%.txt"), b"literal percent\n").unwrap();
+    git(&root, &["add", "100%.txt"]);
+    git(&root, &["commit", "-qm", "add literal-percent path"]);
+    let head = git(&root, &["rev-parse", "HEAD"]);
+
+    atomic_ok(&root, &home, &["git", "shim", "reconcile"]);
+    assert_clean_and_verified(&root, &home);
+    assert_eq!(
+        fs::read(root.join("100%.txt")).unwrap(),
+        b"literal percent\n"
+    );
+    assert!(!root.join("100%25.txt").exists());
+    atomic_ok(&root, &home, &["git", "shim", "reconcile"]);
+    assert_clean_and_verified(&root, &home);
+    assert_eq!(git(&root, &["rev-parse", "HEAD"]), head);
+}
+
+#[test]
+fn literal_percent_lookalikes_reconcile_through_edit_rename_delete() {
+    let (root, home) = shim_repo();
+    for (path, bytes) in [
+        ("100%.txt", "literal percent\n"),
+        ("a%41.txt", "literal escape\n"),
+        ("aA.txt", "decoded lookalike\n"),
+        ("a%2541.txt", "double escape lookalike\n"),
+    ] {
+        fs::write(root.join(path), bytes).unwrap();
+    }
+    git(&root, &["add", "."]);
+    git(
+        &root,
+        &["commit", "-qm", "add distinct literal-percent paths"],
+    );
+    let head = git(&root, &["rev-parse", "HEAD"]);
+    atomic_ok(&root, &home, &["git", "shim", "reconcile"]);
+    assert_clean_and_verified(&root, &home);
+    atomic_ok(&root, &home, &["git", "shim", "reconcile"]);
+    assert_clean_and_verified(&root, &home);
+    assert_eq!(git(&root, &["rev-parse", "HEAD"]), head);
+    assert!(!root.join("100%25.txt").exists());
+
+    fs::write(root.join("a%41.txt"), b"Git edit of literal escape\n").unwrap();
+    git(&root, &["add", "a%41.txt"]);
+    git(&root, &["commit", "-qm", "edit literal escape"]);
+    atomic_ok(&root, &home, &["git", "shim", "reconcile"]);
+    assert_clean_and_verified(&root, &home);
+    assert_eq!(
+        fs::read(root.join("aA.txt")).unwrap(),
+        b"decoded lookalike\n"
+    );
+    assert_eq!(
+        fs::read(root.join("a%2541.txt")).unwrap(),
+        b"double escape lookalike\n"
+    );
+
+    git(&root, &["mv", "100%.txt", "renamed%25.txt"]);
+    git(&root, &["commit", "-qm", "rename literal-percent path"]);
+    atomic_ok(&root, &home, &["git", "shim", "reconcile"]);
+    assert_clean_and_verified(&root, &home);
+    assert_eq!(
+        fs::read(root.join("renamed%25.txt")).unwrap(),
+        b"literal percent\n"
+    );
+    assert!(!root.join("100%.txt").exists());
+
+    git(&root, &["rm", "renamed%25.txt"]);
+    git(&root, &["commit", "-qm", "delete literal-percent path"]);
+    atomic_ok(&root, &home, &["git", "shim", "reconcile"]);
+    assert_clean_and_verified(&root, &home);
+}
+
+#[test]
 fn git_branch_created_after_atomic_records_reconciles() {
     let (root, home) = shim_repo();
     fs::write(root.join("tracked.txt"), b"atomic edit\n").unwrap();

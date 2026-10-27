@@ -1,5 +1,7 @@
 use std::collections::HashMap;
 
+use atomic_core::pristine::GitShaIndexTxnT;
+
 use super::*;
 
 #[derive(Debug, Clone, Copy)]
@@ -89,6 +91,31 @@ impl Repository {
             })?;
         let visibility = graph_visibility_closure(&txn, &view)?;
         let content_filter = crate::content_filter::GitAttributesFilter::for_repository(&self.root);
+        let git_colocated = self.root.join(".git").symlink_metadata().is_ok();
+        // Native tracking keeps raw names, including escape-looking names.
+        // Imported Git identities need decoding only at filesystem boundaries;
+        // the SHA index covers the initial import before a checkpoint exists.
+        let decode_escaped_paths = git_colocated
+            && (self.shim_workspace_active()?
+                || !txn
+                    .list_git_shas()
+                    .map_err(|error| RepositoryError::Database(error.to_string()))?
+                    .is_empty());
+        let worktree_path = |path: &Path| {
+            if decode_escaped_paths {
+                tracked_worktree_path(path)
+            } else {
+                path.to_path_buf()
+            }
+        };
+        let path_selected = |path: &Path| {
+            let path = worktree_path(path);
+            options.path_filters.is_empty()
+                || options
+                    .path_filters
+                    .iter()
+                    .any(|filter| path.starts_with(filter) || filter.starts_with(&path))
+        };
 
         let projection = self.project_tree_for_visibility(&txn, &visibility)?;
         let projected_present = projection.present;
@@ -165,14 +192,8 @@ impl Repository {
             };
 
             // Apply path filter if specified
-            if !options.path_filters.is_empty() {
-                let matches = options
-                    .path_filters
-                    .iter()
-                    .any(|f| normalized.starts_with(f) || f.starts_with(&normalized));
-                if !matches {
-                    continue;
-                }
+            if !path_selected(&normalized) {
+                continue;
             }
 
             // Track directory status
@@ -194,7 +215,6 @@ impl Repository {
         // never see one.
         let reappearance_rules: std::cell::OnceCell<Option<crate::ignore::IgnoreRules>> =
             std::cell::OnceCell::new();
-        let git_colocated = self.root.join(".git").symlink_metadata().is_ok();
         for absent in &projected_absent {
             let normalized = PathBuf::from(&absent.path);
             // A projected deletion is already the recorded state. Reintroduce
@@ -205,7 +225,7 @@ impl Repository {
             // case-only rename still resolves, and a deleted child still
             // resolves through an ancestor that became a symlink to a
             // directory; neither is a reappearance.
-            let reappeared = match present.exact_metadata(&normalized) {
+            let reappeared = match present.exact_metadata(&worktree_path(&normalized)) {
                 Ok(Some(metadata)) => metadata,
                 Ok(None) => continue,
                 // An unreadable ancestor is not a reappearance; status keeps
@@ -218,14 +238,8 @@ impl Repository {
                     continue;
                 }
             };
-            if !options.path_filters.is_empty() {
-                let matches = options
-                    .path_filters
-                    .iter()
-                    .any(|f| normalized.starts_with(f) || f.starts_with(&normalized));
-                if !matches {
-                    continue;
-                }
+            if !path_selected(&normalized) {
+                continue;
             }
             // A directory Git emptied (`git mv` of its last file) stays on
             // disk holding nothing Git could ever commit; in a repository
@@ -242,8 +256,11 @@ impl Repository {
                             .then(|| self.load_ignore_rules())
                     })
                     .as_ref();
-                if !crate::leftover_directory::holds_visible_entries(&self.root, &normalized, rules)
-                {
+                if !crate::leftover_directory::holds_visible_entries(
+                    &self.root,
+                    &worktree_path(&normalized),
+                    rules,
+                ) {
                     log::debug!(
                         "status: projected-absent directory '{}' is on disk but holds nothing visible; not a reappearance",
                         absent.path
@@ -269,12 +286,7 @@ impl Repository {
 
         for path in projected_name_conflicts.keys() {
             let normalized = PathBuf::from(path);
-            if options.path_filters.is_empty()
-                || options
-                    .path_filters
-                    .iter()
-                    .any(|filter| normalized.starts_with(filter) || filter.starts_with(&normalized))
-            {
+            if path_selected(&normalized) {
                 tracked_paths.insert(normalized);
             }
         }
@@ -290,6 +302,9 @@ impl Repository {
 
         let index_start = std::time::Instant::now();
         let mut canonical_tracked = Vec::new();
+        // Candidate discovery uses physical paths. Retain the original
+        // projection item for graph lookup instead of decoding its key twice.
+        let mut projected_by_worktree_path = std::collections::BTreeMap::new();
         let mut gitlink_paths: std::collections::HashSet<PathBuf> =
             std::collections::HashSet::new();
         for path in &tracked_paths {
@@ -329,8 +344,22 @@ impl Repository {
                 gitlink_paths.insert(path.clone());
                 continue;
             }
-            let repo_path = crate::repository::RepoPath::from_native(path)
+            let repo_path = crate::repository::RepoPath::from_native(&worktree_path(path))
                 .map_err(|error| RepositoryError::Output(error.to_string()))?;
+            let Some(item) = path.to_str().and_then(|path| projected_present.get(path)) else {
+                continue;
+            };
+            if projected_by_worktree_path
+                .insert(repo_path.clone(), item)
+                .is_some()
+            {
+                return Err(RepositoryError::InvalidOperation {
+                    message: format!(
+                        "multiple tracked identities resolve to '{}'",
+                        repo_path.escaped()
+                    ),
+                });
+            }
             canonical_tracked.push(CanonicalTrackedPath {
                 path: repo_path,
                 canonical_mode: projected.materialization.mode,
@@ -425,13 +454,7 @@ impl Repository {
             index_write_time,
             &content_filter,
             |path| {
-                let path_text = std::str::from_utf8(path.as_bytes()).map_err(|error| {
-                    ChangeSourceError::CanonicalContent {
-                        path: path.escaped(),
-                        message: error.to_string(),
-                    }
-                })?;
-                let item = projected_present.get(path_text).ok_or_else(|| {
+                let item = projected_by_worktree_path.get(path).ok_or_else(|| {
                     ChangeSourceError::CanonicalContent {
                         path: path.escaped(),
                         message: "path is absent from the canonical graph projection".into(),
@@ -445,7 +468,7 @@ impl Repository {
                     &inode_graph_table,
                     &visibility,
                     &external_hashes,
-                    path_text,
+                    &item.path,
                     item.inode,
                     item.position,
                 )
@@ -502,7 +525,8 @@ impl Repository {
         let mut hash_count = 0u64;
 
         for path in &tracked_paths {
-            let abs_path = self.root.join(path);
+            let worktree_path = worktree_path(path);
+            let abs_path = self.root.join(&worktree_path);
             let inode = inode_map.get(path).copied();
             let has_graph = has_graph_content_cache.get(path).copied().unwrap_or(false);
 
@@ -679,7 +703,7 @@ impl Repository {
             // The source result is only a candidate set. Canonical V2
             // re-verification has already checked metadata, racy-stat, policy,
             // graph mode/kind, and repository bytes before a clean omission.
-            if let Some(verified) = verified_by_path.get(path) {
+            if let Some(verified) = verified_by_path.get(&worktree_path) {
                 match verified.change {
                     VerifiedChange::Unchanged => {
                         if verified.rehashed {
@@ -770,13 +794,17 @@ impl Repository {
             // markers never hide ordinary parent content.
             let walker_options = options
                 .clone()
-                .with_nested_repo_boundaries(gitlink_paths.iter().cloned());
+                .with_nested_repo_boundaries(gitlink_paths.iter().map(|path| worktree_path(path)));
             let working_files =
                 collect_working_copy_files_with_rules(&self.root, &walker_options, rules.as_ref())
                     .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
+            let tracked_worktree_paths: HashSet<_> = tracked_paths
+                .iter()
+                .map(|path| worktree_path(path))
+                .collect();
             for path in working_files {
-                if !tracked_paths.contains(&path) {
+                if !tracked_worktree_paths.contains(&path) {
                     let mut entry = FileStatusEntry::new(path.clone(), FileStatus::Untracked);
                     if hash_untracked && options.hash_contents {
                         let abs_path = self.root.join(&path);
@@ -798,15 +826,10 @@ impl Repository {
         // marker-free bytes alone do not establish a working-copy resolution.
         for (path, conflict) in &projected_name_conflicts {
             let normalized = PathBuf::from(path);
-            if !options.path_filters.is_empty()
-                && !options
-                    .path_filters
-                    .iter()
-                    .any(|filter| normalized.starts_with(filter) || filter.starts_with(&normalized))
-            {
+            if !path_selected(&normalized) {
                 continue;
             }
-            let abs_path = self.root.join(&normalized);
+            let abs_path = self.root.join(worktree_path(&normalized));
             let has_markers = std::fs::read(&abs_path)
                 .ok()
                 .and_then(|bytes| super::materialize::first_conflict_marker_line(&bytes))
@@ -853,7 +876,7 @@ impl Repository {
             // disk still carries markers. Once the user resolves them the
             // file falls back to normal Modified detection and becomes
             // recordable again (which then clears the stale entry).
-            let abs_path = self.root.join(&path);
+            let abs_path = self.root.join(worktree_path(&path));
             let still_conflicted = std::fs::read(&abs_path)
                 .ok()
                 .and_then(|c| super::materialize::first_conflict_marker_line(&c))
@@ -1210,6 +1233,16 @@ fn normalize_tracked_path(path: &str, repo_root: &Path) -> PathBuf {
     }
 }
 
+// Decode only at the filesystem boundary; callers retain stored keys for
+// graph lookup and status entries. Reject decoded traversal/absolute paths.
+fn tracked_worktree_path(path: &Path) -> PathBuf {
+    path.to_str()
+        .and_then(|text| super::project_tree::unescape_repo_path(text).ok())
+        .and_then(|bytes| super::RepoPath::new(bytes).ok())
+        .and_then(|path| path.to_native().ok())
+        .unwrap_or_else(|| path.to_path_buf())
+}
+
 #[cfg(all(test, unix))]
 mod change_source_convergence_tests {
     use std::sync::Arc;
@@ -1224,6 +1257,48 @@ mod change_source_convergence_tests {
         ChangeSourceResult, ScanChangeSource, SelectedChangeSource,
     };
     use crate::record::RecordOptions;
+
+    #[test]
+    fn stored_path_decodes_once_at_worktree_boundary() {
+        for (stored, physical) in [
+            ("100%25.txt", "100%.txt"),
+            ("a%2541.txt", "a%41.txt"),
+            ("a%252541.txt", "a%2541.txt"),
+            ("dir%25/caf%C3%A9%20space.txt", "dir%/café space.txt"),
+            ("native malformed%.txt", "native malformed%.txt"),
+            ("%2E%2E/outside", "%2E%2E/outside"),
+            ("%2Foutside", "%2Foutside"),
+        ] {
+            assert_eq!(
+                tracked_worktree_path(Path::new(stored)),
+                Path::new(physical)
+            );
+        }
+    }
+
+    #[test]
+    fn native_percent_lookalikes_keep_raw_paths_without_shim_enrollment() {
+        for colocated in [false, true] {
+            let dir = tempdir().unwrap();
+            if colocated {
+                git2::Repository::init(dir.path()).unwrap();
+            }
+            let repo = Repository::init(dir.path()).unwrap();
+            let wc = repo.require_working_copy_id().unwrap();
+            for (path, bytes) in [("a%41.txt", "literal\n"), ("aA.txt", "lookalike\n")] {
+                std::fs::write(dir.path().join(path), bytes).unwrap();
+                repo.add(wc, path, Default::default()).unwrap();
+            }
+            repo.record_all(wc, "native percent names").unwrap();
+            let status = repo.status(wc, Default::default()).unwrap();
+            assert!(status.is_clean(), "colocated={colocated}: {status:#?}");
+            std::fs::write(dir.path().join("a%41.txt"), b"edited literal\n").unwrap();
+            let status = repo.status(wc, Default::default()).unwrap();
+            assert_eq!(status.entries().len(), 1, "{status:#?}");
+            assert_eq!(status.entries()[0].path(), Path::new("a%41.txt"));
+            assert_eq!(status.entries()[0].status(), FileStatus::Modified);
+        }
+    }
 
     #[derive(Clone, Copy)]
     enum CandidateMutation {

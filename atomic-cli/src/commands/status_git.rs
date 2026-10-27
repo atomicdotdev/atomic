@@ -448,18 +448,16 @@ pub(crate) fn apply_git_informed_overlays(
         .map_err(|e| CliError::Internal(e.into()))?
         .iter()
         .filter(|file| !file.is_directory)
-        .map(|file| file.path.display().to_string())
+        .map(|file| atomic_repository::canonical_path_identity(&file.path.to_string_lossy()))
         .collect();
 
-    let mut unmerged: Vec<String> = Vec::new();
-    let mut stage_zero_indexed: std::collections::BTreeSet<String> =
-        std::collections::BTreeSet::new();
+    let mut unmerged = Vec::new();
+    let mut stage_zero_indexed = std::collections::BTreeSet::new();
     for entry in &index.entries {
-        let path = String::from_utf8_lossy(entry.path.as_bytes()).into_owned();
         if entry.stage == 0 {
-            stage_zero_indexed.insert(path);
+            stage_zero_indexed.insert(entry.path.clone());
         } else {
-            unmerged.push(path);
+            unmerged.push(entry.path.clone());
         }
     }
     unmerged.sort();
@@ -467,11 +465,15 @@ pub(crate) fn apply_git_informed_overlays(
 
     // Index-new paths displayed as pending additions (Git-index tracking).
     for path in &stage_zero_indexed {
-        if durably_tracked.contains(path) {
+        // Canonicalize the raw index side once; stored identities already
+        // escape literal '%' and must not alias their decoded lookalikes.
+        if durably_tracked.contains(&path.escaped()) {
             continue;
         }
         let mut entry = atomic_repository::FileStatusEntry::new(
-            PathBuf::from(path),
+            path.to_native().map_err(|error| CliError::GitError {
+                message: error.to_string(),
+            })?,
             atomic_repository::FileStatus::Added,
         );
         entry.set_details(
@@ -484,7 +486,9 @@ pub(crate) fn apply_git_informed_overlays(
     // Unmerged index entries displayed as Git merge conflicts.
     for path in &unmerged {
         let mut entry = atomic_repository::FileStatusEntry::new(
-            PathBuf::from(path),
+            path.to_native().map_err(|error| CliError::GitError {
+                message: error.to_string(),
+            })?,
             atomic_repository::FileStatus::Conflicted,
         );
         entry.set_details("Git merge conflict (index stages 1-3)".to_string());

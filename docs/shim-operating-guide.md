@@ -1,5 +1,19 @@
 # Atomic Git Shim — Operating Guide
 
+> **Clean-clone correction (2026-10-26):** after the non-Rust restoration into
+> `atomic-shim-2`, fresh intent 5 corrected the missing percent-path boundaries
+> without transferring whole historical Rust files. The single-percent and
+> distinct escape-lookalike regressions now pass, including repeat reconciliation
+> and Git edit/rename/delete. The focused validation passed 42 Rust tests and
+> 17 offline harness-49 tests, including native-path nonregressions. Fresh results
+> and the retained pre-fix failures are
+> recorded in [the validation report](../tests/harness/train_tracks.md). Subsequent
+> harness-48 Git- and Atomic-authored GitHub round trips both passed (PRs #3/#4).
+> Harness 47 initially refused the fork's non-pristine default branch, then passed
+> all filename cases and real push after an explicitly approved backup/reset of
+> the personal fork's `release`. Upstream remained unchanged. Historical fork
+> results below remain separate from these fresh runs.
+
 Updated 2026-10-13 for PR #207, source `27d06ff` (`atomic 0.19.1`).
 The shim must be enabled for each repository. It is not enabled by default.
 Use Linux or macOS; Windows shim support has not been validated.
@@ -33,6 +47,12 @@ is kept as a regression check.
 - Paths with spaces or non-ASCII bytes are tracked under the name on disk;
   `atomic status` is clean right after an import and incremental imports
   verify. A literal `%` in a file name still keeps its escaped identity.
+- **Fixed (2026-10-26):** literal-percent names reconcile without a false dirty-worktree refusal
+  or stale checkpoint. Filesystem status decodes imported identities once,
+  while the Git-index overlay and semantic verification compare canonical
+  identities without double-escaping them. Names such as `a%41.txt`, `aA.txt`,
+  and `a%2541.txt` remain distinct. Native repositories that have not enrolled
+  in the shim keep their raw path handling.
 - Truncating a file to zero bytes imports on the mainline walk.
 - Untracked files, gitignored or not (`node_modules/`, `target/`,
   `.DS_Store`, scratch files), are not divergence: `reconcile` and

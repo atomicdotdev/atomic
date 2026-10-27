@@ -4016,12 +4016,12 @@ impl Repository {
         }
         let identity_trunks: std::collections::HashSet<atomic_core::crdt::TrunkId> = last_move
             .iter()
-            .filter(|(_, target)| crate::escape_repo_path(target.as_bytes()) == path)
+            .filter(|(_, target)| crate::canonical_path_identity(target) == path)
             .map(|(trunk, _)| *trunk)
             .collect();
         let moved_away: std::collections::HashSet<atomic_core::crdt::TrunkId> = last_move
             .iter()
-            .filter(|(_, target)| target.as_str() != path)
+            .filter(|(_, target)| crate::canonical_path_identity(target) != path)
             .map(|(trunk, _)| *trunk)
             .collect();
         if canonical_trunk.is_none() && identity_trunks.len() > 1 {
@@ -4108,7 +4108,7 @@ impl Repository {
                     // Retain compatibility with semantic-only legacy creates
                     // which have no canonical FileAdd binding.
                     None => {
-                        ((crate::escape_repo_path(ops.path().as_bytes()) == path
+                        ((crate::canonical_path_identity(ops.path()) == path
                             && !moved_away.contains(&resolved_trunk))
                             || trunk_followed)
                             && !superseded.contains(&resolved_trunk)
@@ -4293,7 +4293,9 @@ impl Repository {
             let raw = crate::unescape_repo_path(path)
                 .ok()
                 .and_then(|bytes| String::from_utf8(bytes).ok())
-                .filter(|raw| raw != path);
+                // Literal-percent paths use their stored escaped spelling;
+                // a decoded lookup could select a distinct lookalike's trunk.
+                .filter(|raw| raw != path && !raw.contains('%'));
             let by_raw = match raw.as_deref() {
                 Some(raw) => txn.get_trunk_by_path(raw).map_err(|e| e.to_string())?,
                 None => None,
@@ -4325,7 +4327,7 @@ impl Repository {
                     {
                         let creator = self.load_change(&hash).map_err(|e| e.to_string())?;
                         let mut real_claimant = creator.file_ops().iter().any(|ops| {
-                            crate::escape_repo_path(ops.path().as_bytes()) == path
+                            crate::canonical_path_identity(ops.path()) == path
                                 && file_ops_target_trunk(ops, indexed.change_id(), indexed)
                                 && matches!(
                                     ops.trunk_op(),
