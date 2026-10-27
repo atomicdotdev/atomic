@@ -121,7 +121,7 @@ pub struct Import {
     /// Experimental direct first-parent graph stream for a fresh repository.
     /// Verifies the final tip, not every historical state. Unsupported input
     /// refuses; it never falls back to ordinary recording. Uses 100-change,
-    /// 32-MiB private batches and preserves the normal finalization checks.
+    /// 128-MiB private batches and preserves the normal finalization checks.
     #[arg(long, conflicts_with_all = ["with_crdt", "incremental", "all_branches"])]
     pub stream: bool,
 
@@ -1967,6 +1967,78 @@ mod tests {
     }
 
     #[test]
+    #[serial]
+    #[cfg(unix)]
+    fn stream_flag_imports_spaces_unicode_percent_and_symlinks() {
+        let temp = tempfile::tempdir().unwrap();
+        init_git(temp.path());
+        let names = [
+            "test-images/lot 5.png",
+            "caf\u{e9}.txt",
+            "a%41.txt",
+            "aA.txt",
+        ];
+        fs::create_dir(temp.path().join("test-images")).unwrap();
+        for name in names {
+            fs::write(temp.path().join(name), [0, 1, 255]).unwrap();
+        }
+        fs::write(temp.path().join("AGENTS.md"), b"instructions\n").unwrap();
+        std::os::unix::fs::symlink("AGENTS.md", temp.path().join("CLAUDE.md")).unwrap();
+        fs::create_dir_all(temp.path().join("vendor/sub module")).unwrap();
+        git_ok(temp.path(), &["add", "."]);
+        git_ok(
+            temp.path(),
+            &[
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                "160000",
+                "1111111111111111111111111111111111111111",
+                "vendor/sub module",
+            ],
+        );
+        git_ok(temp.path(), &["commit", "-qm", "names and symlink"]);
+        let before: Vec<_> = names
+            .iter()
+            .map(|name| {
+                fs::symlink_metadata(temp.path().join(name))
+                    .unwrap()
+                    .modified()
+                    .unwrap()
+            })
+            .collect();
+        let _dir_guard = DirGuard::new();
+        std::env::set_current_dir(temp.path()).unwrap();
+        Import {
+            stream: true,
+            no_vault: true,
+            ..Default::default()
+        }
+        .run()
+        .unwrap();
+        for (name, modified) in names.iter().zip(before) {
+            assert_eq!(fs::read(temp.path().join(name)).unwrap(), [0, 1, 255]);
+            assert_eq!(
+                fs::metadata(temp.path().join(name))
+                    .unwrap()
+                    .modified()
+                    .unwrap(),
+                modified
+            );
+        }
+        assert_eq!(
+            fs::read_link(temp.path().join("CLAUDE.md")).unwrap(),
+            Path::new("AGENTS.md")
+        );
+        let repo = Repository::open(temp.path()).unwrap();
+        let wc = repo.require_working_copy_id().unwrap();
+        assert!(repo
+            .status(wc, atomic_repository::StatusOptions::default())
+            .unwrap()
+            .is_clean());
+    }
+
+    #[test]
     fn stream_flag_conflicts_are_explicit() {
         assert!(
             Import::try_parse_from(["import", "--stream", "--no-vault"])
@@ -1980,12 +2052,18 @@ mod tests {
 
     #[test]
     #[serial]
-    fn unsupported_stream_path_rejects_before_atomic_or_git_exclude_writes() {
+    fn unsupported_stream_boundary_rejects_before_atomic_or_git_exclude_writes() {
         let temp = tempfile::tempdir().unwrap();
         init_git(temp.path());
-        fs::write(temp.path().join("100%.txt"), b"literal\n").unwrap();
+        fs::write(temp.path().join("tracked.txt"), b"shallow\n").unwrap();
         git_ok(temp.path(), &["add", "."]);
-        git_ok(temp.path(), &["commit", "-qm", "percent"]);
+        git_ok(temp.path(), &["commit", "-qm", "shallow root"]);
+        let git = GitRepository::open(temp.path()).unwrap();
+        fs::write(
+            git.path().join("shallow"),
+            format!("{}\n", git.head().unwrap().target().unwrap()),
+        )
+        .unwrap();
         let exclude = temp.path().join(".git/info/exclude");
         let before = fs::read(&exclude).unwrap();
         assert_rejected_before_atomic_init(

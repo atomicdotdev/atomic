@@ -974,7 +974,7 @@ pinned first-parent OIDs and existing Git capability/claim checks
   → one commit's old/new Git blobs and metadata (existing parser)
   → existing build_graph_first_change + import-owned live line/edge cache
   → finalized Git-classified change/hash (once)
-  → at most 100 changes / 32 MiB of compiled private batch payload
+  → at most 100 changes / 128 MiB of compiled private batch payload
   → existing graph apply / journal / SHA / interpretation closure writes
   → complete final Git-derived graph/namespace/mode/byte proof
   → one metadata-only promotion into the current target view
@@ -1034,17 +1034,26 @@ silently ignored. No `atomic-core` graph manipulation was changed.
 
 ### Initial restrictions and memory limits
 
-The route initially accepts fresh repositories, the checked-out branch's
-first-parent history and ordinary regular/executable files with unescaped
-ASCII-graphic paths. It explicitly refuses eager CRDT, incremental/all-parent,
-reactive/detached, existing Atomic state, shallow/promisor/replacement/graft,
-Atomic provenance/binding claims, symlink/gitlink or complex path modes. The
-normal import path remains available explicitly. Unsupported inputs do not
-trigger an ordinary-recorder fallback.
+The route accepts fresh repositories and the checked-out branch's first-parent
+history. It shares the ordinary importer's mode/kind validation: regular files,
+executables, symlinks and gitlinks are supported. Git tree names are opaque bytes;
+the shared parser carries them through the reversible `%XX` String encoding and
+the tree writer decodes back to the exact original name bytes. Spaces, Unicode,
+non-UTF-8 bytes, control characters, backslashes and literal percent-escape
+lookalikes do not require a stream-specific filename restriction. Symlink target
+bytes are retained as blobs; gitlinks retain their foreign commit ID without
+requiring that commit's object in the parent repository.
+
+The route still explicitly refuses eager CRDT, incremental/all-parent,
+reactive/detached, existing Atomic state, shallow/promisor/replacement/graft and
+Atomic provenance/binding claims. Unsupported modes and inputs do not trigger an
+ordinary-recorder fallback; the normal import path remains available explicitly.
 
 The direct API reads one parsed commit at a time. Git ODB headers bound the
 old/new input blobs before decoding, and count/serialized-byte bounds limit
-compiled batches. Compiler memory grows with the **current** files/line anchors;
+compiled batches. The CLI defaults to 100 changes and 128 MiB; the byte bound
+also applies to an individual commit's combined old/new input blob sizes.
+Compiler memory grows with the **current** files/line anchors;
 blob/cache/container overhead and pristine/libgit2 caches are not an RSS bound.
 The public command still retains its existing whole-history prospective
 preflight before releasing that plan, so **the entire CLI has not acquired a
@@ -1065,8 +1074,17 @@ passes; that separate fresh-materializer case was not hidden by changing core.
 - Real `Import { stream: true }` command integration passes with two Git commits,
   zero imported FileOps and unchanged tracked-file mtime; ordinary shared
   finalization/checkpoint code still runs.
-- Flag conflicts and unsupported-percent-path refusal before Atomic/exclude
-  writes pass. A bare ODB merge test passes and leaves its side-leg SHA
+- Bare ODB regressions reconstruct exact source tree OIDs for spaces, Unicode
+  normalization pairs, non-UTF-8 components, percent lookalikes, control bytes,
+  backslashes and a component containing every legal non-NUL/non-slash byte.
+  Edits, renames, directory retirement/recreation, symlink kind changes and
+  gitlink add/bump/rename/typechange/delete pass at batch sizes 1 and 100, with
+  identical resulting state hashes. No host checkout is needed for these tests.
+- The real command imports binary files with spaces/Unicode/percent names,
+  `CLAUDE.md -> AGENTS.md` and an unpopulated gitlink without rewriting tracked
+  bytes or mtimes; status is clean afterward.
+- Flag conflicts and shallow-boundary refusal before Atomic/exclude writes
+  pass. A bare ODB merge test passes and leaves its side-leg SHA
   unindexed while retaining both Git parents.
 - The corrected real 100-commit Hyperfine canary passes in **3.494 s on an
   unoptimized test build**, including direct metadata/Git reads, compilation,

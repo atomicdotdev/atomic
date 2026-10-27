@@ -7,6 +7,10 @@ use atomic_repository::{
     GitGraphImportSession, GitStreamLimits, GitStreamOutcome, PreparedGitGraphChange,
 };
 
+// Applies to each commit's input blobs and to compiled private batch payloads,
+// not total process memory. Keep room for large initial asset commits.
+const DEFAULT_STREAM_BYTE_LIMIT: usize = 128 * 1024 * 1024;
+
 #[cfg(test)]
 thread_local! { static FORBID_ORDINARY_RECORDER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
 #[cfg(test)]
@@ -33,53 +37,6 @@ impl Drop for RecorderGuard {
     }
 }
 
-fn allowed_path(path: &str) -> bool {
-    !path.is_empty()
-        && path
-            .bytes()
-            .all(|byte| byte.is_ascii_graphic() && byte != b'%' && byte != b'\\')
-}
-
-fn check_tree(
-    git: &GitRepository,
-    tree: &Tree<'_>,
-    prefix: &str,
-    policy: &ConversionPolicy,
-) -> CliResult<()> {
-    for entry in tree {
-        let raw = entry.name_bytes();
-        let name = std::str::from_utf8(raw)
-            .map_err(|_| git_error("direct stream does not yet support non-UTF-8 paths"))?;
-        let path = format!("{prefix}{name}");
-        let repo_path =
-            RepoPath::from_bytes(path.as_bytes()).map_err(|error| git_error(error.to_string()))?;
-        if policy.exclusions.exclusion(&repo_path).is_some() {
-            continue;
-        }
-        if !allowed_path(&path) {
-            return Err(git_error(format!(
-                "direct stream unsupported escaped/non-ASCII/space path: {path}"
-            )));
-        }
-        match entry.kind() {
-            Some(ObjectType::Tree) => check_tree(
-                git,
-                &git.find_tree(entry.id())
-                    .map_err(|e| git_error(e.to_string()))?,
-                &format!("{path}/"),
-                policy,
-            )?,
-            Some(ObjectType::Blob) if matches!(entry.filemode(), 0o100644 | 0o100755) => {}
-            _ => {
-                return Err(git_error(format!(
-                    "direct stream unsupported kind/mode at {path}; use ordinary import explicitly"
-                )))
-            }
-        }
-    }
-    Ok(())
-}
-
 fn input_budget(git: &GitRepository, commit: &git2::Commit<'_>, limit: usize) -> CliResult<()> {
     let tree = commit.tree().map_err(|e| git_error(e.to_string()))?;
     let parent = if commit.parent_count() == 0 {
@@ -99,7 +56,9 @@ fn input_budget(git: &GitRepository, commit: &git2::Commit<'_>, limit: usize) ->
     let mut bytes = 0usize;
     for delta in diff.deltas() {
         for file in [delta.old_file(), delta.new_file()] {
-            if file.id().is_zero() {
+            // Gitlinks name commits in another repository. Their objects need
+            // not exist here; only blob payloads consume this input budget.
+            if file.id().is_zero() || file.mode() == git2::FileMode::Commit {
                 continue;
             }
             let (size, kind) = odb
@@ -141,12 +100,6 @@ impl Compiler {
             if policy.exclusions.exclusion(&path).is_some() {
                 continue;
             }
-            if !allowed_path(&file.path) {
-                return Err(git_error(format!(
-                    "unsupported stream identity {}",
-                    file.path
-                )));
-            }
             if matches!(
                 file.operation,
                 FileOperation::Modified | FileOperation::Deleted | FileOperation::Renamed
@@ -176,9 +129,6 @@ impl Compiler {
             }
             if file.operation == FileOperation::Renamed {
                 let old = file.old_path.as_ref().unwrap();
-                if !allowed_path(old) {
-                    return Err(git_error("unsupported rename source identity"));
-                }
                 let mut deleted = file.clone();
                 deleted.path = old.clone();
                 deleted.operation = FileOperation::Deleted;
@@ -486,7 +436,7 @@ impl ParallelImporter {
         let outcome = self.import_graph_stream(
             repo,
             Oid::from_str(&tip).map_err(|e| git_error(e.to_string()))?,
-            GitStreamLimits::new(100, 32 * 1024 * 1024).map_err(CliError::from)?,
+            GitStreamLimits::new(100, DEFAULT_STREAM_BYTE_LIMIT).map_err(CliError::from)?,
         )?;
         print_info(&format!("Direct graph stream: {} commits in {} private batches; final tip verified (historical states not independently verified)", outcome.commits, outcome.batches));
         Ok(ImportStats {
@@ -537,8 +487,10 @@ impl ParallelImporter {
                 return Err(git_error("direct stream refuses Atomic provenance/binding claims; use ordinary import explicitly"));
             }
             let tree = commit.tree().map_err(|e| git_error(e.to_string()))?;
+            // Share the ordinary importer's kind/mode validation. The parser
+            // already carries raw Git names through the reversible escape;
+            // there is no stream-specific character or UTF-8 restriction.
             validate_import_tree_capabilities(&git, &tree, "")?;
-            check_tree(&git, &tree, "", &policy)?;
         }
         Ok((git, policy, ordered))
     }
@@ -633,6 +585,230 @@ impl ParallelImporter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Construct Git objects directly: the host filesystem must not normalize
+    // Unicode names or reject raw bytes before the importer can see them.
+    type RawFiles = BTreeMap<Vec<u8>, (Vec<u8>, i32)>;
+
+    fn raw_tree(git: &GitRepository, files: &RawFiles, prefix: &[u8]) -> Oid {
+        let mut builder = git.treebuilder(None).unwrap();
+        let mut dirs = std::collections::BTreeSet::new();
+        for (path, (bytes, mode)) in files {
+            let Some(rest) = path.strip_prefix(prefix) else {
+                continue;
+            };
+            if let Some(slash) = rest.iter().position(|byte| *byte == b'/') {
+                dirs.insert(&rest[..slash]);
+            } else {
+                let oid = if *mode == 0o160000 {
+                    Oid::from_str(std::str::from_utf8(bytes).unwrap()).unwrap()
+                } else {
+                    git.blob(bytes).unwrap()
+                };
+                builder.insert(rest, oid, *mode).unwrap();
+            }
+        }
+        for dir in dirs {
+            let mut child = prefix.to_vec();
+            child.extend_from_slice(dir);
+            child.push(b'/');
+            builder
+                .insert(dir, raw_tree(git, files, &child), 0o040000)
+                .unwrap();
+        }
+        builder.write().unwrap()
+    }
+
+    fn raw_commit(git: &GitRepository, files: &RawFiles, parent: Option<Oid>) -> Oid {
+        let tree = git.find_tree(raw_tree(git, files, b"")).unwrap();
+        let signature = git2::Signature::new(
+            "Stream paths",
+            "paths@example.invalid",
+            &git2::Time::new(1_700_000_000, 0),
+        )
+        .unwrap();
+        let parent = parent.map(|oid| git.find_commit(oid).unwrap());
+        git.commit(
+            Some("refs/heads/main"),
+            &signature,
+            &signature,
+            "raw tree names and kinds",
+            &tree,
+            &parent.iter().collect::<Vec<_>>(),
+        )
+        .unwrap()
+    }
+
+    fn assert_raw_history(git: &GitRepository, tips: &[Oid]) {
+        let policy = conversion_policy(git).unwrap();
+        for tip in tips {
+            let mut state = None;
+            for batch in [1, 100] {
+                let output = tempfile::tempdir().unwrap();
+                let mut repo = Repository::init(output.path()).unwrap();
+                let importer = ParallelImporter::new(
+                    git,
+                    ParallelImportOptions {
+                        graph_only: true,
+                        target_view: repo.current_view().into(),
+                        ..Default::default()
+                    },
+                );
+                let outcome = importer
+                    .import_graph_stream(
+                        &mut repo,
+                        *tip,
+                        GitStreamLimits::new(batch, 32 * 1024 * 1024).unwrap(),
+                    )
+                    .unwrap_or_else(|error| panic!("tip {tip}, batch {batch}: {error}"));
+                if let Some(state) = state {
+                    assert_eq!(outcome.state, state, "batch size changed identity at {tip}");
+                } else {
+                    state = Some(outcome.state);
+                }
+                let source = git.find_commit(*tip).unwrap().tree_id();
+                let actual = repo.project_tree(repo.current_view(), &policy).unwrap();
+                assert_eq!(
+                    actual.git.root.as_bytes(),
+                    source.as_bytes(),
+                    "raw Git tree bytes must survive at {tip}"
+                );
+                assert_eq!(fs::read_dir(output.path()).unwrap().count(), 1);
+            }
+        }
+    }
+
+    #[test]
+    fn direct_stream_raw_tree_names_round_trip_across_edits_and_retired_directories() {
+        let input = tempfile::tempdir().unwrap();
+        let git = GitRepository::init_bare(input.path()).unwrap();
+        let mut files = RawFiles::new();
+        for name in [
+            b"test-images/lot 5.png".as_slice(),
+            "caf\u{e9}.txt".as_bytes(),
+            "cafe\u{301}.txt".as_bytes(),
+            b"d\xffr/f\xfele.txt",
+            b"aA.txt",
+            b"a%41.txt",
+            b"a%2541.txt",
+            b"%2Fdir/%FFliteral",
+            b"back\\slash.txt",
+            b"tabs\tand\nnewlines.txt",
+        ] {
+            files.insert(name.to_vec(), ([name, b"\n\0\xff\n"].concat(), 0o100644));
+        }
+        let all_name_bytes: Vec<_> = (1..=255).filter(|byte| *byte != b'/').collect();
+        files.insert(
+            all_name_bytes,
+            (b"all legal component bytes\n".to_vec(), 0o100644),
+        );
+        let root = raw_commit(&git, &files, None);
+        files
+            .get_mut(b"test-images/lot 5.png".as_slice())
+            .unwrap()
+            .0 = vec![0, 2, 255];
+        let renamed = files.remove(b"d\xffr/f\xfele.txt".as_slice()).unwrap();
+        files.insert(b"moved \xfe/renamed %FF.txt".to_vec(), renamed);
+        files.remove(b"%2Fdir/%FFliteral".as_slice()).unwrap();
+        let edit = raw_commit(&git, &files, Some(root));
+        files.insert(
+            b"d\xffr/recreated file".to_vec(),
+            (b"again\n".to_vec(), 0o100755),
+        );
+        let tip = raw_commit(&git, &files, Some(edit));
+        assert_raw_history(&git, &[root, edit, tip]);
+    }
+
+    #[test]
+    fn direct_stream_symlinks_round_trip_targets_and_typechanges() {
+        let input = tempfile::tempdir().unwrap();
+        let git = GitRepository::init_bare(input.path()).unwrap();
+        let mut files = RawFiles::from([
+            (b"CLAUDE.md".to_vec(), (b"AGENTS.md".to_vec(), 0o120000)),
+            (
+                b"AGENTS.md".to_vec(),
+                (b"instructions\n".to_vec(), 0o100644),
+            ),
+            (
+                b"dangling link".to_vec(),
+                (b"../missing\xff".to_vec(), 0o120000),
+            ),
+            (b"flip".to_vec(), (b"AGENTS.md".to_vec(), 0o100755)),
+        ]);
+        let root = raw_commit(&git, &files, None);
+        // Same bytes, different kind: this must still emit attribute updates.
+        files.get_mut(b"flip".as_slice()).unwrap().1 = 0o120000;
+        files.get_mut(b"CLAUDE.md".as_slice()).unwrap().0 = b"missing".to_vec();
+        let edit = raw_commit(&git, &files, Some(root));
+        files.get_mut(b"flip".as_slice()).unwrap().1 = 0o100644;
+        files.remove(b"dangling link".as_slice()).unwrap();
+        let tip = raw_commit(&git, &files, Some(edit));
+        assert_raw_history(&git, &[root, edit, tip]);
+    }
+
+    #[test]
+    fn direct_stream_gitlinks_do_not_require_submodule_objects() {
+        let input = tempfile::tempdir().unwrap();
+        let git = GitRepository::init_bare(input.path()).unwrap();
+        let mut files = RawFiles::from([(
+            b"vendor/sub module".to_vec(),
+            (
+                b"1111111111111111111111111111111111111111".to_vec(),
+                0o160000,
+            ),
+        )]);
+        let root = raw_commit(&git, &files, None);
+        files.get_mut(b"vendor/sub module".as_slice()).unwrap().0 =
+            b"2222222222222222222222222222222222222222".to_vec();
+        let edit = raw_commit(&git, &files, Some(root));
+        let target = files.remove(b"vendor/sub module".as_slice()).unwrap();
+        files.insert(b"moved %FF/sub module".to_vec(), target);
+        let rename = raw_commit(&git, &files, Some(edit));
+        // Gitlinks may also become ordinary files (and vice versa) without
+        // interpreting either the old or the new bytes as a local commit.
+        files.get_mut(b"moved %FF/sub module".as_slice()).unwrap().1 = 0o100644;
+        let regular = raw_commit(&git, &files, Some(rename));
+        files.get_mut(b"moved %FF/sub module".as_slice()).unwrap().1 = 0o160000;
+        let gitlink = raw_commit(&git, &files, Some(regular));
+        files.clear();
+        let tip = raw_commit(&git, &files, Some(gitlink));
+        assert_raw_history(&git, &[root, edit, rename, regular, gitlink, tip]);
+    }
+
+    #[test]
+    fn direct_stream_default_budget_accepts_commits_above_32_mib() {
+        let input = tempfile::tempdir().unwrap();
+        let git = GitRepository::init_bare(input.path()).unwrap();
+        let size = 33 * 1024 * 1024;
+        let files = RawFiles::from([(b"large.bin".to_vec(), (vec![0; size], 0o100644))]);
+        let tip = raw_commit(&git, &files, None);
+        drop(files);
+        let commit = git.find_commit(tip).unwrap();
+        assert!(input_budget(&git, &commit, 32 * 1024 * 1024).is_err());
+
+        let output = tempfile::tempdir().unwrap();
+        let mut repo = Repository::init(output.path()).unwrap();
+        let importer = ParallelImporter::new(
+            &git,
+            ParallelImportOptions {
+                graph_only: true,
+                target_view: repo.current_view().into(),
+                ..Default::default()
+            },
+        );
+        let outcome = importer
+            .import_graph_stream(
+                &mut repo,
+                tip,
+                GitStreamLimits::new(100, DEFAULT_STREAM_BYTE_LIMIT).unwrap(),
+            )
+            .unwrap();
+        assert_eq!(outcome.commits, 1);
+        let content = repo.get_file_content("large.bin").unwrap().unwrap();
+        assert_eq!(content.len(), size);
+        assert!(content.iter().all(|byte| *byte == 0));
+    }
+
     type Files = BTreeMap<String, (Vec<u8>, i32)>;
     fn tree(git: &GitRepository, files: &Files, prefix: &str) -> Oid {
         let mut builder = git.treebuilder(None).unwrap();

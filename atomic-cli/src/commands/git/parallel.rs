@@ -1384,11 +1384,6 @@ fn repository_entries_from_git_tree(
                         0o100644 => (atomic_core::change::InodeKind::Regular, 0o644u16, None),
                         0o100755 => (atomic_core::change::InodeKind::Regular, 0o755u16, None),
                         0o120000 => (atomic_core::change::InodeKind::Symlink, 0o777u16, None),
-                        0o160000 => {
-                            let oid = git_object_id(policy.object_format, entry.id())?;
-                            let bytes = oid_bytes_as_hex(&oid);
-                            (atomic_core::change::InodeKind::Gitlink, 0o644u16, Some(oid))
-                        }
                         mode => {
                             return Err(git_error(format!(
                                 "unsupported parent-tree Git mode {mode:#o} at '{}'",
@@ -1402,6 +1397,28 @@ fn repository_entries_from_git_tree(
                                 git_error(format!("cannot build prospective entry: {e}"))
                             })?;
                     entries.insert(repository_entry.path.clone(), repository_entry);
+                }
+                Some(git2::ObjectType::Commit) if entry.filemode() == 0o160000 => {
+                    // A gitlink stores a foreign commit's ID, not an object
+                    // that must be present in this repository's ODB.
+                    let path = RepoPath::from_bytes(&path)
+                        .map_err(|error| git_error(error.to_string()))?;
+                    let disposition = policy
+                        .exclusions
+                        .exclusion(&path)
+                        .map(ManifestDisposition::Excluded)
+                        .unwrap_or(ManifestDisposition::Included);
+                    let oid = git_object_id(policy.object_format, entry.id())?;
+                    let entry = RepositoryEntry::new(
+                        path,
+                        oid_bytes_as_hex(&oid),
+                        0o644,
+                        atomic_core::change::InodeKind::Gitlink,
+                        Some(oid),
+                        disposition,
+                    )
+                    .map_err(|error| git_error(error.to_string()))?;
+                    entries.insert(entry.path.clone(), entry);
                 }
                 _ => {
                     return Err(git_error(format!(
