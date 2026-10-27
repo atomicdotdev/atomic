@@ -1065,6 +1065,7 @@ impl Repository {
             );
         }
         let name_conflicts = reduced.conflicts;
+        let name_claims = reduced.name_claims;
         let alive_inodes: HashSet<Inode> = reduced
             .present
             .iter()
@@ -1101,6 +1102,7 @@ impl Repository {
         let debug_projection = std::env::var("ATOMIC_DEBUG_PROJECTION").is_ok();
         let mut absent_checks = 0u64;
         let mut absent_check_ms = 0u128;
+        let visible_changes = visibility.iter_dependency_first().copied().collect();
         for absent in reduced.absent {
             let wanted_here = wanted.is_none_or(|path| path == absent.path.as_str());
             if wanted_here
@@ -1111,12 +1113,13 @@ impl Repository {
                 // content as history. Those bytes cannot resurrect a removed
                 // name (including its pre-rename path). Require a live name
                 // in this exact graph closure before content-based recovery.
-                && !super::materialize::live_names_for_path(
+                && !super::materialize::live_names_for_path_with_claims(
                     txn,
                     &self.change_store,
                     absent.position,
                     &absent.path,
-                    &visibility.iter_dependency_first().copied().collect(),
+                    &visible_changes,
+                    name_claims.get(&absent.position).map(Vec::as_slice).unwrap_or_default(),
                 )?
                 .is_empty()
             {

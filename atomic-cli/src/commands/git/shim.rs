@@ -2133,7 +2133,7 @@ pub(crate) fn refresh_checkpoint_after_verified_import(
     let project = repo
         .project_tree(view, &policy)
         .map_err(|error| git_error(format!("cannot verify imported Atomic tree: {error}")))?;
-    verify_prospective_equivalence(&project, expected_tree)
+    let import_proof = verify_prospective_equivalence(&project, expected_tree)
         .map_err(|error| git_error(format!("imported Atomic tree diverged from Git: {error}")))?;
 
     let observation = observe_git(repo.root()).map_err(observation_error)?;
@@ -2168,6 +2168,14 @@ pub(crate) fn refresh_checkpoint_after_verified_import(
             index_path: observed.paths.index_path,
         }),
     };
+    let seeded = repo
+        .seed_verified_import_file_index_v2(working_copy, &project, &import_proof)
+        .map_err(CliError::from)?;
+    log::debug!(
+        "verified import V2 index: seeded={}, uncached={}",
+        seeded.seeded,
+        seeded.uncached
+    );
     checkpoint::write_checkpoint(repo.root(), &checkpoint).map_err(checkpoint_error)?;
     Ok(CheckpointRefresh::Refreshed)
 }

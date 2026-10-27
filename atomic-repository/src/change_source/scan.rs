@@ -207,15 +207,33 @@ where
     let original_source = source.source;
     let mut fallback = source.fallback.clone();
     let mut force_full = fallback.is_some();
+    // Losing an incremental watcher requires enumerating every tracked path,
+    // not discarding clean-content leases whose full stat observation still
+    // matches. Otherwise watch=off, CI, and unavailable watcher fallback render
+    // the entire graph on every status, even after a successful clean scan.
+    let mut invalidate_leases = matches!(
+        fallback,
+        Some(
+            ChangeSourceFallbackReason::MissingIndex
+                | ChangeSourceFallbackReason::MalformedIndex(_)
+                | ChangeSourceFallbackReason::ConversionPolicyChanged
+                | ChangeSourceFallbackReason::CanonicalAttributesChanged
+                | ChangeSourceFallbackReason::SparsePolicyChanged
+                | ChangeSourceFallbackReason::ConfigurationChanged
+                | ChangeSourceFallbackReason::FilterChanged
+        )
+    );
 
     for entry in tracked {
         match index.get(&entry.path) {
             None => {
                 force_full = true;
+                invalidate_leases = true;
                 fallback.get_or_insert(ChangeSourceFallbackReason::MissingIndex);
             }
             Some(row) if row.conversion_policy != Some(conversion_policy) => {
                 force_full = true;
+                invalidate_leases = true;
                 fallback.get_or_insert(ChangeSourceFallbackReason::ConversionPolicyChanged);
             }
             Some(row)
@@ -224,6 +242,7 @@ where
                     || row.canonical_kind != Some(entry.canonical_kind) =>
             {
                 force_full = true;
+                invalidate_leases = true;
                 fallback.get_or_insert(ChangeSourceFallbackReason::CanonicalAttributesChanged);
             }
             _ => {}
@@ -366,7 +385,7 @@ where
                 if racy {
                     stats.racy_candidates += 1;
                 }
-                let lease_valid = !force_full
+                let lease_valid = !invalidate_leases
                     && !type_changed
                     && !permissions_changed
                     && cached
@@ -975,6 +994,145 @@ mod tests {
 
     #[test]
     fn same_size_and_restored_mtime_attack_is_rehashed() {
+        restored_mtime_attack_is_rehashed(None);
+        restored_mtime_attack_is_rehashed(Some(ChangeSourceFallbackReason::ConfiguredOff));
+        restored_mtime_attack_is_rehashed(Some(ChangeSourceFallbackReason::SourceError(
+            "watchers unavailable".into(),
+        )));
+    }
+
+    #[test]
+    fn complete_watcher_fallback_scans_keep_verified_clean_leases() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("tracked"), b"canonical").unwrap();
+        let path = RepoPath::from_bytes(b"tracked").unwrap();
+        let paths = vec![path.clone()];
+        let policy = Hash::of(b"policy");
+        let expected = Hash::of(b"canonical");
+        let cold = verify_candidates(
+            source(dir.path(), &paths),
+            &tracked(&path),
+            &BTreeMap::new(),
+            policy,
+            now_timestamp(),
+            &ExactFilter,
+            |_| Ok(expected),
+        )
+        .unwrap();
+        let index = cold.index_updates.into_iter().collect();
+        for reason in [
+            ChangeSourceFallbackReason::ConfiguredOff,
+            ChangeSourceFallbackReason::DisabledInCi,
+            ChangeSourceFallbackReason::DisabledInContainer,
+            ChangeSourceFallbackReason::Unavailable("no watcher".into()),
+            ChangeSourceFallbackReason::UnknownToken,
+            ChangeSourceFallbackReason::Overflow,
+            ChangeSourceFallbackReason::MalformedResponse("bad watcher".into()),
+            ChangeSourceFallbackReason::Timeout { milliseconds: 5 },
+            ChangeSourceFallbackReason::SourceError("both watchers unavailable".into()),
+        ] {
+            let mut fallback = source(dir.path(), &paths);
+            fallback.fallback = Some(reason.clone());
+            let result = verify_candidates(
+                fallback,
+                &tracked(&path),
+                &index,
+                policy,
+                now_timestamp(),
+                &ExactFilter,
+                |_| panic!("watcher degradation must not reconstruct unchanged graph content"),
+            )
+            .unwrap();
+            assert_eq!(result.root, cold.root);
+            assert_eq!(result.fallback, Some(reason));
+            assert_eq!(result.stats.metadata_reads, 1);
+            assert_eq!(result.stats.content_reads, 0);
+            assert_eq!(result.stats.cache_leases, 1);
+        }
+
+        // An invalid incremental token must still force complete discovery,
+        // even if the source omitted every otherwise-clean tracked path.
+        let mut omitted = source(dir.path(), &paths);
+        omitted.complete = false;
+        omitted.candidates.clear();
+        omitted.fallback = Some(ChangeSourceFallbackReason::UnknownToken);
+        let rescanned = verify_candidates(
+            omitted,
+            &tracked(&path),
+            &index,
+            policy,
+            now_timestamp(),
+            &ExactFilter,
+            |_| panic!("full metadata discovery still has a valid clean-content lease"),
+        )
+        .unwrap();
+        assert_eq!(rescanned.root, cold.root);
+        assert_eq!(rescanned.stats.content_reads, 0);
+        assert_eq!(rescanned.stats.cache_leases, 1);
+    }
+
+    #[test]
+    fn canonical_invalidation_and_racy_files_still_rehash_on_fallback() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("tracked"), b"canonical").unwrap();
+        let path = RepoPath::from_bytes(b"tracked").unwrap();
+        let paths = vec![path.clone()];
+        let policy = Hash::of(b"policy");
+        let expected = Hash::of(b"canonical");
+        let cold = verify_candidates(
+            source(dir.path(), &paths),
+            &tracked(&path),
+            &BTreeMap::new(),
+            policy,
+            now_timestamp(),
+            &ExactFilter,
+            |_| Ok(expected),
+        )
+        .unwrap();
+        let index: BTreeMap<_, _> = cold.index_updates.into_iter().collect();
+        for reason in [
+            ChangeSourceFallbackReason::MalformedIndex("bad cache".into()),
+            ChangeSourceFallbackReason::ConversionPolicyChanged,
+            ChangeSourceFallbackReason::CanonicalAttributesChanged,
+            ChangeSourceFallbackReason::SparsePolicyChanged,
+            ChangeSourceFallbackReason::ConfigurationChanged,
+            ChangeSourceFallbackReason::FilterChanged,
+        ] {
+            let mut fallback = source(dir.path(), &paths);
+            fallback.fallback = Some(reason);
+            let result = verify_candidates(
+                fallback,
+                &tracked(&path),
+                &index,
+                policy,
+                now_timestamp(),
+                &ExactFilter,
+                |_| Ok(expected),
+            )
+            .unwrap();
+            assert_eq!(result.stats.content_reads, 1);
+            assert_eq!(result.stats.cache_leases, 0);
+        }
+        let mut racy_index = index;
+        let row = racy_index.get_mut(&path).unwrap();
+        row.racy_after = row.mtime;
+        let mut fallback = source(dir.path(), &paths);
+        fallback.fallback = Some(ChangeSourceFallbackReason::ConfiguredOff);
+        let result = verify_candidates(
+            fallback,
+            &tracked(&path),
+            &racy_index,
+            policy,
+            now_timestamp(),
+            &ExactFilter,
+            |_| Ok(expected),
+        )
+        .unwrap();
+        assert_eq!(result.stats.content_reads, 1);
+        assert_eq!(result.stats.racy_candidates, 1);
+    }
+
+    fn restored_mtime_attack_is_rehashed(fallback: Option<ChangeSourceFallbackReason>) {
         let dir = tempdir().unwrap();
         let native = dir.path().join("tracked");
         fs::write(&native, b"abcdefgh").unwrap();
@@ -999,8 +1157,10 @@ mod tests {
         let file = fs::OpenOptions::new().write(true).open(&native).unwrap();
         file.set_times(fs::FileTimes::new().set_modified(original_mtime))
             .unwrap();
+        let mut observed = source(dir.path(), &paths);
+        observed.fallback = fallback;
         let attacked = verify_candidates(
-            source(dir.path(), &paths),
+            observed,
             &tracked(&path),
             &index,
             policy,

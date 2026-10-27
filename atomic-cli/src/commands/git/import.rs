@@ -1867,6 +1867,64 @@ mod tests {
             repo.get_file_content("tracked.txt").unwrap(),
             Some(b"first\nsecond\n".to_vec())
         );
+        assert_first_import_status_uses_v2(&repo, &["tracked.txt", ".atomicignore"]);
+    }
+
+    fn assert_first_import_status_uses_v2(repo: &Repository, paths: &[&str]) {
+        let wc = repo.require_working_copy_id().unwrap();
+        // Check persisted rows BEFORE status can backfill them. In particular,
+        // .atomicignore was added after the Git history was imported.
+        for path in paths {
+            let key = atomic_repository::RepoPath::from_bytes(path.as_bytes()).unwrap();
+            assert!(
+                repo.file_index_v2(wc, &key).unwrap().unwrap().is_complete(),
+                "missing final-import V2 lease for {path}"
+            );
+        }
+        let status = repo
+            .status(wc, atomic_repository::StatusOptions::default())
+            .unwrap();
+        assert!(status.is_clean());
+        let metrics = status.change_source_metrics().unwrap();
+        assert_eq!(
+            metrics.content_reads, 0,
+            "first post-import status reconstructed unchanged file content"
+        );
+        assert_eq!(metrics.valid_lease_hits, paths.len());
+    }
+
+    #[test]
+    #[serial]
+    fn ordinary_import_seeds_v2_for_filtered_and_escaped_paths_before_status() {
+        let temp = tempfile::tempdir().unwrap();
+        init_git(temp.path());
+        git_ok(temp.path(), &["config", "core.autocrlf", "false"]);
+        fs::write(temp.path().join(".gitattributes"), b"*.txt text eol=crlf\n").unwrap();
+        fs::write(temp.path().join("100%.txt"), b"canonical\n").unwrap();
+        git_ok(temp.path(), &["add", "."]);
+        git_ok(temp.path(), &["commit", "-qm", "filtered percent path"]);
+        fs::write(temp.path().join("100%.txt"), b"canonical\r\n").unwrap();
+        let _guard = DirGuard::new();
+        std::env::set_current_dir(temp.path()).unwrap();
+        Import {
+            no_vault: true,
+            ..Default::default()
+        }
+        .run()
+        .unwrap();
+        let repo = Repository::open(temp.path()).unwrap();
+        let wc = repo.require_working_copy_id().unwrap();
+        let path = atomic_repository::RepoPath::from_bytes(b"100%.txt").unwrap();
+        let row = repo.file_index_v2(wc, &path).unwrap().unwrap();
+        assert_eq!(
+            row.content_id,
+            Some(atomic_core::types::Hash::of(b"canonical\n"))
+        );
+        assert_first_import_status_uses_v2(&repo, &["100%.txt", ".gitattributes", ".atomicignore"]);
+        assert_eq!(
+            fs::read(temp.path().join("100%.txt")).unwrap(),
+            b"canonical\r\n"
+        );
     }
 
     #[test]

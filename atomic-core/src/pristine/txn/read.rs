@@ -1926,6 +1926,17 @@ pub struct CachedGraphTxn<'txn> {
     /// parallel paths use the inode-linear walk and don't hit these finders,
     /// so the lock is effectively uncontended.
     span_index: std::sync::Mutex<crate::pristine::span_index::VertexSpanIndex>,
+    /// Causal probes in different files share these immutable snapshot reads.
+    /// Cache successful reads (including absence), never errors; no entry
+    /// survives the borrowed read transaction or crosses a write boundary.
+    dependency_reads: std::sync::Mutex<CachedDependencyReads>,
+}
+
+#[derive(Default)]
+struct CachedDependencyReads {
+    internal: std::collections::HashMap<Hash, Option<NodeId>>,
+    external: std::collections::HashMap<NodeId, Option<Hash>>,
+    dependencies: std::collections::HashMap<NodeId, Vec<Hash>>,
 }
 
 impl<'txn> CachedGraphTxn<'txn> {
@@ -1938,6 +1949,7 @@ impl<'txn> CachedGraphTxn<'txn> {
             graph_table,
             inode_graph_table,
             span_index: std::sync::Mutex::new(Default::default()),
+            dependency_reads: Default::default(),
         })
     }
 
@@ -1965,15 +1977,65 @@ impl<'txn> CachedGraphTxn<'txn> {
     }
 }
 
+impl PathClaimTxnT for CachedGraphTxn<'_> {
+    fn path_claim_schema_version(&self) -> PristineResult<Option<u32>> {
+        self.txn.path_claim_schema_version()
+    }
+
+    fn get_path_claims(&self, path: &str) -> PristineResult<Vec<PathClaimEvent>> {
+        self.txn.get_path_claims(path)
+    }
+
+    fn iter_path_claims(&self) -> PristineResult<Vec<PathClaimEntry>> {
+        self.txn.iter_path_claims()
+    }
+
+    fn iter_rev_tree_pairs(&self) -> PristineResult<Vec<(Inode, String)>> {
+        self.txn.iter_rev_tree_pairs()
+    }
+}
+
 impl<'txn> GraphTxnT for CachedGraphTxn<'txn> {
     type Adj = AdjIterator;
 
     fn get_external(&self, id: NodeId) -> PristineResult<Option<Hash>> {
-        self.txn.get_external(id)
+        if let Some(value) = self
+            .dependency_reads
+            .lock()
+            .unwrap()
+            .external
+            .get(&id)
+            .copied()
+        {
+            return Ok(value);
+        }
+        let value = self.txn.get_external(id)?;
+        self.dependency_reads
+            .lock()
+            .unwrap()
+            .external
+            .insert(id, value);
+        Ok(value)
     }
 
     fn get_internal(&self, hash: &Hash) -> PristineResult<Option<NodeId>> {
-        self.txn.get_internal(hash)
+        if let Some(value) = self
+            .dependency_reads
+            .lock()
+            .unwrap()
+            .internal
+            .get(hash)
+            .copied()
+        {
+            return Ok(value);
+        }
+        let value = self.txn.get_internal(hash)?;
+        self.dependency_reads
+            .lock()
+            .unwrap()
+            .internal
+            .insert(*hash, value);
+        Ok(value)
     }
 
     fn list_registered_changes(&self) -> PristineResult<Vec<(NodeId, Hash)>> {
@@ -2074,7 +2136,23 @@ impl<'txn> GraphTxnT for CachedGraphTxn<'txn> {
     }
 
     fn get_change_deps(&self, change_id: NodeId) -> PristineResult<Vec<Hash>> {
-        self.txn.get_change_deps(change_id)
+        if let Some(value) = self
+            .dependency_reads
+            .lock()
+            .unwrap()
+            .dependencies
+            .get(&change_id)
+            .cloned()
+        {
+            return Ok(value);
+        }
+        let value = self.txn.get_change_deps(change_id)?;
+        self.dependency_reads
+            .lock()
+            .unwrap()
+            .dependencies
+            .insert(change_id, value.clone());
+        Ok(value)
     }
 
     fn change_deps_indexed_count(&self, change_id: NodeId) -> PristineResult<Option<u64>> {
@@ -3233,5 +3311,169 @@ mod tests {
             .unwrap();
         assert_eq!(preload_edges, edges);
         assert!(preload.has_change_in_graph(global_only_change).unwrap());
+    }
+
+    #[test]
+    fn cached_graph_transaction_preserves_path_claim_observations() {
+        use crate::pristine::{PathClaimId, PathClaimKind, PathClaimMutTxnT, PathClaimState};
+        let dir = tempdir().unwrap();
+        let pristine = Pristine::open(dir.path().join("claims.redb")).unwrap();
+        let mut txn = pristine.write_txn().unwrap();
+        let id = txn.register_change(&Hash::of(b"claim")).unwrap();
+        let event = PathClaimEvent::new(
+            id,
+            0,
+            PathClaimKind::File,
+            PathClaimState::Alive,
+            PathClaimId::new(
+                Position::new(id, ChangePosition::new(8)),
+                GraphNode::ROOT,
+                GraphNode::new(id, ChangePosition::new(0), ChangePosition::new(8)),
+                id,
+            ),
+        );
+        txn.put_path_claim("file.txt", &event).unwrap();
+        txn.commit().unwrap();
+        let txn = pristine.read_txn().unwrap();
+        let cached = CachedGraphTxn::new(&txn).unwrap();
+        assert_eq!(
+            cached.path_claim_schema_version().unwrap(),
+            txn.path_claim_schema_version().unwrap()
+        );
+        assert_eq!(cached.get_path_claims("file.txt").unwrap(), vec![event]);
+        assert_eq!(
+            cached.iter_path_claims().unwrap(),
+            txn.iter_path_claims().unwrap()
+        );
+        assert_eq!(
+            cached.iter_rev_tree_pairs().unwrap(),
+            txn.iter_rev_tree_pairs().unwrap()
+        );
+    }
+
+    #[test]
+    fn cached_dependency_reads_are_scoped_to_the_read_snapshot() {
+        let dir = tempdir().unwrap();
+        let pristine = Pristine::open(dir.path().join("deps.redb")).unwrap();
+        let hash = Hash::of(b"writer");
+        let dependency = Hash::of(b"dependency");
+        let mut write = pristine.write_txn().unwrap();
+        let id = write.register_change(&hash).unwrap();
+        write.put_change_deps(id, &[]).unwrap();
+        write.commit().unwrap();
+        let before = pristine.read_txn().unwrap();
+        let cached_before = CachedGraphTxn::new(&before).unwrap();
+        assert!(cached_before.get_change_deps(id).unwrap().is_empty());
+        assert_eq!(cached_before.get_external(id).unwrap(), Some(hash));
+        assert_eq!(cached_before.get_internal(&dependency).unwrap(), None);
+
+        let mut write = pristine.write_txn().unwrap();
+        let dependency_id = write.register_change(&dependency).unwrap();
+        write.put_change_deps(dependency_id, &[]).unwrap();
+        write.put_change_deps(id, &[dependency]).unwrap();
+        write.commit().unwrap();
+        assert!(cached_before.get_change_deps(id).unwrap().is_empty());
+        assert_eq!(cached_before.get_internal(&dependency).unwrap(), None);
+        let after = pristine.read_txn().unwrap();
+        let cached_after = CachedGraphTxn::new(&after).unwrap();
+        assert_eq!(cached_after.get_change_deps(id).unwrap(), vec![dependency]);
+        assert_eq!(
+            cached_after.get_internal(&dependency).unwrap(),
+            Some(dependency_id)
+        );
+        assert_eq!(
+            cached_after.get_external(dependency_id).unwrap(),
+            Some(dependency)
+        );
+    }
+
+    #[test]
+    fn exact_namespace_claims_avoid_span_sweeps_and_keep_fallback_verdicts() {
+        use crate::output::{
+            repo::{live_inode_names, live_inode_names_with_claims},
+            RetrieveOptions,
+        };
+        use crate::pristine::PathClaimId;
+        for unlinked in [false, true] {
+            let dir = tempdir().unwrap();
+            let pristine = Pristine::open(dir.path().join("names.redb")).unwrap();
+            let mut write = pristine.write_txn().unwrap();
+            let id = write.register_change(&Hash::of(b"names")).unwrap();
+            write.put_change_deps(id, &[]).unwrap();
+            let inode = Position::new(id, ChangePosition::new(7));
+            let name = GraphNode::new(id, ChangePosition::new(3), ChangePosition::new(7));
+            let flags = EdgeFlags::BLOCK | EdgeFlags::FOLDER | EdgeFlags::PARENT;
+            write
+                .put_graph(
+                    inode.inode_node(),
+                    SerializedGraphEdge::new(flags, inode, id),
+                )
+                .unwrap();
+            write
+                .put_graph(name, SerializedGraphEdge::new(flags, Position::ROOT, id))
+                .unwrap();
+            if unlinked {
+                write
+                    .put_graph(
+                        name,
+                        SerializedGraphEdge::new(flags | EdgeFlags::DELETED, Position::ROOT, id),
+                    )
+                    .unwrap();
+            }
+            write.commit().unwrap();
+            let read = pristine.read_txn().unwrap();
+            let opts =
+                RetrieveOptions::new().with_change_filter(std::collections::HashSet::from([id]));
+            let reference =
+                live_inode_names(&CachedGraphTxn::new(&read).unwrap(), inode, &opts).unwrap();
+            assert_eq!(reference.is_empty(), unlinked);
+            let claim = PathClaimId::new(inode, GraphNode::ROOT, name, id);
+            for claims in [vec![claim], vec![claim, claim]] {
+                let cached = CachedGraphTxn::new(&read).unwrap();
+                assert_eq!(
+                    live_inode_names_with_claims(&cached, inode, &opts, &claims).unwrap(),
+                    reference
+                );
+                assert!(
+                    !cached.span_index.lock().unwrap().contains_change(id.get()),
+                    "exact name claim built a whole-change vertex index"
+                );
+            }
+            let missing = PathClaimId {
+                name: GraphNode::new(id, ChangePosition::new(4), ChangePosition::new(7)),
+                ..claim
+            };
+            let empty = PathClaimId {
+                name: inode.inode_node(),
+                ..claim
+            };
+            let wrong_inode = PathClaimId {
+                claimant: Position::ROOT,
+                ..claim
+            };
+            for claims in [
+                vec![],
+                vec![missing],
+                vec![empty],
+                vec![wrong_inode],
+                vec![claim, missing],
+            ] {
+                let cached = CachedGraphTxn::new(&read).unwrap();
+                assert_eq!(
+                    live_inode_names_with_claims(&cached, inode, &opts, &claims).unwrap(),
+                    reference
+                );
+                assert!(
+                    cached.span_index.lock().unwrap().contains_change(id.get()),
+                    "unproven name claim did not use the original block lookup"
+                );
+            }
+            let invisible = RetrieveOptions::new().with_change_filter(Default::default());
+            assert!(
+                live_inode_names_with_claims(&read, inode, &invisible, &[claim])
+                    .unwrap()
+                    .is_empty()
+            );
+        }
     }
 }
