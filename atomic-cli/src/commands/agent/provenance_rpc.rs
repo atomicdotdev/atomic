@@ -458,6 +458,24 @@ fn journal_turn_status(turn: &pb::StoredProvenanceTurn) -> anyhow::Result<Journa
         provenance_id: turn.provenance_id,
         generation: turn.generation,
         lifecycle,
+        checkpoint_change_hashes: turn
+            .checkpoint_attempt
+            .as_ref()
+            .and_then(|attempt| attempt.source.as_ref())
+            .map(|source| {
+                source
+                    .change_hashes
+                    .iter()
+                    .filter_map(|hash| hash.value.clone().try_into().ok())
+                    .map(|bytes: [u8; 32]| Hash::from_bytes(bytes))
+                    .collect()
+            })
+            .unwrap_or_default(),
+        final_provenance_hash: turn
+            .final_hash
+            .as_ref()
+            .and_then(|hash| hash.value.clone().try_into().ok())
+            .map(|bytes: [u8; 32]| Hash::from_bytes(bytes)),
     })
 }
 

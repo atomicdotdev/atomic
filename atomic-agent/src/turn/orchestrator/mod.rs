@@ -321,6 +321,17 @@ pub struct JournalTurnStatus {
     pub provenance_id: u64,
     pub generation: u64,
     pub lifecycle: JournalTurnLifecycle,
+    /// The change hashes this turn's checkpoint claim explains — the
+    /// durable record of what the turn recorded. A resumed session's
+    /// fresh local state adopts these so its attestation knows what the
+    /// session's earlier turns already covered (and can chain to them).
+    /// Empty for a turn that never reached its checkpoint claim.
+    pub checkpoint_change_hashes: Vec<Hash>,
+    /// The provenance graph hash this turn published (`final_hash`) — the
+    /// chain link a resumed round's checkpoint needs when its local ledger
+    /// read (a remote sandbox's cache) holds no previous turn. `None` for
+    /// a turn that never bound its graph.
+    pub final_provenance_hash: Option<Hash>,
 }
 
 /// Committed provenance-journal boundary supplied by the CLI owner client.

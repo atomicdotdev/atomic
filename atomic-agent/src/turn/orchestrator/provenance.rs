@@ -911,7 +911,7 @@ impl TurnOrchestrator {
                 }
             })?
         };
-        let (previous_provenance, ledger_turn_number) = ledger
+        let (mut previous_provenance, ledger_turn_number) = ledger
             .map(|(_, turns)| {
                 (
                     turns.last().map(|turn| turn.provenance_hash),
@@ -919,6 +919,38 @@ impl TurnOrchestrator {
                 )
             })
             .unwrap_or((None, 0));
+        // CB-12B: a resumed round runs in a NEW sandbox whose cache holds
+        // no session turns, so the ledger read above yields no chain link
+        // — and the owner would refuse the checkpoint's append as
+        // non-contiguous ("turn N is not an append"). The durable journal
+        // (reachable through the sink's provenance RPCs, which a sandbox's
+        // cache does not shadow) knows the session's previous turn and its
+        // published graph hash: derive the link from there. A genuinely
+        // fresh session has no previous turn anywhere and stays unchained.
+        if previous_provenance.is_none() {
+            if let Some(sink) = &self.journal_sink {
+                let mut probe = session.turn_count.max(1);
+                while previous_provenance.is_none() && probe > 0 {
+                    match sink.turn_status(session_id, probe) {
+                        Ok(Some(status)) => {
+                            previous_provenance = status.final_provenance_hash;
+                        }
+                        Ok(None) => break,
+                        Err(error) => {
+                            log::debug!(
+                                "Could not probe the durable journal for session {} turn \
+                                 {} while chaining the checkpoint: {} (non-fatal)",
+                                session_id,
+                                probe,
+                                error
+                            );
+                            break;
+                        }
+                    }
+                    probe -= 1;
+                }
+            }
+        }
         let source = super::JournalCheckpointSource {
             agent_name: session.agent_name.clone(),
             agent_display_name: session.agent_display_name.clone(),

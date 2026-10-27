@@ -778,6 +778,174 @@ fn a_remote_sandboxs_session_attestation_reaches_its_owner() {
     assert_only_the_cache(&vm);
 }
 
+/// CB-12B: a resumed expedition round — outpost's managed expeditions —
+/// runs in a NEW sandbox on the SAME session id (the expedition id). The
+/// fresh sandbox has no local session state, so its round must adopt the
+/// durable ledger before numbering anything: numbering the resumed round's
+/// turn like round 1's collides with round 1's published journal turn, the
+/// checkpoint reservation fails with `ProvenanceCheckpointConflict`, and
+/// the turn-end hook dies BEFORE its session save — so the round-2 change
+/// reaches the view but never the session ledger, and the round-2
+/// session-end has no recorded hashes left to attest. The publication gate
+/// then refuses the promote with `MissingProvenanceRoot` and
+/// `MissingAttestation`. Here: both rounds end-to-end, and the owner
+/// carries round 2's ledger turn, its covering provenance graph, and a
+/// second same-session attestation that covers only round 2's change and
+/// chains to round 1's.
+#[test]
+fn a_resumed_remote_sandbox_session_attests_its_second_round() {
+    let (_server, env, host) = setup();
+    let host = host.path();
+    let vms = TempDir::new().unwrap();
+    let sid = "agent-session";
+    let now = "2026-01-01T00:00:00Z";
+
+    // One dispatch of the expedition: session-start → turn → session-end
+    // in one sandbox. The resumed dispatch repeats the same lifecycle in a
+    // SECOND sandbox on the same view and session id.
+    let dispatch = |vm: &Path, round: u32, title: &str| {
+        let cwd = vm.to_str().unwrap();
+        let turn = serde_json::json!({
+            "session_id": sid, "cwd": cwd, "model": "m", "provider": "p",
+            "turn_number": 1, "intent_title": title, "timestamp": now,
+        });
+        ok(
+            hook(
+                &env,
+                vm,
+                "session-start",
+                serde_json::json!({
+                    "session_id": sid, "cwd": cwd, "model": "m", "provider": "p",
+                    "turn_number": 0, "timestamp": now,
+                }),
+            ),
+            "session-start",
+        );
+        ok(
+            hook(&env, vm, "turn-start", turn.clone()),
+            &format!("round {round} turn-start"),
+        );
+        ok(
+            hook(&env, vm, "turn-end", turn),
+            // Before the resume fix this exited nonzero: the resumed round
+            // numbered its turn like round 1's and the durable journal
+            // refused the collision ("Provenance turn 1 is not running").
+            &format!("round {round} turn-end"),
+        );
+        ok(
+            hook(
+                &env,
+                vm,
+                "session-end",
+                serde_json::json!({
+                    "session_id": sid, "cwd": cwd, "turn_number": 1, "timestamp": now,
+                }),
+            ),
+            &format!("round {round} session-end"),
+        );
+    };
+
+    // Round 1 — the first dispatch.
+    let vm1 = vms.path().join("round-1");
+    open(&env, host, "exp-1", &vm1);
+    ok(
+        env.run(&vm1, &["sandbox", "materialize"]),
+        "materialize round 1",
+    );
+    write(&vm1, "README.md", "hello\nreader\n");
+    dispatch(&vm1, 1, "greet the reader");
+
+    // Round 2 — the RESUMED dispatch: a fresh sandbox (fresh local session
+    // state, exactly as a re-forked expedition VM), same view, same id.
+    let vm2 = vms.path().join("round-2");
+    open(&env, host, "exp-1", &vm2);
+    ok(
+        env.run(&vm2, &["sandbox", "materialize"]),
+        "materialize round 2",
+    );
+    write(&vm2, "REVIEW_NOTES.md", "addressed\n");
+    dispatch(&vm2, 2, "address the review");
+
+    // The owner carries BOTH rounds in the session ledger.
+    let repo = atomic_repository::Repository::open_existing(host).unwrap();
+    let (_, turns) = repo
+        .get_session_ledger(sid)
+        .unwrap()
+        .unwrap_or_else(|| panic!("no session ledger for {sid} on the host"));
+    assert_eq!(turns.len(), 2, "both rounds published: {turns:?}");
+    let round_one_change = turns[0]
+        .change_hashes
+        .first()
+        .copied()
+        .unwrap_or_else(|| panic!("round 1 recorded no change: {turns:?}"));
+    let round_two_change = turns[1]
+        .change_hashes
+        .first()
+        .copied()
+        .unwrap_or_else(|| panic!("round 2 recorded no change: {turns:?}"));
+    assert_ne!(round_one_change, round_two_change);
+
+    // The round-2 change carries its covering provenance graph — the
+    // `MissingProvenanceRoot` half of the pre-fix refusal.
+    assert!(
+        !repo
+            .find_provenance_for_change(&round_two_change)
+            .unwrap()
+            .is_empty(),
+        "round 2's change must carry a provenance root"
+    );
+
+    // And a same-session attestation covering the round-2 change — the
+    // `MissingAttestation` half of the pre-fix refusal. A resumed sandbox
+    // cannot see the owner's earlier attestations (its cache holds none),
+    // so its incremental attestation degrades to covering the session's
+    // whole hydrated history — round 1's change included — rather than
+    // only the new round's; the owner-side ideal (cover only the new
+    // change, chain to the previous attestation) is pinned by the
+    // atomic-agent orchestrator test against a local repository.
+    let attestations = repo
+        .find_attestations_for_change(&round_two_change)
+        .unwrap();
+    let (_, round_two_attestation) = attestations
+        .iter()
+        .find(|(_, attest)| attest.session_id == sid)
+        .unwrap_or_else(|| panic!("no attestation for {sid}: {attestations:?}"));
+    assert!(
+        round_two_attestation
+            .changes_covered
+            .contains(&round_two_change),
+        "the resumed round's attestation covers the new round's change: {:?}",
+        round_two_attestation.changes_covered,
+    );
+    assert!(
+        round_two_attestation
+            .changes_covered
+            .contains(&round_one_change),
+        "the resumed round re-attests the session's hydrated history: {:?}",
+        round_two_attestation.changes_covered,
+    );
+    let round_one_attestations = repo
+        .find_attestations_for_change(&round_one_change)
+        .unwrap();
+    assert!(
+        round_one_attestations
+            .iter()
+            .any(|(_, attest)| attest.session_id == sid),
+        "round 1's attestation still exists for {sid}"
+    );
+    // The resumed round's attestation verifies under the session state the
+    // owner filed for it — read from where the publication gate reads.
+    // (Round 1's own MAC signature cannot be re-verified host-side after
+    // round 2's submission replaced the session state file; the demo's
+    // attestations are agent-DID-signed, which never depended on it.)
+    assert!(round_two_attestation.verify_mac(
+        &atomic_repository::repository::provenance_gate::local_session_mac_key_provider(&repo)(sid)
+            .expect("the gate resolves the session's MAC key")
+    ),);
+    assert_only_the_cache(&vm1);
+    assert_only_the_cache(&vm2);
+}
+
 /// A sherpa turn's provenance is the full account of how the change was
 /// made: the transcript the harness writes (assistant text, tool calls, tool
 /// results — Claude Code's JSONL shape) rides the change as its unhashed
