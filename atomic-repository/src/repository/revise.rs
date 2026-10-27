@@ -90,7 +90,13 @@ impl Repository {
                 .collect();
             let closure = super::provenance_gate::reachable_closure(self, &roots)?;
             let provider = super::provenance_gate::local_session_mac_key_provider(self);
-            self.enforce_publication_gate("revise reinsertion", &closure, Some(&provider))?;
+            let did_provider = super::provenance_gate::local_did_key_provider(self);
+            self.enforce_publication_gate(
+                "revise reinsertion",
+                &closure,
+                Some(&provider),
+                Some(&did_provider),
+            )?;
         }
 
         let mut header = original.hashed.header.clone();
@@ -111,7 +117,13 @@ impl Repository {
         if self.get_view_info(&view)?.scope == atomic_core::pristine::ViewScope::Shared {
             let closure = super::provenance_gate::reachable_closure(self, &plan.hashes)?;
             let provider = super::provenance_gate::local_session_mac_key_provider(self);
-            self.enforce_publication_gate("revised history", &closure, Some(&provider))?;
+            let did_provider = super::provenance_gate::local_did_key_provider(self);
+            self.enforce_publication_gate(
+                "revised history",
+                &closure,
+                Some(&provider),
+                Some(&did_provider),
+            )?;
         }
         let result = (|| {
             for (_, hash) in history[target_index..].iter().rev() {

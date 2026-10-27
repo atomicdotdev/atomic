@@ -1789,7 +1789,13 @@ impl Repository {
                 let closure =
                     super::provenance_gate::reachable_closure(self, std::slice::from_ref(hash))?;
                 let provider = super::provenance_gate::local_session_mac_key_provider(self);
-                self.enforce_publication_gate("shared-view insertion", &closure, Some(&provider))?;
+                let did_provider = super::provenance_gate::local_did_key_provider(self);
+                self.enforce_publication_gate(
+                    "shared-view insertion",
+                    &closure,
+                    Some(&provider),
+                    Some(&did_provider),
+                )?;
             }
         }
 
@@ -2215,7 +2221,13 @@ impl Repository {
             if shared_target {
                 let closure = super::provenance_gate::reachable_closure(self, &to_insert)?;
                 let provider = super::provenance_gate::local_session_mac_key_provider(self);
-                self.enforce_publication_gate("shared-view insertion", &closure, Some(&provider))?;
+                let did_provider = super::provenance_gate::local_did_key_provider(self);
+                self.enforce_publication_gate(
+                    "shared-view insertion",
+                    &closure,
+                    Some(&provider),
+                    Some(&did_provider),
+                )?;
                 options.skip_publication_gate = true;
             }
         }
@@ -2759,7 +2771,13 @@ impl Repository {
         if target_is_shared {
             let closure = super::provenance_gate::reachable_closure(self, &source_changes)?;
             let provider = super::provenance_gate::local_session_mac_key_provider(self);
-            self.enforce_publication_gate("triage promotion", &closure, Some(&provider))?;
+            let did_provider = super::provenance_gate::local_did_key_provider(self);
+            self.enforce_publication_gate(
+                "triage promotion",
+                &closure,
+                Some(&provider),
+                Some(&did_provider),
+            )?;
         }
 
         // When the source view is Draft, its changes were recorded against

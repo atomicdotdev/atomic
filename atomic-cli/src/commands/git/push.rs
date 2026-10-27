@@ -130,8 +130,17 @@ impl Command for Push {
                 atomic_repository::repository::provenance_gate::local_session_mac_key_provider(
                     &readonly_repo,
                 );
+            let did_provider =
+                atomic_repository::repository::provenance_gate::local_did_key_provider(
+                    &readonly_repo,
+                );
             readonly_repo
-                .enforce_publication_gate("Git ref export", &closure, Some(&provider))
+                .enforce_publication_gate(
+                    "Git ref export",
+                    &closure,
+                    Some(&provider),
+                    Some(&did_provider),
+                )
                 .map_err(CliError::Repository)?;
         }
         // RFC §8.3 (CB-8B): remote export of a view with unresolved Atomic
