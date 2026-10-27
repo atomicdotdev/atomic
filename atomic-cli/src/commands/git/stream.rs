@@ -667,12 +667,31 @@ mod tests {
                     state = Some(outcome.state);
                 }
                 let source = git.find_commit(*tip).unwrap().tree_id();
-                let actual = repo.project_tree(repo.current_view(), &policy).unwrap();
-                assert_eq!(
-                    actual.git.root.as_bytes(),
-                    source.as_bytes(),
-                    "raw Git tree bytes must survive at {tip}"
-                );
+                let projection = repo.project_tree(repo.current_view(), &policy);
+                if policy.platform.lossless_unix_paths {
+                    let actual = projection.unwrap();
+                    assert_eq!(
+                        actual.git.root.as_bytes(),
+                        source.as_bytes(),
+                        "raw Git tree bytes must survive at {tip}"
+                    );
+                } else {
+                    // The import itself verifies the staged graph against the
+                    // source tree before promotion. The separate graph-to-Git
+                    // projection API deliberately refuses this host policy.
+                    assert!(matches!(
+                        projection,
+                        Err(atomic_repository::repository::ProjectTreeError::UnsupportedPlatformPath)
+                    ));
+                }
+                // Exercise the Windows policy contract on Unix too, without
+                // claiming the host can project arbitrary Git paths natively.
+                let mut unsupported_policy = policy.clone();
+                unsupported_policy.platform.lossless_unix_paths = false;
+                assert!(matches!(
+                    repo.project_tree(repo.current_view(), &unsupported_policy),
+                    Err(atomic_repository::repository::ProjectTreeError::UnsupportedPlatformPath)
+                ));
                 assert_eq!(fs::read_dir(output.path()).unwrap().count(), 1);
             }
         }

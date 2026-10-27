@@ -1074,12 +1074,15 @@ passes; that separate fresh-materializer case was not hidden by changing core.
 - Real `Import { stream: true }` command integration passes with two Git commits,
   zero imported FileOps and unchanged tracked-file mtime; ordinary shared
   finalization/checkpoint code still runs.
-- Bare ODB regressions reconstruct exact source tree OIDs for spaces, Unicode
+- On Unix, bare ODB regressions reconstruct exact source tree OIDs for spaces, Unicode
   normalization pairs, non-UTF-8 components, percent lookalikes, control bytes,
   backslashes and a component containing every legal non-NUL/non-slash byte.
   Edits, renames, directory retirement/recreation, symlink kind changes and
   gitlink add/bump/rename/typechange/delete pass at batch sizes 1 and 100, with
   identical resulting state hashes. No host checkout is needed for these tests.
+  On Windows, the fixtures still exercise import's staged-tree verification and
+  batch invariance; the separate graph-to-Git projection API explicitly refuses
+  the Windows platform policy, so the tests assert that refusal instead.
 - The real command imports binary files with spaces/Unicode/percent names,
   `CLAUDE.md -> AGENTS.md` and an unpopulated gitlink without rewriting tracked
   bytes or mtimes; status is clean afterward.
