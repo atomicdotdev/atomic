@@ -9,12 +9,13 @@
 
 use std::fs;
 use std::io::ErrorKind;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use super::hooks::{
     canonical_root, git_error, git_hook_context, is_legacy_atomic_only, is_owned_dispatcher,
-    print_unmanaged_instructions,
+    print_unmanaged_instructions, GitHookContext,
 };
+use super::observation::{observe_git, GitObservation};
 use crate::error::CliResult;
 use crate::output::{print_info, print_warning};
 
@@ -147,41 +148,133 @@ fn remove_owned_hook(path: &Path) -> CliResult<HookRemoval> {
 pub(crate) fn show_status(root: &Path) -> CliResult<()> {
     let root = canonical_root(root)?;
     let context = git_hook_context(&root)?;
-    if let Some(custom_hooks_path) = context.custom_hooks_path {
-        for hook_name in ATOMIC_DISPATCHER_HOOKS {
-            print_info(&format!(
-                "{hook_name}: externally managed through core.hooksPath '{}'",
-                custom_hooks_path.display()
-            ));
+    match dispatcher_states(&context)? {
+        DispatcherReport::External { hooks_path } => {
+            for hook_name in ATOMIC_DISPATCHER_HOOKS {
+                print_info(&format!(
+                    "{hook_name}: externally managed through core.hooksPath '{}'",
+                    hooks_path.display()
+                ));
+            }
         }
-        return Ok(());
-    }
-
-    let hooks_dir = context.common_dir.join("hooks");
-    for hook_name in ATOMIC_DISPATCHER_HOOKS {
-        let path = hooks_dir.join(hook_name);
-        print_info(&format!(
-            "{hook_name}: {} ({})",
-            hook_status(&path)?,
-            path.display()
-        ));
+        DispatcherReport::Inspected(hooks) => {
+            for hook in hooks {
+                print_info(&format!(
+                    "{}: {} ({})",
+                    hook.name,
+                    hook.state.label(),
+                    hook.path.display()
+                ));
+            }
+        }
     }
     Ok(())
 }
 
-fn hook_status(path: &Path) -> CliResult<&'static str> {
+/// Where the shim's dispatchers live, and the state of each one.
+#[derive(Debug)]
+pub(crate) enum DispatcherReport {
+    /// A custom `core.hooksPath` is set; Atomic never manages hooks there.
+    External { hooks_path: PathBuf },
+    /// One entry per hook in [`ATOMIC_DISPATCHER_HOOKS`], in that order.
+    Inspected(Vec<DispatcherHook>),
+}
+
+#[derive(Debug)]
+pub(crate) struct DispatcherHook {
+    pub(crate) name: &'static str,
+    pub(crate) path: PathBuf,
+    pub(crate) state: HookState,
+}
+
+/// What occupies one hook path.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum HookState {
+    NotInstalled,
+    AtomicOwned,
+    UnmanagedSymlink,
+    UnmanagedNonFile,
+    Unmanaged,
+    UnmanagedUnreadable,
+}
+
+impl HookState {
+    /// The wording `atomic git hooks status` prints.
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::NotInstalled => "not installed",
+            Self::AtomicOwned => "Atomic-owned dispatcher installed",
+            Self::UnmanagedSymlink => "unmanaged symlink",
+            Self::UnmanagedNonFile => "unmanaged non-file",
+            Self::Unmanaged => "unmanaged hook installed",
+            Self::UnmanagedUnreadable => "unmanaged unreadable hook",
+        }
+    }
+
+    /// Stable machine-readable key.
+    pub(crate) fn code(self) -> &'static str {
+        match self {
+            Self::NotInstalled => "not_installed",
+            Self::AtomicOwned => "atomic_owned",
+            Self::UnmanagedSymlink => "unmanaged_symlink",
+            Self::UnmanagedNonFile => "unmanaged_non_file",
+            Self::Unmanaged => "unmanaged",
+            Self::UnmanagedUnreadable => "unmanaged_unreadable",
+        }
+    }
+}
+
+/// Inspect the dispatchers of the Git repository colocated with `root`, or
+/// `None` when there is no Git repository there. Read-only.
+pub(crate) fn inspect_dispatchers(root: &Path) -> CliResult<Option<DispatcherReport>> {
+    let root = canonical_root(root)?;
+    match observe_git(&root) {
+        Ok(GitObservation::NoGit { .. }) => return Ok(None),
+        Ok(GitObservation::Repository(_)) => {}
+        Err(error) => {
+            return Err(git_error(format!(
+                "cannot resolve Git administrative paths: {error}"
+            )))
+        }
+    }
+    dispatcher_states(&git_hook_context(&root)?).map(Some)
+}
+
+/// Inspect every dispatcher path without changing anything.
+fn dispatcher_states(context: &GitHookContext) -> CliResult<DispatcherReport> {
+    if let Some(hooks_path) = &context.custom_hooks_path {
+        return Ok(DispatcherReport::External {
+            hooks_path: hooks_path.clone(),
+        });
+    }
+    let hooks_dir = context.common_dir.join("hooks");
+    ATOMIC_DISPATCHER_HOOKS
+        .into_iter()
+        .map(|name| {
+            let path = hooks_dir.join(name);
+            Ok(DispatcherHook {
+                name,
+                state: hook_status(&path)?,
+                path,
+            })
+        })
+        .collect::<CliResult<_>>()
+        .map(DispatcherReport::Inspected)
+}
+
+fn hook_status(path: &Path) -> CliResult<HookState> {
     match fs::symlink_metadata(path) {
-        Err(error) if error.kind() == ErrorKind::NotFound => Ok("not installed"),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(HookState::NotInstalled),
         Err(error) => Err(git_error(format!(
             "cannot inspect hook '{}': {error}",
             path.display()
         ))),
-        Ok(metadata) if metadata.file_type().is_symlink() => Ok("unmanaged symlink"),
-        Ok(metadata) if !metadata.file_type().is_file() => Ok("unmanaged non-file"),
+        Ok(metadata) if metadata.file_type().is_symlink() => Ok(HookState::UnmanagedSymlink),
+        Ok(metadata) if !metadata.file_type().is_file() => Ok(HookState::UnmanagedNonFile),
         Ok(_) => Ok(match fs::read(path) {
-            Ok(content) if is_owned_dispatcher(&content) => "Atomic-owned dispatcher installed",
-            Ok(_) => "unmanaged hook installed",
-            Err(_) => "unmanaged unreadable hook",
+            Ok(content) if is_owned_dispatcher(&content) => HookState::AtomicOwned,
+            Ok(_) => HookState::Unmanaged,
+            Err(_) => HookState::UnmanagedUnreadable,
         }),
     }
 }
@@ -268,17 +361,20 @@ mod tests {
     fn hook_status_classifies_missing_owned_and_foreign_hooks() {
         let dir = TempDir::new().unwrap();
         assert_eq!(
-            hook_status(&dir.path().join("missing")).unwrap(),
+            hook_status(&dir.path().join("missing")).unwrap().label(),
             "not installed"
         );
         let owned = dir.path().join("owned");
         fs::write(&owned, OWNED).unwrap();
         assert_eq!(
-            hook_status(&owned).unwrap(),
+            hook_status(&owned).unwrap().label(),
             "Atomic-owned dispatcher installed"
         );
         let foreign = dir.path().join("foreign");
         fs::write(&foreign, CUSTOM).unwrap();
-        assert_eq!(hook_status(&foreign).unwrap(), "unmanaged hook installed");
+        assert_eq!(
+            hook_status(&foreign).unwrap().label(),
+            "unmanaged hook installed"
+        );
     }
 }

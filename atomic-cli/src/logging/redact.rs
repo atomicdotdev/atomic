@@ -5,7 +5,7 @@
 /// name the URL they failed on, remote URLs can carry credentials in either
 /// place, and an "invalid URL" error may quote one too malformed to parse,
 /// so this over-redacts rather than parsing.
-pub(super) fn urls(text: &str) -> String {
+pub(crate) fn urls(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
     while let Some(at) = rest.find("://") {

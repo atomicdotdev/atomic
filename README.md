@@ -592,6 +592,7 @@ Every change stores two parallel representations:
 | `atomic agent status` | Show sessions, hook liveness, and failures (`--json` for tooling) |
 | `atomic agent explain <id>` | Generate AI reasoning summary for a session |
 | `atomic agent attest` | List and inspect attestations |
+| `atomic diagnostics` | Read-only support report: version, integrations, skills, enabled agents, Git shim (`--json`) |
 
 Hook health is computed from session-scoped logs, so concurrent agents retain
 their own outcomes and a child's success cannot hide a parent's failure. See
