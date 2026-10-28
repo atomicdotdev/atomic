@@ -115,7 +115,8 @@ pub struct Import {
 
     /// Use the rolling first-parent graph stream (default for fresh imports).
     /// Verifies the final tip, not every historical state. Unsupported input
-    /// refuses; use --no-stream for the ordinary importer.
+    /// refuses; use --no-stream for the ordinary importer. Without --stream,
+    /// binding-bearing repositories select the ordinary importer up front.
     #[arg(long, conflicts_with_all = ["no_stream", "with_crdt", "incremental", "all_branches"])]
     pub stream: bool,
 
@@ -171,6 +172,22 @@ fn current_git_branch(git_repo: &GitRepository) -> Option<String> {
         return None;
     }
     head.shorthand().map(ToOwned::to_owned)
+}
+
+/// Binding transport requires the ordinary importer. Presence selects the
+/// route only; it is not evidence that any binding is valid or trusted.
+pub(super) fn has_binding_transport(git_repo: &GitRepository) -> CliResult<bool> {
+    git_repo
+        .references_glob("refs/atomic/bindings/*")
+        .map_err(|error| CliError::GitError {
+            message: error.to_string(),
+        })?
+        .next()
+        .transpose()
+        .map(|reference| reference.is_some())
+        .map_err(|error| CliError::GitError {
+            message: error.to_string(),
+        })
 }
 
 const GIT_SHADOW_EXCLUDE_PATTERNS: &[&str] = &["/.atomic/", "/.vault/", "/.atomicignore"];
@@ -874,7 +891,13 @@ impl Import {
             return Ok(());
         }
 
-        let stream = self.uses_stream(workdir.join(".atomic").exists());
+        let mut stream = self.uses_stream(workdir.join(".atomic").exists());
+        if stream && !self.stream && has_binding_transport(&git_repo)? {
+            // Classify before preflight or mutation, not a fallback after a
+            // failed stream. Explicit --stream keeps its strict refusal.
+            stream = false;
+            print_info("Atomic binding refs detected; using the ordinary importer.");
+        }
         if self.stream_window_mib.is_some() && !stream {
             return Err(CliError::GitError { message: "--stream-window-mib requires a fresh streaming import; use --stream to request streaming explicitly".into() });
         }
@@ -1984,6 +2007,84 @@ mod tests {
         )
         .unwrap();
         assert!(repo.get_file_content("tracked.txt").unwrap().is_none());
+    }
+
+    #[test]
+    #[file_serial]
+    #[cfg_attr(not(unix), ignore = "Git shim requires lossless unix paths")]
+    fn binding_refs_select_ordinary_import_without_implicit_adoption() {
+        let temp = tempfile::tempdir().unwrap();
+        init_git(temp.path());
+        fs::write(temp.path().join("tracked.txt"), b"original\n").unwrap();
+        git_ok(temp.path(), &["add", "."]);
+        git_ok(temp.path(), &["commit", "-qm", "original"]);
+        let git = GitRepository::open(temp.path()).unwrap();
+        let head = git.head().unwrap().target().unwrap();
+        assert!(!has_binding_transport(&git).unwrap());
+        // Deliberately not a valid binding transport: refs select routing,
+        // never verification, trust, closure fetch, or binding adoption.
+        git.reference("refs/atomic/bindings/00/unverified", head, false, "test")
+            .unwrap();
+        assert!(has_binding_transport(&git).unwrap());
+        let _dir_guard = DirGuard::new();
+        std::env::set_current_dir(temp.path()).unwrap();
+        Import {
+            no_vault: true,
+            ..Default::default()
+        }
+        .run()
+        .unwrap();
+        let repo = Repository::open(temp.path()).unwrap();
+        assert!(!repo.view_exists("git-stream-private").unwrap());
+        assert!(repo.binding_ids().unwrap().is_empty());
+        assert_eq!(
+            repo.get_file_content("tracked.txt").unwrap(),
+            Some(b"original\n".to_vec())
+        );
+        assert_eq!(git.head().unwrap().target(), Some(head));
+    }
+
+    #[test]
+    #[file_serial]
+    #[cfg_attr(not(unix), ignore = "Git shim requires lossless unix paths")]
+    fn explicit_stream_with_binding_refs_refuses_before_initialization() {
+        let temp = tempfile::tempdir().unwrap();
+        init_git(temp.path());
+        fs::write(temp.path().join("tracked.txt"), b"original\n").unwrap();
+        git_ok(temp.path(), &["add", "."]);
+        git_ok(temp.path(), &["commit", "-qm", "original"]);
+        let git = GitRepository::open(temp.path()).unwrap();
+        let head = git.head().unwrap().target().unwrap();
+        git.reference("refs/atomic/bindings/00/unverified", head, false, "test")
+            .unwrap();
+        let excludes = fs::read(git.path().join("info/exclude")).ok();
+        let _dir_guard = DirGuard::new();
+        std::env::set_current_dir(temp.path()).unwrap();
+        for stream_window_mib in [None, Some(64)] {
+            let error = Import {
+                stream: true,
+                no_vault: true,
+                stream_window_mib,
+                ..Default::default()
+            }
+            .run()
+            .unwrap_err();
+            assert!(error.to_string().contains("binding transport"), "{error}");
+            assert!(!temp.path().join(".atomic").exists());
+            assert_eq!(fs::read(git.path().join("info/exclude")).ok(), excludes);
+            assert_eq!(git.head().unwrap().target(), Some(head));
+        }
+        // A stream-only tuning option must not be silently ignored by routing.
+        assert!(Import {
+            no_vault: true,
+            stream_window_mib: Some(64),
+            ..Default::default()
+        }
+        .run()
+        .unwrap_err()
+        .to_string()
+        .contains("--stream-window-mib"));
+        assert!(!temp.path().join(".atomic").exists());
     }
 
     fn assert_first_import_status_uses_v2(repo: &Repository, paths: &[&str]) {

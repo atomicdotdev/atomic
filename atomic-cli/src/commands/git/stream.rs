@@ -198,7 +198,7 @@ impl Compiler {
                 GraphOp::FileAdd {
                     path, add_inode, ..
                 } => Some((
-                    path.clone(),
+                    atomic_repository::canonical_path_identity(path),
                     Position {
                         change: None,
                         pos: add_inode.start,
@@ -237,12 +237,12 @@ impl Compiler {
             }
             hunks.push(GraphOp::SetAttr {
                 inode,
-                path: file.path.clone(),
+                path: repository_path(&file.path).into_owned(),
                 value: InodeAttr::Mode(expected.mode()),
             });
             hunks.push(GraphOp::SetAttr {
                 inode,
-                path: file.path.clone(),
+                path: repository_path(&file.path).into_owned(),
                 value: InodeAttr::Kind(expected.kind()),
             });
             attr_updates.push((file.path.clone(), expected.mode(), expected.kind()));
@@ -292,12 +292,12 @@ impl Compiler {
                 inode
                     .pos
                     .get()
-                    .checked_sub(extract_filename(path).len() as u64)
+                    .checked_sub(repository_path(extract_filename(path)).len() as u64)
                     .ok_or_else(|| git_error("invalid stream directory name span"))?,
             );
             let flags = EdgeFlags::FOLDER | EdgeFlags::BLOCK;
             hunks.push(GraphOp::DirDel {
-                path: path.clone(),
+                path: repository_path(path).into_owned(),
                 del: EdgeUpdate {
                     inode,
                     edges: vec![
@@ -502,14 +502,8 @@ impl ParallelImporter {
         tip: Oid,
     ) -> CliResult<(GitRepository, ConversionPolicy, Vec<Oid>)> {
         let git = self.open_git_repo()?;
-        for reference in git
-            .references()
-            .map_err(|error| git_error(error.to_string()))?
-        {
-            let reference = reference.map_err(|error| git_error(error.to_string()))?;
-            if reference.name_bytes().starts_with(b"refs/atomic/bindings/") {
-                return Err(git_error("direct stream does not restore Atomic binding transport; use --no-stream for the ordinary importer"));
-            }
+        if crate::commands::git::import::has_binding_transport(&git)? {
+            return Err(git_error("direct stream does not restore Atomic binding transport; use --no-stream for the ordinary importer"));
         }
         if !detect_git_boundaries(&git)?.is_empty() {
             return Err(git_error(
@@ -1151,6 +1145,7 @@ mod tests {
             b"test-images/lot 5.png".as_slice(),
             "caf\u{e9}.txt".as_bytes(),
             "cafe\u{301}.txt".as_bytes(),
+            "d\u{ed}r/child.txt".as_bytes(),
             b"d\xffr/f\xfele.txt",
             b"aA.txt",
             b"a%41.txt",
@@ -1174,13 +1169,56 @@ mod tests {
         let renamed = files.remove(b"d\xffr/f\xfele.txt".as_slice()).unwrap();
         files.insert(b"moved \xfe/renamed %FF.txt".to_vec(), renamed);
         files.remove(b"%2Fdir/%FFliteral".as_slice()).unwrap();
+        files.remove("d\u{ed}r/child.txt".as_bytes()).unwrap();
         let edit = raw_commit(&git, &files, Some(root));
         files.insert(
             b"d\xffr/recreated file".to_vec(),
             (b"again\n".to_vec(), 0o100755),
         );
+        files.insert(
+            "d\u{ed}r/recreated.txt".as_bytes().to_vec(),
+            (b"unicode directory\n".to_vec(), 0o100755),
+        );
         let tip = raw_commit(&git, &files, Some(edit));
         assert_raw_history(&git, &[root, edit, tip]);
+    }
+
+    #[test]
+    fn streamed_directory_markers_do_not_alias_unrelated_file_names() {
+        for directory in ["dir", "d\u{ed}r with space"] {
+            let input = tempfile::tempdir().unwrap();
+            let git = GitRepository::init_bare(input.path()).unwrap();
+            let files = RawFiles::from([
+                (b"a.txt".to_vec(), (b"root\n".to_vec(), 0o100644)),
+                (
+                    format!("{directory}/child.txt").into_bytes(),
+                    (b"child\n".to_vec(), 0o100644),
+                ),
+            ]);
+            let tip = raw_commit(&git, &files, None);
+            let parsed = parse_commit(&git, tip, 0, &HashMap::from([(tip, 0)])).unwrap();
+            let mut compiler = Compiler::default();
+            compiler
+                .compile(
+                    &parsed,
+                    &conversion_policy(&git).unwrap(),
+                    &[],
+                    serde_json::json!({"git": {}}),
+                )
+                .unwrap();
+            let marker = compiler.index.directories
+                [&atomic_repository::escape_repo_path(directory.as_bytes())]
+                .pos
+                .get();
+            for (path, indexed) in &compiler.index.files {
+                let name_start = indexed.inode_pos.pos.get()
+                    - repository_path(extract_filename(path)).len() as u64;
+                assert_ne!(
+                    name_start, marker,
+                    "a later move must not confuse its file name with the destination directory"
+                );
+            }
+        }
     }
 
     #[test]

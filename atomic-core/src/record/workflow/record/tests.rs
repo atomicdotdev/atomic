@@ -576,7 +576,7 @@ fn test_record_moved_file_pure_move_preserves_identity_and_semantic_move() {
         inode,
         position,
         claim,
-        trunk_id,
+        Some(trunk_id),
         None,
     )
     .unwrap();
@@ -614,7 +614,7 @@ fn test_record_moved_file_retains_generated_line_and_token_ops() {
         inode,
         position,
         claim,
-        trunk_id,
+        Some(trunk_id),
         None,
     )
     .unwrap();
@@ -629,6 +629,68 @@ fn test_record_moved_file_retains_generated_line_and_token_ops() {
 // ========================================================================
 // CRDT Integration Tests
 // ========================================================================
+
+#[test]
+fn test_record_moved_graph_only_file_keeps_claim_without_semantic_ops() {
+    for content in [
+        b"same\n".as_slice(),
+        b"edited\nnew line\n",
+        b"binary\0bytes",
+    ] {
+        let wc = Memory::new();
+        wc.add_file("new.txt", content);
+        let (inode, position, claim, _) = move_identity();
+        let recorded = record_moved_file(
+            &wc,
+            &DetectedFile::moved("old.txt", "new.txt"),
+            b"same\n",
+            None,
+            &RecordingOptions::new(),
+            inode,
+            position,
+            claim,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(recorded.inode(), Some(inode));
+        assert_eq!(recorded.position(), Some(position));
+        assert_eq!(recorded.exact_source_claim(), Some(claim));
+        assert_eq!(recorded.content(), content);
+        assert_eq!(recorded.hunk_count() > 0, content != b"same\n");
+        assert!(!recorded.has_crdt_ops());
+        assert!(recorded.crdt_stats().is_none());
+    }
+}
+
+#[test]
+fn test_record_undeleted_graph_only_file_keeps_identity_without_semantic_ops() {
+    for content in [b"same\n".as_slice(), b"edited\nnew line\n"] {
+        let wc = Memory::new();
+        wc.add_file("old.txt", content);
+        let (inode, position, _, _) = move_identity();
+        let deleted_by = [Hash::of(b"delete")];
+        let recorded = record_undeleted_file(
+            &wc,
+            &DetectedFile::added("old.txt")
+                .with_inode(inode)
+                .with_position(position),
+            &deleted_by,
+            b"same\n",
+            None,
+            &RecordingOptions::new(),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(recorded.inode(), Some(inode));
+        assert_eq!(recorded.position(), Some(position));
+        assert!(recorded.is_undelete());
+        assert_eq!(recorded.content(), content);
+        assert!(!recorded.has_crdt_ops());
+        assert!(recorded.crdt_stats().is_none());
+    }
+}
 
 #[test]
 fn test_record_added_file_has_crdt_ops() {

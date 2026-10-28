@@ -7,14 +7,27 @@ Fresh `atomic git import` commands now select the rolling path by default.
 the restricted stream route. Existing Atomic repositories, `--incremental`,
 `--all`, `--with-crdt`, internal detached/reactive imports keep the ordinary
 path unless streaming is explicitly requested (and refused if unsupported).
+Fresh checkouts with `refs/atomic/bindings/*` also select the ordinary importer
+before preflight: the streaming engine does not restore binding transport.
+This routing does not fetch, trust, verify, or adopt a binding. Explicit
+`--stream` still refuses binding-bearing repositories before mutation, and
+stream-only tuning options are never silently ignored on the ordinary route.
 `--stream-window-mib 128` can be supplied without `--stream` for a default fresh
 import; it defaults to 32 MiB and is incompatible with ordinary-only options.
 Unsupported stream input never triggers a silent fallback; shallow/boundary
 and provenance cases must use the ordinary path explicitly where supported.
 Upstream raw-name, symlink and gitlink support is preserved in both the direct
 and rolling stream; the obsolete ASCII-only/kind restriction is not restored.
+Stream indexes retain canonical escaped Git identities. Stored graph names and
+operation paths use the same repository spelling as ordinary imports: decoded
+UTF-8 when it contains no literal percent, otherwise the reversible escaped
+spelling. Directory-name byte spans follow that stored spelling too. This lets
+ordinary incremental imports and native operations continue through Unicode and
+space-containing paths without confusing literal-percent or non-UTF-8 names.
+The final complete-namespace proof compares canonical identities and rejects
+duplicate identities, so raw versus escaped spelling cannot hide an extra path.
 
-### Graph-only history; native CRDT handoff is separate
+### Graph-only history and native file lifecycles
 
 The rolling compiler and the direct graph API both emit **zero FileOps**.
 The prepared-change boundary rejects nonempty FileOps. Git does not capture
@@ -30,10 +43,16 @@ Private staging, journaling, final graph verification and checkpoint finalizatio
 are unchanged; no historical checkout or per-commit reconstructed-graph diff is
 introduced. Shared/native semantic verifiers are not weakened.
 
-Graph-only history is not a promise that every downstream native record or
-incremental operation works. That handoff is a separate task. Semantic lifecycle
-and ordinary fidelity tests explicitly select `--no-stream`; streaming tests
-check graph bytes, zero FileOps, bounded batches and equality with the direct API.
+Native shim snapshots and file lifecycle recording accept graph-only imported
+files. Moves, edits, deletions, restorations and mode/kind writes preserve graph
+inode and path-claim identity without fabricating historical FileOps. Files whose
+canonical FileAdd contains a semantic creation retain their semantic lifecycle
+operations; a missing or inconsistent semantic inode index is still an error.
+This is not a blanket guarantee for every incremental-import or semantic-index
+handoff. Semantic lifecycle tests explicitly select `--no-stream`; graph-only
+lifecycle tests exercise native operations without prebuilt CRDT trunks.
+Streaming tests continue to check graph bytes, zero FileOps, bounded batches and
+equality with the direct API.
 
 The rejected synthetic-identity implementation was measured at 89.50 s for the
 1,097-commit default import during concurrent builds/tests. That is historical

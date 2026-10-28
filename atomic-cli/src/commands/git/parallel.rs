@@ -3137,7 +3137,7 @@ fn build_graph_first_change(
         };
         dependencies.extend(position_hashes(&parent_pos));
 
-        let dirname = extract_filename(&directory_path);
+        let dirname = repository_path(extract_filename(&directory_path));
         if dirname.is_empty() {
             return Err(vec![GraphFirstSkip {
                 path: directory_path,
@@ -3173,22 +3173,31 @@ fn build_graph_first_change(
                 end: name_end,
                 inode: inode_pos,
             },
-            path: directory_path.clone(),
+            path: repository_path(&directory_path).into_owned(),
         });
         pending.push(PendingLineIndexUpdate::DirectoryAdd {
             path: directory_path.clone(),
             inode_pos,
         });
         directory_anchors.insert(directory_path, inode_pos);
+        // Keep the empty directory anchor distinct from the next file's name
+        // start. A later move into this directory resolves context through the
+        // moved file's inode index first; an unrelated name starting at the
+        // same position would otherwise impersonate that directory marker.
+        contents.push(0);
     }
 
     for file in &parsed.files {
+        // Index keys remain canonical escaped Git identities. Persist names
+        // and operation paths using native repository spelling so subsequent
+        // ordinary imports and native records address the same path claims.
+        let repo_path = repository_path(&file.path);
         match file.operation {
             FileOperation::Added | FileOperation::Copied => {
                 let new_content = file.new_content.as_deref().unwrap_or(&[]);
                 let encoding = Encoding::detect(new_content);
 
-                let filename = extract_filename(&file.path);
+                let filename = repository_path(extract_filename(&file.path));
                 let name_start = ChangePosition::new(contents.len() as u64);
                 contents.extend_from_slice(filename.as_bytes());
                 let name_end = ChangePosition::new(contents.len() as u64);
@@ -3262,7 +3271,7 @@ fn build_graph_first_change(
                         inode: inode_pos,
                     },
                     contents: first_content,
-                    path: file.path.clone(),
+                    path: repo_path.to_string(),
                     encoding: Some(encoding),
                 });
 
@@ -3279,14 +3288,14 @@ fn build_graph_first_change(
                             end,
                             inode: inode_pos,
                         }),
-                        local: Local::new(&file.path, (idx + 1) as u64),
+                        local: Local::new(repo_path.as_ref(), (idx + 1) as u64),
                         encoding: Some(encoding),
                     });
                 }
 
                 if !graph_only {
                     file_ops.push(build_graph_first_file_ops_for_added_file(
-                        &file.path,
+                        &repo_path,
                         &new_line_contents,
                         &new_ranges,
                         encoding,
@@ -3315,12 +3324,12 @@ fn build_graph_first_change(
                 let new_content = file.new_content.as_deref().unwrap_or(&[]);
                 let encoding = Encoding::detect(new_content);
 
-                let new_filename = extract_filename(&file.path);
+                let new_filename = repository_path(extract_filename(&file.path));
                 let name_start = ChangePosition::new(contents.len() as u64);
                 contents.extend_from_slice(new_filename.as_bytes());
                 let name_end = ChangePosition::new(contents.len() as u64);
 
-                let old_filename = extract_filename(old_path);
+                let old_filename = repository_path(extract_filename(old_path));
                 let old_name_end = indexed.inode_pos.pos;
                 let old_name_start = ChangePosition::new(
                     old_name_end.get().saturating_sub(old_filename.len() as u64),
@@ -3357,7 +3366,7 @@ fn build_graph_first_change(
                         end: name_end,
                         inode: indexed.inode_pos,
                     },
-                    path: file.path.clone(),
+                    path: repo_path.to_string(),
                 });
                 pending.push(PendingLineIndexUpdate::Rename {
                     old_path: old_path.to_string(),
@@ -3370,7 +3379,7 @@ fn build_graph_first_change(
                 {
                     if let Some(diff_lines) = file.diff_lines.as_ref() {
                         let (ops, _) = atomic_core::record::workflow::build_crdt_ops_from_git_diff(
-                            &file.path, diff_lines,
+                            &repo_path, diff_lines,
                         );
                         file_ops.push(ops);
                     }
@@ -3462,7 +3471,7 @@ fn build_graph_first_change(
                         if new_ranges.is_empty() {
                             hunks.push(GraphOp::Edit {
                                 change: Atom::EdgeUpdate(edge_update),
-                                local: Local::new(&file.path, replacement.new_start as u64),
+                                local: Local::new(repo_path.as_ref(), replacement.new_start as u64),
                                 encoding: Some(encoding),
                             });
                         } else if replacement.old_len == 0 {
@@ -3481,7 +3490,7 @@ fn build_graph_first_change(
                                     end: first.1,
                                     inode: indexed.inode_pos,
                                 }),
-                                local: Local::new(&file.path, replacement.new_start as u64),
+                                local: Local::new(repo_path.as_ref(), replacement.new_start as u64),
                                 encoding: Some(encoding),
                             });
                         } else {
@@ -3501,7 +3510,7 @@ fn build_graph_first_change(
                                     end: first.1,
                                     inode: indexed.inode_pos,
                                 },
-                                local: Local::new(&file.path, replacement.new_start as u64),
+                                local: Local::new(repo_path.as_ref(), replacement.new_start as u64),
                                 encoding: Some(encoding),
                             });
                         }
@@ -3526,7 +3535,7 @@ fn build_graph_first_change(
                                     inode: indexed.inode_pos,
                                 }),
                                 local: Local::new(
-                                    &file.path,
+                                    repo_path.as_ref(),
                                     (replacement.new_start + new_idx) as u64,
                                 ),
                                 encoding: Some(encoding),
@@ -3582,7 +3591,7 @@ fn build_graph_first_change(
                 hunks.push(GraphOp::FileDel {
                     del: edge_update,
                     contents: None,
-                    path: file.path.clone(),
+                    path: repo_path.to_string(),
                     encoding: file.old_content.as_deref().map(Encoding::detect),
                 });
                 pending.push(PendingLineIndexUpdate::Delete {
@@ -3592,7 +3601,7 @@ fn build_graph_first_change(
                 if !graph_only {
                     if let Some(diff_lines) = file.diff_lines.as_ref() {
                         let (ops, _) = atomic_core::record::workflow::build_crdt_ops_from_git_diff(
-                            &file.path, diff_lines,
+                            &repo_path, diff_lines,
                         );
                         file_ops.push(ops);
                     }
@@ -3633,7 +3642,7 @@ fn build_graph_first_change(
                 };
                 if !graph_only {
                     let (ops, _) = atomic_core::record::workflow::build_crdt_ops_from_git_diff(
-                        &file.path, diff_lines,
+                        &repo_path, diff_lines,
                     );
                     file_ops.push(ops);
                 }
@@ -3730,7 +3739,7 @@ fn build_graph_first_change(
             if new_ranges.is_empty() {
                 hunks.push(GraphOp::Edit {
                     change: Atom::EdgeUpdate(edge_update),
-                    local: Local::new(&file.path, replacement.new_start as u64),
+                    local: Local::new(repo_path.as_ref(), replacement.new_start as u64),
                     encoding,
                 });
             } else if replacement.old_len == 0 {
@@ -3749,7 +3758,7 @@ fn build_graph_first_change(
                         end: first.1,
                         inode: indexed.inode_pos,
                     }),
-                    local: Local::new(&file.path, replacement.new_start as u64),
+                    local: Local::new(repo_path.as_ref(), replacement.new_start as u64),
                     encoding,
                 });
             } else {
@@ -3769,7 +3778,7 @@ fn build_graph_first_change(
                         end: first.1,
                         inode: indexed.inode_pos,
                     },
-                    local: Local::new(&file.path, replacement.new_start as u64),
+                    local: Local::new(repo_path.as_ref(), replacement.new_start as u64),
                     encoding,
                 });
             }
@@ -3793,7 +3802,7 @@ fn build_graph_first_change(
                         end,
                         inode: indexed.inode_pos,
                     }),
-                    local: Local::new(&file.path, (replacement.new_start + new_idx) as u64),
+                    local: Local::new(repo_path.as_ref(), (replacement.new_start + new_idx) as u64),
                     encoding,
                 });
             }
