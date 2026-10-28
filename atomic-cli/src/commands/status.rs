@@ -922,6 +922,26 @@ fn print_forensic_status(
     Ok(())
 }
 
+/// Native-only forensic status: no Git observation is available without the
+/// shim, so report the Atomic anchor and the remediation classification only.
+#[cfg(not(feature = "git-shim"))]
+fn print_forensic_status(
+    repo_root: &Path,
+    repo: &Repository,
+    view: &str,
+    remediation: Option<&WorkspaceRemediation>,
+) -> CliResult<()> {
+    let info = repo.get_view_info(view)?;
+    println!("Forensic status (read-only; reconciliation disabled)");
+    println!("Atomic root: {}", repo_root.display());
+    println!("Atomic view: {view}");
+    println!("Atomic state: {}", info.state);
+    if let Some(remediation) = remediation {
+        println!("Workspace remediation required: {}", remediation.describe());
+    }
+    Ok(())
+}
+
 #[cfg(feature = "git-shim")]
 fn forensic_manifest_root(repo_root: &Path, repo: &Repository, view: &str) -> Option<String> {
     if !repo_root.join(".git").exists() {
@@ -2291,19 +2311,4 @@ mod tests {
         let result = status_cmd.print_short_format(&repo_status);
         assert!(result.is_ok());
     }
-}
-
-#[cfg(not(feature = "git-shim"))]
-fn print_forensic_status(
-    root: &Path,
-    repo: &Repository,
-    view: &str,
-    remediation: Option<&WorkspaceRemediation>,
-) -> CliResult<()> {
-    let info = repo.get_view_info(view)?;
-    println!("Forensic status (read-only; reconciliation disabled)\nAtomic root: {}\nAtomic view: {view}\nAtomic state: {}", root.display(), info.state);
-    if let Some(remediation) = remediation {
-        println!("Workspace remediation required: {remediation:#?}");
-    }
-    Ok(())
 }

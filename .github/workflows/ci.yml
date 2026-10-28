@@ -166,6 +166,11 @@ jobs:
       - name: cargo clippy
         run: cargo clippy --workspace -- -D warnings
 
+      - name: cargo clippy (CLI without Git shim, with and without teams)
+        run: |
+          cargo clippy -p atomic-cli --no-default-features --all-targets -- -D warnings
+          cargo clippy -p atomic-cli --no-default-features --features teams --all-targets -- -D warnings
+
   doc:
     name: Documentation
     runs-on: ubuntu-latest
