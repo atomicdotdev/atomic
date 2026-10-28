@@ -1629,7 +1629,14 @@ impl Repository {
             // binding carries a fresh inode with no graph position, so anchor
             // attributes to the resurrected claimant; otherwise they queue
             // against a FileAdd this record will never create.
+            // Entry-boundary snapshots also capture untracked reappearances
+            // before `add` has staged any inode. They follow the same undelete
+            // content path and must use that claimant's attributes too.
             let inode = match (inode, move_position) {
+                (None, None) if !fresh_additions.contains(&path) => projected_absent
+                    .get(&path)
+                    .filter(|absent| !absent.directory)
+                    .map(|absent| absent.inode),
                 (Some(current), None)
                     if !fresh_additions.contains(&path)
                         && shared_txn

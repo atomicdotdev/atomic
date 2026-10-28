@@ -2398,7 +2398,14 @@ impl Repository {
                 })?;
             txn.update_view(&removal_view)
                 .map_err(|error| RepositoryError::Database(error.to_string()))?;
-            self.realign_tree_projection_in_txn(&mut txn, removal_view_name)?;
+            // A private snapshot's membership changed, not the selected
+            // working-copy closure. Projecting its namespace here would hide
+            // pending deletions (or rename paths) from the next durable
+            // record. Preserve the same selected-view boundary as the write
+            // above, including separately staged working-copy paths.
+            if removal_view_name == self.current_view {
+                self.realign_tree_projection_in_txn(&mut txn, removal_view_name)?;
+            }
             if removal_view_name == view_name {
                 let final_view = txn
                     .get_view(view_name)

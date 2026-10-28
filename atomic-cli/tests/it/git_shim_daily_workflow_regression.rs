@@ -1532,3 +1532,8 @@ fn importing_a_crlf_file_committed_before_eol_normalization() {
         "the recorded bytes are the committed blob"
     );
 }
+
+// Keep snapshot regressions under the shim suite so its platform and optional
+// build-feature gates also cover these entry-boundary workflows.
+#[path = "git_snapshot_lifecycle_regression.rs"]
+mod snapshot_lifecycle;
