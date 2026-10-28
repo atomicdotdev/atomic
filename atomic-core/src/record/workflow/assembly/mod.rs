@@ -386,7 +386,7 @@ impl AssemblyContext {
 /// Each write also produces the semantic counterpart (`FileOps::set_mode` /
 /// `set_kind`) bound to the file's trunk: the change's own generated trunk
 /// when the record carries CRDT ops, otherwise the trunk already stored for
-/// the inode.
+/// the inode. Graph-only existing files emit the graph attribute write alone.
 fn emit_recorded_attributes<T>(
     ctx: &mut AssemblyContext,
     glob_ctx: &mut GlobalizeContext<'_, T>,
@@ -411,7 +411,7 @@ where
     // Resolve the semantic trunk once: the file's generated ops carry it for
     // new files; existing files resolve through the CRDT inode index.
     let trunk = match file.crdt_ops() {
-        Some(ops) => ops.trunk_id(),
+        Some(ops) => Some(ops.trunk_id()),
         None => {
             let inode = file
                 .inode()
@@ -422,9 +422,8 @@ where
                 .map_err(|error| AssemblyError::Globalize {
                     path: path.clone(),
                     source: super::globalize::GlobalizeError::Pristine(Box::new(error)),
-                })?
-                .ok_or_else(|| invalid(format!("inode {inode:?} has no CRDT trunk")))?;
-            crate::crdt::tables::decode_trunk_id(&key)
+                })?;
+            key.map(|key| crate::crdt::tables::decode_trunk_id(&key))
         }
     };
 
@@ -510,6 +509,9 @@ where
         };
         ctx.add_hunk(hunk);
 
+        let Some(trunk) = trunk else {
+            continue;
+        };
         let semantic = match value {
             crate::change::InodeAttr::Mode(mode) => FileOps::set_mode(trunk, path.clone(), *mode)
                 .map_err(|error| AssemblyError::Globalize {

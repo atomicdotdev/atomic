@@ -29,7 +29,7 @@
 //! `attestations/…` and are never in `manifest.intents`, so they can never
 //! surface as a row.
 
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 
 use atomic_canonical::did::did_for_public_key;
 use atomic_identity::keypair::PublicKey;
@@ -63,9 +63,62 @@ pub struct IntentList {
     #[arg(long)]
     pub review: bool,
 
+    /// Column to order the listing by. Every key sorts ascending; ties keep
+    /// id order.
+    #[arg(long, value_enum, default_value_t = IntentSort::Id)]
+    pub sort: IntentSort,
+
+    /// Reverse the `--sort` order (ties still keep id order).
+    #[arg(short = 'r', long)]
+    pub reverse: bool,
+
     /// Output as JSON (an array of {id,status,kind,attested,verifies}).
     #[arg(long)]
     pub json: bool,
+}
+
+/// `atomic intent list --sort` keys.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum IntentSort {
+    Id,
+    Title,
+    Status,
+    Kind,
+    /// fresh, then stale, then unattested.
+    Attested,
+    /// ✓, then ✗, then –.
+    Verifies,
+}
+
+impl IntentSort {
+    pub(crate) fn wire(self) -> atomic_client::proto::VaultListSort {
+        use atomic_client::proto::VaultListSort as W;
+        match self {
+            IntentSort::Id => W::Id,
+            IntentSort::Title => W::Title,
+            IntentSort::Status => W::Status,
+            IntentSort::Kind => W::Kind,
+            IntentSort::Attested => W::Attested,
+            IntentSort::Verifies => W::Verifies,
+        }
+    }
+}
+
+/// Order `rows` by `key` (the local body's twin of the service's listing
+/// sort), with id as the tiebreak. `reverse` flips the key,
+/// not the tiebreak.
+pub(crate) fn sort_rows(rows: &mut [Row], key: IntentSort, reverse: bool) {
+    rows.sort_by(|a, b| {
+        let ord = match key {
+            IntentSort::Id => a.human_key.cmp(&b.human_key),
+            IntentSort::Title => a.title.cmp(&b.title),
+            IntentSort::Status => a.status.cmp(&b.status),
+            IntentSort::Kind => a.kind.cmp(&b.kind),
+            IntentSort::Attested => a.attested.cmp(&b.attested),
+            IntentSort::Verifies => a.verifies.cmp(&b.verifies),
+        };
+        if reverse { ord.reverse() } else { ord }.then_with(|| a.human_key.cmp(&b.human_key))
+    });
 }
 
 impl IntentList {
@@ -80,7 +133,7 @@ impl IntentList {
 }
 
 /// The classification of one intent's attestation, for a table/JSON row.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum Attested {
     Fresh,
     Stale,
@@ -108,7 +161,7 @@ impl Attested {
 }
 
 /// The result of the DID-match-then-verify rule for one row.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum Verifies {
     /// Same-signer, fresh attestation that cryptographically verified.
     Yes,
@@ -419,7 +472,8 @@ impl Command for IntentList {
         // Enumerate via the SAME source `atomic vault intent list` uses; already
         // sorted by id. Attestation entries are never in `manifest.intents`. The
         // kind tag is read from the manifest summary (no lift).
-        let rows = build_rows(&repo, verifier.as_ref(), filter.as_deref())?;
+        let mut rows = build_rows(&repo, verifier.as_ref(), filter.as_deref())?;
+        sort_rows(&mut rows, self.sort, self.reverse);
 
         if self.json {
             let json: Vec<serde_json::Value> = rows
@@ -742,6 +796,41 @@ mod tests {
         assert!(none.is_empty());
     }
 
+    fn sort_row(id: &str, title: &str, kind: &str, attested: Attested) -> Row {
+        Row {
+            human_key: id.to_string(),
+            title: title.to_string(),
+            status: "todo".to_string(),
+            kind: kind.to_string(),
+            attested,
+            verifies: Verifies::Na,
+        }
+    }
+
+    fn keys(rows: &[Row]) -> Vec<&str> {
+        rows.iter().map(|r| r.human_key.as_str()).collect()
+    }
+
+    #[test]
+    fn sort_orders_by_key_with_id_tiebreak() {
+        let mut rows = vec![
+            sort_row("A-3", "beta", "bug", Attested::None),
+            sort_row("A-1", "gamma", "feature", Attested::Fresh),
+            sort_row("A-2", "alpha", "bug", Attested::Stale),
+        ];
+        sort_rows(&mut rows, IntentSort::Title, false);
+        assert_eq!(keys(&rows), ["A-2", "A-3", "A-1"]);
+        sort_rows(&mut rows, IntentSort::Attested, false);
+        assert_eq!(keys(&rows), ["A-1", "A-2", "A-3"]);
+        sort_rows(&mut rows, IntentSort::Kind, false);
+        assert_eq!(keys(&rows), ["A-2", "A-3", "A-1"]);
+        // Reverse flips the key; equal kinds still list in id order.
+        sort_rows(&mut rows, IntentSort::Kind, true);
+        assert_eq!(keys(&rows), ["A-1", "A-2", "A-3"]);
+        sort_rows(&mut rows, IntentSort::Id, true);
+        assert_eq!(keys(&rows), ["A-3", "A-2", "A-1"]);
+    }
+
     #[test]
     fn review_flag_is_kind_review_shortcut() {
         // `--review` and `--kind review` resolve to the same filter.
@@ -749,12 +838,16 @@ mod tests {
             identity: None,
             kind: None,
             review: true,
+            sort: IntentSort::Id,
+            reverse: false,
             json: false,
         };
         let via_kind = IntentList {
             identity: None,
             kind: Some("review".to_string()),
             review: false,
+            sort: IntentSort::Id,
+            reverse: false,
             json: false,
         };
         assert_eq!(via_review.kind_filter(), Some("review".to_string()));

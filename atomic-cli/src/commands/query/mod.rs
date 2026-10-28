@@ -314,12 +314,8 @@ impl Command for QueryGraph {
             .take(self.limit)
             .collect();
 
-        if seed_nodes.is_empty() {
-            if self.json {
-                println!("{{\"nodes\":[],\"edges\":[]}}");
-            } else {
-                eprintln!("No results for {:?} (kinds: {}).", self.query, self.kinds);
-            }
+        if seed_nodes.is_empty() && !self.json {
+            eprintln!("No results for {:?} (kinds: {}).", self.query, self.kinds);
             return Ok(());
         }
 
@@ -1456,6 +1452,11 @@ impl Command for QueryEntities {
         let root = find_repository_root()?;
 
         if !atomic_semantic::is_supported(&self.path) {
+            if self.json {
+                return Err(CliError::InvalidArgument {
+                    message: format!("Unsupported file type: {}", self.path),
+                });
+            }
             println!("Unsupported file type: {}", self.path);
             return Ok(());
         }

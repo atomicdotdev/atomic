@@ -142,9 +142,6 @@ impl Repo {
                 .map_err(CliError::Repository)?;
             Ok::<_, CliError>((project_id, previous))
         })?;
-        if let Some(previous) = previous.filter(|p| *p != project_id) {
-            println!("Replaced local identity {previous}");
-        }
         if json {
             println!(
                 "{}",
@@ -155,6 +152,9 @@ impl Repo {
                 .expect("JSON serialization")
             );
         } else {
+            if let Some(previous) = previous.filter(|p| *p != project_id) {
+                println!("Replaced local identity {previous}");
+            }
             println!("Adopted project identity {project_id}");
             println!("The derived knowledge graph was rebuilt under the adopted id.");
         }

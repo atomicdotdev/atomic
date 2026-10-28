@@ -55,6 +55,13 @@ workspace transactions retain their existing owners. The `shadow` module
 inside the adapter still coordinates projection and checkpoint rollback;
 its name does not make that behavior obsolete.
 
+Fresh eligible `atomic git import` runs use the rolling importer from #302.
+Use `--no-stream` to select the ordinary importer. The default rolling payload
+window is 32 MiB (`--stream-window-mib`); this is not a process memory limit.
+`--agent-mode` uses an animation on supported terminals and falls back to
+normal output when either stream is redirected or `TERM=dumb`. Both import
+visuals and their terminal dependencies are part of the optional shim crate.
+
 ## 1. Current behavior and scope
 
 The shim imports Git history, projects Atomic records into Git, checks that

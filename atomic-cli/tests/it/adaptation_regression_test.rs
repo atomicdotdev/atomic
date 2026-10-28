@@ -64,7 +64,9 @@ fn git_import_retires_empty_parent_directories_and_recreates_them() {
     let git = git2::Repository::open(root.path()).unwrap();
     let branch = git.head().unwrap().shorthand().unwrap().to_owned();
     drop(git);
-    cli(root.path(), &["git", "import", "--no-vault"]);
+    // This exercises incremental semantic deletions and view restoration,
+    // not the separate graph-only streaming-to-native handoff.
+    cli(root.path(), &["git", "import", "--no-stream", "--no-vault"]);
     cli(
         root.path(),
         &["view", "create", "before-delete", "--from", &branch],

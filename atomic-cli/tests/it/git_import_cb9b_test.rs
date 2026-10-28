@@ -39,8 +39,13 @@ use atomic_core::types::Base32;
 const ATOMIC_BIN: &str = env!("CARGO_BIN_EXE_atomic");
 
 fn atomic(root: &Path, home: &Path, args: &[&str]) -> Output {
-    Command::new(ATOMIC_BIN)
-        .args(args)
+    let mut command = Command::new(ATOMIC_BIN);
+    command.args(args);
+    // Native/incremental semantic lifecycle belongs to the ordinary importer.
+    if args.starts_with(&["git", "import"]) {
+        command.arg("--no-stream");
+    }
+    command
         .current_dir(root)
         .env("HOME", home)
         .env("ATOMIC_HOME", home.join(".atomic"))

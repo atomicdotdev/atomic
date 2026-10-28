@@ -12,6 +12,19 @@ to coordinate recording, switching, and publication. Applications can install
 an `output::set_reporter` callback for notices; tables, progress, and JSON
 remain command output. This is not yet a presentation-free SDK.
 
+Fresh eligible imports use the rolling pipeline by default. `--no-stream`
+selects the ordinary importer; `--stream-window-mib` controls the rolling
+payload budget (32 MiB by default), not a process RSS limit. `--agent-mode`
+selects the import animation when both output streams are terminals. The
+rolling dashboard, animation, and their terminal dependencies live in this
+crate and are excluded from CLI builds without `git-shim`.
+
+An embedding reporter must record diagnostics before calling
+`output::live::capture`, then suppress immediate console output when capture
+returns true. The CLI and shim visuals share that capture state, so logging
+continues during animation and the two visuals do not compete for the screen.
+Without a reporter, the crate captures notices itself before printing them.
+
 ## Building
 
 ```sh

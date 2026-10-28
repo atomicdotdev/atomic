@@ -42,8 +42,17 @@ use atomic_core::types::Base32;
 const ATOMIC_BIN: &str = env!("CARGO_BIN_EXE_atomic");
 
 fn atomic(root: &Path, home: &Path, args: &[&str]) -> Output {
-    Command::new(ATOMIC_BIN)
-        .args(args)
+    let mut command = Command::new(ATOMIC_BIN);
+    command.args(args);
+    // This corpus exercises ordinary-import fidelity, including symlinks,
+    // arbitrary paths and identity-preserving rename evidence. The default
+    // restricted stream has independent coverage and explicitly loses rename
+    // identity, so select the corpus's intended importer rather than broaden
+    // its contract silently when the CLI default changes.
+    if args.starts_with(&["git", "import"]) {
+        command.arg("--no-stream");
+    }
+    command
         .current_dir(root)
         .env("HOME", home)
         .env("ATOMIC_HOME", home.join(".atomic"))
@@ -68,6 +77,9 @@ fn atomic_env(root: &Path, home: &Path, args: &[&str], extra_env: &[(&str, &str)
         .current_dir(root)
         .env("HOME", home)
         .env("ATOMIC_HOME", home.join(".atomic"));
+    if args.starts_with(&["git", "import"]) {
+        command.arg("--no-stream");
+    }
     for (key, value) in extra_env {
         command.env(key, value);
     }

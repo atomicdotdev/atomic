@@ -27,6 +27,114 @@ fn record_all(repo: &Repository, message: &str) -> Result<RecordOutcome, RecordE
     repo.record(repo.require_working_copy_id().unwrap(), header, options)
 }
 
+#[test]
+fn graph_only_file_lifecycle_preserves_graph_identity_without_file_ops() {
+    let (temp, repo) = create_temp_repo();
+    let old = temp.path().join("old.txt");
+    let new = temp.path().join("new.txt");
+    std::fs::write(&old, b"one\ntwo\nthree\n").unwrap();
+    repo.add("old.txt", TrackingOptions::default()).unwrap();
+    let base = repo
+        .record(
+            ChangeHeader::new("graph-only base"),
+            RecordOptions::new()
+                .with_all(true)
+                .apply_after_record(false)
+                .save_to_store(false),
+        )
+        .unwrap();
+    let mut change = base.change().clone();
+    change.set_file_ops(Vec::new());
+    let hash = repo.save_change(&change).unwrap();
+    repo.insert_change(&hash, InsertOptions::default()).unwrap();
+    let identity = repo.get_inode_and_position("old.txt").unwrap().unwrap();
+
+    std::fs::rename(&old, &new).unwrap();
+    repo.move_file("old.txt", "new.txt").unwrap();
+    std::fs::write(&new, b"one\nedited\nthree\n").unwrap();
+    let moved = record_all(&repo, "graph-only move and edit").unwrap();
+    assert!(!moved.change().has_file_ops());
+    assert!(moved
+        .change()
+        .hunks()
+        .iter()
+        .any(|op| matches!(op, GraphOp::FileMove { .. })));
+    assert_eq!(
+        repo.get_inode_and_position("new.txt").unwrap(),
+        Some(identity)
+    );
+    assert_eq!(
+        repo.get_file_content("new.txt").unwrap().unwrap(),
+        b"one\nedited\nthree\n"
+    );
+
+    std::fs::write(&new, b"one\nedited again\nthree\n").unwrap();
+    let edited = record_all(&repo, "graph-only edit").unwrap();
+    assert!(!edited.change().has_file_ops());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&new, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let chmod = record_all(&repo, "graph-only chmod").unwrap();
+        assert!(!chmod.change().has_file_ops());
+        assert!(chmod.change().hunks().iter().any(|op| matches!(
+            op,
+            GraphOp::SetAttr {
+                value: atomic_core::change::InodeAttr::Mode(0o755),
+                ..
+            }
+        )));
+        assert_eq!(
+            repo.get_inode_and_position("new.txt").unwrap(),
+            Some(identity)
+        );
+        repo.materialize().unwrap();
+        assert_eq!(
+            std::fs::metadata(&new).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+    }
+    std::fs::remove_file(&new).unwrap();
+    let deleted = record_all(&repo, "graph-only delete").unwrap();
+    assert!(!deleted.change().has_file_ops());
+    assert!(repo.get_file_content("new.txt").unwrap().is_none());
+
+    std::fs::write(&new, b"restored\n").unwrap();
+    repo.add("new.txt", TrackingOptions::default()).unwrap();
+    let restored = record_all(&repo, "graph-only undelete with edit").unwrap();
+    assert!(!restored.change().has_file_ops());
+    assert_eq!(
+        repo.get_inode_and_position("new.txt").unwrap(),
+        Some(identity)
+    );
+    repo.materialize().unwrap();
+    assert_eq!(std::fs::read(&new).unwrap(), b"restored\n");
+}
+
+#[test]
+fn semantic_move_refuses_corrupt_trunk_index_instead_of_using_graph_only_path() {
+    use atomic_core::pristine::MutTxnT;
+    let (temp, repo) = create_temp_repo();
+    let old = temp.path().join("old.txt");
+    std::fs::write(&old, b"content\n").unwrap();
+    repo.add("old.txt", TrackingOptions::default()).unwrap();
+    record_all(&repo, "semantic base").unwrap();
+    let (inode, position) = repo.get_inode_and_position("old.txt").unwrap().unwrap();
+    let mut txn = repo.pristine.write_txn().unwrap();
+    let wrong_trunk = atomic_core::crdt::TrunkId::new(position.change, u32::MAX);
+    txn.put_crdt_inode_trunk(inode.get(), &wrong_trunk.to_bytes())
+        .unwrap();
+    txn.commit().unwrap();
+    std::fs::rename(&old, temp.path().join("new.txt")).unwrap();
+    let error = record_all(&repo, "refused move").unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("disagrees with its canonical FileAdd"),
+        "{error}"
+    );
+}
+
 /// A raw disk rename (new path untracked) records as one FileMove, reusing the
 /// original inode, with no FileDel/FileAdd for the involved paths.
 #[test]

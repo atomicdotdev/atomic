@@ -781,6 +781,86 @@ fn vault_entry_bundle(
         .map_err(|error| Status::internal(error.to_string()))
 }
 
+/// Validate a `ListVaultEntries` sort against the listing it applies to and
+/// resolve UNSPECIFIED to the kind's default key (intents by id, memories by
+/// last update). Only the intent and memory listings sort, and only by
+/// columns they carry.
+fn listing_sort(kind: Option<Kind>, raw: Option<i32>) -> Result<VaultListSort, Status> {
+    use VaultListSort as S;
+    let sort = raw
+        .map(|raw| {
+            S::try_from(raw).map_err(|_| Status::invalid_argument("unknown vault list sort"))
+        })
+        .transpose()?
+        .unwrap_or(S::Unspecified);
+    match (kind, sort) {
+        (Some(Kind::Intent), S::Unspecified) => Ok(S::Id),
+        (Some(Kind::Memory), S::Unspecified) => Ok(S::Updated),
+        (_, S::Unspecified) => Ok(S::Unspecified),
+        (Some(Kind::Intent), S::Updated | S::About) | (Some(Kind::Memory), S::Title) => {
+            Err(Status::invalid_argument(format!(
+                "{} is not a sort key for this vault listing",
+                sort.as_str_name()
+            )))
+        }
+        (Some(Kind::Intent | Kind::Memory), _) => Ok(sort),
+        _ => Err(Status::invalid_argument(
+            "sort applies only to the intent and memory listings",
+        )),
+    }
+}
+
+/// Order an intent or memory listing by an already-validated key, with id as
+/// the tiebreak. `reverse` flips the key, not the tiebreak.
+fn sort_listing(entries: &mut [VaultEntry], sort: VaultListSort, reverse: bool) {
+    use VaultListSort as S;
+    fn attested_rank(entry: &VaultEntry) -> u8 {
+        match entry.attested.as_deref() {
+            Some("fresh") => 0,
+            Some("stale") => 1,
+            _ => 2,
+        }
+    }
+    fn verifies_rank(entry: &VaultEntry) -> u8 {
+        match entry.verifies.as_deref() {
+            Some("yes") => 0,
+            Some("no") => 1,
+            _ => 2,
+        }
+    }
+    // Intents carry their status and kind in `status_label`/`manifest_kind`,
+    // memories in `memory_status`/`memory_kind`; each entry has one pair.
+    fn status(entry: &VaultEntry) -> Option<&str> {
+        entry
+            .status_label
+            .as_deref()
+            .or(entry.memory_status.as_deref())
+    }
+    fn kind(entry: &VaultEntry) -> Option<&str> {
+        entry
+            .manifest_kind
+            .as_deref()
+            .or(entry.memory_kind.as_deref())
+    }
+    if sort == S::Unspecified {
+        return;
+    }
+    entries.sort_by(|a, b| {
+        let ord = match sort {
+            S::Unspecified | S::Id => a.id.cmp(&b.id),
+            // RFC 3339, so lexical == chronological; newest first.
+            S::Updated => b.updated_at_label.cmp(&a.updated_at_label),
+            S::Title => a.title.cmp(&b.title),
+            S::Status => status(a).cmp(&status(b)),
+            S::Kind => kind(a).cmp(&kind(b)),
+            S::About => a.about_count.cmp(&b.about_count),
+            S::Attested => attested_rank(a).cmp(&attested_rank(b)),
+            S::Verifies => verifies_rank(a).cmp(&verifies_rank(b)),
+        };
+        if reverse { ord.reverse() } else { ord }.then_with(|| a.id.cmp(&b.id))
+    });
+}
+
 /// The RAW intent attestation sources (the bridge's dual-read inputs):
 /// the tracked vault entry (frontmatter + body bytes) and the legacy
 /// sidecar candidate's text — the first EXISTING candidate (the
@@ -1777,6 +1857,8 @@ impl vault_service_server::VaultService for VaultImpl {
             raw.parse::<VaultEntryType>()
                 .map_err(|_| Status::invalid_argument("unknown vault entry type"))?;
         }
+        let sort = listing_sort(kind, request.sort)?;
+        let reverse = request.reverse;
         let reference = request
             .repository
             .as_ref()
@@ -1841,7 +1923,7 @@ impl vault_service_server::VaultService for VaultImpl {
                     let verifier = resolve_listing_verifier(&identity)?;
                     let manifest = repo.vault_manifest().map_err(repository_error)?;
                     let infos = repo.vault_intent_list(None).map_err(repository_error)?;
-                    let entries = infos
+                    let mut entries = infos
                         .into_iter()
                         .map(|info| {
                             // The manifest kind tag (a manifest read, never a
@@ -1893,7 +1975,8 @@ impl vault_service_server::VaultService for VaultImpl {
                                 ..Default::default()
                             }
                         })
-                        .collect();
+                        .collect::<Vec<_>>();
+                    sort_listing(&mut entries, sort, reverse);
                     Ok::<_, Status>(ListVaultEntriesResponse {
                         entries,
                         next_cursor: None,
@@ -1925,12 +2008,18 @@ impl vault_service_server::VaultService for VaultImpl {
                         })
                         .collect();
                     items.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-                    if let Some(limit) = limit {
-                        items.truncate(limit);
+                    // The default order needs only (id, updated), so the
+                    // budget cuts before the per-row attestation work; any
+                    // other key needs every row's computed columns first.
+                    let presorted = sort == VaultListSort::Updated && !reverse;
+                    if presorted {
+                        if let Some(limit) = limit {
+                            items.truncate(limit);
+                        }
                     }
-                    let entries = items
+                    let mut entries = items
                         .iter()
-                        .map(|(id, _)| {
+                        .map(|(id, updated)| {
                             // kind/status/about degrade to "–"/0 when a single
                             // memory cannot be read or lifted — never the list.
                             let degraded = (
@@ -2021,10 +2110,17 @@ impl vault_service_server::VaultService for VaultImpl {
                                 about_count: Some(about),
                                 attested: Some(attested.to_string()),
                                 verifies: Some(verifies.to_string()),
+                                updated_at_label: Some(updated.clone()),
                                 ..Default::default()
                             }
                         })
-                        .collect();
+                        .collect::<Vec<_>>();
+                    if !presorted {
+                        sort_listing(&mut entries, sort, reverse);
+                        if let Some(limit) = limit {
+                            entries.truncate(limit);
+                        }
+                    }
                     Ok(ListVaultEntriesResponse {
                         entries,
                         next_cursor: None,

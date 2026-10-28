@@ -110,7 +110,11 @@ fn git_import_records_a_modified_generated_file_with_exact_content() {
     git(&root, &["add", "."]);
     git(&root, &["commit", "-q", "-m", "bump lockfile dependencies"]);
 
-    atomic_ok(&root, &home, &["git", "import", "--no-vault"]);
+    atomic_ok(
+        &root,
+        &home,
+        &["git", "import", "--no-stream", "--no-vault"],
+    );
 
     let repo = atomic_repository::Repository::open(&root).unwrap();
     let rendered = repo
@@ -169,7 +173,11 @@ fn git_import_records_the_real_helpers_history_with_exact_content() {
     git(&root, &["add", "."]);
     git(&root, &["commit", "-q", "-m", "AI Cleanup"]);
 
-    atomic_ok(&root, &home, &["git", "import", "--no-vault"]);
+    atomic_ok(
+        &root,
+        &home,
+        &["git", "import", "--no-stream", "--no-vault"],
+    );
 
     let repo = atomic_repository::Repository::open(&root).unwrap();
     let rendered = repo

@@ -438,9 +438,12 @@ impl Command for Hooks {
         }
 
         // Some agents (e.g., Antigravity) read a JSON object from hook stdout
-        // as part of their hook contract. Print the adapter's response body.
-        if let Some(response) = agent.stdout_response(hook_type) {
-            println!("{}", response);
+        // as part of their hook contract. Explicit --json selects the bridge
+        // result instead, so stdout always contains at most one document.
+        if !self.json {
+            if let Some(response) = agent.stdout_response(hook_type) {
+                println!("{}", response);
+            }
         }
 
         // Emit the recorded change hash for UI/bridge callers.

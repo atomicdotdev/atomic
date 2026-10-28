@@ -2,6 +2,8 @@
 //!
 //! Embedders can route notices through their own UI and redacting logger.
 //! Direct command output (tables, progress, JSON) retains the CLI contract.
+pub mod live;
+
 use std::sync::OnceLock;
 
 #[derive(Debug, Clone, Copy)]
@@ -23,6 +25,16 @@ pub fn set_reporter(reporter: fn(Notice, &str)) -> bool {
 fn report(kind: Notice, message: &str) {
     if let Some(reporter) = REPORTER.get() {
         reporter(kind, message);
+        return;
+    }
+    // A reporter owns logging and capture. Only use the fallback capture
+    // when no reporter is installed, so logging still sees every notice.
+    let capture_kind = match kind {
+        Notice::Success => live::Kind::Success,
+        Notice::Info | Notice::Hint => live::Kind::Info,
+        Notice::Warning => live::Kind::Warning,
+    };
+    if live::capture(capture_kind, message) {
         return;
     }
     match kind {

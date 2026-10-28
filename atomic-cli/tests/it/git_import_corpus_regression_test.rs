@@ -55,7 +55,7 @@ fn commit_named(
 }
 
 fn import(root: &Path, git: &GitRepository, tip: Oid, config: &Path) {
-    import_with_args(root, git, tip, config, &[]);
+    import_with_args(root, git, tip, config, &["--no-stream"]);
 }
 
 fn import_with_args(root: &Path, git: &GitRepository, tip: Oid, config: &Path, args: &[&str]) {
@@ -277,7 +277,8 @@ fn merge_rename_over_symlink_deletes_the_displaced_identity() {
         ],
         &[main, side],
     );
-    import(root.path(), &git, tip, config.path());
+    // Symlink fidelity belongs to the ordinary import contract.
+    import_with_args(root.path(), &git, tip, config.path(), &["--no-stream"]);
     let repo = atomic_repository::Repository::open(root.path()).unwrap();
     assert_eq!(
         repo.get_file_content("README.md").unwrap().unwrap(),
@@ -307,7 +308,7 @@ fn symlink_to_regular_file_survives_simultaneous_sibling_deletion() {
     ];
     let side = commit(&git, &result, &[first]);
     let tip = commit(&git, &result, &[first, side]);
-    import(root.path(), &git, tip, config.path());
+    import_with_args(root.path(), &git, tip, config.path(), &["--no-stream"]);
     let repo = atomic_repository::Repository::open(root.path()).unwrap();
     assert_eq!(
         repo.get_file_content("b/LICENSE").unwrap().unwrap(),
@@ -324,7 +325,7 @@ fn identical_side_edits_need_a_causal_merge_resolution() {
         for args in [
             vec!["--all"],
             vec!["--all", "--with-crdt"],
-            vec![],
+            vec!["--no-stream"],
             vec!["--with-crdt"],
         ] {
             let root = tempfile::tempdir().unwrap();

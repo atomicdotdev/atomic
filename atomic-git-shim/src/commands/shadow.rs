@@ -2194,6 +2194,60 @@ fn is_forbidden_shadow_path(path: &str) -> bool {
     path == ".atomicignore" || path.starts_with(".atomic/") || path.starts_with(".vault/")
 }
 
+pub fn checkpoint_shadow_switch(
+    shadow_sync: crate::commands::shadow::ShadowSwitchSync,
+    repo_root: &std::path::Path,
+    view: &str,
+) -> ShimResult<()> {
+    let shadow_was_synchronized = shadow_sync.is_synchronized();
+    // A native (unenrolled) colocated repository must neither fail its view
+    // switch on Git observation errors nor bootstrap the first shim
+    // checkpoint: `.git` beside `.atomic` is not shim consent. Only an
+    // enrolled workspace refreshes; import anchors explicitly.
+    if !shadow_was_synchronized && !crate::commands::shadow::shim_workspace_enrolled(repo_root)? {
+        return Ok(());
+    }
+    let checkpoint = match crate::commands::shim::refresh_checkpoint_if_aligned(repo_root) {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            return match shadow_sync.rollback(repo_root) {
+                Ok(()) => Err(error),
+                Err(rollback_error) => Err(ShimError::GitError {
+                    message: format!("{error}; {rollback_error}"),
+                }),
+            };
+        }
+    };
+    if shadow_was_synchronized && checkpoint != crate::commands::shim::CheckpointRefresh::Refreshed
+    {
+        let error = ShimError::GitError {
+            message: format!(
+                "Git shadow synchronization for view '{view}' completed, but the shim verifier did not refresh its checkpoint ({checkpoint:?}); run `atomic git shim verify` for details"
+            ),
+        };
+        return match shadow_sync.rollback(repo_root) {
+            Ok(()) => Err(error),
+            Err(rollback_error) => Err(ShimError::GitError {
+                message: format!("{error}; {rollback_error}"),
+            }),
+        };
+    }
+    Ok(())
+}
+
+/// Finish the existing Git boundary after a successful service-owned native
+/// switch. The service has released its workspace lease and database handle.
+pub fn finish_service_switch(repo_root: &std::path::Path, view: &str) -> ShimResult<()> {
+    let repo = Repository::open_for_workspace_transaction_wait(
+        repo_root,
+        atomic_repository::database_lock_wait(),
+    )
+    .map_err(ShimError::Repository)?;
+    let shadow_sync = crate::commands::shadow::sync_git_head_to_view(&repo, repo_root, view)?;
+    drop(repo);
+    checkpoint_shadow_switch(shadow_sync, repo_root, view)
+}
+
 #[cfg(test)]
 mod tests {
     use super::is_forbidden_shadow_path as forbidden;
@@ -2431,58 +2485,4 @@ mod tests {
             .map(|refs| refs.flatten().count())
             .unwrap_or(0)
     }
-}
-
-pub fn checkpoint_shadow_switch(
-    shadow_sync: crate::commands::shadow::ShadowSwitchSync,
-    repo_root: &std::path::Path,
-    view: &str,
-) -> ShimResult<()> {
-    let shadow_was_synchronized = shadow_sync.is_synchronized();
-    // A native (unenrolled) colocated repository must neither fail its view
-    // switch on Git observation errors nor bootstrap the first shim
-    // checkpoint: `.git` beside `.atomic` is not shim consent. Only an
-    // enrolled workspace refreshes; import anchors explicitly.
-    if !shadow_was_synchronized && !crate::commands::shadow::shim_workspace_enrolled(repo_root)? {
-        return Ok(());
-    }
-    let checkpoint = match crate::commands::shim::refresh_checkpoint_if_aligned(repo_root) {
-        Ok(outcome) => outcome,
-        Err(error) => {
-            return match shadow_sync.rollback(repo_root) {
-                Ok(()) => Err(error),
-                Err(rollback_error) => Err(ShimError::GitError {
-                    message: format!("{error}; {rollback_error}"),
-                }),
-            };
-        }
-    };
-    if shadow_was_synchronized && checkpoint != crate::commands::shim::CheckpointRefresh::Refreshed
-    {
-        let error = ShimError::GitError {
-            message: format!(
-                "Git shadow synchronization for view '{view}' completed, but the shim verifier did not refresh its checkpoint ({checkpoint:?}); run `atomic git shim verify` for details"
-            ),
-        };
-        return match shadow_sync.rollback(repo_root) {
-            Ok(()) => Err(error),
-            Err(rollback_error) => Err(ShimError::GitError {
-                message: format!("{error}; {rollback_error}"),
-            }),
-        };
-    }
-    Ok(())
-}
-
-/// Finish the existing Git boundary after a successful service-owned native
-/// switch. The service has released its workspace lease and database handle.
-pub fn finish_service_switch(repo_root: &std::path::Path, view: &str) -> ShimResult<()> {
-    let repo = Repository::open_for_workspace_transaction_wait(
-        repo_root,
-        atomic_repository::database_lock_wait(),
-    )
-    .map_err(ShimError::Repository)?;
-    let shadow_sync = crate::commands::shadow::sync_git_head_to_view(&repo, repo_root, view)?;
-    drop(repo);
-    checkpoint_shadow_switch(shadow_sync, repo_root, view)
 }

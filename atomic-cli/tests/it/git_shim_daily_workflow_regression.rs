@@ -283,6 +283,32 @@ fn paths_with_spaces_and_unicode_import_clean() {
 
     atomic_ok(&root, &home, &["git", "import", "--no-vault"]);
     assert_clean(&root, &home);
+    {
+        let repo = atomic_repository::Repository::open(&root).unwrap();
+        assert!(
+            repo.view_exists("git-stream-private").unwrap(),
+            "the Unicode lifecycle must start with the default streaming importer"
+        );
+        for path in [
+            "has space.txt",
+            "caf\u{e9}.txt",
+            "dir with space/inner file.md",
+        ] {
+            assert!(
+                repo.get_inode_and_position(path).unwrap().is_some(),
+                "native repository spelling must resolve: {path}"
+            );
+        }
+        for entry in repo.effective_history(Some("main")).unwrap() {
+            let change = repo.load_change(&entry.hash).unwrap();
+            if matches!(
+                change.origin(),
+                atomic_core::change::ChangeOrigin::GitSynthesized { .. }
+            ) {
+                assert!(change.file_ops().is_empty());
+            }
+        }
+    }
     atomic_ok(
         &root,
         &home,
@@ -330,8 +356,17 @@ fn paths_with_spaces_and_unicode_import_clean() {
 
     // A native record of such a path round-trips through the shim too.
     fs::write(root.join("has space.txt"), b"s3\n").unwrap();
+    fs::write(
+        root.join("dir with space/caf\u{e9} moved.txt"),
+        b"native unicode edit\n",
+    )
+    .unwrap();
     atomic_ok(&root, &home, &["record", "-am", "atomic edit"]);
     assert_eq!(git(&root, &["show", "HEAD:has space.txt"]), "s3");
+    assert_eq!(
+        git(&root, &["show", "HEAD:dir with space/caf\u{e9} moved.txt"]),
+        "native unicode edit"
+    );
     assert_clean(&root, &home);
 }
 

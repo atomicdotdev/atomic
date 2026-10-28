@@ -119,7 +119,7 @@ fn an_intent_is_attested_by_a_key_held_elsewhere() {
     let signed = sign_elsewhere(&prepared, &key);
     let file = home.join("signed.json");
     std::fs::write(&file, signed.to_string()).unwrap();
-    ok(&atomic(
+    let attested = ok(&atomic(
         home,
         repo,
         &[
@@ -130,8 +130,14 @@ fn an_intent_is_attested_by_a_key_held_elsewhere() {
             "ada+bot",
             "--signed",
             file.to_str().unwrap(),
+            "--json",
         ],
     ));
+    let attested: serde_json::Value = serde_json::from_str(&attested).expect("attested JSON-LD");
+    assert_eq!(
+        attested, signed,
+        "return the canonical externally signed node"
+    );
 
     let report: serde_json::Value = serde_json::from_str(&ok(&atomic(
         home,

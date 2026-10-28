@@ -90,7 +90,13 @@ fn rendered_on_main(root: &Path, path: &str) -> Vec<u8> {
 
 /// Import, then prove the workspace is clean and the shim layer verifies.
 fn import_and_verify(root: &Path, home: &Path, expected_changes: &str) {
-    let summary = atomic_ok(root, home, &["git", "import", "--no-vault"]);
+    import_and_verify_with_args(root, home, expected_changes, &[]);
+}
+
+fn import_and_verify_with_args(root: &Path, home: &Path, expected_changes: &str, extra: &[&str]) {
+    let mut args = vec!["git", "import", "--no-vault"];
+    args.extend_from_slice(extra);
+    let summary = atomic_ok(root, home, &args);
     assert!(
         summary.contains(expected_changes),
         "expected '{expected_changes}', got:\n{summary}"
@@ -136,7 +142,7 @@ fn import_of_symlink_replaced_by_directory_lands() {
     fs::write(root.join(".agents/skills/review/SKILL.md"), b"copied\n").unwrap();
     commit_all(&root, "skill as directory");
 
-    import_and_verify(&root, &home, "2 changes");
+    import_and_verify_with_args(&root, &home, "2 changes", &["--no-stream"]);
     assert_eq!(
         rendered_on_main(&root, ".agents/skills/review/SKILL.md"),
         b"copied\n"
@@ -162,7 +168,7 @@ fn import_of_directory_replaced_by_symlink_to_directory_lands() {
     .unwrap();
     commit_all(&root, "skill as symlink");
 
-    import_and_verify(&root, &home, "2 changes");
+    import_and_verify_with_args(&root, &home, "2 changes", &["--no-stream"]);
     assert_eq!(
         rendered_on_main(&root, ".claude/skills/review/SKILL.md"),
         b"linked\n"

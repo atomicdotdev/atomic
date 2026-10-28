@@ -117,7 +117,11 @@ fn import_of_prepend_insert_delete_history_renders_every_state_byte_exact() {
     // successful import proves EVERY intermediate state rendered
     // byte-exactly against its commit tree. Pre-fix, this failed at the
     // last commit with "renders 88 byte(s) but the commit tree expects 89".
-    let summary = atomic_ok(&root, &home, &["git", "import", "--no-vault"]);
+    let summary = atomic_ok(
+        &root,
+        &home,
+        &["git", "import", "--no-stream", "--no-vault"],
+    );
     assert!(summary.contains("4 changes"), "expected 4 imported changes");
 
     // The final state's graph render is byte-exact (not only the worktree).

@@ -259,7 +259,7 @@ fn prepare_hyperfine_publication_sample() {
             completed += 1;
             merges += usize::from(parsed.is_merge);
             assert_no_checkout(repo.root());
-            if completed % 10 == 0 || completed == count {
+            if completed.is_multiple_of(10) || completed == count {
                 println!(
                     "HYPERFINE prepare commits={completed}/{count} elapsed_ms={:.3}",
                     started.elapsed().as_secs_f64() * 1000.0

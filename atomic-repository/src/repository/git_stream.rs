@@ -1,4 +1,4 @@
-//! Private, bounded publication for a direct graph-only Git producer. This
+//! Private, bounded publication for a direct Git producer. This
 //! module owns transactions, not graph algorithms or working-copy recording.
 
 use super::operation::{current_operation_timestamp_ms, working_copy_state_ref};
@@ -322,9 +322,10 @@ impl<'a> GitGraphImportSession<'a> {
             if entry.disposition != super::ManifestDisposition::Included {
                 continue;
             }
-            let path = std::str::from_utf8(entry.path.as_bytes())
-                .map_err(|error| invalid(error.to_string()))?
-                .to_string();
+            let path = match std::str::from_utf8(entry.path.as_bytes()) {
+                Ok(path) => crate::canonical_path_identity(path),
+                Err(_) => crate::escape_repo_path(entry.path.as_bytes()),
+            };
             expected.insert(
                 path,
                 StagedPathExpectation {
@@ -338,6 +339,8 @@ impl<'a> GitGraphImportSession<'a> {
             paths: Vec::new(),
             tree: Some(StagedTreeExpectation {
                 entries: expected,
+                // Full closure verification below checks every inherited
+                // semantic path; an empty Git tip need not invent FileOps.
                 semantic_paths: Vec::new(),
                 verify_paths: None,
                 semantic_verify_paths: None,
@@ -445,13 +448,16 @@ impl<'a> GitGraphImportSession<'a> {
                     }
                 }
             }
-            if projection
+            // Projection keys use repository spelling (raw UTF-8 or escaped),
+            // while the Git expectation is keyed by canonical escaped identity.
+            // Compare that same lossless identity and reject any folded duplicate
+            // rather than letting set collection hide an extra graph path.
+            let actual_paths = projection
                 .present
                 .keys()
-                .cloned()
-                .collect::<std::collections::BTreeSet<_>>()
-                != paths
-            {
+                .map(|path| crate::canonical_path_identity(path))
+                .collect::<std::collections::BTreeSet<_>>();
+            if actual_paths.len() != projection.present.len() || actual_paths != paths {
                 return Err(invalid(
                     "final stream namespace has missing/extra paths or directories",
                 ));
@@ -588,6 +594,37 @@ mod tests {
         .unwrap()
     }
     #[test]
+    fn prepared_graph_boundary_rejects_file_ops() {
+        let (project, _) = project();
+        let prepared = entry(1, None, "a.txt", b"one\n", &project, false);
+        let mut change = prepared.change;
+        change
+            .hashed
+            .file_ops
+            .push(atomic_core::change::FileOps::create(
+                atomic_core::crdt::TrunkId::new(atomic_core::types::NodeId::ROOT, 0),
+                "a.txt".into(),
+                Some(Encoding::Utf8),
+            ));
+        let origin = GitSynthesisOrigin::root(
+            GitObjectId::new(GitHashAlgorithm::Sha1, vec![1; 20]).unwrap(),
+            project.git.root.clone(),
+        )
+        .unwrap();
+        let error = PreparedGitGraphChange::new(
+            change,
+            origin.clone(),
+            Vec::new(),
+            crate::git_synthesis_metadata(&origin, &[], None),
+        )
+        .err()
+        .expect("FileOps must be rejected before finalization or publication");
+        assert!(error
+            .to_string()
+            .contains("eager semantics are unsupported"));
+    }
+
+    #[test]
     fn failed_final_proof_never_promotes_private_stream() {
         let dir = tempfile::tempdir().unwrap();
         let mut repo = Repository::init(dir.path()).unwrap();
@@ -629,5 +666,62 @@ mod tests {
             ])
             .unwrap();
         assert_eq!(session.finish(&project, &proof).unwrap().commits, 2);
+    }
+
+    #[test]
+    fn final_namespace_accepts_native_unicode_spelling_but_refuses_duplicate_identity() {
+        let policy = ConversionPolicy::new(GitHashAlgorithm::Sha1);
+        let raw = "caf\u{e9}.txt";
+        let manifest = RepositoryManifest::new(
+            SetId::ZERO,
+            policy.root().content_key,
+            vec![RepositoryEntry::new(
+                RepoPath::from_bytes(raw.as_bytes()).unwrap(),
+                b"one\n".to_vec(),
+                0o644,
+                atomic_core::change::InodeKind::Regular,
+                None,
+                ManifestDisposition::Included,
+            )
+            .unwrap()],
+        )
+        .unwrap();
+        let project = ProjectTree::from_manifest(manifest, &policy).unwrap();
+        let proof = crate::verify_prospective_equivalence(&project, &project.git.root).unwrap();
+        for duplicate in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut repo = Repository::init(dir.path()).unwrap();
+            let mut session = GitGraphImportSession::begin(
+                &mut repo,
+                GitStreamLimits::new(2, 1024 * 1024).unwrap(),
+            )
+            .unwrap();
+            session
+                .publish(&[entry(1, None, raw, b"one\n", &project, false)])
+                .unwrap();
+            if duplicate {
+                session
+                    .publish(&[entry(
+                        2,
+                        Some(1),
+                        "caf%C3%A9.txt",
+                        b"one\n",
+                        &project,
+                        false,
+                    )])
+                    .unwrap();
+            }
+            let result = session.finish(&project, &proof);
+            if duplicate {
+                assert!(
+                    result.is_err(),
+                    "canonicalization must not hide an extra graph path"
+                );
+                assert!(repo.effective_history(None).unwrap().is_empty());
+            } else {
+                result.unwrap();
+                assert_eq!(repo.get_file_content(raw).unwrap(), Some(b"one\n".to_vec()));
+            }
+        }
     }
 }

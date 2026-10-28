@@ -277,9 +277,11 @@ impl Diff {
         use std::collections::BTreeMap;
 
         // The --git staging diff is a versioned, bounded subset (RFC §9.1):
-        // the version marker makes the contract inspectable in every output
-        // format and asserts this is not full Git porcelain compatibility.
-        println!("# atomic-diff-git v1 (bounded subset; layers: --cached baseline→index, default index→worktree)");
+        // Human output carries the subset marker; JSON uses the shared
+        // versioned diff schema without a text preamble.
+        if !self.json {
+            println!("# atomic-diff-git v1 (bounded subset; layers: --cached baseline→index, default index→worktree)");
+        }
 
         let mut repo =
             Repository::open_readonly(repo_root).map_err(|e| CliError::InvalidRepository {
@@ -440,12 +442,7 @@ impl Diff {
         }
 
         let config = self.get_output_config();
-        match config.format {
-            DiffFormat::Unified => self.print_unified(&file_diffs, &config),
-            DiffFormat::Stat => self.print_stat(&stats, &config),
-            DiffFormat::NameOnly => self.print_name_only(&file_diffs),
-            DiffFormat::NameStatus => self.print_name_status(&file_diffs, &config),
-        }
+        self.render(&file_diffs, &stats, &config, None, None)
     }
 }
 
