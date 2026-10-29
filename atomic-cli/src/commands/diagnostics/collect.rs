@@ -7,6 +7,7 @@
 //! the network. A value that cannot be read is reported with the reason,
 //! never filled in by inference.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
@@ -102,11 +103,21 @@ pub(crate) struct InstalledIntegration {
     /// The Atomic version that performed the install.
     pub installed_with: String,
     pub installed_at: String,
+    pub last_fired: HookActivity,
     /// `registry`, `local`, or `url`.
     pub source_kind: &'static str,
     /// Where the package came from, with any URL credentials removed.
     pub source: String,
     pub files: FileCounts,
+}
+
+/// The latest recorded dispatch in this workspace, not a machine-wide history.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub(crate) enum HookActivity {
+    Observed { at: String },
+    NotObserved,
+    Unavailable { reason: &'static str },
 }
 
 /// The receipt's files compared against what is on disk now.
@@ -149,9 +160,46 @@ pub(crate) struct InstalledSkill {
     pub name: String,
     pub path: String,
     pub state: FileState,
-    /// The skill file's own `version:` frontmatter; `null` when it declares
-    /// none or cannot be read.
+    /// Nested metadata version, or the legacy top-level version when present.
     pub version: Option<String>,
+    pub updated_at: Option<String>,
+    pub metadata_status: SkillMetadataStatus,
+    pub missing_metadata: Vec<&'static str>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum SkillMetadataStatus {
+    Complete,
+    Incomplete,
+    Invalid,
+    Unavailable,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct SkillMetadata {
+    version: Option<String>,
+    updated_at: Option<String>,
+    status: SkillMetadataStatus,
+    missing: Vec<&'static str>,
+}
+
+impl SkillMetadata {
+    fn unavailable() -> Self {
+        Self {
+            version: None,
+            updated_at: None,
+            status: SkillMetadataStatus::Unavailable,
+            missing: Vec::new(),
+        }
+    }
+
+    fn invalid() -> Self {
+        Self {
+            status: SkillMetadataStatus::Invalid,
+            ..Self::unavailable()
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
@@ -537,6 +585,12 @@ pub(crate) fn collect_from(
         _ => None,
     };
 
+    let hook_activity = match &sources.workspace {
+        Ok(Some(root)) => read_hook_activity(root),
+        Ok(None) => Err("not inside an Atomic workspace"),
+        Err(_) => Err("workspace cannot be determined"),
+    };
+
     let mut installed_skills = Vec::new();
     let integrations = receipts
         .iter()
@@ -560,16 +614,20 @@ pub(crate) fn collect_from(
                             FileState::Unreadable => files.unreadable += 1,
                         }
                         if let Some(name) = skill_name(&file.dst, declared) {
+                            let metadata = match state {
+                                FileState::Present | FileState::Modified => {
+                                    skill_metadata(&file.dst)
+                                }
+                                _ => SkillMetadata::unavailable(),
+                            };
                             installed_skills.push(InstalledSkill {
                                 agent: agent.clone(),
                                 name,
                                 path: display_path(&file.dst, home),
-                                version: match state {
-                                    FileState::Present | FileState::Modified => {
-                                        skill_version(&file.dst)
-                                    }
-                                    _ => None,
-                                },
+                                version: metadata.version,
+                                updated_at: metadata.updated_at,
+                                metadata_status: metadata.status,
+                                missing_metadata: metadata.missing,
                                 state,
                             });
                         }
@@ -579,6 +637,16 @@ pub(crate) fn collect_from(
                         version: receipt.version.clone(),
                         installed_with: receipt.cli_version.clone(),
                         installed_at: receipt.installed_at.clone(),
+                        last_fired: match &hook_activity {
+                            Ok(events) => {
+                                events.get(agent).map_or(HookActivity::NotObserved, |at| {
+                                    HookActivity::Observed {
+                                        at: at.to_rfc3339(),
+                                    }
+                                })
+                            }
+                            Err(reason) => HookActivity::Unavailable { reason },
+                        },
                         source_kind,
                         source,
                         files,
@@ -728,6 +796,54 @@ pub(crate) fn collect_from(
                      detecting them would mean running third-party programs",
         }],
     }
+}
+
+/// Read immutable observations without starting the service or opening the
+/// repository for writes. Any unreadable source makes the latest time unknown.
+fn read_hook_activity(
+    root: &Path,
+) -> Result<BTreeMap<String, chrono::DateTime<chrono::Utc>>, &'static str> {
+    use atomic_core::pristine::tables::SESSION_LOG;
+    use redb::{ReadableDatabase, ReadableTable};
+
+    let dot = atomic_repository::Repository::canonical_dot_dir(root)
+        .map_err(|_| "hook history location cannot be resolved")?;
+    let database = redb::ReadOnlyDatabase::open(dot.join("atomic.redb"))
+        .map_err(|_| "hook history cannot be read or is in use")?;
+    let txn = database
+        .begin_read()
+        .map_err(|_| "hook history cannot be read")?;
+    let mut times = BTreeMap::new();
+    let mut observe = |event: atomic_agent::hook_log::SessionLogEvent| -> Result<(), &'static str> {
+        let at = chrono::DateTime::parse_from_rfc3339(&event.at)
+            .map_err(|_| "hook history contains an invalid timestamp")?
+            .with_timezone(&chrono::Utc);
+        times
+            .entry(event.agent)
+            .and_modify(|last: &mut chrono::DateTime<chrono::Utc>| {
+                *last = (*last).max(at);
+            })
+            .or_insert(at);
+        Ok(())
+    };
+    match txn.open_table(SESSION_LOG) {
+        Ok(table) => {
+            for entry in table.iter().map_err(|_| "hook history cannot be read")? {
+                let (_, value) = entry.map_err(|_| "hook history cannot be read")?;
+                let event = serde_json::from_slice(value.value())
+                    .map_err(|_| "hook history contains an invalid event")?;
+                observe(event)?;
+            }
+        }
+        Err(redb::TableError::TableDoesNotExist(_)) => {}
+        Err(_) => return Err("hook history cannot be read"),
+    }
+    for (_, event) in
+        atomic_agent::hook_log::pending(root).map_err(|_| "pending hook history cannot be read")?
+    {
+        observe(event)?;
+    }
+    Ok(times)
 }
 
 // Receipts and files
@@ -983,22 +1099,92 @@ fn skill_name(dst: &Path, declared: Option<&[String]>) -> Option<String> {
         .then(|| stem.to_string())
 }
 
-/// The `version:` key of a skill file's YAML frontmatter, when it has one.
-fn skill_version(path: &Path) -> Option<String> {
-    let text = std::fs::read_to_string(path).ok()?;
-    frontmatter_version(&text)
+fn skill_metadata(path: &Path) -> SkillMetadata {
+    match std::fs::read_to_string(path) {
+        Ok(text) => frontmatter_metadata(&text),
+        Err(_) => SkillMetadata::unavailable(),
+    }
 }
 
-fn frontmatter_version(text: &str) -> Option<String> {
-    let mut lines = text.lines();
-    if lines.next()?.trim_end() != "---" {
-        return None;
+fn frontmatter_metadata(text: &str) -> SkillMetadata {
+    use serde_yaml_ng::Value;
+
+    fn key(name: &str) -> Value {
+        Value::String(name.to_string())
     }
-    lines
-        .take_while(|line| line.trim_end() != "---")
-        .find_map(|line| line.strip_prefix("version:"))
-        .map(|value| value.trim().trim_matches(['"', '\'']).to_string())
-        .filter(|value| !value.is_empty())
+    fn string(value: Option<&Value>) -> Result<Option<String>, ()> {
+        match value {
+            None | Some(Value::Null) => Ok(None),
+            Some(Value::String(value)) if value.trim().is_empty() => Ok(None),
+            Some(Value::String(value)) if !value.chars().any(char::is_control) => {
+                Ok(Some(value.trim().to_string()))
+            }
+            _ => Err(()),
+        }
+    }
+    let incomplete = || SkillMetadata {
+        version: None,
+        updated_at: None,
+        status: SkillMetadataStatus::Incomplete,
+        missing: vec!["metadata.version", "metadata.updatedAt"],
+    };
+    let mut lines = text.lines();
+    if lines.next().map(str::trim_end) != Some("---") {
+        return incomplete();
+    }
+    let mut yaml = String::new();
+    let mut closed = false;
+    for line in lines {
+        if line.trim_end() == "---" {
+            closed = true;
+            break;
+        }
+        yaml.push_str(line);
+        yaml.push('\n');
+    }
+    if !closed {
+        return SkillMetadata::invalid();
+    }
+    let root = match serde_yaml_ng::from_str(&yaml) {
+        Ok(Value::Null) => return incomplete(),
+        Ok(Value::Mapping(root)) => root,
+        _ => return SkillMetadata::invalid(),
+    };
+    let legacy_version = string(root.get(key("version"))).unwrap_or(None);
+    let metadata = match root.get(key("metadata")) {
+        None | Some(Value::Null) => {
+            return SkillMetadata {
+                version: legacy_version,
+                ..incomplete()
+            };
+        }
+        Some(Value::Mapping(metadata)) => metadata,
+        _ => return SkillMetadata::invalid(),
+    };
+    let (version, updated_at) = match (
+        string(metadata.get(key("version"))),
+        string(metadata.get(key("updatedAt"))),
+    ) {
+        (Ok(version), Ok(updated_at)) => (version, updated_at),
+        _ => return SkillMetadata::invalid(),
+    };
+    let mut missing = Vec::new();
+    if version.is_none() {
+        missing.push("metadata.version");
+    }
+    if updated_at.is_none() {
+        missing.push("metadata.updatedAt");
+    }
+    SkillMetadata {
+        version: version.or(legacy_version),
+        updated_at,
+        status: if missing.is_empty() {
+            SkillMetadataStatus::Complete
+        } else {
+            SkillMetadataStatus::Incomplete
+        },
+        missing,
+    }
 }
 
 // Agents
@@ -1529,18 +1715,44 @@ mod tests {
     }
 
     #[test]
-    fn frontmatter_version_is_read_only_from_frontmatter() {
+    fn skill_metadata_reads_nested_yaml_only_from_frontmatter() {
+        let nested = frontmatter_metadata("---\nname: atomic-vault\nmetadata:\n  version: \"1.0.0\"\n  updatedAt: \"2026-10-28T18:18:12Z\"\n---\n");
+        assert_eq!(nested.version.as_deref(), Some("1.0.0"));
+        assert_eq!(nested.updated_at.as_deref(), Some("2026-10-28T18:18:12Z"));
+        assert_eq!(nested.status, SkillMetadataStatus::Complete);
+        assert!(nested.missing.is_empty());
+
+        let flow = frontmatter_metadata(
+            "---\nmetadata: {updatedAt: '2026-10-29', version: '2.1.0'}\n---\n",
+        );
+        assert_eq!(flow.version.as_deref(), Some("2.1.0"));
+        assert_eq!(flow.updated_at.as_deref(), Some("2026-10-29"));
+        assert_eq!(flow.status, SkillMetadataStatus::Complete);
+
+        let partial =
+            frontmatter_metadata("---\nmetadata:\n  updatedAt: '2026-10-29'\n---\nversion: 9\n");
+        assert_eq!(partial.version, None);
+        assert_eq!(partial.missing, ["metadata.version"]);
+        assert_eq!(partial.updated_at.as_deref(), Some("2026-10-29"));
+        let legacy = frontmatter_metadata("---\nversion: '2.0.0'\nother: {version: 'wrong'}\n---\nmetadata:\n  version: 'wrong'\n");
+        assert_eq!(legacy.version.as_deref(), Some("2.0.0"));
+        assert_eq!(legacy.missing, ["metadata.version", "metadata.updatedAt"]);
         assert_eq!(
-            frontmatter_version("---\nversion: 1.2.3\n---\n").as_deref(),
-            Some("1.2.3")
+            frontmatter_metadata("version: 9\n").status,
+            SkillMetadataStatus::Incomplete
         );
         assert_eq!(
-            frontmatter_version("---\nversion: '1.2.3'\n---\n").as_deref(),
-            Some("1.2.3")
+            frontmatter_metadata("---\nmetadata: [broken\n---\n").status,
+            SkillMetadataStatus::Invalid
         );
-        assert_eq!(frontmatter_version("---\nname: x\n---\nversion: 9\n"), None);
-        assert_eq!(frontmatter_version("version: 9\n"), None);
-        assert_eq!(frontmatter_version("---\nversion:\n---\n"), None);
+        assert_eq!(
+            frontmatter_metadata("---\nmetadata:\n  version: x\n").status,
+            SkillMetadataStatus::Invalid
+        );
+        assert_eq!(
+            frontmatter_metadata("---\nmetadata: {version: [1, 2]}\n---\n").status,
+            SkillMetadataStatus::Invalid
+        );
     }
 
     fn settings(path: &str, hooks: HookPresence) -> SettingsProbe {

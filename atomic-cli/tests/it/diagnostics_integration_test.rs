@@ -1,8 +1,9 @@
 //! `atomic diagnostics` end to end: a hermetic home, the real binary.
 #![cfg(not(windows))]
 
+use std::io::Write;
 use std::path::Path;
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 use std::sync::OnceLock;
 
 use serde_json::Value;
@@ -335,6 +336,206 @@ fn malformed_repository_config_never_discloses_values_in_either_renderer() {
         leaks.is_empty(),
         "configuration values leaked into formats: {leaks:?}"
     );
+}
+
+#[test]
+fn installed_skill_metadata_and_missing_fields_are_reported() {
+    let fixture = Fixture::new();
+    fixture.install_integration("claude-code", "1.4.0");
+    let skill = fixture
+        .home
+        .path()
+        .join(".claude/skills/atomic-vault/SKILL.md");
+    std::fs::write(&skill, "---\nname: atomic-vault\nmetadata:\n  version: \"1.0.0\"\n  updatedAt: \"2026-10-28T18:18:12Z\"\n---\nbody\n").unwrap();
+    let report = fixture.json();
+    let installed = find(&report["skills"]["installed"], "name", "atomic-vault");
+    assert_eq!(installed["version"], "1.0.0");
+    assert_eq!(installed["updated_at"], "2026-10-28T18:18:12Z");
+    assert_eq!(installed["metadata_status"], "complete");
+    assert_eq!(installed["missing_metadata"], serde_json::json!([]));
+    let text = fixture.ok(&["diagnostics"]);
+    assert!(text.contains("v1.0.0, updated 2026-10-28T18:18:12Z"));
+
+    std::fs::write(
+        &skill,
+        "---\nname: atomic-vault\nmetadata:\n  version: '1.0.0'\n---\n",
+    )
+    .unwrap();
+    let report = fixture.json();
+    let installed = find(&report["skills"]["installed"], "name", "atomic-vault");
+    assert_eq!(installed["metadata_status"], "incomplete");
+    assert_eq!(
+        installed["missing_metadata"],
+        serde_json::json!(["metadata.updatedAt"])
+    );
+    assert!(fixture
+        .ok(&["diagnostics"])
+        .contains("missing metadata.updatedAt"));
+
+    std::fs::write(&skill, "---\nname: atomic-vault\n---\n").unwrap();
+    let report = fixture.json();
+    let installed = find(&report["skills"]["installed"], "name", "atomic-vault");
+    assert_eq!(installed["metadata_status"], "incomplete");
+    assert_eq!(
+        installed["missing_metadata"],
+        serde_json::json!(["metadata.version", "metadata.updatedAt"])
+    );
+    assert!(fixture
+        .ok(&["diagnostics"])
+        .contains("older or unversioned copy"));
+
+    std::fs::write(&skill, "---\nmetadata: [SYNTHETIC_PRIVATE_DETAIL\n---\n").unwrap();
+    let report = fixture.json();
+    let installed = find(&report["skills"]["installed"], "name", "atomic-vault");
+    assert_eq!(installed["metadata_status"], "invalid");
+    assert!(!report.to_string().contains("SYNTHETIC_PRIVATE_DETAIL"));
+    let text = fixture.ok(&["diagnostics"]);
+    assert!(text.contains("invalid skill metadata"));
+    assert!(!text.contains("SYNTHETIC_PRIVATE_DETAIL"));
+
+    std::fs::remove_file(&skill).unwrap();
+    std::fs::create_dir(&skill).unwrap();
+    let report = fixture.json();
+    let installed = find(&report["skills"]["installed"], "name", "atomic-vault");
+    assert_eq!(installed["metadata_status"], "unavailable");
+    assert!(fixture
+        .ok(&["diagnostics"])
+        .contains("skill metadata unavailable"));
+}
+
+fn hook_event(agent: &str, at: &str, outcome: &str) -> atomic_agent::hook_log::SessionLogEvent {
+    atomic_agent::hook_log::SessionLogEvent {
+        event_id: uuid::Uuid::new_v4().to_string(),
+        session_id: None,
+        parent_session_id: None,
+        agent: agent.to_string(),
+        display_name: agent.to_string(),
+        verb: "session-start".to_string(),
+        outcome: outcome.to_string(),
+        detail: Some("SYNTHETIC_PRIVATE_DETAIL".to_string()),
+        at: at.to_string(),
+    }
+}
+
+#[test]
+fn last_fired_uses_repository_history_and_pending_events() {
+    let fixture = Fixture::new();
+    fixture.ok(&["init", "--view", "main"]);
+    fixture.install_integration("claude-code", "1.4.0");
+    {
+        let store = atomic_repository::redb_change_store::RedbChangeStore::open_existing(
+            fixture.work.path().join(".atomic/atomic.redb"),
+        )
+        .unwrap();
+        store
+            .append_session_log(&hook_event("claude-code", "2026-10-01T12:00:00Z", "ok"))
+            .unwrap();
+        store
+            .append_session_log(&hook_event("other-agent", "2026-12-01T12:00:00Z", "ok"))
+            .unwrap();
+        store
+            .append_session_log(&hook_event(
+                "claude-code",
+                "2026-10-02T12:00:00+03:00",
+                "error",
+            ))
+            .unwrap();
+    }
+    atomic_agent::hook_log::spool(
+        fixture.work.path(),
+        &hook_event("claude-code", "2026-10-02T11:00:00Z", "error"),
+    )
+    .unwrap();
+    let report = fixture.json();
+    let integration = find(&report["integrations"]["packages"], "agent", "claude-code");
+    assert_eq!(integration["last_fired"]["status"], "observed");
+    assert_eq!(integration["last_fired"]["at"], "2026-10-02T11:00:00+00:00");
+    let text = fixture.ok(&["diagnostics"]);
+    assert!(text.contains("Last fired:"));
+    assert!(text.contains("2026-10-02T11:00:00+00:00 (current repository)"));
+    assert!(!text.contains("SYNTHETIC_PRIVATE_DETAIL"));
+    assert!(!report.to_string().contains("SYNTHETIC_PRIVATE_DETAIL"));
+}
+
+#[test]
+fn last_fired_distinguishes_missing_and_unavailable_history() {
+    let fixture = Fixture::new();
+    fixture.install_integration("claude-code", "1.4.0");
+    let report = fixture.json();
+    let integration = find(&report["integrations"]["packages"], "agent", "claude-code");
+    assert_eq!(integration["last_fired"]["status"], "unavailable");
+    fixture.ok(&["init", "--view", "main"]);
+    let report = fixture.json();
+    let integration = find(&report["integrations"]["packages"], "agent", "claude-code");
+    assert_eq!(integration["last_fired"]["status"], "not_observed");
+    let pending = fixture.work.path().join(".atomic/hook-log-pending");
+    std::fs::create_dir_all(&pending).unwrap();
+    std::fs::write(pending.join("bad.json"), "SYNTHETIC_PRIVATE_DETAIL").unwrap();
+    let report = fixture.json();
+    let integration = find(&report["integrations"]["packages"], "agent", "claude-code");
+    assert_eq!(integration["last_fired"]["status"], "unavailable");
+    assert!(!report.to_string().contains("SYNTHETIC_PRIVATE_DETAIL"));
+    let text = fixture.ok(&["diagnostics"]);
+    assert!(text.contains("Last fired:    unknown"));
+    assert!(!text.contains("SYNTHETIC_PRIVATE_DETAIL"));
+}
+
+#[test]
+fn last_fired_is_populated_by_a_real_hook_dispatch() {
+    let fixture = Fixture::new();
+    fixture.ok(&["init", "--view", "main"]);
+    fixture.install_integration("claude-code", "1.4.0");
+    let mut command = Command::new(&fixture.binary);
+    for (name, _) in std::env::vars_os() {
+        if name.to_string_lossy().starts_with("ATOMIC_")
+            || name.to_string_lossy().starts_with("GIT_")
+        {
+            command.env_remove(name);
+        }
+    }
+    let mut hook = command
+        .args([
+            "agent",
+            "hooks",
+            "claude-code",
+            "session-start",
+            "--foreground",
+        ])
+        .current_dir(fixture.work.path())
+        .env("HOME", fixture.home.path())
+        .env("ATOMIC_HOME", fixture.home.path().join(".atomic"))
+        .env("ATOMIC_CONFIG_DIR", fixture.home.path().join(".atomic"))
+        .env("ATOMIC_SERVICE", "local")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    hook.stdin.take().unwrap().write_all(b"{").unwrap();
+    assert!(!hook.wait_with_output().unwrap().status.success());
+    let report = fixture.json();
+    let integration = find(&report["integrations"]["packages"], "agent", "claude-code");
+    assert_eq!(integration["last_fired"]["status"], "observed");
+    chrono::DateTime::parse_from_rfc3339(integration["last_fired"]["at"].as_str().unwrap())
+        .expect("hook dispatch timestamp");
+}
+
+#[test]
+fn last_fired_reports_unknown_when_database_is_in_use() {
+    let fixture = Fixture::new();
+    fixture.ok(&["init", "--view", "main"]);
+    fixture.install_integration("claude-code", "1.4.0");
+    let _held = atomic_repository::redb_change_store::RedbChangeStore::open_existing(
+        fixture.work.path().join(".atomic/atomic.redb"),
+    )
+    .unwrap();
+    let report = fixture.json();
+    let integration = find(&report["integrations"]["packages"], "agent", "claude-code");
+    assert_eq!(integration["last_fired"]["status"], "unavailable");
+    assert!(integration["last_fired"]["reason"]
+        .as_str()
+        .unwrap()
+        .contains("in use"));
 }
 
 #[test]

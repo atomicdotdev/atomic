@@ -7,8 +7,8 @@
 use std::fmt::Write;
 
 use super::collect::{
-    AgentState, Enabled, FileCounts, FileState, GitHooks, IntegrationState, Report, ShimStatus,
-    SkillsPackage, Workspace,
+    AgentState, Enabled, FileCounts, FileState, GitHooks, HookActivity, IntegrationState, Report,
+    ShimStatus, SkillMetadataStatus, SkillsPackage, Workspace,
 };
 
 /// Width of the label column.
@@ -80,6 +80,12 @@ fn render_integrations(o: &mut String, report: &Report) {
                         installed.installed_at, installed.installed_with
                     ),
                 );
+                let last_fired = match &installed.last_fired {
+                    HookActivity::Observed { at } => format!("{at} (current repository)"),
+                    HookActivity::NotObserved => "not observed in this repository".to_string(),
+                    HookActivity::Unavailable { reason } => format!("unknown — {reason}"),
+                };
+                field(o, "  Last fired", &last_fired);
                 field(
                     o,
                     "  Source",
@@ -129,19 +135,37 @@ fn render_skills(o: &mut String, report: &Report) {
         field(o, "Installed", "none recorded in integration receipts");
     }
     for skill in &report.skills.installed {
-        let version = skill
-            .version
-            .as_deref()
-            .map_or_else(|| "no version declared".to_string(), |v| format!("v{v}"));
+        let version = skill.version.as_deref().map_or_else(
+            || match skill.metadata_status {
+                SkillMetadataStatus::Incomplete => "no version declared".to_string(),
+                _ => "version unknown".to_string(),
+            },
+            |v| format!("v{v}"),
+        );
         let state = match skill.state {
             FileState::Present => "",
             FileState::Modified => ", modified since install",
             FileState::Missing => ", missing",
             FileState::Unreadable => ", unreadable",
         };
+        let metadata = match skill.metadata_status {
+            SkillMetadataStatus::Complete => format!(
+                ", updated {}",
+                skill.updated_at.as_deref().unwrap_or("unknown")
+            ),
+            SkillMetadataStatus::Incomplete => format!(
+                ", missing {} (older or unversioned copy)",
+                skill.missing_metadata.join(", ")
+            ),
+            SkillMetadataStatus::Invalid => ", invalid skill metadata".to_string(),
+            SkillMetadataStatus::Unavailable => ", skill metadata unavailable".to_string(),
+        };
         line(
             o,
-            &format!("  {} for {} — {version}{state}", skill.name, skill.agent),
+            &format!(
+                "  {} for {} — {version}{metadata}{state}",
+                skill.name, skill.agent
+            ),
         );
     }
     blank(o);
@@ -257,6 +281,9 @@ mod tests {
                             version: "1.4.0".to_string(),
                             installed_with: "0.19.0".to_string(),
                             installed_at: "2026-10-01T12:00:00+00:00".to_string(),
+                            last_fired: HookActivity::Observed {
+                                at: "2026-10-28T11:00:00+00:00".to_string(),
+                            },
                             source_kind: "registry",
                             source: "https://example.atomic.storage/pkg".to_string(),
                             files: FileCounts {
@@ -289,6 +316,9 @@ mod tests {
                     path: "~/.claude/skills/atomic-vault/SKILL.md".to_string(),
                     state: FileState::Modified,
                     version: None,
+                    updated_at: None,
+                    metadata_status: SkillMetadataStatus::Incomplete,
+                    missing_metadata: vec!["metadata.version", "metadata.updatedAt"],
                 }],
             },
             agents: vec![
@@ -344,13 +374,14 @@ Agent integrations (installed packages)
   Claude Code (claude-code)
     Version:       1.4.0
     Installed:     2026-10-01T12:00:00+00:00 with atomic 0.19.0
+    Last fired:    2026-10-28T11:00:00+00:00 (current repository)
     Source:        https://example.atomic.storage/pkg (registry)
     Files:         3 recorded, 2 unchanged, 1 missing
   Not installed:   cline, codex
 
 Skills
   Skills package:  unknown — no synced atomic-skills package
-  atomic-vault for claude-code — no version declared, modified since install
+  atomic-vault for claude-code — no version declared, missing metadata.version, metadata.updatedAt (older or unversioned copy), modified since install
 
 Enabled agents (Atomic hooks active)
   Claude Code (claude-code): yes

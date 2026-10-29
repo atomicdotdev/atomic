@@ -20,8 +20,8 @@ invocation appends to.
 |---|---|
 | Atomic version, install source, platform | The running binary (`atomic --version`); install source uses the same detection as `atomic update` |
 | Workspace | The same upward search other commands use |
-| Agent integrations (installed packages) | Install receipts in `~/.atomic/integrations/<agent>/receipt.json`: package version, the Atomic version that installed it, install time, source, and whether each recorded file is unchanged, modified, or missing |
-| Skills | The `atomic-skills` package manifest cached by the last `atomic agent enable`, plus each skill file listed in an integration receipt with its own `version:` frontmatter |
+| Agent integrations (installed packages) | Install receipts in `~/.atomic/integrations/<agent>/receipt.json`, plus last recorded hook dispatch from the current repository's hook log |
+| Skills | The cached `atomic-skills` package manifest and each installed skill's `metadata.version` and `metadata.updatedAt` frontmatter |
 | Enabled agents | Whether supported settings contain recognizable active Atomic hooks, with the evidence and inspection limitations |
 | Git shim | `[git.shim] enabled` in `.atomic/config.toml`, plus the state of each Atomic hook dispatcher (as `atomic git hooks status` reports them) |
 
@@ -42,6 +42,13 @@ or `unknown`:
 These are observations of supported local configuration, not a guarantee that
 an agent actually runs a hook. See the inspection limits below.
 
+The last-fired time includes successful and failed dispatches recorded in the
+current repository, including pending events for this working copy. Repositories
+and their linked working copies share committed history; other repositories are
+not searched. An absent observation does not prove the hook never ran.
+If another process holds the repository database for writing, the timestamp is
+reported as unknown rather than opening or modifying the database.
+
 ## Privacy
 
 The report contains versions, timestamps, paths, integration sources, and
@@ -61,8 +68,11 @@ information, and arbitrary non-URL source strings are not credential scrubbed.
 - **Agent application versions** (for example, the Claude Code version) are not
   collected. Atomic has no record of them, and detecting them would mean running
   third-party programs. The report says so explicitly.
-- **Skill versions** come from a skill file's `version:` frontmatter when it has
-  one. The skills package version comes from the local cache. That cache is
+- **Skill metadata** comes from each installed skill file's YAML frontmatter:
+  `metadata.version` and `metadata.updatedAt`. Missing fields are flagged as a
+  possible older or unversioned copy; unreadable or invalid files are reported
+  separately. A legacy top-level `version` remains visible but does not satisfy
+  the nested metadata requirement. The skills package version comes from the local cache. That cache is
   refreshed on every `atomic agent enable`, so it shows the most recent sync.
   An install that used `--from-skills` leaves no cache.
 - **Flat-layout skills** (`<name>.md`, as used for Cline and agy) are recognised
