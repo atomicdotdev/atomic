@@ -112,6 +112,92 @@ fn intent_list_json_carries_attestation_columns_over_the_wire() {
 }
 
 #[test]
+fn intent_human_key_sort_is_natural_in_service_output() {
+    let repo = TempDir::new().unwrap();
+    let home = TempDir::new().unwrap();
+    let run_isolated = |args: &[&str]| {
+        let mut command = Command::new(ATOMIC_BIN);
+        for (key, _) in std::env::vars_os() {
+            let name = key.to_string_lossy();
+            if name.starts_with("ATOMIC_") || name.starts_with("OPENCODE_") {
+                command.env_remove(key);
+            }
+        }
+        let output = command
+            .args(args)
+            .current_dir(repo.path())
+            .env("HOME", home.path())
+            .env("ATOMIC_CONFIG_DIR", home.path().join(".atomic"))
+            .env("ATOMIC_SERVICE", "local")
+            .output()
+            .expect("run isolated atomic");
+        assert!(
+            output.status.success(),
+            "{args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap()
+    };
+
+    run_isolated(&["init", "--vault"]);
+    let ids: Vec<_> = (1..=11)
+        .map(|n| {
+            let output = run_isolated(&["intent", "new", &format!("Intent {n}")]);
+            output
+                .lines()
+                .find_map(|line| line.strip_prefix("Created intent: "))
+                .unwrap()
+                .to_owned()
+        })
+        .collect();
+    let help = run_isolated(&["intent", "list", "--help"]);
+    assert!(help.contains("human-key"), "{help}");
+    for (spelling, reverse, json) in [
+        ("human-key", false, true),
+        ("humanKey", true, true),
+        ("human-key", false, false),
+        ("humanKey", true, false),
+    ] {
+        let mut args = vec!["intent", "list", "--sort", spelling];
+        if reverse {
+            args.push("--reverse");
+        }
+        if json {
+            args.push("--json");
+        }
+        let output = run_isolated(&args);
+        let actual: Vec<String> = if json {
+            serde_json::from_str::<Vec<serde_json::Value>>(&output)
+                .unwrap()
+                .iter()
+                .map(|row| row["id"].as_str().unwrap().to_owned())
+                .collect()
+        } else {
+            output
+                .lines()
+                .skip(1)
+                .filter_map(|line| line.split_whitespace().next())
+                .map(str::to_owned)
+                .collect()
+        };
+        let mut expected = ids.clone();
+        if reverse {
+            expected.reverse();
+        }
+        assert_eq!(actual, expected, "{args:?}");
+    }
+    let lexical = run_isolated(&["intent", "list", "--sort", "id", "--json"]);
+    let actual: Vec<_> = serde_json::from_str::<Vec<serde_json::Value>>(&lexical)
+        .unwrap()
+        .iter()
+        .map(|row| row["id"].as_str().unwrap().to_owned())
+        .collect();
+    let mut expected = ids;
+    expected.sort();
+    assert_eq!(actual, expected);
+}
+
+#[test]
 fn memory_new_json_outputs_only_the_created_memory_object() {
     let (repo, home) = fixture("memory-new-json");
     let (repo_dir, home_dir) = (repo.path(), home.path());
