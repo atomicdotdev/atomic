@@ -472,6 +472,7 @@ dependencies = [
  "reflink-copy",
  "regex",
  "reqwest",
+ "rustix",
  "serde",
  "serde_json",
  "sha1",

@@ -109,6 +109,14 @@ fn decode_working_copy_row(
 }
 
 impl ReadTxn {
+    /// Adapt an existing redb read snapshot to Atomic's validated typed readers.
+    ///
+    /// Physical maintenance uses this while it owns the exclusive database
+    /// handle, without opening/migrating/recovering a second Repository.
+    pub fn from_redb(txn: ReadTransaction) -> Self {
+        Self::new(txn)
+    }
+
     /// Create a new read transaction
     pub(crate) fn new(txn: ReadTransaction) -> Self {
         Self {

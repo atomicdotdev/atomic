@@ -133,35 +133,81 @@ the copied tables, and archives the old files under `.atomic/legacy/<timestamp>/
 If you already replaced the binary, the process-stop and socket-cleanup steps
 still apply; the new CLI no longer has the old `database-owner shutdown` command.
 
-### Reclaiming unused database space
+### Reclaiming database and recovery space
 
 Run explicit maintenance when the repository is quiet:
 
 ```bash
 atomic compact
-atomic compact --repository /path/to/repo --json
+atomic compact --repository /path/to/repo --full --dry-run --json
+# Review the per-path decisions, then explicitly expire deleted-view artifacts:
+atomic compact --repository /path/to/repo --full --json
+# Retain the old database-pages-only behavior:
+atomic compact --repository /path/to/repo --database-only
 ```
 
-The command compacts the existing `.atomic/atomic.redb` and reports its
-before/after sizes and reclaimed bytes. It preserves history, views,
-provenance, change files and unrecorded working files. It does not delete
-live data or deduplicate change objects; zero bytes reclaimed is a valid result.
+Ordinary CLI compaction now combines redb page compaction with journal-aware
+cleanup of disposable operation-recovery data. It can remove non-head backups
+for verified operations and failed operations with a verified inverse recovery.
+It preserves **all current operation heads**, incomplete-operation dependencies,
+and effect-bearing metadata backups needed by undo. Ambiguous/divergent heads,
+malformed journals or inconsistent working-copy registrations refuse cleanup;
+unknown operation/working-copy directories are retained. No operation, receipt,
+view, provenance, source-history change object or active working file is deleted.
+
+**`--full` additionally expires journal-known shelves for deleted views.** These
+may contain ignored **or uncommitted** files, not only rebuildable `node_modules`
+and `target` caches. Use a verified backup if you might want them back. Live-view
+shelves (including a parent directory containing a live nested view), head/undo
+dependencies and unknown or legacy shelf layouts are kept. This option does not
+expire graph/journal history or purge `.atomic/changes`; deleting the last view
+reference is not proof that every historical source object is disposable.
+
+**`--dry-run` uses a read-only database handle**, inventories decisions and does
+not compact the database, remove candidates or write logical records. Ordinary
+lock-file bookkeeping may occur. **`--database-only`** skips filesystem inventory
+and cleanup, retaining physical-page-only semantics; it cannot be combined with
+`--full` or `--dry-run`.
+
+Reports separate database `before_bytes`, `after_bytes`, `reclaimed_bytes` from
+filesystem `cleanup_candidate_bytes`, `cleanup_removed_bytes`, and the per-path
+`cleanup_items` list (`eligible`, `removed`, `reason`). Filesystem byte counts are
+logical file/link lengths, **not unique allocated disk blocks**. Unsafe/unrecognized
+roots can report zero when they were deliberately not inventoried. APFS/reflink
+archives, hard links and filesystem snapshots can retain blocks after deletion;
+moving an archive elsewhere on the same disk does not necessarily free space.
+Zero reclaimed bytes is a valid result.
 
 Compaction runs through libatomic, in-process by default. With
 `ATOMIC_SERVICE=reactor`, it uses the same handler through the configured
-Reactor service; that service must advertise `CompactDatabase`. An older or
-unavailable service produces an error, with no local fallback.
+Reactor service. Cleanup modes require its advertised `compact_cleanup_v1`
+feature, negotiated **before** sending the request so an old server cannot
+silently ignore dry-run/full flags and perform a write. Older clients retain
+their original database-only request semantics. An older or unavailable service
+produces an error, with no local fallback; `--database-only` may be used with a
+service that supports the original `CompactDatabase` operation.
 
-Other database readers and writers must release their handles. Lock waiting
+Apply takes the common `bridge.lock` before the exclusive database handle;
+Unix deletion is descriptor-relative and never follows symlink parents or roots.
+Nested symlinks are unlinked, not traversed. The complete inventory is validated
+before deleting candidates. Other database readers and writers must release their handles. Lock waiting
 uses `ATOMIC_DB_LOCK_WAIT_MS` (30 seconds by default); a busy database produces
 an error that can be retried. Once blocking maintenance starts, it finishes
 independently of the caller, including the bounded lock wait. Use a quiet period:
 other commands may time out while the database is being compacted. Persistent
-savepoints block compaction and are never deleted automatically.
+savepoints block compaction and are never deleted automatically. Source graph and
+journal records are not rewritten. Filesystem cleanup is repeatable, not an
+all-or-nothing transaction: an I/O failure can leave a subset removed; retry
+re-evaluates the remaining data. Filesystem application currently supports Unix;
+other platforms retain those candidates while still supporting database compaction.
 
 This is manual maintenance of an existing combined database, with no implicit
 initialization or migration. Hosted Storage's open-handle cache requires separate
-maintenance coordination before online compaction can be supported.
+maintenance coordination before online compaction can be supported. Common
+per-working-copy recovery/shelf directories are inspected across the registered
+repository; worktree-local staging is inspected only for the canonical worktree
+and the explicitly addressed local worktree, with its location identity checked.
+Other linked worktree paths are not guessed or scanned.
 
 ### Provenance Graphs
 

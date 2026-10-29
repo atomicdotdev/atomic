@@ -74,7 +74,8 @@ that would incorrectly exclude the serving local atomicd.
 
 `MaintenanceService.CompactDatabase` is an explicit exception to logical-mutation
 replay/publication semantics. It changes the physical page layout of an existing
-database without changing its logical records. redb performs its own internal
+database and, when explicitly requested by the negotiated cleanup mode, disposes
+of journal-proven recovery artifacts without changing logical records. redb performs its own internal
 transactions; there is no Atomic replay receipt written into the database.
 `RequestMeta.request_id` correlates an attempt and is echoed, with `replayed=false`.
 A repeated request may run again and report different byte counts, including zero
@@ -95,6 +96,55 @@ finishes independently of the RPC caller, including its bounded file-lock wait.
 Persistent savepoints are preserved and reported as a precondition failure.
 Successful byte counts are sampled before compaction and after closing redb;
 other processes should remain idle until the command returns.
+
+### Journal-aware cleanup (`compact_cleanup_v1`)
+
+The additive request fields `cleanup`, `dry_run`, and `full` are feature-gated.
+Old clients omit them and retain physical-only semantics. The CLI negotiates
+`GetCapabilities.features` before using cleanup; an old peer must be refused
+before dispatch, never allowed to ignore a preview flag and execute compaction.
+`dry_run` and `full` require `cleanup=true`. Administrative caller restrictions
+are unchanged, including on preview requests.
+
+Cleanup acquires the repository's common `bridge.lock` before opening redb, holds
+it through planning/application/database close, and uses the strict typed journal,
+receipt, view and working-copy readers without recovery or schema migration.
+Preview opens redb **read-only**: merely opening/closing a writable handle can
+change allocator/header bytes even without invoking `compact`. Apply owns the
+exclusive database handle. The source graph, immutable operations, receipts,
+change objects, logical heads and provenance/session records are never rewritten.
+
+Eligible normal candidates are non-head terminal-operation backup directories:
+verified operations, or failed operations whose same-working-copy verified
+`Recover` child selects the original before-state. Protect every scope's head,
+incomplete operations and their referenced originals, plus effect-bearing
+metadata backups which undo replays from retained original bytes. Divergent or
+unverified heads, malformed canonical records or inconsistent registrations fail
+closed before deletion. Unknown directories/owners/operations are retained.
+
+`full=true` additionally authorizes irreversible expiration of ignored/uncommitted
+artifacts shelved for journal-known deleted views, not source-history expiration.
+Keep live views, directories containing nested live views, head/undo/pending
+references and unknown/legacy shelf layouts. A deleted view name is not by itself
+a safe garbage-collection root for source change objects; this implementation
+retains the entire `.atomic/changes` store rather than inventing incomplete graph,
+journal, session, vault or Git-binding reachability rules.
+
+Only the canonical worktree and the addressed local worktree's local staging
+roots are inspected; other worktree locations are not inferred from an ID.
+Location fingerprints must match registration before local staging is disposable.
+All candidates are inventoried/revalidated under the same guard. Unix deletion
+uses no-follow descriptor-relative traversal/unlink, including when an ancestor
+is replaced after preflight. Other platforms retain filesystem candidates.
+
+`cleanup_items` explains each kept/candidate/removed path; filesystem candidate
+and removed bytes are separate from database byte counts. These are logical
+file/link lengths, not actual physical free space (APFS clones, hard links and
+snapshots may retain blocks). Repeated cleanup is safe, but a filesystem I/O
+failure or process termination can leave a subset of independently disposable
+roots removed. Retry plans the remainder; no durable logical mutation or replay
+receipt is claimed. Persistent-savepoint/compaction preconditions are checked by
+compacting before filesystem deletion, never by dropping the savepoints.
 
 ## Repository and workspace routing
 

@@ -30,6 +30,20 @@ pub struct RepositoryCommonLockGuard {
     reentrant: bool,
 }
 
+/// Common operation exclusion for physical maintenance without a Pristine handle.
+/// Keeping this separate lets maintenance close and compact redb under the same
+/// outer lock rather than keeping a database handle alive through the guard.
+pub struct RepositoryMaintenanceLockGuard {
+    _common_lock: AdvisoryFileLock,
+    dot_dir: PathBuf,
+}
+
+impl RepositoryMaintenanceLockGuard {
+    pub(super) fn dot_dir(&self) -> &Path {
+        &self.dot_dir
+    }
+}
+
 /// A repository operation lock scoped to one persistent working copy.
 ///
 /// The embedded common guard keeps the repository-common lock alive until this
@@ -135,6 +149,35 @@ enum FinalResource {
 }
 
 impl Repository {
+    /// Enter repository-wide physical maintenance before opening the database.
+    /// Does not initialize a repository, migrate its schema or recover operations.
+    pub fn try_lock_maintenance(
+        dot_dir: &Path,
+    ) -> Result<RepositoryMaintenanceLockGuard, RepositoryError> {
+        let dot_dir = dot_dir.canonicalize()?;
+        let database = std::fs::symlink_metadata(dot_dir.join(super::DATABASE_FILE))?;
+        if !database.is_file() || database.file_type().is_symlink() {
+            return Err(RepositoryError::InvalidOperation {
+                message: "maintenance requires an existing regular atomic.redb".to_string(),
+            });
+        }
+        let path = common_operation_lock_path(&dot_dir);
+        match std::fs::symlink_metadata(&path) {
+            Ok(meta) if !meta.is_file() || meta.file_type().is_symlink() => {
+                return Err(RepositoryError::InvalidOperation {
+                    message: "maintenance refuses a non-regular bridge.lock".to_string(),
+                });
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        Ok(RepositoryMaintenanceLockGuard {
+            _common_lock: try_lock_file(&path, RepositoryLockKind::Common, false)?,
+            dot_dir,
+        })
+    }
+
     pub(super) fn common_operation_lock_path(&self) -> PathBuf {
         common_operation_lock_path(&self.dot_dir)
     }

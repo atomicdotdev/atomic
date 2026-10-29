@@ -11,7 +11,8 @@ import "atomic/services/maintenance/maintenance_messages.proto";
 
 service MaintenanceService {
   // Explicit physical maintenance of an existing atomic.redb. Busy handles
-  // cause bounded waiting, then UNAVAILABLE. Not logical garbage collection.
+  // cause bounded waiting, then UNAVAILABLE. Optional negotiated filesystem
+  // cleanup does not expire logical graph/journal/change history.
   rpc CompactDatabase(CompactDatabaseRequest) returns (CompactDatabaseResponse) {
     option (atomic.execution_scope) = EXECUTION_SCOPE_LOCAL;
     option (atomic.required_capability) = "maintenance.admin";

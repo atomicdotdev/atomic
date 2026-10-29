@@ -17,6 +17,22 @@ message CompactDatabaseRequest {
   // Correlates this physical maintenance attempt. Unlike logical mutations,
   // compaction is repeatable, without a durable replay receipt (CONTRACT.md).
   RequestMeta meta = 2;
+  // Preview only: no cleanup, database compaction or logical record writes.
+  // Negotiate compact_cleanup_v1 before sending these additive mode fields.
+  bool dry_run = 3;
+  // Old clients omit this and retain physical-database-only semantics.
+  bool cleanup = 4;
+  // Explicitly expire ignored/uncommitted artifacts shelved for deleted views.
+  // Live shelves and unresolved/undo-dependent state are never removed.
+  bool full = 5;
+}
+message CompactCleanupItem {
+  string path = 1;
+  string kind = 2;
+  uint64 bytes = 3; // logical file/link lengths; 0 for un-inventoried unsafe roots
+  bool eligible = 4;
+  bool removed = 5;
+  string reason = 6;
 }
 message CompactDatabaseResponse {
   // Canonical physical path, available only to local administrative callers.
@@ -24,6 +40,12 @@ message CompactDatabaseResponse {
   uint64 before_bytes = 2;
   uint64 after_bytes = 3;
   uint64 reclaimed_bytes = 4;
+  repeated CompactCleanupItem cleanup_items = 5;
+  uint64 cleanup_candidate_bytes = 6;
+  uint64 cleanup_removed_bytes = 7;
+  bool dry_run = 8;
+  bool cleanup = 9;
+  bool full = 10;
   ResponseMeta meta = 100;
 }
 

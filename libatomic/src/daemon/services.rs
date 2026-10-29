@@ -203,7 +203,10 @@ impl daemon_service_server::DaemonService for DaemonImpl {
             implementation_version: env!("CARGO_PKG_VERSION").to_string(),
             endpoint_kind: EndpointKind::LocalDaemon as i32,
             methods,
-            features: vec!["full-turn-slice".to_string()],
+            features: vec![
+                "full-turn-slice".to_string(),
+                "compact_cleanup_v1".to_string(),
+            ],
             limits: Some(Limits {
                 max_message_bytes: 64 * 1024 * 1024,
                 max_frozen_page_fragments: 256,

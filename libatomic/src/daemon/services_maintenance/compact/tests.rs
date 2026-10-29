@@ -10,6 +10,7 @@ fn request(handle: &crate::daemon::state::RepoHandle) -> Request<CompactDatabase
             request_id: uuid::Uuid::new_v4().to_string(),
             observed_at: None,
         }),
+        ..Default::default()
     })
 }
 
@@ -197,6 +198,89 @@ async fn capability_advertises_local_administrative_write() {
     assert_eq!(method.required_capabilities, ["maintenance.admin"]);
     assert_eq!(method.allowed_callers, [CallerClass::Local as i32]);
     assert_eq!(method.effects, [RpcEffect::RepositoryWrite as i32]);
+    assert!(capabilities
+        .features
+        .iter()
+        .any(|feature| feature == "compact_cleanup_v1"));
+}
+
+#[tokio::test]
+async fn cleanup_preview_preserves_database_and_unknown_recovery_bytes() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = Repository::init(dir.path()).unwrap();
+    let wc = repo.require_working_copy_id().unwrap();
+    let root = dir.path().join(".atomic");
+    let unknown = root
+        .join("working-copies")
+        .join(wc.to_string())
+        .join("operation-recovery")
+        .join(atomic_core::OperationId::from_bytes([77; 32]).to_string());
+    std::fs::create_dir_all(&unknown).unwrap();
+    std::fs::write(unknown.join("precious"), b"unclassified bytes").unwrap();
+    drop(repo);
+    let before = std::fs::read(root.join("atomic.redb")).unwrap();
+    let state = Arc::new(DaemonState::new());
+    let handle = state.register(dir.path().to_path_buf());
+    let mut call = request(&handle);
+    call.get_mut().cleanup = true;
+    call.get_mut().full = true;
+    call.get_mut().dry_run = true;
+    let response = compact(&state, call, Duration::from_secs(2)).await.unwrap();
+    assert!(response.dry_run && response.cleanup && response.full);
+    assert_eq!(response.reclaimed_bytes, 0);
+    assert_eq!(response.cleanup_removed_bytes, 0);
+    assert_eq!(
+        blake3::hash(&std::fs::read(root.join("atomic.redb")).unwrap()),
+        blake3::hash(&before)
+    );
+    assert_eq!(
+        std::fs::read(unknown.join("precious")).unwrap(),
+        b"unclassified bytes"
+    );
+    assert!(
+        response
+            .cleanup_items
+            .iter()
+            .any(
+                |item| Path::new(&item.path) == unknown.canonicalize().unwrap()
+                    && !item.eligible
+                    && item.reason.contains("unknown operation")
+            ),
+        "{:?}",
+        response.cleanup_items
+    );
+}
+
+#[tokio::test]
+async fn unsupported_mode_combinations_are_refused_with_request_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = Arc::new(DaemonState::new());
+    let handle = state.register(dir.path().to_path_buf());
+    let mut call = request(&handle);
+    let id = call.get_ref().meta.as_ref().unwrap().request_id.clone();
+    call.get_mut().dry_run = true; // cleanup=false is intentionally invalid.
+    let error = compact(&state, call, Duration::ZERO).await.unwrap_err();
+    assert_eq!(error.code(), tonic::Code::InvalidArgument);
+    assert_eq!(
+        ErrorInfo::decode(error.details()).unwrap().request_id,
+        Some(id)
+    );
+    assert!(!dir.path().join(".atomic").exists());
+}
+
+#[test]
+fn common_operation_lock_is_required_before_compaction() {
+    let dir = tempfile::tempdir().unwrap();
+    drop(Repository::init(dir.path()).unwrap());
+    let dot_dir = dir.path().join(".atomic");
+    let guard = Repository::try_lock_maintenance(&dot_dir).unwrap();
+    let error = compact_file(&dot_dir.join("atomic.redb")).unwrap_err();
+    assert!(error
+        .downcast_ref::<atomic_repository::RepositoryError>()
+        .unwrap()
+        .is_lock_contended());
+    drop(guard);
+    compact_file(&dot_dir.join("atomic.redb")).unwrap();
 }
 
 #[test]

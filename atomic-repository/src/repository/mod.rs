@@ -104,6 +104,7 @@ pub use git_stream::{
 };
 mod ignore_mirror;
 mod locks;
+pub mod maintenance;
 mod materialize;
 pub use materialize::{ViewEntry, ViewEntryKind, ViewSnapshot};
 mod migration;
@@ -181,7 +182,7 @@ pub use ignore_mirror::{
     check_ignore_policy, mirror_ignores, IgnoreMirrorError, IgnorePolicyReport,
     MANAGED_BLOCK_BEGIN, MANAGED_BLOCK_END,
 };
-pub use locks::RepositoryCommonLockGuard;
+pub use locks::{RepositoryCommonLockGuard, RepositoryMaintenanceLockGuard};
 pub use operation::{
     OperationDetails, OperationHeadState, OperationLog, OperationLogEntry,
     OperationVerificationState, PreparedRemoteOperation, PreparedShimGitWrite,

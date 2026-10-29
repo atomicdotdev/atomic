@@ -38,6 +38,7 @@ impl Service {
                             "the running Reactor does not support database compaction; update/restart it and retry",
                         ));
                     }
+                    require_cleanup_capability(request.get_ref(), &capabilities.features)?;
                     pb::maintenance_service_client::MaintenanceServiceClient::new(channel)
                         .compact_database(request)
                         .await
@@ -45,5 +46,48 @@ impl Service {
                 }
             }
         })
+    }
+}
+
+fn require_cleanup_capability(
+    request: &pb::CompactDatabaseRequest,
+    features: &[String],
+) -> Result<(), Status> {
+    if request.cleanup
+        && !features
+            .iter()
+            .any(|feature| feature == "compact_cleanup_v1")
+    {
+        return Err(Status::failed_precondition(
+            "the running Reactor lacks journal-aware compaction; update/restart it or use --database-only (dry-run/full must not be ignored)",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn old_peer_cannot_silently_turn_preview_or_full_into_an_ordinary_write() {
+        for (dry_run, full) in [(true, false), (true, true), (false, true), (false, false)] {
+            let request = pb::CompactDatabaseRequest {
+                cleanup: true,
+                dry_run,
+                full,
+                ..Default::default()
+            };
+            assert_eq!(
+                require_cleanup_capability(&request, &[])
+                    .unwrap_err()
+                    .code(),
+                tonic::Code::FailedPrecondition
+            );
+            assert!(
+                require_cleanup_capability(&request, &["compact_cleanup_v1".to_string()]).is_ok()
+            );
+        }
+        assert!(require_cleanup_capability(&Default::default(), &[]).is_ok());
     }
 }

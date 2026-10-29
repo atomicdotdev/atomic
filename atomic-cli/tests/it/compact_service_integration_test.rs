@@ -139,6 +139,126 @@ fn busy_database_reports_actionable_error_and_can_retry() {
 }
 
 #[test]
+#[cfg(unix)]
+fn preview_and_full_cleanup_are_explicit_and_preserve_live_data() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("repo");
+    let mut repo = Repository::init(&root).unwrap();
+    let wc = repo.require_working_copy_id().unwrap();
+    let original_view = repo.current_view().to_owned();
+    repo.create_view("discarded").unwrap();
+    repo.switch_view(wc, "discarded").unwrap();
+    let old = repo
+        .operation_log(
+            atomic_core::operation::OperationScope::WorkingCopy(wc),
+            None,
+            false,
+        )
+        .unwrap()
+        .entries
+        .into_iter()
+        .find(|entry| entry.is_head)
+        .unwrap()
+        .operation
+        .id();
+    repo.switch_view(wc, &original_view).unwrap();
+    repo.delete_view("discarded").unwrap();
+    let metadata = root.join(".atomic");
+    let wc_dir = metadata.join("working-copies").join(wc.to_string());
+    let discarded = wc_dir.join("workspaces/discarded");
+    let live = wc_dir.join("workspaces").join(&original_view);
+    std::fs::create_dir_all(&discarded).unwrap();
+    std::fs::create_dir_all(&live).unwrap();
+    std::fs::write(discarded.join("ignored.txt"), "expired ignored artifact").unwrap();
+    std::fs::write(live.join("ignored.txt"), "live ignored artifact").unwrap();
+    let recovery = wc_dir.join("operation-recovery").join(old.to_string());
+    assert!(recovery.exists());
+    drop(repo);
+    let before = blake3::hash(&std::fs::read(metadata.join("atomic.redb")).unwrap());
+    let preview = report(
+        command(&root)
+            .args(["--full", "--dry-run"])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(preview["dry_run"], true);
+    assert!(preview["cleanup_candidate_bytes"].as_u64().unwrap() > 0);
+    assert_eq!(preview["cleanup_removed_bytes"], 0);
+    assert_eq!(
+        blake3::hash(&std::fs::read(metadata.join("atomic.redb")).unwrap()),
+        before
+    );
+    assert!(discarded.exists() && recovery.exists());
+
+    let physical_only = report(command(&root).arg("--database-only").output().unwrap());
+    assert_eq!(physical_only["cleanup"], false);
+    assert!(discarded.exists() && recovery.exists());
+    let safe = report(command(&root).output().unwrap());
+    assert_eq!(safe["cleanup"], true);
+    assert!(
+        !recovery.exists(),
+        "older terminal recovery data should be reclaimed"
+    );
+    assert!(
+        discarded.exists(),
+        "ordinary compact must not expire a deleted-view shelf"
+    );
+    let full = report(command(&root).arg("--full").output().unwrap());
+    assert!(full["cleanup_removed_bytes"].as_u64().unwrap() >= 24);
+    assert!(!discarded.exists());
+    assert_eq!(
+        std::fs::read_to_string(live.join("ignored.txt")).unwrap(),
+        "live ignored artifact"
+    );
+    let repeated = report(command(&root).arg("--full").output().unwrap());
+    assert_eq!(repeated["cleanup_removed_bytes"], 0);
+    assert!(!command(&root)
+        .args(["--database-only", "--dry-run"])
+        .output()
+        .unwrap()
+        .status
+        .success());
+}
+
+#[test]
+fn cleanup_keeps_current_undo_and_historical_tracked_restore_working() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("repo");
+    let mut repo = Repository::init(&root).unwrap();
+    let wc = repo.require_working_copy_id().unwrap();
+    std::fs::write(root.join("file.txt"), "recorded fixture\n").unwrap();
+    repo.add(wc, "file.txt", Default::default()).unwrap();
+    repo.record_all(wc, "fixture baseline").unwrap();
+    let original = repo.current_view().to_owned();
+    repo.create_view("other").unwrap();
+    repo.switch_view(wc, "other").unwrap();
+    let selected = repo
+        .operation_log(
+            atomic_core::operation::OperationScope::WorkingCopy(wc),
+            None,
+            false,
+        )
+        .unwrap()
+        .entries
+        .into_iter()
+        .find(|entry| entry.is_head)
+        .unwrap()
+        .operation
+        .id();
+    repo.switch_view(wc, &original).unwrap();
+    drop(repo);
+    report(command(&root).output().unwrap());
+    let mut repo = Repository::open_existing(&root).unwrap();
+    repo.undo_operation(wc, None).unwrap();
+    assert_eq!(repo.current_view(), "other");
+    repo.restore_operation(wc, selected).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(root.join("file.txt")).unwrap(),
+        "recorded fixture\n"
+    );
+}
+
+#[test]
 fn missing_repository_is_not_created() {
     let dir = tempfile::tempdir().unwrap();
     assert!(!command(dir.path()).output().unwrap().status.success());
