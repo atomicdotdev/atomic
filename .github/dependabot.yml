@@ -1,0 +1,13 @@
+version: 2
+updates:
+  # The JSON admission crate the canonical layer pins, and the DSSE crate the
+  # optional provenance export uses. Each new release arrives as a pull request
+  # that runs the canonical tests and the conformance replay before it lands.
+  - package-ecosystem: cargo
+    directory: /
+    target-branch: dev
+    schedule:
+      interval: weekly
+    allow:
+      - dependency-name: jcs-admit
+      - dependency-name: dsse
