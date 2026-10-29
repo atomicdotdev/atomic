@@ -217,3 +217,14 @@ objects produce unresolved-reference findings rather than fabricated targets. Ol
 signed snapshots do not resurrect declarations removed from the current source.
 
 Automatic hook retry/intent capture is separate from this explicit repair path.
+
+## Optional retained-evidence replay
+
+Reviewers can supplement `atomic intent validate ID` with bounded claims over
+pinned artifacts using `--replay-evidence MANIFEST --evidence-checker PROGRAM`.
+`--json --evidence-context` supplies native intent/substance/source and view-chain
+pins for the manifest. The checker is optional trusted local code; replay never
+changes acceptance status or the ordinary authoring gate. Missing, stale,
+contradictory, unsupported, and failed-checker evidence cannot pass. A supported
+claim only establishes its declared scope, not arbitrary task correctness.
+See the [runnable example and protocol](examples/evidence-replay/README.md).

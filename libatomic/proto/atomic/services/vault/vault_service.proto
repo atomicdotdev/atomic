@@ -110,6 +110,15 @@ service VaultService {
     option (atomic.allowed_caller) = CALLER_CLASS_SANDBOX;
     option (atomic.effect) = RPC_EFFECT_REPOSITORY_READ;
   }
+  // `atomic intent validate --replay-evidence ...` — optional bounded evidence
+  // replay with native intent/view pins. The checker executes on the service
+  // host with the caller's privileges; only local callers are admitted.
+  rpc ReplayVaultEvidence(ReplayVaultEvidenceRequest) returns (ReplayVaultEvidenceResponse) {
+    option (atomic.execution_scope) = EXECUTION_SCOPE_BOTH;
+    option (atomic.required_capability) = "vault.read";
+    option (atomic.allowed_caller) = CALLER_CLASS_LOCAL;
+    option (atomic.effect) = RPC_EFFECT_REPOSITORY_READ;
+  }
   // `atomic intent link` — link entities (e.g. intent ↔ intent provenance).
   rpc LinkVaultEntities(LinkVaultEntitiesRequest) returns (LinkVaultEntitiesResponse) {
     option (atomic.execution_scope) = EXECUTION_SCOPE_BOTH;

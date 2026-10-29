@@ -1,13 +1,14 @@
 //! `atomic intent validate <ID|path>` — gate an intent against the canonical
 //! shapes.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use clap::Parser;
 
 use atomic_canonical::lift::{lift_intent, parse_markdown};
 use atomic_canonical::{validate_intent, ValidationReport, Violation};
 use atomic_core::types::{Base32, Hash};
+use atomic_repository::intent_evidence;
 use atomic_repository::Repository;
 
 use crate::commands::intent::bridge;
@@ -25,6 +26,18 @@ pub struct IntentValidate {
     /// Output the validation report as JSON.
     #[arg(long)]
     pub json: bool,
+
+    /// Replay bounded evidence claims from a locally supplied manifest.
+    #[arg(long, requires = "evidence_checker")]
+    pub replay_evidence: Option<PathBuf>,
+
+    /// Trusted local checker executable (no shell; never loaded from the manifest).
+    #[arg(long, requires = "replay_evidence")]
+    pub evidence_checker: Option<PathBuf>,
+
+    /// Include native intent substance and view-chain pins in the JSON report.
+    #[arg(long, requires = "json")]
+    pub evidence_context: bool,
 }
 
 impl Command for IntentValidate {
@@ -40,6 +53,7 @@ impl Command for IntentValidate {
         // if a FRESH attestation sidecar exists we gate the attested node (so a
         // previously-attested intent reports conforms), a STALE one warns and
         // falls back to the raw node.
+        let mut stored_inputs = None;
         let node = if is_path_shaped(&self.id_or_path) {
             let path = Path::new(&self.id_or_path);
             if !path.is_file() {
@@ -58,7 +72,7 @@ impl Command for IntentValidate {
             let root = find_repository_root()?;
             let repo = Repository::open(&root).map_err(CliError::Repository)?;
             let inputs = bridge::read_intent(&repo, &self.id_or_path)?;
-            match bridge::load_attestation(&repo, &self.id_or_path, &inputs)? {
+            let node = match bridge::load_attestation(&repo, &self.id_or_path, &inputs)? {
                 bridge::Attestation::Fresh(node) => *node,
                 bridge::Attestation::Stale(_) => {
                     eprintln!(
@@ -69,10 +83,29 @@ impl Command for IntentValidate {
                     bridge::lift(&inputs)?
                 }
                 bridge::Attestation::None => bridge::lift(&inputs)?,
-            }
+            };
+            stored_inputs = Some(inputs);
+            node
         };
 
         let mut report = validate_intent(&node);
+        let wants_context = self.evidence_context || self.replay_evidence.is_some();
+        if wants_context && is_path_shaped(&self.id_or_path) {
+            return Err(validation_failed(
+                "evidence replay/context requires a stored intent ID",
+            ));
+        }
+        let context = if wants_context {
+            let inputs = stored_inputs.as_ref().ok_or_else(|| {
+                validation_failed("evidence replay/context requires a stored intent ID")
+            })?;
+            let root = find_repository_root()?;
+            let repo =
+                crate::commands::open_readonly_repository(&root).map_err(CliError::Repository)?;
+            Some(intent_evidence::context_from_inputs(&repo, inputs).map_err(evidence_error)?)
+        } else {
+            None
+        };
 
         // Evidence URNs must RESOLVE to real changes when a repository is
         // reachable — the gate only checks presence. (Recording the Why: a met
@@ -88,11 +121,47 @@ impl Command for IntentValidate {
             report.results.extend(extra);
         }
 
+        let replay = match (&self.replay_evidence, &self.evidence_checker, &context) {
+            (Some(manifest), Some(checker), Some(context)) => {
+                let replay = intent_evidence::replay(manifest, checker, context, &node)
+                    .map_err(evidence_error)?;
+                // Release the repository before invoking a checker, then re-read.
+                // A checker result from another intent definition or view state
+                // must not be reused as a fresh validation result.
+                let root = find_repository_root()?;
+                let repo = crate::commands::open_readonly_repository(&root)
+                    .map_err(CliError::Repository)?;
+                let after = intent_evidence::read_context(&repo, &self.id_or_path)
+                    .map_err(evidence_error)?;
+                drop(repo);
+                let mut violations = replay.violations();
+                if &after != context {
+                    violations.push(Violation {
+                        focus_node: node.id.clone(),
+                        shape: "EvidenceReplayFreshness".into(),
+                        path: None,
+                        message: "intent substance or view chain changed during evidence replay"
+                            .into(),
+                    });
+                }
+                if !violations.is_empty() {
+                    report.conforms = false;
+                    report.results.extend(violations);
+                }
+                Some(replay)
+            }
+            _ => None,
+        };
+
         if self.json {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&report_json(&report)).unwrap()
-            );
+            let mut output = report_json(&report);
+            if let Some(context) = &context {
+                output["evidence_context"] = serde_json::to_value(context).unwrap();
+            }
+            if let Some(replay) = &replay {
+                output["evidence_replay"] = serde_json::to_value(replay).unwrap();
+            }
+            println!("{}", serde_json::to_string_pretty(&output).unwrap());
         } else {
             print!("{report}");
         }
@@ -115,6 +184,16 @@ impl Command for IntentValidate {
 /// Intent IDs are `PREFIX-N` / `N` — no `.md` suffix, no separator.
 fn is_path_shaped(arg: &str) -> bool {
     arg.ends_with(".md") || arg.contains('/') || arg.contains(std::path::MAIN_SEPARATOR)
+}
+
+/// Keep repository and I/O failures distinct; every other evidence refusal is
+/// a user-fixable gate error (exit 2).
+fn evidence_error(error: intent_evidence::EvidenceError) -> CliError {
+    match error {
+        intent_evidence::EvidenceError::Repository(error) => CliError::Repository(error),
+        intent_evidence::EvidenceError::Io(error) => CliError::Io(error),
+        other => validation_failed(other.to_string()),
+    }
 }
 
 /// Resolve `urn:atomic:change:<hash>` evidence URNs against the change store at

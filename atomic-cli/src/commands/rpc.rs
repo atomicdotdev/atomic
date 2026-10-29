@@ -22,12 +22,14 @@ use std::path::{Path, PathBuf};
 
 use atomic_client::proto as pb;
 use atomic_core::types::{Base32, Merkle};
+use atomic_repository::intent_evidence;
 use libatomic::atomic::attestation_target::Kind as TargetKind;
 use libatomic::atomic::update_vault_entity_request::Update as UpdateKind;
 use libatomic::atomic::verify_attestation_request::Target as VerifyTarget;
 use libatomic::atomic::VaultEntityKind as Kind;
 use libatomic::atomic::VaultEntityStatus as Status;
 
+use crate::commands::intent::validation_failed;
 use crate::error::{CliError, CliResult};
 use crate::output::{print_hint, print_info, print_success, print_warning};
 use crate::service::{status_message, Service};
@@ -940,7 +942,193 @@ pub fn intent_validate(args: &super::intent::validate::IntentValidate) -> CliRes
     let Some(session) = Service::open()? else {
         return Ok(false);
     };
+    // Evidence replay needs the manifest and checker on the service host; the
+    // handler owns the pins, the ordinary gate, and the post-checker freshness
+    // read. The local body remains the fallback when no service session exists.
+    if args.evidence_context || args.replay_evidence.is_some() {
+        return replay_evidence(&session, args);
+    }
     validate_entity(&session, Kind::Intent, &args.id_or_path, args.json)
+}
+
+fn replay_evidence(
+    session: &Service,
+    args: &super::intent::validate::IntentValidate,
+) -> CliResult<bool> {
+    let (manifest, manifest_base) = match &args.replay_evidence {
+        Some(path) => {
+            let bytes = intent_evidence::read_manifest(path).map_err(evidence_cli_error)?;
+            // Relative artifact roots must resolve against the manifest's
+            // directory on the service host, not the service process's cwd.
+            let absolute = std::path::absolute(path).map_err(CliError::Io)?;
+            let base = absolute.parent().unwrap_or_else(|| Path::new("."));
+            (bytes, base.display().to_string())
+        }
+        None => (Vec::new(), String::new()),
+    };
+    let request = pb::ReplayVaultEvidenceRequest {
+        repository: Some(session.reference.clone()),
+        kind: Kind::Intent as i32,
+        id: args.id_or_path.clone(),
+        evidence_context: true,
+        manifest,
+        manifest_base,
+        checker: args
+            .evidence_checker
+            .as_ref()
+            .map(|path| {
+                std::path::absolute(path)
+                    .unwrap_or_else(|_| path.clone())
+                    .display()
+                    .to_string()
+            })
+            .unwrap_or_default(),
+        view: None,
+    };
+    let response = session
+        .replay_vault_evidence(request)
+        .map_err(validation_refusal)?;
+
+    let context = response
+        .evidence_context
+        .as_ref()
+        .map(evidence_context_json);
+    let replay = response.evidence_replay.as_ref().map(evidence_replay_json);
+    let mut results: Vec<serde_json::Value> = response
+        .issues
+        .iter()
+        .map(|message| serde_json::json!({ "message": message }))
+        .collect();
+    if let Some(report) = &response.evidence_replay {
+        for decision in &report.decisions {
+            if decision.decision != "supported" {
+                results.push(serde_json::json!({
+                    "focus_node": decision.criterion_id,
+                    "shape": "EvidenceReplay",
+                    "path": "evidence",
+                    "message": format!(
+                        "{}: {} ({})",
+                        decision.claim_type, decision.decision, decision.reason
+                    ),
+                }));
+            }
+        }
+        if report.freshness_changed {
+            let focus = response
+                .evidence_context
+                .as_ref()
+                .map(|context| context.intent_id.as_str())
+                .unwrap_or_default();
+            results.push(serde_json::json!({
+                "focus_node": focus,
+                "shape": "EvidenceReplayFreshness",
+                "path": serde_json::Value::Null,
+                "message": "intent substance or view chain changed during evidence replay",
+            }));
+        }
+    }
+    let conforms = response.valid;
+
+    if args.json {
+        let mut output = serde_json::json!({
+            "conforms": conforms,
+            "results": results,
+        });
+        if let Some(context) = context {
+            output["evidence_context"] = context;
+        }
+        if let Some(replay) = replay {
+            output["evidence_replay"] = replay;
+        }
+        println!("{}", serde_json::to_string_pretty(&output).unwrap());
+    } else {
+        if conforms {
+            println!("conforms: yes");
+        } else {
+            println!("conforms: no ({} violation(s))", results.len());
+            for result in &results {
+                if let Some(message) = result["message"].as_str() {
+                    println!("  ✗ {message}");
+                }
+            }
+        }
+        if let Some(report) = &response.evidence_replay {
+            for decision in &report.decisions {
+                println!(
+                    "  evidence {}: {} ({})",
+                    decision.claim_type, decision.decision, decision.reason
+                );
+            }
+            if report.freshness_changed {
+                println!("  evidence replay: intent or view chain changed during replay");
+            }
+        }
+    }
+
+    if conforms {
+        Ok(true)
+    } else {
+        Err(validation_failed(format!(
+            "intent does not conform ({} violation(s))",
+            results.len()
+        )))
+    }
+}
+
+/// Evidence refusals over the wire are user-fixable gate errors (exit 2), not
+/// generic service refusals (exit 1).
+fn validation_refusal(error: CliError) -> CliError {
+    match error {
+        CliError::ServiceRefusal { message } if message.contains("atomic:INVALID_ARGUMENT:") => {
+            validation_failed(message)
+        }
+        other => other,
+    }
+}
+
+fn evidence_cli_error(error: intent_evidence::EvidenceError) -> CliError {
+    match error {
+        intent_evidence::EvidenceError::Repository(error) => CliError::Repository(error),
+        intent_evidence::EvidenceError::Io(error) => CliError::Io(error),
+        other => validation_failed(other.to_string()),
+    }
+}
+
+fn evidence_context_json(context: &pb::EvidenceContext) -> serde_json::Value {
+    serde_json::json!({
+        "intent_id": context.intent_id,
+        "intent_substance_hash": context.intent_substance_hash,
+        "intent_source_hash": context.intent_source_hash,
+        "view_chain": context
+            .view_chain
+            .iter()
+            .map(|pin| serde_json::json!({
+                "name": pin.name,
+                "merkle": pin.merkle,
+                "scope": pin.scope,
+            }))
+            .collect::<Vec<_>>(),
+    })
+}
+
+fn evidence_replay_json(replay: &pb::EvidenceReplay) -> serde_json::Value {
+    serde_json::json!({
+        "schema_version": replay.schema_version,
+        "decisions": replay
+            .decisions
+            .iter()
+            .map(|decision| serde_json::json!({
+                "schema_version": decision.schema_version,
+                "request_digest": decision.request_digest,
+                "criterion_id": decision.criterion_id,
+                "claim_type": decision.claim_type,
+                "decision": decision.decision,
+                "reason": decision.reason,
+                "details": serde_json::from_str::<serde_json::Value>(&decision.details_json)
+                    .unwrap_or(serde_json::Value::Null),
+            }))
+            .collect::<Vec<_>>(),
+    })
 }
 
 pub fn intent_verify(args: &super::intent::verify::IntentVerify) -> CliResult<bool> {

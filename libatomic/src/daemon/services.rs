@@ -87,6 +87,7 @@ const METHOD_MATRIX: &[(&str, &str)] = &[
     ("VaultService", "GetVaultEntry"),
     ("VaultService", "ListVaultEntries"),
     ("VaultService", "ValidateVaultEntity"),
+    ("VaultService", "ReplayVaultEvidence"),
     ("VaultService", "SyncVault"),
     ("AttestationService", "RecordAttestation"),
     ("AttestationService", "VerifyAttestation"),
@@ -148,6 +149,15 @@ impl daemon_service_server::DaemonService for DaemonImpl {
                         required_capabilities: vec!["maintenance.admin".to_string()],
                         allowed_callers: vec![CallerClass::Local as i32],
                         effects: vec![RpcEffect::RepositoryWrite as i32],
+                    }
+                } else if *service == "VaultService" && *method == "ReplayVaultEvidence" {
+                    MethodDescriptorInfo {
+                        service: service.to_string(),
+                        method: method.to_string(),
+                        scope: ExecutionScope::Both as i32,
+                        required_capabilities: vec!["vault.read".to_string()],
+                        allowed_callers: vec![CallerClass::Local as i32],
+                        effects: vec![RpcEffect::RepositoryRead as i32],
                     }
                 } else if *service == "KnowledgeService"
                     && matches!(*method, "GetProjectIdentity" | "GetWorkflowSnapshot")
